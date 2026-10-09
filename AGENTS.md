@@ -2071,6 +2071,18 @@ depending on a supervisor's redirection:
   `POST /api/upgrade` on a live handover once wrote `replaced` over `parking`
   and the watchdog blamed the wrong component for 46 minutes.
 
+**The park also waits for chat turns.** `hand_over` sets `TalkTurns::parking`
+(`ParkingTurns`) and `finish_talks` waits, alongside `finish_loop`, until
+`TalkTurns::live` is empty. While parking, `claim_talk_turn` refuses a direct
+start ("upgrade in progress, try again in a moment"), a queued claim and
+`begin_talk_turn_unless_pending` read as busy so `/say` and consult leave a
+durable draft, and `drain_loop` gives its slot up instead of draining the next
+draft (the draft stays for a manual resume after the restart). The wait is
+bounded by `talk_wait_bound`: web's `[graph] timeout_talk` plus `TALK_PARK_GRACE`;
+past it the talk ids go to `upgrade.log` and the `restarting` stage's `detail`
+and the hand-over proceeds. `Progress::parked_talks` carries the ids for
+`/api/health`'s `waiting_on`. The run wait itself is unchanged and unbounded.
+
 Supervisor redirection (launchd, NSSM, systemd...) only ever holds the first
 generation's descriptors, and a rename of its log files at start does not
 change what an already-running process writes to. So `magi-web.err.log` can

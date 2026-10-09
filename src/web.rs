@@ -726,6 +726,15 @@ impl Ui {
             .talk_turns
             .lock()
             .map_err(|_| ApiError::internal("the talk turn lock was poisoned"))?;
+        if live.parking {
+            if queued {
+                // The draft is already durable; nothing may drain it until
+                // the successor is up, so the caller sees a busy slot.
+                *live.queued.entry(id.to_owned()).or_default() += 1;
+                return Ok(None);
+            }
+            return Err(ApiError::conflict(UPGRADE_IN_PROGRESS));
+        }
         let inserted = live.live.insert(id.to_owned());
         // The on-disk lease is the cross-process half of the gate. Taken
         // second, and undone if lost, so `live` never claims a turn the lease
@@ -772,7 +781,8 @@ impl Ui {
             .talk_turns
             .lock()
             .map_err(|_| ApiError::internal("the talk turn lock was poisoned"))?;
-        if live.live.contains(id) {
+        // Same answer as a running turn: the text is queued as a draft.
+        if live.parking || live.live.contains(id) {
             return Ok(TalkTurnStart::Busy);
         }
         let Some(lease) = self.talks.claim_turn(id).map_err(ApiError::from)? else {
@@ -790,6 +800,11 @@ impl Ui {
             released: false,
             lease: Some(lease),
         }))
+    }
+
+    /// The shared turn slots, for the upgrade hand-over to wait on.
+    fn turns(&self) -> Arc<Mutex<TalkTurns>> {
+        Arc::clone(&self.talk_turns)
     }
 
     /// Park the loop for an upgrade, and report the run that is parking.
@@ -941,6 +956,10 @@ impl Ui {
     }
 }
 
+/// What a chat request is told while an upgrade is parking and the request
+/// cannot be queued as a draft.
+const UPGRADE_IN_PROGRESS: &str = "upgrade in progress, try again in a moment";
+
 /// One talk's turn slot, released on drop.
 ///
 /// A guard rather than a matching `remove` at the end of the handler, because
@@ -965,6 +984,10 @@ struct TalkTurnGuard {
 struct TalkTurns {
     live: HashSet<String>,
     queued: HashMap<String, u64>,
+    /// Set while an upgrade hand-over is parking: no turn may start, so the
+    /// set in `live` can only shrink. Cleared again if the hand-over ends
+    /// without exiting the process.
+    parking: bool,
 }
 
 /// The atomic initial-state decision made by
@@ -1249,6 +1272,8 @@ pub async fn serve(opts: Opts) -> Result<()> {
     // it for, and it exits on its own the moment the process does.
     tokio::spawn(run_update_recheck(repo, home.clone()));
     let looping = ui.looping();
+    let turns = ui.turns();
+    let talk_store = ui.talks.clone();
     let socket = SocketAddr::new(addr, opts.port);
     let listener = bind_waiting(socket).await?;
     let url = format!("http://{addr}:{}", opts.port);
@@ -1299,7 +1324,8 @@ pub async fn serve(opts: Opts) -> Result<()> {
         () = handover => {
             updater::log_step(&home, "serve: the select! woke on the handover signal");
             let successor_home = home.clone();
-            hand_over(&home, &looping, served, move |resume| {
+            let wait_for = move |ids: &[String]| talk_wait_for(&talk_store, ids);
+            hand_over(&home, &looping, &turns, &wait_for, served, move |resume| {
                 spawn_successor(&successor_home, resume)
             })
             .await
@@ -1394,6 +1420,8 @@ async fn normalize_default_repo(repo: PathBuf) -> PathBuf {
 async fn hand_over(
     home: &FsPath,
     looping: &Mutex<LoopState>,
+    turns: &Arc<Mutex<TalkTurns>>,
+    talk_wait: &(dyn Fn(&[String]) -> Duration + Sync),
     served: tokio::task::JoinHandle<std::io::Result<()>>,
     successor: impl FnOnce(bool) -> Result<u32>,
 ) -> Result<()> {
@@ -1408,7 +1436,20 @@ async fn hand_over(
             "hand_over: upgrade.json is unreadable; no parking stage",
         );
     }
-    finish_loop(home, looping, Some(&mut lease)).await;
+    let parking = ParkingTurns::begin(turns);
+    let loop_done = finish_loop(home, looping, None);
+    let talks_done = finish_talks(home, turns, talk_wait);
+    tokio::pin!(loop_done, talks_done);
+    let (mut loop_ended, mut talks_ended) = (false, None);
+    let mut beat = tokio::time::interval(LEASE_BEAT);
+    while !loop_ended || talks_ended.is_none() {
+        tokio::select! {
+            () = &mut loop_done, if !loop_ended => loop_ended = true,
+            left = &mut talks_done, if talks_ended.is_none() => talks_ended = Some(left),
+            _ = beat.tick() => lease.beat(),
+        }
+    }
+    let (abandoned, waited_for) = talks_ended.unwrap_or_default();
     drop(lease);
     updater::log_step(home, "hand_over: releasing the listener (abort and await)");
     served.abort();
@@ -1420,6 +1461,13 @@ async fn hand_over(
     match updater::read_progress(home) {
         Some(mut progress) => {
             progress.advance(updater::Stage::Restarting);
+            if !abandoned.is_empty() {
+                progress.detail = Some(format!(
+                    "handed over while {} still running after {} s",
+                    updater::talks_phrase(&abandoned),
+                    waited_for.as_secs()
+                ));
+            }
             updater::write_progress_logged(home, &progress);
         }
         None => updater::log_warn(
@@ -1431,6 +1479,7 @@ async fn hand_over(
         home,
         &format!("hand_over: starting the successor (resume={resume})"),
     );
+    drop(parking);
     match successor(resume) {
         Ok(pid) => {
             updater::log_step(home, &format!("hand_over: successor started, pid {pid}"));
@@ -1443,6 +1492,118 @@ async fn hand_over(
             );
             Err(e)
         }
+    }
+}
+
+/// Grace added to `[graph] timeout_talk` for the upgrade's wait on chat turns:
+/// a turn that runs its full timeout still needs a moment to record its answer.
+const TALK_PARK_GRACE: Duration = Duration::from_secs(60);
+
+/// How often the park looks at the chat turns still running.
+const TALK_POLL: Duration = Duration::from_millis(250);
+
+/// The longest an upgrade waits for chat turns: one turn's timeout plus a
+/// grace. Beyond it a stuck turn must not block the hand-over.
+fn talk_wait_bound(timeout_talk_secs: u64) -> Duration {
+    Duration::from_secs(timeout_talk_secs) + TALK_PARK_GRACE
+}
+
+/// The bound for the turns of `ids`: the longest `[graph] timeout_talk` among
+/// the repositories those talks run in (each turn uses its own talk's
+/// configuration), plus the grace. A talk or config that cannot be read counts
+/// with the default timeout.
+fn talk_wait_for(talks: &Talks, ids: &[String]) -> Duration {
+    let default = Config::default().graph.timeout_talk;
+    let longest = ids
+        .iter()
+        .map(|id| {
+            talks
+                .get(id)
+                .ok()
+                .and_then(|t| Config::discover(&t.repo, None).ok())
+                .map_or(default, |(c, _)| c.graph.timeout_talk)
+        })
+        .max()
+        .unwrap_or(default);
+    talk_wait_bound(longest)
+}
+
+/// Stops new chat turns for as long as it lives, so the hand-over only ever
+/// waits on a set that cannot grow. Dropping it reopens the slots.
+struct ParkingTurns(Arc<Mutex<TalkTurns>>);
+
+impl ParkingTurns {
+    fn begin(turns: &Arc<Mutex<TalkTurns>>) -> Self {
+        turns.lock().unwrap_or_else(PoisonError::into_inner).parking = true;
+        Self(Arc::clone(turns))
+    }
+}
+
+impl Drop for ParkingTurns {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .parking = false;
+    }
+}
+
+/// Wait until no chat turn is running in this process, for at most the longest
+/// `bound_for` has given for the turns seen so far. Returns the talk ids still
+/// running when the bound was hit (empty when the turns finished) with the
+/// bound that applied, after saying so in the upgrade log.
+async fn finish_talks(
+    home: &FsPath,
+    turns: &Mutex<TalkTurns>,
+    bound_for: &(dyn Fn(&[String]) -> Duration + Sync),
+) -> (Vec<String>, Duration) {
+    let running = || {
+        let mut ids: Vec<String> = turns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .live
+            .iter()
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
+    };
+    let started = std::time::Instant::now();
+    let mut seen = Vec::new();
+    let mut bound = Duration::ZERO;
+    loop {
+        let ids = running();
+        if ids != seen {
+            bound = bound.max(bound_for(&ids));
+            if ids.is_empty() {
+                updater::log_step(home, "finish_talks: no chat turn is running");
+            } else {
+                updater::log_step(
+                    home,
+                    &format!(
+                        "finish_talks: waiting for {} to finish",
+                        updater::talks_phrase(&ids)
+                    ),
+                );
+            }
+            updater::set_parked_talks(home, &ids);
+            seen = ids;
+        }
+        if seen.is_empty() {
+            return (Vec::new(), bound);
+        }
+        if started.elapsed() >= bound {
+            updater::log_warn(
+                home,
+                &format!(
+                    "finish_talks: {} still running after {} s; handing over anyway",
+                    updater::talks_phrase(&seen),
+                    bound.as_secs()
+                ),
+            );
+            return (seen, bound);
+        }
+        tokio::time::sleep(TALK_POLL).await;
     }
 }
 
@@ -1981,23 +2142,30 @@ fn upgrade_progress_view(ui: &Ui, progress: updater::Progress) -> UpgradeProgres
     let run_id = alive
         .and_then(|l| l.parked_run.as_deref())
         .or(progress.parked_run.as_deref());
-    let waiting_on = (progress.stage == updater::Stage::Parking)
-        .then_some(run_id)
-        .flatten()
-        .map(|id| {
-            let waited = alive.map_or_else(String::new, |l| {
-                let secs = updater::waited_secs(l, now);
-                format!(" (waited {} min so far)", secs / 60)
-            });
-            match read_run(&ui.runs, id).ok() {
-                Some(run) => format!(
-                    "run {} is finishing {} before the address is handed over{waited}",
-                    run.short(),
-                    run.status.as_str()
-                ),
-                None => format!("run {id} is finishing before the address is handed over{waited}"),
-            }
+    let parking = progress.stage == updater::Stage::Parking;
+    let waited = alive.map_or_else(String::new, |l| {
+        let secs = updater::waited_secs(l, now);
+        format!(" (waited {} min so far)", secs / 60)
+    });
+    let run_text = run_id
+        .filter(|_| parking)
+        .map(|id| match read_run(&ui.runs, id).ok() {
+            Some(run) => format!("run {} is finishing {}", run.short(), run.status.as_str()),
+            None => format!("run {id} is finishing"),
         });
+    let talks_text = Some(updater::talks_phrase(&progress.parked_talks))
+        .filter(|t| parking && !t.is_empty())
+        .map(|t| format!("{t} finishing"));
+    let waiting_on = match (run_text, talks_text) {
+        (None, None) => None,
+        (run, talks) => {
+            let parts: Vec<String> = [run, talks].into_iter().flatten().collect();
+            Some(format!(
+                "{} before the address is handed over{waited}",
+                parts.join(" and ")
+            ))
+        }
+    };
     let detail = progress
         .detail
         .clone()
@@ -6565,6 +6733,17 @@ async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn:
             }
             break;
         }
+        {
+            // A parking upgrade starts no further turn: whatever is queued
+            // stays a durable draft for the successor.
+            let mut live = live_set.lock().unwrap_or_else(PoisonError::into_inner);
+            if live.parking {
+                if let Some(turn) = turn.take() {
+                    turn.release(&mut live);
+                }
+                break;
+            }
+        }
         // `talk::drain` takes the store lock and can write/rename the talk
         // file. Keep the turn mutex out of that synchronous work: it protects
         // every talk's in-memory claim, not this talk's disk operation.
@@ -6577,8 +6756,19 @@ async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn:
             .unwrap_or(0);
         let drained = blocking({
             let talks = talks.clone();
+            let live_set = Arc::clone(&live_set);
             move || {
-                let result = talk::drain(&mut talk, &talks);
+                // Promoting a draft is what starts a turn, so it is decided
+                // under the same lock a parking upgrade takes: either the
+                // promotion lands first (and its turn is waited for) or the
+                // draft stays queued.
+                let live = live_set.lock().unwrap_or_else(PoisonError::into_inner);
+                let result = if live.parking {
+                    Ok(None)
+                } else {
+                    talk::drain(&mut talk, &talks)
+                };
+                drop(live);
                 Ok((talk, result))
             }
         })
@@ -10988,6 +11178,7 @@ mod tests {
         .with_worktrees_root(home.path().join("wt"))
         .with_launch(launch_knocking_on_the_way_out);
         let looping = ui.looping();
+        let turns = ui.turns();
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind loopback");
@@ -11013,26 +11204,33 @@ mod tests {
         // the closure and every attempt would fail. Inferred from the bind
         // rules and the code; not reproduced on macOS.
         let bound = std::sync::Mutex::new(None);
-        hand_over(home.path(), &looping, served, |_| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let attempt = loop {
-                match std::net::TcpListener::bind(addr) {
-                    Ok(l) => {
-                        drop(l);
-                        break Ok(());
+        hand_over(
+            home.path(),
+            &looping,
+            &turns,
+            &|_: &[String]| Duration::from_secs(5),
+            served,
+            |_| {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let attempt = loop {
+                    match std::net::TcpListener::bind(addr) {
+                        Ok(l) => {
+                            drop(l);
+                            break Ok(());
+                        }
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::AddrInUse
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        Err(e) => break Err(e.to_string()),
                     }
-                    Err(e)
-                        if e.kind() == std::io::ErrorKind::AddrInUse
-                            && std::time::Instant::now() < deadline =>
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(e) => break Err(e.to_string()),
-                }
-            };
-            *bound.lock().expect("bound") = Some(attempt);
-            Ok(1)
-        })
+                };
+                *bound.lock().expect("bound") = Some(attempt);
+                Ok(1)
+            },
+        )
         .await
         .expect("hand over");
 
@@ -14735,6 +14933,7 @@ mod tests {
         )
         .with_launch(launch_idle);
         let looping = ui.looping();
+        let turns = ui.turns();
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind loopback");
@@ -14743,9 +14942,16 @@ mod tests {
         let progress = crate::updater::Progress::new("0.5.1".to_owned(), "0.5.2".to_owned());
         crate::updater::write_progress(home.path(), &progress).expect("seed progress");
 
-        hand_over(home.path(), &looping, served, |_| Ok(1))
-            .await
-            .expect("hand over");
+        hand_over(
+            home.path(),
+            &looping,
+            &turns,
+            &|_: &[String]| Duration::from_secs(5),
+            served,
+            |_| Ok(1),
+        )
+        .await
+        .expect("hand over");
 
         let after = crate::updater::read_progress(home.path()).expect("progress on disk");
         assert_eq!(
@@ -14764,6 +14970,7 @@ mod tests {
             let home = TempDir::new().expect("temp home");
             let ui = idle_ui(&home);
             let looping = ui.looping();
+            let turns = ui.turns();
             let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
                 .await
                 .expect("bind loopback");
@@ -14772,14 +14979,21 @@ mod tests {
             crate::updater::write_progress(home.path(), &progress).expect("seed progress");
 
             let calls = std::sync::atomic::AtomicUsize::new(0);
-            let outcome = hand_over(home.path(), &looping, served, |_| {
-                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if fail {
-                    anyhow::bail!("no exec")
-                } else {
-                    Ok(4242)
-                }
-            })
+            let outcome = hand_over(
+                home.path(),
+                &looping,
+                &turns,
+                &|_: &[String]| Duration::from_secs(5),
+                served,
+                |_| {
+                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if fail {
+                        anyhow::bail!("no exec")
+                    } else {
+                        Ok(4242)
+                    }
+                },
+            )
             .await;
             assert_eq!(outcome.is_err(), fail);
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -14903,18 +15117,206 @@ mod tests {
         .with_launch(launch_idle)
     }
 
+    async fn park_fixture(
+        home: &TempDir,
+    ) -> (
+        Ui,
+        Arc<Mutex<LoopState>>,
+        Arc<Mutex<TalkTurns>>,
+        tokio::task::JoinHandle<std::io::Result<()>>,
+    ) {
+        let ui = idle_ui(home);
+        let looping = ui.looping();
+        let turns = ui.turns();
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind loopback");
+        let served = tokio::spawn(axum::serve(listener, ui.clone().router()).into_future());
+        let progress = crate::updater::Progress::new("0.5.1".to_owned(), "0.5.2".to_owned());
+        crate::updater::write_progress(home.path(), &progress).expect("seed progress");
+        (ui, looping, turns, served)
+    }
+
+    /// The hand-over does not release the address while a chat turn is in
+    /// flight, a `/say` arriving meanwhile starts nothing, and the successor is
+    /// started once the turn ends.
+    #[tokio::test]
+    async fn hand_over_waits_for_a_running_chat_turn() {
+        let home = TempDir::new().expect("temp home");
+        let (ui, looping, turns, served) = park_fixture(&home).await;
+        let ui = Arc::new(ui);
+        let id = "20260901-000000-chat";
+        let turn = ui.begin_talk_turn(id).expect("claim").expect("free");
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handover = tokio::spawn({
+            let home = home.path().to_path_buf();
+            let turns = Arc::clone(&turns);
+            let calls = Arc::clone(&calls);
+            async move {
+                hand_over(
+                    &home,
+                    &looping,
+                    &turns,
+                    &|_: &[String]| Duration::from_secs(60),
+                    served,
+                    move |_| {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(1)
+                    },
+                )
+                .await
+            }
+        });
+
+        let waiting = async {
+            for _ in 0..200 {
+                if crate::updater::read_progress(home.path())
+                    .is_some_and(|p| p.parked_talks == [id.to_owned()])
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("the park never named the chat turn");
+        };
+        waiting.await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // A new turn is refused, a queued claim and a direct `/say` see a busy
+        // slot, and nothing new is live.
+        let refused = ui.begin_talk_turn("20260901-000000-late").err();
+        assert!(
+            refused.is_some_and(|e| e.message.contains("upgrade in progress")),
+            "a direct start says an upgrade is in progress"
+        );
+        assert!(
+            ui.begin_queued_talk_turn("20260901-000000-late")
+                .expect("queued claim")
+                .is_none()
+        );
+        assert!(matches!(
+            ui.begin_talk_turn_unless_pending("20260901-000000-late")
+                .expect("start"),
+            TalkTurnStart::Busy
+        ));
+        assert_eq!(turns.lock().unwrap().live.len(), 1);
+
+        // The health text names the turn.
+        let progress = crate::updater::read_progress(home.path()).expect("progress");
+        let view = upgrade_progress_view(&ui, progress);
+        assert!(
+            view.waiting_on.as_deref().is_some_and(|w| w.contains(id)),
+            "{:?}",
+            view.waiting_on
+        );
+
+        assert!(!handover.is_finished());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(turn);
+        handover.await.expect("join").expect("hand over");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!turns.lock().unwrap().parking, "slots reopen afterwards");
+    }
+
+    /// A turn that never ends cannot block the upgrade: past the bound the
+    /// hand-over proceeds and records which talk it gave up on.
+    #[tokio::test]
+    async fn hand_over_gives_up_on_a_stuck_chat_turn_after_the_bound() {
+        let home = TempDir::new().expect("temp home");
+        let (ui, looping, turns, served) = park_fixture(&home).await;
+        let id = "20260901-000000-stuk";
+        let _turn = ui.begin_talk_turn(id).expect("claim").expect("free");
+
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        hand_over(
+            home.path(),
+            &looping,
+            &turns,
+            &|_: &[String]| Duration::from_millis(300),
+            served,
+            |_| {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(1)
+            },
+        )
+        .await
+        .expect("hand over");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let progress = crate::updater::read_progress(home.path()).expect("progress");
+        assert_eq!(progress.stage, crate::updater::Stage::Restarting);
+        assert!(
+            progress.detail.as_deref().is_some_and(|d| d.contains(id)),
+            "{:?}",
+            progress.detail
+        );
+        let log = std::fs::read_to_string(crate::updater::log_path(home.path())).expect("log");
+        assert!(
+            log.contains("handing over anyway") && log.contains(id),
+            "{log}"
+        );
+    }
+
+    /// A drain that finds the upgrade parking leaves the queued draft alone
+    /// and gives the slot up, instead of starting another turn.
+    #[tokio::test]
+    async fn drain_loop_starts_no_turn_while_parking() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::write(repo.join("magi.toml"), MOCK_AGENT_TOML).expect("write magi.toml");
+        let home = TempDir::new().expect("temp home");
+        let talks = Talks::at(home.path().join("talks"));
+        let ui = Ui::new(
+            Queue::at(home.path().join("queue")),
+            Questions::at(home.path().join("questions")),
+            talks.clone(),
+            home.path().join("runs"),
+            home.path().to_path_buf(),
+            repo.clone(),
+        )
+        .with_worktrees_root(home.path().join("wt"));
+        let cfg = config_for(&repo).await.expect("discover config");
+        let mut talk = talk::begin(&talks, &cfg, repo.clone(), Some("mock")).expect("begin talk");
+        let id = talk.id.clone();
+        talk::queue(&mut talk, &talks, "later", Vec::new()).expect("queue");
+        let turn = ui.begin_talk_turn(&id).expect("claim").expect("free");
+        let turns = ui.turns();
+        let parking = ParkingTurns::begin(&turns);
+
+        drain_loop(talk, talks.clone(), cfg, id.clone(), turn).await;
+
+        assert!(
+            turns.lock().unwrap().live.is_empty(),
+            "the slot is given up"
+        );
+        let fresh = talks.get(&id).expect("talk");
+        assert_eq!(fresh.pending, "later", "the draft is still queued");
+        assert!(fresh.turns.is_empty(), "no turn ran");
+        drop(parking);
+    }
+
     /// Run `hand_over` against `ui` and return what the successor was told.
     async fn handed_over(home: &TempDir, ui: Ui) -> bool {
         let looping = ui.looping();
+        let turns = ui.turns();
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind loopback");
         let served = tokio::spawn(axum::serve(listener, ui.router()).into_future());
         let told = std::sync::Mutex::new(None);
-        hand_over(home.path(), &looping, served, |resume| {
-            *told.lock().unwrap() = Some(resume);
-            Ok(1)
-        })
+        hand_over(
+            home.path(),
+            &looping,
+            &turns,
+            &|_: &[String]| Duration::from_secs(5),
+            served,
+            |resume| {
+                *told.lock().unwrap() = Some(resume);
+                Ok(1)
+            },
+        )
         .await
         .expect("hand over");
         told.into_inner().unwrap().expect("successor was started")

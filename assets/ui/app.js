@@ -990,7 +990,8 @@ function renderLoop() {
       ? `${upgradeInfo.waiting_on || "Nothing is moving."} ${stuckHint} (Once the address is released this page cannot reach the deck, so this is the last value it saw.)`
       : overdue
       ? `Asked for ${upgradeInfo.to || "an update"} more than an hour ago and has not come back. Check on it by hand.`
-      : (upgradeInfo.waiting_on || upgradeStageDetail(upgradeStage)));
+      : [upgradeInfo.waiting_on || upgradeStageDetail(upgradeStage),
+         upgradeStage === "restarting" ? upgradeInfo.detail : null].filter(Boolean).join(" "));
     state.lastUpgradeStage = upgradeStage;
     return;
   }

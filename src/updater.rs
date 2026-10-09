@@ -293,6 +293,9 @@ pub struct Progress {
     /// The run [`Stage::Parking`] is waiting on, when one was in flight.
     #[serde(default)]
     pub parked_run: Option<String>,
+    /// Chat turns [`Stage::Parking`] is still waiting on, by talk id.
+    #[serde(default)]
+    pub parked_talks: Vec<String>,
     /// When this upgrade was asked for.
     pub started_at: Timestamp,
     /// Last time `stage` changed.
@@ -312,6 +315,7 @@ impl Progress {
             from,
             to: Some(to),
             parked_run: None,
+            parked_talks: Vec::new(),
             started_at: now,
             updated_at: now,
             detail: None,
@@ -324,6 +328,7 @@ impl Progress {
         self.updated_at = Timestamp::now();
         // A note belongs to the stage it was written for.
         self.detail = None;
+        self.parked_talks.clear();
     }
 
     /// Stop at [`Stage::Failed`], with a reason a human can read.
@@ -388,11 +393,46 @@ fn write_progress_locked(home: &Path, progress: &Progress) -> Result<()> {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let to_write = monotonic(read_progress(home).as_ref(), progress);
-    let body = serde_json::to_string_pretty(&to_write).context("serialize upgrade progress")?;
+    store_progress(home, &to_write)
+}
+
+/// Write `progress` as given, atomically. The caller holds [`WRITE_LOCK`] and
+/// has already decided the record may replace the current one.
+fn store_progress(home: &Path, progress: &Progress) -> Result<()> {
+    let path = progress_path(home);
+    let body = serde_json::to_string_pretty(progress).context("serialize upgrade progress")?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &body).with_context(|| format!("write {}", tmp.display()))?;
     std::fs::rename(&tmp, &path).with_context(|| format!("replace {}", path.display()))?;
     Ok(())
+}
+
+/// Record which chat turns the parked handover is still waiting on. Written
+/// only while the stage is [`Stage::Parking`], under the same lock as
+/// [`write_progress`], so a stage that moved on is never touched.
+pub fn set_parked_talks(home: &Path, talks: &[String]) {
+    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut progress) = read_progress(home) else {
+        return;
+    };
+    if progress.stage != Stage::Parking || progress.parked_talks == talks {
+        return;
+    }
+    progress.parked_talks = talks.to_vec();
+    // Same stage, so `monotonic` would keep the old record: store directly.
+    if let Err(e) = store_progress(home, &progress) {
+        log_warn(home, &format!("could not write upgrade.json: {e:#}"));
+    }
+}
+
+/// The phrase naming the chat turns a park waits on, empty for none.
+#[must_use]
+pub fn talks_phrase(talks: &[String]) -> String {
+    match talks {
+        [] => String::new(),
+        [one] => format!("chat turn {one} is"),
+        many => format!("chat turns {} are", many.join(", ")),
+    }
 }
 
 /// Record `detail` as the failure of the upgrade request that is asking,
@@ -656,9 +696,17 @@ fn waiting_on(progress: &Progress, lease: Option<&HandoverLease>) -> String {
             let run = lease
                 .and_then(|l| l.parked_run.as_ref())
                 .or(progress.parked_run.as_ref());
+            let talks = talks_phrase(&progress.parked_talks);
+            let talks = if talks.is_empty() {
+                String::new()
+            } else {
+                format!("{talks} still finishing; ")
+            };
             match run {
-                Some(run) => format!("the loop to finish run {run} at its next node boundary"),
-                None => "the loop to stop (no run was recorded as in flight)".to_owned(),
+                Some(run) => {
+                    format!("{talks}the loop to finish run {run} at its next node boundary")
+                }
+                None => format!("{talks}the loop to stop (no run was recorded as in flight)"),
             }
         }
         Stage::Restarting => "spawn_successor returning and this process exiting".to_owned(),
