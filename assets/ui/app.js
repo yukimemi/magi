@@ -4610,7 +4610,9 @@ function updateAskCard(row, question, { compact = false } = {}) {
   const canConsult = open && typeof question.origin_chat === "string" && question.origin_chat !== "";
   show(r.consultBox, canConsult);
   r.consultBtn.disabled = Boolean(question.consult);
-  setText(r.consultBtn, question.consult ? "Asked the chat agent" : "Ask the chat agent");
+  setText(r.consultBtn, question.consult
+    ? "Asked the chat agent"
+    : question.origin_chat_closed ? "Reopen chat and ask" : "Ask the chat agent");
   r.consultBtn.onclick = () => consultChat(question.id, row);
   r.sayText.disabled = waitingOnAgent;
   r.saySend.disabled = waitingOnAgent;
@@ -4783,7 +4785,7 @@ async function consultChat(id, row) {
   try {
     const said = await postJson(API.questionConsult(id), {});
     reflectQuestion(said);
-    announce("Sent to the chat. It stays open until the chat or you answer it.");
+    announce("Sent to the chat (reopened if it was closed). It stays open until the chat or you answer it.");
     ok();
   } catch (error) {
     if (error.status === 409) {
