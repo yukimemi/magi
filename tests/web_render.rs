@@ -1281,6 +1281,16 @@ async fn settings_gear_is_reachable_on_a_phone_and_never_doubles_the_rail_link()
 /// Exercise the actual client functions without boot's timers. The test-only
 /// harness is appended to the embedded source; shipped assets need no hooks.
 async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
+    // `open_page` returns right after `Page.navigate`; app.js looks up
+    // elements at top level, so it must not run before the document is parsed.
+    browser
+        .wait_for(
+            page,
+            "document.readyState !== 'loading' && !!document.getElementById('notifications-read-all')",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("document parsed before the client harness");
     browser
         .eval(
             page,
