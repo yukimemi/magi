@@ -36,10 +36,7 @@ pub fn origin_talk(tasks: &[Task], talks: &[Talk], q: &Question) -> Option<Talk>
     }
     let task = crate::daemon::task_of_question(tasks, q)?;
     let run = chat_talk_of(tasks, task)?;
-    talks
-        .iter()
-        .find(|t| t.id == run)
-        .cloned()
+    talks.iter().find(|t| t.id == run).cloned()
 }
 
 /// The talk `start` descends from: the id recorded on a task
