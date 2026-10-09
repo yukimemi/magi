@@ -207,3 +207,42 @@ description = "Wired to renri's [[hooks.post_create]] — runs in a freshly crea
 # moved — see yukimemi/pj-base#8 for the companion change in
 # `renri.toml.base`.
 dependencies = ["apm-install", "vcs-fetch"]
+
+# --- README demo gif (tools/demo) -------------------------------------------
+# Opt-in tooling: nothing here is a dependency of `check`, so CI and the
+# pre-push hook never need node, a browser or ffmpeg.
+
+[tasks.demo-deps]
+description = "Install what tools/demo needs: the npm package, then the browser it drives"
+script_runner = "@shell"
+# `playwright-core` downloads no browser on install, so the browser is a second
+# step. MAGI_CHROME (a Chrome/Chromium binary) skips it.
+script = '''
+cd tools/demo
+npm ci
+if [ -z "$MAGI_CHROME" ]; then node node_modules/playwright-core/cli.js install chromium; fi
+'''
+
+[tasks.demo-build]
+description = "Build the release binary and the demo seeder the recorder drives"
+command = "cargo"
+args = ["build", "--release", "--locked", "--bin", "magi", "--example", "demo_seed"]
+
+[tasks.demo-gif]
+description = "Re-record assets/demo.gif from a scratch MAGI_HOME (no agents, no network)"
+dependencies = ["demo-build", "demo-deps"]
+script_runner = "@shell"
+# node, not bun: playwright's CDP pipes (fd 3 and 4) do not survive bun.
+script = '''
+cd tools/demo
+node record.mjs
+'''
+
+[tasks.demo-shots]
+description = "Run the demo storyboard to target/demo-shots as one PNG per beat (no encode)"
+dependencies = ["demo-build", "demo-deps"]
+script_runner = "@shell"
+script = '''
+cd tools/demo
+node record.mjs --shots
+'''

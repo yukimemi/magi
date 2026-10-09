@@ -2142,3 +2142,64 @@ dependency, so offline tests and CI are unaffected.
 - Wired into `graph::Runner::guarded_pr_message` (first check, the rewrite's
   re-check and the final `prepare_with`); `bump.rs` and `land.rs` still use the
   heuristics. The event log records which source decided, never the text.
+
+### Re-recording the README's demo gif
+
+`assets/demo.gif` is scripted, never recorded by hand. `cargo make demo-gif`
+rebuilds the release binary and the seeder, starts the real web server on a
+scratch home, drives a phone-sized Chromium through the storyboard and encodes
+(`ffmpeg`, two-pass palette, target under 3 MB; the recorder warns above it).
+`cargo make demo-shots` runs the same storyboard and writes one PNG per beat to
+`target/demo-shots` with no encode: look at those before encoding, and use them
+as the loop while changing a beat. Everything is in `tools/demo/`
+(`record.mjs`, `seed.mjs`, `fake-agent.mjs`, `package.json` with
+`playwright-core` as its only dependency) plus `examples/demo_seed.rs`.
+
+Prerequisites: `node`, `npm`, `ffmpeg` on `PATH` (`demo-shots` does not need
+ffmpeg). The first run downloads a browser; `MAGI_CHROME=<binary>` uses an
+existing one instead, and `demo-deps` skips the download then. **Nothing here
+is a dependency of `cargo make check` or CI**, and the tooling is outside the
+crate so building the binary never installs a browser.
+
+- **Offline, no agent CLIs.** The scratch machine layer (`MAGI_CONFIG_DIR`)
+  has one `kind = "command"` agent, `fake-agent.mjs`, as `[roles] chatter`;
+  `[update] mode = "off"`, `[repos] fetch_interval = 0`, `max_deputies = 0`.
+  The chat turn is real: the Asuka persona is picked in the persona selector, the
+  briefing carries it, and the fake agent files the task with the real
+  `magi task add` (the queue row comes from real state). The fake agent refuses
+  to answer if the persona did not reach the prompt. Its reply (the line
+  `あんたバカァ！` included) lives only in `fake-agent.mjs`, not in
+  `src/persona.rs`. Keep the reply to a few short lines: the frame does not scroll.
+- **Seeded state is typed.** Runs, questions and the queue entry are written
+  by `examples/demo_seed.rs` through magi's own types, in stages (`inflight`,
+  `reviewed`, `question`, `approval`, `merged`) of one run. A `run::SCHEMA` or
+  field change is therefore a compile error there (`cargo test --all-targets`
+  builds it), not a gif of "Nothing has run yet". Dates are relative to the
+  recording day. Candidates have an empty `agent`, so only A/B/C show.
+- **The last transition is seeded, honestly.** The approval is a real tap
+  (Merge this pull request… → Yes, merge now) answered through the real API,
+  but there is no forge and no land loop, so `merged` (pull request state and
+  run status) is written by the seeder afterwards. `queue loop` is never started
+  (`magi web` alone), so nothing else moves a run.
+- **Never touch the operator's machine.** `seed.mjs` makes a temp tree (repo +
+  local bare `origin`, `MAGI_HOME`, `MAGI_CONFIG_DIR`), refuses a scratch home
+  equal to a real one, and `demo_seed` refuses to run without `MAGI_HOME`.
+  The server binds a port the OS chose, which is then checked against the
+  occupied list in "Never take a port you did not check" and probed; after
+  start `/api/health` must name the scratch home before anything is driven
+  (`magi web --port 0` cannot be used: the port it got is not reported). If
+  you add a port to that list, add it to `OCCUPIED` in `record.mjs`.
+- **Run it with `node`, not `bun`**: playwright talks CDP over extra stdio
+  pipes (fd 3/4) that bun's `child_process` does not carry; the browser starts
+  and the launch times out minutes later.
+- **Capture frames, not video.** `recordVideo` is VP8 and shimmers on a still
+  screen, which a gif cannot collapse. The recorder takes CDP screencast PNGs
+  with their own timestamps and encodes a variable-delay gif.
+- **Japanese needs a CJK font** on the recording machine, or the quoted line
+  renders as tofu; check the `reply` shot. Wrapping is the other trap: a longer
+  reply pushes the line out of the frame.
+- **`Makefile.toml` is kata-managed.** The `demo-*` tasks are appended after
+  kata's content; a `kata apply` may drop them. If it does, restore them from
+  history rather than moving the recorder into the crate.
+- Keep beats 1.5-3 s and the whole take under about 25 s. If a beat cannot be
+  produced from seeded state without a real agent, drop it; never inject DOM.

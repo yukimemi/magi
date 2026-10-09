@@ -19,3 +19,6 @@ apm_modules/
 # fragment, so the Cargo build directory has to be named here — `cargo init`
 # wrote it and the kata apply replaced the file.
 /target/
+
+# Demo recorder (tools/demo): installed by `cargo make demo-deps` only.
+/tools/demo/node_modules/

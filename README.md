@@ -5,6 +5,10 @@
   </picture>
 </p>
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/yukimemi/magi/main/assets/demo.gif" width="360" alt="Demo on a phone: a chat in Asuka's voice files the task 'add retry with backoff to the uploader', the Runs page shows three blind candidates A/B/C, the judges rank them and the review rounds close with the finding fixed, the owner answers an agent's question with one tap, then approves the merge of the pull request.">
+</p>
+
 # magi
 
 **A blind multi-agent implementation competition, as a CLI.**
