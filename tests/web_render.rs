@@ -1512,10 +1512,24 @@ async fn unreachable_banner_waits_out_transient_failures() {
         clock += 60000; await deck.loadHealth(); await deck.loadHealth();
         out.offline = shown();
         Object.defineProperty(Navigator.prototype, 'onLine', onLine);
+        /* The pre-resume request fails only after the resume's own request has
+           failed and the clock has moved past the grace period, so counting it
+           would raise the banner; the generation guard must drop it. */
+        let failLate;
+        window.fetch = (url) => String(url).includes('/api/health')
+          ? (window.fetch = async () => { throw new TypeError('Failed to fetch'); },
+             new Promise((_, reject) => { failLate = () => reject(new TypeError('Failed to fetch')); }))
+          : native(url);
         const stale = deck.loadHealth();
         deck.resumeConnection();
+        await new Promise(r => setTimeout(r, 50));
+        out.resumeFailures = deck.unreachable.failures;
+        clock += 20000;
+        failLate();
         await stale;
-        await new Promise(r => setTimeout(r, 50)); out.stale = shown();
+        await new Promise(r => setTimeout(r, 50));
+        out.staleFailures = deck.unreachable.failures;
+        out.stale = shown();
         await deck.loadHealth({ explicit: true });
         out.explicit = shown();
       } finally {
@@ -1537,6 +1551,8 @@ async fn unreachable_banner_waits_out_transient_failures() {
     assert_eq!(r["successResets"], true);
     assert_eq!(r["cleared"], true);
     assert_eq!(r["offline"], false);
+    assert_eq!(r["resumeFailures"], 1);
+    assert_eq!(r["staleFailures"], 1);
     assert_eq!(r["stale"], false);
     assert_eq!(r["explicit"], true);
     browser.close_page(&page).await;
