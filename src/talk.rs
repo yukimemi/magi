@@ -1231,6 +1231,7 @@ pub fn record(
     // Do not let this older handle overwrite a draft accepted while it was
     // waiting for configuration discovery.
     talk.pending = fresh.pending;
+    talk.pending_breaks = fresh.pending_breaks;
     talk.pending_attachments = fresh.pending_attachments;
     if !talk.status.open() {
         bail!(
@@ -1881,6 +1882,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // running. This handle predates that write, so preserving only `status`
     // would overwrite the durable draft when the reply is appended below.
     talk.pending = fresh.pending;
+    talk.pending_breaks = fresh.pending_breaks;
     talk.pending_attachments = fresh.pending_attachments;
     if let Some(from) = fell_back_from.filter(|_| failure.is_none()) {
         // The switch persists: quota coming back does not move the chat
@@ -3085,6 +3087,7 @@ mod tests {
 
         let saved = talks.get(&id).expect("reload");
         assert_eq!(saved.pending, "next");
+        assert_eq!(saved.pending_breaks, Some(Vec::new()));
         assert_eq!(saved.turns.len(), 2, "operator message and reply remain");
     }
 
