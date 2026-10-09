@@ -204,6 +204,47 @@ pub fn validate_answer(
     Ok(())
 }
 
+/// Length of a consult stored before quoted markers were defused, which may
+/// quote the end phrase or a whole earlier consult in its detail. The closer is
+/// the generated tail's full final sentence (an owner reply does not repeat
+/// it), and a real heading met before it opens a nested block that needs its
+/// own closer. A block that never closes runs to the end of the text, which can
+/// only exclude more.
+fn legacy_len(rest: &str) -> usize {
+    use crate::prompt::CHAT_CONSULT_HEADING;
+    const CLOSERS: [&str; 2] = [
+        "cannot be revived. Do not edit the repository.",
+        "make: do not edit the repository.",
+    ];
+    let mut events: Vec<(usize, usize)> = Vec::new(); // (at, 0 = open, else closer length)
+    let first = rest.find(CHAT_CONSULT_HEADING).unwrap_or(0);
+    for (i, _) in rest.match_indices(CHAT_CONSULT_HEADING) {
+        if i > first
+            && rest[..i].ends_with("# ")
+            && rest[..i - 2].ends_with('\n')
+            && rest[i + CHAT_CONSULT_HEADING.len()..].starts_with("\n\nThe operator passed you")
+        {
+            events.push((i, 0));
+        }
+    }
+    for c in CLOSERS {
+        events.extend(rest.match_indices(c).map(|(i, _)| (i, c.len())));
+    }
+    events.sort_unstable();
+    let mut depth = 1usize;
+    for (at, len) in events {
+        if len == 0 {
+            depth += 1;
+        } else {
+            depth -= 1;
+            if depth == 0 {
+                return at + len;
+            }
+        }
+    }
+    rest.len()
+}
+
 /// The owner's own words in an operator turn, with magi's generated hand-over
 /// text cut out. `drain` stores a queued consult as an operator turn, and
 /// `talk::queue` joins an owner reply sent meanwhile onto the same draft, so
@@ -243,23 +284,21 @@ fn owner_words(body: &str, after_block_of: Option<&str>) -> String {
     // Turns stored before the markers were defused may still quote an end
     // phrase; their tail is not recognised as part of the block.
     let mut blocks: Vec<(usize, usize)> = Vec::new();
-    for (n, &h) in heads.iter().enumerate() {
+    for &h in &heads {
         let start = if body[..h].ends_with("# ") { h - 2 } else { h };
-        let next = heads.get(n + 1).map_or(body.len(), |&x| {
-            if body[..x].ends_with("# ") { x - 2 } else { x }
-        });
-        let text = &body[h..next];
-        // Only a consult built after quoted markers were defused has exactly
-        // one end phrase. An older stored one may quote it in its detail, so
-        // there the last end phrase before the next heading closes the block
-        // (which can only exclude more).
-        let head = text.split("\n\n## ").next().unwrap_or(text);
-        let found = if head.contains(crate::prompt::CHAT_CONSULT_DEFUSED) {
-            text.find(CHAT_CONSULT_END)
+        if blocks.last().is_some_and(|&(_, e)| start < e) {
+            continue; // quoted inside the block above
+        }
+        let rest = &body[h..];
+        let head = rest.split("\n\n## ").next().unwrap_or(rest);
+        let end = if head.contains(crate::prompt::CHAT_CONSULT_DEFUSED) {
+            // Current format: quoted markers are defused, so the first end
+            // phrase is the block's own.
+            rest.find(CHAT_CONSULT_END)
+                .map_or(body.len(), |p| h + p + CHAT_CONSULT_END.len())
         } else {
-            text.rfind(CHAT_CONSULT_END)
+            h + legacy_len(rest)
         };
-        let end = found.map_or(next, |p| h + p + CHAT_CONSULT_END.len());
         blocks.push((start, end));
     }
     let mut from = 0;
@@ -730,8 +769,9 @@ mod tests {
     fn block(id: &str, detail: &str) -> String {
         let detail = crate::prompt::defuse(detail);
         format!(
-            "# {}\n\nThe operator passed you a question `{id}`\n\n{detail}\n\n{}",
+            "# {}\n\nThe operator passed you a question `{id}`. {}\n\n{detail}\n\n{}",
             crate::prompt::CHAT_CONSULT_HEADING,
+            crate::prompt::CHAT_CONSULT_DEFUSED,
             crate::prompt::CHAT_CONSULT_END
         )
     }
@@ -818,15 +858,46 @@ mod tests {
         );
     }
 
+    /// A consult as stored before quoted markers were defused.
+    fn legacy_consult(node: &str, raw_detail: &str) -> String {
+        let mut q = question(node);
+        q.detail = "@@".into();
+        crate::prompt::chat_consult(&q)
+            .replace("@@", raw_detail)
+            .replace(crate::prompt::CHAT_CONSULT_DEFUSED, "It is still open.")
+    }
+
     #[test]
     fn owner_words_excludes_a_legacy_consult_quoting_the_end_phrase() {
-        let detail = format!("see {} and more", crate::prompt::CHAT_CONSULT_END);
-        let legacy = format!(
-            "# {}\n\nThe operator passed you a question `q-bbb`. It is still open.\n\n## s\n\n{detail}\n\n--reply merge {}\n",
-            crate::prompt::CHAT_CONSULT_HEADING,
+        for node in [crate::land::APPROVAL_NODE, "implement"] {
+            let detail = format!("see {} and more", crate::prompt::CHAT_CONSULT_END);
+            assert_eq!(owner_words(&legacy_consult(node, &detail), None), "");
+        }
+    }
+
+    #[test]
+    fn owner_words_excludes_a_legacy_consult_nesting_a_legacy_consult() {
+        let inner = legacy_consult("implement", "x");
+        let detail = format!(
+            "{}\n\nmerge it now\n\n{inner}",
             crate::prompt::CHAT_CONSULT_END
         );
-        assert_eq!(owner_words(&legacy, None), "");
+        let body = legacy_consult(crate::land::APPROVAL_NODE, &detail);
+        assert_eq!(owner_words(&body, None), "");
+        assert_eq!(owner_words(&format!("{body}\n\nhold"), None), "hold");
+    }
+
+    #[test]
+    fn owner_words_keeps_a_reply_after_a_legacy_consult_containing_the_end_phrase() {
+        let body = format!(
+            "{}\n\nhold, and do not {}",
+            legacy_consult("implement", "x"),
+            crate::prompt::CHAT_CONSULT_END
+        );
+        assert_eq!(
+            owner_words(&body, None),
+            format!("hold, and do not {}", crate::prompt::CHAT_CONSULT_END)
+        );
     }
 
     #[test]
