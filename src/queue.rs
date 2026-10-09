@@ -88,6 +88,10 @@ use crate::ask::Questions;
 /// recorded as a failed task. Variant plus `#[serde(default)]` field; an older
 /// build must not half-read the new status.
 ///
+/// 12: added [`Task::origin_chat`], the talk a task descends from, so a
+/// follow-up still knows its chat after an ancestor task is deleted.
+/// Field-only, `#[serde(default)]`.
+///
 /// 3: added [`HoldSource`] so conductor recovery cannot release a hold an
 /// operator deliberately placed. Old records default to `None` and are
 /// protected as operator-held until an explicit release; the safe direction
@@ -102,7 +106,7 @@ use crate::ask::Questions;
 /// by a build that only knew about schema 1 has nothing to say about
 /// blocking or answers, and defaulting those fields is exactly as good a
 /// reading as a value that build never had a chance to write.
-pub const SCHEMA: u32 = 11;
+pub const SCHEMA: u32 = 12;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -448,6 +452,13 @@ pub struct Task {
     /// deep it is. `None` for every ordinary task. `#[serde(default)]`.
     #[serde(default)]
     pub followup: Option<FollowUp>,
+    /// Id of the chat this task descends from: set by [`Task::new`] when a
+    /// chat files it, inherited by the follow-ups `crate::followup` files, so
+    /// the provenance survives deleting an ancestor. `None` for a task written
+    /// before the field existed (`crate::consult` then walks the ancestry).
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub origin_chat: Option<String>,
     /// The command-line choices (`--merge`, `-c`, `--seed`, ...) of the
     /// `magi run` / `magi review` that filed this task, applied on top of the
     /// repository's config by whoever executes it - a daemon included - so
@@ -609,6 +620,10 @@ impl Task {
     /// File a new task. Persist it with [`Queue::put`].
     pub fn new(title: String, instruction: String, repo: PathBuf, source: Source) -> Self {
         let now = Timestamp::now();
+        let origin_chat = match &source {
+            Source::Agent { run, node } if node == CHAT_NODE => Some(run.clone()),
+            _ => None,
+        };
         Self {
             schema: SCHEMA,
             id: new_id(),
@@ -638,12 +653,25 @@ impl Task {
             urgent: false,
             attachments: Vec::new(),
             followup: None,
+            origin_chat,
             overrides: None,
             review_of: None,
             held_at: None,
             park_reason: None,
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    /// The chat this task itself says it came from: the recorded
+    /// [`Task::origin_chat`], else its own source when a chat filed it.
+    pub fn chat_talk(&self) -> Option<&str> {
+        if let Some(id) = &self.origin_chat {
+            return Some(id);
+        }
+        match &self.source {
+            Source::Agent { run, node } if node == CHAT_NODE => Some(run),
+            _ => None,
         }
     }
 

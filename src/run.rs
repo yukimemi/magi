@@ -1986,6 +1986,10 @@ pub struct RunState {
     /// time it was read so deleting that task cannot reset the cap.
     #[serde(default)]
     pub followup_generation: Option<u32>,
+    /// Chat the task this run served descends from, fixed at start like
+    /// `followup_generation` so deleting the task cannot lose it.
+    #[serde(default)]
+    pub origin_chat: Option<String>,
     /// The pull-request comment naming the filed follow-ups was posted.
     #[serde(default)]
     pub followup_commented: bool,
@@ -2066,6 +2070,7 @@ impl RunState {
             origin: None,
             followups: Vec::new(),
             followup_generation: None,
+            origin_chat: None,
             followup_commented: false,
             events: Vec::new(),
             jobs: Vec::new(),

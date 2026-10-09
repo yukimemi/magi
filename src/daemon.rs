@@ -3024,6 +3024,9 @@ async fn attempt(
     // The follow-up depth is fixed now, while the task certainly exists:
     // deleting it later must not reset the cap (`crate::followup`).
     runner.state.followup_generation = Some(task.followup.as_ref().map_or(0, |f| f.generation));
+    if runner.state.origin_chat.is_none() {
+        runner.state.origin_chat = task.chat_talk().map(str::to_owned);
+    }
     // A stop that means "park" reaches the graph through this handle.
     runner.on_pause(stop.pause());
     // `poll`'s interrupt scheduler reaches this one run - and no other -
