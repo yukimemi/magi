@@ -146,6 +146,13 @@ pub fn file(state: &mut RunState, pr_url: &str, queue: &Queue) -> Result<Outcome
     }
 
     let tasks = queue.list();
+    let origin_chat = state.origin_chat.clone().or_else(|| {
+        let tasks = queue.list();
+        let parent = origin_task
+            .as_deref()
+            .and_then(|id| tasks.iter().find(|t| t.id == id))?;
+        crate::consult::chat_talk_of(&tasks, parent)
+    });
     let mut failure = None;
     for group in group_findings(chosen) {
         let ids: Vec<String> = group.iter().map(|f| f.id.clone()).collect();
@@ -168,6 +175,7 @@ pub fn file(state: &mut RunState, pr_url: &str, queue: &Queue) -> Result<Outcome
             continue;
         }
         let mut task = build_task(state, pr_url, origin_task.clone(), &group, parent_gen + 1);
+        task.origin_chat = origin_chat.clone();
         match queue.create_new(&mut task) {
             Ok(created) => {
                 if created {
@@ -659,6 +667,47 @@ mod tests {
         file(&mut s, "u", &q).unwrap();
         let t = q.list().into_iter().find(|t| t.followup.is_some()).unwrap();
         assert_eq!(t.followup.unwrap().origin_task, Some(parent.id));
+    }
+
+    #[test]
+    fn the_chat_is_inherited_from_the_run_even_when_the_parent_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        s.origin = Some(Origin {
+            by: crate::run::StartedBy::Operator,
+            task: Some("gone".to_owned()),
+        });
+        s.followup_generation = Some(1);
+        s.origin_chat = Some("talk-1".to_owned());
+        file(&mut s, "u", &q).unwrap();
+        let t = q.list().into_iter().find(|t| t.followup.is_some()).unwrap();
+        assert_eq!(t.origin_chat.as_deref(), Some("talk-1"));
+    }
+
+    #[test]
+    fn a_parent_without_the_field_passes_on_what_its_ancestry_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut parent = Task::new(
+            "p".to_owned(),
+            "i".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Agent {
+                run: "talk-2".to_owned(),
+                node: crate::queue::CHAT_NODE.to_owned(),
+            },
+        );
+        parent.origin_chat = None;
+        q.put(&mut parent).unwrap();
+        let mut s = merged(two_seats());
+        s.origin = Some(Origin {
+            by: crate::run::StartedBy::Operator,
+            task: Some(parent.id.clone()),
+        });
+        file(&mut s, "u", &q).unwrap();
+        let t = q.list().into_iter().find(|t| t.followup.is_some()).unwrap();
+        assert_eq!(t.origin_chat.as_deref(), Some("talk-2"));
     }
 
     const PR: &str = "https://github.com/o/r/pull/473";

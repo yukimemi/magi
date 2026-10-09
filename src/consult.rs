@@ -22,7 +22,7 @@ use jiff::Timestamp;
 
 use crate::ask::{ChatConsult, Question, Questions};
 use crate::config::Config;
-use crate::queue::{CHAT_NODE, Source, Task};
+use crate::queue::{CHAT_NODE, Task};
 use crate::talk::{self, Talk, Talks};
 
 /// The conversation `q` may be handed to, if any.
@@ -35,15 +35,17 @@ pub fn origin_talk(tasks: &[Task], talks: &[Talk], q: &Question) -> Option<Talk>
         return None;
     }
     let task = crate::daemon::task_of_question(tasks, q)?;
-    let Source::Agent { run, .. } = &chat_origin(tasks, task)?.source else {
-        return None;
-    };
+    let run = chat_talk_of(tasks, task)?;
     talks
         .iter()
-        .find(|t| &t.id == run && t.status.open())
+        .find(|t| t.id == run && t.status.open())
         .cloned()
 }
 
+/// The talk `start` descends from: the id recorded on a task
+/// ([`Task::chat_talk`]) wins, so deleted ancestors do not matter; tasks
+/// written before it existed are resolved by walking the ancestry.
+///
 /// Walk the provenance of `start` to the task a chat filed.
 ///
 /// A follow-up goes to the task its merged run served: `FollowUp::origin_task`
@@ -51,15 +53,15 @@ pub fn origin_talk(tasks: &[Task], talks: &[Talk], q: &Question) -> Option<Talk>
 /// hand the question to an unrelated chat), else the task whose `runs` hold
 /// `FollowUp::run`. At most `MAX_FOLLOWUP_GENERATION + 1` tasks are looked at,
 /// each once, so a cycle ends in `None`.
-fn chat_origin<'a>(tasks: &'a [Task], start: &'a Task) -> Option<&'a Task> {
+pub fn chat_talk_of(tasks: &[Task], start: &Task) -> Option<String> {
     let mut seen = std::collections::HashSet::new();
     let mut cur = start;
     for _ in 0..=crate::followup::MAX_FOLLOWUP_GENERATION {
         if !seen.insert(cur.id.as_str()) {
             return None;
         }
-        if matches!(&cur.source, Source::Agent { node, .. } if node == CHAT_NODE) {
-            return Some(cur);
+        if let Some(id) = cur.chat_talk() {
+            return Some(id.to_owned());
         }
         let f = cur.followup.as_ref()?;
         cur = match &f.origin_task {
@@ -693,6 +695,39 @@ mod tests {
         f1.followup.as_mut().unwrap().origin_task = Some("gone".to_owned());
         let q = q_for(&f1);
         assert!(origin_talk(&[chat, f1], &[talk], &q).is_none());
+    }
+
+    #[test]
+    fn a_recorded_chat_survives_deleted_ancestors() {
+        let (_tmp, _store, talk) = talks();
+        let chat = from_chat(&talk);
+        assert_eq!(chat.origin_chat.as_deref(), Some(talk.id.as_str()));
+        let mut f1 = followup_of(&chat, 1);
+        f1.origin_chat = chat.origin_chat.clone();
+        let mut f2 = followup_of(&f1, 2);
+        f2.origin_chat = f1.origin_chat.clone();
+        // Neither the chat task nor f1 is in the queue any more.
+        let q = q_for(&f2);
+        let got = origin_talk(std::slice::from_ref(&f2), std::slice::from_ref(&talk), &q);
+        assert_eq!(got.map(|t| t.id), Some(talk.id.clone()));
+        // The recorded id still has to name an open chat.
+        assert!(origin_talk(&[f2], &[], &q).is_none());
+    }
+
+    #[test]
+    fn a_task_without_the_field_still_walks_the_ancestry() {
+        let (_tmp, _store, talk) = talks();
+        let mut chat = from_chat(&talk);
+        chat.origin_chat = None;
+        let mut f1 = followup_of(&chat, 1);
+        f1.origin_chat = None;
+        let q = q_for(&f1);
+        assert!(origin_talk(&[chat, f1.clone()], std::slice::from_ref(&talk), &q).is_some());
+        // And the old JSON shape reads with the field absent.
+        let mut v = serde_json::to_value(&f1).unwrap();
+        v.as_object_mut().unwrap().remove("origin_chat");
+        let back: Task = serde_json::from_value(v).unwrap();
+        assert!(back.origin_chat.is_none());
     }
 
     #[test]
