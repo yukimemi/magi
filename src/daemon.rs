@@ -7160,14 +7160,25 @@ mod tests {
         let stop = Stop::new();
         let stopper = {
             let stop = stop.clone();
+            let queue = Queue::at(dir.path().join("queue"));
+            let id = t.id.clone();
             tokio::spawn(async move {
+                // Stop once the task has demonstrably been retried, not after
+                // a fixed delay: under a loaded machine 400 ms can pass before
+                // the loop has finished a second attempt.
                 tokio::time::sleep(Duration::from_millis(400)).await;
+                for _ in 0..200 {
+                    if queue.get(&id).is_ok_and(|t| t.attempts >= 2) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 stop.stop();
             })
         };
 
         tokio::time::timeout(
-            Duration::from_secs(10),
+            Duration::from_secs(20),
             drive(&opts, &queue, &status_file, &home, &worktrees, &stop),
         )
         .await
