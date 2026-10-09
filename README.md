@@ -5,6 +5,10 @@
   </picture>
 </p>
 
+<p align="center">
+  <img src="assets/demo.gif" width="360" alt="Phone demo: Asuka's chat files an uploader retry task; three blind candidates compete, judges rank them and reviews fix a finding; the owner answers a question and approves the pull request merge.">
+</p>
+
 # magi
 
 **A blind multi-agent implementation competition, as a CLI.**

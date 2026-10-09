@@ -2142,3 +2142,41 @@ dependency, so offline tests and CI are unaffected.
 - Wired into `graph::Runner::guarded_pr_message` (first check, the rewrite's
   re-check and the final `prepare_with`); `bump.rs` and `land.rs` still use the
   heuristics. The event log records which source decided, never the text.
+
+### Re-recording the README's demo gif
+
+Run `cargo make demo-shots`, inspect the PNGs in `$CARGO_TARGET_DIR/demo-shots`
+(or `target/demo-shots` when unset), then run `cargo make demo-gif` to replace
+`assets/demo.gif`. Both build the release binary and typed `demo_seed` example.
+Prerequisites: Node, npm and Chromium; encoding also needs ffmpeg. Set
+`MAGI_CHROME` to an existing browser to skip the browser download. These opt-in
+tasks are outside `check` and CI; building Rust never installs a browser.
+
+The take is fully scripted in `tools/demo/record.mjs`: Chat → Queue → blind
+A/B/C competition → judging/review → question → merge approval. The real Chat
+persona picker selects Asuka; `fake-agent.mjs` verifies her briefing, replies
+with `あんたバカァ！` and files the task through the real `magi task add`.
+Keep that short reply in the fake agent, never in `src/persona.rs`.
+Runs and questions are seeded through public Rust types, with dates relative
+to today. Field changes are caught when `demo_seed` compiles. The final merged
+transition is also seeded: the two approval taps save a real answer, but the
+demo runs neither a forge nor the landing/queue loop. Never inject DOM.
+
+Traps:
+
+- The recorder isolates `MAGI_HOME` and `MAGI_CONFIG_DIR` in a temp tree with a
+  local bare origin and only the scripted command agent. Updates, fetch timers
+  and deputies are disabled; browser requests outside the scratch server are
+  blocked. Never substitute an operator home or a real agent CLI.
+- The OS chooses a port, then it is checked against the occupied list in
+  “Never take a port you did not check” and TCP-probed. Update `OCCUPIED` in
+  `record.mjs` when that list changes. Health must report the scratch home.
+  `magi web --port 0` does not report its actual port. Shutdown is awaited
+  before removing the scratch tree.
+- Use Node, not Bun: the latter loses Playwright's CDP pipes. Capture lossless
+  PNGs rather than VP8 video; ffmpeg uses a two-pass palette and loops forever.
+  Keep the take below about 25 seconds and the GIF below about 3 MB.
+- Check Japanese font rendering and reply wrapping in the `reply` shot.
+  Browser installation may download files; the take itself stays offline.
+- `Makefile.toml` is kata-managed; `kata apply` may remove the appended demo
+  tasks. Restore them from history rather than adding recording to CI.
