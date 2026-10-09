@@ -1415,6 +1415,10 @@ pub struct DeputyPrompt<'a> {
 /// Heading of the turn that hands a question to the chat it came from.
 pub const CHAT_CONSULT_HEADING: &str = "A question was handed to you";
 
+/// Opening sentence that only a defused (current) consult carries; the
+/// no-break space is what `consult::owner_words` looks for.
+pub const CHAT_CONSULT_DEFUSED: &str = "It is still\u{a0}open.";
+
 /// The last words of every generated consult text, used to find where it ends.
 pub const CHAT_CONSULT_END: &str = "edit the repository.";
 
@@ -1441,7 +1445,7 @@ pub fn chat_consult(q: &crate::ask::Question) -> String {
     let mut s = format!(
         "# {CHAT_CONSULT_HEADING}\n\n\
          The operator passed you a question that one of the tasks filed from \
-         this conversation is waiting on (question `{id}`). It is still open.\n\n\
+         this conversation is waiting on (question `{id}`). {CHAT_CONSULT_DEFUSED}\n\n\
          ## {summary}\n\n",
         id = q.id,
         summary = defuse(&q.summary),

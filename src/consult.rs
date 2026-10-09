@@ -210,7 +210,9 @@ pub fn validate_answer(
 /// the turn's origin cannot be told from the turn as a whole. Each generated
 /// block runs from its [`CHAT_CONSULT_HEADING`](crate::prompt::CHAT_CONSULT_HEADING)
 /// to the first [`CHAT_CONSULT_END`](crate::prompt::CHAT_CONSULT_END) after it
-/// (quoted markers are defused by `prompt::chat_consult`); with no end the
+/// (quoted markers are defused by `prompt::chat_consult`; a consult stored
+/// before that, recognised by its opening sentence, ends at the last one before
+/// the next heading); with no end the
 /// block runs to the next heading. Only the blocks are cut: owner replies
 /// between them are kept, in order, even when they contain the phrase. With `after_block_of` (the turn
 /// carrying the hand-over itself) everything up to the end of the last block
@@ -246,9 +248,18 @@ fn owner_words(body: &str, after_block_of: Option<&str>) -> String {
         let next = heads.get(n + 1).map_or(body.len(), |&x| {
             if body[..x].ends_with("# ") { x - 2 } else { x }
         });
-        let end = body[h..next]
-            .find(CHAT_CONSULT_END)
-            .map_or(next, |p| h + p + CHAT_CONSULT_END.len());
+        let text = &body[h..next];
+        // Only a consult built after quoted markers were defused has exactly
+        // one end phrase. An older stored one may quote it in its detail, so
+        // there the last end phrase before the next heading closes the block
+        // (which can only exclude more).
+        let head = text.split("\n\n## ").next().unwrap_or(text);
+        let found = if head.contains(crate::prompt::CHAT_CONSULT_DEFUSED) {
+            text.find(CHAT_CONSULT_END)
+        } else {
+            text.rfind(CHAT_CONSULT_END)
+        };
+        let end = found.map_or(next, |p| h + p + CHAT_CONSULT_END.len());
         blocks.push((start, end));
     }
     let mut from = 0;
@@ -805,6 +816,17 @@ mod tests {
             owner_words(&body, None),
             format!("hold, and do not {}", crate::prompt::CHAT_CONSULT_END)
         );
+    }
+
+    #[test]
+    fn owner_words_excludes_a_legacy_consult_quoting_the_end_phrase() {
+        let detail = format!("see {} and more", crate::prompt::CHAT_CONSULT_END);
+        let legacy = format!(
+            "# {}\n\nThe operator passed you a question `q-bbb`. It is still open.\n\n## s\n\n{detail}\n\n--reply merge {}\n",
+            crate::prompt::CHAT_CONSULT_HEADING,
+            crate::prompt::CHAT_CONSULT_END
+        );
+        assert_eq!(owner_words(&legacy, None), "");
     }
 
     #[test]
