@@ -27,9 +27,9 @@ use crate::talk::{self, Talk, Talks};
 
 /// The conversation `q` may be handed to, if any.
 ///
-/// Requires an open question whose task was filed from a chat that is still
-/// open. Release notices are left out. Merge approvals may be discussed, but
-/// answering from chat requires the owner's latest words.
+/// Requires an open question whose task was filed from a chat. The chat may
+/// be closed: [`begin`] reopens it. Release notices are left out. Merge
+/// approvals may be discussed, but answering from chat requires the owner's latest words.
 pub fn origin_talk(tasks: &[Task], talks: &[Talk], q: &Question) -> Option<Talk> {
     if !q.status.open() || q.node == crate::bump::NOTICE_NODE {
         return None;
@@ -38,7 +38,7 @@ pub fn origin_talk(tasks: &[Task], talks: &[Talk], q: &Question) -> Option<Talk>
     let run = chat_talk_of(tasks, task)?;
     talks
         .iter()
-        .find(|t| t.id == run && t.status.open())
+        .find(|t| t.id == run)
         .cloned()
 }
 
@@ -108,6 +108,17 @@ pub fn begin(questions: &Questions, talks: &Talks, q: &Question, talk: &Talk) ->
         return Ok(false);
     }
     let mut talk = talk.clone();
+    // A closed origin chat is reopened (idempotent) before the question is
+    // queued; `close` dropped its drafts, so only the question is sent.
+    if !talk.status.open()
+        && let Err(e) = talk::reopen(&mut talk, talks)
+    {
+        let _ = questions.update(&q.id, |r| {
+            r.consult = None;
+            Ok(())
+        });
+        return Err(e).context("reopen the chat");
+    }
     if let Err(e) = talk::queue(
         &mut talk,
         talks,
@@ -566,7 +577,8 @@ mod tests {
         assert!(hit(&[other], std::slice::from_ref(&talk), &q).is_none());
         // The conversation is gone, or no longer takes turns.
         assert!(hit(std::slice::from_ref(&chat), &[], &q).is_none());
-        assert!(hit(std::slice::from_ref(&chat), &[closed], &q).is_none());
+        // A closed conversation is reopened by `begin`, so it still qualifies.
+        assert!(hit(std::slice::from_ref(&chat), &[closed], &q).is_some());
         // No task owns the question.
         assert!(hit(&[], std::slice::from_ref(&talk), &q).is_none());
         // Merge approvals can be consulted; release notices cannot.
@@ -614,7 +626,7 @@ mod tests {
         assert!(origin_talk(std::slice::from_ref(&chat), &[], &q).is_none());
         let mut closed = talk.clone();
         closed.status = TalkStatus::Closed;
-        assert!(origin_talk(std::slice::from_ref(&chat), &[closed], &q).is_none());
+        assert!(origin_talk(std::slice::from_ref(&chat), &[closed], &q).is_some());
         q.abandon("expired");
         assert!(
             origin_talk(std::slice::from_ref(&chat), std::slice::from_ref(&talk), &q).is_none()
@@ -764,6 +776,23 @@ mod tests {
             })
             .unwrap();
         assert!(!pending_consults(&questions, &talk.id), "closed question");
+    }
+
+    #[test]
+    fn begin_reopens_a_closed_chat_before_queueing() {
+        let (tmp, store, mut talk) = talks();
+        let questions = Questions::at(tmp.path().join("questions"));
+        let mut q = question("implement");
+        questions.put(&mut q).unwrap();
+        talk::close(&mut talk, &store).unwrap();
+        assert!(!store.get(&talk.id).unwrap().status.open());
+
+        assert!(begin(&questions, &store, &q, &talk).unwrap());
+
+        let after = store.get(&talk.id).unwrap();
+        assert!(after.status.open(), "the chat was reopened");
+        assert!(after.pending.contains(&q.id), "{}", after.pending);
+        assert!(questions.get(&q.id).unwrap().consult.is_some());
     }
 
     #[test]

@@ -5618,6 +5618,8 @@ struct QuestionView {
     /// UI offers "Ask the chat agent" only when this is set; it is never one
     /// of `question.choices`.
     origin_chat: Option<String>,
+    /// `origin_chat` is closed; consulting reopens it first.
+    origin_chat_closed: bool,
 }
 
 impl QuestionView {
@@ -5646,13 +5648,16 @@ impl QuestionView {
             deputies_enabled,
             run_is_task: question.run_names_task(),
             origin_chat: None,
+            origin_chat_closed: false,
             question,
         }
     }
 
     /// Fill `origin_chat` from the queue and the talks.
     fn with_origin(mut self, tasks: &[crate::queue::Task], talks: &[Talk]) -> Self {
-        self.origin_chat = crate::consult::origin_talk(tasks, talks, &self.question).map(|t| t.id);
+        let talk = crate::consult::origin_talk(tasks, talks, &self.question);
+        self.origin_chat_closed = talk.as_ref().is_some_and(|t| !t.status.open());
+        self.origin_chat = talk.map(|t| t.id);
         self
     }
 }
@@ -5922,7 +5927,7 @@ async fn question_consult(
             let (tasks, talks) = (ui.queue.list(), ui.talks.list());
             let Some(talk) = crate::consult::origin_talk(&tasks, &talks, &q) else {
                 return Err(ApiError::conflict(format!(
-                    "question {} has no open chat to ask",
+                    "question {} has no chat to ask",
                     q.short()
                 )));
             };

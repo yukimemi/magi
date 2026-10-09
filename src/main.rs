@@ -2560,7 +2560,7 @@ async fn answer_cmd(
         let talks = magi::talk::Talks::open();
         let tasks = Queue::open().list();
         let talk = magi::consult::origin_talk(&tasks, &talks.list(), &q)
-            .context("this question has no open chat to ask")?;
+            .context("this question has no chat to ask")?;
         // Read before anything is saved: a failure here leaves no record.
         let cfg = Config::discover(&talk.repo, None)?.0;
         match magi::consult::start_turn(&store, &talks, &q, &talk, &cfg).await? {
