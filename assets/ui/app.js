@@ -9389,6 +9389,13 @@ function wireAttachments({ fileInput, say, turns, box, attach }) {
 }
 
 /* ---- boot -------------------------------------------------------------- */
+/* A plain pageshow also retries, but only while a failure is recorded: an
+   unconditional call would double the cold load's own fetch and, by advancing
+   `gen`, make that first fetch's failure be ignored. */
+function onPageShow(event) {
+  if (event.persisted || unreachable.since !== null) resumeConnection();
+}
+
 function wire() {
   $("stats-unreadable-close").addEventListener("click", () => {
     if (state.stats) {
@@ -9523,9 +9530,7 @@ function wire() {
     if (state.route.name === "talk" && state.talkDetail.id) renderTalk();
   });
   window.addEventListener("online", resumeConnection);
-  window.addEventListener("pageshow", (event) => {
-    if (event.persisted) resumeConnection();
-  });
+  window.addEventListener("pageshow", onPageShow);
 }
 
 async function boot() {
