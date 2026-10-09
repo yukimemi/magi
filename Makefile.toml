@@ -239,7 +239,7 @@ node record.mjs
 '''
 
 [tasks.demo-shots]
-description = "Run the demo storyboard to target/demo-shots as one PNG per beat (no encode)"
+description = "Run the demo storyboard to Cargo's target/demo-shots as one PNG per beat (no encode)"
 dependencies = ["demo-build", "demo-deps"]
 script_runner = "@shell"
 script = '''

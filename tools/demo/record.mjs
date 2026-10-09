@@ -1,7 +1,7 @@
 // Records assets/demo.gif: a scripted, re-recordable take of the phone UI.
 //
 //   node record.mjs            record and encode assets/demo.gif
-//   node record.mjs --shots    one PNG per beat in target/demo-shots, no encode
+//   node record.mjs --shots    one PNG per beat in Cargo's target/demo-shots, no encode
 //   node record.mjs --headed   watch it happen; --keep keeps the scratch tree
 //
 // Run through `cargo make demo-gif` / `demo-shots`, which build the release
@@ -23,11 +23,10 @@ import { spawn, execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, rm, stat, writeFile } from "node:fs/promises";
 import { createConnection, createServer } from "node:net";
-import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { setTimeout as wait } from "node:timers/promises";
 import { chromium } from "playwright-core";
-import { ROOT, binaries, prepare, seedStage } from "./seed.mjs";
+import { ROOT, binaries, prepare, seedStage, targetDir } from "./seed.mjs";
 
 const argv = new Set(process.argv.slice(2));
 const SHOTS = argv.has("--shots");
@@ -56,6 +55,8 @@ const log = (msg) => console.error(`demo: ${msg}`);
 function connects(port) {
   return new Promise((done) => {
     const s = createConnection({ port, host: "127.0.0.1" });
+    s.setTimeout(1500);
+    s.once("timeout", () => (s.destroy(), done(true)));
     s.once("connect", () => (s.destroy(), done(true)));
     s.once("error", () => done(false));
   });
@@ -77,7 +78,7 @@ async function freePort() {
   throw new Error("no free port found");
 }
 
-async function startServer(scratch) {
+async function startServer(scratch, ownChild) {
   const { magi } = binaries();
   if (!existsSync(magi)) {
     throw new Error(`${magi} is missing — run \`cargo make demo-gif\` (it builds it)`);
@@ -88,10 +89,14 @@ async function startServer(scratch) {
     ["web", "--bind", "127.0.0.1", "--port", String(port), "--repo", scratch.repo],
     { env: scratch.env, stdio: ["ignore", "ignore", "pipe"], cwd: scratch.repo },
   );
+  // Own the process before the first readiness check: startup failures must
+  // take the same cleanup path as failures halfway through the storyboard.
+  ownChild(child);
   const err = [];
+  child.on("error", (e) => err.push(e.message));
   child.stderr.on("data", (d) => err.push(d.toString()));
   let exited = false;
-  child.on("exit", () => (exited = true));
+  child.on("close", () => (exited = true));
 
   const base = `http://127.0.0.1:${port}`;
   // The port was free a moment ago; whatever answers must be OUR server, on
@@ -116,15 +121,23 @@ async function startServer(scratch) {
   throw new Error(`magi web did not come up:\n${err.join("")}`);
 }
 
-function stopServer(child) {
-  if (child.exitCode !== null) return;
-  if (process.platform === "win32") {
-    try {
-      execFileSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
-    } catch {}
-  } else {
-    child.kill("SIGTERM");
-  }
+async function stopServer(child) {
+  if (!child.pid || child.exitCode !== null || child.signalCode !== null) return;
+  // Wait for termination before removing the scratch state. SIGTERM alone
+  // only requests shutdown; a still-running child can recreate those files.
+  await new Promise((done) => {
+    const timer = setTimeout(() => child.kill("SIGKILL"), 5000);
+    child.once("close", () => (clearTimeout(timer), done()));
+    if (process.platform === "win32") {
+      try {
+        execFileSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+      } catch {
+        child.kill("SIGKILL");
+      }
+    } else {
+      child.kill("SIGTERM");
+    }
+  });
 }
 
 // ---------------------------------------------------------------------
@@ -191,7 +204,7 @@ async function startScreencast(page) {
 }
 
 /** Frames closer than this (s) are dropped: animations paint at the display rate. */
-const MIN_GAP = 0.04;
+const MIN_GAP = 1 / 12;
 
 function thin(frames) {
   const kept = [frames[0]];
@@ -251,6 +264,7 @@ async function encode(list, gif) {
   await ffmpeg([
     "-y", ...input,
     "-vf", `${chain},palettegen=max_colors=${COLORS}:stats_mode=diff`,
+    "-frames:v", "1",
     palette,
   ]);
   await ffmpeg([
@@ -352,7 +366,7 @@ async function storyboard(page, scratch, base, beat, quiet) {
   await quiet(async () => {
     await page.locator("#talk-turns").getByText(QUOTE).waitFor({ timeout: 30_000 });
     await page.locator("#talk-wait").waitFor({ state: "hidden", timeout: 10_000 });
-  }, 1000);
+  }, 500);
   // Long enough to read the line the operator asked for.
   await beat("reply", 2600);
 
@@ -362,7 +376,7 @@ async function storyboard(page, scratch, base, beat, quiet) {
     await page.locator("#queue-sections").getByText(REQUEST).first().waitFor();
     await scrollTo(0);
   }, 200);
-  await beat("queue", 1200);
+  await beat("queue", 1500);
 
   // 2. The run in flight: three candidates, no agent names.
   const card = page.locator("#view-runs a.card.run-card").first();
@@ -383,15 +397,20 @@ async function storyboard(page, scratch, base, beat, quiet) {
   // 3. Ranking, tally, winner and the review rounds closing.
   await quiet(async () => {
     seedStage(scratch, "reviewed");
-    await wait(600);
+    await page.getByText("Unanimous final vote", { exact: true }).first().waitFor();
   }, 150);
-  await beat("run-reviewed", 900);
-  await scrollTo(760);
-  await beat("run-ranking", 1000);
-  await scrollTo(1500);
+  await beat("run-reviewed", 800);
+  await page.getByText("First choices", { exact: true }).first().evaluate(
+    (el) => el.scrollIntoView({ block: "center", behavior: "instant" }),
+  );
+  await beat("run-ranking", 1500);
   // Open the review rounds for real: round 1's finding, fixed in round 2.
   await tap(page.locator("summary", { hasText: "Reviews" }).first());
-  await wait(200);
+  // Show the adoption report and clean closing round, rather than stopping
+  // above the fix at the old blocking finding.
+  await page.getByText("1 addressed", { exact: true }).evaluate(
+    (el) => el.scrollIntoView({ block: "center", behavior: "instant" }),
+  );
   await beat("run-reviews", 1500);
 
   // 4. A question from an agent, answered with a tap.
@@ -400,11 +419,15 @@ async function storyboard(page, scratch, base, beat, quiet) {
     seedStage(scratch, "question");
     await tap(dock("questions"));
     await choice.waitFor();
-    await choice.evaluate((el) => el.scrollIntoView({ block: "center", behavior: "instant" }));
+    await page.locator("#questions-list .ask-summary").filter({
+      hasText: "Postgres or SQLite for the cache?",
+    }).first().evaluate(
+      (el) => el.scrollIntoView({ block: "center", behavior: "instant" }),
+    );
   }, 200);
-  await beat("question", 1200);
+  await beat("question", 1500);
   await tap(choice);
-  await beat("answered", 800);
+  await beat("answered", 500);
 
   // 5. The merge approval: the real two-step tap.
   const arm = page.getByRole("button", { name: /Merge this pull request/ }).first();
@@ -452,12 +475,13 @@ async function storyboard(page, scratch, base, beat, quiet) {
 async function main() {
   const scratch = await prepare();
   let server;
+  let serverChild;
   let browser;
   try {
-    server = await startServer(scratch);
+    server = await startServer(scratch, (child) => (serverChild = child));
     log(`serving ${server.base} on ${scratch.home}`);
     browser = await launchBrowser();
-    const shotDir = join(ROOT, "target", "demo-shots");
+    const shotDir = join(targetDir(), "demo-shots");
     if (SHOTS) {
       await rm(shotDir, { recursive: true, force: true });
       await mkdir(shotDir, { recursive: true });
@@ -470,6 +494,12 @@ async function main() {
       hasTouch: true,
       colorScheme: "dark",
       locale: "en-US",
+    });
+    // Only the scratch server may be reached during a take. This also catches
+    // accidentally adding an external image/font to the storyboard.
+    await context.route("**/*", (route) => {
+      if (new URL(route.request().url()).origin === server.base) return route.continue();
+      return route.abort("blockedbyclient");
     });
     const page = await context.newPage();
     await page.goto(`${server.base}/#/chat`);
@@ -529,7 +559,7 @@ async function main() {
     if (size > MAX_BYTES) log("WARNING: over 3 MB — shorten a beat or lower COLORS / OUT_WIDTH");
   } finally {
     if (browser) await browser.close().catch(() => {});
-    if (server) stopServer(server.child);
+    if (serverChild) await stopServer(serverChild);
     if (!KEEP) await rm(scratch.work, { recursive: true, force: true }).catch(() => {});
   }
 }
