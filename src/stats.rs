@@ -438,12 +438,11 @@ pub struct Stats {
     pub retired_hidden: Vec<String>,
 }
 
-/// The agent ids of the current configured roster, or `None` when there is
-/// nothing to filter by: an empty roster is "not configured", never "every
-/// agent retired", so it must not blank the tables.
-pub fn roster_of(cfg: &crate::config::Config) -> Option<BTreeSet<String>> {
-    let ids: BTreeSet<String> = cfg.agents.iter().map(|a| a.id.clone()).collect();
-    (!ids.is_empty()).then_some(ids)
+/// The agent ids of the current configured roster. A successfully loaded
+/// empty roster (`agents = []`) is a statement, so it hides every agent row;
+/// only a config that cannot be read means "no filtering".
+pub fn roster_of(cfg: &crate::config::Config) -> BTreeSet<String> {
+    cfg.agents.iter().map(|a| a.id.clone()).collect()
 }
 
 /// Drop the per-agent rows of agents outside `roster`, keeping the order.
@@ -466,11 +465,11 @@ pub fn retain_roster(stats: &mut Stats, roster: &BTreeSet<String>) {
 }
 
 /// [`retain_roster`] against the layered config discovered for `repo`; an
-/// unreadable config (or an empty roster) leaves `stats` unfiltered.
+/// unreadable config leaves `stats` unfiltered.
 pub fn retain_current_roster(stats: &mut Stats, repo: &Path) {
     if let Some(roster) = crate::config::Config::discover(repo, None)
         .ok()
-        .and_then(|(cfg, _)| roster_of(&cfg))
+        .map(|(cfg, _)| roster_of(&cfg))
     {
         retain_roster(stats, &roster);
     }
@@ -954,12 +953,14 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_roster_is_no_filter() {
-        let cfg = Config {
-            agents: vec![],
-            ..Config::default()
-        };
-        assert!(roster_of(&cfg).is_none());
+    fn a_loaded_empty_roster_hides_every_agent_row() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("magi.toml"), "agents = []\n").unwrap();
+        let mut st = mixed_stats();
+        retain_current_roster(&mut st, dir.path());
+        assert!(st.agents.is_empty() && st.reviewers.is_empty() && st.advisors.is_empty());
+        assert_eq!(st.retired_hidden, ["cc", "cx", "gone", "oc"]);
+        assert_eq!(st.totals.runs, 7);
     }
 
     #[test]
