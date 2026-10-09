@@ -1415,8 +1415,27 @@ pub struct DeputyPrompt<'a> {
 /// Heading of the turn that hands a question to the chat it came from.
 pub const CHAT_CONSULT_HEADING: &str = "A question was handed to you";
 
+/// Opening sentence that only a defused (current) consult carries; the
+/// no-break space is what `consult::owner_words` looks for.
+pub const CHAT_CONSULT_DEFUSED: &str = "It is still\u{a0}open.";
+
 /// The last words of every generated consult text, used to find where it ends.
 pub const CHAT_CONSULT_END: &str = "edit the repository.";
+
+/// Make the consult markers unrecognisable in text that is only quoted.
+///
+/// A summary, detail or choice may hold anything, a whole earlier consult
+/// included. The first space of every marker becomes a no-break space, so the
+/// generated text has exactly one real heading and one real end phrase and a
+/// reader of the turn can tell them from a quotation.
+pub fn defuse(text: &str) -> String {
+    let mut out = text.to_owned();
+    for marker in [CHAT_CONSULT_HEADING, CHAT_CONSULT_END] {
+        let quiet = marker.replacen(' ', "\u{a0}", 1);
+        out = out.replace(marker, &quiet);
+    }
+    out
+}
 
 /// The operator turn that puts an open question in front of the chat agent.
 ///
@@ -1426,13 +1445,13 @@ pub fn chat_consult(q: &crate::ask::Question) -> String {
     let mut s = format!(
         "# {CHAT_CONSULT_HEADING}\n\n\
          The operator passed you a question that one of the tasks filed from \
-         this conversation is waiting on (question `{id}`). It is still open.\n\n\
+         this conversation is waiting on (question `{id}`). {CHAT_CONSULT_DEFUSED}\n\n\
          ## {summary}\n\n",
         id = q.id,
-        summary = q.summary,
+        summary = defuse(&q.summary),
     );
     if !q.detail.trim().is_empty() {
-        s.push_str(q.detail.trim());
+        s.push_str(&defuse(q.detail.trim()));
         s.push_str("\n\n");
     }
     if q.free_text() {
@@ -1440,7 +1459,7 @@ pub fn chat_consult(q: &crate::ask::Question) -> String {
     } else {
         s.push_str("Choices:\n\n");
         for c in &q.choices {
-            s.push_str(&format!("- {c}\n"));
+            s.push_str(&format!("- {}\n", defuse(c)));
         }
         s.push('\n');
     }
