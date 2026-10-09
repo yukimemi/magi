@@ -1287,7 +1287,7 @@ async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
             r#"(async () => {
       const source = await (await fetch('/app.js')).text();
       window.deck = new Function(source.replace('queue: "/api/queue"', 'queue: "/api/queue?test_client=1"').replace(/\nboot\(\);\s*$/, `
-        return { state, loadHealth, loadLoop, loadStats, resumeConnection, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter };
+        return { state, loadHealth, loadLoop, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter };
       `))();
       await Promise.all([deck.loadQueue(), deck.loadRuns(), deck.loadTalks()]);
     })()"#,
@@ -1518,6 +1518,17 @@ async fn unreachable_banner_waits_out_transient_failures() {
         await new Promise(r => setTimeout(r, 50)); out.stale = shown();
         await deck.loadHealth({ explicit: true });
         out.explicit = shown();
+        const u = deck.unreachable, pageshow = (persisted) => {
+          const before = u.gen;
+          deck.onPageShow({ persisted });
+          return u.gen - before;
+        };
+        window.fetch = async () => { throw new TypeError('Failed to fetch'); };
+        await deck.loadHealth();
+        out.pageshowAfterFailure = pageshow(false);
+        u.since = null; u.failures = 0;
+        out.pageshowHealthy = pageshow(false);
+        out.pageshowPersisted = pageshow(true);
       } finally {
         window.fetch = native; Date.now = nativeNow;
         Object.defineProperty(Navigator.prototype, 'onLine', onLine);
@@ -1539,6 +1550,9 @@ async fn unreachable_banner_waits_out_transient_failures() {
     assert_eq!(r["offline"], false);
     assert_eq!(r["stale"], false);
     assert_eq!(r["explicit"], true);
+    assert_eq!(r["pageshowAfterFailure"], 1);
+    assert_eq!(r["pageshowHealthy"], 0);
+    assert_eq!(r["pageshowPersisted"], 1);
     browser.close_page(&page).await;
 }
 
