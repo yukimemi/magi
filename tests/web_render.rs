@@ -1454,7 +1454,11 @@ async fn unreachable_banner_waits_out_transient_failures() {
         .await
         .expect("page");
     browser
-        .wait_for(&page, "!!document.getElementById('alert')", Duration::from_secs(30))
+        .wait_for(
+            &page,
+            "!!document.getElementById('alert')",
+            Duration::from_secs(30),
+        )
         .await
         .expect("page loaded");
     client_harness(&mut browser, &page).await;
