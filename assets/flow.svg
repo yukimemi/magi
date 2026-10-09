@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 1472" width="760" height="1472" role="img" aria-label="magi flow: queue loop with conductor, one competition from prep to land, and standing chat / release bump">
+<title>magi flow: queue loop, one competition, standing chat</title>
+<!-- Hand-authored static copy of the mermaid diagram kept in README.md (details block). Update both together. -->
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0 0L10 5L0 10z" fill="#57606a"/></marker></defs>
+<g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+<rect width="760" height="1472" rx="12" fill="#fafafa" stroke="#d0d7de"/>
+<rect x="20" y="20" width="720" height="86" rx="10" fill="#eef2f7" stroke="#8c959f" stroke-width="1.2"/>
+<text x="36" y="42" font-size="13" font-weight="700" fill="#1f2328">queue loop — `magi serve` (outside any one run)</text>
+<rect x="110" y="50" width="540" height="48" rx="8" fill="#ffe8cc" stroke="#c5582d" stroke-width="1.5"/>
+<text x="380" y="79" text-anchor="middle" font-size="13" fill="#1f2328"><tspan x="380" dy="0" font-weight="700">conductor ×1 per poll cycle</tspan><tspan x="380" dy="16" fill="#57606a">[roles] conductor</tspan></text>
+<rect x="20" y="148" width="720" height="1188" rx="10" fill="#eef2f7" stroke="#8c959f" stroke-width="1.2"/><text x="36" y="170" font-size="13" font-weight="700" fill="#1f2328">one competition — `magi run`</text>
+<rect x="110" y="184" width="540" height="48" rx="8" fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+<text x="380" y="213" text-anchor="middle" font-size="13" fill="#1f2328"><tspan x="380" dy="0" font-weight="700">prep: worktrees + blind hook</tspan><tspan x="380" dy="16" fill="#57606a">(no agent)</tspan></text>
+<rect x="110" y="266" width="540" height="64" rx="8" fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+<text x="380" y="295" text-anchor="middle" font-size="13" fill="#1f2328"><tspan x="380" dy="0" font-weight="700">advise: advisors ×A, read-only</tspan><tspan x="380" dy="16" fill="#57606a">[roles] advisors (falls back to judges)</tspan><tspan x="380" dy="16" fill="#57606a">[graph] advise, advisors</tspan></text>
+<rect x="110" y="364" width="540" height="48" rx="8" fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+<text x="380" y="393" text-anchor="middle" font-size="13" fill="#1f2328"><tspan x="380" dy="0" font-weight="700">advise: synthesis ×1, blends the advisors</tspan><tspan x="380" dy="16" fill="#57606a">[roles] synthesizer</tspan></text>
+<rect x="110" y="446" width="540" height="64" rx="8" fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+<text x="380" y="475" text-anchor="middle" font-size="13" fill="#1f2328"><tspan x="380" dy="0" font-weight="700">implement ×N</tspan><tspan x="380" dy="16" fill="#57606a">[roles] implementers</tspan><tspan x="380" dy="16" fill="#57606a">[graph] implementers</tspan></text>
+<rect x="110" y="544" width="540" height="64" rx="8" fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+<text x="380" y="573" text-anchor="middle" font-size="13" fill="#1f2328"><tspan x="380" dy="0" font-weight="700">judge ×M, blind</tspan><tspan x="380" dy="16" fill="#57606a">[roles] judges</tspan><tspan x="380" dy="16" fill="#57606a">[graph] judges</tspan></text>
+<rect x="420" y="658" width="260" height="64" rx="8" fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+<text x="550" y="687" text-anchor="middle" font-size="13" fill="#1f2328"><tspan x="550" dy="0" font-weight="700">deliberate</tspan><tspan x="550" dy="16" fill="#57606a">[roles] judges</tspan><tspan x="550" dy="16" fill="#57606a">[graph] deliberate_rounds</tspan></text>
+<rect x="110" y="756" width="540" height="48" rx="8" fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+<text x="380" y="785" text-anchor="middle" font-size="13" fill="#1f2328"><tspan x="380" dy="0" font-weight="700">final vote, private</tspan><tspan x="380" dy="16" fill="#57606a">[roles] judges</tspan></text>
+<rect x="110" y="838" width="540" height="48" rx="8" fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+<text x="380" y="867" text-anchor="middle" font-size="13" fill="#1f2328"><tspan x="380" dy="0" font-weight="700">tally</tspan><tspan x="380" dy="16" fill="#57606a">(mechanical, no agent)</tspan></text>
+<rect x="110" y="920" width="540" height="48" rx="8" fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+<text x="380" y="949" text-anchor="middle" font-size="13" fill="#1f2328"><tspan x="380" dy="0" font-weight="700">fold losers</tspan><tspan x="380" dy="16" fill="#57606a">(no agent)</tspan></text>
+<rect x="110" y="1002" width="540" height="64" rx="8" fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+<text x="380" y="1031" text-anchor="middle" font-size="13" fill="#1f2328"><tspan x="380" dy="0" font-weight="700">review ×R + E2E + fix, bounded</tspan><tspan x="380" dy="16" fill="#57606a">[roles] reviewers, fixer</tspan><tspan x="380" dy="16" fill="#57606a">[graph] reviewers, review_rounds</tspan></text>
+<rect x="110" y="1100" width="540" height="48" rx="8" fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+<text x="380" y="1129" text-anchor="middle" font-size="13" fill="#1f2328"><tspan x="380" dy="0" font-weight="700">gate commands</tspan><tspan x="380" dy="16" fill="#57606a">[verify] gate — shell, no agent</tspan></text>
+<rect x="110" y="1182" width="540" height="48" rx="8" fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+<text x="380" y="1211" text-anchor="middle" font-size="13" fill="#1f2328"><tspan x="380" dy="0" font-weight="700">merge</tspan><tspan x="380" dy="16" fill="#57606a">[graph] land, land_approval — no agent</tspan></text>
+<rect x="110" y="1264" width="540" height="48" rx="8" fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+<text x="380" y="1293" text-anchor="middle" font-size="13" fill="#1f2328"><tspan x="380" dy="0" font-weight="700">land loop: watch CI, fix, ask to merge</tspan><tspan x="380" dy="16" fill="#57606a">[roles] fixer, reused</tspan></text>
+<line x1="380" y1="232" x2="380" y2="266" stroke="#57606a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="380" y1="330" x2="380" y2="364" stroke="#57606a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="380" y1="412" x2="380" y2="446" stroke="#57606a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="380" y1="510" x2="380" y2="544" stroke="#57606a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="380" y1="98" x2="380" y2="184" stroke="#57606a" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#a)"/>
+<path d="M 170 608 L 170 756" stroke="none"/>
+<line x1="170" y1="608" x2="170" y2="756" stroke="#57606a" stroke-width="1.5" marker-end="url(#a)"/>
+<text x="178" y="630" font-size="12" font-style="italic" fill="#1f2328">first choices agree</text>
+<line x1="550" y1="608" x2="550" y2="658" stroke="#57606a" stroke-width="1.5" marker-end="url(#a)"/>
+<text x="558" y="638" font-size="12" font-style="italic" fill="#1f2328">split</text>
+<line x1="550" y1="722" x2="550" y2="756" stroke="#57606a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="380" y1="804" x2="380" y2="838" stroke="#57606a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="380" y1="886" x2="380" y2="920" stroke="#57606a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="380" y1="968" x2="380" y2="1002" stroke="#57606a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="380" y1="1066" x2="380" y2="1100" stroke="#57606a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="380" y1="1148" x2="380" y2="1182" stroke="#57606a" stroke-width="1.5" marker-end="url(#a)"/>
+<line x1="380" y1="1230" x2="380" y2="1264" stroke="#57606a" stroke-width="1.5" marker-end="url(#a)"/>
+<text x="390" y="1252" font-size="12" font-style="italic" fill="#1f2328">merge = pr, land = true</text>
+<text x="390" y="129" font-size="12" font-style="italic" fill="#1f2328">arranges blocked_by / recovery, then hands off</text>
+<rect x="20" y="1366" width="720" height="86" rx="10" fill="#eef2f7" stroke="#8c959f" stroke-width="1.2"/><text x="36" y="1388" font-size="13" font-weight="700" fill="#1f2328">standing chat / release bump — `magi chat`, `magi bump` (outside any run)</text>
+<rect x="110" y="1406" width="540" height="48" rx="8" fill="#ffe8cc" stroke="#c5582d" stroke-width="1.5"/>
+<text x="380" y="1435" text-anchor="middle" font-size="13" fill="#1f2328"><tspan x="380" dy="0" font-weight="700">chatter ×1 per turn</tspan><tspan x="380" dy="16" fill="#57606a">[roles] chatter</tspan></text>
+</g></svg>
