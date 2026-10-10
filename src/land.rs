@@ -5812,6 +5812,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         q = store.get(&q.id).unwrap();
         assert!(q.answer.is_none());
         talk.turns.push(crate::talk::Turn {
+            breaks: Some(Vec::new()),
             who: crate::talk::Who::Operator,
             body: "Merge this pull request now".into(),
             at: Timestamp::now(),

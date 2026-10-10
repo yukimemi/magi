@@ -136,6 +136,14 @@ pub struct Turn {
     /// why [`SCHEMA`] stays put: no existing field changed meaning.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<TurnUsage>,
+    /// Byte offsets in [`Self::body`] where the second and later messages of
+    /// an operator turn begin. Replies queued while a turn runs are joined
+    /// with a blank line, which an owner's own blank lines cannot be told
+    /// apart from, so the boundary is recorded when it is made. `Some(empty)`
+    /// is one message; `None` is unknown (a turn stored before this field, or
+    /// not an operator turn) and readers fall back to paragraphs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub breaks: Option<Vec<usize>>,
 }
 
 /// Raw usage of one agent reply, stored as the CLI reported it.
@@ -324,6 +332,9 @@ pub struct Talk {
     /// Attachments paired with [`Self::pending`].
     #[serde(default)]
     pub pending_attachments: Vec<Attachment>,
+    /// Message boundaries inside [`Self::pending`], as [`Turn::breaks`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_breaks: Option<Vec<usize>>,
     /// May a failed turn fall back through the rest of `[roles] chatter`?
     /// True only while the agent was chosen by that chain; an explicit
     /// `--agent` or an operator's switch pins the conversation to its agent
@@ -1169,6 +1180,7 @@ pub fn begin(store: &Talks, cfg: &Config, repo: PathBuf, agent: Option<&str>) ->
 
     let now = Timestamp::now();
     let mut talk = Talk {
+        pending_breaks: None,
         schema: SCHEMA,
         id: new_id(),
         repo,
@@ -1219,6 +1231,7 @@ pub fn record(
     // Do not let this older handle overwrite a draft accepted while it was
     // waiting for configuration discovery.
     talk.pending = fresh.pending;
+    talk.pending_breaks = fresh.pending_breaks;
     talk.pending_attachments = fresh.pending_attachments;
     if !talk.status.open() {
         bail!(
@@ -1237,6 +1250,7 @@ pub fn record(
         at: Timestamp::now(),
         attachments,
         usage: None,
+        breaks: Some(Vec::new()),
     });
     store.put(talk)?;
     Ok(text.to_owned())
@@ -1267,8 +1281,12 @@ pub fn queue(
     if !text.is_empty() {
         if fresh.pending.is_empty() {
             fresh.pending = text.to_owned();
+            fresh.pending_breaks = Some(Vec::new());
         } else {
             fresh.pending.push_str("\n\n");
+            if let Some(b) = fresh.pending_breaks.as_mut() {
+                b.push(fresh.pending.len());
+            }
             fresh.pending.push_str(text);
         }
     }
@@ -1290,12 +1308,14 @@ pub fn drain(talk: &mut Talk, store: &Talks) -> Result<Option<String>> {
     }
     let text = std::mem::take(&mut fresh.pending);
     let attachments = std::mem::take(&mut fresh.pending_attachments);
+    let breaks = fresh.pending_breaks.take();
     fresh.turns.push(Turn {
         who: Who::Operator,
         body: text.clone(),
         at: Timestamp::now(),
         attachments,
         usage: None,
+        breaks,
     });
     store.put(&mut fresh)?;
     *talk = fresh;
@@ -1373,6 +1393,7 @@ pub fn close(talk: &mut Talk, store: &Talks) -> Result<()> {
     fresh.status = TalkStatus::Closed;
     // A closed conversation must not replay a draft if it is reopened later.
     fresh.pending.clear();
+    fresh.pending_breaks = None;
     fresh.pending_attachments.clear();
     store.put(&mut fresh)?;
     *talk = fresh;
@@ -1426,6 +1447,7 @@ pub fn switch_agent(talk: &mut Talk, store: &Talks, spec: &AgentSpec) -> Result<
     // A deliberate switch pins the conversation to the agent chosen.
     fresh.fallback = false;
     fresh.turns.push(Turn {
+        breaks: None,
         who: Who::Agent,
         body: format!("{MAGI_NOTE}agent changed from {from} to {}", spec.id),
         at: Timestamp::now(),
@@ -1468,6 +1490,7 @@ pub fn switch_persona(talk: &mut Talk, store: &Talks, id: &str) -> Result<bool> 
         }
     };
     fresh.turns.push(Turn {
+        breaks: None,
         who: Who::Agent,
         body: format!(
             "{MAGI_NOTE}persona changed from {} to {}",
@@ -1490,6 +1513,7 @@ pub fn clear_pending(talk: &mut Talk, store: &Talks) -> Result<()> {
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
     fresh.pending.clear();
+    fresh.pending_breaks = None;
     fresh.pending_attachments.clear();
     store.put(&mut fresh)?;
     *talk = fresh;
@@ -1512,6 +1536,7 @@ pub fn clear_pending_if_matches(
         return Ok(false);
     }
     fresh.pending.clear();
+    fresh.pending_breaks = None;
     fresh.pending_attachments.clear();
     store.put(&mut fresh)?;
     *talk = fresh;
@@ -1537,6 +1562,7 @@ pub fn edit_pending_text(
         return Ok(false);
     }
     fresh.pending = text.trim().to_owned();
+    fresh.pending_breaks = Some(Vec::new());
     store.put(&mut fresh)?;
     *talk = fresh;
     Ok(true)
@@ -1766,6 +1792,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     }
     let outcome = outcome.expect("a chain holds at least one agent");
     let note = |why: String| Turn {
+        breaks: None,
         who: Who::Agent,
         body: format!("{MAGI_NOTE}{why}"),
         at: Timestamp::now(),
@@ -1809,6 +1836,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         }
         Ok(out) => (
             Turn {
+                breaks: None,
                 who: Who::Agent,
                 body: out.text.trim().to_owned(),
                 at: Timestamp::now(),
@@ -1854,6 +1882,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // running. This handle predates that write, so preserving only `status`
     // would overwrite the durable draft when the reply is appended below.
     talk.pending = fresh.pending;
+    talk.pending_breaks = fresh.pending_breaks;
     talk.pending_attachments = fresh.pending_attachments;
     if let Some(from) = fell_back_from.filter(|_| failure.is_none()) {
         // The switch persists: quota coming back does not move the chat
@@ -2313,6 +2342,7 @@ mod tests {
 
     fn ctx_talk(agent: &str, turns: Vec<Turn>) -> Talk {
         Talk {
+            pending_breaks: None,
             schema: SCHEMA,
             id: "20260904-014455-ab12".to_owned(),
             repo: PathBuf::from("."),
@@ -2332,6 +2362,7 @@ mod tests {
 
     fn reply(body: &str, usage: Option<(u64, &str, Option<&str>)>) -> Turn {
         Turn {
+            breaks: None,
             who: Who::Agent,
             body: body.to_owned(),
             at: Timestamp::now(),
@@ -2556,6 +2587,7 @@ mod tests {
     fn the_frozen_json_field_names_round_trip_through_disk() {
         let (tmp, talks) = store();
         let mut talk = Talk {
+            pending_breaks: None,
             schema: SCHEMA,
             id: "20260904-014455-ab12".to_owned(),
             repo: tmp.path().to_owned(),
@@ -2958,6 +2990,7 @@ mod tests {
         queue(&mut talk, &talks, "second", Vec::new()).expect("queue second");
         let saved = talks.get(&talk.id).expect("reload queued talk");
         assert_eq!(saved.pending, "first\n\nsecond");
+        assert_eq!(saved.pending_breaks, Some(vec!["first\n\n".len()]));
         assert!(saved.turns.is_empty(), "a draft is not a transcript turn");
 
         let drained = drain(&mut talk, &talks).expect("drain");
@@ -2966,6 +2999,8 @@ mod tests {
         assert!(saved.pending.is_empty());
         assert_eq!(saved.turns.len(), 1);
         assert_eq!(saved.turns[0].body, "first\n\nsecond");
+        assert_eq!(saved.turns[0].breaks, Some(vec!["first\n\n".len()]));
+        assert_eq!(saved.pending_breaks, None);
     }
 
     #[test]
@@ -3052,6 +3087,7 @@ mod tests {
 
         let saved = talks.get(&id).expect("reload");
         assert_eq!(saved.pending, "next");
+        assert_eq!(saved.pending_breaks, Some(Vec::new()));
         assert_eq!(saved.turns.len(), 2, "operator message and reply remain");
     }
 
@@ -4063,6 +4099,7 @@ mod tests {
         let (tmp, talks) = store();
         let make = |id: &str, status: TalkStatus| {
             let mut t = Talk {
+                pending_breaks: None,
                 schema: SCHEMA,
                 id: id.to_owned(),
                 repo: tmp.path().to_owned(),
