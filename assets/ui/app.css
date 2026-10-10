@@ -538,9 +538,23 @@ main {
 
 .view-head { display: flex; flex-direction: column; gap: var(--s1); }
 .view-sub { font-size: var(--t2); color: var(--ink-3); }
-.talk-selectors { display: flex; flex-wrap: wrap; column-gap: var(--s4); }
-.talk-agent { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: var(--t2); color: var(--ink-3); }
-.talk-agent select { min-width: 0; max-width: min(100%, 22rem); min-height: 36px; font: inherit; }
+.talk-selectors { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s2); }
+/* Each selector is a chip: the label is the pill, the native select inside is
+   its value. Tapping opens the platform's own sheet in place. */
+.talk-agent {
+  display: flex; flex-direction: column; justify-content: center; gap: 0;
+  min-width: 0; min-height: 44px; padding: 2px var(--s2);
+  border: 1px solid var(--edge); border-radius: 999px;
+  font-size: var(--t2); color: var(--ink-3); background: var(--bg);
+}
+.talk-agent-label { font-size: 11px; line-height: 1.2; }
+.talk-agent select {
+  appearance: none; -webkit-appearance: none;
+  min-width: 0; width: 100%; max-width: 100%; min-height: 22px;
+  border: 0; background: transparent; padding: 0; margin: 0;
+  font: inherit; color: var(--ink); text-overflow: ellipsis;
+}
+.talk-agent:has(select:disabled) { opacity: .55; }
 
 .talks-actions { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; }
 
@@ -1909,14 +1923,17 @@ details.panel > summary + * { margin-top: var(--s2); }
 /* The composer sits above the dock and stays there, because a conversation
    grows downwards and hunting for the reply box at the bottom of a long
    transcript is the one thing that would make this unusable on a phone. */
-.say {
+.talk-composer {
   position: sticky; z-index: 10;
   /* Parked one dock above the bottom edge. The dock is its 44px tap target
      plus the label row under the glyph, which is what --s3 stands in for
      here; at 44px alone the composer's own edge crossed the dock's top rule. */
   bottom: calc(var(--tap) + var(--s3) + env(safe-area-inset-bottom));
-  display: flex; flex-direction: column; gap: var(--s2);
   padding: var(--s2) 0;
+  background: var(--bg);
+}
+.say {
+  display: flex; flex-direction: column; gap: var(--s2);
   background: var(--bg);
   border-radius: var(--radius);
   transition: background-color .15s var(--ease);
@@ -2047,7 +2064,7 @@ details.panel > summary + * { margin-top: var(--s2); }
      of conversations is a list of cards to scan, not a document to read start
      to finish, and a cap here would leave it stuck at two columns at widths
      where Queue, the same `.cards` grid, already runs to three. */
-  .say { bottom: 0; padding-bottom: var(--s4); }
+  .talk-composer { bottom: 0; padding-bottom: var(--s4); }
   .turn { max-width: 80%; }
 }
 
@@ -2083,7 +2100,7 @@ details.panel > summary + * { margin-top: var(--s2); }
 
 /* ---- print ------------------------------------------------------------- */
 @media print {
-  .top, .daemon, .ask-bar, .dock, .back, .sheet, .full, .say { display: none; }
+  .top, .daemon, .ask-bar, .dock, .back, .sheet, .full, .talk-composer { display: none; }
   .frame-wrap iframe { height: 520px; }
   .card, .panel { box-shadow: none; break-inside: avoid; }
   .report { max-height: none; white-space: pre-wrap; }
@@ -2267,7 +2284,7 @@ details.panel > summary + * { margin-top: var(--s2); }
     main[data-split] .report { max-height: calc(100dvh - 220px); }
   }
   main[data-split] #view-talk { max-width: none; }
-  main[data-split] .say { bottom: 0; }
+  main[data-split] .talk-composer { bottom: 0; }
   body[data-split] .run-actions-fab { bottom: var(--s4); }
 
   /* The list pane is the one scroll region; the toolbar scrolls with it. */

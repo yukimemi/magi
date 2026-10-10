@@ -556,24 +556,6 @@
       <div class="run-status" id="talk-status"></div>
       <h1 id="talk-h">Loading conversation…</h1>
       <p class="view-sub" id="talk-meta"></p>
-      <div class="talk-selectors">
-        <label class="talk-agent" id="talk-agent-box">
-          <span class="talk-agent-label">Agent</span>
-          <select id="talk-agent" aria-label="Agent for this conversation"></select>
-        </label>
-        <label class="talk-agent" id="talk-persona-box">
-          <span class="talk-agent-label">Persona</span>
-          <select id="talk-persona" aria-label="Persona for this conversation"></select>
-        </label>
-        <label class="talk-agent" id="talk-implementers-box">
-          <span class="talk-agent-label">Implementers</span>
-          <select id="talk-implementers" aria-label="Implementers for tasks this conversation files">
-            <option value="1">Solo</option>
-            <option value="2">2 implementers</option>
-            <option value="3">3 implementers</option>
-          </select>
-        </label>
-      </div>
     </div>
 
     <ol class="turns" id="talk-turns"></ol>
@@ -593,6 +575,25 @@
       <ol class="plain" id="talk-tasks"></ol>
     </details>
 
+    <div class="talk-composer" id="talk-composer">
+      <div class="talk-selectors">
+        <label class="talk-agent" id="talk-agent-box">
+          <span class="talk-agent-label">Agent</span>
+          <select id="talk-agent" aria-label="Agent for this conversation"></select>
+        </label>
+        <label class="talk-agent" id="talk-persona-box">
+          <span class="talk-agent-label">Persona</span>
+          <select id="talk-persona" aria-label="Persona for this conversation"></select>
+        </label>
+        <label class="talk-agent" id="talk-implementers-box">
+          <span class="talk-agent-label">Implementers</span>
+          <select id="talk-implementers" aria-label="Implementers for tasks this conversation files">
+            <option value="1">Solo</option>
+            <option value="2">2 implementers</option>
+            <option value="3">3 implementers</option>
+          </select>
+        </label>
+      </div>
     <form class="say" id="talk-say">
       <div class="say-thumbs" id="talk-say-thumbs" hidden></div>
       <p class="say-upload-status" id="talk-say-upload-status" role="status" hidden></p>
@@ -608,6 +609,7 @@
         <button class="btn btn-gold" type="submit" id="talk-send">Send</button>
       </div>
     </form>
+    </div>
     <p class="form-error" id="talk-error" role="alert" hidden></p>
     <p class="panel-note" id="talk-closed" hidden>
       This conversation is closed.
