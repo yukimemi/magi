@@ -28,7 +28,8 @@
 //! - **`[release] mode = "local"` replaces all of the above for that
 //!   repository's release pull requests.** No check is awaited, reran or
 //!   stalled on. The watcher asks the owner (`merge` / `hold`, bound to the
-//!   head it observed), merges with `--match-head-commit`, and after the merge
+//!   head it observed) unless `graph.land_approval` is off, in which case it
+//!   merges that head without asking. It merges with `--match-head-commit`, and after the merge
 //!   drives [`crate::release_local`] - tag, then the configured commands - with
 //!   its progress in the watch record. A failure is a notice and a question
 //!   (`retry` / `leave it`), never a blind retry. See [`decide_local`].
@@ -313,17 +314,28 @@ pub(crate) enum LocalStep {
 /// Decide an *open* local-mode pull request. No I/O, and no CI: nothing is
 /// awaited, rerun or stalled on, because nothing will ever report. The head is
 /// what the owner approved: an answer about an older head asks again.
-pub(crate) fn decide_local(head: &str, st: &WatchState, approved: Approved) -> LocalStep {
+///
+/// `ask_first` is `graph.land_approval`. When it is off, a head nobody has been
+/// asked about is merged straight away, pinned to that head; an approval
+/// question that is already open is still respected.
+pub(crate) fn decide_local(
+    head: &str,
+    st: &WatchState,
+    approved: Approved,
+    ask_first: bool,
+) -> LocalStep {
     if st.ignored || st.held_head.as_deref() == Some(head) {
         return LocalStep::Wait;
     }
     let about_this_head = st.asked_head.as_deref() == Some(head);
     match approved {
         Approved::Open => LocalStep::Wait,
+        Approved::NoQuestion if !ask_first => LocalStep::Merge(head.to_owned()),
         Approved::NoQuestion => LocalStep::Ask,
         Approved::Merge if about_this_head => LocalStep::Merge(head.to_owned()),
         Approved::Hold if about_this_head => LocalStep::Hold(head.to_owned()),
         // The head moved after the question was filed.
+        Approved::Merge | Approved::Hold if !ask_first => LocalStep::Merge(head.to_owned()),
         Approved::Merge | Approved::Hold => LocalStep::Ask,
     }
 }
@@ -450,6 +462,11 @@ pub(crate) trait ReleaseForge: Send + Sync {
     fn config<'a>(&'a self, _repo: &'a Path) -> Fut<'a, Result<crate::config::Config>> {
         Box::pin(async { Ok(crate::config::Config::default()) })
     }
+    /// `graph.land_approval` of the repository. An error means "unknown", and
+    /// the caller then asks.
+    fn land_approval<'a>(&'a self, _repo: &'a Path) -> Fut<'a, Result<bool>> {
+        Box::pin(async { Ok(true) })
+    }
     /// Head branch and merge commit of a pull request (local mode).
     fn info<'a>(&'a self, _repo: &'a Path, url: &'a str) -> Fut<'a, Result<PrInfo>> {
         Box::pin(async move { bail!("no pull request info for {url}") })
@@ -536,6 +553,18 @@ impl ReleaseForge for GhForge {
 
     fn config<'a>(&'a self, repo: &'a Path) -> Fut<'a, Result<crate::config::Config>> {
         Box::pin(async move { Ok(crate::config::Config::discover(repo, None)?.0) })
+    }
+
+    fn land_approval<'a>(&'a self, repo: &'a Path) -> Fut<'a, Result<bool>> {
+        // A second `discover` may read a newer generation of the config than
+        // the one `config` returned; only this one value rides on it, and an
+        // unreadable config makes the caller ask.
+        Box::pin(async move {
+            Ok(crate::config::Config::discover(repo, None)?
+                .0
+                .graph
+                .land_approval)
+        })
     }
 
     fn info<'a>(&'a self, repo: &'a Path, url: &'a str) -> Fut<'a, Result<PrInfo>> {
@@ -830,7 +859,14 @@ impl Watcher {
                         Err(_) => Approved::NoQuestion,
                     },
                 };
-                let step = decide_local(&snap.head, &st, approved);
+                let ask_first = match self.forge.land_approval(repo).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!("could not read graph.land_approval for {pr}: {e:#}");
+                        true
+                    }
+                };
+                let step = decide_local(&snap.head, &st, approved, ask_first);
                 if matches!(
                     step,
                     LocalStep::Merge(_) | LocalStep::Hold(_) | LocalStep::Ask
@@ -870,14 +906,19 @@ impl Watcher {
                     }
                     LocalStep::Merge(head) => {
                         match self.forge.merge(repo, &snap.url, &head).await {
-                            Ok(_) => {
+                            Ok(true) => {
                                 // Release at once rather than a lap later.
                                 self.save(pr, &st);
                                 self.release_merged(repo, pr, st, cfg).await;
                                 return;
                             }
-                            Err(e) => {
-                                tracing::warn!("could not merge {}: {e:#}", snap.url);
+                            res => {
+                                match res {
+                                    Err(e) => {
+                                        tracing::warn!("could not merge {}: {e:#}", snap.url)
+                                    }
+                                    _ => tracing::warn!("{} did not merge", snap.url),
+                                }
                                 st.held_head = Some(head);
                                 self.raise(
                                     pr,
@@ -1464,6 +1505,9 @@ mod tests {
         local: Mutex<bool>,
         info: Mutex<Option<PrInfo>>,
         merges: Mutex<Vec<String>>,
+        /// `graph.land_approval` as read; `None` is an unreadable config.
+        approval: Mutex<Option<bool>>,
+        merge_fails: Mutex<bool>,
     }
 
     impl ReleaseForge for std::sync::Arc<Fake> {
@@ -1492,13 +1536,20 @@ mod tests {
         }
         fn merge<'a>(&'a self, _: &'a Path, _: &'a str, head: &'a str) -> Fut<'a, Result<bool>> {
             self.merges.lock().unwrap().push(head.to_owned());
-            Box::pin(async { Ok(true) })
+            let fails = *self.merge_fails.lock().unwrap();
+            Box::pin(async move { if fails { bail!("refused") } else { Ok(true) } })
+        }
+        fn land_approval<'a>(&'a self, _: &'a Path) -> Fut<'a, Result<bool>> {
+            let a = *self.approval.lock().unwrap();
+            Box::pin(async move { a.context("unreadable config") })
         }
     }
 
     fn rig() -> (tempfile::TempDir, std::sync::Arc<Fake>, Watcher) {
         let dir = tempfile::tempdir().unwrap();
         let fake = std::sync::Arc::new(Fake::default());
+        // The repository's default: `graph.land_approval` on.
+        *fake.approval.lock().unwrap() = Some(true);
         let w = Watcher::new(Box::new(fake.clone()), dir.path().to_path_buf());
         (dir, fake, w)
     }
@@ -1753,27 +1804,115 @@ mod tests {
     fn local_decisions_never_wait_on_ci_and_bind_approval_to_the_head() {
         use Approved::*;
         let none = local_st(None, None);
-        assert_eq!(decide_local("h1", &none, NoQuestion), LocalStep::Ask);
-        assert_eq!(decide_local("h1", &none, Open), LocalStep::Wait);
+        assert_eq!(decide_local("h1", &none, NoQuestion, true), LocalStep::Ask);
+        assert_eq!(decide_local("h1", &none, Open, true), LocalStep::Wait);
         let asked = local_st(Some("h1"), None);
         assert_eq!(
-            decide_local("h1", &asked, Merge),
+            decide_local("h1", &asked, Merge, true),
             LocalStep::Merge("h1".to_owned())
         );
         assert_eq!(
-            decide_local("h1", &asked, Hold),
+            decide_local("h1", &asked, Hold, true),
             LocalStep::Hold("h1".to_owned())
         );
         // The head moved after the owner answered: ask again, never merge.
-        assert_eq!(decide_local("h2", &asked, Merge), LocalStep::Ask);
-        assert_eq!(decide_local("h2", &asked, Hold), LocalStep::Ask);
+        assert_eq!(decide_local("h2", &asked, Merge, true), LocalStep::Ask);
+        assert_eq!(decide_local("h2", &asked, Hold, true), LocalStep::Ask);
         // A held head stays quiet until it moves; ignored stays quiet.
         let held = local_st(Some("h1"), Some("h1"));
-        assert_eq!(decide_local("h1", &held, NoQuestion), LocalStep::Wait);
-        assert_eq!(decide_local("h2", &held, NoQuestion), LocalStep::Ask);
+        assert_eq!(decide_local("h1", &held, NoQuestion, true), LocalStep::Wait);
+        assert_eq!(decide_local("h2", &held, NoQuestion, true), LocalStep::Ask);
         let mut ign = local_st(None, None);
         ign.ignored = true;
-        assert_eq!(decide_local("h1", &ign, NoQuestion), LocalStep::Wait);
+        assert_eq!(decide_local("h1", &ign, NoQuestion, true), LocalStep::Wait);
+    }
+
+    #[test]
+    fn without_land_approval_an_unasked_head_merges_but_stops_stay_stopped() {
+        use Approved::*;
+        let none = local_st(None, None);
+        assert_eq!(
+            decide_local("h1", &none, NoQuestion, false),
+            LocalStep::Merge("h1".to_owned())
+        );
+        // An open question is respected, a held head and ignored stay quiet.
+        assert_eq!(decide_local("h1", &none, Open, false), LocalStep::Wait);
+        let held = local_st(Some("h1"), Some("h1"));
+        assert_eq!(
+            decide_local("h1", &held, NoQuestion, false),
+            LocalStep::Wait
+        );
+        assert_eq!(
+            decide_local("h2", &held, NoQuestion, false),
+            LocalStep::Merge("h2".to_owned())
+        );
+        let mut ign = local_st(None, None);
+        ign.ignored = true;
+        assert_eq!(decide_local("h1", &ign, NoQuestion, false), LocalStep::Wait);
+        // The owner's recorded no for this head still holds.
+        let asked = local_st(Some("h1"), None);
+        assert_eq!(
+            decide_local("h1", &asked, Hold, false),
+            LocalStep::Hold("h1".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn land_approval_off_merges_the_observed_head_without_a_question() {
+        let (_d, fake, w) = rig();
+        *fake.local.lock().unwrap() = true;
+        *fake.approval.lock().unwrap() = Some(false);
+        *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Open, "h1", vec![]));
+        let repo = PathBuf::from("/nowhere");
+        let no = || false;
+        w.lap(std::slice::from_ref(&repo), 60, 1, &no).await;
+        assert_eq!(*fake.merges.lock().unwrap(), vec!["h1".to_owned()]);
+        assert!(w.questions().list().is_empty(), "no approval question");
+    }
+
+    #[tokio::test]
+    async fn land_approval_on_or_unreadable_still_asks_and_never_merges() {
+        for approval in [Some(true), None] {
+            let (_d, fake, w) = rig();
+            *fake.local.lock().unwrap() = true;
+            *fake.approval.lock().unwrap() = approval;
+            *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Open, "h1", vec![]));
+            let repo = PathBuf::from("/nowhere");
+            let no = || false;
+            w.lap(std::slice::from_ref(&repo), 60, 1, &no).await;
+            w.lap(std::slice::from_ref(&repo), 60, 2, &no).await;
+            assert!(fake.merges.lock().unwrap().is_empty(), "silence is a hold");
+            let qs = w.questions().list();
+            assert_eq!(qs.len(), 1);
+            assert_eq!(qs[0].choices, vec![land::APPROVE, land::HOLD]);
+        }
+    }
+
+    #[tokio::test]
+    async fn land_approval_off_does_not_merge_on_an_unreadable_forge_or_retry_a_refusal() {
+        let (_d, fake, w) = rig();
+        *fake.local.lock().unwrap() = true;
+        *fake.approval.lock().unwrap() = Some(false);
+        let repo = PathBuf::from("/nowhere");
+        let no = || false;
+        // Unreadable forge answer: nothing moves.
+        *fake.snap.lock().unwrap() = None;
+        w.lap(std::slice::from_ref(&repo), 60, 1, &no).await;
+        assert!(fake.merges.lock().unwrap().is_empty());
+        // A refused merge holds that head: one attempt, no retry loop.
+        *fake.merge_fails.lock().unwrap() = true;
+        *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Open, "h1", vec![]));
+        w.lap(std::slice::from_ref(&repo), 60, 2, &no).await;
+        w.lap(std::slice::from_ref(&repo), 60, 3, &no).await;
+        assert_eq!(fake.merges.lock().unwrap().len(), 1);
+        assert!(w.questions().list().is_empty());
+        // A moved head is judged afresh.
+        *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Open, "h2", vec![]));
+        w.lap(std::slice::from_ref(&repo), 60, 4, &no).await;
+        assert_eq!(
+            *fake.merges.lock().unwrap(),
+            vec!["h1".to_owned(), "h2".to_owned()]
+        );
     }
 
     #[test]
