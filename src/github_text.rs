@@ -626,18 +626,19 @@ pub struct Withheld {
 }
 
 impl Withheld {
-    /// From the gate's violations; `None` when no field is withheld.
-    pub fn from_violations(violations: &[Violation]) -> Option<Self> {
-        let title = violations.contains(&Violation::TitleLanguage);
-        let body = violations.contains(&Violation::BodyLanguage);
+    /// From the gate's violations and the texts they were found in; `None`
+    /// when no field is withheld. A field is withheld for a language violation
+    /// or when the redaction rules would change it; categories include
+    /// `sensitive-data`, never the data.
+    pub fn from_check(violations: &[Violation], title: &str, body: &str) -> Option<Self> {
+        let sensitive = violations.contains(&Violation::SensitiveData);
+        let title =
+            violations.contains(&Violation::TitleLanguage) || (sensitive && !shareable(title));
+        let body = violations.contains(&Violation::BodyLanguage) || (sensitive && !shareable(body));
         if !title && !body {
             return None;
         }
-        let categories = violations
-            .iter()
-            .filter(|v| **v != Violation::SensitiveData)
-            .map(|v| category(*v).to_owned())
-            .collect();
+        let categories = violations.iter().map(|v| category(*v).to_owned()).collect();
         Some(Self {
             title,
             body,
@@ -716,7 +717,9 @@ pub fn question_detail(w: &Withheld, title: &str, body: &str, retry: bool) -> St
         w.categories.join(", ")
     ));
     s.push_str(&format!(
-        "- `{USE_FALLBACK}` posts `{NEUTRAL_TITLE}` / the neutral description for what was withheld.\n"
+        "- `{USE_FALLBACK}` posts `{NEUTRAL_TITLE}` / the neutral description for what was withheld \
+         for language; text withheld only for sensitive data is posted with the \
+         sensitive spans redacted.\n"
     ));
     if w.title {
         s.push_str(&format!(
@@ -1337,11 +1340,24 @@ mod owner_question_tests {
 
     #[test]
     fn withheld_names_fields_and_categories_only() {
-        let w = Withheld::from_violations(&[Violation::TitleLanguage, Violation::SensitiveData])
-            .unwrap();
+        let secret = "token=abcdefghijklmnop0123456789";
+        let w = Withheld::from_check(
+            &[Violation::TitleLanguage, Violation::SensitiveData],
+            "修正: 再試行",
+            "clean body",
+        )
+        .unwrap();
         assert!(w.title && !w.body);
-        assert_eq!(w.categories, ["title-language"]);
-        assert!(Withheld::from_violations(&[Violation::SensitiveData]).is_none());
+        assert_eq!(w.categories, ["title-language", "sensitive-data"]);
+        let w = Withheld::from_check(&[Violation::SensitiveData], "fix: retry", secret).unwrap();
+        assert!(!w.title && w.body);
+        assert_eq!(w.categories, ["sensitive-data"]);
+        let detail = question_detail(&w, "fix: retry", secret, false);
+        assert!(detail.contains("sensitive-data") && !detail.contains("abcdefghijklmnop"));
+        assert_eq!(question_choices(&w), [USE_FALLBACK]);
+        let w = Withheld::from_check(&[Violation::SensitiveData], secret, "ok").unwrap();
+        assert_eq!(question_choices(&w), [USE_FALLBACK, USE_MY_TEXT]);
+        assert!(Withheld::from_check(&[Violation::SensitiveData], "a", "b").is_none());
     }
 
     #[test]
@@ -1352,7 +1368,7 @@ mod owner_question_tests {
 
     #[test]
     fn detail_never_repeats_sensitive_text_but_shows_a_clean_candidate() {
-        let w = Withheld::from_violations(&[Violation::TitleLanguage]).unwrap();
+        let w = Withheld::from_check(&[Violation::TitleLanguage], "", "").unwrap();
         let secret = "token=abcdefghijklmnop0123456789";
         let hidden = question_detail(&w, secret, "", false);
         assert!(!hidden.contains("abcdefghijklmnop"), "{hidden}");
@@ -1361,13 +1377,13 @@ mod owner_question_tests {
         assert!(shown.contains("Candidate title") && shown.contains("再試行"));
         assert!(shown.contains("title-language"));
         assert_eq!(question_choices(&w), [USE_FALLBACK, USE_MY_TEXT]);
-        let body_only = Withheld::from_violations(&[Violation::BodyLanguage]).unwrap();
+        let body_only = Withheld::from_check(&[Violation::BodyLanguage], "", "").unwrap();
         assert_eq!(question_choices(&body_only), [USE_FALLBACK]);
     }
 
     #[test]
     fn only_the_summary_line_follows_the_language() {
-        let w = Withheld::from_violations(&[Violation::TitleLanguage]).unwrap();
+        let w = Withheld::from_check(&[Violation::TitleLanguage], "", "").unwrap();
         assert!(question_summary("ja", &w).contains("タイトル"));
         assert!(question_summary("en", &w).starts_with("The posting gate"));
     }

@@ -2221,8 +2221,11 @@ Traps:
 `graph::Runner::guarded_pr_message` used to swap a title or body the posting
 gate rejected for `NEUTRAL_TITLE` / `NEUTRAL_BODY` and tell nobody; a merged
 squash commit then carried "chore: update repository". Now, after the one
-rewrite attempt, a still-rejected text (language rules only; sensitive data is
-still redacted in place) goes to the owner through `ask::Questions`.
+rewrite attempt (language violations only; a rewrite cannot fix sensitive
+data), a still-rejected text (language rules and sensitive data; the question
+names categories only, never the text) goes to the owner through
+`ask::Questions`. A field withheld only for sensitive data keeps its text and
+is redacted in place on fallback; a language-withheld field becomes neutral.
 
 - **The question** (`github_text::ASK_NODE` `github-text`, seat `posting-gate`)
   has no `cwd`, `answer_timeout` set, and a fixed `asked_at + answer_timeout`
