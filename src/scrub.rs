@@ -652,7 +652,7 @@ mod tests {
     fn dotted_code_paths_ending_in_local_are_not_hosts() {
         for t in [
             "`WatchState.local` is true",
-            "`cfg.internal` and self.local",
+            "WatchState.lan and self.local",
             "WatchState.local",
         ] {
             assert_eq!(scrub(t, &Identity::default()), t);
