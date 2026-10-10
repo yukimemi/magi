@@ -917,6 +917,8 @@ mod tests {
             &[
                 "clone",
                 "-q",
+                "--branch",
+                "main",
                 "--depth",
                 "1",
                 &url,
