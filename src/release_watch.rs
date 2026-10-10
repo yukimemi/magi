@@ -924,7 +924,14 @@ impl Watcher {
                 }
                 return;
             };
-            st.job = Some(Job::new(&version, &st.url, &commit));
+            let mut job = Job::new(&version, &st.url, &commit);
+            // An escalated pull request keeps its first branch name but gets a
+            // new title; the manifest at the merge commit picks between them.
+            job.accepted = release_local::version_from_title(&info.title)
+                .into_iter()
+                .filter(|t| *t != version)
+                .collect();
+            st.job = Some(job);
             if !self.save(pr, &st) {
                 return;
             }
@@ -1851,6 +1858,23 @@ mod tests {
         w.lap(std::slice::from_ref(&repo), 60, 2, &no).await;
         assert_eq!(w.questions().list().len(), 1);
         assert_eq!(Notices::at(d.path().join("notifications")).list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_escalated_pull_request_records_the_title_version_as_acceptable() {
+        let (d, fake, w) = rig();
+        *fake.local.lock().unwrap() = true;
+        *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Merged, "h1", vec![]));
+        *fake.info.lock().unwrap() = Some(PrInfo {
+            branch: "chore/release-v0.1.4".to_owned(),
+            merge_commit: Some("deadbeef".to_owned()),
+            title: "chore: release v0.2.0 (minor bump)".to_owned(),
+        });
+        let repo = d.path().join("nowhere");
+        w.lap(std::slice::from_ref(&repo), 60, 1, &(|| false)).await;
+        let job = w.load("o/r#7").job.expect("the job is recorded");
+        assert_eq!(job.version, "0.1.4");
+        assert_eq!(job.accepted, vec!["0.2.0".to_owned()]);
     }
 
     #[tokio::test]

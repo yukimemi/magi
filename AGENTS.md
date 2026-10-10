@@ -1125,6 +1125,14 @@ timeout_minutes = 30                # per command
   between saving the failure and holding cannot lose it), recorded in
   `WatchState::held_task`, and given back (`Task::succeed`) when a retry
   finishes - only if the task is still a machine hold with that prefix.
+- **The version comes from the manifest, not the branch name.** An escalated
+  bump (patch -> minor) keeps its first branch name but gets a new title and
+  manifest. The merge commit's `Cargo.toml` decides (`release_local::reconcile_version`):
+  it replaces the job's version only before anything is tagged or run, and only
+  when the title names it or the merge commit itself changed the version
+  relative to its first parent; otherwise a mismatch still refuses to tag. A
+  record failed with that mismatch recovers on `retry`. Adopting an open release
+  PR (`bump.rs`) likewise reads its head's manifest, falling back to the branch name.
 - **Needs `magi serve`** (the watcher is a task inside it) and
   `[daemon] release_stall_minutes > 0` (`0` switches the watcher off, local
   releases included). The per-repo config is read with `Config::discover(repo,
