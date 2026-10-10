@@ -3948,8 +3948,12 @@ function truncateLabel(text, max) {
   return `${out}…`;
 }
 
-const DEP_NODE_W = 156;
+const DEP_NODE_W = 164;
 const DEP_NODE_H = 56;
+/* Title budget: DEP_NODE_W - 2 * DEP_NODE_PAD_X is the text width (140px),
+   which ~20 latin units of 12px/600 text fill; keep the three in step. */
+const DEP_NODE_PAD_X = 12;
+const DEP_LABEL_UNITS = 20;
 const DEP_COL_GAP = 24;
 const DEP_ROW_GAP = 48;
 
@@ -4089,7 +4093,7 @@ function renderDependencyGraph(tasks, questionsById) {
     },
     svg("title", { text: node.detail ? `${node.label}\n${node.status}\n${node.detail}` : `${node.label}\n${node.status}` }),
     svg("rect", { x: x - DEP_NODE_W / 2, y: y - DEP_NODE_H / 2, width: DEP_NODE_W, height: DEP_NODE_H, rx: 10 }),
-    svg("text", { x, y: y - 8, class: "dep-node-title", "text-anchor": "middle", text: truncateLabel(node.label, 22) }),
+    svg("text", { x, y: y - 8, class: "dep-node-title", "text-anchor": "middle", text: truncateLabel(node.label, DEP_LABEL_UNITS) }),
     svg("text", { x, y: y + 12, class: "dep-node-meta", "text-anchor": "middle", text: `${shortId(node.id)} · ${node.status}` }));
     g.addEventListener("click", jump);
     g.addEventListener("keydown", (ev) => {
