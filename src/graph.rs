@@ -6270,12 +6270,29 @@ impl Runner {
                     body: g.body,
                     categories,
                 };
+                // Named by the fingerprint alone, so a resume rewrites the same
+                // file and the detail stays identical.
+                let artifact = if retry {
+                    None
+                } else {
+                    match crate::run::write_artifact(
+                        &self.state,
+                        &gt::artifact_name(&g.fingerprint),
+                        &gt::artifact_text(&pr.title, &pr.body),
+                    ) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            tracing::warn!("could not write the withheld-text artifact: {e:#}");
+                            None
+                        }
+                    }
+                };
                 let mut q = ask::Question::new(
                     self.state.id.clone(),
                     gt::ASK_NODE.to_owned(),
                     gt::ASK_SEAT.to_owned(),
                     gt::question_summary(&self.state.config.graph.language, &w),
-                    gt::question_detail(&w, &pr.title, &pr.body, retry),
+                    gt::question_detail(&w, &pr.title, &pr.body, retry, artifact.as_deref()),
                     gt::question_choices(&w),
                 );
                 q.answer_timeout = timeout;
@@ -12196,6 +12213,19 @@ mod tests {
         };
         let run = runner.state.id.clone();
         let q = find(&run);
+        let fp = runner
+            .state
+            .github_text
+            .as_ref()
+            .unwrap()
+            .fingerprint
+            .clone();
+        let name = crate::github_text::artifact_name(&fp);
+        let path = crate::run::artifact_path(&runner.state, &name);
+        assert!(q.detail.contains(&path.display().to_string()));
+        assert!(q.detail.contains("title-language: title"));
+        let saved = std::fs::read_to_string(&path).expect("artifact written");
+        assert!(saved.contains("日本語のタイトル"));
         assert!(q.cwd.is_none());
         assert_eq!(q.choices, ["use fallback", "use my text"]);
         // A bad replacement is refused and asked about once more.
