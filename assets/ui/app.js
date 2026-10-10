@@ -7636,9 +7636,12 @@ function renderCandidates(run) {
         r.reviews = candidateReviews(run.id, label);
         r.slot.append(r.reviews.details);
       }
-      const reviewSig = JSON.stringify([rounds, gate, run.reviews_md]);
+      const passed = reviewPassed(run);
+      const reviewSig = JSON.stringify([rounds, gate, run.reviews_md, displayedRunStatus(run), passed]);
       if (r.slot.dataset.sig !== reviewSig) {
         r.slot.dataset.sig = reviewSig;
+        r.slot.querySelector(".review-stamp-row")?.remove();
+        if (passed) r.slot.prepend(reviewStamp());
         setText(r.reviews.count, reviewGist(rounds, gate));
         clear(r.reviews.list);
         r.reviews.list.append(...buildReviewRounds(rounds, gate, run.reviews_md));
@@ -7705,16 +7708,45 @@ function voteTone(vote) {
   }
 }
 
-/* A review vote as a tag. Only a `reject` vote carries the 否決 stamp; nothing
-   else (a failed or blocked run included) is ever read as a rejection, and
-   `approve_with_findings` keeps its own gold tone, apart from a plain approve.
-   The English label stays in the DOM beside the stamp. */
+/* A review vote as a tag. A `reject` vote carries the 否決 stamp and a plain
+   `approve` the 承認 stamp; nothing else (a failed or blocked run included) is
+   ever read as either. `approve_with_findings` keeps its own gold tone and no
+   stamp, so it stays distinguishable from a plain approve. The English label
+   stays in the DOM beside the stamp. */
 function voteTag(vote, prefix) {
   const tag = el("span", { class: "tag", "data-tone": voteTone(vote), text: `${prefix || ""}${voteLabel(vote)}` });
   if (vote === "reject") {
     tag.append(" ", el("span", { class: "stamp-ja", lang: "ja", "aria-label": "rejected", text: "\u5426\u6c7a" }));
+  } else if (vote === "approve") {
+    tag.append(" ", el("span", { class: "stamp-ja", lang: "ja", "aria-label": "approved", text: "\u627f\u8a8d" }));
   }
   return tag;
+}
+
+/* The review passed completely: the last round's verdict is a plain approve,
+   every reviewer (and every revote) approved without a finding, and the round
+   is clean with nothing blocking. Anything missing, failed or stalled is
+   false. Separate from the candidate-selection stamp. */
+function reviewPassed(run) {
+  const rounds = Array.isArray(run.reviews) ? run.reviews : [];
+  if (!rounds.length) return false;
+  if (displayedRunStatus(run) === "stalled" || run.status === "stalled") return false;
+  const last = rounds[rounds.length - 1];
+  if (!last || last.verdict !== "approve" || last.clean !== true || Number(last.blocking) !== 0) return false;
+  const records = Array.isArray(last.reviews) ? last.reviews : [];
+  if (!records.length) return false;
+  if (Number(last.expected) > 0 && records.length < Number(last.expected)) return false;
+  const plain = (rec) => rec && !rec.failed && rec.vote === "approve";
+  if (!records.every((rec) => plain(rec) && !(Array.isArray(rec.findings) && rec.findings.length))) return false;
+  const revotes = Array.isArray(last.reconsideration) ? last.reconsideration : [];
+  return revotes.every(plain);
+}
+
+function reviewStamp() {
+  return el("div", { class: "verdict-stamp-row review-stamp-row" },
+    el("span", { class: "stamp stamp-approved", lang: "ja", "aria-label": "Review passed" },
+      el("span", { class: "stamp-ja", text: "\u627f\u8a8d" }),
+      el("span", { class: "stamp-en", lang: "en", text: "REVIEW PASSED" })));
 }
 
 function voteLabel(vote) {
@@ -7908,9 +7940,14 @@ function renderReviews(run) {
   setText($("review-count"), reviewGist(rounds, gate));
 
   const list = $("run-reviews");
-  const sig = JSON.stringify([run.id, rounds, gate]);
+  const passed = reviewPassed(run);
+  const sig = JSON.stringify([run.id, rounds, gate, displayedRunStatus(run), passed]);
   if (list.dataset.sig === sig) return;
   list.dataset.sig = sig;
+  const stampBox = $("review-stamp");
+  clear(stampBox);
+  if (passed) stampBox.append(...reviewStamp().childNodes);
+  show(stampBox, passed);
   clear(list);
   list.append(...buildReviewRounds(rounds, gate, run.reviews_md));
 }

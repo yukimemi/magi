@@ -2633,6 +2633,7 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
 
 /* ---- verdict stamps ------------------------------------------------------ */
 .verdict-stamp-row { display: flex; }
+.review-stamp-row { margin: var(--s2) 0; }
 .stamp {
   display: inline-flex; align-items: baseline; gap: var(--s3); flex-wrap: wrap;
   padding: var(--s2) var(--s4); border: 3px double currentColor; transform: rotate(-3deg);
