@@ -128,6 +128,22 @@ pub(crate) struct WatchState {
     pub held_task: Option<String>,
     /// Local mode: the release after the merge.
     pub job: Option<Job>,
+    /// Set when this pull request was last seen as a local-mode release, so a
+    /// lap that cannot read the config does not fall back to Actions rules.
+    pub local: bool,
+}
+
+impl WatchState {
+    /// Whether this record belongs to a local-mode release. Records written
+    /// before `local` existed lack the flag, but only local mode ever sets
+    /// `run`, `asked_head`, `held_head` or `job`.
+    fn is_local(&self) -> bool {
+        self.local
+            || self.run.is_some()
+            || self.asked_head.is_some()
+            || self.held_head.is_some()
+            || self.job.is_some()
+    }
 }
 
 fn is_failed(v: Verdict) -> bool {
@@ -354,6 +370,7 @@ pub(crate) fn register(home: &Path, repo: &Path, url: &str, run: &str) {
         repo: repo.to_string_lossy().into_owned(),
         url: url.to_owned(),
         run: Some(run.to_owned()),
+        local: true,
         ..WatchState::default()
     };
     w.save(&pr, &st);
@@ -755,10 +772,19 @@ impl Watcher {
         };
         match self.forge.config(repo).await {
             Ok(cfg) if cfg.release.is_local() => {
-                self.watch_local(repo, &pr, st, snap, &cfg).await;
+                st.local = true;
+                self.watch_local(repo, &pr, st, snap, Some(&cfg)).await;
                 return;
             }
-            Ok(_) => {}
+            Ok(_) => st.local = false,
+            Err(e) if st.is_local() => {
+                tracing::warn!(
+                    "could not read the config of {}: {e:#}; watching {url} as a local release without it",
+                    repo.display()
+                );
+                self.watch_local(repo, &pr, st, snap, None).await;
+                return;
+            }
             Err(e) => tracing::warn!(
                 "could not read the config of {}: {e:#}; watching {url} as an Actions release",
                 repo.display()
@@ -835,14 +861,20 @@ impl Watcher {
         pr: &str,
         mut st: WatchState,
         snap: Option<RollupView>,
-        cfg: &crate::config::Config,
+        cfg: Option<&crate::config::Config>,
     ) {
         let Some(snap) = snap else {
             return;
         };
         match snap.state {
             PrLifecycle::Closed => self.finish(pr, &st),
-            PrLifecycle::Merged => self.release_merged(repo, pr, st, cfg).await,
+            PrLifecycle::Merged => match cfg {
+                Some(cfg) => self.release_merged(repo, pr, st, cfg).await,
+                // The release commands live in the config: wait, keep the record.
+                None => {
+                    tracing::warn!("{pr} is merged but its config is unreadable; not released yet")
+                }
+            },
             PrLifecycle::Open => {
                 let approved = match st.question.clone() {
                     None => Approved::NoQuestion,
@@ -859,14 +891,23 @@ impl Watcher {
                         Err(_) => Approved::NoQuestion,
                     },
                 };
-                let ask_first = match self.forge.land_approval(repo).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!("could not read graph.land_approval for {pr}: {e:#}");
-                        true
+                let ask_first = if cfg.is_none() {
+                    true
+                } else {
+                    match self.forge.land_approval(repo).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!("could not read graph.land_approval for {pr}: {e:#}");
+                            true
+                        }
                     }
                 };
                 let step = decide_local(&snap.head, &st, approved, ask_first);
+                if cfg.is_none() && matches!(step, LocalStep::Merge(_)) {
+                    // Nothing to release with: keep the answer for a lap that can read the config.
+                    tracing::warn!("not merging {pr} while its config is unreadable");
+                    return;
+                }
                 if matches!(
                     step,
                     LocalStep::Merge(_) | LocalStep::Hold(_) | LocalStep::Ask
@@ -909,7 +950,9 @@ impl Watcher {
                             Ok(true) => {
                                 // Release at once rather than a lap later.
                                 self.save(pr, &st);
-                                self.release_merged(repo, pr, st, cfg).await;
+                                if let Some(cfg) = cfg {
+                                    self.release_merged(repo, pr, st, cfg).await;
+                                }
                                 return;
                             }
                             res => {
@@ -1508,6 +1551,8 @@ mod tests {
         /// `graph.land_approval` as read; `None` is an unreadable config.
         approval: Mutex<Option<bool>>,
         merge_fails: Mutex<bool>,
+        /// `Config::discover` itself fails.
+        config_fails: Mutex<bool>,
     }
 
     impl ReleaseForge for std::sync::Arc<Fake> {
@@ -1523,6 +1568,9 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
         fn config<'a>(&'a self, _: &'a Path) -> Fut<'a, Result<crate::config::Config>> {
+            if *self.config_fails.lock().unwrap() {
+                return Box::pin(async { bail!("unreadable config") });
+            }
             let mut c = crate::config::Config::default();
             if *self.local.lock().unwrap() {
                 c.release.mode = crate::config::ReleaseMode::Local;
@@ -1855,6 +1903,82 @@ mod tests {
             decide_local("h1", &asked, Hold, false),
             LocalStep::Hold("h1".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn a_registered_local_pr_still_asks_but_never_merges_while_the_config_is_unreadable() {
+        let (dir, fake, w) = rig();
+        *fake.config_fails.lock().unwrap() = true;
+        *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Open, "h1", vec![]));
+        let repo = PathBuf::from("/nowhere");
+        let no = || false;
+        let pr = pr_key(URL).unwrap();
+        register(dir.path(), &repo, URL, "run1");
+        // `register` goes through the real forge; make sure the record exists.
+        assert!(w.load(&pr).local);
+        w.lap(std::slice::from_ref(&repo), 60, 1, &no).await;
+        w.lap(std::slice::from_ref(&repo), 60, 2, &no).await;
+        assert!(fake.merges.lock().unwrap().is_empty());
+        let qs = w.questions().list();
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].choices, vec![land::APPROVE, land::HOLD]);
+        // The owner says merge: nothing merges and the answer is not consumed.
+        answer(&w, &qs[0].id, land::APPROVE);
+        w.lap(std::slice::from_ref(&repo), 60, 3, &no).await;
+        assert!(fake.merges.lock().unwrap().is_empty());
+        assert_eq!(w.load(&pr).question.as_deref(), Some(qs[0].id.as_str()));
+        // The config is readable again: the kept answer merges.
+        *fake.config_fails.lock().unwrap() = false;
+        *fake.local.lock().unwrap() = true;
+        w.lap(std::slice::from_ref(&repo), 60, 4, &no).await;
+        assert_eq!(*fake.merges.lock().unwrap(), vec!["h1".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_local_record_written_before_the_flag_existed_is_still_local() {
+        let (_d, fake, w) = rig();
+        *fake.config_fails.lock().unwrap() = true;
+        *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Open, "h1", vec![]));
+        let repo = PathBuf::from("/nowhere");
+        let no = || false;
+        let pr = pr_key(URL).unwrap();
+        let old = WatchState {
+            repo: repo.to_string_lossy().into_owned(),
+            url: URL.to_owned(),
+            run: Some("run1".to_owned()),
+            ..WatchState::default()
+        };
+        assert!(!old.local);
+        w.save(&pr, &old);
+        w.lap(std::slice::from_ref(&repo), 60, 1, &no).await;
+        assert!(fake.merges.lock().unwrap().is_empty());
+        let qs = w.questions().list();
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].choices, vec![land::APPROVE, land::HOLD]);
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_pr_is_an_actions_release_when_the_config_is_unreadable() {
+        let (_d, fake, w) = rig();
+        *fake.config_fails.lock().unwrap() = true;
+        *fake.snap.lock().unwrap() = Some(red());
+        let repo = PathBuf::from("/nowhere");
+        let no = || false;
+        w.lap(std::slice::from_ref(&repo), 3600, 1000, &no).await;
+        assert_eq!(*fake.reruns.lock().unwrap(), vec!["11".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_merged_local_pr_waits_with_its_record_while_the_config_is_unreadable() {
+        let (dir, fake, w) = rig();
+        *fake.config_fails.lock().unwrap() = true;
+        *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Merged, "h1", vec![]));
+        let repo = PathBuf::from("/nowhere");
+        let no = || false;
+        let pr = pr_key(URL).unwrap();
+        register(dir.path(), &repo, URL, "run1");
+        w.lap(std::slice::from_ref(&repo), 60, 1, &no).await;
+        assert!(w.state_path(&pr).exists(), "the record is kept");
     }
 
     #[tokio::test]
