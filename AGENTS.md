@@ -1901,8 +1901,8 @@ stay text. `idref::href` is the hash-route rule `source_link` uses.
 
 - **Markdown**: `idref::link_nodes` turns text and inline code into
   `md::Node::Ref` (always a `#/` href). Code blocks and existing links are
-  untouched. Applied to chat turns and question detail / thread; a task or run
-  `instruction_md` and run prose are not linked yet.
+  untouched. Applied to chat turns, question detail / thread, task and run
+  `instruction_md` and run prose.
 - **Plain text**: `linkify` cuts tokens with `ID_RE` and asks the table from
   `GET /api/refs` (`Index::table`). The lexical rule exists twice, in
   `idref::scan` and `ID_RE` in `assets/ui/app.js`; `web::tests::the_page_cuts_ids_with_the_rule_rust_uses`
@@ -1910,7 +1910,11 @@ stay text. `idref::href` is the hash-route rule `source_link` uses.
 - `Ui::refs` rebuilds the index only when a store revision or the run count
   moves. `loadRefs` repaints on a changed table and never touches the hash.
 - `#/questions/<id>` scrolls to and flashes that card on arrival only.
-- Finding ids are not linked: they repeat across runs and need a run context.
+- **Finding ids** (`R2-1-3`, markdown only) repeat across runs, so one links
+  only when the document pins one run (`link_nodes_in` for a run's own prose,
+  else exactly one real run mentioned) whose `run.json` recorded it; the
+  target is `#/runs/<run>/report`. A chat row's key includes the tree's
+  signature (`mdSignature`), so a changed resolution repaints it.
 
 ### Duplicate-work claims are gathered from several places
 

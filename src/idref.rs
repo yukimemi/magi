@@ -195,6 +195,8 @@ pub struct Index {
     short: HashMap<String, Option<(Kind, String)>>,
     /// Per kind: short id -> full id; `None` when ambiguous within the kind.
     scoped: HashMap<(Kind, String), Option<String>>,
+    /// Where the runs live, to read a run's finding ids on demand.
+    runs_dir: Option<std::path::PathBuf>,
 }
 
 /// Merge `new` into a unique-or-ambiguous slot.
@@ -248,6 +250,59 @@ impl Index {
         }
     }
 
+    /// Read finding ids from `<dir>/<run>/run.json` when a document needs them.
+    #[must_use]
+    pub fn with_runs_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.runs_dir = Some(dir);
+        self
+    }
+
+    /// The finding ids a run recorded, read tolerantly (any unreadable record
+    /// has none).
+    fn findings_of(&self, run: &str) -> std::collections::HashSet<String> {
+        let Some(dir) = &self.runs_dir else {
+            return Default::default();
+        };
+        let Ok(text) = std::fs::read_to_string(dir.join(run).join("run.json")) else {
+            return Default::default();
+        };
+        let Ok(doc) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return Default::default();
+        };
+        let list = |v: &serde_json::Value, key: &str| {
+            v.get(key)
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default()
+        };
+        list(&doc, "reviews")
+            .iter()
+            .flat_map(|round| list(round, "reviews"))
+            .flat_map(|rec| list(&rec, "findings"))
+            .filter_map(|f| f.get("id").and_then(|i| i.as_str()).map(str::to_owned))
+            .collect()
+    }
+
+    /// The one real run `nodes` mention, when there is exactly one.
+    fn single_run(&self, nodes: &[Node]) -> Option<String> {
+        let mut texts = Vec::new();
+        leaves(nodes, &mut texts);
+        let mut found: Option<String> = None;
+        for t in texts {
+            for span in scan(t) {
+                if let Some(r) = self.resolve(&t[span.start..span.end])
+                    && r.kind == Kind::Run
+                {
+                    match &found {
+                        Some(f) if *f != r.id => return None,
+                        _ => found = Some(r.id),
+                    }
+                }
+            }
+        }
+        found
+    }
+
     /// Whether anything is indexed at all.
     pub fn is_empty(&self) -> bool {
         self.full.is_empty()
@@ -296,123 +351,235 @@ impl Index {
     }
 }
 
-/// Split `text` into plain pieces and resolved refs, in order.
-fn split_text<'a>(text: &'a str, idx: &Index) -> Vec<Result<&'a str, (&'a str, Ref)>> {
-    let mut out = Vec::new();
-    let mut last = 0;
-    for span in scan(text) {
-        let token = &text[span.start..span.end];
-        if let Some(r) = idx.resolve(token) {
-            if span.start > last {
-                out.push(Ok(&text[last..span.start]));
-            }
-            out.push(Err((token, r)));
-            last = span.end;
+/// `R<round>-<reviewer>-<n>`, the shape magi gives a finding.
+fn is_finding(token: &str) -> bool {
+    let mut parts = token
+        .strip_prefix('R')
+        .into_iter()
+        .flat_map(|r| r.split('-'));
+    let mut n = 0;
+    for p in parts {
+        if p.is_empty() || !p.bytes().all(|c| c.is_ascii_digit()) {
+            return false;
         }
+        n += 1;
     }
-    if last < text.len() {
-        out.push(Ok(&text[last..]));
+    n == 3
+}
+
+/// Finding-shaped tokens in `text`, with the same ASCII boundaries as [`scan`].
+fn scan_findings(text: &str) -> Vec<Span> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let before_ok = i == 0 || !(word_byte(b[i - 1]) || matches!(b[i - 1], b'@' | b'.' | b'/'));
+        if before_ok && b[i] == b'R' {
+            let mut end = i + 1;
+            while end < b.len() && (b[end].is_ascii_digit() || b[end] == b'-') {
+                end += 1;
+            }
+            let after_ok = end >= b.len() || !word_byte(b[end]);
+            if after_ok && is_finding(&text[i..end]) {
+                out.push(Span { start: i, end });
+                i = end;
+                continue;
+            }
+        }
+        i += 1;
     }
     out
 }
 
+/// One pass of linking over a document. A finding id repeats across runs, so
+/// it resolves only when the document pins down one run (the caller names it,
+/// or exactly one real run is mentioned) and that run recorded the finding.
+struct Linker<'a> {
+    idx: &'a Index,
+    run: Option<String>,
+    findings: std::cell::OnceCell<std::collections::HashSet<String>>,
+}
+
+impl<'a> Linker<'a> {
+    fn new(idx: &'a Index, nodes: &[Node], run: Option<&str>) -> Self {
+        let run = run.map(str::to_owned).or_else(|| idx.single_run(nodes));
+        Self {
+            idx,
+            run,
+            findings: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn resolve(&self, token: &str) -> Option<Ref> {
+        if is_finding(token) {
+            let run = self.run.as_deref()?;
+            let known = self.findings.get_or_init(|| self.idx.findings_of(run));
+            return known.contains(token).then(|| Ref {
+                kind: Kind::Run,
+                id: run.to_owned(),
+                href: format!("{}/report", href(Kind::Run, run)),
+            });
+        }
+        self.idx.resolve(token)
+    }
+
+    /// Split `text` into plain pieces and resolved refs, in order.
+    fn split<'t>(&self, text: &'t str) -> Vec<Result<&'t str, (&'t str, Ref)>> {
+        let mut spans = scan(text);
+        spans.extend(scan_findings(text));
+        spans.sort_by_key(|s| s.start);
+        let mut out = Vec::new();
+        let mut last = 0;
+        for span in spans {
+            let token = &text[span.start..span.end];
+            if let Some(r) = self.resolve(token) {
+                if span.start > last {
+                    out.push(Ok(&text[last..span.start]));
+                }
+                out.push(Err((token, r)));
+                last = span.end;
+            }
+        }
+        if last < text.len() {
+            out.push(Ok(&text[last..]));
+        }
+        out
+    }
+
+    fn nodes(&self, nodes: Vec<Node>) -> Vec<Node> {
+        nodes.into_iter().flat_map(|n| self.node(n)).collect()
+    }
+
+    fn node(&self, node: Node) -> Vec<Node> {
+        let kids = |v: Vec<Node>| self.nodes(v);
+        vec![match node {
+            Node::Text { value } => {
+                let pieces = self.split(&value);
+                if pieces.iter().all(Result::is_ok) {
+                    return vec![Node::Text { value }];
+                }
+                return pieces
+                    .into_iter()
+                    .map(|p| match p {
+                        Ok(t) => Node::Text {
+                            value: t.to_owned(),
+                        },
+                        Err((t, r)) => Node::Ref {
+                            kind: r.kind,
+                            href: r.href,
+                            text: t.to_owned(),
+                            code: false,
+                        },
+                    })
+                    .collect();
+            }
+            Node::Code { code } => {
+                let pieces = self.split(&code);
+                if pieces.iter().all(Result::is_ok) {
+                    return vec![Node::Code { code }];
+                }
+                return pieces
+                    .into_iter()
+                    .map(|p| match p {
+                        Ok(t) => Node::Code { code: t.to_owned() },
+                        Err((t, r)) => Node::Ref {
+                            kind: r.kind,
+                            href: r.href,
+                            text: t.to_owned(),
+                            code: true,
+                        },
+                    })
+                    .collect();
+            }
+            Node::Paragraph { children } => Node::Paragraph {
+                children: kids(children),
+            },
+            Node::Heading { level, children } => Node::Heading {
+                level,
+                children: kids(children),
+            },
+            Node::BulletList { items } => Node::BulletList { items: kids(items) },
+            Node::OrderedList { start, items } => Node::OrderedList {
+                start,
+                items: kids(items),
+            },
+            Node::ListItem { checked, children } => Node::ListItem {
+                checked,
+                children: kids(children),
+            },
+            Node::Table { align, rows } => Node::Table {
+                align,
+                rows: rows
+                    .into_iter()
+                    .map(|row| {
+                        row.into_iter()
+                            .map(|mut c| {
+                                c.children = kids(c.children);
+                                c
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            },
+            Node::BlockQuote { children } => Node::BlockQuote {
+                children: kids(children),
+            },
+            Node::Emphasis { children } => Node::Emphasis {
+                children: kids(children),
+            },
+            Node::Strong { children } => Node::Strong {
+                children: kids(children),
+            },
+            Node::Strikethrough { children } => Node::Strikethrough {
+                children: kids(children),
+            },
+            // A link keeps its text as written: an anchor inside an anchor is
+            // invalid, and the author chose where it points.
+            other => other,
+        }]
+    }
+}
+
+/// The text and inline-code leaves of a tree, outside links.
+fn leaves<'a>(nodes: &'a [Node], out: &mut Vec<&'a str>) {
+    for n in nodes {
+        match n {
+            Node::Text { value } => out.push(value),
+            Node::Code { code } => out.push(code),
+            Node::Paragraph { children }
+            | Node::Heading { children, .. }
+            | Node::ListItem { children, .. }
+            | Node::BlockQuote { children }
+            | Node::Emphasis { children }
+            | Node::Strong { children }
+            | Node::Strikethrough { children } => leaves(children, out),
+            Node::BulletList { items } | Node::OrderedList { items, .. } => leaves(items, out),
+            Node::Table { rows, .. } => {
+                rows.iter().flatten().for_each(|c| leaves(&c.children, out))
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Turn the real ids in `nodes` into [`Node::Ref`]. Text and inline code are
 /// searched; code blocks, images and anything under an existing link are left
-/// alone.
+/// alone. A finding id links when the document mentions exactly one real run.
 pub fn link_nodes(nodes: Vec<Node>, idx: &Index) -> Vec<Node> {
     if idx.is_empty() {
         return nodes;
     }
-    nodes.into_iter().flat_map(|n| link_node(n, idx)).collect()
+    let linker = Linker::new(idx, &nodes, None);
+    linker.nodes(nodes)
 }
 
-fn link_node(node: Node, idx: &Index) -> Vec<Node> {
-    let kids = |v: Vec<Node>| link_nodes(v, idx);
-    vec![match node {
-        Node::Text { value } => {
-            let pieces = split_text(&value, idx);
-            if pieces.iter().all(Result::is_ok) {
-                return vec![Node::Text { value }];
-            }
-            return pieces
-                .into_iter()
-                .map(|p| match p {
-                    Ok(t) => Node::Text {
-                        value: t.to_owned(),
-                    },
-                    Err((t, r)) => Node::Ref {
-                        kind: r.kind,
-                        href: r.href,
-                        text: t.to_owned(),
-                        code: false,
-                    },
-                })
-                .collect();
-        }
-        Node::Code { code } => {
-            let pieces = split_text(&code, idx);
-            if pieces.iter().all(Result::is_ok) {
-                return vec![Node::Code { code }];
-            }
-            return pieces
-                .into_iter()
-                .map(|p| match p {
-                    Ok(t) => Node::Code { code: t.to_owned() },
-                    Err((t, r)) => Node::Ref {
-                        kind: r.kind,
-                        href: r.href,
-                        text: t.to_owned(),
-                        code: true,
-                    },
-                })
-                .collect();
-        }
-        Node::Paragraph { children } => Node::Paragraph {
-            children: kids(children),
-        },
-        Node::Heading { level, children } => Node::Heading {
-            level,
-            children: kids(children),
-        },
-        Node::BulletList { items } => Node::BulletList { items: kids(items) },
-        Node::OrderedList { start, items } => Node::OrderedList {
-            start,
-            items: kids(items),
-        },
-        Node::ListItem { checked, children } => Node::ListItem {
-            checked,
-            children: kids(children),
-        },
-        Node::Table { align, rows } => Node::Table {
-            align,
-            rows: rows
-                .into_iter()
-                .map(|row| {
-                    row.into_iter()
-                        .map(|mut c| {
-                            c.children = kids(c.children);
-                            c
-                        })
-                        .collect()
-                })
-                .collect(),
-        },
-        Node::BlockQuote { children } => Node::BlockQuote {
-            children: kids(children),
-        },
-        Node::Emphasis { children } => Node::Emphasis {
-            children: kids(children),
-        },
-        Node::Strong { children } => Node::Strong {
-            children: kids(children),
-        },
-        Node::Strikethrough { children } => Node::Strikethrough {
-            children: kids(children),
-        },
-        // A link keeps its text as written: an anchor inside an anchor is
-        // invalid, and the author chose where it points.
-        other => other,
-    }]
+/// As [`link_nodes`], for prose that belongs to `run` (its own page).
+pub fn link_nodes_in(nodes: Vec<Node>, idx: &Index, run: &str) -> Vec<Node> {
+    if idx.is_empty() {
+        return nodes;
+    }
+    let linker = Linker::new(idx, &nodes, Some(run));
+    linker.nodes(nodes)
 }
 
 #[cfg(test)]
@@ -505,5 +672,34 @@ mod tests {
     #[test]
     fn href_encodes_the_segment() {
         assert_eq!(href(Kind::Chat, "a b"), "#/chat/a%20b");
+    }
+
+    #[test]
+    fn a_finding_links_only_when_one_run_is_pinned_and_recorded_it() {
+        let dir = std::env::temp_dir().join(format!("idref-findings-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(RUN)).unwrap();
+        std::fs::write(
+            dir.join(RUN).join("run.json"),
+            r#"{"reviews":[{"reviews":[{"findings":[{"id":"R1-1-1"}]}]}]}"#,
+        )
+        .unwrap();
+        let idx = idx().with_runs_dir(dir.clone());
+        let link = |md: &str| {
+            serde_json::to_string(&link_nodes(to_nodes(md, &ImageBase::None), &idx)).unwrap()
+        };
+        let hit = link("run c9eb found `R1-1-1` and R9-9-9");
+        assert!(hit.contains(&format!("#/runs/{RUN}/report")), "{hit}");
+        assert_eq!(hit.matches(r#""type":"ref""#).count(), 2, "{hit}");
+        // No run in the text: nothing to pin the finding to.
+        assert!(!link("R1-1-1").contains(r#""type":"ref""#));
+        // Two runs: ambiguous.
+        let two = Index::new([], [RUN, "20260101-000000-aaaa"], [], []).with_runs_dir(dir.clone());
+        let out = serde_json::to_string(&link_nodes(
+            to_nodes("c9eb aaaa R1-1-1", &ImageBase::None),
+            &two,
+        ))
+        .unwrap();
+        assert_eq!(out.matches(r#""type":"ref""#).count(), 2, "{out}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -5100,6 +5100,18 @@ function attachmentUrl(conversationId, att) {
   return API.talkAttachment(conversationId, att.id);
 }
 
+/* A cheap fingerprint of a server-sent markdown tree (FNV-1a over its JSON),
+   so a row is rebuilt when the tree changes even if the text does not. */
+function mdSignature(nodes) {
+  const text = JSON.stringify(nodes || []);
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return `${text.length}.${h.toString(16)}`;
+}
+
 function updateTurnRow(row, item) {
   const r = row.refs;
   const turn = item.turn;
@@ -5115,7 +5127,9 @@ function updateTurnRow(row, item) {
      nodes, never as markup: the rule that no API data is ever assigned as
      HTML holds everywhere outside the sandboxed panel frame, and a model that
      writes a script tag into a fence has to see the characters of one. */
-  const key = `${kind}:${body.length}`;
+  /* The rendered markdown is part of the key: which ids resolve changes with
+     the stores, while the body does not. */
+  const key = `${kind}:${body.length}:${kind === "agent" ? mdSignature(item.md) : ""}`;
   if (row.dataset.turnKey !== key) {
     row.dataset.turnKey = key;
     clear(r.body);
@@ -8852,6 +8866,11 @@ async function applyRevisions_(source) {
     jobs.push(loadLoop({ background: true }));
   }
   if (refsStale) jobs.push(loadRefs());
+  /* Which ids resolve is part of a transcript's markdown, so a talk on screen
+     is re-read when another store moved (the talks stream covers its own). */
+  if (refsStale && talksRev === state.rev.talks && state.route.name === "talk" && state.talkDetail.id && !state.talkDetail.gone) {
+    jobs.push(loadTalk(state.talkDetail.id, { background: true }));
+  }
   if (jobs.length) {
     const saidBefore = saidAt;
     await Promise.allSettled(jobs);

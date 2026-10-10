@@ -479,12 +479,15 @@ impl Ui {
         let tasks = self.queue.list();
         let questions = self.questions.list();
         let talks = self.talks.list();
-        let idx = Arc::new(idref::Index::new(
-            tasks.iter().map(|t| t.id.as_str()),
-            runs.iter().map(String::as_str),
-            questions.iter().map(|q| q.id.as_str()),
-            talks.iter().map(|t| t.id.as_str()),
-        ));
+        let idx = Arc::new(
+            idref::Index::new(
+                tasks.iter().map(|t| t.id.as_str()),
+                runs.iter().map(String::as_str),
+                questions.iter().map(|q| q.id.as_str()),
+                talks.iter().map(|t| t.id.as_str()),
+            )
+            .with_runs_dir(self.runs.clone()),
+        );
         *cache = Some((key, Arc::clone(&idx)));
         idx
     }
@@ -3222,8 +3225,9 @@ struct FixMd {
 }
 
 /// Parse a run's agent-written prose; a pure function of the state.
-fn run_prose_md(state: &RunState) -> RunProseMd {
-    let nodes = |t: &str| md::to_nodes(t, &md::ImageBase::None);
+fn run_prose_md(state: &RunState, refs: &idref::Index) -> RunProseMd {
+    let nodes =
+        |t: &str| idref::link_nodes_in(md::to_nodes(t, &md::ImageBase::None), refs, &state.id);
     RunProseMd {
         advice_md: state.advice.as_ref().map(|a| AdviceMd {
             synthesis: nodes(a.synthesis.as_deref().unwrap_or("")),
@@ -3263,14 +3267,19 @@ fn run_prose_md(state: &RunState) -> RunProseMd {
 impl RunDetailView {
     fn of(
         state: RunState,
+        refs: &idref::Index,
         live: crate::run::Liveness,
         superseded_by: Option<String>,
         latest_attempt: Option<LatestAttempt>,
         task: Option<TaskRef>,
     ) -> Self {
         Self {
-            instruction_md: md::to_nodes(&state.instruction, &md::ImageBase::None),
-            prose_md: run_prose_md(&state),
+            instruction_md: idref::link_nodes_in(
+                md::to_nodes(&state.instruction, &md::ImageBase::None),
+                refs,
+                &state.id,
+            ),
+            prose_md: run_prose_md(&state, refs),
             origin_label: crate::run::origin_label(state.origin.as_ref()),
             live,
             unmerged_by_design: state.unmerged_by_design(),
@@ -3319,6 +3328,7 @@ async fn run_detail(
             .map(|t| task_outcome(&t, &id, max_attempts, |r| read_run(&ui.runs, r).ok()));
         Ok(Json(RunDetailView::of(
             state,
+            &ui.refs(),
             live,
             superseded_by,
             latest_attempt,
@@ -3706,6 +3716,13 @@ impl From<Task> for TaskView {
 }
 
 impl TaskView {
+    /// Link the real ids the instruction names.
+    #[must_use]
+    fn linked(mut self, refs: &idref::Index) -> Self {
+        self.instruction_md = idref::link_nodes(self.instruction_md, refs);
+        self
+    }
+
     fn with_inventory(task: Task, inv: &crate::blockers::Inventory) -> Self {
         let waits_on = inv.waits_on(&task);
         let stuck_roots = inv
@@ -3812,11 +3829,12 @@ async fn queue_list(
     blocking(move || {
         let tasks = ui.queue.list();
         let inv = crate::blockers::Inventory::new(tasks.clone(), &ui.questions.list());
+        let refs = ui.refs();
         Ok(Json(
             tasks
                 .into_iter()
                 .filter(|t| q.contains(&t.id) || t.status == crate::queue::TaskStatus::Blocked)
-                .map(|t| TaskView::with_inventory(t, &inv))
+                .map(|t| TaskView::with_inventory(t, &inv).linked(&refs))
                 .collect(),
         ))
     })
@@ -4724,7 +4742,7 @@ async fn task_detail(
             history,
             runs_unreadable,
             attempts_note: ATTEMPTS_NOTE,
-            task: TaskView::with_inventory(task, &inv),
+            task: TaskView::with_inventory(task, &inv).linked(&ui.refs()),
         }))
     })
     .await
@@ -12919,6 +12937,7 @@ mod tests {
             state.status = status;
             let v = serde_json::to_value(RunDetailView::of(
                 state,
+                &idref::Index::default(),
                 crate::run::Liveness::Unknown,
                 None,
                 None,
@@ -12984,6 +13003,7 @@ mod tests {
 
         let v = serde_json::to_value(RunDetailView::of(
             state,
+            &idref::Index::default(),
             crate::run::Liveness::Unknown,
             None,
             None,
@@ -13025,7 +13045,7 @@ mod tests {
             "x".to_owned(),
             crate::config::Config::default(),
         );
-        let p = run_prose_md(&state);
+        let p = run_prose_md(&state, &idref::Index::default());
         assert!(p.advice_md.is_none());
         assert!(p.candidate_summaries_md.is_empty() && p.reviews_md.is_empty());
     }
