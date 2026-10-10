@@ -264,7 +264,9 @@ pub fn settle_deputy_tasks(state: &mut RunState, pr_url: &str, queue: &Queue, re
                 mark_held(state, queue, cand, why, pr_url, "superseded");
                 continue;
             }
-            // The owner's task wins; the idle automatic ones are held.
+            // The owner's task wins; the idle automatic ones are held. Only
+            // when every one is confirmed held is the deputy task released.
+            let mut failed: Option<String> = None;
             for (id, _guard) in &guards {
                 let why = format!(
                     "{SUPERSEDED}the owner's approval deputy filed task {} for the same finding(s) of {pr_url}",
@@ -285,9 +287,26 @@ pub fn settle_deputy_tasks(state: &mut RunState, pr_url: &str, queue: &Queue, re
                             cand.id
                         ),
                     ),
-                    Ok(false) => {}
-                    Err(e) => state.event(NODE, format!("could not hold follow-up {id}: {e:#}")),
+                    Ok(false) => {
+                        failed = Some(id.clone());
+                        break;
+                    }
+                    Err(e) => {
+                        state.event(NODE, format!("could not hold follow-up {id}: {e:#}"));
+                        failed = Some(id.clone());
+                        break;
+                    }
                 }
+            }
+            if let Some(id) = failed {
+                drop(guards);
+                let why = format!(
+                    "{SUPERSEDED}follow-up task {id} could not be held, so it may still run for {} of {pr_url}; was: {}",
+                    matched.join(", "),
+                    cand.hold_reason.as_deref().unwrap_or_default()
+                );
+                mark_held(state, queue, cand, why, pr_url, "superseded");
+                continue;
             }
         } else if !release {
             continue;
