@@ -2232,7 +2232,7 @@ still redacted in place) goes to the owner through `ask::Questions`.
   resumes as soon as it is answered. Silence, abandonment and `use fallback`
   all end in today's neutral text, so an unattended run still finishes and only
   the withheld field is replaced. Needs `magi serve`: a run started in-process
-  with no loop alive stays parked, exactly like a land approval.
+  with no loop alive waits in `daemon::run_claimed` (claim held, `land_resume_state` polled every 15 s) and finishes itself at the answer or the deadline; only Ctrl-C leaves it parked for a later `magi serve`.
 - **A replacement goes through the same gate** (`github_text::vet_title`, with
   the `language_judge` when configured). Sensitive data is rejected, never
   redacted into text the owner did not write. A failing reply gets one more
