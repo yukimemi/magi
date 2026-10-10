@@ -981,14 +981,6 @@ the rest. On a large repository that is real disk; lower `judges` or point
 State lives in `<data_local>/magi/runs/<id>/` — `run.json` plus every prompt and
 raw agent reply under `artifacts/`. `MAGI_HOME` moves it.
 
-## Prior art
-
-The graph is the one described in
-[コードを書くのもレビューも大好きだったのについに全部AIの仕事になった](https://zenn.dev/ttlg/articles/4077fffd458d61)
-(yota, AGI Cockpit), reimplemented as a standalone CLI: three implementations,
-blind judges, deliberation on a split, private final votes, double review plus
-E2E behind a test gate.
-
 ## License
 
 MIT
