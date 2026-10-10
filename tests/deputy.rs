@@ -827,7 +827,11 @@ fn generic_brief_offers_read_only_investigation_only_for_a_run_id() {
     let with = brief(&mk("20261011-120000-7756"));
     assert!(with.contains("20261011-120000-7756"));
     assert!(with.contains("magi show 20261011-120000-7756"));
-    assert!(with.contains("runs/20261011-120000-7756/artifacts"));
+    let artifacts = home
+        .join("runs")
+        .join("20261011-120000-7756")
+        .join("artifacts");
+    assert!(with.contains(&artifacts.display().to_string()));
     assert!(with.contains("read-only"));
     assert!(with.contains("not yours to guess"));
     assert!(with.contains("`use fallback`"));
