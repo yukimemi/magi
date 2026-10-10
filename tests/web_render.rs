@@ -1297,7 +1297,7 @@ async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
             r#"(async () => {
       const source = await (await fetch('/app.js')).text();
       window.deck = new Function(source.replace('queue: "/api/queue"', 'queue: "/api/queue?test_client=1"').replace(/\nboot\(\);\s*$/, `
-        return { state, loadHealth, loadLoop, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter, reviewPassed, voteTag, reviewStamp };
+        return { linkify, state, loadHealth, loadLoop, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter, reviewPassed, voteTag, reviewStamp };
       `))();
       await Promise.all([deck.loadQueue(), deck.loadRuns(), deck.loadTalks()]);
     })()"#,
@@ -1975,4 +1975,73 @@ async fn review_stamp_condition_and_vote_tags() {
     assert_eq!(out["stampText"], "\u{627f}\u{8a8d}REVIEW PASSED");
     assert_eq!(out["fits"], true);
     browser.close_page(&page).await;
+}
+
+#[tokio::test]
+async fn linkify_builds_anchors_and_keeps_markup_as_text() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP linkify: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    seed_tasks(&queue, &fx.repo, "run");
+    let base = serve(
+        &home,
+        queue.clone(),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    let page = browser
+        .open_page(&format!("{base}#/queue"), 1280, 900, false)
+        .await
+        .expect("page");
+    browser
+        .wait_for(
+            &page,
+            "!!document.querySelector('#queue-sections li.card')",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("loaded queue");
+    client_harness(&mut browser, &page).await;
+    let out = browser
+        .eval(
+            &page,
+            r#"(() => {
+      const text = 'Pr: https://github.com/o/r/pull/635 (https://github.com/yukimemi/magi/pull/636). `https://x.test/a`; javascript:alert(1) <b>x</b> ftp://h/';
+      const div = document.createElement('div');
+      deck.linkify(div, text);
+      deck.linkify(div, text, { replace: true });
+      deck.linkify(div, text, { replace: true });
+      const anchors = [...div.querySelectorAll('a')];
+      return {
+        hrefs: anchors.map(a => a.getAttribute('href')),
+        rel: anchors.map(a => a.rel),
+        target: anchors.map(a => a.target),
+        bold: div.querySelectorAll('b').length,
+        text: div.textContent === text,
+      };
+    })()"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out["hrefs"],
+        serde_json::json!([
+            "https://github.com/o/r/pull/635",
+            "https://github.com/yukimemi/magi/pull/636",
+            "https://x.test/a"
+        ])
+    );
+    assert_eq!(out["rel"], serde_json::json!(["noopener noreferrer", "noopener noreferrer", "noopener noreferrer"]));
+    assert_eq!(out["target"], serde_json::json!(["_blank", "_blank", "_blank"]));
+    assert_eq!(out["bold"], 0);
+    assert_eq!(out["text"], true);
 }

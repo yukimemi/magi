@@ -11607,6 +11607,16 @@ mod tests {
     }
 
     #[test]
+    fn plain_text_message_surfaces_go_through_linkify() {
+        assert!(APP_JS.contains("function linkify("));
+        assert!(!APP_JS.contains("class: \"event-msg\", text:"));
+        assert!(!APP_JS.contains("class: \"notice-msg\", text:"));
+        assert!(APP_JS.contains("linkify(el(\"span\", { class: \"event-msg\" })"));
+        assert!(APP_JS.contains("linkify(el(\"div\", { class: \"notice-msg\" })"));
+        assert!(!APP_JS.contains("innerHTML = text"));
+    }
+
+    #[test]
     fn stats_bars_share_one_id_keyed_plan() {
         let start = APP_JS
             .find("function statsBarRows(")
