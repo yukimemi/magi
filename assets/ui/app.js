@@ -8761,6 +8761,110 @@ function parseRoute() {
 const SPLIT_QUERY = "(min-width: 1080px)";
 const splitMedia = typeof window.matchMedia === "function" ? window.matchMedia(SPLIT_QUERY) : null;
 
+/* ---- resizable list column ------------------------------------------------
+ * The width lives in --split-master on <main>, used by grid-template-columns in
+ * app.css. The CSS clamp() owns the bounds, so a narrowing window never needs a
+ * listener; only a value the operator confirmed (drag end, key) is persisted,
+ * never a clamped one. SPLIT_MIN is the list's minimum, SPLIT_PREVIEW_MIN the
+ * space the preview keeps: both are also in app.css's default (360px). */
+const SPLIT_WIDTH_KEY = "magi-split-master";
+const SPLIT_MIN = 360;
+const SPLIT_PREVIEW_MIN = 480;
+const SPLIT_STEP = 16;
+const SPLIT_STEP_BIG = 64;
+
+const splitDivider = (() => {
+  let drag = null;   /* { id, startX, startWidth } while a pointer holds the bar */
+  const main = () => $("main");
+  const bar = () => $("split-divider");
+  const master = () => ["view-runs", "view-queue", "view-talks"].map($).find((n) => n && !n.hidden) || null;
+  const bounds = () => {
+    const w = main().getBoundingClientRect().width;
+    return { min: SPLIT_MIN, max: Math.max(SPLIT_MIN, Math.floor(w - SPLIT_PREVIEW_MIN)) };
+  };
+  const current = () => {
+    const m = master();
+    return m ? m.getBoundingClientRect().width : SPLIT_MIN;
+  };
+  const apply = (px) => {
+    main().style.setProperty("--split-master", `clamp(${SPLIT_MIN}px, ${Math.round(px)}px, calc(100% - ${SPLIT_PREVIEW_MIN}px))`);
+    sync();
+  };
+  const save = (px) => {
+    try { localStorage.setItem(SPLIT_WIDTH_KEY, String(Math.round(px))); } catch (_) { /* private mode */ }
+  };
+  const sync = () => {
+    const b = bar();
+    const m = master();
+    if (!b || b.hidden || !m) return;
+    const { min, max } = bounds();
+    setAttr(b, "aria-valuemin", min);
+    setAttr(b, "aria-valuemax", max);
+    setAttr(b, "aria-valuenow", Math.round(Math.min(max, Math.max(min, current()))));
+    setAttr(b, "aria-controls", m.id);
+  };
+  const release = () => {
+    if (!drag) return;
+    const b = bar();
+    try { b.releasePointerCapture(drag.id); } catch (_) { /* already gone */ }
+    drag = null;
+    b.removeAttribute("data-dragging");
+    document.body.removeAttribute("data-split-dragging");
+  };
+  const finish = () => {
+    if (!drag) return;
+    const w = current();
+    release();
+    save(w);
+    sync();
+  };
+  const restore = () => {
+    try {
+      const px = Number(localStorage.getItem(SPLIT_WIDTH_KEY));
+      if (Number.isFinite(px) && px > 0) main().style.setProperty("--split-master", `clamp(${SPLIT_MIN}px, ${Math.round(px)}px, calc(100% - ${SPLIT_PREVIEW_MIN}px))`);
+    } catch (_) { /* private mode */ }
+  };
+  const wireUp = () => {
+    const b = bar();
+    if (!b) return;
+    restore();
+    b.addEventListener("pointerdown", (e) => {
+      if (drag || !e.isPrimary || (e.pointerType === "mouse" && e.button !== 0)) return;
+      e.preventDefault();
+      drag = { id: e.pointerId, startX: e.clientX, startWidth: current() };
+      try { b.setPointerCapture(e.pointerId); } catch (_) { /* synthetic pointer */ }
+      b.setAttribute("data-dragging", "");
+      document.body.setAttribute("data-split-dragging", "");
+    });
+    b.addEventListener("pointermove", (e) => {
+      if (!drag || e.pointerId !== drag.id) return;
+      const { min, max } = bounds();
+      apply(Math.min(max, Math.max(min, drag.startWidth + e.clientX - drag.startX)));
+    });
+    for (const type of ["pointerup", "pointercancel", "lostpointercapture"]) b.addEventListener(type, finish);
+    b.addEventListener("keydown", (e) => {
+      const { min, max } = bounds();
+      const step = e.shiftKey ? SPLIT_STEP_BIG : SPLIT_STEP;
+      let next = null;
+      if (e.key === "ArrowLeft") next = current() - step;
+      else if (e.key === "ArrowRight") next = current() + step;
+      else if (e.key === "Home") next = min;
+      else if (e.key === "End") next = max;
+      if (next === null) return;
+      e.preventDefault();
+      next = Math.min(max, Math.max(min, next));
+      apply(next);
+      save(next);
+    });
+    b.addEventListener("dblclick", () => {
+      main().style.removeProperty("--split-master");
+      try { localStorage.removeItem(SPLIT_WIDTH_KEY); } catch (_) { /* private mode */ }
+      sync();
+    });
+  };
+  return { wireUp, sync, release };
+})();
+
 /* Which list and which detail a route puts on screen in the two-pane layout,
    or null when the route is not a master/detail one or the screen is narrow.
    `#/queue/<id>` is a deep link to a task: a phone scrolls to its card, a wide
@@ -8820,6 +8924,9 @@ function applyRoute() {
   show($("split-empty"), Boolean(split) && !split.detail);
   setAttr($("main"), "data-split", split ? "1" : null);
   setAttr(document.body, "data-split", split ? "1" : null);
+  show($("split-divider"), Boolean(split));
+  if (!split) splitDivider.release();
+  else splitDivider.sync();
 
   /* The fab is the only entry point into Resume / Fold / Delete, so it must
      not survive a navigation away from the run it belongs to — nor stay
@@ -9512,6 +9619,7 @@ function onPageShow(event) {
 }
 
 function wire() {
+  splitDivider.wireUp();
   $("stats-unreadable-close").addEventListener("click", () => {
     if (state.stats) {
       saveUnreadableDismissed(state.stats.runs_unreadable);

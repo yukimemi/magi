@@ -1037,6 +1037,36 @@ async fn queue_row_click_previews_task_in_split_pane() {
             .unwrap_or_else(|e| panic!("{tag}: not in the two-pane layout: {e}"));
         browser.settle(Duration::from_millis(300)).await.unwrap();
 
+        // The divider sits on the list/preview seam, is a labelled separator,
+        // and resizes by keyboard; a double click restores the default.
+        let divider = browser
+            .eval(
+                &page,
+                "(() => { const d = document.getElementById('split-divider'); \
+                 const m = document.getElementById('view-queue'); \
+                 const r = d.getBoundingClientRect(); const w0 = m.getBoundingClientRect().width; \
+                 const key = (k) => d.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true, cancelable: true })); \
+                 key('ArrowRight'); const w1 = m.getBoundingClientRect().width; \
+                 d.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })); \
+                 const w2 = m.getBoundingClientRect().width; \
+                 return { visible: r.width > 0 && r.height > 0, role: d.getAttribute('role'), \
+                   orient: d.getAttribute('aria-orientation'), tab: d.tabIndex, \
+                   gap: Math.abs(r.left - m.getBoundingClientRect().right), w0, w1, w2 }; })()",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: divider: {e}"));
+        let num = |k: &str| divider[k].as_f64().unwrap_or(f64::NAN);
+        if divider["visible"] != true
+            || divider["role"] != "separator"
+            || divider["orient"] != "vertical"
+            || num("tab") != 0.0
+            || num("gap") > 2.0
+            || (num("w1") - num("w0") - 16.0).abs() > 1.0
+            || (num("w2") - num("w0")).abs() > 1.0
+        {
+            failures.push(format!("{tag}: split divider misbehaves: {divider}"));
+        }
+
         for id in &ids {
             // Bring the row into view, then aim at its status chip: part of
             // the row, but not a link, a button or the title.
