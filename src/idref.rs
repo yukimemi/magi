@@ -353,7 +353,7 @@ impl Index {
 
 /// `R<round>-<reviewer>-<n>`, the shape magi gives a finding.
 fn is_finding(token: &str) -> bool {
-    let mut parts = token
+    let parts = token
         .strip_prefix('R')
         .into_iter()
         .flat_map(|r| r.split('-'));
