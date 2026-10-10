@@ -1441,8 +1441,11 @@ not move on a say.
   hold, and `operator_held` tasks still refuse a settle. A reply that asks for
   **follow-up tasks** is carried out by the deputy with `magi task add --hold
   <reason>` (the task is filed already held by hand, so nothing runs before the
-  pull request lands, and it says so; only `magi task release` runs it). There
-  is no automatic release after the merge: that stays a human step. The deputy
+  pull request lands, and it says so). Once the merge is confirmed,
+  `followup::settle_deputy_tasks` releases them (see "A merge must not take
+  open findings with it"); the hold reason must name the pull request, which
+  the prompt tells the deputy to do. Without that, only `magi task release`
+  runs it. The deputy
   seat now also gets the queue directory as a writable root, so - as for
   opencode / omp seats - its being limited to those two writes rests on the
   prompt, not on the sandbox. `magi task add` from `MAGI_NODE=deputy` leaves
@@ -1985,6 +1988,32 @@ never blocked or changed by it (`land_approval`, `review_rounds` untouched);
   when it starts or resumes the run, so deleting the parent later cannot reset
   it; a run with an origin task whose depth was never recorded and whose task
   is gone is treated as at the cap (nothing filed), never as generation 0.
+- **The approval deputy's tasks are released, and deduped against these.**
+  `followup::after_merge` first calls `settle_deputy_tasks` (and again after
+  filing when the switch below is off). A candidate is a task that is `Held`,
+  has no `followup`, has `Source::Agent { run: <this run>, node: "deputy" }`
+  and a hold reason (manual or machine) naming this pull request (`names_pr`,
+  bounded number or URL); nothing else is ever touched, never by text
+  similarity alone, and the conditions are re-checked under the queue's lock
+  (`Queue::modify`). Release is one queue write: `Task::release` plus a
+  `FollowUp` stamp (generation = parent + 1), so it happens once, survives a
+  restart (a held task is no longer a candidate; `RunState::deputy_followups`
+  is rebuilt from the queue) and counts for the cap. At
+  `MAX_FOLLOWUP_GENERATION` the task stays held with a `[generation cap]`
+  reason. `[graph] release_deputy_followups` (default on) switches the
+  release off; it is independent of `file_followups`, which still only
+  governs automatic filing.
+- **Two paths, one run.** A deputy task and an automatic follow-up cover the
+  same finding when the deputy task names the finding id, names a `file:line`
+  within the 5-line window, or has the finding's normalized title; matches
+  widen to the whole defect group. The order does not matter: if the
+  automatic task is still queued the owner's deputy task wins and the
+  automatic one is held (`[superseded]` reason); if it is running, done or
+  otherwise not idle, the deputy task stays held with a `[superseded]`
+  reason naming it. Nothing is deleted, an event is recorded on the run, and
+  the reason is the note on the dropped task. A released deputy task stamps
+  its findings, so `file` reports them as covered. Held duplicates left by
+  runs merged before this existed are not cleaned up: it only runs at merge.
 - **Best-effort.** `followup::after_merge` returns `()`, records failures as
   run events and never touches `status`. It is called from
   `Runner::run_land` after `bump::after_merge`, independent of it, and from

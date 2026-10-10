@@ -454,6 +454,14 @@ pub struct Graph {
     /// findings are only listed in the pull-request comment. Does not affect
     /// whether the merge happens. On; best-effort, a failure is a run event.
     pub file_followups: bool,
+    /// After a run's pull request merges, release the follow-up tasks the
+    /// merge approval's deputy filed held for that pull request
+    /// (`crate::followup::settle_deputy_tasks`): only a task the deputy filed
+    /// for this run whose hold reason names this pull request, exactly once,
+    /// and never one that duplicates an automatic follow-up (that one is left
+    /// held with the reason). The generation cap applies. Independent of
+    /// `file_followups`. On; off leaves them held until `magi task release`.
+    pub release_deputy_followups: bool,
     /// How long to wait for an owner to answer a question before the run is
     /// abandoned, seconds. A parked run costs nothing, so this is generous;
     /// it exists so a forgotten question cannot pin a worktree forever.
@@ -526,6 +534,7 @@ impl Default for Graph {
             land_approval: true,
             hold_contested_merge: true,
             file_followups: true,
+            release_deputy_followups: true,
             answer_timeout: 86_400,
             incomplete_review: IncompleteReviewPolicy::Block,
             e2e_every_round: false,

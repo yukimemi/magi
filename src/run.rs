@@ -2026,6 +2026,12 @@ pub struct RunState {
     /// The pull-request comment naming the filed follow-ups was posted.
     #[serde(default)]
     pub followup_commented: bool,
+    /// Held tasks the merge approval's deputy filed for this run that were
+    /// released after the merge (`crate::followup::settle_deputy_tasks`).
+    /// Additive and `#[serde(default)]`, so `SCHEMA` stays put; the task
+    /// record is the source of truth and this is rebuilt from the queue.
+    #[serde(default)]
+    pub deputy_followups: Vec<String>,
 }
 
 /// One follow-up task filed from a merged run. See [`RunState::followups`].
@@ -2104,6 +2110,7 @@ impl RunState {
             origin: None,
             followups: Vec::new(),
             followup_generation: None,
+            deputy_followups: Vec::new(),
             origin_chat: None,
             followup_commented: false,
             events: Vec::new(),
