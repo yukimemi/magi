@@ -15295,7 +15295,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(turns.lock().unwrap().parking, "closed once the loop is done");
+        assert!(
+            turns.lock().unwrap().parking,
+            "closed once the loop is done"
+        );
         let refused = ui.begin_talk_turn("20260901-000000-late").err();
         assert!(
             refused.is_some_and(|e| e.message.contains("upgrade in progress")),
