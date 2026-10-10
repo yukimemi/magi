@@ -1928,6 +1928,98 @@ async fn chat_persona_select_sits_beside_the_agent_select_without_overlap() {
     }
 }
 
+/// The per-conversation selectors are chips just above the composer, so a
+/// long transcript never has to be scrolled to the top to change one.
+#[tokio::test]
+async fn chat_selector_chips_stay_reachable_with_a_long_transcript() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
+        );
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let agent = fx.config.agents[0].id.clone();
+    let mut t = talk::begin(&talks, &fx.config, fx.repo.clone(), Some(&agent)).expect("seed talk");
+    for i in 0..40 {
+        talk::record(&mut t, &talks, &format!("Question number {i}"), Vec::new())
+            .expect("seed turn");
+    }
+    let talk_id = t.id.clone();
+
+    let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
+    let mut browser = cdp::Browser::launch(&chrome)
+        .await
+        .unwrap_or_else(|e| panic!("could not start Chrome at {}: {e}", chrome.display()));
+    let w = Duration::from_secs(30);
+
+    for (width, height, mobile) in [(1280u32, 900u32, false), (390, 844, true)] {
+        let tag = format!("selector chips @{width}px");
+        let page = browser
+            .open_page(&format!("{base}#/chat/{talk_id}"), width, height, mobile)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: open: {e}"));
+        browser
+            .wait_for(
+                &page,
+                "(() => { const b = document.getElementById('talk-persona-box'); \
+                 return !!b && !b.hidden && document.querySelectorAll('#talk-persona option').length > 1 \
+                 && document.querySelectorAll('#talk-turns > li').length >= 40; })()",
+                w,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: never rendered: {e}"));
+        let got = browser
+            .eval(
+                &page,
+                "(() => { window.scrollTo(0, document.documentElement.scrollHeight); \
+                 const vw = document.documentElement.clientWidth, vh = window.innerHeight; \
+                 const hit = (r) => ({ x: r.left + r.width / 2, y: r.top + r.height / 2 }); \
+                 const rect = (id) => document.getElementById(id).getBoundingClientRect(); \
+                 const dock = document.querySelector('.dock'); \
+                 const dr = dock && dock.offsetParent !== null ? dock.getBoundingClientRect() : null; \
+                 const cross = (a, b) => !!b && a.left < b.right - 1 && b.left < a.right - 1 \
+                   && a.top < b.bottom - 1 && b.top < a.bottom - 1; \
+                 const out = { inHead: document.querySelectorAll('.view-head select').length, chips: [] }; \
+                 for (const id of ['talk-agent-box', 'talk-persona-box', 'talk-implementers-box']) { \
+                   const box = document.getElementById(id), r = box.getBoundingClientRect(); \
+                   const p = hit(r), top = document.elementFromPoint(p.x, p.y); \
+                   out.chips.push({ id, visible: !box.hidden && r.width > 0, h: r.height, \
+                     inside: r.top >= 0 && r.bottom <= vh && r.left >= 0 && r.right <= vw, \
+                     hit: !!top && box.contains(top), \
+                     clash: cross(r, rect('f-talk-say')) || cross(r, rect('talk-send')) || cross(r, dr) }); \
+                 } \
+                 out.scrolled = window.scrollY > 0 || document.getElementById('talk-turns').scrollTop > 0; \
+                 return out; })()",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: eval: {e}"));
+        assert_eq!(got["inHead"], 0, "{tag}: selector left in the head {got}");
+        for c in got["chips"].as_array().expect("chips") {
+            // The agent chip is hidden while no agent is installed (a CI
+            // runner has none); persona and implementers are always shown.
+            if c["id"] == "talk-agent-box" && c["visible"] == false {
+                continue;
+            }
+            assert_eq!(c["visible"], true, "{tag}: {c}");
+            assert!(
+                c["h"].as_f64().unwrap_or(0.0) >= 44.0,
+                "{tag}: too short {c}"
+            );
+            assert_eq!(c["inside"], true, "{tag}: outside the viewport {c}");
+            assert_eq!(c["hit"], true, "{tag}: covered by something else {c}");
+            assert_eq!(c["clash"], false, "{tag}: overlaps composer or dock {c}");
+        }
+    }
+}
+
 /// The whole-review stamp is a pure condition over the run record, and the
 /// vote tag stamps only a plain approve (承認) or a reject (否決).
 #[tokio::test]

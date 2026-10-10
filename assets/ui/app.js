@@ -5511,6 +5511,7 @@ function renderTalk() {
     clear($("talk-turns"));
     show($("talk-tasks-panel"), false);
     show($("talk-say"), false);
+    show($("talk-composer"), !gone);
     show($("talk-closed"), false);
     show($("talk-close-go"), false);
     show($("talk-reopen-go"), false);
@@ -5590,6 +5591,7 @@ function renderTalk() {
 
   const canSay = status === "open";
   show($("talk-say"), canSay);
+  show($("talk-composer"), true);
   show($("talk-closed"), !canSay);
   show($("talk-close-go"), canSay);
   show($("talk-reopen-go"), !canSay);
