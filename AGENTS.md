@@ -2177,18 +2177,23 @@ it - the shape of `consult`: no new seat, no new waiter, no fresh agent.
   is two notices). Queued, running, parked and failed are not: a failed task is
   retried, and running out of attempts holds it, which is the report. Held and
   blocked are final for now, not forever.
-- **Recorded first, idempotent.** `Queue::record_chat_report` writes
-  `Task::chat_report` (`queue::SCHEMA` 13) under the task lock *before* the
-  draft is queued and `withdraw_chat_report` takes it back if queueing fails: a
-  crash loses one notice, never posts two. `Queue::put` keeps a stored record a
+- **Recorded first, completed later, idempotent.** `Queue::record_chat_report`
+  writes `Task::chat_report` (`queue::SCHEMA` 13, `sent: false`) under the task
+  lock *before* the draft is queued; the draft carries a `magi-report:` marker
+  line, and `finish_chat_report` sets `sent` afterwards. A record that is not
+  `sent` (a crash in between, a failed queue) is finished by the next sweep,
+  which first looks for the marker in the talk's draft and transcript, so a
+  notice is neither lost nor posted twice. `Queue::put` keeps a stored record a
   stale snapshot lacks; release, start and edit never clear it. A terminal chat
   task read from a schema before 13 counts as already reported, so an upgrade
-  does not announce the backlog.
+  does not announce the backlog. Each distinct ending is reported once; a task
+  released and later finished is a new ending and a new notice.
 - **A gone chat is silence.** A missing or closed talk is recorded `skipped`;
   unlike a consult, a report never reopens a chat. An unreadable talk is retried.
 - **Starting the turn.** `daemon::Opts::talk_kick` (set by `magi web` to its
   turn gate: `begin_queued_talk_turn` + `drain_loop`) is called per talk and
-  only spawns. Without it (`magi serve`) the sweep claims the talk's lease and
+  only spawns, and again on every lap while a report sits undrained in the
+  draft (a failed start is retried). Without it (`magi serve`) the sweep claims the talk's lease and
   drains with `consult::drain_owned`. While an upgrade parks, no turn starts and
   the draft stays durable for a manual resume.
 - **`magi talk post <talk> <message>`** appends an agent turn without starting

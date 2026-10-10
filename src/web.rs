@@ -598,8 +598,13 @@ impl Ui {
                 let Some(turn_guard) = claim else { return };
                 let talks = ui.talks.clone();
                 let Ok(talk) = talks.get(&id) else { return };
-                let Ok((cfg, _)) = Config::discover(&talk.repo, None) else {
-                    return;
+                let (cfg, _) = match Config::discover(&talk.repo, None) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // The draft stays; the next sweep lap kicks again.
+                        tracing::warn!("chat report turn for talk {id}: {e:#}");
+                        return;
+                    }
                 };
                 drain_loop(talk, talks, cfg, id, turn_guard).await;
             });

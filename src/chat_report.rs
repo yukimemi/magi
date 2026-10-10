@@ -11,7 +11,7 @@
 //!   `magi task done`, the conductor, the web's buttons), so [`sweep`] looks at
 //!   the queue instead; the loop calls it on a timer. A notice can be one lap
 //!   late, and none is queued while no `magi serve` / `magi web` runs.
-//! - **Recorded first.** [`Queue::record_chat_report`] writes
+//! - **Recorded first, completed later.** [`Queue::record_chat_report`] writes
 //!   [`Task::chat_report`] under the task's lock *before* the draft is queued,
 //!   and withdraws it if queueing fails: a crash loses one notice, never posts
 //!   two.
@@ -102,26 +102,46 @@ pub fn sweep(
     kick: &dyn Fn(&str),
 ) -> Vec<String> {
     let mut reported = Vec::new();
+    let mut waiting = std::collections::BTreeSet::new();
     for task in queue.list() {
-        if task.chat_report_due().is_none() {
-            continue;
-        }
-        match report_one(queue, talks, home, &task.id) {
-            Ok(Some(talk_id)) => {
-                reported.push(task.id.clone());
-                if let Some(id) = talk_id {
-                    kick(&id);
+        if task.chat_report_due().is_some() || task.chat_report_unsent().is_some() {
+            match report_one(queue, talks, home, &task.id) {
+                Ok(Some(talk_id)) => {
+                    reported.push(task.id.clone());
+                    waiting.extend(talk_id);
                 }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("chat report for task {}: {e:#}", task.short()),
             }
-            Ok(None) => {}
-            Err(e) => tracing::warn!("chat report for task {}: {e:#}", task.short()),
+        } else if let Some(talk) = task.filed_by_chat()
+            && task.chat_report.as_ref().is_some_and(|r| !r.skipped)
+        {
+            waiting.insert(talk.to_owned());
+        }
+    }
+    // A draft that holds a report nobody has run (the kick failed, or the
+    // process stopped before it) is started again; a talk mid-turn is left.
+    for id in waiting {
+        let owed = talks
+            .get(&id)
+            .is_ok_and(|t| t.status.open() && t.pending.contains(MARKER));
+        if owed && !talks.turn_held(&id) {
+            kick(&id);
         }
     }
     reported
 }
 
-/// `Ok(None)`: nothing was due. `Ok(Some(None))`: recorded as skipped.
-/// `Ok(Some(Some(talk)))`: a draft was queued for `talk`.
+/// Identifies a report inside a draft or transcript, so a notice whose
+/// recording survived a crash is neither lost nor posted twice.
+const MARKER: &str = "magi-report:";
+
+fn marker_of(task: &Task, key: &str) -> String {
+    format!("{MARKER} {} {key}", task.id)
+}
+
+/// `Ok(None)`: nothing to do. `Ok(Some(None))`: settled as skipped.
+/// `Ok(Some(Some(talk)))`: the draft for `talk` holds the report.
 fn report_one(
     queue: &Queue,
     talks: &Talks,
@@ -142,25 +162,40 @@ fn report_one(
     {
         bail!("talk {talk} is unreadable");
     }
-    let Some((task, key)) = queue.record_chat_report(id, gone)? else {
-        return Ok(None);
+    // Either a fresh ending, or one recorded earlier whose draft was never
+    // confirmed.
+    let (task, key) = match queue.record_chat_report(id, gone)? {
+        Some(r) => r,
+        None => {
+            let task = queue.get(id)?;
+            let Some(key) = task.chat_report_unsent().map(str::to_owned) else {
+                return Ok(None);
+            };
+            (task, key)
+        }
     };
     if task.chat_report.as_ref().is_some_and(|r| r.skipped) {
         return Ok(Some(None));
     }
     let talk_id = task.filed_by_chat().context("task has no chat")?.to_owned();
-    let run = task
-        .runs
-        .last()
-        .and_then(|r| crate::run::RunState::load_under(r, home).ok());
-    let text = message(&task, run.as_ref());
-    let queued = talks
-        .get(&talk_id)
-        .and_then(|mut talk| talk::queue(&mut talk, talks, &text, Vec::new()));
-    if let Err(e) = queued {
-        let _ = queue.withdraw_chat_report(&task.id, &key);
-        return Err(e).context("queue the report into the chat");
+    if gone(&task) {
+        queue.finish_chat_report(&task.id, &key, true)?;
+        return Ok(Some(None));
     }
+    let marker = marker_of(&task, &key);
+    let mut talk = talks.get(&talk_id)?;
+    let already =
+        talk.pending.contains(&marker) || talk.turns.iter().any(|t| t.body.contains(&marker));
+    if !already {
+        let run = task
+            .runs
+            .last()
+            .and_then(|r| crate::run::RunState::load_under(r, home).ok());
+        let text = format!("{}\n\n{marker}", message(&task, run.as_ref()));
+        talk::queue(&mut talk, talks, &text, Vec::new())
+            .context("queue the report into the chat")?;
+    }
+    queue.finish_chat_report(&task.id, &key, false)?;
     Ok(Some(Some(talk_id)))
 }
 

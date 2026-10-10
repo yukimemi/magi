@@ -90,12 +90,12 @@ fn a_done_task_is_reported_once() {
     let text = pending(&w);
     assert!(text.contains(HEADING) && text.contains(&t.id) && text.contains("done"));
 
-    // Neither a second lap nor a stale snapshot written back posts again.
-    assert_eq!(sweep(&w), (vec![], vec![]));
+    // The undrained draft is kicked again, but neither a second lap nor a stale snapshot written back posts again.
+    assert_eq!(sweep(&w), (vec![], vec![w.talk.id.clone()]));
     let mut stale = t.clone();
     stale.chat_report = None;
     w.queue.put(&mut stale).unwrap();
-    assert_eq!(sweep(&w), (vec![], vec![]));
+    assert_eq!(sweep(&w), (vec![], vec![w.talk.id.clone()]));
     assert_eq!(pending(&w).matches(HEADING).count(), 1);
 }
 
@@ -151,25 +151,47 @@ fn a_closed_or_missing_talk_is_skipped_silently() {
 }
 
 #[test]
-fn a_report_survives_a_restart_between_record_and_queue() {
-    // The record is written before the draft: a crash in between loses the
-    // notice, and the next lap must not post a second.
+fn a_crash_between_record_and_queue_is_completed_not_lost_or_doubled() {
     let w = world();
     let mut t = chat_task(&w);
     t.succeed();
     w.queue.put(&mut t).unwrap();
+    // Recorded, but the draft never reached the talk.
     let (_, key) = w
         .queue
         .record_chat_report(&t.id, |_| false)
         .unwrap()
         .expect("due");
     assert_eq!(key, format!("done:{}", t.runs[0]));
-    assert_eq!(sweep(&w), (vec![], vec![]));
     assert!(pending(&w).is_empty());
 
-    // Withdrawn (queueing failed): the next lap tries again.
-    w.queue.withdraw_chat_report(&t.id, &key).unwrap();
-    assert_eq!(sweep(&w).0, vec![t.id.clone()]);
+    let (done, kicked) = sweep(&w);
+    assert_eq!(done, vec![t.id.clone()]);
+    assert_eq!(kicked, vec![w.talk.id.clone()]);
+    assert_eq!(pending(&w).matches(HEADING).count(), 1);
+
+    // Drafted but never confirmed: found by its marker, not queued again.
+    let mut again = w.queue.get(&t.id).unwrap();
+    again.chat_report.as_mut().unwrap().sent = false;
+    w.queue.put(&mut again).unwrap();
+    sweep(&w);
+    assert_eq!(pending(&w).matches(HEADING).count(), 1);
+    assert_eq!(w.queue.get(&t.id).unwrap().chat_report_unsent(), None);
+}
+
+#[test]
+fn a_draft_nobody_ran_is_kicked_again_on_every_lap() {
+    let w = world();
+    let mut t = chat_task(&w);
+    t.succeed();
+    w.queue.put(&mut t).unwrap();
+    assert_eq!(sweep(&w).1.len(), 1);
+    // The first kick failed to start a turn: the draft is still there.
+    assert_eq!(sweep(&w), (vec![], vec![w.talk.id.clone()]));
+    // Once drained there is nothing left to start.
+    let mut talk = w.talks.get(&w.talk.id).unwrap();
+    talk::drain(&mut talk, &w.talks).unwrap();
+    assert_eq!(sweep(&w), (vec![], vec![]));
 }
 
 #[test]
