@@ -38,7 +38,10 @@ cache = "{{ env.MAGI_CACHE | default(value='/tmp') }}"
 # winner's worktree runs these commands, and only one at a time, so nothing
 # contends on cargo's lock.
 e2e = ["CARGO_TARGET_DIR={{ vars.cache }}/magi-target cargo test --locked --all-targets"]
-# Same gate as CI and the pre-push hook.
+# Same gate as the pre-push hook. CI's test job runs the integration binaries
+# under cargo-nextest (`.config/nextest.toml`, profile `ci`) for wall time; this
+# gate runs the same tests under `cargo test`, so nextest-only failures (its
+# config, per-test processes, cross-binary concurrency) are caught by CI alone.
 gate = ["CARGO_TARGET_DIR={{ vars.cache }}/magi-target cargo make check"]
 # Run just before the gate, on the winner only. Run 892b was blocked by nothing
 # but a one-line rustfmt wrap; a formatter is deterministic, so run it rather
