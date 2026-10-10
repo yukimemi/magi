@@ -2182,7 +2182,7 @@ it - the shape of `consult`: no new seat, no new waiter, no fresh agent.
   text as it was when the task ended) under the task lock *before* the draft is
   queued, and the marker check plus append run inside that same lock
   (`Queue::report_chat`), so two sweeping processes cannot both deliver; the draft carries a `magi-report:` marker
-  line, and `finish_chat_report` sets `sent` afterwards. A record that is not
+  line, and `report_chat` sets `sent` afterwards. A record that is not
   `sent` (a crash in between, a failed queue) is finished by the next sweep,
   which delivers the stored text (never one rebuilt from the task's newer state)
   after looking for the marker in the talk's draft and transcript, so a
