@@ -11,7 +11,9 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
-const INSTRUCTION = "add retry with backoff to the uploader";
+// The operator's request, from the same seeder strings the recorder types
+// (seed.mjs puts it in this agent's env), so the filed task always matches.
+const INSTRUCTION = process.env.DEMO_REQUEST;
 const prompt = readFileSync(process.argv[2], "utf8");
 
 const fail = (why) => {
@@ -23,6 +25,7 @@ const fail = (why) => {
 if (!/Persona \(tone only\)/.test(prompt) || !/asuka/i.test(prompt)) {
   fail("the Asuka persona is not in the prompt");
 }
+if (!INSTRUCTION) fail("DEMO_REQUEST is not set");
 if (!prompt.includes(INSTRUCTION)) fail("the operator's request is not in the prompt");
 
 const magi = process.env.MAGI_BIN;

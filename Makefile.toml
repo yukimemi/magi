@@ -265,12 +265,50 @@ cd tools/demo
 node record.mjs --profile=desktop --shots
 '''
 
+[tasks.demo-shots-ja]
+description = "Run the Japanese-content storyboard to Cargo's target/demo-shots-ja (no encode)"
+dependencies = ["demo-build", "demo-deps"]
+script_runner = "@shell"
+script = '''
+cd tools/demo
+node record.mjs --lang=ja --shots
+'''
+
+[tasks.demo-gif-ja]
+description = "Re-record assets/demo-ja.gif (Japanese content, UI chrome stays English)"
+dependencies = ["demo-build", "demo-deps"]
+script_runner = "@shell"
+script = '''
+cd tools/demo
+node record.mjs --lang=ja
+'''
+
+[tasks.demo-shots-desktop-ja]
+description = "Run the Japanese-content desktop storyboard to Cargo's target/demo-shots-desktop-ja (no encode)"
+dependencies = ["demo-build", "demo-deps"]
+script_runner = "@shell"
+script = '''
+cd tools/demo
+node record.mjs --lang=ja --profile=desktop --shots
+'''
+
+[tasks.demo-gif-desktop-ja]
+description = "Re-record assets/demo-desktop-ja.gif (Japanese content, two-pane desktop layout)"
+dependencies = ["demo-build", "demo-deps"]
+script_runner = "@shell"
+script = '''
+cd tools/demo
+node record.mjs --lang=ja --profile=desktop
+'''
+
 [tasks.demo-gif-all]
-description = "Re-record both README gifs (mobile, then desktop)"
+description = "Re-record all four README gifs (en then ja, each mobile then desktop)"
 dependencies = ["demo-build", "demo-deps"]
 script_runner = "@shell"
 script = '''
 cd tools/demo
 node record.mjs
 node record.mjs --profile=desktop
+node record.mjs --lang=ja
+node record.mjs --lang=ja --profile=desktop
 '''
