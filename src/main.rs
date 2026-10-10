@@ -2601,8 +2601,10 @@ async fn answer_cmd(
     } else {
         ask::Answer::Choice(reply)
     };
+    let tasks = magi::queue::Queue::open().list();
     store.update(&q.id, |r| {
         if let Some((run, node)) = agent_env() {
+            magi::consult::refuse_operator_held(r, &node, &tasks)?;
             let reply = match &answer {
                 ask::Answer::Choice(s) | ask::Answer::Text(s) => s,
             };
