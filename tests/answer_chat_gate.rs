@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::process::{Command, Output};
 
 use jiff::Timestamp;
-use magi::ask::{Questions, QuestionStatus};
+use magi::ask::{QuestionStatus, Questions};
 use magi::config::{AgentKind, AgentSpec, Config};
 use magi::talk::{self, Talks};
 
@@ -108,7 +108,10 @@ fn a_chat_merge_without_a_quote_is_refused() {
     let out = answer(&f, &f.talk_id, None);
     assert_untouched(&f, &out);
     let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
-    assert!(err.contains("quote"), "refusal should name the quote: {err}");
+    assert!(
+        err.contains("quote"),
+        "refusal should name the quote: {err}"
+    );
 }
 
 #[test]
