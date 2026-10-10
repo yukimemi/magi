@@ -117,6 +117,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::agent;
 use crate::ask::{self, Answer, Question, Questions};
 use crate::config::{AgentKind, Config, Update, UpdateMode};
+use crate::idref;
 use crate::md;
 use crate::notices::{Notice, Notices};
 use crate::persona;
@@ -306,6 +307,9 @@ pub struct Ui {
     /// sizes it, and sizing the operator's real `~/wt/magi` from a test would
     /// be measuring the machine instead of the server.
     worktrees_root: PathBuf,
+    /// The id index [`Ui::refs`] last built, with the store revisions it was
+    /// built at.
+    refs_cache: Arc<Mutex<Option<RefsCached>>>,
     /// Talks with an agent turn in flight right now.
     ///
     /// In-process and therefore not durable, which is correct: it guards
@@ -391,6 +395,18 @@ impl std::fmt::Debug for BusyQueueGate {
     }
 }
 
+/// An index with the key it was built at.
+type RefsCached = (RefsKey, Arc<idref::Index>);
+
+/// What [`Ui::refs`] was built from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefsKey {
+    queue: u64,
+    questions: u64,
+    talks: u64,
+    runs: usize,
+}
+
 impl Ui {
     /// A server over explicit paths.
     pub fn new(
@@ -413,6 +429,7 @@ impl Ui {
             // builder step rather than a ninth parameter, for the reason
             // `with_merge` gives.
             worktrees_root: run::default_worktree_root(),
+            refs_cache: Arc::default(),
             talk_turns: Arc::default(),
             upgrade_gate: Arc::default(),
             upgrade_spawned: Arc::default(),
@@ -438,6 +455,38 @@ impl Ui {
             run::home(),
             repo,
         )
+    }
+
+    /// The ids that exist right now, for linking them in prose. Rebuilt only
+    /// when a store's revision (or the number of runs) moved.
+    fn refs(&self) -> Arc<idref::Index> {
+        let runs = run::list_ids_in(&self.runs);
+        let key = RefsKey {
+            queue: self.queue.revision(),
+            questions: self.questions.revision(),
+            talks: self.talks.revision(),
+            runs: runs.len(),
+        };
+        let mut cache = self
+            .refs_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some((k, idx)) = cache.as_ref()
+            && *k == key
+        {
+            return Arc::clone(idx);
+        }
+        let tasks = self.queue.list();
+        let questions = self.questions.list();
+        let talks = self.talks.list();
+        let idx = Arc::new(idref::Index::new(
+            tasks.iter().map(|t| t.id.as_str()),
+            runs.iter().map(String::as_str),
+            questions.iter().map(|q| q.id.as_str()),
+            talks.iter().map(|t| t.id.as_str()),
+        ));
+        *cache = Some((key, Arc::clone(&idx)));
+        idx
     }
 
     /// The merge mode the loop should use, as the command line gave it.
@@ -928,6 +977,7 @@ impl Ui {
                 "/api/notifications/{id}/dismiss",
                 post(notification_dismiss),
             )
+            .route("/api/refs", get(refs_get))
             .route("/api/talks", get(talks_list).post(talk_post))
             .route("/api/talks/{id}", get(talk_detail).delete(talk_delete))
             .route("/api/talks/{id}/say", post(talk_say))
@@ -3025,19 +3075,6 @@ struct SourceLink {
     href: String,
 }
 
-/// Percent-encode everything outside the URL-unreserved set.
-fn encode_segment(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for b in raw.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
 /// The one place that decides where a task's source links to. A chat
 /// conversation opens `#/chat/<id>`, any other agent node `#/runs/<id>`;
 /// a person or an imported issue has no page, so no link.
@@ -3045,15 +3082,15 @@ fn source_link(source: &Source) -> Option<SourceLink> {
     let Source::Agent { run, node } = source else {
         return None;
     };
-    let (kind, route) = if node == crate::queue::CHAT_NODE {
-        ("chat", "chat")
+    let (kind, target) = if node == crate::queue::CHAT_NODE {
+        ("chat", idref::Kind::Chat)
     } else {
-        ("run", "runs")
+        ("run", idref::Kind::Run)
     };
     Some(SourceLink {
         kind,
         id: run.clone(),
-        href: format!("#/{route}/{}", encode_segment(run)),
+        href: idref::href(target, run),
     })
 }
 
@@ -5629,22 +5666,31 @@ impl QuestionView {
     /// The view of `question`, reading who is waiting on it from `store`.
     ///
     /// `holder` needs the lease sidecar, which is why this is not a `From`.
-    fn of(question: Question, store: &ask::Questions, deputies_enabled: bool) -> Self {
+    fn of(
+        question: Question,
+        store: &ask::Questions,
+        deputies_enabled: bool,
+        refs: &idref::Index,
+    ) -> Self {
         let base = md::ImageBase::QuestionPanel {
             id: question.id.clone(),
         };
         let holder = holder_of(&question, store.read_lease(&question.id).as_ref());
         Self {
-            detail_md: md::to_nodes(&question.detail, &base),
+            detail_md: idref::link_nodes(md::to_nodes(&question.detail, &base), refs),
             thread_bodies_md: question
                 .thread
                 .iter()
-                .map(|t| md::to_nodes(&t.body, &base))
+                .map(|t| idref::link_nodes(md::to_nodes(&t.body, &base), refs))
                 .collect(),
             thread_notes_md: question
                 .thread
                 .iter()
-                .map(|t| t.note.as_deref().map(|n| md::to_nodes(n, &base)))
+                .map(|t| {
+                    t.note
+                        .as_deref()
+                        .map(|n| idref::link_nodes(md::to_nodes(n, &base), refs))
+                })
                 .collect(),
             waiting_on_agent: question.waiting_on_agent(),
             holder,
@@ -5682,6 +5728,7 @@ fn deputies_enabled(cfg: Option<&Config>, q: &Question) -> bool {
 fn question_views(
     qs: Vec<Question>,
     store: &ask::Questions,
+    refs: &idref::Index,
     load: impl FnOnce() -> Option<Config>,
 ) -> Vec<QuestionView> {
     if qs.is_empty() {
@@ -5691,7 +5738,7 @@ fn question_views(
     qs.into_iter()
         .map(|q| {
             let on = deputies_enabled(cfg.as_ref(), &q);
-            QuestionView::of(q, store, on)
+            QuestionView::of(q, store, on, refs)
         })
         .collect()
 }
@@ -5729,7 +5776,7 @@ async fn questions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<Questio
     blocking(move || {
         let (tasks, talks) = (ui.queue.list(), ui.talks.list());
         Ok(Json(
-            question_views(ui.questions.list(), &ui.questions, || {
+            question_views(ui.questions.list(), &ui.questions, &ui.refs(), || {
                 deputy_config(&ui.repo)
             })
             .into_iter()
@@ -5841,7 +5888,7 @@ async fn question_answer(
         let on = deputies_enabled(deputy_config(&ui.repo).as_ref(), &q);
         let (tasks, talks) = (ui.queue.list(), ui.talks.list());
         Ok(Json(
-            QuestionView::of(q, &ui.questions, on).with_origin(&tasks, &talks),
+            QuestionView::of(q, &ui.questions, on, &ui.refs()).with_origin(&tasks, &talks),
         ))
     })
     .await
@@ -5894,7 +5941,7 @@ async fn question_say(
         let on = deputies_enabled(deputy_config(&ui.repo).as_ref(), &q);
         let (tasks, talks) = (ui.queue.list(), ui.talks.list());
         Ok(Json(
-            QuestionView::of(q, &ui.questions, on).with_origin(&tasks, &talks),
+            QuestionView::of(q, &ui.questions, on, &ui.refs()).with_origin(&tasks, &talks),
         ))
     })
     .await
@@ -5960,7 +6007,8 @@ async fn question_consult(
             };
             let q = ui.questions.get(&q.id)?;
             let on = deputies_enabled(deputy_config(&ui.repo).as_ref(), &q);
-            let view = QuestionView::of(q, &ui.questions, on).with_origin(&tasks, &talks);
+            let view =
+                QuestionView::of(q, &ui.questions, on, &ui.refs()).with_origin(&tasks, &talks);
             Ok((view, claim))
         }
     })
@@ -6145,6 +6193,12 @@ fn panel_response(content_type: &'static str, download: bool, body: Vec<u8>) -> 
     res
 }
 
+/// `GET /api/refs`: which ids exist, as the page's plain-text linker looks
+/// them up (see [`idref::Index::table`]). The decision is made here.
+async fn refs_get(State(ui): State<Arc<Ui>>) -> ApiResult<Json<serde_json::Value>> {
+    blocking(move || Ok(Json(ui.refs().table()))).await
+}
+
 /// A talk as the phone reads it.
 ///
 /// Every field of [`Talk`] verbatim, plus `turn_bodies_md` - one markdown node
@@ -6177,19 +6231,19 @@ struct TalkView {
 impl TalkView {
     /// Reads the talk's repository config itself; a config that cannot be
     /// read leaves the window unknown but never fails the conversation.
-    fn new(talk: Talk, thinking: bool) -> Self {
+    fn new(talk: Talk, thinking: bool, refs: &idref::Index) -> Self {
         let cfg = Config::discover(&talk.repo, None).ok().map(|(cfg, _)| cfg);
-        Self::with_config(talk, thinking, cfg.as_ref())
+        Self::with_config(talk, thinking, cfg.as_ref(), refs)
     }
 
     /// As [`Self::new`], with the config already in hand (the list reads one
     /// per repository, not one per conversation).
-    fn with_config(talk: Talk, thinking: bool, cfg: Option<&Config>) -> Self {
+    fn with_config(talk: Talk, thinking: bool, cfg: Option<&Config>, refs: &idref::Index) -> Self {
         let context = talk::context_usage(&talk, cfg);
         let turn_bodies_md = talk
             .turns
             .iter()
-            .map(|turn| md::to_nodes(&turn.body, &md::ImageBase::None))
+            .map(|turn| idref::link_nodes(md::to_nodes(&turn.body, &md::ImageBase::None), refs))
             .collect();
         let specs = cfg.map_or(&[][..], |c| &c.talk.personas[..]);
         let persona_name = persona::find(specs, &talk.persona)
@@ -6250,6 +6304,7 @@ async fn talks_list(
 ) -> ApiResult<Json<Vec<TalkView>>> {
     blocking(move || {
         let mut configs: HashMap<PathBuf, Option<Config>> = HashMap::new();
+        let refs = ui.refs();
         Ok(Json(
             ui.talks
                 .list()
@@ -6260,7 +6315,7 @@ async fn talks_list(
                     let cfg = configs
                         .entry(talk.repo.clone())
                         .or_insert_with(|| Config::discover(&talk.repo, None).ok().map(|(c, _)| c));
-                    TalkView::with_config(talk, thinking, cfg.as_ref())
+                    TalkView::with_config(talk, thinking, cfg.as_ref(), &refs)
                 })
                 .collect(),
         ))
@@ -6298,7 +6353,7 @@ async fn talk_post(
     let view = blocking(move || {
         let talk = talk::begin(&ui.talks, &cfg, repo, body.agent.as_deref())?;
         let thinking = ui.is_thinking(&talk.id);
-        Ok(TalkView::new(talk, thinking))
+        Ok(TalkView::new(talk, thinking, &ui.refs()))
     })
     .await?;
     Ok((StatusCode::CREATED, Json(view)))
@@ -6343,7 +6398,7 @@ async fn talk_detail(
             })
             .collect();
         Ok(Json(TalkDetailView {
-            view: TalkView::with_config(talk, thinking, cfg.as_ref()),
+            view: TalkView::with_config(talk, thinking, cfg.as_ref(), &ui.refs()),
             tasks,
             roster,
             personas,
@@ -6539,7 +6594,7 @@ async fn talk_say(
                                 None => None,
                             };
                             let thinking = ui.is_thinking(&id);
-                            Ok((TalkView::new(talk, thinking), claim))
+                            Ok((TalkView::new(talk, thinking, &ui.refs()), claim))
                         }
                     })
                     .await;
@@ -6661,7 +6716,10 @@ async fn talk_say(
         .map_err(|_| ApiError::internal("the talk turn task ended without answering"))??;
 
     // 202: the operator's message is recorded and a turn is running.
-    Ok((StatusCode::ACCEPTED, Json(TalkView::new(queued, thinking))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(TalkView::new(queued, thinking, &ui.refs())),
+    ))
 }
 
 /// `POST /api/talks/{id}/pending/resume` promotes a persisted draft without
@@ -6701,7 +6759,7 @@ async fn talk_pending_resume(
         })
         .await?
     };
-    let view = TalkView::new(talk.clone(), true);
+    let view = TalkView::new(talk.clone(), true, &ui.refs());
     let talks = ui.talks.clone();
     tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
     Ok((StatusCode::ACCEPTED, Json(view)))
@@ -6858,7 +6916,7 @@ async fn talk_pending_clear(
             ));
         }
         let thinking = ui.is_thinking(&talk.id);
-        Ok(Json(TalkView::new(talk, thinking)))
+        Ok(Json(TalkView::new(talk, thinking, &ui.refs())))
     })
     .await
 }
@@ -6903,7 +6961,7 @@ async fn talk_pending_edit(
                 None => None,
             };
             let thinking = ui.is_thinking(&id);
-            Ok((TalkView::new(talk, thinking), claim))
+            Ok((TalkView::new(talk, thinking, &ui.refs()), claim))
         }
     })
     .await?;
@@ -6984,7 +7042,7 @@ async fn talk_agent(
         Err(_) => false,
     };
     let talk = switched?;
-    Ok(Json(TalkView::new(talk, draining)))
+    Ok(Json(TalkView::new(talk, draining, &ui.refs())))
 }
 
 /// The body of `POST /api/talks/{id}/persona`.
@@ -7057,7 +7115,7 @@ async fn talk_persona(
         Err(_) => false,
     };
     let talk = switched?;
-    Ok(Json(TalkView::new(talk, draining)))
+    Ok(Json(TalkView::new(talk, draining, &ui.refs())))
 }
 
 /// The body of `POST /api/talks/{id}/implementers`.
@@ -7126,7 +7184,7 @@ async fn talk_implementers(
         Err(_) => false,
     };
     let talk = switched?;
-    Ok(Json(TalkView::new(talk, draining)))
+    Ok(Json(TalkView::new(talk, draining, &ui.refs())))
 }
 
 /// `POST /api/talks/{id}/close`.
@@ -7139,7 +7197,7 @@ async fn talk_close(
         let mut talk = ui.talks.get(&id)?;
         talk::close(&mut talk, &ui.talks)?;
         let thinking = ui.is_thinking(&talk.id);
-        Ok(Json(TalkView::new(talk, thinking)))
+        Ok(Json(TalkView::new(talk, thinking, &ui.refs())))
     })
     .await
 }
@@ -7154,7 +7212,7 @@ async fn talk_reopen(
         let mut talk = ui.talks.get(&id)?;
         talk::reopen(&mut talk, &ui.talks)?;
         let thinking = ui.is_thinking(&talk.id);
-        Ok(Json(TalkView::new(talk, thinking)))
+        Ok(Json(TalkView::new(talk, thinking, &ui.refs())))
     })
     .await
 }
@@ -7511,7 +7569,7 @@ mod tests {
         let qs = vec![plain_question("a"), with_deputy, plain_question("c")];
 
         let calls = std::cell::Cell::new(0usize);
-        let views = question_views(qs.clone(), &store, || {
+        let views = question_views(qs.clone(), &store, &idref::Index::default(), || {
             calls.set(calls.get() + 1);
             Some(stub_config())
         });
@@ -7524,11 +7582,11 @@ mod tests {
             );
         }
 
-        let views = question_views(qs, &store, || None);
+        let views = question_views(qs, &store, &idref::Index::default(), || None);
         assert!(views.iter().all(|v| !v.deputies_enabled));
 
         let calls = std::cell::Cell::new(0usize);
-        let views = question_views(Vec::new(), &store, || {
+        let views = question_views(Vec::new(), &store, &idref::Index::default(), || {
             calls.set(calls.get() + 1);
             None
         });
@@ -8049,6 +8107,53 @@ mod tests {
         std::fs::write(store.path_of(id), body.to_string()).expect("write the talk");
         store.get(id).expect("the seeded talk has to be readable");
         id.to_owned()
+    }
+
+    #[tokio::test]
+    async fn chat_replies_link_ids_that_exist_and_refs_serves_the_same_table() {
+        let fx = Fixture::start().await;
+        let run = "20260908-205802-c9eb";
+        std::fs::create_dir_all(fx.runs().join(run)).expect("run dir");
+        let id = seed_talk(&fx, "20260904-014455-6f0d", "open");
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fx.talks().path_of(&id)).unwrap())
+                .unwrap();
+        doc["turns"] = serde_json::json!([{
+            "who": "agent",
+            "body": format!("run `c9eb` / {run}, not beef"),
+            "at": Timestamp::now().to_string(),
+        }]);
+        std::fs::write(fx.talks().path_of(&id), doc.to_string()).unwrap();
+
+        let view = fx.get(&format!("/api/talks/{id}")).await.json();
+        let nodes = view["turn_bodies_md"][0][0]["children"].to_string();
+        assert!(
+            nodes.contains(&format!(r##""href":"#/runs/{run}""##)),
+            "{nodes}"
+        );
+        assert!(nodes.contains(r#""code":true"#), "{nodes}");
+        assert_eq!(nodes.matches(r#""type":"ref""#).count(), 2, "{nodes}");
+        assert!(!nodes.contains(r#""text":"beef""#), "{nodes}");
+
+        let refs = fx.get("/api/refs").await.json();
+        assert_eq!(refs["short"]["c9eb"]["href"], format!("#/runs/{run}"));
+        assert_eq!(
+            refs["scoped"]["chat"]["6f0d"]["href"],
+            format!("#/chat/{id}")
+        );
+        assert!(refs["short"].get("beef").is_none(), "{refs}");
+    }
+
+    #[test]
+    fn the_page_cuts_ids_with_the_rule_rust_uses() {
+        // `assets/ui/app.js` repeats `idref::scan`'s lexical rule; the regex is
+        // pinned here so a change to one cannot go unnoticed in the other.
+        assert!(
+            APP_JS.contains(
+                r"/(?<![A-Za-z0-9_@\-./])(?:[a-z][a-z-]*@)?(?:\d{8}-\d{6}-[0-9a-f]{4}|[0-9a-f]{4})(?![A-Za-z0-9_-]|\.[A-Za-z0-9])/g"
+            ),
+            "ID_RE drifted from idref::scan"
+        );
     }
 
     #[tokio::test]
@@ -12939,7 +13044,8 @@ mod tests {
         );
         q.say("plain words").unwrap();
         q.reply("use **this**", Vec::new()).unwrap();
-        let v = serde_json::to_value(QuestionView::of(q, &store, false)).unwrap();
+        let v = serde_json::to_value(QuestionView::of(q, &store, false, &idref::Index::default()))
+            .unwrap();
         let bodies = &v["thread_bodies_md"];
         assert_eq!(bodies.as_array().unwrap().len(), 2);
         assert!(!bodies[0].to_string().contains("strong"));
@@ -12965,7 +13071,8 @@ mod tests {
             at: jiff::Timestamp::now(),
             note: Some("filed `abc123` _Fix [R1-1]_ (held; `magi task release abc123`)".to_owned()),
         });
-        let v = serde_json::to_value(QuestionView::of(q, &store, false)).unwrap();
+        let v = serde_json::to_value(QuestionView::of(q, &store, false, &idref::Index::default()))
+            .unwrap();
         let notes = &v["thread_notes_md"];
         assert_eq!(notes.as_array().unwrap().len(), 2);
         assert!(notes[0].is_null());

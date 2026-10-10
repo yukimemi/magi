@@ -197,6 +197,19 @@ pub enum Node {
         /// The image's alt text.
         alt: String,
     },
+    /// A magi id that names something real, linked to its in-app page. Never
+    /// produced by [`to_nodes`]; only [`crate::idref::link_nodes`] builds it,
+    /// after checking the id exists, so `href` is always a `#/` route.
+    Ref {
+        /// What the id names.
+        kind: crate::idref::Kind,
+        /// The hash route that opens it.
+        href: String,
+        /// The id as written.
+        text: String,
+        /// It was written in an inline code span; keep that look.
+        code: bool,
+    },
     /// A soft line break: a single newline in the source, conventionally
     /// rendered as a space or an ordinary wrap.
     SoftBreak,
@@ -346,6 +359,7 @@ fn plain_text(nodes: &[Node]) -> String {
     for node in nodes {
         match node {
             Node::Text { value } | Node::Code { code: value } => out.push_str(value),
+            Node::Ref { text, .. } => out.push_str(text),
             Node::Image { alt, .. } => out.push_str(alt),
             Node::SoftBreak => out.push(' '),
             Node::LineBreak => out.push('\n'),

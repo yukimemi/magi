@@ -44,6 +44,7 @@ pub mod git;
 pub mod github_text;
 pub mod graph;
 pub mod handover;
+pub mod idref;
 pub mod land;
 pub mod lang;
 pub mod md;

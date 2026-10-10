@@ -2176,6 +2176,52 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
     );
     assert_eq!(out["bold"], 0);
     assert_eq!(out["text"], true);
+
+    // Ids: only the ones the server's table knows become in-app links, a
+    // click changes the hash without a reload, and a table arriving later
+    // repaints a node that was built without it.
+    let ids = browser
+        .eval(
+            &page,
+            r#"(() => {
+      const text = '12ba の修正を待つ, beef and chat@6f0d; https://x.test/12ba';
+      const div = document.createElement('div');
+      document.body.append(div);
+      deck.linkify(div, text, { replace: true });
+      const before = div.querySelectorAll('a.id-link').length;
+      deck.state.refs = {
+        full: {}, scoped: { chat: { '6f0d': { kind: 'chat', id: 'x-6f0d', href: '#/chat/x-6f0d' } } },
+        short: { '12ba': { kind: 'task', id: 'x-12ba', href: '#/tasks/x-12ba' } },
+      };
+      deck.state.refsRev += 1;
+      deck.linkify(div, text, { replace: true });
+      const marker = window.__noReload = {};
+      const anchors = [...div.querySelectorAll('a.id-link')];
+      const url = div.querySelector('a.text-link');
+      anchors[0].click();
+      return {
+        before,
+        hrefs: anchors.map(a => a.getAttribute('href')),
+        texts: anchors.map(a => a.textContent),
+        urlHref: url && url.getAttribute('href'),
+        text: div.textContent === text,
+        hash: location.hash,
+        sameDocument: window.__noReload === marker,
+      };
+    })()"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids["before"], 0);
+    assert_eq!(
+        ids["hrefs"],
+        serde_json::json!(["#/tasks/x-12ba", "#/chat/x-6f0d"])
+    );
+    assert_eq!(ids["texts"], serde_json::json!(["12ba", "chat@6f0d"]));
+    assert_eq!(ids["urlHref"], "https://x.test/12ba");
+    assert_eq!(ids["text"], true);
+    assert_eq!(ids["hash"], "#/tasks/x-12ba");
+    assert_eq!(ids["sameDocument"], true);
 }
 
 #[tokio::test]

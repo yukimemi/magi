@@ -42,6 +42,7 @@ const API = {
   editTask: (id) => `/api/queue/${encodeURIComponent(id)}/edit`,
   doneTask: (id) => `/api/queue/${encodeURIComponent(id)}/done`,
   questions: "/api/questions",
+  refs: "/api/refs",
   notifications: "/api/notifications",
   notificationsReadAll: "/api/notifications/read-all",
   notificationRead: (id) => `/api/notifications/${encodeURIComponent(id)}/read`,
@@ -301,18 +302,57 @@ function setText(node, value) {
   if (node.textContent !== next) node.textContent = next;
 }
 
-/* Puts `value` into `node` as text nodes and, for each http(s) URL in it, an
-   anchor. Nodes only, never innerHTML, so the text cannot inject markup. Other
-   schemes stay text. Trailing . , ; : and an unmatched ) are not part of the
-   URL; backticks and quotes end it. `{ replace: true }` swaps the node's
-   children and does nothing when the text is unchanged (keeps an SSE refresh
-   from dropping a selection); the default appends. Do not mix with setText on
-   one node. */
+/* Puts `value` into `node` as text nodes, an anchor for each http(s) URL in
+   it, and an in-app anchor for each magi id that exists. Nodes only, never
+   innerHTML, so the text cannot inject markup. Other schemes stay text.
+   Trailing . , ; : and an unmatched ) are not part of the URL; backticks and
+   quotes end it. Ids are cut by ID_RE (the lexical rule of `magi::idref::scan`;
+   change both together) and kept only when `resolveRef` finds them in the table
+   the server decided (`/api/refs`): an unknown 4-hex word stays text.
+   `{ replace: true }` swaps the node's children and does nothing when the text
+   and the id table are unchanged (keeps an SSE refresh from dropping a
+   selection); the default appends. Do not mix with setText on one node. */
 const URL_RE = /https?:\/\/[^\s<>"'`]+/gi;
+const ID_RE = /(?<![A-Za-z0-9_@\-./])(?:[a-z][a-z-]*@)?(?:\d{8}-\d{6}-[0-9a-f]{4}|[0-9a-f]{4})(?![A-Za-z0-9_-]|\.[A-Za-z0-9])/g;
+
+/* The server's table entry for an id token, or null. Mirrors
+   `idref::Index::resolve`, which decided what is in the table. */
+function resolveRef(token) {
+  const t = state.refs;
+  if (!t) return null;
+  const at = token.indexOf("@");
+  if (at >= 0) {
+    const qualifier = token.slice(0, at);
+    const kind = qualifier === "chat" ? "chat" : qualifier === "task" ? "task"
+      : ["question", "ask", "approval"].includes(qualifier) ? "question" : "run";
+    return (t.scoped && t.scoped[kind] && t.scoped[kind][token.slice(at + 1)]) || null;
+  }
+  const hit = token.length === 4 ? t.short && t.short[token] : t.full && t.full[token];
+  return hit || null;
+}
+
+/* Text with its resolvable ids as in-app links (hash routes only: a click is
+   a hashchange, never a reload, and nothing here touches state or location). */
+function idParts(text) {
+  const out = [];
+  let last = 0;
+  if (state.refs) {
+    for (const m of text.matchAll(ID_RE)) {
+      const hit = resolveRef(m[0]);
+      if (!hit || !String(hit.href).startsWith("#/")) continue;
+      if (m.index > last) out.push(document.createTextNode(text.slice(last, m.index)));
+      out.push(el("a", { class: "id-link", href: hit.href, "data-ref-kind": hit.kind, text: m[0] }));
+      last = m.index + m[0].length;
+    }
+  }
+  if (last < text.length) out.push(document.createTextNode(text.slice(last)));
+  return out;
+}
+
 function linkify(node, value, opts) {
   const text = value === null || value === undefined ? "" : String(value);
   const replace = Boolean(opts && opts.replace);
-  if (replace && node.textContent === text) return node;
+  if (replace && node.textContent === text && node.dataset.refsRev === String(state.refsRev)) return node;
   const parts = [];
   let last = 0;
   for (const m of text.matchAll(URL_RE)) {
@@ -326,14 +366,34 @@ function linkify(node, value, opts) {
     let ok = false;
     try { ok = /^https?:$/.test(new URL(url).protocol); } catch (_) { ok = false; }
     if (!ok) continue;
-    if (m.index > last) parts.push(document.createTextNode(text.slice(last, m.index)));
+    if (m.index > last) parts.push(...idParts(text.slice(last, m.index)));
     parts.push(el("a", { class: "text-link", href: url, target: "_blank", rel: "noopener noreferrer", text: url }));
     last = m.index + url.length;
   }
-  if (last < text.length) parts.push(document.createTextNode(text.slice(last)));
-  if (replace) node.replaceChildren(...parts);
-  else node.append(...parts);
+  if (last < text.length) parts.push(...idParts(text.slice(last)));
+  if (replace) {
+    node.replaceChildren(...parts);
+    node.dataset.refsRev = String(state.refsRev);
+  } else node.append(...parts);
   return node;
+}
+
+/* Which magi ids exist. Re-read when a store moves; when the answer changed,
+   the surfaces that built their text with linkify are painted again so ids
+   that became real turn into links. Painting never changes the route. */
+async function loadRefs() {
+  try {
+    const next = await getJson(API.refs);
+    if (JSON.stringify(next) === JSON.stringify(state.refs)) return;
+    state.refs = next;
+    state.refsRev += 1;
+    if (state.taskDetail && state.taskDetail.task) renderTask();
+    if (state.notices) renderNotifications();
+    if (state.detail && state.detail.run && state.route.name === "run") renderRunDetail();
+    if (state.queue) renderQueue();
+  } catch (error) {
+    failBackground(`Could not load ids: ${error.message}`, error);
+  }
 }
 
 function setAttr(node, name, value) {
@@ -576,6 +636,11 @@ const state = {
      loop asked to stop while idle answers "still running" and goes quiet a
      poll later, which without this looked like the tap had done nothing. */
   stopAskedAt: 0,
+  /* Which magi ids exist (`GET /api/refs`, decided by `magi::idref`), or null
+     until the first answer. `refsRev` counts changes so linkify can tell a
+     node it already built from one built before the ids were known. */
+  refs: null,
+  refsRev: 0,
   runs: null,
   /* Which node of the Runs tree is narrowing the card list, or neither set
      when nothing is picked. Lives only in memory — reloading the page always
@@ -4251,6 +4316,13 @@ function buildMd(node) {
     case "link":
       return el("a", { href: node.href, target: "_blank", rel: "noopener noreferrer" },
         (node.children || []).map(buildMd));
+    case "ref": {
+      /* Built only for an id the server checked exists. A href that is not a
+         hash route is never made into a link. */
+      const label = node.code ? el("code", { text: node.text || "" }) : (node.text || "");
+      if (!String(node.href || "").startsWith("#/")) return node.code ? label : document.createTextNode(label);
+      return el("a", { class: "id-link", href: node.href, "data-ref-kind": node.kind || null }, label);
+    }
     case "image":
       return el("img", { src: node.src, alt: node.alt || "", loading: "lazy" });
     case "table":
@@ -4977,6 +5049,24 @@ function renderQuestions() {
 
 /* The operator followed the band here to answer one specific thing; leaving
    the caret at the top of the document would make them find it again. */
+/* `#/questions/<id>` names one card: scroll to it and flash it once, on
+   arrival at that route. A card that is not there (yet) falls back to the
+   first open question; nothing here writes the hash. */
+function focusAsk(id) {
+  if (!id) return focusFirstAsk();
+  requestAnimationFrame(() => {
+    const card = $("questions-list").querySelector(`[data-key="${CSS.escape(id)}"]`);
+    if (!card) return focusFirstAsk();
+    const header = document.querySelector(".top");
+    card.style.scrollMarginTop = `${header ? Math.ceil(header.getBoundingClientRect().height) + 4 : 0}px`;
+    const motion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    card.scrollIntoView({ behavior: motion ? "auto" : "smooth", block: "start" });
+    card.classList.remove("card-flash");
+    void card.offsetWidth;
+    card.classList.add("card-flash");
+  });
+}
+
 function focusFirstAsk() {
   requestAnimationFrame(() => {
     const first = $("questions-list").querySelector('.ask[data-state="open"] .ask-summary');
@@ -8719,6 +8809,8 @@ async function applyRevisions_(source) {
 
   /* Same reason, read before the revisions are overwritten. */
   const taskStale = queueRev !== state.rev.queue || runsRev !== state.rev.runs;
+  /* The id table follows all four stores. */
+  const refsStale = taskStale || questionsRev !== state.rev.questions || talksRev !== state.rev.talks;
 
   if (notificationsRev !== state.rev.notifications) {
     state.rev.notifications = notificationsRev;
@@ -8759,6 +8851,7 @@ async function applyRevisions_(source) {
     state.rev.loop = source.loop_rev;
     jobs.push(loadLoop({ background: true }));
   }
+  if (refsStale) jobs.push(loadRefs());
   if (jobs.length) {
     const saidBefore = saidAt;
     await Promise.allSettled(jobs);
@@ -8823,7 +8916,7 @@ function parseRoute() {
   if (parts[0] === "queue") return { name: "queue", id: null };
   if (parts[0] === "stats") return { name: "stats", id: null };
   if (parts[0] === "settings") return { name: "settings", id: null };
-  if (parts[0] === "questions") return { name: "questions", id: null };
+  if (parts[0] === "questions") return { name: "questions", id: parts[1] ? decodeURIComponent(parts[1]) : null };
   if (parts[0] === "notifications") return { name: "notifications", id: null };
   if (parts[0] === "chat" && parts[1]) return { name: "talk", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "chat") return { name: "talks", id: null };
@@ -9071,7 +9164,7 @@ function applyRoute() {
   markSelected();
   /* The operator arrived to answer one specific thing, so the caret goes on
      it rather than on the top of the document. */
-  if (changed && route.name === "questions") focusFirstAsk();
+  if (changed && route.name === "questions") focusAsk(route.id);
   /* A `#/queue/<id>` hash (a card permalink or an old bookmark) names the
      card it is about; land on it the same way a single-hit search does, rather than leaving
      the operator to scroll the whole Backlog by hand. Queued rather than
@@ -9855,7 +9948,7 @@ async function boot() {
      all five now share one round trip, and renderRuns runs once more after
      to pick up whichever of health/runs landed second. */
   await Promise.allSettled([
-    loadHealth(), loadRuns(), loadQueue(), loadQuestions(), loadTalks(), loadNotifications(),
+    loadHealth(), loadRuns(), loadQueue(), loadQuestions(), loadTalks(), loadNotifications(), loadRefs(),
   ]);
   if (state.health) {
     // The first stream event (or stream-down health poll) establishes list

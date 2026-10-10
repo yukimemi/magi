@@ -1890,6 +1890,28 @@ sat for hours with auto-merge waiting and nobody told.
   goes through `ReleaseForge`, so tests inject a fake and never touch `gh`,
   a port or the real home.
 
+### Magi ids in prose are linked only when they exist
+
+`src/idref.rs` is the one resolver. `Index` holds the ids of the queue,
+runs (directory names), questions and talks; a full id resolves when one thing
+has it, a bare 4-hex short id only when exactly one thing across all four
+stores ends in it, `kind@short` (a task source label; any node word other than
+`chat` / `task` / `question` means a run) within that kind. Unresolvable tokens
+stay text. `idref::href` is the hash-route rule `source_link` uses.
+
+- **Markdown**: `idref::link_nodes` turns text and inline code into
+  `md::Node::Ref` (always a `#/` href). Code blocks and existing links are
+  untouched. Applied to chat turns and question detail / thread; a task or run
+  `instruction_md` and run prose are not linked yet.
+- **Plain text**: `linkify` cuts tokens with `ID_RE` and asks the table from
+  `GET /api/refs` (`Index::table`). The lexical rule exists twice, in
+  `idref::scan` and `ID_RE` in `assets/ui/app.js`; `web::tests::the_page_cuts_ids_with_the_rule_rust_uses`
+  pins the JS side. Change both together.
+- `Ui::refs` rebuilds the index only when a store revision or the run count
+  moves. `loadRefs` repaints on a changed table and never touches the hash.
+- `#/questions/<id>` scrolls to and flashes that card on arrival only.
+- Finding ids are not linked: they repeat across runs and need a run context.
+
 ### Duplicate-work claims are gathered from several places
 
 `src/dupes.rs` refuses (`--force` overrides) a `magi task add`, `magi run` or
