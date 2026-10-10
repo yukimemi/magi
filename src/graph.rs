@@ -12601,7 +12601,7 @@ mod tests {
         let saved = std::fs::read_to_string(&path).expect("artifact written");
         assert!(saved.contains("日本語のタイトル"));
         assert!(q.cwd.is_none());
-        assert_eq!(q.choices, ["use fallback", "use my text"]);
+        assert_eq!(q.choices, ["use fallback", "post original", "use my text"]);
         // A bad replacement is refused and asked about once more.
         let say = |id: &str, text: &str, choice: &str| {
             store
@@ -12627,17 +12627,11 @@ mod tests {
         let second = find(&run);
         assert_ne!(second.id, q.id);
         assert!(second.detail.contains("did not pass"));
-        assert!(second.detail.contains("まだ日本語"));
-        let retry_path = crate::run::artifact_path(
-            &runner.state,
-            &crate::github_text::artifact_name(&crate::github_text::fingerprint("まだ日本語", "")),
-        );
-        assert!(second.detail.contains(&retry_path.display().to_string()));
-        assert!(
-            std::fs::read_to_string(&retry_path)
-                .expect("retry artifact written")
-                .contains("まだ日本語")
-        );
+        // The retry still compares the original text; the rejected
+        // replacement is named by category only.
+        assert!(second.detail.contains("日本語のタイトル"));
+        assert!(!second.detail.contains("まだ日本語"));
+        assert!(second.detail.contains(&path.display().to_string()));
         say(&second.id, "fix: retry failed requests", "use my text");
         let message = runner
             .guarded_pr_message(&winner, None, true)
