@@ -153,7 +153,9 @@ pub fn reconcile_version(manifest: &str, bumped: bool, job: &mut Job) -> bool {
 /// parent says something else. A root commit has no parent and never counts; a
 /// parent that exists but cannot be read (a shallow clone, a manifest that did
 /// not exist yet) is unknown, and then the commit's own manifest is trusted,
-/// since the commit is the one the pull request merged as.
+/// since the commit is the one the pull request merged as. A shallow boundary
+/// hides its parent from every revision lookup, so existence is read from the
+/// commit object's own `parent` header, which no graft rewrites.
 async fn bumped_by(wt: &Path, commit: &str, version: &str) -> bool {
     let parent = format!("{commit}^1");
     let shown = git::git_raw(wt, &["show", &format!("{parent}:Cargo.toml")]).await;
@@ -163,9 +165,17 @@ async fn bumped_by(wt: &Path, commit: &str, version: &str) -> bool {
     {
         return v != version;
     }
-    git::git_raw(wt, &["rev-parse", "--verify", "--quiet", &parent])
+    git::git_raw(wt, &["cat-file", "commit", commit])
         .await
-        .is_ok_and(|o| o.code == Some(0))
+        .is_ok_and(|o| o.code == Some(0) && has_parent_header(&o.stdout))
+}
+
+/// Whether a raw commit object names a parent: a `parent ` line in the header,
+/// which ends at the first blank line (a message line must not count).
+fn has_parent_header(raw: &str) -> bool {
+    raw.lines()
+        .take_while(|l| !l.is_empty())
+        .any(|l| l.starts_with("parent "))
 }
 
 /// `1.2.3` out of `chore/release-v1.2.3`.
@@ -887,5 +897,47 @@ mod tests {
             .to_string();
         assert!(err.starts_with(VERSION_MISMATCH_PREFIX), "{err}");
         assert_eq!(g(&f.remote, &["tag", "-l"]), "");
+    }
+
+    #[tokio::test]
+    async fn a_shallow_boundary_merge_commit_still_recovers_a_stale_branch_version() {
+        let mut f = fixture();
+        std::fs::write(
+            f.repo.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"1.1.0\"\n",
+        )
+        .unwrap();
+        g(&f.repo, &["commit", "-q", "-am", "bump"]);
+        g(&f.repo, &["push", "-q", "origin", "main"]);
+        let commit = g(&f.repo, &["rev-parse", "HEAD"]);
+        let shallow = f.repo.parent().unwrap().join("shallow-clone");
+        let url = format!("file://{}", f.remote.display());
+        g(
+            &f.repo,
+            &[
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+                &url,
+                shallow.to_str().unwrap(),
+            ],
+        );
+        assert!(shallow.join(".git/shallow").exists());
+        let probe = std::process::Command::new("git")
+            .current_dir(&shallow)
+            .args(["rev-parse", "--verify", "--quiet", &format!("{commit}^1")])
+            .output()
+            .unwrap();
+        assert!(!probe.status.success(), "the parent must be hidden");
+        f.repo = shallow;
+        let mut job = Job::new("1.0.1", "u", &commit);
+        job.failed = Some(format!(
+            "{VERSION_MISMATCH_PREFIX}1.1.0, but the release is 1.0.1; not tagging"
+        ));
+        job.resume();
+        go(&f, &release(&[]), &mut job).await.unwrap();
+        assert_eq!(job.version, "1.1.0");
+        assert_eq!(g(&f.remote, &["tag", "-l"]), "v1.1.0");
     }
 }
