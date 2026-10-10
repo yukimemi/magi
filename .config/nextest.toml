@@ -18,7 +18,7 @@ path = "junit.xml"
 # so the cap has to be expressed here, or end-to-end scenes (each spawning git,
 # and a mock agent) pile up and trip node timeouts.
 [test-groups]
-e2e = { max-threads = 3 }
+e2e = { max-threads = 4 }
 chrome = { max-threads = 2 }
 
 [[profile.default.overrides]]
