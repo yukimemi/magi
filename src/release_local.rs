@@ -124,14 +124,16 @@ pub fn version_from_title(title: &str) -> Option<String> {
     (!v.is_empty()).then_some(v)
 }
 
-/// The manifest's version is the truth, but only a version the pull request
-/// named (branch or title) may replace the job's, and only before anything has
-/// been tagged or run. Anything else stays a mismatch. Pure.
-pub fn reconcile_version(manifest: &str, job: &mut Job) -> bool {
+/// The manifest's version is the truth, but it may replace the job's only
+/// before anything has been tagged or run, and only when the pull request named
+/// it (title) or the merge commit itself changed the manifest's version
+/// (`bumped`: an escalation whose title edit failed still qualifies). A
+/// manifest the commit did not touch and nobody named stays a mismatch. Pure.
+pub fn reconcile_version(manifest: &str, bumped: bool, job: &mut Job) -> bool {
     if manifest == job.version {
         return true;
     }
-    if job.tag_done || job.done > 0 || !job.accepted.iter().any(|a| a == manifest) {
+    if job.tag_done || job.done > 0 || !(bumped || job.accepted.iter().any(|a| a == manifest)) {
         return false;
     }
     job.log.push(StepLog {
@@ -145,6 +147,17 @@ pub fn reconcile_version(manifest: &str, job: &mut Job) -> bool {
     });
     job.version = manifest.to_owned();
     true
+}
+
+/// Whether the merge commit itself moved the manifest to `version`: its first
+/// parent says something else (or the parent's manifest is unreadable). A root
+/// commit has no parent and never counts.
+async fn bumped_by(wt: &Path, commit: &str, version: &str) -> bool {
+    let Ok(out) = git::git_raw(wt, &["show", &format!("{commit}^1:Cargo.toml")]).await else {
+        return false;
+    };
+    out.code == Some(0)
+        && crate::bump::current_version(&out.stdout).is_ok_and(|parent| parent != version)
 }
 
 /// `1.2.3` out of `chore/release-v1.2.3`.
@@ -320,12 +333,20 @@ async fn drive(env: &Env<'_>, dir: &Path, wt: &Path, job: &mut Job, save: Save<'
     if let Ok(toml) = std::fs::read_to_string(wt.join("Cargo.toml")) {
         let before = job.version.clone();
         match crate::bump::current_version(&toml) {
-            Ok(v) if reconcile_version(&v, job) => {
+            Ok(v) if v != job.version && !job.tag_done && job.done == 0 => {
+                let bumped = bumped_by(wt, &job.commit, &v).await;
+                if !reconcile_version(&v, bumped, job) {
+                    bail!(
+                        "{VERSION_MISMATCH_PREFIX}{v}, but the release is {}; not tagging",
+                        job.version
+                    );
+                }
                 // Record an adopted version before anything is tagged.
                 if job.version != before && !save(job) {
                     bail!("could not record progress; nothing was run");
                 }
             }
+            Ok(v) if v == job.version => {}
             Ok(v) => bail!(
                 "{VERSION_MISMATCH_PREFIX}{v}, but the release is {}; not tagging",
                 job.version
@@ -789,12 +810,12 @@ mod tests {
     fn only_a_version_the_pull_request_named_replaces_the_job_version() {
         let mut job = Job::new("1.0.0", "u", "c");
         job.accepted = vec!["2.0.0".to_owned()];
-        assert!(!reconcile_version("3.0.0", &mut job));
+        assert!(!reconcile_version("3.0.0", false, &mut job));
         assert_eq!(job.version, "1.0.0");
         job.tag_done = true;
-        assert!(!reconcile_version("2.0.0", &mut job));
+        assert!(!reconcile_version("2.0.0", false, &mut job));
         job.tag_done = false;
-        assert!(reconcile_version("2.0.0", &mut job));
+        assert!(reconcile_version("2.0.0", false, &mut job));
         assert_eq!(job.version, "2.0.0");
     }
 
@@ -819,5 +840,27 @@ mod tests {
             .to_string();
         assert!(err.starts_with(VERSION_MISMATCH_PREFIX), "{err}");
         assert_eq!(g(&f.remote, &["tag", "-l"]), "");
+    }
+
+    #[tokio::test]
+    async fn a_merge_that_bumped_the_manifest_recovers_a_stale_branch_version() {
+        let f = fixture();
+        std::fs::write(
+            f.repo.join("Cargo.toml"),
+            "[package]\nname = \"x\"\nversion = \"1.1.0\"\n",
+        )
+        .unwrap();
+        g(&f.repo, &["commit", "-q", "-am", "bump"]);
+        g(&f.repo, &["push", "-q", "origin", "main"]);
+        let commit = g(&f.repo, &["rev-parse", "HEAD"]);
+        // A record failed on the mismatch, nothing in `accepted`.
+        let mut job = Job::new("1.0.1", "u", &commit);
+        job.failed = Some(format!(
+            "{VERSION_MISMATCH_PREFIX}1.1.0, but the release is 1.0.1; not tagging"
+        ));
+        job.resume();
+        go(&f, &release(&[]), &mut job).await.unwrap();
+        assert_eq!(job.version, "1.1.0");
+        assert_eq!(g(&f.remote, &["tag", "-l"]), "v1.1.0");
     }
 }

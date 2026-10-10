@@ -589,6 +589,22 @@ pub(crate) fn current_version(toml: &str) -> Result<String> {
         .context("no `version` field found under `[package]` or `[workspace.package]`")
 }
 
+/// The version a release pull request really carries: the manifest on its head
+/// branch (an escalation rewrites it but keeps the branch name), falling back
+/// to the branch name only when the manifest cannot be read.
+async fn branch_version(repo: &Path, remote: &str, branch: &str) -> Option<String> {
+    let from_name = branch.strip_prefix("chore/release-v").map(str::to_owned);
+    let fetched = git::git_raw(repo, &["fetch", "--quiet", remote, branch]).await;
+    if fetched.is_ok_and(|o| o.code == Some(0))
+        && let Ok(out) = git::git_raw(repo, &["show", "FETCH_HEAD:Cargo.toml"]).await
+        && out.code == Some(0)
+        && let Ok(v) = current_version(&out.stdout)
+    {
+        return Some(v);
+    }
+    from_name
+}
+
 /// Build the prompt asking an agent which digit of `major.minor.patch` a
 /// merged change earns.
 ///
@@ -1240,9 +1256,9 @@ async fn after_merge_inner(
         // See `find_open_release_pr`'s own doc for what this does and does
         // not close.
         if let Ok(Some((branch, url))) = find_open_release_pr(&repo).await
-            && let Some(target) = branch
-                .strip_prefix("chore/release-v")
-                .and_then(|v| Version::parse(v).ok())
+            && let Some(target) = branch_version(&repo, &remote, &branch)
+                .await
+                .and_then(|v| Version::parse(&v).ok())
         {
             let base_parsed = Version::parse(&base_version)?;
             if target > base_parsed

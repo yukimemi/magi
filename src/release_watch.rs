@@ -955,14 +955,6 @@ impl Watcher {
                 job.running.clone().unwrap_or_default()
             ));
         }
-        let was_mismatch = !job.tag_done
-            && job.done == 0
-            && job.running.is_none()
-            && job.accepted.is_empty()
-            && job
-                .failed
-                .as_deref()
-                .is_some_and(|f| f.starts_with(release_local::VERSION_MISMATCH_PREFIX));
         if let Some(why) = job.failed.clone() {
             // Reconcile first: a stop between saving the failure and holding
             // the task (or an interrupted step) must not leave the task Done.
@@ -973,16 +965,6 @@ impl Watcher {
                 st.job = Some(job);
                 self.save(pr, &st);
                 return;
-            }
-            if was_mismatch {
-                // A record from before the title was consulted: learn the
-                // title's version now; the manifest still has the last word.
-                if let Ok(info) = self.forge.info(repo, &st.url).await {
-                    job.accepted = release_local::version_from_title(&info.title)
-                        .into_iter()
-                        .filter(|t| *t != job.version)
-                        .collect();
-                }
             }
         }
         let shell = cfg.shell();
