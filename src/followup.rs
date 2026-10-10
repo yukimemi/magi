@@ -201,46 +201,59 @@ pub fn settle_deputy_tasks(state: &mut RunState, pr_url: &str, queue: &Queue, re
             .filter(|g| g.iter().any(|f| task_matches_finding(cand, f)))
             .flat_map(|g| g.iter().map(|f| f.id.clone()))
             .collect();
-        let rival = autos.iter().find(|a| {
-            a.followup
-                .as_ref()
-                .is_some_and(|f| f.findings.iter().any(|x| matched.contains(x)))
-        });
-        if let Some(a) = rival {
-            let auto_idle = matches!(
-                a.status,
-                crate::queue::TaskStatus::Queued | crate::queue::TaskStatus::Held
-            );
-            if release && auto_idle {
-                // The automatic task has not started: the owner's wins.
-                if a.status == crate::queue::TaskStatus::Queued {
-                    let why = format!(
-                        "{SUPERSEDED}the owner's approval deputy filed task {} for the same finding(s) of {pr_url}",
-                        cand.id
-                    );
-                    let held = queue.modify(&a.id, |t| {
-                        if t.status != crate::queue::TaskStatus::Queued {
-                            return false;
-                        }
-                        t.hold_manual(Some(why));
-                        true
-                    });
-                    match held {
-                        Ok(true) => state.event(
-                            NODE,
-                            format!(
-                                "follow-up task {} held: superseded by deputy task {}",
-                                a.id, cand.id
-                            ),
-                        ),
-                        Ok(false) => continue,
-                        Err(e) => {
-                            state.event(NODE, format!("could not hold follow-up {}: {e:#}", a.id));
-                            continue;
+        let rivals: Vec<&&Task> = autos
+            .iter()
+            .filter(|a| {
+                a.followup
+                    .as_ref()
+                    .is_some_and(|f| f.findings.iter().any(|x| matched.contains(x)))
+            })
+            .collect();
+        if release {
+            let parent_gen = *gen_of_parent
+                .get_or_insert_with(|| parent_generation(state, queue, origin_task.as_deref()));
+            if parent_gen >= MAX_FOLLOWUP_GENERATION {
+                let why = format!(
+                    "{CAPPED}generation {parent_gen} reached, not released after {pr_url} merged; was: {}",
+                    cand.hold_reason.as_deref().unwrap_or_default()
+                );
+                mark_held(state, queue, cand, why, pr_url, "generation cap");
+                continue;
+            }
+        }
+        if !rivals.is_empty() {
+            // Hold every idle rival under its claim, so the daemon cannot be
+            // between reading it and starting it. Any rival that is not
+            // idle, or cannot be claimed, means the automatic path owns the
+            // finding and the deputy task is the one left held.
+            let mut guards = Vec::new();
+            let mut blocker: Option<&Task> = None;
+            if release {
+                for a in &rivals {
+                    if a.status == crate::queue::TaskStatus::Held {
+                        continue;
+                    }
+                    match queue.claim(&a.id) {
+                        Ok(g) => guards.push((a.id.clone(), g)),
+                        Err(_) => {
+                            blocker = Some(a);
+                            break;
                         }
                     }
                 }
+                if blocker.is_none() {
+                    blocker = rivals.iter().map(|a| &***a).find(|a| {
+                        !matches!(
+                            queue.get(&a.id).map(|t| t.status),
+                            Ok(crate::queue::TaskStatus::Queued | crate::queue::TaskStatus::Held)
+                        )
+                    });
+                }
             } else {
+                blocker = Some(&***rivals.first().expect("non-empty"));
+            }
+            if let Some(a) = blocker {
+                drop(guards);
                 let why = format!(
                     "{SUPERSEDED}follow-up task {} ({:?}) already covers {} of {pr_url}; was: {}",
                     a.id,
@@ -251,19 +264,35 @@ pub fn settle_deputy_tasks(state: &mut RunState, pr_url: &str, queue: &Queue, re
                 mark_held(state, queue, cand, why, pr_url, "superseded");
                 continue;
             }
+            // The owner's task wins; the idle automatic ones are held.
+            for (id, _guard) in &guards {
+                let why = format!(
+                    "{SUPERSEDED}the owner's approval deputy filed task {} for the same finding(s) of {pr_url}",
+                    cand.id
+                );
+                let held = queue.modify(id, |t| {
+                    if t.status != crate::queue::TaskStatus::Queued {
+                        return false;
+                    }
+                    t.hold_manual(Some(why));
+                    true
+                });
+                match held {
+                    Ok(true) => state.event(
+                        NODE,
+                        format!(
+                            "follow-up task {id} held: superseded by deputy task {}",
+                            cand.id
+                        ),
+                    ),
+                    Ok(false) => {}
+                    Err(e) => state.event(NODE, format!("could not hold follow-up {id}: {e:#}")),
+                }
+            }
         } else if !release {
             continue;
         }
-        let parent_gen = *gen_of_parent
-            .get_or_insert_with(|| parent_generation(state, queue, origin_task.as_deref()));
-        if parent_gen >= MAX_FOLLOWUP_GENERATION {
-            let why = format!(
-                "{CAPPED}generation {parent_gen} reached, not released after {pr_url} merged; was: {}",
-                cand.hold_reason.as_deref().unwrap_or_default()
-            );
-            mark_held(state, queue, cand, why, pr_url, "generation cap");
-            continue;
-        }
+        let parent_gen = gen_of_parent.expect("computed when releasing");
         let stamp = FollowUp {
             run: state.id.clone(),
             origin_task: origin_task.clone(),
@@ -1358,5 +1387,50 @@ mod tests {
         assert!(body.contains("`abcd-1`"));
         assert!(!body.contains("already covered"));
         assert!(crate::github_text::check("", &body).is_empty());
+    }
+
+    #[test]
+    fn a_deputy_task_over_two_automatic_ones_holds_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        s.followup_generation = Some(0);
+        file(&mut s, PR, &q).unwrap();
+        let mut t = deputy_task(&s.id, "both", "R3-1-1 and R3-1-2", &format!("after {PR}"));
+        q.put(&mut t).unwrap();
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        assert_eq!(status_of(&q, &t.id), crate::queue::TaskStatus::Queued);
+        let live = q
+            .list()
+            .into_iter()
+            .filter(|x| x.status == crate::queue::TaskStatus::Queued)
+            .count();
+        assert_eq!(live, 1, "only the owner's task still runs");
+    }
+
+    #[test]
+    fn a_claimed_automatic_task_is_not_touched_and_the_deputys_stays_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        s.followup_generation = Some(0);
+        file(&mut s, PR, &q).unwrap();
+        let auto = q
+            .list()
+            .into_iter()
+            .find(|x| {
+                x.followup
+                    .as_ref()
+                    .is_some_and(|f| f.findings.iter().any(|i| i == "R3-1-1"))
+            })
+            .unwrap();
+        let _claim = q.claim(&auto.id).unwrap();
+        let mut t = deputy_task(&s.id, "x", "R3-1-1", &format!("after {PR}"));
+        q.put(&mut t).unwrap();
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        assert_eq!(status_of(&q, &auto.id), crate::queue::TaskStatus::Queued);
+        let got = q.get(&t.id).unwrap();
+        assert_eq!(got.status, crate::queue::TaskStatus::Held);
+        assert!(got.hold_reason.unwrap().starts_with(SUPERSEDED));
     }
 }
