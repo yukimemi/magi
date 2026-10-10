@@ -463,7 +463,7 @@ fn ipv6(rest: &str) -> Option<(usize, &'static str)> {
 
 /// Plain words (and the bare mDNS suffix) that show up as a hostname or account
 /// name on some machines but are ordinary prose everywhere. Matched against the
-/// whole trimmed value only, so `m1air.local` is still a hostname.
+/// whole trimmed value only, so `devbox.local` is still a hostname.
 const GENERIC_IDENTITY_WORDS: [&str; 12] = [
     "local",
     "localhost",
@@ -621,7 +621,7 @@ mod tests {
 
     #[test]
     fn generic_host_and_user_values_do_not_redact_prose() {
-        for host in ["local", ".local", "m1air.local"] {
+        for host in ["local", ".local", "devbox.local"] {
             let i = Identity {
                 host: host.into(),
                 ..Identity::default()
@@ -630,10 +630,10 @@ mod tests {
             assert_eq!(scrub(t, &i), t, "{host}");
         }
         let real = Identity {
-            host: "m1air.local".into(),
+            host: "devbox.local".into(),
             ..Identity::default()
         };
-        assert_eq!(scrub("on m1air.local now", &real), "on [redacted-host] now");
+        assert_eq!(scrub("on devbox.local now", &real), "on [redacted-host] now");
         for (user, host) in [("local", ""), ("admin", "localhost")] {
             let i = Identity {
                 user: user.into(),
@@ -658,10 +658,10 @@ mod tests {
             assert_eq!(scrub(t, &Identity::default()), t);
         }
         for t in [
-            "ssh m1air.local",
+            "ssh devbox.local",
             "ssh BUILD-SERVER.local",
             "ssh Alices-MacBook-Pro.local",
-            "`m1air.local`",
+            "`devbox.local`",
             "ssh BUILD.local",
         ] {
             assert!(
