@@ -3105,7 +3105,7 @@ fn followup_origin(
     let parent = fu
         .origin_task
         .as_deref()
-        .and_then(|id| task(id))
+        .and_then(task)
         .map(|t| FollowUpParent {
             short: t.short().to_owned(),
             href: format!("#/tasks/{}", encode_segment(&t.id)),
