@@ -1025,6 +1025,18 @@ impl Runner {
             self.settle_questions();
             return Ok(());
         }
+        // A run parked at `merge` on the owner's word about a withheld PR text
+        // resumes straight into `merge`. Re-walking the tail would sync to the
+        // base again (possibly rebasing, possibly spending the fixer) after the
+        // gate had passed, and then push a tree nobody reviewed or gated.
+        if self.state.github_text.is_some()
+            && self.state.merge.is_none()
+            && self.state.status == RunStatus::Gating
+        {
+            self.merge().await?;
+            self.state.save()?;
+            return Ok(());
+        }
         self.prep().await?;
         if self.park_here()? {
             return Ok(());
