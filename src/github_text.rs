@@ -599,6 +599,218 @@ pub fn prepare_with(
     (title, body)
 }
 
+// ------------------------------------------------------------ owner question
+
+/// Graph node of the question filed when the gate withholds a title or body.
+pub const ASK_NODE: &str = "github-text";
+/// Seat recorded on that question.
+pub const ASK_SEAT: &str = "posting-gate";
+/// Choice: post the fixed neutral text for every withheld field.
+pub const USE_FALLBACK: &str = "use fallback";
+/// Choice: post the owner's own replacement title (their latest message).
+pub const USE_MY_TEXT: &str = "use my text";
+/// Longest title accepted from the owner, in characters (GitHub caps at 256).
+const MAX_TITLE_CHARS: usize = 200;
+/// Longest candidate excerpt shown in the question, in characters.
+const SHOWN_MAX_CHARS: usize = 600;
+
+/// What the gate withheld. Categories only, never the text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Withheld {
+    /// The title is replaced by [`NEUTRAL_TITLE`] unless the owner supplies one.
+    pub title: bool,
+    /// The body is replaced by [`NEUTRAL_BODY`].
+    pub body: bool,
+    /// Which rules fired, as stable category names.
+    pub categories: Vec<String>,
+}
+
+impl Withheld {
+    /// From the gate's violations; `None` when no field is withheld.
+    pub fn from_violations(violations: &[Violation]) -> Option<Self> {
+        let title = violations.contains(&Violation::TitleLanguage);
+        let body = violations.contains(&Violation::BodyLanguage);
+        if !title && !body {
+            return None;
+        }
+        let categories = violations
+            .iter()
+            .filter(|v| **v != Violation::SensitiveData)
+            .map(|v| category(*v).to_owned())
+            .collect();
+        Some(Self {
+            title,
+            body,
+            categories,
+        })
+    }
+}
+
+/// Stable name of a violation category.
+pub fn category(v: Violation) -> &'static str {
+    match v {
+        Violation::TitleLanguage => "title-language",
+        Violation::BodyLanguage => "body-language",
+        Violation::SensitiveData => "sensitive-data",
+    }
+}
+
+/// Identity of a rejected text: FNV-1a over title and body, so one run asks at
+/// most once per text and the text itself is never stored.
+pub fn fingerprint(title: &str, body: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in title.bytes().chain([0u8]).chain(body.bytes()) {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// May this text be shown to the owner? Only when the shared redaction rules
+/// leave it untouched.
+pub fn shareable(text: &str) -> bool {
+    scrub(text, &Identity::current()) == text && scrub(text, &Identity::default()) == text
+}
+
+fn excerpt(text: &str) -> String {
+    let mut out: String = text.chars().take(SHOWN_MAX_CHARS).collect();
+    if text.chars().count() > SHOWN_MAX_CHARS {
+        out.push('…');
+    }
+    out
+}
+
+/// One-line summary; the only line allowed to follow the configured language.
+pub fn question_summary(language: &str, w: &Withheld) -> String {
+    let what = match (w.title, w.body) {
+        (true, true) => "title and description",
+        (true, false) => "title",
+        _ => "description",
+    };
+    if crate::lang::is_japanese(language) {
+        let what = match (w.title, w.body) {
+            (true, true) => "タイトルと説明",
+            (true, false) => "タイトル",
+            _ => "説明",
+        };
+        format!("投稿ゲートが PR の{what}を保留しました。どうしますか？")
+    } else {
+        format!("The posting gate withheld the pull request {what}. What should be posted?")
+    }
+}
+
+/// Question body (English; it is also what a deputy reads). Names the rules
+/// that fired and shows a candidate only if it passes the redaction rules.
+pub fn question_detail(w: &Withheld, title: &str, body: &str, retry: bool) -> String {
+    let mut s = String::new();
+    if retry {
+        s.push_str("Your replacement title did not pass the posting gate either.\n\n");
+    }
+    s.push_str(&format!(
+        "Withheld: {}. Rules that fired: {}.\n\n",
+        match (w.title, w.body) {
+            (true, true) => "title and description",
+            (true, false) => "title",
+            _ => "description",
+        },
+        w.categories.join(", ")
+    ));
+    s.push_str(&format!(
+        "- `{USE_FALLBACK}` posts `{NEUTRAL_TITLE}` / the neutral description for what was withheld.\n"
+    ));
+    if w.title {
+        s.push_str(&format!(
+            "- `{USE_MY_TEXT}` posts the title you write in your latest message \
+             here (say it first, then pick this). It must pass the same gate: \
+             English, no secrets or local data.\n"
+        ));
+    }
+    s.push_str("\nSilence falls back to the neutral text when the answer timeout passes.\n");
+    if w.title && shareable(title) {
+        s.push_str(&format!("\nCandidate title:\n\n    {}\n", excerpt(title)));
+    }
+    if w.body && shareable(body) {
+        s.push_str(&format!(
+            "\nCandidate description (excerpt):\n\n{}\n",
+            excerpt(body)
+                .lines()
+                .map(|l| format!("    {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    s
+}
+
+/// The choices a question for `w` offers.
+pub fn question_choices(w: &Withheld) -> Vec<String> {
+    let mut c = vec![USE_FALLBACK.to_owned()];
+    if w.title {
+        c.push(USE_MY_TEXT.to_owned());
+    }
+    c
+}
+
+/// Vet an owner-supplied title with the same rules as a generated one.
+/// `Err` carries categories only. Sensitive data is rejected, never redacted
+/// into something the owner did not write.
+pub fn vet_title(
+    text: &str,
+    decision: Option<LanguageDecision>,
+) -> std::result::Result<String, Vec<&'static str>> {
+    let Some(title) = text.lines().map(str::trim).find(|l| !l.is_empty()) else {
+        return Err(vec!["empty"]);
+    };
+    let mut bad = Vec::new();
+    if title.chars().count() > MAX_TITLE_CHARS {
+        bad.push("too-long");
+    }
+    if !shareable(title) {
+        bad.push(category(Violation::SensitiveData));
+    }
+    if check_with(title, "", decision).contains(&Violation::TitleLanguage) {
+        bad.push(category(Violation::TitleLanguage));
+    }
+    if bad.is_empty() {
+        Ok(title.to_owned())
+    } else {
+        Err(bad)
+    }
+}
+
+/// What the owner's answer asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reply {
+    /// Use the neutral text (also silence, abandonment, an unknown answer).
+    Fallback,
+    /// Post this raw, not yet vetted title.
+    Title(String),
+}
+
+/// Read the answer. `use my text` takes the latest operator message that is
+/// not newer than the answer; none means fallback.
+pub fn read_reply(q: &crate::ask::Question) -> Reply {
+    use crate::ask::{Answer, Who};
+    let chose = match (&q.answer, q.status) {
+        (Some(Answer::Choice(c)), crate::ask::QuestionStatus::Answered) => c.as_str(),
+        _ => return Reply::Fallback,
+    };
+    if chose != USE_MY_TEXT {
+        return Reply::Fallback;
+    }
+    q.thread
+        .iter()
+        .rev()
+        .find(|t| t.who == Who::Operator && !t.body.trim().is_empty())
+        .map_or(Reply::Fallback, |t| Reply::Title(t.body.clone()))
+}
+
+/// Has the fixed `asked_at + timeout` deadline passed?
+pub fn expired(q: &crate::ask::Question, timeout_secs: u64) -> bool {
+    let elapsed = jiff::Timestamp::now().as_second() - q.asked_at.as_second();
+    elapsed >= 0 && elapsed as u64 >= timeout_secs
+}
+
 /// Whole-call wall-clock budget: a slow judge must not hold up posting.
 const JUDGE_BUDGET: Duration = Duration::from_secs(15);
 /// Longest prose sent to the judge, in characters.
@@ -1092,5 +1304,119 @@ mod quoted_value_tests {
         assert!(
             check_with("Fix", "Plain English text.", rejected).contains(&Violation::BodyLanguage)
         );
+    }
+}
+
+#[cfg(test)]
+mod owner_question_tests {
+    use super::*;
+    use crate::ask::{Answer, Question, Turn, Who};
+
+    fn question(choice: Option<&str>, says: &[&str]) -> Question {
+        let mut q = Question::new(
+            "run".into(),
+            ASK_NODE.into(),
+            ASK_SEAT.into(),
+            "s".into(),
+            String::new(),
+            vec![USE_FALLBACK.into(), USE_MY_TEXT.into()],
+        );
+        for s in says {
+            q.thread.push(Turn {
+                who: Who::Operator,
+                body: (*s).to_owned(),
+                at: jiff::Timestamp::now(),
+                note: None,
+            });
+        }
+        if let Some(c) = choice {
+            q.answer(Answer::Choice(c.to_owned())).unwrap();
+        }
+        q
+    }
+
+    #[test]
+    fn withheld_names_fields_and_categories_only() {
+        let w = Withheld::from_violations(&[Violation::TitleLanguage, Violation::SensitiveData])
+            .unwrap();
+        assert!(w.title && !w.body);
+        assert_eq!(w.categories, ["title-language"]);
+        assert!(Withheld::from_violations(&[Violation::SensitiveData]).is_none());
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_separates_title_from_body() {
+        assert_eq!(fingerprint("a", "b"), fingerprint("a", "b"));
+        assert_ne!(fingerprint("a", "b"), fingerprint("ab", ""));
+    }
+
+    #[test]
+    fn detail_never_repeats_sensitive_text_but_shows_a_clean_candidate() {
+        let w = Withheld::from_violations(&[Violation::TitleLanguage]).unwrap();
+        let secret = "token=abcdefghijklmnop0123456789";
+        let hidden = question_detail(&w, secret, "", false);
+        assert!(!hidden.contains("abcdefghijklmnop"), "{hidden}");
+        assert!(!hidden.contains("Candidate title"));
+        let shown = question_detail(&w, "修正: 再試行", "", false);
+        assert!(shown.contains("Candidate title") && shown.contains("再試行"));
+        assert!(shown.contains("title-language"));
+        assert_eq!(question_choices(&w), [USE_FALLBACK, USE_MY_TEXT]);
+        let body_only = Withheld::from_violations(&[Violation::BodyLanguage]).unwrap();
+        assert_eq!(question_choices(&body_only), [USE_FALLBACK]);
+    }
+
+    #[test]
+    fn only_the_summary_line_follows_the_language() {
+        let w = Withheld::from_violations(&[Violation::TitleLanguage]).unwrap();
+        assert!(question_summary("ja", &w).contains("タイトル"));
+        assert!(question_summary("en", &w).starts_with("The posting gate"));
+    }
+
+    #[test]
+    fn vet_title_applies_the_same_gate() {
+        assert_eq!(
+            vet_title("\n  fix: retry failed requests \nignored", None).unwrap(),
+            "fix: retry failed requests"
+        );
+        assert_eq!(vet_title("  ", None).unwrap_err(), ["empty"]);
+        assert!(
+            vet_title("修正: 再試行を追加", None)
+                .unwrap_err()
+                .contains(&"title-language")
+        );
+        assert!(
+            vet_title("fix: token=abcdefghijklmnop0123456789", None)
+                .unwrap_err()
+                .contains(&"sensitive-data")
+        );
+        assert!(
+            vet_title(&"a ".repeat(150), None)
+                .unwrap_err()
+                .contains(&"too-long")
+        );
+    }
+
+    #[test]
+    fn reply_reads_choice_and_latest_operator_say() {
+        assert_eq!(
+            read_reply(&question(Some(USE_FALLBACK), &["x"])),
+            Reply::Fallback
+        );
+        assert_eq!(
+            read_reply(&question(Some(USE_MY_TEXT), &["one", "two"])),
+            Reply::Title("two".into())
+        );
+        assert_eq!(
+            read_reply(&question(Some(USE_MY_TEXT), &[])),
+            Reply::Fallback
+        );
+        assert_eq!(read_reply(&question(None, &["x"])), Reply::Fallback);
+    }
+
+    #[test]
+    fn expiry_runs_from_asking() {
+        let q = question(None, &[]);
+        assert!(!expired(&q, 3600));
+        assert!(expired(&q, 0));
     }
 }

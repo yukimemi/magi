@@ -1232,6 +1232,35 @@ pub struct LandApproval {
     pub head: String,
 }
 
+/// The owner question filed when the posting gate withheld a pull request
+/// title or description, and how it ended. One record per rejected text
+/// (`fingerprint`); see `github_text` for the flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubTextAsk {
+    /// Hash of the rejected title and body; the text itself is never stored.
+    pub fingerprint: String,
+    /// The title is withheld.
+    pub title: bool,
+    /// The description is withheld.
+    pub body: bool,
+    /// Rule categories that fired.
+    pub categories: Vec<String>,
+    /// The question currently standing, if one was filed.
+    #[serde(default)]
+    pub question: Option<String>,
+    /// Questions filed so far (at most 2: the second follows a bad reply).
+    #[serde(default)]
+    pub asks: u32,
+    /// The decision has been made (saved before the pull request is opened,
+    /// so it is applied once and survives a restart).
+    #[serde(default)]
+    pub resolved: bool,
+    /// With `resolved`: the owner's vetted replacement title; `None` means the
+    /// neutral text for every withheld field.
+    #[serde(default)]
+    pub chosen_title: Option<String>,
+}
+
 /// A review hand-off the panel did not agree to: findings that hold the merge
 /// are still open and at least one seat's final vote was reject. Recorded on
 /// [`RunState::contested_handoff`] so `land` can name them in its question.
@@ -1796,6 +1825,10 @@ pub struct RunState {
     /// or rebase push makes a new head the owner has not seen.
     #[serde(default)]
     pub land_approval: Option<LandApproval>,
+    /// The posting-gate question for this run's pull request text, if the gate
+    /// withheld any. While `resolved` is `None` the run is parked on it.
+    #[serde(default)]
+    pub github_text: Option<GithubTextAsk>,
     /// Outcomes of the `verify.pre_gate` commands from the latest time they
     /// ran on the winner. Informational only: a failure here never blocks the
     /// run, the gate stays the single arbiter. Overwritten on each pass.
@@ -2042,6 +2075,7 @@ impl RunState {
             contested_handoff: None,
             land_armed_head: None,
             land_approval: None,
+            github_text: None,
             pre_gate: Vec::new(),
             pre_gate_commit: None,
             merge: None,

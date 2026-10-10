@@ -1976,14 +1976,24 @@ fn land_resume_state(task: &Task) -> LandResume {
     let Ok(state) = RunState::load(run_id) else {
         return LandResume::NotLanding;
     };
-    if state.status != RunStatus::Landing || !state.parked {
+    if !state.parked {
         return LandResume::NotLanding;
     }
+    // Parked in `land` on the merge approval, or at `merge` on the owner's
+    // word about a title/body the posting gate withheld. Told apart by the
+    // run's own record, not by a status both can share.
+    let node = if state.status == RunStatus::Landing {
+        land::APPROVAL_NODE
+    } else if state.github_text.as_ref().is_some_and(|g| !g.resolved) {
+        crate::github_text::ASK_NODE
+    } else {
+        return LandResume::NotLanding;
+    };
     let store = ask::Questions::open();
     let waiting = store
         .list()
         .into_iter()
-        .filter(|q| &q.run == run_id && q.node == land::APPROVAL_NODE)
+        .filter(|q| &q.run == run_id && q.node == node)
         .max_by(|a, b| a.id.cmp(&b.id));
     let Some(mut q) = waiting else {
         return LandResume::Ready;
@@ -3113,7 +3123,15 @@ pub fn finish_attempt(
 /// or requeued) is **held**: nobody asked for a retry, and a loop starting
 /// later must not spend agent calls on it. `magi task release` retries.
 pub fn hold_if_runnable(queue: &Queue, task: &mut Task) {
-    if task.status.runnable() {
+    // A run parked on the owner's word about a withheld PR title/body is not a
+    // failure nobody asked to retry: it resumes (answer, or the neutral text on
+    // the deadline) the moment a loop serves the queue, via `land_resume_state`.
+    // Holding it would keep it from ever being a candidate.
+    let waits_on_owner = task.runs.last().is_some_and(|id| {
+        RunState::load(id)
+            .is_ok_and(|s| s.parked && s.github_text.as_ref().is_some_and(|g| !g.resolved))
+    });
+    if task.status.runnable() && !waits_on_owner {
         let why = task.last_error.clone().map_or_else(
             || "the run did not finish".to_owned(),
             |e| format!("the run did not finish: {e}"),
@@ -5985,6 +6003,47 @@ mod tests {
             LandResume::StillWaiting,
             "nobody has answered and the timeout has not passed"
         );
+    }
+
+    #[test]
+    fn land_resume_state_waits_on_a_withheld_text_question_then_resumes() {
+        crate::run::pin_test_home();
+        let mut state = run_state(RunStatus::Gating);
+        state.id = "20260101-000000-gt01".to_owned();
+        state.parked = true;
+        state.config.graph.answer_timeout = 60;
+        state.github_text = Some(crate::run::GithubTextAsk {
+            fingerprint: "f".into(),
+            title: true,
+            body: false,
+            categories: vec!["title-language".into()],
+            question: None,
+            asks: 1,
+            resolved: false,
+            chosen_title: None,
+        });
+        state.save().unwrap();
+        let store = ask::Questions::open();
+        let mut q = ask::Question::new(
+            state.id.clone(),
+            crate::github_text::ASK_NODE.to_owned(),
+            crate::github_text::ASK_SEAT.to_owned(),
+            "s".into(),
+            String::new(),
+            vec!["use fallback".into()],
+        );
+        store.put(&mut q).unwrap();
+        let mut t = task();
+        t.runs.push(state.id.clone());
+        assert_eq!(land_resume_state(&t), LandResume::StillWaiting);
+        q.asked_at = Timestamp::now() - jiff::SignedDuration::from_secs(120);
+        store.put(&mut q).unwrap();
+        assert_eq!(land_resume_state(&t), LandResume::Ready);
+        assert!(!store.get(&q.id).unwrap().status.open());
+        // Once decided, a parked run is an ordinary candidate again.
+        state.github_text.as_mut().unwrap().resolved = true;
+        state.save().unwrap();
+        assert_eq!(land_resume_state(&t), LandResume::NotLanding);
     }
 
     #[test]
