@@ -2169,7 +2169,9 @@ details.panel > summary + * { margin-top: var(--s2); }
   main[data-split] {
     flex: 1 1 0; min-height: 0; width: 100%; max-width: none; margin: 0; padding: 0;
     display: grid;
-    grid-template-columns: minmax(360px, 30%) minmax(0, 1fr);
+    /* --split-master is set by wireSplitDivider in app.js (clamped there to
+       360px..100% - 480px); unset, it is the default width. */
+    grid-template-columns: var(--split-master, minmax(360px, 30%)) minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr);
   }
   /* The master column. */
@@ -2192,6 +2194,62 @@ details.panel > summary + * { margin-top: var(--s2); }
     display: flex; align-items: center; justify-content: center;
     color: var(--ink-3); font-size: var(--t3); text-align: center;
   }
+  /* Thin, theme-coloured scrollbars for the two panes. */
+  main[data-split] > #view-runs,
+  main[data-split] > #view-queue,
+  main[data-split] > #view-talks,
+  main[data-split] > #view-run,
+  main[data-split] > #view-task,
+  main[data-split] > #view-talk,
+  main[data-split] > .split-empty {
+    scrollbar-width: thin;
+    scrollbar-color: var(--edge) transparent;
+  }
+  main[data-split] > #view-runs::-webkit-scrollbar,
+  main[data-split] > #view-queue::-webkit-scrollbar,
+  main[data-split] > #view-talks::-webkit-scrollbar,
+  main[data-split] > #view-run::-webkit-scrollbar,
+  main[data-split] > #view-task::-webkit-scrollbar,
+  main[data-split] > #view-talk::-webkit-scrollbar,
+  main[data-split] > .split-empty::-webkit-scrollbar { width: 8px; height: 8px; }
+  main[data-split] > #view-runs::-webkit-scrollbar-track,
+  main[data-split] > #view-queue::-webkit-scrollbar-track,
+  main[data-split] > #view-talks::-webkit-scrollbar-track,
+  main[data-split] > #view-run::-webkit-scrollbar-track,
+  main[data-split] > #view-task::-webkit-scrollbar-track,
+  main[data-split] > #view-talk::-webkit-scrollbar-track,
+  main[data-split] > .split-empty::-webkit-scrollbar-track { background: transparent; }
+  main[data-split] > #view-runs::-webkit-scrollbar-thumb,
+  main[data-split] > #view-queue::-webkit-scrollbar-thumb,
+  main[data-split] > #view-talks::-webkit-scrollbar-thumb,
+  main[data-split] > #view-run::-webkit-scrollbar-thumb,
+  main[data-split] > #view-task::-webkit-scrollbar-thumb,
+  main[data-split] > #view-talk::-webkit-scrollbar-thumb,
+  main[data-split] > .split-empty::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 999px; }
+  main[data-split] > #view-runs::-webkit-scrollbar-thumb:hover,
+  main[data-split] > #view-queue::-webkit-scrollbar-thumb:hover,
+  main[data-split] > #view-talks::-webkit-scrollbar-thumb:hover,
+  main[data-split] > #view-run::-webkit-scrollbar-thumb:hover,
+  main[data-split] > #view-task::-webkit-scrollbar-thumb:hover,
+  main[data-split] > #view-talk::-webkit-scrollbar-thumb:hover,
+  main[data-split] > .split-empty::-webkit-scrollbar-thumb:hover { background: var(--edge); }
+
+  /* Draggable divider: a thin strip over the preview column's left padding, so
+     it never covers the list's scrollbar or its row ends. The visible line is
+     the list's own border-right; the strip only lights up on hover / focus. */
+  .split-divider { display: none; }
+  main[data-split] > .split-divider:not([hidden]) {
+    display: block; grid-column: 2; grid-row: 1; justify-self: start;
+    width: 8px; z-index: 2; cursor: col-resize; touch-action: none;
+    background: transparent; outline: none;
+  }
+  main[data-split] > .split-divider:hover,
+  main[data-split] > .split-divider:focus-visible,
+  main[data-split] > .split-divider[data-dragging] {
+    background: linear-gradient(to right, var(--gold-line) 0 2px, transparent 2px);
+  }
+  body[data-split-dragging] { user-select: none; cursor: col-resize; }
+
   /* The row is the way back; a back link would only navigate away. */
   main[data-split] #view-run > .back,
   main[data-split] #view-task > .back,

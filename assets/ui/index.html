@@ -143,6 +143,9 @@
 </div>
 
 <main id="main">
+  <!-- Two-pane layout only (see wireSplitDivider in app.js): drag or use the
+       arrow keys to resize the list column. Hidden below the split breakpoint. -->
+  <div id="split-divider" class="split-divider" role="separator" aria-orientation="vertical" aria-label="Resize list" tabindex="0" hidden></div>
   <!-- Two-pane layout only (see splitPanes in app.js): stands in for the right
        pane while a list is open and nothing is selected. -->
   <aside class="split-empty" id="split-empty" hidden>
