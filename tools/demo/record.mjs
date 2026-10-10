@@ -434,7 +434,7 @@ async function storyboard(page, scratch, base, beat, quiet) {
       await scrollTo(0);
     } else {
       // Stay on the Backlog: the task's own Run link opens the run beside it.
-      await page.locator("#view-task a[href*='/runs/']:visible").first().waitFor({ timeout: 30_000 });
+      await page.locator("#task-runs a[href^='#/queue/']:visible").first().waitFor({ timeout: 30_000 });
     }
   }, 200);
   if (PROFILE.touch) await beat("runs", 1000);
@@ -442,7 +442,7 @@ async function storyboard(page, scratch, base, beat, quiet) {
     if (PROFILE.touch) {
       await tap(card);
     } else {
-      await tap(page.locator("#view-task a[href*='/runs/']:visible").first());
+      await tap(page.locator("#task-runs a[href^='#/queue/']:visible").first());
       await page.waitForSelector("body[data-split='1'] #view-queue:not([hidden])");
     }
     await page.waitForSelector("#view-run:not([hidden])");

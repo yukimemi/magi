@@ -9132,7 +9132,7 @@ function renderTask() {
     const top = el("div", { class: "task-run-top" },
       el("span", { class: "task-run-n", text: `#${h.n}` }),
       h.status ? chip(h.status, RUN_STATUS) : el("span", { class: "tag", text: "unreadable" }),
-      el("a", { href: `#/runs/${encodeURIComponent(h.id)}`, text: `Run ${h.short}`, title: h.id }),
+      el("a", { href: `#/queue/${encodeURIComponent(task.id)}/runs/${encodeURIComponent(h.id)}`, text: `Run ${h.short}`, title: h.id }),
       el("span", { class: "tag", "data-tone": "ink", text: h.kind }),
     );
     if (h.provisional) top.append(el("span", { class: "tag", "data-tone": "rust", text: "provisional" }));
