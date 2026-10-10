@@ -2004,7 +2004,10 @@ async fn chat_selector_chips_stay_reachable_with_a_long_transcript() {
         assert_eq!(got["inHead"], 0, "{tag}: selector left in the head {got}");
         for c in got["chips"].as_array().expect("chips") {
             assert_eq!(c["visible"], true, "{tag}: {c}");
-            assert!(c["h"].as_f64().unwrap_or(0.0) >= 44.0, "{tag}: too short {c}");
+            assert!(
+                c["h"].as_f64().unwrap_or(0.0) >= 44.0,
+                "{tag}: too short {c}"
+            );
             assert_eq!(c["inside"], true, "{tag}: outside the viewport {c}");
             assert_eq!(c["hit"], true, "{tag}: covered by something else {c}");
             assert_eq!(c["clash"], false, "{tag}: overlaps composer or dock {c}");
