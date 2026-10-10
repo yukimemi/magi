@@ -300,6 +300,41 @@ function setText(node, value) {
   if (node.textContent !== next) node.textContent = next;
 }
 
+/* Puts `value` into `node` as text nodes and, for each http(s) URL in it, an
+   anchor. Nodes only, never innerHTML, so the text cannot inject markup. Other
+   schemes stay text. Trailing . , ; : and an unmatched ) are not part of the
+   URL; backticks and quotes end it. `{ replace: true }` swaps the node's
+   children and does nothing when the text is unchanged (keeps an SSE refresh
+   from dropping a selection); the default appends. Do not mix with setText on
+   one node. */
+const URL_RE = /https?:\/\/[^\s<>"'`]+/gi;
+function linkify(node, value, opts) {
+  const text = value === null || value === undefined ? "" : String(value);
+  const replace = Boolean(opts && opts.replace);
+  if (replace && node.textContent === text) return node;
+  const parts = [];
+  let last = 0;
+  for (const m of text.matchAll(URL_RE)) {
+    let url = m[0];
+    for (;;) {
+      const tail = url[url.length - 1];
+      if (".,;:".includes(tail)) url = url.slice(0, -1);
+      else if (tail === ")" && url.split(")").length > url.split("(").length) url = url.slice(0, -1);
+      else break;
+    }
+    let ok = false;
+    try { ok = /^https?:$/.test(new URL(url).protocol); } catch (_) { ok = false; }
+    if (!ok) continue;
+    if (m.index > last) parts.push(document.createTextNode(text.slice(last, m.index)));
+    parts.push(el("a", { class: "text-link", href: url, target: "_blank", rel: "noopener noreferrer", text: url }));
+    last = m.index + url.length;
+  }
+  if (last < text.length) parts.push(document.createTextNode(text.slice(last)));
+  if (replace) node.replaceChildren(...parts);
+  else node.append(...parts);
+  return node;
+}
+
 function setAttr(node, name, value) {
   if (value === null || value === undefined || value === false) {
     if (node.hasAttribute(name)) node.removeAttribute(name);
@@ -2386,7 +2421,7 @@ function updateTaskCard(row, task) {
       noteText = `${noteText} Stuck: nothing will run ${stuckRoots.join(", ")} - answer its question in Questions, or release it.`;
     }
   }
-  setText(r.note, noteText);
+  linkify(r.note, noteText, { replace: true });
   show(r.note, Boolean(noteText));
   /* A very long note is clamped to a few lines; tapping it toggles the full
      text. The class is only ever added here, so an expanded note stays
@@ -2394,10 +2429,13 @@ function updateTaskCard(row, task) {
   r.note.classList.add("note-clamp");
   if (!r.note.dataset.clampWired) {
     r.note.dataset.clampWired = "1";
-    r.note.addEventListener("click", () => r.note.classList.toggle("expanded"));
+    r.note.addEventListener("click", (event) => {
+      if (event.target.closest("a")) return;
+      r.note.classList.toggle("expanded");
+    });
   }
 
-  setText(r.error, task.last_error || "");
+  linkify(r.error, task.last_error || "", { replace: true });
   show(r.error, Boolean(task.last_error));
 
   const full = task.instruction || "";
@@ -6364,7 +6402,8 @@ function renderRound(runId, r) {
       : null,
     (r.reconsideration || []).length
       ? el("div", null, el("p", { class: "rmeta", text: "reconsideration" }),
-        rlines(r.reconsideration.map((x) => `review-${x.reviewer} → ${x.vote ? x.vote.replace(/_/g, " ") : ""} ${x.reason || ""}`.trim())))
+        el("ul", { class: "rlist" }, r.reconsideration.map((x) => linkify(el("li", { class: "rrow" }),
+          `review-${x.reviewer} → ${x.vote ? x.vote.replace(/_/g, " ") : ""} ${x.reason || ""}`.trim()))))
       : null);
 }
 
@@ -6412,7 +6451,7 @@ function renderSection(runId, s) {
     }
     case "operator_fixes":
       return card([], (s.requests || []).map((req) => el("div", { class: "rblock" },
-        el("p", { class: "rmeta", text: `${req.requested_at}${req.stale ? " · stale head" : ""} — ${req.reason}` }),
+        linkify(el("p", { class: "rmeta" }), `${req.requested_at}${req.stale ? " · stale head" : ""} — ${req.reason}`),
         rlines((req.findings || []).map((f) => `${f.id} [${f.severity}] ${f.title}: ${f.outcome}${f.why ? ` (${f.why})` : ""}`)),
         req.follow_up_review_run ? el("p", { class: "rmeta", text: `re-verified by run ${req.follow_up_review_run}` })
           : req.unverified_commit ? el("p", { class: "rmeta rwarn", text: "committed, but the follow-up review could not be opened" }) : null)));
@@ -6596,7 +6635,7 @@ function renderRunDetail() {
   const note = successorNote(latest, inFlight);
   if (note) head.append(note);
   if (!superseded && meta.note) {
-    head.append(el("p", { class: "card-note", text: meta.note }));
+    head.append(linkify(el("p", { class: "card-note" }), meta.note));
   }
 
   setText($("run-h"), firstLine(run.instruction) || shortId(run.id));
@@ -8091,7 +8130,7 @@ function renderHandovers(run) {
     list.append(el("li", {},
       el("span", { class: "seat", text: move.seat || "" }),
       el("span", { text: `${move.from || "?"} \u2192 ${move.to || "?"}` }),
-      el("span", { text: `during ${move.node || "?"}: ${move.reason || ""}` }),
+      linkify(el("span"), `during ${move.node || "?"}: ${move.reason || ""}`),
       el("span", { text: clock(move.at) }),
     ));
   }
@@ -8146,7 +8185,7 @@ function renderTimeline(run) {
       el("ul", { class: "tl-events" },
         ...group.events.map((event) => el("li", {},
           el("span", { class: "event-at", text: clock(event.at) }),
-          el("span", { class: "event-msg", text: event.message || "" }),
+          linkify(el("span", { class: "event-msg" }), event.message || ""),
         )),
       ),
     ));
@@ -8416,7 +8455,7 @@ function renderNotifications() {
        link's own click keep behaving exactly as before. */
     const card = el("li", { class: "notice", "data-sev": n.severity, "data-read": unread ? "0" : "1",
       onclick: link ? (event) => { if (!event.target.closest("a, button")) link.click(); } : null },
-      el("div", { class: "notice-msg", text: n.message }),
+      linkify(el("div", { class: "notice-msg" }), n.message),
       el("div", { class: "notice-meta" },
         el("span", { text: n.severity }),
         el("time", { datetime: n.last_at, title: at.title, text: at.text }),
@@ -9135,9 +9174,9 @@ function renderTask() {
 
   const waitingOn = task.hold_reason || task.block_reason;
   const noteBits = [(TASK_STATUS[status] || {}).note, waitingOn ? `Waiting on: ${waitingOn}` : "", status === "parked" ? task.park_reason : ""].filter(Boolean);
-  setText($("task-note"), noteBits.join(" "));
+  linkify($("task-note"), noteBits.join(" "), { replace: true });
   show($("task-note"), noteBits.length > 0);
-  setText($("task-error"), task.last_error || "");
+  linkify($("task-error"), task.last_error || "", { replace: true });
   show($("task-error"), Boolean(task.last_error));
   show($("task-why-panel"), noteBits.length > 0 || Boolean(task.last_error));
 
