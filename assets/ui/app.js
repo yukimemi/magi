@@ -4301,24 +4301,26 @@ function mdBlock(cls, nodes) {
  * refuses to put API data into markup at all, and that rule is not being
  * relaxed here — the panel is never parsed, inspected or inserted by this
  * document. It is fetched by the browser from its own endpoint into an
- * <iframe sandbox> carrying NO tokens, which means no script inside it runs,
- * it has no origin, and it can reach neither this document, nor its cookies,
- * nor localStorage. The endpoint additionally sends a Content-Security-Policy
- * of `default-src 'none'`, so nothing inside the frame can reach the network
+ * <iframe sandbox> carrying only `allow-popups` and
+ * `allow-popups-to-escape-sandbox`. No script inside it runs, it has no origin,
+ * and it can reach neither this document, nor its cookies, nor localStorage.
+ * The endpoint additionally sends a Content-Security-Policy of
+ * `default-src 'none'`, so nothing inside the frame can reach the network
  * either: a panel cannot beacon out through a remote image.
  *
- * Nothing below may add a sandbox token. `allow-scripts` would hand a
+ * Nothing below may add other sandbox tokens. `allow-scripts` would hand a
  * scriptable document to agent-authored HTML and `allow-same-origin` would
  * hand it this session; either one, and rendering the panel stops being
  * defensible. Everything the design wants is done in the frame's own CSS or
  * not at all.
  */
 
-/* A tokenless frame is opaque in both directions, so a 404 inside it looks
-   exactly like a rendered panel and would leave a silent blank hole where the
-   evidence should be. The status is therefore asked for directly, once per
-   question — the panel of a given question never changes — with HEAD, which
-   the route answers identically to GET without sending the body. */
+/* A frame without script or same-origin access is opaque in both directions,
+   so a 404 inside it looks exactly like a rendered panel and would leave a
+   silent blank hole where the evidence should be. The status is therefore
+   asked for directly, once per question — the panel of a given question never
+   changes — with HEAD, which the route answers identically to GET without
+   sending the body. */
 async function panelReachable(id) {
   if (state.panelOk.has(id)) return state.panelOk.get(id);
   let reachable = false;
@@ -4332,14 +4334,18 @@ async function panelReachable(id) {
   return reachable;
 }
 
-/* The one place an iframe is built. `sandbox: ""` is deliberate and load
-   bearing: `el` writes an empty attribute value for it, which is a sandbox
-   with every capability withheld. An omitted `sandbox` attribute would be no
-   sandbox at all, and any token inside it would give some of them back. */
+/* The one place an iframe is built. The sandbox carries exactly `allow-popups`
+   and `allow-popups-to-escape-sandbox`. Without `allow-popups`, links opening in
+   new tabs (`target="_blank"`) are silently ignored; without
+   `allow-popups-to-escape-sandbox`, the opened tab inherits the sandbox flags
+   and destinations like github.com break because they refuse sandboxing. The
+   operator accepts opening links in a new tab; whether a link is safe to follow
+   is left to the operator's judgement. Never add `allow-scripts` or
+   `allow-same-origin`. */
 function panelFrame(question, label) {
   return el("iframe", {
     src: API.panel(question.id),
-    sandbox: "",
+    sandbox: "allow-popups allow-popups-to-escape-sandbox",
     referrerpolicy: "no-referrer",
     title: `${label}: ${question.summary || shortId(question.id)}`,
   });

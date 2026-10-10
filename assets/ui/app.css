@@ -1704,17 +1704,18 @@ details.panel > summary + * { margin-top: var(--s2); }
 /* ---- agent-authored panels --------------------------------------------- *
  * A question may hand over a whole HTML page — a diff, a table of changed
  * files, an image — because one line of prose is not enough to judge by. It
- * is rendered inside <iframe sandbox> with NO tokens, so nothing in it runs
- * and it can reach neither this document nor its storage, and the endpoint
- * that serves it sends a CSP denying every network request from inside the
- * frame. That sandbox is the entire reason this is allowed, so nothing below
- * may ask for a token back.
+ * is rendered inside <iframe sandbox> carrying only allow-popups and
+ * allow-popups-to-escape-sandbox, so no script in it runs and it can reach
+ * neither this document nor its storage, and the endpoint that serves it sends
+ * a CSP denying every network request from inside the frame. Never add
+ * allow-scripts or allow-same-origin.
  *
- * A tokenless frame is opaque to this page in both directions: its height
- * cannot be measured and there is no channel to ask it. So the inline frame
- * is bounded and the full-screen dialog carries the rest, and the bounded
- * state is drawn as a deliberate window — its own edge, a fade at the sill,
- * and a sentence saying where the rest is — rather than as a clipped card.
+ * A frame without script or same-origin access is opaque to this page in both
+ * directions: its height cannot be measured and there is no channel to ask it.
+ * So the inline frame is bounded and the full-screen dialog carries the rest,
+ * and the bounded state is drawn as a deliberate window — its own edge, a fade
+ * at the sill, and a sentence saying where the rest is — rather than as a
+ * clipped card.
  */
 .ask-panel { display: flex; flex-direction: column; gap: var(--s2); }
 .ask-panel-bar { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }

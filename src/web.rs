@@ -48,7 +48,8 @@
 //! never part of this document.
 //!
 //! It is served by [`question_panel`] and [`question_asset`] and rendered in an
-//! `<iframe sandbox>` carrying no tokens: no `allow-scripts`, no
+//! `<iframe sandbox>` carrying exactly `allow-popups` and
+//! `allow-popups-to-escape-sandbox`: no `allow-scripts`, no
 //! `allow-same-origin`. So no script in a panel runs, and the frame cannot
 //! reach the parent document, the cookie jar or `localStorage`. On top of that
 //! both routes send [`PANEL_CSP`], which denies every network destination, so a
@@ -6130,7 +6131,7 @@ fn resolve_question(store: &Questions, id: &str) -> ApiResult<String> {
 /// `GET /api/questions/{id}/panel`.
 ///
 /// The panel an agent wrote for this question, as `text/html` under
-/// [`PANEL_CSP`], for the front end to mount in a token-less sandboxed iframe.
+/// [`PANEL_CSP`], for the front end to mount in a sandboxed iframe.
 /// A question without one is a 404 rather than an empty page: the client
 /// preflights this route with `HEAD` and must be able to tell "no panel" from
 /// "a panel that rendered blank", and a sandboxed frame is opaque to the
@@ -13419,9 +13420,38 @@ mod tests {
         assert!(APP_JS.contains("if (state.talkDetail.id !== id) return;"));
         assert!(APP_JS.contains("const relayout = () => applyRoute();"));
 
-        // The panel sandbox and its CSP are untouched by any of this.
-        assert!(APP_JS.contains("sandbox: \"\""));
-        assert!(!APP_JS.contains("sandbox: \"allow"));
+        // The panel sandbox carries exactly allow-popups and allow-popups-to-escape-sandbox.
+        assert!(APP_JS.contains("sandbox: \"allow-popups allow-popups-to-escape-sandbox\""));
+    }
+
+    #[test]
+    fn panel_sandbox_carries_exactly_popups() {
+        let needle = "sandbox: \"";
+        let matches: Vec<_> = APP_JS.match_indices(needle).collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "APP_JS must have exactly one sandbox attribute setting: found {matches:?}"
+        );
+        let start = matches[0].0 + needle.len();
+        let end = APP_JS[start..]
+            .find('"')
+            .expect("sandbox attribute value must be terminated by a closing quote");
+        let val = &APP_JS[start..start + end];
+        let tokens: std::collections::BTreeSet<&str> = val.split_whitespace().collect();
+        let expected: std::collections::BTreeSet<&str> =
+            ["allow-popups", "allow-popups-to-escape-sandbox"]
+                .into_iter()
+                .collect();
+        assert_eq!(tokens, expected, "sandbox tokens must match exactly");
+        assert!(
+            !tokens.contains("allow-scripts"),
+            "allow-scripts must never be present in sandbox"
+        );
+        assert!(
+            !tokens.contains("allow-same-origin"),
+            "allow-same-origin must never be present in sandbox"
+        );
     }
 
     #[test]

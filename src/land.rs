@@ -1132,7 +1132,7 @@ pub fn approval_panel(
          <code style=\"background:#f6f8fa;padding:1px 4px;border-radius:4px\">{}</code></h1>\n\
          <p style=\"margin:0 0 4px;font-size:17px;font-weight:600\">{}</p>\n\
          <p style=\"margin:0 0 12px;font-size:13px;color:#57606a\">squash merge · run {} · \
-         <a href=\"{}\" style=\"color:#0969da\">{}</a></p>",
+         <a href=\"{}\" target=\"_blank\" rel=\"noopener noreferrer\" style=\"color:#0969da\">{}</a></p>",
         pr.number,
         esc(&state.base_branch),
         esc(subject),
@@ -5611,6 +5611,14 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             html.matches("http").count(),
             html.matches(pr.url.as_str()).count(),
             "the only http url in the panel is the pull request's own link"
+        );
+        assert!(
+            html.contains("target=\"_blank\""),
+            "the PR link must open in a new tab so it escapes the iframe"
+        );
+        assert!(
+            html.contains("rel=\"noopener noreferrer\""),
+            "external links opening in new tabs must carry noopener noreferrer"
         );
     }
 

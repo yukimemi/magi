@@ -286,7 +286,9 @@ judges: a diff, a table of what changes, a rendered before and after.\n\n\
 magi ask --summary \"...\" --choice A --choice B --panel panel.html --asset shot.png\n\
 ```\n\n\
 The panel is your own HTML and CSS, rendered in a sandbox: **no JavaScript \
-runs and nothing may load from the network**. Inline your styles, reference \
+runs and nothing may load from the network**. External links must carry \
+`target=\"_blank\"` to work: a link that navigates the frame itself is refused. \
+Inline your styles, reference \
 attached assets by their bare filename, and use `data:` URIs for anything \
 small. A `<script>`, a remote font or an external image is silently blocked, \
 so do not spend effort on them.\n\n\
@@ -2922,6 +2924,7 @@ mod tests {
         // JavaScript and a remote stylesheet that the CSP silently drops.
         assert!(p.contains("no JavaScript"), "{p}");
         assert!(p.contains("nothing may load from the network"), "{p}");
+        assert!(p.contains("target=\"_blank\""), "{p}");
         // Asking is not free: it stops the run until a human notices.
         assert!(p.contains("Ask sparingly"), "{p}");
     }
