@@ -140,7 +140,7 @@ fn match_at(before: &str, rest: &str, id: &Identity) -> Option<(usize, &'static 
                 .then(|| {
                     token(rest).or_else(|| credential(rest)).or_else(|| {
                         prev.is_none_or(|c| !is_name(c))
-                            .then(|| named_identity(before, rest))
+                            .then(|| named_identity(rest))
                             .flatten()
                     })
                 })
@@ -212,7 +212,7 @@ fn token(rest: &str) -> Option<(usize, &'static str)> {
 }
 
 /// Explicit assignments avoid guessing whether an ordinary word is an account.
-fn named_identity(before: &str, rest: &str) -> Option<(usize, &'static str)> {
+fn named_identity(rest: &str) -> Option<(usize, &'static str)> {
     for key in [
         "hostname=",
         "hostname: ",
@@ -233,7 +233,7 @@ fn named_identity(before: &str, rest: &str) -> Option<(usize, &'static str)> {
     }
     let n = name_len(rest);
     if n > 0
-        && !code_receiver(before, &rest[..n])
+        && !code_receiver(&rest[..n])
         && [".local", ".internal", ".lan"].iter().any(|suffix| {
             n.checked_sub(suffix.len())
                 .and_then(|start| rest.get(start..n))
@@ -245,13 +245,24 @@ fn named_identity(before: &str, rest: &str) -> Option<(usize, &'static str)> {
     None
 }
 
-/// A dotted name that reads as a code path (`WatchState.local`, `self.local`,
-/// or anything inside backticks) rather than a hostname. The real hostname is
-/// still caught by `identity_word`.
-fn code_receiver(before: &str, name: &str) -> bool {
-    before.ends_with('`')
-        || name.starts_with("self.")
-        || name.chars().any(|c| c.is_ascii_uppercase())
+/// A dotted name that reads as a code path (`WatchState.local`, `self.local`)
+/// rather than a hostname: one dot, no hyphen, and either a `self.` / `this.`
+/// receiver or a CamelCase one (a capital right after a lowercase letter).
+/// Anything else, mixed-case or backticked hostnames included, stays a host.
+fn code_receiver(name: &str) -> bool {
+    if name.matches('.').count() != 1 || name.contains('-') {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("self.") || lower.starts_with("this.") {
+        return true;
+    }
+    let mut prev_lower = false;
+    name.chars().any(|c| {
+        let hump = prev_lower && c.is_ascii_uppercase();
+        prev_lower = c.is_ascii_lowercase();
+        hump
+    })
 }
 
 /// `"password": "value"` and `'token':'value'`: the key is quoted, so the
@@ -646,10 +657,18 @@ mod tests {
         ] {
             assert_eq!(scrub(t, &Identity::default()), t);
         }
-        assert_eq!(
-            scrub("ssh m1air.local now", &Identity::default()),
-            "ssh [redacted-host] now"
-        );
+        for t in [
+            "ssh m1air.local",
+            "ssh BUILD-SERVER.local",
+            "ssh Alices-MacBook-Pro.local",
+            "`m1air.local`",
+            "ssh BUILD.local",
+        ] {
+            assert!(
+                scrub(t, &Identity::default()).contains("[redacted-host]"),
+                "{t}"
+            );
+        }
     }
 
     #[test]
