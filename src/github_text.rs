@@ -81,7 +81,7 @@ fn non_english_with(text: &str, english: Option<bool>) -> bool {
         return true;
     }
     // Everything else, an approval included, still has to clear the floor.
-    foreign_share(text)
+    foreign_share(text) || (english != Some(true) && short_foreign(text))
 }
 
 /// Too large a share of non-ASCII letters, whoever vouched for the text.
@@ -101,17 +101,22 @@ fn foreign_share(text: &str) -> bool {
                 .count();
             foreign >= 4 && foreign * 2 >= letters.max(1)
         })
-        || text.lines().any(|line| {
-            // Short lines: a conventional-commit prefix (`fix(scope)!:`) says
-            // nothing about the language, so `fix: 修正` is judged on `修正`.
-            let rest = strip_commit_prefix(line);
-            let letters = rest.chars().filter(|c| c.is_alphabetic()).count();
-            let foreign = rest
-                .chars()
-                .filter(|c| c.is_alphabetic() && !c.is_ascii())
-                .count();
-            foreign >= 2 && foreign * 3 >= letters
-        })
+}
+
+/// Short non-ASCII lines the share floor above lets through. Applied only
+/// when no judge vouched for the text: an approval keeps the plain floor.
+fn short_foreign(text: &str) -> bool {
+    text.lines().any(|line| {
+        // A conventional-commit prefix (`fix(scope)!:`) says nothing about the
+        // language, so `fix: 修正` is judged on `修正`.
+        let rest = strip_commit_prefix(line);
+        let letters = rest.chars().filter(|c| c.is_alphabetic()).count();
+        let foreign = rest
+            .chars()
+            .filter(|c| c.is_alphabetic() && !c.is_ascii())
+            .count();
+        foreign >= 2 && foreign * 3 >= letters
+    })
 }
 
 fn strip_commit_prefix(line: &str) -> &str {
@@ -636,6 +641,13 @@ mod tests {
             );
         }
         assert!(check("fix: retries", "LGTM。修正済").contains(&Violation::BodyLanguage));
+        // An approval keeps only the plain share floor.
+        let ok = Some(LanguageDecision {
+            title_english: true,
+            body_english: true,
+            body_complete: true,
+        });
+        assert!(check_with("fix: résumé", "Update résumé.", ok).is_empty());
         assert!(
             check(
                 "fix: retries",
