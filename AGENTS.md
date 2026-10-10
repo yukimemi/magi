@@ -1088,12 +1088,22 @@ timeout_minutes = 30                # per command
   `decide` always passes, is unchanged); the watcher's own `decide_local` is
   pure and applies the same rule to a `RollupView`. A conflict is not a check
   and still stops.
-- **The owner approves, bound to the head.** The watcher files a
+- **The approval follows `graph.land_approval`, and is bound to the head.**
+  With it on (the default), or when the repository config cannot be read
+  (`ReleaseForge::land_approval` errors: ask, never merge), the watcher files a
   `bump::NOTICE_NODE` question (`merge` / `hold`, no run, no `cwd`) recording
   the head it observed; `merge` runs `gh pr merge --match-head-commit <head>`
   and the forge decides whether it merged (`land::merged_after_all`). An answer
   about an older head asks again; silence and `hold` stay put until the head
-  moves. CI rerun and stall escalation do not apply to a local PR.
+  moves. With it off, `decide_local` returns `Merge(<observed head>)` for a head
+  nobody was asked about and the same head-bound merge runs with no question,
+  then `run_job` as after an approved merge. An approval question that is
+  already open is still respected, and a recorded `hold` is not undone by
+  turning the setting off. Unchanged either way: nothing moves on an unreadable
+  forge answer, a moved head is judged afresh, a conflict still stops, no
+  `--admin`. A merge the forge refuses or does not confirm holds that head with
+  a "merge it by hand" notice and is not retried until the head moves. CI rerun
+  and stall escalation do not apply to a local PR.
 - **After the merge** `release_local::run_job` runs from a clean detached
   checkout of the merge commit: the Cargo.toml version there must equal the
   release version; the tag is created (annotated) and pushed with an explicit
