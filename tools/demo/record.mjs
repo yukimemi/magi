@@ -428,13 +428,23 @@ async function storyboard(page, scratch, base, beat, quiet) {
   const card = page.locator("#view-runs a.card.run-card").first();
   await quiet(async () => {
     seedStage(scratch, "inflight");
-    await tap(dock("runs"));
-    await card.waitFor();
-    await scrollTo(0);
+    if (PROFILE.touch) {
+      await tap(dock("runs"));
+      await card.waitFor();
+      await scrollTo(0);
+    } else {
+      // Stay on the Backlog: the task's own Run link opens the run beside it.
+      await page.locator("#view-task a[href*='/runs/']:visible").first().waitFor({ timeout: 30_000 });
+    }
   }, 200);
-  await beat("runs", 1000);
+  if (PROFILE.touch) await beat("runs", 1000);
   await quiet(async () => {
-    await tap(card);
+    if (PROFILE.touch) {
+      await tap(card);
+    } else {
+      await tap(page.locator("#view-task a[href*='/runs/']:visible").first());
+      await page.waitForSelector("body[data-split='1'] #view-queue:not([hidden])");
+    }
     await page.waitForSelector("#view-run:not([hidden])");
     await scrollTo(0);
   }, 200);

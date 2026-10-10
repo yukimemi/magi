@@ -2421,7 +2421,7 @@ function updateTaskCard(row, task) {
   const runs = Array.isArray(task.runs) ? task.runs : [];
   const latest = runs.length ? runs[runs.length - 1] : null;
   if (latest) {
-    setAttr(r.runLink, "href", `#/runs/${latest}`);
+    setAttr(r.runLink, "href", `#/queue/${encodeURIComponent(task.id)}/runs/${latest}`);
     setText(r.runLink, `Run ${shortId(latest)}`);
   }
   show(r.runLink, Boolean(latest));
@@ -8129,7 +8129,9 @@ function applyRunTab() {
     const link = $(`run-tab-${name}`);
     setAttr(link, "aria-selected", name === tab ? "true" : "false");
     setAttr(link, "tabindex", name === tab ? null : "-1");
-    setAttr(link, "href", `#/runs/${encodeURIComponent(id)}/${name}`);
+    const via = state.route.name === "run" && state.route.taskId
+      ? `#/queue/${encodeURIComponent(state.route.taskId)}/runs/` : "#/runs/";
+    setAttr(link, "href", `${via}${encodeURIComponent(id)}/${name}`);
     show($(`run-tabpanel-${name}`), name === tab);
   }
 }
@@ -8649,6 +8651,14 @@ function subscribe() {
 function parseRoute() {
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   if (parts[0] === "tasks" && parts[1]) return { name: "task", id: decodeURIComponent(parts[1]) };
+  if (parts[0] === "queue" && parts[1] && parts[2] === "runs" && parts[3]) {
+    /* A run opened from a task: the Backlog stays the list beside it. */
+    const tab = RUN_TABS.includes(parts[4]) ? parts[4] : "overview";
+    return {
+      name: "run", id: decodeURIComponent(parts[3]), tab,
+      list: "queue", taskId: decodeURIComponent(parts[1]),
+    };
+  }
   if (parts[0] === "queue" && parts[1]) return { name: "queue", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "queue") return { name: "queue", id: null };
   if (parts[0] === "stats") return { name: "stats", id: null };
@@ -8683,7 +8693,7 @@ function splitPanes(route, wide) {
   if (!wide) return null;
   switch (route.name) {
     case "runs": return { list: "runs", detail: null };
-    case "run": return { list: "runs", detail: "run" };
+    case "run": return { list: route.list || "runs", detail: "run" };
     case "queue": return { list: "queue", detail: route.id ? "task" : null };
     case "task": return { list: "queue", detail: "task" };
     case "talks": return { list: "talks", detail: null };
@@ -8699,7 +8709,8 @@ function markSelected() {
   const route = state.route;
   const selected = {
     runId: route.name === "run" ? route.id : null,
-    taskId: route.name === "task" || route.name === "queue" ? route.id : null,
+    taskId: route.name === "run" ? route.taskId || null
+      : route.name === "task" || route.name === "queue" ? route.id : null,
     talkId: route.name === "talk" ? route.id : null,
   };
   const mark = (selector, key, id) => {
@@ -8743,7 +8754,7 @@ function applyRoute() {
   show($("task-actions-fab"), route.name === "task");
   if (route.name !== "task") closeTaskActions();
 
-  const section = route.name === "run" ? "runs"
+  const section = route.name === "run" ? route.list || "runs"
     : route.name === "task" ? "queue"
     : route.name === "talk" ? "talks"
     : route.name;
