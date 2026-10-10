@@ -633,7 +633,10 @@ mod tests {
             host: "devbox.local".into(),
             ..Identity::default()
         };
-        assert_eq!(scrub("on devbox.local now", &real), "on [redacted-host] now");
+        assert_eq!(
+            scrub("on devbox.local now", &real),
+            "on [redacted-host] now"
+        );
         for (user, host) in [("local", ""), ("admin", "localhost")] {
             let i = Identity {
                 user: user.into(),
