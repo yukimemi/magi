@@ -928,6 +928,7 @@ mod tests {
         assert!(shallow.join(".git/shallow").exists());
         let probe = std::process::Command::new("git")
             .current_dir(&shallow)
+            .quiet()
             .args(["rev-parse", "--verify", "--quiet", &format!("{commit}^1")])
             .output()
             .unwrap();
