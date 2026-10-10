@@ -473,21 +473,17 @@ pub fn question_detail(
         },
         w.categories.join(", ")
     ));
-    // After a retry the categories describe the owner's replacement, not the
-    // original text, so there is nothing of the original to point at.
-    if !retry {
-        let found = diagnose(&w.categories, title, body);
-        if !found.is_empty() {
-            s.push_str("What triggered each rule:\n\n");
-            s.push_str(&found.join("\n"));
-            s.push_str("\n\n");
-        }
-        if let Some(p) = artifact {
-            s.push_str(&format!(
-                "Full withheld text (redacted like what would be posted): {}\n\n",
-                p.display()
-            ));
-        }
+    let found = diagnose(&w.categories, title, body);
+    if !found.is_empty() {
+        s.push_str("What triggered each rule:\n\n");
+        s.push_str(&found.join("\n"));
+        s.push_str("\n\n");
+    }
+    if let Some(p) = artifact {
+        s.push_str(&format!(
+            "Full withheld text (redacted like what would be posted): {}\n\n",
+            p.display()
+        ));
     }
     s.push_str(&format!(
         "- `{USE_FALLBACK}` posts `{NEUTRAL_TITLE}` / the neutral description for what was withheld \
