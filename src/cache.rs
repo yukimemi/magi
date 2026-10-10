@@ -677,51 +677,165 @@ pub fn parse_workspace_package_names(metadata_json: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Every `--manifest-path` the given verify commands pass, in order of first
+/// appearance, without duplicates. Understands `--manifest-path X` and
+/// `--manifest-path=X`, with `'` / `"` quoting. Pure.
+#[must_use]
+pub fn extract_manifest_paths(commands: &[String]) -> Vec<PathBuf> {
+    const KEY: &str = "--manifest-path";
+    let mut out: Vec<PathBuf> = Vec::new();
+    for command in commands {
+        let mut rest = command.as_str();
+        while let Some(at) = rest.find(KEY) {
+            rest = &rest[at + KEY.len()..];
+            let value = if let Some(r) = rest.strip_prefix('=') {
+                r
+            } else if rest.starts_with(char::is_whitespace) {
+                rest.trim_start()
+            } else {
+                continue;
+            };
+            let value = if let Some(s) = value.strip_prefix('\'') {
+                s.split('\'').next().unwrap_or("")
+            } else if let Some(s) = value.strip_prefix('"') {
+                s.split('"').next().unwrap_or("")
+            } else {
+                let end = value.find(char::is_whitespace).unwrap_or(value.len());
+                &value[..end]
+            };
+            if !value.is_empty() {
+                let path = PathBuf::from(value);
+                if !out.contains(&path) {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Where cargo is asked about the workspace's own packages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    /// The worktree root, as before (no `--manifest-path`).
+    Root,
+    /// A manifest named by a verify command, resolved against the worktree.
+    Manifest(PathBuf),
+}
+
+/// Decide which manifests `cargo metadata` / `cargo clean -p` run against: the
+/// root when it has a `Cargo.toml`, plus every verify-named manifest that
+/// exists. Nothing at all is a valid answer (no crate, or one the commands do
+/// not name). Pure apart from `exists`.
+fn plan_targets(
+    worktree: &Path,
+    manifests: &[PathBuf],
+    exists: impl Fn(&Path) -> Result<bool>,
+) -> Result<Vec<Target>> {
+    let mut targets = Vec::new();
+    if exists(&worktree.join("Cargo.toml"))? {
+        targets.push(Target::Root);
+    }
+    for m in manifests {
+        let full = if m.is_absolute() {
+            m.clone()
+        } else {
+            worktree.join(m)
+        };
+        if exists(&full)? {
+            targets.push(Target::Manifest(full));
+        } else {
+            tracing::warn!(
+                manifest = %m.display(),
+                "build cache: --manifest-path from a verify command does not exist; skipped"
+            );
+        }
+    }
+    Ok(targets)
+}
+
+/// Existence of a file: only NotFound counts as "no"; any other I/O error
+/// propagates so an unreadable tree is never mistaken for an empty one.
+fn file_exists(path: &Path) -> Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(m) => Ok(m.is_file()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
+    }
+}
+
 /// Selectively invalidate the workspace's own compiled artifacts in
 /// `cache_dir` — `cargo clean -p <name> --target-dir <cache_dir>` for every
 /// package `cargo metadata` reports as local to `worktree`, never a bare
 /// `cargo clean` (which would throw away every dependency's compile too).
+/// Returns `None` when there is no manifest to ask (no cargo is spawned).
 /// Real subprocess execution: never called from a test, only from
 /// [`ensure_fresh`] in the running binary.
-fn refresh_stale_packages(worktree: &Path, cache_dir: &Path) -> Result<Vec<String>> {
-    let meta = std::process::Command::new("cargo")
-        .args(["metadata", "--no-deps", "--format-version", "1"])
-        .current_dir(worktree)
-        .quiet()
-        .output()
-        .context("run `cargo metadata`")?;
-    if !meta.status.success() {
-        bail!(
-            "cargo metadata failed: {}",
-            String::from_utf8_lossy(&meta.stderr)
-        );
+fn refresh_stale_packages(
+    worktree: &Path,
+    cache_dir: &Path,
+    manifests: &[PathBuf],
+) -> Result<Option<Vec<String>>> {
+    let targets = plan_targets(worktree, manifests, file_exists)?;
+    if targets.is_empty() {
+        return Ok(None);
     }
-    let names = parse_workspace_package_names(&String::from_utf8_lossy(&meta.stdout));
+    let mut all = Vec::new();
     let mut failed = Vec::new();
-    for name in &names {
-        let out = std::process::Command::new("cargo")
-            .arg("clean")
-            .arg("-p")
-            .arg(name)
-            .arg("--target-dir")
-            .arg(cache_dir)
+    for target in &targets {
+        let manifest_arg = match target {
+            Target::Root => None,
+            Target::Manifest(m) => Some(m),
+        };
+        let mut cmd = std::process::Command::new("cargo");
+        cmd.args(["metadata", "--no-deps", "--format-version", "1"]);
+        if let Some(m) = manifest_arg {
+            cmd.arg("--manifest-path").arg(m);
+        }
+        let meta = cmd
             .current_dir(worktree)
             .quiet()
             .output()
-            .with_context(|| format!("cargo clean -p {name}"))?;
-        if !out.status.success() {
-            // A failure here — a Windows test executable still holding its
-            // own file open is the case the evidence log records — means the
-            // stale artifact this was meant to remove may still be sitting
-            // in `cache_dir`. Collecting it rather than only warning is what
-            // lets `ensure_fresh` refuse to record the new identity: the
-            // next reuse must not be told this cache is confirmed to match
-            // `identity` when a piece of the *previous* one could not be
-            // proven gone.
-            failed.push(format!(
-                "{name}: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            .context("run `cargo metadata`")?;
+        if !meta.status.success() {
+            bail!(
+                "cargo metadata failed: {}",
+                String::from_utf8_lossy(&meta.stderr)
+            );
+        }
+        let names = parse_workspace_package_names(&String::from_utf8_lossy(&meta.stdout));
+        for name in &names {
+            let mut clean = std::process::Command::new("cargo");
+            clean.arg("clean").arg("-p").arg(name);
+            if let Some(m) = manifest_arg {
+                clean.arg("--manifest-path").arg(m);
+            }
+            let out = clean
+                .arg("--target-dir")
+                .arg(cache_dir)
+                .current_dir(worktree)
+                .quiet()
+                .output()
+                .with_context(|| format!("cargo clean -p {name}"))?;
+            if !out.status.success() {
+                // A failure here — a Windows test executable still holding its
+                // own file open is the case the evidence log records — means the
+                // stale artifact this was meant to remove may still be sitting
+                // in `cache_dir`. Collecting it rather than only warning is what
+                // lets `ensure_fresh` refuse to record the new identity: the
+                // next reuse must not be told this cache is confirmed to match
+                // `identity` when a piece of the *previous* one could not be
+                // proven gone.
+                failed.push(format!(
+                    "{name}: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+        }
+        for n in names {
+            if !all.contains(&n) {
+                all.push(n);
+            }
         }
     }
     if !failed.is_empty() {
@@ -731,7 +845,7 @@ fn refresh_stale_packages(worktree: &Path, cache_dir: &Path) -> Result<Vec<Strin
             failed.join("; ")
         );
     }
-    Ok(names)
+    Ok(Some(all))
 }
 
 /// What cargo itself writes into a target directory it creates.
@@ -778,7 +892,12 @@ fn restore_cachedir_tag(cache_dir: &Path) -> Result<bool> {
 /// Called with the lease already held: this is a mutation of the cache
 /// directory's contents, and it must never race a concurrent build the same
 /// way a plain `cargo clean` run by hand would not.
-pub fn ensure_fresh(home: &Path, cache_dir: &Path, identity: &Identity) -> Result<()> {
+pub fn ensure_fresh(
+    home: &Path,
+    cache_dir: &Path,
+    identity: &Identity,
+    manifests: &[PathBuf],
+) -> Result<()> {
     match restore_cachedir_tag(cache_dir) {
         Ok(true) => tracing::info!(
             cache = %cache_dir.display(),
@@ -789,12 +908,26 @@ pub fn ensure_fresh(home: &Path, cache_dir: &Path, identity: &Identity) -> Resul
         Err(e) => tracing::warn!(error = %e, "build cache: could not restore CACHEDIR.TAG"),
     }
     if needs_refresh(home, cache_dir, identity) {
-        let cleaned = refresh_stale_packages(&PathBuf::from(&identity.worktree), cache_dir)?;
-        tracing::info!(
-            ?cleaned,
-            cache = %cache_dir.display(),
-            "build cache: source identity changed; cleaned the workspace's own packages before reuse"
-        );
+        let worktree = PathBuf::from(&identity.worktree);
+        match refresh_stale_packages(&worktree, cache_dir, manifests)? {
+            Some(cleaned) => tracing::info!(
+                ?cleaned,
+                cache = %cache_dir.display(),
+                "build cache: source identity changed; cleaned the workspace's own packages before reuse"
+            ),
+            None => {
+                // No Cargo.toml at the root and none named by a verify
+                // command: there is nothing to clean by name, and a crate
+                // we could not locate may have left stale output behind, so
+                // the identity is not vouched for either.
+                tracing::warn!(
+                    cache = %cache_dir.display(),
+                    "build cache: no Cargo manifest found for the freshness check; skipping the package clean"
+                );
+                invalidate_identity(home, cache_dir);
+                return Ok(());
+            }
+        }
     }
     record_identity(home, cache_dir, identity)
 }
@@ -1210,5 +1343,86 @@ mod tests {
                 AcquireOutcome::Busy(b) => panic!("expected Acquired, got Busy({b:?})"),
             }
         }
+    }
+
+    fn cmds(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn manifest_paths_are_read_in_every_spelling() {
+        let got = extract_manifest_paths(&cmds(&[
+            "cargo test --manifest-path tools/a/Cargo.toml",
+            "cargo build --manifest-path=tools/b/Cargo.toml --release",
+            "cargo fmt --manifest-path 'q q/Cargo.toml'",
+            "cargo clippy --manifest-path \"d/Cargo.toml\" && cargo test --manifest-path tools/a/Cargo.toml",
+        ]));
+        let want: Vec<PathBuf> = [
+            "tools/a/Cargo.toml",
+            "tools/b/Cargo.toml",
+            "q q/Cargo.toml",
+            "d/Cargo.toml",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(got, want);
+        assert!(extract_manifest_paths(&cmds(&["cargo test", "cd x && cargo test"])).is_empty());
+    }
+
+    #[test]
+    fn plan_targets_covers_blog_root_both_and_none() {
+        let w = Path::new("/w");
+        let only = |set: &'static [&'static str]| {
+            move |p: &Path| Ok(set.iter().any(|s| p == Path::new(s)))
+        };
+        let m = vec![PathBuf::from("tools/postprocess/Cargo.toml")];
+        let blog = plan_targets(w, &m, only(&["/w/tools/postprocess/Cargo.toml"])).unwrap();
+        assert_eq!(
+            blog,
+            vec![Target::Manifest(PathBuf::from(
+                "/w/tools/postprocess/Cargo.toml"
+            ))]
+        );
+        let root = plan_targets(w, &[], only(&["/w/Cargo.toml"])).unwrap();
+        assert_eq!(root, vec![Target::Root]);
+        let both = plan_targets(
+            w,
+            &m,
+            only(&["/w/Cargo.toml", "/w/tools/postprocess/Cargo.toml"]),
+        )
+        .unwrap();
+        assert_eq!(both.len(), 2);
+        assert_eq!(both[0], Target::Root);
+        assert!(plan_targets(w, &m, only(&[])).unwrap().is_empty());
+        assert!(plan_targets(w, &[], only(&[])).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_repo_without_a_reachable_manifest_passes_untouched() {
+        let home = tempfile::TempDir::new().expect("temp");
+        let wt = tempfile::TempDir::new().expect("temp");
+        // Only a nested crate, which no verify command names.
+        std::fs::create_dir_all(wt.path().join("sub")).unwrap();
+        std::fs::write(wt.path().join("sub/Cargo.toml"), "").unwrap();
+        let cache = home.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("artifact"), "x").unwrap();
+        let old = Identity {
+            worktree: "/w/old".to_owned(),
+            head: "old".to_owned(),
+        };
+        record_identity(home.path(), &cache, &old).unwrap();
+        let id = Identity::new(wt.path(), "head");
+        ensure_fresh(home.path(), &cache, &id, &[]).expect("must not fail");
+        assert_eq!(
+            std::fs::read_to_string(cache.join("artifact")).unwrap(),
+            "x"
+        );
+        assert!(
+            needs_refresh(home.path(), &cache, &old),
+            "identity was invalidated, not recorded"
+        );
+        assert!(needs_refresh(home.path(), &cache, &id));
     }
 }

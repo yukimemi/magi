@@ -676,6 +676,13 @@ impl Verify {
             .chain(self.gate.iter())
             .find_map(|cmd| crate::disk::extract_cargo_target_dir(cmd))
     }
+
+    /// Every `--manifest-path` the e2e and gate commands pass to cargo, for the
+    /// shared cache's freshness check in repositories with no root manifest.
+    pub fn cargo_manifests(&self) -> Vec<PathBuf> {
+        let all: Vec<String> = self.e2e.iter().chain(self.gate.iter()).cloned().collect();
+        crate::cache::extract_manifest_paths(&all)
+    }
 }
 
 /// Per-repository worktree preparation, run right after magi creates a worktree.

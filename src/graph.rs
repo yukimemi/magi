@@ -8013,7 +8013,12 @@ where
         }
     };
     let identity = crate::cache::Identity::new(worktree, head);
-    if let Err(e) = crate::cache::ensure_fresh(&home, cache_dir, &identity) {
+    if let Err(e) = crate::cache::ensure_fresh(
+        &home,
+        cache_dir,
+        &identity,
+        &state.config.verify.cargo_manifests(),
+    ) {
         // A failed freshness check means this process cannot vouch for what
         // is sitting in the cache right now - on Windows this is exactly the
         // "a stale test executable is still locked, `cargo clean -p` cannot
