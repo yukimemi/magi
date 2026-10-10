@@ -76,6 +76,11 @@ pub struct Job {
     pub finished: bool,
     /// What each step that ran said, in order.
     pub log: Vec<StepLog>,
+    /// Other versions the pull request itself names (its title, which an
+    /// escalation rewrites while the branch keeps its first name). The merge
+    /// commit's manifest may replace `version` with one of these, never with
+    /// anything else.
+    pub accepted: Vec<String>,
 }
 
 impl Job {
@@ -105,6 +110,41 @@ impl Job {
         self.failed = None;
         self.running = None;
     }
+}
+
+/// Start of the message [`drive`] fails with when the manifest at the merge
+/// commit disagrees with the job; the watcher recognises a recoverable record
+/// by it.
+pub const VERSION_MISMATCH_PREFIX: &str = "Cargo.toml at the merge commit says ";
+
+/// `1.2.3` out of a title such as `chore: release v1.2.3 (minor bump)`.
+pub fn version_from_title(title: &str) -> Option<String> {
+    let rest = title.split_once("release v")?.1;
+    let v: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
+    (!v.is_empty()).then_some(v)
+}
+
+/// The manifest's version is the truth, but only a version the pull request
+/// named (branch or title) may replace the job's, and only before anything has
+/// been tagged or run. Anything else stays a mismatch. Pure.
+pub fn reconcile_version(manifest: &str, job: &mut Job) -> bool {
+    if manifest == job.version {
+        return true;
+    }
+    if job.tag_done || job.done > 0 || !job.accepted.iter().any(|a| a == manifest) {
+        return false;
+    }
+    job.log.push(StepLog {
+        name: "version".to_owned(),
+        code: Some(0),
+        tail: format!(
+            "the release is {manifest} (the manifest), not {} (the branch name)",
+            job.version
+        ),
+        output: None,
+    });
+    job.version = manifest.to_owned();
+    true
 }
 
 /// `1.2.3` out of `chore/release-v1.2.3`.
@@ -278,10 +318,16 @@ async fn drive(env: &Env<'_>, dir: &Path, wt: &Path, job: &mut Job, save: Save<'
         }
     }
     if let Ok(toml) = std::fs::read_to_string(wt.join("Cargo.toml")) {
+        let before = job.version.clone();
         match crate::bump::current_version(&toml) {
-            Ok(v) if v == job.version => {}
+            Ok(v) if reconcile_version(&v, job) => {
+                // Record an adopted version before anything is tagged.
+                if job.version != before && !save(job) {
+                    bail!("could not record progress; nothing was run");
+                }
+            }
             Ok(v) => bail!(
-                "Cargo.toml at the merge commit says {v}, but the release is {}; not tagging",
+                "{VERSION_MISMATCH_PREFIX}{v}, but the release is {}; not tagging",
                 job.version
             ),
             Err(e) => bail!("cannot read the version at the merge commit: {e:#}"),
@@ -727,6 +773,51 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not tagging"), "{err}");
+        assert_eq!(g(&f.remote, &["tag", "-l"]), "");
+    }
+
+    #[test]
+    fn the_title_names_the_escalated_version() {
+        assert_eq!(
+            version_from_title("chore: release v0.2.0 (minor bump)").as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(version_from_title("feat: x"), None);
+    }
+
+    #[test]
+    fn only_a_version_the_pull_request_named_replaces_the_job_version() {
+        let mut job = Job::new("1.0.0", "u", "c");
+        job.accepted = vec!["2.0.0".to_owned()];
+        assert!(!reconcile_version("3.0.0", &mut job));
+        assert_eq!(job.version, "1.0.0");
+        job.tag_done = true;
+        assert!(!reconcile_version("2.0.0", &mut job));
+        job.tag_done = false;
+        assert!(reconcile_version("2.0.0", &mut job));
+        assert_eq!(job.version, "2.0.0");
+    }
+
+    #[tokio::test]
+    async fn an_escalated_version_named_by_the_title_is_tagged() {
+        let f = fixture();
+        let mut job = Job::new("0.9.0", "u", &f.commit);
+        job.accepted = vec!["1.0.0".to_owned()];
+        go(&f, &release(&[]), &mut job).await.unwrap();
+        assert_eq!(job.version, "1.0.0");
+        assert_eq!(g(&f.remote, &["tag", "-l"]), "v1.0.0");
+    }
+
+    #[tokio::test]
+    async fn a_manifest_matching_no_candidate_is_not_tagged() {
+        let f = fixture();
+        let mut job = Job::new("0.9.0", "u", &f.commit);
+        job.accepted = vec!["0.8.0".to_owned()];
+        let err = go(&f, &release(&[]), &mut job)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with(VERSION_MISMATCH_PREFIX), "{err}");
         assert_eq!(g(&f.remote, &["tag", "-l"]), "");
     }
 }
