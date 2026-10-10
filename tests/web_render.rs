@@ -2003,6 +2003,11 @@ async fn chat_selector_chips_stay_reachable_with_a_long_transcript() {
             .unwrap_or_else(|e| panic!("{tag}: eval: {e}"));
         assert_eq!(got["inHead"], 0, "{tag}: selector left in the head {got}");
         for c in got["chips"].as_array().expect("chips") {
+            // The agent chip is hidden while no agent is installed (a CI
+            // runner has none); persona and implementers are always shown.
+            if c["id"] == "talk-agent-box" && c["visible"] == false {
+                continue;
+            }
             assert_eq!(c["visible"], true, "{tag}: {c}");
             assert!(
                 c["h"].as_f64().unwrap_or(0.0) >= 44.0,
