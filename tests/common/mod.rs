@@ -66,12 +66,21 @@ static SLOTS: LazyLock<(std::sync::Mutex<usize>, std::sync::Condvar)> = LazyLock
 /// The parent insists the child reported `1 passed`: a name that drifts from
 /// what libtest filters on would otherwise run zero tests and pass. Concurrency
 /// is capped (half the CPUs) so load alone cannot trip a node timeout.
+///
+/// Under `cargo nextest` (`NEXTEST_EXECUTION_MODE=process-per-test`) the body
+/// runs directly: the process is already the test's own, and the cap lives in
+/// `.config/nextest.toml` as a test group.
 pub fn isolated<F, Fut>(name: &str, body: F)
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    if std::env::var_os(CHILD_ENV).is_some() {
+    // Under `cargo nextest` every test already owns a process (and so its own
+    // `set_home` OnceLock), so re-executing would only pay start-up twice.
+    // Only the exact mode nextest documents counts; anything else re-executes.
+    let own_process = std::env::var_os(CHILD_ENV).is_some()
+        || std::env::var("NEXTEST_EXECUTION_MODE").is_ok_and(|m| m == "process-per-test");
+    if own_process {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

@@ -66,7 +66,13 @@ jobs:
       # --doc` errors with `no library targets found` on bin-only
       # crates (yukimemi/todoke#50, yukimemi/rvpm#176 track the
       # consumer-side refactor). Drop this `if:` once both land.
-      - run: cargo test --all-targets
+      # nextest runs one process per test across all binaries at once;
+      # `cargo test` ran the ~40 test binaries one after another, which
+      # dominated the Windows job. Config: .config/nextest.toml.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: cargo nextest run --all-targets --profile ci
       - if: ${{ hashFiles('src/lib.rs') != '' }}
         run: cargo test --doc
 

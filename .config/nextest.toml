@@ -1,0 +1,30 @@
+# Used by the `test` job in .github/workflows/ci.yml (`--profile ci`).
+# `cargo make check` keeps running plain `cargo test`; nextest only changes
+# how the same tests are scheduled (one process per test, binaries in parallel).
+
+[profile.default]
+# Flakes must show, not be retried away.
+retries = 0
+
+[profile.ci]
+retries = 0
+fail-fast = false
+
+[profile.ci.junit]
+path = "junit.xml"
+
+# `tests/common::isolated` used to cap concurrent children at half the CPUs
+# per binary. Under nextest every test is its own process and binaries overlap,
+# so the cap has to be expressed here, or end-to-end scenes (each spawning git,
+# and a mock agent) pile up and trip node timeouts.
+[test-groups]
+e2e = { max-threads = 3 }
+chrome = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = "binary(web_render)"
+test-group = "chrome"
+
+[[profile.default.overrides]]
+filter = "kind(test) & not binary(web_render) & not binary(cli_help_color)"
+test-group = "e2e"
