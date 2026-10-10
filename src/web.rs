@@ -13000,7 +13000,11 @@ mod tests {
 
         // The route -> panes table, and a narrow screen opting out of it.
         assert!(APP_JS.contains("function splitPanes(route, wide) {\n  if (!wide) return null;"));
-        assert!(APP_JS.contains("case \"run\": return { list: route.list || \"runs\", detail: \"run\" };"));
+        assert!(
+            APP_JS.contains(
+                "case \"run\": return { list: route.list || \"runs\", detail: \"run\" };"
+            )
+        );
         assert!(APP_JS.contains("case \"task\": return { list: \"queue\", detail: \"task\" };"));
         assert!(APP_JS.contains("case \"talk\": return { list: \"talks\", detail: \"talk\" };"));
         assert!(INDEX_HTML.contains("id=\"split-empty\""));
