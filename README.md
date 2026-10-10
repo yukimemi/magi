@@ -27,6 +27,11 @@ of reviewing fixes. Review a bad design carefully and you get a well-polished
 bad design. So magi does not review one implementation — it holds an election
 between several, and only then reviews.
 
+<p align="center"><img src="assets/flow.svg" width="760" alt="magi flow: the queue loop (conductor), one competition from prep to land, and the standing chat / release bump"></p>
+
+<details>
+<summary>Mermaid source (for editing; keep <code>assets/flow.svg</code> in sync)</summary>
+
 ```mermaid
 flowchart TD
   subgraph Q["queue loop — `magi serve` (outside any one run)"]
@@ -63,6 +68,8 @@ flowchart TD
     chatter["chatter ×1 per turn\n[roles] chatter"]
   end
 ```
+
+</details>
 
 Every box above that spawns an agent has a `[roles]` field to pin it to a
 specific one:
