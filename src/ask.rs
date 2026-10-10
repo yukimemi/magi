@@ -2908,6 +2908,43 @@ mod tests {
     }
 
     #[test]
+    fn posting_the_original_text_needs_an_unhedged_verbatim_quote() {
+        use crate::github_text::{POST_ORIGINAL, USE_FALLBACK};
+        let mk = || {
+            let mut q = Question::new(
+                "run".into(),
+                crate::github_text::ASK_NODE.into(),
+                crate::github_text::ASK_SEAT.into(),
+                "s".into(),
+                String::new(),
+                vec![USE_FALLBACK.into(), POST_ORIGINAL.into()],
+            );
+            let mut dep = Deputy::new("brief".into());
+            dep.seat = Some(crate::agent::SeatState::new("deputy-x", "alpha", 1));
+            q.deputy = Some(dep);
+            q
+        };
+        let mut hedged = mk();
+        hedged.say("Post the original, maybe?").unwrap();
+        assert!(
+            hedged
+                .settle_by_deputy("deputy-x", POST_ORIGINAL, "Post the original", None)
+                .is_err()
+        );
+        let mut clear = mk();
+        clear.say("Post the original text as it is.").unwrap();
+        clear
+            .settle_by_deputy("deputy-x", POST_ORIGINAL, "Post the original text", None)
+            .unwrap();
+        assert_eq!(clear.resolution().as_deref(), Some(POST_ORIGINAL));
+        // The changed text is the safe default: no extra guard beyond the quote.
+        let mut safe = mk();
+        safe.say("use the fallback").unwrap();
+        safe.settle_by_deputy("deputy-x", USE_FALLBACK, "use the fallback", None)
+            .unwrap();
+    }
+
+    #[test]
     fn a_local_release_approval_is_held_to_the_merge_rules_but_an_escalation_is_not() {
         let mk = |choices: Vec<String>| {
             let mut q = Question::new(

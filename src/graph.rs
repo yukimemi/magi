@@ -48,10 +48,10 @@ use crate::refs;
 use crate::run::{
     BaseSync, Candidate, CommandOutcome, ContinuationOutcome, ContinuationRecord,
     DeliberationRound, DeliberationTurn, E2eStatus, FailClass, FixRecord, GateFixRecord,
-    GraftOutcome, GraftRecord, Handover, JobRecord, JobStatus, Judgement, MergeOutcome,
-    OperatorFixFinding, OperatorFixOutcome, OperatorFixRequest, Origin, QuotaLoss, ReviewRecord,
-    ReviewRevoteRecord, ReviewRound, RunState, RunStatus, SeatHistory, Tally, VoteRecord, tail,
-    write_artifact,
+    GithubTextChoice, GraftOutcome, GraftRecord, Handover, JobRecord, JobStatus, Judgement,
+    MergeOutcome, OperatorFixFinding, OperatorFixOutcome, OperatorFixRequest, Origin, QuotaLoss,
+    ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, SeatHistory, Tally,
+    VoteRecord, tail, write_artifact,
 };
 use crate::verdict::{
     self, FinalVote, Finding, FixReport, Position, Proposal, Ranking, Review, ReviewRevote,
@@ -6481,6 +6481,7 @@ impl Runner {
                         asks: 0,
                         resolved: false,
                         chosen_title: None,
+                        choice: None,
                     };
                     return self.settle_withheld(winner, &pr, record).await;
                 }
@@ -6537,17 +6538,18 @@ impl Runner {
                     .ok()
                     .map(|(q, ())| q);
             }
-            let mut ask_again: Option<(Vec<String>, Option<String>)> = None;
+            let mut ask_again: Option<Option<Vec<String>>> = None;
             match standing {
                 // Recorded but never written (a stop between the two saves),
                 // or removed: ask again without spending the retry.
                 None if g.asks <= 1 => {
                     g.asks = 0;
-                    ask_again = Some((g.categories.clone(), None));
+                    ask_again = Some(None);
                 }
                 None => {
                     g.resolved = true;
                     g.chosen_title = None;
+                    g.choice = Some(GithubTextChoice::Fallback);
                 }
                 Some(q) if q.status.open() => {
                     self.park_on_github_text(&g)?;
@@ -6557,6 +6559,12 @@ impl Runner {
                     gt::Reply::Fallback => {
                         g.resolved = true;
                         g.chosen_title = None;
+                        g.choice = Some(GithubTextChoice::Fallback);
+                    }
+                    gt::Reply::Original => {
+                        g.resolved = true;
+                        g.chosen_title = None;
+                        g.choice = Some(GithubTextChoice::Original);
                     }
                     gt::Reply::Title(text) => {
                         let first = text
@@ -6577,40 +6585,36 @@ impl Runner {
                             Ok(title) => {
                                 g.resolved = true;
                                 g.chosen_title = Some(title);
+                                g.choice = Some(GithubTextChoice::MyTitle);
                             }
                             Err(cats) if g.asks < 2 => {
-                                ask_again = Some((
-                                    cats.into_iter().map(str::to_owned).collect(),
-                                    Some(first.to_owned()),
+                                ask_again = Some(Some(
+                                    cats.into_iter().map(str::to_owned).collect::<Vec<_>>(),
                                 ))
                             }
                             Err(_) => {
                                 g.resolved = true;
                                 g.chosen_title = None;
+                                g.choice = Some(GithubTextChoice::Fallback);
                             }
                         }
                     }
                 },
             }
-            if let Some((categories, replacement)) = ask_again {
-                let retry = replacement.is_some();
-                // After a retry the question is about the owner's rejected
-                // replacement title, not the original message.
-                let (shown_title, shown_body) = match replacement.as_deref() {
-                    Some(t) => (t, ""),
-                    None => (pr.title.as_str(), pr.body.as_str()),
-                };
+            if let Some(rejected) = ask_again {
+                // A retry (after a rejected replacement title) is still about
+                // the original text: the same ORIGINAL / CHANGED comparison.
                 let w = gt::Withheld {
-                    title: g.title || retry,
-                    body: g.body && !retry,
-                    categories,
+                    title: g.title,
+                    body: g.body,
+                    categories: g.categories.clone(),
                 };
-                // Named by the shown text's fingerprint alone, so a resume rewrites
-                // the same file and the detail stays identical.
+                // Named by the original text's fingerprint alone, so a resume
+                // rewrites the same file and the detail stays identical.
                 let artifact = match crate::run::write_artifact(
                     &self.state,
-                    &gt::artifact_name(&gt::fingerprint(shown_title, shown_body)),
-                    &gt::artifact_text(shown_title, shown_body),
+                    &gt::artifact_name(&gt::fingerprint(&pr.title, &pr.body)),
+                    &gt::artifact_text(&w, &pr.title, &pr.body, &self.state.id),
                 ) {
                     Ok(p) => Some(p),
                     Err(e) => {
@@ -6623,7 +6627,14 @@ impl Runner {
                     gt::ASK_NODE.to_owned(),
                     gt::ASK_SEAT.to_owned(),
                     gt::question_summary(&self.state.config.graph.language, &w),
-                    gt::question_detail(&w, shown_title, shown_body, retry, artifact.as_deref()),
+                    gt::question_detail(
+                        &w,
+                        &pr.title,
+                        &pr.body,
+                        &self.state.id,
+                        rejected.as_deref(),
+                        artifact.as_deref(),
+                    ),
                     gt::question_choices(&w),
                 );
                 q.answer_timeout = timeout;
@@ -6651,36 +6662,53 @@ impl Runner {
             }
         }
         let resolved = g.chosen_title.clone();
+        let original = g.choice == Some(GithubTextChoice::Original);
+        // Field names only: the event log never records the text.
         self.state.event(
             "github-text",
-            if resolved.is_some() {
-                "posting the owner's replacement title"
+            if original {
+                format!(
+                    "posting the original text for: {}",
+                    match (g.title, g.body) {
+                        (true, true) => "title, description",
+                        (true, false) => "title",
+                        _ => "description",
+                    }
+                )
+            } else if resolved.is_some() {
+                "posting the owner's replacement title".to_owned()
             } else {
-                "posting the neutral text for the withheld fields"
+                "posting the neutral text for the withheld fields".to_owned()
             },
         );
         self.state.github_text = Some(g.clone());
         self.state.save()?;
-        // A field withheld only for sensitive data keeps its text; `prepare_with`
-        // below redacts it in place.
-        let neutral = |cat: &str| g.categories.iter().any(|c| c == cat);
-        let title = match (g.title, resolved) {
-            (true, Some(t)) => t,
-            (true, None) if neutral("title-language") => gt::NEUTRAL_TITLE.to_owned(),
-            _ => pr.title.clone(),
+        let w = gt::Withheld {
+            title: g.title,
+            body: g.body,
+            categories: g.categories.clone(),
         };
-        let body = if g.body && neutral("body-language") {
-            format!("{}\n\nmagi:run/{}", gt::NEUTRAL_BODY, self.state.id)
-        } else {
-            pr.body.clone()
-        };
+        let (mut title, body) = gt::fallback_text(&w, &pr.title, &pr.body, &self.state.id);
+        if let Some(t) = resolved {
+            title = t;
+        }
         // Every withheld field is now neutral or vetted English.
         let english = gt::LanguageDecision {
             title_english: true,
             body_english: true,
             body_complete: true,
         };
-        let (title, body) = gt::prepare_with(&mut self.state, &title, &body, Some(english));
+        let (mut title, mut body) = gt::prepare_with(&mut self.state, &title, &body, Some(english));
+        if original {
+            // The owner's explicit choice overrides the gate for the fields it
+            // was made for; the others keep what the gate produced.
+            if g.title {
+                title = pr.title.clone();
+            }
+            if g.body {
+                body = pr.body.clone();
+            }
+        }
         Ok(Some(PrMessage { title, body }))
     }
 
@@ -6890,13 +6918,28 @@ impl Runner {
                                     || leaked
                                         .as_deref()
                                         .is_some_and(|l| should_retitle(&title, &pr.title, l)))
-                                && let Err(e) = land::set_pr_title(
-                                    &mut self.state,
-                                    &winner.worktree,
-                                    &url,
-                                    &pr.title,
-                                )
-                                .await
+                                && let Err(e) =
+                                    if self.state.github_text.as_ref().is_some_and(|g| {
+                                        g.resolved
+                                            && g.title
+                                            && g.choice == Some(GithubTextChoice::Original)
+                                    }) {
+                                        // The owner chose to post the original title.
+                                        land::set_pr_title_verbatim(
+                                            &winner.worktree,
+                                            &url,
+                                            &pr.title,
+                                        )
+                                        .await
+                                    } else {
+                                        land::set_pr_title(
+                                            &mut self.state,
+                                            &winner.worktree,
+                                            &url,
+                                            &pr.title,
+                                        )
+                                        .await
+                                    }
                             {
                                 tracing::warn!("could not refresh title of {url}: {e:#}");
                                 self.state

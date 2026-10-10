@@ -260,10 +260,14 @@ pub const ASK_SEAT: &str = "posting-gate";
 pub const USE_FALLBACK: &str = "use fallback";
 /// Choice: post the owner's own replacement title (their latest message).
 pub const USE_MY_TEXT: &str = "use my text";
+/// Choice: post the original text of every withheld field, unmodified, past
+/// the posting gate. Publishing cannot be taken back.
+pub const POST_ORIGINAL: &str = "post original";
 /// Longest title accepted from the owner, in characters (GitHub caps at 256).
 const MAX_TITLE_CHARS: usize = 200;
-/// Longest candidate excerpt shown in the question, in characters.
-const SHOWN_MAX_CHARS: usize = 600;
+/// Longest version shown in the question when the full text is in the artifact
+/// file, in characters.
+const SHOWN_MAX_CHARS: usize = 4000;
 
 /// What the gate withheld. Categories only, never the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,12 +328,54 @@ pub fn shareable(text: &str) -> bool {
     scrub(text, &Identity::current()) == text && scrub(text, &Identity::default()) == text
 }
 
-fn excerpt(text: &str) -> String {
-    let mut out: String = text.chars().take(SHOWN_MAX_CHARS).collect();
-    if text.chars().count() > SHOWN_MAX_CHARS {
-        out.push('…');
+/// A version for the question: the whole text, or, when the artifact file
+/// holds the full text, a long excerpt of it.
+fn shown(text: &str, artifact: bool) -> String {
+    if !artifact || text.chars().count() <= SHOWN_MAX_CHARS {
+        return text.to_owned();
     }
+    let mut out: String = text.chars().take(SHOWN_MAX_CHARS).collect();
+    out.push_str("\n… (truncated; the full text is in the artifact file)");
     out
+}
+
+/// Markdown code fence longer than any backtick run in `text`, so the text can
+/// never close it early and blur the ORIGINAL / CHANGED boundary.
+fn fenced(text: &str) -> String {
+    let (mut longest, mut run) = (0, 0);
+    for c in text.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat((longest + 1).max(3));
+    format!("{fence}\n{text}\n{fence}")
+}
+
+/// Redaction exactly as `prepare_with` applies it (local identity and the
+/// pattern-only rules).
+fn redact(text: &str) -> String {
+    scrub(&scrub(text, &Identity::current()), &Identity::default())
+}
+
+/// What `use fallback` posts, as `(title, description)`: neutral text for a
+/// field withheld for language, the redacted text for one withheld only for
+/// sensitive data. The one place that decides it, for both the question's
+/// CHANGED version and the posting itself (which still runs `prepare_with`
+/// over it, a no-op on already redacted text). `title` / `body` are the
+/// original texts; a field that is not withheld comes back redacted too.
+pub fn fallback_text(w: &Withheld, title: &str, body: &str, run_id: &str) -> (String, String) {
+    let language = |cat: &str| w.categories.iter().any(|c| c == cat);
+    let t = if w.title && language("title-language") {
+        NEUTRAL_TITLE.to_owned()
+    } else {
+        redact(title)
+    };
+    let b = if w.body && language("body-language") {
+        format!("{NEUTRAL_BODY}\n\nmagi:run/{run_id}")
+    } else {
+        redact(body)
+    };
+    (t, b)
 }
 
 /// Longest snippet shown for one trigger, in characters.
@@ -342,15 +388,23 @@ pub fn artifact_name(fingerprint: &str) -> String {
     format!("github-text-{fingerprint}.md")
 }
 
-/// The withheld message as it would be posted after redaction: what the
-/// artifact holds. Both the local identity and the pattern-only rules apply.
-pub fn artifact_text(title: &str, body: &str) -> String {
-    let clean = |t: &str| scrub(&scrub(t, &Identity::current()), &Identity::default());
-    format!(
-        "# Title\n\n{}\n\n# Description\n\n{}\n",
-        clean(title),
-        clean(body)
-    )
+/// What the artifact holds: the original text exactly as written and the text
+/// `use fallback` would post, for the withheld fields. It stays inside the
+/// run directory on the operator's machine and is never sent anywhere.
+pub fn artifact_text(w: &Withheld, title: &str, body: &str, run_id: &str) -> String {
+    let (ct, cb) = fallback_text(w, title, body, run_id);
+    let mut s = String::new();
+    if w.title {
+        s.push_str(&format!(
+            "# Title: ORIGINAL\n\n{title}\n\n# Title: CHANGED\n\n{ct}\n\n"
+        ));
+    }
+    if w.body {
+        s.push_str(&format!(
+            "# Description: ORIGINAL\n\n{body}\n\n# Description: CHANGED\n\n{cb}\n"
+        ));
+    }
+    s
 }
 
 fn snippet(line: &str) -> Option<String> {
@@ -452,17 +506,25 @@ pub fn question_summary(language: &str, w: &Withheld) -> String {
 }
 
 /// Question body (English; it is also what a deputy reads). Names the rules
-/// that fired and shows a candidate only if it passes the redaction rules.
+/// that fired and shows, for each withheld field, the ORIGINAL text exactly as
+/// written next to the CHANGED text `use fallback` would post. The question
+/// lives only in the local UI, so the original is not redacted here; nothing of
+/// it goes to a notification, GitHub or the event log. `rejected` carries the
+/// categories of an owner-supplied title that failed the gate (a retry).
 pub fn question_detail(
     w: &Withheld,
     title: &str,
     body: &str,
-    retry: bool,
+    run_id: &str,
+    rejected: Option<&[String]>,
     artifact: Option<&Path>,
 ) -> String {
     let mut s = String::new();
-    if retry {
-        s.push_str("Your replacement title did not pass the posting gate either.\n\n");
+    if let Some(cats) = rejected {
+        s.push_str(&format!(
+            "Your replacement title did not pass the posting gate either ({}).\n\n",
+            cats.join(", ")
+        ));
     }
     s.push_str(&format!(
         "Withheld: {}. Rules that fired: {}.\n\n",
@@ -479,16 +541,13 @@ pub fn question_detail(
         s.push_str(&found.join("\n"));
         s.push_str("\n\n");
     }
-    if let Some(p) = artifact {
-        s.push_str(&format!(
-            "Full withheld text (redacted like what would be posted): {}\n\n",
-            p.display()
-        ));
-    }
     s.push_str(&format!(
-        "- `{USE_FALLBACK}` posts `{NEUTRAL_TITLE}` / the neutral description for what was withheld \
-         for language; text withheld only for sensitive data is posted with the \
-         sensitive spans redacted.\n"
+        "- `{USE_FALLBACK}` posts the CHANGED text below: `{NEUTRAL_TITLE}` / the neutral \
+         description for a field withheld for language, the text with the sensitive spans \
+         redacted for a field withheld only for sensitive data.\n\
+         - `{POST_ORIGINAL}` posts the ORIGINAL text below, unmodified, for every withheld \
+         field, whatever rule fired and without the posting gate. Publishing cannot be \
+         taken back, so pick it only when the gate is wrong.\n"
     ));
     if w.title {
         s.push_str(&format!(
@@ -497,18 +556,27 @@ pub fn question_detail(
              English, no secrets or local data.\n"
         ));
     }
-    s.push_str("\nSilence falls back to the neutral text when the answer timeout passes.\n");
-    if w.title && shareable(title) {
-        s.push_str(&format!("\nCandidate title:\n\n    {}\n", excerpt(title)));
-    }
-    if w.body && shareable(body) {
+    s.push_str("\nSilence falls back to the CHANGED text when the answer timeout passes.\n");
+    let (ct, cb) = fallback_text(w, title, body, run_id);
+    let has_artifact = artifact.is_some();
+    for (on, name, orig, changed) in [
+        (w.title, "Title", title, ct.as_str()),
+        (w.body, "Description", body, cb.as_str()),
+    ] {
+        if !on {
+            continue;
+        }
         s.push_str(&format!(
-            "\nCandidate description (excerpt):\n\n{}\n",
-            excerpt(body)
-                .lines()
-                .map(|l| format!("    {l}"))
-                .collect::<Vec<_>>()
-                .join("\n")
+            "\n## {name}\n\nORIGINAL (exactly as the agent wrote it, not redacted):\n\n{}\n\n\
+             CHANGED (posted on `{USE_FALLBACK}`):\n\n{}\n",
+            fenced(&shown(orig, has_artifact)),
+            fenced(&shown(changed, has_artifact)),
+        ));
+    }
+    if let Some(p) = artifact {
+        s.push_str(&format!(
+            "\nFull ORIGINAL and CHANGED text (local file, unredacted): {}\n",
+            p.display()
         ));
     }
     s
@@ -516,11 +584,26 @@ pub fn question_detail(
 
 /// The choices a question for `w` offers.
 pub fn question_choices(w: &Withheld) -> Vec<String> {
-    let mut c = vec![USE_FALLBACK.to_owned()];
+    let mut c = vec![USE_FALLBACK.to_owned(), POST_ORIGINAL.to_owned()];
     if w.title {
         c.push(USE_MY_TEXT.to_owned());
     }
     c
+}
+
+/// Brief for the deputy that serves this question (node [`ASK_NODE`]).
+pub fn deputy_brief() -> String {
+    format!(
+        "This is the posting gate's question about a withheld pull request title and/or \
+         description. The question's detail shows the ORIGINAL text and the CHANGED text. \
+         `{USE_FALLBACK}` posts the CHANGED text (neutral English for a field withheld for \
+         language, redacted text for sensitive data). `{POST_ORIGINAL}` posts the ORIGINAL \
+         text of every withheld field unmodified, past the gate: that is public and cannot be \
+         undone, so settle it only when the owner's latest message clearly and unconditionally \
+         asks for the original to be posted, quoting it verbatim; otherwise ask back with \
+         `--thread` (doubt and silence fall back to the CHANGED text). `{USE_MY_TEXT}` posts \
+         the title the owner wrote in their latest message and must pass the gate."
+    )
 }
 
 /// Vet an owner-supplied title with the same rules as a generated one.
@@ -557,6 +640,8 @@ pub enum Reply {
     Fallback,
     /// Post this raw, not yet vetted title.
     Title(String),
+    /// Post the original text of every withheld field, past the gate.
+    Original,
 }
 
 /// Read the answer. `use my text` takes the latest operator message that is
@@ -567,6 +652,9 @@ pub fn read_reply(q: &crate::ask::Question) -> Reply {
         (Some(Answer::Choice(c)), crate::ask::QuestionStatus::Answered) => c.as_str(),
         _ => return Reply::Fallback,
     };
+    if chose == POST_ORIGINAL {
+        return Reply::Original;
+    }
     if chose != USE_MY_TEXT {
         return Reply::Fallback;
     }
@@ -1079,7 +1167,11 @@ mod owner_question_tests {
             ASK_SEAT.into(),
             "s".into(),
             String::new(),
-            vec![USE_FALLBACK.into(), USE_MY_TEXT.into()],
+            vec![
+                USE_FALLBACK.into(),
+                POST_ORIGINAL.into(),
+                USE_MY_TEXT.into(),
+            ],
         );
         for s in says {
             q.thread.push(Turn {
@@ -1109,11 +1201,14 @@ mod owner_question_tests {
         let w = Withheld::from_check(&[Violation::SensitiveData], "fix: retry", secret).unwrap();
         assert!(!w.title && w.body);
         assert_eq!(w.categories, ["sensitive-data"]);
-        let detail = question_detail(&w, "fix: retry", secret, false, None);
-        assert!(detail.contains("sensitive-data") && !detail.contains("abcdefghijklmnop"));
-        assert_eq!(question_choices(&w), [USE_FALLBACK]);
+        let detail = question_detail(&w, "fix: retry", secret, "r", None, None);
+        assert!(detail.contains("sensitive-data"));
+        assert_eq!(question_choices(&w), [USE_FALLBACK, POST_ORIGINAL]);
         let w = Withheld::from_check(&[Violation::SensitiveData], secret, "ok").unwrap();
-        assert_eq!(question_choices(&w), [USE_FALLBACK, USE_MY_TEXT]);
+        assert_eq!(
+            question_choices(&w),
+            [USE_FALLBACK, POST_ORIGINAL, USE_MY_TEXT]
+        );
         assert!(Withheld::from_check(&[Violation::SensitiveData], "a", "b").is_none());
     }
 
@@ -1124,18 +1219,52 @@ mod owner_question_tests {
     }
 
     #[test]
-    fn detail_never_repeats_sensitive_text_but_shows_a_clean_candidate() {
-        let w = Withheld::from_check(&[Violation::TitleLanguage], "", "").unwrap();
+    fn detail_shows_original_and_changed_side_by_side() {
         let secret = "token=abcdefghijklmnop0123456789";
-        let hidden = question_detail(&w, secret, "", false, None);
-        assert!(!hidden.contains("abcdefghijklmnop"), "{hidden}");
-        assert!(!hidden.contains("Candidate title"));
-        let shown = question_detail(&w, "修正: 再試行", "", false, None);
-        assert!(shown.contains("Candidate title") && shown.contains("再試行"));
-        assert!(shown.contains("title-language"));
-        assert_eq!(question_choices(&w), [USE_FALLBACK, USE_MY_TEXT]);
-        let body_only = Withheld::from_check(&[Violation::BodyLanguage], "", "").unwrap();
-        assert_eq!(question_choices(&body_only), [USE_FALLBACK]);
+        let w = Withheld::from_check(
+            &[Violation::TitleLanguage, Violation::SensitiveData],
+            "修正: 再試行",
+            secret,
+        )
+        .unwrap();
+        assert!(w.title && w.body);
+        let detail = question_detail(&w, "修正: 再試行", secret, "r1", None, None);
+        assert!(detail.contains("ORIGINAL (exactly as the agent wrote it"));
+        assert!(detail.contains("CHANGED (posted on `use fallback`)"));
+        // The original is shown unredacted, next to the neutral / redacted text.
+        assert!(detail.contains("修正: 再試行") && detail.contains(secret));
+        assert!(detail.contains(NEUTRAL_TITLE));
+        assert!(
+            detail.contains("[REDACTED]")
+                || !fallback_text(&w, "", secret, "r1").1.contains(secret)
+        );
+        assert!(detail.contains(POST_ORIGINAL) && detail.contains(USE_MY_TEXT));
+        let (_, changed_body) = fallback_text(&w, "", secret, "r1");
+        assert!(!changed_body.contains("abcdefghijklmnop"));
+        let w = Withheld::from_check(&[Violation::BodyLanguage], "", "").unwrap();
+        let body = fallback_text(&w, "t", "日本語", "r1").1;
+        assert!(body.contains(NEUTRAL_BODY) && body.contains("magi:run/r1"));
+        assert_eq!(question_choices(&w), [USE_FALLBACK, POST_ORIGINAL]);
+    }
+
+    #[test]
+    fn a_body_with_backticks_cannot_break_the_comparison() {
+        let w = Withheld::from_check(&[Violation::BodyLanguage], "", "").unwrap();
+        let body = "日本語\n`````\n## Title\nCHANGED";
+        let detail = question_detail(&w, "t", body, "r", None, None);
+        assert!(detail.contains("``````\n日本語"), "{detail}");
+    }
+
+    #[test]
+    fn a_long_text_is_cut_only_when_the_artifact_holds_it() {
+        let w = Withheld::from_check(&[Violation::BodyLanguage], "", "").unwrap();
+        let body = "あ".repeat(SHOWN_MAX_CHARS + 50);
+        let whole = question_detail(&w, "t", &body, "r", None, None);
+        assert!(whole.contains(&body));
+        let path = Path::new("/run/artifacts/x.md");
+        let cut = question_detail(&w, "t", &body, "r", None, Some(path));
+        assert!(!cut.contains(&body) && cut.contains("truncated"));
+        assert!(artifact_text(&w, "t", &body, "r").contains(&body));
     }
 
     #[test]
@@ -1145,14 +1274,14 @@ mod owner_question_tests {
             format!("{filler}\n\nこれは日本語の段落であり、投稿ゲートが保留する部分です。\n");
         let w = Withheld::from_check(&check("feat: x", &body), "feat: x", &body).unwrap();
         let path = Path::new("/run/artifacts/github-text-abc.md");
-        let detail = question_detail(&w, "feat: x", &body, false, Some(path));
+        let detail = question_detail(&w, "feat: x", &body, "r", None, Some(path));
         assert!(detail.contains("body-language: description line 3"));
         assert!(detail.contains("これは日本語の段落"));
         assert!(detail.contains("/run/artifacts/github-text-abc.md"));
         // Same inputs, same detail: the dedupe relies on it.
         assert_eq!(
             detail,
-            question_detail(&w, "feat: x", &body, false, Some(path))
+            question_detail(&w, "feat: x", &body, "r", None, Some(path))
         );
     }
 
@@ -1161,10 +1290,13 @@ mod owner_question_tests {
         let secret = "ghp_abcdefghijklmnopqrstuvwx1234";
         let body = format!("Fine line.\nthe key is {secret} ok\n");
         let w = Withheld::from_check(&check("feat: x", &body), "feat: x", &body).unwrap();
-        let detail = question_detail(&w, "feat: x", &body, false, None);
+        let detail = question_detail(&w, "feat: x", &body, "r", None, None);
         assert!(detail.contains("sensitive-data: description line 2: token"));
-        assert!(!detail.contains(secret));
-        assert!(!artifact_text("t", &body).contains(secret));
+        // The diagnosis never repeats the value; the comparison below it is
+        // for the owner alone and carries the original.
+        let diagnosis = detail.split("## Description").next().unwrap();
+        assert!(!diagnosis.contains(secret));
+        assert!(artifact_text(&w, "feat: x", &body, "r").contains(secret));
     }
 
     #[test]
@@ -1211,6 +1343,10 @@ mod owner_question_tests {
         assert_eq!(
             read_reply(&question(Some(USE_MY_TEXT), &[])),
             Reply::Fallback
+        );
+        assert_eq!(
+            read_reply(&question(Some(POST_ORIGINAL), &["x"])),
+            Reply::Original
         );
         assert_eq!(read_reply(&question(None, &["x"])), Reply::Fallback);
     }

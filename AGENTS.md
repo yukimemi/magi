@@ -2462,28 +2462,60 @@ Traps:
 gate rejected for `NEUTRAL_TITLE` / `NEUTRAL_BODY` and tell nobody; a merged
 squash commit then carried "chore: update repository". Now, after the one
 rewrite attempt (language violations only; a rewrite cannot fix sensitive
-data), a still-rejected text (language rules and sensitive data; the question
-names categories only, never the text) goes to the owner through
-`ask::Questions`. A field withheld only for sensitive data keeps its text and
-is redacted in place on fallback; a language-withheld field becomes neutral.
+data), a still-rejected text (language rules and sensitive data) goes to the
+owner through `ask::Questions`. The gate has many false positives and the
+question is read only by the owner, locally, so it offers to post the
+**original**. A field withheld only for sensitive data is redacted in place on
+fallback; a language-withheld field becomes neutral.
 
 - **The question** (`github_text::ASK_NODE` `github-text`, seat `posting-gate`)
   has no `cwd`, `answer_timeout` set, and a fixed `asked_at + answer_timeout`
   clock (`deputy::fixed_clock`), so the waiter ignores it and a Generic deputy
-  may serve it. Choices: `use fallback`, plus `use my text` when the title is
-  withheld (the replacement title is the owner's latest operator say, sent
-  before picking the choice; no new `Question` field, `ask::SCHEMA` unchanged).
-  The detail is English and names the field and the rule categories only; a
-  candidate is shown only if `scrub` leaves it unchanged. Only the summary line
-  follows `[graph] language`. The event log never records the text.
+  may serve it. Choices: `use fallback` (post the CHANGED text),
+  `post original` (post the ORIGINAL text of every withheld field,
+  whatever rule fired, past the gate) and, when the title is withheld,
+  `use my text` (the replacement title is the owner's latest operator say,
+  sent before picking the choice; no new `Question` field, `ask::SCHEMA`
+  unchanged). The detail is English, keeps the "What triggered each rule"
+  diagnosis, and shows for each withheld field the ORIGINAL text exactly as the
+  agent wrote it next to the CHANGED text, in fences longer than any backtick
+  run in the text. `github_text::fallback_text` is the one function that
+  produces CHANGED, for the display and for the posting alike. The original is
+  **not** redacted or hidden in the question (the old "shown only if `scrub`
+  leaves it unchanged" rule is gone; do not bring it back): it is shown up to
+  `SHOWN_MAX_CHARS` when the artifact file holds the full text, in full when
+  that file could not be written. The artifact
+  (`github-text-<fingerprint>.md`, ORIGINAL and CHANGED, unredacted) stays in the
+  run directory. The retry question after a rejected replacement title compares
+  the same original and names only the replacement's categories. Only the
+  summary line follows `[graph] language`. Nothing of this reaches a remote
+  surface: `ask::notify` / notices send the summary only, and the event log
+  never records the text (only field names, e.g. `posting the original text
+  for: title, description`). The detail is readable by the Generic deputy (an
+  agent CLI); accepted, because the agent wrote the text in the first place.
 - **The run parks, the daemon resumes it.** `merge` returns before pushing or
   opening anything with `parked = true`; `daemon::land_resume_state` reads the
   `github-text` question for such a run (told apart from a land approval by
   `RunState::github_text`, not by status), abandons it at the deadline, and
   resumes as soon as it is answered. Silence, abandonment and `use fallback`
-  all end in today's neutral text, so an unattended run still finishes and only
+  all end in the CHANGED text, so an unattended run still finishes and only
   the withheld field is replaced. Needs `magi serve`: a run started in-process
   with no loop alive waits in `daemon::run_claimed` (claim held, `land_resume_state` polled every 15 s) and finishes itself at the answer or the deadline; only Ctrl-C leaves it parked for a later `magi serve`.
+- **`post original` overrides the gate, for the fields it was chosen for.**
+  `settle_withheld` records `GithubTextChoice::Original` (`GithubTextAsk::choice`,
+  `#[serde(default)]`) and `resolved` before anything is opened, then takes
+  `pr.title` / `pr.body` as written for the withheld fields (fields that were
+  not withheld still go through `prepare_with`). An adopted open pull request's
+  title is refreshed through `land::set_pr_title_verbatim`, which skips the
+  re-scrub that `set_pr_title` applies. The original is not stored in the run
+  state: `settle_withheld` is only entered with a matching fingerprint, so `pr`
+  is the text that was asked about.
+- **A deputy may settle `post original` only under the irreversible-choice
+  guard.** `deputy::destructive` names it by *label* (not position: the retry
+  question has the same choices, but never rely on order), so `--settle` needs a
+  verbatim quote of the owner's latest message that passes `land::unhedged`.
+  `github_text::deputy_brief` is appended to the Generic brief for this node and
+  says publishing is irreversible and doubt means asking back with `--thread`.
 - **A replacement goes through the same gate** (`github_text::vet_title`, with
   the `language_judge` when configured). Sensitive data is rejected, never
   redacted into text the owner did not write. A failing reply gets one more

@@ -219,6 +219,10 @@ pub fn generic_brief(
             artifacts.display()
         ));
     }
+    if q.node == crate::github_text::ASK_NODE {
+        s.push_str("\n\n");
+        s.push_str(&crate::github_text::deputy_brief());
+    }
     if !q.choices.is_empty() {
         s.push_str("\n\nWhat each option does:");
         for c in &q.choices {
@@ -239,6 +243,10 @@ pub fn generic_brief(
 /// drops commits.
 pub fn destructive(q: &Question, label: &str) -> bool {
     let at = q.choices.iter().position(|c| c == label);
+    // By label, not position: the retry question orders its choices differently.
+    if q.node == crate::github_text::ASK_NODE {
+        return label == crate::github_text::POST_ORIGINAL;
+    }
     match q.node.as_str() {
         crate::triage::NODE => at == Some(2),
         crate::triage::DEPS_NODE => at == Some(1),

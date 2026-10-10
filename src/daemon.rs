@@ -6090,6 +6090,7 @@ mod tests {
             asks: 1,
             resolved: false,
             chosen_title: None,
+            choice: None,
         });
         state.save().unwrap();
         let store = ask::Questions::open();

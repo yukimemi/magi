@@ -1305,6 +1305,23 @@ pub struct GithubTextAsk {
     /// neutral text for every withheld field.
     #[serde(default)]
     pub chosen_title: Option<String>,
+    /// With `resolved`: which way the question was settled. `None` on a record
+    /// written before this field existed (read as the neutral text).
+    #[serde(default)]
+    pub choice: Option<GithubTextChoice>,
+}
+
+/// How a withheld pull request text was settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GithubTextChoice {
+    /// The changed text: neutral for language, redacted for sensitive data
+    /// (also silence, abandonment and an unknown answer).
+    Fallback,
+    /// The owner's vetted replacement title (`chosen_title`).
+    MyTitle,
+    /// The original text of every withheld field, past the posting gate.
+    Original,
 }
 
 /// A review hand-off the panel did not agree to: findings that hold the merge
