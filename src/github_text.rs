@@ -149,11 +149,17 @@ fn closing_run(text: &str, n: usize) -> Option<usize> {
 }
 
 fn prose(body: &str) -> String {
+    prose_mapped(body).0
+}
+
+/// [`prose`] plus, for each output line, the 1-based line of `body` it came from.
+fn prose_mapped(body: &str) -> (String, Vec<usize>) {
+    let mut lines = Vec::new();
     let mut out = String::new();
     let mut details = 0usize;
     let mut quote = false;
     let mut fence: Option<(char, usize)> = None;
-    for line in body.lines() {
+    for (idx, line) in body.lines().enumerate() {
         let trimmed = line.trim_start();
         if let Some((marker, width)) = fence {
             if trimmed.chars().take_while(|c| *c == marker).count() >= width {
@@ -203,8 +209,9 @@ fn prose(body: &str) -> String {
             rest = &rest[c.len_utf8()..];
         }
         out.push('\n');
+        lines.push(idx + 1);
     }
-    out
+    (out, lines)
 }
 
 /// Scrub local identity and pattern matches, then replace failing prose.
@@ -325,6 +332,106 @@ fn excerpt(text: &str) -> String {
     out
 }
 
+/// Longest snippet shown for one trigger, in characters.
+const SNIPPET_CHARS: usize = 160;
+/// Most triggers listed per rule and field.
+const MAX_TRIGGERS: usize = 3;
+
+/// Artifact file name for the scrubbed full text of a withheld message.
+pub fn artifact_name(fingerprint: &str) -> String {
+    format!("github-text-{fingerprint}.md")
+}
+
+/// The withheld message as it would be posted after redaction: what the
+/// artifact holds. Both the local identity and the pattern-only rules apply.
+pub fn artifact_text(title: &str, body: &str) -> String {
+    let clean = |t: &str| scrub(&scrub(t, &Identity::current()), &Identity::default());
+    format!(
+        "# Title\n\n{}\n\n# Description\n\n{}\n",
+        clean(title),
+        clean(body)
+    )
+}
+
+fn snippet(line: &str) -> Option<String> {
+    let line = line.trim();
+    if !shareable(line) {
+        return None;
+    }
+    let mut s: String = line.chars().take(SNIPPET_CHARS).collect();
+    if line.chars().count() > SNIPPET_CHARS {
+        s.push('…');
+    }
+    Some(s)
+}
+
+fn line_foreign(line: &str) -> bool {
+    let letters = line.chars().filter(|c| c.is_alphabetic()).count();
+    let foreign = line
+        .chars()
+        .filter(|c| c.is_alphabetic() && !c.is_ascii())
+        .count();
+    (foreign >= 4 && foreign * 2 >= letters.max(1)) || short_foreign(line)
+}
+
+/// Which part of the text each fired rule points at, as ready-made lines.
+/// Deterministic (heuristics only): the same text gives the same lines.
+/// Sensitive data yields field, line and kind only, never the value; a
+/// snippet is shown only when it passes the redaction rules untouched.
+pub fn diagnose(categories: &[String], title: &str, body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for cat in categories {
+        match cat.as_str() {
+            "title-language" => out.push(match snippet(title) {
+                Some(s) => format!("- title-language: title: `{s}`"),
+                None => "- title-language: title (not shown)".to_owned(),
+            }),
+            "body-language" => {
+                let (text, map) = prose_mapped(body);
+                let lines: Vec<&str> = text.lines().collect();
+                let mut hits: Vec<usize> = (0..lines.len())
+                    .filter(|i| line_foreign(lines[*i]))
+                    .collect();
+                if hits.is_empty() {
+                    hits = (0..lines.len())
+                        .filter(|i| {
+                            lines[*i]
+                                .chars()
+                                .any(|c| c.is_alphabetic() && !c.is_ascii())
+                        })
+                        .collect();
+                }
+                if hits.is_empty() {
+                    out.push(
+                        "- body-language: no single line stands out; the language judge or the \
+                         overall non-English share rejected the prose as a whole"
+                            .to_owned(),
+                    );
+                }
+                for i in hits.into_iter().take(MAX_TRIGGERS) {
+                    out.push(match snippet(lines[i]) {
+                        Some(s) => format!("- body-language: description line {}: `{s}`", map[i]),
+                        None => format!("- body-language: description line {} (not shown)", map[i]),
+                    });
+                }
+            }
+            "sensitive-data" => {
+                for (field, text) in [("title", title), ("description", body)] {
+                    let mut hits = crate::scrub::locate(text, &Identity::current());
+                    hits.extend(crate::scrub::locate(text, &Identity::default()));
+                    hits.sort_unstable();
+                    hits.dedup();
+                    for (line, kind) in hits.into_iter().take(MAX_TRIGGERS) {
+                        out.push(format!("- sensitive-data: {field} line {line}: {kind}"));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// One-line summary; the only line allowed to follow the configured language.
 pub fn question_summary(language: &str, w: &Withheld) -> String {
     let what = match (w.title, w.body) {
@@ -346,7 +453,13 @@ pub fn question_summary(language: &str, w: &Withheld) -> String {
 
 /// Question body (English; it is also what a deputy reads). Names the rules
 /// that fired and shows a candidate only if it passes the redaction rules.
-pub fn question_detail(w: &Withheld, title: &str, body: &str, retry: bool) -> String {
+pub fn question_detail(
+    w: &Withheld,
+    title: &str,
+    body: &str,
+    retry: bool,
+    artifact: Option<&Path>,
+) -> String {
     let mut s = String::new();
     if retry {
         s.push_str("Your replacement title did not pass the posting gate either.\n\n");
@@ -360,6 +473,18 @@ pub fn question_detail(w: &Withheld, title: &str, body: &str, retry: bool) -> St
         },
         w.categories.join(", ")
     ));
+    let found = diagnose(&w.categories, title, body);
+    if !found.is_empty() {
+        s.push_str("What triggered each rule:\n\n");
+        s.push_str(&found.join("\n"));
+        s.push_str("\n\n");
+    }
+    if let Some(p) = artifact {
+        s.push_str(&format!(
+            "Full withheld text (redacted like what would be posted): {}\n\n",
+            p.display()
+        ));
+    }
     s.push_str(&format!(
         "- `{USE_FALLBACK}` posts `{NEUTRAL_TITLE}` / the neutral description for what was withheld \
          for language; text withheld only for sensitive data is posted with the \
@@ -984,7 +1109,7 @@ mod owner_question_tests {
         let w = Withheld::from_check(&[Violation::SensitiveData], "fix: retry", secret).unwrap();
         assert!(!w.title && w.body);
         assert_eq!(w.categories, ["sensitive-data"]);
-        let detail = question_detail(&w, "fix: retry", secret, false);
+        let detail = question_detail(&w, "fix: retry", secret, false, None);
         assert!(detail.contains("sensitive-data") && !detail.contains("abcdefghijklmnop"));
         assert_eq!(question_choices(&w), [USE_FALLBACK]);
         let w = Withheld::from_check(&[Violation::SensitiveData], secret, "ok").unwrap();
@@ -1002,15 +1127,44 @@ mod owner_question_tests {
     fn detail_never_repeats_sensitive_text_but_shows_a_clean_candidate() {
         let w = Withheld::from_check(&[Violation::TitleLanguage], "", "").unwrap();
         let secret = "token=abcdefghijklmnop0123456789";
-        let hidden = question_detail(&w, secret, "", false);
+        let hidden = question_detail(&w, secret, "", false, None);
         assert!(!hidden.contains("abcdefghijklmnop"), "{hidden}");
         assert!(!hidden.contains("Candidate title"));
-        let shown = question_detail(&w, "修正: 再試行", "", false);
+        let shown = question_detail(&w, "修正: 再試行", "", false, None);
         assert!(shown.contains("Candidate title") && shown.contains("再試行"));
         assert!(shown.contains("title-language"));
         assert_eq!(question_choices(&w), [USE_FALLBACK, USE_MY_TEXT]);
         let body_only = Withheld::from_check(&[Violation::BodyLanguage], "", "").unwrap();
         assert_eq!(question_choices(&body_only), [USE_FALLBACK]);
+    }
+
+    #[test]
+    fn detail_names_the_triggering_paragraph_and_the_artifact() {
+        let filler = "Plain English sentence. ".repeat(40);
+        let body =
+            format!("{filler}\n\nこれは日本語の段落であり、投稿ゲートが保留する部分です。\n");
+        let w = Withheld::from_check(&check("feat: x", &body), "feat: x", &body).unwrap();
+        let path = Path::new("/run/artifacts/github-text-abc.md");
+        let detail = question_detail(&w, "feat: x", &body, false, Some(path));
+        assert!(detail.contains("body-language: description line 3"));
+        assert!(detail.contains("これは日本語の段落"));
+        assert!(detail.contains("/run/artifacts/github-text-abc.md"));
+        // Same inputs, same detail: the dedupe relies on it.
+        assert_eq!(
+            detail,
+            question_detail(&w, "feat: x", &body, false, Some(path))
+        );
+    }
+
+    #[test]
+    fn detail_locates_a_secret_by_kind_and_line_only() {
+        let secret = "ghp_abcdefghijklmnopqrstuvwx1234";
+        let body = format!("Fine line.\nthe key is {secret} ok\n");
+        let w = Withheld::from_check(&check("feat: x", &body), "feat: x", &body).unwrap();
+        let detail = question_detail(&w, "feat: x", &body, false, None);
+        assert!(detail.contains("sensitive-data: description line 2: token"));
+        assert!(!detail.contains(secret));
+        assert!(!artifact_text("t", &body).contains(secret));
     }
 
     #[test]

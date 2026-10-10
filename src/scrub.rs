@@ -103,6 +103,36 @@ pub fn scrub(text: &str, id: &Identity) -> String {
     out
 }
 
+/// Where [`scrub`] would replace something: `(line, kind)` per match, lines
+/// counted from 1. Never carries the matched text. Pure.
+pub fn locate(text: &str, id: &Identity) -> Vec<(usize, &'static str)> {
+    let mut hits = Vec::new();
+    let mut i = 0;
+    let mut line = 1;
+    while i < text.len() {
+        let prev = text[..i].chars().next_back();
+        if let Some((len, rep)) = match_at(&text[i..], prev, id) {
+            let kind = match rep {
+                "~" => "home-path",
+                r => r
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .trim_start_matches("redacted-"),
+            };
+            hits.push((line, kind));
+            line += text[i..i + len].matches('\n').count();
+            i += len;
+        } else {
+            let c = text[i..].chars().next().expect("i is on a char boundary");
+            if c == '\n' {
+                line += 1;
+            }
+            i += c.len_utf8();
+        }
+    }
+    hits
+}
+
 fn match_at(rest: &str, prev: Option<char>, id: &Identity) -> Option<(usize, &'static str)> {
     let starts_word = prev.is_none_or(|p| !is_word(p));
     home_path(rest, prev, id)
@@ -436,6 +466,13 @@ mod tests {
 
     fn s(t: &str) -> String {
         scrub(t, &id())
+    }
+
+    #[test]
+    fn locate_names_kind_and_line_without_the_text() {
+        let id = Identity::default();
+        let text = "fine\ntoken=abcdefghijklmnop1234 here\nmail a@b.example";
+        assert_eq!(locate(text, &id), vec![(2, "token"), (3, "email")]);
     }
 
     #[test]

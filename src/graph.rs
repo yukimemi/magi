@@ -6211,13 +6211,13 @@ impl Runner {
                     .ok()
                     .map(|(q, ())| q);
             }
-            let mut ask_again: Option<(Vec<String>, bool)> = None;
+            let mut ask_again: Option<(Vec<String>, Option<String>)> = None;
             match standing {
                 // Recorded but never written (a stop between the two saves),
                 // or removed: ask again without spending the retry.
                 None if g.asks <= 1 => {
                     g.asks = 0;
-                    ask_again = Some((g.categories.clone(), false));
+                    ask_again = Some((g.categories.clone(), None));
                 }
                 None => {
                     g.resolved = true;
@@ -6253,8 +6253,10 @@ impl Runner {
                                 g.chosen_title = Some(title);
                             }
                             Err(cats) if g.asks < 2 => {
-                                ask_again =
-                                    Some((cats.into_iter().map(str::to_owned).collect(), true))
+                                ask_again = Some((
+                                    cats.into_iter().map(str::to_owned).collect(),
+                                    Some(first.to_owned()),
+                                ))
                             }
                             Err(_) => {
                                 g.resolved = true;
@@ -6264,18 +6266,38 @@ impl Runner {
                     }
                 },
             }
-            if let Some((categories, retry)) = ask_again {
+            if let Some((categories, replacement)) = ask_again {
+                let retry = replacement.is_some();
+                // After a retry the question is about the owner's rejected
+                // replacement title, not the original message.
+                let (shown_title, shown_body) = match replacement.as_deref() {
+                    Some(t) => (t, ""),
+                    None => (pr.title.as_str(), pr.body.as_str()),
+                };
                 let w = gt::Withheld {
-                    title: g.title,
-                    body: g.body,
+                    title: g.title || retry,
+                    body: g.body && !retry,
                     categories,
+                };
+                // Named by the shown text's fingerprint alone, so a resume rewrites
+                // the same file and the detail stays identical.
+                let artifact = match crate::run::write_artifact(
+                    &self.state,
+                    &gt::artifact_name(&gt::fingerprint(shown_title, shown_body)),
+                    &gt::artifact_text(shown_title, shown_body),
+                ) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        tracing::warn!("could not write the withheld-text artifact: {e:#}");
+                        None
+                    }
                 };
                 let mut q = ask::Question::new(
                     self.state.id.clone(),
                     gt::ASK_NODE.to_owned(),
                     gt::ASK_SEAT.to_owned(),
                     gt::question_summary(&self.state.config.graph.language, &w),
-                    gt::question_detail(&w, &pr.title, &pr.body, retry),
+                    gt::question_detail(&w, shown_title, shown_body, retry, artifact.as_deref()),
                     gt::question_choices(&w),
                 );
                 q.answer_timeout = timeout;
@@ -12196,6 +12218,19 @@ mod tests {
         };
         let run = runner.state.id.clone();
         let q = find(&run);
+        let fp = runner
+            .state
+            .github_text
+            .as_ref()
+            .unwrap()
+            .fingerprint
+            .clone();
+        let name = crate::github_text::artifact_name(&fp);
+        let path = crate::run::artifact_path(&runner.state, &name);
+        assert!(q.detail.contains(&path.display().to_string()));
+        assert!(q.detail.contains("title-language: title"));
+        let saved = std::fs::read_to_string(&path).expect("artifact written");
+        assert!(saved.contains("日本語のタイトル"));
         assert!(q.cwd.is_none());
         assert_eq!(q.choices, ["use fallback", "use my text"]);
         // A bad replacement is refused and asked about once more.
@@ -12223,6 +12258,17 @@ mod tests {
         let second = find(&run);
         assert_ne!(second.id, q.id);
         assert!(second.detail.contains("did not pass"));
+        assert!(second.detail.contains("まだ日本語"));
+        let retry_path = crate::run::artifact_path(
+            &runner.state,
+            &crate::github_text::artifact_name(&crate::github_text::fingerprint("まだ日本語", "")),
+        );
+        assert!(second.detail.contains(&retry_path.display().to_string()));
+        assert!(
+            std::fs::read_to_string(&retry_path)
+                .expect("retry artifact written")
+                .contains("まだ日本語")
+        );
         say(&second.id, "fix: retry failed requests", "use my text");
         let message = runner
             .guarded_pr_message(&winner, None, true)
