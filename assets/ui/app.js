@@ -2262,6 +2262,7 @@ function createTaskCard() {
      card must show, the same way priority is shown, rather than something
      only visible by opening the full instruction. */
   const solo = el("span", { class: "tag", "data-tone": "teal", text: "solo" });
+  const followup = el("span", { class: "tag", "data-tone": "ink", text: "follow-up" });
   const whenSlot = el("time", { class: "card-when" });
   const title = el("h2", { class: "card-title" });
   const source = el("a", { class: "task-source" });
@@ -2298,7 +2299,7 @@ function createTaskCard() {
     historyLink, runLink, priorityBox, editBtn, holdBox, doneBox, deleteBox);
 
   const card = el("li", { class: "card task-card" },
-    el("div", { class: "card-top" }, chipSlot, priority, solo, permalink, whenSlot),
+    el("div", { class: "card-top" }, chipSlot, priority, solo, followup, permalink, whenSlot),
     title, meta, note, snippet, error, instruction, answers, actions,
   );
   /* Tapping the card body opens the task page; anything interactive inside it
@@ -2329,7 +2330,7 @@ function createTaskCard() {
     openTask();
   });
   card.refs = {
-    card, chipSlot, priority, solo, permalink, whenSlot, title, source, repo, attempts,
+    card, chipSlot, priority, solo, followup, permalink, whenSlot, title, source, repo, attempts,
     outcome, note, snippet, error, instruction, answers, answersList, runLink, historyLink,
     priorityDown, priorityUp, editBtn, holdBox, doneBox, deleteBox,
   };
@@ -2361,6 +2362,7 @@ function updateTaskCard(row, task) {
   show(r.priority, priority !== 0);
 
   show(r.solo, Boolean(task.solo));
+  show(r.followup, Boolean(task.followup));
 
   const at = when(task.updated_at || task.created_at);
   setText(r.whenSlot, at.text);
@@ -9389,6 +9391,7 @@ function renderTask() {
   show($("task-unreadable"), unreadable > 0);
 
   renderTaskFlow(task.flow);
+  renderTaskFollowup(task.followup_origin);
 
   const list = $("task-runs");
   clear(list);
@@ -9413,6 +9416,29 @@ function renderTask() {
 /* The chart is drawn from `task.flow` as the server built it (nodes and edges
  * in order); nothing here infers why a run ended. Plain DOM, no SVG: a
  * vertical stack wraps at phone width and follows the theme's variables. */
+/* The "Follow-up of" block. Every href except the pull request's was decided
+ * by the API (`followup_origin`); the PR is a forge URL from a record, so it
+ * goes through forgeUrl() and falls back to plain text. Cleared for any task
+ * that is not a follow-up, so a previous task's block never lingers. */
+function renderTaskFollowup(o) {
+  const box = $("task-followup");
+  clear(box);
+  show($("task-followup-panel"), Boolean(o));
+  if (!o) return;
+  const row = (k, ...kids) => box.append(el("dt", { text: k }), el("dd", {}, ...kids));
+  const link = (href, text, title) => (href ? el("a", { href, text, title }) : el("span", { text }));
+  if (o.parent) {
+    row("Parent task", link(o.parent.href, o.parent.title || o.parent.short, o.parent.id), chip(o.parent.status, TASK_STATUS));
+  } else {
+    row("Parent task", el("span", { text: "not in the queue any more" }));
+  }
+  row("Merged run", link(o.run.href, `Run ${o.run.short}`, o.run.id), o.run.status ? chip(o.run.status, RUN_STATUS) : el("span", { class: "tag", text: "unreadable" }));
+  const prHref = forgeUrl(o.pr);
+  row("Pull request", prHref ? el("a", { href: prHref, target: "_blank", rel: "noopener noreferrer", text: o.pr }) : el("span", { text: o.pr || "unknown" }));
+  row("Findings", el("span", { text: (o.findings || []).join(", ") || "none recorded" }));
+  row("Generation", el("span", { text: String(o.generation) }));
+}
+
 const FLOW_COST = { spent: "\u22121 attempt", refunded: "\u21ba refunded", unknown: "attempt unknown" };
 
 function renderTaskFlow(flow) {
@@ -9433,10 +9459,11 @@ function renderTaskFlow(flow) {
       list.append(li);
     }
     const top = el("div", { class: "flow-top" }, el("strong", { text: n.label }));
-    if (n.status) top.append(chip(n.status, n.kind === "end" ? TASK_STATUS : RUN_STATUS));
+    if (n.status) top.append(chip(n.status, n.status_of === "task" ? TASK_STATUS : RUN_STATUS));
     if (n.note) top.append(el("span", { class: "tag", "data-tone": n.note === "no verdict" ? "rust" : "ink", text: n.note }));
     if (n.run_kind && n.run_kind !== "unknown") top.append(el("span", { class: "tag", "data-tone": "ink", text: n.run_kind }));
     if (n.kind === "chat") top.append(el("span", { class: "tag", "data-tone": "ink", text: "chat" }));
+    if (n.kind === "followup") top.append(el("span", { class: "tag", "data-tone": "ink", text: "follow-up" }));
     const attrs = { class: "flow-node", "data-kind": n.kind };
     if (n.kind === "run" && !n.decided && n.readable) attrs["data-undecided"] = "";
     if (!n.readable) attrs["data-unreadable"] = "";

@@ -1994,6 +1994,14 @@ never blocked or changed by it (`land_approval`, `review_rounds` untouched);
   section in `magi show`, task links on the web run page, and one English
   comment on the pull request (marker `magi-followup run=<id>`), posted only
   when something is filed, and retried by a re-entered `land` if it failed.
+  The child links back to its parent too: `web::followup_origin` resolves
+  `FollowUp::origin_task` (falling back to the merged run, then to no link
+  at all, never a dead href) once per task page, and the task page shows it as
+  the flow chart's first node (`kind: "followup"`, edge "open findings ..."),
+  a "Follow-up of" block and a "follow-up" chip on the Queue card. A task whose
+  *source* is a chat keeps the chat node first and the follow-up node second;
+  an inherited `Task::origin_chat` alone adds no chat node. The pull request
+  is the one raw value, passed through `forgeUrl()` in the client.
 
 ### origin/main is kept fresh by its own task, and only refs/remotes move
 
