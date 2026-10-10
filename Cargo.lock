@@ -1774,7 +1774,7 @@ dependencies = [
 
 [[package]]
 name = "magi-cli"
-version = "0.110.3"
+version = "0.110.4"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
