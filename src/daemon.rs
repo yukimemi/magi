@@ -3201,7 +3201,15 @@ pub async fn run_claimed(opts: &Opts, queue: &Queue, task: &mut Task) {
     // daemon to finish it. Nobody else will enforce `answer_timeout`, so wait
     // here with the claim still held, and resume once the question is settled
     // (answered, or abandoned at its deadline -> the neutral text).
-    if let Some(timeout) = withheld_text_wait(task) {
+    // A rejected reply files one more question (the gate asks at most twice),
+    // so after a resume the run may be waiting again: keep going, with a fresh
+    // limit for the new question. `resumes` bounds it even if a resume parks
+    // without asking anything new.
+    let mut resumes = 0;
+    while resumes < MAX_WITHHELD_RESUMES {
+        let Some(timeout) = withheld_text_wait(task) else {
+            break;
+        };
         eprintln!(
             "waiting for the owner's answer on a withheld pull request text \
              (up to {timeout}s; Ctrl-C leaves the run parked for a later `magi serve`)"
@@ -3209,29 +3217,35 @@ pub async fn run_claimed(opts: &Opts, queue: &Queue, task: &mut Task) {
         // The deadline abandons the question itself; the extra margin only
         // covers an abandon that could not be saved.
         let limit = std::time::Instant::now() + Duration::from_secs(timeout + 60);
-        loop {
+        let ready = loop {
             match land_resume_state(task) {
                 LandResume::StillWaiting if std::time::Instant::now() < limit => {
                     tokio::time::sleep(WITHHELD_POLL).await;
                 }
-                LandResume::Ready => {
-                    attempt(
-                        opts,
-                        queue,
-                        &status,
-                        &stop,
-                        crate::graph::Pause::new(),
-                        task,
-                    )
-                    .await;
-                    break;
-                }
-                _ => break,
+                LandResume::Ready => break true,
+                _ => break false,
             }
+        };
+        if !ready {
+            break;
         }
+        resumes += 1;
+        attempt(
+            opts,
+            queue,
+            &status,
+            &stop,
+            crate::graph::Pause::new(),
+            task,
+        )
+        .await;
     }
     hold_if_runnable(queue, task);
 }
+
+/// Resumes an in-process run makes for withheld-text questions: the gate asks
+/// at most twice, plus one for a resume that asks nothing new.
+const MAX_WITHHELD_RESUMES: u32 = 3;
 
 /// How often an in-process run rechecks its withheld-text question.
 const WITHHELD_POLL: Duration = Duration::from_secs(15);
