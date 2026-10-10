@@ -2700,3 +2700,8 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
 .stats-daily-legend [data-s="merged"]::before { background: var(--verdict-merged); }
 .stats-daily-legend [data-s="ready"]::before { background: var(--verdict-ready); }
 .stats-daily-legend [data-s="rate"]::before { height: 2px; background: var(--ink); opacity: .55; }
+
+/* A queued draft is operator text of any length: wrap it instead of letting a
+   <pre> stretch the page (and the fixed dock) past the viewport. */
+#talk-pending { min-width: 0; max-width: 100%; }
+.talk-pending-text { margin: var(--s2) 0; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; }
