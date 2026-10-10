@@ -1563,6 +1563,21 @@ impl Queue {
         Ok(())
     }
 
+    /// Change the task `id` in place: read it inside its write lock, let `f`
+    /// edit it, and write it back only when `f` returns `true`. The check a
+    /// caller makes in `f` therefore sees the record as stored now, not a
+    /// snapshot taken before another writer got in. Returns whether it wrote.
+    pub fn modify(&self, id: &str, f: impl FnOnce(&mut Task) -> bool) -> Result<bool> {
+        let id = self.resolve_id(id)?;
+        let _lock = self.lock_task(&id)?;
+        let mut task = self.get(&id)?;
+        if !f(&mut task) {
+            return Ok(false);
+        }
+        self.put_unlocked(&mut task)?;
+        Ok(true)
+    }
+
     /// Append `run` to the runs of the task `id` (or an unambiguous prefix),
     /// leaving everything else about it alone — see [`Task::link_run`]. Read
     /// and written back in one breath, because [`Queue::put`] replaces the

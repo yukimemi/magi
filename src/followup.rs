@@ -46,19 +46,30 @@ pub struct Outcome {
 /// File follow-ups for a run that just merged, and comment on the pull
 /// request. Never fails: problems become run events.
 pub async fn after_merge(state: &mut RunState, pr_url: &str) {
-    if !state.config.graph.file_followups {
-        return;
-    }
     let queue = Queue::open();
-    let outcome = match file(state, pr_url, &queue) {
-        Ok(o) => o,
-        Err(e) => {
-            state.event(NODE, format!("follow-up filing failed: {e:#}"));
-            return;
+    let release = state.config.graph.release_deputy_followups;
+    // The deputy's tasks are settled first and again after filing, so the
+    // outcome is the same whichever side got to the queue first.
+    settle_deputy_tasks(state, pr_url, &queue, release);
+    let outcome = if state.config.graph.file_followups {
+        match file(state, pr_url, &queue) {
+            Ok(o) => o,
+            Err(e) => {
+                state.event(NODE, format!("follow-up filing failed: {e:#}"));
+                return;
+            }
         }
+    } else {
+        Outcome::default()
     };
+    if state.config.graph.file_followups && !release {
+        settle_deputy_tasks(state, pr_url, &queue, false);
+    }
     if outcome.filed.is_empty()
-        && (state.followup_commented || (state.followups.is_empty() && outcome.covered.is_empty()))
+        && (state.followup_commented
+            || (state.followups.is_empty()
+                && outcome.covered.is_empty()
+                && state.deputy_followups.is_empty()))
     {
         return;
     }
@@ -69,42 +80,57 @@ pub async fn after_merge(state: &mut RunState, pr_url: &str) {
     }
 }
 
-/// The deterministic half of [`after_merge`]: select, group, and file into
-/// `queue`. Records the event and the run's own bookkeeping; the caller
-/// saves the state.
-pub fn file(state: &mut RunState, pr_url: &str, queue: &Queue) -> Result<Outcome> {
-    let mut out = Outcome::default();
-    let Some(round) = state.reviews.last().cloned() else {
-        return Ok(out);
-    };
-    let rejecters: Vec<usize> = round
-        .final_votes()
-        .into_iter()
-        .filter(|(_, _, v)| *v == ReviewVote::Reject)
-        .map(|(seat, _, _)| seat)
-        .collect();
-    let mut chosen: Vec<Finding> = Vec::new();
-    for rec in &round.reviews {
-        let rejected = rejecters.contains(&rec.reviewer);
-        for f in &rec.findings {
-            if f.severity.blocks() || rejected {
-                chosen.push(f.clone());
-            } else {
-                out.unfiled.push(f.id.clone());
-            }
-        }
-    }
-    if chosen.is_empty() {
-        return Ok(out);
-    }
+/// Reason prefixes that mark a deputy task this module already judged and
+/// left held. Both stop a second pass from rewriting the reason again.
+const SUPERSEDED: &str = "[superseded] ";
+const CAPPED: &str = "[generation cap] ";
 
-    let origin_task = state.origin.as_ref().and_then(|o| o.task.clone());
-    // The depth recorded when the run started wins; the queue is only a
-    // fallback for runs that predate it, and an unknown depth is read as
-    // unbounded-until-proven-otherwise only when there is no origin task.
-    let parent_gen = match state.followup_generation {
+/// A task the merge approval's deputy filed for run `run` that is still held
+/// for pull request `pr_url`: the only kind [`settle_deputy_tasks`] touches.
+/// Concrete identifiers only - the filer is the deputy seat of this run and
+/// the hold reason names the pull request - never text similarity alone.
+fn is_deputy_candidate(t: &Task, run: &str, pr_url: &str) -> bool {
+    t.status == crate::queue::TaskStatus::Held
+        && t.followup.is_none()
+        && matches!(&t.source, Source::Agent { run: r, node }
+            if r == run && node == crate::deputy::NODE)
+        && t.hold_reason.as_deref().is_some_and(|r| {
+            !r.starts_with(SUPERSEDED) && !r.starts_with(CAPPED) && names_pr(r, pr_url)
+        })
+}
+
+/// Does deputy task `t` talk about finding `f`: its id as a word, a
+/// `file:line` within [`LINE_WINDOW`] of the finding, or the finding's title
+/// (normalized; contained only when long enough not to match by accident).
+fn task_matches_finding(t: &Task, f: &Finding) -> bool {
+    let text = format!("{}\n{}", t.title, t.instruction);
+    if names_word(&text, &f.id) {
+        return true;
+    }
+    if let (Some(file), Some(line)) = (&f.file, f.line)
+        && text.match_indices(file.as_str()).any(|(i, _)| {
+            text[i + file.len()..]
+                .strip_prefix(':')
+                .map(|r| {
+                    r.chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                })
+                .and_then(|d| d.parse::<u32>().ok())
+                .is_some_and(|n| n.abs_diff(line) <= LINE_WINDOW)
+        })
+    {
+        return true;
+    }
+    let (nt, nf) = (normalize(&t.title), normalize(&f.title));
+    !nf.is_empty() && (nt == nf || (nf.split(' ').count() >= 3 && nt.contains(&nf)))
+}
+
+/// The follow-up depth of the task the run served; see [`file`].
+fn parent_generation(state: &mut RunState, queue: &Queue, origin_task: Option<&str>) -> u32 {
+    match state.followup_generation {
         Some(g) => g,
-        None => match origin_task.as_deref().map(|t| queue.get(t)) {
+        None => match origin_task.map(|t| queue.get(t)) {
             Some(Ok(t)) => {
                 let g = t.followup.map_or(0, |f| f.generation);
                 state.followup_generation = Some(g);
@@ -113,7 +139,237 @@ pub fn file(state: &mut RunState, pr_url: &str, queue: &Queue) -> Result<Outcome
             Some(Err(_)) => MAX_FOLLOWUP_GENERATION,
             None => 0,
         },
+    }
+}
+
+/// Reconcile the follow-up tasks the merge approval's deputy filed (held,
+/// reason naming this pull request) with the automatic ones, once the merge
+/// is confirmed. Idempotent, and the same whichever side reached the queue
+/// first:
+///
+/// - a deputy task that covers a finding an automatic follow-up already
+///   covers (same finding, same file within [`LINE_WINDOW`] lines, or the same
+///   normalized title) never runs twice: if the automatic one is queued the
+///   owner's task wins and the automatic one is held with the reason, else
+///   the deputy task stays held with a `[superseded]` reason. Nothing is
+///   deleted;
+/// - otherwise, with `release`, the task is released in the same queue write
+///   that stamps it with a [`FollowUp`] (so it is released once, counts
+///   toward the generation cap, and covers its findings for [`file`]);
+/// - a task at the generation cap stays held with a `[generation cap]`
+///   reason.
+///
+/// Only [`is_deputy_candidate`] tasks are touched, re-checked under the
+/// queue's lock. Best-effort: failures are run events.
+pub fn settle_deputy_tasks(state: &mut RunState, pr_url: &str, queue: &Queue, release: bool) {
+    let tasks = queue.list();
+    // The queue is the record: restore what a crash after the write lost.
+    for t in &tasks {
+        if t.followup.as_ref().is_some_and(|f| f.run == state.id)
+            && matches!(&t.source, Source::Agent { node, .. } if node == crate::deputy::NODE)
+            && !state.deputy_followups.contains(&t.id)
+        {
+            state.deputy_followups.push(t.id.clone());
+        }
+    }
+    let cands: Vec<&Task> = tasks
+        .iter()
+        .filter(|t| is_deputy_candidate(t, &state.id, pr_url))
+        .collect();
+    if cands.is_empty() {
+        return;
+    }
+    let chosen = state
+        .reviews
+        .last()
+        .map(|r| select(r).0)
+        .unwrap_or_default();
+    let groups = group_findings(chosen);
+    let autos: Vec<&Task> = tasks
+        .iter()
+        .filter(|t| {
+            t.followup.as_ref().is_some_and(|f| f.run == state.id)
+                && matches!(&t.source, Source::Agent { node, .. } if node == NODE)
+        })
+        .collect();
+    let origin_task = state.origin.as_ref().and_then(|o| o.task.clone());
+    let mut gen_of_parent = None;
+    for cand in cands {
+        // Findings the task covers, widened to whole defect groups.
+        let matched: Vec<String> = groups
+            .iter()
+            .filter(|g| g.iter().any(|f| task_matches_finding(cand, f)))
+            .flat_map(|g| g.iter().map(|f| f.id.clone()))
+            .collect();
+        let rival = autos.iter().find(|a| {
+            a.followup
+                .as_ref()
+                .is_some_and(|f| f.findings.iter().any(|x| matched.contains(x)))
+        });
+        if let Some(a) = rival {
+            let auto_idle = matches!(
+                a.status,
+                crate::queue::TaskStatus::Queued | crate::queue::TaskStatus::Held
+            );
+            if release && auto_idle {
+                // The automatic task has not started: the owner's wins.
+                if a.status == crate::queue::TaskStatus::Queued {
+                    let why = format!(
+                        "{SUPERSEDED}the owner's approval deputy filed task {} for the same finding(s) of {pr_url}",
+                        cand.id
+                    );
+                    let held = queue.modify(&a.id, |t| {
+                        if t.status != crate::queue::TaskStatus::Queued {
+                            return false;
+                        }
+                        t.hold_manual(Some(why));
+                        true
+                    });
+                    match held {
+                        Ok(true) => state.event(
+                            NODE,
+                            format!(
+                                "follow-up task {} held: superseded by deputy task {}",
+                                a.id, cand.id
+                            ),
+                        ),
+                        Ok(false) => continue,
+                        Err(e) => {
+                            state.event(NODE, format!("could not hold follow-up {}: {e:#}", a.id));
+                            continue;
+                        }
+                    }
+                }
+            } else {
+                let why = format!(
+                    "{SUPERSEDED}follow-up task {} ({:?}) already covers {} of {pr_url}; was: {}",
+                    a.id,
+                    a.status,
+                    matched.join(", "),
+                    cand.hold_reason.as_deref().unwrap_or_default()
+                );
+                mark_held(state, queue, cand, why, pr_url, "superseded");
+                continue;
+            }
+        } else if !release {
+            continue;
+        }
+        let parent_gen = *gen_of_parent
+            .get_or_insert_with(|| parent_generation(state, queue, origin_task.as_deref()));
+        if parent_gen >= MAX_FOLLOWUP_GENERATION {
+            let why = format!(
+                "{CAPPED}generation {parent_gen} reached, not released after {pr_url} merged; was: {}",
+                cand.hold_reason.as_deref().unwrap_or_default()
+            );
+            mark_held(state, queue, cand, why, pr_url, "generation cap");
+            continue;
+        }
+        let stamp = FollowUp {
+            run: state.id.clone(),
+            origin_task: origin_task.clone(),
+            pr: pr_url.to_owned(),
+            findings: matched,
+            generation: parent_gen + 1,
+        };
+        let id = cand.id.clone();
+        let run = state.id.clone();
+        let result = queue.modify(&id, |t| {
+            if !is_deputy_candidate(t, &run, pr_url) {
+                return false;
+            }
+            t.release();
+            t.followup = Some(stamp);
+            true
+        });
+        match result {
+            Ok(true) => {
+                if !state.deputy_followups.contains(&id) {
+                    state.deputy_followups.push(id.clone());
+                }
+                state.event(
+                    NODE,
+                    format!("released deputy follow-up task {id} after {pr_url} merged"),
+                );
+            }
+            Ok(false) => {}
+            Err(e) => state.event(NODE, format!("could not release deputy task {id}: {e:#}")),
+        }
+    }
+}
+
+/// Rewrite a still-candidate deputy task's hold reason, leaving it held.
+fn mark_held(
+    state: &mut RunState,
+    queue: &Queue,
+    cand: &Task,
+    why: String,
+    pr_url: &str,
+    kind: &str,
+) {
+    let run = state.id.clone();
+    let reason = why.clone();
+    match queue.modify(&cand.id, |t| {
+        if !is_deputy_candidate(t, &run, pr_url) {
+            return false;
+        }
+        t.hold_reason = Some(reason);
+        true
+    }) {
+        Ok(true) => state.event(
+            NODE,
+            format!("deputy task {} left held ({kind}): {why}", cand.id),
+        ),
+        Ok(false) => {}
+        Err(e) => state.event(
+            NODE,
+            format!("could not mark deputy task {}: {e:#}", cand.id),
+        ),
+    }
+}
+
+/// Findings the last review round leaves to be followed up, and the ids of
+/// those only listed: every Major-or-above finding, plus all findings of a
+/// seat whose final vote was reject.
+fn select(round: &crate::run::ReviewRound) -> (Vec<Finding>, Vec<String>) {
+    let rejecters: Vec<usize> = round
+        .final_votes()
+        .into_iter()
+        .filter(|(_, _, v)| *v == ReviewVote::Reject)
+        .map(|(seat, _, _)| seat)
+        .collect();
+    let (mut chosen, mut unfiled) = (Vec::new(), Vec::new());
+    for rec in &round.reviews {
+        let rejected = rejecters.contains(&rec.reviewer);
+        for f in &rec.findings {
+            if f.severity.blocks() || rejected {
+                chosen.push(f.clone());
+            } else {
+                unfiled.push(f.id.clone());
+            }
+        }
+    }
+    (chosen, unfiled)
+}
+
+/// The deterministic half of [`after_merge`]: select, group, and file into
+/// `queue`. Records the event and the run's own bookkeeping; the caller
+/// saves the state.
+pub fn file(state: &mut RunState, pr_url: &str, queue: &Queue) -> Result<Outcome> {
+    let mut out = Outcome::default();
+    let Some(round) = state.reviews.last().cloned() else {
+        return Ok(out);
     };
+    let (chosen, unfiled) = select(&round);
+    out.unfiled = unfiled;
+    if chosen.is_empty() {
+        return Ok(out);
+    }
+
+    let origin_task = state.origin.as_ref().and_then(|o| o.task.clone());
+    // The depth recorded when the run started wins; the queue is only a
+    // fallback for runs that predate it, and an unknown depth is read as
+    // unbounded-until-proven-otherwise only when there is no origin task.
+    let parent_gen = parent_generation(state, queue, origin_task.as_deref());
     if parent_gen >= MAX_FOLLOWUP_GENERATION {
         out.capped = chosen.iter().map(|f| f.id.clone()).collect();
         state.event(
@@ -136,7 +392,9 @@ pub fn file(state: &mut RunState, pr_url: &str, queue: &Queue) -> Result<Outcome
             && f.run == state.id
         {
             done.extend(f.findings.iter().cloned());
-            if !state.followups.iter().any(|r| r.task == t.id) {
+            let by_deputy =
+                matches!(&t.source, Source::Agent { node, .. } if node == crate::deputy::NODE);
+            if !by_deputy && !state.followups.iter().any(|r| r.task == t.id) {
                 state.followups.push(FollowupRecord {
                     task: t.id,
                     findings: f.findings,
@@ -397,7 +655,9 @@ fn comment_body(state: &RunState, out: &Outcome) -> String {
         state.id
     );
     if state.followups.is_empty() {
-        s.push_str(" Each is already covered by another task:\n");
+        if !out.covered.is_empty() || state.deputy_followups.is_empty() {
+            s.push_str(" Each is already covered by another task:\n");
+        }
     } else {
         s.push_str(" They were filed as follow-up tasks:\n\n");
         for r in &state.followups {
@@ -412,6 +672,14 @@ fn comment_body(state: &RunState, out: &Outcome) -> String {
     }
     for (id, by) in &out.covered {
         s.push_str(&format!("- {id}: already covered by task `{by}`\n"));
+    }
+    if !state.deputy_followups.is_empty() {
+        s.push_str(
+            "\nFollow-up tasks filed by the approval deputy and released after the merge:\n\n",
+        );
+        for id in &state.deputy_followups {
+            s.push_str(&format!("- `{id}`\n"));
+        }
     }
     if !out.unfiled.is_empty() {
         s.push_str(&format!(
@@ -825,5 +1093,270 @@ mod tests {
     fn an_id_next_to_japanese_prose_still_covers() {
         let (out, ..) = filed_with("PR #473 の R3-1-1を修正、R3-2-1も対応");
         assert_eq!(out.covered.len(), 2, "{out:?}");
+    }
+
+    // ---- deputy tasks released after the merge ----
+
+    fn deputy_task(run: &str, title: &str, text: &str, reason: &str) -> Task {
+        let mut t = Task::new(
+            title.to_owned(),
+            text.to_owned(),
+            PathBuf::from("/repo"),
+            Source::Agent {
+                run: run.to_owned(),
+                node: crate::deputy::NODE.to_owned(),
+            },
+        );
+        t.hold_manual(Some(reason.to_owned()));
+        t
+    }
+
+    fn status_of(q: &Queue, id: &str) -> crate::queue::TaskStatus {
+        q.get(id).unwrap().status
+    }
+
+    #[test]
+    fn a_deputy_task_is_released_once_and_stamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        s.followup_generation = Some(0);
+        let mut t = deputy_task(
+            &s.id,
+            "Unrelated work",
+            "do the thing",
+            &format!("after {PR}"),
+        );
+        q.put(&mut t).unwrap();
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        let got = q.get(&t.id).unwrap();
+        assert_eq!(got.status, crate::queue::TaskStatus::Queued);
+        assert!(got.hold_reason.is_none());
+        let f = got.followup.unwrap();
+        assert_eq!((f.run.as_str(), f.generation), (s.id.as_str(), 1));
+        assert_eq!(s.deputy_followups, vec![t.id.clone()]);
+        let events = s.events.len();
+        // A second pass, or a restart that lost the run's record, changes nothing.
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        assert_eq!(s.events.len(), events);
+        s.deputy_followups.clear();
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        assert_eq!(
+            s.deputy_followups,
+            vec![t.id.clone()],
+            "rebuilt from the queue"
+        );
+        assert_eq!(status_of(&q, &t.id), crate::queue::TaskStatus::Queued);
+    }
+
+    #[test]
+    fn unrelated_held_tasks_are_never_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        s.followup_generation = Some(0);
+        let mut other_run = deputy_task("someone-else", "a", "b", &format!("after {PR}"));
+        let mut other_pr = deputy_task(&s.id, "c", "d", "after https://github.com/o/r/pull/4731");
+        let mut no_reason = deputy_task(&s.id, "e", "f", "x");
+        no_reason.hold_reason = None;
+        let mut human = manual("g");
+        human.hold_manual(Some(format!("waiting for {PR}")));
+        let mut queued = deputy_task(&s.id, "h", "i", &format!("after {PR}"));
+        queued.release();
+        let ids: Vec<String> = [
+            &mut other_run,
+            &mut other_pr,
+            &mut no_reason,
+            &mut human,
+            &mut queued,
+        ]
+        .into_iter()
+        .map(|t| {
+            q.put(t).unwrap();
+            t.id.clone()
+        })
+        .collect();
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        for id in &ids[..4] {
+            assert_eq!(status_of(&q, id), crate::queue::TaskStatus::Held, "{id}");
+            assert!(q.get(id).unwrap().followup.is_none());
+        }
+        assert!(s.deputy_followups.is_empty());
+    }
+
+    #[test]
+    fn the_switch_off_leaves_the_task_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        s.followup_generation = Some(0);
+        let mut t = deputy_task(&s.id, "x", "y", &format!("after {PR}"));
+        q.put(&mut t).unwrap();
+        settle_deputy_tasks(&mut s, PR, &q, false);
+        assert_eq!(status_of(&q, &t.id), crate::queue::TaskStatus::Held);
+    }
+
+    #[test]
+    fn the_generation_cap_applies_to_released_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        s.followup_generation = Some(MAX_FOLLOWUP_GENERATION);
+        let mut t = deputy_task(&s.id, "x", "y", &format!("after {PR}"));
+        q.put(&mut t).unwrap();
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        let got = q.get(&t.id).unwrap();
+        assert_eq!(got.status, crate::queue::TaskStatus::Held);
+        assert!(got.hold_reason.unwrap().starts_with(CAPPED));
+        let events = s.events.len();
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        assert_eq!(s.events.len(), events, "marked once");
+        let mut s2 = merged(two_seats());
+        s2.followup_generation = Some(MAX_FOLLOWUP_GENERATION - 1);
+        let mut t2 = deputy_task(&s2.id, "x", "y", &format!("after {PR}"));
+        q.put(&mut t2).unwrap();
+        settle_deputy_tasks(&mut s2, PR, &q, true);
+        assert_eq!(
+            q.get(&t2.id).unwrap().followup.unwrap().generation,
+            MAX_FOLLOWUP_GENERATION
+        );
+    }
+
+    #[test]
+    fn deputy_first_the_owners_task_runs_and_the_automatic_one_is_not_filed() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        s.followup_generation = Some(0);
+        let mut t = deputy_task(
+            &s.id,
+            "Fix the waiter",
+            "R3-1-1 at src/waiter.rs:212 loses replies",
+            &format!("after {PR}"),
+        );
+        q.put(&mut t).unwrap();
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        let out = file(&mut s, PR, &q).unwrap();
+        assert_eq!(out.covered.len(), 2, "{out:?}");
+        // Only the seat-1 Minor group is filed; the waiter.rs defect has one task.
+        assert_eq!(out.filed.len(), 1, "{out:?}");
+        let runnable: Vec<_> = q
+            .list()
+            .into_iter()
+            .filter(|t| {
+                t.status == crate::queue::TaskStatus::Queued
+                    && t.followup
+                        .as_ref()
+                        .is_some_and(|f| f.findings.iter().any(|x| x == "R3-1-1"))
+            })
+            .collect();
+        assert_eq!(runnable.len(), 1);
+        assert_eq!(runnable[0].id, t.id);
+    }
+
+    #[test]
+    fn followup_first_a_queued_automatic_task_gives_way_to_the_owners() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        s.followup_generation = Some(0);
+        file(&mut s, PR, &q).unwrap();
+        let mut t = deputy_task(
+            &s.id,
+            "Waiter replies",
+            "see R3-2-1",
+            &format!("after {PR}"),
+        );
+        q.put(&mut t).unwrap();
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        let all = q.list();
+        let live: Vec<_> = all
+            .iter()
+            .filter(|t| {
+                t.status == crate::queue::TaskStatus::Queued
+                    && t.followup
+                        .as_ref()
+                        .is_some_and(|f| f.findings.iter().any(|x| x == "R3-2-1"))
+            })
+            .collect();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, t.id);
+        let dropped = all
+            .iter()
+            .find(|a| {
+                a.id != t.id
+                    && a.followup
+                        .as_ref()
+                        .is_some_and(|f| f.findings.iter().any(|x| x == "R3-2-1"))
+            })
+            .unwrap();
+        assert_eq!(dropped.status, crate::queue::TaskStatus::Held);
+        assert!(
+            dropped
+                .hold_reason
+                .as_ref()
+                .unwrap()
+                .starts_with(SUPERSEDED)
+        );
+    }
+
+    #[test]
+    fn followup_first_a_finished_automatic_task_supersedes_the_deputys() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        s.followup_generation = Some(0);
+        file(&mut s, PR, &q).unwrap();
+        for mut a in q.list() {
+            a.status = crate::queue::TaskStatus::Done;
+            q.put(&mut a).unwrap();
+        }
+        // Matched by the finding's title, not its id.
+        let mut t = deputy_task(&s.id, "title R3-1-1", "no ids here", &format!("after {PR}"));
+        t.instruction = "nothing".to_owned();
+        q.put(&mut t).unwrap();
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        let got = q.get(&t.id).unwrap();
+        assert_eq!(got.status, crate::queue::TaskStatus::Held);
+        assert!(got.followup.is_none());
+        let reason = got.hold_reason.unwrap();
+        assert!(reason.starts_with(SUPERSEDED), "{reason}");
+        assert!(reason.contains(PR));
+        let events = s.events.len();
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        assert_eq!(s.events.len(), events, "judged once");
+    }
+
+    #[test]
+    fn a_held_deputy_task_is_superseded_by_a_later_filing_when_the_switch_is_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        s.followup_generation = Some(0);
+        let mut t = deputy_task(&s.id, "x", "R3-1-1 here", &format!("after {PR}"));
+        q.put(&mut t).unwrap();
+        settle_deputy_tasks(&mut s, PR, &q, false);
+        assert!(
+            !q.get(&t.id)
+                .unwrap()
+                .hold_reason
+                .unwrap()
+                .starts_with(SUPERSEDED)
+        );
+        file(&mut s, PR, &q).unwrap();
+        settle_deputy_tasks(&mut s, PR, &q, false);
+        let got = q.get(&t.id).unwrap();
+        assert_eq!(got.status, crate::queue::TaskStatus::Held);
+        assert!(got.hold_reason.unwrap().starts_with(SUPERSEDED));
+    }
+
+    #[test]
+    fn the_comment_lists_released_deputy_tasks() {
+        let mut s = merged(two_seats());
+        s.deputy_followups.push("abcd-1".to_owned());
+        let body = comment_body(&s, &Outcome::default());
+        assert!(body.contains("`abcd-1`"));
+        assert!(!body.contains("already covered"));
+        assert!(crate::github_text::check("", &body).is_empty());
     }
 }

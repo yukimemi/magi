@@ -1564,7 +1564,11 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
              implementer who never saw this conversation: the problem, the \
              finding id and `file:line`, the change wanted, how to tell it is \
              done. Do not put the pull request number or branch name in the \
-             text (put them in the `--hold` reason), and never pass `--force`. \
+             text (put them in the `--hold` reason: write the pull request's full URL \
+             there, because once magi confirms the merge it releases exactly the \
+             tasks held with a reason naming that pull request), and never pass \
+             `--force`. A finding magi already files as an automatic follow-up is \
+             not run twice; the duplicate stays held with the reason. \
              Run `magi task list` first so a request is not filed twice. A follow-up request alone is \
              not a merge: file the tasks, then tell the owner the task ids with \
              `--thread` and settle nothing. When you also settle, file the tasks \
