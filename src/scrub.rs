@@ -140,7 +140,7 @@ fn match_at(before: &str, rest: &str, id: &Identity) -> Option<(usize, &'static 
                 .then(|| {
                     token(rest).or_else(|| credential(rest)).or_else(|| {
                         prev.is_none_or(|c| !is_name(c))
-                            .then(|| named_identity(rest))
+                            .then(|| named_identity(before, rest))
                             .flatten()
                     })
                 })
@@ -212,7 +212,7 @@ fn token(rest: &str) -> Option<(usize, &'static str)> {
 }
 
 /// Explicit assignments avoid guessing whether an ordinary word is an account.
-fn named_identity(rest: &str) -> Option<(usize, &'static str)> {
+fn named_identity(before: &str, rest: &str) -> Option<(usize, &'static str)> {
     for key in [
         "hostname=",
         "hostname: ",
@@ -233,6 +233,7 @@ fn named_identity(rest: &str) -> Option<(usize, &'static str)> {
     }
     let n = name_len(rest);
     if n > 0
+        && !code_receiver(before, &rest[..n])
         && [".local", ".internal", ".lan"].iter().any(|suffix| {
             n.checked_sub(suffix.len())
                 .and_then(|start| rest.get(start..n))
@@ -242,6 +243,15 @@ fn named_identity(rest: &str) -> Option<(usize, &'static str)> {
         return Some((n, "[redacted-host]"));
     }
     None
+}
+
+/// A dotted name that reads as a code path (`WatchState.local`, `self.local`,
+/// or anything inside backticks) rather than a hostname. The real hostname is
+/// still caught by `identity_word`.
+fn code_receiver(before: &str, name: &str) -> bool {
+    before.ends_with('`')
+        || name.starts_with("self.")
+        || name.chars().any(|c| c.is_ascii_uppercase())
 }
 
 /// `"password": "value"` and `'token':'value'`: the key is quoted, so the
@@ -625,6 +635,21 @@ mod tests {
         let once = s("https://github.com/alice/x alice buildbox");
         assert_eq!(scrub(&once, &id()), once);
         assert_eq!(s("on buildbox"), "on [redacted-host]");
+    }
+
+    #[test]
+    fn dotted_code_paths_ending_in_local_are_not_hosts() {
+        for t in [
+            "`WatchState.local` is true",
+            "`cfg.internal` and self.local",
+            "WatchState.local",
+        ] {
+            assert_eq!(scrub(t, &Identity::default()), t);
+        }
+        assert_eq!(
+            scrub("ssh m1air.local now", &Identity::default()),
+            "ssh [redacted-host] now"
+        );
     }
 
     #[test]
