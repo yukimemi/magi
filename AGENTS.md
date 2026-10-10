@@ -2071,8 +2071,10 @@ depending on a supervisor's redirection:
   `POST /api/upgrade` on a live handover once wrote `replaced` over `parking`
   and the watchdog blamed the wrong component for 46 minutes.
 
-**The park also waits for chat turns.** `hand_over` sets `TalkTurns::parking`
-(`ParkingTurns`) and `finish_talks` waits, alongside `finish_loop`, until
+**The park also waits for chat turns, but only after the loop is done.**
+`hand_over` first awaits `finish_loop` (chat stays open meanwhile: a park can
+last as long as a node and nothing restarts yet), then sets `TalkTurns::parking`
+(`ParkingTurns`) and `finish_talks` waits, beating the lease, until
 `TalkTurns::live` is empty. While parking, `claim_talk_turn` refuses a direct
 start ("upgrade in progress, try again in a moment"), a queued claim and
 `begin_talk_turn_unless_pending` read as busy so `/say` and consult leave a
