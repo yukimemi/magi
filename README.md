@@ -79,7 +79,7 @@ specific one:
 | conductor | once per poll cycle | `conductor` | — | yes |
 | advisors (design deliberation) | ×`advisors` (default 3) | `advisors` *(unset falls back to `judges`)* | `[graph] advise` on/off, `[graph] advisors` count | yes |
 | advise-synthesis (blends the advisors into one brief) | ×1 | `synthesizer` *(unset falls back to a claude seat, else roster order)* | — | yes |
-| implementers | ×`implementers` (default 3) | `implementers` | `[graph] implementers` | yes |
+| implementers | ×`implementers` (default 1) | `implementers` | `[graph] implementers` | yes |
 | judges (rank / deliberate / vote) | ×`judges` (default 3) | `judges` | `[graph] judges`, `deliberate_rounds` | yes |
 | reviewers | ×`reviewers` (default 3) | `reviewers` | `[graph] reviewers`, `review_rounds` | yes |
 | fixer (review loop and land loop) | ×1, only when findings block | `fixer` *(unset falls back to the winner's own seat)* | — | yes |
@@ -772,7 +772,7 @@ reviewers = ["opus", "opencode"]
 # guard falls back to the built-in heuristics.
 
 [graph]
-implementers = 3
+implementers = 3                # default 1 (solo); 2+ runs a blind competition
 judges = 3
 deliberate_rounds = 1
 reviewers = 3
