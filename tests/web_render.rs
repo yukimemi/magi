@@ -1297,7 +1297,7 @@ async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
             r#"(async () => {
       const source = await (await fetch('/app.js')).text();
       window.deck = new Function(source.replace('queue: "/api/queue"', 'queue: "/api/queue?test_client=1"').replace(/\nboot\(\);\s*$/, `
-        return { state, loadHealth, loadLoop, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter };
+        return { state, loadHealth, loadLoop, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter, reviewPassed, voteTag, reviewStamp };
       `))();
       await Promise.all([deck.loadQueue(), deck.loadRuns(), deck.loadTalks()]);
     })()"#,
@@ -1896,4 +1896,83 @@ async fn chat_persona_select_sits_beside_the_agent_select_without_overlap() {
             "{tag}: overlaps the agent select {got}"
         );
     }
+}
+
+/// The whole-review stamp is a pure condition over the run record, and the
+/// vote tag stamps only a plain approve (承認) or a reject (否決).
+#[tokio::test]
+async fn review_stamp_condition_and_vote_tags() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
+        );
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let base = serve(
+        &home,
+        queue.clone(),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    let page = browser
+        .open_page(&format!("{base}#/runs"), 390, 800, true)
+        .await
+        .expect("page");
+    client_harness(&mut browser, &page).await;
+    let out = browser
+        .eval(
+            &page,
+            r#"(() => {
+      const rec = (vote, extra) => Object.assign({ reviewer: 1, agent: 'a', vote, findings: [] }, extra || {});
+      const round = (extra) => Object.assign({ round: 1, clean: true, blocking: 0, expected: 2,
+        verdict: 'approve', reviews: [rec('approve'), rec('approve')], reconsideration: [] }, extra || {});
+      const run = (r, extra) => Object.assign({ id: 'x', status: 'ready', reviews: [r] }, extra || {});
+      const finding = { id: 'R1-1-1', severity: 'minor', title: 't' };
+      const cases = {
+        pass: run(round()),
+        none: run(round(), { reviews: [] }),
+        stalled: run(round(), { status: 'stalled' }),
+        failed: run(round({ reviews: [rec('approve'), rec('approve', { failed: 'boom' })] })),
+        absent: run(round({ reviews: [rec('approve')] })),
+        withFindings: run(round({ verdict: 'approve_with_findings', reviews: [rec('approve'), rec('approve_with_findings')] })),
+        reject: run(round({ verdict: 'reject' })),
+        revote: run(round({ reconsideration: [{ reviewer: 1, vote: 'approve_with_findings' }] })),
+        open: run(round({ clean: false, blocking: 1 })),
+        minor: run(round({ reviews: [rec('approve', { findings: [finding] }), rec('approve')] })),
+      };
+      const passed = {};
+      for (const [k, v] of Object.entries(cases)) passed[k] = deck.reviewPassed(v);
+      const text = (v) => deck.voteTag(v, '').textContent;
+      const stamp = deck.reviewStamp();
+      document.body.append(stamp);
+      const box = stamp.getBoundingClientRect();
+      return {
+        passed,
+        approve: text('approve'), awf: text('approve_with_findings'), reject: text('reject'), failed: text('failed'),
+        stampText: stamp.textContent,
+        fits: box.right <= window.innerWidth + 1 && box.left >= -1 && document.documentElement.scrollWidth <= window.innerWidth + 1,
+      };
+    })()"#,
+        )
+        .await
+        .unwrap();
+    for (k, v) in out["passed"].as_object().unwrap() {
+        assert_eq!(v, &serde_json::json!(k == "pass"), "reviewPassed {k}");
+    }
+    assert_eq!(out["approve"], "approve \u{627f}\u{8a8d}");
+    assert_eq!(out["awf"], "approve w/ findings");
+    assert_eq!(out["reject"], "reject \u{5426}\u{6c7a}");
+    assert_eq!(out["failed"], "failed");
+    assert_eq!(out["stampText"], "\u{627f}\u{8a8d}REVIEW PASSED");
+    assert_eq!(out["fits"], true);
+    browser.close_page(&page).await;
 }
