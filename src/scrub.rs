@@ -90,8 +90,7 @@ pub fn scrub(text: &str, id: &Identity) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < text.len() {
-        let prev = text[..i].chars().next_back();
-        if let Some((len, rep)) = match_at(&text[i..], prev, id) {
+        if let Some((len, rep)) = match_at(&text[..i], &text[i..], id) {
             out.push_str(rep);
             i += len;
         } else {
@@ -110,8 +109,7 @@ pub fn locate(text: &str, id: &Identity) -> Vec<(usize, &'static str)> {
     let mut i = 0;
     let mut line = 1;
     while i < text.len() {
-        let prev = text[..i].chars().next_back();
-        if let Some((len, rep)) = match_at(&text[i..], prev, id) {
+        if let Some((len, rep)) = match_at(&text[..i], &text[i..], id) {
             let kind = match rep {
                 "~" => "home-path",
                 r => r
@@ -133,7 +131,8 @@ pub fn locate(text: &str, id: &Identity) -> Vec<(usize, &'static str)> {
     hits
 }
 
-fn match_at(rest: &str, prev: Option<char>, id: &Identity) -> Option<(usize, &'static str)> {
+fn match_at(before: &str, rest: &str, id: &Identity) -> Option<(usize, &'static str)> {
+    let prev = before.chars().next_back();
     let starts_word = prev.is_none_or(|p| !is_word(p));
     home_path(rest, prev, id)
         .or_else(|| {
@@ -158,7 +157,11 @@ fn match_at(rest: &str, prev: Option<char>, id: &Identity) -> Option<(usize, &'s
                 .then(|| ipv4(rest).or_else(|| ipv6(rest)))
                 .flatten()
         })
-        .or_else(|| starts_word.then(|| identity_word(rest, id)).flatten())
+        .or_else(|| {
+            (starts_word && !github_owner_slot(before))
+                .then(|| identity_word(rest, id))
+                .flatten()
+        })
 }
 
 /// `/Users/x`, `/home/x`, `/root`, `C:\Users\x`, `C:/Users/x` and the literal
@@ -230,6 +233,7 @@ fn named_identity(rest: &str) -> Option<(usize, &'static str)> {
     }
     let n = name_len(rest);
     if n > 0
+        && !code_receiver(&rest[..n])
         && [".local", ".internal", ".lan"].iter().any(|suffix| {
             n.checked_sub(suffix.len())
                 .and_then(|start| rest.get(start..n))
@@ -239,6 +243,26 @@ fn named_identity(rest: &str) -> Option<(usize, &'static str)> {
         return Some((n, "[redacted-host]"));
     }
     None
+}
+
+/// A dotted name that reads as a code path (`WatchState.local`, `self.local`)
+/// rather than a hostname: one dot, no hyphen, and either a `self.` / `this.`
+/// receiver or a CamelCase one (a capital right after a lowercase letter).
+/// Anything else, mixed-case or backticked hostnames included, stays a host.
+fn code_receiver(name: &str) -> bool {
+    if name.matches('.').count() != 1 || name.contains('-') {
+        return false;
+    }
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("self.") || lower.starts_with("this.") {
+        return true;
+    }
+    let mut prev_lower = false;
+    name.chars().any(|c| {
+        let hump = prev_lower && c.is_ascii_uppercase();
+        prev_lower = c.is_ascii_lowercase();
+        hump
+    })
 }
 
 /// `"password": "value"` and `'token':'value'`: the key is quoted, so the
@@ -437,10 +461,50 @@ fn ipv6(rest: &str) -> Option<(usize, &'static str)> {
     Some((n, "[redacted-ip]"))
 }
 
+/// Plain words (and the bare mDNS suffix) that show up as a hostname or account
+/// name on some machines but are ordinary prose everywhere. Matched against the
+/// whole trimmed value only, so `devbox.local` is still a hostname.
+const GENERIC_IDENTITY_WORDS: [&str; 12] = [
+    "local",
+    "localhost",
+    "localdomain",
+    "lan",
+    "internal",
+    "user",
+    "host",
+    "admin",
+    "root",
+    "test",
+    "default",
+    "unknown",
+];
+
+fn is_generic_identity(w: &str) -> bool {
+    let w = w.strip_prefix('.').unwrap_or(w);
+    GENERIC_IDENTITY_WORDS
+        .iter()
+        .any(|g| g.eq_ignore_ascii_case(w))
+}
+
+/// True when the text before the cursor ends with `github.com/` as the start of
+/// a URL, i.e. the cursor is on the owner segment of a GitHub URL.
+fn github_owner_slot(before: &str) -> bool {
+    let b = before.to_ascii_lowercase();
+    let Some(head) = b.strip_suffix("github.com/") else {
+        return false;
+    };
+    let head = head.strip_suffix("www.").unwrap_or(head);
+    head.ends_with("http://") || head.ends_with("https://")
+}
+
 fn identity_word(rest: &str, id: &Identity) -> Option<(usize, &'static str)> {
     for (word, rep) in [(&id.user, "[redacted-user]"), (&id.host, "[redacted-host]")] {
         let w = word.trim();
-        if w.len() < MIN_IDENTITY_WORD || rest.len() < w.len() || !rest.is_char_boundary(w.len()) {
+        if w.len() < MIN_IDENTITY_WORD
+            || is_generic_identity(w)
+            || rest.len() < w.len()
+            || !rest.is_char_boundary(w.len())
+        {
             continue;
         }
         if rest[..w.len()].eq_ignore_ascii_case(w)
@@ -530,6 +594,84 @@ mod tests {
             s("alicein wonderland, xbuildbox"),
             "alicein wonderland, xbuildbox"
         );
+    }
+
+    #[test]
+    fn github_url_owner_is_kept_but_other_mentions_are_not() {
+        assert_eq!(
+            s("https://github.com/alice/magi/pull/681 by alice"),
+            "https://github.com/alice/magi/pull/681 by [redacted-user]"
+        );
+        assert_eq!(
+            s("http://www.GitHub.com/Alice/x"),
+            "http://www.GitHub.com/Alice/x"
+        );
+        for t in [
+            "https://github.com.evil/alice",
+            "https://github.com/x/alice",
+            "git@github.com:alice/x",
+            "https://api.github.com/alice",
+            "github.com/alice",
+        ] {
+            assert!(s(t).contains("[redacted-user]"), "{t}");
+        }
+        let text = "https://github.com/alice/magi alice";
+        assert_eq!(locate(text, &id()), vec![(1, "user")]);
+    }
+
+    #[test]
+    fn generic_host_and_user_values_do_not_redact_prose() {
+        for host in ["local", ".local", "devbox.local"] {
+            let i = Identity {
+                host: host.into(),
+                ..Identity::default()
+            };
+            let t = "`WatchState::local` and local mode";
+            assert_eq!(scrub(t, &i), t, "{host}");
+        }
+        let real = Identity {
+            host: "devbox.local".into(),
+            ..Identity::default()
+        };
+        assert_eq!(
+            scrub("on devbox.local now", &real),
+            "on [redacted-host] now"
+        );
+        for (user, host) in [("local", ""), ("admin", "localhost")] {
+            let i = Identity {
+                user: user.into(),
+                host: host.into(),
+                ..Identity::default()
+            };
+            let t = "local admin localhost";
+            assert_eq!(scrub(t, &i), t);
+        }
+        let once = s("https://github.com/alice/x alice buildbox");
+        assert_eq!(scrub(&once, &id()), once);
+        assert_eq!(s("on buildbox"), "on [redacted-host]");
+    }
+
+    #[test]
+    fn dotted_code_paths_ending_in_local_are_not_hosts() {
+        for t in [
+            "`WatchState.local` is true",
+            "WatchState.lan and self.local",
+            "WatchState.local",
+        ] {
+            assert_eq!(scrub(t, &Identity::default()), t);
+        }
+        for t in [
+            "ssh devbox.local",
+            "ssh BUILD-SERVER.local",
+            "ssh Alices-MacBook-Pro.local",
+            "`devbox.local`",
+            "ssh BUILD.local",
+        ] {
+            assert!(
+                scrub(t, &Identity::default()).contains("[redacted-host]"),
+                "{t}"
+            );
+        }
     }
 
     #[test]
