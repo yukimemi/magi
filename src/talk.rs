@@ -3457,7 +3457,8 @@ mod tests {
 
     #[test]
     fn implementers_are_validated_and_old_records_load_as_solo() {
-        let cfg = config(mock_agent(Path::new("/tmp"), ECHO, BTreeMap::new()));
+        let (tmp, talks) = store();
+        let cfg = config(mock_agent(tmp.path(), ECHO, BTreeMap::new()));
         assert_eq!(check_implementers(1, &cfg), Ok(1));
         assert_eq!(check_implementers(3, &cfg), Ok(3));
         assert!(check_implementers(0, &cfg).is_err());
@@ -3466,7 +3467,6 @@ mod tests {
         empty.agents.clear();
         assert!(check_implementers(2, &empty).is_err());
 
-        let (tmp, talks) = store();
         let talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
         let path = talks.path_of(&talk.id);
         let mut v: serde_json::Value =
