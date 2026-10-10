@@ -131,6 +131,29 @@ pub fn begin(questions: &Questions, talks: &Talks, q: &Question, talk: &Talk) ->
     Ok(true)
 }
 
+/// Refuse a chat's answer to a merge approval whose task the operator held, as
+/// `ask_settle_cmd` does for a deputy: such a hold is lifted by the operator's
+/// button. The task is the one `q.run` names, directly or as one of its runs;
+/// none found (an unreadable task is not listed) does not refuse. The caller
+/// reads the queue before taking the question lock, so a hold placed in between
+/// is missed for that one call.
+pub fn refuse_operator_held(q: &Question, node: &str, tasks: &[crate::queue::Task]) -> Result<()> {
+    if q.node != crate::land::APPROVAL_NODE || node != CHAT_NODE {
+        return Ok(());
+    }
+    if let Some(task) = tasks
+        .iter()
+        .find(|t| t.id == q.run || t.runs.contains(&q.run))
+        && task.operator_held()
+    {
+        bail!(
+            "task {} is held by the operator; an answer cannot settle it",
+            task.short()
+        );
+    }
+    Ok(())
+}
+
 /// Validate a merge approval answered by a running chat. Terminal answers and
 /// other question types retain their existing behavior. Intent is judged by
 /// the chat; this gate requires evidence from the correct conversation.
@@ -512,6 +535,30 @@ mod tests {
             "SQLite is simpler.".to_owned(),
             vec!["SQLite".to_owned(), "Redis".to_owned()],
         )
+    }
+
+    #[test]
+    fn chat_answer_is_refused_for_an_operator_held_task() {
+        let mut task = crate::queue::Task::new(
+            "t".into(),
+            "i".into(),
+            std::path::PathBuf::from("."),
+            crate::queue::Source::Human,
+        );
+        task.runs.push("run-1".into());
+        let mut q = question(crate::land::APPROVAL_NODE);
+        q.run = "run-1".into();
+        let check = |t: &crate::queue::Task, node: &str| {
+            refuse_operator_held(&q, node, std::slice::from_ref(t))
+        };
+        assert!(check(&task, CHAT_NODE).is_ok());
+        task.hold_machine(None);
+        assert!(check(&task, CHAT_NODE).is_ok());
+        task.hold_manual(None);
+        assert!(check(&task, CHAT_NODE).is_err());
+        // Not a chat's answer, or another question: untouched.
+        assert!(check(&task, "implement").is_ok());
+        assert!(refuse_operator_held(&q, CHAT_NODE, &[]).is_ok());
     }
 
     #[tokio::test]
