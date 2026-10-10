@@ -2516,6 +2516,9 @@ fallback; a language-withheld field becomes neutral.
   verbatim quote of the owner's latest message that passes `land::unhedged`.
   `github_text::deputy_brief` is appended to the Generic brief for this node and
   says publishing is irreversible and doubt means asking back with `--thread`.
+  A consulted chat is held to the same rule: `consult::validate_answer` requires
+  `--quote` from the owner's latest message, passing `land::unhedged`, for
+  `post original` (`use fallback` stays unguarded).
 - **A replacement goes through the same gate** (`github_text::vet_title`, with
   the `language_judge` when configured). Sensitive data is rejected, never
   redacted into text the owner did not write. A failing reply gets one more

@@ -165,7 +165,11 @@ pub fn validate_answer(
     reply: &str,
     quote: Option<&str>,
 ) -> Result<()> {
-    if q.node != crate::land::APPROVAL_NODE || node != CHAT_NODE {
+    // Publishing the original of a withheld pull request text is as
+    // irreversible as a merge: it takes the same evidence.
+    let original =
+        q.node == crate::github_text::ASK_NODE && reply == crate::github_text::POST_ORIGINAL;
+    if !(q.node == crate::land::APPROVAL_NODE || original) || node != CHAT_NODE {
         return Ok(());
     }
     let consult = q
@@ -216,6 +220,7 @@ pub fn validate_answer(
         .filter(|s| !s.is_empty())
         .context("chat merge approval requires --quote from the owner's latest message")?;
     let valid = match reply {
+        _ if original => crate::land::unhedged(&latest, quote),
         crate::land::APPROVE => latest.contains(quote),
         crate::land::HOLD => {
             latest.trim().eq_ignore_ascii_case(crate::land::HOLD)
@@ -1119,6 +1124,46 @@ mod tests {
             assert_eq!(s.matches(H).count(), 1, "{s}");
             assert_eq!(s.matches(E).count(), 1, "{s}");
         }
+    }
+
+    #[test]
+    fn a_chat_posts_the_original_text_only_on_an_unhedged_quote() {
+        use crate::github_text::{ASK_NODE, POST_ORIGINAL, USE_FALLBACK};
+        let (tmp, store, mut talk) = talks();
+        let questions = Questions::at(tmp.path().join("questions"));
+        let mut q = question(ASK_NODE);
+        q.choices = vec![USE_FALLBACK.into(), POST_ORIGINAL.into()];
+        questions.put(&mut q).unwrap();
+        assert!(begin(&questions, &store, &q, &talk).unwrap());
+        q = questions.get(&q.id).unwrap();
+        let queued = store.get(&talk.id).unwrap().pending;
+        let owner_turn = |body: &str| talk::Turn {
+            breaks: Some(Vec::new()),
+            who: talk::Who::Operator,
+            body: body.into(),
+            at: Timestamp::now(),
+            attachments: Vec::new(),
+            usage: None,
+        };
+        talk.turns.push(owner_turn(&queued));
+        talk.pending.clear();
+        let check = |q: &Question, run: &str, reply: &str, quote: Option<&str>| {
+            validate_answer(q, &store, run, CHAT_NODE, reply, quote)
+        };
+        store.put(&mut talk).unwrap();
+        // No owner word after the hand-over: nothing to quote.
+        assert!(check(&q, &talk.id, POST_ORIGINAL, Some("post it")).is_err());
+        talk.turns.push(owner_turn("Post the original, maybe?"));
+        store.put(&mut talk).unwrap();
+        assert!(check(&q, &talk.id, POST_ORIGINAL, Some("Post the original")).is_err());
+        talk.turns
+            .push(owner_turn("Post the original text as it is."));
+        store.put(&mut talk).unwrap();
+        assert!(check(&q, &talk.id, POST_ORIGINAL, None).is_err());
+        assert!(check(&q, &talk.id, POST_ORIGINAL, Some("never said")).is_err());
+        assert!(check(&q, &talk.id, POST_ORIGINAL, Some("Post the original text")).is_ok());
+        // The safe default stays unguarded, as before.
+        assert!(check(&q, &talk.id, USE_FALLBACK, None).is_ok());
     }
 
     #[test]
