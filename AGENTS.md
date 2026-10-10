@@ -2182,8 +2182,8 @@ dependency, so offline tests and CI are unaffected.
   object on stdout (a code fence or earlier log lines are tolerated).
 - Only prose goes out (code, quotes and `<details>` are dropped) and only after
   `scrub`; sensitive-data detection always runs on the original text.
-- A decision replaces the vocabulary heuristics only. "Not English" always
-  stands; "English" still has to clear the non-ASCII share floor.
+- A decision replaces the ASCII default only (ASCII text passes without one).
+  "Not English" always stands; "English" still has to clear the non-ASCII share floor.
 - Wired into `graph::Runner::guarded_pr_message` (first check, the rewrite's
   re-check and the final `prepare_with`); `bump.rs` and `land.rs` still use the
   heuristics. The event log records which source decided, never the text.

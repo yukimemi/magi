@@ -51,7 +51,7 @@ fn all_seen() -> bool {
 
 /// [`check`] with an optional decision from [`judge_language`].
 ///
-/// A decision replaces the vocabulary heuristics only: "not English" always
+/// A decision replaces the ASCII default only (ASCII text passes without one): "not English" always
 /// stands, "English" still has to clear the non-ASCII share floor, so a wrong
 /// answer alone cannot put CJK text on GitHub. `None` is exactly [`check`].
 pub fn check_with(title: &str, body: &str, decision: Option<LanguageDecision>) -> Vec<Violation> {
@@ -75,399 +75,13 @@ pub fn check_with(title: &str, body: &str, decision: Option<LanguageDecision>) -
     out
 }
 
-/// Function words and common verbs of the Latin-script languages most likely
-/// to appear, chosen to avoid ordinary English words.
-const FOREIGN_WORDS: &[&str] = &[
-    "este",
-    "esta",
-    "para",
-    "los",
-    "las",
-    "del",
-    "una",
-    "que",
-    "por",
-    "errores",
-    "corregir",
-    "agrega",
-    "cambio",
-    "solicitudes",
-    "fallidas",
-    "reintentos",
-    "les",
-    "des",
-    "pour",
-    "avec",
-    "dans",
-    "est",
-    "une",
-    "pas",
-    "und",
-    "der",
-    "das",
-    "nicht",
-    "mit",
-    "ein",
-    "eine",
-    "für",
-    "wird",
-    "não",
-    "uma",
-    "della",
-    "che",
-    "con",
-    "fehler",
-    "corrigir",
-    "erreurs",
-    "bitte",
-    "anfrage",
-    "anfragen",
-    "wiederholen",
-    "korrigieren",
-];
-
-/// English function words and everyday development vocabulary. Text whose
-/// words never meet this list is not English, whatever FOREIGN_WORDS knows.
-/// Words spelled the same in German or Dutch (will, die, also) stay out.
-const ENGLISH_WORDS: &[&str] = &[
-    "the",
-    "a",
-    "an",
-    "to",
-    "of",
-    "and",
-    "or",
-    "for",
-    "in",
-    "on",
-    "at",
-    "by",
-    "with",
-    "from",
-    "when",
-    "while",
-    "this",
-    "that",
-    "these",
-    "those",
-    "is",
-    "are",
-    "be",
-    "was",
-    "were",
-    "been",
-    "not",
-    "no",
-    "it",
-    "its",
-    "as",
-    "if",
-    "so",
-    "but",
-    "than",
-    "then",
-    "into",
-    "after",
-    "before",
-    "only",
-    "can",
-    "should",
-    "must",
-    "may",
-    "has",
-    "have",
-    "had",
-    "do",
-    "does",
-    "all",
-    "any",
-    "each",
-    "one",
-    "two",
-    "new",
-    "old",
-    "more",
-    "less",
-    "which",
-    "what",
-    "why",
-    "how",
-    "now",
-    "never",
-    "always",
-    "instead",
-    "without",
-    "within",
-    "over",
-    "under",
-    "per",
-    "via",
-    "we",
-    "you",
-    "they",
-    "there",
-    "their",
-    "your",
-    "our",
-    "use",
-    "used",
-    "uses",
-    "make",
-    "makes",
-    "fix",
-    "add",
-    "update",
-    "remove",
-    "bump",
-    "refactor",
-    "test",
-    "retry",
-    "request",
-    "review",
-    "run",
-    "task",
-    "branch",
-    "merge",
-    "release",
-    "error",
-    "config",
-    "build",
-    "check",
-    "docs",
-    "feat",
-    "chore",
-    "change",
-    "changes",
-    "file",
-    "code",
-    "repository",
-    "repo",
-    "pull",
-    "commit",
-    "message",
-    "text",
-    "title",
-    "body",
-    "github",
-    "gate",
-    "default",
-    "value",
-    "key",
-    "name",
-    "path",
-    "state",
-    "agent",
-    "seat",
-    "fail",
-    "failure",
-    "failed",
-    "pass",
-    "read",
-    "write",
-    "set",
-    "get",
-    "send",
-    "post",
-    "open",
-    "close",
-    "start",
-    "stop",
-    "keep",
-    "drop",
-    "move",
-    "rename",
-    "handle",
-    "support",
-    "allow",
-    "avoid",
-    "ensure",
-    "prevent",
-    "background",
-    "summary",
-    "risk",
-    "risks",
-    "follow",
-    "verify",
-    "hand",
-    "version",
-    "bug",
-    "issue",
-    "finding",
-    "findings",
-    "round",
-    "rounds",
-    "queue",
-    "worktree",
-    "diff",
-    "line",
-    "lines",
-    "word",
-    "words",
-    "list",
-    "case",
-    "cases",
-    "input",
-    "output",
-    "result",
-    "results",
-    "fallback",
-    "replace",
-    "replaced",
-    "withheld",
-    "generated",
-    "neutral",
-    "english",
-    "language",
-    "detect",
-    "detection",
-    "match",
-    "matches",
-    "wrong",
-    "stale",
-    "missing",
-    "extra",
-    "small",
-    "let",
-    "settle",
-    "carry",
-    "note",
-    "help",
-    "colour",
-    "color",
-    "palette",
-    "deputy",
-    "brief",
-    "briefs",
-    "serde",
-    "tokio",
-];
-
-fn english_words(text: &str) -> (usize, usize) {
-    // A conventional-commit prefix (`fix(scope)!:`) says nothing about the
-    // language; drop it from the raw text, before punctuation is flattened.
-    let t = text.trim_start();
-    let kind = t.chars().take_while(|c| c.is_ascii_lowercase()).count();
-    let mut rest = &t[kind..];
-    if kind > 0 && rest.starts_with('(') {
-        rest = rest.find(')').map_or(rest, |i| &rest[i + 1..]);
-    }
-    let rest = rest.strip_prefix('!').unwrap_or(rest);
-    let text = if kind > 0 && rest.starts_with(':') {
-        &rest[1..]
-    } else {
-        text
-    };
-    let cleaned: String = text
-        .chars()
-        .map(|c| {
-            if "()[],;!?\"'*#<>`-=|".contains(c) {
-                ' '
-            } else {
-                c
-            }
-        })
-        .collect();
-    let (mut counted, mut hits) = (0, 0);
-    let tokens = cleaned.split_whitespace();
-    for raw in tokens {
-        let w = raw.trim_matches(|c| c == ':' || c == '.');
-        if w.len() < 2 || !w.chars().all(|c| c.is_ascii_alphabetic()) {
-            continue;
-        }
-        if w.chars().all(|c| c.is_ascii_uppercase())
-            || w.chars().skip(1).any(|c| c.is_ascii_uppercase())
-        {
-            continue;
-        }
-        counted += 1;
-        let w = w.to_ascii_lowercase();
-        let known = |x: &str| ENGLISH_WORDS.contains(&x);
-        let stem = |suffix: &str, add: &str| w.strip_suffix(suffix).map(|b| format!("{b}{add}"));
-        if known(&w)
-            || [
-                stem("ies", "y"),
-                stem("es", ""),
-                stem("s", ""),
-                stem("ed", ""),
-                stem("ed", "e"),
-                stem("ing", ""),
-                stem("ing", "e"),
-            ]
-            .iter()
-            .flatten()
-            .any(|x| known(x))
-        {
-            hits += 1;
-        }
-    }
-    (counted, hits)
-}
-
-/// Word endings that are common in German, Dutch, Spanish and Italian and
-/// rare in English. Only ever applied to long ASCII words (see `foreign_looking`).
-const FOREIGN_SUFFIXES: &[&str] = &[
-    "ieren", "ierung", "ungen", "ung", "keit", "heit", "lich", "zeit", "zeiten", "mente", "zione",
-];
-
-/// Prose shorter than this many counted words cannot be judged by a zero-hit
-/// result alone: a title like `Improve performance` has no word the list knows.
-const PROSE_WORDS: usize = 5;
-
-/// Positive evidence that a short text is not English, without needing a
-/// match against the English list: non-ASCII letters, any known foreign word,
-/// or a long ASCII word with a foreign ending (`Wartezeiten`, `reduzieren`).
-fn foreign_looking(text: &str) -> bool {
-    text.chars().any(|c| c.is_alphabetic() && !c.is_ascii())
-        || text
-            .split(|c: char| !c.is_alphabetic())
-            .filter(|w| !w.is_empty())
-            .map(str::to_lowercase)
-            .any(|w| {
-                FOREIGN_WORDS.contains(&w.as_str())
-                    || (w.len() >= 6
-                        && w.is_ascii()
-                        && FOREIGN_SUFFIXES.iter().any(|s| w.ends_with(s)))
-            })
-}
-
-fn lacks_english(text: &str) -> bool {
-    let (counted, hits) = english_words(text);
-    if counted < PROSE_WORDS {
-        // Too short for "no English word" to mean anything by itself.
-        return (hits == 0 || hits * 2 < counted) && foreign_looking(text);
-    }
-    hits == 0 || hits * 3 < counted
-}
-
-fn foreign_words(text: &str) -> bool {
-    let words: Vec<String> = text
-        .split(|c: char| !c.is_alphabetic())
-        .filter(|w| !w.is_empty())
-        .map(str::to_lowercase)
-        .collect();
-    let hits = words
-        .iter()
-        .filter(|w| FOREIGN_WORDS.contains(&w.as_str()))
-        .count();
-    hits >= 2 && hits * 4 >= words.len()
-}
-
 fn non_english_with(text: &str, english: Option<bool>) -> bool {
-    match english {
-        Some(false) if text.chars().any(|c| c.is_alphabetic()) => return true,
-        Some(_) => {}
-        None => {
-            if foreign_words(text)
-                || lacks_english(text)
-                || text
-                    .split("\n\n")
-                    .any(|p| p.split_whitespace().count() >= 5 && lacks_english(p))
-            {
-                return true;
-            }
-        }
+    // A rejection stands whenever there is text to reject.
+    if english == Some(false) && text.chars().any(|c| c.is_alphabetic()) {
+        return true;
     }
-    foreign_share(text)
+    // Everything else, an approval included, still has to clear the floor.
+    foreign_share(text) || (english != Some(true) && short_foreign(text))
 }
 
 /// Too large a share of non-ASCII letters, whoever vouched for the text.
@@ -487,6 +101,36 @@ fn foreign_share(text: &str) -> bool {
                 .count();
             foreign >= 4 && foreign * 2 >= letters.max(1)
         })
+}
+
+/// Short non-ASCII lines the share floor above lets through. Applied only
+/// when no judge vouched for the text: an approval keeps the plain floor.
+fn short_foreign(text: &str) -> bool {
+    text.lines().any(|line| {
+        // A conventional-commit prefix (`fix(scope)!:`) says nothing about the
+        // language, so `fix: 修正` is judged on `修正`.
+        let rest = strip_commit_prefix(line);
+        let letters = rest.chars().filter(|c| c.is_alphabetic()).count();
+        let foreign = rest
+            .chars()
+            .filter(|c| c.is_alphabetic() && !c.is_ascii())
+            .count();
+        foreign >= 2 && foreign * 3 >= letters
+    })
+}
+
+fn strip_commit_prefix(line: &str) -> &str {
+    let t = line.trim_start();
+    let kind = t.chars().take_while(|c| c.is_ascii_lowercase()).count();
+    let mut rest = &t[kind..];
+    if kind > 0 && rest.starts_with('(') {
+        rest = rest.find(')').map_or(rest, |i| &rest[i + 1..]);
+    }
+    let rest = rest.strip_prefix('!').unwrap_or(rest);
+    match rest.strip_prefix(':') {
+        Some(r) if kind > 0 => r,
+        _ => line,
+    }
 }
 
 /// Offset just past the first backtick run of exactly `n` in `text`, if any.
@@ -988,61 +632,61 @@ mod tests {
         ] {
             assert!(check(title, "").is_empty(), "{title}");
         }
-        assert!(check("Bitte Anfragen wiederholen", "").contains(&Violation::TitleLanguage));
-        assert!(
-            check("fix: retries", "Bitte Anfragen wiederholen").contains(&Violation::BodyLanguage)
-        );
+        assert!(check("再試行を修正する", "").contains(&Violation::TitleLanguage));
+        assert!(check("fix: 再試行を修正", "").contains(&Violation::TitleLanguage));
+        for short in ["fix: 修正", "chore: 更新", "feat(web)!: 追加", "修正"] {
+            assert!(
+                check(short, "").contains(&Violation::TitleLanguage),
+                "{short}"
+            );
+        }
+        assert!(check("fix: retries", "LGTM。修正済").contains(&Violation::BodyLanguage));
+        // An approval keeps only the plain share floor.
+        let ok = Some(LanguageDecision {
+            title_english: true,
+            body_english: true,
+            body_complete: true,
+        });
+        assert!(check_with("fix: résumé", "Update résumé.", ok).is_empty());
         assert!(
             check(
                 "fix: retries",
-                "Add retries for failed requests.\n\nBitte Anfragen schnell wiederholen heute."
+                "Add retries.\n\n再試行の処理を修正します。\n"
             )
             .contains(&Violation::BodyLanguage)
-        );
-        assert!(
-            check("fix: retries", "Zeitweise Sperren lösen Wartezeiten aus")
-                .contains(&Violation::BodyLanguage)
         );
     }
 
     #[test]
-    fn short_english_without_list_hits_passes_but_foreign_short_text_fails() {
+    fn jargon_heavy_ascii_passes_without_a_word_list() {
         for text in [
+            "fix(web): truncate dependency graph labels by display width",
             "Improve performance",
             "perf: speed cache",
-            "Trim idle sockets",
-            "Optimize memory consumption",
-            "ci: pin actions",
-            "Quicker warmup sprocket",
+            "Quicker warmup sprocket tweak gizmo",
+            "refactor(graph): memoize topo sort over worktree DAG nodes",
         ] {
-            assert_eq!(english_words(text).1, 0, "{text} must have no list hit");
             assert!(check(text, "").is_empty(), "{text}");
             assert!(check("fix: retries", text).is_empty(), "{text}");
         }
+        let body = "Memoize the topological sort so reviewer seats stop re-walking the DAG.\n\nClamp sprocket gizmo widths via grapheme clusters.";
+        assert!(check("fix: retries", body).is_empty());
+    }
+
+    #[test]
+    fn non_ascii_prose_is_still_withheld() {
+        // Line-level share: a Japanese line is not diluted by English lines.
+        let body = format!("{}\nこれは日本語の行です\n", "Fix the queue.\n".repeat(30));
+        assert!(check("fix: retries", &body).contains(&Violation::BodyLanguage));
         for text in [
-            "fix(request): Wartezeiten reduzieren",
-            "Leistung verbessern",
-            "Corrección rápida",
-            "fix: Wartezeiten im request reduzieren",
-            "fix: retries schneller wiederholen",
-            "fix(request): Wartezeiten bei retries reduzieren",
+            "Исправить повторные запросы",
+            "Διόρθωση επαναλήψεων αιτημάτων",
         ] {
             assert!(
                 check(text, "").contains(&Violation::TitleLanguage),
                 "{text}"
             );
-            assert!(
-                check("fix: retries", text).contains(&Violation::BodyLanguage),
-                "{text}"
-            );
         }
-        // Four zero-hit words are short; five are prose and need a hit.
-        let four = "Quicker warmup sprocket tweak";
-        let five = "Quicker warmup sprocket tweak gizmo";
-        assert_eq!(english_words(four), (4, 0));
-        assert_eq!(english_words(five), (5, 0));
-        assert!(check(four, "").is_empty());
-        assert!(check(five, "").contains(&Violation::TitleLanguage));
     }
 
     #[test]
@@ -1136,15 +780,7 @@ mod review_round_tests {
     use super::*;
 
     #[test]
-    fn latin_script_non_english_is_flagged() {
-        assert!(check("Corregir errores", "fix: retry").contains(&Violation::TitleLanguage));
-        assert!(
-            check(
-                "fix: retries",
-                "Este cambio agrega reintentos para solicitudes fallidas."
-            )
-            .contains(&Violation::BodyLanguage)
-        );
+    fn english_prose_passes() {
         assert!(
             check(
                 "fix: retry failed requests",
@@ -1185,11 +821,7 @@ mod review_round_tests {
     }
 
     #[test]
-    fn a_decision_overrides_the_vocabulary_heuristics_only() {
-        // Latin-script text the word list calls foreign: the judge vouches.
-        let foreign = "Corregir errores para los reintentos";
-        assert!(check(foreign, "").contains(&Violation::TitleLanguage));
-        assert!(check_with(foreign, "", decision(true, true)).is_empty());
+    fn a_decision_overrides_the_ascii_default_only() {
         // A rejection stands even where the heuristics pass.
         let english = "Fix retry handling in the queue";
         assert!(check(english, "").is_empty());
@@ -1207,7 +839,7 @@ mod review_round_tests {
     #[test]
     fn no_decision_is_exactly_the_heuristic_check() {
         for (t, b) in [
-            ("Corregir errores para los reintentos", ""),
+            ("再試行の処理を修正する", ""),
             ("Fix it", "Plain English body text here."),
         ] {
             assert_eq!(check(t, b), check_with(t, b, None));
@@ -1288,9 +920,9 @@ mod quoted_value_tests {
     }
 
     #[test]
-    fn an_approval_of_a_truncated_prose_leaves_the_heuristics_on_the_body() {
+    fn an_approval_of_a_truncated_prose_leaves_the_share_floor_on_the_body() {
         let body = format!(
-            "{}\n\nCorregir errores para los reintentos de solicitudes fallidas en las colas del sistema\n",
+            "{}\n\n再試行の処理を修正してキューの失敗した要求を扱うようにします\n",
             "Fix the queue. ".repeat(10)
         );
         let partial = Some(LanguageDecision {
