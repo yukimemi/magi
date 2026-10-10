@@ -2045,6 +2045,152 @@ async fn chat_persona_select_sits_beside_the_agent_select_without_overlap() {
     }
 }
 
+/// The Chat selectors are remembered per browser and applied to the next new
+/// conversation only; the conversation they were changed in keeps its values.
+#[tokio::test]
+async fn chat_remembers_persona_and_implementers_for_new_conversations() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
+        );
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let agent = fx.config.agents[0].id.clone();
+    let mut t = talk::begin(&talks, &fx.config, fx.repo.clone(), Some(&agent)).expect("seed talk");
+    talk::record(&mut t, &talks, "Remember my choices", Vec::new()).expect("seed turn");
+    let talk_id = t.id.clone();
+
+    let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
+    let mut browser = cdp::Browser::launch(&chrome)
+        .await
+        .unwrap_or_else(|e| panic!("could not start Chrome at {}: {e}", chrome.display()));
+    let w = Duration::from_secs(30);
+    let page = browser
+        .open_page(&format!("{base}#/chat/{talk_id}"), 1280, 900, false)
+        .await
+        .unwrap_or_else(|e| panic!("open: {e}"));
+    browser
+        .wait_for(
+            &page,
+            "(() => { const s = document.getElementById('talk-persona'); \
+             return !!s && !s.disabled && s.options.length > 1 \
+               && !localStorage.getItem('magi-talk-defaults'); })()",
+            w,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("persona select never rendered (or something was stored on load): {e}")
+        });
+
+    browser
+        .eval(
+            &page,
+            "(() => { const s = document.getElementById('talk-persona'); \
+             s.value = 'rei'; s.dispatchEvent(new Event('change')); return true; })()",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("change persona: {e}"));
+    browser
+        .wait_for(
+            &page,
+            "(() => { try { return JSON.parse(localStorage.getItem('magi-talk-defaults')).persona === 'rei'; } \
+             catch (_) { return false; } })()",
+            w,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("persona was not remembered: {e}"));
+    browser
+        .wait_for(
+            &page,
+            "(() => { const s = document.getElementById('talk-implementers'); return !!s && !s.disabled; })()",
+            w,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("implementers select never settled: {e}"));
+    browser
+        .eval(
+            &page,
+            "(() => { const s = document.getElementById('talk-implementers'); \
+             s.value = '3'; s.dispatchEvent(new Event('change')); return true; })()",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("change implementers: {e}"));
+    // The config may refuse 3 here; either way the stored value is whatever
+    // the server confirmed for this conversation, never a guess.
+    browser
+        .wait_for(
+            &page,
+            "(() => { const s = document.getElementById('talk-implementers'); return !!s && !s.disabled; })()",
+            w,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("implementers change never settled: {e}"));
+
+    browser
+        .eval(
+            &page,
+            "(() => { document.getElementById('talk-start-go').click(); return true; })()",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("start: {e}"));
+    browser
+        .wait_for(
+            &page,
+            &format!(
+                "(() => {{ const s = document.getElementById('talk-persona'); \
+                 return location.hash.startsWith('#/chat/') && !location.hash.endsWith('{talk_id}') \
+                   && !!s && s.value === 'rei'; }})()"
+            ),
+            w,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("new conversation did not start with the remembered persona: {e}"));
+
+    let stored = browser
+        .eval(
+            &page,
+            "(() => JSON.parse(localStorage.getItem('magi-talk-defaults')))()",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("read stored: {e}"));
+    let implementers = stored["implementers"].as_u64();
+    if let Some(n) = implementers {
+        let got = browser
+            .eval(
+                &page,
+                "(() => document.getElementById('talk-implementers').value)()",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("read implementers: {e}"));
+        assert_eq!(
+            got,
+            n.to_string(),
+            "new conversation takes the remembered count: {stored}"
+        );
+    }
+
+    // The original conversation keeps its own stored values.
+    let original = browser
+        .eval(
+            &page,
+            &format!(
+                "(async () => {{ const r = await fetch('/api/talks/{talk_id}'); \
+                 const t = await r.json(); return {{ persona: t.persona, implementers: t.implementers }}; }})()"
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("read original: {e}"));
+    assert_eq!(original["persona"], "rei", "{original}");
+}
+
 /// The per-conversation selectors are chips just above the composer, so a
 /// long transcript never has to be scrolled to the top to change one.
 #[tokio::test]

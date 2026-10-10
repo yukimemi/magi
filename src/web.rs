@@ -6420,6 +6420,12 @@ async fn talks_list(
 struct NewTalk {
     agent: Option<String>,
     repo: Option<PathBuf>,
+    /// Remembered choices from the browser. Soft: kept as raw JSON so a
+    /// wrong type is dropped like a stale value instead of failing the request;
+    /// each falls back to its default on its own (see [`talk::begin_with`]).
+    preferred_agent: Option<serde_json::Value>,
+    persona: Option<serde_json::Value>,
+    implementers: Option<serde_json::Value>,
 }
 
 /// `POST /api/talks` - open a conversation. Takes no agent turn: see
@@ -6439,7 +6445,20 @@ async fn talk_post(
     let repo = body.repo.clone().unwrap_or_else(|| ui.repo.clone());
     let cfg = config_for(&repo).await?;
     let view = blocking(move || {
-        let talk = talk::begin(&ui.talks, &cfg, repo, body.agent.as_deref())?;
+        let preferred = talk::Preferred {
+            agent: body
+                .preferred_agent
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            persona: body
+                .persona
+                .as_ref()
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            implementers: body.implementers.as_ref().and_then(|v| v.as_i64()),
+        };
+        let talk = talk::begin_with(&ui.talks, &cfg, repo, body.agent.as_deref(), &preferred)?;
         let thinking = ui.is_thinking(&talk.id);
         Ok(TalkView::new(talk, thinking))
     })
@@ -9152,6 +9171,44 @@ mod tests {
         std::fs::write(repo.join("magi.toml"), MOCK_AGENT_TOML).expect("write magi.toml");
         let f = Fixture::with_repo(repo.clone()).await;
         (tmp, repo, f)
+    }
+
+    #[tokio::test]
+    async fn posting_a_talk_with_remembered_choices_is_soft() {
+        let (_tmp, _repo, f) = talk_fixture().await;
+
+        let good = f
+            .post("/api/talks", Some(r#"{"persona":"rei","implementers":1}"#))
+            .await;
+        assert_eq!(good.status, 201, "{}", good.body);
+        assert_eq!(good.json()["persona"], "rei");
+
+        // Wrong values and wrong types are dropped one by one, never a 4xx.
+        let stale = f
+            .post(
+                "/api/talks",
+                Some(r#"{"preferred_agent":"gone","persona":"nobody","implementers":7}"#),
+            )
+            .await;
+        assert_eq!(stale.status, 201, "{}", stale.body);
+        let v = stale.json();
+        assert_eq!(v["implementers"], 1);
+        assert_ne!(v["persona"], "nobody");
+        let typed = f
+            .post(
+                "/api/talks",
+                Some(r#"{"preferred_agent":3,"persona":[],"implementers":"x"}"#),
+            )
+            .await;
+        assert_eq!(typed.status, 201, "{}", typed.body);
+
+        // The strict `agent` field still refuses an unknown id.
+        let strict = f.post("/api/talks", Some(r#"{"agent":"gone"}"#)).await;
+        assert!(
+            !strict.status.to_string().starts_with('2'),
+            "{}",
+            strict.body
+        );
     }
 
     #[tokio::test]
