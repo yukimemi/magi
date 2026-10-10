@@ -3127,10 +3127,7 @@ pub fn hold_if_runnable(queue: &Queue, task: &mut Task) {
     // failure nobody asked to retry: it resumes (answer, or the neutral text on
     // the deadline) the moment a loop serves the queue, via `land_resume_state`.
     // Holding it would keep it from ever being a candidate.
-    let waits_on_owner = task.runs.last().is_some_and(|id| {
-        RunState::load(id)
-            .is_ok_and(|s| s.parked && s.github_text.as_ref().is_some_and(|g| !g.resolved))
-    });
+    let waits_on_owner = withheld_text_wait(task).is_some();
     if task.status.runnable() && !waits_on_owner {
         let why = task.last_error.clone().map_or_else(
             || "the run did not finish".to_owned(),
@@ -3200,7 +3197,52 @@ pub async fn run_claimed(opts: &Opts, queue: &Queue, task: &mut Task) {
         task,
     )
     .await;
+    // A run parked on the owner's word about a withheld PR title/body has no
+    // daemon to finish it. Nobody else will enforce `answer_timeout`, so wait
+    // here with the claim still held, and resume once the question is settled
+    // (answered, or abandoned at its deadline -> the neutral text).
+    if let Some(timeout) = withheld_text_wait(task) {
+        eprintln!(
+            "waiting for the owner's answer on a withheld pull request text \
+             (up to {timeout}s; Ctrl-C leaves the run parked for a later `magi serve`)"
+        );
+        // The deadline abandons the question itself; the extra margin only
+        // covers an abandon that could not be saved.
+        let limit = std::time::Instant::now() + Duration::from_secs(timeout + 60);
+        loop {
+            match land_resume_state(task) {
+                LandResume::StillWaiting if std::time::Instant::now() < limit => {
+                    tokio::time::sleep(WITHHELD_POLL).await;
+                }
+                LandResume::Ready => {
+                    attempt(
+                        opts,
+                        queue,
+                        &status,
+                        &stop,
+                        crate::graph::Pause::new(),
+                        task,
+                    )
+                    .await;
+                    break;
+                }
+                _ => break,
+            }
+        }
+    }
     hold_if_runnable(queue, task);
+}
+
+/// How often an in-process run rechecks its withheld-text question.
+const WITHHELD_POLL: Duration = Duration::from_secs(15);
+
+/// The `answer_timeout` (seconds) of the task's last run when that run is
+/// parked on an unresolved withheld-text question; `None` otherwise.
+fn withheld_text_wait(task: &Task) -> Option<u64> {
+    let id = task.runs.last()?;
+    let s = RunState::load(id).ok()?;
+    (s.parked && s.github_text.as_ref().is_some_and(|g| !g.resolved))
+        .then_some(s.config.graph.answer_timeout)
 }
 
 /// The quota losses `after` holds that `before` did not: what one execution
