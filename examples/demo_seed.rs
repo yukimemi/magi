@@ -8,8 +8,15 @@
 //! builds this file.
 //!
 //! ```text
-//! MAGI_HOME=<scratch> demo_seed <stage> <repo>
+//! MAGI_HOME=<scratch> demo_seed <stage> <repo> [en|ja]
+//! demo_seed strings [en|ja]
 //! ```
+//!
+//! The language picks which `Content` is written (the operator-visible prose:
+//! task, run summaries, question, approval text). It is the ONE place those
+//! words live; `strings` prints the few the recorder has to type or tap
+//! (as JSON), so `tools/demo` carries no copy of them. The UI chrome stays
+//! English either way.
 //!
 //! Stages are cumulative states of ONE run (its id is kept in
 //! `<home>/demo-run-id`), re-run in order by the recorder:
@@ -40,8 +47,145 @@ use magi::run::{
 };
 use magi::verdict::{Finding, ReviewVote, Severity};
 
-const INSTRUCTION: &str = "add retry with backoff to the uploader";
-const SUBJECT: &str = "feat(uploader): retry failed uploads with exponential backoff";
+/// Everything the operator reads that is not UI chrome, in one language.
+struct Content {
+    /// The request typed into Chat; also the filed task's instruction.
+    request: &'static str,
+    subject: &'static str,
+    /// Candidates A, B, C.
+    summaries: [&'static str; 3],
+    /// Per judge: the reason for each of its three ranked labels.
+    reasons: [[&'static str; 3]; 3],
+    finding_title: &'static str,
+    finding_detail: &'static str,
+    review_backoff: &'static str,
+    review_reads_well: &'static str,
+    review_fixed: &'static str,
+    review_nothing: &'static str,
+    fix_notes: &'static str,
+    event_implement: &'static str,
+    event_review: &'static str,
+    event_opened: &'static str,
+    event_merged: &'static str,
+    question_summary: &'static str,
+    question_detail: &'static str,
+    /// The first is the one the recorder taps.
+    question_choices: [&'static str; 2],
+    commits: [&'static str; 2],
+    approval_summary: &'static str,
+    approval_detail: &'static str,
+    /// `[graph] language`, so magi's own panel text follows.
+    language: &'static str,
+}
+
+const EN: Content = Content {
+    request: "add retry with backoff to the uploader",
+    subject: "feat(uploader): retry failed uploads with exponential backoff",
+    summaries: [
+        "Retry loop inside `upload`, fixed 1s delay, three attempts.",
+        "Exponential backoff with jitter in its own module, transient errors only.",
+        "Wraps the client in a generic retry middleware with a config knob.",
+    ],
+    reasons: [
+        [
+            "Backoff is isolated and tested; only transient errors retry.",
+            "Sound, but the middleware is more surface than the task asks for.",
+            "A fixed delay hammers a struggling server.",
+        ],
+        [
+            "Smallest correct design with a real test.",
+            "Simple, but no jitter and no test.",
+            "Over-engineered for one call site.",
+        ],
+        [
+            "Jitter and a cap: what the task meant by backoff.",
+            "Reasonable, heavy.",
+            "Fixed delay, untested.",
+        ],
+    ],
+    finding_title: "Permanent errors are retried",
+    finding_detail: "A permanent error is retried as if it were transient.",
+    review_backoff: "Backoff is right, but a 4xx must not be retried.",
+    review_reads_well: "Reads well.",
+    review_fixed: "The finding is fixed.",
+    review_nothing: "Nothing further.",
+    fix_notes: "Retry only when the error reports itself transient.",
+    event_implement: "3 candidates ready",
+    event_review: "round 2 clean: 2 of 2 approve",
+    event_opened: "opened pull request #{n}",
+    event_merged: "merged pull request #{n}",
+    question_summary: "Postgres or SQLite for the cache?",
+    question_detail: "The uploader keeps a small table of in-flight uploads. SQLite needs no server \
+                 and fits a single host; Postgres survives several workers.",
+    question_choices: ["SQLite", "Postgres"],
+    commits: [
+        "feat(uploader): add backoff module",
+        "fix(uploader): retry transient errors only",
+    ],
+    approval_summary: "merge pull request #{n}: {subject}",
+    approval_detail: "{url} is green and ready to squash into `main` as `{subject}`. \
+                     The panel holds the diffstat, the patch and the commits being squashed.",
+    language: "en",
+};
+
+const JA: Content = Content {
+    request: "アップローダーに指数バックオフ付きのリトライを追加して",
+    subject: "feat(uploader): 失敗したアップロードを指数バックオフで再試行する",
+    summaries: [
+        "`upload` 内の再試行ループ。待ち時間は 1 秒固定で 3 回まで。",
+        "ジッター付き指数バックオフを専用モジュールに分離。一時的なエラーのみ再試行。",
+        "クライアントを汎用の再試行ミドルウェアで包み、設定項目を用意。",
+    ],
+    reasons: [
+        [
+            "バックオフが独立していてテストもあり、再試行は一時的なエラーだけ。",
+            "堅実だが、ミドルウェアはタスクが求める範囲より大きい。",
+            "固定の待ち時間では、不調なサーバーに負荷をかけ続ける。",
+        ],
+        [
+            "本物のテストを備えた、最小で正しい設計。",
+            "単純だが、ジッターもテストもない。",
+            "呼び出し箇所が 1 つなのに作り込みすぎ。",
+        ],
+        [
+            "ジッターと上限あり。バックオフの意図どおり。",
+            "妥当だが重い。",
+            "固定の待ち時間でテストなし。",
+        ],
+    ],
+    finding_title: "恒久的なエラーまで再試行している",
+    finding_detail: "恒久的なエラーを一時的なエラーと同じように再試行している。",
+    review_backoff: "バックオフは正しいが、4xx は再試行してはいけない。",
+    review_reads_well: "読みやすい。",
+    review_fixed: "指摘は修正された。",
+    review_nothing: "追加の指摘なし。",
+    fix_notes: "エラー自身が一時的だと示した場合だけ再試行する。",
+    event_implement: "候補 3 件が完成",
+    event_review: "ラウンド 2 は指摘なし: 2 人中 2 人が承認",
+    event_opened: "プルリクエスト #{n} を作成",
+    event_merged: "プルリクエスト #{n} をマージ",
+    question_summary: "キャッシュは Postgres と SQLite のどちらにしますか？",
+    question_detail: "アップローダーは処理中のアップロードを小さなテーブルで管理します。\
+                 SQLite はサーバー不要で単一ホスト向き、Postgres は複数ワーカーでも耐えられます。",
+    question_choices: ["SQLite", "Postgres"],
+    commits: [
+        "feat(uploader): バックオフのモジュールを追加",
+        "fix(uploader): 一時的なエラーだけ再試行する",
+    ],
+    approval_summary: "プルリクエスト #{n} をマージ: {subject}",
+    approval_detail: "{url} は green で、`main` に `{subject}` として squash できます。\
+                     パネルに差分の統計、パッチ、squash されるコミットがあります。",
+    language: "ja",
+};
+
+fn content(lang: &str) -> Result<&'static Content> {
+    match lang {
+        "en" => Ok(&EN),
+        "ja" => Ok(&JA),
+        other => bail!("unknown language {other:?} (en | ja)"),
+    }
+}
+
 const PR_NUMBER: u64 = 42;
 const PR_URL: &str = "https://github.com/example/uploader/pull/42";
 
@@ -82,6 +226,13 @@ fn ago(minutes: i64) -> Timestamp {
     Timestamp::now() - SignedDuration::from_mins(minutes)
 }
 
+fn fill(template: &str, c: &Content) -> String {
+    template
+        .replace("{n}", &PR_NUMBER.to_string())
+        .replace("{url}", PR_URL)
+        .replace("{subject}", c.subject)
+}
+
 fn candidate(label: char, summary: &str, stat: &str, files: usize, secs: u64) -> Candidate {
     Candidate {
         index: (label as usize) - ('A' as usize),
@@ -120,14 +271,21 @@ fn judgement(judge: usize, ranking: [char; 3], why: [&str; 3]) -> Judgement {
     }
 }
 
-fn finding(id: &str, severity: Severity, file: &str, line: u32, title: &str) -> Finding {
+fn finding(
+    id: &str,
+    severity: Severity,
+    file: &str,
+    line: u32,
+    title: &str,
+    detail: &str,
+) -> Finding {
     Finding {
         id: id.to_owned(),
         severity,
         file: Some(file.to_owned()),
         line: Some(line),
         title: title.to_owned(),
-        detail: "A permanent error is retried as if it were transient.".to_owned(),
+        detail: detail.to_owned(),
     }
 }
 
@@ -151,13 +309,15 @@ fn review(
 
 /// The run as it stands at `stage`; everything an earlier stage wrote is
 /// rebuilt from scratch, so any stage can be applied to a fresh home.
-fn build(id: &str, repo: &std::path::Path, stage: &str) -> RunState {
+fn build(id: &str, repo: &std::path::Path, stage: &str, c: &Content) -> RunState {
+    let mut config = Config::default();
+    config.graph.language = c.language.to_owned();
     let mut run = RunState::new(
         repo.to_path_buf(),
         "main".to_owned(),
         "0000000".to_owned(),
-        INSTRUCTION.to_owned(),
-        Config::default(),
+        c.request.to_owned(),
+        config,
     );
     run.id = id.to_owned();
     run.created_at = ago(24);
@@ -165,59 +325,35 @@ fn build(id: &str, repo: &std::path::Path, stage: &str) -> RunState {
     run.candidates = vec![
         candidate(
             'A',
-            "Retry loop inside `upload`, fixed 1s delay, three attempts.",
+            c.summaries[0],
             " src/uploader.rs | 19 +++++++++++--\n 1 file changed",
             1,
             214,
         ),
         candidate(
             'B',
-            "Exponential backoff with jitter in its own module, transient errors only.",
+            c.summaries[1],
             " src/backoff.rs  | 21 +++++++\n src/uploader.rs | 38 +++++++++-\n tests/retry.rs  | 17 +++++\n 3 files changed",
             3,
             268,
         ),
         candidate(
             'C',
-            "Wraps the client in a generic retry middleware with a config knob.",
+            c.summaries[2],
             " src/middleware.rs | 64 ++++++++++++\n src/uploader.rs   | 12 ++-\n 2 files changed",
             2,
             301,
         ),
     ];
-    run.event("implement", "3 candidates ready");
+    run.event("implement", c.event_implement);
     if stage == "inflight" {
         return run;
     }
 
     run.judgements = vec![
-        judgement(
-            1,
-            ['B', 'C', 'A'],
-            [
-                "Backoff is isolated and tested; only transient errors retry.",
-                "Sound, but the middleware is more surface than the task asks for.",
-                "A fixed delay hammers a struggling server.",
-            ],
-        ),
-        judgement(
-            2,
-            ['B', 'A', 'C'],
-            [
-                "Smallest correct design with a real test.",
-                "Simple, but no jitter and no test.",
-                "Over-engineered for one call site.",
-            ],
-        ),
-        judgement(
-            3,
-            ['B', 'C', 'A'],
-            [
-                "Jitter and a cap: what the task meant by backoff.",
-                "Reasonable, heavy.",
-                "Fixed delay, untested.",
-            ],
-        ),
+        judgement(1, ['B', 'C', 'A'], c.reasons[0]),
+        judgement(2, ['B', 'A', 'C'], c.reasons[1]),
+        judgement(3, ['B', 'C', 'A'], c.reasons[2]),
     ];
     run.tally = Some(Tally {
         first_choice: BTreeMap::from([('A', 0), ('B', 3), ('C', 0)]),
@@ -240,7 +376,8 @@ fn build(id: &str, repo: &std::path::Path, stage: &str) -> RunState {
         Severity::Major,
         "src/uploader.rs",
         27,
-        "Permanent errors are retried",
+        c.finding_title,
+        c.finding_detail,
     );
     run.reviews = vec![
         ReviewRound {
@@ -251,11 +388,11 @@ fn build(id: &str, repo: &std::path::Path, stage: &str) -> RunState {
             reviews: vec![
                 review(
                     1,
-                    "Backoff is right, but a 4xx must not be retried.",
+                    c.review_backoff,
                     vec![f1],
                     ReviewVote::ApproveWithFindings,
                 ),
-                review(2, "Reads well.", Vec::new(), ReviewVote::Approve),
+                review(2, c.review_reads_well, Vec::new(), ReviewVote::Approve),
             ],
             e2e: Vec::new(),
             verify_retried: false,
@@ -265,7 +402,7 @@ fn build(id: &str, repo: &std::path::Path, stage: &str) -> RunState {
                 agent: String::new(),
                 addressed: vec!["R1-1-1".to_owned()],
                 rejected: Vec::new(),
-                notes: "Retry only when the error reports itself transient.".to_owned(),
+                notes: c.fix_notes.to_owned(),
                 committed: true,
                 failed: None,
                 duration_ms: 63_000,
@@ -286,8 +423,8 @@ fn build(id: &str, repo: &std::path::Path, stage: &str) -> RunState {
             verified_head: Some("e07a4d2".to_owned()),
             verified_at: Some(ago(4)),
             reviews: vec![
-                review(1, "The finding is fixed.", Vec::new(), ReviewVote::Approve),
-                review(2, "Nothing further.", Vec::new(), ReviewVote::Approve),
+                review(1, c.review_fixed, Vec::new(), ReviewVote::Approve),
+                review(2, c.review_nothing, Vec::new(), ReviewVote::Approve),
             ],
             e2e: Vec::new(),
             verify_retried: false,
@@ -305,7 +442,7 @@ fn build(id: &str, repo: &std::path::Path, stage: &str) -> RunState {
         },
     ];
     run.status = RunStatus::Reviewing;
-    run.event("review", "round 2 clean: 2 of 2 approve");
+    run.event("review", c.event_review);
     if matches!(stage, "reviewed" | "question") {
         return run;
     }
@@ -320,7 +457,7 @@ fn build(id: &str, repo: &std::path::Path, stage: &str) -> RunState {
         rounds: 3,
         red_at_merge: Vec::new(),
     });
-    run.event("land", format!("opened pull request #{PR_NUMBER}"));
+    run.event("land", fill(c.event_opened, c));
     if stage == "approval" {
         return run;
     }
@@ -336,14 +473,29 @@ fn build(id: &str, repo: &std::path::Path, stage: &str) -> RunState {
         detail: PR_URL.to_owned(),
         empty: false,
     });
-    run.event("land", format!("merged pull request #{PR_NUMBER}"));
+    run.event("land", fill(c.event_merged, c));
     run
 }
 
 fn main() -> Result<()> {
+    const USAGE: &str = "usage: demo_seed <stage> <repo> [en|ja] | demo_seed strings [en|ja]";
     let mut args = std::env::args().skip(1);
-    let stage = args.next().context("usage: demo_seed <stage> <repo>")?;
-    let repo = PathBuf::from(args.next().context("usage: demo_seed <stage> <repo>")?);
+    let stage = args.next().context(USAGE)?;
+    if stage == "strings" {
+        let c = content(&args.next().unwrap_or_else(|| "en".to_owned()))?;
+        // What the recorder types and taps; nothing else is duplicated in JS.
+        println!(
+            "{}",
+            serde_json::json!({
+                "request": c.request,
+                "choice": c.question_choices[0],
+                "question": c.question_summary,
+            })
+        );
+        return Ok(());
+    }
+    let repo = PathBuf::from(args.next().context(USAGE)?);
+    let c = content(&args.next().unwrap_or_else(|| "en".to_owned()))?;
     if !["inflight", "reviewed", "question", "approval", "merged"].contains(&stage.as_str()) {
         bail!("unknown stage {stage:?}");
     }
@@ -364,7 +516,7 @@ fn main() -> Result<()> {
         }
     };
 
-    let mut run = build(&id, &repo, &stage);
+    let mut run = build(&id, &repo, &stage, c);
 
     // The task the chat filed becomes the run's task: the loop is not running
     // in the demo, so this is the one place the "picked up" step is written.
@@ -372,11 +524,11 @@ fn main() -> Result<()> {
     let mut task = queue
         .list()
         .into_iter()
-        .find(|t| t.instruction.contains(INSTRUCTION))
+        .find(|t| t.instruction.contains(c.request))
         .unwrap_or_else(|| {
             Task::new(
-                INSTRUCTION.to_owned(),
-                INSTRUCTION.to_owned(),
+                c.request.to_owned(),
+                c.request.to_owned(),
                 repo.clone(),
                 Source::Human,
             )
@@ -407,11 +559,9 @@ fn main() -> Result<()> {
                 id.clone(),
                 "implement".to_owned(),
                 "impl-B".to_owned(),
-                "Postgres or SQLite for the cache?".to_owned(),
-                "The uploader keeps a small table of in-flight uploads. SQLite needs no server \
-                 and fits a single host; Postgres survives several workers."
-                    .to_owned(),
-                vec!["SQLite".to_owned(), "Postgres".to_owned()],
+                c.question_summary.to_owned(),
+                c.question_detail.to_owned(),
+                c.question_choices.iter().map(|s| (*s).to_owned()).collect(),
             );
             q.asked_at = ago(6);
             questions.put(&mut q)?;
@@ -437,20 +587,14 @@ fn main() -> Result<()> {
                 review_comments: Vec::new(),
                 blocking: Blocking::No,
             };
-            let commits = vec![
-                "feat(uploader): add backoff module".to_owned(),
-                "fix(uploader): retry transient errors only".to_owned(),
-            ];
-            let html = land::approval_panel(&run, &pr, NUMSTAT, DIFF, &commits, SUBJECT);
+            let commits: Vec<String> = c.commits.iter().map(|s| (*s).to_owned()).collect();
+            let html = land::approval_panel(&run, &pr, NUMSTAT, DIFF, &commits, c.subject);
             let mut q = magi::ask::Question::new(
                 id.clone(),
                 land::APPROVAL_NODE.to_owned(),
                 "land".to_owned(),
-                format!("merge pull request #{PR_NUMBER}: {SUBJECT}"),
-                format!(
-                    "{PR_URL} is green and ready to squash into `main` as `{SUBJECT}`. \
-                     The panel holds the diffstat, the patch and the commits being squashed."
-                ),
+                fill(c.approval_summary, c),
+                fill(c.approval_detail, c),
                 vec![land::APPROVE.to_owned(), land::HOLD.to_owned()],
             );
             questions.put_panel(&mut q, &html, &[])?;

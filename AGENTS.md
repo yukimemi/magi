@@ -2218,7 +2218,32 @@ waits for `body[data-split="1"]` and fails otherwise, so keep the width above
 that. Desktop navigates with `.rail-link` and clicks (no touch context; `tap`
 would throw), mobile uses `.dock-item` and taps; desktop panes scroll on their
 own, so `scrollTo` is a no-op there. `kata apply` may drop the appended
-`Makefile.toml` demo tasks (all four plus `demo-gif-all`).
+`Makefile.toml` demo tasks (the English four, the four `-ja` ones and `demo-gif-all`).
+
+**Language.** `--lang=en|ja` (default `en`) is independent of the profile and
+changes only operator-visible *content*: the Chat request the take types, the
+seeded task, run summaries, candidate / judge / review text, the agent question
+and its choices, and the merge-approval text. The UI chrome stays English (the
+web UI has no i18n; do not add one for this) and Asuka's reply is unchanged.
+`--lang=ja` writes `assets/demo-ja.gif` / `assets/demo-desktop-ja.gif` and
+`demo-shots-ja` / `demo-shots-desktop-ja` under the target dir; English names
+are untouched. Tasks: `demo-shots-ja`, `demo-gif-ja`, `demo-shots-desktop-ja`,
+`demo-gif-desktop-ja`; `demo-gif-all` records all four gifs.
+
+- **The words live in one place**: `Content` (`EN` / `JA`) in
+  `examples/demo_seed.rs`. `demo_seed <stage> <repo> [en|ja]` seeds with it and
+  `demo_seed strings [en|ja]` prints the few the recorder types or taps (JSON:
+  `request`, `choice`, `question`). `seed.mjs` hands the request to
+  `fake-agent.mjs` as `DEMO_REQUEST`, so the typed text, the filed task and the
+  seeded task are the same string. Never copy a sentence into JS. The request
+  may not contain `'`, a newline, `{{` or `{%` (TOML literal + teravars);
+  `prepare` refuses it. `merge` / `hold` tokens are not translated; the approval
+  panel follows the seeded run's `[graph] language`.
+- Check CJK rendering in the `reply`, `typed` and `question` shots (macOS records
+  with Hiragino; a Linux box without a Japanese font shows boxes or Chinese
+  glyph forms). Japanese has no spaces, so keep summaries short: card titles
+  and `.ask-summary` truncate mid-sentence otherwise. Never set a `lang`
+  attribute or inject DOM to fix glyph shapes.
 
 Traps:
 

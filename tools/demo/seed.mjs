@@ -38,7 +38,24 @@ function git(cwd, ...args) {
   execFileSync("git", args, { cwd, stdio: ["ignore", "ignore", "inherit"] });
 }
 
-export async function prepare() {
+/**
+ * The words the recorder types and taps, from the seeder: examples/demo_seed.rs
+ * is the one place the demo's content lives, so JS carries no copy of it.
+ */
+export function strings(lang) {
+  return JSON.parse(
+    execFileSync(binaries().seeder, ["strings", lang], {
+      stdio: ["ignore", "pipe", "inherit"],
+    }).toString(),
+  );
+}
+
+export async function prepare({ lang = "en" } = {}) {
+  const words = strings(lang);
+  // The request goes into a TOML literal string that teravars renders first.
+  if (/['\r\n]|\{\{|\{%/.test(words.request)) {
+    throw new Error(`the demo request cannot be written into the config: ${words.request}`);
+  }
   // realpath: macOS reports /var as /private/var, and the server compares
   // paths it was handed with the ones it canonicalised.
   const work = await realpath(await mkdtemp(join(tmpdir(), "magi-demo-")));
@@ -83,7 +100,7 @@ export async function prepare() {
       'id = "demo"',
       'kind = "command"',
       `command = [${q(process.execPath)}, ${q(join(HERE, "fake-agent.mjs"))}, '{prompt_file}']`,
-      `env = { MAGI_BIN = ${q(magi)} }`,
+      `env = { MAGI_BIN = ${q(magi)}, DEMO_REQUEST = ${q(words.request)} }`,
       "",
       "[roles]",
       'chatter = "demo"',
@@ -108,12 +125,12 @@ export async function prepare() {
     Object.entries(process.env).filter(([k]) => !k.toUpperCase().startsWith("MAGI_")),
   );
   Object.assign(env, { MAGI_HOME: home, MAGI_CONFIG_DIR: cfgDir, NO_COLOR: "1" });
-  return { work, home, cfgDir, repo, env };
+  return { work, home, cfgDir, repo, env, lang, words };
 }
 
 /** inflight | reviewed | question | approval | merged — see examples/demo_seed.rs. */
 export function seedStage(scratch, stage) {
-  execFileSync(binaries().seeder, [stage, scratch.repo], {
+  execFileSync(binaries().seeder, [stage, scratch.repo, scratch.lang], {
     env: scratch.env,
     stdio: ["ignore", "ignore", "inherit"],
   });

@@ -3,6 +3,8 @@
 //
 //   node record.mjs                       mobile: assets/demo.gif
 //   node record.mjs --profile=desktop     desktop: assets/demo-desktop.gif
+//   node record.mjs --lang=ja             Japanese content: assets/demo-ja.gif,
+//                                         demo-desktop-ja.gif (combine with --profile)
 //   node record.mjs --shots               one PNG per beat in Cargo's target/demo-shots
 //                                         (demo-shots-desktop for desktop), no encode
 //   node record.mjs --headed              watch it happen; --keep keeps the scratch tree
@@ -55,6 +57,18 @@ const PROFILES = {
     gif: "demo-desktop.gif", shots: "demo-shots-desktop",
   },
 };
+// Content language: the operator-visible text the take types and seeds. The UI
+// chrome stays English (the web UI has no i18n). Outputs get the suffix.
+const LANGS = { en: { suffix: "" }, ja: { suffix: "-ja" } };
+const langArg = process.argv
+  .slice(2)
+  .map((a) => /^--lang=(.+)$/.exec(a)?.[1])
+  .find(Boolean) ?? "en";
+if (!LANGS[langArg]) {
+  console.error(`demo: unknown language "${langArg}" (en | ja)`);
+  process.exit(2);
+}
+const SUFFIX = LANGS[langArg].suffix;
 const profileArg = process.argv
   .slice(2)
   .map((a) => /^--profile=(.+)$/.exec(a)?.[1])
@@ -64,6 +78,7 @@ if (!PROFILES[profileArg]) {
   process.exit(2);
 }
 const PROFILE = PROFILES[profileArg];
+const withSuffix = (name) => name.replace(/(\.[^.]+)?$/, (ext) => `${SUFFIX}${ext ?? ""}`);
 const { width: WIDTH, height: HEIGHT, scale: SCALE, outWidth: OUT_WIDTH, colors: COLORS } = PROFILE;
 const MAX_BYTES = PROFILE.maxBytes;
 
@@ -308,10 +323,10 @@ async function encode(list, gif) {
 // The storyboard
 // ---------------------------------------------------------------------
 
-const REQUEST = "add retry with backoff to the uploader";
 const QUOTE = "あんたバカァ！";
 
 async function storyboard(page, scratch, base, beat, quiet) {
+  const { request: REQUEST, choice: CHOICE, question: QUESTION } = scratch.words;
   // Scroll the target to mid-screen first: at the edge the dock sits on top
   // of it and the tap lands on the dock instead.
   // The UI re-renders a view when its data lands, which can replace the
@@ -473,13 +488,13 @@ async function storyboard(page, scratch, base, beat, quiet) {
   await beat("run-reviews", 1500, "story");
 
   // 4. A question from an agent, answered with a tap.
-  const choice = page.getByRole("button", { name: "SQLite" }).first();
+  const choice = page.getByRole("button", { name: CHOICE }).first();
   await quiet(async () => {
     seedStage(scratch, "question");
     await tap(dock("questions"));
     await choice.waitFor();
     await page.locator("#questions-list .ask-summary").filter({
-      hasText: "Postgres or SQLite for the cache?",
+      hasText: QUESTION,
     }).first().evaluate(
       (el) => el.scrollIntoView({ block: "center", behavior: "instant" }),
     );
@@ -532,7 +547,7 @@ async function storyboard(page, scratch, base, beat, quiet) {
 }
 
 async function main() {
-  const scratch = await prepare();
+  const scratch = await prepare({ lang: langArg });
   let server;
   let serverChild;
   let browser;
@@ -540,7 +555,7 @@ async function main() {
     server = await startServer(scratch, (child) => (serverChild = child));
     log(`serving ${server.base} on ${scratch.home}`);
     browser = await launchBrowser();
-    const shotDir = join(targetDir(), PROFILE.shots);
+    const shotDir = join(targetDir(), withSuffix(PROFILE.shots));
     if (SHOTS) {
       await rm(shotDir, { recursive: true, force: true });
       await mkdir(shotDir, { recursive: true });
@@ -617,7 +632,7 @@ async function main() {
     await context.close();
     const list = await writeFrames(frames, join(scratch.work, "frames"), 1.2);
     log(`captured ${captured.length} frames, encoding ${frames.length}`);
-    const gif = join(ROOT, "assets", PROFILE.gif);
+    const gif = join(ROOT, "assets", withSuffix(PROFILE.gif));
     await encode(list, gif);
     const { size } = await stat(gif);
     log(`wrote ${gif} (${(size / 1024 / 1024).toFixed(2)} MB)`);
