@@ -248,12 +248,13 @@ pub fn context_usage(talk: &Talk, cfg: Option<&Config>) -> ContextUsage {
     let measured = usage.map(|u| u.context_tokens);
     let tokens = measured.or_else(|| {
         let standing = cfg.map_or(STANDING_PROMPT_FALLBACK_CHARS, |c| {
-            briefing_with(
+            briefing_for(
                 &talk.repo,
                 &c.graph.language,
                 c.talk.allow_write,
                 crate::persona::active(&c.talk.personas, &talk.persona).as_ref(),
                 c.talk.operator_name(),
+                talk.implementers,
             )
             .chars()
             .count() as u64
@@ -350,6 +351,14 @@ pub struct Talk {
     /// has succeeded (a fresh seat's briefing already holds the new persona).
     #[serde(default)]
     pub persona_dirty: bool,
+    /// How many implementers the tasks this chat files use (1..=3; 1 is
+    /// `--solo`). Only the briefing's wording changes; nothing enforces it.
+    #[serde(default = "solo_implementers")]
+    pub implementers: u8,
+    /// [`Self::implementers`] changed after the CLI session was last told;
+    /// cleared only once a turn has succeeded, like [`Self::persona_dirty`].
+    #[serde(default)]
+    pub implementers_dirty: bool,
     /// When the conversation was opened.
     pub created_at: Timestamp,
     /// Last change to this file.
@@ -1192,6 +1201,8 @@ pub fn begin(store: &Talks, cfg: &Config, repo: PathBuf, agent: Option<&str>) ->
         fallback: agent.is_none(),
         persona: String::new(),
         persona_dirty: false,
+        implementers: 1,
+        implementers_dirty: false,
         created_at: now,
         updated_at: now,
         seat: SeatState::new(SEAT, &spec.id, crate::rng::entropy()),
@@ -1679,6 +1690,14 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         String::new()
     };
 
+    // The filing command is not in the transcript either, so a non-Solo count
+    // rides on every turn that has no session to remember it.
+    let filing_update = if talk.implementers_dirty {
+        format!("{}\n\n", filing_update_block(talk.implementers))
+    } else {
+        String::new()
+    };
+
     let mut outcome = None;
     let mut fell_back_from: Option<String> = None;
     // What the conversation looked like after the first agent's failed try,
@@ -1701,12 +1720,13 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         let body = if talk.seat.turns == 0 && first_ever {
             format!(
                 "{}\n\n# Operator\n\n{text}{last_note}",
-                briefing_with(
+                briefing_for(
                     &talk.repo,
                     &cfg.graph.language,
                     cfg.talk.allow_write,
                     persona.as_ref(),
-                    operator_name
+                    operator_name,
+                    talk.implementers
                 )
             )
         } else if talk.seat.turns == 0 {
@@ -1714,17 +1734,18 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             // agent was switched): the briefing, then everything said so far.
             format!(
                 "{}\n\n{}\n\n# Operator\n\n{text}{last_note}",
-                briefing_with(
+                briefing_for(
                     &talk.repo,
                     &cfg.graph.language,
                     cfg.talk.allow_write,
                     persona.as_ref(),
-                    operator_name
+                    operator_name,
+                    talk.implementers
                 ),
                 transcript(talk, store)
             )
         } else if resuming {
-            format!("{persona_update}{text}{last_note}")
+            format!("{persona_update}{filing_update}{text}{last_note}")
         } else {
             // No session to hold the persona: the transcript never stores it,
             // so a non-default persona is re-sent on every such turn (the
@@ -1740,6 +1761,9 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
                     "# Addressing the operator\n{}\n",
                     crate::persona::addressing(n)
                 ));
+            }
+            if talk.implementers_dirty || talk.implementers != 1 {
+                standing.push_str(&format!("{}\n\n", filing_update_block(talk.implementers)));
             }
             format!("{}\n\n{standing}{text}{last_note}", transcript(talk, store))
         };
@@ -1896,6 +1920,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // (a failed one may never have reached the agent), so only then is it clean.
     if failure.is_none() {
         talk.persona_dirty = false;
+        talk.implementers_dirty = false;
     }
     talk.turns.push(reply);
     if let Err(put_err) = store.put(talk) {
@@ -2050,6 +2075,118 @@ pub fn briefing_with(
     persona: Option<&crate::persona::Persona>,
     operator_name: Option<&str>,
 ) -> String {
+    briefing_for(repo, language, allow_write, persona, operator_name, 1)
+}
+
+/// The most implementers a chat can ask its filed tasks to use.
+pub const MAX_IMPLEMENTERS: u8 = 3;
+
+fn solo_implementers() -> u8 {
+    1
+}
+
+/// The `magi task add` flag for `n` implementers: `--solo` for one,
+/// `--implementers N` otherwise (the two are never combined).
+fn filing_flag(n: u8) -> String {
+    if n <= 1 {
+        "--solo".to_owned()
+    } else {
+        format!("--implementers {n}")
+    }
+}
+
+/// The note a resumed (or transcript-replayed) turn opens with after the
+/// implementer count changed, or while it is not Solo.
+pub fn filing_update_block(n: u8) -> String {
+    let flag = filing_flag(n);
+    if n <= 1 {
+        format!(
+            "# Task filing update\n\nThe operator changed how many implementers tasks use. \
+             From now on file with `magi task add {flag} --repo <repo> <instruction>` \
+             (one implementer, straight into review).\n"
+        )
+    } else {
+        format!(
+            "# Task filing update\n\nThe operator changed how many implementers tasks use. \
+             From now on file with `magi task add {flag} --repo <repo> <instruction>` \
+             ({n} independent implementations compete). Do not pass `--solo` \
+             together with `--implementers`; drop any earlier `--solo`.\n"
+        )
+    }
+}
+
+/// Validate a requested implementer count: 1..=3, and one the repository's
+/// config can actually resolve. Never clamps.
+pub fn check_implementers(n: u8, cfg: &crate::config::Config) -> std::result::Result<u8, String> {
+    if !(1..=MAX_IMPLEMENTERS).contains(&n) {
+        return Err(format!(
+            "implementers must be 1..={MAX_IMPLEMENTERS}, got {n}"
+        ));
+    }
+    if n > 1 {
+        let mut cfg = cfg.clone();
+        crate::queue::RunOverrides {
+            candidates: Some(usize::from(n)),
+            ..Default::default()
+        }
+        .apply(&mut cfg);
+        cfg.resolve_roles()
+            .map_err(|e| format!("{n} implementers is not allowed here: {e:#}"))?;
+    }
+    Ok(n)
+}
+
+/// Set how many implementers this chat files tasks with. Same shape as
+/// [`switch_persona`]: `false` and no write when unchanged.
+pub fn switch_implementers(talk: &mut Talk, store: &Talks, n: u8) -> Result<bool> {
+    let _guard = store.guard()?;
+    let mut fresh = store
+        .get(&talk.id)
+        .with_context(|| format!("talk {} was deleted", talk.short()))?;
+    if fresh.implementers == n {
+        *talk = fresh;
+        return Ok(false);
+    }
+    let from = std::mem::replace(&mut fresh.implementers, n);
+    fresh.implementers_dirty = true;
+    fresh.turns.push(Turn {
+        breaks: None,
+        who: Who::Agent,
+        body: format!("{MAGI_NOTE}implementers changed from {from} to {n}"),
+        at: Timestamp::now(),
+        attachments: Vec::new(),
+        usage: None,
+    });
+    store.put(&mut fresh)?;
+    *talk = fresh;
+    Ok(true)
+}
+
+/// [`briefing_with`] for a chat that files tasks with `implementers`
+/// implementers (1 is the unchanged `--solo` text).
+pub fn briefing_for(
+    repo: &Path,
+    language: &str,
+    allow_write: bool,
+    persona: Option<&crate::persona::Persona>,
+    operator_name: Option<&str>,
+    implementers: u8,
+) -> String {
+    let flag = filing_flag(implementers);
+    let shape = if implementers <= 1 {
+        "Use --solo: it runs the task through one implementer \
+         straight into review instead of the usual multi-agent competition, \
+         which is the right shape for a change this conversation has already \
+         settled, rather than one still worth several independent takes."
+            .to_owned()
+    } else {
+        format!(
+            "Use --implementers {implementers}: it has {implementers} \
+             implementers work on the task independently and compete, which \
+             is the right shape when several independent takes are worth \
+             having. Never add --solo to it; the two do not go together."
+        )
+    };
     let write_policy = if allow_write {
         "Write access is enabled for this conversation (`allow_write = \
          true`), so you may write files - but only a small, \
@@ -2084,7 +2221,7 @@ pub fn briefing_with(
          you would answer any other question in this conversation.\n\n\
          # When the operator wants something done\n\n\
          Run:\n\n\
-         magi task add --solo --repo {repo} <instruction>\n\n\
+         magi task add {flag} --repo {repo} <instruction>\n\n\
          and tell the operator the task id it prints, so they can follow it \
          from the Queue. If it refuses with a duplicate warning (the \
          instruction names a branch, commit or pull request that an \
@@ -2092,10 +2229,7 @@ pub fn briefing_with(
          --force yourself: tell the operator what it matched and let them \
          decide. Write <instruction> so that an implementer who has \
          never seen this conversation can act on it alone - it is everything \
-         they get. Use --solo: it runs the task through one implementer \
-         straight into review instead of the usual multi-agent competition, \
-         which is the right shape for a change this conversation has already \
-         settled, rather than one still worth several independent takes.\n\n\
+         they get. {shape}\n\n\
          If the operator asks for something in a different repository, \
          --repo does not have to be a full path: --repo owner/repo (or just \
          repo, when that is unambiguous) is resolved against local checkouts \
@@ -2114,7 +2248,7 @@ pub fn briefing_with(
          If the operator attached an image (a screenshot, say) that the task \
          is about, pass it with `--attach <path>`, using the absolute path \
          the turn's attachment note gives; repeat the flag for several. \
-         `magi task add --solo --attach <path> <instruction>` copies the \
+         `magi task add {flag} --attach <path> <instruction>` copies the \
          file into the task, so the implementer receives it. Do not paste the \
          path into <instruction> instead: deleting this conversation deletes \
          its attachments, and then that path reaches no one.\n",
@@ -2354,6 +2488,8 @@ mod tests {
             fallback: false,
             persona: String::new(),
             persona_dirty: false,
+            implementers: 1,
+            implementers_dirty: false,
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
             seat: SeatState::new(SEAT, agent, 1),
@@ -2599,6 +2735,8 @@ mod tests {
             fallback: false,
             persona: String::new(),
             persona_dirty: false,
+            implementers: 1,
+            implementers_dirty: false,
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
             seat: SeatState::new(SEAT, "sonnet", 7),
@@ -3296,6 +3434,95 @@ mod tests {
         let loaded = talks.get(&talk.id).expect("old record loads");
         assert_eq!(loaded.persona, "");
         assert!(!loaded.persona_dirty);
+    }
+
+    #[test]
+    fn the_briefing_files_with_solo_or_the_chosen_implementer_count() {
+        let repo = Path::new("/repo");
+        let solo = briefing_for(repo, "", false, None, None, 1);
+        assert_eq!(solo, briefing(repo, "", false));
+        assert!(solo.contains("magi task add --solo --repo"));
+        assert!(solo.contains("magi task add --solo --attach"));
+        for n in [2u8, 3] {
+            let b = briefing_for(repo, "", false, None, None, n);
+            assert!(
+                b.contains(&format!("magi task add --implementers {n} --repo")),
+                "{b}"
+            );
+            assert!(b.contains(&format!("magi task add --implementers {n} --attach")));
+            assert!(!b.contains("task add --solo"), "{b}");
+            assert!(!b.contains("Use --solo"), "{b}");
+        }
+    }
+
+    #[test]
+    fn implementers_are_validated_and_old_records_load_as_solo() {
+        let (tmp, talks) = store();
+        let cfg = config(mock_agent(tmp.path(), ECHO, BTreeMap::new()));
+        assert_eq!(check_implementers(1, &cfg), Ok(1));
+        assert_eq!(check_implementers(3, &cfg), Ok(3));
+        assert!(check_implementers(0, &cfg).is_err());
+        assert!(check_implementers(4, &cfg).is_err());
+        let mut empty = cfg.clone();
+        empty.agents.clear();
+        assert!(check_implementers(2, &empty).is_err());
+
+        let talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        let path = talks.path_of(&talk.id);
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("implementers");
+        v.as_object_mut().unwrap().remove("implementers_dirty");
+        std::fs::write(&path, v.to_string()).unwrap();
+        let loaded = talks.get(&talk.id).expect("load");
+        assert_eq!(loaded.implementers, 1);
+        assert!(!loaded.implementers_dirty);
+    }
+
+    #[tokio::test]
+    async fn an_implementers_switch_is_noted_once_and_kept_across_a_failed_turn() {
+        let (tmp, talks) = store();
+        let spec = mock_agent(tmp.path(), ECHO, BTreeMap::new());
+        let cfg = config(spec);
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        let lease = talks.claim_turn(&talk.id).unwrap().unwrap();
+        say(&lease, &mut talk, &talks, &cfg, "hello", Vec::new())
+            .await
+            .expect("first turn");
+
+        assert!(switch_implementers(&mut talk, &talks, 2).expect("switch"));
+        assert!(!switch_implementers(&mut talk, &talks, 2).expect("same"));
+        assert!(talk.implementers_dirty);
+        say(&lease, &mut talk, &talks, &cfg, "next", Vec::new())
+            .await
+            .expect("turn");
+        let prompt = &talk.turns.last().unwrap().body;
+        assert!(prompt.contains("# Task filing update"), "{prompt}");
+        assert!(prompt.contains("--implementers 2"));
+        assert!(!talk.implementers_dirty, "cleared after a successful turn");
+
+        say(&lease, &mut talk, &talks, &cfg, "again", Vec::new())
+            .await
+            .expect("turn");
+        assert!(
+            !talk
+                .turns
+                .last()
+                .unwrap()
+                .body
+                .contains("# Task filing update")
+        );
+
+        // Without a resumable session the current policy rides on every turn.
+        let mut no_sessions = cfg.clone();
+        no_sessions.graph.sessions = false;
+        say(&lease, &mut talk, &talks, &no_sessions, "one", Vec::new())
+            .await
+            .expect("turn");
+        say(&lease, &mut talk, &talks, &no_sessions, "two", Vec::new())
+            .await
+            .expect("turn");
+        assert!(talk.turns.last().unwrap().body.contains("--implementers 2"));
     }
 
     #[tokio::test]
@@ -4111,6 +4338,8 @@ mod tests {
                 fallback: false,
                 persona: String::new(),
                 persona_dirty: false,
+                implementers: 1,
+                implementers_dirty: false,
                 created_at: Timestamp::now(),
                 updated_at: Timestamp::now(),
                 seat: SeatState::new(SEAT, "mock", 7),

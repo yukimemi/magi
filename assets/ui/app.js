@@ -65,6 +65,7 @@ const API = {
   talkPendingEdit: (id) => `/api/talks/${encodeURIComponent(id)}/pending/edit`,
   talkClose: (id) => `/api/talks/${encodeURIComponent(id)}/close`,
   talkPersona: (id) => `/api/talks/${encodeURIComponent(id)}/persona`,
+  talkImplementers: (id) => `/api/talks/${encodeURIComponent(id)}/implementers`,
   talkAgent: (id) => `/api/talks/${encodeURIComponent(id)}/agent`,
   talkReopen: (id) => `/api/talks/${encodeURIComponent(id)}/reopen`,
   talkDelete: (id) => `/api/talks/${encodeURIComponent(id)}`,
@@ -5520,9 +5521,12 @@ function renderTalk() {
       const shown = summary || { agent: "Loading…", persona: "default", status: "open" };
       renderTalkAgent(shown, true, true);
       renderTalkPersona(shown, true, true);
+      show($("talk-implementers-box"), true);
+      $("talk-implementers").disabled = true;
     } else {
       show($("talk-agent-box"), false);
       show($("talk-persona-box"), false);
+      show($("talk-implementers-box"), false);
     }
     clear($("talk-delete-box"));
     renderTalkThumbs();
@@ -5597,6 +5601,7 @@ function renderTalk() {
   renderTalkPending(talk);
   renderTalkAgent(talk, busy);
   renderTalkPersona(talk, busy);
+  renderTalkImplementers(talk, busy);
   show($("talk-wait"), busy);
   renderTalkDelete(talk);
 }
@@ -5625,7 +5630,7 @@ function renderTalkAgent(talk, busy, loading = false) {
     }
     select.value = talk.agent;
   }
-  select.disabled = busy || talkAgentSwitching || talkPersonaSwitching
+  select.disabled = busy || talkAgentSwitching || talkPersonaSwitching || talkImplementersSwitching
     || String(talk.status || "open") !== "open" || roster.length < 2;
 }
 
@@ -5677,8 +5682,48 @@ function renderTalkPersona(talk, busy, loading = false) {
     for (const p of entries) select.append(el("option", { value: p.id, text: p.name }));
     select.value = current;
   }
-  select.disabled = busy || talkPersonaSwitching || talkAgentSwitching
+  select.disabled = busy || talkPersonaSwitching || talkAgentSwitching || talkImplementersSwitching
     || String(talk.status || "open") !== "open";
+}
+
+/* How many implementers the tasks this conversation files use. Same rules as
+   the persona selector; the server validates and the choice is put back on a
+   refusal. */
+let talkImplementersSwitching = false;
+
+function renderTalkImplementers(talk, busy) {
+  const select = $("talk-implementers");
+  if (document.activeElement !== select) select.value = String(talk.implementers || 1);
+  select.disabled = busy || talkImplementersSwitching || talkPersonaSwitching
+    || talkAgentSwitching || String(talk.status || "open") !== "open";
+}
+
+async function switchTalkImplementers() {
+  const id = state.talkDetail.id;
+  const select = $("talk-implementers");
+  const implementers = Number(select.value);
+  const current = state.talkDetail.talk;
+  if (!id || !current || implementers === (current.implementers || 1)) return;
+  talkImplementersSwitching = true;
+  renderTalk();
+  try {
+    const talk = await postJson(API.talkImplementers(id), { implementers });
+    if (state.talkDetail.id === id) {
+      state.talkDetail.talk = talk;
+      announce(`Implementers set to ${implementers === 1 ? "Solo" : implementers}.`);
+    }
+    loadTalks().catch(() => {});
+    ok();
+  } catch (error) {
+    select.value = String(current.implementers || 1);
+    fail(`Could not change the implementers: ${error.message}`);
+  } finally {
+    talkImplementersSwitching = false;
+    if (state.talkDetail.id === id) {
+      select.blur();
+      renderTalk();
+    }
+  }
 }
 
 async function switchTalkPersona() {
@@ -9733,6 +9778,7 @@ function wire() {
   $("talk-close-go").addEventListener("click", closeTalk);
   $("talk-agent").addEventListener("change", switchTalkAgent);
   $("talk-persona").addEventListener("change", switchTalkPersona);
+  $("talk-implementers").addEventListener("change", switchTalkImplementers);
   $("talk-reopen-go").addEventListener("click", reopenTalk);
   wireRunPanels();
   wireRunTabs();
