@@ -13064,7 +13064,7 @@ mod tests {
         assert!(APP_JS.contains("`#/queue/${encodeURIComponent(task.id)}`"));
         assert!(APP_CSS.contains(".card-permalink"));
         assert!(APP_CSS.contains(".queue-focus-status"));
-        assert!(APP_JS.contains("const section = route.name === \"run\" ? \"runs\""));
+        assert!(APP_JS.contains("const section = route.name === \"run\" ? route.list || \"runs\""));
     }
 
     #[test]
