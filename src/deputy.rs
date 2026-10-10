@@ -235,7 +235,7 @@ pub fn merge_gated(q: &Question) -> bool {
 /// questions that something other than the waiter retires: a merge approval
 /// (land) and a release-watch question (the watcher, by silence being a hold).
 pub fn fixed_clock(q: &Question) -> bool {
-    matches!(kind_of(q), Some(Kind::Land | Kind::Release))
+    matches!(kind_of(q), Some(Kind::Land | Kind::Release)) || q.node == crate::github_text::ASK_NODE
 }
 
 /// Second after which nobody is to be started or kept on `q`.

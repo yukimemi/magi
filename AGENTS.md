@@ -2207,3 +2207,40 @@ Traps:
   Browser installation may download files; the take itself stays offline.
 - `Makefile.toml` is kata-managed; `kata apply` may remove the appended demo
   tasks. Restore them from history rather than adding recording to CI.
+
+### A withheld pull request title or body is asked about, never silently replaced
+
+`graph::Runner::guarded_pr_message` used to swap a title or body the posting
+gate rejected for `NEUTRAL_TITLE` / `NEUTRAL_BODY` and tell nobody; a merged
+squash commit then carried "chore: update repository". Now, after the one
+rewrite attempt, a still-rejected text (language rules only; sensitive data is
+still redacted in place) goes to the owner through `ask::Questions`.
+
+- **The question** (`github_text::ASK_NODE` `github-text`, seat `posting-gate`)
+  has no `cwd`, `answer_timeout` set, and a fixed `asked_at + answer_timeout`
+  clock (`deputy::fixed_clock`), so the waiter ignores it and a Generic deputy
+  may serve it. Choices: `use fallback`, plus `use my text` when the title is
+  withheld (the replacement title is the owner's latest operator say, sent
+  before picking the choice; no new `Question` field, `ask::SCHEMA` unchanged).
+  The detail is English and names the field and the rule categories only; a
+  candidate is shown only if `scrub` leaves it unchanged. Only the summary line
+  follows `[graph] language`. The event log never records the text.
+- **The run parks, the daemon resumes it.** `merge` returns before pushing or
+  opening anything with `parked = true`; `daemon::land_resume_state` reads the
+  `github-text` question for such a run (told apart from a land approval by
+  `RunState::github_text`, not by status), abandons it at the deadline, and
+  resumes as soon as it is answered. Silence, abandonment and `use fallback`
+  all end in today's neutral text, so an unattended run still finishes and only
+  the withheld field is replaced. Needs `magi serve`: a run started in-process
+  with no loop alive stays parked, exactly like a land approval.
+- **A replacement goes through the same gate** (`github_text::vet_title`, with
+  the `language_judge` when configured). Sensitive data is rejected, never
+  redacted into text the owner did not write. A failing reply gets one more
+  question naming the categories; the second failure falls back.
+- **Once, and across restarts.** `RunState::github_text` (`GithubTextAsk`,
+  `#[serde(default)]`, `run::SCHEMA` unchanged) holds the fingerprint of the
+  rejected text, the question id, `asks` (max 2) and `resolved`. The question
+  id is saved before the question is written; `resolved` is saved before the
+  pull request is opened. A resume with the same fingerprint skips the judge
+  and the rewrite and asks nothing new; a different text retires the old
+  question and starts over.

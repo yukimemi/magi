@@ -670,6 +670,11 @@ fn unasked_questions() -> Vec<Question> {
             &["release", "discard", "detach"],
         ),
         q(
+            magi::github_text::ASK_NODE,
+            magi::github_text::ASK_SEAT,
+            &["use fallback", "use my text"],
+        ),
+        q(
             magi::reconcile::NODE,
             magi::reconcile::SEAT,
             &["push local", "keep remote"],
@@ -724,7 +729,13 @@ fn only_the_conductors_question_is_ever_given_a_cwd_or_a_fixed_clock() {
         let kind = kind_of(&q).unwrap();
         // Triage and fallback questions run from their last activity, like a
         // conductor's; the waiter would otherwise take them as its own.
-        if matches!(kind, Kind::Triage | Kind::Generic) {
+        // The posting gate's question is a deliberate exception: the graph
+        // retires it at `asked_at + answer_timeout`, so a reply must not move
+        // that deadline.
+        if q.node == magi::github_text::ASK_NODE {
+            assert!(fixed_clock(&q));
+            assert!(q.cwd.is_none());
+        } else if matches!(kind, Kind::Triage | Kind::Generic) {
             assert!(!fixed_clock(&q), "{}", q.node);
             assert!(q.cwd.is_none());
         }

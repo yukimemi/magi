@@ -5999,20 +5999,34 @@ impl Runner {
 
     // ---------------------------------------------------------------- merge
 
-    /// One read-only rewrite by the summary's author, followed by a fixed fallback.
+    /// One read-only rewrite by the summary's author; a text the gate still
+    /// withholds goes to the owner (see `github_text`) and the fixed fallback
+    /// applies on their word or on silence. `None` means the run is parked on
+    /// that question and nothing may be pushed or opened yet.
     async fn guarded_pr_message(
         &mut self,
         winner: &Candidate,
         facts: Option<&BranchFacts>,
         posting: bool,
-    ) -> PrMessage {
+    ) -> Result<Option<PrMessage>> {
         let mut pr = pr_message_raw(&self.state, winner.label, facts);
         if !posting {
             let identity = crate::scrub::Identity::current();
-            return PrMessage {
+            return Ok(Some(PrMessage {
                 title: crate::scrub::scrub(&pr.title, &identity),
                 body: crate::scrub::scrub(&pr.body, &identity),
-            };
+            }));
+        }
+        // This very text was already rejected and asked about: no second
+        // judge call, rewrite or question, just carry the record on.
+        let raw_fp = crate::github_text::fingerprint(&pr.title, &pr.body);
+        if let Some(known) = self
+            .state
+            .github_text
+            .clone()
+            .filter(|g| g.fingerprint == raw_fp)
+        {
+            return self.settle_withheld(winner, &pr, known).await;
         }
         let mut decision = self.judge_pr_language(&winner.worktree, &pr).await;
         let mut violations = crate::github_text::check_with(&pr.title, &pr.body, decision);
@@ -6103,27 +6117,207 @@ impl Runner {
             if !rewritten {
                 self.state.event(
                     "github-text",
-                    "description rewrite unavailable or rejected; using neutral body",
+                    "description rewrite unavailable or rejected; asking the owner",
                 );
-                pr = PrMessage {
-                    title: pr.title,
-                    body: format!(
-                        "{}\n\nmagi:run/{}",
-                        crate::github_text::NEUTRAL_BODY,
-                        self.state.id
-                    ),
-                };
-                // The neutral body is fixed English; only the title's verdict
-                // still applies.
-                decision = decision.map(|d| crate::github_text::LanguageDecision {
-                    body_english: true,
-                    ..d
-                });
+                if let Some(w) = crate::github_text::Withheld::from_violations(&violations) {
+                    // A different text than the one asked about before: that
+                    // question no longer describes anything.
+                    self.retire_github_text_question("the withheld text changed");
+                    let record = crate::run::GithubTextAsk {
+                        fingerprint: raw_fp,
+                        title: w.title,
+                        body: w.body,
+                        categories: w.categories.iter().map(|c| (*c).to_owned()).collect(),
+                        question: None,
+                        asks: 0,
+                        resolved: false,
+                        chosen_title: None,
+                    };
+                    return self.settle_withheld(winner, &pr, record).await;
+                }
             }
         }
         let (title, body) =
             crate::github_text::prepare_with(&mut self.state, &pr.title, &pr.body, decision);
-        PrMessage { title, body }
+        Ok(Some(PrMessage { title, body }))
+    }
+
+    /// Abandon the standing posting-gate question, if any.
+    fn retire_github_text_question(&mut self, why: &str) {
+        let Some(id) = self
+            .state
+            .github_text
+            .as_ref()
+            .and_then(|g| g.question.clone())
+        else {
+            return;
+        };
+        let _ = ask::Questions::open().update(&id, |q| {
+            q.abandon(why);
+            Ok(())
+        });
+    }
+
+    /// Carry a withheld text to its end: file the question, park while it is
+    /// open, and on an answer, silence or timeout pick the text to post. The
+    /// decision is saved before it is used, so it applies once.
+    async fn settle_withheld(
+        &mut self,
+        winner: &Candidate,
+        pr: &PrMessage,
+        mut g: crate::run::GithubTextAsk,
+    ) -> Result<Option<PrMessage>> {
+        use crate::github_text as gt;
+        let store = ask::Questions::open();
+        let timeout = self.state.config.graph.answer_timeout;
+        if !g.resolved {
+            let mut standing = g
+                .question
+                .as_ref()
+                .and_then(|id| store.list().into_iter().find(|q| &q.id == id));
+            if let Some(q) = standing.as_ref()
+                && q.status.open()
+                && gt::expired(q, timeout)
+            {
+                let why = format!("no answer within {}s of asking", timeout.max(1));
+                standing = store
+                    .update(&q.id, |q| {
+                        q.abandon(&why);
+                        Ok(())
+                    })
+                    .ok()
+                    .map(|(q, ())| q);
+            }
+            let mut ask_again: Option<(Vec<String>, bool)> = None;
+            match standing {
+                // Recorded but never written (a stop between the two saves),
+                // or removed: ask again without spending the retry.
+                None if g.asks <= 1 => {
+                    g.asks = 0;
+                    ask_again = Some((g.categories.clone(), false));
+                }
+                None => {
+                    g.resolved = true;
+                    g.chosen_title = None;
+                }
+                Some(q) if q.status.open() => {
+                    self.park_on_github_text(&g)?;
+                    return Ok(None);
+                }
+                Some(q) => match gt::read_reply(&q) {
+                    gt::Reply::Fallback => {
+                        g.resolved = true;
+                        g.chosen_title = None;
+                    }
+                    gt::Reply::Title(text) => {
+                        let first = text
+                            .lines()
+                            .map(str::trim)
+                            .find(|l| !l.is_empty())
+                            .unwrap_or("");
+                        let decision = if first.is_empty() {
+                            None
+                        } else {
+                            let candidate = PrMessage {
+                                title: first.to_owned(),
+                                body: String::new(),
+                            };
+                            self.judge_pr_language(&winner.worktree, &candidate).await
+                        };
+                        match gt::vet_title(&text, decision) {
+                            Ok(title) => {
+                                g.resolved = true;
+                                g.chosen_title = Some(title);
+                            }
+                            Err(cats) if g.asks < 2 => {
+                                ask_again =
+                                    Some((cats.into_iter().map(str::to_owned).collect(), true))
+                            }
+                            Err(_) => {
+                                g.resolved = true;
+                                g.chosen_title = None;
+                            }
+                        }
+                    }
+                },
+            }
+            if let Some((categories, retry)) = ask_again {
+                let w = gt::Withheld {
+                    title: g.title,
+                    body: g.body,
+                    categories,
+                };
+                let mut q = ask::Question::new(
+                    self.state.id.clone(),
+                    gt::ASK_NODE.to_owned(),
+                    gt::ASK_SEAT.to_owned(),
+                    gt::question_summary(&self.state.config.graph.language, &w),
+                    gt::question_detail(&w, &pr.title, &pr.body, retry),
+                    gt::question_choices(&w),
+                );
+                q.answer_timeout = timeout;
+                // Recorded before it is written: a stop in between leaves a
+                // record naming a question the resume then files again.
+                g.question = Some(q.id.clone());
+                g.asks += 1;
+                self.state.github_text = Some(g.clone());
+                self.state.event(
+                    "github-text",
+                    format!("asking the owner about the withheld text ({})", q.short()),
+                );
+                self.state.save()?;
+                store
+                    .put(&mut q)
+                    .context("file the posting-gate question")?;
+                if let Err(e) = ask::notify(&self.state.config.notify, &q).await {
+                    tracing::warn!(
+                        "could not notify about posting-gate question {}: {e:#}",
+                        q.short()
+                    );
+                }
+                self.park_on_github_text(&g)?;
+                return Ok(None);
+            }
+        }
+        let resolved = g.chosen_title.clone();
+        self.state.event(
+            "github-text",
+            if resolved.is_some() {
+                "posting the owner's replacement title"
+            } else {
+                "posting the neutral text for the withheld fields"
+            },
+        );
+        self.state.github_text = Some(g.clone());
+        self.state.save()?;
+        let title = match (g.title, resolved) {
+            (true, Some(t)) => t,
+            (true, None) => gt::NEUTRAL_TITLE.to_owned(),
+            (false, _) => pr.title.clone(),
+        };
+        let body = if g.body {
+            format!("{}\n\nmagi:run/{}", gt::NEUTRAL_BODY, self.state.id)
+        } else {
+            pr.body.clone()
+        };
+        // Every withheld field is now neutral or vetted English.
+        let english = gt::LanguageDecision {
+            title_english: true,
+            body_english: true,
+            body_complete: true,
+        };
+        let (title, body) = gt::prepare_with(&mut self.state, &title, &body, Some(english));
+        Ok(Some(PrMessage { title, body }))
+    }
+
+    fn park_on_github_text(&mut self, g: &crate::run::GithubTextAsk) -> Result<()> {
+        self.state.github_text = Some(g.clone());
+        self.state.parked = true;
+        self.state.event(
+            "github-text",
+            "parked awaiting the owner's word on the withheld pull request text - resumes once answered",
+        );
+        self.state.save()
     }
 
     /// Ask `[roles] language_judge` about this text and record which source
@@ -6220,9 +6414,15 @@ impl Runner {
         } else {
             Some(Vec::new())
         };
-        let pr = self
+        // `None`: parked on the owner's word about a withheld title or body.
+        // Nothing has been pushed or opened, and `merge` stays unrecorded so
+        // the resume arrives here again.
+        let Some(pr) = self
             .guarded_pr_message(&winner, facts.as_ref(), mode == MergeMode::Pr)
-            .await;
+            .await?
+        else {
+            return Ok(());
+        };
         let message = pr.commit_message();
 
         let outcome = match mode {
@@ -11879,7 +12079,45 @@ mod tests {
             author.env.insert("REWRITE_REPLY".into(), reply.into());
             runner.state.config.agents = vec![author];
             let winner = runner.state.candidates[0].clone();
-            let message = runner.guarded_pr_message(&winner, None, true).await;
+            let first = runner
+                .guarded_pr_message(&winner, None, true)
+                .await
+                .unwrap();
+            let message = if accepted {
+                first.expect("a passing rewrite never asks")
+            } else {
+                // Withheld: the run parks on a question and posts nothing yet.
+                assert!(first.is_none());
+                assert!(runner.state.parked);
+                let store = ask::Questions::open();
+                let asked: Vec<_> = store
+                    .list()
+                    .into_iter()
+                    .filter(|q| q.run == runner.state.id && q.node == crate::github_text::ASK_NODE)
+                    .collect();
+                assert_eq!(asked.len(), 1);
+                assert!(!asked[0].detail.contains("secret"));
+                // Silence: the question lapses and the neutral text is used,
+                // without a second rewrite call or a second question.
+                store
+                    .update(&asked[0].id, |q| {
+                        q.abandon("test");
+                        Ok(())
+                    })
+                    .unwrap();
+                let again = runner
+                    .guarded_pr_message(&winner, None, true)
+                    .await
+                    .unwrap()
+                    .expect("an abandoned question falls back");
+                let n = store
+                    .list()
+                    .into_iter()
+                    .filter(|q| q.run == runner.state.id && q.node == crate::github_text::ASK_NODE)
+                    .count();
+                assert_eq!(n, 1, "asked once per rejected text");
+                again
+            };
             assert!(crate::github_text::check(&message.title, &message.body).is_empty());
             assert_eq!(
                 message.body.contains("Add retries for failed requests."),
@@ -11899,6 +12137,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn withheld_title_takes_the_owner_replacement_and_rechecks_it() {
+        crate::run::pin_test_home();
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = runner_at(RunStatus::Gating);
+        runner.state = state_with_summary("add retries", "TITLE: 日本語のタイトル\nAdd retries.");
+        runner.state.repo = dir.path().to_owned();
+        runner.state.candidates[0].worktree = dir.path().to_owned();
+        let winner = runner.state.candidates[0].clone();
+        assert!(
+            runner
+                .guarded_pr_message(&winner, None, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let store = ask::Questions::open();
+        let find = |run: &str| {
+            store
+                .list()
+                .into_iter()
+                .find(|q| q.run == run && q.node == crate::github_text::ASK_NODE && q.status.open())
+                .unwrap()
+        };
+        let run = runner.state.id.clone();
+        let q = find(&run);
+        assert!(q.cwd.is_none());
+        assert_eq!(q.choices, ["use fallback", "use my text"]);
+        // A bad replacement is refused and asked about once more.
+        let say = |id: &str, text: &str, choice: &str| {
+            store
+                .update(id, |q| {
+                    q.thread.push(ask::Turn {
+                        who: ask::Who::Operator,
+                        body: text.to_owned(),
+                        at: jiff::Timestamp::now(),
+                        note: None,
+                    });
+                    q.answer(ask::Answer::Choice(choice.to_owned()))
+                })
+                .unwrap();
+        };
+        say(&q.id, "まだ日本語", "use my text");
+        assert!(
+            runner
+                .guarded_pr_message(&winner, None, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let second = find(&run);
+        assert_ne!(second.id, q.id);
+        assert!(second.detail.contains("did not pass"));
+        say(&second.id, "fix: retry failed requests", "use my text");
+        let message = runner
+            .guarded_pr_message(&winner, None, true)
+            .await
+            .unwrap()
+            .expect("a vetted replacement is posted");
+        assert_eq!(message.title, "fix: retry failed requests");
+        assert_eq!(
+            runner
+                .state
+                .github_text
+                .as_ref()
+                .unwrap()
+                .chosen_title
+                .as_deref(),
+            Some("fix: retry failed requests")
+        );
+        assert!(runner.state.github_text.as_ref().unwrap().resolved);
+        // Resumed again: the saved decision is applied, nothing is re-asked.
+        let again = runner
+            .guarded_pr_message(&winner, None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.title, message.title);
+        assert_eq!(
+            store
+                .list()
+                .into_iter()
+                .filter(|q| q.run == run && q.node == crate::github_text::ASK_NODE)
+                .count(),
+            2
+        );
     }
 
     #[test]
