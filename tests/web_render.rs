@@ -1327,7 +1327,7 @@ async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
             r#"(async () => {
       const source = await (await fetch('/app.js')).text();
       window.deck = new Function(source.replace('queue: "/api/queue"', 'queue: "/api/queue?test_client=1"').replace(/\nboot\(\);\s*$/, `
-        return { linkify, truncateLabel, state, loadHealth, loadLoop, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter, reviewPassed, voteTag, reviewStamp };
+        return { linkify, truncateLabel, state, loadHealth, loadLoop, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter, reviewPassed, voteTag, reviewStamp, createTaskCard, updateTaskCard, renderTask, renderRunDetail, createAskCard, updateAskCard };
       `))();
       await Promise.all([deck.loadQueue(), deck.loadRuns(), deck.loadTalks()]);
     })()"#,
@@ -2222,6 +2222,111 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
     assert_eq!(ids["text"], true);
     assert_eq!(ids["hash"], "#/tasks/x-12ba");
     assert_eq!(ids["sameDocument"], true);
+}
+
+#[tokio::test]
+async fn markdown_caches_follow_resolved_reference_changes() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP markdown caches: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let mut run = RunState::new(
+        fx.repo.clone(),
+        "main".to_owned(),
+        "0000000".to_owned(),
+        "12ba".to_owned(),
+        fx.config.clone(),
+    );
+    run.save_under(&home).unwrap();
+    seed_tasks(&queue, &fx.repo, &run.id);
+    let base = serve(
+        &home,
+        queue,
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    let page = browser
+        .open_page(&format!("{base}#/queue"), 1280, 900, false)
+        .await
+        .expect("page");
+    client_harness(&mut browser, &page).await;
+    let script = r#"(async () => {
+      const run = await (await fetch('/api/runs/' + __RUN_ID__)).json();
+      const task = { ...deck.state.queue[0], instruction: '12ba' };
+      const question = {
+        id: 'question', run: run.id, detail: '12ba', status: 'open',
+        thread: [{ who: 'agent', body: '12ba', note: '12ba' }],
+      };
+      const card = deck.createTaskCard();
+      const ask = deck.createAskCard();
+      deck.state.taskDetail = { id: task.id, task, error: null };
+      deck.state.detail = { id: run.id, run, report: '', reportView: null };
+      const targets = {
+        queue: card.refs.instruction.querySelector('.instruction'),
+        task: document.getElementById('task-instruction'),
+        run: document.getElementById('run-instruction'),
+        question: ask.refs.detail,
+        thread: ask.refs.thread,
+      };
+      const results = [];
+      const hash = location.hash;
+      // Keep the text and top-level node count fixed. Only resolution changes.
+      for (const href of [null, '#/tasks/task-12ba', '#/tasks/other-12ba', null]) {
+        const child = href
+          ? { type: 'ref', text: '12ba', code: true, kind: 'task', href }
+          : { type: 'code', code: '12ba' };
+        const md = [{ type: 'paragraph', children: [child] }];
+        task.instruction_md = run.instruction_md = question.detail_md = md;
+        question.thread_bodies_md = question.thread_notes_md = [md];
+        deck.updateTaskCard(card, task);
+        deck.renderTask();
+        deck.renderRunDetail();
+        deck.updateAskCard(ask, question);
+        results.push(Object.fromEntries(Object.entries(targets).map(([name, box]) => [name, {
+          hrefs: [...box.querySelectorAll('a.id-link')].map(a => a.getAttribute('href')),
+          codes: [...box.querySelectorAll('code')].map(c => c.textContent),
+        }])));
+        const first = targets.task.firstChild;
+        deck.renderTask();
+        if (targets.task.firstChild !== first) throw new Error('unchanged tree rebuilt');
+      }
+      return { results, sameRoute: location.hash === hash };
+    })()"#
+        .replace("__RUN_ID__", &serde_json::to_string(&run.id).unwrap());
+    let out = browser.eval(&page, &script).await.unwrap();
+    for (index, href) in [
+        None,
+        Some("#/tasks/task-12ba"),
+        Some("#/tasks/other-12ba"),
+        None,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for surface in ["queue", "task", "run", "question", "thread"] {
+            let count = if surface == "thread" { 2 } else { 1 };
+            let expected: Vec<_> = href.into_iter().cycle().take(count).collect();
+            assert_eq!(
+                out["results"][index][surface]["hrefs"],
+                serde_json::json!(expected),
+                "{surface} resolution step {index}"
+            );
+            assert_eq!(
+                out["results"][index][surface]["codes"],
+                serde_json::json!(vec!["12ba"; count]),
+                "{surface} keeps inline code"
+            );
+        }
+    }
+    assert_eq!(out["sameRoute"], true, "refresh must never navigate");
 }
 
 #[tokio::test]

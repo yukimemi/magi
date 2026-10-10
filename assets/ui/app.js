@@ -2506,8 +2506,9 @@ function updateTaskCard(row, task) {
 
   const full = task.instruction || "";
   const instructionBox = r.instruction.querySelector(".instruction");
-  if (instructionBox.dataset.forTask !== task.id) {
-    instructionBox.dataset.forTask = task.id;
+  const instructionKey = `${task.id}:${mdSignature(task.instruction_md)}`;
+  if (instructionBox.dataset.forTask !== instructionKey) {
+    instructionBox.dataset.forTask = instructionKey;
     renderMd(instructionBox, task.instruction_md);
   }
   show(r.instruction, full.trim() !== (task.title || "").trim() && full !== "");
@@ -4350,8 +4351,8 @@ function buildMdTable(node) {
 }
 
 /* Replace `container`'s children with `nodes` (a server-sent markdown tree)
-   turned into DOM. The one call every one of the five markdown surfaces in
-   this UI goes through. */
+   turned into DOM. Every markdown surface goes through this call. Cached
+   surfaces use mdSignature: unchanged text can gain or lose resolved links. */
 function renderMd(container, nodes) {
   clear(container);
   append(container, (Array.isArray(nodes) ? nodes : []).map(buildMd));
@@ -4685,7 +4686,8 @@ function updateAskCard(row, question, { compact = false } = {}) {
   setAttr(row, "data-waiting-agent", waitingOnAgent ? "1" : null);
 
   const turns = Array.isArray(question.thread) ? question.thread : [];
-  const threadKey = turns.map((t) => (t.note ? "n" : "-")).join("") + ":" + turns.length;
+  const threadKey = turns.map((t) => (t.note ? "n" : "-")).join("") + ":" + turns.length
+    + ":" + mdSignature(question.thread_bodies_md) + ":" + mdSignature(question.thread_notes_md);
   if (row.dataset.threadKey !== threadKey) {
     row.dataset.threadKey = threadKey;
     clear(r.thread);
@@ -4765,12 +4767,12 @@ function updateAskCard(row, question, { compact = false } = {}) {
   r.sayText.disabled = waitingOnAgent;
   r.saySend.disabled = waitingOnAgent;
 
-  /* The detail is immutable for a given question, so it is parsed once. An
+  /* The detail text is immutable, but resolved links can change. An
      open question shows it outright — it is the case for the decision. A
      settled one folds it away, so the record does not push the next open
      question off a 390px screen. */
   const detail = typeof question.detail === "string" ? question.detail.trim() : "";
-  const key = `${open ? "open" : "settled"}:${detail.length}`;
+  const key = `${open ? "open" : "settled"}:${mdSignature(question.detail_md)}`;
   if (row.dataset.detailKey !== key) {
     row.dataset.detailKey = key;
     clear(r.detail);
@@ -6839,8 +6841,9 @@ function renderRunDetail() {
   setAttr($("run-meta"), "title", `${run.id}\n${run.repo || ""}\nstarted ${created.title}\nupdated ${updated.title}`);
 
   const instructionEl = $("run-instruction");
-  if (instructionEl.dataset.forRun !== run.id) {
-    instructionEl.dataset.forRun = run.id;
+  const instructionKey = `${run.id}:${mdSignature(run.instruction_md)}`;
+  if (instructionEl.dataset.forRun !== instructionKey) {
+    instructionEl.dataset.forRun = instructionKey;
     renderMd(instructionEl, run.instruction_md);
   }
 
@@ -9484,7 +9487,7 @@ function renderTask() {
   show($("task-why-panel"), noteBits.length > 0 || Boolean(task.last_error));
 
   const box = $("task-instruction");
-  const stamp = `${task.id}:${task.instruction_md || task.instruction || ""}`;
+  const stamp = `${task.id}:${mdSignature(task.instruction_md)}`;
   if (box.dataset.forTask !== stamp) {
     box.dataset.forTask = stamp;
     renderMd(box, task.instruction_md);
