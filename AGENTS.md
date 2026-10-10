@@ -1178,6 +1178,19 @@ briefing is byte-for-byte unchanged for it.
   id the config no longer has is treated as `default` with a warning.
 - Both new `Talk` fields are `#[serde(default)]`; `talk::SCHEMA` is unchanged.
 
+### Chat implementer count changes a command, not a tone
+
+`Talk::implementers` (1..=3, `#[serde(default)]` to 1 = Solo, `talk::SCHEMA`
+unchanged) only changes which filing command the briefing teaches:
+`--solo` for 1, `--implementers N` (never with `--solo`) otherwise, built in
+`talk::briefing_for` at all three places the briefing names it. It follows the
+persona's dirty-flag style (`implementers_dirty`, a `# Task filing update`
+prefix, cleared only after a successful turn); a turn with no resumable session
+re-sends the policy whenever it is not Solo. Enforcement is the prompt only;
+`POST /api/talks/{id}/implementers` validates 1..=3 and the *conversation's*
+repo config (`talk::check_implementers`), so `--repo` pointing elsewhere is
+checked only when the task runs.
+
 ### Handing the address over: release, then spawn
 
 `POST /api/upgrade` ends the process it is serving from, and the order of the

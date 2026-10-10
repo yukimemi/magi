@@ -936,6 +936,7 @@ impl Ui {
             .route("/api/talks/{id}/pending/edit", post(talk_pending_edit))
             .route("/api/talks/{id}/agent", post(talk_agent))
             .route("/api/talks/{id}/persona", post(talk_persona))
+            .route("/api/talks/{id}/implementers", post(talk_implementers))
             .route("/api/talks/{id}/close", post(talk_close))
             .route("/api/talks/{id}/reopen", post(talk_reopen))
             // `DefaultBodyLimit` is raised only on this one route - every
@@ -7059,6 +7060,75 @@ async fn talk_persona(
     Ok(Json(TalkView::new(talk, draining)))
 }
 
+/// The body of `POST /api/talks/{id}/implementers`.
+#[derive(Debug, Deserialize)]
+struct TalkImplementers {
+    implementers: u8,
+}
+
+/// `POST /api/talks/{id}/implementers` - choose how many implementers the tasks it files use (1 is Solo). Shaped
+/// like [`talk_agent`]: the turn guard is held for the change and always handed
+/// to `drain_loop`, so a draft left meanwhile is not stranded.
+async fn talk_implementers(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    Json(body): Json<TalkImplementers>,
+) -> ApiResult<Json<TalkView>> {
+    let id = {
+        let ui = Arc::clone(&ui);
+        blocking(move || resolve_talk(&ui.talks, &id)).await?
+    };
+    let repo = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        blocking(move || Ok(ui.talks.get(&id)?.repo)).await?
+    };
+    let cfg = config_for(&repo).await?;
+    let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
+        return Err(ApiError::conflict(
+            "a talk turn is running; change the implementers once it has answered",
+        ));
+    };
+    let switched = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        let cfg = cfg.clone();
+        blocking(move || {
+            let chosen =
+                talk::check_implementers(body.implementers, &cfg).map_err(ApiError::bad_request)?;
+            let mut talk = ui.talks.get(&id)?;
+            if !talk.status.open() {
+                return Err(ApiError::conflict(format!(
+                    "talk {} is {} and takes no more turns",
+                    talk.short(),
+                    talk.status.as_str()
+                )));
+            }
+            talk::switch_implementers(&mut talk, &ui.talks, chosen)?;
+            Ok(talk)
+        })
+        .await
+    };
+    // As in `talk_agent`: the claim goes to `drain_loop` whatever happened.
+    let fresh = {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        blocking(move || Ok(ui.talks.get(&id)?)).await
+    };
+    let draining = match fresh {
+        Ok(talk) => {
+            let draining = talk.status.open()
+                && (!talk.pending.is_empty() || !talk.pending_attachments.is_empty());
+            let talks = ui.talks.clone();
+            tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
+            draining
+        }
+        Err(_) => false,
+    };
+    let talk = switched?;
+    Ok(Json(TalkView::new(talk, draining)))
+}
+
 /// `POST /api/talks/{id}/close`.
 async fn talk_close(
     State(ui): State<Arc<Ui>>,
@@ -9044,6 +9114,66 @@ mod tests {
         talk::close(&mut closed, &talks).expect("close");
         let refused = call("mock").await.expect_err("closed talk");
         assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.message);
+    }
+
+    #[tokio::test]
+    async fn talk_implementers_validates_and_refuses_busy_or_closed() {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::write(repo.join("magi.toml"), MOCK_AGENT_TOML).expect("write magi.toml");
+        let home = TempDir::new().expect("temp home");
+        let talks = Talks::at(home.path().join("talks"));
+        let ui = Arc::new(
+            Ui::new(
+                Queue::at(home.path().join("queue")),
+                Questions::at(home.path().join("questions")),
+                talks.clone(),
+                home.path().join("runs"),
+                home.path().to_path_buf(),
+                repo.clone(),
+            )
+            .with_worktrees_root(home.path().join("wt")),
+        );
+        let cfg = config_for(&repo).await.expect("discover config");
+        let talk = talk::begin(&talks, &cfg, repo.clone(), Some("mock")).expect("begin talk");
+        let id = talk.id.clone();
+        let call = |n: u8| {
+            talk_implementers(
+                State(Arc::clone(&ui)),
+                Path(id.clone()),
+                Json(TalkImplementers { implementers: n }),
+            )
+        };
+
+        for bad in [0u8, 4] {
+            let e = call(bad).await.expect_err("out of range");
+            assert_eq!(e.status, StatusCode::BAD_REQUEST, "{}", e.message);
+        }
+        assert_eq!(talks.get(&id).expect("reload").implementers, 1);
+
+        {
+            let mut claimed = None;
+            for _ in 0..200 {
+                claimed = ui.begin_talk_turn(&id).expect("claim");
+                if claimed.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let _busy = claimed.expect("free");
+            let busy = call(2).await.expect_err("busy talk");
+            assert_eq!(busy.status, StatusCode::CONFLICT, "{}", busy.message);
+        }
+
+        let Json(view) = call(3).await.expect("switch");
+        assert_eq!(view.talk.implementers, 3);
+        assert!(talks.get(&id).expect("reload").implementers_dirty);
+
+        let mut closed = talks.get(&id).expect("reload");
+        talk::close(&mut closed, &talks).expect("close");
+        let e = call(2).await.expect_err("closed talk");
+        assert_eq!(e.status, StatusCode::CONFLICT, "{}", e.message);
     }
 
     #[tokio::test]
