@@ -1436,20 +1436,21 @@ async fn hand_over(
             "hand_over: upgrade.json is unreadable; no parking stage",
         );
     }
+    // Chat stays open while the loop parks: nothing restarts until it ends,
+    // and the park can last as long as a node. Only once it is done is the
+    // slot closed, right before the restart; a turn started earlier is in
+    // `live` by then, so `finish_talks` waits for it.
+    finish_loop(home, looping, Some(&mut lease)).await;
     let parking = ParkingTurns::begin(turns);
-    let loop_done = finish_loop(home, looping, None);
     let talks_done = finish_talks(home, turns, talk_wait);
-    tokio::pin!(loop_done, talks_done);
-    let (mut loop_ended, mut talks_ended) = (false, None);
+    tokio::pin!(talks_done);
     let mut beat = tokio::time::interval(LEASE_BEAT);
-    while !loop_ended || talks_ended.is_none() {
+    let (abandoned, waited_for) = loop {
         tokio::select! {
-            () = &mut loop_done, if !loop_ended => loop_ended = true,
-            left = &mut talks_done, if talks_ended.is_none() => talks_ended = Some(left),
+            left = &mut talks_done => break left,
             _ = beat.tick() => lease.beat(),
         }
-    }
-    let (abandoned, waited_for) = talks_ended.unwrap_or_default();
+    };
     drop(lease);
     updater::log_step(home, "hand_over: releasing the listener (abort and await)");
     served.abort();
@@ -1529,7 +1530,8 @@ fn talk_wait_for(talks: &Talks, ids: &[String]) -> Duration {
 }
 
 /// Stops new chat turns for as long as it lives, so the hand-over only ever
-/// waits on a set that cannot grow. Dropping it reopens the slots.
+/// waits on a set that cannot grow. `hand_over` takes it only after the loop
+/// has stopped, so chat stays usable while the loop parks. Dropping it reopens the slots.
 struct ParkingTurns(Arc<Mutex<TalkTurns>>);
 
 impl ParkingTurns {
@@ -15221,6 +15223,95 @@ mod tests {
 
         assert!(!handover.is_finished());
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(turn);
+        handover.await.expect("join").expect("hand over");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!turns.lock().unwrap().parking, "slots reopen afterwards");
+    }
+
+    /// Chat stays open while the loop is still parking, and closes only once
+    /// the loop is done; a turn started during the park is waited for.
+    #[tokio::test]
+    async fn hand_over_keeps_chat_open_until_the_loop_is_done() {
+        let home = TempDir::new().expect("temp home");
+        let (ui, looping, turns, served) = park_fixture(&home).await;
+        let ui = Arc::new(ui);
+        // A loop that ends only when told to.
+        let (end_loop, loop_ended) = tokio::sync::oneshot::channel::<()>();
+        lock_or_recover(&looping).live = Some(Live {
+            stop: daemon::Stop::new(),
+            handle: tokio::spawn(async move {
+                let _ = loop_ended.await;
+            }),
+            opts: daemon::Opts::default(),
+        });
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handover = tokio::spawn({
+            let home = home.path().to_path_buf();
+            let turns = Arc::clone(&turns);
+            let calls = Arc::clone(&calls);
+            async move {
+                hand_over(
+                    &home,
+                    &looping,
+                    &turns,
+                    &|_: &[String]| Duration::from_secs(60),
+                    served,
+                    move |_| {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(1)
+                    },
+                )
+                .await
+            }
+        });
+
+        let reached = async {
+            for _ in 0..200 {
+                if crate::updater::read_progress(home.path())
+                    .is_some_and(|p| p.stage == crate::updater::Stage::Parking)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("the hand-over never reached parking");
+        };
+        reached.await;
+
+        // The loop is still parking: a chat turn starts.
+        assert!(!turns.lock().unwrap().parking);
+        let turn = ui
+            .begin_talk_turn("20260901-000000-chat")
+            .expect("claim")
+            .expect("a turn can start while the loop parks");
+
+        // The loop ends; the slot closes while the first turn is still held.
+        end_loop.send(()).expect("loop still waiting");
+        for _ in 0..200 {
+            if turns.lock().unwrap().parking {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            turns.lock().unwrap().parking,
+            "closed once the loop is done"
+        );
+        let refused = ui.begin_talk_turn("20260901-000000-late").err();
+        assert!(
+            refused.is_some_and(|e| e.message.contains("upgrade in progress")),
+            "no turn starts once the loop is done"
+        );
+        assert!(
+            ui.begin_queued_talk_turn("20260901-000000-late")
+                .expect("queued claim")
+                .is_none()
+        );
+        assert!(!handover.is_finished());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
         drop(turn);
         handover.await.expect("join").expect("hand over");
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
