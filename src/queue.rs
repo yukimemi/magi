@@ -516,6 +516,10 @@ pub struct ChatReport {
     /// between recording and queueing, and the next sweep completes it.
     #[serde(default)]
     pub sent: bool,
+    /// The notice, kept while it is unsent so a retry says what was true when
+    /// the task ended, not what the task has become since.
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 /// Command-line choices carried by a task. See [`Task::overrides`].
@@ -1666,45 +1670,50 @@ impl Queue {
         Ok(task)
     }
 
-    /// Record, under the task's write lock, that the chat is being told about
-    /// the task's present ending. Returns the task and the key, or `None` when
-    /// nothing is due (not a final state, or already on record). Written
-    /// *before* the notice is queued: a crash in between loses one notice
-    /// rather than posting two.
-    pub fn record_chat_report(
+    /// Tell the chat how task `id` ended, all under the task's write lock, so
+    /// two processes sweeping one queue cannot both deliver.
+    ///
+    /// A fresh ending is first recorded (`sent: false`, with the notice text
+    /// built from the task *as it is now*, `build(task, key)`), then
+    /// `deliver(text)` runs; `Ok(true)` means the draft holds it, `Ok(false)`
+    /// that there is no chat to tell, and an error leaves the record unsent.
+    /// A record left unsent by a crash or an error is delivered again from its
+    /// stored text, never rebuilt from whatever state the task has moved to.
+    /// `None`: nothing due. `Some(delivered)` otherwise.
+    pub fn report_chat(
         &self,
         id: &str,
-        skipped: impl FnOnce(&Task) -> bool,
-    ) -> Result<Option<(Task, String)>> {
+        build: impl FnOnce(&Task, &str) -> String,
+        deliver: impl FnOnce(&str) -> Result<bool>,
+    ) -> Result<Option<bool>> {
         let id = self.resolve_id(id)?;
         let _lock = self.lock_task(&id)?;
         let mut task = self.get(&id)?;
-        let Some(key) = task.chat_report_due() else {
+        let (key, text) = if let Some(key) = task.chat_report_due() {
+            let text = build(&task, &key);
+            task.chat_report = Some(ChatReport {
+                key: key.clone(),
+                at: Timestamp::now(),
+                skipped: false,
+                sent: false,
+                text: Some(text.clone()),
+            });
+            self.put_unlocked(&mut task)?;
+            (key, text)
+        } else if let Some(r) = task.chat_report.as_ref().filter(|r| !r.sent && !r.skipped) {
+            let text = r.text.clone().unwrap_or_else(|| build(&task, &r.key));
+            (r.key.clone(), text)
+        } else {
             return Ok(None);
         };
-        let skipped = skipped(&task);
-        task.chat_report = Some(ChatReport {
-            key: key.clone(),
-            at: Timestamp::now(),
-            skipped,
-            sent: skipped,
-        });
-        self.put_unlocked(&mut task)?;
-        Ok(Some((task, key)))
-    }
-
-    /// Confirm that the report for `key` is in the chat's draft (`skipped`:
-    /// there is no chat to tell). A record that has moved on to another ending
-    /// is left alone.
-    pub fn finish_chat_report(&self, id: &str, key: &str, skipped: bool) -> Result<()> {
-        let _lock = self.lock_task(id)?;
-        let mut task = self.get(id)?;
+        let delivered = deliver(&text)?;
         if let Some(r) = task.chat_report.as_mut().filter(|r| r.key == key) {
             r.sent = true;
-            r.skipped = skipped;
+            r.skipped = !delivered;
+            r.text = None;
             self.put_unlocked(&mut task)?;
         }
-        Ok(())
+        Ok(Some(delivered))
     }
 
     /// Exclusive right to rewrite task `id`'s record, held until the guard
@@ -2335,6 +2344,7 @@ fn read_path(path: &Path) -> Result<Task> {
                 at: Timestamp::now(),
                 skipped: true,
                 sent: true,
+                text: None,
             });
         }
         task.schema = SCHEMA;
@@ -4263,6 +4273,7 @@ mod tests {
             at: Timestamp::now(),
             skipped: false,
             sent: true,
+            text: None,
         });
         assert_eq!(t.chat_report_due(), None);
         t.release();
@@ -4279,7 +4290,14 @@ mod tests {
         let mut t = chat_task();
         t.succeed();
         q.put(&mut t).unwrap();
-        let (_, key) = q.record_chat_report(&t.id, |_| false).unwrap().unwrap();
+        let failed = q.report_chat(&t.id, |_, _| "x".to_owned(), |_| bail!("no"));
+        assert!(failed.is_err());
+        let key = q
+            .get(&t.id)
+            .unwrap()
+            .chat_report_unsent()
+            .unwrap()
+            .to_owned();
         let mut stale = t.clone();
         assert!(stale.chat_report.is_none());
         q.put(&mut stale).unwrap();
@@ -4288,7 +4306,11 @@ mod tests {
             q.get(&t.id).unwrap().chat_report_unsent(),
             Some(key.as_str())
         );
-        q.finish_chat_report(&t.id, &key, false).unwrap();
+        assert_eq!(
+            q.report_chat(&t.id, |_, _| String::new(), |t| Ok(t == "x"))
+                .unwrap(),
+            Some(true)
+        );
         assert_eq!(q.get(&t.id).unwrap().chat_report_unsent(), None);
     }
 

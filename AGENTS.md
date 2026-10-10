@@ -2177,12 +2177,15 @@ it - the shape of `consult`: no new seat, no new waiter, no fresh agent.
   is two notices). Queued, running, parked and failed are not: a failed task is
   retried, and running out of attempts holds it, which is the report. Held and
   blocked are final for now, not forever.
-- **Recorded first, completed later, idempotent.** `Queue::record_chat_report`
-  writes `Task::chat_report` (`queue::SCHEMA` 13, `sent: false`) under the task
-  lock *before* the draft is queued; the draft carries a `magi-report:` marker
+- **Recorded first, completed later, idempotent.** `Queue::report_chat`
+  writes `Task::chat_report` (`queue::SCHEMA` 13, `sent: false`, with the notice
+  text as it was when the task ended) under the task lock *before* the draft is
+  queued, and the marker check plus append run inside that same lock
+  (`Queue::report_chat`), so two sweeping processes cannot both deliver; the draft carries a `magi-report:` marker
   line, and `finish_chat_report` sets `sent` afterwards. A record that is not
   `sent` (a crash in between, a failed queue) is finished by the next sweep,
-  which first looks for the marker in the talk's draft and transcript, so a
+  which delivers the stored text (never one rebuilt from the task's newer state)
+  after looking for the marker in the talk's draft and transcript, so a
   notice is neither lost nor posted twice. `Queue::put` keeps a stored record a
   stale snapshot lacks; release, start and edit never clear it. A terminal chat
   task read from a schema before 13 counts as already reported, so an upgrade

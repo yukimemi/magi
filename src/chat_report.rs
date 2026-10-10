@@ -11,7 +11,7 @@
 //!   `magi task done`, the conductor, the web's buttons), so [`sweep`] looks at
 //!   the queue instead; the loop calls it on a timer. A notice can be one lap
 //!   late, and none is queued while no `magi serve` / `magi web` runs.
-//! - **Recorded first, completed later.** [`Queue::record_chat_report`] writes
+//! - **Recorded first, completed later.** [`Queue::report_chat`] writes
 //!   [`Task::chat_report`] under the task's lock *before* the draft is queued,
 //!   and withdraws it if queueing fails: a crash loses one notice, never posts
 //!   two.
@@ -142,61 +142,53 @@ fn marker_of(task: &Task, key: &str) -> String {
 
 /// `Ok(None)`: nothing to do. `Ok(Some(None))`: settled as skipped.
 /// `Ok(Some(Some(talk)))`: the draft for `talk` holds the report.
+///
+/// The check for the marker and the append happen inside
+/// [`Queue::report_chat`], under the task's lock.
 fn report_one(
     queue: &Queue,
     talks: &Talks,
     home: &std::path::Path,
     id: &str,
 ) -> Result<Option<Option<String>>> {
-    let gone = |t: &Task| {
-        let Some(talk) = t.filed_by_chat() else {
-            return true;
-        };
-        !talks.path_of(talk).exists() || talks.get(talk).map_or(true, |t| !t.status.open())
-    };
-    // An unreadable (not missing) talk is a transient failure, not a reason
-    // to record "skipped" for good.
-    if let Some(talk) = queue.get(id)?.filed_by_chat()
-        && talks.path_of(talk).exists()
-        && talks.get(talk).is_err()
-    {
-        bail!("talk {talk} is unreadable");
-    }
-    // Either a fresh ending, or one recorded earlier whose draft was never
-    // confirmed.
-    let (task, key) = match queue.record_chat_report(id, gone)? {
-        Some(r) => r,
-        None => {
-            let task = queue.get(id)?;
-            let Some(key) = task.chat_report_unsent().map(str::to_owned) else {
-                return Ok(None);
-            };
-            (task, key)
-        }
-    };
-    if task.chat_report.as_ref().is_some_and(|r| r.skipped) {
-        return Ok(Some(None));
-    }
-    let talk_id = task.filed_by_chat().context("task has no chat")?.to_owned();
-    if gone(&task) {
-        queue.finish_chat_report(&task.id, &key, true)?;
-        return Ok(Some(None));
-    }
-    let marker = marker_of(&task, &key);
-    let mut talk = talks.get(&talk_id)?;
-    let already =
-        talk.pending.contains(&marker) || talk.turns.iter().any(|t| t.body.contains(&marker));
-    if !already {
-        let run = task
-            .runs
-            .last()
-            .and_then(|r| crate::run::RunState::load_under(r, home).ok());
-        let text = format!("{}\n\n{marker}", message(&task, run.as_ref()));
-        talk::queue(&mut talk, talks, &text, Vec::new())
-            .context("queue the report into the chat")?;
-    }
-    queue.finish_chat_report(&task.id, &key, false)?;
-    Ok(Some(Some(talk_id)))
+    let talk_id = queue
+        .get(id)?
+        .filed_by_chat()
+        .context("task has no chat")?
+        .to_owned();
+    let delivered = queue.report_chat(
+        id,
+        |task, key| {
+            let run = task
+                .runs
+                .last()
+                .and_then(|r| crate::run::RunState::load_under(r, home).ok());
+            format!(
+                "{}\n\n{}",
+                message(task, run.as_ref()),
+                marker_of(task, key)
+            )
+        },
+        |text| {
+            // Missing or closed: nobody to tell. Unreadable: try again later.
+            if !talks.path_of(&talk_id).exists() {
+                return Ok(false);
+            }
+            let mut talk = talks.get(&talk_id)?;
+            if !talk.status.open() {
+                return Ok(false);
+            }
+            let marker = text.rsplit("\n\n").next().unwrap_or(text);
+            let already =
+                talk.pending.contains(marker) || talk.turns.iter().any(|t| t.body.contains(marker));
+            if !already {
+                talk::queue(&mut talk, talks, text, Vec::new())
+                    .context("queue the report into the chat")?;
+            }
+            Ok(true)
+        },
+    )?;
+    Ok(delivered.map(|d| d.then_some(talk_id)))
 }
 
 /// Run [`sweep`] every [`LAP`] until `stop`. With no `kick` of its own the

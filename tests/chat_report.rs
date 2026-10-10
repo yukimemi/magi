@@ -157,11 +157,19 @@ fn a_crash_between_record_and_queue_is_completed_not_lost_or_doubled() {
     t.succeed();
     w.queue.put(&mut t).unwrap();
     // Recorded, but the draft never reached the talk.
-    let (_, key) = w
+    let failed = w.queue.report_chat(
+        &t.id,
+        |task, key| format!("# {HEADING}\n\nmagi-report: {} {key}", task.id),
+        |_| anyhow::bail!("down"),
+    );
+    assert!(failed.is_err());
+    let key = w
         .queue
-        .record_chat_report(&t.id, |_| false)
+        .get(&t.id)
         .unwrap()
-        .expect("due");
+        .chat_report_unsent()
+        .expect("unsent")
+        .to_owned();
     assert_eq!(key, format!("done:{}", t.runs[0]));
     assert!(pending(&w).is_empty());
 
@@ -240,4 +248,41 @@ fn talk_post_is_restricted_to_the_chat_that_filed_the_task() {
     // No turn was started: nothing queued, no lease taken.
     assert!(after.pending.is_empty());
     assert!(!w.talks.turn_held(&w.talk.id));
+}
+
+#[test]
+fn an_unsent_report_says_what_was_true_when_the_task_ended() {
+    let w = world();
+    let mut t = chat_task(&w);
+    t.hold_machine(Some("disk full".to_owned()));
+    w.queue.put(&mut t).unwrap();
+    let failed = w.queue.report_chat(
+        &t.id,
+        |task, _| format!("held: {}", task.hold_reason.clone().unwrap_or_default()),
+        |_| anyhow::bail!("down"),
+    );
+    assert!(failed.is_err());
+
+    // The operator releases it and a new run starts before the retry.
+    t.release();
+    w.queue.put(&mut t).unwrap();
+    t.start("20260902-000009-beef".to_owned());
+    w.queue.put(&mut t).unwrap();
+
+    let delivered = RefCell::new(String::new());
+    let out = w
+        .queue
+        .report_chat(
+            &t.id,
+            |_, _| "rebuilt from the running task".to_owned(),
+            |text| {
+                *delivered.borrow_mut() = text.to_owned();
+                Ok(true)
+            },
+        )
+        .unwrap();
+    assert_eq!(out, Some(true));
+    assert_eq!(delivered.into_inner(), "held: disk full");
+    // Running again is no ending: nothing more is due.
+    assert_eq!(sweep(&w), (vec![], vec![]));
 }
