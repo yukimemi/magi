@@ -231,6 +231,9 @@ async function startScreencast(page) {
 /** Frames closer than this (s) are dropped: animations paint at the display rate. */
 const MIN_GAP = 1 / 12;
 
+/** Floor (ms) for a `story` beat, whatever the profile's holdScale. */
+const STORY_HOLD = 1500;
+
 function thin(frames) {
   const kept = [frames[0]];
   for (const frame of frames.slice(1)) {
@@ -406,7 +409,7 @@ async function storyboard(page, scratch, base, beat, quiet) {
     await page.locator("#talk-wait").waitFor({ state: "hidden", timeout: 10_000 });
   }, 500);
   // Long enough to read the line the operator asked for.
-  await beat("reply", 2600, true);
+  await beat("reply", 2600, "exact");
 
   // 1. The task the chat filed, in the real queue.
   await quiet(async () => {
@@ -414,14 +417,14 @@ async function storyboard(page, scratch, base, beat, quiet) {
     await page.locator("#queue-sections").getByText(REQUEST).first().waitFor();
     await scrollTo(0);
   }, 200);
-  await beat("queue", 1500);
+  await beat("queue", 1500, "story");
   if (!PROFILE.touch) {
     // Two panes: select the task and read it beside the list.
     await quiet(async () => {
       await tap(page.locator("#queue-sections").getByText(REQUEST).first());
       await page.waitForSelector("#view-task:not([hidden])");
     }, 200);
-    await beat("queue-task", 1500);
+    await beat("queue-task", 1500, "story");
   }
 
   // 2. The run in flight: three candidates, no agent names.
@@ -448,7 +451,7 @@ async function storyboard(page, scratch, base, beat, quiet) {
     await page.waitForSelector("#view-run:not([hidden])");
     await scrollTo(0);
   }, 200);
-  await beat("run-inflight", 1000);
+  await beat("run-inflight", 1000, "story");
 
   // 3. Ranking, tally, winner and the review rounds closing.
   await quiet(async () => {
@@ -459,7 +462,7 @@ async function storyboard(page, scratch, base, beat, quiet) {
   await page.getByText("First choices", { exact: true }).first().evaluate(
     (el) => el.scrollIntoView({ block: "center", behavior: "instant" }),
   );
-  await beat("run-ranking", 1500);
+  await beat("run-ranking", 1500, "story");
   // Open the review rounds for real: round 1's finding, fixed in round 2.
   await tap(page.locator("summary", { hasText: "Reviews" }).first());
   // Show the adoption report and clean closing round, rather than stopping
@@ -467,7 +470,7 @@ async function storyboard(page, scratch, base, beat, quiet) {
   await page.getByText("1 addressed", { exact: true }).evaluate(
     (el) => el.scrollIntoView({ block: "center", behavior: "instant" }),
   );
-  await beat("run-reviews", 1500);
+  await beat("run-reviews", 1500, "story");
 
   // 4. A question from an agent, answered with a tap.
   const choice = page.getByRole("button", { name: "SQLite" }).first();
@@ -481,7 +484,7 @@ async function storyboard(page, scratch, base, beat, quiet) {
       (el) => el.scrollIntoView({ block: "center", behavior: "instant" }),
     );
   }, 200);
-  await beat("question", 1500);
+  await beat("question", 1500, "story");
   await tap(choice);
   await beat("answered", 500);
 
@@ -525,7 +528,7 @@ async function storyboard(page, scratch, base, beat, quiet) {
     await page.waitForSelector("#view-run:not([hidden])");
     await scrollTo(0);
   }, 250);
-  await beat("merged", 1500);
+  await beat("merged", 1500, "story");
 }
 
 async function main() {
@@ -569,9 +572,14 @@ async function main() {
     const cuts = [];
     let n = 0;
     const t0 = Date.now();
-    // `exact` holds are not scaled: the reply must stay readable.
-    const beat = async (name, hold = 0, exact = false) => {
-      if (hold) await wait(exact ? hold : hold * PROFILE.holdScale);
+    // `exact` holds are not scaled: the reply must stay readable. `story`
+    // holds are scaled but never drop below STORY_HOLD: a screen the viewer is
+    // meant to read keeps its minimum time in every profile.
+    const beat = async (name, hold = 0, kind = "") => {
+      if (hold) {
+        const scaled = hold * PROFILE.holdScale;
+        await wait(kind === "exact" ? hold : kind === "story" ? Math.max(scaled, STORY_HOLD) : scaled);
+      }
       if (SHOTS) {
         await page.screenshot({
           path: join(shotDir, `${String(n++).padStart(2, "0")}-${name}.png`),
