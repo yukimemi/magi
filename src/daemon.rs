@@ -3123,7 +3123,15 @@ pub fn finish_attempt(
 /// or requeued) is **held**: nobody asked for a retry, and a loop starting
 /// later must not spend agent calls on it. `magi task release` retries.
 pub fn hold_if_runnable(queue: &Queue, task: &mut Task) {
-    if task.status.runnable() {
+    // A run parked on the owner's word about a withheld PR title/body is not a
+    // failure nobody asked to retry: it resumes (answer, or the neutral text on
+    // the deadline) the moment a loop serves the queue, via `land_resume_state`.
+    // Holding it would keep it from ever being a candidate.
+    let waits_on_owner = task.runs.last().is_some_and(|id| {
+        RunState::load(id)
+            .is_ok_and(|s| s.parked && s.github_text.as_ref().is_some_and(|g| !g.resolved))
+    });
+    if task.status.runnable() && !waits_on_owner {
         let why = task.last_error.clone().map_or_else(
             || "the run did not finish".to_owned(),
             |e| format!("the run did not finish: {e}"),
