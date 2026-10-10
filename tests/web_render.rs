@@ -2040,8 +2040,18 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
             "https://x.test/a"
         ])
     );
-    assert_eq!(out["rel"], serde_json::json!(["noopener noreferrer", "noopener noreferrer", "noopener noreferrer"]));
-    assert_eq!(out["target"], serde_json::json!(["_blank", "_blank", "_blank"]));
+    assert_eq!(
+        out["rel"],
+        serde_json::json!([
+            "noopener noreferrer",
+            "noopener noreferrer",
+            "noopener noreferrer"
+        ])
+    );
+    assert_eq!(
+        out["target"],
+        serde_json::json!(["_blank", "_blank", "_blank"])
+    );
     assert_eq!(out["bold"], 0);
     assert_eq!(out["text"], true);
 }
