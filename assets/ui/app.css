@@ -2055,6 +2055,7 @@ details.panel > summary + * { margin-top: var(--s2); }
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
     align-items: start;
+    align-content: start;
     column-gap: var(--s5);
   }
   #view-run > .back, #view-run > .view-head { grid-column: 1 / -1; }
