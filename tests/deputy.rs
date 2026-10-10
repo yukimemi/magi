@@ -808,3 +808,39 @@ async fn a_say_on_a_triage_or_unknown_question_gets_a_deputy_without_a_cwd() {
     assert_eq!(log(&s).len(), 3);
 }
 }
+
+#[test]
+fn generic_brief_offers_read_only_investigation_only_for_a_run_id() {
+    let home = std::path::Path::new("/tmp/magi-home-for-test");
+    let mk = |run: &str| {
+        Question::new(
+            run.to_owned(),
+            magi::github_text::ASK_NODE.to_owned(),
+            "posting-gate".to_owned(),
+            "title withheld".to_owned(),
+            "detail".to_owned(),
+            vec!["use fallback".to_owned()],
+        )
+    };
+    let brief = |q: &Question| magi::deputy::generic_brief(q, &q.actions, home);
+
+    let with = brief(&mk("20261011-120000-7756"));
+    assert!(with.contains("20261011-120000-7756"));
+    assert!(with.contains("magi show 20261011-120000-7756"));
+    let artifacts = home
+        .join("runs")
+        .join("20261011-120000-7756")
+        .join("artifacts");
+    assert!(with.contains(&artifacts.display().to_string()));
+    assert!(with.contains("read-only"));
+    assert!(with.contains("not yours to guess"));
+    assert!(with.contains("`use fallback`"));
+
+    for run in ["", "a1b2c3"] {
+        let without = brief(&mk(run));
+        assert!(!without.contains("magi show"), "run {run:?}");
+        assert!(!without.contains("read-only"), "run {run:?}");
+        assert!(!without.contains("artifacts"), "run {run:?}");
+        assert!(without.contains("You know only what the question itself says"));
+    }
+}

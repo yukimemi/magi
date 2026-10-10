@@ -63,7 +63,7 @@
 //!   of the owner, never on a task the operator holds.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -184,16 +184,41 @@ pub fn kind_of(q: &Question) -> Option<Kind> {
 
 /// What a deputy is told about a question of no known kind: only what the
 /// question itself stored.
-pub fn generic_brief(q: &Question, actions: &BTreeMap<String, ChoiceAction>) -> String {
+pub fn generic_brief(
+    q: &Question,
+    actions: &BTreeMap<String, ChoiceAction>,
+    home: &Path,
+) -> String {
+    // `Question::run` may also hold a task id; only a run id can be shown.
+    let run = crate::run::is_run_id(&q.run).then_some(q.run.as_str());
+    let knows = if run.is_some() {
+        "You know what the question itself says and what you can learn from \
+         its run by the read-only investigation described below."
+    } else {
+        "You know only what the question itself says."
+    };
     let mut s = format!(
         "This question was filed by magi (node `{}`, seat `{}`) with no agent \
          waiting on it. Magi records the owner's answer and the component that \
-         asked applies it; you apply nothing. You know only what the question \
-         itself says. A choice whose effect you cannot read from the question is \
-         not yours to guess: do not settle it, ask the owner what they mean with \
-         `--thread` instead.",
+         asked applies it; you apply nothing. {knows} A choice whose effect you \
+         cannot read is not yours to guess: do not settle it, ask the owner \
+         what they mean with `--thread` instead.",
         q.node, q.seat
     );
+    if let Some(run) = run {
+        let artifacts = home.join("runs").join(run).join("artifacts");
+        s.push_str(&format!(
+            "\n\nThis question concerns run `{run}`. You may investigate it on \
+             your own, read-only: run `magi show {run}` and read files under \
+             `{}`. When the owner asks about details (for example which part \
+             was wrong), look it up yourself and answer; do not reply that you \
+             cannot see the details, and do not tell the owner to run `magi show` \
+             themselves. Investigating never changes anything: edit, commit, push \
+             and apply nothing. If the run cannot be read, say exactly that and do \
+             not guess at the cause or at what an option does.",
+            artifacts.display()
+        ));
+    }
     if !q.choices.is_empty() {
         s.push_str("\n\nWhat each option does:");
         for c in &q.choices {
@@ -385,7 +410,7 @@ impl Deputies {
                             r,
                             &crate::queue::Queue::at(self.home.join("queue")),
                         ),
-                        Kind::Generic => generic_brief(r, &r.actions),
+                        Kind::Generic => generic_brief(r, &r.actions, &self.home),
                     }));
                 }
                 if kind == Kind::Conduct && r.cwd.is_none() {
