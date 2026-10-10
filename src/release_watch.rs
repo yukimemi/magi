@@ -133,6 +133,19 @@ pub(crate) struct WatchState {
     pub local: bool,
 }
 
+impl WatchState {
+    /// Whether this record belongs to a local-mode release. Records written
+    /// before `local` existed lack the flag, but only local mode ever sets
+    /// `run`, `asked_head`, `held_head` or `job`.
+    fn is_local(&self) -> bool {
+        self.local
+            || self.run.is_some()
+            || self.asked_head.is_some()
+            || self.held_head.is_some()
+            || self.job.is_some()
+    }
+}
+
 fn is_failed(v: Verdict) -> bool {
     v == Verdict::Fail
 }
@@ -764,7 +777,7 @@ impl Watcher {
                 return;
             }
             Ok(_) => st.local = false,
-            Err(e) if st.local => {
+            Err(e) if st.is_local() => {
                 tracing::warn!(
                     "could not read the config of {}: {e:#}; watching {url} as a local release without it",
                     repo.display()
@@ -1919,6 +1932,29 @@ mod tests {
         *fake.local.lock().unwrap() = true;
         w.lap(std::slice::from_ref(&repo), 60, 4, &no).await;
         assert_eq!(*fake.merges.lock().unwrap(), vec!["h1".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn a_local_record_written_before_the_flag_existed_is_still_local() {
+        let (_d, fake, w) = rig();
+        *fake.config_fails.lock().unwrap() = true;
+        *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Open, "h1", vec![]));
+        let repo = PathBuf::from("/nowhere");
+        let no = || false;
+        let pr = pr_key(URL).unwrap();
+        let old = WatchState {
+            repo: repo.to_string_lossy().into_owned(),
+            url: URL.to_owned(),
+            run: Some("run1".to_owned()),
+            ..WatchState::default()
+        };
+        assert!(!old.local);
+        w.save(&pr, &old);
+        w.lap(std::slice::from_ref(&repo), 60, 1, &no).await;
+        assert!(fake.merges.lock().unwrap().is_empty());
+        let qs = w.questions().list();
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].choices, vec![land::APPROVE, land::HOLD]);
     }
 
     #[tokio::test]
