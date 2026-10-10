@@ -3057,6 +3057,79 @@ fn source_link(source: &Source) -> Option<SourceLink> {
     })
 }
 
+/// The parent task of a follow-up, when its file can still be read.
+#[derive(Debug, Serialize, PartialEq)]
+struct FollowUpParent {
+    id: String,
+    short: String,
+    title: String,
+    /// The parent's own status (`TaskStatus::as_str`).
+    status: &'static str,
+    href: String,
+}
+
+/// The merged run a follow-up was filed from.
+#[derive(Debug, Serialize, PartialEq)]
+struct FollowUpRun {
+    id: String,
+    short: String,
+    /// `None` when the run's record cannot be read.
+    status: Option<&'static str>,
+    /// `None` unless the record could be read: never a dead link.
+    href: Option<String>,
+}
+
+/// Where a follow-up task came from, resolved once per task page so the flow
+/// chart and the detail block cannot disagree. See [`followup_origin`].
+#[derive(Debug, Serialize, PartialEq)]
+struct FollowUpOrigin {
+    /// Present only when `origin_task` is set and that task still exists.
+    parent: Option<FollowUpParent>,
+    run: FollowUpRun,
+    /// The merged pull request, verbatim. Not an href: the client passes it
+    /// through `forgeUrl()` and renders text when that refuses it (the one
+    /// exception to "the href rule is Rust's alone", since a forge URL is
+    /// data from a record, not a route).
+    pr: String,
+    findings: Vec<String>,
+    generation: u32,
+}
+
+/// The one place that decides what a follow-up links to. A parent that cannot
+/// be read (gone, or an id that names nothing) is `None`, never an error.
+fn followup_origin(
+    fu: &crate::queue::FollowUp,
+    task: impl Fn(&str) -> Option<Task>,
+    run: impl Fn(&str) -> Option<RunState>,
+) -> FollowUpOrigin {
+    let parent = fu
+        .origin_task
+        .as_deref()
+        .and_then(|id| task(id))
+        .map(|t| FollowUpParent {
+            short: t.short().to_owned(),
+            href: format!("#/tasks/{}", encode_segment(&t.id)),
+            status: t.status.as_str(),
+            title: t.title,
+            id: t.id,
+        });
+    let state = run(&fu.run);
+    FollowUpOrigin {
+        parent,
+        run: FollowUpRun {
+            short: run::short_of(&fu.run).to_owned(),
+            status: state.as_ref().map(|s| s.status.as_str()),
+            href: state
+                .is_some()
+                .then(|| format!("#/runs/{}", encode_segment(&fu.run))),
+            id: fu.run.clone(),
+        },
+        pr: fu.pr.clone(),
+        findings: fu.findings.clone(),
+        generation: fu.generation,
+    }
+}
+
 /// Another run of the same task, as named from a run's detail page.
 #[derive(Debug, Serialize)]
 struct RunBrief {
@@ -4303,6 +4376,8 @@ struct TaskDetailView {
     max_attempts: usize,
     history: Vec<TaskRunView>,
     flow: FlowView,
+    /// Set for a follow-up task; see [`followup_origin`].
+    followup_origin: Option<FollowUpOrigin>,
     /// How many entries of `history` could not be read.
     runs_unreadable: usize,
     /// Why the attempt count can be lower than the number of runs.
@@ -4488,12 +4563,15 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
 struct FlowNode {
     /// Unique by position: a resumed run id appears once per pass.
     key: String,
-    /// `chat`, `start`, `run` or `end`.
+    /// `chat`, `followup`, `start`, `run` or `end`.
     kind: &'static str,
     label: String,
     /// Run status (or the task's, for `end`); `None` when it is not a fact
     /// about this box (unreadable, or a pass the run later resumed from).
     status: Option<&'static str>,
+    /// Whose status `status` is, so the client picks the right colour table:
+    /// `task` (the `followup` parent and `end`) or `run`.
+    status_of: &'static str,
     /// Why there is no status: `unreadable`, `interrupted` or `no verdict`.
     note: Option<&'static str>,
     run_kind: Option<&'static str>,
@@ -4523,12 +4601,24 @@ struct FlowView {
 
 /// Turn a task and its described runs into the flowchart's boxes and arrows.
 /// Pure: the page only draws what this returns.
-fn task_flow(task: &Task, history: &[TaskRunView], max_attempts: usize) -> FlowView {
+///
+/// A follow-up opens with its parent (or the merged run) unless the task's
+/// *source* is itself a chat, in which case the chat stays first and the
+/// follow-up node comes second. An inherited `Task::origin_chat` alone never
+/// adds a chat node: `crate::followup` files with `node: "followup"`, so the
+/// two normally do not coincide and the nearer origin wins.
+fn task_flow(
+    task: &Task,
+    history: &[TaskRunView],
+    max_attempts: usize,
+    origin: Option<&FollowUpOrigin>,
+) -> FlowView {
     let node = |key: &str, kind, label: String| FlowNode {
         key: key.to_owned(),
         kind,
         label,
         status: None,
+        status_of: "run",
         note: None,
         run_kind: None,
         detail: None,
@@ -4549,8 +4639,51 @@ fn task_flow(task: &Task, history: &[TaskRunView], max_attempts: usize) -> FlowV
         nodes.push(n);
         edges.push(FlowEdge {
             from: "chat".to_owned(),
-            to: "start".to_owned(),
+            to: if origin.is_some() { "origin" } else { "start" }.to_owned(),
             label: "queued from chat".to_owned(),
+            attempt: AttemptCost::None,
+        });
+    }
+    if let Some(o) = origin {
+        let mut n = match &o.parent {
+            Some(p) => {
+                let mut n = node("origin", "followup", format!("Follow-up of {}", p.short));
+                n.status = Some(p.status);
+                n.status_of = "task";
+                n.detail = Some(p.title.clone()).filter(|t| !t.is_empty());
+                n.href = Some(p.href.clone());
+                n
+            }
+            None => {
+                let mut n = node(
+                    "origin",
+                    "followup",
+                    format!("Follow-up of run {}", o.run.short),
+                );
+                n.detail = Some("merged run".to_owned());
+                n.status = o.run.status;
+                n.href = o.run.href.clone();
+                if o.run.href.is_none() {
+                    n.readable = false;
+                    n.note = Some("unreadable");
+                }
+                n
+            }
+        };
+        n.decided = true;
+        let from = n.key.clone();
+        nodes.push(n);
+        let shown: Vec<&str> = o.findings.iter().take(3).map(String::as_str).collect();
+        let more = o.findings.len().saturating_sub(shown.len());
+        let label = match (shown.is_empty(), more) {
+            (true, _) => "open findings".to_owned(),
+            (false, 0) => format!("open findings {}", shown.join(", ")),
+            (false, m) => format!("open findings {} +{m} more", shown.join(", ")),
+        };
+        edges.push(FlowEdge {
+            from,
+            to: "start".to_owned(),
+            label,
             attempt: AttemptCost::None,
         });
     }
@@ -4605,6 +4738,7 @@ fn task_flow(task: &Task, history: &[TaskRunView], max_attempts: usize) -> FlowV
     }
     let mut end = node("end", "end", task.status.as_str().to_owned());
     end.status = Some(task.status.as_str());
+    end.status_of = "task";
     nodes.push(end);
     let (label, attempt) = match prev_exit {
         None => (
@@ -4680,10 +4814,18 @@ async fn task_detail(
         let history = task_history(&task, |id| read_run(&ui.runs, id).ok());
         let runs_unreadable = history.iter().filter(|h| !h.readable).count();
         let max_attempts = daemon::Opts::default().max_attempts;
-        let flow = task_flow(&task, &history, max_attempts);
+        let origin = task.followup.as_ref().map(|fu| {
+            followup_origin(
+                fu,
+                |tid| ui.queue.get(tid).ok(),
+                |rid| read_run(&ui.runs, rid).ok(),
+            )
+        });
+        let flow = task_flow(&task, &history, max_attempts, origin.as_ref());
         Ok(Json(TaskDetailView {
             max_attempts,
             flow,
+            followup_origin: origin,
             history,
             runs_unreadable,
             attempts_note: ATTEMPTS_NOTE,
@@ -10187,7 +10329,110 @@ mod tests {
                 .find(|(i, _)| *i == id)
                 .and_then(|(_, s)| s.clone())
         });
-        task_flow(task, &h, 5)
+        task_flow(task, &h, 5, None)
+    }
+
+    fn fu(origin_task: Option<&str>) -> crate::queue::FollowUp {
+        crate::queue::FollowUp {
+            run: "20260901-000000-aaaa".to_owned(),
+            origin_task: origin_task.map(str::to_owned),
+            pr: "https://example.com/o/r/pull/1".to_owned(),
+            findings: ["R3-1-1", "R3-1-2", "R3-1-3", "R3-1-4"]
+                .map(str::to_owned)
+                .to_vec(),
+            generation: 1,
+        }
+    }
+
+    fn parent_task() -> Task {
+        let mut p = flow_task(&[]);
+        p.title = "Parent title".to_owned();
+        p.status = TaskStatus::Done;
+        p
+    }
+
+    #[test]
+    fn flow_opens_with_the_parent_task_of_a_followup() {
+        let p = parent_task();
+        let pid = p.id.clone();
+        let o = followup_origin(&fu(Some(&pid)), |i| (i == pid).then(|| p.clone()), |_| None);
+        let f = task_flow(&flow_task(&[]), &[], 5, Some(&o));
+        let n = &f.nodes[0];
+        assert_eq!((n.kind, n.key.as_str()), ("followup", "origin"));
+        assert_eq!(
+            n.label,
+            format!("Follow-up of {}", crate::queue::short(&pid))
+        );
+        assert_eq!(n.detail.as_deref(), Some("Parent title"));
+        assert_eq!(n.status, Some("done"));
+        assert_eq!(n.status_of, "task");
+        assert_eq!(n.href.as_deref(), Some(format!("#/tasks/{pid}").as_str()));
+        assert_eq!(f.nodes[1].key, "start");
+        assert_eq!(f.edges[0].from, "origin");
+        assert_eq!(
+            f.edges[0].label,
+            "open findings R3-1-1, R3-1-2, R3-1-3 +1 more"
+        );
+    }
+
+    #[test]
+    fn flow_falls_back_to_the_merged_run_when_the_parent_is_gone() {
+        let o = followup_origin(
+            &fu(Some("gone")),
+            |_| None,
+            |_| {
+                Some(RunState::new(
+                    std::path::PathBuf::from("."),
+                    "main".to_owned(),
+                    "0".to_owned(),
+                    "t".to_owned(),
+                    crate::config::Config::default(),
+                ))
+            },
+        );
+        assert!(o.parent.is_none());
+        let f = task_flow(&flow_task(&[]), &[], 5, Some(&o));
+        let n = &f.nodes[0];
+        assert_eq!(n.status_of, "run");
+        assert_eq!(n.href.as_deref(), Some("#/runs/20260901-000000-aaaa"));
+        assert!(n.label.starts_with("Follow-up of run "), "{}", n.label);
+    }
+
+    #[test]
+    fn flow_followup_with_nothing_readable_has_no_link() {
+        let o = followup_origin(&fu(None), |_| panic!("no parent id to look up"), |_| None);
+        let f = task_flow(&flow_task(&[]), &[], 5, Some(&o));
+        let n = &f.nodes[0];
+        assert_eq!(n.href, None);
+        assert_eq!(n.note, Some("unreadable"));
+        assert!(!n.readable);
+    }
+
+    #[test]
+    fn flow_keeps_the_chat_first_only_when_the_source_is_a_chat() {
+        let o = followup_origin(&fu(None), |_| None, |_| None);
+        let mut t = flow_task(&[]);
+        t.origin_chat = Some("c1".to_owned());
+        let f = task_flow(&t, &[], 5, Some(&o));
+        assert_eq!(f.nodes[0].kind, "followup", "inherited chat adds no node");
+        t.source = Source::Agent {
+            run: "c1".to_owned(),
+            node: crate::queue::CHAT_NODE.to_owned(),
+        };
+        let f = task_flow(&t, &[], 5, Some(&o));
+        assert_eq!((f.nodes[0].kind, f.nodes[1].kind), ("chat", "followup"));
+        assert_eq!(
+            (f.edges[0].from.as_str(), f.edges[0].to.as_str()),
+            ("chat", "origin")
+        );
+    }
+
+    #[test]
+    fn followup_origin_encodes_ids_and_survives_a_self_reference() {
+        let mut p = parent_task();
+        p.id = "a b/c".to_owned();
+        let o = followup_origin(&fu(Some("a b/c")), |_| Some(p.clone()), |_| None);
+        assert_eq!(o.parent.expect("parent").href, "#/tasks/a%20b%2Fc");
     }
 
     #[test]

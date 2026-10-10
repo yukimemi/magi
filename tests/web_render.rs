@@ -555,6 +555,123 @@ async fn runs_search_counts_extra_rows_as_shown_and_never_parses_hit_text() {
     browser.close_page(&page).await;
 }
 
+/// A follow-up task shows where it came from: the flow chart opens with a link
+/// to the parent task with a visible label, the detail page has a "Follow-up
+/// of" block, and the Queue card carries a chip. Both widths.
+#[tokio::test]
+async fn followup_task_links_back_to_its_parent() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
+        );
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+
+    let mut parent = Task::new(
+        "Parent task that was merged".to_owned(),
+        "Do the parent thing".to_owned(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    parent.status = TaskStatus::Done;
+    queue.put(&mut parent).expect("seed parent");
+    let mut child = Task::new(
+        "Follow-up of the parent".to_owned(),
+        "Fix what was left open".to_owned(),
+        fx.repo.clone(),
+        Source::Agent {
+            run: "20260901-000001-aa01".to_owned(),
+            node: "followup".to_owned(),
+        },
+    );
+    child.followup = Some(magi::queue::FollowUp {
+        run: "20260901-000001-aa01".to_owned(),
+        origin_task: Some(parent.id.clone()),
+        pr: "https://github.com/example/repo/pull/7".to_owned(),
+        findings: vec!["R3-1-1".to_owned(), "R3-1-2".to_owned()],
+        generation: 1,
+    });
+    queue.put(&mut child).expect("seed child");
+
+    let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
+    let mut browser = cdp::Browser::launch(&chrome)
+        .await
+        .unwrap_or_else(|e| panic!("could not start Chrome at {}: {e}", chrome.display()));
+    for &(w, h, mobile) in &VIEWPORTS {
+        let page = browser
+            .open_page(&format!("{base}#/tasks/{}", child.id), w, h, mobile)
+            .await
+            .expect("open");
+        browser
+            .wait_for(
+                &page,
+                "!!document.querySelector('#task-flow .flow-node')",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("@{w}px: {e}"));
+        let out = browser
+            .eval(
+                &page,
+                "(() => { const n = document.querySelector('#task-flow .flow-node'); \
+                   const s = n.querySelector('strong'); const r = s.getBoundingClientRect(); \
+                   const b = document.getElementById('task-followup'); \
+                   return { tag: n.tagName, href: n.getAttribute('href'), kind: n.dataset.kind, \
+                     label: s.textContent, visible: r.width > 0 && r.height > 0, \
+                     panelHidden: document.getElementById('task-followup-panel').hidden, \
+                     block: b.textContent, \
+                     spill: document.documentElement.scrollWidth > document.documentElement.clientWidth }; })()",
+            )
+            .await
+            .expect("read");
+        let tag = format!("@{w}px: {out}");
+        assert_eq!(out["tag"], "A", "{tag}");
+        assert_eq!(out["kind"], "followup", "{tag}");
+        assert_eq!(
+            out["href"].as_str(),
+            Some(format!("#/tasks/{}", parent.id).as_str()),
+            "{tag}"
+        );
+        assert!(
+            out["label"]
+                .as_str()
+                .is_some_and(|l| l.starts_with("Follow-up of ") && l.len() > 13),
+            "{tag}"
+        );
+        assert_eq!(out["visible"], true, "{tag}");
+        assert_eq!(out["panelHidden"], false, "{tag}");
+        let block = out["block"].as_str().unwrap_or_default();
+        assert!(
+            block.contains("R3-1-1, R3-1-2") && block.contains("pull/7"),
+            "{tag}"
+        );
+        assert_eq!(out["spill"], false, "{tag}");
+        browser.close_page(&page).await;
+
+        let page = browser
+            .open_page(&format!("{base}#/queue"), w, h, mobile)
+            .await
+            .expect("open queue");
+        browser
+            .wait_for(
+                &page,
+                "[...document.querySelectorAll('.task-card .tag')].some((e) => e.textContent === 'follow-up' && e.getClientRects().length > 0)",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("queue @{w}px: {e}"));
+        browser.close_page(&page).await;
+    }
+}
+
 /// The run detail: tabs live in the hash and survive a live refresh, the
 /// landing panel never prints a null child, the deliberation strip is slim and
 /// the list pane has no nested scroller. Checked at both widths, in both themes.
