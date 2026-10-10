@@ -6049,23 +6049,30 @@ impl Runner {
         {
             violations.push(crate::github_text::Violation::SensitiveData);
         }
-        // Sensitive-only hits are handled by `prepare`'s span redaction; a
-        // rewrite cannot fix them (e.g. a quoted original task) and the
-        // fallback would discard a useful description.
-        violations.retain(|v| *v != crate::github_text::Violation::SensitiveData);
+        // A rewrite cannot fix sensitive data (e.g. a quoted original task), so
+        // only a language violation starts one; sensitive data alone goes
+        // straight to the owner, with the redacted text as the fallback.
+        let has_language = violations
+            .iter()
+            .any(|v| *v != crate::github_text::Violation::SensitiveData);
         if self.state.config.graph.github_text_guard && !violations.is_empty() {
             self.state.event(
                 "github-text",
-                format!("description rejected: {violations:?}; requesting one rewrite"),
+                if has_language {
+                    format!("description rejected: {violations:?}; requesting one rewrite")
+                } else {
+                    format!("description rejected: {violations:?}; asking the owner")
+                },
             );
             let mut rewritten = false;
-            if let Some(spec) = self
-                .state
-                .config
-                .agents
-                .iter()
-                .find(|a| a.id == winner.agent)
-                .cloned()
+            if has_language
+                && let Some(spec) = self
+                    .state
+                    .config
+                    .agents
+                    .iter()
+                    .find(|a| a.id == winner.agent)
+                    .cloned()
             {
                 let key = format!("impl-{}", winner.label);
                 let seat = self.seat(&key, &spec.id);
@@ -6113,6 +6120,8 @@ impl Runner {
                     let redecision = self.judge_pr_language(&winner.worktree, &rewrite).await;
                     if !body.trim().is_empty()
                         && crate::github_text::check_with(&title, &body, redecision).is_empty()
+                        && crate::github_text::shareable(&title)
+                        && crate::github_text::shareable(&body)
                     {
                         decision = redecision;
                         let marker = format!("magi:run/{}", self.state.id);
@@ -6131,7 +6140,9 @@ impl Runner {
                     "github-text",
                     "description rewrite unavailable or rejected; asking the owner",
                 );
-                if let Some(w) = crate::github_text::Withheld::from_violations(&violations) {
+                if let Some(w) =
+                    crate::github_text::Withheld::from_check(&violations, &pr.title, &pr.body)
+                {
                     // A different text than the one asked about before: that
                     // question no longer describes anything.
                     self.retire_github_text_question("the withheld text changed");
@@ -6302,12 +6313,15 @@ impl Runner {
         );
         self.state.github_text = Some(g.clone());
         self.state.save()?;
+        // A field withheld only for sensitive data keeps its text; `prepare_with`
+        // below redacts it in place.
+        let neutral = |cat: &str| g.categories.iter().any(|c| c == cat);
         let title = match (g.title, resolved) {
             (true, Some(t)) => t,
-            (true, None) => gt::NEUTRAL_TITLE.to_owned(),
-            (false, _) => pr.title.clone(),
+            (true, None) if neutral("title-language") => gt::NEUTRAL_TITLE.to_owned(),
+            _ => pr.title.clone(),
         };
-        let body = if g.body {
+        let body = if g.body && neutral("body-language") {
             format!("{}\n\nmagi:run/{}", gt::NEUTRAL_BODY, self.state.id)
         } else {
             pr.body.clone()
