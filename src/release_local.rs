@@ -150,14 +150,22 @@ pub fn reconcile_version(manifest: &str, bumped: bool, job: &mut Job) -> bool {
 }
 
 /// Whether the merge commit itself moved the manifest to `version`: its first
-/// parent says something else (or the parent's manifest is unreadable). A root
-/// commit has no parent and never counts.
+/// parent says something else. A root commit has no parent and never counts; a
+/// parent that exists but cannot be read (a shallow clone, a manifest that did
+/// not exist yet) is unknown, and then the commit's own manifest is trusted,
+/// since the commit is the one the pull request merged as.
 async fn bumped_by(wt: &Path, commit: &str, version: &str) -> bool {
-    let Ok(out) = git::git_raw(wt, &["show", &format!("{commit}^1:Cargo.toml")]).await else {
-        return false;
-    };
-    out.code == Some(0)
-        && crate::bump::current_version(&out.stdout).is_ok_and(|parent| parent != version)
+    let parent = format!("{commit}^1");
+    let shown = git::git_raw(wt, &["show", &format!("{parent}:Cargo.toml")]).await;
+    if let Ok(out) = &shown
+        && out.code == Some(0)
+        && let Ok(v) = crate::bump::current_version(&out.stdout)
+    {
+        return v != version;
+    }
+    git::git_raw(wt, &["rev-parse", "--verify", "--quiet", &parent])
+        .await
+        .is_ok_and(|o| o.code == Some(0))
 }
 
 /// `1.2.3` out of `chore/release-v1.2.3`.
@@ -862,5 +870,22 @@ mod tests {
         go(&f, &release(&[]), &mut job).await.unwrap();
         assert_eq!(job.version, "1.1.0");
         assert_eq!(g(&f.remote, &["tag", "-l"]), "v1.1.0");
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_left_the_version_alone_is_not_tagged_under_a_stale_one() {
+        let f = fixture();
+        std::fs::write(f.repo.join("a.txt"), "x").unwrap();
+        g(&f.repo, &["add", "."]);
+        g(&f.repo, &["commit", "-q", "-m", "other"]);
+        g(&f.repo, &["push", "-q", "origin", "main"]);
+        let commit = g(&f.repo, &["rev-parse", "HEAD"]);
+        let mut job = Job::new("0.9.0", "u", &commit);
+        let err = go(&f, &release(&[]), &mut job)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with(VERSION_MISMATCH_PREFIX), "{err}");
+        assert_eq!(g(&f.remote, &["tag", "-l"]), "");
     }
 }

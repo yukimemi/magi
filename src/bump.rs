@@ -594,9 +594,13 @@ pub(crate) fn current_version(toml: &str) -> Result<String> {
 /// to the branch name only when the manifest cannot be read.
 async fn branch_version(repo: &Path, remote: &str, branch: &str) -> Option<String> {
     let from_name = branch.strip_prefix("chore/release-v").map(str::to_owned);
-    let fetched = git::git_raw(repo, &["fetch", "--quiet", remote, branch]).await;
+    // A tracking ref of its own: FETCH_HEAD is shared with every other fetch in
+    // this repository (the release watcher runs them concurrently).
+    let tracking = format!("refs/remotes/{remote}/{branch}");
+    let spec = format!("+refs/heads/{branch}:{tracking}");
+    let fetched = git::git_raw(repo, &["fetch", "--quiet", remote, &spec]).await;
     if fetched.is_ok_and(|o| o.code == Some(0))
-        && let Ok(out) = git::git_raw(repo, &["show", "FETCH_HEAD:Cargo.toml"]).await
+        && let Ok(out) = git::git_raw(repo, &["show", &format!("{tracking}:Cargo.toml")]).await
         && out.code == Some(0)
         && let Ok(v) = current_version(&out.stdout)
     {
