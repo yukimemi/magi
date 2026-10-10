@@ -3910,9 +3910,42 @@ function dependencyRanks(nodeIds, outEdges) {
   return ranks;
 }
 
+/* Display width of one code point: East Asian Wide / Fullwidth count as two
+   units, everything else (half-width katakana included) as one. */
+function labelUnits(cp) {
+  return (cp >= 0x1100 && cp <= 0x115f) ||
+    (cp >= 0x2e80 && cp <= 0x303e) ||
+    (cp >= 0x3041 && cp <= 0x33ff) ||
+    (cp >= 0x3400 && cp <= 0x4dbf) ||
+    (cp >= 0x4e00 && cp <= 0x9fff) ||
+    (cp >= 0xa000 && cp <= 0xa4cf) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe30 && cp <= 0xfe4f) ||
+    (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x1f300 && cp <= 0x1f64f) ||
+    (cp >= 0x1f900 && cp <= 0x1f9ff) ||
+    (cp >= 0x20000 && cp <= 0x3fffd)
+    ? 2
+    : 1;
+}
+
+/* `max` is a budget in Latin-character units; full-width characters cost two. */
 function truncateLabel(text, max) {
-  const s = String(text || "");
-  return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  const chars = Array.from(String(text || ""));
+  let total = 0;
+  for (const ch of chars) total += labelUnits(ch.codePointAt(0));
+  if (total <= max) return chars.join("");
+  let used = 0;
+  let out = "";
+  for (const ch of chars) {
+    const w = labelUnits(ch.codePointAt(0));
+    if (used + w > max - 1) break;
+    used += w;
+    out += ch;
+  }
+  return `${out}…`;
 }
 
 const DEP_NODE_W = 156;

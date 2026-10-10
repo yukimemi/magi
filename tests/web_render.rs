@@ -1327,7 +1327,7 @@ async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
             r#"(async () => {
       const source = await (await fetch('/app.js')).text();
       window.deck = new Function(source.replace('queue: "/api/queue"', 'queue: "/api/queue?test_client=1"').replace(/\nboot\(\);\s*$/, `
-        return { linkify, state, loadHealth, loadLoop, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter, reviewPassed, voteTag, reviewStamp };
+        return { linkify, truncateLabel, state, loadHealth, loadLoop, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter, reviewPassed, voteTag, reviewStamp };
       `))();
       await Promise.all([deck.loadQueue(), deck.loadRuns(), deck.loadTalks()]);
     })()"#,
@@ -2084,4 +2084,75 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
     );
     assert_eq!(out["bold"], 0);
     assert_eq!(out["text"], true);
+}
+
+#[tokio::test]
+async fn dep_graph_labels_are_truncated_by_display_width() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP truncateLabel: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    seed_tasks(&queue, &fx.repo, "run");
+    let base = serve(
+        &home,
+        queue.clone(),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    let page = browser
+        .open_page(&format!("{base}#/queue"), 1280, 900, false)
+        .await
+        .expect("page");
+    browser
+        .wait_for(
+            &page,
+            "!!document.querySelector('#queue-sections li.card')",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("loaded queue");
+    client_harness(&mut browser, &page).await;
+    let out = browser
+        .eval(
+            &page,
+            r#"(() => {
+      const t = deck.truncateLabel;
+      const w = s => [...s].reduce((n, c) => n + (c.codePointAt(0) >= 0x3000 && c.codePointAt(0) <= 0x9fff ? 2 : 1), 0);
+      const a22 = 'a'.repeat(22), a23 = 'a'.repeat(23);
+      const kana = 'あ'.repeat(30);
+      const mixed = 'PR ' + 'レビュー指摘への対応方針を決める';
+      const half = 'ｱ'.repeat(30);
+      const astral = '𠮷'.repeat(30);
+      return {
+        a22: t(a22, 22) === a22,
+        a23: t(a23, 22) === 'a'.repeat(21) + '…',
+        kana: t(kana, 22),
+        kanaW: w(t(kana, 22).slice(0, -1)),
+        mixedW: w(t(mixed, 22).slice(0, -1)),
+        mixedCut: t(mixed, 22).endsWith('…'),
+        half: t(half, 22) === 'ｱ'.repeat(21) + '…',
+        astral: t(astral, 22),
+        short: t('日本語', 22) === '日本語',
+      };
+    })()"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out["a22"], true);
+    assert_eq!(out["a23"], true);
+    assert_eq!(out["kana"], "あ".repeat(10) + "…");
+    assert!(out["kanaW"].as_i64().unwrap() <= 21);
+    assert!(out["mixedW"].as_i64().unwrap() <= 21);
+    assert_eq!(out["mixedCut"], true);
+    assert_eq!(out["half"], true);
+    assert_eq!(out["astral"], "𠮷".repeat(10) + "…");
+    assert_eq!(out["short"], true);
 }
