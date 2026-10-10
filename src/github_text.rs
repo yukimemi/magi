@@ -101,6 +101,31 @@ fn foreign_share(text: &str) -> bool {
                 .count();
             foreign >= 4 && foreign * 2 >= letters.max(1)
         })
+        || text.lines().any(|line| {
+            // Short lines: a conventional-commit prefix (`fix(scope)!:`) says
+            // nothing about the language, so `fix: 修正` is judged on `修正`.
+            let rest = strip_commit_prefix(line);
+            let letters = rest.chars().filter(|c| c.is_alphabetic()).count();
+            let foreign = rest
+                .chars()
+                .filter(|c| c.is_alphabetic() && !c.is_ascii())
+                .count();
+            foreign >= 2 && foreign * 3 >= letters
+        })
+}
+
+fn strip_commit_prefix(line: &str) -> &str {
+    let t = line.trim_start();
+    let kind = t.chars().take_while(|c| c.is_ascii_lowercase()).count();
+    let mut rest = &t[kind..];
+    if kind > 0 && rest.starts_with('(') {
+        rest = rest.find(')').map_or(rest, |i| &rest[i + 1..]);
+    }
+    let rest = rest.strip_prefix('!').unwrap_or(rest);
+    match rest.strip_prefix(':') {
+        Some(r) if kind > 0 => r,
+        _ => line,
+    }
 }
 
 /// Offset just past the first backtick run of exactly `n` in `text`, if any.
@@ -604,6 +629,13 @@ mod tests {
         }
         assert!(check("再試行を修正する", "").contains(&Violation::TitleLanguage));
         assert!(check("fix: 再試行を修正", "").contains(&Violation::TitleLanguage));
+        for short in ["fix: 修正", "chore: 更新", "feat(web)!: 追加", "修正"] {
+            assert!(
+                check(short, "").contains(&Violation::TitleLanguage),
+                "{short}"
+            );
+        }
+        assert!(check("fix: retries", "LGTM。修正済").contains(&Violation::BodyLanguage));
         assert!(
             check(
                 "fix: retries",
