@@ -2174,6 +2174,19 @@ to today. Field changes are caught when `demo_seed` compiles. The final merged
 transition is also seeded: the two approval taps save a real answer, but the
 demo runs neither a forge nor the landing/queue loop. Never inject DOM.
 
+**Profiles.** `record.mjs` takes `--profile=mobile|desktop` (default mobile) from
+one `PROFILES` table; server, seeding, capture and encode are shared.
+`cargo make demo-gif` / `demo-shots` stay mobile; `demo-gif-desktop` /
+`demo-shots-desktop` write `assets/demo-desktop.gif` and
+`$CARGO_TARGET_DIR/demo-shots-desktop`, and `demo-gif-all` records both. Desktop
+is 1100x660 at 1x with a mouse (limit 4 MB; mobile 3 MB). It shows the two-pane
+layout, which app.js enables at `SPLIT_QUERY` `(min-width: 1080px)`: the take
+waits for `body[data-split="1"]` and fails otherwise, so keep the width above
+that. Desktop navigates with `.rail-link` and clicks (no touch context; `tap`
+would throw), mobile uses `.dock-item` and taps; desktop panes scroll on their
+own, so `scrollTo` is a no-op there. `kata apply` may drop the appended
+`Makefile.toml` demo tasks (all four plus `demo-gif-all`).
+
 Traps:
 
 - The recorder isolates `MAGI_HOME` and `MAGI_CONFIG_DIR` in a temp tree with a

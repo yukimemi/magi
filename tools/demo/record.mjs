@@ -1,10 +1,14 @@
-// Records assets/demo.gif: a scripted, re-recordable take of the phone UI.
+// Records the README gifs: a scripted, re-recordable take of the web UI in one
+// of two viewport profiles.
 //
-//   node record.mjs            record and encode assets/demo.gif
-//   node record.mjs --shots    one PNG per beat in Cargo's target/demo-shots, no encode
-//   node record.mjs --headed   watch it happen; --keep keeps the scratch tree
+//   node record.mjs                       mobile: assets/demo.gif
+//   node record.mjs --profile=desktop     desktop: assets/demo-desktop.gif
+//   node record.mjs --shots               one PNG per beat in Cargo's target/demo-shots
+//                                         (demo-shots-desktop for desktop), no encode
+//   node record.mjs --headed              watch it happen; --keep keeps the scratch tree
 //
-// Run through `cargo make demo-gif` / `demo-shots`, which build the release
+// Run through `cargo make demo-gif` / `demo-shots` (and the `-desktop` pair),
+// which build the release
 // binary first. Node, not bun: playwright talks CDP over extra stdio pipes (fd
 // 3 and 4) that bun's child_process does not carry, so under bun the browser
 // launches, nothing connects, and it fails minutes later with a launch timeout.
@@ -33,14 +37,35 @@ const SHOTS = argv.has("--shots");
 const HEADED = argv.has("--headed");
 const KEEP = argv.has("--keep");
 
-// A phone-shaped frame. The capture is 2x so the text stays crisp; the encode
-// scales it to OUT_WIDTH.
-const WIDTH = 390;
-const HEIGHT = 700;
-const SCALE = 2;
-const OUT_WIDTH = 360;
-const COLORS = 128;
-const MAX_BYTES = 3 * 1024 * 1024;
+// Viewport profiles. The server, seeding, capture and encode are shared; a
+// profile only changes the frame, how the page is driven and where output goes.
+//   mobile:  a phone frame, touch, bottom dock, one column. The capture is 2x so
+//            the text stays crisp; the encode scales it to `outWidth`.
+//   desktop: 1x, mouse, side rail, and (>= 1080px, app.js SPLIT_QUERY) the
+//            two-pane layout: list pane beside detail pane.
+const PROFILES = {
+  mobile: {
+    width: 390, height: 700, scale: 2, mobile: true, touch: true,
+    outWidth: 360, colors: 128, maxBytes: 3 * 1024 * 1024, holdScale: 1,
+    gif: "demo.gif", shots: "demo-shots",
+  },
+  desktop: {
+    width: 1100, height: 660, scale: 1, mobile: false, touch: false,
+    outWidth: 1100, colors: 96, maxBytes: 4 * 1024 * 1024, holdScale: 0.7,
+    gif: "demo-desktop.gif", shots: "demo-shots-desktop",
+  },
+};
+const profileArg = process.argv
+  .slice(2)
+  .map((a) => /^--profile=(.+)$/.exec(a)?.[1])
+  .find(Boolean) ?? "mobile";
+if (!PROFILES[profileArg]) {
+  console.error(`demo: unknown profile "${profileArg}" (mobile | desktop)`);
+  process.exit(2);
+}
+const PROFILE = PROFILES[profileArg];
+const { width: WIDTH, height: HEIGHT, scale: SCALE, outWidth: OUT_WIDTH, colors: COLORS } = PROFILE;
+const MAX_BYTES = PROFILE.maxBytes;
 
 // Ports other services on the operator's machine own (AGENTS.md, "Never take a
 // port you did not check"). A floor, not a list: the port is also probed.
@@ -293,7 +318,9 @@ async function storyboard(page, scratch, base, beat, quiet) {
       try {
         await locator.evaluate((el) => el.scrollIntoView({ block: "center", behavior: "instant" }), null, { timeout: 5000 });
         await wait(150);
-        await locator.tap({ force: true, timeout: 5000 });
+        // tap() throws in a context without touch; the desktop profile clicks.
+        if (PROFILE.touch) await locator.tap({ force: true, timeout: 5000 });
+        else await locator.click({ force: true, timeout: 5000 });
         return;
       } catch (e) {
         if (tries >= 4) throw e;
@@ -301,10 +328,21 @@ async function storyboard(page, scratch, base, beat, quiet) {
       }
     }
   };
-  const dock = (name) => page.locator(`.dock-item[data-nav="${name}"]`);
+  // The phone navigates with the bottom dock, the desktop with the side rail.
+  const dock = (name) =>
+    page.locator(`${PROFILE.touch ? ".dock-item" : ".rail-link"}[data-nav="${name}"]`);
+  // Desktop panes scroll on their own and the page itself does not.
   const scrollTo = (y) =>
-    page.evaluate((top) => window.scrollTo({ top, behavior: "instant" }), y);
+    PROFILE.touch
+      ? page.evaluate((top) => window.scrollTo({ top, behavior: "instant" }), y)
+      : Promise.resolve();
   const questions = async () => (await fetch(`${base}/api/questions`)).json();
+
+  if (!PROFILE.touch) {
+    // A layout change must fail the take, not silently record the phone's
+    // single column.
+    await page.waitForSelector('body[data-split="1"]', { timeout: 5000 });
+  }
 
   // 0. Chat, in Asuka's voice. Everything is typed and tapped for real; the
   //    reply is the scripted agent's, and it files the task itself.
@@ -368,7 +406,7 @@ async function storyboard(page, scratch, base, beat, quiet) {
     await page.locator("#talk-wait").waitFor({ state: "hidden", timeout: 10_000 });
   }, 500);
   // Long enough to read the line the operator asked for.
-  await beat("reply", 2600);
+  await beat("reply", 2600, true);
 
   // 1. The task the chat filed, in the real queue.
   await quiet(async () => {
@@ -377,6 +415,14 @@ async function storyboard(page, scratch, base, beat, quiet) {
     await scrollTo(0);
   }, 200);
   await beat("queue", 1500);
+  if (!PROFILE.touch) {
+    // Two panes: select the task and read it beside the list.
+    await quiet(async () => {
+      await tap(page.locator("#queue-sections").getByText(REQUEST).first());
+      await page.waitForSelector("#view-task:not([hidden])");
+    }, 200);
+    await beat("queue-task", 1500);
+  }
 
   // 2. The run in flight: three candidates, no agent names.
   const card = page.locator("#view-runs a.card.run-card").first();
@@ -481,7 +527,7 @@ async function main() {
     server = await startServer(scratch, (child) => (serverChild = child));
     log(`serving ${server.base} on ${scratch.home}`);
     browser = await launchBrowser();
-    const shotDir = join(targetDir(), "demo-shots");
+    const shotDir = join(targetDir(), PROFILE.shots);
     if (SHOTS) {
       await rm(shotDir, { recursive: true, force: true });
       await mkdir(shotDir, { recursive: true });
@@ -490,8 +536,8 @@ async function main() {
     const context = await browser.newContext({
       viewport: { width: WIDTH, height: HEIGHT },
       deviceScaleFactor: SCALE,
-      isMobile: true,
-      hasTouch: true,
+      isMobile: PROFILE.mobile,
+      hasTouch: PROFILE.touch,
       colorScheme: "dark",
       locale: "en-US",
     });
@@ -513,8 +559,9 @@ async function main() {
     const cuts = [];
     let n = 0;
     const t0 = Date.now();
-    const beat = async (name, hold = 0) => {
-      if (hold) await wait(hold);
+    // `exact` holds are not scaled: the reply must stay readable.
+    const beat = async (name, hold = 0, exact = false) => {
+      if (hold) await wait(exact ? hold : hold * PROFILE.holdScale);
       if (SHOTS) {
         await page.screenshot({
           path: join(shotDir, `${String(n++).padStart(2, "0")}-${name}.png`),
@@ -552,11 +599,13 @@ async function main() {
     await context.close();
     const list = await writeFrames(frames, join(scratch.work, "frames"), 1.2);
     log(`captured ${captured.length} frames, encoding ${frames.length}`);
-    const gif = join(ROOT, "assets", "demo.gif");
+    const gif = join(ROOT, "assets", PROFILE.gif);
     await encode(list, gif);
     const { size } = await stat(gif);
     log(`wrote ${gif} (${(size / 1024 / 1024).toFixed(2)} MB)`);
-    if (size > MAX_BYTES) log("WARNING: over 3 MB — shorten a beat or lower COLORS / OUT_WIDTH");
+    if (size > MAX_BYTES) {
+      log(`WARNING: over ${MAX_BYTES / 1024 / 1024} MB — shorten a beat or lower colors / outWidth`);
+    }
   } finally {
     if (browser) await browser.close().catch(() => {});
     if (serverChild) await stopServer(serverChild);

@@ -6,7 +6,11 @@
 </p>
 
 <p align="center">
-  <img src="assets/demo.gif" width="360" alt="Phone demo: Asuka's chat files an uploader retry task; three blind candidates compete, judges rank them and reviews fix a finding; the owner answers a question and approves the pull request merge.">
+  <img src="assets/demo-desktop.gif" width="800" height="480" alt="Desktop demo, two-pane layout: Asuka's chat files an uploader retry task, the Queue list and task detail sit side by side, three blind candidates compete and the judges' tally and review rounds show in the detail pane, then the owner answers an agent question and approves the pull request merge.">
+</p>
+
+<p align="center">
+  <img src="assets/demo.gif" width="360" height="646" alt="Phone demo: Asuka's chat files an uploader retry task; three blind candidates compete, judges rank them and reviews fix a finding; the owner answers a question and approves the pull request merge.">
 </p>
 
 # magi
