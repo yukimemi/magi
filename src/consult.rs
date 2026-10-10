@@ -433,17 +433,29 @@ pub async fn start_turn(
     if q.consult.is_some() {
         return Ok(Started::Nothing);
     }
-    let Some(mut lease) = talks.claim_turn(&talk.id)? else {
+    let Some(lease) = talks.claim_turn(&talk.id)? else {
         return Ok(Started::Busy);
     };
     if !begin(questions, talks, q, talk)? {
         return Ok(Started::Nothing);
     }
-    let mut talk = talks.get(&talk.id)?;
-    // Other starters that found the lease held queued drafts and left them to
-    // us, so drain until nothing is left (as the web's drain loop does).
-    // A failed turn is kept and reported at the end, not returned at once:
-    // drafts accepted meanwhile are still owed an answer.
+    drain_owned(talks, cfg, &talk.id, lease).await?;
+    Ok(Started::Answered)
+}
+
+/// Run the drafts queued on talk `talk_id` under `lease` until nothing is left.
+///
+/// Other starters that found the lease held queued drafts and left them to the
+/// holder, so this drains until nothing is owed (as the web's drain loop does).
+/// A failed turn is kept and reported at the end, not returned at once: drafts
+/// accepted meanwhile are still owed an answer.
+pub async fn drain_owned(
+    talks: &Talks,
+    cfg: &Config,
+    talk_id: &str,
+    mut lease: talk::TurnLease,
+) -> Result<()> {
+    let mut talk = talks.get(talk_id)?;
     let mut failed = None;
     loop {
         while let Some(text) = talk::drain(&mut talk, talks)? {
@@ -471,10 +483,10 @@ pub async fn start_turn(
         };
         lease = again;
     }
-    if let Some(e) = failed {
-        return Err(e);
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
-    Ok(Started::Answered)
 }
 
 #[cfg(test)]

@@ -2160,6 +2160,45 @@ with `magi answer` or puts the decision points to the owner in the chat.
   when the turn slot is free; the CLI takes the lease and runs the turn itself
   (or reports that another process holds it). The question's `answer_timeout` is not extended.
 
+### A chat hears back from the tasks it filed
+
+`src/chat_report.rs`. A chat is single-turn and cannot wait, so when a task it
+filed (`Task::filed_by_chat`: `Source::Agent` with `queue::CHAT_NODE`; a
+follow-up of one does not count) reaches an ending, magi queues a notice as the
+next draft of that talk (`talk::queue`) and the talk's own turn machinery runs
+it - the shape of `consult`: no new seat, no new waiter, no fresh agent.
+
+- **A sweep, not hooks.** Endings are reached from `settle`, `magi task done`,
+  the conductor and the web, so `chat_report::sweep` looks at the queue every
+  `LAP` (5 s) from a task inside `magi serve` / `magi web`. A notice can be one
+  lap late, and none is queued while neither runs.
+- **What is an ending.** `Task::chat_report_due`: done, held, blocked, keyed by
+  status plus the last run (`held_at` for a hold, so hold, release, hold again
+  is two notices). Queued, running, parked and failed are not: a failed task is
+  retried, and running out of attempts holds it, which is the report. Held and
+  blocked are final for now, not forever.
+- **Recorded first, idempotent.** `Queue::record_chat_report` writes
+  `Task::chat_report` (`queue::SCHEMA` 13) under the task lock *before* the
+  draft is queued and `withdraw_chat_report` takes it back if queueing fails: a
+  crash loses one notice, never posts two. `Queue::put` keeps a stored record a
+  stale snapshot lacks; release, start and edit never clear it. A terminal chat
+  task read from a schema before 13 counts as already reported, so an upgrade
+  does not announce the backlog.
+- **A gone chat is silence.** A missing or closed talk is recorded `skipped`;
+  unlike a consult, a report never reopens a chat. An unreadable talk is retried.
+- **Starting the turn.** `daemon::Opts::talk_kick` (set by `magi web` to its
+  turn gate: `begin_queued_talk_turn` + `drain_loop`) is called per talk and
+  only spawns. Without it (`magi serve`) the sweep claims the talk's lease and
+  drains with `consult::drain_owned`. While an upgrade parks, no turn starts and
+  the draft stays durable for a manual resume.
+- **`magi talk post <talk> <message>`** appends an agent turn without starting
+  one (`talk::post_agent`, under the store guard; `talk::turn`'s save keeps turns
+  posted meanwhile). `MAGI_RUN` must be set and must belong to a task whose
+  filing chat is that talk; `MAGI_NODE=chat` and any other talk are refused. The
+  chat agent's CLI session does not remember a posted message.
+- The chat briefing says it cannot wait or push, and that its own tasks report
+  back automatically; `talk::briefing_for` carries the sentence.
+
 ### `--no-color` reaches clap through a pre-scan of argv
 
 clap renders `--help` and usage errors inside parsing, before `Cli::no_color`

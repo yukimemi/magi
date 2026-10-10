@@ -29,6 +29,7 @@ pub mod blind;
 pub mod blockers;
 pub mod bump;
 pub mod cache;
+pub mod chat_report;
 pub mod clean;
 pub mod conduct;
 pub mod config;

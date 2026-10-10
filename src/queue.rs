@@ -92,6 +92,11 @@ use crate::ask::Questions;
 /// follow-up still knows its chat after an ancestor task is deleted.
 /// Field-only, `#[serde(default)]`.
 ///
+/// 13: added [`Task::chat_report`], the record that the chat which filed a
+/// task was told how it ended. Field-only, `#[serde(default)]`; a terminal
+/// chat task read from an older schema is initialised as already reported, so
+/// an upgrade does not announce the whole backlog.
+///
 /// 3: added [`HoldSource`] so conductor recovery cannot release a hold an
 /// operator deliberately placed. Old records default to `None` and are
 /// protected as operator-held until an explicit release; the safe direction
@@ -106,7 +111,7 @@ use crate::ask::Questions;
 /// by a build that only knew about schema 1 has nothing to say about
 /// blocking or answers, and defaulting those fields is exactly as good a
 /// reading as a value that build never had a chance to write.
-pub const SCHEMA: u32 = 12;
+pub const SCHEMA: u32 = 13;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,10 +490,27 @@ pub struct Task {
     /// transition out of the parked state. `#[serde(default)]`.
     #[serde(default)]
     pub park_reason: Option<String>,
+    /// The completion notice queued to the chat that filed this task. See
+    /// [`Task::chat_report_due`]. Never cleared by release, start or edit, and
+    /// kept by [`Queue::put`] when a stale snapshot lacks it. `#[serde(default)]`.
+    #[serde(default)]
+    pub chat_report: Option<ChatReport>,
     /// When the task was filed.
     pub created_at: Timestamp,
     /// Last change to this file.
     pub updated_at: Timestamp,
+}
+
+/// That a chat was told how a task ended. See [`Task::chat_report`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatReport {
+    /// The ending that was reported, [`Task::chat_report_due`]'s key.
+    pub key: String,
+    /// When it was recorded.
+    pub at: Timestamp,
+    /// True when no notice was queued (the chat was gone or closed).
+    #[serde(default)]
+    pub skipped: bool,
 }
 
 /// Command-line choices carried by a task. See [`Task::overrides`].
@@ -658,6 +680,7 @@ impl Task {
             review_of: None,
             held_at: None,
             park_reason: None,
+            chat_report: None,
             created_at: now,
             updated_at: now,
         }
@@ -673,6 +696,40 @@ impl Task {
             Source::Agent { run, node } if node == CHAT_NODE => Some(run),
             _ => None,
         }
+    }
+
+    /// The talk that filed this task itself (`Source::Agent` from the chat),
+    /// not one it merely descends from.
+    pub fn filed_by_chat(&self) -> Option<&str> {
+        match &self.source {
+            Source::Agent { run, node } if node == CHAT_NODE => Some(run),
+            _ => None,
+        }
+    }
+
+    /// The identity of the ending the filing chat has not been told about yet.
+    ///
+    /// Only a task a chat filed has one, and only in a state that is final for
+    /// now: done, held, or blocked. Queued, running, parked and failed are
+    /// intermediate (a failed task is retried; running out of attempts turns it
+    /// into a hold, which is the report). The key is the status plus what makes
+    /// this ending different from an earlier one: the last run for done and
+    /// blocked, the start of the hold for held, so hold, release, hold again is
+    /// two notices and a retry loop is none. `None` once that ending is on
+    /// record in [`Task::chat_report`].
+    pub fn chat_report_due(&self) -> Option<String> {
+        self.filed_by_chat()?;
+        let run = self.runs.last().map_or("-", String::as_str);
+        let key = match self.status {
+            TaskStatus::Done => format!("done:{run}"),
+            TaskStatus::Held => {
+                let since = self.held_at.unwrap_or(self.created_at);
+                format!("held:{since}")
+            }
+            TaskStatus::Blocked => format!("blocked:{run}"),
+            _ => return None,
+        };
+        (self.chat_report.as_ref().is_none_or(|r| r.key != key)).then_some(key)
     }
 
     /// Short form used in reports, matching a run's short id.
@@ -1535,10 +1592,27 @@ impl Queue {
 
     /// [`Queue::put`] for a caller already holding [`Queue::lock_task`].
     fn put_unlocked(&self, task: &mut Task) -> Result<()> {
+        self.write_unlocked(task, true)
+    }
+
+    /// Write the record. `keep_report` carries the stored
+    /// [`Task::chat_report`] over a snapshot that lacks one; only
+    /// [`Queue::withdraw_chat_report`] writes without it.
+    fn write_unlocked(&self, task: &mut Task, keep_report: bool) -> Result<()> {
         if let Ok(stored) = read_path(&self.path_of(&task.id)) {
             for run in stored.runs {
                 if !task.runs.contains(&run) {
                     task.runs.push(run);
+                }
+            }
+            if keep_report {
+                let older = match (&task.chat_report, &stored.chat_report) {
+                    (None, _) => true,
+                    (Some(mine), Some(theirs)) => theirs.at > mine.at,
+                    (Some(_), None) => false,
+                };
+                if older {
+                    task.chat_report = stored.chat_report;
                 }
             }
         }
@@ -1577,6 +1651,44 @@ impl Queue {
             self.put_unlocked(&mut task)?;
         }
         Ok(task)
+    }
+
+    /// Record, under the task's write lock, that the chat is being told about
+    /// the task's present ending. Returns the task and the key, or `None` when
+    /// nothing is due (not a final state, or already on record). Written
+    /// *before* the notice is queued: a crash in between loses one notice
+    /// rather than posting two.
+    pub fn record_chat_report(
+        &self,
+        id: &str,
+        skipped: impl FnOnce(&Task) -> bool,
+    ) -> Result<Option<(Task, String)>> {
+        let id = self.resolve_id(id)?;
+        let _lock = self.lock_task(&id)?;
+        let mut task = self.get(&id)?;
+        let Some(key) = task.chat_report_due() else {
+            return Ok(None);
+        };
+        task.chat_report = Some(ChatReport {
+            key: key.clone(),
+            at: Timestamp::now(),
+            skipped: skipped(&task),
+        });
+        self.put_unlocked(&mut task)?;
+        Ok(Some((task, key)))
+    }
+
+    /// Take back [`Queue::record_chat_report`] for `key` after the notice
+    /// could not be queued, so a later pass tries again. A record that has
+    /// moved on to another ending is left alone.
+    pub fn withdraw_chat_report(&self, id: &str, key: &str) -> Result<()> {
+        let _lock = self.lock_task(id)?;
+        let mut task = self.get(id)?;
+        if task.chat_report.as_ref().is_some_and(|r| r.key == key) {
+            task.chat_report = None;
+            self.write_unlocked(&mut task, false)?;
+        }
+        Ok(())
     }
 
     /// Exclusive right to rewrite task `id`'s record, held until the guard
@@ -2196,6 +2308,19 @@ fn read_path(path: &Path) -> Result<Task> {
             task.id,
             task.schema
         );
+    }
+    let mut task = task;
+    if task.schema < 13 {
+        // Before schema 13 nothing was ever reported: an ending that already
+        // happened is not news, so the upgrade does not announce the backlog.
+        if let Some(key) = task.chat_report_due() {
+            task.chat_report = Some(ChatReport {
+                key,
+                at: Timestamp::now(),
+                skipped: true,
+            });
+        }
+        task.schema = SCHEMA;
     }
     Ok(task)
 }
@@ -4073,5 +4198,95 @@ mod tests {
         assert!(break_stale(&lock, "dead-1"));
         assert!(!lock.exists());
         assert!(!marker.exists());
+    }
+
+    fn chat_task() -> Task {
+        Task::new(
+            "t".to_owned(),
+            "i".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Agent {
+                run: "talk-1".to_owned(),
+                node: CHAT_NODE.to_owned(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_report_is_due_only_for_a_chat_task_in_a_final_state() {
+        let mut t = chat_task();
+        assert_eq!(t.chat_report_due(), None, "queued");
+        t.start("run-1".to_owned());
+        assert_eq!(t.chat_report_due(), None, "running");
+        t.fail("boom", 2);
+        assert_eq!(t.status, TaskStatus::Failed);
+        assert_eq!(t.chat_report_due(), None, "a failure that will be retried");
+        t.start("run-2".to_owned());
+        t.succeed();
+        assert_eq!(t.chat_report_due().as_deref(), Some("done:run-2"));
+
+        let mut human = Task::new(
+            "t".to_owned(),
+            "i".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        human.succeed();
+        assert_eq!(human.chat_report_due(), None);
+    }
+
+    #[test]
+    fn a_recorded_ending_is_not_due_again_but_a_new_one_is() {
+        let mut t = chat_task();
+        t.start("run-1".to_owned());
+        t.hold_machine(Some("why".to_owned()));
+        let first = t.chat_report_due().expect("held is final");
+        t.chat_report = Some(ChatReport {
+            key: first.clone(),
+            at: Timestamp::now(),
+            skipped: false,
+        });
+        assert_eq!(t.chat_report_due(), None);
+        t.release();
+        t.start("run-2".to_owned());
+        t.succeed();
+        let second = t.chat_report_due().expect("done is a new ending");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn put_keeps_a_stored_report_a_stale_snapshot_lacks() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let q = Queue::at(tmp.path().join("queue"));
+        let mut t = chat_task();
+        t.succeed();
+        q.put(&mut t).unwrap();
+        let (_, key) = q.record_chat_report(&t.id, |_| false).unwrap().unwrap();
+        let mut stale = t.clone();
+        assert!(stale.chat_report.is_none());
+        q.put(&mut stale).unwrap();
+        assert_eq!(q.get(&t.id).unwrap().chat_report.unwrap().key, key);
+        q.withdraw_chat_report(&t.id, &key).unwrap();
+        assert!(q.get(&t.id).unwrap().chat_report.is_none());
+    }
+
+    #[test]
+    fn an_older_schema_ending_reads_as_already_reported() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let q = Queue::at(tmp.path().join("queue"));
+        let mut t = chat_task();
+        t.succeed();
+        t.schema = 12;
+        q.put(&mut t).unwrap();
+        // `put` writes whatever the snapshot carries; force the old schema.
+        let path = q.path_of(&t.id);
+        let body = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(&format!("\"schema\": {SCHEMA}"), "\"schema\": 12");
+        std::fs::write(&path, body).unwrap();
+        let read = q.get(&t.id).unwrap();
+        assert!(read.chat_report.as_ref().is_some_and(|r| r.skipped));
+        assert_eq!(read.chat_report_due(), None);
+        assert_eq!(read.schema, SCHEMA);
     }
 }

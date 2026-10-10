@@ -1307,6 +1307,38 @@ pub fn queue(
     Ok(())
 }
 
+/// Append an agent-authored message to talk `id` without starting a turn.
+///
+/// Read-modify-write under the store guard, so the record it extends is the
+/// newest one and a turn's later save (which re-reads under the same guard)
+/// keeps it. The chat agent's CLI session never saw this message.
+pub fn post_agent(store: &Talks, id: &str, text: &str) -> Result<()> {
+    let text = text.trim();
+    if text.is_empty() {
+        bail!("nothing to post");
+    }
+    let _guard = store.guard()?;
+    let mut fresh = store
+        .get(id)
+        .with_context(|| format!("talk {id} does not exist"))?;
+    if !fresh.status.open() {
+        bail!(
+            "talk {} is {} and takes no more messages",
+            fresh.short(),
+            fresh.status.as_str()
+        );
+    }
+    fresh.turns.push(Turn {
+        who: Who::Agent,
+        body: text.to_owned(),
+        at: Timestamp::now(),
+        attachments: Vec::new(),
+        usage: None,
+        breaks: None,
+    });
+    store.put(&mut fresh)
+}
+
 /// Promote the current durable draft to one operator turn.
 pub fn drain(talk: &mut Talk, store: &Talks) -> Result<Option<String>> {
     let _guard = store.guard()?;
@@ -1908,6 +1940,11 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     talk.pending = fresh.pending;
     talk.pending_breaks = fresh.pending_breaks;
     talk.pending_attachments = fresh.pending_attachments;
+    // Messages posted by a task's seat (`post_agent`) while the CLI ran sit
+    // after the turns this handle knows; keep them ahead of the reply.
+    if let Some(posted) = fresh.turns.get(talk.turns.len()..) {
+        talk.turns.extend_from_slice(posted);
+    }
     if let Some(from) = fell_back_from.filter(|_| failure.is_none()) {
         // The switch persists: quota coming back does not move the chat
         // home, an operator's switch does.
@@ -2251,7 +2288,13 @@ pub fn briefing_for(
          `magi task add {flag} --attach <path> <instruction>` copies the \
          file into the task, so the implementer receives it. Do not paste the \
          path into <instruction> instead: deleting this conversation deletes \
-         its attachments, and then that path reaches no one.\n",
+         its attachments, and then that path reaches no one.\n\n\
+         You cannot wait and you cannot push a message on your own: you only \
+         speak when a turn is run. A task you file with `magi task add` \
+         reports back to this conversation automatically when it finishes or \
+         stops, so you do not need to promise that. For anything else, never \
+         say you will tell the operator when it is done; say that you cannot \
+         and let them ask.\n",
         repo = repo.display(),
     );
     out.push_str(&language_note(language));

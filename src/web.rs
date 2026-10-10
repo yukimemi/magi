@@ -542,6 +542,9 @@ impl Ui {
             // janitor pass reclaiming a directory nothing else on this
             // process is even looking at.
             worktrees_root: Some(self.worktrees_root.clone()),
+            // A chat sent a task report goes through this process's own turn
+            // gate, like any queued draft.
+            talk_kick: Some(self.talk_kick()),
             ..daemon::Opts::default()
         };
         let launch = self.launch;
@@ -580,6 +583,27 @@ impl Ui {
         state.last_error = None;
         state.rev += 1;
         Ok(())
+    }
+
+    /// What starts the turn of a chat that [`crate::chat_report`] just queued a
+    /// draft for: the claim and drain every queued draft goes through. A busy
+    /// slot or a parking upgrade leaves the draft durable.
+    fn talk_kick(&self) -> daemon::TalkKick {
+        let ui = self.clone();
+        let handle = tokio::runtime::Handle::current();
+        daemon::TalkKick(Arc::new(move |id: &str| {
+            let (ui, id) = (ui.clone(), id.to_owned());
+            handle.spawn(async move {
+                let claim = ui.begin_queued_talk_turn(&id).ok().flatten();
+                let Some(turn_guard) = claim else { return };
+                let talks = ui.talks.clone();
+                let Ok(talk) = talks.get(&id) else { return };
+                let Ok((cfg, _)) = Config::discover(&talk.repo, None) else {
+                    return;
+                };
+                drain_loop(talk, talks, cfg, id, turn_guard).await;
+            });
+        }))
     }
 
     /// Ask the loop to stop, without waiting for it to get there.

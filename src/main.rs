@@ -372,6 +372,12 @@ enum Command {
         #[command(subcommand)]
         command: TaskCmd,
     },
+    /// Write to a chat conversation from a task's seat.
+    Talk {
+        /// What to do with the conversation.
+        #[command(subcommand)]
+        command: TalkCmd,
+    },
     /// Drain the queue unattended: take the next task, run the graph, repeat.
     ///
     /// One competition at a time on purpose. The graph is already parallel
@@ -584,6 +590,23 @@ enum Command {
         /// Install without asking.
         #[arg(long)]
         yes: bool,
+    },
+}
+
+/// Operations on a chat conversation.
+#[derive(Debug, Subcommand)]
+enum TalkCmd {
+    /// Append a message to the transcript of the chat that filed your task,
+    /// without starting a turn.
+    ///
+    /// For an implementer seat only: `MAGI_RUN` must belong to a task this
+    /// conversation filed. The chat agent's own session does not see the
+    /// message; the operator does.
+    Post {
+        /// Conversation id or unambiguous prefix.
+        talk: String,
+        /// The message.
+        message: String,
     },
 }
 
@@ -1577,6 +1600,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 once,
                 merge: merge.map(|m| m.as_str().to_owned()),
                 worktrees_root: None,
+                talk_kick: None,
             })
             .await
         }
@@ -1642,6 +1666,25 @@ async fn dispatch(command: Command) -> Result<()> {
         } => answer_cmd(id, reply, quote, say, ask_chat, list).await,
 
         Command::Task { command } => task_cmd(command).await,
+
+        Command::Talk {
+            command: TalkCmd::Post { talk, message },
+        } => {
+            let (run, node) = std::env::var("MAGI_RUN")
+                .ok()
+                .map(|r| (Some(r), std::env::var("MAGI_NODE").ok()))
+                .unwrap_or((None, None));
+            magi::chat_report::post(
+                &Queue::open(),
+                &magi::talk::Talks::open(),
+                &talk,
+                run.as_deref(),
+                node.as_deref(),
+                &message,
+            )?;
+            println!("posted to chat {}", magi::queue::short(&talk));
+            Ok(())
+        }
 
         Command::Doctor { repo, config } => doctor(&repo, config.as_deref()).await,
 

@@ -178,6 +178,25 @@ impl Default for Status {
     }
 }
 
+/// What starts a talk's turn once [`crate::chat_report`] has queued a draft
+/// for it. The web server passes its own turn gate; `None` in [`Opts`] means
+/// the loop runs the turn itself under the talk's lease.
+#[derive(Clone)]
+pub struct TalkKick(pub Arc<dyn Fn(&str) + Send + Sync>);
+
+impl TalkKick {
+    /// Start the turn for talk `id`. Returns at once; never waits for the turn.
+    pub fn call(&self, id: &str) {
+        (self.0)(id);
+    }
+}
+
+impl std::fmt::Debug for TalkKick {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TalkKick")
+    }
+}
+
 /// How the loop should behave.
 #[derive(Debug, Clone)]
 pub struct Opts {
@@ -202,6 +221,9 @@ pub struct Opts {
     /// worktrees itself) must set this, or every idle tick reclaims worktrees
     /// out from under whoever actually does.
     pub worktrees_root: Option<PathBuf>,
+    /// Starts the turn of a chat that was just sent a task report. `None`: the
+    /// loop drains the draft itself.
+    pub talk_kick: Option<TalkKick>,
 }
 
 impl Default for Opts {
@@ -214,6 +236,7 @@ impl Default for Opts {
             once: false,
             merge: None,
             worktrees_root: None,
+            talk_kick: None,
         }
     }
 }
@@ -1808,6 +1831,24 @@ async fn drive(
         stop.clone(),
     ));
 
+    // Tells the chat that filed a task how it ended; its own task, like the
+    // waiter, because endings are reached from everywhere and a run is long.
+    let chat_reports = tokio::spawn(crate::chat_report::run(
+        queue.clone(),
+        crate::talk::Talks::at(home.join("talks")),
+        home.to_path_buf(),
+        opts.talk_kick.clone().map(|k| {
+            // A parking upgrade starts no further turn; the draft stays durable.
+            let stop = stop.clone();
+            TalkKick(Arc::new(move |id: &str| {
+                if !stop.parking() {
+                    k.call(id);
+                }
+            }))
+        }),
+        stop.clone(),
+    ));
+
     // Keeps every checkout's origin/main fresh; its own task so a slow remote
     // never holds up the poll loop.
     let fetcher = tokio::spawn(fetch_loop(opts.repo.clone(), opts.clone(), stop.clone()));
@@ -1863,6 +1904,7 @@ async fn drive(
     deputies.abort();
     fetcher.abort();
     release_watch.abort();
+    chat_reports.abort();
     clear_status_at(status_file);
     outcome
 }
