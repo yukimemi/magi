@@ -5689,12 +5689,12 @@ async function switchTalkAgent() {
   renderTalk();
   try {
     const talk = await postJson(API.talkAgent(id), { agent });
+    rememberTalkDefault("agent", talk.agent);
     /* Only the conversation still on screen takes the answer: the operator
        may have navigated away while this was in flight. */
     if (state.talkDetail.id === id) {
       state.talkDetail.talk = talk;
       announce(`Agent changed to ${agent}.`);
-      rememberTalkDefault("agent", talk.agent);
     }
     loadTalks().catch(() => {});
     ok();
@@ -5754,10 +5754,10 @@ async function switchTalkImplementers() {
   renderTalk();
   try {
     const talk = await postJson(API.talkImplementers(id), { implementers });
+    rememberTalkDefault("implementers", talk.implementers || 1);
     if (state.talkDetail.id === id) {
       state.talkDetail.talk = talk;
       announce(`Implementers set to ${implementers === 1 ? "Solo" : implementers}.`);
-      rememberTalkDefault("implementers", talk.implementers || 1);
     }
     loadTalks().catch(() => {});
     ok();
@@ -5783,10 +5783,10 @@ async function switchTalkPersona() {
   renderTalk();
   try {
     const talk = await postJson(API.talkPersona(id), { persona });
+    rememberTalkDefault("persona", talk.persona || "default");
     if (state.talkDetail.id === id) {
       state.talkDetail.talk = talk;
       announce(`Persona changed to ${persona}.`);
-      rememberTalkDefault("persona", talk.persona || "default");
     }
     loadTalks().catch(() => {});
     ok();

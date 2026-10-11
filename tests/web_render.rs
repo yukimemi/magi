@@ -2191,6 +2191,144 @@ async fn chat_remembers_persona_and_implementers_for_new_conversations() {
     assert_eq!(original["persona"], "rei", "{original}");
 }
 
+/// Successful selector changes must be remembered even when their response
+/// arrives after the operator has opened another conversation.
+#[tokio::test]
+async fn chat_remembers_selector_changes_after_navigation() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
+        );
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let talks = Talks::at(home.join("talks"));
+    let agent = fx.config.agents[0].id.clone();
+    let first = talk::begin(&talks, &fx.config, fx.repo.clone(), Some(&agent)).unwrap();
+    let second = talk::begin(&talks, &fx.config, fx.repo.clone(), Some(&agent)).unwrap();
+    let base = serve(
+        &home,
+        Queue::at(home.join("queue")),
+        talks,
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("launch Chrome");
+    let page = browser
+        .open_page(&format!("{base}#/chat/{}", first.id), 1280, 900, false)
+        .await
+        .expect("open chat");
+    let w = Duration::from_secs(30);
+    for (field, value) in [
+        ("agent", fx.config.agents[1].id.as_str()),
+        ("persona", "rei"),
+        ("implementers", "3"),
+    ] {
+        browser
+            .eval(&page, &format!(
+                "(async () => {{ const hash = '#/chat/{}'; if (location.hash !== hash) {{ \
+                 const changed = new Promise(resolve => window.addEventListener('hashchange', \
+                 () => setTimeout(resolve, 0), {{ once: true }})); location.hash = hash; await changed; }} return true; }})()",
+                first.id
+            ))
+            .await
+            .expect("return to first chat");
+        browser
+            .wait_for(
+                &page,
+                &format!(
+                    "location.hash === '#/chat/{}' \
+                     && document.getElementById('talk-agent').options.length > 1 \
+                     && document.getElementById('talk-persona').options.length > 1 \
+                     && !document.getElementById('talk-{field}').disabled",
+                    first.id
+                ),
+                w,
+            )
+            .await
+            .expect("selector ready");
+        browser
+            .eval(
+                &page,
+                &format!(
+                    r#"(() => {{
+                        const originalFetch = window.fetch;
+                        window.releaseTalkPreference = null;
+                        window.fetch = async (...args) => {{
+                            const response = await originalFetch(...args);
+                            if (String(args[0]).endsWith('/{}/{field}') && args[1]?.method === 'POST') {{
+                                window.fetch = originalFetch;
+                                await new Promise(resolve => {{ window.releaseTalkPreference = resolve; }});
+                            }}
+                            return response;
+                        }};
+                        const select = document.getElementById('talk-{field}');
+                        select.value = '{value}';
+                        select.dispatchEvent(new Event('change'));
+                        return true;
+                    }})()"#,
+                    first.id
+                ),
+            )
+            .await
+            .expect("change selector with response held");
+        browser
+            .wait_for(
+                &page,
+                "typeof window.releaseTalkPreference === 'function'",
+                w,
+            )
+            .await
+            .expect("server accepted change");
+        browser
+            .eval(&page, &format!(
+                "(async () => {{ const changed = new Promise(resolve => window.addEventListener('hashchange', \
+                 () => setTimeout(resolve, 0), {{ once: true }})); \
+                 location.hash = '#/chat/{}'; await changed; return true; }})()",
+                second.id
+            ))
+            .await
+            .expect("navigate away");
+        browser
+            .wait_for(
+                &page,
+                &format!(
+                    "location.hash === '#/chat/{}' && document.getElementById('talk-agent').value === '{}'",
+                    second.id, agent
+                ),
+                w,
+            )
+            .await
+            .expect("second chat loaded");
+        browser
+            .eval(&page, "window.releaseTalkPreference(); true")
+            .await
+            .expect("release successful response");
+        browser
+            .wait_for(
+                &page,
+                &format!(
+                    "String(JSON.parse(localStorage.getItem('magi-talk-defaults') || '{{}}').{field}) === '{value}'"
+                ),
+                w,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{field} was not remembered after navigation: {e}"));
+        let current = browser
+            .eval(&page, "({ agent: document.getElementById('talk-agent').value, persona: document.getElementById('talk-persona').value, implementers: Number(document.getElementById('talk-implementers').value) })")
+            .await
+            .expect("read second chat");
+        assert_eq!(current["agent"], agent);
+        assert_eq!(current["persona"], "default");
+        assert_eq!(current["implementers"], 1);
+    }
+}
+
 /// The per-conversation selectors are chips just above the composer, so a
 /// long transcript never has to be scrolled to the top to change one.
 #[tokio::test]

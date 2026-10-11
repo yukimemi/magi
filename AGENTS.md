@@ -1200,7 +1200,9 @@ keep their own stored values.
   accepted: it does not follow the operator across devices.
 - **Written only after a manual switch succeeded** (`switchTalkAgent` /
   `Persona` / `Implementers`), one field at a time, from the TalkView the
-  server returned. Never from `renderTalk` / `loadTalk` / `startTalk`: opening an
+  server returned, even if the operator navigated away before the response.
+  Only the on-screen conversation update is guarded by its id.
+  Never from `renderTalk` / `loadTalk` / `startTalk`: opening an
   old conversation would overwrite the operator's last choice with its values.
   A chatter-chain fallback that rewrites `talk.agent` is not a choice.
 - **Applied only at creation**: `startTalk` sends `preferred_agent`, `persona`,
@@ -1212,7 +1214,9 @@ keep their own stored values.
 - **`preferred_agent` is not `agent`.** `agent` is strict (an unknown id is an
   error); `preferred_agent` is soft, and `agent` wins when both are sent. A
   preferred agent other than the chain head is an explicit choice
-  (`fallback = false`); the head itself keeps `fallback = true`.
+  (`fallback = false`); the head itself keeps `fallback = true`. A valid
+  preferred agent also works when the chatter chain cannot resolve; in that
+  case it is an explicit choice with `fallback = false`.
 - Persona and implementers are set before the single save and the dirty flags
   stay false: the new seat's briefing already carries them.
 

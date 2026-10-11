@@ -1218,7 +1218,6 @@ pub fn begin_with(
     let spec = match agent {
         Some(id) => agent::pick(&cfg.agents, Some(id), &agent::installed)?,
         None => {
-            let head = head()?;
             match preferred
                 .agent
                 .as_deref()
@@ -1227,12 +1226,12 @@ pub fn begin_with(
             {
                 Some(id) => match agent::pick(&cfg.agents, Some(id), &agent::installed) {
                     Ok(spec) => {
-                        fallback = spec.id == head.id;
+                        fallback = head().is_ok_and(|head| spec.id == head.id);
                         spec
                     }
-                    Err(_) => head,
+                    Err(_) => head()?,
                 },
-                None => head,
+                None => head()?,
             }
         }
     };
@@ -3586,6 +3585,43 @@ mod tests {
             },
         );
         assert!(strict.is_err());
+    }
+
+    #[test]
+    fn remembered_agent_can_open_when_the_chatter_chain_cannot_resolve() {
+        let (tmp, talks) = store();
+        let spec = mock_agent(tmp.path(), ECHO, BTreeMap::new());
+        // A missing chain member makes head resolution fail independently of
+        // which subscription CLIs happen to be installed on this machine.
+        let cfg = chain_config(vec![spec.clone()], &["missing-chatter"]);
+        assert!(begin(&talks, &cfg, tmp.path().to_owned(), None).is_err());
+        let talk = begin_with(
+            &talks,
+            &cfg,
+            tmp.path().to_owned(),
+            None,
+            &Preferred {
+                agent: Some(spec.id.clone()),
+                ..Preferred::default()
+            },
+        )
+        .expect("a valid remembered agent does not require a default chain");
+        assert_eq!(talk.agent, spec.id);
+        assert!(!talk.fallback);
+        assert_eq!(talks.get(&talk.id).unwrap().agent, spec.id);
+        assert!(
+            begin_with(
+                &talks,
+                &cfg,
+                tmp.path().to_owned(),
+                None,
+                &Preferred {
+                    agent: Some("missing-preference".into()),
+                    ..Preferred::default()
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]
