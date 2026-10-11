@@ -3656,11 +3656,30 @@ impl Runner {
         let mut post = None;
         let mut lines = None;
         if why.is_none() {
-            if let Ok(r) = git::rescue_commit(&wt, "magi: graft (uncommitted work)").await {
+            let rescued = git::rescue_commit(&wt, "magi: graft (uncommitted work)").await;
+            if let Ok(r) = &rescued {
                 self.state.note_withheld("graft", &r.withheld);
             }
             let head = git::rev_parse(&wt, "HEAD").await?;
-            if head == pre {
+            // What is measured must be what gets reviewed and gated: a failed
+            // rescue, or anything still uncommitted (withheld lockfiles
+            // aside, which are never part of the tree), rejects the graft.
+            let dirty = match &rescued {
+                Ok(r) => git::status_porcelain(&wt)
+                    .await
+                    .map(|st| {
+                        st.lines().any(|l| {
+                            !r.withheld
+                                .iter()
+                                .any(|w| l.trim_end().ends_with(w.path.as_str()))
+                        })
+                    })
+                    .unwrap_or(true),
+                Err(_) => true,
+            };
+            if dirty {
+                why = Some("the fixer left changes that could not be committed".to_owned());
+            } else if head == pre {
                 why = Some("the fixer changed nothing".to_owned());
             } else {
                 lines = git::changed_lines(&wt, &pre, &head).await;
@@ -4791,10 +4810,17 @@ impl Runner {
                     &class,
                     &reason,
                 );
+                // A failed agent's edits must not reach the next one, and a
+                // restore that did not work ends the chain: the call fails
+                // and the caller's own (confirmed) restore decides.
                 if let Some((wt, rev)) = restore
                     && let Err(e) = git::restore_to(wt, rev).await
                 {
-                    tracing::warn!("restore {} before the next fixer: {e:#}", wt.display());
+                    let why =
+                        format!("could not restore the worktree before the next fixer: {e:#}");
+                    tracing::warn!("{why}");
+                    last = Some((job, seat, AgentOutcome::Failed(why)));
+                    break;
                 }
                 continue;
             }
