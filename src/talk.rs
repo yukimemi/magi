@@ -332,6 +332,11 @@ pub struct Talk {
     pub status: TalkStatus,
     /// Everything said, oldest first.
     pub turns: Vec<Turn>,
+    /// Exclusive transcript boundary included in the last successful CLI prompt.
+    /// Posts at or beyond it still need replay, even if a reply follows them.
+    /// Missing on older records, which infer it from the last non-post reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posts_read_through: Option<usize>,
     /// Text and attachments accepted while the single CLI turn is busy.
     /// They are durable, but become a real turn only when [`drain`] records them.
     #[serde(default)]
@@ -1262,6 +1267,7 @@ pub fn begin_with(
 
     let now = Timestamp::now();
     let mut talk = Talk {
+        posts_read_through: Some(0),
         pending_breaks: None,
         schema: SCHEMA,
         id: new_id(),
@@ -1439,20 +1445,27 @@ pub fn post(store: &Talks, talk_id: &str, body: &str, by: &str) -> Result<()> {
     store.put(&mut fresh)
 }
 
-/// Posts appended by task seats since the chat agent last answered, as a
-/// prompt block. The agent's CLI session never saw them.
+/// Infer the old format's boundary only until an explicit one is saved.
+fn posts_read_through(talk: &Talk) -> usize {
+    talk.posts_read_through.unwrap_or_else(|| {
+        talk.turns
+            .iter()
+            .rposition(|t| t.who != Who::Operator && t.posted_by.is_none())
+            .map_or(0, |i| i + 1)
+    })
+}
+
+/// Posts not yet included in a successful chat prompt, in transcript order.
 pub fn posts_since_last_reply(talk: &Talk) -> Option<String> {
-    let mut posts: Vec<&Turn> = talk
+    let posts: Vec<&Turn> = talk
         .turns
         .iter()
-        .rev()
-        .take_while(|t| t.who == Who::Operator || t.posted_by.is_some())
+        .skip(posts_read_through(talk))
         .filter(|t| t.posted_by.is_some())
         .collect();
     if posts.is_empty() {
         return None;
     }
-    posts.reverse();
     let mut out = String::from("# Posted by a task\n\n");
     for t in posts {
         out.push_str(&format!(
@@ -1755,6 +1768,11 @@ fn pending_matches(talk: &Talk, expected_text: &str, expected_attachments: &[Str
 /// Every turn after that resends nothing when the CLI can resume its own
 /// session, and falls back to [`transcript`] only when it cannot.
 async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Result<()> {
+    // Freeze both boundaries before invoking the CLI. Failure notes must not
+    // hide unread posts in old records, and posts arriving during any attempt
+    // (including fallback) were absent from this snapshot's prompt.
+    let prompt_turns = talk.turns.len();
+    talk.posts_read_through = Some(posts_read_through(talk));
     let spec = cfg
         .agents
         .iter()
@@ -2094,6 +2112,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     if failure.is_none() {
         talk.persona_dirty = false;
         talk.implementers_dirty = false;
+        talk.posts_read_through = Some(prompt_turns);
     }
     talk.turns.push(reply);
     if let Err(put_err) = store.put(talk) {
@@ -2656,6 +2675,7 @@ mod tests {
 
     fn ctx_talk(agent: &str, turns: Vec<Turn>) -> Talk {
         Talk {
+            posts_read_through: None,
             pending_breaks: None,
             schema: SCHEMA,
             id: "20260904-014455-ab12".to_owned(),
@@ -2905,6 +2925,7 @@ mod tests {
     fn the_frozen_json_field_names_round_trip_through_disk() {
         let (tmp, talks) = store();
         let mut talk = Talk {
+            posts_read_through: None,
             pending_breaks: None,
             schema: SCHEMA,
             id: "20260904-014455-ab12".to_owned(),
@@ -2944,6 +2965,7 @@ mod tests {
         assert_eq!(v["status"], "open");
 
         let back = talks.get(&talk.id).expect("get");
+        assert_eq!(back.posts_read_through, None);
         assert_eq!(back.id, talk.id);
         assert_eq!(back.status, TalkStatus::Open);
     }
@@ -3412,6 +3434,123 @@ mod tests {
         assert_eq!(saved.turns.len(), 2, "operator message and reply remain");
     }
 
+    #[tokio::test]
+    async fn posts_during_a_resumed_turn_are_replayed_once_even_after_a_reply_save_failure() {
+        for lose_reply in [false, true] {
+            let (tmp, talks) = store();
+            let cfg = config(mock_agent(tmp.path(), ECHO, BTreeMap::new()));
+            let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+            say(
+                &talks.claim_turn(&talk.id).unwrap().unwrap(),
+                &mut talk,
+                &talks,
+                &cfg,
+                "establish the session",
+                Vec::new(),
+            )
+            .await
+            .expect("first turn");
+            assert!(agent::has_session(
+                AgentKind::Command,
+                &talk.seat,
+                cfg.graph.sessions
+            ));
+
+            post(&talks, &talk.id, "already available", "task-earlier").expect("earlier post");
+            talk = talks.get(&talk.id).expect("reload earlier post");
+            let ready = tmp.path().join("ready");
+            let release = tmp.path().join("release");
+            let slow = "#!/bin/sh\ncat >/dev/null\ntouch \"$READY\"\nn=0\nwhile [ ! -f \"$RELEASE\" ] && [ \"$n\" -lt 200 ]; do sleep 0.01; n=$((n + 1)); done\nprintf reply\n";
+            let slow_cfg = config(mock_agent(
+                tmp.path(),
+                slow,
+                BTreeMap::from([
+                    ("READY".to_owned(), ready.to_string_lossy().into_owned()),
+                    ("RELEASE".to_owned(), release.to_string_lossy().into_owned()),
+                ]),
+            ));
+            let text = record(&mut talk, &talks, "keep going", Vec::new()).expect("record");
+            let prompt_turns = talk.turns.len();
+            let id = talk.id.clone();
+            let response_talks = talks.clone();
+            let running = tokio::spawn(async move {
+                respond(
+                    &response_talks.claim_turn(&talk.id).unwrap().unwrap(),
+                    &mut talk,
+                    &response_talks,
+                    &slow_cfg,
+                    &text,
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !ready.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("CLI read its prompt");
+            post(&talks, &id, "concurrent task result", "task-one").expect("post");
+            post(&talks, &id, "second task result", "task-two").expect("second post");
+            if lose_reply {
+                failpoint::force_put_failures(PUT_RETRIES);
+            }
+            std::fs::write(release, "go").expect("release CLI");
+            let result = running.await.expect("join");
+            if lose_reply {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("could not be saved")
+                );
+            } else {
+                result.expect("reply");
+            }
+
+            let mut saved = talks.get(&id).expect("reload");
+            assert_eq!(saved.posts_read_through, Some(prompt_turns));
+            assert_eq!(saved.turns[prompt_turns].body, "concurrent task result");
+            assert_eq!(saved.turns[prompt_turns + 1].body, "second task result");
+            assert!(posts_since_last_reply(&saved).is_some());
+            let cfg = config(mock_agent(tmp.path(), ECHO, BTreeMap::new()));
+            say(
+                &talks.claim_turn(&id).unwrap().unwrap(),
+                &mut saved,
+                &talks,
+                &cfg,
+                "read the results",
+                Vec::new(),
+            )
+            .await
+            .expect("replay turn");
+            let prompt = &saved.turns.last().unwrap().body;
+            assert!(prompt.contains("# Posted by a task"), "{prompt}");
+            assert!(!prompt.contains("already available"), "{prompt}");
+            assert!(
+                prompt
+                    .find("concurrent task result")
+                    .expect("first post in prompt")
+                    < prompt
+                        .find("second task result")
+                        .expect("second post in prompt")
+            );
+            let mut saved = talks.get(&id).expect("reload after replay");
+            assert!(posts_since_last_reply(&saved).is_none());
+            say(
+                &talks.claim_turn(&id).unwrap().unwrap(),
+                &mut saved,
+                &talks,
+                &cfg,
+                "continue",
+                Vec::new(),
+            )
+            .await
+            .expect("next turn");
+            assert!(!saved.turns.last().unwrap().body.contains("task result"));
+        }
+    }
+
     /// A mock whose script counts its own calls in `<dir>/<id>.calls` before
     /// running `body`.
     fn counting_agent(dir: &Path, id: &str, body: &str) -> AgentSpec {
@@ -3454,6 +3593,8 @@ mod tests {
         let cfg = chain_config(vec![a, b], &["a", "b"]);
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
         assert_eq!(talk.agent, "a");
+        post(&talks, &talk.id, "fallback task result", "task").expect("post");
+        talk = talks.get(&talk.id).expect("reload");
 
         say(
             &talks.claim_turn(&talk.id).unwrap().unwrap(),
@@ -3471,6 +3612,10 @@ mod tests {
         assert!(talks.get(&talk.id).unwrap().agent == "b");
         let reply = talk.turns.last().unwrap();
         assert!(reply.body.contains("hello there"));
+        assert!(reply.body.contains("fallback task result"));
+        let saved = talks.get(&talk.id).expect("reload fallback");
+        assert_eq!(saved.posts_read_through, Some(2));
+        assert!(posts_since_last_reply(&saved).is_none());
         assert!(
             reply.body.contains("magi task add --solo"),
             "a fresh seat gets the full briefing"
@@ -4000,6 +4145,11 @@ mod tests {
         let cfg = config(spec);
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
 
+        talk.posts_read_through = None;
+        talks.put(&mut talk).expect("save old-format boundary");
+        post(&talks, &talk.id, "unread task result", "task").expect("post");
+        talk = talks.get(&talk.id).expect("reload");
+
         let err = say(
             &talks.claim_turn(&talk.id).unwrap().unwrap(),
             &mut talk,
@@ -4013,9 +4163,15 @@ mod tests {
         assert!(err.to_string().contains("no answer"), "{err}");
 
         let on_disk = talks.get(&talk.id).expect("get");
-        assert_eq!(on_disk.turns.len(), 2);
-        assert_eq!(on_disk.turns[0].body, "check the tests");
-        let note = &on_disk.turns[1];
+        assert_eq!(on_disk.turns.len(), 3);
+        assert_eq!(on_disk.posts_read_through, Some(0));
+        assert!(
+            posts_since_last_reply(&on_disk)
+                .unwrap()
+                .contains("unread task result")
+        );
+        assert_eq!(on_disk.turns[1].body, "check the tests");
+        let note = &on_disk.turns[2];
         assert_eq!(note.who, Who::Agent);
         assert!(note.body.starts_with(MAGI_NOTE), "{}", note.body);
         assert!(note.body.contains("your message is saved"));
@@ -4617,6 +4773,7 @@ mod tests {
         let (tmp, talks) = store();
         let make = |id: &str, status: TalkStatus| {
             let mut t = Talk {
+                posts_read_through: None,
                 pending_breaks: None,
                 schema: SCHEMA,
                 id: id.to_owned(),
