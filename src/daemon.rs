@@ -4062,15 +4062,18 @@ fn prepare_instruction(
 fn record(queue: &Queue, task: &mut Task) {
     if let Err(e) = queue.put(task) {
         tracing::error!("could not record task {}: {e:#}", task.short());
-        notices::raise(
-            Notice::error(
-                "loop:record",
-                "The loop could not save a task's state; check the disk.",
-            )
-            .link(Link::Task {
-                id: task.id.clone(),
-            }),
-        );
+        let notice = Notice::error(
+            "loop:record",
+            "The loop could not save a task's state; check the disk.",
+        )
+        .link(Link::Task {
+            id: task.id.clone(),
+        });
+        // The queue lives at `<home>/queue`, so its parent is the home.
+        match queue.root().parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(home) => notices::raise_in(home, notice),
+            None => notices::raise(notice),
+        }
     }
 }
 
@@ -4276,6 +4279,27 @@ mod tests {
             PathBuf::from("/repo"),
             Source::Human,
         )
+    }
+
+    #[test]
+    fn record_failure_notice_links_the_task() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the queue directory should be makes every
+        // `put` fail, on every platform and whoever runs the test.
+        std::fs::write(dir.path().join("queue"), b"not a directory").unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let mut t = interrupt_task("rec-fail-1");
+        record(&queue, &mut t);
+
+        let found = crate::notices::Notices::at(dir.path().join("notifications")).list();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].key, "loop:record");
+        assert_eq!(
+            found[0].link,
+            Some(Link::Task {
+                id: "rec-fail-1".to_owned()
+            })
+        );
     }
 
     /// A runnable task marked to interrupt, with an id fixed for assertions
