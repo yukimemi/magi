@@ -267,26 +267,33 @@ pub fn settle_deputy_tasks(state: &mut RunState, pr_url: &str, queue: &Queue, re
             // The owner's task wins; the idle automatic ones are held. Only
             // when every one is confirmed held is the deputy task released.
             let mut failed: Option<String> = None;
+            // What each held task looked like before, for a rollback.
+            let mut done: Vec<(String, Task, String)> = Vec::new();
             for (id, _guard) in &guards {
                 let why = format!(
                     "{SUPERSEDED}the owner's approval deputy filed task {} for the same finding(s) of {pr_url}",
                     cand.id
                 );
+                let mut before: Option<Task> = None;
                 let held = queue.modify(id, |t| {
                     if t.status != crate::queue::TaskStatus::Queued {
                         return false;
                     }
-                    t.hold_manual(Some(why));
+                    before = Some(t.clone());
+                    t.hold_manual(Some(why.clone()));
                     true
                 });
                 match held {
-                    Ok(true) => state.event(
-                        NODE,
-                        format!(
-                            "follow-up task {id} held: superseded by deputy task {}",
-                            cand.id
-                        ),
-                    ),
+                    Ok(true) => {
+                        done.extend(before.map(|b| (id.clone(), b, why)));
+                        state.event(
+                            NODE,
+                            format!(
+                                "follow-up task {id} held: superseded by deputy task {}",
+                                cand.id
+                            ),
+                        );
+                    }
                     Ok(false) => {
                         failed = Some(id.clone());
                         break;
@@ -299,7 +306,45 @@ pub fn settle_deputy_tasks(state: &mut RunState, pr_url: &str, queue: &Queue, re
                 }
             }
             if let Some(id) = failed {
+                // Give back what was already held, still under its claim, so
+                // the automatic path keeps covering every finding. Only a
+                // task still carrying our hold is touched.
+                let mut stuck = false;
+                for (tid, before, why) in done.into_iter().rev() {
+                    let back = queue.modify(&tid, |t| {
+                        if t.status != crate::queue::TaskStatus::Held
+                            || t.hold_reason.as_deref() != Some(why.as_str())
+                        {
+                            return false;
+                        }
+                        *t = before;
+                        true
+                    });
+                    match back {
+                        Ok(true) => state.event(
+                            NODE,
+                            format!(
+                                "follow-up task {tid} restored: deputy task {} could not take it over",
+                                cand.id
+                            ),
+                        ),
+                        Ok(false) => {}
+                        Err(e) => {
+                            stuck = true;
+                            state.event(
+                                NODE,
+                                format!(
+                                    "rollback of {tid} failed, deputy task {} left as a candidate for the next settle: {e:#}",
+                                    cand.id
+                                ),
+                            );
+                        }
+                    }
+                }
                 drop(guards);
+                if stuck {
+                    continue;
+                }
                 let why = format!(
                     "{SUPERSEDED}follow-up task {id} could not be held, so it may still run for {} of {pr_url}; was: {}",
                     matched.join(", "),
@@ -1448,6 +1493,32 @@ mod tests {
         q.put(&mut t).unwrap();
         settle_deputy_tasks(&mut s, PR, &q, true);
         assert_eq!(status_of(&q, &auto.id), crate::queue::TaskStatus::Queued);
+        let got = q.get(&t.id).unwrap();
+        assert_eq!(got.status, crate::queue::TaskStatus::Held);
+        assert!(got.hold_reason.unwrap().starts_with(SUPERSEDED));
+    }
+
+    #[test]
+    fn a_failed_hold_restores_the_automatic_tasks_already_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        s.followup_generation = Some(0);
+        file(&mut s, PR, &q).unwrap();
+        let autos = q.list();
+        assert_eq!(autos.len(), 2);
+        let mut t = deputy_task(&s.id, "both", "R3-1-1 and R3-1-2", &format!("after {PR}"));
+        q.put(&mut t).unwrap();
+        // Make the save of the second automatic task fail.
+        let last = autos.last().unwrap().id.clone();
+        let tmp = dir.path().join("queue").join(format!("{last}.json.tmp"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        for a in &autos {
+            let got = q.get(&a.id).unwrap();
+            assert_eq!(got.status, crate::queue::TaskStatus::Queued, "{}", a.id);
+            assert_eq!(got.attempts, a.attempts);
+        }
         let got = q.get(&t.id).unwrap();
         assert_eq!(got.status, crate::queue::TaskStatus::Held);
         assert!(got.hold_reason.unwrap().starts_with(SUPERSEDED));
