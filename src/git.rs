@@ -392,6 +392,35 @@ pub async fn diff_stat(worktree: &Path, base: &str, head: &str) -> Result<String
     git(worktree, &["diff", "--no-color", "--stat", &range]).await
 }
 
+/// Total changed lines (added + removed) between two revisions, from
+/// `--numstat`. `None` when git could not say, or a binary file changed
+/// (numstat prints `-` for it): a size that cannot be measured is not small.
+pub async fn changed_lines(worktree: &Path, base: &str, head: &str) -> Option<usize> {
+    let out = git_raw(worktree, &["diff", "--numstat", base, head])
+        .await
+        .ok()?;
+    if !out.ok() {
+        return None;
+    }
+    let mut total = 0usize;
+    for line in out.stdout.lines().filter(|l| !l.trim().is_empty()) {
+        let mut cols = line.split('\t');
+        let added: usize = cols.next()?.parse().ok()?;
+        let removed: usize = cols.next()?.parse().ok()?;
+        total = total.saturating_add(added).saturating_add(removed);
+    }
+    Some(total)
+}
+
+/// Put the worktree back on `rev`: tracked files reset, untracked files
+/// removed. Ignored paths (a `[worktree] setup`'s products are hidden through
+/// the per-worktree excludes) are left alone.
+pub async fn restore_to(worktree: &Path, rev: &str) -> Result<()> {
+    git(worktree, &["reset", "--hard", "-q", rev]).await?;
+    git(worktree, &["clean", "-fdq"]).await?;
+    Ok(())
+}
+
 /// Number of files touched by `base...head`.
 pub async fn changed_files(worktree: &Path, base: &str, head: &str) -> Result<Vec<String>> {
     let range = format!("{base}...{head}");

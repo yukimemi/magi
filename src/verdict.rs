@@ -21,6 +21,11 @@ pub struct Ranking {
     /// Self-reported confidence, 1-5.
     #[serde(default)]
     pub confidence: Option<u8>,
+    /// Per-label strengths worth porting onto the winner, written for the
+    /// candidates the judge did not rank first. Optional: a judge that
+    /// names none simply leaves the graft phase nothing to do.
+    #[serde(default)]
+    pub strengths: BTreeMap<String, Vec<String>>,
 }
 
 impl Ranking {
@@ -441,6 +446,7 @@ mod tests {
             ranking: vec!["A".to_owned(), "A".to_owned()],
             reasons: BTreeMap::new(),
             confidence: None,
+            strengths: BTreeMap::new(),
         };
         assert!(r.validate(&['A', 'B', 'C']).is_err());
 
@@ -448,6 +454,7 @@ mod tests {
             ranking: vec!["c".to_owned(), "B".to_owned(), "A".to_owned()],
             reasons: BTreeMap::new(),
             confidence: None,
+            strengths: BTreeMap::new(),
         };
         r.validate(&['A', 'B', 'C']).expect("case is normalised");
         assert_eq!(r.normalized(), ['C', 'B', 'A']);

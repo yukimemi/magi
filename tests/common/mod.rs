@@ -420,7 +420,13 @@ if has "independent judges"; then
   else
     r='["A","B","C"]'
   fi
-  printf '```json\n{"ranking":%s,"reasons":{"A":"mock"},"confidence":4}\n```\n' "$r"
+  # `MOCK_STRENGTHS` makes every judge name a portable strength for B and C,
+  # the input of the graft phase.
+  if [ -n "$MOCK_STRENGTHS" ]; then
+    printf '```json\n{"ranking":%s,"reasons":{"A":"mock"},"strengths":{"B":["mock strength of B"],"C":["mock strength of C"]},"confidence":4}\n```\n' "$r"
+  else
+    printf '```json\n{"ranking":%s,"reasons":{"A":"mock"},"confidence":4}\n```\n' "$r"
+  fi
   exit 0
 fi
 
@@ -512,6 +518,29 @@ fi
 # The gate-fix round: the failure came from `verify.gate`, not a reviewer, so
 # there is no finding id to echo back. `MOCK_GATE_FIX_NOOP` leaves the tree as
 # it is, for a fixer that cannot help.
+# The graft round (`prompt::graft`). `MOCK_GRAFT` picks the behaviour: `apply`
+# commits a small file, `huge` commits a diff far over the size limit, `fail`
+# exits non-zero, `noop` changes nothing, `dirty` leaves the work uncommitted.
+if has "# Graft the runner-up strengths"; then
+  case "$MOCK_GRAFT" in
+    fail) echo "graft failed" >&2; exit 1 ;;
+    noop) ;;
+    huge)
+      i=0; : > grafted.txt
+      while [ "$i" -lt 500 ]; do echo "line $i" >> grafted.txt; i=$((i + 1)); done
+      git add -A >/dev/null 2>&1
+      git commit -q -m "graft a lot" >/dev/null 2>&1
+      ;;
+    *)
+      echo "ported" > grafted.txt
+      git add -A >/dev/null 2>&1
+      git commit -q -m "graft a strength" >/dev/null 2>&1
+      ;;
+  esac
+  printf '{"addressed":[],"rejected":[],"notes":"graft mock"}\n'
+  exit 0
+fi
+
 if has "failed the verification gate"; then
   if [ -n "$MOCK_GATE_FIX_NOOP" ]; then
     printf '{"addressed":[],"rejected":[],"notes":"changed nothing"}\n'

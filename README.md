@@ -83,6 +83,7 @@ specific one:
 | judges (rank / deliberate / vote) | ×`judges` (default 3) | `judges` | `[graph] judges`, `deliberate_rounds` | yes |
 | reviewers | ×`reviewers` (default 3) | `reviewers` | `[graph] reviewers`, `review_rounds` | yes |
 | fixer (review loop and land loop) | ×1, only when findings block | `fixer` *(unset falls back to the winner's own seat)* | — | yes |
+| fixer (graft, between tally and review) | ×1, only with 2+ candidates and judge-named strengths in the losers | `fixer` *(same chain; unset uses a fresh seat for the winner's author)* | `[graph] graft_runner_up` on/off (default on) | yes |
 | chatter (`magi chat`, `magi bump`) | ×1 per turn | `chatter` *(unset falls back to a claude seat, else roster order)* | — | yes |
 | language_judge (PR title / body English check) | ×1 per check, only when set | `language_judge` *(optional; unset spawns nothing and the built-in heuristics decide, as they do after a failed, timed-out or unparsable call)* | `[graph] github_text_guard` | yes |
 | tally / fold / gate / merge | n/a — no agent seat | — | `[verify] gate`, `[graph] land`, `land_approval` | n/a |

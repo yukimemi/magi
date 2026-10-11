@@ -569,6 +569,10 @@ pub struct Judgement {
     /// Self-reported confidence.
     #[serde(default)]
     pub confidence: Option<u8>,
+    /// Per-label strengths this judge attributed to candidates it did not
+    /// rank first; the only input of the graft phase.
+    #[serde(default)]
+    pub strengths: BTreeMap<String, Vec<String>>,
     /// Order the candidates were presented in, as candidate indices.
     #[serde(default)]
     pub order: Vec<usize>,
@@ -820,6 +824,48 @@ pub struct RebaseFixRecord {
     /// Why the round produced nothing (agent failure, quota).
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// How the graft phase ended (see `graph::Runner::graft`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraftOutcome {
+    /// The fixer's result was kept.
+    Applied,
+    /// Started but not finished: a record in this state on load means the
+    /// process stopped mid-round and the winner is restored on resume.
+    Running,
+    /// The winner's pre-graft commit was restored, with the reason.
+    RolledBack(String),
+}
+
+impl GraftOutcome {
+    /// Is the record final, i.e. must a resume leave it alone?
+    pub fn settled(&self) -> bool {
+        !matches!(self, GraftOutcome::Running)
+    }
+}
+
+/// The graft phase's record: what ran, on which commits, and how it ended.
+/// `pre` and a `Running` outcome are saved before the fixer is called.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GraftRecord {
+    /// The winner's commit before the graft; restored on a rollback.
+    pub pre: String,
+    /// The winner's commit after an applied graft.
+    #[serde(default)]
+    pub post: Option<String>,
+    /// Changed lines (added + removed) the graft introduced, when measured.
+    #[serde(default)]
+    pub lines: Option<usize>,
+    /// The size limit that applied.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Agent that answered the round.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// How it ended.
+    pub outcome: GraftOutcome,
 }
 
 /// The fixer's response to a round.
@@ -1807,6 +1853,10 @@ pub struct RunState {
     /// each fixer call, so a resumed run spends only what is left.
     #[serde(default)]
     pub rebase_fixes: Vec<RebaseFixRecord>,
+    /// The graft phase's record, once it started or was skipped for a
+    /// reason worth keeping. `None` for a run that never reached it.
+    #[serde(default)]
+    pub graft: Option<GraftRecord>,
     /// Set at the review loop's hand-off when the last round ended with a
     /// blocking finding still open *and* a reviewer's final vote was reject
     /// (see [`ReviewRound::contested_handoff`]). `land` reads it to ask the
@@ -2078,6 +2128,7 @@ impl RunState {
             gate_ran: false,
             gate_fixes: Vec::new(),
             rebase_fixes: Vec::new(),
+            graft: None,
             contested_handoff: None,
             land_armed_head: None,
             land_approval: None,
