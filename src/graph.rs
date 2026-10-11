@@ -3490,6 +3490,25 @@ impl Runner {
             self.state.save()?;
             return Err(e);
         }
+        // An error after the `Running` record was saved may have left the
+        // fixer's work in the tree: the record must not stay unsettled
+        // (a later resume would reset past the review fixes), so confirm the
+        // restore now, or block.
+        if let Some(rec) = self.state.graft.clone()
+            && !rec.outcome.settled()
+        {
+            if let Some(winner) = self.state.winner().cloned() {
+                if let Err(re) = Self::graft_restore(&winner.worktree, &rec.pre).await {
+                    self.state.status = RunStatus::Blocked;
+                    self.state.event("graft", format!("blocked: {re:#}"));
+                    self.state.save()?;
+                    return Err(re);
+                }
+            }
+            if let Some(g) = self.state.graft.as_mut() {
+                g.outcome = GraftOutcome::RolledBack(format!("{e:#}"));
+            }
+        }
         self.state.event("graft", format!("skipped: {e:#}"));
         if let Err(e) = self.state.save() {
             tracing::warn!("save after graft: {e:#}");
@@ -3531,7 +3550,12 @@ impl Runner {
         if let Some(rec) = self.state.graft.clone()
             && !rec.outcome.settled()
         {
-            if let Some(winner) = self.state.winner().cloned() {
+            // Reviews exist only if the graft ended without its record being
+            // settled (a swallowed error): the tree has moved on since, and
+            // a reset to `pre` would discard the review fixes.
+            if self.state.reviews.is_empty()
+                && let Some(winner) = self.state.winner().cloned()
+            {
                 Self::graft_restore(&winner.worktree, &rec.pre).await?;
             }
             if let Some(g) = self.state.graft.as_mut() {

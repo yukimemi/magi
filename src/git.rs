@@ -418,6 +418,26 @@ pub async fn changed_lines(worktree: &Path, base: &str, head: &str) -> Option<us
 pub async fn restore_to(worktree: &Path, rev: &str) -> Result<()> {
     git(worktree, &["reset", "--hard", "-q", rev]).await?;
     git(worktree, &["clean", "-fdq"]).await?;
+    // The parent's reset leaves an initialised submodule's own tree alone
+    // (`submodule.recurse` defaults to false): put each back on the commit the
+    // parent records, and drop what is untracked inside. No-ops without
+    // submodules; an error is an unconfirmed restore.
+    git(
+        worktree,
+        &["submodule", "--quiet", "update", "--recursive", "--force"],
+    )
+    .await?;
+    git(
+        worktree,
+        &[
+            "submodule",
+            "--quiet",
+            "foreach",
+            "--recursive",
+            "git clean -fdq",
+        ],
+    )
+    .await?;
     Ok(())
 }
 
