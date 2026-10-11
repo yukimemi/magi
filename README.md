@@ -785,7 +785,7 @@ sessions = true
 timeout_implement = 3600
 # A re-ask that only has to restate an answer the seat already worked out gets
 # a quarter of these budgets, not the whole one again.
-worktree_root = "~/wt/magi"   # optional
+worktree_root = '{{ home() }}/wt/magi'   # optional; see path notes under [repos]
 
 [blind]
 commit_msg_hook = true
@@ -824,7 +824,10 @@ mode = "notify"          # off | notify | install
 # layer" rule as `[[agents]]` - and since which checkouts exist on disk is a
 # machine fact rather than a repository one, that layer is almost always the
 # machine config.
-roots = ["~/src/github.com"]   # scanned as <root>/<host>/<owner>/<repo>
+# The root is the directory above <host>, e.g. src above github.com.
+# These roots and worktree_root do not expand ~; use {{ home() }} instead.
+# Single quotes keep home()'s raw Windows backslashes from being TOML escapes.
+roots = ['{{ home() }}/src']   # scanned as <root>/<host>/<owner>/<repo>
 scan_ttl = 86400                # seconds a scan is trusted before re-scanning
 fetch_interval = 600            # seconds between `git fetch origin` in every checkout (0 = off)
 ```
