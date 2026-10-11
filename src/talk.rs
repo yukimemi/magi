@@ -1356,7 +1356,7 @@ pub fn queue(
     text: &str,
     attachments: Vec<Attachment>,
 ) -> Result<()> {
-    queue_keyed(talk, store, text, attachments, None).map(|_| ())
+    queue_keyed(talk, store, text, attachments, None, &|_| false).map(|_| ())
 }
 
 /// [`queue`] for a message that must be accepted at most once: `key` is
@@ -1364,7 +1364,19 @@ pub fn queue(
 /// after a crash (or a second sweep) finds the key and queues nothing.
 /// Returns whether this call queued it.
 pub fn queue_once(talk: &mut Talk, store: &Talks, text: &str, key: &str) -> Result<bool> {
-    queue_keyed(talk, store, text, Vec::new(), Some(key))
+    queue_once_matching(talk, store, text, key, &|_| false)
+}
+
+/// Accept a key once, also recognizing older equivalent keys under the same
+/// store lock as the draft write.
+pub(crate) fn queue_once_matching(
+    talk: &mut Talk,
+    store: &Talks,
+    text: &str,
+    key: &str,
+    previous: &dyn Fn(&str) -> bool,
+) -> Result<bool> {
+    queue_keyed(talk, store, text, Vec::new(), Some(key), previous)
 }
 
 fn queue_keyed(
@@ -1373,6 +1385,7 @@ fn queue_keyed(
     text: &str,
     attachments: Vec<Attachment>,
     key: Option<&str>,
+    previous: &dyn Fn(&str) -> bool,
 ) -> Result<bool> {
     let text = text.trim();
     if text.is_empty() && attachments.is_empty() {
@@ -1390,7 +1403,7 @@ fn queue_keyed(
         );
     }
     if let Some(key) = key {
-        if fresh.notified.iter().any(|k| k == key) {
+        if fresh.notified.iter().any(|k| k == key || previous(k)) {
             *talk = fresh;
             return Ok(false);
         }

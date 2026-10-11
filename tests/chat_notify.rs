@@ -97,9 +97,90 @@ async fn a_crash_between_the_talk_and_the_task_write_does_not_post_twice() {
     let key = format!("{}:{}", t.id, t.chat_notice_due().expect("due"));
     assert!(talk::queue_once(&mut talk, &w.talks, "notice", &key).expect("queue"));
     let before = drafts(&w);
-    chat_notify::sweep(&w.queue, &w.talks, w.tmp.path());
+    assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
     assert_eq!(drafts(&w), before, "the draft must not grow");
     assert!(w.queue.get(&t.id).expect("task").chat_notice.is_some());
+}
+
+#[tokio::test]
+async fn completion_stays_once_per_task_after_requeue_and_store_reload() {
+    let _home = common::home_lock().await;
+    for legacy in [false, true] {
+        for held in [false, true] {
+            let w = world();
+            let t = finished_task(&w, &w.talk_id, "run-1");
+            if legacy {
+                // Simulate an older build dying after saving only the talk.
+                let mut talk = w.talks.get(&w.talk_id).expect("talk");
+                talk::queue_once(
+                    &mut talk,
+                    &w.talks,
+                    "old completion",
+                    &format!("{}:done#1", t.id),
+                )
+                .expect("legacy notice");
+            } else {
+                assert_eq!(
+                    chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()),
+                    vec![w.talk_id.clone()]
+                );
+            }
+            w.queue
+                .modify(&t.id, |task| {
+                    task.requeue();
+                    true
+                })
+                .expect("requeue");
+            if held {
+                w.queue
+                    .modify(&t.id, |task| {
+                        task.hold_manual(Some("decision".to_owned()));
+                        true
+                    })
+                    .expect("hold");
+                assert_eq!(
+                    chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()),
+                    vec![w.talk_id.clone()],
+                    "a new hold still notifies"
+                );
+            }
+            let before = drafts(&w);
+            w.queue
+                .modify(&t.id, |task| {
+                    task.requeue();
+                    task.start("run-2".to_owned());
+                    task.succeed();
+                    true
+                })
+                .expect("finish again");
+            let queue = Queue::at(w.tmp.path().join("queue"));
+            let talks = Talks::at(w.tmp.path().join("talks"));
+            assert!(chat_notify::sweep(&queue, &talks, w.tmp.path()).is_empty());
+            assert_eq!(drafts(&w), before, "completion must not grow the draft");
+            assert_eq!(queue.get(&t.id).expect("task").chat_notice_due(), None);
+        }
+    }
+}
+
+#[tokio::test]
+async fn completion_matching_requires_the_exact_task_and_a_valid_legacy_key() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let t = finished_task(&w, &w.talk_id, "run-1");
+    let mut talk = w.talks.get(&w.talk_id).expect("talk");
+    for key in [
+        format!("{}x:done#1", t.id),
+        format!("{}:done#", t.id),
+        format!("{}:done#1extra", t.id),
+        format!("{}:held#1", t.id),
+    ] {
+        talk::queue_once(&mut talk, &w.talks, "unrelated notice", &key).expect("queue");
+    }
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()),
+        vec![w.talk_id.clone()]
+    );
+    assert!(drafts(&w).contains(magi::prompt::CHAT_TASK_NOTICE_HEADING));
 }
 
 #[tokio::test]
