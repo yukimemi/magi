@@ -1044,9 +1044,10 @@ A takeover comment preserves the link between attempts. Writes are not atomic
 with the push: a saved push lease permits a subsequent publication retry;
 an unrecorded successful push fails closed rather than guessing ownership.
 
-**Publication details.** A review-only run of a branch under `magi/` (a retry
-that reopens an earlier attempt's candidate) also publishes to the task head
-(`RunState::task_pr_branch`); a hand-named branch keeps its own head. Auto-merge
+**Publication details.** A review-only run publishes to the task head only when it
+inherited `pr_head` from an earlier attempt of the task whose work is the
+reviewed branch (`Runner::review_taking_over`); a legacy `magi/<run>/<label>`
+PR or a hand-named branch keeps its own head and adopts its own open PR. Auto-merge
 is disabled on a reused PR only when `autoMergeRequest` is set. The takeover
 comment is best effort. A run whose `pr_publication_pending` is set is resumed,
 never re-competed: `daemon::exhausted_review_budget` does not count it as spent.

@@ -2231,10 +2231,12 @@ impl RunState {
                 .iter()
                 .any(|c| c.agent == "(existing branch)")
         {
-            // A review-only run of a branch magi itself published (a retry
-            // that reopens an earlier attempt's candidate) keeps updating the
-            // task's pull request. A hand-named branch keeps its own head.
-            if !self.winner().is_some_and(|w| w.branch.starts_with("magi/")) {
+            // A review-only run continues the task's pull request only when
+            // it inherited that head from an earlier attempt (see
+            // `Runner::review_taking_over`). A legacy `magi/<run>/<label>`
+            // PR or a hand-named branch keeps its own head.
+            let inherited = self.pr_head.is_some();
+            if !inherited {
                 return None;
             }
         }
@@ -2247,6 +2249,15 @@ impl RunState {
             .status()
             .ok()
             .filter(|s| s.success())?;
+        if (self.reviewed_commits.is_some()
+            || self
+                .candidates
+                .iter()
+                .any(|c| c.agent == "(existing branch)"))
+            && self.pr_head.as_deref() != Some(branch.as_str())
+        {
+            return None;
+        }
         Some(branch)
     }
 
@@ -3219,7 +3230,7 @@ mod tests {
     }
 
     #[test]
-    fn review_run_of_a_magi_branch_keeps_the_task_public_head() {
+    fn review_run_keeps_the_task_public_head_only_when_inherited() {
         let mut run = state();
         run.origin = Some(Origin::queue("abcd-1234"));
         run.reviewed_commits = Some(Vec::new());
@@ -3258,9 +3269,12 @@ mod tests {
             met_quorum: true,
             uncontested: None,
         });
+        // A legacy candidate-branch PR: nothing inherited, keep its own head.
+        assert!(run.task_pr_branch().is_none());
+        run.pr_head = Some("magi/task-abcd-1234".to_owned());
         assert_eq!(run.task_pr_branch().as_deref(), Some("magi/task-abcd-1234"));
-        // A hand-named branch is not ours to move.
-        run.candidates[0].branch = "feat/own".to_owned();
+        // A head that is not this task's is never followed.
+        run.pr_head = Some("magi/task-other".to_owned());
         assert!(run.task_pr_branch().is_none());
     }
 

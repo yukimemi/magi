@@ -720,6 +720,20 @@ impl Runner {
             }
             return Err(e.context("applying the owner's answer about the diverged branch"));
         }
+        // An earlier attempt of this task that published the task head, and
+        // whose work is the branch under review, hands that head over: the
+        // review run updates the same pull request. Without one (a legacy
+        // `magi/<run>/<label>` PR, a hand-named branch) the branch keeps its
+        // own head and its own open pull request is adopted as before.
+        for id in takeover.earlier.iter().rev() {
+            if let Ok(old) = RunState::load_under(id, &takeover.home)
+                && let Some(head) = old.pr_head.clone()
+                && (head == branch || old.winner().is_some_and(|w| w.branch == branch))
+            {
+                state.pr_head = Some(head);
+                break;
+            }
+        }
         let opened =
             Self::open_review(&repo, branch, state, roles, max_parallel, base_commit).await;
         if opened.is_err()
