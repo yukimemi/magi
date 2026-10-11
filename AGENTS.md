@@ -630,6 +630,11 @@ candidates onto the winner. Decisions are pure and live in `src/graft.rs`.
   blocks the run. A record found `Running` on re-entry is restored to `pre` and
   becomes `RolledBack("interrupted")`; a settled record, or a run that already
   has reviews, is never grafted again.
+- **The one thing that blocks.** A rollback is settled only after the restore
+  is confirmed (`graft_restore`: `reset` succeeded and `HEAD == pre`). If it is
+  not (a stale `index.lock`, say), the record stays `Running`, the run becomes
+  `Blocked` and is resumable, and a resume retries the restore - the rejected
+  commit is never reviewed, gated or merged.
 - Everything after is unchanged: the review loop and `verify.gate` see the
   grafted tree like any other.
 

@@ -1159,7 +1159,7 @@ impl Runner {
     async fn finish_after_tally(&mut self) -> Result<()> {
         // Before the losers are folded: their branches are what the graft
         // reads from.
-        self.graft().await;
+        self.graft().await?;
         self.fold_losers().await?;
         // Before review starts, and again right before the gate: a run's
         // review rounds can themselves take long enough for the base to move
@@ -3475,12 +3475,40 @@ impl Runner {
     /// winner exactly at the commit it had before (`GraftRecord::pre`) and the
     /// run carries on as if the phase were off. See [`graft`] for the
     /// decisions and `AGENTS.md` for the invariants.
-    async fn graft(&mut self) {
-        if let Err(e) = self.graft_inner().await {
-            self.state.event("graft", format!("skipped: {e:#}"));
-            if let Err(e) = self.state.save() {
-                tracing::warn!("save after graft: {e:#}");
+    ///
+    /// The one exception is a rollback that could not be confirmed: the
+    /// rejected commit may still be the winner's tip, so the run is blocked
+    /// (resumable; the record stays `Running`, which makes a resume retry the
+    /// restore) instead of reviewing, gating and merging it.
+    async fn graft(&mut self) -> Result<()> {
+        let Err(e) = self.graft_inner().await else {
+            return Ok(());
+        };
+        if e.downcast_ref::<GraftRestoreFailed>().is_some() {
+            self.state.status = RunStatus::Blocked;
+            self.state.event("graft", format!("blocked: {e:#}"));
+            self.state.save()?;
+            return Err(e);
+        }
+        self.state.event("graft", format!("skipped: {e:#}"));
+        if let Err(e) = self.state.save() {
+            tracing::warn!("save after graft: {e:#}");
+        }
+        Ok(())
+    }
+
+    /// Put the winner back on `pre` and confirm it: a failed `reset` (a stale
+    /// `index.lock`, say) or a tip that is not `pre` afterwards is an error.
+    async fn graft_restore(wt: &Path, pre: &str) -> Result<()> {
+        let restored = git::restore_to(wt, pre).await;
+        let tip = git::rev_parse(wt, "HEAD").await;
+        match (restored, tip) {
+            (Ok(()), Ok(tip)) if tip == pre => Ok(()),
+            (Err(e), _) => Err(GraftRestoreFailed(format!("{e:#}")).into()),
+            (Ok(()), Ok(tip)) => {
+                Err(GraftRestoreFailed(format!("the winner is at {tip}, not {pre}")).into())
             }
+            (Ok(()), Err(e)) => Err(GraftRestoreFailed(format!("{e:#}")).into()),
         }
     }
 
@@ -3504,7 +3532,7 @@ impl Runner {
             && !rec.outcome.settled()
         {
             if let Some(winner) = self.state.winner().cloned() {
-                git::restore_to(&winner.worktree, &rec.pre).await?;
+                Self::graft_restore(&winner.worktree, &rec.pre).await?;
             }
             if let Some(g) = self.state.graft.as_mut() {
                 g.outcome = GraftOutcome::RolledBack(graft::INTERRUPTED.to_owned());
@@ -3661,13 +3689,12 @@ impl Runner {
                 GraftOutcome::Applied
             }
             Some(why) => {
-                let restored = git::restore_to(&wt, &pre).await;
+                // Not settled until the restore is confirmed: the record
+                // stays `Running`, so a resume retries it.
+                Self::graft_restore(&wt, &pre).await?;
                 self.state.event(
                     "graft",
-                    match restored {
-                        Ok(()) => format!("rolled back: {why}; the winner is untouched"),
-                        Err(e) => format!("rolled back: {why}; restoring the winner failed: {e:#}"),
-                    },
+                    format!("rolled back: {why}; the winner is untouched"),
                 );
                 GraftOutcome::RolledBack(why)
             }
@@ -12814,3 +12841,20 @@ mod tests {
         assert_eq!(runner.state.status, RunStatus::Failed);
     }
 }
+
+/// A graft rollback whose restore could not be confirmed (see
+/// [`Runner::graft`]).
+#[derive(Debug)]
+struct GraftRestoreFailed(String);
+
+impl std::fmt::Display for GraftRestoreFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "could not restore the winner to its pre-graft commit: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for GraftRestoreFailed {}
