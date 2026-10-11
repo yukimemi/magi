@@ -495,12 +495,18 @@ fn is_generic_identity(w: &str) -> bool {
 /// True when the text before the cursor ends with `github.com/` as the start of
 /// a URL, i.e. the cursor is on the owner segment of a GitHub URL.
 fn github_owner_slot(before: &str) -> bool {
-    let b = before.to_ascii_lowercase();
-    let Some(head) = b.strip_suffix("github.com/") else {
+    let Some(head) = strip_suffix_ci(before.as_bytes(), b"github.com/") else {
         return false;
     };
-    let head = head.strip_suffix("www.").unwrap_or(head);
-    head.ends_with("http://") || head.ends_with("https://")
+    let head = strip_suffix_ci(head, b"www.").unwrap_or(head);
+    strip_suffix_ci(head, b"http://").is_some() || strip_suffix_ci(head, b"https://").is_some()
+}
+
+fn strip_suffix_ci<'a>(s: &'a [u8], suffix: &[u8]) -> Option<&'a [u8]> {
+    let start = s.len().checked_sub(suffix.len())?;
+    s[start..]
+        .eq_ignore_ascii_case(suffix)
+        .then_some(&s[..start])
 }
 
 fn identity_word(rest: &str, id: &Identity) -> Option<(usize, &'static str)> {
@@ -623,6 +629,41 @@ mod tests {
         }
         let text = "https://github.com/alice/magi alice";
         assert_eq!(locate(text, &id()), vec![(1, "user")]);
+    }
+
+    #[test]
+    fn github_owner_slot_checks_only_ascii_url_suffixes() {
+        for before in [
+            "https://github.com/",
+            "http://github.com/",
+            "https://www.github.com/",
+            "http://www.github.com/",
+            "HTTPS://GitHub.com/",
+            "HTTP://WWW.GitHub.com/",
+            "prose éhttps://github.com/",
+        ] {
+            assert!(github_owner_slot(before), "{before}");
+        }
+        for before in [
+            "https://api.github.com/",
+            "github.com/",
+            "www.github.com/",
+            "",
+            "git",
+            "égithub.com/",
+            "éwww.github.com/",
+            "é",
+        ] {
+            assert!(!github_owner_slot(before), "{before}");
+        }
+    }
+
+    #[test]
+    fn long_body_of_short_words_passes_scrub_and_locate() {
+        let text = "a ".repeat(32768);
+        let id = Identity::default();
+        assert_eq!(scrub(&text, &id), text);
+        assert!(locate(&text, &id).is_empty());
     }
 
     #[test]
