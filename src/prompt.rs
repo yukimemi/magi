@@ -2303,8 +2303,14 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
              `--thread` and settle nothing. When you also settle, file the tasks \
              BEFORE the settle and pass `--note \"...\"` to it: the note is what the \
              owner reads under the settle, so list each task you actually filed \
-             (its id and a one-line title) and say they are held until the owner \
-             runs `magi task release <id>`. If the owner asked for follow-ups but \
+             (its id and a one-line title) and say how they are released. By \
+             default magi releases them itself once the merge is confirmed \
+             (unless `release_deputy_followups` is off, then the owner runs \
+             `magi task release <id>`), except one that \
+             stays held because it duplicates an automatic follow-up or hit the \
+             generation cap: the hold reason says so, and the owner runs \
+             `magi task release <id>` for those. Promise no particular task will \
+             be released automatically. If the owner asked for follow-ups but \
              you filed none (nothing eligible, or `magi task add` refused it as a \
              duplicate), say so in the note and give the real reason. On a resumed \
              session, run `magi task list` and report only ids that exist.\n\
