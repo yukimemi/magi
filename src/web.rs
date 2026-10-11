@@ -9345,7 +9345,7 @@ mod tests {
         {
             // Nothing refused so far took a claim, so the guard is free to take
             // and holding it is what makes the talk busy.
-            let _busy = ui.begin_talk_turn(&id).expect("claim").expect("free");
+            let guard = ui.begin_talk_turn(&id).expect("claim").expect("free");
             let busy = call("second").await.expect_err("busy talk");
             assert_eq!(busy.status, StatusCode::CONFLICT, "{}", busy.message);
             assert!(
@@ -9353,6 +9353,7 @@ mod tests {
                 "{}",
                 busy.message
             );
+            drop(guard);
         }
         assert_eq!(talks.get(&id).expect("reload").agent, "mock");
 
@@ -9419,7 +9420,7 @@ mod tests {
         {
             // Nothing refused so far took a claim, so the guard is free to take
             // and holding it is what makes the talk busy.
-            let _busy = ui.begin_talk_turn(&id).expect("claim").expect("free");
+            let guard = ui.begin_talk_turn(&id).expect("claim").expect("free");
             let busy = call(2).await.expect_err("busy talk");
             assert_eq!(busy.status, StatusCode::CONFLICT, "{}", busy.message);
             assert!(
@@ -9427,6 +9428,7 @@ mod tests {
                 "{}",
                 busy.message
             );
+            drop(guard);
         }
 
         let Json(view) = call(3).await.expect("switch");
@@ -9489,7 +9491,7 @@ mod tests {
         {
             // Nothing refused so far took a claim, so the guard is free to take
             // and holding it is what makes the talk busy.
-            let _busy = ui.begin_talk_turn(&id).expect("claim").expect("free");
+            let guard = ui.begin_talk_turn(&id).expect("claim").expect("free");
             let busy = call("rei").await.expect_err("busy talk");
             assert_eq!(busy.status, StatusCode::CONFLICT, "{}", busy.message);
             assert!(
@@ -9497,6 +9499,7 @@ mod tests {
                 "{}",
                 busy.message
             );
+            drop(guard);
         }
         assert_eq!(talks.get(&id).expect("reload").persona, "");
 
