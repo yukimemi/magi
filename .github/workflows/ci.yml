@@ -44,12 +44,14 @@ jobs:
       - run: cargo check --all-targets
 
   test:
+    # Windows is split into `test-windows-unit` + `test-windows-shard` and
+    # reported under the same required name by `test-windows` below.
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
@@ -81,6 +83,73 @@ jobs:
       - run: cargo nextest run --profile ci --test '*'
       - if: ${{ hashFiles('src/lib.rs') != '' }}
         run: cargo test --doc
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.os }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+
+  test-windows-unit:
+    name: test windows unit
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          key: windows-unit
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+        continue-on-error: true
+      - run: cargo test --lib --bins
+      - if: ${{ hashFiles('src/lib.rs') != '' }}
+        run: cargo test --doc
+
+  test-windows-shard:
+    # The integration binaries are CPU-bound on a 4-vCPU Windows runner (the
+    # summed test time is ~3.8x the wall time), so they are spread over
+    # runners with `--partition`. Each shard recompiles them. When changing
+    # the shard count, change the `--partition` denominator, the job name and
+    # the matrix together.
+    name: test windows shard ${{ matrix.shard }}/3
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2.9.2
+        with:
+          # Identical contents in every shard: share one key, and let one
+          # shard save it so they do not race.
+          key: windows-shard
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 1 }}
+        continue-on-error: true
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: cargo nextest run --profile ci --test '*' --partition count:${{ matrix.shard }}/3
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-windows-${{ matrix.shard }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+
+  test-windows:
+    # The required status check `test (windows-latest)`. It must fail when any
+    # part failed or was skipped: `needs` alone would leave a skipped job
+    # looking green.
+    name: test (windows-latest)
+    runs-on: ubuntu-latest
+    needs: [test-windows-unit, test-windows-shard]
+    if: always()
+    steps:
+      - run: |
+          echo "unit=${{ needs.test-windows-unit.result }} shards=${{ needs.test-windows-shard.result }}"
+          [ "${{ needs.test-windows-unit.result }}" = success ] && [ "${{ needs.test-windows-shard.result }}" = success ]
 
   fmt:
     name: rustfmt

@@ -1211,6 +1211,21 @@ timeout_minutes = 30                # per command
   commands) and `release_watch` (fake forge) for the flow; `config` for the
   keys and defaults.
 
+### The Windows `test` check is an aggregate over sharded jobs
+
+The required check `test (windows-latest)` is not a matrix entry: it is the
+`test-windows` job (ubuntu, `if: always()`) that fails unless `test-windows-unit`
+(`cargo test --lib --bins` + `--doc`) and every `test-windows-shard` succeeded.
+Integration binaries run with `cargo nextest run --partition count:N/3`, because
+the Windows runner is CPU-bound (summed test time ~3.8x wall time). Changing the
+shard count means changing the matrix, the job name and the `--partition`
+denominator together; the aggregate needs no edit, and its name must stay exactly
+`test (windows-latest)` or the branch protection waits forever. Do not raise
+`test-threads` or the nextest group caps to compensate: contention shows up as
+node-timeout flakes. Each shard recompiles the integration binaries (~100 s), so
+more shards give diminishing returns; the three ~80 s `graph_seat_handover*`
+tests are a floor per shard.
+
 ### Chat personas are a tone, never a behaviour
 
 `src/persona.rs` holds the built-ins (`default`, `magi`, `rei`, `misato`,
