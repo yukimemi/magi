@@ -3531,7 +3531,7 @@ mod tests {
         let talk = open(&Preferred {
             agent: Some("second".into()),
             persona: Some("rei".into()),
-            implementers: Some(i64::from(check_implementers(3, &cfg).map_or(1, |n| n))),
+            implementers: Some(i64::from(check_implementers(3, &cfg).unwrap_or(1))),
         });
         assert_eq!(talk.agent, "second");
         assert!(
