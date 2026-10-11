@@ -259,6 +259,10 @@ pub struct Roles {
     /// Accepts one id or an ordered array of ids: a fallback chain, see
     /// [`AgentChoice`].
     pub chatter: Option<AgentChoice>,
+    /// Agent that judges duplicate-work claims in [`crate::dupes`].
+    /// Unset inherits [`Self::chatter`], including its default agent selection.
+    /// Accepts a string or an ordered fallback chain, like [`Self::chatter`].
+    pub dupes_judge: Option<AgentChoice>,
     /// Agent that arranges the queue between polls: `crate::conduct`'s single
     /// seat, called once per cycle to decide a runnable task's `blocked_by`
     /// and how a stalled or finished task recovers.
@@ -2120,6 +2124,7 @@ impl Config {
              # synthesizer = \"opus\"  # blends the advisors into one brief; unset picks a seat like chatter does\n\
              # synthesizer = [\"opus\", \"codex\"]  # array form: fallback chain, each tried once on quota or failure\n\
              # language_judge = \"jev\"  # kind = \"command\" wrapper deciding if PR text is English; unset keeps the built-in heuristics\n\
+             # dupes_judge = \"opus\"  # judges duplicate-work claims; unset inherits chatter (string or fallback chain)\n\
              # fixer = \"opus\"  # applies review findings; unset keeps the winner's own author\n\
              # fixer = [\"opus\", \"codex\"]  # array form: fallback chain, each tried once on quota or failure\n\n\
              [graph]\n\
@@ -2874,6 +2879,36 @@ mod tests {
             "string stays a string: {text}"
         );
         assert!(toml::from_str::<Roles>("synthesizer = 3").is_err());
+    }
+
+    #[test]
+    fn dupes_judge_role_accepts_strings_and_chains_and_round_trips() {
+        for (text, ids) in [
+            (r#"dupes_judge = "dedicated""#, vec!["dedicated"]),
+            (
+                r#"dupes_judge = ["first", "second"]"#,
+                vec!["first", "second"],
+            ),
+            ("dupes_judge = []", vec![]),
+        ] {
+            let roles: Roles = toml::from_str(text).unwrap();
+            assert_eq!(roles.dupes_judge.as_ref().unwrap().ids(), ids);
+            let serialized = toml::to_string(&roles).unwrap();
+            let back: Roles = toml::from_str(&serialized).unwrap();
+            assert_eq!(back.dupes_judge, roles.dupes_judge);
+            assert!(serialized.contains(text));
+        }
+        assert!(toml::from_str::<Roles>("dupes_judge = 3").is_err());
+        assert!(Roles::default().dupes_judge.is_none());
+        assert!(Config::starter_toml().contains("# dupes_judge ="));
+
+        // Standalone roles are resolved lazily, just like chatter.
+        let mut cfg = Config {
+            agents: vec![spec("a")],
+            ..Config::default()
+        };
+        cfg.roles.dupes_judge = Some("missing".into());
+        assert!(cfg.resolve_roles().is_ok());
     }
 
     #[test]

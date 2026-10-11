@@ -210,7 +210,8 @@ fn parse_judgement(text: &str) -> Result<(bool, String)> {
     Ok((raw.duplicate, reason.chars().take(300).collect()))
 }
 
-/// Ask the `[roles] chatter` chain (or the default agent) once. Each agent is
+/// Ask the `[roles] dupes_judge` chain, or inherit `chatter` when unset.
+/// With neither role set, use the default agent. Each agent is
 /// tried at most once, with a fresh seat; only an error, quota or unusable
 /// answer moves on. A usable answer that does not parse ends the chain.
 pub async fn chain_judge(
@@ -221,9 +222,12 @@ pub async fn chain_judge(
 ) -> Result<Judgement> {
     let chain = agent::pick_chain(
         &cfg.agents,
-        cfg.roles.chatter.as_ref(),
+        cfg.roles
+            .dupes_judge
+            .as_ref()
+            .or(cfg.roles.chatter.as_ref()),
         &agent::installed,
-        "dupes judge",
+        "dupes_judge",
     )?;
     let claims: Vec<(String, String)> = hits
         .iter()
@@ -337,7 +341,7 @@ pub async fn screen(
     }
 }
 
-/// [`screen`] with the production judge: the `[roles] chatter` chain of `cfg`.
+/// [`screen`] with the production judge: `dupes_judge`, inheriting `chatter` when unset.
 /// No config (`None`) means no judge, so a hit is let through unjudged.
 pub async fn screen_with_config(
     hits: Vec<Hit>,
@@ -1076,6 +1080,134 @@ fn short_sha(sha: &str) -> String {
 mod tests {
     use super::*;
     use crate::queue::{Source, Task};
+
+    #[cfg(unix)]
+    fn judge_agent(id: &str, fails: bool) -> crate::config::AgentSpec {
+        crate::config::AgentSpec {
+            id: id.to_owned(),
+            kind: crate::config::AgentKind::Command,
+            model: None,
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "echo {id} >> calls; {}",
+                    if fails {
+                        "exit 1"
+                    } else {
+                        r#"printf '%s' '{"duplicate":false,"reason":"different work"}'"#
+                    }
+                ),
+            ],
+            extra_args: Vec::new(),
+            env: Default::default(),
+            prompt_delivery: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn judge_config() -> Config {
+        let mut cfg = Config {
+            agents: vec![
+                judge_agent("chat", false),
+                judge_agent("dedicated", false),
+                judge_agent("failed", true),
+            ],
+            ..Config::default()
+        };
+        cfg.roles.chatter = Some("chat".into());
+        cfg
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dupes_judge_overrides_chatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = judge_config();
+        cfg.roles.dupes_judge = Some("dedicated".into());
+        let verdict = chain_judge(&cfg, dir.path(), "task".into(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(verdict.agent, "dedicated");
+        assert!(!verdict.duplicate);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "dedicated\n"
+        );
+        assert_eq!(cfg.roles.chatter.as_ref().unwrap().ids(), ["chat"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dupes_judge_unset_inherits_chatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = judge_config();
+        let verdict = chain_judge(&cfg, dir.path(), "task".into(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(verdict.agent, "chat");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "chat\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dupes_judge_dedicated_and_inherited_chains_advance_on_failure() {
+        for dedicated in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = judge_config();
+            let chain =
+                crate::config::AgentChoice::Chain(vec!["failed".into(), "dedicated".into()]);
+            if dedicated {
+                cfg.roles.dupes_judge = Some(chain);
+            } else {
+                cfg.roles.chatter = Some(chain);
+            }
+            let verdict = chain_judge(&cfg, dir.path(), "task".into(), vec![])
+                .await
+                .unwrap();
+            assert_eq!(verdict.agent, "dedicated");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+                "failed\ndedicated\n"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dupes_judge_unavailable_choice_does_not_inherit_chatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = judge_config();
+        cfg.roles.dupes_judge = Some("missing".into());
+        let err = chain_judge(&cfg, dir.path(), "task".into(), vec![])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("[roles] dupes_judge"), "{err}");
+        assert!(!dir.path().join("calls").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dupes_judge_empty_choice_uses_default_instead_of_chatter() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = judge_config();
+        cfg.roles.chatter = Some("dedicated".into());
+        cfg.roles.dupes_judge = Some(crate::config::AgentChoice::Chain(vec![]));
+        let verdict = chain_judge(&cfg, dir.path(), "task".into(), vec![])
+            .await
+            .unwrap();
+        assert_eq!(
+            verdict.agent, "chat",
+            "the first roster agent is the default"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("calls")).unwrap(),
+            "chat\n"
+        );
+    }
 
     struct Fx {
         _tmp: tempfile::TempDir,
