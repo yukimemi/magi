@@ -892,6 +892,27 @@ pub async fn push(repo: &Path, remote: &str, branch: &str) -> Result<GitOut> {
     git_raw(repo, &["push", "-u", remote, branch]).await
 }
 
+/// Push a local branch to a separate public head with an explicit lease.
+/// An empty expected SHA requires the remote branch to be absent.
+pub async fn push_as(
+    repo: &Path,
+    remote: &str,
+    local: &str,
+    head: &str,
+    expected: &str,
+) -> Result<GitOut> {
+    let lease = format!("--force-with-lease=refs/heads/{head}:{expected}");
+    let refspec = format!("refs/heads/{local}:refs/heads/{head}");
+    git_raw(repo, &["push", &lease, remote, &refspec]).await
+}
+
+/// Read a remote head without moving a tracking ref. Unreadable is an error.
+pub async fn remote_head(repo: &Path, remote: &str, branch: &str) -> Result<Option<String>> {
+    let reference = format!("refs/heads/{branch}");
+    let out = git(repo, &["ls-remote", "--refs", remote, &reference]).await?;
+    Ok(out.split_whitespace().next().map(str::to_owned))
+}
+
 /// Force-push a branch that has been rewritten, refusing to clobber work
 /// pushed since this side last looked.
 ///

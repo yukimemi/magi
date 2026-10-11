@@ -2919,8 +2919,10 @@ where
             let live =
                 state.liveness_with(claimed.contains(&state.id), &mut status_q, &mut identity_q);
             let mut row = RunSummary::of(&state, waiting, live);
-            row.superseded_by = superseded
-                .get(&state.id)
+            row.superseded_by = state
+                .pr_taken_over_by
+                .as_ref()
+                .or_else(|| superseded.get(&state.id))
                 .map(String::as_str)
                 .map(crate::run::short_of)
                 .map(str::to_owned);
@@ -3339,9 +3341,10 @@ async fn run_detail(
         let state = read_run(&ui.runs, &id)?;
         let daemon_claims = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
         let live = state.liveness(daemon_claims);
-        let superseded_by = ui
-            .queue
-            .superseded_by(&id)
+        let superseded_by = state
+            .pr_taken_over_by
+            .clone()
+            .or_else(|| ui.queue.superseded_by(&id))
             .as_deref()
             .map(crate::run::short_of)
             .map(str::to_owned);
@@ -3616,10 +3619,13 @@ async fn run_resume(
         })
         .await?
     };
-    if let Some(to) = &state.released_to {
+    if let Some(to) = state
+        .pr_taken_over_by
+        .as_ref()
+        .or(state.released_to.as_ref())
+    {
         return Err(ApiError::conflict(format!(
-            "run {} can no longer be resumed: its worktree was released to run {}, which \
-             took the branch over.",
+            "run {} can no longer be resumed: its pull request or worktree ownership moved to run {}.",
             state.short(),
             crate::run::short_of(to)
         )));

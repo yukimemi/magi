@@ -2186,7 +2186,7 @@ pub async fn find_external_merge(state: &RunState) -> Result<Option<ExternalMerg
     let Some(winner) = state.winner() else {
         return Ok(None);
     };
-    let branch = winner.branch.clone();
+    let branch = state.pr_branch().unwrap_or(&winner.branch).to_owned();
     let out = gh(
         &state.repo,
         &[
@@ -2448,8 +2448,8 @@ fn names_same_pr(a: &RunState, url: &str, number: u64, repo: &Path) -> bool {
 /// Rewrite `pr.state` to a final state on every run record under `home` that
 /// `decide` picks, and report how many were rewritten.
 ///
-/// This is the one place a run other than the driver changes another run's
-/// record, so it is deliberately narrow: only a **terminal** run (never one a
+/// Lifecycle writes through to other runs are deliberately narrow (task-head
+/// ownership is recorded separately): only a **terminal** run (never one a
 /// driver may still be writing), never one a live daemon claims, only a record
 /// whose `pr.state` is still `open`, and only `merged` / `closed` ever goes in.
 /// The record is read as folding reads it (no schema check: every bump so far
@@ -3142,6 +3142,7 @@ async fn stop_disarmed<F: Forge>(
 }
 
 async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> Result<PrState> {
+    crate::pr_head::ensure_owner(state)?;
     let repo = state.repo.clone();
     let budget = state.config.graph.land_rounds;
     let mut round = 0usize;
@@ -3154,10 +3155,8 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
     // recorded decision, not an open question, and re-feeding it would loop the
     // budget away on a comment the fixer already declined with an argument.
     let mut shown: BTreeSet<String> = BTreeSet::new();
-    // The head a fix round pushed, until the pull request is seen on it. Memory
-    // only: a resume after a crash between the push and the next look can read
-    // the old head's green once more, and a refused merge then waits it out.
-    let mut awaiting_head: Option<String> = None;
+    // Await the last successfully published head, including across resumes.
+    let mut awaiting_head: Option<String> = state.pr_pushed_head.clone();
     // Whether a settled-checks refusal has already been given its one re-look.
     let mut rechecked = false;
 
@@ -3597,9 +3596,10 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 // Onto the base as the *remote* has it: the local ref may be
                 // behind, and rebasing onto a stale base produces a branch
                 // that conflicts all over again.
-                git::fetch(&repo, "origin", &base).await.ok();
+                let remote = state.config.merge.remote.clone();
+                git::fetch(&repo, &remote, &base).await.ok();
                 let scratch = state.dir().join("rebase");
-                let onto = format!("origin/{base}");
+                let onto = format!("{remote}/{base}");
                 let rebased =
                     match crate::rebase::rebase_with_fixer(state, &scratch, &branch, &onto).await {
                         Ok(crate::rebase::Rebased::Applied) => Ok(None),
@@ -3611,7 +3611,27 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                         let pushed = {
                             let merge_lock = repo_merge_lock(&repo);
                             let _merge_slot = merge_lock.lock().await;
-                            git::push_rewritten(&repo, "origin", &branch).await?
+                            if let Some(head) = &state.pr_head {
+                                git::push_as(
+                                    &repo,
+                                    &state.config.merge.remote,
+                                    &branch,
+                                    head,
+                                    state
+                                        .pr_pushed_head
+                                        .as_deref()
+                                        .context("missing public head lease")?,
+                                )
+                                .await?
+                            } else {
+                                git::push_pinned(
+                                    &repo,
+                                    &state.config.merge.remote,
+                                    &branch,
+                                    &seen.head,
+                                )
+                                .await?
+                            }
                         };
                         if !pushed.ok() {
                             let why = format!(
@@ -3636,6 +3656,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                                 }
                             };
                         crate::graph::refresh_reviewed_commits(state, &branch).await;
+                        state.pr_pushed_head = Some(head.clone());
                         awaiting_head = Some(head);
                         rechecked = false;
                         state.event("land", format!("rebased {branch} onto {base}"));
@@ -3682,6 +3703,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                     Fixed::Committed { head } => {
                         // Whatever the next look shows may still be the
                         // previous head; see `awaiting_new_head`.
+                        state.pr_pushed_head = Some(head.clone());
                         awaiting_head = Some(head);
                         rechecked = false;
                         waited = Duration::ZERO;
@@ -4027,17 +4049,35 @@ pub async fn fix_round(
     }
 
     let remote = state.config.merge.remote.clone();
-    let push = git::push(&winner.worktree, &remote, &winner.branch).await?;
+    let public_head = state.pr_branch().unwrap_or(&winner.branch).to_owned();
+    let push = if state.pr_head.is_some() {
+        let expected = state
+            .pr_pushed_head
+            .as_deref()
+            .context("missing public head lease")?;
+        git::push_as(
+            &winner.worktree,
+            &remote,
+            &winner.branch,
+            &public_head,
+            expected,
+        )
+        .await?
+    } else {
+        git::push(&winner.worktree, &remote, &winner.branch).await?
+    };
     if !push.ok() {
         return Ok(Fixed::Failed(format!(
             "pushing {} to {remote} failed: {}",
-            winner.branch, push.stderr
+            public_head, push.stderr
         )));
     }
     state.event(
         "land",
-        format!("round {round}: pushed a fix to {}", winner.branch),
+        format!("round {round}: pushed a fix to {public_head}"),
     );
+    state.pr_pushed_head = Some(after.clone());
+    state.save()?;
     Ok(Fixed::Committed { head: after })
 }
 
@@ -6635,6 +6675,41 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             .await
             .ok();
         assert_ne!(state.status, RunStatus::Merged);
+    }
+
+    #[tokio::test]
+    async fn a_task_public_head_is_awaited_on_land_entry() {
+        let mut state = landing_state();
+        state.pr_head = Some("magi/task-abcd-1234".into());
+        state.pr_pushed_head = Some("new".into());
+        let forge = Scripted::new(
+            vec![
+                seen("old", Checks::Green, "CLEAN", false),
+                seen("new", Checks::Green, "CLEAN", false),
+            ],
+            vec![(true, "")],
+        );
+        land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
+            .await
+            .unwrap();
+        assert_eq!(
+            forge.calls(),
+            ["view", "poll", "view", "view", "merge", "view"]
+        );
+        assert_eq!(state.status, RunStatus::Merged);
+    }
+
+    #[tokio::test]
+    async fn a_superseded_public_head_owner_cannot_reenter_land() {
+        let mut state = landing_state();
+        state.pr_taken_over_by = Some("next".into());
+        let forge = Scripted::new(vec![seen("a", Checks::Green, "CLEAN", false)], vec![]);
+        assert!(
+            land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
+                .await
+                .is_err()
+        );
+        assert!(forge.calls().is_empty());
     }
 
     #[tokio::test]

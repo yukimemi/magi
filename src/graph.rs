@@ -362,7 +362,7 @@ async fn leaked_subjects(state: &RunState, branch: &str) -> Option<Vec<String>> 
 /// May an adopted pull request's title be replaced with `computed`? Only when
 /// it is empty, magi's own shape, or a base commit's subject that leaked in;
 /// a title a person wrote stays. Never when `computed` is itself a leak.
-fn should_retitle(current: &str, computed: &str, leaked: &[String]) -> bool {
+pub(crate) fn should_retitle(current: &str, computed: &str, leaked: &[String]) -> bool {
     let is_leak = |t: &str| leaked.iter().any(|l| l.trim() == t.trim());
     if is_leak(computed) {
         return false;
@@ -908,6 +908,7 @@ impl Runner {
     /// Blocked / Stalled / Failed, or died with an error, is announced to the
     /// notification centre. Best-effort: see [`crate::notices::raise`].
     pub async fn execute(&mut self) -> Result<()> {
+        crate::pr_head::ensure_owner(&self.state)?;
         let result = self.execute_graph().await;
         self.mark_driver_exited();
         let ended = if result.is_err() {
@@ -3966,7 +3967,9 @@ impl Runner {
         // that never reached the remote): anything else is somebody else's work.
         let branch_tracking = format!("{remote}/{}", winner.branch);
         let fetched_branch = git::fetch(&repo, &remote, &winner.branch).await;
-        let remote_tip = if matches!(&fetched_branch, Ok(o) if o.ok()) {
+        let remote_tip = if self.state.task_pr_branch().is_none()
+            && matches!(&fetched_branch, Ok(o) if o.ok())
+        {
             git::rev_parse(&repo, &branch_tracking).await.ok()
         } else {
             None
@@ -4097,6 +4100,11 @@ impl Runner {
     /// (no remote copy, the same tip, or a remote copy this branch already
     /// contains, which the PR-time push fast-forwards) or the push succeeded.
     async fn publish_resumed_rebase(&mut self, branch: &str, head: &str) -> Option<String> {
+        // Task competitions publish only after the PR text gate, to their
+        // public head; never resurrect a candidate branch on the remote.
+        if self.state.task_pr_branch().is_some() {
+            return None;
+        }
         let repo = self.state.repo.clone();
         let remote = self.state.config.merge.remote.clone();
         let fetched = git::fetch(&repo, &remote, branch).await;
@@ -4172,9 +4180,10 @@ impl Runner {
             }
         };
         let mut verified = vec![head.to_owned()];
-        let fetched = git::fetch(&repo, &remote, branch).await;
+        let public_branch = self.state.pr_branch().unwrap_or(branch).to_owned();
+        let fetched = git::fetch(&repo, &remote, &public_branch).await;
         if matches!(&fetched, Ok(o) if o.ok())
-            && let Ok(theirs) = git::rev_parse(&repo, &format!("{remote}/{branch}")).await
+            && let Ok(theirs) = git::rev_parse(&repo, &format!("{remote}/{public_branch}")).await
             && theirs != head
         {
             match crate::already::classify(&repo, tip, &theirs, Some(&start)).await {
@@ -4190,7 +4199,8 @@ impl Runner {
             evidence.proof.as_str()
         );
         let closed =
-            crate::land::close_superseded_pr(&mut self.state, branch, &evidence, &verified).await;
+            crate::land::close_superseded_pr(&mut self.state, &public_branch, &evidence, &verified)
+                .await;
         match closed {
             Ok(Ok(url)) => self
                 .state
@@ -6785,7 +6795,7 @@ impl Runner {
         // open a second pull request. `self.state.merge` is set exactly once
         // this node (or `land`) has already produced a verdict, under every
         // mode, which is what "already done" actually means here.
-        if self.state.merge.is_some() {
+        if self.state.merge.is_some() && !self.state.pr_publication_pending {
             return Ok(());
         }
         let Some(winner) = self.state.winner().cloned() else {
@@ -6880,6 +6890,22 @@ impl Runner {
                         detail: if out.ok() { out.stdout } else { out.stderr },
                         empty: false,
                     }
+                }
+            }
+            MergeMode::Pr if self.state.task_pr_branch().is_some() => {
+                self.state.pr_publication_pending = true;
+                self.state.save()?;
+                let out =
+                    crate::pr_head::publish(&mut self.state, &winner, &pr.title, &pr.body).await;
+                self.state.pr_publication_pending = out.is_err();
+                MergeOutcome {
+                    mode,
+                    ok: out.is_ok(),
+                    detail: match out {
+                        Ok(url) => url,
+                        Err(e) => format!("{e:#}"),
+                    },
+                    empty: false,
                 }
             }
             MergeMode::Pr => {
@@ -7013,6 +7039,7 @@ impl Runner {
     /// in the same repository, which is exactly the "must not wait on
     /// another task" property the daemon's slot-freeing exists to give.
     async fn run_land(&mut self) -> Result<()> {
+        crate::pr_head::ensure_owner(&self.state)?;
         let url = self
             .state
             .merge
@@ -9266,7 +9293,7 @@ fn pr_merge_plan(found: Result<land::OpenPr>) -> PrPlan {
 }
 
 /// `gh pr create`, returning the PR url.
-async fn gh_pr_create(
+pub(crate) async fn gh_pr_create(
     cwd: &Path,
     base: &str,
     head: &str,

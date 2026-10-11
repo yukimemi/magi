@@ -1420,8 +1420,10 @@ async fn dispatch(command: Command) -> Result<()> {
                     jiff::Timestamp::now(),
                 );
                 let live = state.liveness(daemon_claims);
-                let superseded_by = Queue::at(magi::run::home().join("queue"))
-                    .superseded_by(&id)
+                let superseded_by = state
+                    .pr_taken_over_by
+                    .clone()
+                    .or_else(|| Queue::at(magi::run::home().join("queue")).superseded_by(&id))
                     .as_deref()
                     .map(magi::run::short_of)
                     .map(str::to_owned);

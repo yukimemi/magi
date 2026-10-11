@@ -1808,6 +1808,21 @@ pub struct RunState {
     /// run sharing this repository has released its own reference too.
     #[serde(default)]
     pub enabled_worktree_config: bool,
+    /// Public pull request head, separate from competition branches.
+    #[serde(default)]
+    pub pr_head: Option<String>,
+    /// Last head successfully pushed by this run; never an observed remote tip.
+    #[serde(default)]
+    pub pr_pushed_head: Option<String>,
+    /// Last title posted by this run, used to preserve human title edits.
+    #[serde(default)]
+    pub pr_posted_title: Option<String>,
+    /// Publication has not completed; resume retries it without competing again.
+    #[serde(default)]
+    pub pr_publication_pending: bool,
+    /// Successor that owns this run's pull request; this record is historical.
+    #[serde(default)]
+    pub pr_taken_over_by: Option<String>,
     /// Candidates.
     #[serde(default)]
     pub candidates: Vec<Candidate>,
@@ -2134,6 +2149,11 @@ impl RunState {
             seed,
             config,
             enabled_worktree_config: false,
+            pr_head: None,
+            pr_pushed_head: None,
+            pr_posted_title: None,
+            pr_publication_pending: false,
+            pr_taken_over_by: None,
             candidates: Vec::new(),
             judgements: Vec::new(),
             judge_skipped: false,
@@ -2200,6 +2220,36 @@ impl RunState {
     /// Branch name for a label.
     pub fn branch_for(&self, label: char) -> String {
         format!("magi/{}/{}", self.short(), label)
+    }
+
+    /// Public head for a queue competition. Review-only and standalone runs
+    /// keep their existing branch. Invalid task ids cannot become git refs.
+    pub fn task_pr_branch(&self) -> Option<String> {
+        if self.reviewed_commits.is_some()
+            || self
+                .candidates
+                .iter()
+                .any(|c| c.agent == "(existing branch)")
+        {
+            return None;
+        }
+        let task = self.origin.as_ref()?.task.as_ref()?;
+        let branch = format!("magi/task-{task}");
+        std::process::Command::new("git")
+            .args(["check-ref-format", "--branch", &branch])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .ok()
+            .filter(|s| s.success())?;
+        Some(branch)
+    }
+
+    /// Recorded public head, falling back to the winner for older runs.
+    pub fn pr_branch(&self) -> Option<&str> {
+        self.pr_head
+            .as_deref()
+            .or_else(|| self.winner().map(|w| w.branch.as_str()))
     }
 
     /// Root of this run's worktrees.
@@ -3145,6 +3195,22 @@ mod tests {
             "add retries".to_owned(),
             Config::default(),
         )
+    }
+
+    #[test]
+    fn task_public_head_contains_only_the_task_identity() {
+        let mut run = state();
+        run.origin = Some(Origin::queue("abcd-1234"));
+        assert_eq!(run.task_pr_branch().as_deref(), Some("magi/task-abcd-1234"));
+        assert_ne!(run.task_pr_branch().unwrap(), run.branch_for('A'));
+        run.origin = Some(Origin::queue("bad..task"));
+        assert!(run.task_pr_branch().is_none());
+        run.origin = Some(Origin::queue("abcd-1234"));
+        run.reviewed_commits = Some(Vec::new());
+        assert!(run.task_pr_branch().is_none());
+        run.reviewed_commits = None;
+        run.origin = Some(Origin::operator());
+        assert!(run.task_pr_branch().is_none());
     }
 
     #[test]
