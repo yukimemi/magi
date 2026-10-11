@@ -12,6 +12,8 @@
 //! relative paths, URLs, `std::io::Error`, `v1.2.3` and `@handle` all pass.
 //! Dotted IPv4-shaped section references after `§`, `section`, `sec.` or
 //! `clause` also pass; the exception never applies to IPv6.
+//! A few conventional public system paths also pass the absolute-path rule;
+//! configured homes and known identity words within them are still scrubbed.
 
 /// The local facts worth hiding. `Default` is "nothing known", which leaves only
 /// the pattern-based rules.
@@ -397,9 +399,42 @@ fn absolute_path(rest: &str, prev: Option<char>) -> Option<(usize, &'static str)
         let n = run(rest, |c| {
             !c.is_whitespace() && !matches!(c, '`' | '"' | '\'' | '<' | '>')
         });
+        if unix && public_system_path(&rest[..n]) {
+            return None;
+        }
         return Some((n, "[redacted-path]"));
     }
     None
+}
+
+fn public_system_path(path: &str) -> bool {
+    // These fixed prefixes have no account, host, checkout or mount-name slot:
+    // /etc/hosts is the standard host table; /usr/local/bin holds commands;
+    // direct /var/log children are system logs; /var/run/<service>/<file>.sock
+    // names a service socket. Arbitrary leaf/service names cannot be guaranteed
+    // anonymous: returning None from absolute_path keeps the other identity
+    // rules scanning them, and home_path has already had priority.
+    // Keep the original consumption boundary for redaction; only the allow
+    // check ignores prose punctuation. Never normalize traversal or extra levels.
+    let path = path.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']']);
+    let components: Vec<_> = path.split('/').collect();
+    if components.iter().skip(1).any(|part| {
+        part.is_empty()
+            || matches!(*part, "." | "..")
+            || !part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    }) {
+        return false;
+    }
+    match components.as_slice() {
+        ["", "etc", "hosts"] | ["", "usr", "local", "bin"] => true,
+        ["", "usr", "local", "bin", _] | ["", "var", "log", _] => true,
+        ["", "var", "run", _, file] => file
+            .strip_suffix(".sock")
+            .is_some_and(|name| !name.is_empty() && !matches!(name, "." | "..")),
+        _ => false,
+    }
 }
 
 fn email(rest: &str) -> Option<(usize, &'static str)> {
@@ -609,6 +644,137 @@ mod tests {
         assert_eq!(s("at C:/Users/Bob/proj"), "at ~/proj");
         assert_eq!(s("/root/x and /root."), "~/x and ~.");
         assert_eq!(s("/srv/people/alice/wt/a"), "~/wt/a");
+    }
+
+    #[test]
+    fn public_system_paths_pass_scrub_and_locate() {
+        for path in [
+            "/run/kanade/agent.sock",
+            "/var/run/kanade/agent.sock",
+            "/etc/hosts",
+            "/usr/local/bin",
+            "/usr/local/bin/foo",
+            "/var/log/syslog",
+        ] {
+            for text in [
+                path.to_owned(),
+                format!("uses `{path}` on this platform"),
+                format!("uses \"{path}\" on this platform"),
+                format!("See ({path}), then {path}."),
+            ] {
+                assert_eq!(s(&text), text, "{text}");
+                assert!(locate(&text, &id()).is_empty(), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn private_paths_and_non_public_shapes_still_redact() {
+        let identity = Identity::default();
+        for path in [
+            "/Volumes/disk-name/project",
+            "/Volumes/disk name/project",
+            "/srv/people/alice/wt/a",
+            "/tmp/checkout/build",
+            "/private/var/folders/ab/account/build",
+            "/var/folders/ab/account/build",
+            "/mnt/disk/project",
+            "/usr/home/bob/project",
+            "/opt/checkout/build",
+            "/etc/hosts/private",
+            "/etc/hostname",
+            "/etc/hosts-backup",
+            "/usr/local/bin/foo/private",
+            "/usr/local/bin/../private",
+            "/usr/local/bin/..",
+            "/usr/local/bin/./foo",
+            "/usr/local/bin//foo",
+            "/usr/local/bin/foo/",
+            "/var/log/../private",
+            "/var/log/service/private",
+            "/var/run/agent.sock",
+            "/var/run/service/agent.pid",
+            "/var/run/service/.sock",
+            "/var/run/../agent.sock",
+            "/var/run/service/../agent.sock",
+            "/var/run//agent.sock",
+            r"/var/log/foo\private",
+            r"C:\build\checkout",
+        ] {
+            assert!(
+                scrub(path, &identity).starts_with("[redacted-path]"),
+                "{path}"
+            );
+            assert_eq!(locate(path, &identity), vec![(1, "path")], "{path}");
+        }
+        for (text, expected) in [
+            ("/Users/bob/src/x", "~/src/x"),
+            ("/home/bob/.config", "~/.config"),
+            ("C:/Users/Bob/proj", "~/proj"),
+            (r"C:\Users\Bob\proj", r"~\proj"),
+            ("/srv/people/alice/wt/a", "~/wt/a"),
+        ] {
+            assert_eq!(s(text), expected, "{text}");
+            assert_eq!(locate(text, &id()), vec![(1, "home-path")], "{text}");
+        }
+        // The existing whitespace consumption boundary stays unchanged.
+        assert_eq!(
+            scrub("/Volumes/disk name/project", &identity),
+            "[redacted-path] name/project"
+        );
+        for text in [
+            "/unknown/checkout/build",
+            "/api/v1/runs",
+            "/run/service/agent.sock",
+        ] {
+            assert_eq!(scrub(text, &identity), text);
+            assert!(locate(text, &identity).is_empty());
+        }
+    }
+
+    #[test]
+    fn public_paths_keep_home_and_identity_rules_and_do_not_rescan() {
+        let identity = Identity {
+            home: "/usr/local/bin".into(),
+            ..id()
+        };
+        assert_eq!(scrub("/usr/local/bin/foo", &identity), "~/foo");
+        assert_eq!(
+            locate("/usr/local/bin/foo", &identity),
+            vec![(1, "home-path")]
+        );
+        for (text, expected, kind) in [
+            (
+                "/usr/local/bin/alice",
+                "/usr/local/bin/[redacted-user]",
+                "user",
+            ),
+            (
+                "/var/log/buildbox.log",
+                "/var/log/[redacted-host].log",
+                "host",
+            ),
+            (
+                "/var/run/alice/agent.sock",
+                "/var/run/[redacted-user]/agent.sock",
+                "user",
+            ),
+            ("/var/log/box.local", "/var/log/[redacted-host]", "host"),
+        ] {
+            assert_eq!(s(text), expected, "{text}");
+            assert_eq!(locate(text, &id()), vec![(1, kind)], "{text}");
+        }
+        let identity = Identity {
+            user: "redacted".into(),
+            host: "redacted-path".into(),
+            ..Identity::default()
+        };
+        let text = "/tmp/checkout /usr/local/bin/redacted";
+        assert_eq!(
+            scrub(text, &identity),
+            "[redacted-path] /usr/local/bin/[redacted-user]"
+        );
+        assert_eq!(locate(text, &identity), vec![(1, "path"), (1, "user")]);
     }
 
     #[test]
