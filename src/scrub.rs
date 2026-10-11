@@ -249,16 +249,22 @@ fn named_identity(rest: &str) -> Option<(usize, &'static str)> {
 /// rather than a hostname: one dot, no hyphen, and either a `self.` / `this.`
 /// receiver or a CamelCase one (a capital right after a lowercase letter).
 /// Anything else, mixed-case or backticked hostnames included, stays a host.
+/// Only the part before the dot is looked at, so the suffix's spelling
+/// (`.loCal`) never matters. A CamelCase single-label hostname (`MyServer.lan`)
+/// is deliberately read as code; the operator's own host name is caught by
+/// `identity_word` instead.
 fn code_receiver(name: &str) -> bool {
     if name.matches('.').count() != 1 || name.contains('-') {
         return false;
     }
-    let lower = name.to_ascii_lowercase();
-    if lower.starts_with("self.") || lower.starts_with("this.") {
+    let Some((receiver, _)) = name.split_once('.') else {
+        return false;
+    };
+    if receiver.eq_ignore_ascii_case("self") || receiver.eq_ignore_ascii_case("this") {
         return true;
     }
     let mut prev_lower = false;
-    name.chars().any(|c| {
+    receiver.chars().any(|c| {
         let hump = prev_lower && c.is_ascii_uppercase();
         prev_lower = c.is_ascii_lowercase();
         hump
@@ -659,6 +665,18 @@ mod tests {
             "WatchState.local",
         ] {
             assert_eq!(scrub(t, &Identity::default()), t);
+        }
+        // Known trade-off: a CamelCase single-label host reads as code.
+        for t in ["ssh MyServer.lan", "JohnsMacBook.local"] {
+            assert_eq!(scrub(t, &Identity::default()), t);
+        }
+        for (t, want) in [
+            ("ssh m1air.loCal now", "ssh [redacted-host] now"),
+            ("ssh devbox.LOCAL", "ssh [redacted-host]"),
+            ("ssh box.InterNal", "ssh [redacted-host]"),
+            ("ssh box.LaN", "ssh [redacted-host]"),
+        ] {
+            assert_eq!(scrub(t, &Identity::default()), want, "{t}");
         }
         for t in [
             "ssh devbox.local",
