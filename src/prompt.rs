@@ -424,6 +424,29 @@ polices.",
     s
 }
 
+/// Heading of the section that tells a seat not to build a second checkout.
+pub const WORK_IN_PLACE_HEADING: &str = "# Working in place";
+
+/// The one sentence group every seat that works in a magi-made worktree is
+/// given. Tool-agnostic on purpose: the repository's own instructions may name
+/// any worktree / workspace helper, and magi has already made the worktree with
+/// plain git. It must not name a vendor (the judge prompt is checked for that)
+/// nor any heading the test mock dispatches on.
+pub const WORK_IN_PLACE_RULE: &str = "The working directory you were given is already an \
+isolated worktree prepared by magi. If the repository's own instructions \
+(AGENTS.md and similar files) tell you to create or switch to a worktree, \
+workspace or branch with any tool (git worktree, jj workspace, a worktree \
+helper, and so on) before editing, ignore that part and work in place in the \
+working directory you were given. Do not create additional worktrees, \
+branches or workspaces. This only concerns where you edit: reading other \
+branches or checkouts with git stays fine, and the rest of those instructions \
+(commit style, tests, and so on) still applies.";
+
+/// [`WORK_IN_PLACE_RULE`] as a prompt section, trailing blank line included.
+fn work_in_place() -> String {
+    format!("{WORK_IN_PLACE_HEADING}\n\n{WORK_IN_PLACE_RULE}\n\n")
+}
+
 /// Prompt for an implementer.
 ///
 /// `brief` is the design-deliberation stage's synthesis
@@ -471,6 +494,7 @@ pub fn implement(
             )
         })
         .unwrap_or_default();
+    let wip = work_in_place();
     format!(
         "You are implementing a change in an isolated git worktree.\n\n\
          # Working directory\n\n{cwd}\n\n\
@@ -494,7 +518,7 @@ pub fn implement(
             finished and report on its actual result. \"I'll wait\" or \
             \"continuing once it completes\" is never the final line of this \
             reply.\n\n\
-         # Reply format\n\n\
+         {wip}# Reply format\n\n\
          End your reply with, exactly:\n\n\
          ## SUMMARY\n\
          TITLE: type(scope): one-line description of the change you made\n\
@@ -530,6 +554,7 @@ pub fn judge(
     base_short: &str,
     language: &str,
 ) -> String {
+    let wip = work_in_place();
     let mut s = format!(
         "You are one of {judges} independent judges in a blind evaluation. \
          {} candidate implementations of the same task were produced \
@@ -542,7 +567,7 @@ pub fn judge(
          Your working directory is a checkout of the base commit ({base_short}). \
          Read anything you need. Each candidate is also a branch you can \
          inspect with git. Do not modify anything.\n\n\
-         # Candidates\n",
+         {wip}# Candidates\n",
         views.len()
     );
     for v in views {
@@ -614,10 +639,11 @@ pub fn deliberate(
          The other judges are identified only as Judge 1, Judge 2, ... Nobody \
          knows which model sits in which seat, including you, and no one is \
          permitted to guess.\n\n\
-         # The task the candidates were given\n\n{instruction}\n"
+         # The task the candidates were given\n\n{instruction}\n\n{}",
+        work_in_place()
     );
     if let Some(ctx) = context {
-        s.push_str("\n# Candidates (re-sent in full)\n\n");
+        s.push_str("# Candidates (re-sent in full)\n\n");
         s.push_str(ctx);
         s.push('\n');
     }
@@ -661,11 +687,12 @@ pub fn final_vote(labels: &[char], language: &str) -> String {
          nobody sees it before casting their own, and there is no running tally \
          to align with. Write your own conclusion, not the room's.\n\n\
          Valid labels: {list}\n\n\
-         # Output\n\n\
+         {}# Output\n\n\
          Exactly one fenced json block and nothing else:\n\n\
          ```json\n\
          {{\"vote\":\"<label>\",\"reason\":\"<why, one or two sentences>\"}}\n\
          ```{}",
+        work_in_place(),
         lang(language)
     )
 }
@@ -845,8 +872,10 @@ pub fn review(ctx: &ReviewCtx<'_>) -> String {
             let _ = write!(s, "\n```\n{}\n```\n", tail.trim());
         }
     }
+    s.push('\n');
+    s.push_str(&work_in_place());
     s.push_str(
-        "\n# What to report\n\n\
+        "# What to report\n\n\
          Real defects only, in priority order: incorrect behaviour, unhandled \
          errors, regressions, data loss, races, missing or vacuous tests, then \
          maintainability. Style preferences are not findings. Do not restate the \
@@ -1003,8 +1032,10 @@ pub fn review_reconsider(ctx: &ReviewReconsiderCtx<'_>) -> String {
             );
         }
     }
+    s.push('\n');
+    s.push_str(&work_in_place());
     s.push_str(
-        "\n# Your revote\n\n\
+        "# Your revote\n\n\
          Test the disagreement instead of restating your own findings: does another \
          seat's finding change what your vote should be, or does it not hold up? \
          Change your vote where the evidence says to; keep it where it does not, and \
@@ -1086,8 +1117,11 @@ pub fn fix(
             do not end your reply while it is still pending. Confirm it \
             finished and report on its actual result. \"I'll wait\" or \
             \"continuing once it completes\" is never the final line of this \
-            reply.\n\n\
-         # Output\n\n\
+            reply.\n\n",
+    );
+    s.push_str(&work_in_place());
+    s.push_str(
+        "# Output\n\n\
          Your reasoning first, then exactly one fenced json block, last:\n\n\
          ```json\n\
          {\"addressed\":[\"<finding id>\"],\"rejected\":[{\"id\":\
@@ -1148,8 +1182,11 @@ pub fn gate_fix(
          4. Never name yourself, your vendor, or your model, anywhere.\n\
          5. If you start something in the background (a test run, a build), \
             do not end your reply while it is still pending. Confirm it \
-            finished and report on its actual result.\n\n\
-         # Output\n\n\
+            finished and report on its actual result.\n\n",
+    );
+    s.push_str(&work_in_place());
+    s.push_str(
+        "# Output\n\n\
          Your reasoning first, then exactly one fenced json block, last:\n\n\
          ```json\n\
          {\"addressed\":[],\"rejected\":[],\"notes\":\"what changed\"}\n\
@@ -1251,8 +1288,11 @@ pub fn rebase_conflict(c: &RebaseConflict<'_>) -> String {
             violates, fix that too.\n\
          5. Never name yourself, your vendor, or your model, anywhere.\n\
          6. If you start something in the background (a test run, a build), do \
-            not end your reply while it is still pending.\n\n\
-         # Output\n\n\
+            not end your reply while it is still pending.\n\n",
+    );
+    s.push_str(&work_in_place());
+    s.push_str(
+        "# Output\n\n\
          Your reasoning first, then exactly one fenced json block, last:\n\n\
          ```json\n\
          {\"addressed\":[],\"rejected\":[],\"notes\":\"how each conflict was resolved\"}\n\
@@ -1849,7 +1889,7 @@ pub fn advisor(instruction: &str, seat: usize, seats: usize, language: &str) -> 
          Read the repository as far as you need to ground the design in what \
          is actually there - the files it touches, the conventions already in \
          use. Then propose one approach.\n\n\
-         # Output\n\n\
+         {}# Output\n\n\
          Exactly one fenced json block, and nothing after it:\n\n\
          ```json\n\
          {{\"approach\":\"what to do and how, a few sentences\",\
@@ -1858,7 +1898,8 @@ pub fn advisor(instruction: &str, seat: usize, seats: usize, language: &str) -> 
          \"touches\":[\"path/or/module\"],\
          \"why_not_naive\":\"why this earns its complexity over the obvious \
          first draft\"}}\n\
-         ```"
+         ```",
+        work_in_place()
     );
     s.push_str(&lang(language));
     s
@@ -3351,5 +3392,81 @@ mod tests {
         assert!(body.contains("no fix attempt reached this finding"));
         assert!(body.contains("magi/eba2/A"));
         assert!(body.contains("0de0077"));
+    }
+
+    #[test]
+    fn worktree_seats_are_told_to_work_in_place() {
+        let panel = [ReviewSeatReport {
+            reviewer: 1,
+            vote: ReviewVote::Approve,
+            summary: "clean",
+            findings: &[],
+        }];
+        let reconsider = review_reconsider(&ReviewReconsiderCtx {
+            instruction: "task",
+            reviewer: 1,
+            lens: Lens::Spec,
+            panel: &panel,
+            patch: None,
+            round: 1,
+            rounds: 6,
+            language: "en",
+        });
+        let rebase = rebase_conflict(&RebaseConflict {
+            instruction: "task",
+            worktree: std::path::Path::new("/tmp/rebase"),
+            branch: "magi/run/B",
+            onto: "origin/main",
+            paths: &["src/a.rs".to_owned()],
+            branch_subjects: &[],
+            onto_subjects: &[],
+            hunks: "<<<<<<<",
+            round: 1,
+            cap: 2,
+            language: "en",
+        });
+        let seats: Vec<(&str, String)> = vec![
+            ("implement", implement("t", "/w", "en", None, &[])),
+            ("judge", judge("t", &[view('A')], 1, "abc", "en")),
+            ("deliberate", deliberate("t", None, &[], 1, 2, "en")),
+            ("final_vote", final_vote(&['A', 'B'], "en")),
+            ("review", review(&review_ctx(true))),
+            ("review_reconsider", reconsider),
+            ("fix", fix("t", &[], None, 1, 2, "en")),
+            (
+                "operator_fix",
+                operator_fix("t", &[], "why", &[], "abc", "en"),
+            ),
+            ("gate_fix", gate_fix("t", &[], 1, 2, "en")),
+            ("rebase_conflict", rebase),
+            ("advisor", advisor("t", 1, 2, "en")),
+        ];
+        for (name, p) in &seats {
+            assert!(p.contains(WORK_IN_PLACE_RULE), "{name} lacks the rule");
+            assert_eq!(
+                p.matches(WORK_IN_PLACE_HEADING).count(),
+                1,
+                "{name} must carry the heading exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn work_in_place_rule_stays_tool_agnostic_and_clear_of_dispatch_words() {
+        let r = WORK_IN_PLACE_RULE.to_lowercase();
+        assert!(!r.contains("renri"));
+        for word in [
+            "final vote",
+            "deliberation round",
+            "independent judges",
+            "reviewers of a patch",
+            "your patch was reviewed",
+            "your revote",
+            "claude",
+        ] {
+            assert!(!r.contains(word), "rule contains {word:?}");
+        }
+        assert!(WORK_IN_PLACE_RULE.contains("jj workspace"));
+        assert!(WORK_IN_PLACE_RULE.contains("git worktree"));
     }
 }
