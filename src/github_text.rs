@@ -917,7 +917,7 @@ mod tests {
             "password=example",
             "password=\"example\"",
             "token aBcdEfgHijkLmn0123456789",
-            "buildbox.local",
+            "build-box.local",
             "token=abcdefghijklmnop012345",
             "Authorization: Bearer abcdefghijklmnop",
             "hostname=buildbox",
@@ -938,7 +938,18 @@ mod tests {
                 "{secret}"
             );
         }
+        // Bare alphabetic hosts remain sensitive; directly backticked ones
+        // share the field-access shape and are deliberately treated as code.
+        assert!(check("buildbox.local", "").contains(&Violation::SensitiveData));
+        assert!(
+            check("fix: retries", "Connect to buildbox.local.").contains(&Violation::SensitiveData)
+        );
         for clean in [
+            "`st.local` is true",
+            "`cfg.local`",
+            "`ctx.lan`",
+            "my_state.local",
+            "`buildbox.local`",
             "https://github.com/example/repo",
             "src/graph.rs",
             "docs/home/example",
