@@ -768,14 +768,15 @@
 </dialog>
 
 <!-- PANEL, FULL SCREEN -------------------------------------------------- *
-     An agent-authored panel is rendered inside <iframe sandbox> with NO
-     tokens, so no script in it runs and it can reach neither this document
-     nor its storage; the server additionally sends a CSP that denies every
-     network request from inside the frame. A frame with no tokens is also
-     opaque to this page, so its height cannot be measured — which is why the
-     inline panel is bounded and this dialog exists. On a phone this is where
-     a diff becomes readable. The iframe is created on open and removed on
-     close, so a closed dialog holds no live document. -->
+     An agent-authored panel is rendered inside <iframe sandbox> carrying only
+     allow-popups and allow-popups-to-escape-sandbox, so no script in it runs
+     and it can reach neither this document nor its storage; the server
+     additionally sends a CSP that denies every network request from inside the
+     frame. A frame without script or same-origin access is also opaque to this
+     page, so its height cannot be measured — which is why the inline panel is
+     bounded and this dialog exists. On a phone this is where a diff becomes
+     readable. The iframe is created on open and removed on close, so a closed
+     dialog holds no live document. -->
 <dialog class="full" id="panel-full" aria-labelledby="panel-full-h">
   <div class="full-head">
     <h2 id="panel-full-h">Panel</h2>

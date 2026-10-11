@@ -1300,10 +1300,14 @@ Agent-authored HTML is rendered in the operator's browser, which the rest of
 this UI refuses to do. Three things make that acceptable, and none of them is
 optional:
 
-1. **`<iframe sandbox>` with no tokens.** One function in `app.js` builds it.
-   `allow-scripts` would hand a scriptable document to agent HTML;
-   `allow-same-origin` would give it the operator's origin. Neither is ever
-   added, and a comment above the function says so.
+1. **`<iframe sandbox>` carries exactly `allow-popups` and `allow-popups-to-escape-sandbox`.**
+   One function in `app.js` builds it. `allow-popups` lets links open in a new
+   tab (`target="_blank"`), and `allow-popups-to-escape-sandbox` prevents the
+   opened tab from inheriting the sandbox (which causes destinations like
+   github.com to break). The trade-off is accepted by the operator: link safety
+   is left to the operator's judgement. `allow-scripts` would hand a scriptable
+   document to agent HTML; `allow-same-origin` would give it the operator's
+   origin. Neither is ever added, and a comment above the function says so.
 2. **`PANEL_CSP`, asserted as a whole string** by a test, so weakening one
    directive fails it. `img-src 'self' data:` is what lets a panel show its
    own attachments while every external load is refused.
