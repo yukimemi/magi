@@ -922,7 +922,6 @@ impl Runner {
     /// Blocked / Stalled / Failed, or died with an error, is announced to the
     /// notification centre. Best-effort: see [`crate::notices::raise`].
     pub async fn execute(&mut self) -> Result<()> {
-        crate::pr_head::ensure_owner(&self.state)?;
         let result = self.execute_graph().await;
         self.mark_driver_exited();
         let ended = if result.is_err() {
@@ -947,6 +946,9 @@ impl Runner {
     fn mark_driver_exited(&mut self) {
         self.state.driver_exited = true;
         let pid = std::process::id();
+        let Ok(_lock) = crate::pr_head::owner_lock(&crate::run::home(), &self.state.id) else {
+            return;
+        };
         let Ok(mut disk) = RunState::load(&self.state.id) else {
             return;
         };
@@ -959,7 +961,11 @@ impl Runner {
         }
     }
 
-    async fn execute_graph(&mut self) -> Result<()> {
+    /// Validate ownership and persist the driver claim in one critical section.
+    fn claim_driver(&mut self) -> Result<()> {
+        let _lock = crate::pr_head::owner_lock(&crate::run::home(), &self.state.id)?;
+        let disk = RunState::load(&self.state.id)?;
+        crate::pr_head::ensure_owner(&disk)?;
         // Moving again, so it is no longer parked. Set before the walk rather
         // than in `resume`, so every way of re-entering the graph clears it
         // and a card cannot claim a run is waiting to be resumed while the
@@ -989,9 +995,7 @@ impl Runner {
         // A resume that raced a takeover: the record on disk says the worktree
         // was handed to a later run after this copy was read. Saving over it
         // would erase that and drive a run with nothing to run in.
-        if let Ok(disk) = RunState::load(&self.state.id)
-            && let Some(to) = &disk.released_to
-        {
+        if let Some(to) = &disk.released_to {
             bail!(
                 "run {} cannot continue: its worktree was released to run {}",
                 self.state.short(),
@@ -1003,6 +1007,19 @@ impl Runner {
         self.state.driver_started_at = crate::proc::process_started_at(pid);
         self.state.driver_exited = false;
         self.state.save()?;
+        Ok(())
+    }
+
+    async fn execute_graph(&mut self) -> Result<()> {
+        self.claim_driver()?;
+        // Publication already passed review and gate. Resume only that node:
+        // syncing to a newer base here could change the verified commit.
+        if self.state.pr_publication_pending {
+            self.merge().await?;
+            self.state.save()?;
+            self.settle_questions();
+            return Ok(());
+        }
         // A run that already lost its quorum never resumes into the verdict
         // machinery: `deliberate` and `vote` would otherwise clobber the
         // stalled marker back to Voting and the run would keep going past a

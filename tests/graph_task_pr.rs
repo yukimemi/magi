@@ -153,6 +153,14 @@ async fn public_head_metadata_failure_resumes_without_competing_again() {
     assert!(RunState::load(&first.id).unwrap().pr_taken_over_by.is_none());
     let branch = second.state.winner().unwrap().branch.clone();
     let reviews = second.state.reviews.len();
+    let verified_tip = git::rev_parse(&fx.repo, &branch).await.unwrap();
+    let synced_base = second.state.base_sync.clone();
+    // Advance the remote base after verification and the failed metadata call.
+    // Publication retry must not rebase the candidate under its old checks.
+    std::fs::write(fx.repo.join("base-update.txt"), "new base").unwrap();
+    git::git(&fx.repo, &["add", "base-update.txt"]).await.unwrap();
+    git::git(&fx.repo, &["commit", "-m", "test: advance base during publication retry"]).await.unwrap();
+    git::git(&fx.repo, &["push", "origin", "main"]).await.unwrap();
     std::fs::remove_file(forge.join("fail-edit")).unwrap();
     let mut resumed = Runner::resume(&second.state.id).unwrap();
     resumed.execute().await.unwrap();
@@ -160,8 +168,47 @@ async fn public_head_metadata_failure_resumes_without_competing_again() {
     assert!(!resumed.state.pr_publication_pending);
     assert_eq!(resumed.state.winner().unwrap().branch, branch);
     assert_eq!(resumed.state.reviews.len(), reviews);
+    assert_eq!(git::rev_parse(&fx.repo, &branch).await.unwrap(), verified_tip);
+    assert_eq!(resumed.state.pr_pushed_head.as_deref(), Some(verified_tip.as_str()));
+    assert_eq!(serde_json::to_value(&resumed.state.base_sync).unwrap(), serde_json::to_value(&synced_base).unwrap());
     let calls = std::fs::read_to_string(forge.join("calls")).unwrap();
     assert_eq!(calls.lines().filter(|l| *l == "pr create").count(), 1);
+    assert_eq!(RunState::load(&first.id).unwrap().pr_taken_over_by.as_deref(), Some(resumed.state.id.as_str()));
+}
+}
+
+common::e2e! {
+async fn driver_claim_and_publication_takeover_share_an_ownership_lock() {
+    let home = home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    forge(fx.tmp.path());
+    fx.config.merge.mode = MergeMode::Pr;
+    fx.config.graph.land = false;
+    fx.config.graph.implementers = 1;
+    fx.config.graph.reviewers = 1;
+    let first = attempt(&fx.repo, &fx.config).await;
+    let mut stale = Runner::resume(&first.id).unwrap();
+    let lock = std::fs::OpenOptions::new().read(true).write(true)
+        .open(first.dir().join("pr-owner.lock")).unwrap();
+    use std::os::fd::AsRawFd;
+    // SAFETY: lock owns a live descriptor; closing it releases the lock.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    // Model the takeover's critical section: a stale driver cannot claim or
+    // save while publication owns the old record.
+    let error = stale.execute().await.unwrap_err();
+    assert!(format!("{error:#}").contains("ownership is being updated"));
+    assert!(RunState::load(&first.id).unwrap().driver_exited);
+    let mut second = Runner::start(&fx.repo, "create note.txt".into(), fx.config.clone(), Origin::queue("abcd-1234")).await.unwrap();
+    second.execute().await.unwrap();
+    assert!(!second.state.merge.as_ref().unwrap().ok);
+    assert_eq!(git::remote_head(&fx.repo, "origin", first.pr_branch().unwrap()).await.unwrap(), first.pr_pushed_head);
+    drop(lock);
+    let mut resumed = Runner::resume(&second.state.id).unwrap();
+    resumed.execute().await.unwrap();
+    assert!(resumed.state.merge.as_ref().unwrap().ok);
+    // Even the runner whose first check raced publication must now reject
+    // the disk takeover without saving its old in-memory state over it.
+    assert!(stale.execute().await.is_err());
     assert_eq!(RunState::load(&first.id).unwrap().pr_taken_over_by.as_deref(), Some(resumed.state.id.as_str()));
 }
 }

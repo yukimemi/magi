@@ -8,6 +8,57 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 
+/// Serializes driver claims with publication takeover. The file stays in place:
+/// unlinking a locked inode would let a second caller lock a different one.
+/// Contention fails closed rather than blocking an async executor.
+pub(crate) fn owner_lock(home: &Path, id: &str) -> Result<std::fs::File> {
+    let path = home.join("runs").join(id).join("pr-owner.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .context("open public head ownership lock")?;
+    try_lock_file(&file).context("public head ownership is being updated; retry later")?;
+    Ok(file)
+}
+
+// std::fs::File locking requires Rust 1.89; keep the declared 1.85 MSRV.
+#[cfg(unix)]
+fn try_lock_file(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the descriptor belongs to a live File. flock does not retain
+    // pointers; closing the File releases the lock, including on process exit.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(windows)]
+fn try_lock_file(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LockFile(
+            file: *mut std::ffi::c_void,
+            offset_low: u32,
+            offset_high: u32,
+            length_low: u32,
+            length_high: u32,
+        ) -> i32;
+    }
+    // SAFETY: this is a live file handle and the Win32 LockFile ABI. LockFile
+    // fails immediately on contention; closing the handle releases the lock.
+    if unsafe { LockFile(file.as_raw_handle(), 0, 0, 1, 0) } != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
 pub(crate) fn ensure_owner(state: &RunState) -> Result<()> {
     let disk = run::try_home().and_then(|home| RunState::load_under(&state.id, &home).ok());
     if let Some(next) = state
@@ -33,7 +84,11 @@ fn lease_for(remote: Option<&str>, expected: Option<&str>, local: &str) -> Resul
     }
 }
 
-async fn predecessors(state: &RunState, home: &Path, head: &str) -> Result<Vec<RunState>> {
+async fn predecessors(
+    state: &RunState,
+    home: &Path,
+    head: &str,
+) -> Result<Vec<(RunState, std::fs::File)>> {
     let common = git::git(
         &state.repo,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -54,8 +109,10 @@ async fn predecessors(state: &RunState, home: &Path, head: &str) -> Result<Vec<R
         if view["pr_head"].as_str() != Some(head) {
             continue;
         }
-        let old: RunState =
-            serde_json::from_value(view).context("read previous public head owner")?;
+        let _lock = owner_lock(home, &id)?;
+        // The scan only selects possible owners; validate a fresh record under
+        // the same lock the driver claim uses, and hold it through takeover.
+        let old = RunState::load_under(&id, home)?;
         let other = git::git(
             &old.repo,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -78,9 +135,9 @@ async fn predecessors(state: &RunState, home: &Path, head: &str) -> Result<Vec<R
                 old.short()
             );
         }
-        previous.push(old);
+        previous.push((old, _lock));
     }
-    previous.sort_by_key(|s| s.updated_at);
+    previous.sort_by_key(|(s, _)| s.updated_at);
     Ok(previous)
 }
 
@@ -94,14 +151,15 @@ pub(crate) async fn publish(
     let head = state.task_pr_branch().context("missing task public head")?;
     let home = run::home();
     let previous = predecessors(state, &home, &head).await?;
-    let expected = state
-        .pr_pushed_head
-        .as_deref()
-        .or_else(|| previous.last().and_then(|s| s.pr_pushed_head.as_deref()));
+    let expected = state.pr_pushed_head.as_deref().or_else(|| {
+        previous
+            .last()
+            .and_then(|(s, _)| s.pr_pushed_head.as_deref())
+    });
     let posted_title = state
         .pr_posted_title
         .clone()
-        .or_else(|| previous.last().and_then(|s| s.pr_posted_title.clone()));
+        .or_else(|| previous.last().and_then(|(s, _)| s.pr_posted_title.clone()));
     // Query before any mutation: ambiguous or unreadable PR lists cannot create duplicates.
     let found = land::find_open_pr(&winner.worktree, &head, &state.base_branch).await?;
     if let land::OpenPr::Many(_) = found {
@@ -209,7 +267,7 @@ pub(crate) async fn publish(
         red_at_merge: Vec::new(),
     });
     state.save()?;
-    for old in previous {
+    for (old, _lock) in previous {
         // Re-read before writing, using the same terminal/driver guard.
         let mut old = RunState::load_under(&old.id, &home)?;
         let claimed = crate::daemon::is_working_on(&home, &old.id, jiff::Timestamp::now());
