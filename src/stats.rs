@@ -640,7 +640,10 @@ pub fn collect_refs<'a>(states: impl IntoIterator<Item = &'a RunState>) -> Stats
         // A review-only run never implements anything; exclude its pseudo-candidate
         // from both competitive and solo calculations.
         let is_review = state.reviewed_commits.is_some()
-            || state.candidates.iter().any(|c| c.agent == "(existing branch)");
+            || state
+                .candidates
+                .iter()
+                .any(|c| c.agent == "(existing branch)");
 
         let competitive = !is_review && state.candidates.iter().filter(|c| c.viable()).count() >= 2;
         let solo = !is_review && state.candidates.len() == 1;
@@ -714,12 +717,10 @@ pub fn collect_refs<'a>(states: impl IntoIterator<Item = &'a RunState>) -> Stats
                 }
             }
             if let Some(w) = state.candidates.iter().find(|c| c.label == t.winner) {
-                let entry = agents
-                    .entry(w.agent.clone())
-                    .or_insert_with(|| AgentStats {
-                        agent: w.agent.clone(),
-                        ..AgentStats::default()
-                    });
+                let entry = agents.entry(w.agent.clone()).or_insert_with(|| AgentStats {
+                    agent: w.agent.clone(),
+                    ..AgentStats::default()
+                });
                 entry.wins += 1;
 
                 if competitive && w.viable() {
@@ -1248,10 +1249,7 @@ mod tests {
         );
         let mut rival_failed = candidate('B', "rival_agent");
         rival_failed.failed = Some("crashed".to_owned());
-        walkover_state.candidates = vec![
-            candidate('A', "competitive_agent"),
-            rival_failed,
-        ];
+        walkover_state.candidates = vec![candidate('A', "competitive_agent"), rival_failed];
         walkover_state.tally = Some(Tally {
             first_choice: BTreeMap::new(),
             borda: BTreeMap::new(),
@@ -1293,7 +1291,11 @@ mod tests {
         ];
         let stats = collect(&states);
 
-        let solo = stats.agents.iter().find(|a| a.agent == "solo_agent").unwrap();
+        let solo = stats
+            .agents
+            .iter()
+            .find(|a| a.agent == "solo_agent")
+            .unwrap();
         // entered: 1 (viable solo). empty: 1 (from solo_failed; noop excluded).
         assert_eq!(solo.entered, 1);
         assert_eq!(solo.wins, 1);
@@ -1308,7 +1310,11 @@ mod tests {
         assert_eq!(solo.competitive_wins, 0);
         assert_eq!(solo.competitive_win_rate(), 0.0);
 
-        let comp = stats.agents.iter().find(|a| a.agent == "competitive_agent").unwrap();
+        let comp = stats
+            .agents
+            .iter()
+            .find(|a| a.agent == "competitive_agent")
+            .unwrap();
         // entered: 2 (comp_state + walkover_state)
         // wins: 2 (comp_state + walkover_state)
         assert_eq!(comp.entered, 2);
@@ -1321,7 +1327,11 @@ mod tests {
         assert_eq!(comp.solo_entered, 0);
         assert_eq!(comp.solo_adopted, 0);
 
-        let rival = stats.agents.iter().find(|a| a.agent == "rival_agent").unwrap();
+        let rival = stats
+            .agents
+            .iter()
+            .find(|a| a.agent == "rival_agent")
+            .unwrap();
         // entered: 1 (from comp_state; in walkover it failed so not viable)
         assert_eq!(rival.entered, 1);
         assert_eq!(rival.wins, 0);

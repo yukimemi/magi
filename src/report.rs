@@ -1293,7 +1293,10 @@ pub fn stats(stats: &Stats) -> String {
             let b_tier = if b.competitive_entered < 10 { 1 } else { 0 };
             a_tier
                 .cmp(&b_tier)
-                .then(b.competitive_win_rate().total_cmp(&a.competitive_win_rate()))
+                .then(
+                    b.competitive_win_rate()
+                        .total_cmp(&a.competitive_win_rate()),
+                )
                 .then(b.competitive_entered.cmp(&a.competitive_entered))
                 .then(a.agent.cmp(&b.agent))
         });
