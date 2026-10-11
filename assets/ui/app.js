@@ -3482,13 +3482,29 @@ function statsBarRows(root, rows) {
 }
 
 function renderStatsAgents(agents) {
-  show($("stats-agents-panel"), agents.length > 0);
-  if (agents.length === 0) return;
-  statsBarRows($("stats-agents-bars"), agents.map((a) => ({
-    agent: a.agent,
-    fraction: `${a.wins}/${a.entered} won`,
-    rate: a.win_rate,
-  })));
+  const compRows = (agents || [])
+    .filter((a) => a.competitive_entered > 0)
+    .map((a) => ({
+      agent: a.agent,
+      fraction: `${a.competitive_wins}/${a.competitive_entered} won`,
+      rate: a.competitive_win_rate,
+    }));
+  show($("stats-agents-panel"), compRows.length > 0);
+  if (compRows.length > 0) {
+    statsBarRows($("stats-agents-bars"), compRows);
+  }
+
+  const soloRows = (agents || [])
+    .filter((a) => a.solo_entered > 0)
+    .map((a) => ({
+      agent: a.agent,
+      fraction: `${a.solo_adopted}/${a.solo_entered} adopted`,
+      rate: a.solo_adoption_rate,
+    }));
+  show($("stats-solo-panel"), soloRows.length > 0);
+  if (soloRows.length > 0) {
+    statsBarRows($("stats-solo-bars"), soloRows);
+  }
 }
 
 function renderStatsReviewers(reviewers) {

@@ -4927,6 +4927,12 @@ struct AgentStatsView {
     wins: usize,
     empty: usize,
     win_rate: Option<RateView>,
+    competitive_entered: usize,
+    competitive_wins: usize,
+    competitive_win_rate: Option<RateView>,
+    solo_entered: usize,
+    solo_adopted: usize,
+    solo_adoption_rate: Option<RateView>,
 }
 
 impl From<&stats::AgentStats> for AgentStatsView {
@@ -4937,6 +4943,12 @@ impl From<&stats::AgentStats> for AgentStatsView {
             wins: a.wins,
             empty: a.empty,
             win_rate: RateView::of(a.wins, a.entered),
+            competitive_entered: a.competitive_entered,
+            competitive_wins: a.competitive_wins,
+            competitive_win_rate: RateView::of(a.competitive_wins, a.competitive_entered),
+            solo_entered: a.solo_entered,
+            solo_adopted: a.solo_adopted,
+            solo_adoption_rate: RateView::of(a.solo_adopted, a.solo_entered),
         }
     }
 }
@@ -12457,7 +12469,7 @@ mod tests {
         assert!(body.contains("statsAgentTone(row.agent)"));
         assert!(!body.contains("candTone(i)"));
         assert!(APP_JS.contains("const STATS_LOW_N = 10;"));
-        for root in ["stats-agents-bars", "stats-reviewers-bars"] {
+        for root in ["stats-agents-bars", "stats-solo-bars", "stats-reviewers-bars"] {
             assert!(APP_JS.contains(&format!("statsBarRows($(\"{root}\")")));
         }
     }
@@ -12674,6 +12686,19 @@ mod tests {
         let all = f.get("/api/stats?all=true").await.json();
         assert_eq!(agents_of(&all).len(), 2);
         assert_eq!(all["retired_hidden"], serde_json::json!([]));
+        // Verify competitive and solo keys exist on agent entries
+        let keep_agent = all["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["agent"] == "keep")
+            .unwrap();
+        assert_eq!(keep_agent["competitive_entered"], 1);
+        assert_eq!(keep_agent["competitive_wins"], 0);
+        assert_eq!(keep_agent["competitive_win_rate"]["pct"], 0.0);
+        assert_eq!(keep_agent["solo_entered"], 0);
+        assert_eq!(keep_agent["solo_adopted"], 0);
+        assert!(keep_agent["solo_adoption_rate"].is_null());
     }
 
     #[tokio::test]

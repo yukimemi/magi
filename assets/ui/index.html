@@ -438,9 +438,15 @@
         </div>
 
         <div class="panel" id="stats-agents-panel" hidden>
-          <h2>Implementation win rate</h2>
-          <p class="panel-note">Relative to this workload only — the task mix and seat rotation are not controlled.</p>
+          <h2>Implementation win rate (competitive runs)</h2>
+          <p class="panel-note">Competitive runs only (2 or more viable candidates). Relative to this workload only — the task mix and seat rotation are not controlled.</p>
           <div class="bar-rows" id="stats-agents-bars"></div>
+        </div>
+
+        <div class="panel" id="stats-solo-panel" hidden>
+          <h2>Solo completion rate</h2>
+          <p class="panel-note">Solo runs only (exactly one candidate). Tally adoption rate over single-candidate implementations (excludes verified no-ops).</p>
+          <div class="bar-rows" id="stats-solo-bars"></div>
         </div>
 
         <div class="panel" id="stats-reviewers-panel" hidden>

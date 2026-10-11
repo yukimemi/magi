@@ -21,6 +21,14 @@ pub struct AgentStats {
     pub wins: usize,
     /// Candidates that produced no change at all.
     pub empty: usize,
+    /// Competitive candidates it produced that were viable and judged.
+    pub competitive_entered: usize,
+    /// Competitive contests it won.
+    pub competitive_wins: usize,
+    /// Solo implementations it attempted (failed and empty included; verified no-ops excluded).
+    pub solo_entered: usize,
+    /// Solo implementations adopted (won the uncontested tally).
+    pub solo_adopted: usize,
 }
 
 impl AgentStats {
@@ -30,6 +38,24 @@ impl AgentStats {
             0.0
         } else {
             100.0 * self.wins as f64 / self.entered as f64
+        }
+    }
+
+    /// Competitive win rate over competitive entries, as a percentage.
+    pub fn competitive_win_rate(&self) -> f64 {
+        if self.competitive_entered == 0 {
+            0.0
+        } else {
+            100.0 * self.competitive_wins as f64 / self.competitive_entered as f64
+        }
+    }
+
+    /// Solo completion/adoption rate over solo runs, as a percentage.
+    pub fn solo_adoption_rate(&self) -> f64 {
+        if self.solo_entered == 0 {
+            0.0
+        } else {
+            100.0 * self.solo_adopted as f64 / self.solo_entered as f64
         }
     }
 }
@@ -611,6 +637,11 @@ pub fn collect_refs<'a>(states: impl IntoIterator<Item = &'a RunState>) -> Stats
             | RunStatus::Landing => totals.in_progress += 1,
         }
 
+        // A review-only run never implements anything; exclude its pseudo-candidate
+        // from both competitive and solo calculations.
+        let is_review = state.reviewed_commits.is_some()
+            || state.candidates.iter().any(|c| c.agent == "(existing branch)");
+
         for c in &state.candidates {
             let entry = agents.entry(c.agent.clone()).or_insert_with(|| AgentStats {
                 agent: c.agent.clone(),
@@ -625,6 +656,36 @@ pub fn collect_refs<'a>(states: impl IntoIterator<Item = &'a RunState>) -> Stats
             }
             if c.viable() {
                 entry.entered += 1;
+            }
+        }
+
+        if !is_review {
+            let viable_count = state.candidates.iter().filter(|c| c.viable()).count();
+            if viable_count >= 2 {
+                // Competitive run: 2 or more viable candidates.
+                for c in &state.candidates {
+                    if c.viable() {
+                        agents
+                            .entry(c.agent.clone())
+                            .or_insert_with(|| AgentStats {
+                                agent: c.agent.clone(),
+                                ..AgentStats::default()
+                            })
+                            .competitive_entered += 1;
+                    }
+                }
+            } else if state.candidates.len() == 1 {
+                // Solo run: exactly one candidate. Exclude verified no-ops.
+                let c = &state.candidates[0];
+                if c.verified_noop.is_none() {
+                    agents
+                        .entry(c.agent.clone())
+                        .or_insert_with(|| AgentStats {
+                            agent: c.agent.clone(),
+                            ..AgentStats::default()
+                        })
+                        .solo_entered += 1;
+                }
             }
         }
 
@@ -651,13 +712,22 @@ pub fn collect_refs<'a>(states: impl IntoIterator<Item = &'a RunState>) -> Stats
                 }
             }
             if let Some(w) = state.candidates.iter().find(|c| c.label == t.winner) {
-                agents
+                let entry = agents
                     .entry(w.agent.clone())
                     .or_insert_with(|| AgentStats {
                         agent: w.agent.clone(),
                         ..AgentStats::default()
-                    })
-                    .wins += 1;
+                    });
+                entry.wins += 1;
+
+                if !is_review {
+                    let viable_count = state.candidates.iter().filter(|c| c.viable()).count();
+                    if viable_count >= 2 {
+                        entry.competitive_wins += 1;
+                    } else if state.candidates.len() == 1 && w.verified_noop.is_none() {
+                        entry.solo_adopted += 1;
+                    }
+                }
             }
         }
 
@@ -1063,6 +1133,196 @@ mod tests {
         assert_eq!(beta.entered, 2);
         assert_eq!(beta.wins, 1);
         assert_eq!(beta.win_rate(), 50.0);
+        assert_eq!(beta.competitive_entered, 2);
+        assert_eq!(beta.competitive_wins, 1);
+        assert_eq!(beta.competitive_win_rate(), 50.0);
+        assert_eq!(beta.solo_entered, 0);
+        assert_eq!(beta.solo_adopted, 0);
+        assert_eq!(beta.solo_adoption_rate(), 0.0);
+    }
+
+    #[test]
+    fn competitive_and_solo_win_rates_are_counted_separately() {
+        let mut solo_state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "111111".to_owned(),
+            "solo task".to_owned(),
+            Config::default(),
+        );
+        solo_state.candidates = vec![candidate('A', "solo_agent")];
+        solo_state.tally = Some(Tally {
+            first_choice: BTreeMap::new(),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 0,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+            uncontested: Some("solo".to_owned()),
+        });
+        solo_state.status = RunStatus::Merged;
+
+        // Solo run that failed (e.g. empty or failed, no tally)
+        let mut solo_failed = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "222222".to_owned(),
+            "solo fail task".to_owned(),
+            Config::default(),
+        );
+        let mut c_failed = candidate('A', "solo_agent");
+        c_failed.empty = true;
+        solo_failed.candidates = vec![c_failed];
+        solo_failed.status = RunStatus::Failed;
+
+        // Solo run with verified_noop (must be excluded from solo rates)
+        let mut solo_noop = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "333333".to_owned(),
+            "noop task".to_owned(),
+            Config::default(),
+        );
+        let mut c_noop = candidate('A', "solo_agent");
+        c_noop.empty = true;
+        c_noop.verified_noop = Some("no change needed".to_owned());
+        solo_noop.candidates = vec![c_noop];
+        solo_noop.status = RunStatus::VerifiedNoop;
+
+        // Competitive run with 2 candidates where competitive_agent wins
+        let mut comp_state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "444444".to_owned(),
+            "comp task".to_owned(),
+            Config::default(),
+        );
+        comp_state.candidates = vec![
+            candidate('A', "competitive_agent"),
+            candidate('B', "rival_agent"),
+        ];
+        comp_state.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 2), ('B', 1)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 3,
+            unanimous_initial: false,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: false,
+            tie_break: None,
+            judges: 3,
+            present: 3,
+            quorum: 2,
+            met_quorum: true,
+            uncontested: None,
+        });
+        comp_state.status = RunStatus::Merged;
+
+        // Multi-candidate run where only 1 candidate was viable (walkover)
+        // Must be excluded from competitive and solo rates
+        let mut walkover_state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "555555".to_owned(),
+            "walkover task".to_owned(),
+            Config::default(),
+        );
+        let mut rival_failed = candidate('B', "rival_agent");
+        rival_failed.failed = Some("crashed".to_owned());
+        walkover_state.candidates = vec![
+            candidate('A', "competitive_agent"),
+            rival_failed,
+        ];
+        walkover_state.tally = Some(Tally {
+            first_choice: BTreeMap::new(),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 0,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+            uncontested: Some("walkover".to_owned()),
+        });
+        walkover_state.status = RunStatus::Merged;
+
+        // Review-only run (must be excluded from competitive and solo rates)
+        let mut review_state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "666666".to_owned(),
+            "review task".to_owned(),
+            Config::default(),
+        );
+        let c_rev = candidate('A', "(existing branch)");
+        review_state.candidates = vec![c_rev];
+        review_state.reviewed_commits = Some(vec!["feat: stuff".to_owned()]);
+        review_state.status = RunStatus::Merged;
+
+        let states = vec![
+            solo_state,
+            solo_failed,
+            solo_noop,
+            comp_state,
+            walkover_state,
+            review_state,
+        ];
+        let stats = collect(&states);
+
+        let solo = stats.agents.iter().find(|a| a.agent == "solo_agent").unwrap();
+        // entered: 1 (viable solo). empty: 1 (from solo_failed; noop excluded).
+        assert_eq!(solo.entered, 1);
+        assert_eq!(solo.wins, 1);
+        assert_eq!(solo.empty, 1);
+        // solo_entered: 2 (solo_state + solo_failed; solo_noop excluded).
+        // solo_adopted: 1 (solo_state).
+        assert_eq!(solo.solo_entered, 2);
+        assert_eq!(solo.solo_adopted, 1);
+        assert_eq!(solo.solo_adoption_rate(), 50.0);
+        // competitive: 0
+        assert_eq!(solo.competitive_entered, 0);
+        assert_eq!(solo.competitive_wins, 0);
+        assert_eq!(solo.competitive_win_rate(), 0.0);
+
+        let comp = stats.agents.iter().find(|a| a.agent == "competitive_agent").unwrap();
+        // entered: 2 (comp_state + walkover_state)
+        // wins: 2 (comp_state + walkover_state)
+        assert_eq!(comp.entered, 2);
+        assert_eq!(comp.wins, 2);
+        // competitive: only comp_state had 2+ viable candidates. walkover excluded!
+        assert_eq!(comp.competitive_entered, 1);
+        assert_eq!(comp.competitive_wins, 1);
+        assert_eq!(comp.competitive_win_rate(), 100.0);
+        // solo: 0 (walkover had 2 candidates so it is not solo)
+        assert_eq!(comp.solo_entered, 0);
+        assert_eq!(comp.solo_adopted, 0);
+
+        let rival = stats.agents.iter().find(|a| a.agent == "rival_agent").unwrap();
+        // entered: 1 (from comp_state; in walkover it failed so not viable)
+        assert_eq!(rival.entered, 1);
+        assert_eq!(rival.wins, 0);
+        assert_eq!(rival.competitive_entered, 1);
+        assert_eq!(rival.competitive_wins, 0);
+        assert_eq!(rival.competitive_win_rate(), 0.0);
+
+        // "(existing branch)" is not in competitive or solo
+        if let Some(rev) = stats.agents.iter().find(|a| a.agent == "(existing branch)") {
+            assert_eq!(rev.competitive_entered, 0);
+            assert_eq!(rev.solo_entered, 0);
+        }
     }
 
     #[test]
