@@ -1867,6 +1867,10 @@ struct GhOpenPr {
     #[serde(default)]
     title: String,
     base_ref_name: String,
+    // A fork's branch of the same name is not the task head; `gh pr list --head`
+    // matches by branch name alone, so the filter has to be ours.
+    #[serde(default)]
+    is_cross_repository: bool,
 }
 
 /// Pure half of [`find_open_pr`]: classify the raw `--json
@@ -1879,7 +1883,7 @@ pub fn pick_open_pr(json: &str, base: &str) -> Result<OpenPr> {
         serde_json::from_str(json).context("parse `gh pr list ... --json ...` output")?;
     let mut hits: Vec<GhOpenPr> = raw
         .into_iter()
-        .filter(|p| p.base_ref_name == base)
+        .filter(|p| p.base_ref_name == base && !p.is_cross_repository)
         .collect();
     Ok(match hits.len() {
         0 => OpenPr::None,
@@ -1910,7 +1914,7 @@ pub async fn find_open_pr(repo: &Path, branch: &str, base: &str) -> Result<OpenP
             "--state".to_owned(),
             "open".to_owned(),
             "--json".to_owned(),
-            "number,url,title,baseRefName".to_owned(),
+            "number,url,title,baseRefName,isCrossRepository".to_owned(),
         ],
     )
     .await?;
@@ -6147,6 +6151,9 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             pick_open_pr(two, "main").unwrap(),
             OpenPr::Many(vec!["u1".into(), "u2".into()])
         );
+        // A fork's same-named branch is not a pull request for this head.
+        let fork = r#"[{"url":"f","baseRefName":"main","isCrossRepository":true}]"#;
+        assert_eq!(pick_open_pr(fork, "main").unwrap(), OpenPr::None);
         assert!(pick_open_pr("not json", "main").is_err());
         // An incomplete record is an error, never "nothing open".
         assert!(pick_open_pr(r#"[{"url":"u","title":"t"}]"#, "main").is_err());

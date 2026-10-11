@@ -23,11 +23,12 @@ pub(crate) fn ensure_owner(state: &RunState) -> Result<()> {
     Ok(())
 }
 
-/// The remote is either absent or exactly the head we last published.
-fn lease_for(remote: Option<&str>, expected: Option<&str>) -> Result<String> {
+/// The remote is absent, exactly the head we last published, or already at the
+/// tip being pushed (an idempotent re-push).
+fn lease_for(remote: Option<&str>, expected: Option<&str>, local: &str) -> Result<String> {
     match remote {
         None => Ok(String::new()),
-        Some(head) if Some(head) == expected => Ok(head.to_owned()),
+        Some(head) if Some(head) == expected || head == local => Ok(head.to_owned()),
         Some(_) => bail!("public head moved or has no recorded lease; refusing to overwrite it"),
     }
 }
@@ -108,7 +109,8 @@ pub(crate) async fn publish(
     }
     let remote = state.config.merge.remote.clone();
     let remote_head = git::remote_head(&winner.worktree, &remote, &head).await?;
-    let expected = lease_for(remote_head.as_deref(), expected)?;
+    let local_tip = git::rev_parse(&winner.worktree, &winner.branch).await?;
+    let expected = lease_for(remote_head.as_deref(), expected, &local_tip)?;
     if let land::OpenPr::One { ref url, .. } = found {
         let (ok, raw) = land::gh(
             &winner.worktree,
@@ -256,9 +258,11 @@ mod tests {
 
     #[test]
     fn public_head_lease_refuses_unknown_or_moved_remote() {
-        assert_eq!(lease_for(None, None).unwrap(), "");
-        assert_eq!(lease_for(Some("a"), Some("a")).unwrap(), "a");
-        assert!(lease_for(Some("b"), Some("a")).is_err());
-        assert!(lease_for(Some("a"), None).is_err());
+        assert_eq!(lease_for(None, None, "l").unwrap(), "");
+        assert_eq!(lease_for(Some("a"), Some("a"), "l").unwrap(), "a");
+        assert!(lease_for(Some("b"), Some("a"), "l").is_err());
+        assert!(lease_for(Some("a"), None, "l").is_err());
+        // Already at the tip being pushed: allowed even with no record.
+        assert_eq!(lease_for(Some("l"), None, "l").unwrap(), "l");
     }
 }
