@@ -384,12 +384,25 @@ mod tests {
 
     #[test]
     fn an_icon_never_reaches_the_briefing() {
-        let plain = catalog(&[spec("rei", "Rei", "Be curt.")]);
-        let iconed = catalog(&[with_icon(spec("rei", "Rei", "Be curt."), "~/r.png")]);
-        let (a, b) = (&plain[2], &iconed[2]);
-        assert_eq!(section(a), section(b));
-        assert_eq!(section_for(a, Some("Cmdr")), section_for(b, Some("Cmdr")));
-        assert_eq!(update_block(Some(a)), update_block(Some(b)));
+        let without_icon = Persona {
+            id: "rei".into(),
+            name: "Rei".into(),
+            prompt: "Be curt.".into(),
+            icon: None,
+        };
+        let iconed = Persona {
+            icon: Some("~/r.png".into()),
+            ..without_icon.clone()
+        };
+        assert_eq!(section(&without_icon), section(&iconed));
+        assert_eq!(
+            section_for(&without_icon, Some("Cmdr")),
+            section_for(&iconed, Some("Cmdr"))
+        );
+        assert_eq!(
+            update_block(Some(&without_icon)),
+            update_block(Some(&iconed))
+        );
         // The default voice is unchanged by an icon on it.
         let d = catalog(&[with_icon(spec("default", "", ""), "~/d.png")]);
         assert!(active(&[with_icon(spec("default", "", ""), "~/d.png")], "").is_none());
