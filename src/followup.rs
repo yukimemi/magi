@@ -479,6 +479,30 @@ fn restore_takeover_hold(
     }
 }
 
+/// Leave a replaced run's deputy tasks held instead of releasing stale findings.
+pub(crate) fn supersede_deputy_tasks(
+    state: &mut RunState,
+    pr_url: &str,
+    queue: &Queue,
+    successor: &str,
+) {
+    for task in queue.list() {
+        if is_deputy_candidate(&task, &state.id, pr_url) {
+            mark_held(
+                state,
+                queue,
+                &task,
+                format!(
+                    "{SUPERSEDED}pull request ownership moved to run {}",
+                    crate::run::short_of(successor)
+                ),
+                pr_url,
+                "superseded",
+            );
+        }
+    }
+}
+
 /// Rewrite a still-candidate deputy task's hold reason, leaving it held.
 fn mark_held(
     state: &mut RunState,

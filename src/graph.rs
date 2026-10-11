@@ -362,7 +362,7 @@ async fn leaked_subjects(state: &RunState, branch: &str) -> Option<Vec<String>> 
 /// May an adopted pull request's title be replaced with `computed`? Only when
 /// it is empty, magi's own shape, or a base commit's subject that leaked in;
 /// a title a person wrote stays. Never when `computed` is itself a leak.
-fn should_retitle(current: &str, computed: &str, leaked: &[String]) -> bool {
+pub(crate) fn should_retitle(current: &str, computed: &str, leaked: &[String]) -> bool {
     let is_leak = |t: &str| leaked.iter().any(|l| l.trim() == t.trim());
     if is_leak(computed) {
         return false;
@@ -720,6 +720,20 @@ impl Runner {
             }
             return Err(e.context("applying the owner's answer about the diverged branch"));
         }
+        // An earlier attempt of this task that published the task head, and
+        // whose work is the branch under review, hands that head over: the
+        // review run updates the same pull request. Without one (a legacy
+        // `magi/<run>/<label>` PR, a hand-named branch) the branch keeps its
+        // own head and its own open pull request is adopted as before.
+        for id in takeover.earlier.iter().rev() {
+            if let Ok(old) = RunState::load_under(id, &takeover.home)
+                && let Some(head) = old.pr_head.clone()
+                && (head == branch || old.winner().is_some_and(|w| w.branch == branch))
+            {
+                state.pr_head = Some(head);
+                break;
+            }
+        }
         let opened =
             Self::open_review(&repo, branch, state, roles, max_parallel, base_commit).await;
         if opened.is_err()
@@ -932,6 +946,9 @@ impl Runner {
     fn mark_driver_exited(&mut self) {
         self.state.driver_exited = true;
         let pid = std::process::id();
+        let Ok(_lock) = crate::pr_head::owner_lock(&crate::run::home(), &self.state.id) else {
+            return;
+        };
         let Ok(mut disk) = RunState::load(&self.state.id) else {
             return;
         };
@@ -944,7 +961,11 @@ impl Runner {
         }
     }
 
-    async fn execute_graph(&mut self) -> Result<()> {
+    /// Validate ownership and persist the driver claim in one critical section.
+    fn claim_driver(&mut self) -> Result<()> {
+        let _lock = crate::pr_head::owner_lock(&crate::run::home(), &self.state.id)?;
+        let disk = RunState::load(&self.state.id)?;
+        crate::pr_head::ensure_owner(&disk)?;
         // Moving again, so it is no longer parked. Set before the walk rather
         // than in `resume`, so every way of re-entering the graph clears it
         // and a card cannot claim a run is waiting to be resumed while the
@@ -974,9 +995,7 @@ impl Runner {
         // A resume that raced a takeover: the record on disk says the worktree
         // was handed to a later run after this copy was read. Saving over it
         // would erase that and drive a run with nothing to run in.
-        if let Ok(disk) = RunState::load(&self.state.id)
-            && let Some(to) = &disk.released_to
-        {
+        if let Some(to) = &disk.released_to {
             bail!(
                 "run {} cannot continue: its worktree was released to run {}",
                 self.state.short(),
@@ -988,6 +1007,19 @@ impl Runner {
         self.state.driver_started_at = crate::proc::process_started_at(pid);
         self.state.driver_exited = false;
         self.state.save()?;
+        Ok(())
+    }
+
+    async fn execute_graph(&mut self) -> Result<()> {
+        self.claim_driver()?;
+        // Publication already passed review and gate. Resume only that node:
+        // syncing to a newer base here could change the verified commit.
+        if self.state.pr_publication_pending {
+            self.merge().await?;
+            self.state.save()?;
+            self.settle_questions();
+            return Ok(());
+        }
         // A run that already lost its quorum never resumes into the verdict
         // machinery: `deliberate` and `vote` would otherwise clobber the
         // stalled marker back to Voting and the run would keep going past a
@@ -3966,7 +3998,9 @@ impl Runner {
         // that never reached the remote): anything else is somebody else's work.
         let branch_tracking = format!("{remote}/{}", winner.branch);
         let fetched_branch = git::fetch(&repo, &remote, &winner.branch).await;
-        let remote_tip = if matches!(&fetched_branch, Ok(o) if o.ok()) {
+        let remote_tip = if self.state.task_pr_branch().is_none()
+            && matches!(&fetched_branch, Ok(o) if o.ok())
+        {
             git::rev_parse(&repo, &branch_tracking).await.ok()
         } else {
             None
@@ -4097,6 +4131,11 @@ impl Runner {
     /// (no remote copy, the same tip, or a remote copy this branch already
     /// contains, which the PR-time push fast-forwards) or the push succeeded.
     async fn publish_resumed_rebase(&mut self, branch: &str, head: &str) -> Option<String> {
+        // Task competitions publish only after the PR text gate, to their
+        // public head; never resurrect a candidate branch on the remote.
+        if self.state.task_pr_branch().is_some() {
+            return None;
+        }
         let repo = self.state.repo.clone();
         let remote = self.state.config.merge.remote.clone();
         let fetched = git::fetch(&repo, &remote, branch).await;
@@ -4172,9 +4211,10 @@ impl Runner {
             }
         };
         let mut verified = vec![head.to_owned()];
-        let fetched = git::fetch(&repo, &remote, branch).await;
+        let public_branch = self.state.pr_branch().unwrap_or(branch).to_owned();
+        let fetched = git::fetch(&repo, &remote, &public_branch).await;
         if matches!(&fetched, Ok(o) if o.ok())
-            && let Ok(theirs) = git::rev_parse(&repo, &format!("{remote}/{branch}")).await
+            && let Ok(theirs) = git::rev_parse(&repo, &format!("{remote}/{public_branch}")).await
             && theirs != head
         {
             match crate::already::classify(&repo, tip, &theirs, Some(&start)).await {
@@ -4190,7 +4230,8 @@ impl Runner {
             evidence.proof.as_str()
         );
         let closed =
-            crate::land::close_superseded_pr(&mut self.state, branch, &evidence, &verified).await;
+            crate::land::close_superseded_pr(&mut self.state, &public_branch, &evidence, &verified)
+                .await;
         match closed {
             Ok(Ok(url)) => self
                 .state
@@ -6785,7 +6826,7 @@ impl Runner {
         // open a second pull request. `self.state.merge` is set exactly once
         // this node (or `land`) has already produced a verdict, under every
         // mode, which is what "already done" actually means here.
-        if self.state.merge.is_some() {
+        if self.state.merge.is_some() && !self.state.pr_publication_pending {
             return Ok(());
         }
         let Some(winner) = self.state.winner().cloned() else {
@@ -6880,6 +6921,22 @@ impl Runner {
                         detail: if out.ok() { out.stdout } else { out.stderr },
                         empty: false,
                     }
+                }
+            }
+            MergeMode::Pr if self.state.task_pr_branch().is_some() => {
+                self.state.pr_publication_pending = true;
+                self.state.save()?;
+                let out =
+                    crate::pr_head::publish(&mut self.state, &winner, &pr.title, &pr.body).await;
+                self.state.pr_publication_pending = out.is_err();
+                MergeOutcome {
+                    mode,
+                    ok: out.is_ok(),
+                    detail: match out {
+                        Ok(url) => url,
+                        Err(e) => format!("{e:#}"),
+                    },
+                    empty: false,
                 }
             }
             MergeMode::Pr => {
@@ -7013,6 +7070,7 @@ impl Runner {
     /// in the same repository, which is exactly the "must not wait on
     /// another task" property the daemon's slot-freeing exists to give.
     async fn run_land(&mut self) -> Result<()> {
+        crate::pr_head::ensure_owner(&self.state)?;
         let url = self
             .state
             .merge
@@ -9266,7 +9324,7 @@ fn pr_merge_plan(found: Result<land::OpenPr>) -> PrPlan {
 }
 
 /// `gh pr create`, returning the PR url.
-async fn gh_pr_create(
+pub(crate) async fn gh_pr_create(
     cwd: &Path,
     base: &str,
     head: &str,
@@ -11792,6 +11850,9 @@ mod tests {
         // through `merge`, which is exactly the call site that used to skip
         // `settle_questions` - see the fixture below.
         ask_test_home();
+        // A real resume loads a persisted run; driver ownership is checked
+        // against that record before the Landing shortcut is entered.
+        state.save().expect("save landing run");
         let store = ask::Questions::open();
         let q = ask_open_question(&store, &state.id);
 

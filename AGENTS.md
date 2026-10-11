@@ -845,7 +845,11 @@ upstream CRLF, not drift worth committing — normalise back to LF and
 
 ### Invariants the blindness rests on
 
-- Branch names carry the **label**, never the agent id (`RunState::branch_for`).
+- Competition branch names carry the **label**, never the agent id
+  (`RunState::branch_for`). Queue competitions publish to `magi/task-<task id>`
+  (`RunState::task_pr_branch`); neither label nor agent identity appears in
+  that public head. Review-only and taskless runs keep their existing head;
+  an invalid task ref falls back to the candidate branch.
   A judge inspecting `magi/<run>/B` with git must not be able to infer authorship.
 - Sessions are keyed by **seat**, never agent id (`SeatState::key`). The same
   model may implement and judge in one run; its judge seat must never have seen
@@ -1015,6 +1019,47 @@ Do not "simplify" them into one flag: the useful middle state - magi does the
 watching and the fixing, a human owns the irreversible step - is exactly the
 default, and one flag cannot express it.
 
+**Retries publish the same task head.** `pr_head` is separate from the
+per-run candidate branch. Before pushing, publication searches for an open PR
+on that head and base; an unreadable or ambiguous answer stops. It reuses the
+open PR or creates one when absent. Every task-head push (publication, fix,
+rebase) uses an explicit `--force-with-lease=refs/heads/<head>:<sha>` measured
+against `pr_pushed_head`, the last successful push, never a fetched tracking
+ref. An absent remote requires an empty lease; an existing remote with an
+unknown or different SHA is refused, preserving human pushes.
+
+On reuse, the guarded body replaces the body in full. The title refreshes only
+if it equals the recorded `pr_posted_title` or `should_retitle` identifies a
+machine-generated title; human title edits survive. Metadata errors stop with
+`pr_publication_pending`, so a resume retries publication using the saved
+lease and existing candidates.
+
+The old run must be terminal with a proven stopped driver and no daemon claim;
+unknown liveness refuses takeover. Auto-merge is disabled before replacing the
+head. Successful publication saves the new run's pushed SHA and PR record,
+then marks predecessors `pr_taken_over_by` (idempotently); their PR records
+remain history and lifecycle writes still propagate to them. Reports and the
+web show them as superseded, and they cannot re-enter the graph or land.
+A takeover comment preserves the link between attempts. Writes are not atomic
+with the push: a saved push lease permits a subsequent publication retry;
+an unrecorded successful push fails closed rather than guessing ownership.
+
+**Publication details.** A review-only run publishes to the task head only when it
+inherited `pr_head` from an earlier attempt of the task whose work is the
+reviewed branch (`Runner::review_taking_over`); a legacy `magi/<run>/<label>`
+PR or a hand-named branch keeps its own head and adopts its own open PR. Auto-merge
+is disabled on a reused PR only when `autoMergeRequest` is set. The takeover
+comment is best effort. A run whose `pr_publication_pending` is set is resumed,
+never re-competed: `daemon::exhausted_review_budget` does not count it as spent.
+
+The new run owns its own land rounds and budget (`graph.land_rounds`), review
+findings, contested hand-off, approval, and armed head. None is copied from the
+predecessor. Checks start unknown and land awaits the newly pushed SHA before
+deciding. Follow-ups are filed only after this run confirms merge; the old
+run's deputy tasks naming this PR remain held with a `[superseded]` reason.
+Legacy PR heads (`magi/<run>/<label>`) are not migrated or automatically closed
+by task-head publication; existing evidence-based closure rules still apply.
+
 **A third, conditional reason to hold: a contested hand-off.** Both gates
 stay on by default, and `land_approval = false` still means an unattended
 merge for an ordinary run. The exception is a run whose review loop handed
@@ -1046,10 +1091,9 @@ both SHAs - never a merge. The merge itself is `gh pr merge
 --match-head-commit <observed sha>`, so a push between the look and the merge
 is refused by the forge, and a refusal after which the head differs goes back
 to observing without failing the run. The non-required-red policy is
-unchanged. Known limit: the awaited SHA is memory only, so a crash right after
-a push can bind the old head once on resume; `--match-head-commit` still stops
-that merge. `gh` truncates `commits` near 100 entries, so a very long pull
-request waits out the ceiling and stops (the safe direction).
+unchanged. The successfully pushed SHA is persisted as `pr_pushed_head`, so
+a resume also awaits that head. `gh` truncates `commits` near 100 entries, so
+a very long pull request waits out the ceiling and stops (the safe direction).
 
 **A conflict is a rebase, not a fix round.** `Step::Rebase` is decided before
 the checks, because every check on a branch that cannot land is an answer
@@ -2030,14 +2074,19 @@ a branch, a commit SHA or a pull request that unfinished work already owns
 judge that cannot answer lets it through (fail-open, stderr note + warn).
 Only concrete identifiers match, never text similarity. What counts as
 "owned" is spread over `Task::review_branch`, `Task::runs`, and each run's
-`candidates[].branch` / `pr` / `base_commit` in `run.json`, none of which a
-compiler ties together, so a new field that names a branch or PR belongs in
+`candidates[].branch` / `pr_head` / `pr` / `base_commit` in `run.json`, none of
+which a compiler ties together, so a new field that names a branch or PR belongs in
 `dupes::task_claims` / `run_claims`. `run.json` is read through a tolerant
 view, not `RunState::load`, so a schema bump cannot silently drop claims. The
 daemon's retries, requeues, review requests and resumes never go through this
 check: they would collide with themselves. A PR number the text names that no
 record explains is asked of the forge (`gh pr view`, 5 s cap, any failure is
 "unknown" and ignored); tests inject that lookup via `dupes::check_with`.
+
+A terminal run with `pr_taken_over_by` naming a readable successor drops its
+PR and public-head claims, like `released_to`; the successor owns them.
+`task_claims` keeps those claims within the owning task rather than attributing
+the same PR to each attempt.
 
 ### A run record's `pr.state` is the last value *its own* land loop polled
 

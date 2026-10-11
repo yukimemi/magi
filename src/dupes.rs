@@ -390,6 +390,10 @@ struct RunView {
     /// The run that took this one's worktree (and pull request) over.
     #[serde(default)]
     released_to: Option<String>,
+    #[serde(default)]
+    pr_head: Option<String>,
+    #[serde(default)]
+    pr_taken_over_by: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -469,6 +473,12 @@ impl<'a> Staleness<'a> {
     /// `true` when `view`'s recorded-open pull request is known not to be this
     /// run's to claim any more.
     fn pr_released(&mut self, repo: &Path, view: &RunView) -> bool {
+        if let Some(next) = &view.pr_taken_over_by
+            && next != &view.id
+            && RunView::read(self.runs_root, next).is_some()
+        {
+            return true;
+        }
         let Some(pr) = view.pr.as_ref().filter(|p| p.state == "open") else {
             return false;
         };
@@ -589,6 +599,11 @@ pub fn check_with(
         let Some(view) = RunView::read(runs_root, &id) else {
             continue;
         };
+        // A task-scoped publication is one task's hand-off, even when
+        // several run records retain its history.
+        if from_task.contains(&id) && view.pr_head.is_some() {
+            continue;
+        }
         if (view.terminal() && !view.pr_open()) || idents.of(&view.repo) != here {
             continue;
         }
@@ -813,6 +828,9 @@ fn task_claims(
             // A merged or closed pull request is not in flight, even when the
             // task that owns it is.
             let live_pr = !(view.terminal() && stale.pr_released(repo, &view));
+            if view.terminal() && !live_pr && view.pr_taken_over_by.is_some() {
+                continue;
+            }
             out.extend(run_claims(
                 &view,
                 Owner::Task,
@@ -867,6 +885,18 @@ fn run_claims(
             pr: None,
         })
         .collect();
+    if live_pr && let Some(branch) = &view.pr_head {
+        out.push(Claim {
+            owner: owner.clone(),
+            id: id.clone(),
+            status: status.clone(),
+            via: via_pr(""),
+            about: about.clone(),
+            branch: Some(branch.clone()),
+            base: None,
+            pr: None,
+        });
+    }
     if pr.is_some() {
         out.push(Claim {
             owner,
@@ -1362,6 +1392,33 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         v["released_to"] = serde_json::json!(to);
         std::fs::write(path, v.to_string()).unwrap();
+    }
+
+    #[test]
+    fn a_task_public_head_and_pr_are_claimed_only_by_the_successor() {
+        let (f, base, _) = fx();
+        write_run(&f, RID, "blocked", &base, Some((48, "open")));
+        let next = "20260901-000001-bbbb";
+        write_run(&f, next, "landing", &base, Some((48, "open")));
+        for id in [RID, next] {
+            let path = f.runs.join(id).join("run.json");
+            let mut value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            value["pr_head"] = serde_json::json!("magi/task-abcd-1234");
+            if id == RID {
+                value["pr_taken_over_by"] = serde_json::json!(next);
+            }
+            std::fs::write(path, value.to_string()).unwrap();
+        }
+        for text in ["update #48", "update magi/task-abcd-1234"] {
+            let hits = with_forge(&f, text, Some(PrLifecycle::Open));
+            assert!(!hits.is_empty());
+            assert!(hits.iter().all(|h| h.id == next), "{hits:?}");
+        }
+        let task = file_task(&f, TaskStatus::Held, &[RID, next]);
+        let hits = with_forge(&f, "update magi/task-abcd-1234", Some(PrLifecycle::Open));
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].id, task.id);
     }
 
     #[test]
