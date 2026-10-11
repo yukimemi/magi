@@ -2846,8 +2846,9 @@ fn run_display_status(state: &RunState, waiting: bool, live: crate::run::Livenes
         return "unmerged".to_owned();
     }
     if !state.status.done() && live == crate::run::Liveness::Dead {
-        let parked = state.parked || state.events.last().is_some_and(|e| e.node == "park");
-        if parked {
+        // The driver claim clears this flag before saving another event.
+        // A previous park event can therefore outlive a resumed driver.
+        if state.parked {
             return "parked".to_owned();
         }
         return "stale".to_owned();
@@ -13336,7 +13337,7 @@ mod tests {
                 Dead,
                 "parked",
             ),
-            (RunStatus::Judging, false, "park", false, Dead, "parked"),
+            (RunStatus::Judging, false, "park", false, Dead, "stale"),
             (RunStatus::Judging, false, "judge", false, Dead, "stale"),
             (
                 RunStatus::Judging,
@@ -13427,6 +13428,30 @@ mod tests {
             assert_eq!(detail["waiting"], list[0]["waiting"]);
             q.status = ask::QuestionStatus::Answered;
             store.put(&mut q).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resumed_crashed_driver_is_stale_despite_its_last_park_event() {
+        let f = Fixture::start().await;
+        let id = "20260922-090200-abcd";
+        write_run(&f.runs(), id, RunStatus::Judging);
+        let mut state = read_run(&f.runs(), id).unwrap();
+        state.parked = true;
+        state.driver_exited = true;
+        state.event("park", "stopped at a node boundary");
+        state.save_under(f.home.path()).unwrap();
+
+        for expected in ["parked", "stale"] {
+            let list = f.get("/api/runs").await.json();
+            let detail = f.get(&format!("/api/runs/{id}")).await.json();
+            assert_eq!(list[0]["live"], "dead");
+            assert_eq!(list[0]["display_status"], expected);
+            assert_eq!(detail["display_status"], expected);
+            // Model a driver claim followed by a crash before the next event:
+            // the persisted flag changes, but the last event is still park.
+            state.parked = false;
+            state.save_under(f.home.path()).unwrap();
         }
     }
 
