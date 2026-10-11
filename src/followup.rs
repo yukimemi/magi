@@ -228,13 +228,27 @@ pub fn settle_deputy_tasks(state: &mut RunState, pr_url: &str, queue: &Queue, re
             // finding and the deputy task is the one left held.
             let mut guards = Vec::new();
             let mut blocker: Option<&Task> = None;
+            let takeover = format!(
+                "{SUPERSEDED}the owner's approval deputy filed task {} for the same finding(s) of {pr_url}",
+                cand.id
+            );
+            // Held by an earlier pass of this same takeover that could not
+            // finish (or be rolled back): it is ours to restore on failure.
+            let mut carried: Vec<String> = Vec::new();
             if release {
                 for a in &rivals {
-                    if a.status == crate::queue::TaskStatus::Held {
+                    let ours = a.status == crate::queue::TaskStatus::Held
+                        && a.hold_reason.as_deref() == Some(takeover.as_str());
+                    if a.status == crate::queue::TaskStatus::Held && !ours {
                         continue;
                     }
                     match queue.claim(&a.id) {
-                        Ok(g) => guards.push((a.id.clone(), g)),
+                        Ok(g) => {
+                            if ours {
+                                carried.push(a.id.clone());
+                            }
+                            guards.push((a.id.clone(), g));
+                        }
                         Err(_) => {
                             blocker = Some(a);
                             break;
@@ -253,7 +267,33 @@ pub fn settle_deputy_tasks(state: &mut RunState, pr_url: &str, queue: &Queue, re
                 blocker = Some(&***rivals.first().expect("non-empty"));
             }
             if let Some(a) = blocker {
+                // A hold left by an interrupted takeover is not covered by
+                // the blocker: give it back before superseding the deputy.
+                let mut stuck = false;
+                for r in &rivals {
+                    let held_by_us = queue.get(&r.id).is_ok_and(|t| {
+                        t.status == crate::queue::TaskStatus::Held
+                            && t.hold_reason.as_deref() == Some(takeover.as_str())
+                    });
+                    if !held_by_us {
+                        continue;
+                    }
+                    let _own;
+                    if !guards.iter().any(|(g, _)| g == &r.id) {
+                        match queue.claim(&r.id) {
+                            Ok(g) => _own = g,
+                            Err(_) => {
+                                stuck = true;
+                                continue;
+                            }
+                        }
+                    }
+                    stuck |= !restore_takeover_hold(state, queue, &r.id, &takeover, &cand.id);
+                }
                 drop(guards);
+                if stuck {
+                    continue;
+                }
                 let why = format!(
                     "{SUPERSEDED}follow-up task {} ({:?}) already covers {} of {pr_url}; was: {}",
                     a.id,
@@ -267,26 +307,33 @@ pub fn settle_deputy_tasks(state: &mut RunState, pr_url: &str, queue: &Queue, re
             // The owner's task wins; the idle automatic ones are held. Only
             // when every one is confirmed held is the deputy task released.
             let mut failed: Option<String> = None;
+            // What each held task looked like before, for a rollback.
+            let mut done: Vec<(String, Task, String)> = Vec::new();
             for (id, _guard) in &guards {
-                let why = format!(
-                    "{SUPERSEDED}the owner's approval deputy filed task {} for the same finding(s) of {pr_url}",
-                    cand.id
-                );
+                if carried.contains(id) {
+                    continue;
+                }
+                let why = takeover.clone();
+                let mut before: Option<Task> = None;
                 let held = queue.modify(id, |t| {
                     if t.status != crate::queue::TaskStatus::Queued {
                         return false;
                     }
-                    t.hold_manual(Some(why));
+                    before = Some(t.clone());
+                    t.hold_manual(Some(why.clone()));
                     true
                 });
                 match held {
-                    Ok(true) => state.event(
-                        NODE,
-                        format!(
-                            "follow-up task {id} held: superseded by deputy task {}",
-                            cand.id
-                        ),
-                    ),
+                    Ok(true) => {
+                        done.extend(before.map(|b| (id.clone(), b, why)));
+                        state.event(
+                            NODE,
+                            format!(
+                                "follow-up task {id} held: superseded by deputy task {}",
+                                cand.id
+                            ),
+                        );
+                    }
                     Ok(false) => {
                         failed = Some(id.clone());
                         break;
@@ -299,7 +346,48 @@ pub fn settle_deputy_tasks(state: &mut RunState, pr_url: &str, queue: &Queue, re
                 }
             }
             if let Some(id) = failed {
+                // Give back what was already held, still under its claim, so
+                // the automatic path keeps covering every finding. Only a
+                // task still carrying our hold is touched.
+                let mut stuck = false;
+                for tid in &carried {
+                    stuck |= !restore_takeover_hold(state, queue, tid, &takeover, &cand.id);
+                }
+                for (tid, before, why) in done.into_iter().rev() {
+                    let back = queue.modify(&tid, |t| {
+                        if t.status != crate::queue::TaskStatus::Held
+                            || t.hold_reason.as_deref() != Some(why.as_str())
+                        {
+                            return false;
+                        }
+                        *t = before;
+                        true
+                    });
+                    match back {
+                        Ok(true) => state.event(
+                            NODE,
+                            format!(
+                                "follow-up task {tid} restored: deputy task {} could not take it over",
+                                cand.id
+                            ),
+                        ),
+                        Ok(false) => {}
+                        Err(e) => {
+                            stuck = true;
+                            state.event(
+                                NODE,
+                                format!(
+                                    "rollback of {tid} failed, deputy task {} left as a candidate for the next settle: {e:#}",
+                                    cand.id
+                                ),
+                            );
+                        }
+                    }
+                }
                 drop(guards);
+                if stuck {
+                    continue;
+                }
                 let why = format!(
                     "{SUPERSEDED}follow-up task {id} could not be held, so it may still run for {} of {pr_url}; was: {}",
                     matched.join(", "),
@@ -341,6 +429,52 @@ pub fn settle_deputy_tasks(state: &mut RunState, pr_url: &str, queue: &Queue, re
             }
             Ok(false) => {}
             Err(e) => state.event(NODE, format!("could not release deputy task {id}: {e:#}")),
+        }
+    }
+}
+
+/// Give a follow-up task held by an interrupted takeover back to the
+/// automatic path. `false` when the write failed (the caller keeps the deputy
+/// task a candidate); a task no longer carrying `takeover` is left alone.
+fn restore_takeover_hold(
+    state: &mut RunState,
+    queue: &Queue,
+    tid: &str,
+    takeover: &str,
+    cand_id: &str,
+) -> bool {
+    let back = queue.modify(tid, |t| {
+        if t.status != crate::queue::TaskStatus::Held || t.hold_reason.as_deref() != Some(takeover)
+        {
+            return false;
+        }
+        // No snapshot survives a restart; an automatic follow-up is filed
+        // Queued with nothing else set.
+        t.status = crate::queue::TaskStatus::Queued;
+        t.held_at = None;
+        t.hold_reason = None;
+        t.hold_source = None;
+        true
+    });
+    match back {
+        Ok(true) => {
+            state.event(
+                NODE,
+                format!(
+                    "follow-up task {tid} restored: deputy task {cand_id} could not take it over"
+                ),
+            );
+            true
+        }
+        Ok(false) => true,
+        Err(e) => {
+            state.event(
+                NODE,
+                format!(
+                    "rollback of {tid} failed, deputy task {cand_id} left as a candidate for the next settle: {e:#}"
+                ),
+            );
+            false
         }
     }
 }
@@ -1451,5 +1585,105 @@ mod tests {
         let got = q.get(&t.id).unwrap();
         assert_eq!(got.status, crate::queue::TaskStatus::Held);
         assert!(got.hold_reason.unwrap().starts_with(SUPERSEDED));
+    }
+
+    #[test]
+    fn a_failed_hold_restores_the_automatic_tasks_already_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        s.followup_generation = Some(0);
+        file(&mut s, PR, &q).unwrap();
+        let autos = q.list();
+        assert_eq!(autos.len(), 2);
+        let mut t = deputy_task(&s.id, "both", "R3-1-1 and R3-1-2", &format!("after {PR}"));
+        q.put(&mut t).unwrap();
+        // Make the save of the second automatic task fail.
+        let last = autos.last().unwrap().id.clone();
+        let tmp = dir.path().join("queue").join(format!("{last}.json.tmp"));
+        std::fs::create_dir_all(&tmp).unwrap();
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        for a in &autos {
+            let got = q.get(&a.id).unwrap();
+            assert_eq!(got.status, crate::queue::TaskStatus::Queued, "{}", a.id);
+            assert_eq!(got.attempts, a.attempts);
+        }
+        let got = q.get(&t.id).unwrap();
+        assert_eq!(got.status, crate::queue::TaskStatus::Held);
+        assert!(got.hold_reason.unwrap().starts_with(SUPERSEDED));
+    }
+
+    #[test]
+    fn a_hold_left_by_an_earlier_failed_pass_is_restored_on_the_next_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        s.followup_generation = Some(0);
+        file(&mut s, PR, &q).unwrap();
+        let autos = q.list();
+        let mut t = deputy_task(&s.id, "both", "R3-1-1 and R3-1-2", &format!("after {PR}"));
+        q.put(&mut t).unwrap();
+        // The first auto task is left held by an earlier, interrupted pass.
+        let why = format!(
+            "{SUPERSEDED}the owner's approval deputy filed task {} for the same finding(s) of {PR}",
+            t.id
+        );
+        q.modify(&autos[0].id, |x| {
+            x.hold_manual(Some(why));
+            true
+        })
+        .unwrap();
+        let tmp = dir
+            .path()
+            .join("queue")
+            .join(format!("{}.json.tmp", autos[1].id));
+        std::fs::create_dir_all(&tmp).unwrap();
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        for a in &autos {
+            let got = q.get(&a.id).unwrap();
+            assert_eq!(got.status, crate::queue::TaskStatus::Queued, "{}", a.id);
+            assert!(got.hold_reason.is_none());
+        }
+        assert!(
+            q.get(&t.id)
+                .unwrap()
+                .hold_reason
+                .unwrap()
+                .starts_with(SUPERSEDED)
+        );
+    }
+
+    #[test]
+    fn a_blocked_takeover_restores_a_hold_left_by_an_earlier_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        s.followup_generation = Some(0);
+        file(&mut s, PR, &q).unwrap();
+        let autos = q.list();
+        let mut t = deputy_task(&s.id, "both", "R3-1-1 and R3-1-2", &format!("after {PR}"));
+        q.put(&mut t).unwrap();
+        let why = format!(
+            "{SUPERSEDED}the owner's approval deputy filed task {} for the same finding(s) of {PR}",
+            t.id
+        );
+        q.modify(&autos[0].id, |x| {
+            x.hold_manual(Some(why));
+            true
+        })
+        .unwrap();
+        let _claim = q.claim(&autos[1].id).unwrap();
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        assert_eq!(
+            status_of(&q, &autos[0].id),
+            crate::queue::TaskStatus::Queued
+        );
+        assert!(
+            q.get(&t.id)
+                .unwrap()
+                .hold_reason
+                .unwrap()
+                .starts_with(SUPERSEDED)
+        );
     }
 }
