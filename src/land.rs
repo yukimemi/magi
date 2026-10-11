@@ -3286,6 +3286,76 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
             }
         }
 
+        // A failed workflow run is rerun once, judged by its own run rather
+        // than by the rollup's aggregate: another run still pending, or a fix
+        // budget already spent, must not keep a flaky failure from its one
+        // rerun. It spends no round and no attempt.
+        if pr.state == PrLifecycle::Open && state.config.graph.rerun_flaky_checks {
+            let failing = rerunnable(&seen.contexts);
+            let now = forge.now();
+            match rerun_step(&failing, state.land_reruns.as_ref(), &seen.head, now) {
+                RerunStep::Rerun(runs) => {
+                    let rec = state.land_reruns.get_or_insert_with(Default::default);
+                    if !rec.head.eq_ignore_ascii_case(&seen.head) {
+                        *rec = LandReruns {
+                            head: seen.head.clone(),
+                            runs: BTreeMap::new(),
+                        };
+                    }
+                    for run in &runs {
+                        rec.runs.insert(run.clone(), now);
+                    }
+                    // Durable before the call: a restart must not
+                    // rerun the same run twice. A save that fails
+                    // means no rerun.
+                    state.save()?;
+                    let mut any = false;
+                    for run in &runs {
+                        let names = failing
+                            .iter()
+                            .filter(|(_, r)| r.as_deref() == Some(run))
+                            .map(|(l, _)| l.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        match forge.rerun(&repo, run).await {
+                            Ok(()) => {
+                                any = true;
+                                state.event(
+                                    "land",
+                                    format!("reran failed check(s) {names} (run {run})"),
+                                );
+                            }
+                            // Stays recorded: never a retry loop.
+                            Err(e) => state.event(
+                                "land",
+                                format!("could not rerun check(s) {names} (run {run}): {e:#}"),
+                            ),
+                        }
+                    }
+                    state.save()?;
+                    if any {
+                        waited = Duration::ZERO;
+                        forge.poll().await;
+                        continue;
+                    }
+                }
+                RerunStep::Grace => {
+                    if waited >= WAIT_CEILING {
+                        let why = format!(
+                            "checks were still failing after a rerun and {} minutes",
+                            WAIT_CEILING.as_secs() / 60
+                        );
+                        stop(state, &repo, &pr, &why).await?;
+                        return Ok(pr);
+                    }
+                    waited += POLL;
+                    forge.poll().await;
+                    continue;
+                }
+                RerunStep::Fix => {}
+            }
+        }
+
         let step = decide(&pr, round, budget, waited);
         // Armed on exactly this head: the forge is doing the waiting. A
         // decision to merge (or keep waiting) is only watched, never re-armed
@@ -3690,76 +3760,6 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 return Ok(pr);
             }
             Step::Fix { reason } => {
-                // A red check is rerun once before it costs a fix round: the
-                // fixer cannot commit a change for a flaky test. The rerun
-                // spends no round and no attempt.
-                if state.config.graph.rerun_flaky_checks && pr.checks == Checks::Red {
-                    let failing = rerunnable(&seen.contexts);
-                    let now = forge.now();
-                    match rerun_step(&failing, state.land_reruns.as_ref(), &seen.head, now) {
-                        RerunStep::Rerun(runs) => {
-                            let rec = state.land_reruns.get_or_insert_with(Default::default);
-                            if !rec.head.eq_ignore_ascii_case(&seen.head) {
-                                *rec = LandReruns {
-                                    head: seen.head.clone(),
-                                    runs: BTreeMap::new(),
-                                };
-                            }
-                            for run in &runs {
-                                rec.runs.insert(run.clone(), now);
-                            }
-                            // Durable before the call: a restart must not
-                            // rerun the same run twice. A save that fails
-                            // means no rerun.
-                            state.save()?;
-                            let mut any = false;
-                            for run in &runs {
-                                let names = failing
-                                    .iter()
-                                    .filter(|(_, r)| r.as_deref() == Some(run))
-                                    .map(|(l, _)| l.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                match forge.rerun(&repo, run).await {
-                                    Ok(()) => {
-                                        any = true;
-                                        state.event(
-                                            "land",
-                                            format!("reran failed check(s) {names} (run {run})"),
-                                        );
-                                    }
-                                    // Stays recorded: never a retry loop.
-                                    Err(e) => state.event(
-                                        "land",
-                                        format!(
-                                            "could not rerun check(s) {names} (run {run}): {e:#}"
-                                        ),
-                                    ),
-                                }
-                            }
-                            state.save()?;
-                            if any {
-                                waited = Duration::ZERO;
-                                forge.poll().await;
-                                continue;
-                            }
-                        }
-                        RerunStep::Grace => {
-                            if waited >= WAIT_CEILING {
-                                let why = format!(
-                                    "checks were still failing after a rerun and {} minutes",
-                                    WAIT_CEILING.as_secs() / 60
-                                );
-                                stop(state, &repo, &pr, &why).await?;
-                                return Ok(pr);
-                            }
-                            waited += POLL;
-                            forge.poll().await;
-                            continue;
-                        }
-                        RerunStep::Fix => {}
-                    }
-                }
                 round += 1;
                 waited = Duration::ZERO;
                 for c in &pr.review_comments {
@@ -3853,11 +3853,20 @@ enum RerunStep {
 
 /// Failed checks a rerun may help: a failure of a check that blocks (`required`
 /// unreadable counts), as `(label, run)`. Judged one workflow run at a time;
-/// the caller only asks once the rollup has no pending check at all.
+/// pending checks in another run do not delay this run's rerun.
 fn rerunnable(contexts: &[CheckInfo]) -> Vec<(String, Option<String>)> {
     contexts
         .iter()
         .filter(|c| c.verdict == Verdict::Fail && c.required != Some(false))
+        // `gh run rerun --failed` refuses a run with a job still going.
+        .filter(|c| {
+            c.run.as_ref().is_none_or(|r| {
+                !contexts.iter().any(|o| {
+                    matches!(o.verdict, Verdict::Pending | Verdict::Unknown)
+                        && o.run.as_ref() == Some(r)
+                })
+            })
+        })
         .map(|c| (c.label.clone(), c.run.clone()))
         .collect()
 }
@@ -7341,6 +7350,83 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let rerun_at = calls.iter().position(|c| *c == "rerun").unwrap();
         let fix_at = calls.iter().position(|c| *c == "fix");
         assert!(fix_at.is_none_or(|f| f > rerun_at));
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_is_rerun_while_another_run_is_still_pending() {
+        let mut state = landing_state();
+        let mut v = red("a", Some("7"));
+        v.pr.checks = Checks::Pending;
+        v.contexts.push(CheckInfo {
+            label: "slow".to_owned(),
+            verdict: Verdict::Pending,
+            required: Some(true),
+            run: Some("8".to_owned()),
+        });
+        let forge = Scripted::new(
+            vec![v, seen("a", Checks::Green, "CLEAN", false)],
+            vec![(true, "")],
+        );
+        land_with(&mut state, RERUN_PR, &forge).await.unwrap();
+        assert_eq!(*forge.reruns.lock().unwrap(), ["7"]);
+        assert_eq!(state.status, RunStatus::Merged);
+    }
+
+    #[test]
+    fn a_run_with_a_job_still_going_is_not_rerun_yet() {
+        let mut v = red("a", Some("7"));
+        v.contexts.push(CheckInfo {
+            label: "same run, still going".to_owned(),
+            verdict: Verdict::Pending,
+            required: Some(true),
+            run: Some("7".to_owned()),
+        });
+        assert!(rerunnable(&v.contexts).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_rerun_is_made_even_when_the_fix_budget_is_spent() {
+        let mut state = landing_state();
+        state.config.graph.land_rounds = 0;
+        let forge = Scripted::new(
+            vec![
+                red("a", Some("7")),
+                seen("a", Checks::Green, "CLEAN", false),
+            ],
+            vec![(true, "")],
+        );
+        land_with(&mut state, RERUN_PR, &forge).await.unwrap();
+        assert_eq!(*forge.reruns.lock().unwrap(), ["7"]);
+        assert_eq!(state.status, RunStatus::Merged);
+        assert!(!forge.calls().contains(&"fix"));
+        assert_eq!(state.pr.as_ref().unwrap().round, 0);
+    }
+
+    #[tokio::test]
+    async fn the_last_fix_rounds_new_head_gets_its_rerun() {
+        let mut state = landing_state();
+        state.config.graph.land_rounds = 1;
+        let forge = Scripted::new(
+            vec![
+                seen("a", Checks::Green, "CLEAN", true),
+                red("b", Some("7")),
+                seen("b", Checks::Green, "CLEAN", false),
+            ],
+            vec![(true, "")],
+        );
+        *forge.fix.lock().unwrap() = Some(Fixed::Committed {
+            head: "b".to_owned(),
+        });
+        land_with(&mut state, RERUN_PR, &forge).await.unwrap();
+        assert_eq!(*forge.reruns.lock().unwrap(), ["7"]);
+        assert_eq!(forge.calls().iter().filter(|c| **c == "fix").count(), 1);
+        assert_eq!(state.pr.as_ref().unwrap().round, 1);
+        assert_eq!(state.status, RunStatus::Merged);
+        assert_eq!(state.land_reruns.as_ref().unwrap().head, "b");
+        assert_eq!(
+            value_of(&forge.argvs()[0], "--match-head-commit"),
+            Some("b")
+        );
     }
 
     #[tokio::test]
