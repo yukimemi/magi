@@ -1314,10 +1314,19 @@ impl Talk {
 pub struct PersonaSpec {
     /// Stable id the conversation stores. Not `default`.
     pub id: String,
-    /// What the selector shows.
+    /// What the selector shows. May be omitted when `id` is a built-in's: the
+    /// built-in's name is kept.
+    #[serde(default)]
     pub name: String,
-    /// The voice instruction appended to the chat's system prompt.
+    /// The voice instruction appended to the chat's system prompt. May be
+    /// omitted when `id` is a built-in's.
+    #[serde(default)]
     pub prompt: String,
+    /// Optional avatar, display only: a `data:image/(png|jpeg|gif|webp);base64,`
+    /// URI or an absolute (or `~/`) path to a raster image. See
+    /// [`crate::persona_icon`]. Never part of the briefing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
 }
 
 /// Roles resolved to concrete agent specs for one run.
@@ -2134,11 +2143,15 @@ impl Config {
              # Chat personas (tone only; the web Chat picks one per conversation).\n\
              # Built in: magi, rei, misato, ritsuko, shinji, asuka, kaworu. Entries add to\n\
              # them, and one with a built-in's id replaces it. `default` is the plain\n\
-             # voice and cannot be redefined. Declare this in one layer only.\n\
+             # voice and cannot be redefined (it may only set `icon`). Declare this in one\n\
+             # layer only. `icon` is an optional avatar, display only: an absolute or\n\
+             # ~/ path to a png/jpg/gif/webp, or a data:image/...;base64 URI, up to\n\
+             # 256 KiB; a missing or bad one falls back to the built-in avatar.\n\
              # [[talk.personas]]\n\
              # id = \"gendo\"\n\
              # name = \"Gendo Ikari\"\n\
-             # prompt = \"Speak coldly and tersely, hands folded.\"\n\n\
+             # prompt = \"Speak coldly and tersely, hands folded.\"\n\
+             # icon = \"~/pictures/gendo.png\"\n\n\
              [verify]\n\
              # Run once per review round in the winner's worktree; failures are\n\
              # fed back to the fixer.\n\
@@ -3164,6 +3177,44 @@ mod tests {
         assert!(load("[talk]\noperator_name = \"a\\nb\"\n").is_err());
         let long = "x".repeat(65);
         assert!(load(&format!("[talk]\noperator_name = \"{long}\"\n")).is_err());
+    }
+
+    #[test]
+    fn talk_persona_icon_parses_and_a_bad_shape_keeps_config_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let load = |body: &str| {
+            let path = dir.path().join("c.toml");
+            std::fs::write(&path, body).unwrap();
+            Config::load(&path)
+        };
+        let ok = load(
+            "[[talk.personas]]\nid = \"rei\"\nicon = \"~/rei.png\"\n\n\
+             [[talk.personas]]\nid = \"default\"\nicon = \"data:image/png;base64,AAAA\"\n",
+        )
+        .unwrap();
+        let c = crate::persona::catalog(&ok.talk.personas);
+        assert_eq!(c[0].icon.as_deref(), Some("data:image/png;base64,AAAA"));
+        assert_eq!(c[2].icon.as_deref(), Some("~/rei.png"));
+        assert!(c[2].prompt.contains("Rei"), "built-in voice kept");
+        let oversized = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(crate::persona_icon::ICON_MAX_BYTES)
+        );
+        for bad in ["", "rei.png", "/a/b.svg", "/a/../b.png", &oversized] {
+            for (id, fields) in [
+                ("rei", ""),
+                ("default", ""),
+                ("custom", "name = \"Custom\"\nprompt = \"Keep calm\"\n"),
+            ] {
+                let body = format!("[[talk.personas]]\nid = \"{id}\"\nicon = \"{bad}\"\n{fields}");
+                let cfg = load(&body).expect("bad icon must not invalidate config");
+                let persona = crate::persona::find(&cfg.talk.personas, id).unwrap();
+                assert_eq!(persona.id, id);
+                assert!(crate::persona_icon::load(bad).is_err());
+            }
+        }
+        let doc = Config::starter_toml();
+        assert!(doc.contains("# icon = "));
     }
 
     #[test]
