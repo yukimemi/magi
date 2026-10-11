@@ -722,19 +722,17 @@ async fn run_detail_tabs_landing_and_strip_hold_at_both_widths_and_themes() {
             .collect(),
         synthesis: Some("A blended brief.".to_owned()),
     });
-    run.judgements = vec![
-        magi::run::Judgement {
-            judge: 1,
-            seat: "judge-1".to_owned(),
-            agent: "agent-1".to_owned(),
-            ranking: vec!['A', 'B'],
-            reasons: std::collections::BTreeMap::new(),
-            confidence: Some(8),
-            order: vec![0, 1],
-            failed: None,
-            duration_ms: 100,
-        },
-    ];
+    run.judgements = vec![magi::run::Judgement {
+        judge: 1,
+        seat: "judge-1".to_owned(),
+        agent: "agent-1".to_owned(),
+        ranking: vec!['A', 'B'],
+        reasons: std::collections::BTreeMap::new(),
+        confidence: Some(8),
+        order: vec![0, 1],
+        failed: None,
+        duration_ms: 100,
+    }];
     run.tally = Some(magi::run::Tally {
         first_choice: [('A', 1)].into_iter().collect(),
         borda: [('A', 2)].into_iter().collect(),
@@ -881,13 +879,13 @@ async fn run_detail_tabs_landing_and_strip_hold_at_both_widths_and_themes() {
 
             // Raw HTML in deliberation turn bodies must not be executed as DOM elements.
             let injected_script = browser
-                .eval(
-                    &page,
-                    "document.getElementById('injected-delib') !== null",
-                )
+                .eval(&page, "document.getElementById('injected-delib') !== null")
                 .await
                 .unwrap();
-            assert_eq!(injected_script, false, "{tag}: raw HTML script must not be in DOM");
+            assert_eq!(
+                injected_script, false,
+                "{tag}: raw HTML script must not be in DOM"
+            );
 
             browser
                 .eval(
