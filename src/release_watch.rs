@@ -58,7 +58,7 @@ const LAP: Duration = Duration::from_secs(300);
 /// How long after a rerun the forge may still report the old failure before
 /// that is read as "still red". `gh run rerun` returns before the checks flip
 /// to pending.
-const RERUN_GRACE: i64 = 180;
+pub(crate) const RERUN_GRACE: i64 = 180;
 
 /// Choice: rerun the failed jobs once more. The three choices are matched
 /// verbatim when applied.
