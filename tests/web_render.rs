@@ -1984,7 +1984,6 @@ async fn chat_persona_select_sits_beside_the_agent_select_without_overlap() {
 
     let guard = common::home_lock().await;
     let fx = common::fixture(guard, common::Judges::Unanimous, false);
-    publish_fixture_roster(&fx).await;
     let home = fx.tmp.path().join("magi-home");
     let queue = Queue::at(home.join("queue"));
     let talks = Talks::at(home.join("talks"));
@@ -2061,6 +2060,7 @@ async fn chat_remembers_persona_and_implementers_for_new_conversations() {
 
     let guard = common::home_lock().await;
     let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    publish_fixture_roster(&fx).await;
     let home = fx.tmp.path().join("magi-home");
     let queue = Queue::at(home.join("queue"));
     let talks = Talks::at(home.join("talks"));
