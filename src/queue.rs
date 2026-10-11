@@ -4269,7 +4269,7 @@ mod tests {
         assert_eq!(inherited.chat_notice_due(), None);
         let mut old = chat_task();
         old.schema = 12;
-        old.succeed();
+        old.status = TaskStatus::Done;
         assert_eq!(old.chat_notice_due(), None, "history is not replayed");
         let mut live = chat_task();
         live.schema = 12;

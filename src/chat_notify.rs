@@ -197,7 +197,8 @@ fn pending_is_only_notices(t: &talk::Talk) -> bool {
 }
 
 /// Start the chat's turn for every talk owed a notice, under the talk's own
-/// lease, each in its own task. `parking` (an upgrade is parking) starts
+/// lease, each spawned into `turns` (the daemon's in-flight set, which its exit
+/// waits for). `parking` (an upgrade is parking) starts
 /// nothing. Returns how many turns were started; a talk whose lease is held
 /// elsewhere is left to its holder, who drains the draft before letting go.
 pub fn start_turns(talks: &Talks, parking: bool, turns: &mut tokio::task::JoinSet<()>) -> usize {
