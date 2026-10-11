@@ -3789,7 +3789,11 @@ fn month_number(name: &str) -> Option<i8> {
 /// silently resume the exhausted run instead, spending an attempt on a
 /// cycle that cannot change anything.
 fn exhausted_review_budget(state: &RunState) -> bool {
-    state.status == RunStatus::Blocked && state.reviews.len() >= state.config.graph.review_rounds
+    // A run whose task-head publication failed has nothing left to review:
+    // resuming it only retries the publication, so it is never "exhausted".
+    state.status == RunStatus::Blocked
+        && !state.pr_publication_pending
+        && state.reviews.len() >= state.config.graph.review_rounds
 }
 
 /// This task's *most recent* run, if resuming it would actually make
@@ -8213,6 +8217,26 @@ mod tests {
                 Ok(has_budget_left.clone())
             }),
             Some(has_budget_left.id.clone())
+        );
+    }
+
+    #[test]
+    fn unfinished_run_resumes_a_run_whose_task_head_publication_is_pending() {
+        let mut run = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234def".to_owned(),
+            "add retries".to_owned(),
+            Config::default(),
+        );
+        run.status = RunStatus::Blocked;
+        run.config.graph.review_rounds = 1;
+        run.reviews = vec![review_round(1)];
+        run.pr_publication_pending = true;
+        assert_eq!(
+            unfinished_run_with(&[run.id.clone()], "t", |_| Ok(run.clone())),
+            Some(run.id.clone()),
+            "a spent review budget must not turn a failed publication into a re-competition"
         );
     }
 

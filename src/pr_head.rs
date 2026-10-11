@@ -119,7 +119,8 @@ pub(crate) async fn publish(
                 "view".into(),
                 url.clone(),
                 "--json".into(),
-                "headRefName,baseRefName,isCrossRepository,headRefOid,state".into(),
+                "headRefName,baseRefName,isCrossRepository,headRefOid,state,autoMergeRequest"
+                    .into(),
             ],
         )
         .await?;
@@ -131,6 +132,8 @@ pub(crate) async fn publish(
             is_cross_repository: bool,
             head_ref_oid: String,
             state: String,
+            #[serde(default)]
+            auto_merge_request: Option<serde_json::Value>,
         }
         if !ok {
             bail!("could not verify task PR head: {raw}");
@@ -146,8 +149,12 @@ pub(crate) async fn publish(
         {
             bail!("task pull request does not name the expected repository head");
         }
-        // A predecessor's approval must not arm a merge of the replacement head.
-        checked_gh(&winner.worktree, &["pr", "merge", url, "--disable-auto"]).await?;
+        // A predecessor's approval must not arm a merge of the replacement
+        // head. Only a pull request that actually has auto-merge armed is
+        // touched: the forge may refuse to disable what is not enabled.
+        if pr_head.auto_merge_request.is_some_and(|v| !v.is_null()) {
+            checked_gh(&winner.worktree, &["pr", "merge", url, "--disable-auto"]).await?;
+        }
     }
     let tip = git::rev_parse(&winner.worktree, &format!("refs/heads/{}", winner.branch)).await?;
     let push = git::push_as(&winner.worktree, &remote, &winner.branch, &head, &expected).await?;
@@ -232,11 +239,16 @@ pub(crate) async fn publish(
                 state.short(),
                 old.short()
             );
-            checked_gh(
+            // Best effort: the head is already published and recorded, and a
+            // failed note must not turn a landed update into a failed step.
+            if let Err(e) = checked_gh(
                 &winner.worktree,
                 &["pr", "comment", &url, "--body", &comment],
             )
-            .await?;
+            .await
+            {
+                tracing::warn!("takeover comment on {url} failed: {e:#}");
+            }
         }
     }
     state.event("merge", format!("published task head {head}: {url}"));

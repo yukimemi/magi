@@ -2231,7 +2231,12 @@ impl RunState {
                 .iter()
                 .any(|c| c.agent == "(existing branch)")
         {
-            return None;
+            // A review-only run of a branch magi itself published (a retry
+            // that reopens an earlier attempt's candidate) keeps updating the
+            // task's pull request. A hand-named branch keeps its own head.
+            if !self.winner().is_some_and(|w| w.branch.starts_with("magi/")) {
+                return None;
+            }
         }
         let task = self.origin.as_ref()?.task.as_ref()?;
         let branch = format!("magi/task-{task}");
@@ -3210,6 +3215,52 @@ mod tests {
         assert!(run.task_pr_branch().is_none());
         run.reviewed_commits = None;
         run.origin = Some(Origin::operator());
+        assert!(run.task_pr_branch().is_none());
+    }
+
+    #[test]
+    fn review_run_of_a_magi_branch_keeps_the_task_public_head() {
+        let mut run = state();
+        run.origin = Some(Origin::queue("abcd-1234"));
+        run.reviewed_commits = Some(Vec::new());
+        let mut cand = |branch: &str| {
+            run.candidates = vec![Candidate {
+                index: 0,
+                label: 'A',
+                agent: "(existing branch)".to_owned(),
+                branch: branch.to_owned(),
+                worktree: PathBuf::from("/w"),
+                summary: String::new(),
+                stat: String::new(),
+                files: 1,
+                commits: 1,
+                empty: false,
+                failed: None,
+                verified_noop: None,
+                duration_ms: 0,
+                folded: false,
+            }];
+        };
+        cand("magi/ab12/A");
+        run.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 0)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 0,
+            unanimous_initial: false,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: false,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+            uncontested: None,
+        });
+        assert_eq!(run.task_pr_branch().as_deref(), Some("magi/task-abcd-1234"));
+        // A hand-named branch is not ours to move.
+        run.candidates[0].branch = "feat/own".to_owned();
         assert!(run.task_pr_branch().is_none());
     }
 
