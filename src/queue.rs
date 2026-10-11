@@ -1783,7 +1783,10 @@ impl Queue {
             crate::notices::Notice::info(
                 &format!("unblocked:{}:{}", dependent.id, deleted),
                 message,
-            ),
+            )
+            .link(crate::notices::Link::Task {
+                id: dependent.id.clone(),
+            }),
         );
     }
 
@@ -3570,6 +3573,12 @@ mod tests {
         let notes = notices_of(dir.path());
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert_eq!(notes[0].severity, crate::notices::Severity::Info);
+        assert_eq!(
+            notes[0].link,
+            Some(crate::notices::Link::Task {
+                id: blocked.id.clone(),
+            })
+        );
     }
 
     #[test]

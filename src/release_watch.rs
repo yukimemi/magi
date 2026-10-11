@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::ask::{Answer, Question, Questions};
 use crate::land::{self, PrLifecycle, RollupView, Verdict};
-use crate::notices::{self, Notice, Notices};
+use crate::notices::{self, Link, Notice, Notices};
 use crate::release_local::{self, Job};
 use crate::run::RunState;
 
@@ -693,8 +693,13 @@ impl Watcher {
         Questions::at(self.home.join("questions"))
     }
 
-    fn raise(&self, pr: &str, message: String) {
-        notices::raise_in(&self.home, Notice::warn(&notice_key(pr), message));
+    fn raise(&self, pr: &str, url: &str, message: String) {
+        notices::raise_in(
+            &self.home,
+            Notice::warn(&notice_key(pr), message).link(Link::Url {
+                url: url.to_owned(),
+            }),
+        );
     }
 
     /// One pass over every repo. `stall_secs` is `[daemon] release_stall_minutes`
@@ -832,11 +837,11 @@ impl Watcher {
                     }
                 }
                 if ok {
-                    self.raise(&pr, rerun_message(&pr));
+                    self.raise(&pr, url, rerun_message(&pr));
                 }
             }
             Step::Escalate(why) => {
-                self.raise(&pr, human_message(&pr));
+                self.raise(&pr, url, human_message(&pr));
                 let mut q = Question::new(
                     String::new(),
                     crate::bump::NOTICE_NODE.to_owned(),
@@ -921,7 +926,7 @@ impl Watcher {
                     LocalStep::Ask => {
                         st.held_head = None;
                         st.asked_head = Some(snap.head.clone());
-                        self.raise(pr, approval_message(pr));
+                        self.raise(pr, &snap.url, approval_message(pr));
                         let mut q = Question::new(
                             String::new(),
                             crate::bump::NOTICE_NODE.to_owned(),
@@ -965,6 +970,7 @@ impl Watcher {
                                 st.held_head = Some(head);
                                 self.raise(
                                     pr,
+                                    &snap.url,
                                     format!(
                                         "Release PR {pr} could not be merged; merge it by hand"
                                     ),
@@ -1070,7 +1076,7 @@ impl Watcher {
         };
         match result {
             Ok(()) => {
-                self.raise_released(pr, &job);
+                self.raise_released(pr, &st.url, &job);
                 st.job = Some(job);
                 if self.record_on_run(&st) {
                     self.complete(pr, &mut st);
@@ -1083,7 +1089,7 @@ impl Watcher {
             Err(e) => {
                 job.failed = Some(format!("{e:#}"));
                 self.hold_task(&mut st, &format!("release {} failed: {e:#}", job.tag()));
-                self.raise(pr, failed_message(pr));
+                self.raise(pr, &st.url, failed_message(pr));
                 self.file_job_question(pr, &mut st, &job);
                 st.job = Some(job);
                 self.save(pr, &st);
@@ -1210,10 +1216,14 @@ impl Watcher {
         }
     }
 
-    fn raise_released(&self, pr: &str, job: &Job) {
+    fn raise_released(&self, pr: &str, url: &str, job: &Job) {
         notices::raise_in(
             &self.home,
-            Notice::info(&released_key(pr), format!("Released {} ({pr})", job.tag())),
+            Notice::info(&released_key(pr), format!("Released {} ({pr})", job.tag())).link(
+                Link::Url {
+                    url: url.to_owned(),
+                },
+            ),
         );
     }
 
@@ -1277,7 +1287,7 @@ impl Watcher {
             }
         }
         if !st.ignored && st.held.as_deref() != Some(why.as_str()) {
-            self.raise(pr, failed_message(pr));
+            self.raise(pr, &st.url, failed_message(pr));
             self.file_job_question(pr, st, job);
         }
         false
@@ -1650,6 +1660,12 @@ mod tests {
         let ns = Notices::at(dir.path().join("notifications")).list();
         assert_eq!(ns.len(), 1);
         assert_eq!(ns[0].key, "release-pr:o/r#7");
+        assert_eq!(
+            ns[0].link,
+            Some(Link::Url {
+                url: URL.to_owned(),
+            })
+        );
     }
 
     async fn escalated() -> (tempfile::TempDir, std::sync::Arc<Fake>, Watcher, String) {
@@ -2120,7 +2136,14 @@ mod tests {
         // Later laps change nothing: no retry, no second question.
         w.lap(std::slice::from_ref(&repo), 60, 2, &no).await;
         assert_eq!(w.questions().list().len(), 1);
-        assert_eq!(Notices::at(d.path().join("notifications")).list().len(), 1);
+        let ns = Notices::at(d.path().join("notifications")).list();
+        assert_eq!(ns.len(), 1);
+        assert_eq!(
+            ns[0].link,
+            Some(Link::Url {
+                url: URL.to_owned(),
+            })
+        );
     }
 
     #[tokio::test]
@@ -2325,5 +2348,21 @@ mod tests {
         w.save("o/r#7", &mk("gone"));
         w.lap(std::slice::from_ref(&repo), 60, 1, &(|| false)).await;
         assert!(!w.state_path("o/r#7").exists());
+    }
+
+    #[tokio::test]
+    async fn raise_released_attaches_url_link() {
+        let (d, _fake, w) = rig();
+        let job = Job::new("1.0.0", URL, "deadbeef");
+        w.raise_released("o/r#7", URL, &job);
+        let ns = Notices::at(d.path().join("notifications")).list();
+        assert_eq!(ns.len(), 1);
+        assert_eq!(ns[0].key, "release-done:o/r#7");
+        assert_eq!(
+            ns[0].link,
+            Some(Link::Url {
+                url: URL.to_owned(),
+            })
+        );
     }
 }

@@ -4054,10 +4054,15 @@ fn prepare_instruction(
 fn record(queue: &Queue, task: &mut Task) {
     if let Err(e) = queue.put(task) {
         tracing::error!("could not record task {}: {e:#}", task.short());
-        notices::raise(Notice::error(
-            "loop:record",
-            "The loop could not save a task's state; check the disk.",
-        ));
+        notices::raise(
+            Notice::error(
+                "loop:record",
+                "The loop could not save a task's state; check the disk.",
+            )
+            .link(Link::Task {
+                id: task.id.clone(),
+            }),
+        );
     }
 }
 
