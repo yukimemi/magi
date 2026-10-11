@@ -232,3 +232,15 @@ async fn talk_post_is_refused_without_a_traceable_seat() {
     assert!(!out.status.success(), "another talk's task");
     assert!(w.talks.get(&w.talk_id).expect("talk").turns.is_empty());
 }
+
+#[tokio::test]
+async fn a_notice_appended_to_an_operators_draft_is_not_started() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let mut talk = w.talks.get(&w.talk_id).expect("talk");
+    talk::queue(&mut talk, &w.talks, "half a thought", Vec::new()).expect("queue");
+    finished_task(&w, &w.talk_id, "20260902-000000-aaaa");
+    chat_notify::sweep(&w.queue, &w.talks, w.tmp.path());
+    assert!(drafts(&w).contains(magi::prompt::CHAT_TASK_NOTICE_HEADING));
+    assert!(chat_notify::talks_to_start(&w.talks).is_empty());
+}

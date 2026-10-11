@@ -1569,6 +1569,14 @@ async fn finish_talks(
             .iter()
             .cloned()
             .collect();
+        // A turn another task of this process (the daemon's completion
+        // notice) or another process runs holds only the on-disk lease.
+        let talks = talk::Talks::at(home.join("talks"));
+        for t in talks.list() {
+            if talks.turn_held(&t.id) && !ids.contains(&t.id) {
+                ids.push(t.id);
+            }
+        }
         ids.sort();
         ids
     };

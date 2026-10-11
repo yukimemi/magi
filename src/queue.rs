@@ -794,6 +794,9 @@ impl Task {
     /// boundary, for as long as its attempts hold out, instead of the
     /// one-shot "let this go next" the mark is meant to be.
     pub fn start(&mut self, run: String) {
+        // A task this build starts is eligible for a chat notice even when
+        // it was filed under an older schema (see `chat_notice_due`).
+        self.schema = self.schema.max(SCHEMA);
         self.status = TaskStatus::Running;
         self.attempts += 1;
         self.runs.push(run);
@@ -4259,6 +4262,11 @@ mod tests {
         old.schema = 12;
         old.succeed();
         assert_eq!(old.chat_notice_due(), None, "history is not replayed");
+        let mut live = chat_task();
+        live.schema = 12;
+        live.start("r1".to_owned());
+        live.succeed();
+        assert!(live.chat_notice_due().is_some(), "started by this build");
     }
 
     #[test]

@@ -173,13 +173,27 @@ pub fn talks_to_start(talks: &Talks) -> Vec<String> {
     talks
         .list()
         .into_iter()
-        .filter(|t| {
-            t.status.open()
-                && t.pending
-                    .contains(&format!("# {CHAT_TASK_NOTICE_HEADING}\n"))
-        })
+        .filter(|t| t.status.open() && pending_is_only_notices(t))
         .map(|t| t.id)
         .collect()
+}
+
+/// Is the draft made of completion notices alone? A notice appended to an
+/// operator's unsent draft must not start that draft on the daemon's initiative.
+fn pending_is_only_notices(t: &talk::Talk) -> bool {
+    let head = format!("# {CHAT_TASK_NOTICE_HEADING}\n");
+    let body = &t.pending;
+    if body.is_empty() || !t.pending_attachments.is_empty() {
+        return false;
+    }
+    let Some(cuts) = t.pending_breaks.as_deref() else {
+        return false;
+    };
+    let mut starts = vec![0];
+    starts.extend_from_slice(cuts);
+    starts
+        .iter()
+        .all(|&s| body.is_char_boundary(s) && body.get(s..).is_some_and(|m| m.starts_with(&head)))
 }
 
 /// Start the chat's turn for every talk owed a notice, under the talk's own
