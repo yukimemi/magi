@@ -1805,6 +1805,23 @@ impl Config {
         Ok(paths)
     }
 
+    /// Describe a repository layer without directing the operator to its cache.
+    pub(crate) fn repo_layer_description(repo: &Path, path: &Path) -> String {
+        let cached = path.ancestors().find(|p| p.join(REPO_MARKER).is_file());
+        if let Some(root) = cached {
+            let relative = path.strip_prefix(root).unwrap_or(path);
+            let reference = resolve_remote_base(repo)
+                .map(|(remote, base)| format!("{remote}/{base}"))
+                .unwrap_or_else(|_| "remote base".to_owned());
+            format!(
+                "{} at {reference} (including its includes)",
+                repo.join(relative).display()
+            )
+        } else {
+            format!("{} (including its includes)", path.display())
+        }
+    }
+
     /// Only the repository layers (lowest first), from `<remote>/<base>` in a
     /// git working tree and from disk elsewhere.
     pub(crate) fn repo_layers(repo: &Path) -> Result<Vec<PathBuf>> {

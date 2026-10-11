@@ -2174,7 +2174,11 @@ details.panel > summary + * { margin-top: var(--s2); }
 .sheet-task-link { display: flex; align-items: center; justify-content: center; gap: var(--s2); min-height: 44px; text-decoration: none; }
 
 /* ---- settings ---------------------------------------------------------- */
+#settings-sub, .set-note { overflow-wrap: anywhere; }
 .set-note { color: var(--ink-2); font-size: var(--t3); max-width: 64ch; margin: 0 0 var(--s4); }
+.set-context { display: flex; flex-direction: column; gap: var(--s2); margin-bottom: var(--s4); min-width: 0; }
+.set-context select { width: 100%; min-width: 0; max-width: 100%; }
+.set-override { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); }
 .set-role { margin-bottom: var(--s4); }
 .set-meta { color: var(--ink-2); font-size: var(--t3); margin: var(--s2) 0; overflow-wrap: anywhere; }
 .set-seats { list-style: none; margin: var(--s3) 0; padding: 0; display: flex; flex-direction: column; gap: var(--s2); }

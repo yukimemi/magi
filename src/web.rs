@@ -3804,11 +3804,87 @@ async fn repos_list(
     .await
 }
 
+/// Optional context, restricted to the server's known checkouts.
+#[derive(Debug, Default, Deserialize)]
+struct SettingsQuery {
+    repo: Option<PathBuf>,
+}
+
+/// Always discover against the server's original context, never the selection.
+/// If that config is broken, retain the default context and machine-only roots
+/// so the settings error contract and recovery picker remain available.
+fn settings_repositories(ui: &Ui, refresh: bool) -> Vec<repos::Repo> {
+    let cfg = settings::repository_config(&ui.repo, ui.machine_config.as_deref()).or_else(|_| {
+        let paths: Vec<PathBuf> = ui
+            .machine_config
+            .iter()
+            .filter(|p| p.is_file())
+            .cloned()
+            .collect();
+        if paths.is_empty() {
+            Ok(Config::autodetected())
+        } else {
+            Config::load_layers(&paths)
+        }
+    });
+    let mut known = cfg
+        .map(|cfg| {
+            ui.repos_cache.list(
+                &cfg.repos.roots,
+                Duration::from_secs(cfg.repos.scan_ttl),
+                refresh,
+            )
+        })
+        .unwrap_or_default();
+    let path = ui.repo.canonicalize().unwrap_or_else(|_| ui.repo.clone());
+    if !known.iter().any(|r| r.path == path) {
+        known.push(repos::Repo {
+            name: path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            path,
+        });
+    }
+    known
+}
+
+fn settings_context(ui: &Ui, q: SettingsQuery) -> ApiResult<(PathBuf, Vec<repos::Repo>)> {
+    let requested = q.repo.unwrap_or_else(|| ui.repo.clone());
+    let canonical = requested.canonicalize().ok();
+    let mut known = settings_repositories(ui, false);
+    let matches = |r: &repos::Repo| canonical.as_ref().is_some_and(|p| p == &r.path);
+    if !known.iter().any(matches) {
+        known = settings_repositories(ui, true);
+    }
+    let repo = known
+        .iter()
+        .find(|r| matches(r))
+        .map(|r| r.path.clone())
+        .ok_or_else(|| ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: "Choose a known repository from the Settings selector.".to_owned(),
+        })?;
+    Ok((repo, known))
+}
+
 /// `GET /api/settings` - the effective role assignments and roster, with the
 /// layer each came from. A config that fails to load answers 200 with an
 /// `error`, so the screen can say so instead of drawing empty lists.
-async fn settings_get(State(ui): State<Arc<Ui>>) -> ApiResult<Json<settings::SettingsView>> {
-    blocking(move || Ok(Json(settings::view(&ui.repo, ui.machine_config.as_deref())))).await
+async fn settings_get(
+    State(ui): State<Arc<Ui>>,
+    Query(q): Query<SettingsQuery>,
+) -> ApiResult<Json<settings::SettingsView>> {
+    blocking(move || {
+        let (repo, known) = settings_context(&ui, q)?;
+        Ok(Json(settings::view_with_repos(
+            &repo,
+            ui.machine_config.as_deref(),
+            &known,
+        )))
+    })
+    .await
 }
 
 /// The body of `PUT /api/settings/roles`.
@@ -3834,16 +3910,19 @@ struct RolesBody {
 /// 422 with the reason in words.
 async fn settings_put_roles(
     State(ui): State<Arc<Ui>>,
+    Query(q): Query<SettingsQuery>,
     body: std::result::Result<Json<RolesBody>, JsonRejection>,
 ) -> ApiResult<Json<settings::SettingsView>> {
     let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
     blocking(move || {
-        settings::save(
-            &ui.repo,
+        let (repo, known) = settings_context(&ui, q)?;
+        settings::save_with_repos(
+            &repo,
             ui.machine_config.as_deref(),
             &body.revision,
             &body.roles,
             &body.counts,
+            &known,
         )
         .map(Json)
         .map_err(|e| match e {
@@ -9082,6 +9161,224 @@ mod tests {
             std::fs::write(&machine, text).expect("machine toml");
         }
         (tmp, repo, machine)
+    }
+
+    async fn settings_checkout(path: &FsPath, text: &str) {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::write(path.join("magi.toml"), text).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["add", "magi.toml"],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "fixture",
+            ],
+            vec!["update-ref", "refs/remotes/origin/main", "HEAD"],
+            vec![
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        ] {
+            crate::git::git(path, &args).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_context_handlers_validate_and_save_without_a_socket() {
+        let (tmp, repo, machine) =
+            settings_dirs("[roles]\nreviewers = [\"a\"]\n", Some(SETTINGS_AGENTS));
+        let root = tmp.path().join("roots");
+        let selected = root.join("host/owner/selected");
+        settings_checkout(
+            &selected,
+            "[roles]\nconductor = \"b\"\n[graph]\njudges = 2\n",
+        )
+        .await;
+        std::fs::write(&machine, format!("{SETTINGS_AGENTS}\n[roles]\nconductor = \"a\"\n[graph]\njudges = 1\n[repos]\nroots = [{}]\nscan_ttl = 3600\n", toml::Value::String(root.display().to_string()))).unwrap();
+        let before = std::fs::read(&machine).unwrap();
+        let ui = Arc::new(
+            Ui::new(
+                Queue::at(tmp.path().join("queue")),
+                Questions::at(tmp.path().join("questions")),
+                Talks::at(tmp.path().join("talks")),
+                tmp.path().join("runs"),
+                tmp.path().to_path_buf(),
+                repo.clone(),
+            )
+            .with_machine_config(Some(machine.clone())),
+        );
+        let query = || {
+            Query(SettingsQuery {
+                repo: Some(selected.clone()),
+            })
+        };
+        let Json(v) = settings_get(State(ui.clone()), query()).await.unwrap();
+        assert!(v.error.is_none(), "{:?}", v.error);
+        let conductor = v.roles.iter().find(|r| r.key == "conductor").unwrap();
+        assert_eq!(conductor.source, "repo");
+        assert_eq!(
+            conductor.machine_value,
+            Some(toml::Value::String("a".into()))
+        );
+        assert!(!conductor.editable);
+        let judges = v.roles.iter().find(|r| r.key == "judges").unwrap();
+        assert_eq!(
+            judges.count.as_ref().unwrap().machine_value,
+            Some(toml::Value::Integer(1))
+        );
+        assert!(
+            !v.roles
+                .iter()
+                .find(|r| r.key == "reviewers")
+                .unwrap()
+                .editable
+        );
+        let unknown = || {
+            Query(SettingsQuery {
+                repo: Some(tmp.path().to_path_buf()),
+            })
+        };
+        assert_eq!(
+            settings_get(State(ui.clone()), unknown())
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let body = || {
+            Ok(Json(RolesBody {
+                revision: v.revision.clone(),
+                roles: std::collections::BTreeMap::from([("judges".into(), vec!["b".into()])]),
+                counts: Default::default(),
+            }))
+        };
+        assert_eq!(
+            settings_put_roles(State(ui.clone()), unknown(), body())
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        assert_eq!(std::fs::read(&machine).unwrap(), before);
+        let Json(saved) = settings_put_roles(State(ui.clone()), query(), body())
+            .await
+            .unwrap();
+        assert_eq!(
+            saved.repo,
+            selected.canonicalize().unwrap().display().to_string()
+        );
+        assert!(settings::repository_config(&repo, Some(&machine)).is_ok());
+        assert!(settings::repository_config(&selected, Some(&machine)).is_ok());
+        // A cache miss refreshes the stable candidate list exactly for validation.
+        let fresh = root.join("host/owner/fresh");
+        settings_checkout(&fresh, "[graph]\nadvisors = 0\n").await;
+        let Json(fresh_view) = settings_get(State(ui), Query(SettingsQuery { repo: Some(fresh) }))
+            .await
+            .unwrap();
+        assert_eq!(fresh_view.repositories.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn settings_context_selector_validates_paths_and_preserves_all_checkouts() {
+        let (tmp, repo, machine) = settings_dirs(
+            "[roles]\nreviewers = [\"a\"]\n",
+            Some(&format!("{SETTINGS_AGENTS}\n[graph]\njudges = 1\n")),
+        );
+        let root = tmp.path().join("roots");
+        let selected = root.join("host/owner/selected");
+        settings_checkout(
+            &selected,
+            "[roles]\nadvisors = [\"b\"]\n[graph]\njudges = 2\n",
+        )
+        .await;
+        let broken = root.join("host/owner/broken");
+        settings_checkout(&broken, "[roles\nbroken").await;
+        let machine_text = format!(
+            "{SETTINGS_AGENTS}\n[graph]\njudges = 1\n[repos]\nroots = [{}]\n",
+            toml::Value::String(root.display().to_string())
+        );
+        std::fs::write(&machine, &machine_text).unwrap();
+        let originals: Vec<_> = [&repo, &selected, &broken]
+            .iter()
+            .map(|p| std::fs::read(p.join("magi.toml")).unwrap())
+            .collect();
+        let f = Fixture::with_repo_and_machine(repo.clone(), machine.clone()).await;
+        let default = f.get("/api/settings").await.json();
+        assert_eq!(
+            default["repo"],
+            repo.canonicalize().unwrap().display().to_string()
+        );
+        assert_eq!(default["repositories"].as_array().unwrap().len(), 3);
+        let query = format!("?repo={}", selected.display());
+        let res = f.get(&format!("/api/settings{query}")).await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let v = res.json();
+        assert!(v["error"].is_null(), "{v}");
+        assert_eq!(v["repositories"], default["repositories"]);
+        let role = |key: &str| {
+            v["roles"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["key"] == key)
+                .unwrap()
+        };
+        assert_eq!(role("advisors")["configured"], serde_json::json!(["b"]));
+        assert_eq!(role("advisors")["source"], "repo");
+        assert_eq!(role("advisors")["editable"], false);
+        assert!(role("advisors")["machine_value"].is_null());
+        assert_eq!(role("judges")["count"]["value"], 2);
+        assert_eq!(role("judges")["count"]["machine_value"], 1);
+        assert_eq!(role("judges")["count"]["source"], "repo");
+        let source = role("judges")["count"]["source_path"].as_str().unwrap();
+        assert!(
+            source.contains("origin/main") && !source.contains("magi/config/"),
+            "{source}"
+        );
+        assert_eq!(
+            role("reviewers")["editable"],
+            false,
+            "default context outside roots must protect its declarations"
+        );
+        let body =
+            serde_json::json!({"revision": v["revision"], "roles": {"judges": ["b"]}}).to_string();
+        let unknown = format!("?repo={}", tmp.path().display());
+        assert_eq!(f.get(&format!("/api/settings{unknown}")).await.status, 422);
+        assert_eq!(
+            f.put(&format!("/api/settings/roles{unknown}"), &body)
+                .await
+                .status,
+            422
+        );
+        assert_eq!(std::fs::read_to_string(&machine).unwrap(), machine_text);
+        let refuse = serde_json::json!({"revision": v["revision"], "roles": {"reviewers": ["b"]}})
+            .to_string();
+        assert_eq!(
+            f.put(&format!("/api/settings/roles{query}"), &refuse)
+                .await
+                .status,
+            422
+        );
+        let saved = f.put(&format!("/api/settings/roles{query}"), &body).await;
+        assert_eq!(saved.status, 200, "{}", saved.body);
+        assert_eq!(saved.json()["repo"], v["repo"]);
+        assert!(settings::repository_config(&repo, Some(&machine)).is_ok());
+        assert!(settings::repository_config(&selected, Some(&machine)).is_ok());
+        for (p, before) in [&repo, &selected, &broken].iter().zip(originals) {
+            assert_eq!(std::fs::read(p.join("magi.toml")).unwrap(), before);
+        }
+        let error = f
+            .get(&format!("/api/settings?repo={}", broken.display()))
+            .await;
+        assert_eq!(error.status, 200);
+        assert!(error.json()["error"]["message"].is_string());
+        assert_eq!(error.json()["repositories"], default["repositories"]);
     }
 
     #[tokio::test]

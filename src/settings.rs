@@ -22,11 +22,11 @@
 //! from `PATH` whenever no layer declares the key), so a role save adds no
 //! second `[[agents]]` declaration and CLIs installed later are still found.
 //! And a save is also loaded against every other checkout found under
-//! `[repos] roots`: one that loaded before and would not now (it declares the
-//! same `roles.*` key) refuses the save in words. Limits: checkouts outside
-//! `roots` are not checked, a checkout already broken is ignored, and another
-//! process editing a repo config between the check and the rename is not
-//! prevented. The view shows the same lock up front.
+//! `[repos] roots` and the Settings selector: one that loaded before and would
+//! not now (it declares the same `roles.*` key) refuses the save in words.
+//! Limits: checkouts outside both lists are not checked, a checkout already
+//! broken is ignored, and another process editing a repo config between the
+//! check and the rename is not prevented. The view shows the same lock up front.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -67,6 +67,7 @@ pub(crate) struct SettingsView {
     /// The repository the effective config was resolved against.
     pub(crate) repo: String,
     pub(crate) machine: MachineView,
+    pub(crate) repositories: Vec<crate::repos::Repo>,
     /// Fingerprint of the machine file's bytes; a save must quote it.
     pub(crate) revision: String,
     /// Set when the layered config does not load. `roles` and `agents` are
@@ -102,6 +103,8 @@ pub(crate) struct RoleView {
     /// `machine`, `repo` or `default`.
     pub(crate) source: &'static str,
     pub(crate) source_path: Option<String>,
+    /// The rendered machine declaration, even when the repo shadows it.
+    pub(crate) machine_value: Option<toml::Value>,
     /// Whether a machine-file save can change what a run sees.
     pub(crate) editable: bool,
     pub(crate) locked_reason: Option<String>,
@@ -131,6 +134,8 @@ pub(crate) struct CountView {
     /// `machine`, `repo` or `default`.
     pub(crate) source: &'static str,
     pub(crate) source_path: Option<String>,
+    /// The rendered machine declaration, even when the repo shadows it.
+    pub(crate) machine_value: Option<toml::Value>,
     pub(crate) editable: bool,
     pub(crate) locked_reason: Option<String>,
     /// Length of the untruncated roster; `None` when roles do not resolve.
@@ -307,7 +312,20 @@ fn ids_of(specs: &[AgentSpec]) -> Vec<String> {
 
 /// The effective roles and roster for `repo`, with the machine layer at
 /// `machine`.
+#[cfg(test)]
 pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
+    view_with_repos(repo, machine, &[])
+}
+
+pub(crate) fn repository_config(repo: &Path, machine: Option<&Path>) -> anyhow::Result<Config> {
+    effective(&layer_paths_strict(repo, machine)?)
+}
+
+pub(crate) fn view_with_repos(
+    repo: &Path,
+    machine: Option<&Path>,
+    known: &[crate::repos::Repo],
+) -> SettingsView {
     let bytes = machine
         .and_then(|m| std::fs::read(m).ok())
         .unwrap_or_default();
@@ -322,6 +340,7 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
                     .to_owned()
             }),
         },
+        repositories: known.to_vec(),
         revision: fingerprint(&bytes),
         error: None,
         roles: Vec::new(),
@@ -358,7 +377,7 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
     let is_machine = |p: &Path| machine.is_some_and(|m| m == p);
 
     let mut other_declares: BTreeMap<&str, String> = BTreeMap::new();
-    for other in other_checkouts(repo, &cfg.repos.roots) {
+    for other in other_checkouts(repo, &cfg.repos.roots, known) {
         let theirs = Config::layer_tables(&repo_layers(&other.path));
         for key in ROLE_KEYS {
             if theirs
@@ -378,7 +397,7 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
         let owner = tables.iter().rev().find(|(_, t)| declares(t, key));
         let (source, source_path) = match owner {
             Some((p, _)) if is_machine(p) => ("machine", Some(p.display().to_string())),
-            Some((p, _)) => ("repo", Some(p.display().to_string())),
+            Some((p, _)) => ("repo", Some(Config::repo_layer_description(repo, p))),
             None => ("default", None),
         };
         let repo_owner = tables
@@ -389,7 +408,7 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
                 false,
                 Some(format!(
                     "This repo overrides roles.{key} in {} - edit it there.",
-                    p.display()
+                    Config::repo_layer_description(repo, p)
                 )),
             )
         } else if let Some(name) = other_declares.get(key) {
@@ -411,6 +430,11 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
             configured,
             source,
             source_path,
+            machine_value: tables
+                .iter()
+                .find(|(p, _)| is_machine(p))
+                .and_then(|(_, t)| t.get("roles")?.get(key))
+                .cloned(),
             editable,
             locked_reason,
             fallback: None,
@@ -423,7 +447,7 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
             let owner = tables.iter().rev().find(|(_, t)| declares_count(t, key));
             let (source, source_path) = match owner {
                 Some((p, _)) if is_machine(p) => ("machine", Some(p.display().to_string())),
-                Some((p, _)) => ("repo", Some(p.display().to_string())),
+                Some((p, _)) => ("repo", Some(Config::repo_layer_description(repo, p))),
                 None => ("default", None),
             };
             let repo_owner = tables
@@ -434,7 +458,7 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
                     false,
                     Some(format!(
                         "This repo overrides graph.{key} in {} - edit it there.",
-                        p.display()
+                        Config::repo_layer_description(repo, p)
                     )),
                 )
             } else if machine.is_none() {
@@ -465,6 +489,15 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
                 file_key,
                 source,
                 source_path,
+                machine_value: tables
+                    .iter()
+                    .find(|(p, _)| is_machine(p))
+                    .and_then(|(_, t)| {
+                        count_spellings(key)
+                            .iter()
+                            .find_map(|k| t.get("graph")?.get(*k))
+                    })
+                    .cloned(),
                 editable,
                 locked_reason,
                 roster_len,
@@ -558,7 +591,7 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
             });
             let (source, source_path) = match owner {
                 Some((p, _)) if is_machine(p) => ("machine", Some(p.display().to_string())),
-                Some((p, _)) => ("repo", Some(p.display().to_string())),
+                Some((p, _)) => ("repo", Some(Config::repo_layer_description(repo, p))),
                 None => ("detected", None),
             };
             AgentView {
@@ -580,12 +613,24 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
 ///
 /// `roles` maps a key to its new ids; an empty list removes the key (back to
 /// the default). Keys not named are left exactly as they are.
+#[cfg(test)]
 pub(crate) fn save(
     repo: &Path,
     machine: Option<&Path>,
     revision: &str,
     roles: &BTreeMap<String, Vec<String>>,
     counts: &BTreeMap<String, serde_json::Value>,
+) -> Result<SettingsView, SaveError> {
+    save_with_repos(repo, machine, revision, roles, counts, &[])
+}
+
+pub(crate) fn save_with_repos(
+    repo: &Path,
+    machine: Option<&Path>,
+    revision: &str,
+    roles: &BTreeMap<String, Vec<String>>,
+    counts: &BTreeMap<String, serde_json::Value>,
+    known: &[crate::repos::Repo],
 ) -> Result<SettingsView, SaveError> {
     let _guard = SAVE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let Some(machine) = machine else {
@@ -594,7 +639,7 @@ pub(crate) fn save(
                 .to_owned(),
         ));
     };
-    let current = view(repo, Some(machine));
+    let current = view_with_repos(repo, Some(machine), known);
     if let Some(err) = &current.error {
         return Err(SaveError::Refused(format!(
             "The current config does not load, so it cannot be edited safely: {}",
@@ -611,7 +656,7 @@ pub(crate) fn save(
     if roles.is_empty() && counts.is_empty() {
         return Err(SaveError::Refused("Nothing to change.".to_owned()));
     }
-    let known: Vec<&str> = current.agents.iter().map(|a| a.id.as_str()).collect();
+    let agent_ids: Vec<&str> = current.agents.iter().map(|a| a.id.as_str()).collect();
     let mut edits: Vec<(&'static str, Vec<String>)> = Vec::new();
     for (key, ids) in roles {
         let Some(role) = current.roles.iter().find(|r| r.key == key) else {
@@ -629,11 +674,11 @@ pub(crate) fn save(
         let ids: Vec<String> = ids.iter().map(|i| i.trim().to_owned()).collect();
         if let Some(bad) = ids
             .iter()
-            .find(|i| i.is_empty() || !known.contains(&i.as_str()))
+            .find(|i| i.is_empty() || !agent_ids.contains(&i.as_str()))
         {
             return Err(SaveError::Refused(format!(
                 "`{bad}` is not a defined agent. Defined: {}.",
-                known.join(", ")
+                agent_ids.join(", ")
             )));
         }
         edits.push((role.key, ids));
@@ -747,21 +792,31 @@ pub(crate) fn save(
             ))));
         }
     }
-    other_repos_still_load(repo, machine, &tmp, &loaded.repos.roots).map_err(cleanup)?;
+    other_repos_still_load(repo, machine, &tmp, &loaded.repos.roots, known).map_err(cleanup)?;
     std::fs::rename(&tmp, machine).map_err(|e| {
         cleanup(SaveError::Internal(format!(
             "replacing {}: {e}",
             machine.display()
         )))
     })?;
-    Ok(view(repo, Some(machine)))
+    Ok(view_with_repos(repo, Some(machine), known))
 }
 
 /// Every checkout under `roots` other than `repo` that has its own config
 /// layers.
-fn other_checkouts(repo: &Path, roots: &[PathBuf]) -> Vec<crate::repos::Repo> {
+fn other_checkouts(
+    repo: &Path,
+    roots: &[PathBuf],
+    known: &[crate::repos::Repo],
+) -> Vec<crate::repos::Repo> {
     let here = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
-    crate::repos::scan(roots)
+    let mut checkouts = crate::repos::scan(roots);
+    for r in known {
+        if !checkouts.iter().any(|c| c.path == r.path) {
+            checkouts.push(r.clone());
+        }
+    }
+    checkouts
         .into_iter()
         .filter(|r| r.path != here && !repo_layers(&r.path).is_empty())
         .collect()
@@ -777,8 +832,9 @@ fn other_repos_still_load(
     machine: &Path,
     proposal: &Path,
     roots: &[PathBuf],
+    known: &[crate::repos::Repo],
 ) -> Result<(), SaveError> {
-    for other in other_checkouts(repo, roots) {
+    for other in other_checkouts(repo, roots, known) {
         let layers = repo_layers(&other.path);
         let mut old = layer_paths(&other.path, Some(machine));
         if old.is_empty() {
