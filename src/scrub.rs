@@ -142,7 +142,7 @@ fn match_at(before: &str, rest: &str, id: &Identity) -> Option<(usize, &'static 
                 .then(|| {
                     token(rest).or_else(|| credential(rest)).or_else(|| {
                         prev.is_none_or(|c| !is_name(c))
-                            .then(|| named_identity(rest))
+                            .then(|| named_identity(rest, prev))
                             .flatten()
                     })
                 })
@@ -218,7 +218,7 @@ fn token(rest: &str) -> Option<(usize, &'static str)> {
 }
 
 /// Explicit assignments avoid guessing whether an ordinary word is an account.
-fn named_identity(rest: &str) -> Option<(usize, &'static str)> {
+fn named_identity(rest: &str, prev: Option<char>) -> Option<(usize, &'static str)> {
     for key in [
         "hostname=",
         "hostname: ",
@@ -239,7 +239,7 @@ fn named_identity(rest: &str) -> Option<(usize, &'static str)> {
     }
     let n = name_len(rest);
     if n > 0
-        && !code_receiver(&rest[..n])
+        && !code_receiver(&rest[..n], prev == Some('`') && rest[n..].starts_with('`'))
         && [".local", ".internal", ".lan"].iter().any(|suffix| {
             n.checked_sub(suffix.len())
                 .and_then(|start| rest.get(start..n))
@@ -251,15 +251,13 @@ fn named_identity(rest: &str) -> Option<(usize, &'static str)> {
     None
 }
 
-/// A dotted name that reads as a code path (`WatchState.local`, `self.local`)
-/// rather than a hostname: one dot, no hyphen, and either a `self.` / `this.`
-/// receiver or a CamelCase one (a capital right after a lowercase letter).
-/// Anything else, mixed-case or backticked hostnames included, stays a host.
-/// Only the part before the dot is looked at, so the suffix's spelling
-/// (`.loCal`) never matters. A CamelCase single-label hostname (`MyServer.lan`)
-/// is deliberately read as code; the operator's own host name is caught by
-/// `identity_word` instead.
-fn code_receiver(name: &str) -> bool {
+/// A dotted name that reads as a code path: one dot, no hyphen, and either
+/// a `self.` / `this.` receiver, a CamelCase one, or a lowercase ASCII
+/// identifier containing an underscore or directly enclosed in backticks.
+/// Only the receiver is inspected, so the suffix's case never matters.
+/// Unknown CamelCase hosts and backticked alphabetic hosts also read as code;
+/// the operator's known hostname is still caught by `identity_word`.
+fn code_receiver(name: &str, backticked: bool) -> bool {
     if name.matches('.').count() != 1 || name.contains('-') {
         return false;
     }
@@ -267,6 +265,11 @@ fn code_receiver(name: &str) -> bool {
         return false;
     };
     if receiver.eq_ignore_ascii_case("self") || receiver.eq_ignore_ascii_case("this") {
+        return true;
+    }
+    let lowercase_identifier =
+        !receiver.is_empty() && receiver.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+    if lowercase_identifier && (backticked || receiver.contains('_')) {
         return true;
     }
     let mut prev_lower = false;
@@ -859,7 +862,6 @@ mod tests {
             "ssh devbox.local",
             "ssh BUILD-SERVER.local",
             "ssh Alices-MacBook-Pro.local",
-            "`devbox.local`",
             "ssh BUILD.local",
         ] {
             assert!(
@@ -867,6 +869,56 @@ mod tests {
                 "{t}"
             );
         }
+    }
+
+    #[test]
+    fn lowercase_field_receivers_pass_scrub_and_locate() {
+        let id = Identity::default();
+        for text in [
+            "`st.local` is true",
+            "`cfg.local`",
+            "`ctx.lan`",
+            "`env.internal`",
+            "my_state.local",
+            "`my_state.local`",
+            "`st.local`, then continue.",
+            "`devbox.local`",
+        ] {
+            assert_eq!(scrub(text, &id), text, "{text}");
+            assert!(locate(text, &id).is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn field_receiver_exception_keeps_host_redaction() {
+        let id = Identity::default();
+        for text in [
+            "st.local",
+            "cfg.local",
+            "devbox.local",
+            "box.lan",
+            "`st.local",
+            "st.local`",
+            "`st.local is true`",
+            "`st.local.`",
+            "`box1.local`",
+            "`build-box.local`",
+            "`box.example.local`",
+        ] {
+            assert!(scrub(text, &id).contains("[redacted-host]"), "{text}");
+            assert_eq!(locate(text, &id), vec![(1, "host")], "{text}");
+        }
+        for text in ["host=st.local", "`host=cfg.local`"] {
+            assert!(scrub(text, &id).contains("[redacted-identity]"), "{text}");
+            assert_eq!(locate(text, &id), vec![(1, "identity")], "{text}");
+        }
+        let known = Identity {
+            host: "devbox.local".into(),
+            ..Identity::default()
+        };
+        let text = "`devbox.local`";
+        assert_eq!(scrub(text, &known), "`[redacted-host]`");
+        assert_eq!(locate(text, &known), vec![(1, "host")]);
     }
 
     #[test]
