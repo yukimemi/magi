@@ -54,7 +54,9 @@ use crate::config::MergeMode;
 use crate::git;
 use crate::proc::Quiet as _;
 use crate::prompt;
-use crate::run::{ContestedHandoff, LandApproval, MergeOutcome, RunState, RunStatus, tail};
+use crate::run::{
+    ContestedHandoff, LandApproval, LandReruns, MergeOutcome, RunState, RunStatus, tail,
+};
 
 /// How often the pull request is re-read while its checks are still running.
 ///
@@ -2876,6 +2878,10 @@ trait Forge {
     async fn view(&self, repo: &Path, pr_url: &str) -> Result<Seen>;
     async fn merge(&self, repo: &Path, argv: &[String]) -> Result<(bool, String)>;
     async fn poll(&self);
+    /// Rerun the failed jobs of one workflow run.
+    async fn rerun(&self, repo: &Path, run: &str) -> Result<()>;
+    /// Unix seconds, behind the seam so a test owns the clock.
+    fn now(&self) -> i64;
     /// The check contexts the base branch requires, for a stop reason only.
     /// `None` when they could not be read, which is not the same as none.
     async fn required_contexts(&self, repo: &Path, base: &str) -> Option<BTreeSet<String>>;
@@ -2902,6 +2908,22 @@ impl Forge for GhForge {
     }
     async fn poll(&self) {
         tokio::time::sleep(POLL).await;
+    }
+    async fn rerun(&self, repo: &Path, run: &str) -> Result<()> {
+        let args = [
+            "run".to_owned(),
+            "rerun".to_owned(),
+            run.to_owned(),
+            "--failed".to_owned(),
+        ];
+        let (ok, out) = gh(repo, &args).await?;
+        if !ok {
+            bail!("gh run rerun {run}: {out}");
+        }
+        Ok(())
+    }
+    fn now(&self) -> i64 {
+        jiff::Timestamp::now().as_second()
     }
     async fn required_contexts(&self, repo: &Path, base: &str) -> Option<BTreeSet<String>> {
         required_contexts_of(repo, base).await
@@ -3668,6 +3690,76 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 return Ok(pr);
             }
             Step::Fix { reason } => {
+                // A red check is rerun once before it costs a fix round: the
+                // fixer cannot commit a change for a flaky test. The rerun
+                // spends no round and no attempt.
+                if state.config.graph.rerun_flaky_checks && pr.checks == Checks::Red {
+                    let failing = rerunnable(&seen.contexts);
+                    let now = forge.now();
+                    match rerun_step(&failing, state.land_reruns.as_ref(), &seen.head, now) {
+                        RerunStep::Rerun(runs) => {
+                            let rec = state.land_reruns.get_or_insert_with(Default::default);
+                            if !rec.head.eq_ignore_ascii_case(&seen.head) {
+                                *rec = LandReruns {
+                                    head: seen.head.clone(),
+                                    runs: BTreeMap::new(),
+                                };
+                            }
+                            for run in &runs {
+                                rec.runs.insert(run.clone(), now);
+                            }
+                            // Durable before the call: a restart must not
+                            // rerun the same run twice. A save that fails
+                            // means no rerun.
+                            state.save()?;
+                            let mut any = false;
+                            for run in &runs {
+                                let names = failing
+                                    .iter()
+                                    .filter(|(_, r)| r.as_deref() == Some(run))
+                                    .map(|(l, _)| l.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                match forge.rerun(&repo, run).await {
+                                    Ok(()) => {
+                                        any = true;
+                                        state.event(
+                                            "land",
+                                            format!("reran failed check(s) {names} (run {run})"),
+                                        );
+                                    }
+                                    // Stays recorded: never a retry loop.
+                                    Err(e) => state.event(
+                                        "land",
+                                        format!(
+                                            "could not rerun check(s) {names} (run {run}): {e:#}"
+                                        ),
+                                    ),
+                                }
+                            }
+                            state.save()?;
+                            if any {
+                                waited = Duration::ZERO;
+                                forge.poll().await;
+                                continue;
+                            }
+                        }
+                        RerunStep::Grace => {
+                            if waited >= WAIT_CEILING {
+                                let why = format!(
+                                    "checks were still failing after a rerun and {} minutes",
+                                    WAIT_CEILING.as_secs() / 60
+                                );
+                                stop(state, &repo, &pr, &why).await?;
+                                return Ok(pr);
+                            }
+                            waited += POLL;
+                            forge.poll().await;
+                            continue;
+                        }
+                        RerunStep::Fix => {}
+                    }
+                }
                 round += 1;
                 waited = Duration::ZERO;
                 for c in &pr.review_comments {
@@ -3744,6 +3836,66 @@ struct CheckInfo {
     label: String,
     verdict: Verdict,
     required: Option<bool>,
+    /// The workflow run the check belongs to; `None` for an external status.
+    run: Option<String>,
+}
+
+/// What to do with a red head before a fix round is spent on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RerunStep {
+    /// Rerun these workflow runs (each not yet rerun for this head).
+    Rerun(Vec<String>),
+    /// Reran already and the forge may still report the old failure: wait.
+    Grace,
+    /// Nothing to rerun, or the rerun did not help: the fixer's turn.
+    Fix,
+}
+
+/// Failed checks a rerun may help: a failure of a check that blocks (`required`
+/// unreadable counts), as `(label, run)`. Judged one workflow run at a time;
+/// the caller only asks once the rollup has no pending check at all.
+fn rerunnable(contexts: &[CheckInfo]) -> Vec<(String, Option<String>)> {
+    contexts
+        .iter()
+        .filter(|c| c.verdict == Verdict::Fail && c.required != Some(false))
+        .map(|c| (c.label.clone(), c.run.clone()))
+        .collect()
+}
+
+/// Pure: rerun once per run id, wait out the grace, then hand over.
+fn rerun_step(
+    failing: &[(String, Option<String>)],
+    record: Option<&LandReruns>,
+    head: &str,
+    now: i64,
+) -> RerunStep {
+    // A failure with no workflow run (an external status) cannot be rerun, and
+    // the fixer's push re-runs everything anyway.
+    if failing.is_empty() || failing.iter().any(|(_, run)| run.is_none()) {
+        return RerunStep::Fix;
+    }
+    // Reruns belong to the head they were made on.
+    let record = record.filter(|r| r.head.eq_ignore_ascii_case(head));
+    let mut fresh: Vec<String> = Vec::new();
+    let mut recent = false;
+    for run in failing.iter().filter_map(|(_, run)| run.as_deref()) {
+        match record.and_then(|r| r.runs.get(run)) {
+            None => {
+                if !fresh.iter().any(|f| f == run) {
+                    fresh.push(run.to_owned());
+                }
+            }
+            Some(&at) if now - at < crate::release_watch::RERUN_GRACE => recent = true,
+            Some(_) => {}
+        }
+    }
+    if !fresh.is_empty() {
+        RerunStep::Rerun(fresh)
+    } else if recent {
+        RerunStep::Grace
+    } else {
+        RerunStep::Fix
+    }
 }
 
 /// Read the pull request: `gh pr view` for the top-level thread and merge
@@ -3822,6 +3974,7 @@ fn seen_from(view_json: &str, node_json: Option<&str>) -> Result<Seen> {
                 label: c.label(),
                 verdict: c.verdict(),
                 required: c.is_required,
+                run: c.url().and_then(run_of),
             })
             .collect();
         rollup_head = oid;
@@ -6433,6 +6586,11 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         queued: Mutex<bool>,
         /// Views fail once a merge answered ok.
         unreadable_after_merge: Mutex<bool>,
+        /// Workflow runs asked to rerun, and whether that call fails.
+        reruns: Mutex<Vec<String>>,
+        rerun_fails: Mutex<bool>,
+        /// Unix seconds; every poll moves it on by `POLL`.
+        clock: Mutex<i64>,
     }
 
     impl Scripted {
@@ -6452,6 +6610,9 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 merged: Mutex::new(false),
                 queued: Mutex::new(false),
                 unreadable_after_merge: Mutex::new(false),
+                reruns: Mutex::new(Vec::new()),
+                rerun_fails: Mutex::new(false),
+                clock: Mutex::new(1_000),
             }
         }
         fn argvs(&self) -> Vec<Vec<String>> {
@@ -6498,6 +6659,18 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         }
         async fn poll(&self) {
             self.log.lock().unwrap().push("poll");
+            *self.clock.lock().unwrap() += POLL.as_secs() as i64;
+        }
+        async fn rerun(&self, _repo: &Path, run: &str) -> Result<()> {
+            self.log.lock().unwrap().push("rerun");
+            self.reruns.lock().unwrap().push(run.to_owned());
+            if *self.rerun_fails.lock().unwrap() {
+                anyhow::bail!("gh run rerun: no");
+            }
+            Ok(())
+        }
+        fn now(&self) -> i64 {
+            *self.clock.lock().unwrap()
         }
         async fn required_contexts(&self, _repo: &Path, _base: &str) -> Option<BTreeSet<String>> {
             self.required.lock().unwrap().clone()
@@ -7026,7 +7199,193 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             label: label.to_owned(),
             verdict: Verdict::Pass,
             required: Some(false),
+            run: None,
         }
+    }
+
+    fn failing(label: &str, run: Option<&str>) -> (String, Option<String>) {
+        (label.to_owned(), run.map(str::to_owned))
+    }
+
+    fn reran(head: &str, runs: &[(&str, i64)]) -> LandReruns {
+        LandReruns {
+            head: head.to_owned(),
+            runs: runs.iter().map(|(r, at)| ((*r).to_owned(), *at)).collect(),
+        }
+    }
+
+    #[test]
+    fn a_failed_run_is_rerun_once_then_waited_on_then_left_to_the_fixer() {
+        let f = [failing("test (macos)", Some("7"))];
+        assert_eq!(
+            rerun_step(&f, None, "h", 100),
+            RerunStep::Rerun(vec!["7".to_owned()])
+        );
+        let rec = reran("h", &[("7", 100)]);
+        let grace = crate::release_watch::RERUN_GRACE;
+        assert_eq!(
+            rerun_step(&f, Some(&rec), "h", 100 + grace - 1),
+            RerunStep::Grace
+        );
+        assert_eq!(rerun_step(&f, Some(&rec), "h", 100 + grace), RerunStep::Fix);
+    }
+
+    #[test]
+    fn a_failure_without_a_run_id_goes_to_the_fixer() {
+        let f = [failing("a", Some("7")), failing("ci/external", None)];
+        assert_eq!(rerun_step(&f, None, "h", 0), RerunStep::Fix);
+        assert_eq!(rerun_step(&[], None, "h", 0), RerunStep::Fix);
+    }
+
+    #[test]
+    fn a_moved_head_forgets_the_reruns() {
+        let f = [failing("a", Some("7"))];
+        let rec = reran("old", &[("7", 100)]);
+        assert_eq!(
+            rerun_step(&f, Some(&rec), "new", 101),
+            RerunStep::Rerun(vec!["7".to_owned()])
+        );
+    }
+
+    #[test]
+    fn only_unrerun_runs_are_rerun_and_duplicates_collapse() {
+        let f = [
+            failing("a", Some("7")),
+            failing("b", Some("7")),
+            failing("c", Some("8")),
+        ];
+        assert_eq!(
+            rerun_step(&f, None, "h", 0),
+            RerunStep::Rerun(vec!["7".to_owned(), "8".to_owned()])
+        );
+        let rec = reran("h", &[("7", 0)]);
+        assert_eq!(
+            rerun_step(&f, Some(&rec), "h", 1),
+            RerunStep::Rerun(vec!["8".to_owned()])
+        );
+    }
+
+    #[test]
+    fn only_blocking_failures_are_candidates_for_a_rerun() {
+        let check = |label: &str, verdict, required, run: &str| CheckInfo {
+            label: label.to_owned(),
+            verdict,
+            required,
+            run: Some(run.to_owned()),
+        };
+        let got = rerunnable(&[
+            check("passed", Verdict::Pass, Some(true), "1"),
+            check("optional", Verdict::Fail, Some(false), "2"),
+            check("required", Verdict::Fail, Some(true), "3"),
+            check("unknown", Verdict::Fail, None, "4"),
+        ]);
+        let labels: Vec<_> = got.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels, ["required", "unknown"]);
+    }
+
+    fn red(head: &str, run: Option<&str>) -> Seen {
+        let mut s = seen(head, Checks::Red, "BLOCKED", false);
+        s.pr.failing = vec!["test (macos)".to_owned()];
+        s.contexts = vec![CheckInfo {
+            label: "test (macos)".to_owned(),
+            verdict: Verdict::Fail,
+            required: Some(true),
+            run: run.map(str::to_owned),
+        }];
+        s
+    }
+
+    const RERUN_PR: &str = "https://github.com/o/r/pull/42";
+
+    #[tokio::test]
+    async fn a_flaky_red_check_is_rerun_without_a_fix_round_and_then_merges() {
+        let mut state = landing_state();
+        let forge = Scripted::new(
+            vec![
+                red("a", Some("7")),
+                seen("a", Checks::Pending, "BLOCKED", false),
+                seen("a", Checks::Green, "CLEAN", false),
+            ],
+            vec![(true, "")],
+        );
+        land_with(&mut state, RERUN_PR, &forge).await.unwrap();
+        assert_eq!(*forge.reruns.lock().unwrap(), ["7"]);
+        assert!(!forge.calls().contains(&"fix"));
+        assert_eq!(state.status, RunStatus::Merged);
+        assert_eq!(state.pr.as_ref().unwrap().round, 0);
+        let argvs = forge.argvs();
+        assert_eq!(value_of(&argvs[0], "--match-head-commit"), Some("a"));
+        assert!(
+            state
+                .events
+                .iter()
+                .any(|e| e.message.contains("test (macos)") && e.message.contains("run 7"))
+        );
+    }
+
+    #[tokio::test]
+    async fn still_red_after_the_grace_goes_to_the_fixer_and_a_run_is_not_rerun_twice() {
+        let mut state = landing_state();
+        let forge = Scripted::new(
+            vec![
+                red("a", Some("7")),
+                seen("a", Checks::Green, "CLEAN", false),
+            ],
+            vec![(true, "")],
+        );
+        *forge.fix.lock().unwrap() = Some(Fixed::Declined);
+        // The red view repeats for the grace, then the fixer is asked once.
+        land_with(&mut state, RERUN_PR, &forge).await.unwrap();
+        assert_eq!(forge.reruns.lock().unwrap().len(), 1);
+        let calls = forge.calls();
+        let rerun_at = calls.iter().position(|c| *c == "rerun").unwrap();
+        let fix_at = calls.iter().position(|c| *c == "fix");
+        assert!(fix_at.is_none_or(|f| f > rerun_at));
+    }
+
+    #[tokio::test]
+    async fn a_failed_rerun_call_falls_through_to_the_fix_in_the_same_lap() {
+        let mut state = landing_state();
+        let forge = Scripted::new(vec![red("a", Some("7"))], vec![]);
+        *forge.rerun_fails.lock().unwrap() = true;
+        *forge.fix.lock().unwrap() = Some(Fixed::Declined);
+        land_with(&mut state, RERUN_PR, &forge).await.unwrap();
+        assert_eq!(forge.reruns.lock().unwrap().len(), 1, "never retried");
+        assert_eq!(
+            forge.calls().iter().filter(|c| **c == "fix").count(),
+            1,
+            "{:?}",
+            forge.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_saved_rerun_record_stops_a_restart_from_rerunning() {
+        let mut state = landing_state();
+        let forge = Scripted::new(vec![red("a", Some("7"))], vec![]);
+        // The record was written just before the previous pass died.
+        state.land_reruns = Some(reran("a", &[("7", *forge.clock.lock().unwrap())]));
+        *forge.fix.lock().unwrap() = Some(Fixed::Declined);
+        land_with(&mut state, RERUN_PR, &forge).await.unwrap();
+        assert!(forge.reruns.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_switch_off_and_a_missing_run_id_go_straight_to_the_fixer() {
+        let mut state = landing_state();
+        state.config.graph.rerun_flaky_checks = false;
+        let forge = Scripted::new(vec![red("a", Some("7"))], vec![]);
+        *forge.fix.lock().unwrap() = Some(Fixed::Declined);
+        land_with(&mut state, RERUN_PR, &forge).await.unwrap();
+        assert!(forge.reruns.lock().unwrap().is_empty());
+        assert!(forge.calls().contains(&"fix"));
+
+        let mut state = landing_state();
+        let forge = Scripted::new(vec![red("a", None)], vec![]);
+        *forge.fix.lock().unwrap() = Some(Fixed::Declined);
+        land_with(&mut state, RERUN_PR, &forge).await.unwrap();
+        assert!(forge.reruns.lock().unwrap().is_empty());
+        assert!(forge.calls().contains(&"fix"));
     }
 
     fn names(xs: &[&str]) -> BTreeSet<String> {

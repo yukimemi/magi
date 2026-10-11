@@ -1777,6 +1777,15 @@ pub struct ReleaseBump {
     pub action_required: Option<String>,
 }
 
+/// The workflow runs `land` reran on one head, with when (unix seconds).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LandReruns {
+    /// The commit the reruns were made on.
+    pub head: String,
+    /// Workflow run id to the unix second it was rerun.
+    pub runs: BTreeMap<String, i64>,
+}
+
 /// The whole run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunState {
@@ -1887,6 +1896,11 @@ pub struct RunState {
     /// moment auto-merge is disabled or the pull request is done.
     #[serde(default)]
     pub land_armed_head: Option<String>,
+    /// Workflow runs `land` has rerun for the head it is bound to. Saved
+    /// *before* each `gh run rerun`, so a restart never reruns twice; replaced
+    /// when the head moves.
+    #[serde(default)]
+    pub land_reruns: Option<LandReruns>,
     /// The merge-approval question `land` last filed, and the head commit its
     /// panel showed. An answer is only honoured for that exact commit: a fix
     /// or rebase push makes a new head the owner has not seen.
@@ -2148,6 +2162,7 @@ impl RunState {
             graft: None,
             contested_handoff: None,
             land_armed_head: None,
+            land_reruns: None,
             land_approval: None,
             github_text: None,
             pre_gate: Vec::new(),

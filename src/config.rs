@@ -422,6 +422,14 @@ pub struct Graph {
     pub land: bool,
     /// Land rounds - watch, fix, push - before the run is left for a human.
     pub land_rounds: usize,
+    /// When `land` sees a required check fail on the head it is bound to, rerun
+    /// that check's workflow run once (`gh run rerun <id> --failed`) before
+    /// spending a fix round on it. A run id is rerun at most once, recorded
+    /// before the call, and forgotten when the head moves; the rerun costs no
+    /// fix round and no attempt. A failure with no workflow run (an external
+    /// status) goes straight to the fixer. On; off sends every red check to
+    /// the fixer at once.
+    pub rerun_flaky_checks: bool,
     /// Ask the owner before merging, showing what is about to land.
     ///
     /// On, and it is what makes `land` safe to have on: the question carries a
@@ -540,6 +548,7 @@ impl Default for Graph {
             worktree_root: None,
             land: true,
             land_rounds: 4,
+            rerun_flaky_checks: true,
             land_approval: true,
             hold_contested_merge: true,
             file_followups: true,
@@ -2123,6 +2132,8 @@ impl Config {
              review_rounds = 6\n\
              # Fix rounds a failing verify.gate gets before the run is blocked (0 = none).\n\
              gate_fix_rounds = 1\n\
+             # Rerun a failed required CI check once before a land fix round (flaky tests).\n\
+             rerun_flaky_checks = true\n\
              # Port the strengths judges named in the losing candidates onto the\n\
              # winner before review (best-effort; rolled back on failure or a big diff).\n\
              graft_runner_up = true\n\
@@ -2570,6 +2581,14 @@ mod tests {
         let config = layered("", "[graph]\ngithub_text_guard = false\n").unwrap();
         assert!(!config.graph.github_text_guard);
         assert!(Config::starter_toml().contains("github_text_guard = true"));
+    }
+
+    #[test]
+    fn rerun_flaky_checks_defaults_on_and_is_in_the_starter() {
+        assert!(Graph::default().rerun_flaky_checks);
+        let off: Graph = toml::from_str("rerun_flaky_checks = false").unwrap();
+        assert!(!off.rerun_flaky_checks);
+        assert!(Config::starter_toml().contains("rerun_flaky_checks = true"));
     }
 
     #[test]
