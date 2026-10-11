@@ -794,9 +794,7 @@ impl Task {
     /// boundary, for as long as its attempts hold out, instead of the
     /// one-shot "let this go next" the mark is meant to be.
     pub fn start(&mut self, run: String) {
-        // A task this build starts is eligible for a chat notice even when
-        // it was filed under an older schema (see `chat_notice_due`).
-        self.schema = self.schema.max(SCHEMA);
+        self.stamp_schema();
         self.status = TaskStatus::Running;
         self.attempts += 1;
         self.runs.push(run);
@@ -830,6 +828,7 @@ impl Task {
     /// as done without ever being released would still read as waiting on
     /// something in `magi task show` and on its card, after it no longer is.
     pub fn succeed(&mut self) {
+        self.stamp_schema();
         self.status = TaskStatus::Done;
         self.resume_override = None;
         self.last_error = None;
@@ -914,7 +913,16 @@ impl Task {
 
     /// Stamp [`Task::held_at`] on the way into [`TaskStatus::Held`]; a task
     /// that is already held keeps the time its hold began.
+    /// A transition this build makes (start, hold, block, done) makes the task
+    /// eligible for a chat notice even when it was filed under an older
+    /// schema; only records no build has touched since stay silent
+    /// ([`Task::chat_notice_due`]).
+    fn stamp_schema(&mut self) {
+        self.schema = self.schema.max(SCHEMA);
+    }
+
     fn note_held(&mut self) {
+        self.stamp_schema();
         if self.status != TaskStatus::Held || self.held_at.is_none() {
             self.held_at = Some(Timestamp::now());
         }
@@ -1039,6 +1047,7 @@ impl Task {
     /// second question about an already-blocked task must not overwrite the
     /// status it should eventually return to with `Blocked` itself.
     pub fn block(&mut self, blocked_by: Vec<String>, reason: Option<String>) {
+        self.stamp_schema();
         if self.status != TaskStatus::Blocked {
             self.blocked_from = Some(self.status);
         }
@@ -4267,6 +4276,10 @@ mod tests {
         live.start("r1".to_owned());
         live.succeed();
         assert!(live.chat_notice_due().is_some(), "started by this build");
+        let mut held = chat_task();
+        held.schema = 12;
+        held.hold_machine(Some("config".to_owned()));
+        assert!(held.chat_notice_due().is_some(), "held before any start");
     }
 
     #[test]

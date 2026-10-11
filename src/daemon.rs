@@ -2498,7 +2498,7 @@ async fn poll(
         {
             let talks = crate::talk::Talks::at(home.join("talks"));
             crate::chat_notify::sweep(queue, &talks, home);
-            crate::chat_notify::start_turns(&talks, stop.parking());
+            crate::chat_notify::start_turns(&talks, stop.parking(), &mut inflight);
         }
 
         // The conductor gets one look per cycle, right before the loop takes

@@ -200,7 +200,7 @@ fn pending_is_only_notices(t: &talk::Talk) -> bool {
 /// lease, each in its own task. `parking` (an upgrade is parking) starts
 /// nothing. Returns how many turns were started; a talk whose lease is held
 /// elsewhere is left to its holder, who drains the draft before letting go.
-pub fn start_turns(talks: &Talks, parking: bool) -> usize {
+pub fn start_turns(talks: &Talks, parking: bool, turns: &mut tokio::task::JoinSet<()>) -> usize {
     if parking {
         return 0;
     }
@@ -216,7 +216,7 @@ pub fn start_turns(talks: &Talks, parking: bool) -> usize {
         };
         started += 1;
         let talks = talks.clone();
-        tokio::spawn(async move {
+        turns.spawn(async move {
             let run = async {
                 let talk = talks.get(&id)?;
                 let (cfg, _) = Config::discover(&talk.repo, None)?;

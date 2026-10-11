@@ -133,7 +133,10 @@ async fn a_parking_upgrade_leaves_the_draft_and_starts_nothing() {
         chat_notify::talks_to_start(&w.talks),
         vec![w.talk_id.clone()]
     );
-    assert_eq!(chat_notify::start_turns(&w.talks, true), 0);
+    assert_eq!(
+        chat_notify::start_turns(&w.talks, true, &mut tokio::task::JoinSet::new()),
+        0
+    );
     assert!(drafts(&w).contains(magi::prompt::CHAT_TASK_NOTICE_HEADING));
     assert!(
         w.talks.claim_turn(&w.talk_id).expect("claim").is_some(),
