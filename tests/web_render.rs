@@ -2045,40 +2045,10 @@ async fn chat_persona_select_sits_beside_the_agent_select_without_overlap() {
     }
 }
 
-/// The Chat selectors are remembered per browser and applied to the next new
-/// conversation only; the conversation they were changed in keeps its values.
-#[test]
-fn chat_remembers_persona_and_implementers_for_new_conversations() {
-    // Config::discover in an integration binary includes the machine layer,
-    // so run in a child that has none (as the selector test below does).
-    const CHILD: &str = "MAGI_CHAT_PERSONA_TEST_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "chat_remembers_persona_and_implementers_for_new_conversations",
-                "--exact",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env(magi::config::Config::CONFIG_DIR_ENV, "")
-            .output()
-            .expect("spawn isolated browser test");
-        assert!(
-            output.status.success(),
-            "browser test failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("test runtime")
-        .block_on(chat_remembers_persona_and_implementers_inner());
-}
-
-async fn chat_remembers_persona_and_implementers_inner() {
+// The Chat selectors are remembered per browser and applied to the next new
+// conversation only; the conversation they were changed in keeps its values.
+common::e2e! {
+async fn chat_remembers_persona_and_implementers_for_new_conversations() {
     let Some(chrome) = cdp::find_chrome() else {
         assert!(
             std::env::var_os("CI").is_none(),
@@ -2221,39 +2191,18 @@ async fn chat_remembers_persona_and_implementers_inner() {
         .unwrap_or_else(|e| panic!("read original: {e}"));
     assert_eq!(original["persona"], "rei", "{original}");
 }
+}
 
-/// Successful selector changes must be remembered even when their response
-/// arrives after the operator has opened another conversation.
-#[test]
-fn chat_remembers_selector_changes_after_navigation() {
-    // Config::discover in an integration binary includes the machine layer.
-    // Isolate this fixture's roster in a child, without mutating process-wide
-    // environment variables while other rendering tests are running.
-    const CHILD: &str = "MAGI_CHAT_PREFS_TEST_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "chat_remembers_selector_changes_after_navigation",
-                "--exact",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env(magi::config::Config::CONFIG_DIR_ENV, "")
-            .output()
-            .expect("spawn isolated browser test");
-        assert!(
-            output.status.success(),
-            "browser test failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("test runtime")
-        .block_on(chat_remembers_selector_changes_after_navigation_inner());
+// Regression guard, no browser needed: the fixture's own `[[agents]]` must
+// load whatever the operator keeps in their machine layer. `isolated` hands
+// the child an empty machine layer; without it this fails on any machine whose
+// own `config.toml` declares `[[agents]]`.
+common::e2e! {
+async fn fixture_roster_loads_without_the_machine_layer() {
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    publish_fixture_roster(&fx).await;
+}
 }
 
 /// The server discovers config from origin/main, rather than the in-memory
@@ -2278,7 +2227,10 @@ async fn publish_fixture_roster(fx: &common::Fixture) {
     assert!(discovered.agents.iter().any(|spec| spec.id == "beta"));
 }
 
-async fn chat_remembers_selector_changes_after_navigation_inner() {
+// Successful selector changes must be remembered even when their response
+// arrives after the operator has opened another conversation.
+common::e2e! {
+async fn chat_remembers_selector_changes_after_navigation() {
     let Some(chrome) = cdp::find_chrome() else {
         assert!(
             std::env::var_os("CI").is_none(),
@@ -2416,6 +2368,7 @@ async fn chat_remembers_selector_changes_after_navigation_inner() {
         assert_eq!(current["persona"], "default");
         assert_eq!(current["implementers"], 1);
     }
+}
 }
 
 /// The per-conversation selectors are chips just above the composer, so a

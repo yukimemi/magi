@@ -81,6 +81,14 @@ where
     let own_process = std::env::var_os(CHILD_ENV).is_some()
         || std::env::var("NEXTEST_EXECUTION_MODE").is_ok_and(|m| m == "process-per-test");
     if own_process {
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Under nextest nobody set the empty machine layer for us (the
+            // re-executed child gets it from its parent). The process holds
+            // exactly this one test and no runtime exists yet, so nothing else
+            // reads the environment concurrently.
+            // SAFETY: single test per process, set before any runtime or task.
+            unsafe { std::env::set_var(magi::config::Config::CONFIG_DIR_ENV, "") };
+        }
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -98,6 +106,11 @@ where
     let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
         .args([name, "--exact", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, "1")
+        // Named and empty: no machine layer. `Config::discover` in an
+        // integration binary links the non-test library, so the operator's own
+        // `config.toml` would otherwise merge with a fixture's `magi.toml` and
+        // trip the "array declared in two layers" refusal on that machine only.
+        .env(magi::config::Config::CONFIG_DIR_ENV, "")
         .output();
     *lock.lock().unwrap() += 1;
     cv.notify_one();
