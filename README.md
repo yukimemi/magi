@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/yukimemi/magi/main/assets/logo-dark.svg">
-    <img src="https://raw.githubusercontent.com/yukimemi/magi/main/assets/logo.svg" alt="magi — blind multi-agent implementation competition" width="540">
+    <img src="https://raw.githubusercontent.com/yukimemi/magi/main/assets/logo.svg" alt="magi — multi-agent implementation competition" width="540">
   </picture>
 </p>
 
@@ -15,7 +15,7 @@
 
 # magi
 
-**A blind multi-agent implementation competition, as a CLI.**
+**A multi-agent implementation competition, as a CLI.**
 
 Three agents solve the same task in isolation. Three judges rank the results
 without knowing who wrote what. If they disagree, they argue, and then vote
