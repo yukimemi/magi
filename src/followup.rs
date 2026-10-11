@@ -228,13 +228,27 @@ pub fn settle_deputy_tasks(state: &mut RunState, pr_url: &str, queue: &Queue, re
             // finding and the deputy task is the one left held.
             let mut guards = Vec::new();
             let mut blocker: Option<&Task> = None;
+            let takeover = format!(
+                "{SUPERSEDED}the owner's approval deputy filed task {} for the same finding(s) of {pr_url}",
+                cand.id
+            );
+            // Held by an earlier pass of this same takeover that could not
+            // finish (or be rolled back): it is ours to restore on failure.
+            let mut carried: Vec<String> = Vec::new();
             if release {
                 for a in &rivals {
-                    if a.status == crate::queue::TaskStatus::Held {
+                    let ours = a.status == crate::queue::TaskStatus::Held
+                        && a.hold_reason.as_deref() == Some(takeover.as_str());
+                    if a.status == crate::queue::TaskStatus::Held && !ours {
                         continue;
                     }
                     match queue.claim(&a.id) {
-                        Ok(g) => guards.push((a.id.clone(), g)),
+                        Ok(g) => {
+                            if ours {
+                                carried.push(a.id.clone());
+                            }
+                            guards.push((a.id.clone(), g));
+                        }
                         Err(_) => {
                             blocker = Some(a);
                             break;
@@ -270,10 +284,10 @@ pub fn settle_deputy_tasks(state: &mut RunState, pr_url: &str, queue: &Queue, re
             // What each held task looked like before, for a rollback.
             let mut done: Vec<(String, Task, String)> = Vec::new();
             for (id, _guard) in &guards {
-                let why = format!(
-                    "{SUPERSEDED}the owner's approval deputy filed task {} for the same finding(s) of {pr_url}",
-                    cand.id
-                );
+                if carried.contains(id) {
+                    continue;
+                }
+                let why = takeover.clone();
                 let mut before: Option<Task> = None;
                 let held = queue.modify(id, |t| {
                     if t.status != crate::queue::TaskStatus::Queued {
@@ -310,6 +324,42 @@ pub fn settle_deputy_tasks(state: &mut RunState, pr_url: &str, queue: &Queue, re
                 // the automatic path keeps covering every finding. Only a
                 // task still carrying our hold is touched.
                 let mut stuck = false;
+                for tid in &carried {
+                    let back = queue.modify(tid, |t| {
+                        if t.status != crate::queue::TaskStatus::Held
+                            || t.hold_reason.as_deref() != Some(takeover.as_str())
+                        {
+                            return false;
+                        }
+                        // No snapshot survives a restart; an automatic
+                        // follow-up is filed Queued with nothing else set.
+                        t.status = crate::queue::TaskStatus::Queued;
+                        t.held_at = None;
+                        t.hold_reason = None;
+                        t.hold_source = None;
+                        true
+                    });
+                    match back {
+                        Ok(true) => state.event(
+                            NODE,
+                            format!(
+                                "follow-up task {tid} restored: deputy task {} could not take it over",
+                                cand.id
+                            ),
+                        ),
+                        Ok(false) => {}
+                        Err(e) => {
+                            stuck = true;
+                            state.event(
+                                NODE,
+                                format!(
+                                    "rollback of {tid} failed, deputy task {} left as a candidate for the next settle: {e:#}",
+                                    cand.id
+                                ),
+                            );
+                        }
+                    }
+                }
                 for (tid, before, why) in done.into_iter().rev() {
                     let back = queue.modify(&tid, |t| {
                         if t.status != crate::queue::TaskStatus::Held
@@ -1522,5 +1572,45 @@ mod tests {
         let got = q.get(&t.id).unwrap();
         assert_eq!(got.status, crate::queue::TaskStatus::Held);
         assert!(got.hold_reason.unwrap().starts_with(SUPERSEDED));
+    }
+
+    #[test]
+    fn a_hold_left_by_an_earlier_failed_pass_is_restored_on_the_next_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut s = merged(two_seats());
+        s.followup_generation = Some(0);
+        file(&mut s, PR, &q).unwrap();
+        let autos = q.list();
+        let mut t = deputy_task(&s.id, "both", "R3-1-1 and R3-1-2", &format!("after {PR}"));
+        q.put(&mut t).unwrap();
+        // The first auto task is left held by an earlier, interrupted pass.
+        let why = format!(
+            "{SUPERSEDED}the owner's approval deputy filed task {} for the same finding(s) of {PR}",
+            t.id
+        );
+        q.modify(&autos[0].id, |x| {
+            x.hold_manual(Some(why));
+            true
+        })
+        .unwrap();
+        let tmp = dir
+            .path()
+            .join("queue")
+            .join(format!("{}.json.tmp", autos[1].id));
+        std::fs::create_dir_all(&tmp).unwrap();
+        settle_deputy_tasks(&mut s, PR, &q, true);
+        for a in &autos {
+            let got = q.get(&a.id).unwrap();
+            assert_eq!(got.status, crate::queue::TaskStatus::Queued, "{}", a.id);
+            assert!(got.hold_reason.is_none());
+        }
+        assert!(
+            q.get(&t.id)
+                .unwrap()
+                .hold_reason
+                .unwrap()
+                .starts_with(SUPERSEDED)
+        );
     }
 }
