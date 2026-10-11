@@ -1171,21 +1171,82 @@ impl Drop for TurnLease {
 /// [`crate::config`] for why a dedicated field exists rather than reusing a
 /// judge seat.
 pub fn begin(store: &Talks, cfg: &Config, repo: PathBuf, agent: Option<&str>) -> Result<Talk> {
+    begin_with(store, cfg, repo, agent, &Preferred::default())
+}
+
+/// Remembered choices for a new conversation (`POST /api/talks`). Every field
+/// is soft: one that does not fit `cfg` is dropped on its own and the default
+/// stands, so a stale remembered value never stops a conversation opening.
+#[derive(Debug, Default, Clone)]
+pub struct Preferred {
+    /// Remembered agent id.
+    pub agent: Option<String>,
+    /// Remembered persona id.
+    pub persona: Option<String>,
+    /// Remembered implementer count.
+    pub implementers: Option<i64>,
+}
+
+/// [`begin`] with remembered choices. An explicit `agent` wins over
+/// `preferred.agent` and keeps its strict error. A preferred agent that is on
+/// the roster and runnable is an explicit choice (`fallback = false`) unless
+/// it is the chatter chain's own head. Persona and implementers are applied
+/// before the single save, so neither is marked dirty: the new seat's briefing
+/// already carries them.
+pub fn begin_with(
+    store: &Talks,
+    cfg: &Config,
+    repo: PathBuf,
+    agent: Option<&str>,
+    preferred: &Preferred,
+) -> Result<Talk> {
     // Absolute: a relative path means the wrong repository once anything
     // other than this process reads it back.
     let repo = repo.canonicalize().unwrap_or(repo);
     // An explicit agent is a chain of one; otherwise the first id of
     // `[roles] chatter` that can run here (later ones are `turn`'s fallbacks).
-    let spec = match agent {
-        Some(id) => agent::pick(&cfg.agents, Some(id), &agent::installed)?,
-        None => agent::pick_chain(
+    let head = || -> Result<AgentSpec> {
+        Ok(agent::pick_chain(
             &cfg.agents,
             cfg.roles.chatter.as_ref(),
             &agent::installed,
             "chatter",
         )?
-        .remove(0),
+        .remove(0))
     };
+    let mut fallback = agent.is_none();
+    let spec = match agent {
+        Some(id) => agent::pick(&cfg.agents, Some(id), &agent::installed)?,
+        None => {
+            match preferred
+                .agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                Some(id) => match agent::pick(&cfg.agents, Some(id), &agent::installed) {
+                    Ok(spec) => {
+                        fallback = head().is_ok_and(|head| spec.id == head.id);
+                        spec
+                    }
+                    Err(_) => head()?,
+                },
+                None => head()?,
+            }
+        }
+    };
+    let persona = preferred
+        .persona
+        .as_deref()
+        .and_then(|id| crate::persona::find(&cfg.talk.personas, id))
+        .filter(|p| !p.is_default())
+        .map(|p| p.id)
+        .unwrap_or_default();
+    let implementers = preferred
+        .implementers
+        .and_then(|n| u8::try_from(n).ok())
+        .and_then(|n| check_implementers(n, cfg).ok())
+        .unwrap_or(1);
 
     let now = Timestamp::now();
     let mut talk = Talk {
@@ -1198,10 +1259,10 @@ pub fn begin(store: &Talks, cfg: &Config, repo: PathBuf, agent: Option<&str>) ->
         turns: Vec::new(),
         pending: String::new(),
         pending_attachments: Vec::new(),
-        fallback: agent.is_none(),
-        persona: String::new(),
+        fallback,
+        persona,
         persona_dirty: false,
-        implementers: 1,
+        implementers,
         implementers_dirty: false,
         created_at: now,
         updated_at: now,
@@ -3453,6 +3514,114 @@ mod tests {
             assert!(!b.contains("task add --solo"), "{b}");
             assert!(!b.contains("Use --solo"), "{b}");
         }
+    }
+
+    #[test]
+    fn begin_with_applies_remembered_choices_and_drops_unfit_ones_alone() {
+        let (tmp, talks) = store();
+        let first = mock_agent(tmp.path(), ECHO, BTreeMap::new());
+        let mut second = first.clone();
+        second.id = "second".to_owned();
+        let mut cfg = config(first.clone());
+        cfg.agents.push(second.clone());
+        let open = |p: &Preferred| {
+            begin_with(&talks, &cfg, tmp.path().to_owned(), None, p).expect("begin")
+        };
+
+        let talk = open(&Preferred {
+            agent: Some("second".into()),
+            persona: Some("rei".into()),
+            implementers: Some(i64::from(check_implementers(3, &cfg).unwrap_or(1))),
+        });
+        assert_eq!(talk.agent, "second");
+        assert!(
+            !talk.fallback,
+            "a remembered non-head agent is an explicit choice"
+        );
+        assert_eq!(talk.persona, "rei");
+        assert_eq!(talk.implementers, check_implementers(3, &cfg).unwrap_or(1));
+        assert!(!talk.persona_dirty && !talk.implementers_dirty);
+
+        // The chain head chosen again stays a fallback-capable talk.
+        let head = open(&Preferred {
+            agent: Some(first.id.clone()),
+            ..Preferred::default()
+        });
+        assert!(head.fallback);
+
+        // Each unfit field falls back by itself.
+        for implementers in [0, 4, -1, 1000] {
+            let t = open(&Preferred {
+                agent: Some("gone".into()),
+                persona: Some("no-such-persona".into()),
+                implementers: Some(implementers),
+            });
+            assert_eq!(t.agent, first.id);
+            assert!(t.fallback);
+            assert_eq!(t.persona, "");
+            assert_eq!(t.implementers, 1);
+        }
+
+        // `default` stays the empty string; a good field survives a bad one.
+        let t = open(&Preferred {
+            agent: Some("second".into()),
+            persona: Some("default".into()),
+            implementers: Some(9),
+        });
+        assert_eq!(
+            (t.agent.as_str(), t.persona.as_str(), t.implementers),
+            ("second", "", 1)
+        );
+
+        // An explicit agent still wins and keeps its strict error.
+        let strict = begin_with(
+            &talks,
+            &cfg,
+            tmp.path().to_owned(),
+            Some("first-unknown"),
+            &Preferred {
+                agent: Some("second".into()),
+                ..Preferred::default()
+            },
+        );
+        assert!(strict.is_err());
+    }
+
+    #[test]
+    fn remembered_agent_can_open_when_the_chatter_chain_cannot_resolve() {
+        let (tmp, talks) = store();
+        let spec = mock_agent(tmp.path(), ECHO, BTreeMap::new());
+        // A missing chain member makes head resolution fail independently of
+        // which subscription CLIs happen to be installed on this machine.
+        let cfg = chain_config(vec![spec.clone()], &["missing-chatter"]);
+        assert!(begin(&talks, &cfg, tmp.path().to_owned(), None).is_err());
+        let talk = begin_with(
+            &talks,
+            &cfg,
+            tmp.path().to_owned(),
+            None,
+            &Preferred {
+                agent: Some(spec.id.clone()),
+                ..Preferred::default()
+            },
+        )
+        .expect("a valid remembered agent does not require a default chain");
+        assert_eq!(talk.agent, spec.id);
+        assert!(!talk.fallback);
+        assert_eq!(talks.get(&talk.id).unwrap().agent, spec.id);
+        assert!(
+            begin_with(
+                &talks,
+                &cfg,
+                tmp.path().to_owned(),
+                None,
+                &Preferred {
+                    agent: Some("missing-preference".into()),
+                    ..Preferred::default()
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]

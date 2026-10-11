@@ -2045,6 +2045,349 @@ async fn chat_persona_select_sits_beside_the_agent_select_without_overlap() {
     }
 }
 
+/// The Chat selectors are remembered per browser and applied to the next new
+/// conversation only; the conversation they were changed in keeps its values.
+#[tokio::test]
+async fn chat_remembers_persona_and_implementers_for_new_conversations() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
+        );
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    publish_fixture_roster(&fx).await;
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let agent = fx.config.agents[0].id.clone();
+    let mut t = talk::begin(&talks, &fx.config, fx.repo.clone(), Some(&agent)).expect("seed talk");
+    talk::record(&mut t, &talks, "Remember my choices", Vec::new()).expect("seed turn");
+    let talk_id = t.id.clone();
+
+    let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
+    let mut browser = cdp::Browser::launch(&chrome)
+        .await
+        .unwrap_or_else(|e| panic!("could not start Chrome at {}: {e}", chrome.display()));
+    let w = Duration::from_secs(30);
+    let page = browser
+        .open_page(&format!("{base}#/chat/{talk_id}"), 1280, 900, false)
+        .await
+        .unwrap_or_else(|e| panic!("open: {e}"));
+    browser
+        .wait_for(
+            &page,
+            "(() => { const s = document.getElementById('talk-persona'); \
+             return !!s && !s.disabled && s.options.length > 1 \
+               && !localStorage.getItem('magi-talk-defaults'); })()",
+            w,
+        )
+        .await
+        .unwrap_or_else(|e| {
+            panic!("persona select never rendered (or something was stored on load): {e}")
+        });
+
+    browser
+        .eval(
+            &page,
+            "(() => { const s = document.getElementById('talk-persona'); \
+             s.value = 'rei'; s.dispatchEvent(new Event('change')); return true; })()",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("change persona: {e}"));
+    browser
+        .wait_for(
+            &page,
+            "(() => { try { return JSON.parse(localStorage.getItem('magi-talk-defaults')).persona === 'rei'; } \
+             catch (_) { return false; } })()",
+            w,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("persona was not remembered: {e}"));
+    browser
+        .wait_for(
+            &page,
+            "(() => { const s = document.getElementById('talk-implementers'); return !!s && !s.disabled; })()",
+            w,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("implementers select never settled: {e}"));
+    browser
+        .eval(
+            &page,
+            "(() => { const s = document.getElementById('talk-implementers'); \
+             s.value = '3'; s.dispatchEvent(new Event('change')); return true; })()",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("change implementers: {e}"));
+    // The config may refuse 3 here; either way the stored value is whatever
+    // the server confirmed for this conversation, never a guess.
+    browser
+        .wait_for(
+            &page,
+            "(() => { const s = document.getElementById('talk-implementers'); return !!s && !s.disabled; })()",
+            w,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("implementers change never settled: {e}"));
+
+    browser
+        .eval(
+            &page,
+            "(() => { document.getElementById('talk-start-go').click(); return true; })()",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("start: {e}"));
+    browser
+        .wait_for(
+            &page,
+            &format!(
+                "(() => {{ const s = document.getElementById('talk-persona'); \
+                 return location.hash.startsWith('#/chat/') && !location.hash.endsWith('{talk_id}') \
+                   && !!s && s.value === 'rei'; }})()"
+            ),
+            w,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("new conversation did not start with the remembered persona: {e}"));
+
+    let stored = browser
+        .eval(
+            &page,
+            "(() => JSON.parse(localStorage.getItem('magi-talk-defaults')))()",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("read stored: {e}"));
+    let implementers = stored["implementers"].as_u64();
+    if let Some(n) = implementers {
+        let got = browser
+            .eval(
+                &page,
+                "(() => document.getElementById('talk-implementers').value)()",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("read implementers: {e}"));
+        assert_eq!(
+            got,
+            n.to_string(),
+            "new conversation takes the remembered count: {stored}"
+        );
+    }
+
+    // The original conversation keeps its own stored values.
+    let original = browser
+        .eval(
+            &page,
+            &format!(
+                "(async () => {{ const r = await fetch('/api/talks/{talk_id}'); \
+                 const t = await r.json(); return {{ persona: t.persona, implementers: t.implementers }}; }})()"
+            ),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("read original: {e}"));
+    assert_eq!(original["persona"], "rei", "{original}");
+}
+
+/// Successful selector changes must be remembered even when their response
+/// arrives after the operator has opened another conversation.
+#[test]
+fn chat_remembers_selector_changes_after_navigation() {
+    // Config::discover in an integration binary includes the machine layer.
+    // Isolate this fixture's roster in a child, without mutating process-wide
+    // environment variables while other rendering tests are running.
+    const CHILD: &str = "MAGI_CHAT_PREFS_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "chat_remembers_selector_changes_after_navigation",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(magi::config::Config::CONFIG_DIR_ENV, "")
+            .output()
+            .expect("spawn isolated browser test");
+        assert!(
+            output.status.success(),
+            "browser test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(chat_remembers_selector_changes_after_navigation_inner());
+}
+
+/// The server discovers config from origin/main, rather than the in-memory
+/// fixture used to seed talks. Give both sides the same mock roster.
+async fn publish_fixture_roster(fx: &common::Fixture) {
+    std::fs::write(
+        fx.repo.join("magi.toml"),
+        toml::to_string(&fx.config).expect("serialize fixture config"),
+    )
+    .expect("write fixture config");
+    for args in [
+        vec!["add", "magi.toml"],
+        vec!["commit", "-m", "configure chat test roster"],
+        vec!["push", "origin", "main"],
+    ] {
+        magi::git::git(&fx.repo, &args)
+            .await
+            .expect("publish fixture config");
+    }
+    let (discovered, _) =
+        magi::config::Config::discover(&fx.repo, None).expect("discover published fixture config");
+    assert!(discovered.agents.iter().any(|spec| spec.id == "beta"));
+}
+
+async fn chat_remembers_selector_changes_after_navigation_inner() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
+        );
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    publish_fixture_roster(&fx).await;
+    let home = fx.tmp.path().join("magi-home");
+    let talks = Talks::at(home.join("talks"));
+    let agent = fx.config.agents[0].id.clone();
+    let first = talk::begin(&talks, &fx.config, fx.repo.clone(), Some(&agent)).unwrap();
+    let second = talk::begin(&talks, &fx.config, fx.repo.clone(), Some(&agent)).unwrap();
+    let base = serve(
+        &home,
+        Queue::at(home.join("queue")),
+        talks,
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("launch Chrome");
+    let page = browser
+        .open_page(&format!("{base}#/chat/{}", first.id), 1280, 900, false)
+        .await
+        .expect("open chat");
+    let w = Duration::from_secs(30);
+    for (field, value) in [
+        ("agent", fx.config.agents[1].id.as_str()),
+        ("persona", "rei"),
+        ("implementers", "3"),
+    ] {
+        browser
+            .eval(&page, &format!(
+                "(async () => {{ const hash = '#/chat/{}'; if (location.hash !== hash) {{ \
+                 const changed = new Promise(resolve => window.addEventListener('hashchange', \
+                 () => setTimeout(resolve, 0), {{ once: true }})); location.hash = hash; await changed; }} return true; }})()",
+                first.id
+            ))
+            .await
+            .expect("return to first chat");
+        let ready = browser
+            .wait_for(
+                &page,
+                &format!(
+                    "location.hash === '#/chat/{}' \
+                     && document.getElementById('talk-agent')?.options.length > 1 \
+                     && document.getElementById('talk-persona')?.options.length > 1 \
+                     && document.getElementById('talk-{field}')?.disabled === false",
+                    first.id
+                ),
+                w,
+            )
+            .await;
+        if let Err(error) = ready {
+            let snapshot = browser.eval(&page, "({ hash: location.hash, body: document.body?.innerText, agent: document.getElementById('talk-agent')?.outerHTML })").await;
+            panic!("selector ready: {error}; {snapshot:?}");
+        }
+        browser
+            .eval(
+                &page,
+                &format!(
+                    r#"(() => {{
+                        const originalFetch = window.fetch;
+                        window.releaseTalkPreference = null;
+                        window.fetch = async (...args) => {{
+                            const response = await originalFetch(...args);
+                            if (String(args[0]).endsWith('/{}/{field}') && args[1]?.method === 'POST') {{
+                                if (!response.ok) throw new Error(await response.text());
+                                window.fetch = originalFetch;
+                                await new Promise(resolve => {{ window.releaseTalkPreference = resolve; }});
+                            }}
+                            return response;
+                        }};
+                        const select = document.getElementById('talk-{field}');
+                        select.value = '{value}';
+                        select.dispatchEvent(new Event('change'));
+                        return true;
+                    }})()"#,
+                    first.id
+                ),
+            )
+            .await
+            .expect("change selector with response held");
+        browser
+            .wait_for(
+                &page,
+                "typeof window.releaseTalkPreference === 'function'",
+                w,
+            )
+            .await
+            .expect("server accepted change");
+        browser
+            .eval(&page, &format!(
+                "(async () => {{ const changed = new Promise(resolve => window.addEventListener('hashchange', \
+                 () => setTimeout(resolve, 0), {{ once: true }})); \
+                 location.hash = '#/chat/{}'; await changed; return true; }})()",
+                second.id
+            ))
+            .await
+            .expect("navigate away");
+        browser
+            .wait_for(
+                &page,
+                &format!(
+                    "location.hash === '#/chat/{}' && document.getElementById('talk-agent')?.value === '{}'",
+                    second.id, agent
+                ),
+                w,
+            )
+            .await
+            .expect("second chat loaded");
+        browser
+            .eval(&page, "window.releaseTalkPreference(); true")
+            .await
+            .expect("release successful response");
+        browser
+            .wait_for(
+                &page,
+                &format!(
+                    "String(JSON.parse(localStorage.getItem('magi-talk-defaults') || '{{}}').{field}) === '{value}'"
+                ),
+                w,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{field} was not remembered after navigation: {e}"));
+        let current = browser
+            .eval(&page, "({ agent: document.getElementById('talk-agent').value, persona: document.getElementById('talk-persona').value, implementers: Number(document.getElementById('talk-implementers').value) })")
+            .await
+            .expect("read second chat");
+        assert_eq!(current["agent"], agent);
+        assert_eq!(current["persona"], "default");
+        assert_eq!(current["implementers"], 1);
+    }
+}
+
 /// The per-conversation selectors are chips just above the composer, so a
 /// long transcript never has to be scrolled to the top to change one.
 #[tokio::test]

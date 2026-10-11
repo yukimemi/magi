@@ -1188,6 +1188,38 @@ briefing is byte-for-byte unchanged for it.
   id the config no longer has is treated as `default` with a warning.
 - Both new `Talk` fields are `#[serde(default)]`; `talk::SCHEMA` is unchanged.
 
+### Chat defaults are remembered by the browser and checked by the server
+
+The web Chat remembers the last Agent / Persona / Implementers the operator
+chose and starts the *next new* conversation with them. Existing conversations
+keep their own stored values.
+
+- **Storage is `localStorage["magi-talk-defaults"]`** (JSON `{agent, persona,
+  implementers}`), like the theme and split width. Chosen over a machine-layer
+  or state-file setting because it needs no new server state; consequence
+  accepted: it does not follow the operator across devices.
+- **Written only after a manual switch succeeded** (`switchTalkAgent` /
+  `Persona` / `Implementers`), one field at a time, from the TalkView the
+  server returned, even if the operator navigated away before the response.
+  Only the on-screen conversation update is guarded by its id.
+  Never from `renderTalk` / `loadTalk` / `startTalk`: opening an
+  old conversation would overwrite the operator's last choice with its values.
+  A chatter-chain fallback that rewrites `talk.agent` is not a choice.
+- **Applied only at creation**: `startTalk` sends `preferred_agent`, `persona`,
+  `implementers` in `POST /api/talks`. `talk::begin_with` (`begin` is the
+  all-`None` wrapper) checks each against the repo's current config and drops
+  an unfit one on its own, never a 400: unrunnable / unknown agent -> chatter
+  chain head; unknown persona -> default; implementers outside 1..=3 or refused
+  by `check_implementers` -> 1. Wrong JSON types are dropped the same way.
+- **`preferred_agent` is not `agent`.** `agent` is strict (an unknown id is an
+  error); `preferred_agent` is soft, and `agent` wins when both are sent. A
+  preferred agent other than the chain head is an explicit choice
+  (`fallback = false`); the head itself keeps `fallback = true`. A valid
+  preferred agent also works when the chatter chain cannot resolve; in that
+  case it is an explicit choice with `fallback = false`.
+- Persona and implementers are set before the single save and the dirty flags
+  stay false: the new seat's briefing already carries them.
+
 ### Chat implementer count changes a command, not a tone
 
 `Talk::implementers` (1..=3, `#[serde(default)]` to 1 = Solo, `talk::SCHEMA`

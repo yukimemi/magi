@@ -5644,6 +5644,41 @@ function renderTalkAgent(talk, busy, loading = false) {
     || String(talk.status || "open") !== "open" || roster.length < 2;
 }
 
+/* ---- Chat defaults: the last Agent / Persona / Implementers the operator
+   picked, applied to the next new conversation only. One key, written only
+   after a manual switch succeeded (never from render/load, which would
+   overwrite it with an old conversation's values). Per browser: the server
+   check in `talk::begin_with` is what keeps a stale value harmless. ------- */
+const TALK_DEFAULTS_KEY = "magi-talk-defaults";
+let talkDefaultsMemory = {};
+
+function readTalkDefaults() {
+  let stored = {};
+  try {
+    const parsed = JSON.parse(localStorage.getItem(TALK_DEFAULTS_KEY) || "{}");
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) stored = parsed;
+  } catch (_) { /* denied or junk: fall back to the in-memory copy */ }
+  const out = { ...talkDefaultsMemory, ...stored };
+  if (typeof out.agent !== "string") delete out.agent;
+  if (typeof out.persona !== "string") delete out.persona;
+  if (!Number.isInteger(out.implementers)) delete out.implementers;
+  return out;
+}
+
+function rememberTalkDefault(field, value) {
+  talkDefaultsMemory = { ...readTalkDefaults(), [field]: value };
+  try { localStorage.setItem(TALK_DEFAULTS_KEY, JSON.stringify(talkDefaultsMemory)); } catch (_) { /* private mode */ }
+}
+
+function newTalkBody() {
+  const d = readTalkDefaults();
+  const body = {};
+  if (d.agent) body.preferred_agent = d.agent;
+  if (d.persona !== undefined) body.persona = d.persona;
+  if (d.implementers !== undefined) body.implementers = d.implementers;
+  return body;
+}
+
 async function switchTalkAgent() {
   const id = state.talkDetail.id;
   const select = $("talk-agent");
@@ -5654,6 +5689,7 @@ async function switchTalkAgent() {
   renderTalk();
   try {
     const talk = await postJson(API.talkAgent(id), { agent });
+    rememberTalkDefault("agent", talk.agent);
     /* Only the conversation still on screen takes the answer: the operator
        may have navigated away while this was in flight. */
     if (state.talkDetail.id === id) {
@@ -5718,6 +5754,7 @@ async function switchTalkImplementers() {
   renderTalk();
   try {
     const talk = await postJson(API.talkImplementers(id), { implementers });
+    rememberTalkDefault("implementers", talk.implementers || 1);
     if (state.talkDetail.id === id) {
       state.talkDetail.talk = talk;
       announce(`Implementers set to ${implementers === 1 ? "Solo" : implementers}.`);
@@ -5746,6 +5783,7 @@ async function switchTalkPersona() {
   renderTalk();
   try {
     const talk = await postJson(API.talkPersona(id), { persona });
+    rememberTalkDefault("persona", talk.persona || "default");
     if (state.talkDetail.id === id) {
       state.talkDetail.talk = talk;
       announce(`Persona changed to ${persona}.`);
@@ -6067,7 +6105,7 @@ async function startTalk() {
   go.disabled = true;
   setText(go, "Opening…");
   try {
-    const talk = await postJson(API.talks, {});
+    const talk = await postJson(API.talks, newTalkBody());
     state.talks = sortTalks([talk, ...(state.talks || []).filter((t) => t.id !== talk.id)]);
     state.talkDetail = { ...talkShell(talk.id, talk), talk };
     trackTalkThinking(talk);
