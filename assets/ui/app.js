@@ -156,6 +156,9 @@ const RUN_STATUS = {
      assumed them contradicted the card it sat on. */
   stalled:      { glyph: "\u26a0", tone: "rust", note: "The judging panel never reached a quorum, so no verdict was recorded. The work is kept." },
   blocked:      { glyph: "\u2298", tone: "rust", note: "magi stopped short of merging." },
+  /* Stopped intentionally at a node boundary or approval point. Nothing failed
+     and the next loop iteration resumes it automatically; neutral ink tone. */
+  parked:       { glyph: "\u2016", tone: "ink",  note: "Parked at a node boundary. Nothing failed; the next loop resumes the same run." },
   /* Derived from a confirmed-dead driver, not from elapsed time. The saved
      graph status says where its process stopped; this is the actionable fact:
      nobody is currently moving it, so it must not sit under In flight. */
@@ -1552,6 +1555,7 @@ const RUN_SECTIONS = [
    legacy run with no recorded driver is `unknown`, deliberately not stale:
    guessing would turn a still-running manual invocation into a false alarm. */
 function isStale(run) {
+  if (run.display_status) return run.display_status === "stale";
   const status = String(run.status || "");
   return run.live === "dead" && !run.waiting
     && !["merged", "ready", "stalled", "blocked", "failed", "verified_noop", "superseded", "already_in_base"].includes(status);
@@ -1568,6 +1572,7 @@ function isLiveAttempt(run) {
 function displayedRunStatus(run) {
   if (run.waiting) return "waiting";
   if (run.unmerged_by_design) return "unmerged";
+  if (run.display_status) return run.display_status;
   return isStale(run) ? "stale" : String(run.status || "");
 }
 
@@ -1635,6 +1640,7 @@ const REPRESENTATIVE_RUN_SHAPES = [
   { waiting: true, status: "blocked" },
   { waiting: false, status: "implementing" },
   { waiting: false, status: "implementing", live: "dead" },
+  { waiting: false, status: "implementing", live: "dead", display_status: "parked" },
   { waiting: false, status: "merged" },
   { waiting: false, status: "ready" },
   { waiting: false, status: "stalled" },
@@ -6891,7 +6897,7 @@ function renderRunActions(run) {
   clear(box);
 
   const status = String(run.status || "");
-  if (isStale(run) || ["stalled", "blocked"].includes(status)) {
+  if (isStale(run) || displayedRunStatus(run) === "parked" || ["stalled", "blocked"].includes(status)) {
     const busy = resumeBusy === run.id;
     const gone = !unfolded(run);
     box.append(
@@ -6907,6 +6913,8 @@ function renderRunActions(run) {
           ? `This run's worktree was released to run ${String(run.released_to).split("-").pop()}, which took the branch over. It can no longer be resumed from here; carry on with that run.`
           : gone
           ? "The candidate worktrees are gone, so there is nothing left to continue from. File the task again instead."
+          : displayedRunStatus(run) === "parked"
+            ? "Nothing failed; the next loop resumes this run. Resume now continues from its last saved node and spends agent calls."
           : isStale(run)
             ? "No process is driving this run. Resume continues from its last saved node and spends agent calls."
             : "Carries on from where it stopped, re-asking only the seats that went missing. It spends agent calls." }),

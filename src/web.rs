@@ -2778,6 +2778,10 @@ struct RunSummary {
     /// [`RunState::unmerged_by_design`]. The front end reads this rather than
     /// re-deriving the same check from `status` and `merge.mode` itself.
     unmerged_by_design: bool,
+    /// Derived presentation status matching [`RunDetailView::display_status`].
+    /// Distinguishes parked runs, crashes, and waiting states from raw node statuses.
+    #[serde(default)]
+    display_status: String,
     /// Who started the run, as the one label every surface shares; the
     /// "origin unknown" wording when the record predates origins.
     origin_label: String,
@@ -2791,6 +2795,7 @@ impl RunSummary {
             status: status_word(state.status),
             done: state.status.done(),
             unmerged_by_design: state.unmerged_by_design(),
+            display_status: run_display_status(state, waiting, live),
             instruction: state.instruction.clone(),
             title: title_from(&state.instruction, TITLE_MAX),
             repo: state.repo.display().to_string(),
@@ -2826,6 +2831,28 @@ fn status_word(status: RunStatus) -> String {
     // was a third way of naming the same statuses, and one that changed
     // silently with a derive.
     status.as_str().to_owned()
+}
+
+/// The presentation status for a run, unified across summaries and details.
+///
+/// Distinguishes runs that stopped deliberately at a node boundary (`"parked"`)
+/// from genuine driver crashes (`"stale"`), while preserving `"waiting"` for
+/// runs awaiting operator answers.
+fn run_display_status(state: &RunState, waiting: bool, live: crate::run::Liveness) -> String {
+    if waiting {
+        return "waiting".to_owned();
+    }
+    if state.unmerged_by_design() {
+        return "unmerged".to_owned();
+    }
+    if !state.status.done() && live == crate::run::Liveness::Dead {
+        let parked = state.parked || state.events.last().is_some_and(|e| e.node == "park");
+        if parked {
+            return "parked".to_owned();
+        }
+        return "stale".to_owned();
+    }
+    status_word(state.status)
 }
 
 /// `?limit=`, clamped by the handler.
@@ -2967,6 +2994,12 @@ struct RunDetailView {
     /// `RunState` has no business knowing which of its own methods a caller
     /// wants serialized.
     unmerged_by_design: bool,
+    /// Same field and meaning as [`RunSummary::waiting`].
+    #[serde(default)]
+    waiting: bool,
+    /// Same derived presentation status as [`RunSummary::display_status`].
+    #[serde(default)]
+    display_status: String,
     /// Same field and meaning as [`RunSummary::done`]: whether the status is
     /// terminal. The client's `landView` keys on it, and the flattened state
     /// has no such field, so without it a finished run's stale `open` PR
@@ -3312,17 +3345,21 @@ fn run_prose_md(state: &RunState) -> RunProseMd {
 impl RunDetailView {
     fn of(
         state: RunState,
+        waiting: bool,
         live: crate::run::Liveness,
         superseded_by: Option<String>,
         latest_attempt: Option<LatestAttempt>,
         task: Option<TaskRef>,
     ) -> Self {
+        let display_status = run_display_status(&state, waiting, live);
         Self {
             instruction_md: md::to_nodes(&state.instruction, &md::ImageBase::None),
             prose_md: run_prose_md(&state),
             origin_label: crate::run::origin_label(state.origin.as_ref()),
             live,
             unmerged_by_design: state.unmerged_by_design(),
+            waiting,
+            display_status,
             done: state.status.done(),
             superseded_by,
             latest_attempt,
@@ -3341,6 +3378,7 @@ async fn run_detail(
         let state = read_run(&ui.runs, &id)?;
         let daemon_claims = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
         let live = state.liveness(daemon_claims);
+        let waiting = !ui.questions.open_for(&id).is_empty();
         let superseded_by = state
             .pr_taken_over_by
             .clone()
@@ -3369,6 +3407,7 @@ async fn run_detail(
             .map(|t| task_outcome(&t, &id, max_attempts, |r| read_run(&ui.runs, r).ok()));
         Ok(Json(RunDetailView::of(
             state,
+            waiting,
             live,
             superseded_by,
             latest_attempt,
@@ -13273,8 +13312,122 @@ mod tests {
         let row = serde_json::to_value(RunSummary::of(&state, false, crate::run::Liveness::Dead))
             .expect("serialize list row");
         assert_eq!(row["status"], "reviewing");
+        assert_eq!(row["display_status"], "stale");
         assert_eq!(row["live"], "dead", "{row}");
         assert!(!row["done"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn run_display_status_distinguishes_park_crash_and_owner_wait() {
+        use crate::run::Liveness::{Dead, Live, Unknown};
+        let mut state = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "abc".to_owned(),
+            "Review only".to_owned(),
+            Config::default(),
+        );
+        for (status, parked, node, waiting, live, expected) in [
+            (
+                RunStatus::Judging,
+                true,
+                "github-text",
+                false,
+                Dead,
+                "parked",
+            ),
+            (RunStatus::Judging, false, "park", false, Dead, "parked"),
+            (RunStatus::Judging, false, "judge", false, Dead, "stale"),
+            (
+                RunStatus::Judging,
+                true,
+                "github-text",
+                true,
+                Dead,
+                "waiting",
+            ),
+            (
+                RunStatus::Judging,
+                false,
+                "github-text",
+                true,
+                Dead,
+                "waiting",
+            ),
+            (
+                RunStatus::Judging,
+                false,
+                "github-text",
+                false,
+                Dead,
+                "stale",
+            ),
+            (RunStatus::Judging, false, "resume", false, Dead, "stale"),
+            (RunStatus::Judging, true, "park", false, Live, "judging"),
+            (RunStatus::Judging, true, "park", false, Unknown, "judging"),
+            (RunStatus::Merged, true, "park", false, Dead, "merged"),
+            (RunStatus::Blocked, true, "park", false, Dead, "blocked"),
+            (
+                RunStatus::Blocked,
+                true,
+                "github-text",
+                true,
+                Dead,
+                "waiting",
+            ),
+        ] {
+            state.status = status;
+            state.parked = parked;
+            state.events.clear();
+            state.event(
+                "park",
+                "an earlier park does not determine the latest state",
+            );
+            state.event(node, "message is not used for classification");
+            let summary = RunSummary::of(&state, waiting, live);
+            let detail = RunDetailView::of(state.clone(), waiting, live, None, None, None);
+            assert_eq!(
+                summary.display_status, expected,
+                "{status:?}/{node}/{live:?}"
+            );
+            assert_eq!(detail.display_status, summary.display_status);
+            assert_eq!(detail.waiting, summary.waiting);
+        }
+        state.status = RunStatus::Judging;
+        state.parked = false;
+        state.events.clear();
+        assert_eq!(run_display_status(&state, false, Dead), "stale");
+    }
+
+    #[tokio::test]
+    async fn run_display_status_routes_share_the_open_question_store() {
+        let f = Fixture::start().await;
+        let id = "20260922-090200-abcd";
+        write_run(&f.runs(), id, RunStatus::Judging);
+        let mut state = read_run(&f.runs(), id).unwrap();
+        state.parked = true;
+        state.driver_exited = true;
+        state.event("github-text", "waiting for the owner");
+        state.save_under(f.home.path()).unwrap();
+        let store = f.questions();
+        let mut q = Question::new(
+            id.to_owned(),
+            "github-text".to_owned(),
+            "owner".to_owned(),
+            "Approve the text?".to_owned(),
+            String::new(),
+            Vec::new(),
+        );
+        store.put(&mut q).unwrap();
+        for expected in ["waiting", "parked"] {
+            let list = f.get("/api/runs").await.json();
+            let detail = f.get(&format!("/api/runs/{id}")).await.json();
+            assert_eq!(list[0]["display_status"], expected);
+            assert_eq!(detail["display_status"], expected);
+            assert_eq!(detail["waiting"], list[0]["waiting"]);
+            q.status = ask::QuestionStatus::Answered;
+            store.put(&mut q).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -13514,6 +13667,7 @@ mod tests {
             state.status = status;
             let v = serde_json::to_value(RunDetailView::of(
                 state,
+                false,
                 crate::run::Liveness::Unknown,
                 None,
                 None,
@@ -13579,6 +13733,7 @@ mod tests {
 
         let v = serde_json::to_value(RunDetailView::of(
             state,
+            false,
             crate::run::Liveness::Unknown,
             None,
             None,
@@ -17085,7 +17240,7 @@ mod tests {
             + shapes_body_start;
         let shapes_src = &APP_JS[shapes_body_start..shapes_close];
 
-        let mut shapes: Vec<(bool, String, bool)> = Vec::new();
+        let mut shapes: Vec<(bool, String, bool, bool)> = Vec::new();
         for entry in shapes_src.split('{').skip(1) {
             let waiting = entry.contains("waiting: true");
             let dead = entry.contains("live: \"dead\"");
@@ -17095,7 +17250,13 @@ mod tests {
                 .find('"')
                 .expect("the status string is closed")
                 + status_at;
-            shapes.push((waiting, entry[status_at..status_end].to_string(), dead));
+            let parked = entry.contains("display_status: \"parked\"");
+            shapes.push((
+                waiting,
+                entry[status_at..status_end].to_string(),
+                dead,
+                parked,
+            ));
         }
         assert!(shapes.len() >= 6, "parsed shapes: {shapes:?}");
 
@@ -17121,22 +17282,23 @@ mod tests {
             .filter(|s| !s.is_empty())
             .collect();
 
-        let shapes: Vec<(bool, String, bool, bool)> = shapes
+        let shapes: Vec<(bool, String, bool, bool, bool)> = shapes
             .into_iter()
-            .map(|(waiting, status, dead)| {
+            .map(|(waiting, status, dead, parked)| {
                 let done = !not_done.contains(&status.as_str());
-                (waiting, status, dead, done)
+                (waiting, status, dead, parked, done)
             })
             .collect();
 
         // `runSection` reimplemented from assets/ui/app.js: `waiting` wins
         // outright, then merged/ready land, stalled/blocked/failed/
         // verified_noop end, and everything else is still in flight.
-        fn run_section(waiting: bool, status: &str, dead: bool) -> &'static str {
+        fn run_section(waiting: bool, status: &str, dead: bool, parked: bool) -> &'static str {
             if waiting {
                 return "waiting";
             }
             if dead
+                && !parked
                 && !matches!(
                     status,
                     "merged"
@@ -17174,9 +17336,9 @@ mod tests {
         }
 
         let compatible = |section: &str, filter_key: &str| {
-            shapes.iter().any(|(waiting, status, dead, done)| {
-                run_section(*waiting, status, *dead) == section
-                    && filter_matches(filter_key, *waiting, *dead, *done)
+            shapes.iter().any(|(waiting, status, dead, parked, done)| {
+                run_section(*waiting, status, *dead, *parked) == section
+                    && filter_matches(filter_key, *waiting, *dead && !*parked, *done)
             })
         };
 
