@@ -7084,6 +7084,18 @@ async fn talk_pending_edit(
     Ok(Json(view))
 }
 
+/// The 409 for a talk that takes no more turns.
+fn refuse_if_closed(talk: &Talk) -> ApiResult<()> {
+    if talk.status.open() {
+        return Ok(());
+    }
+    Err(ApiError::conflict(format!(
+        "talk {} is {} and takes no more turns",
+        talk.short(),
+        talk.status.as_str()
+    )))
+}
+
 /// The body of `POST /api/talks/{id}/agent`.
 #[derive(Debug, Deserialize)]
 struct TalkAgent {
@@ -7109,6 +7121,19 @@ async fn talk_agent(
         blocking(move || Ok(ui.talks.get(&id)?.repo)).await?
     };
     let cfg = config_for(&repo).await?;
+    // Refuse before taking the claim; see `talk_implementers`.
+    {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        let cfg = cfg.clone();
+        let wanted = body.agent.clone();
+        blocking(move || {
+            agent::pick(&cfg.agents, Some(&wanted), &agent::installed)
+                .map_err(ApiError::bad_request_from)?;
+            refuse_if_closed(&ui.talks.get(&id)?)
+        })
+        .await?;
+    }
     let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
         return Err(ApiError::conflict(
             "a talk turn is running; change the agent once it has answered",
@@ -7136,7 +7161,7 @@ async fn talk_agent(
     };
     // A `/say` that landed while this held the claim saw the talk busy and
     // left a durable draft, trusting the claim's owner to drain it. So the
-    // claim goes to `drain_loop` whatever the outcome - it releases at once
+    // claim, once taken, goes to `drain_loop` whatever the outcome - it releases at once
     // when nothing is queued - rather than being dropped here.
     let fresh = {
         let ui = Arc::clone(&ui);
@@ -7181,6 +7206,20 @@ async fn talk_persona(
         blocking(move || Ok(ui.talks.get(&id)?.repo)).await?
     };
     let cfg = config_for(&repo).await?;
+    // Refuse before taking the claim; see `talk_implementers`.
+    {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        let cfg = cfg.clone();
+        let wanted = body.persona.clone();
+        blocking(move || {
+            if persona::find(&cfg.talk.personas, &wanted).is_none() {
+                return Err(ApiError::bad_request(format!("unknown persona `{wanted}`")));
+            }
+            refuse_if_closed(&ui.talks.get(&id)?)
+        })
+        .await?;
+    }
     let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
         return Err(ApiError::conflict(
             "a talk turn is running; change the persona once it has answered",
@@ -7210,7 +7249,7 @@ async fn talk_persona(
         })
         .await
     };
-    // As in `talk_agent`: the claim goes to `drain_loop` whatever happened.
+    // As in `talk_agent`: a taken claim goes to `drain_loop` whatever happened.
     let fresh = {
         let ui = Arc::clone(&ui);
         let id = id.clone();
@@ -7254,6 +7293,21 @@ async fn talk_implementers(
         blocking(move || Ok(ui.talks.get(&id)?.repo)).await?
     };
     let cfg = config_for(&repo).await?;
+    // Refuse a request that cannot succeed before taking the claim: a claim
+    // taken for it is handed to `drain_loop`, which holds the talk busy for a
+    // moment, so a refusal would make the next request see "busy" instead of
+    // its own answer. The checks after the claim stay the ones that decide.
+    {
+        let ui = Arc::clone(&ui);
+        let id = id.clone();
+        let cfg = cfg.clone();
+        let wanted = body.implementers;
+        blocking(move || {
+            talk::check_implementers(wanted, &cfg).map_err(ApiError::bad_request)?;
+            refuse_if_closed(&ui.talks.get(&id)?)
+        })
+        .await?;
+    }
     let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
         return Err(ApiError::conflict(
             "a talk turn is running; change the implementers once it has answered",
@@ -7279,7 +7333,7 @@ async fn talk_implementers(
         })
         .await
     };
-    // As in `talk_agent`: the claim goes to `drain_loop` whatever happened.
+    // As in `talk_agent`: a taken claim goes to `drain_loop` whatever happened.
     let fresh = {
         let ui = Arc::clone(&ui);
         let id = id.clone();
@@ -9289,19 +9343,16 @@ mod tests {
         );
 
         {
-            // The refused call hands its claim to a drain loop that releases
-            // it a moment later.
-            let mut claimed = None;
-            for _ in 0..200 {
-                claimed = ui.begin_talk_turn(&id).expect("claim");
-                if claimed.is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            let _busy = claimed.expect("free");
+            // Nothing refused so far took a claim, so the guard is free to take
+            // and holding it is what makes the talk busy.
+            let _busy = ui.begin_talk_turn(&id).expect("claim").expect("free");
             let busy = call("second").await.expect_err("busy talk");
             assert_eq!(busy.status, StatusCode::CONFLICT, "{}", busy.message);
+            assert!(
+                busy.message.contains("a talk turn is running"),
+                "{}",
+                busy.message
+            );
         }
         assert_eq!(talks.get(&id).expect("reload").agent, "mock");
 
@@ -9322,6 +9373,11 @@ mod tests {
         talk::close(&mut closed, &talks).expect("close");
         let refused = call("mock").await.expect_err("closed talk");
         assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.message);
+        assert!(
+            refused.message.contains("takes no more turns"),
+            "{}",
+            refused.message
+        );
     }
 
     #[tokio::test]
@@ -9361,17 +9417,16 @@ mod tests {
         assert_eq!(talks.get(&id).expect("reload").implementers, 1);
 
         {
-            let mut claimed = None;
-            for _ in 0..200 {
-                claimed = ui.begin_talk_turn(&id).expect("claim");
-                if claimed.is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            let _busy = claimed.expect("free");
+            // Nothing refused so far took a claim, so the guard is free to take
+            // and holding it is what makes the talk busy.
+            let _busy = ui.begin_talk_turn(&id).expect("claim").expect("free");
             let busy = call(2).await.expect_err("busy talk");
             assert_eq!(busy.status, StatusCode::CONFLICT, "{}", busy.message);
+            assert!(
+                busy.message.contains("a talk turn is running"),
+                "{}",
+                busy.message
+            );
         }
 
         let Json(view) = call(3).await.expect("switch");
@@ -9382,6 +9437,7 @@ mod tests {
         talk::close(&mut closed, &talks).expect("close");
         let e = call(2).await.expect_err("closed talk");
         assert_eq!(e.status, StatusCode::CONFLICT, "{}", e.message);
+        assert!(e.message.contains("takes no more turns"), "{}", e.message);
     }
 
     #[tokio::test]
@@ -9431,17 +9487,16 @@ mod tests {
         );
 
         {
-            let mut claimed = None;
-            for _ in 0..200 {
-                claimed = ui.begin_talk_turn(&id).expect("claim");
-                if claimed.is_some() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            let _busy = claimed.expect("free");
+            // Nothing refused so far took a claim, so the guard is free to take
+            // and holding it is what makes the talk busy.
+            let _busy = ui.begin_talk_turn(&id).expect("claim").expect("free");
             let busy = call("rei").await.expect_err("busy talk");
             assert_eq!(busy.status, StatusCode::CONFLICT, "{}", busy.message);
+            assert!(
+                busy.message.contains("a talk turn is running"),
+                "{}",
+                busy.message
+            );
         }
         assert_eq!(talks.get(&id).expect("reload").persona, "");
 
@@ -9463,6 +9518,11 @@ mod tests {
         talk::close(&mut closed, &talks).expect("close");
         let refused = call("rei").await.expect_err("closed talk");
         assert_eq!(refused.status, StatusCode::CONFLICT, "{}", refused.message);
+        assert!(
+            refused.message.contains("takes no more turns"),
+            "{}",
+            refused.message
+        );
     }
 
     #[tokio::test]
