@@ -2663,6 +2663,34 @@ mod tests {
     }
 
     #[test]
+    fn implementation_rates_use_independent_low_n_boundaries() {
+        let _guard = plain();
+        for (competitive_n, solo_n) in [(9, 10), (10, 9)] {
+            let text = stats(&Stats {
+                agents: vec![crate::stats::AgentStats {
+                    agent: "alpha".to_owned(),
+                    competitive_entered: competitive_n,
+                    competitive_wins: 1,
+                    solo_entered: solo_n,
+                    solo_adopted: 2,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            let (competitive, solo) = text
+                .split_once("implementation (solo runs, completion/adoption rate)")
+                .unwrap();
+            for (section, n, numerator) in [(competitive, competitive_n, 1), (solo, solo_n, 2)] {
+                let row = section.lines().find(|line| line.contains("alpha")).unwrap();
+                let cells: Vec<_> = row.split_whitespace().collect();
+                assert_eq!(cells[1], numerator.to_string());
+                assert_eq!(cells[2], n.to_string());
+                assert_eq!(row.contains("low n"), n < 10);
+            }
+        }
+    }
+
+    #[test]
     fn stats_table_renders_competitive_and_solo_tables_with_low_n() {
         let _guard = plain();
         let st = Stats {

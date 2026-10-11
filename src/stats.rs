@@ -642,6 +642,9 @@ pub fn collect_refs<'a>(states: impl IntoIterator<Item = &'a RunState>) -> Stats
         let is_review = state.reviewed_commits.is_some()
             || state.candidates.iter().any(|c| c.agent == "(existing branch)");
 
+        let competitive = !is_review && state.candidates.iter().filter(|c| c.viable()).count() >= 2;
+        let solo = !is_review && state.candidates.len() == 1;
+
         for c in &state.candidates {
             let entry = agents.entry(c.agent.clone()).or_insert_with(|| AgentStats {
                 agent: c.agent.clone(),
@@ -659,9 +662,8 @@ pub fn collect_refs<'a>(states: impl IntoIterator<Item = &'a RunState>) -> Stats
             }
         }
 
-        if !is_review {
-            let viable_count = state.candidates.iter().filter(|c| c.viable()).count();
-            if viable_count >= 2 {
+        if competitive || solo {
+            if competitive {
                 // Competitive run: 2 or more viable candidates.
                 for c in &state.candidates {
                     if c.viable() {
@@ -674,7 +676,7 @@ pub fn collect_refs<'a>(states: impl IntoIterator<Item = &'a RunState>) -> Stats
                             .competitive_entered += 1;
                     }
                 }
-            } else if state.candidates.len() == 1 {
+            } else if solo {
                 // Solo run: exactly one candidate. Exclude verified no-ops.
                 let c = &state.candidates[0];
                 if c.verified_noop.is_none() {
@@ -720,13 +722,10 @@ pub fn collect_refs<'a>(states: impl IntoIterator<Item = &'a RunState>) -> Stats
                     });
                 entry.wins += 1;
 
-                if !is_review {
-                    let viable_count = state.candidates.iter().filter(|c| c.viable()).count();
-                    if viable_count >= 2 {
-                        entry.competitive_wins += 1;
-                    } else if state.candidates.len() == 1 && w.verified_noop.is_none() {
-                        entry.solo_adopted += 1;
-                    }
+                if competitive && w.viable() {
+                    entry.competitive_wins += 1;
+                } else if solo && w.verified_noop.is_none() {
+                    entry.solo_adopted += 1;
                 }
             }
         }
@@ -1139,6 +1138,18 @@ mod tests {
         assert_eq!(beta.solo_entered, 0);
         assert_eq!(beta.solo_adopted, 0);
         assert_eq!(beta.solo_adoption_rate(), 0.0);
+    }
+
+    #[test]
+    fn competitive_adoption_requires_a_counted_entry() {
+        let mut state = state_with(Vec::new(), 'C', RunStatus::Ready);
+        let mut failed = candidate('C', "gamma");
+        failed.failed = Some("failed".to_owned());
+        state.candidates.push(failed);
+        let stats = collect(&[state]);
+        let gamma = stats.agents.iter().find(|a| a.agent == "gamma").unwrap();
+        assert_eq!((gamma.competitive_entered, gamma.competitive_wins), (0, 0));
+        assert_eq!(gamma.wins, 1); // Preserve the legacy counter.
     }
 
     #[test]
