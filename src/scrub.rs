@@ -408,33 +408,23 @@ fn absolute_path(rest: &str, prev: Option<char>) -> Option<(usize, &'static str)
 }
 
 fn public_system_path(path: &str) -> bool {
-    // These fixed prefixes have no account, host, checkout or mount-name slot:
-    // /etc/hosts is the standard host table; /usr/local/bin holds commands;
-    // direct /var/log children are system logs; /var/run/<service>/<file>.sock
-    // names a service socket. Arbitrary leaf/service names cannot be guaranteed
-    // anonymous: returning None from absolute_path keeps the other identity
-    // rules scanning them, and home_path has already had priority.
-    // Keep the original consumption boundary for redaction; only the allow
-    // check ignores prose punctuation. Never normalize traversal or extra levels.
-    let path = path.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']']);
-    let components: Vec<_> = path.split('/').collect();
-    if components.iter().skip(1).any(|part| {
-        part.is_empty()
-            || matches!(*part, "." | "..")
-            || !part
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-    }) {
-        return false;
-    }
-    match components.as_slice() {
-        ["", "etc", "hosts"] | ["", "usr", "local", "bin"] => true,
-        ["", "usr", "local", "bin", _] | ["", "var", "log", _] => true,
-        ["", "var", "run", _, file] => file
-            .strip_suffix(".sock")
-            .is_some_and(|name| !name.is_empty() && !matches!(name, "." | "..")),
-        _ => false,
-    }
+    // Exact public locations, with no variable account/host/checkout/mount slot:
+    // /etc/hosts is the standard host table; /usr/local/bin is the command
+    // directory and foo a literal example command; /var/log/syslog is the
+    // standard system log; /var/run/kanade/agent.sock is the documented service
+    // endpoint. Do not generalize to arbitrary command, log or service names:
+    // those may identify an operator even when Identity does not know the name.
+    // Home rules retain priority and other identity rules still scan these paths.
+    // Ignore prose punctuation only for this check, preserving the original
+    // redaction boundary. Exact matching rejects traversal and extra levels.
+    matches!(
+        path.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']']),
+        "/etc/hosts"
+            | "/usr/local/bin"
+            | "/usr/local/bin/foo"
+            | "/var/log/syslog"
+            | "/var/run/kanade/agent.sock"
+    )
 }
 
 fn email(rest: &str) -> Option<(usize, &'static str)> {
@@ -743,36 +733,51 @@ mod tests {
             locate("/usr/local/bin/foo", &identity),
             vec![(1, "home-path")]
         );
+        for path in [
+            "/usr/local/bin/alice",
+            "/usr/local/bin/alice-build",
+            "/usr/local/bin/bob",
+            "/var/log/buildbox.log",
+            "/var/log/alice-build.log",
+            "/var/run/alice/agent.sock",
+            "/var/run/alice-agent/agent.sock",
+            "/var/run/bob/agent.sock",
+            "/var/log/box.local",
+        ] {
+            for identity in [id(), Identity::default()] {
+                assert_eq!(scrub(path, &identity), "[redacted-path]", "{path}");
+                assert_eq!(locate(path, &identity), vec![(1, "path")], "{path}");
+            }
+        }
+        let identity = Identity {
+            user: "foo".into(),
+            host: "kanade".into(),
+            ..Identity::default()
+        };
         for (text, expected, kind) in [
             (
-                "/usr/local/bin/alice",
+                "/usr/local/bin/foo",
                 "/usr/local/bin/[redacted-user]",
                 "user",
             ),
             (
-                "/var/log/buildbox.log",
-                "/var/log/[redacted-host].log",
+                "/var/run/kanade/agent.sock",
+                "/var/run/[redacted-host]/agent.sock",
                 "host",
             ),
-            (
-                "/var/run/alice/agent.sock",
-                "/var/run/[redacted-user]/agent.sock",
-                "user",
-            ),
-            ("/var/log/box.local", "/var/log/[redacted-host]", "host"),
         ] {
-            assert_eq!(s(text), expected, "{text}");
-            assert_eq!(locate(text, &id()), vec![(1, kind)], "{text}");
+            assert_eq!(scrub(text, &identity), expected);
+            assert_eq!(locate(text, &identity), vec![(1, kind)]);
         }
         let identity = Identity {
             user: "redacted".into(),
             host: "redacted-path".into(),
             ..Identity::default()
         };
-        let text = "/tmp/checkout /usr/local/bin/redacted";
+        let text = "/tmp/checkout redacted /usr/local/bin/foo";
         assert_eq!(
             scrub(text, &identity),
-            "[redacted-path] /usr/local/bin/[redacted-user]"
+            "[redacted-path] [redacted-user] /usr/local/bin/foo"
         );
         assert_eq!(locate(text, &identity), vec![(1, "path"), (1, "user")]);
     }
