@@ -1569,6 +1569,14 @@ async fn finish_talks(
             .iter()
             .cloned()
             .collect();
+        // A turn another task of this process (the daemon's completion
+        // notice) or another process runs holds only the on-disk lease.
+        let talks = talk::Talks::at(home.join("talks"));
+        for t in talks.list() {
+            if talks.turn_held(&t.id) && !ids.contains(&t.id) {
+                ids.push(t.id);
+            }
+        }
         ids.sort();
         ids
     };
@@ -13810,6 +13818,7 @@ mod tests {
         let mut on_disk = f.talks().get(&talk).expect("get seeded talk");
         on_disk.turns.push(crate::talk::Turn {
             breaks: Some(Vec::new()),
+            posted_by: None,
             who: crate::talk::Who::Operator,
             body: "a new turn".to_owned(),
             at: Timestamp::now(),

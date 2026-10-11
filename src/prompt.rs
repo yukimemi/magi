@@ -1414,6 +1414,70 @@ pub struct DeputyPrompt<'a> {
     pub language: &'a str,
 }
 
+/// Heading of the automatic turn that reports a chat-filed task's final state
+/// to the conversation. The briefing names it, and `consult` leaves it out of
+/// the owner's words.
+pub const CHAT_TASK_NOTICE_HEADING: &str = "Update on a task you filed";
+
+/// What [`chat_task_notice`] reports; every field is plain data magi read.
+pub struct ChatTaskNotice<'a> {
+    /// Task id.
+    pub id: &'a str,
+    /// Task title.
+    pub title: &'a str,
+    /// `done`, `held` or `blocked`.
+    pub status: &'a str,
+    /// The hold, block or failure reason, if any.
+    pub reason: Option<&'a str>,
+    /// The task's latest run.
+    pub run: Option<&'a str>,
+    /// The pull request the run opened.
+    pub pr: Option<&'a str>,
+    /// A short summary of the result.
+    pub summary: Option<&'a str>,
+}
+
+fn clip(text: &str, max: usize) -> String {
+    let text = defuse(text.trim());
+    if text.chars().count() <= max {
+        return text;
+    }
+    let cut: String = text.chars().take(max).collect();
+    format!("{}...", cut.trim_end())
+}
+
+/// The automatic message that tells a chat how a task it filed ended.
+pub fn chat_task_notice(n: &ChatTaskNotice<'_>) -> String {
+    let mut s = format!(
+        "# {CHAT_TASK_NOTICE_HEADING}\n\n\
+         This is an automatic report from magi, not a message from the operator. \
+         A task filed from this conversation reached a final state.\n\n\
+         - Task: `{id}` - {title}\n\
+         - Status: {status}\n",
+        id = n.id,
+        title = clip(n.title, 120),
+        status = n.status,
+    );
+    if let Some(r) = n.reason.filter(|r| !r.trim().is_empty()) {
+        s.push_str(&format!("- Reason: {}\n", clip(r, 600)));
+    }
+    if let Some(r) = n.run {
+        s.push_str(&format!("- Run: `{r}`\n"));
+    }
+    if let Some(p) = n.pr {
+        s.push_str(&format!("- Pull request: {p}\n"));
+    }
+    if let Some(m) = n.summary.filter(|m| !m.trim().is_empty()) {
+        s.push_str(&format!("- Result: {}\n", clip(m, 600)));
+    }
+    s.push_str(
+        "\nTell the operator briefly how it ended and what, if anything, is \
+         theirs to decide. Do not file new tasks or edit the repository unless \
+         they ask.\n",
+    );
+    s
+}
+
 /// Heading of the turn that hands a question to the chat it came from.
 pub const CHAT_CONSULT_HEADING: &str = "A question was handed to you";
 

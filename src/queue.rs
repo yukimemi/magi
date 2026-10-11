@@ -92,6 +92,11 @@ use crate::ask::Questions;
 /// follow-up still knows its chat after an ancestor task is deleted.
 /// Field-only, `#[serde(default)]`.
 ///
+/// 13: added [`Task::chat_notice`], the record that a chat-filed task's final
+/// state was reported to its conversation. Field-only, `#[serde(default)]`;
+/// a record below this schema is never notified (an upgrade must not replay
+/// the whole history into chats).
+///
 /// 3: added [`HoldSource`] so conductor recovery cannot release a hold an
 /// operator deliberately placed. Old records default to `None` and are
 /// protected as operator-held until an explicit release; the safe direction
@@ -106,7 +111,7 @@ use crate::ask::Questions;
 /// by a build that only knew about schema 1 has nothing to say about
 /// blocking or answers, and defaulting those fields is exactly as good a
 /// reading as a value that build never had a chance to write.
-pub const SCHEMA: u32 = 12;
+pub const SCHEMA: u32 = 13;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,10 +490,35 @@ pub struct Task {
     /// transition out of the parked state. `#[serde(default)]`.
     #[serde(default)]
     pub park_reason: Option<String>,
+    /// The last final state reported to the originating chat. See
+    /// [`Task::chat_notice_due`]. Never cleared by a release or requeue.
+    #[serde(default)]
+    pub chat_notice: Option<ChatNotice>,
     /// When the task was filed.
     pub created_at: Timestamp,
     /// Last change to this file.
     pub updated_at: Timestamp,
+}
+
+/// What became of a completion notice. See [`Task::chat_notice`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatNoticeOutcome {
+    /// Queued as a draft of the originating talk.
+    Posted,
+    /// The talk is gone or closed; nothing was queued, and nothing will be.
+    Skipped,
+}
+
+/// The final state of a chat-filed task that was already reported (or skipped).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatNotice {
+    /// Identity of the cause, see [`Task::chat_notice_key`].
+    pub key: String,
+    /// When it was recorded.
+    pub at: Timestamp,
+    /// Posted or skipped.
+    pub outcome: ChatNoticeOutcome,
 }
 
 /// Command-line choices carried by a task. See [`Task::overrides`].
@@ -658,6 +688,7 @@ impl Task {
             review_of: None,
             held_at: None,
             park_reason: None,
+            chat_notice: None,
             created_at: now,
             updated_at: now,
         }
@@ -672,6 +703,53 @@ impl Task {
         match &self.source {
             Source::Agent { run, node } if node == CHAT_NODE => Some(run),
             _ => None,
+        }
+    }
+
+    /// The talk that filed this task *itself* (`Source::Agent` with
+    /// [`CHAT_NODE`]); unlike [`Task::chat_talk`] a follow-up's inherited
+    /// `origin_chat` does not count.
+    pub fn filed_by_chat(&self) -> Option<&str> {
+        match &self.source {
+            Source::Agent { run, node } if node == CHAT_NODE => Some(run),
+            _ => None,
+        }
+    }
+
+    /// Identity of the final state a chat should hear about, or `None` while
+    /// the task is intermediate (queued, running, parked, a failed attempt the
+    /// loop will retry - the last attempt turns into a hold). A hold is keyed
+    /// by when it began, a block by what it waits on, a completion by how
+    /// many runs it took, so the same cause is never reported twice and a
+    /// release followed by a new final state is.
+    pub fn chat_notice_key(&self) -> Option<String> {
+        match self.status {
+            TaskStatus::Done => Some(format!("done#{}", self.runs.len())),
+            TaskStatus::Held => Some(format!(
+                "held#{}",
+                self.held_at.map(|t| t.to_string()).unwrap_or_default()
+            )),
+            TaskStatus::Blocked => Some(format!(
+                "blocked#{}#{}",
+                self.blocked_by.join(","),
+                self.block_reason.as_deref().unwrap_or_default()
+            )),
+            _ => None,
+        }
+    }
+
+    /// The key of a completion notice owed to the originating chat now, if
+    /// any: filed by a chat, schema 13 or newer, in a final state, and not the
+    /// state already recorded in [`Task::chat_notice`].
+    pub fn chat_notice_due(&self) -> Option<String> {
+        self.filed_by_chat()?;
+        if self.schema < 13 {
+            return None;
+        }
+        let key = self.chat_notice_key()?;
+        match &self.chat_notice {
+            Some(n) if n.key == key => None,
+            _ => Some(key),
         }
     }
 
@@ -716,6 +794,7 @@ impl Task {
     /// boundary, for as long as its attempts hold out, instead of the
     /// one-shot "let this go next" the mark is meant to be.
     pub fn start(&mut self, run: String) {
+        self.stamp_schema();
         self.status = TaskStatus::Running;
         self.attempts += 1;
         self.runs.push(run);
@@ -749,6 +828,7 @@ impl Task {
     /// as done without ever being released would still read as waiting on
     /// something in `magi task show` and on its card, after it no longer is.
     pub fn succeed(&mut self) {
+        self.stamp_schema();
         self.status = TaskStatus::Done;
         self.resume_override = None;
         self.last_error = None;
@@ -833,7 +913,16 @@ impl Task {
 
     /// Stamp [`Task::held_at`] on the way into [`TaskStatus::Held`]; a task
     /// that is already held keeps the time its hold began.
+    /// A transition this build makes (start, hold, block, done) makes the task
+    /// eligible for a chat notice even when it was filed under an older
+    /// schema; only records no build has touched since stay silent
+    /// ([`Task::chat_notice_due`]).
+    fn stamp_schema(&mut self) {
+        self.schema = self.schema.max(SCHEMA);
+    }
+
     fn note_held(&mut self) {
+        self.stamp_schema();
         if self.status != TaskStatus::Held || self.held_at.is_none() {
             self.held_at = Some(Timestamp::now());
         }
@@ -958,6 +1047,7 @@ impl Task {
     /// second question about an already-blocked task must not overwrite the
     /// status it should eventually return to with `Blocked` itself.
     pub fn block(&mut self, blocked_by: Vec<String>, reason: Option<String>) {
+        self.stamp_schema();
         if self.status != TaskStatus::Blocked {
             self.blocked_from = Some(self.status);
         }
@@ -1540,6 +1630,13 @@ impl Queue {
                 if !task.runs.contains(&run) {
                     task.runs.push(run);
                 }
+            }
+            // A completion notice already recorded is never rewound by an
+            // older snapshot: that would report the same state twice.
+            if let Some(n) = stored.chat_notice
+                && task.chat_notice.as_ref().is_none_or(|mine| mine.at < n.at)
+            {
+                task.chat_notice = Some(n);
             }
         }
         task.updated_at = Timestamp::now();
@@ -4097,5 +4194,113 @@ mod tests {
         assert!(break_stale(&lock, "dead-1"));
         assert!(!lock.exists());
         assert!(!marker.exists());
+    }
+
+    fn chat_task() -> Task {
+        Task::new(
+            "t".to_owned(),
+            "do t".to_owned(),
+            PathBuf::from("."),
+            Source::Agent {
+                run: "20260902-000000-beef".to_owned(),
+                node: CHAT_NODE.to_owned(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_chat_notice_is_due_only_for_a_final_state_and_only_once() {
+        let mut t = chat_task();
+        assert_eq!(t.chat_notice_due(), None, "queued");
+        t.start("r1".to_owned());
+        assert_eq!(t.chat_notice_due(), None, "running");
+        t.fail("boom", 3);
+        assert_eq!(t.status, TaskStatus::Failed);
+        assert_eq!(t.chat_notice_due(), None, "a retried failure is not final");
+        t.start("r2".to_owned());
+        t.park("upgrade");
+        assert_eq!(t.chat_notice_due(), None, "parked");
+        t.fail("boom", 1);
+        assert_eq!(t.status, TaskStatus::Held);
+        let key = t
+            .chat_notice_due()
+            .expect("held on the last attempt is final");
+        t.chat_notice = Some(ChatNotice {
+            key,
+            at: Timestamp::now(),
+            outcome: ChatNoticeOutcome::Posted,
+        });
+        assert_eq!(t.chat_notice_due(), None, "same hold, no second notice");
+        t.release();
+        assert_eq!(t.chat_notice_due(), None, "requeued after a release");
+        t.start("r3".to_owned());
+        t.succeed();
+        assert!(t.chat_notice_due().is_some(), "done is a new final state");
+    }
+
+    #[test]
+    fn a_new_hold_after_a_release_is_a_new_cause() {
+        let mut t = chat_task();
+        t.hold_manual(Some("wait".to_owned()));
+        let first = t.chat_notice_due().expect("held");
+        t.chat_notice = Some(ChatNotice {
+            key: first.clone(),
+            at: Timestamp::now(),
+            outcome: ChatNoticeOutcome::Posted,
+        });
+        t.hold_manual(Some("still waiting".to_owned()));
+        assert_eq!(t.chat_notice_due(), None, "a re-hold keeps its start");
+        t.release();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        t.hold_manual(None);
+        let second = t.chat_notice_due().expect("a fresh hold");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_chat_notice_needs_a_chat_source_and_a_current_schema() {
+        let mut human = task("h");
+        human.succeed();
+        assert_eq!(human.chat_notice_due(), None);
+        // A follow-up only inherits the chat; it did not file the task.
+        let mut inherited = task("i");
+        inherited.origin_chat = Some("20260902-000000-beef".to_owned());
+        inherited.succeed();
+        assert_eq!(inherited.chat_notice_due(), None);
+        let mut old = chat_task();
+        old.schema = 12;
+        old.status = TaskStatus::Done;
+        assert_eq!(old.chat_notice_due(), None, "history is not replayed");
+        let mut live = chat_task();
+        live.schema = 12;
+        live.start("r1".to_owned());
+        live.succeed();
+        assert!(live.chat_notice_due().is_some(), "started by this build");
+        let mut held = chat_task();
+        held.schema = 12;
+        held.hold_machine(Some("config".to_owned()));
+        assert!(held.chat_notice_due().is_some(), "held before any start");
+    }
+
+    #[test]
+    fn a_stale_snapshot_does_not_rewind_a_recorded_chat_notice() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let q = Queue::at(tmp.path().join("queue"));
+        let mut t = chat_task();
+        t.succeed();
+        q.put(&mut t).expect("put");
+        let mut stale = q.get(&t.id).expect("get");
+        let key = t.chat_notice_due().expect("due");
+        q.modify(&t.id, |x| {
+            x.chat_notice = Some(ChatNotice {
+                key: key.clone(),
+                at: Timestamp::now(),
+                outcome: ChatNoticeOutcome::Posted,
+            });
+            true
+        })
+        .expect("modify");
+        q.put(&mut stale).expect("stale put");
+        assert_eq!(q.get(&t.id).expect("get").chat_notice_due(), None);
     }
 }

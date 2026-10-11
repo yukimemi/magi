@@ -2198,6 +2198,62 @@ redirection. These values (256 KiB, 120 s, 90 s lease, 20 s beat, 30 s poll, 10 
 shutdown bound in `main::run`) live in `updater.rs` / `main.rs`; keep this
 section aligned with them.
 
+### Telling the chat how a task it filed ended
+
+`src/chat_notify.rs`. A chat is single-turn: it speaks only when the owner
+writes, so "I will tell you when it finishes" cannot be kept by the agent.
+magi keeps it. When a task the chat filed itself (`Task::filed_by_chat`:
+`Source::Agent` with `queue::CHAT_NODE`, `run` = the talk id; an inherited
+`origin_chat` on a follow-up does **not** count) is `Done`, `Held` or
+`Blocked`, a fixed English notice (`prompt::chat_task_notice`, heading
+`CHAT_TASK_NOTICE_HEADING`) is queued as a draft of that talk and the talk's
+own turn machinery runs it. No new seat, no new waiter, never a fresh agent.
+
+- **A reconciler, not a hook.** `chat_notify::sweep` runs on every
+  `daemon::poll` tick beside `resolve_blockers`, so `magi task done`, the web
+  Hold button, `hold_machine` and a restart are all covered the same way.
+  `Failed` is the loop's retry state and `Queued` / `Running` / `Parked` are
+  intermediate: none notifies. The last failed attempt becomes `Held`, which does.
+- **Once.** `Task::chat_notice` (`queue::SCHEMA` 13, `#[serde(default)]`)
+  records the key of the last state reported or skipped
+  (`Task::chat_notice_key`: held by `held_at`, blocked by what it waits on,
+  done by run count). A release or requeue does not clear it; a new final state
+  has a new key. `Queue::put_unlocked` never rewinds a newer record. Records
+  below schema 13 are not notified, so an upgrade does not replay history.
+- **Two writes, one idempotent.** Lock order is task, then talk: `sweep` runs
+  inside `Queue::modify`, calls `talk::queue_once`, which saves the draft and
+  the key in `Talk::notified` in one write, then the task record is saved. A
+  crash between them is repaired by the next sweep (the key is found, nothing
+  is queued twice). `Talk::notified` is never pruned by a drain or a close.
+- **Closed or deleted is skipped** (`ChatNoticeOutcome::Skipped`, recorded so
+  it is not retried), never reopened - unlike `consult::begin`. A transient I/O
+  error records nothing and the next tick retries.
+- **Starting the turn.** `chat_notify::start_turns` takes the talk's own
+  cross-process lease and runs `consult::drain_turns` (shared with
+  `consult::start_turn`) in a spawned task. Only a draft that contains the
+  notice heading is started on the daemon's initiative; an operator's unsent
+  draft is not. If the lease is held elsewhere the holder drains the draft
+  before letting go, and the next tick looks again.
+- **A parking upgrade starts nothing** (`start_turns(.., stop.parking())`):
+  the draft stays durable for a manual resume, as for a consult.
+- **The notice is not the owner's word.** `consult::latest_message` skips
+  messages that are a task notice, so a merge approval's `--quote` can never
+  be taken from one.
+- **`magi talk post <talk-id> <message>`** appends an agent turn
+  (`Turn::posted_by` = the posting run) without a draft, a lease or a turn.
+  `chat_notify::authorize_post`: `MAGI_RUN` and `MAGI_NODE` must both be set,
+  the node may not be `chat`, and the run must belong to a task whose own
+  source is that talk. It writes under `Talks::guard` onto the freshest
+  record; `talk::turn`'s tail keeps posts that landed while the CLI ran, and
+  the next resumed turn carries them as a `# Posted by a task` block. A codex
+  implementer's `workspace-write` sandbox cannot reach the talks store, so the
+  command can fail there with an error; no writable root is added for it.
+- **Known noise.** A `Blocked` task is reported again whenever its blockers or
+  reason change (conductor block, unblock, block again).
+- The briefing (`talk::briefing_for`) tells the chat it cannot wait or push and
+  that only tasks it files report back; `Talk::notified` and `Turn::posted_by`
+  are `#[serde(default)]`, `talk::SCHEMA` is unchanged.
+
 ### Handing a question to the chat it came from
 
 `src/consult.rs`. A task filed by the standing chat (`Source::Agent` with
