@@ -6513,11 +6513,23 @@ function renderSection(runId, s) {
           c.provisional_winner ? rtag("provisional", "warn", "Leads, but the panel did not reach quorum") : null,
           el("span", { class: "rmeta", text: `${c.files} files, ${c.commits} commits, ${c.duration_secs}s` }),
           c.detail ? el("div", { class: "rwide", text: c.detail }) : null))));
-    case "judging":
+    case "judging": {
+      const rounds = s.rounds || [];
+      const deliberationRounds = rounds.length ? rounds.map((r) => el("div", { class: "rblock" },
+        el("p", { class: "rmeta", text: `deliberation round ${r.round}` }),
+        (r.turns || []).map((t, idx) => {
+          const tentativeBadge = rtag(t.tentative ? `→ ${t.tentative}` : "→ -", "neutral");
+          const bodyEl = (t.body && t.body.trim())
+            ? mdBlock("rturn-body", t.body_md)
+            : el("p", { class: "rmeta", text: "(no argument recorded)" });
+          return rcard(runId, `deliberation:${r.round}:${t.judge}:${idx}`, `judge ${t.judge} (${t.agent})`, "neutral", false, [tentativeBadge], bodyEl);
+        }))) : null;
       return card([],
         rlines((s.judges || []).map((j) => `judge ${j.judge} (${j.agent}) ${j.failed ? `no ranking: ${j.failed}` : `${j.ranking}${j.confidence != null ? ` confidence ${j.confidence}` : ""}`}`)),
         (s.deliberation || []).length ? rlines(s.deliberation) : null,
+        deliberationRounds,
         (s.votes || []).length ? rlines(s.votes.map((v) => `final vote: judge ${v.judge} (${v.agent}) ${v.vote}${v.changed ? " (changed after deliberation)" : ""}`)) : null);
+    }
     case "tally": {
       const t = s.tally;
       /* The verdict is only a verdict when the panel met quorum. */

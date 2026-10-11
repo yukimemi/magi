@@ -12946,6 +12946,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_report_json_route_serves_deliberation_turns_with_markdown_bodies() {
+        crate::run::pin_test_home();
+        let f = Fixture::start().await;
+        let id = "20260902-140503-delib";
+        write_run(&f.runs(), id, RunStatus::Merged);
+        let path = f.runs().join(id).join("run.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["judgements"] = serde_json::json!([
+            {"judge": 1, "agent": "judge-1", "ranking": ["A", "B"], "seat": "judge-1"}
+        ]);
+        v["tally"] = serde_json::json!({
+            "first_choice": {"A": 1}, "borda": {"A": 2}, "winner": "A",
+            "unanimous_initial": false, "deliberated": true, "changed_votes": 0,
+            "unanimous_final": true, "judges": 1, "present": 1, "quorum": 1,
+            "met_quorum": true, "rankings": 1
+        });
+        v["deliberation"] = serde_json::json!([
+            {
+                "round": 1,
+                "turns": [
+                    {
+                        "judge": 1,
+                        "agent": "judge-1",
+                        "body": "I prefer candidate **A** because it has cleaner tests.",
+                        "tentative": "A"
+                    }
+                ]
+            },
+            {
+                "round": 2,
+                "turns": [
+                    {
+                        "judge": 1,
+                        "agent": "judge-1",
+                        "body": "Still thinking, no choice yet.",
+                        "tentative": null
+                    }
+                ]
+            }
+        ]);
+        std::fs::write(&path, v.to_string()).unwrap();
+
+        let res = f.get(&format!("/api/runs/{id}/report.json")).await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let j = res.json();
+        let judging = j["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["kind"] == "judging")
+            .expect("judging section exists");
+
+        // Existing summary lines remain intact
+        let delib_lines = judging["deliberation"].as_array().unwrap();
+        assert_eq!(delib_lines.len(), 2);
+        assert_eq!(delib_lines[0], "r1 judge 1 -> A");
+        assert_eq!(delib_lines[1], "r2 judge 1 -> -");
+
+        // rounds carry turn bodies, tentative and parsed body_md
+        let rounds = judging["rounds"].as_array().unwrap();
+        assert_eq!(rounds.len(), 2);
+        let r1_t0 = &rounds[0]["turns"][0];
+        assert_eq!(r1_t0["judge"], 1);
+        assert_eq!(r1_t0["agent"], "judge-1");
+        assert_eq!(r1_t0["tentative"], "A");
+        assert_eq!(
+            r1_t0["body"],
+            "I prefer candidate **A** because it has cleaner tests."
+        );
+        assert!(!r1_t0["body_md"].as_array().unwrap().is_empty());
+
+        let r2_t0 = &rounds[1]["turns"][0];
+        assert_eq!(r2_t0["judge"], 1);
+        assert_eq!(r2_t0["agent"], "judge-1");
+        assert!(r2_t0["tentative"].is_null());
+        assert_eq!(r2_t0["body"], "Still thinking, no choice yet.");
+        assert!(!r2_t0["body_md"].as_array().unwrap().is_empty());
+
+        // A run with empty deliberation array yields empty rounds
+        let id_empty = "20260902-140504-nodelib";
+        write_run(&f.runs(), id_empty, RunStatus::Merged);
+        let path_empty = f.runs().join(id_empty).join("run.json");
+        let mut v_empty: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path_empty).unwrap()).unwrap();
+        v_empty["judgements"] = serde_json::json!([
+            {"judge": 1, "agent": "judge-1", "ranking": ["A", "B"], "seat": "judge-1"}
+        ]);
+        v_empty["deliberation"] = serde_json::json!([]);
+        std::fs::write(&path_empty, v_empty.to_string()).unwrap();
+
+        let res_empty = f.get(&format!("/api/runs/{id_empty}/report.json")).await;
+        assert_eq!(res_empty.status, 200, "{}", res_empty.body);
+        let j_empty = res_empty.json();
+        let judging_empty = j_empty["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["kind"] == "judging")
+            .expect("judging section exists");
+        assert_eq!(judging_empty["rounds"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
     async fn the_front_end_is_served_from_the_binary_with_types_a_phone_renders() {
         let f = Fixture::start().await;
 
