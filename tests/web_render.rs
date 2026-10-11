@@ -1444,13 +1444,117 @@ async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
             r#"(async () => {
       const source = await (await fetch('/app.js')).text();
       window.deck = new Function(source.replace('queue: "/api/queue"', 'queue: "/api/queue?test_client=1"').replace(/\nboot\(\);\s*$/, `
-        return { linkify, truncateLabel, state, loadHealth, loadLoop, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter, reviewPassed, voteTag, reviewStamp };
+        return { settingsState, renderSettings, loadSettings, saveSettings, linkify, truncateLabel, state, loadHealth, loadLoop, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter, reviewPassed, voteTag, reviewStamp };
       `))();
       await Promise.all([deck.loadQueue(), deck.loadRuns(), deck.loadTalks()]);
     })()"#,
         )
         .await
         .expect("install client harness");
+}
+
+#[tokio::test]
+async fn machine_settings_context_and_overrides_fit_phone_and_desktop() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP settings context: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let base = serve(
+        &home,
+        Queue::at(home.join("queue")),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    for width in [390, 1280] {
+        let page = browser
+            .open_page(&format!("{base}#/settings"), width, 900, width == 390)
+            .await
+            .expect("page");
+        client_harness(&mut browser, &page).await;
+        let result = browser.eval(&page, r#"(async () => {
+          await deck.loadSettings();
+          const s = deck.settingsState;
+          const data = structuredClone(s.data);
+          if (data.error || !data.roles.length) return ['fixture config did not load'];
+          data.repositories = [
+            {name: 'owner/same-name', path: '/checkouts/one/' + 'long-repository-name-'.repeat(8)},
+            {name: 'owner/same-name', path: '/checkouts/two/same-name'}
+          ];
+          data.repo = data.repositories[0].path;
+          const role = data.roles.find(r => r.count);
+          role.source = 'repo'; role.editable = false; role.machine_value = ['machine-agent'];
+          role.count.source = 'repo'; role.count.editable = false; role.count.machine_value = 1;
+          s.data = data; s.repo = data.repo; s.repositories = data.repositories;
+          deck.renderSettings();
+          const fails = [];
+          const picker = document.getElementById('settings-repo');
+          const r = picker.getBoundingClientRect();
+          if (r.width <= 0 || r.right > innerWidth + 1) fails.push('selector spills or is hidden');
+          if (document.documentElement.scrollWidth > innerWidth + 1) fails.push('horizontal overflow');
+          if (document.getElementById('settings-h').textContent !== 'Machine settings') fails.push('heading');
+          if (!document.getElementById('settings-sub').textContent.startsWith('As seen from')) fails.push('context');
+          if (picker.options.length !== 2 || !picker.options[0].textContent.includes(data.repo)) fails.push('checkout paths');
+          const overrides = [...document.querySelectorAll('.set-override')];
+          if (overrides.length !== 2 || overrides.some(e => !e.textContent.includes('Repository override') || !e.textContent.includes('shadowed'))) fails.push('override badges');
+          if (!overrides[0].textContent.includes('machine-agent') || !overrides[1].textContent.includes('Machine value: 1')) fails.push('shadowed values');
+          if (document.getElementById('set-count-' + role.key).disabled !== true) fails.push('override count editable');
+          s.loading = true; deck.renderSettings();
+          if (!document.getElementById('settings-repo').disabled) fails.push('loading selector enabled');
+          s.loading = false; s.busy = true; deck.renderSettings();
+          if (!document.getElementById('settings-repo').disabled) fails.push('saving selector enabled');
+          s.busy = false; s.data = {...data, error: {message: 'broken selected config'}}; deck.renderSettings();
+          if (document.getElementById('settings-repo').disabled || document.getElementById('settings-repo').options.length !== 2) fails.push('cannot recover from config error');
+          s.data = null; s.message = {bad: true, text: 'request failed'}; deck.renderSettings();
+          if (document.getElementById('settings-repo').disabled || document.getElementById('settings-repo').options.length !== 2) fails.push('cannot recover from request error');
+          s.data = data; s.repo = data.repo; s.draft = {judges: ['a']}; deck.renderSettings();
+          const confirm = window.confirm, fetch = window.fetch;
+          const requests = [];
+          try {
+            window.confirm = () => false;
+            let picker = document.getElementById('settings-repo');
+            picker.value = data.repositories[1].path;
+            picker.dispatchEvent(new Event('change'));
+            if (s.repo !== data.repo || !s.draft.judges || picker.value !== data.repo) fails.push('discard cancellation lost edits');
+            window.confirm = () => true;
+            window.fetch = async (url, init) => {
+              if (!String(url).startsWith('/api/settings')) return fetch(url, init);
+              requests.push(String(url));
+              return new Response(JSON.stringify({...data, repo: data.repositories[1].path}), {status: 200});
+            };
+            picker.value = data.repositories[1].path;
+            picker.dispatchEvent(new Event('change'));
+            while (s.loading) await new Promise(resolve => setTimeout(resolve, 10));
+            if (Object.keys(s.draft).length || s.data.repo !== data.repositories[1].path) fails.push('context switch retained edits');
+            if (!requests[0]?.includes('repo=' + encodeURIComponent(data.repositories[1].path))) fails.push('GET omitted selected context');
+            s.draft = {judges: ['a']};
+            await deck.saveSettings();
+            if (!requests[1]?.includes('/api/settings/roles?repo=' + encodeURIComponent(data.repositories[1].path))) fails.push('PUT omitted selected context');
+            const pending = [];
+            window.fetch = (url, init) => String(url).startsWith('/api/settings')
+              ? new Promise(resolve => pending.push(resolve)) : fetch(url, init);
+            const first = deck.loadSettings(), second = deck.loadSettings();
+            pending[1](new Response(JSON.stringify({...data, repo: 'newest'}), {status: 200}));
+            await second;
+            pending[0](new Response(JSON.stringify({...data, repo: 'stale'}), {status: 200}));
+            await first;
+            if (s.data.repo !== 'newest') fails.push('stale response replaced selection');
+          } finally { window.confirm = confirm; window.fetch = fetch; }
+          return fails;
+        })()"#).await.expect("settings geometry and states");
+        assert_eq!(
+            result,
+            serde_json::json!([]),
+            "settings at {width}px: {result}"
+        );
+        browser.close_page(&page).await;
+    }
 }
 
 #[tokio::test]

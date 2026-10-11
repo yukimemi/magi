@@ -9204,7 +9204,7 @@ if (splitMedia) {
  * GET /api/settings is the effective layered config; PUT /api/settings/roles
  * writes the machine file only. `draft` holds unsaved edits per role key, so a
  * reload from the server never throws away what the operator is arranging. */
-const settingsState = { data: null, draft: {}, countDraft: {}, busy: false, message: null };
+const settingsState = { data: null, draft: {}, countDraft: {}, busy: false, loading: false, repo: null, repositories: [], request: 0, message: null };
 
 const settingsDirty = () => Object.keys(settingsState.draft).length + Object.keys(settingsState.countDraft).length > 0;
 
@@ -9216,17 +9216,61 @@ async function putJson(url, body) {
   }).then((r) => r.json());
 }
 
+const settingsUrl = (url) => settingsState.repo ? `${url}?repo=${encodeURIComponent(settingsState.repo)}` : url;
+
 async function loadSettings() {
+  if (settingsState.busy) return;
+  const sequence = ++settingsState.request;
+  settingsState.loading = true;
+  renderSettings();
   try {
-    // The draft survives a reload: leaving the screen and coming back must
-    // not throw away what the operator was arranging.
-    settingsState.data = await getJson(API.settings);
+    const data = await getJson(settingsUrl(API.settings));
+    if (sequence !== settingsState.request) return;
+    settingsState.data = data;
+    settingsState.repo = data.repo;
+    settingsState.repositories = data.repositories || [];
+    settingsState.message = null;
     ok();
   } catch (e) {
+    if (sequence !== settingsState.request) return;
     settingsState.data = null;
     settingsState.message = { bad: true, text: `Could not load settings: ${e.message}` };
+  } finally {
+    if (sequence === settingsState.request) {
+      settingsState.loading = false;
+      renderSettings();
+    }
   }
-  renderSettings();
+}
+
+function renderSettingsContext() {
+  const select = el("select", { id: "settings-repo", disabled: settingsState.loading || settingsState.busy },
+    settingsState.repositories.map((r) => el("option", { value: r.path, text: `${r.name} — ${r.path}` })));
+  select.value = settingsState.repo || "";
+  select.addEventListener("change", () => {
+    if (settingsDirty() && !window.confirm("Discard unsaved machine settings and change repository context?")) {
+      select.value = settingsState.repo;
+      return;
+    }
+    settingsState.repo = select.value;
+    settingsState.data = null;
+    settingsState.draft = {};
+    settingsState.countDraft = {};
+    loadSettings();
+  });
+  const machine = settingsState.data?.machine;
+  $("settings-context").replaceChildren(
+    el("label", { class: "set-context", for: "settings-repo" }, "As seen from repository", select),
+    ...(machine ? [el("p", { class: "set-note", text: machine.path
+      ? `Changes are saved to the machine config (${machine.path}), which applies to every repository on this machine; comments and other settings in it are kept. The repository's own magi.toml is never written.`
+      : machine.unavailable })] : []));
+}
+
+function settingsOverride(item) {
+  if (item.source !== "repo") return null;
+  return el("span", { class: "set-override" },
+    el("span", { class: "tag", "data-tone": "rust", text: "Repository override" }),
+    el("span", { class: "set-meta", text: `The machine value is shadowed for this repository.${item.machine_value != null ? ` Machine value: ${JSON.stringify(item.machine_value)}.` : " No machine value is declared."}` }));
 }
 
 function settingsIds(role) {
@@ -9249,7 +9293,7 @@ function settingsSet(role, ids) {
 
 async function saveSettings() {
   const d = settingsState.data;
-  if (!d || settingsState.busy || !settingsDirty()) return;
+  if (!d || settingsState.busy || settingsState.loading || !settingsDirty()) return;
   settingsState.busy = true;
   settingsState.message = null;
   renderSettings();
@@ -9259,7 +9303,7 @@ async function saveSettings() {
     // A count is sent as typed; the server says why a bad one is refused.
     const counts = {};
     for (const [k, v] of Object.entries(sentCounts)) counts[k] = v.trim() === "" ? null : Number(v);
-    settingsState.data = await putJson(API.settingsRoles, {
+    settingsState.data = await putJson(settingsUrl(API.settingsRoles), {
       revision: d.revision,
       roles: sent,
       counts,
@@ -9315,6 +9359,7 @@ function renderSettingsCount(role) {
   return el("div", { class: "set-add" },
     el("label", { class: "set-meta" }, `Seats (graph.${c.file_key}, min ${c.min}): `, input),
     el("span", { class: "set-meta", text: `${origin}${draft !== undefined ? " \u2014 unsaved change" : ""}` }),
+    settingsOverride(c),
     locked && c.locked_reason ? el("span", { class: "set-meta", text: c.locked_reason }) : null,
     hint ? el("span", { class: "set-meta", text: hint }) : null);
 }
@@ -9352,6 +9397,7 @@ function renderSettingsRole(d, role) {
   });
   return el("div", { class: "panel set-role" },
     el("h2", { text: role.key }),
+    settingsOverride(role),
     el("p", { class: "set-meta" }, origin,
       role.fallback ? ` \u2014 unset, so it falls back to ${role.fallback}` : "",
       dirty ? " \u2014 unsaved change" : ""),
@@ -9371,18 +9417,20 @@ function renderSettingsRole(d, role) {
 }
 
 function renderSettings() {
+  renderSettingsContext();
   const d = settingsState.data;
   const body = $("settings-body");
   clear(body);
   const banner = $("settings-error");
   const msg = settingsState.message;
   if (!d) {
-    setText($("settings-sub"), "Unavailable");
+    setText($("settings-sub"), settingsState.loading ? "Loading…" : `As seen from ${settingsState.repo || "the default repository"}`);
     setText($("settings-error-text"), msg ? msg.text : "Settings could not be loaded.");
-    show(banner, true);
+    show(banner, !settingsState.loading);
     return;
   }
-  setText($("settings-sub"), `Roles for ${d.repo}`);
+  setText($("settings-sub"), `As seen from ${d.repo}`);
+  if (settingsState.loading) return;
   if (d.error) {
     setText($("settings-error-text"),
       `The config does not load, so nothing is shown and nothing can be edited: ${d.error.message}${d.error.path ? ` (${d.error.path})` : ""}`);
@@ -9397,10 +9445,6 @@ function renderSettings() {
   }
   const dirty = settingsDirty();
   body.append(
-    el("p", { class: "set-note" },
-      d.machine.path
-        ? `Changes are saved to the machine config (${d.machine.path}), which applies to every repository on this machine; comments and other settings in it are kept. The repository's own magi.toml is never written.`
-        : d.machine.unavailable),
     el("p", { class: "set-note", text: "A change applies to runs started after it is saved. Runs already in flight keep the settings they started with." }),
     ...d.roles.map((r) => renderSettingsRole(d, r)),
     el("div", { class: "set-actions" },
