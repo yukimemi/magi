@@ -444,7 +444,7 @@ pub async fn restore_to(worktree: &Path, rev: &str) -> Result<()> {
             "--quiet",
             "foreach",
             "--recursive",
-            "git clean -fdq",
+            "git clean -ffdq",
         ],
     )
     .await?;
@@ -1271,6 +1271,45 @@ mod tests {
         git(&repo, &["add", "-A"]).await.unwrap();
         git(&repo, &["commit", "-m", "init"]).await.unwrap();
         (dir, repo)
+    }
+
+    #[tokio::test]
+    async fn restore_to_removes_nested_repositories_inside_submodules() {
+        let (_parent_dir, repo) = scratch().await;
+        let (_source_dir, source) = scratch().await;
+        sh(
+            &repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &source.to_string_lossy(),
+                "sub",
+            ],
+        );
+        sh(&repo, &["commit", "-am", "add submodule"]);
+        let pre = rev_parse(&repo, "HEAD").await.unwrap();
+        let sub = repo.join("sub");
+        sh(&sub, &["init", "nested"]);
+        tokio::fs::write(sub.join("nested/rejected.txt"), "rejected\n")
+            .await
+            .unwrap();
+
+        restore_to(&repo, &pre).await.unwrap();
+
+        assert!(!sub.join("nested").exists());
+        assert_eq!(rev_parse(&repo, "HEAD").await.unwrap(), pre);
+        assert_eq!(
+            rev_parse(&sub, "HEAD").await.unwrap(),
+            rev_parse(&source, "HEAD").await.unwrap()
+        );
+        assert!(
+            git(&repo, &["status", "--porcelain"])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
