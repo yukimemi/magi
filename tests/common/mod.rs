@@ -98,6 +98,11 @@ where
     let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
         .args([name, "--exact", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, "1")
+        // Named and empty: no machine layer. `Config::discover` in an
+        // integration binary links the non-test library, so the operator's own
+        // `config.toml` would otherwise merge with a fixture's `magi.toml` and
+        // trip the "array declared in two layers" refusal on that machine only.
+        .env(magi::config::Config::CONFIG_DIR_ENV, "")
         .output();
     *lock.lock().unwrap() += 1;
     cv.notify_one();
