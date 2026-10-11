@@ -10,6 +10,8 @@
 //! `blind::redact` loop, whose `[REDACTED]` contains the letters of the words it
 //! hunted). It prefers missing something to mangling ordinary prose: repo-
 //! relative paths, URLs, `std::io::Error`, `v1.2.3` and `@handle` all pass.
+//! Dotted IPv4-shaped section references after `§`, `section`, `sec.` or
+//! `clause` also pass; the exception never applies to IPv6.
 
 /// The local facts worth hiding. `Default` is "nothing known", which leaves only
 /// the pattern-based rules.
@@ -154,7 +156,11 @@ fn match_at(before: &str, rest: &str, id: &Identity) -> Option<(usize, &'static 
         })
         .or_else(|| {
             prev.is_none_or(|p| !p.is_ascii_alphanumeric() && p != '.' && p != ':')
-                .then(|| ipv4(rest).or_else(|| ipv6(rest)))
+                .then(|| {
+                    ipv4(rest)
+                        .filter(|_| !section_reference(before))
+                        .or_else(|| ipv6(rest))
+                })
                 .flatten()
         })
         .or_else(|| {
@@ -419,6 +425,27 @@ fn email(rest: &str) -> Option<(usize, &'static str)> {
     (labels >= 2).then_some((local + 1 + end, "[redacted-email]"))
 }
 
+/// Only an immediately preceding marker counts, with no newline between it
+/// and the number. English markers require horizontal whitespace; `§` does not.
+fn section_reference(before: &str) -> bool {
+    let trimmed = before.trim_end_matches([' ', '\t']);
+    ["§", "section", "sec.", "clause"].iter().any(|marker| {
+        if *marker != "§" && trimmed.len() == before.len() {
+            return false;
+        }
+        let Some(start) = trimmed.len().checked_sub(marker.len()) else {
+            return false;
+        };
+        trimmed
+            .get(start..)
+            .is_some_and(|tail| tail.eq_ignore_ascii_case(marker))
+            && trimmed[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric() && !matches!(c, '_' | '-'))
+    })
+}
+
 fn ipv4(rest: &str) -> Option<(usize, &'static str)> {
     let mut len = 0;
     for part in 0..4 {
@@ -594,6 +621,115 @@ mod tests {
             s("tok ghp_abcdefghijklmnopqrstuv end"),
             "tok [redacted-token] end"
         );
+    }
+
+    #[test]
+    fn ipv4_section_references_pass_scrub_and_locate() {
+        for text in [
+            "§2.12.4.1-4.4",
+            "see §2.12.4.1",
+            "§ 2.12.4.1",
+            "section 2.12.4.1",
+            "sec. 2.12.4.1",
+            "clause 2.12.4.1",
+            "SECTION\t2.12.4.1",
+            "See (Sec. \t2.12.4.1)",
+            "CLAUSE 2.12.4.1",
+            "仕様 §\t2.12.4.1",
+            "released v1.2.3, version 0.41.1, 300.1.1.1",
+        ] {
+            assert_eq!(s(text), text, "{text}");
+            assert!(locate(text, &id()).is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn ipv4_section_markers_require_boundaries_and_same_line() {
+        for before in [
+            "subsection ",
+            "xsec. ",
+            "9clause ",
+            "_section ",
+            "-clause ",
+            "ésection ",
+            "字sec. ",
+            "x§ ",
+            "section\n",
+            "§\n ",
+            "clause\r\n\t",
+            "section\u{a0}",
+            "RFC ",
+        ] {
+            let text = format!("{before}2.12.4.1");
+            assert_eq!(s(&text), format!("{before}[redacted-ip]"), "{text}");
+            let line = 1 + before.matches('\n').count();
+            assert_eq!(locate(&text, &id()), vec![(line, "ip")], "{text}");
+        }
+        for before in ["section", "sec.", "clause", "é", "字"] {
+            assert!(!section_reference(before), "{before}");
+        }
+    }
+
+    #[test]
+    fn section_exception_keeps_other_sensitive_data_redacted() {
+        for (text, expected, hits) in [
+            (
+                "host 192.168.0.12:8080",
+                "host [redacted-ip]:8080",
+                vec![(1, "ip")],
+            ),
+            (
+                "/Users/bob 10.0.0.1 a@b.io alice",
+                "~ [redacted-ip] [redacted-email] [redacted-user]",
+                vec![(1, "home-path"), (1, "ip"), (1, "email"), (1, "user")],
+            ),
+            (
+                "connect to 10.1.2.3",
+                "connect to [redacted-ip]",
+                vec![(1, "ip")],
+            ),
+            (
+                "§2.12.4.1\nconnect to 10.1.2.3",
+                "§2.12.4.1\nconnect to [redacted-ip]",
+                vec![(2, "ip")],
+            ),
+            (
+                "section 2.12.4.1-10.1.2.3, 10.0.0.1",
+                "section 2.12.4.1-[redacted-ip], [redacted-ip]",
+                vec![(1, "ip"), (1, "ip")],
+            ),
+            (
+                "§fe80::1\nsection ::1\nclause 2001:db8:0:0:0:0:0:1",
+                "§[redacted-ip]\nsection [redacted-ip]\nclause [redacted-ip]",
+                vec![(1, "ip"), (2, "ip"), (3, "ip")],
+            ),
+        ] {
+            assert_eq!(s(text), expected, "{text}");
+            assert_eq!(locate(text, &id()), hits, "{text}");
+        }
+    }
+
+    #[test]
+    fn section_context_uses_original_input_and_does_not_rescan_replacements() {
+        let identity = Identity {
+            user: "redacted-ip".into(),
+            ..Identity::default()
+        };
+        let text = "§2.12.4.1\nconnect to 10.1.2.3";
+        assert_eq!(
+            scrub(text, &identity),
+            "§2.12.4.1\nconnect to [redacted-ip]"
+        );
+        assert_eq!(locate(text, &identity), vec![(2, "ip")]);
+        let identity = Identity {
+            user: "section".into(),
+            ..Identity::default()
+        };
+        assert_eq!(
+            scrub("section 2.12.4.1", &identity),
+            "[redacted-user] 2.12.4.1"
+        );
+        assert_eq!(locate("section 2.12.4.1", &identity), vec![(1, "user")]);
     }
 
     #[test]
