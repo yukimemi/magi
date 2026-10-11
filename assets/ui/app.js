@@ -9313,8 +9313,21 @@ function renderSettingsRole(d, role) {
   const seats = role.seats.length
     ? `A run now fills its seats with: ${role.seats.join(", ")}.`
     : role.seats_error ? `Cannot resolve seats: ${role.seats_error}` : "";
+  const emptyText = {
+    advisors: "No seats named; the judge roster is used.",
+    fixer: "No fixer named; the winner's own implementer applies the findings.",
+    synthesizer: "No synthesizer named; the default agent pick order is used.",
+    chatter: "No chatter named; the default agent pick order is used.",
+    conductor: "No conductor named; the default agent pick order is used.",
+    language_judge: "No language judge named; built-in heuristics decide and no agent is spawned.",
+    dupes_judge: "No duplicate judge named; chatter is used, including its default agent selection.",
+  };
+  const explicitEmptyChain = !dirty && role.chain && role.source !== "default" && !role.fallback;
+  const emptyMessage = explicitEmptyChain
+    ? "Empty fallback chain; the default agent pick order is used."
+    : emptyText[role.key] || "No seats named; the whole roster rotates through.";
   const defined = d.agents.map((a) => a.id);
-  const addable = defined.filter((id) => !ids.includes(id) || !["synthesizer", "fixer"].includes(role.key));
+  const addable = defined.filter((id) => !ids.includes(id) || !role.chain);
   const select = el("select", { "aria-label": `Add an agent to ${role.key}` },
     el("option", { value: "" }, "Add agent…"),
     addable.map((id) => el("option", { value: id }, id)));
@@ -9324,7 +9337,7 @@ function renderSettingsRole(d, role) {
   return el("div", { class: "panel set-role" },
     el("h2", { text: role.key }),
     el("p", { class: "set-meta" }, origin,
-      role.fallback ? ` \u2014 unset, so it falls back to the ${role.fallback} roster` : "",
+      role.fallback ? ` \u2014 unset, so it falls back to ${role.fallback}` : "",
       dirty ? " \u2014 unsaved change" : ""),
     locked && el("p", { class: "set-meta", text: role.locked_reason }),
     renderSettingsCount(role),
@@ -9334,7 +9347,7 @@ function renderSettingsRole(d, role) {
           el("button", { class: "btn btn-quiet", type: "button", disabled: locked || i === 0, "aria-label": `Move ${id} up`, onclick: () => settingsMove(role, i, i - 1) }, "\u2191"),
           el("button", { class: "btn btn-quiet", type: "button", disabled: locked || i === ids.length - 1, "aria-label": `Move ${id} down`, onclick: () => settingsMove(role, i, i + 1) }, "\u2193"),
           el("button", { class: "btn btn-quiet", type: "button", disabled: locked, "aria-label": `Remove ${id}`, onclick: () => settingsSet(role, ids.filter((_, j) => j !== i)) }, "\u00d7"))))
-      : el("p", { class: "set-meta", text: role.key === "advisors" ? "No seats named; the judge roster is used." : role.key === "fixer" ? "No fixer named; the winner's own implementer applies the findings." : "No seats named; the whole roster rotates through." }),
+      : el("p", { class: "set-meta", text: emptyMessage }),
     !locked && el("div", { class: "set-add" }, select,
       ids.length ? el("button", { class: "btn btn-quiet", type: "button", onclick: () => settingsSet(role, []) }, "Reset to default") : null),
     role.skipped.length ? el("p", { class: "set-meta", text: `Cannot run here (not in the roster or not installed): ${role.skipped.join(", ")}.` }) : null,
