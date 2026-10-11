@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::SeatState;
 use crate::blind::Leak;
 use crate::config::{Config, MergeMode};
+use crate::proc::Quiet as _;
 use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 
 /// On-disk format version. Bumped when a field changes meaning, so a resumed
@@ -2243,6 +2244,7 @@ impl RunState {
         let task = self.origin.as_ref()?.task.as_ref()?;
         let branch = format!("magi/task-{task}");
         std::process::Command::new("git")
+            .quiet()
             .args(["check-ref-format", "--branch", &branch])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -3147,8 +3149,6 @@ pub fn read_artifact(run: &RunState, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::proc::Quiet as _;
-
     #[test]
     fn test_home_is_private_stable_and_unique_per_process() {
         // Child mode: report this process's home and stop.

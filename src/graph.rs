@@ -11850,6 +11850,9 @@ mod tests {
         // through `merge`, which is exactly the call site that used to skip
         // `settle_questions` - see the fixture below.
         ask_test_home();
+        // A real resume loads a persisted run; driver ownership is checked
+        // against that record before the Landing shortcut is entered.
+        state.save().expect("save landing run");
         let store = ask::Questions::open();
         let q = ask_open_question(&store, &state.id);
 
