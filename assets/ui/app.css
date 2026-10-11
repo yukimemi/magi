@@ -742,6 +742,9 @@ a.card:active { background: var(--sunk); }
 .cand-nums > [data-sep]::after {
   content: "\00b7"; margin-left: var(--s2); color: var(--line-2);
 }
+/* Keep Queue ids clear of chips even when the split grid replaces the top
+   row's flex gap. */
+.task-card .card-permalink { margin-inline: var(--s1); }
 .repo { font-family: var(--mono); font-size: var(--t1); }
 /* Only styled when it actually has an href - a human-filed task's source has
    nowhere to go, and stays plain text rather than looking tappable. */
@@ -2373,6 +2376,9 @@ details.panel > summary + * { margin-top: var(--s2); }
     grid-row: 2; grid-column: 5; max-width: none; margin: var(--s2) 0 0;
     display: block;
   }
+  /* Inline meta has no flex gap after a dot; preserve the same spacing as
+     the full card without changing the phone layout's wrapping budget. */
+  main[data-split] .task-card .card-meta > [data-sep]::after { margin-right: var(--s2); }
   main[data-split] .task-card .card-when { grid-row: 2; grid-column: 6; margin: var(--s2) 0 0 var(--s2); }
   main[data-split] .task-card > :not(.card-top):not(.card-title):not(.card-meta) { grid-column: 1 / -1; }
   main[data-split] .cards > li:has(> .card[aria-current="true"]) > .card-tail { display: flex; }
