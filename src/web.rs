@@ -13810,6 +13810,7 @@ mod tests {
         let mut on_disk = f.talks().get(&talk).expect("get seeded talk");
         on_disk.turns.push(crate::talk::Turn {
             breaks: Some(Vec::new()),
+            posted_by: None,
             who: crate::talk::Who::Operator,
             body: "a new turn".to_owned(),
             at: Timestamp::now(),

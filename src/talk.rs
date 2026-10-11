@@ -144,6 +144,12 @@ pub struct Turn {
     /// not an operator turn) and readers fall back to paragraphs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub breaks: Option<Vec<usize>>,
+    /// The run id of the task seat that appended this agent turn with
+    /// `magi talk post`. Only ever set on such a turn; the chat's own CLI
+    /// session has not seen it, so [`posts_since_last_reply`] replays it in
+    /// the next prompt. `#[serde(default)]`: [`SCHEMA`] stays put.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posted_by: Option<String>,
 }
 
 /// Raw usage of one agent reply, stored as the CLI reported it.
@@ -359,6 +365,12 @@ pub struct Talk {
     /// cleared only once a turn has succeeded, like [`Self::persona_dirty`].
     #[serde(default)]
     pub implementers_dirty: bool,
+    /// Keys of task-completion notices already accepted into this talk (see
+    /// [`queue_once`]). Kept beside [`Self::pending`] and saved in the same
+    /// write, so a crash between this talk and the task's own record cannot
+    /// post twice; never pruned by a drain or a close.
+    #[serde(default)]
+    pub notified: Vec<String>,
     /// When the conversation was opened.
     pub created_at: Timestamp,
     /// Last change to this file.
@@ -1264,6 +1276,7 @@ pub fn begin_with(
         persona_dirty: false,
         implementers,
         implementers_dirty: false,
+        notified: Vec::new(),
         created_at: now,
         updated_at: now,
         seat: SeatState::new(SEAT, &spec.id, crate::rng::entropy()),
@@ -1305,6 +1318,7 @@ pub fn record(
     talk.pending = fresh.pending;
     talk.pending_breaks = fresh.pending_breaks;
     talk.pending_attachments = fresh.pending_attachments;
+    talk.notified = fresh.notified;
     if !talk.status.open() {
         bail!(
             "talk {} is {} and takes no more turns",
@@ -1323,6 +1337,7 @@ pub fn record(
         attachments,
         usage: None,
         breaks: Some(Vec::new()),
+        posted_by: None,
     });
     store.put(talk)?;
     Ok(text.to_owned())
@@ -1335,6 +1350,24 @@ pub fn queue(
     text: &str,
     attachments: Vec<Attachment>,
 ) -> Result<()> {
+    queue_keyed(talk, store, text, attachments, None).map(|_| ())
+}
+
+/// [`queue`] for a message that must be accepted at most once: `key` is
+/// recorded in [`Talk::notified`] in the same write as the draft, so a retry
+/// after a crash (or a second sweep) finds the key and queues nothing.
+/// Returns whether this call queued it.
+pub fn queue_once(talk: &mut Talk, store: &Talks, text: &str, key: &str) -> Result<bool> {
+    queue_keyed(talk, store, text, Vec::new(), Some(key))
+}
+
+fn queue_keyed(
+    talk: &mut Talk,
+    store: &Talks,
+    text: &str,
+    attachments: Vec<Attachment>,
+    key: Option<&str>,
+) -> Result<bool> {
     let text = text.trim();
     if text.is_empty() && attachments.is_empty() {
         bail!("nothing to say");
@@ -1349,6 +1382,13 @@ pub fn queue(
             fresh.short(),
             fresh.status.as_str()
         );
+    }
+    if let Some(key) = key {
+        if fresh.notified.iter().any(|k| k == key) {
+            *talk = fresh;
+            return Ok(false);
+        }
+        fresh.notified.push(key.to_owned());
     }
     if !text.is_empty() {
         if fresh.pending.is_empty() {
@@ -1365,7 +1405,63 @@ pub fn queue(
     fresh.pending_attachments.extend(attachments);
     store.put(&mut fresh)?;
     *talk = fresh;
-    Ok(())
+    Ok(true)
+}
+
+/// Append an agent-authored message to the transcript without starting a
+/// turn (`magi talk post`). `by` is the posting seat's run id. No draft, no
+/// lease, no agent call: it only writes under the store guard, onto the
+/// freshest record, so it cannot lose a concurrent reply.
+pub fn post(store: &Talks, talk_id: &str, body: &str, by: &str) -> Result<()> {
+    let body = body.trim();
+    if body.is_empty() {
+        bail!("nothing to post");
+    }
+    let _guard = store.guard()?;
+    let mut fresh = store
+        .get(talk_id)
+        .with_context(|| format!("talk {talk_id} does not exist"))?;
+    if !fresh.status.open() {
+        bail!(
+            "talk {} is closed and takes no more messages",
+            fresh.short()
+        );
+    }
+    fresh.turns.push(Turn {
+        who: Who::Agent,
+        body: body.to_owned(),
+        at: Timestamp::now(),
+        attachments: Vec::new(),
+        usage: None,
+        breaks: None,
+        posted_by: Some(by.to_owned()),
+    });
+    store.put(&mut fresh)
+}
+
+/// Posts appended by task seats since the chat agent last answered, as a
+/// prompt block. The agent's CLI session never saw them.
+pub fn posts_since_last_reply(talk: &Talk) -> Option<String> {
+    let mut posts: Vec<&Turn> = talk
+        .turns
+        .iter()
+        .rev()
+        .take_while(|t| t.who == Who::Operator || t.posted_by.is_some())
+        .filter(|t| t.posted_by.is_some())
+        .collect();
+    if posts.is_empty() {
+        return None;
+    }
+    posts.reverse();
+    let mut out = String::from("# Posted by a task\n\n");
+    for t in posts {
+        out.push_str(&format!(
+            "Task seat {} posted to this conversation: {}\n\n",
+            short(t.posted_by.as_deref().unwrap_or_default()),
+            t.body
+        ));
+    }
+    Some(out)
 }
 
 /// Promote the current durable draft to one operator turn.
@@ -1388,6 +1484,7 @@ pub fn drain(talk: &mut Talk, store: &Talks) -> Result<Option<String>> {
         attachments,
         usage: None,
         breaks,
+        posted_by: None,
     });
     store.put(&mut fresh)?;
     *talk = fresh;
@@ -1520,6 +1617,7 @@ pub fn switch_agent(talk: &mut Talk, store: &Talks, spec: &AgentSpec) -> Result<
     fresh.fallback = false;
     fresh.turns.push(Turn {
         breaks: None,
+        posted_by: None,
         who: Who::Agent,
         body: format!("{MAGI_NOTE}agent changed from {from} to {}", spec.id),
         at: Timestamp::now(),
@@ -1563,6 +1661,7 @@ pub fn switch_persona(talk: &mut Talk, store: &Talks, id: &str) -> Result<bool> 
     };
     fresh.turns.push(Turn {
         breaks: None,
+        posted_by: None,
         who: Who::Agent,
         body: format!(
             "{MAGI_NOTE}persona changed from {} to {}",
@@ -1806,7 +1905,8 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
                 transcript(talk, store)
             )
         } else if resuming {
-            format!("{persona_update}{filing_update}{text}{last_note}")
+            let posts = posts_since_last_reply(talk).unwrap_or_default();
+            format!("{persona_update}{filing_update}{posts}{text}{last_note}")
         } else {
             // No session to hold the persona: the transcript never stores it,
             // so a non-default persona is re-sent on every such turn (the
@@ -1878,6 +1978,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     let outcome = outcome.expect("a chain holds at least one agent");
     let note = |why: String| Turn {
         breaks: None,
+        posted_by: None,
         who: Who::Agent,
         body: format!("{MAGI_NOTE}{why}"),
         at: Timestamp::now(),
@@ -1922,6 +2023,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         Ok(out) => (
             Turn {
                 breaks: None,
+                posted_by: None,
                 who: Who::Agent,
                 body: out.text.trim().to_owned(),
                 at: Timestamp::now(),
@@ -1969,6 +2071,16 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     talk.pending = fresh.pending;
     talk.pending_breaks = fresh.pending_breaks;
     talk.pending_attachments = fresh.pending_attachments;
+    talk.notified = fresh.notified;
+    // A `magi talk post` landed while the CLI ran: this handle predates it.
+    if fresh.turns.len() > talk.turns.len() {
+        let posted: Vec<Turn> = fresh.turns[talk.turns.len()..]
+            .iter()
+            .filter(|t| t.posted_by.is_some())
+            .cloned()
+            .collect();
+        talk.turns.extend(posted);
+    }
     if let Some(from) = fell_back_from.filter(|_| failure.is_none()) {
         // The switch persists: quota coming back does not move the chat
         // home, an operator's switch does.
@@ -2212,6 +2324,7 @@ pub fn switch_implementers(talk: &mut Talk, store: &Talks, n: u8) -> Result<bool
     fresh.implementers_dirty = true;
     fresh.turns.push(Turn {
         breaks: None,
+        posted_by: None,
         who: Who::Agent,
         body: format!("{MAGI_NOTE}implementers changed from {from} to {n}"),
         at: Timestamp::now(),
@@ -2298,6 +2411,11 @@ pub fn briefing_for(
          nothing matches or more than one checkout shares that name, ask the \
          operator which repository they mean (or run `magi repos` yourself \
          to see the candidates) rather than guessing.\n\n\
+         You cannot wait, and you cannot send the operator a message on your \
+         own: you only speak when they write. A task you file reports back \
+         into this conversation automatically when it finishes, is held or \
+         fails, as a message headed \"{notice}\", so never promise to \"tell \
+         them when it is done\" for anything else.\n\n\
          The current state of the code is whatever origin/main holds, not \
          whatever a working tree shows: a primary checkout often lags \
          upstream, sits on a detached HEAD and carries uncommitted changes. \
@@ -2314,6 +2432,7 @@ pub fn briefing_for(
          path into <instruction> instead: deleting this conversation deletes \
          its attachments, and then that path reaches no one.\n",
         repo = repo.display(),
+        notice = crate::prompt::CHAT_TASK_NOTICE_HEADING,
     );
     out.push_str(&language_note(language));
     match (persona, operator_name) {
@@ -2551,6 +2670,7 @@ mod tests {
             persona_dirty: false,
             implementers: 1,
             implementers_dirty: false,
+            notified: Vec::new(),
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
             seat: SeatState::new(SEAT, agent, 1),
@@ -2560,6 +2680,7 @@ mod tests {
     fn reply(body: &str, usage: Option<(u64, &str, Option<&str>)>) -> Turn {
         Turn {
             breaks: None,
+            posted_by: None,
             who: Who::Agent,
             body: body.to_owned(),
             at: Timestamp::now(),
@@ -2798,6 +2919,7 @@ mod tests {
             persona_dirty: false,
             implementers: 1,
             implementers_dirty: false,
+            notified: Vec::new(),
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
             seat: SeatState::new(SEAT, "sonnet", 7),
@@ -4509,6 +4631,7 @@ mod tests {
                 persona_dirty: false,
                 implementers: 1,
                 implementers_dirty: false,
+                notified: Vec::new(),
                 created_at: Timestamp::now(),
                 updated_at: Timestamp::now(),
                 seat: SeatState::new(SEAT, "mock", 7),
@@ -4619,5 +4742,43 @@ mod tests {
         // still tells the agent to report what it changed.
         assert!(writable.contains("magi task add --solo"));
         assert!(writable.contains("say plainly what you"));
+    }
+
+    #[test]
+    fn the_briefing_says_the_chat_cannot_push_and_tasks_report_back() {
+        let b = briefing_for(Path::new("/r"), "en", false, None, None, 1);
+        assert!(
+            b.contains("cannot send the operator a message on your own"),
+            "{b}"
+        );
+        assert!(b.contains(crate::prompt::CHAT_TASK_NOTICE_HEADING));
+    }
+
+    #[test]
+    fn a_post_is_replayed_until_the_agent_answers_again() {
+        let (_tmp, talks) = store();
+        let mut talk = ctx_talk("mock", Vec::new());
+        talks.put(&mut talk).expect("put");
+        post(&talks, &talk.id, "  found it  ", "20260902-000000-aaaa").expect("post");
+        let mut talk = talks.get(&talk.id).expect("get");
+        let block = posts_since_last_reply(&talk).expect("block");
+        assert!(block.starts_with("# Posted by a task"), "{block}");
+        assert!(block.contains("found it"));
+        talk.turns.push(reply("ok", None));
+        assert!(posts_since_last_reply(&talk).is_none());
+        assert!(post(&talks, &talk.id, "  ", "r").is_err());
+        close(&mut talk, &talks).expect("close");
+        assert!(post(&talks, &talk.id, "late", "r").is_err());
+    }
+
+    #[test]
+    fn queue_once_accepts_a_key_a_single_time_even_after_a_drain() {
+        let (_tmp, talks) = store();
+        let mut talk = ctx_talk("mock", Vec::new());
+        talks.put(&mut talk).expect("put");
+        assert!(queue_once(&mut talk, &talks, "one", "k").expect("first"));
+        drain(&mut talk, &talks).expect("drain");
+        assert!(!queue_once(&mut talk, &talks, "one", "k").expect("again"));
+        assert!(talks.get(&talk.id).expect("get").pending.is_empty());
     }
 }

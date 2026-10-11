@@ -2492,6 +2492,14 @@ async fn poll(
         resolve_blockers(queue, &questions);
         apply_choice_actions(queue, &questions, home);
         reconcile_task_questions(queue, &questions);
+        // Tell the chat a task it filed has ended. Reconciled here, on
+        // whatever put the task in its final state, and started only when no
+        // upgrade is parking (the draft then waits for a manual resume).
+        {
+            let talks = crate::talk::Talks::at(home.join("talks"));
+            crate::chat_notify::sweep(queue, &talks, home);
+            crate::chat_notify::start_turns(&talks, stop.parking());
+        }
 
         // The conductor gets one look per cycle, right before the loop takes
         // its next task, and only when there is something new to look at -

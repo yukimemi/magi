@@ -372,6 +372,12 @@ enum Command {
         #[command(subcommand)]
         command: TaskCmd,
     },
+    /// Write into a chat conversation from a task seat.
+    Talk {
+        /// What to do with the conversation.
+        #[command(subcommand)]
+        command: TalkCmd,
+    },
     /// Drain the queue unattended: take the next task, run the graph, repeat.
     ///
     /// One competition at a time on purpose. The graph is already parallel
@@ -584,6 +590,22 @@ enum Command {
         /// Install without asking.
         #[arg(long)]
         yes: bool,
+    },
+}
+
+/// Operations on a chat conversation.
+#[derive(Debug, Subcommand)]
+enum TalkCmd {
+    /// Append a message to a conversation's transcript without starting a turn.
+    ///
+    /// Only for an agent seat (`MAGI_RUN` / `MAGI_NODE`) working on a task that
+    /// this very conversation filed. The chat agent sees the message in its
+    /// next turn; nobody is woken up.
+    Post {
+        /// Conversation id or unambiguous prefix.
+        talk_id: String,
+        /// What to say.
+        message: String,
     },
 }
 
@@ -1642,6 +1664,10 @@ async fn dispatch(command: Command) -> Result<()> {
         } => answer_cmd(id, reply, quote, say, ask_chat, list).await,
 
         Command::Task { command } => task_cmd(command).await,
+
+        Command::Talk { command } => match command {
+            TalkCmd::Post { talk_id, message } => talk_post(&talk_id, &message),
+        },
 
         Command::Doctor { repo, config } => doctor(&repo, config.as_deref()).await,
 
@@ -3409,6 +3435,24 @@ fn deputy_own_task(q: &Queue, source: &Source) -> Option<String> {
             .map(|t| t.id),
         _ => None,
     }
+}
+
+/// `magi talk post`: see [`TalkCmd::Post`]. Refuses unless `MAGI_RUN` traces
+/// back to a task whose source is this very conversation.
+fn talk_post(talk_id: &str, message: &str) -> Result<()> {
+    let run = std::env::var("MAGI_RUN").unwrap_or_default();
+    let node = std::env::var("MAGI_NODE").unwrap_or_default();
+    let talks = magi::talk::Talks::open();
+    let talk = talks
+        .get(talk_id)
+        .with_context(|| format!("no chat matches {talk_id}"))?;
+    let id = talk.id.clone();
+    magi::chat_notify::authorize_post(&Queue::open().list(), &run, &node, &id)?;
+    magi::talk::post(&talks, &id, message, &run).with_context(
+        || "the chat could not be written; a sandboxed seat may not reach the talks store",
+    )?;
+    println!("posted to chat {}", talk.short());
+    Ok(())
 }
 
 /// The `(run, node)` an agent seat was spawned with: `MAGI_RUN` and

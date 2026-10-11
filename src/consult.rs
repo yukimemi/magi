@@ -252,6 +252,9 @@ fn latest_message(
             })
     });
     let Some(cuts) = cuts else {
+        if is_task_notice(body) {
+            return None;
+        }
         let words = owner_words(body, after_block_of);
         return words
             .rsplit("\n\n")
@@ -281,8 +284,18 @@ fn latest_message(
         .enumerate()
         .skip(first)
         .rev()
+        .filter(|(_, m)| !is_task_notice(m))
         .map(|(i, m)| owner_words(m, after_block_of.filter(|_| i == first)))
         .find(|w| !w.is_empty())
+}
+
+/// Is this message magi's own completion notice (see
+/// [`crate::prompt::chat_task_notice`])? It is never the owner's word.
+fn is_task_notice(message: &str) -> bool {
+    message
+        .trim_start()
+        .strip_prefix("# ")
+        .is_some_and(|r| r.starts_with(crate::prompt::CHAT_TASK_NOTICE_HEADING))
 }
 
 /// Length of a consult stored before quoted markers were defused, which may
@@ -433,17 +446,29 @@ pub async fn start_turn(
     if q.consult.is_some() {
         return Ok(Started::Nothing);
     }
-    let Some(mut lease) = talks.claim_turn(&talk.id)? else {
+    let Some(lease) = talks.claim_turn(&talk.id)? else {
         return Ok(Started::Busy);
     };
     if !begin(questions, talks, q, talk)? {
         return Ok(Started::Nothing);
     }
-    let mut talk = talks.get(&talk.id)?;
-    // Other starters that found the lease held queued drafts and left them to
-    // us, so drain until nothing is left (as the web's drain loop does).
-    // A failed turn is kept and reported at the end, not returned at once:
-    // drafts accepted meanwhile are still owed an answer.
+    drain_turns(talks, &talk.id, lease, cfg).await?;
+    Ok(Started::Answered)
+}
+
+/// Run the talk's turns under `lease` until no draft is owed.
+///
+/// Other starters that found the lease held queued drafts and left them to
+/// us, so drain until nothing is left (as the web's drain loop does). A failed
+/// turn is kept and reported at the end, not returned at once: drafts accepted
+/// meanwhile are still owed an answer.
+pub async fn drain_turns(
+    talks: &Talks,
+    talk_id: &str,
+    mut lease: talk::TurnLease,
+    cfg: &Config,
+) -> Result<()> {
+    let mut talk = talks.get(talk_id)?;
     let mut failed = None;
     loop {
         while let Some(text) = talk::drain(&mut talk, talks)? {
@@ -474,7 +499,7 @@ pub async fn start_turn(
     if let Some(e) = failed {
         return Err(e);
     }
-    Ok(Started::Answered)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1117,6 +1142,7 @@ mod tests {
 
         let owner_turn = |body: &str| talk::Turn {
             breaks: Some(Vec::new()),
+            posted_by: None,
             who: talk::Who::Operator,
             body: body.into(),
             at: Timestamp::now(),
