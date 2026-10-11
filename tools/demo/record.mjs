@@ -253,6 +253,9 @@ function thin(frames) {
   const kept = [frames[0]];
   for (const frame of frames.slice(1)) {
     if (frame.at - kept.at(-1).at >= MIN_GAP) kept.push(frame);
+    // A frame carried across a cut is the screen the viewer lands on: it
+    // replaces a too-close predecessor rather than being dropped behind it.
+    else if (frame.carried && kept.length > 1) kept[kept.length - 1] = frame;
   }
   if (kept.at(-1) !== frames.at(-1)) kept.push(frames.at(-1));
   return kept;
@@ -260,9 +263,19 @@ function thin(frames) {
 
 /** Drop the frames inside each cut window and close the gap in the timeline. */
 function applyCuts(frames, cuts) {
+  // The screencast only sends a frame when something repaints. What a cut
+  // waited for (a reply rendering) paints inside the window, so the last frame
+  // of each window is carried to its end: it is what was on screen then, and
+  // without it the frame before the cut would stay up until the next repaint.
+  const all = [...frames];
+  for (const c of cuts) {
+    const inside = frames.filter((f) => f.at >= c.from && f.at < c.to);
+    if (inside.length) all.push({ ...inside.at(-1), at: c.to, carried: true });
+  }
+  all.sort((a, b) => a.at - b.at || (b.carried ? 1 : 0) - (a.carried ? 1 : 0));
   const out = [];
-  for (const f of frames) {
-    if (cuts.some((c) => f.at >= c.from && f.at < c.to)) continue;
+  for (const f of all) {
+    if (!f.carried && cuts.some((c) => f.at >= c.from && f.at < c.to)) continue;
     const shift = cuts.filter((c) => c.to <= f.at).reduce((n, c) => n + (c.to - c.from), 0);
     out.push({ ...f, at: f.at - shift });
   }
@@ -324,6 +337,33 @@ async function encode(list, gif) {
 // ---------------------------------------------------------------------
 
 const QUOTE = "あんたバカァ！";
+
+/** The scripted agent's turn in the open conversation, not a list preview. */
+const AGENT_REPLY = `#view-talk #talk-turns li.turn[data-who="agent"]:has-text("${QUOTE}")`;
+
+/** Is the reply visible in its pane, with no thinking indicator anywhere? */
+async function replyShown(page) {
+  return page.evaluate((quote) => {
+    const visible = (el) => !!(el.offsetWidth || el.offsetHeight) && !el.closest("[hidden]");
+    const wait = document.getElementById("talk-wait");
+    if (wait && visible(wait)) return { ok: false, why: "#talk-wait is showing" };
+    const thinking = [...document.querySelectorAll(".talk-thinking")].find(visible);
+    if (thinking) return { ok: false, why: ".talk-thinking is showing" };
+    const row = [...document.querySelectorAll('#view-talk #talk-turns li.turn[data-who="agent"]')]
+      .find((li) => li.textContent.includes(quote));
+    if (!row) return { ok: false, why: "no agent turn with the reply" };
+    const r = row.getBoundingClientRect();
+    const x = r.left + Math.min(r.width / 2, 40);
+    // Top and bottom edges of the row must be the row itself (or inside it):
+    // a sticky header or composer on top would be hit instead.
+    for (const y of [r.top + 4, Math.min(r.bottom - 4, innerHeight - 1)]) {
+      if (y < 0 || y >= innerHeight) return { ok: false, why: "outside the viewport" };
+      const hit = document.elementFromPoint(x, y);
+      if (!hit || !row.contains(hit)) return { ok: false, why: "covered by another element" };
+    }
+    return { ok: true };
+  }, QUOTE);
+}
 
 async function storyboard(page, scratch, base, beat, quiet) {
   const { request: REQUEST, choice: CHOICE, question: QUESTION } = scratch.words;
@@ -420,11 +460,26 @@ async function storyboard(page, scratch, base, beat, quiet) {
     if (tries >= 3) throw new Error("the message was never sent");
   }
   await quiet(async () => {
-    await page.locator("#talk-turns").getByText(QUOTE).waitFor({ timeout: 30_000 });
+    await page.locator(AGENT_REPLY).waitFor({ timeout: 30_000 });
     await page.locator("#talk-wait").waitFor({ state: "hidden", timeout: 10_000 });
+    // Rendered is not on screen: in the two-pane layout the transcript scrolls
+    // on its own. Scroll only when the reply is hidden, so a layout that
+    // already shows it is left as it was.
+    for (let tries = 0; ; tries++) {
+      const shown = await replyShown(page);
+      if (shown.ok) break;
+      if (tries >= 20) throw new Error(`the reply is not on screen: ${shown.why}`);
+      if (tries === 3) {
+        await page.locator(AGENT_REPLY).evaluate((el) => el.scrollIntoView({ block: "center", behavior: "instant" }));
+      }
+      await wait(150);
+    }
+    await wait(300);
   }, 500);
   // Long enough to read the line the operator asked for.
   await beat("reply", 2600, "exact");
+  const after = await replyShown(page);
+  if (!after.ok) throw new Error(`the reply is not on screen at the reply beat: ${after.why}`);
 
   // 1. The task the chat filed, in the real queue.
   await quiet(async () => {
@@ -628,7 +683,7 @@ async function main() {
       return;
     }
     const captured = await stop();
-    const frames = applyCuts(thin(captured), cuts);
+    const frames = thin(applyCuts(captured, cuts));
     await context.close();
     const list = await writeFrames(frames, join(scratch.work, "frames"), 1.2);
     log(`captured ${captured.length} frames, encoding ${frames.length}`);
