@@ -1284,26 +1284,90 @@ pub fn stats(stats: &Stats) -> String {
         );
     }
 
-    if !stats.agents.is_empty() {
+    let has_competitive = stats.agents.iter().any(|a| a.competitive_entered > 0);
+    if has_competitive {
+        let mut comp_agents = stats.agents.clone();
+        comp_agents.retain(|a| a.competitive_entered > 0);
+        comp_agents.sort_by(|a, b| {
+            let a_tier = if a.competitive_entered < 10 { 1 } else { 0 };
+            let b_tier = if b.competitive_entered < 10 { 1 } else { 0 };
+            a_tier
+                .cmp(&b_tier)
+                .then(
+                    b.competitive_win_rate()
+                        .total_cmp(&a.competitive_win_rate()),
+                )
+                .then(b.competitive_entered.cmp(&a.competitive_entered))
+                .then(a.agent.cmp(&b.agent))
+        });
+
         let _ = writeln!(
             s,
             "\n{}",
-            bold("implementation (relative, on this workload)")
+            bold("implementation (competitive runs, 2+ candidates)")
         );
         let _ = writeln!(
             s,
             "  {:<14}{:>6}{:>8}{:>8}{:>8}",
             "agent", "won", "entered", "rate", "empty"
         );
-        for a in &stats.agents {
+        for a in &comp_agents {
+            let low_n_marker = if a.competitive_entered < 10 {
+                format!(" {}", dim("low n"))
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 s,
-                "  {:<14}{:>6}{:>8}{:>7.0}%{:>8}",
+                "  {:<14}{:>6}{:>8}{:>7.0}%{:>8}{}",
                 a.agent,
-                a.wins,
-                a.entered,
-                a.win_rate(),
-                a.empty
+                a.competitive_wins,
+                a.competitive_entered,
+                a.competitive_win_rate(),
+                a.empty,
+                low_n_marker
+            );
+        }
+    }
+
+    let has_solo = stats.agents.iter().any(|a| a.solo_entered > 0);
+    if has_solo {
+        let mut solo_agents = stats.agents.clone();
+        solo_agents.retain(|a| a.solo_entered > 0);
+        solo_agents.sort_by(|a, b| {
+            let a_tier = if a.solo_entered < 10 { 1 } else { 0 };
+            let b_tier = if b.solo_entered < 10 { 1 } else { 0 };
+            a_tier
+                .cmp(&b_tier)
+                .then(b.solo_adoption_rate().total_cmp(&a.solo_adoption_rate()))
+                .then(b.solo_entered.cmp(&a.solo_entered))
+                .then(a.agent.cmp(&b.agent))
+        });
+
+        let _ = writeln!(
+            s,
+            "\n{}",
+            bold("implementation (solo runs, completion/adoption rate)")
+        );
+        let _ = writeln!(
+            s,
+            "  {:<14}{:>8}{:>8}{:>8}",
+            "agent", "adopted", "entered", "rate"
+        );
+        for a in &solo_agents {
+            let low_n_marker = if a.solo_entered < 10 {
+                format!(" {}", dim("low n"))
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                s,
+                "  {:<14}{:>8}{:>8}{:>7.0}%{}",
+                a.agent,
+                a.solo_adopted,
+                a.solo_entered,
+                a.solo_adoption_rate(),
+                low_n_marker
             );
         }
     }
@@ -2599,5 +2663,72 @@ mod tests {
         assert!(text.contains("gate"));
         assert!(text.contains("3 unmeasured"));
         assert!(!text.contains('\x1b'), "colour leaked into a plain render");
+    }
+
+    #[test]
+    fn implementation_rates_use_independent_low_n_boundaries() {
+        let _guard = plain();
+        for (competitive_n, solo_n) in [(9, 10), (10, 9)] {
+            let text = stats(&Stats {
+                agents: vec![crate::stats::AgentStats {
+                    agent: "alpha".to_owned(),
+                    competitive_entered: competitive_n,
+                    competitive_wins: 1,
+                    solo_entered: solo_n,
+                    solo_adopted: 2,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            let (competitive, solo) = text
+                .split_once("implementation (solo runs, completion/adoption rate)")
+                .unwrap();
+            for (section, n, numerator) in [(competitive, competitive_n, 1), (solo, solo_n, 2)] {
+                let row = section.lines().find(|line| line.contains("alpha")).unwrap();
+                let cells: Vec<_> = row.split_whitespace().collect();
+                assert_eq!(cells[1], numerator.to_string());
+                assert_eq!(cells[2], n.to_string());
+                assert_eq!(row.contains("low n"), n < 10);
+            }
+        }
+    }
+
+    #[test]
+    fn stats_table_renders_competitive_and_solo_tables_with_low_n() {
+        let _guard = plain();
+        let st = Stats {
+            agents: vec![
+                crate::stats::AgentStats {
+                    agent: "alpha".to_owned(),
+                    entered: 15,
+                    wins: 10,
+                    empty: 0,
+                    competitive_entered: 12,
+                    competitive_wins: 9,
+                    solo_entered: 3,
+                    solo_adopted: 1,
+                },
+                crate::stats::AgentStats {
+                    agent: "beta".to_owned(),
+                    entered: 5,
+                    wins: 2,
+                    empty: 1,
+                    competitive_entered: 4,
+                    competitive_wins: 2,
+                    solo_entered: 1,
+                    solo_adopted: 0,
+                },
+            ],
+            ..Default::default()
+        };
+        let text = stats(&st);
+        assert!(text.contains("implementation (competitive runs, 2+ candidates)"));
+        assert!(text.contains("alpha"));
+        assert!(text.contains("75%"));
+        assert!(text.contains("beta"));
+        assert!(text.contains("50%"));
+        assert!(text.contains("implementation (solo runs, completion/adoption rate)"));
+        assert!(text.contains("33%"));
+        assert!(text.contains("low n"));
     }
 }
