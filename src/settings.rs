@@ -37,18 +37,25 @@ use serde::Serialize;
 use crate::config::{AgentChoice, AgentSpec, Config};
 
 /// The `[roles]` keys the screen edits, in display order.
-pub(crate) const ROLE_KEYS: [&str; 6] = [
+pub(crate) const ROLE_KEYS: [&str; 10] = [
     "implementers",
     "judges",
     "reviewers",
     "advisors",
     "synthesizer",
     "fixer",
+    "chatter",
+    "conductor",
+    "language_judge",
+    "dupes_judge",
 ];
 
 /// The roles that take one id as a bare string and several as a chain.
 fn is_chain_role(key: &str) -> bool {
-    matches!(key, "synthesizer" | "fixer")
+    matches!(
+        key,
+        "synthesizer" | "fixer" | "chatter" | "conductor" | "language_judge" | "dupes_judge"
+    )
 }
 
 /// Serializes saves: a read-modify-write of one file is not safe to interleave.
@@ -88,7 +95,9 @@ pub(crate) struct ConfigError {
 #[derive(Debug, Serialize)]
 pub(crate) struct RoleView {
     pub(crate) key: &'static str,
-    /// The ids the config names, in order. Empty means unset.
+    /// Whether ids form an ordered fallback chain rather than a seat roster.
+    pub(crate) chain: bool,
+    /// The ids the config names, in order; unset and explicit empty both have no ids.
     pub(crate) configured: Vec<String>,
     /// `machine`, `repo` or `default`.
     pub(crate) source: &'static str,
@@ -96,12 +105,12 @@ pub(crate) struct RoleView {
     /// Whether a machine-file save can change what a run sees.
     pub(crate) editable: bool,
     pub(crate) locked_reason: Option<String>,
-    /// `judges` for advisors that are unset.
+    /// The inherited role or behavior when this role is unset.
     pub(crate) fallback: Option<&'static str>,
     /// The seats a run started now would fill, in order.
     pub(crate) seats: Vec<String>,
     pub(crate) seats_error: Option<String>,
-    /// Synthesizer ids that cannot run here (not in the roster, or not installed).
+    /// Chain ids that cannot run here (not in the roster, or not installed).
     pub(crate) skipped: Vec<String>,
     /// The `[graph]` seat count, for the four roster roles only.
     pub(crate) count: Option<CountView>,
@@ -260,9 +269,36 @@ fn role_ids(cfg: &Config, key: &str) -> Vec<String> {
         "judges" => cfg.roles.judges.clone(),
         "reviewers" => cfg.roles.reviewers.clone(),
         "advisors" => cfg.roles.advisors.clone(),
-        "fixer" => choice_ids(cfg.roles.fixer.as_ref()),
-        _ => choice_ids(cfg.roles.synthesizer.as_ref()),
+        key if is_chain_role(key) => choice_ids(chain_choice(cfg, key)),
+        _ => unreachable!("unknown settings role: {key}"),
     }
+}
+
+fn chain_choice<'a>(cfg: &'a Config, key: &str) -> Option<&'a AgentChoice> {
+    match key {
+        "synthesizer" => cfg.roles.synthesizer.as_ref(),
+        "fixer" => cfg.roles.fixer.as_ref(),
+        "chatter" => cfg.roles.chatter.as_ref(),
+        "conductor" => cfg.roles.conductor.as_ref(),
+        "language_judge" => cfg.roles.language_judge.as_ref(),
+        "dupes_judge" => cfg.roles.dupes_judge.as_ref(),
+        _ => unreachable!("unknown chain role: {key}"),
+    }
+}
+
+fn chain_seats(
+    cfg: &Config,
+    choice: Option<&AgentChoice>,
+    view: &mut RoleView,
+) -> anyhow::Result<Vec<String>> {
+    let seats = crate::agent::pick_chain(&cfg.agents, choice, &crate::agent::installed, view.key)
+        .map(|chain| ids_of(&chain));
+    let runnable = seats.as_ref().cloned().unwrap_or_default();
+    view.skipped = choice_ids(choice)
+        .into_iter()
+        .filter(|id| !runnable.contains(id))
+        .collect();
+    seats
 }
 
 fn ids_of(specs: &[AgentSpec]) -> Vec<String> {
@@ -371,6 +407,7 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
         };
         let mut view = RoleView {
             key,
+            chain: is_chain_role(key),
             configured,
             source,
             source_path,
@@ -461,38 +498,44 @@ pub(crate) fn view(repo: &Path, machine: Option<&Path>) -> SettingsView {
                 view.fallback = Some("winner's implementer");
                 Ok(Vec::new())
             }
-            "fixer" => crate::agent::pick_chain(
-                &cfg.agents,
-                cfg.roles.fixer.as_ref(),
-                &crate::agent::installed,
-                "fixer",
-            )
-            .map(|chain| {
-                let ids = ids_of(&chain);
-                view.skipped = view
-                    .configured
-                    .iter()
-                    .filter(|id| !ids.contains(id))
-                    .cloned()
-                    .collect();
-                ids
-            }),
-            _ => crate::agent::pick_chain(
-                &cfg.agents,
-                cfg.roles.synthesizer.as_ref(),
-                &crate::agent::installed,
-                "synthesizer",
-            )
-            .map(|chain| {
-                let ids = ids_of(&chain);
-                view.skipped = view
-                    .configured
-                    .iter()
-                    .filter(|id| !ids.contains(id))
-                    .cloned()
-                    .collect();
-                ids
-            }),
+            "language_judge" if cfg.roles.language_judge.is_none() => {
+                view.fallback = Some("built-in heuristics");
+                Ok(Vec::new())
+            }
+            "dupes_judge" => {
+                if cfg.roles.dupes_judge.is_none() {
+                    view.fallback = Some("chatter");
+                }
+                chain_seats(
+                    &cfg,
+                    cfg.roles
+                        .dupes_judge
+                        .as_ref()
+                        .or(cfg.roles.chatter.as_ref()),
+                    &mut view,
+                )
+            }
+            // Like conduct::maybe_run, only a multi-id conductor choice preflights CLIs.
+            "conductor"
+                if cfg
+                    .roles
+                    .conductor
+                    .as_ref()
+                    .is_none_or(|c| c.ids().len() <= 1) =>
+            {
+                let seats = resolved
+                    .as_ref()
+                    .map(|r| vec![r.conductor.id.clone()])
+                    .map_err(|e| anyhow::anyhow!("{e:#}"));
+                if seats.is_err() {
+                    view.skipped = view.configured.clone();
+                }
+                seats
+            }
+            "fixer" | "synthesizer" | "chatter" | "conductor" | "language_judge" => {
+                chain_seats(&cfg, chain_choice(&cfg, key), &mut view)
+            }
+            _ => unreachable!("unknown settings role: {key}"),
         };
         match seats {
             Ok(ids) => view.seats = ids,
@@ -770,7 +813,7 @@ fn quote(s: &str) -> String {
 }
 
 /// The value text for `key`: a bare string for a one-agent chain role
-/// (synthesizer, fixer), an array otherwise.
+/// or an array for several ids; roster roles always use arrays.
 fn value_text(key: &str, ids: &[String]) -> String {
     if is_chain_role(key) && ids.len() == 1 {
         return quote(&ids[0]);
@@ -1318,6 +1361,138 @@ mod tests {
         assert!(one.contains("synthesizer = \"a\""), "{one}");
         let two = patch_role("", "synthesizer", &ids(&["a", "b"])).unwrap();
         assert!(two.contains("synthesizer = [\"a\", \"b\"]"), "{two}");
+    }
+
+    const NEW_CHAIN_KEYS: [&str; 4] = ["chatter", "conductor", "language_judge", "dupes_judge"];
+
+    #[test]
+    fn new_chain_roles_save_round_trip_and_reset() {
+        for key in NEW_CHAIN_KEYS {
+            let tmp = TempDir::new().unwrap();
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            std::fs::write(repo.join("magi.toml"), AGENTS).unwrap();
+            let machine = tmp.path().join("config.toml");
+            for wanted in [ids(&["b"]), ids(&["b", "a"]), Vec::new()] {
+                let before = view(&repo, Some(&machine));
+                let after = save(
+                    &repo,
+                    Some(&machine),
+                    &before.revision,
+                    &BTreeMap::from([(key.to_owned(), wanted.clone())]),
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+                let role = after.roles.iter().find(|r| r.key == key).unwrap();
+                assert_eq!(role.configured, wanted, "{key}");
+                assert!(role.chain && role.count.is_none(), "{key}");
+                let text = std::fs::read_to_string(&machine).unwrap();
+                if wanted.is_empty() {
+                    assert!(!text.contains(&format!("{key} =")), "{text}");
+                    assert_eq!(role.source, "default");
+                } else {
+                    assert!(text.contains(&format!("{key} = {}", value_text(key, &wanted))));
+                    assert_eq!(role.source, "machine");
+                }
+                let cfg = effective(&layer_paths(&repo, Some(&machine))).unwrap();
+                assert_eq!(role_ids(&cfg, key), wanted, "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn new_chain_roles_refuse_repo_overrides_in_words() {
+        for key in NEW_CHAIN_KEYS {
+            let tmp = TempDir::new().unwrap();
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            std::fs::write(
+                repo.join("magi.toml"),
+                format!("{AGENTS}\n[roles]\n{key} = \"a\"\n"),
+            )
+            .unwrap();
+            let machine = tmp.path().join("config.toml");
+            let original = "# machine settings\n[vars]\nx = 1\n";
+            std::fs::write(&machine, original).unwrap();
+            let before = view(&repo, Some(&machine));
+            let role = before.roles.iter().find(|r| r.key == key).unwrap();
+            assert_eq!(role.source, "repo");
+            assert!(!role.editable);
+            for wanted in [ids(&["b"]), Vec::new()] {
+                let err = save(
+                    &repo,
+                    Some(&machine),
+                    &before.revision,
+                    &BTreeMap::from([(key.to_owned(), wanted)]),
+                    &BTreeMap::new(),
+                )
+                .unwrap_err();
+                assert!(
+                    matches!(&err, SaveError::Refused(m)
+                        if m.contains(&format!("This repo overrides roles.{key}"))
+                            && m.contains("edit it there")),
+                    "{err:?}"
+                );
+                assert_eq!(std::fs::read_to_string(&machine).unwrap(), original);
+            }
+        }
+    }
+
+    #[test]
+    fn new_chain_roles_show_defaults_inheritance_and_resolution_errors() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let config = repo.join("magi.toml");
+        std::fs::write(&config, AGENTS).unwrap();
+        let defaults = view(&repo, None);
+        for key in ["chatter", "conductor", "dupes_judge"] {
+            let role = defaults.roles.iter().find(|r| r.key == key).unwrap();
+            assert_eq!(role.seats, ids(&["a"]), "{key}");
+        }
+        let language = defaults
+            .roles
+            .iter()
+            .find(|r| r.key == "language_judge")
+            .unwrap();
+        assert!(language.seats.is_empty() && language.seats_error.is_none());
+        assert_eq!(language.fallback, Some("built-in heuristics"));
+        std::fs::write(&config, format!("{AGENTS}\n[roles]\nchatter = \"b\"\n")).unwrap();
+        let inherited = view(&repo, None);
+        let dupes = inherited
+            .roles
+            .iter()
+            .find(|r| r.key == "dupes_judge")
+            .unwrap();
+        assert_eq!(dupes.seats, ids(&["b"]));
+        assert_eq!(dupes.fallback, Some("chatter"));
+        // An explicit empty chain must not inherit chatter.
+        std::fs::write(
+            &config,
+            format!("{AGENTS}\n[roles]\nchatter = \"b\"\ndupes_judge = []\n"),
+        )
+        .unwrap();
+        let explicit = view(&repo, None);
+        let dupes = explicit
+            .roles
+            .iter()
+            .find(|r| r.key == "dupes_judge")
+            .unwrap();
+        assert_eq!(dupes.seats, ids(&["a"]));
+        assert_eq!(dupes.fallback, None);
+        for key in NEW_CHAIN_KEYS {
+            for (choice, expected) in [
+                ("[\"missing\", \"b\"]", ids(&["b"])),
+                ("\"missing\"", Vec::new()),
+            ] {
+                std::fs::write(&config, format!("{AGENTS}\n[roles]\n{key} = {choice}\n")).unwrap();
+                let v = view(&repo, None);
+                let role = v.roles.iter().find(|r| r.key == key).unwrap();
+                assert_eq!(role.seats, expected, "{key}");
+                assert_eq!(role.skipped, ids(&["missing"]), "{key}");
+                assert_eq!(role.seats_error.is_some(), expected.is_empty(), "{key}");
+            }
+        }
     }
 
     #[test]
