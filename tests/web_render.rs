@@ -2193,8 +2193,39 @@ async fn chat_remembers_persona_and_implementers_for_new_conversations() {
 
 /// Successful selector changes must be remembered even when their response
 /// arrives after the operator has opened another conversation.
-#[tokio::test]
-async fn chat_remembers_selector_changes_after_navigation() {
+#[test]
+fn chat_remembers_selector_changes_after_navigation() {
+    // Config::discover in an integration binary includes the machine layer.
+    // Isolate this fixture's roster in a child, without mutating process-wide
+    // environment variables while other rendering tests are running.
+    const CHILD: &str = "MAGI_CHAT_PREFS_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "chat_remembers_selector_changes_after_navigation",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(magi::config::Config::CONFIG_DIR_ENV, "")
+            .output()
+            .expect("spawn isolated browser test");
+        assert!(
+            output.status.success(),
+            "browser test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(chat_remembers_selector_changes_after_navigation_inner());
+}
+
+async fn chat_remembers_selector_changes_after_navigation_inner() {
     let Some(chrome) = cdp::find_chrome() else {
         assert!(
             std::env::var_os("CI").is_none(),
@@ -2205,6 +2236,25 @@ async fn chat_remembers_selector_changes_after_navigation() {
     };
     let guard = common::home_lock().await;
     let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    // The server discovers config from origin/main, rather than the in-memory
+    // fixture used to seed the talks. Give both sides the same mock roster.
+    std::fs::write(
+        fx.repo.join("magi.toml"),
+        toml::to_string(&fx.config).expect("serialize fixture config"),
+    )
+    .expect("write fixture config");
+    for args in [
+        vec!["add", "magi.toml"],
+        vec!["commit", "-m", "configure chat test roster"],
+        vec!["push", "origin", "main"],
+    ] {
+        magi::git::git(&fx.repo, &args)
+            .await
+            .expect("publish fixture config");
+    }
+    let (discovered, _) =
+        magi::config::Config::discover(&fx.repo, None).expect("discover published fixture config");
+    assert!(discovered.agents.iter().any(|spec| spec.id == "beta"));
     let home = fx.tmp.path().join("magi-home");
     let talks = Talks::at(home.join("talks"));
     let agent = fx.config.agents[0].id.clone();
@@ -2238,20 +2288,23 @@ async fn chat_remembers_selector_changes_after_navigation() {
             ))
             .await
             .expect("return to first chat");
-        browser
+        let ready = browser
             .wait_for(
                 &page,
                 &format!(
                     "location.hash === '#/chat/{}' \
-                     && document.getElementById('talk-agent').options.length > 1 \
-                     && document.getElementById('talk-persona').options.length > 1 \
-                     && !document.getElementById('talk-{field}').disabled",
+                     && document.getElementById('talk-agent')?.options.length > 1 \
+                     && document.getElementById('talk-persona')?.options.length > 1 \
+                     && document.getElementById('talk-{field}')?.disabled === false",
                     first.id
                 ),
                 w,
             )
-            .await
-            .expect("selector ready");
+            .await;
+        if let Err(error) = ready {
+            let snapshot = browser.eval(&page, "({ hash: location.hash, body: document.body?.innerText, agent: document.getElementById('talk-agent')?.outerHTML })").await;
+            panic!("selector ready: {error}; {snapshot:?}");
+        }
         browser
             .eval(
                 &page,
@@ -2262,6 +2315,7 @@ async fn chat_remembers_selector_changes_after_navigation() {
                         window.fetch = async (...args) => {{
                             const response = await originalFetch(...args);
                             if (String(args[0]).endsWith('/{}/{field}') && args[1]?.method === 'POST') {{
+                                if (!response.ok) throw new Error(await response.text());
                                 window.fetch = originalFetch;
                                 await new Promise(resolve => {{ window.releaseTalkPreference = resolve; }});
                             }}
@@ -2298,7 +2352,7 @@ async fn chat_remembers_selector_changes_after_navigation() {
             .wait_for(
                 &page,
                 &format!(
-                    "location.hash === '#/chat/{}' && document.getElementById('talk-agent').value === '{}'",
+                    "location.hash === '#/chat/{}' && document.getElementById('talk-agent')?.value === '{}'",
                     second.id, agent
                 ),
                 w,
