@@ -2359,14 +2359,18 @@ own turn machinery runs it. No new seat, no new waiter, never a fresh agent.
 - **Once.** `Task::chat_notice` (`queue::SCHEMA` 13, `#[serde(default)]`)
   records the key of the last state reported or skipped
   (`Task::chat_notice_key`: held by `held_at`, blocked by what it waits on,
-  done by run count). A release or requeue does not clear it; a new final state
-  has a new key. `Queue::put_unlocked` never rewinds a newer record. Records
-  below schema 13 are not notified, so an upgrade does not replay history.
+  done once per task, including legacy `done#N` records). A release or requeue
+  does not clear it; a new hold or block cause has a new key.
+  `Queue::put_unlocked` never rewinds a newer record. Records below schema 13
+  are not notified, so an upgrade does not replay history.
 - **Two writes, one idempotent.** Lock order is task, then talk: `sweep` runs
-  inside `Queue::modify`, calls `talk::queue_once`, which saves the draft and
-  the key in `Talk::notified` in one write, then the task record is saved. A
+  inside `Queue::modify`, calls `talk::queue_once_matching`, which saves the
+  draft and the key in `Talk::notified` in one write, then the task record is
+  saved. A
   crash between them is repaired by the next sweep (the key is found, nothing
-  is queued twice). `Talk::notified` is never pruned by a drain or a close.
+  is queued twice). `Talk::notified` is never pruned by a drain or a close,
+  and recognizes the same task's legacy completion keys even after an
+  intervening hold notice.
 - **Closed or deleted is skipped** (`ChatNoticeOutcome::Skipped`, recorded so
   it is not retried), never reopened - unlike `consult::begin`. A transient I/O
   error records nothing and the next tick retries.

@@ -500,6 +500,14 @@ pub struct Task {
     pub updated_at: Timestamp,
 }
 
+/// Current and legacy completion keys; legacy run counts contain only digits.
+pub(crate) fn is_done_notice_key(key: &str) -> bool {
+    key == "done"
+        || key
+            .strip_prefix("done#")
+            .is_some_and(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
+}
+
 /// What became of a completion notice. See [`Task::chat_notice`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -719,12 +727,11 @@ impl Task {
     /// Identity of the final state a chat should hear about, or `None` while
     /// the task is intermediate (queued, running, parked, a failed attempt the
     /// loop will retry - the last attempt turns into a hold). A hold is keyed
-    /// by when it began, a block by what it waits on, a completion by how
-    /// many runs it took, so the same cause is never reported twice and a
-    /// release followed by a new final state is.
+    /// by when it began and a block by what it waits on. Completion is keyed
+    /// by the task itself, so requeues never report completion twice.
     pub fn chat_notice_key(&self) -> Option<String> {
         match self.status {
-            TaskStatus::Done => Some(format!("done#{}", self.runs.len())),
+            TaskStatus::Done => Some("done".to_owned()),
             TaskStatus::Held => Some(format!(
                 "held#{}",
                 self.held_at.map(|t| t.to_string()).unwrap_or_default()
@@ -748,7 +755,7 @@ impl Task {
         }
         let key = self.chat_notice_key()?;
         match &self.chat_notice {
-            Some(n) if n.key == key => None,
+            Some(n) if n.key == key || (key == "done" && is_done_notice_key(&n.key)) => None,
             _ => Some(key),
         }
     }
@@ -4236,6 +4243,25 @@ mod tests {
         t.start("r3".to_owned());
         t.succeed();
         assert!(t.chat_notice_due().is_some(), "done is a new final state");
+    }
+
+    #[test]
+    fn completed_chat_notices_keep_current_and_legacy_keys_after_requeue() {
+        for key in ["done", "done#0", "done#1", "done#12"] {
+            let mut t = chat_task();
+            t.start("r1".to_owned());
+            t.succeed();
+            t.chat_notice = Some(ChatNotice {
+                key: key.to_owned(),
+                at: Timestamp::now(),
+                outcome: ChatNoticeOutcome::Posted,
+            });
+            t.requeue();
+            t.start("r2".to_owned());
+            t.succeed();
+            assert_eq!(t.chat_notice_key().as_deref(), Some("done"));
+            assert_eq!(t.chat_notice_due(), None, "recorded key: {key}");
+        }
     }
 
     #[test]

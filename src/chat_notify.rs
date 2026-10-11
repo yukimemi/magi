@@ -13,7 +13,7 @@
 //!   task done`, the web UI, a restart) is covered the same way.
 //! - **Once.** The task records what was reported ([`Task::chat_notice`]); the
 //!   talk records the accepted key in the same write as the draft
-//!   ([`talk::queue_once`]). A crash between the two writes is repaired by the
+//!   ([`talk::queue_once_matching`]). A crash between the two writes is repaired by the
 //!   next sweep, which finds the key in the talk and only fixes the task.
 //!   Lock order is task, then talk.
 //! - **Closed or gone is skipped,** never reopened (unlike a consult).
@@ -92,21 +92,22 @@ pub fn notice_text(task: &Task, facts: &RunFacts) -> String {
 
 /// Queue the notice for `task` into its talk, once. `Skipped` when the talk is
 /// gone or closed; an error only for a transient failure worth retrying.
+/// The boolean records whether a new draft was actually added.
 fn deliver(
     talks: &Talks,
     home: &Path,
     task: &Task,
     talk_id: &str,
     key: &str,
-) -> Result<ChatNoticeOutcome> {
+) -> Result<(ChatNoticeOutcome, bool)> {
     let gone = || !talks.list().iter().any(|t| t.id == talk_id);
     let mut talk = match talks.get(talk_id) {
         Ok(t) => t,
-        Err(_) if gone() => return Ok(ChatNoticeOutcome::Skipped),
+        Err(_) if gone() => return Ok((ChatNoticeOutcome::Skipped, false)),
         Err(e) => return Err(e),
     };
     if !talk.status.open() {
-        return Ok(ChatNoticeOutcome::Skipped);
+        return Ok((ChatNoticeOutcome::Skipped, false));
     }
     let facts = task
         .runs
@@ -114,12 +115,25 @@ fn deliver(
         .map(|r| run_facts(home, r))
         .unwrap_or_default();
     let text = notice_text(task, &facts);
-    match talk::queue_once(&mut talk, talks, &text, &format!("{}:{key}", task.id)) {
-        Ok(_) => Ok(ChatNoticeOutcome::Posted),
+    let prefix = format!("{}:", task.id);
+    let previous = |stored: &str| {
+        key == "done"
+            && stored
+                .strip_prefix(&prefix)
+                .is_some_and(crate::queue::is_done_notice_key)
+    };
+    match talk::queue_once_matching(
+        &mut talk,
+        talks,
+        &text,
+        &format!("{prefix}{key}"),
+        &previous,
+    ) {
+        Ok(added) => Ok((ChatNoticeOutcome::Posted, added)),
         Err(e) => match talks.get(talk_id) {
             Ok(t) if t.status.open() => Err(e),
-            Ok(_) => Ok(ChatNoticeOutcome::Skipped),
-            Err(_) if gone() => Ok(ChatNoticeOutcome::Skipped),
+            Ok(_) => Ok((ChatNoticeOutcome::Skipped, false)),
+            Err(_) if gone() => Ok((ChatNoticeOutcome::Skipped, false)),
             Err(_) => Err(e),
         },
     }
@@ -141,8 +155,8 @@ pub fn sweep(queue: &Queue, talks: &Talks, home: &Path) -> Vec<String> {
                 return false;
             };
             match deliver(talks, home, t, &talk_id, &key) {
-                Ok(outcome) => {
-                    if outcome == ChatNoticeOutcome::Posted {
+                Ok((outcome, added)) => {
+                    if added {
                         posted.push(talk_id);
                     }
                     t.chat_notice = Some(ChatNotice {
