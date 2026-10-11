@@ -2143,6 +2143,16 @@ pub async fn close_superseded_pr(
 /// been edited by the owner and cannot be compared.
 pub async fn set_pr_title(state: &mut RunState, repo: &Path, url: &str, title: &str) -> Result<()> {
     let (title, _) = crate::github_text::prepare(state, title, "");
+    edit_pr_title(repo, url, &title).await
+}
+
+/// [`set_pr_title`] for a title the owner explicitly chose to post unmodified
+/// (`github_text::POST_ORIGINAL`): the posting gate is skipped on purpose.
+pub async fn set_pr_title_verbatim(repo: &Path, url: &str, title: &str) -> Result<()> {
+    edit_pr_title(repo, url, title).await
+}
+
+async fn edit_pr_title(repo: &Path, url: &str, title: &str) -> Result<()> {
     let (ok, out) = gh(
         repo,
         &[

@@ -113,7 +113,14 @@ async fn park_on_question(fx: &mut common::Fixture, log: &Path) -> String {
     let asked = withheld_questions(&state.id);
     assert_eq!(asked.len(), 1);
     assert!(asked[0].status.open());
-    assert!(!asked[0].detail.contains("abcdef0123456789"));
+    // The question is for the owner's eyes only: it carries the original.
+    assert!(asked[0].detail.contains("abcdef0123456789"));
+    assert!(asked[0].detail.contains("ORIGINAL") && asked[0].detail.contains("CHANGED"));
+    assert!(
+        asked[0]
+            .choices
+            .contains(&magi::github_text::POST_ORIGINAL.to_owned())
+    );
     assert!(creates(log).is_empty(), "no pull request while parked");
     state.id.clone()
 }
@@ -204,5 +211,44 @@ async fn silence_past_answer_timeout_opens_the_pull_request_with_redacted_text()
     assert_eq!(runner.state.status, RunStatus::Merged);
     assert!(runner.state.github_text.as_ref().unwrap().resolved);
     assert_eq!(withheld_questions(&run_id).len(), 1, "asked once");
+}
+}
+
+common::e2e! {
+async fn post_original_opens_the_pull_request_with_the_unmodified_text() {
+    let home = home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    let log = install_fake_gh(fx.tmp.path());
+    let run_id = park_on_question(&mut fx, &log).await;
+
+    let store = ask::Questions::open();
+    let id = withheld_questions(&run_id)[0].id.clone();
+    store
+        .update(&id, |q| {
+            q.answer(Answer::Choice(magi::github_text::POST_ORIGINAL.to_owned()))
+        })
+        .unwrap();
+    let mut runner = Runner::resume(&run_id).expect("resume");
+    runner.execute().await.expect("execute");
+
+    let made = creates(&log);
+    assert_eq!(made.len(), 1, "calls: {:?}", gh_calls(&log));
+    // The fake gh logs one line per line of an argument, so look at the call.
+    assert!(made[0].join("\n").contains("abcdef0123456789"), "{:?}", made[0]);
+    let g = runner.state.github_text.as_ref().unwrap();
+    assert!(g.resolved);
+    assert_eq!(g.choice, Some(magi::run::GithubTextChoice::Original));
+    assert_eq!(runner.state.status, RunStatus::Merged);
+    // The event log names fields, never the text.
+    let events = runner
+        .state
+        .events
+        .iter()
+        .filter(|e| e.node == "github-text")
+        .map(|e| e.message.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(events.contains("posting the original text for"));
+    assert!(!events.contains("abcdef0123456789"));
 }
 }

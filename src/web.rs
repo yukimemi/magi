@@ -9952,7 +9952,7 @@ mod tests {
 
     /// Keeps both claims observable long enough to exercise the distinction
     /// between one busy talk and a globally locked Chat surface.
-    const SLOW_MOCK_AGENT_TOML: &str = "[[agents]]\nid = \"mock\"\nkind = \"command\"\ncommand = [\"sh\", \"-c\", \"cat >/dev/null && sleep 0.3 && printf ok\"]\n";
+    const SLOW_MOCK_AGENT_TOML: &str = "[[agents]]\nid = \"mock\"\nkind = \"command\"\ncommand = [\"sh\", \"-c\", \"cat >/dev/null && sleep 3 && printf ok\"]\n";
 
     #[tokio::test]
     async fn talks_report_independent_thinking_claims_and_queue_a_second_message() {
