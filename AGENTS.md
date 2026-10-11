@@ -2397,8 +2397,53 @@ own turn machinery runs it. No new seat, no new waiter, never a fresh agent.
 - **Known noise.** A `Blocked` task is reported again whenever its blockers or
   reason change (conductor block, unblock, block again).
 - The briefing (`talk::briefing_for`) tells the chat it cannot wait or push and
-  that only tasks it files report back; `Talk::notified` and `Turn::posted_by`
-  are `#[serde(default)]`, `talk::SCHEMA` is unchanged.
+  that filed tasks and registered watches report back; `Talk::notified` and
+  `Turn::posted_by` are `#[serde(default)]`, `talk::SCHEMA` is unchanged.
+
+### Telling the chat how a command it watched ended
+
+`src/chat_watch.rs` implements `magi talk watch [--timeout <seconds>] --
+<executable> <arguments...>`. Only `MAGI_NODE=chat` and an exact `MAGI_RUN`
+matching an existing open talk authorize it; there is no destination flag.
+Arguments are literal (explicitly invoke `sh -c` for shell syntax), the job
+uses the caller's current directory, and neither the supervisor nor its job
+inherits `MAGI_RUN` / `MAGI_NODE`.
+
+- **Durable reservations.** Under `<home>/chat-watches/store.lock`, reserve
+  one of four global slots before spawning a detached supervisor. The CLI
+  prints a watch id after startup acknowledgement. Default timeout is 900
+  seconds, maximum 3600; zero is refused. Limits are constants in
+  `chat_watch`, not additional configuration. Incomplete staging directories
+  are ignored; a published reservation is reconciled, never rerun.
+- **Supervision outlives serve.** An OS file lock on the job's `lease.lock`
+  lasts for the supervisor's whole lifetime and releases on death, replacing
+  heartbeat expiry guesses. PID plus process start time identify the child.
+  A launch wrapper cannot execute until its identity is persisted and it is
+  armed; a crash in the spawn/save gap leaves only an inert wrapper. Unix
+  process groups and Windows kill-on-close job objects contain descendants.
+  Timeout and normal exit clean up the group/tree and reap the direct child.
+  Pipe reads continually retain at most 8192 combined bytes of stdout/stderr;
+  inherited pipes cannot extend the supervisor's wait indefinitely.
+- **Loss is a result, never a retry.** When a released lease leaves no result,
+  sweeping terminates a child only with corroborated identity (or a gone group
+  leader), records an unknown result, and never executes the job again.
+  Unavailable process identity retains the reservation rather than risking
+  another process. Exit codes, signals, startup failure and timeout are
+  distinct reports. Killing a supervisor can lose its in-memory output tail.
+- **The existing delivery path.** `daemon::poll` sweeps watches beside task
+  notices, then `chat_notify::start_turns` uses `consult::drain_turns` in the
+  talk's own session and lease. Atomic result records and
+  `talk::queue_once` with `watch:<id>:finished` tolerate a restart between
+  saving the draft and marking delivery. Transient I/O failures retry; closed
+  or deleted talks are skipped and never reopened. Delivery waits until the
+  next serve startup if serve is stopped; the job continues independently.
+- **Automatic text stays automatic.** `prompt::chat_watch_notice` creates a
+  fixed English report with scrubbed, clipped, defused output quoted as
+  untrusted data. `prompt::is_completion_notice` is shared by draft-start
+  detection and `consult::latest_message`, so a report cannot become an owner
+  approval quote and cannot start an owner's unsent draft. The chat briefing
+  forbids promises to report back unless task filing or watch registration
+  succeeded. Watches do not grant additional repository write permissions.
 
 ### Handing a question to the chat it came from
 

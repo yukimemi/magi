@@ -2446,8 +2446,17 @@ pub fn briefing_for(
          You cannot wait, and you cannot send the operator a message on your \
          own: you only speak when they write. A task you file reports back \
          into this conversation automatically when it finishes, is held or \
-         fails, as a message headed \"{notice}\", so never promise to \"tell \
-         them when it is done\" for anything else.\n\n\
+         fails, as a message headed \"{notice}\".\n\n\
+         For a background command you run yourself, register it with \
+         `magi talk watch --timeout 900 -- <executable> <arguments...>`, for \
+         example `magi talk watch -- cargo test --locked`. It uses your \
+         current directory; arguments are passed literally. For shell syntax, \
+         explicitly call `sh -c`. Only after watch registration succeeds may \
+         you promise a completion report. Watches default to 900 seconds, \
+         accept at most 3600 seconds, and share four concurrent slots. Their \
+         automatic reports resume this conversation through its own turn. \
+         Never promise to report back on work that is neither a filed task \
+         nor a successfully registered watch.\n\n\
          The current state of the code is whatever origin/main holds, not \
          whatever a working tree shows: a primary checkout often lags \
          upstream, sits on a detached HEAD and carries uncommitted changes. \
@@ -4922,6 +4931,8 @@ mod tests {
             "{b}"
         );
         assert!(b.contains(crate::prompt::CHAT_TASK_NOTICE_HEADING));
+        assert!(b.contains("magi talk watch --timeout 900"));
+        assert!(b.contains("nor a successfully registered watch"));
     }
 
     #[test]

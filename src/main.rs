@@ -596,6 +596,19 @@ enum Command {
 /// Operations on a chat conversation.
 #[derive(Debug, Subcommand)]
 enum TalkCmd {
+    /// Run a supervised background job and report completion in this chat.
+    Watch {
+        /// Duration in seconds (1..=3600).
+        #[arg(long, default_value_t = magi::chat_watch::DEFAULT_TIMEOUT)]
+        timeout: u64,
+        /// Executable and arguments; use an explicit shell for shell syntax.
+        #[arg(required = true, trailing_var_arg = true)]
+        command: Vec<String>,
+    },
+    #[command(hide = true)]
+    WatchRun { home: PathBuf, id: String },
+    #[command(hide = true)]
+    WatchExec { home: PathBuf, id: String },
     /// Append a message to a conversation's transcript without starting a turn.
     ///
     /// Only for an agent seat (`MAGI_RUN` / `MAGI_NODE`) working on a task that
@@ -1669,6 +1682,20 @@ async fn dispatch(command: Command) -> Result<()> {
 
         Command::Talk { command } => match command {
             TalkCmd::Post { talk_id, message } => talk_post(&talk_id, &message),
+            TalkCmd::Watch { timeout, command } => {
+                let id = magi::chat_watch::start(
+                    &magi::run::home(),
+                    &magi::talk::Talks::open(),
+                    &std::env::var("MAGI_RUN").unwrap_or_default(),
+                    &std::env::var("MAGI_NODE").unwrap_or_default(),
+                    command,
+                    timeout,
+                )?;
+                println!("watch {id} registered");
+                Ok(())
+            }
+            TalkCmd::WatchRun { home, id } => magi::chat_watch::supervise(&home, &id),
+            TalkCmd::WatchExec { home, id } => magi::chat_watch::execute(&home, &id),
         },
 
         Command::Doctor { repo, config } => doctor(&repo, config.as_deref()).await,
