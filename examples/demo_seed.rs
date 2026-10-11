@@ -265,6 +265,7 @@ fn judgement(judge: usize, ranking: [char; 3], why: [&str; 3]) -> Judgement {
             .collect::<BTreeMap<_, _>>(),
         ranking: ranking.to_vec(),
         confidence: Some(8),
+        strengths: BTreeMap::new(),
         order: vec![0, 1, 2],
         failed: None,
         duration_ms: 41_000,

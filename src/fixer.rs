@@ -1,8 +1,8 @@
 //! The `[roles] fixer` fallback chain, shared by every node that asks a fixer.
 //!
-//! Four nodes turn a fixer into a seat: the review loop's fix rounds (and the
-//! operator-selected fix), the gate-fix round, `land`'s fix rounds and the
-//! rebase conflict round. Each of them runs a plain forward `for` over
+//! Five nodes turn a fixer into a seat: the review loop's fix rounds (and the
+//! operator-selected fix), the gate-fix round, `land`'s fix rounds, the
+//! rebase conflict round and the graft round. Each of them runs a plain forward `for` over
 //! [`attempts`] and moves to the next entry only when the call advances
 //! ([`crate::agent::output_advances`], the same decision point the other
 //! chained roles use); this module holds what they would otherwise each
@@ -31,7 +31,7 @@ use crate::run::{Candidate, FailClass, Handover, RunState};
 /// consumer records its handovers under exactly one of these, so the two sides
 /// cannot disagree: a name here that nobody records would send every round
 /// back to the first agent and bill its quota again.
-pub const FIX_NODES: [&str; 4] = ["fix", "gate-fix", "land", "rebase"];
+pub const FIX_NODES: [&str; 5] = ["fix", "gate-fix", "land", "rebase", "graft"];
 
 /// The agents to ask, in order, each with the seat key it sits in.
 ///
@@ -74,6 +74,22 @@ pub fn attempts(
                 (f.clone(), "fix".to_owned())
             }
         })
+        .collect()
+}
+
+/// [`attempts`] for the graft round: the same agents in the same order, but
+/// every entry sits in the one `graft` seat - never the winner's `impl-<label>`
+/// conversation, which remembers the implementation. A fresh seat per agent
+/// ([`seat_for`] semantics) keeps what the winner's author knew out of a round
+/// that is told about candidates by label only.
+pub fn graft_attempts(
+    state: &RunState,
+    roles: &ResolvedRoles,
+    winner: &Candidate,
+) -> Vec<(AgentSpec, String)> {
+    attempts(state, roles, winner)
+        .into_iter()
+        .map(|(spec, _)| (spec, "graft".to_owned()))
         .collect()
 }
 
@@ -176,5 +192,7 @@ mod tests {
             sticky_start(&chain, &[handover("fix", "c"), handover("land", "a")]),
             0
         );
+        // A graft handover is a fixer handover too.
+        assert_eq!(sticky_start(&chain, &[handover("graft", "b")]), 1);
     }
 }

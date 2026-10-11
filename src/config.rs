@@ -506,6 +506,15 @@ pub struct Graph {
     /// names as the point where a fourth judge's first choice stopped
     /// changing the tally.
     pub advisors: usize,
+    /// After the tally picks a winner and before the review loop, a fixer
+    /// round ports the strengths the judges explicitly attributed to the
+    /// losing candidates onto the winner (`graph::Runner::graft`). Skipped
+    /// for a single candidate, a run with no winner or no quorum, and when
+    /// no judge recorded a strength for a loser. Best-effort: a failure, a
+    /// quota hit, no change or a diff over the size limit restores the
+    /// winner's pre-graft commit and the run carries on as if this were off.
+    /// On by default.
+    pub graft_runner_up: bool,
 }
 
 impl Default for Graph {
@@ -540,6 +549,7 @@ impl Default for Graph {
             e2e_every_round: false,
             advise: true,
             advisors: 3,
+            graft_runner_up: true,
         }
     }
 }
@@ -2104,6 +2114,9 @@ impl Config {
              review_rounds = 6\n\
              # Fix rounds a failing verify.gate gets before the run is blocked (0 = none).\n\
              gate_fix_rounds = 1\n\
+             # Port the strengths judges named in the losing candidates onto the\n\
+             # winner before review (best-effort; rolled back on failure or a big diff).\n\
+             graft_runner_up = true\n\
              max_parallel = 4\n\
              language = \"en\"\n\
              # One CLI conversation per seat: judges keep their own argument\n\
@@ -2878,6 +2891,7 @@ mod tests {
     fn advise_defaults_to_on_with_three_proposals() {
         let g = Graph::default();
         assert!(g.advise);
+        assert!(g.graft_runner_up, "graft is on by default");
         assert_eq!(g.advisors, 3);
     }
 

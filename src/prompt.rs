@@ -611,9 +611,14 @@ pub fn judge(
          ```json\n\
          {\"ranking\":[\"<best>\",\"...\",\"<worst>\"],\
          \"reasons\":{\"A\":\"one or two sentences\"},\
+         \"strengths\":{\"B\":[\"one concrete, portable point\"]},\
          \"confidence\":3}\n\
          ```\n\n\
-         `ranking` must list every candidate label exactly once.",
+         `ranking` must list every candidate label exactly once. `strengths` is \
+         optional: for a candidate you did not rank first, list only specific \
+         things in it that are worth porting onto the winner (a handled edge \
+         case, a better test, a cleaner helper). Leave a candidate out, or \
+         `strengths` empty, when it has nothing the winner lacks.",
     );
     s.push_str(&lang(language));
     s
@@ -1196,6 +1201,64 @@ pub fn gate_fix(
     s.push_str(&ask_the_owner(language));
     s.push_str(&lang(language));
     s.push_str(&github_english(language));
+    s
+}
+
+/// What the fixer is told in the graft round: port the named strengths of the
+/// losing candidates onto the winner, and nothing else.
+///
+/// The heading `# Graft the runner-up strengths` is load-bearing:
+/// `tests/common/mod.rs` dispatches its mock on it. Only labels appear here,
+/// never an agent id; the strengths were sanitized by the caller.
+pub fn graft(
+    instruction: &str,
+    winner: char,
+    strengths: &[(char, String, Vec<String>)],
+    limit: usize,
+    language: &str,
+) -> String {
+    let mut s = format!(
+        "# Graft the runner-up strengths\n\n\
+         Several candidates implemented the task below independently and \
+         candidate {winner} won. You are working in the winner's worktree. \
+         The judges noted specific strengths in the other candidates; your \
+         job is to port those, and only those, onto the winner.\n\n\
+         # The task\n\n{instruction}\n\n\
+         # Strengths to port\n"
+    );
+    for (label, branch, items) in strengths {
+        let _ = write!(
+            s,
+            "\n## From candidate {label} (branch `{branch}`, read-only)\n\n"
+        );
+        for item in items {
+            let _ = writeln!(s, "- {item}");
+        }
+    }
+    let _ = write!(
+        s,
+        "\n# Rules\n\n\
+         1. Port only the strengths listed above. Anything else in the other \
+            candidates is out of scope. Read a candidate's branch with git if you \
+            need its code; never check it out here or merge it.\n\
+         2. Adapt each one to the winner's design and naming. Never replace \
+            the winner's approach with another candidate's.\n\
+         3. Keep the diff small: at most about {limit} changed lines in total. \
+            A larger change is discarded whole. Skip a strength that does not \
+            fit that.\n\
+         4. Keep the tests passing, and commit the change in this worktree. If \
+            nothing is worth porting, change nothing.\n\
+         5. Never name yourself, your vendor, or your model, anywhere.\n\
+         6. If you start something in the background (a test run, a build), \
+            do not end your reply while it is still pending.\n\n\
+         # Output\n\n\
+         Your reasoning first, then exactly one fenced json block, last:\n\n\
+         ```json\n\
+         {{\"addressed\":[],\"rejected\":[],\"notes\":\"what was ported\"}}\n\
+         ```"
+    );
+    s.push('\n');
+    s.push_str(&lang(language));
     s
 }
 

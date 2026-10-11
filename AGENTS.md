@@ -590,6 +590,54 @@ docs, and each is asserted in `src/agent.rs` tests:
 may rely on memory. If it says no, the node re-sends full context. Never assume
 a resume worked.
 
+### The graft phase: best-effort, label-only, rolled back on any doubt
+
+`[graph] graft_runner_up` (default on) runs `graph::Runner::graft` in
+`finish_after_tally`, **before `fold_losers`** (the losers' branches are what the
+fixer may read; fold deletes them) and before `sync_to_base` / the review loop.
+A fixer round ports the strengths the judges attributed to the losing
+candidates onto the winner. Decisions are pure and live in `src/graft.rs`.
+
+- **Skips are visible and leave the winner alone.** `graft::plan` returns a
+  `Skip` (off, fewer than two candidates, no tally, no quorum, no strengths,
+  already done); the reason becomes a `graft` run event (`skipped: ...`, once).
+  The input is only `Judgement::strengths` (`verdict::Ranking::strengths`,
+  `#[serde(default)]`, asked for in the judge prompt's JSON example; the
+  heading `independent judges` that the mock greps is unchanged): labels of
+  non-winning, unfolded candidates, deduplicated across judges and passed
+  through `blind::sanitize_prose`. Reasons are never mined for strengths.
+- **Blindness.** `prompt::graft` (heading `# Graft the runner-up strengths`,
+  which `tests/common/mod.rs` greps) names the task, labels, branches and the
+  strengths, never an agent id. The seat is `graft`, never the winner's
+  `impl-<label>` (`fixer::graft_attempts`), so the conversation that wrote the
+  winner is not reused.
+- **Chain.** It uses `ask_fixer_among` over `fixer::graft_attempts`; handovers
+  are recorded under exactly `"graft"`, which is in `fixer::FIX_NODES`. A
+  consequence accepted on purpose: a graft handover is sticky for the later
+  fix, gate-fix, land and rebase rounds of the same run. Between agents the
+  worktree is restored to the pre-graft commit.
+- **The valve.** `RunState::graft` (`GraftRecord`, `#[serde(default)]`, so
+  `run::SCHEMA` is unchanged) saves `pre` and `Running` *before* the fixer is
+  called. After it: a failure, a dropped stream, quota, an unusable reply, no
+  change, or `lines > graft::limit(W)` restores `pre` (`git::restore_to`:
+  `reset --hard` plus `clean -fd`, never `-x`, so setup products survive) and
+  the run goes on as if graft were off. `W` is the winner's changed lines
+  against the base, `lines` the graft's own (numstat added + removed, binary or
+  unmeasurable = rejected), and the limit is `min(400, max(40, ceil(W/4)))`:
+  a quarter keeps it a supplement, half would let it replace the winner. A
+  quota hit pushes `QuotaLoss { node: "graft" }` like other fixer nodes; the
+  refund rule (`Verdict::quota_hit`) is unchanged and graft never stalls or
+  blocks the run. A record found `Running` on re-entry is restored to `pre` and
+  becomes `RolledBack("interrupted")`; a settled record, or a run that already
+  has reviews, is never grafted again.
+- **The one thing that blocks.** A rollback is settled only after the restore
+  is confirmed (`graft_restore`: `reset` succeeded and `HEAD == pre`). If it is
+  not (a stale `index.lock`, say), the record stays `Running`, the run becomes
+  `Blocked` and is resumable, and a resume retries the restore - the rejected
+  commit is never reviewed, gated or merged.
+- Everything after is unchanged: the review loop and `verify.gate` see the
+  grafted tree like any other.
+
 ### A reviewer seat remembers who failed it across review rounds
 
 `RunState::seat_history` (`run::SeatHistory`, `#[serde(default)]`, so

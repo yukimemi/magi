@@ -37,6 +37,7 @@ use crate::config::{
 };
 use crate::fixer;
 use crate::git;
+use crate::graft;
 use crate::land;
 use crate::proc::Quiet as _;
 use crate::prompt::{
@@ -46,10 +47,11 @@ use crate::queue;
 use crate::refs;
 use crate::run::{
     BaseSync, Candidate, CommandOutcome, ContinuationOutcome, ContinuationRecord,
-    DeliberationRound, DeliberationTurn, E2eStatus, FailClass, FixRecord, GateFixRecord, Handover,
-    JobRecord, JobStatus, Judgement, MergeOutcome, OperatorFixFinding, OperatorFixOutcome,
-    OperatorFixRequest, Origin, QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState,
-    RunStatus, SeatHistory, Tally, VoteRecord, tail, write_artifact,
+    DeliberationRound, DeliberationTurn, E2eStatus, FailClass, FixRecord, GateFixRecord,
+    GraftOutcome, GraftRecord, Handover, JobRecord, JobStatus, Judgement, MergeOutcome,
+    OperatorFixFinding, OperatorFixOutcome, OperatorFixRequest, Origin, QuotaLoss, ReviewRecord,
+    ReviewRevoteRecord, ReviewRound, RunState, RunStatus, SeatHistory, Tally, VoteRecord, tail,
+    write_artifact,
 };
 use crate::verdict::{
     self, FinalVote, Finding, FixReport, Position, Proposal, Ranking, Review, ReviewRevote,
@@ -1155,6 +1157,9 @@ impl Runner {
     /// The tail of the graph after a trustworthy tally: fold losers, review,
     /// gate, merge, and persist.
     async fn finish_after_tally(&mut self) -> Result<()> {
+        // Before the losers are folded: their branches are what the graft
+        // reads from.
+        self.graft().await?;
         self.fold_losers().await?;
         // Before review starts, and again right before the gate: a run's
         // review rounds can themselves take long enough for the base to move
@@ -2687,6 +2692,7 @@ impl Runner {
                 ranking: Vec::new(),
                 reasons: BTreeMap::new(),
                 confidence: None,
+                strengths: BTreeMap::new(),
                 order: orders[j].clone(),
                 failed: None,
                 duration_ms: 0,
@@ -2695,6 +2701,7 @@ impl Runner {
                 Ok((ranking, out)) => {
                     record.ranking = ranking.normalized();
                     record.reasons = ranking.reasons;
+                    record.strengths = ranking.strengths;
                     record.confidence = ranking.confidence;
                     record.duration_ms = out.duration_ms;
                     self.state.event(
@@ -3326,6 +3333,7 @@ impl Runner {
                     record.agent = agent_id;
                     record.ranking = ranking.normalized();
                     record.reasons = ranking.reasons;
+                    record.strengths = ranking.strengths;
                     record.confidence = ranking.confidence;
                     record.failed = None;
                     record.duration_ms = out.duration_ms;
@@ -3454,6 +3462,296 @@ impl Runner {
             .as_ref()
             .map(|t| t.met_quorum)
             .unwrap_or(false))
+    }
+
+    // ---------------------------------------------------------------- graft
+
+    /// Port the strengths the judges attributed to the losing candidates onto
+    /// the winner, once, between the tally and the review loop.
+    ///
+    /// Best-effort by construction: it returns nothing and fails nothing. A
+    /// skip, a fixer that failed or hit quota, a round that changed nothing
+    /// and a result over the size limit ([`graft::limit`]) all leave the
+    /// winner exactly at the commit it had before (`GraftRecord::pre`) and the
+    /// run carries on as if the phase were off. See [`graft`] for the
+    /// decisions and `AGENTS.md` for the invariants.
+    ///
+    /// The one exception is a rollback that could not be confirmed: the
+    /// rejected commit may still be the winner's tip, so the run is blocked
+    /// (resumable; the record stays `Running`, which makes a resume retry the
+    /// restore) instead of reviewing, gating and merging it.
+    async fn graft(&mut self) -> Result<()> {
+        let Err(e) = self.graft_inner().await else {
+            return Ok(());
+        };
+        if e.downcast_ref::<GraftRestoreFailed>().is_some() {
+            self.state.status = RunStatus::Blocked;
+            self.state.event("graft", format!("blocked: {e:#}"));
+            self.state.save()?;
+            return Err(e);
+        }
+        // An error after the `Running` record was saved may have left the
+        // fixer's work in the tree: the record must not stay unsettled
+        // (a later resume would reset past the review fixes), so confirm the
+        // restore now, or block.
+        if let Some(rec) = self.state.graft.clone()
+            && !rec.outcome.settled()
+        {
+            if let Some(winner) = self.state.winner().cloned() {
+                if let Err(re) = Self::graft_restore(&winner.worktree, &rec.pre).await {
+                    self.state.status = RunStatus::Blocked;
+                    self.state.event("graft", format!("blocked: {re:#}"));
+                    self.state.save()?;
+                    return Err(re);
+                }
+            }
+            if let Some(g) = self.state.graft.as_mut() {
+                g.outcome = GraftOutcome::RolledBack(format!("{e:#}"));
+            }
+        }
+        self.state.event("graft", format!("skipped: {e:#}"));
+        if let Err(e) = self.state.save() {
+            tracing::warn!("save after graft: {e:#}");
+        }
+        Ok(())
+    }
+
+    /// Put the winner back on `pre` and confirm it: a failed `reset` (a stale
+    /// `index.lock`, say) or a tip that is not `pre` afterwards is an error.
+    async fn graft_restore(wt: &Path, pre: &str) -> Result<()> {
+        let restored = git::restore_to(wt, pre).await;
+        let tip = git::rev_parse(wt, "HEAD").await;
+        match (restored, tip) {
+            (Ok(()), Ok(tip)) if tip == pre => Ok(()),
+            (Err(e), _) => Err(GraftRestoreFailed(format!("{e:#}")).into()),
+            (Ok(()), Ok(tip)) => {
+                Err(GraftRestoreFailed(format!("the winner is at {tip}, not {pre}")).into())
+            }
+            (Ok(()), Err(e)) => Err(GraftRestoreFailed(format!("{e:#}")).into()),
+        }
+    }
+
+    /// A skip is a run event, recorded once however often the node is re-entered.
+    fn graft_skipped(&mut self, why: &str) {
+        let message = format!("skipped: {why}");
+        if !self
+            .state
+            .events
+            .iter()
+            .any(|e| e.node == "graft" && e.message == message)
+        {
+            self.state.event("graft", message);
+        }
+    }
+
+    async fn graft_inner(&mut self) -> Result<()> {
+        // A round that was started and never finished (crash, kill): the
+        // fixer may have left anything in the tree, so put the winner back.
+        if let Some(rec) = self.state.graft.clone()
+            && !rec.outcome.settled()
+        {
+            // Reviews exist only if the graft ended without its record being
+            // settled (a swallowed error): the tree has moved on since, and
+            // a reset to `pre` would discard the review fixes.
+            if self.state.reviews.is_empty()
+                && let Some(winner) = self.state.winner().cloned()
+            {
+                Self::graft_restore(&winner.worktree, &rec.pre).await?;
+            }
+            if let Some(g) = self.state.graft.as_mut() {
+                g.outcome = GraftOutcome::RolledBack(graft::INTERRUPTED.to_owned());
+            }
+            self.state.event(
+                "graft",
+                "rolled back: the previous round was interrupted; the winner is untouched",
+            );
+            self.state.save()?;
+            return Ok(());
+        }
+        let plan = match graft::plan(&self.state) {
+            Ok(plan) => plan,
+            Err(skip) => {
+                if skip != graft::Skip::AlreadyDone {
+                    self.graft_skipped(skip.reason());
+                    self.state.save()?;
+                }
+                return Ok(());
+            }
+        };
+        let Some(winner) = self.state.winner().cloned() else {
+            return Ok(());
+        };
+        let wt = winner.worktree.clone();
+        if !git::is_clean(&wt).await? {
+            self.graft_skipped("the winner's worktree has uncommitted changes");
+            self.state.save()?;
+            return Ok(());
+        }
+        let pre = git::rev_parse(&wt, "HEAD").await?;
+        let Some(winner_lines) = git::changed_lines(&wt, &self.state.base_commit, &pre).await
+        else {
+            self.graft_skipped("the winner's diff could not be measured");
+            self.state.save()?;
+            return Ok(());
+        };
+        let limit = graft::limit(winner_lines);
+        // Saved before the fixer is called: a stop from here on is repaired
+        // by the branch above on the next entry.
+        self.state.graft = Some(GraftRecord {
+            pre: pre.clone(),
+            post: None,
+            lines: None,
+            limit: Some(limit),
+            agent: None,
+            outcome: GraftOutcome::Running,
+        });
+        self.state.event(
+            "graft",
+            format!(
+                "porting strengths of candidate(s) {} onto {} (limit {limit} changed lines)",
+                plan.strengths
+                    .iter()
+                    .map(|(l, _, _)| l.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                plan.winner
+            ),
+        );
+        self.state.save()?;
+
+        let fix_prompt = prompt::graft(
+            &self.state.instruction,
+            plan.winner,
+            &plan.strengths,
+            limit,
+            &self.state.config.graph.language,
+        );
+        let timeout = Duration::from_secs(self.state.config.graph.timeout_fix);
+        let sessions = self.state.config.graph.sessions;
+        let artifacts = agent::artifacts_dir(&self.state.dir());
+        let attempts = fixer::graft_attempts(&self.state, &self.roles, &winner);
+        let (_, seat, out) = self
+            .ask_fixer_among(attempts, "graft", None, Some((&wt, &pre)), |spec, seat| {
+                SeatJob {
+                    prompt: fix_prompt.clone(),
+                    spec,
+                    seat,
+                    cwd: wt.clone(),
+                    timeout,
+                    allow_write: true,
+                    sessions,
+                    artifacts: artifacts.clone(),
+                    stem: "graft".to_owned(),
+                    handover: None,
+                }
+            })
+            .await;
+        let mut why: Option<String> = None;
+        match &out {
+            AgentOutcome::Ok(o) if agent::output_advances(o) => {
+                why = Some("the fixer produced nothing usable".to_owned());
+            }
+            AgentOutcome::Ok(_) => {}
+            AgentOutcome::Dropped(_) => why = Some("the CLI dropped the stream".to_owned()),
+            AgentOutcome::Quota(o) => {
+                self.state.quota.push(QuotaLoss {
+                    seat: seat.key.clone(),
+                    node: "graft".to_owned(),
+                    at: Timestamp::now(),
+                    reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
+                });
+                why = Some("rate limited (quota)".to_owned());
+            }
+            AgentOutcome::Failed(e) => {
+                why = Some(format!(
+                    "the fixer failed: {}",
+                    e.lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(160)
+                        .collect::<String>()
+                ));
+            }
+        }
+        let agent_id = seat.agent.clone();
+        self.state.seats.insert(seat.key.clone(), seat);
+
+        let mut post = None;
+        let mut lines = None;
+        if why.is_none() {
+            let rescued = git::rescue_commit(&wt, "magi: graft (uncommitted work)").await;
+            if let Ok(r) = &rescued {
+                self.state.note_withheld("graft", &r.withheld);
+            }
+            let head = git::rev_parse(&wt, "HEAD").await?;
+            // What is measured must be what gets reviewed and gated: a failed
+            // rescue, or anything still uncommitted (withheld lockfiles
+            // aside, which are never part of the tree), rejects the graft.
+            let dirty = match &rescued {
+                Ok(r) => git::status_porcelain(&wt)
+                    .await
+                    .map(|st| {
+                        st.lines().any(|l| {
+                            !r.withheld
+                                .iter()
+                                .any(|w| l.trim_end().ends_with(w.path.as_str()))
+                        })
+                    })
+                    .unwrap_or(true),
+                Err(_) => true,
+            };
+            if dirty {
+                why = Some("the fixer left changes that could not be committed".to_owned());
+            } else if head == pre {
+                why = Some("the fixer changed nothing".to_owned());
+            } else {
+                lines = git::changed_lines(&wt, &pre, &head).await;
+                if graft::within_budget(lines, limit) {
+                    post = Some(head);
+                } else {
+                    why = Some(format!(
+                        "{} changed lines against a limit of {limit}",
+                        lines.map_or_else(
+                            || "an unmeasurable number of".to_owned(),
+                            |l| l.to_string()
+                        )
+                    ));
+                }
+            }
+        }
+        let outcome = match why {
+            None => {
+                self.state.event(
+                    "graft",
+                    format!(
+                        "applied: {} changed lines (limit {limit})",
+                        lines.unwrap_or(0)
+                    ),
+                );
+                GraftOutcome::Applied
+            }
+            Some(why) => {
+                // Not settled until the restore is confirmed: the record
+                // stays `Running`, so a resume retries it.
+                Self::graft_restore(&wt, &pre).await?;
+                self.state.event(
+                    "graft",
+                    format!("rolled back: {why}; the winner is untouched"),
+                );
+                GraftOutcome::RolledBack(why)
+            }
+        };
+        self.state.graft = Some(GraftRecord {
+            pre,
+            post,
+            lines,
+            limit: Some(limit),
+            agent: Some(agent_id),
+            outcome,
+        });
+        self.state.save()?;
+        Ok(())
     }
 
     // ----------------------------------------------------------------- fold
@@ -4475,10 +4773,26 @@ impl Runner {
         round: Option<usize>,
         build: impl Fn(AgentSpec, SeatState) -> SeatJob,
     ) -> (SeatJob, SeatState, AgentOutcome) {
+        let attempts = fixer::attempts(&self.state, &self.roles, winner);
+        self.ask_fixer_among(attempts, node, round, None, build)
+            .await
+    }
+
+    /// [`Self::ask_fixer`] over an explicit attempt list. `restore` is a
+    /// worktree and a commit: before the next agent is asked after one that
+    /// did not satisfy the call, the worktree is put back on that commit, so
+    /// a failed agent's partial edits are not carried into the next one.
+    async fn ask_fixer_among(
+        &mut self,
+        attempts: Vec<(AgentSpec, String)>,
+        node: &'static str,
+        round: Option<usize>,
+        restore: Option<(&Path, &str)>,
+        build: impl Fn(AgentSpec, SeatState) -> SeatJob,
+    ) -> (SeatJob, SeatState, AgentOutcome) {
         let run_id = self.state.id.clone();
         let prompts = self.state.config.prompts.clone();
         let cache = self.state.config.cache_dir();
-        let attempts = fixer::attempts(&self.state, &self.roles, winner);
         let ids: Vec<String> = attempts.iter().map(|(s, _)| s.id.clone()).collect();
         let mut last = None;
         for (i, (spec, key)) in attempts.into_iter().enumerate() {
@@ -4520,6 +4834,18 @@ impl Runner {
                     &class,
                     &reason,
                 );
+                // A failed agent's edits must not reach the next one, and a
+                // restore that did not work ends the chain: the call fails
+                // and the caller's own (confirmed) restore decides.
+                if let Some((wt, rev)) = restore
+                    && let Err(e) = git::restore_to(wt, rev).await
+                {
+                    let why =
+                        format!("could not restore the worktree before the next fixer: {e:#}");
+                    tracing::warn!("{why}");
+                    last = Some((job, seat, AgentOutcome::Failed(why)));
+                    break;
+                }
                 continue;
             }
             last = Some((job, seat, out));
@@ -12565,3 +12891,20 @@ mod tests {
         assert_eq!(runner.state.status, RunStatus::Failed);
     }
 }
+
+/// A graft rollback whose restore could not be confirmed (see
+/// [`Runner::graft`]).
+#[derive(Debug)]
+struct GraftRestoreFailed(String);
+
+impl std::fmt::Display for GraftRestoreFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "could not restore the winner to its pre-graft commit: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for GraftRestoreFailed {}

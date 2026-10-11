@@ -392,6 +392,65 @@ pub async fn diff_stat(worktree: &Path, base: &str, head: &str) -> Result<String
     git(worktree, &["diff", "--no-color", "--stat", &range]).await
 }
 
+/// Total changed lines (added + removed) between two revisions, from
+/// `--numstat`. `None` when git could not say, or a binary file changed
+/// (numstat prints `-` for it): a size that cannot be measured is not small.
+pub async fn changed_lines(worktree: &Path, base: &str, head: &str) -> Option<usize> {
+    let out = git_raw(worktree, &["diff", "--numstat", base, head])
+        .await
+        .ok()?;
+    if !out.ok() {
+        return None;
+    }
+    let mut total = 0usize;
+    for line in out.stdout.lines().filter(|l| !l.trim().is_empty()) {
+        let mut cols = line.split('\t');
+        let added: usize = cols.next()?.parse().ok()?;
+        let removed: usize = cols.next()?.parse().ok()?;
+        total = total.saturating_add(added).saturating_add(removed);
+    }
+    Some(total)
+}
+
+/// Put the worktree back on `rev`: tracked files reset, untracked files
+/// removed. Ignored paths (a `[worktree] setup`'s products are hidden through
+/// the per-worktree excludes) are left alone.
+pub async fn restore_to(worktree: &Path, rev: &str) -> Result<()> {
+    git(worktree, &["reset", "--hard", "-q", rev]).await?;
+    // `-ff`: a single `-f` skips untracked nested git repositories, which is
+    // what a submodule or clone added by a rejected change leaves behind.
+    git(worktree, &["clean", "-ffdq"]).await?;
+    // The parent's reset leaves an initialised submodule's own tree alone
+    // (`submodule.recurse` defaults to false): put each back on the commit the
+    // parent records (`--checkout` overrides a configured
+    // `submodule.<name>.update` such as `none`), and drop what is untracked inside. No-ops without
+    // submodules; an error is an unconfirmed restore.
+    git(
+        worktree,
+        &[
+            "submodule",
+            "--quiet",
+            "update",
+            "--recursive",
+            "--force",
+            "--checkout",
+        ],
+    )
+    .await?;
+    git(
+        worktree,
+        &[
+            "submodule",
+            "--quiet",
+            "foreach",
+            "--recursive",
+            "git clean -ffdq",
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Number of files touched by `base...head`.
 pub async fn changed_files(worktree: &Path, base: &str, head: &str) -> Result<Vec<String>> {
     let range = format!("{base}...{head}");
@@ -1212,6 +1271,45 @@ mod tests {
         git(&repo, &["add", "-A"]).await.unwrap();
         git(&repo, &["commit", "-m", "init"]).await.unwrap();
         (dir, repo)
+    }
+
+    #[tokio::test]
+    async fn restore_to_removes_nested_repositories_inside_submodules() {
+        let (_parent_dir, repo) = scratch().await;
+        let (_source_dir, source) = scratch().await;
+        sh(
+            &repo,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                &source.to_string_lossy(),
+                "sub",
+            ],
+        );
+        sh(&repo, &["commit", "-am", "add submodule"]);
+        let pre = rev_parse(&repo, "HEAD").await.unwrap();
+        let sub = repo.join("sub");
+        sh(&sub, &["init", "nested"]);
+        tokio::fs::write(sub.join("nested/rejected.txt"), "rejected\n")
+            .await
+            .unwrap();
+
+        restore_to(&repo, &pre).await.unwrap();
+
+        assert!(!sub.join("nested").exists());
+        assert_eq!(rev_parse(&repo, "HEAD").await.unwrap(), pre);
+        assert_eq!(
+            rev_parse(&sub, "HEAD").await.unwrap(),
+            rev_parse(&source, "HEAD").await.unwrap()
+        );
+        assert!(
+            git(&repo, &["status", "--porcelain"])
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

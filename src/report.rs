@@ -560,6 +560,22 @@ pub fn run(state: &RunState) -> String {
         }
     }
 
+    if let Some(g) = &state.graft {
+        let _ = writeln!(s, "\n{}", bold("graft"));
+        let size = match (g.lines, g.limit) {
+            (Some(l), Some(m)) => format!("  {l} changed lines (limit {m})"),
+            (None, Some(m)) => format!("  limit {m} changed lines"),
+            _ => String::new(),
+        };
+        let _ = match &g.outcome {
+            crate::run::GraftOutcome::Applied => writeln!(s, "  {}{size}", green("applied")),
+            crate::run::GraftOutcome::Running => writeln!(s, "  {}{size}", yellow("unfinished")),
+            crate::run::GraftOutcome::RolledBack(why) => {
+                writeln!(s, "  {} {why}{size}", yellow("rolled back:"))
+            }
+        };
+    }
+
     if !state.reviews.is_empty() {
         let _ = writeln!(s, "\n{}", bold("review + verification"));
         for r in &state.reviews {
