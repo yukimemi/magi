@@ -116,8 +116,9 @@ fn builtins() -> Vec<Persona> {
         .collect()
 }
 
-/// Check `[[talk.personas]]`: non-blank ids, unique ids, an `icon` of a valid
-/// shape, and no redefinition of `default` beyond its `icon`. A built-in's id
+/// Check `[[talk.personas]]`: non-blank ids, unique ids, and no redefinition
+/// of `default` beyond its `icon`. Icons are validated only when served so a
+/// bad image never invalidates the conversation config. A built-in's id
 /// may omit `name` and `prompt` (the built-in's are kept); a new id may not.
 pub fn validate(specs: &[PersonaSpec]) -> Result<()> {
     let mut seen = BTreeSet::new();
@@ -142,11 +143,6 @@ pub fn validate(specs: &[PersonaSpec]) -> Result<()> {
             if !voiced {
                 bail!("[[talk.personas]] `{id}` has an empty `prompt`");
             }
-        }
-        if let Some(icon) = &p.icon
-            && let Err(e) = crate::persona_icon::validate_shape(icon)
-        {
-            bail!("[[talk.personas]] `{id}`: {e}");
         }
         if !seen.insert(id.to_owned()) {
             bail!("[[talk.personas]] declares the id `{id}` more than once");
@@ -368,17 +364,15 @@ mod tests {
     }
 
     #[test]
-    fn a_bad_icon_shape_is_refused() {
+    fn a_bad_icon_shape_does_not_invalidate_the_persona() {
         for bad in [
             "rel.png",
             "/a/../b.png",
             "/a/b.svg",
             "data:text/html;base64,AA",
         ] {
-            let err = validate(&[with_icon(spec("a", "n", "p"), bad)])
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains("`a`") && err.contains("icon"), "{err}");
+            assert!(validate(&[with_icon(spec("a", "n", "p"), bad)]).is_ok());
+            assert!(crate::persona_icon::load(bad).is_err());
         }
     }
 

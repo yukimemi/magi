@@ -1257,9 +1257,10 @@ briefing is byte-for-byte unchanged for it.
   byte-for-byte unchanged) is a `data:image/(png|jpeg|gif|webp);base64,` URI or
   an absolute / `~/` path to a `.png/.jpg/.jpeg/.gif/.webp`, at most 256 KiB
   (the string, the decoded data, the file). A built-in id may omit `name` and
-  `prompt` and keeps the built-in's. `persona::validate` checks the *shape*
-  only and refuses a bad one (relative path, `..`, other extension, other data
-  type, oversize) with the config; existence and content are judged at serve time.
+  `prompt` and keeps the built-in's. Icon shape, existence and content are
+  checked at serve time; invalid icons (including blank, relative path, `..`,
+  other extension, other data type or oversize) fall back to the built-in
+  without invalidating the config or interrupting conversation operations.
 - **One serving path.** The client only ever gets server-built URLs
   (`TalkView::persona_avatar`, `PersonaEntry::avatar`, `&v=` is a fingerprint of
   the setting); the `icon` string never leaves the server.

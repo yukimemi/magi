@@ -3180,7 +3180,7 @@ mod tests {
     }
 
     #[test]
-    fn talk_persona_icon_parses_and_a_bad_shape_is_refused() {
+    fn talk_persona_icon_parses_and_a_bad_shape_keeps_config_usable() {
         let dir = tempfile::tempdir().unwrap();
         let load = |body: &str| {
             let path = dir.path().join("c.toml");
@@ -3196,9 +3196,22 @@ mod tests {
         assert_eq!(c[0].icon.as_deref(), Some("data:image/png;base64,AAAA"));
         assert_eq!(c[2].icon.as_deref(), Some("~/rei.png"));
         assert!(c[2].prompt.contains("Rei"), "built-in voice kept");
-        for bad in ["rei.png", "/a/b.svg", "/a/../b.png"] {
-            let body = format!("[[talk.personas]]\nid = \"rei\"\nicon = \"{bad}\"\n");
-            assert!(load(&body).is_err(), "{bad}");
+        let oversized = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(crate::persona_icon::ICON_MAX_BYTES)
+        );
+        for bad in ["", "rei.png", "/a/b.svg", "/a/../b.png", &oversized] {
+            for (id, fields) in [
+                ("rei", ""),
+                ("default", ""),
+                ("custom", "name = \"Custom\"\nprompt = \"Keep calm\"\n"),
+            ] {
+                let body = format!("[[talk.personas]]\nid = \"{id}\"\nicon = \"{bad}\"\n{fields}");
+                let cfg = load(&body).expect("bad icon must not invalidate config");
+                let persona = crate::persona::find(&cfg.talk.personas, id).unwrap();
+                assert_eq!(persona.id, id);
+                assert!(crate::persona_icon::load(bad).is_err());
+            }
         }
         let doc = Config::starter_toml();
         assert!(doc.contains("# icon = "));

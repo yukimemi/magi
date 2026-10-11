@@ -9692,13 +9692,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_icons_keep_the_catalog_and_persona_switch_usable() {
+        let oversized = format!(
+            "data:image/png;base64,{}",
+            "A".repeat(persona_icon::ICON_MAX_BYTES)
+        );
+        for bad in ["", "/images/avatar.svg", "/a/../b.png", &oversized] {
+            let extra = format!(
+                "[[talk.personas]]\nid = \"custom\"\nname = \"Custom\"\nprompt = \"Keep calm\"\nicon = \"{bad}\"\n"
+            );
+            let (_t, _h, ui, id, _repo) = avatar_fixture(&extra).await;
+            let Json(detail) = talk_detail(State(Arc::clone(&ui)), Path(id.clone()))
+                .await
+                .expect("detail with invalid icon");
+            assert!(detail.personas.iter().any(|p| p.id == "custom"));
+            let (status, ct, _, _, body) = avatar(&ui, &id, Some("custom"), false).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(ct, "image/svg+xml");
+            assert_eq!(body, persona_icon::builtin_svg("custom").as_bytes());
+            let Json(view) = talk_persona(
+                State(Arc::clone(&ui)),
+                Path(id.clone()),
+                Json(TalkPersona {
+                    persona: "custom".into(),
+                }),
+            )
+            .await
+            .expect("persona switch with invalid icon");
+            assert_eq!(view.talk.persona, "custom");
+            assert_eq!(ui.talks.get(&id).unwrap().persona, "custom");
+        }
+    }
+
+    #[tokio::test]
     async fn an_unreadable_config_still_gets_the_builtin_avatar() {
         let (_t, _h, ui, id, repo) = avatar_fixture("").await;
-        std::fs::write(
-            repo.join("magi.toml"),
-            "[[talk.personas]]\nid = \"rei\"\nicon = \"/x/evil.svg\"\n",
-        )
-        .unwrap();
+        std::fs::write(repo.join("magi.toml"), "this is not valid TOML").unwrap();
         let (status, ct, nosniff, csp, _) = avatar(&ui, &id, Some("rei"), false).await;
         assert_eq!(
             (status, ct.as_str(), nosniff, csp),
