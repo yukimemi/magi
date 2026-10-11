@@ -1144,6 +1144,7 @@ mod tests {
             at: Timestamp::now(),
             attachments: Vec::new(),
             usage: None,
+            posted_by: None,
         };
         talk.turns.push(owner_turn(&queued));
         talk.pending.clear();
