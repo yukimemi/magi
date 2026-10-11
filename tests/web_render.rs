@@ -2045,8 +2045,8 @@ async fn chat_persona_select_sits_beside_the_agent_select_without_overlap() {
     }
 }
 
-/// The Chat selectors are remembered per browser and applied to the next new
-/// conversation only; the conversation they were changed in keeps its values.
+// The Chat selectors are remembered per browser and applied to the next new
+// conversation only; the conversation they were changed in keeps its values.
 common::e2e! {
 async fn chat_remembers_persona_and_implementers_for_new_conversations() {
     let Some(chrome) = cdp::find_chrome() else {
@@ -2193,10 +2193,10 @@ async fn chat_remembers_persona_and_implementers_for_new_conversations() {
 }
 }
 
-/// Regression guard, no browser needed: the fixture's own `[[agents]]` must
-/// load whatever the operator keeps in their machine layer. `isolated` hands
-/// the child an empty machine layer; without it this fails on any machine whose
-/// own `config.toml` declares `[[agents]]`.
+// Regression guard, no browser needed: the fixture's own `[[agents]]` must
+// load whatever the operator keeps in their machine layer. `isolated` hands
+// the child an empty machine layer; without it this fails on any machine whose
+// own `config.toml` declares `[[agents]]`.
 common::e2e! {
 async fn fixture_roster_loads_without_the_machine_layer() {
     let guard = common::home_lock().await;
@@ -2227,8 +2227,8 @@ async fn publish_fixture_roster(fx: &common::Fixture) {
     assert!(discovered.agents.iter().any(|spec| spec.id == "beta"));
 }
 
-/// Successful selector changes must be remembered even when their response
-/// arrives after the operator has opened another conversation.
+// Successful selector changes must be remembered even when their response
+// arrives after the operator has opened another conversation.
 common::e2e! {
 async fn chat_remembers_selector_changes_after_navigation() {
     let Some(chrome) = cdp::find_chrome() else {
