@@ -24,8 +24,40 @@ pub struct Ranking {
     /// Per-label strengths worth porting onto the winner, written for the
     /// candidates the judge did not rank first. Optional: a judge that
     /// names none simply leaves the graft phase nothing to do.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_strengths")]
     pub strengths: BTreeMap<String, Vec<String>>,
+}
+
+/// Read `strengths` without ever failing: this field is optional, so a value of
+/// the wrong shape (`null`, a string, a map of plain strings) must cost the
+/// judge nothing but the strengths. Entries that are not a string array keep
+/// their string members only; anything else is dropped.
+fn lenient_strengths<'de, D>(d: D) -> Result<BTreeMap<String, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    let mut out = BTreeMap::new();
+    if let serde_json::Value::Object(map) = value {
+        for (label, v) in map {
+            match v {
+                serde_json::Value::Array(items) => {
+                    let list: Vec<String> = items
+                        .into_iter()
+                        .filter_map(|i| i.as_str().map(str::to_owned))
+                        .collect();
+                    if !list.is_empty() {
+                        out.insert(label, list);
+                    }
+                }
+                serde_json::Value::String(s) if !s.trim().is_empty() => {
+                    out.insert(label, vec![s]);
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(out)
 }
 
 impl Ranking {
@@ -390,6 +422,21 @@ pub fn verified_noop(summary: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_strengths_never_cost_the_ranking() {
+        for bad in [
+            "null",
+            r#"{"B":"one point"}"#,
+            r#""x""#,
+            r#"[1]"#,
+            r#"{"B":[1,"ok"]}"#,
+        ] {
+            let text = format!(r#"{{"ranking":["A","B"],"strengths":{bad}}}"#);
+            let r: Ranking = extract_json(&text).unwrap();
+            assert_eq!(r.ranking, ["A", "B"]);
+        }
+    }
 
     #[test]
     fn fenced_block_is_found() {

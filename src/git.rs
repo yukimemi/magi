@@ -417,7 +417,9 @@ pub async fn changed_lines(worktree: &Path, base: &str, head: &str) -> Option<us
 /// the per-worktree excludes) are left alone.
 pub async fn restore_to(worktree: &Path, rev: &str) -> Result<()> {
     git(worktree, &["reset", "--hard", "-q", rev]).await?;
-    git(worktree, &["clean", "-fdq"]).await?;
+    // `-ff`: a single `-f` skips untracked nested git repositories, which is
+    // what a submodule or clone added by a rejected change leaves behind.
+    git(worktree, &["clean", "-ffdq"]).await?;
     // The parent's reset leaves an initialised submodule's own tree alone
     // (`submodule.recurse` defaults to false): put each back on the commit the
     // parent records (`--checkout` overrides a configured
