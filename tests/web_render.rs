@@ -1984,6 +1984,7 @@ async fn chat_persona_select_sits_beside_the_agent_select_without_overlap() {
 
     let guard = common::home_lock().await;
     let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    publish_fixture_roster(&fx).await;
     let home = fx.tmp.path().join("magi-home");
     let queue = Queue::at(home.join("queue"));
     let talks = Talks::at(home.join("talks"));
@@ -2225,19 +2226,9 @@ fn chat_remembers_selector_changes_after_navigation() {
         .block_on(chat_remembers_selector_changes_after_navigation_inner());
 }
 
-async fn chat_remembers_selector_changes_after_navigation_inner() {
-    let Some(chrome) = cdp::find_chrome() else {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
-        );
-        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
-        return;
-    };
-    let guard = common::home_lock().await;
-    let fx = common::fixture(guard, common::Judges::Unanimous, false);
-    // The server discovers config from origin/main, rather than the in-memory
-    // fixture used to seed the talks. Give both sides the same mock roster.
+/// The server discovers config from origin/main, rather than the in-memory
+/// fixture used to seed talks. Give both sides the same mock roster.
+async fn publish_fixture_roster(fx: &common::Fixture) {
     std::fs::write(
         fx.repo.join("magi.toml"),
         toml::to_string(&fx.config).expect("serialize fixture config"),
@@ -2255,6 +2246,20 @@ async fn chat_remembers_selector_changes_after_navigation_inner() {
     let (discovered, _) =
         magi::config::Config::discover(&fx.repo, None).expect("discover published fixture config");
     assert!(discovered.agents.iter().any(|spec| spec.id == "beta"));
+}
+
+async fn chat_remembers_selector_changes_after_navigation_inner() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
+        );
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    publish_fixture_roster(&fx).await;
     let home = fx.tmp.path().join("magi-home");
     let talks = Talks::at(home.join("talks"));
     let agent = fx.config.agents[0].id.clone();
