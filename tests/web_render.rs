@@ -2047,8 +2047,38 @@ async fn chat_persona_select_sits_beside_the_agent_select_without_overlap() {
 
 /// The Chat selectors are remembered per browser and applied to the next new
 /// conversation only; the conversation they were changed in keeps its values.
-#[tokio::test]
-async fn chat_remembers_persona_and_implementers_for_new_conversations() {
+#[test]
+fn chat_remembers_persona_and_implementers_for_new_conversations() {
+    // Config::discover in an integration binary includes the machine layer,
+    // so run in a child that has none (as the selector test below does).
+    const CHILD: &str = "MAGI_CHAT_PERSONA_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "chat_remembers_persona_and_implementers_for_new_conversations",
+                "--exact",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(magi::config::Config::CONFIG_DIR_ENV, "")
+            .output()
+            .expect("spawn isolated browser test");
+        assert!(
+            output.status.success(),
+            "browser test failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime")
+        .block_on(chat_remembers_persona_and_implementers_inner());
+}
+
+async fn chat_remembers_persona_and_implementers_inner() {
     let Some(chrome) = cdp::find_chrome() else {
         assert!(
             std::env::var_os("CI").is_none(),
