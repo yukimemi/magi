@@ -420,11 +420,19 @@ pub async fn restore_to(worktree: &Path, rev: &str) -> Result<()> {
     git(worktree, &["clean", "-fdq"]).await?;
     // The parent's reset leaves an initialised submodule's own tree alone
     // (`submodule.recurse` defaults to false): put each back on the commit the
-    // parent records, and drop what is untracked inside. No-ops without
+    // parent records (`--checkout` overrides a configured
+    // `submodule.<name>.update` such as `none`), and drop what is untracked inside. No-ops without
     // submodules; an error is an unconfirmed restore.
     git(
         worktree,
-        &["submodule", "--quiet", "update", "--recursive", "--force"],
+        &[
+            "submodule",
+            "--quiet",
+            "update",
+            "--recursive",
+            "--force",
+            "--checkout",
+        ],
     )
     .await?;
     git(
