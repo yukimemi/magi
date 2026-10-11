@@ -1429,9 +1429,9 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .crown[data-provisional]::before { content: "\25c7"; }
 .cand-nums { display: flex; flex-wrap: wrap; gap: 0 var(--s2); font-size: var(--t2); color: var(--ink-2); }
 .cand-summary { font-size: var(--t3); color: var(--ink-2); overflow-wrap: anywhere; }
-.cand-summary.md, .finding-detail.md, .ask-turn-body.md, .advise-synthesis.md { min-width: 0; max-width: 100%; }
-.cand-summary.md { margin-top: var(--s2); }
-.cand-summary.md pre, .finding-detail.md pre, .advise-synthesis.md pre { max-width: 100%; overflow-x: auto; }
+.cand-summary.md, .finding-detail.md, .ask-turn-body.md, .advise-synthesis.md, .rturn-body.md { min-width: 0; max-width: 100%; }
+.cand-summary.md, .rturn-body.md { margin-top: var(--s2); }
+.cand-summary.md pre, .finding-detail.md pre, .advise-synthesis.md pre, .rturn-body.md pre { max-width: 100%; overflow-x: auto; }
 
 .stat, .report {
   margin: 0;

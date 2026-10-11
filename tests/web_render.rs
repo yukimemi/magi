@@ -722,6 +722,48 @@ async fn run_detail_tabs_landing_and_strip_hold_at_both_widths_and_themes() {
             .collect(),
         synthesis: Some("A blended brief.".to_owned()),
     });
+    run.judgements = vec![
+        magi::run::Judgement {
+            judge: 1,
+            seat: "judge-1".to_owned(),
+            agent: "agent-1".to_owned(),
+            ranking: vec!['A', 'B'],
+            reasons: std::collections::BTreeMap::new(),
+            confidence: Some(8),
+            order: vec![0, 1],
+            failed: None,
+            duration_ms: 100,
+        },
+    ];
+    run.tally = Some(magi::run::Tally {
+        first_choice: [('A', 1)].into_iter().collect(),
+        borda: [('A', 2)].into_iter().collect(),
+        winner: 'A',
+        unanimous_initial: true,
+        deliberated: true,
+        changed_votes: 0,
+        unanimous_final: true,
+        judges: 1,
+        present: 1,
+        quorum: 1,
+        met_quorum: true,
+        rankings: 1,
+        uncontested: None,
+        tie_break: None,
+    });
+    run.deliberation = vec![
+        magi::run::DeliberationRound {
+            round: 1,
+            turns: vec![
+                magi::run::DeliberationTurn {
+                    judge: 1,
+                    agent: "agent-1".to_owned(),
+                    body: "I strongly back candidate **A** <script id=\"injected-delib\"></script> with clean changes.".to_owned(),
+                    tentative: Some('A'),
+                },
+            ],
+        },
+    ];
     run.save_under(&home).expect("seed run");
 
     let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
@@ -825,6 +867,28 @@ async fn run_detail_tabs_landing_and_strip_hold_at_both_widths_and_themes() {
             assert_eq!(cards["titles"], true, "{tag}: {cards}");
             assert_eq!(cards["inside"], true, "{tag}: card spills out: {cards}");
             assert!(cards["n"].as_u64().unwrap_or(0) >= 1, "{tag}: {cards}");
+
+            // The judging section rendered deliberation turns with judge 1.
+            let has_judge_turn = browser
+                .eval(
+                    &page,
+                    "(() => { const titles = [...document.querySelectorAll('#run-report-cards .rcard-title')]; \
+                     return titles.some((t) => t.textContent.includes('judge 1')); })()",
+                )
+                .await
+                .unwrap();
+            assert_eq!(has_judge_turn, true, "{tag}: judging turn title rendered");
+
+            // Raw HTML in deliberation turn bodies must not be executed as DOM elements.
+            let injected_script = browser
+                .eval(
+                    &page,
+                    "document.getElementById('injected-delib') !== null",
+                )
+                .await
+                .unwrap();
+            assert_eq!(injected_script, false, "{tag}: raw HTML script must not be in DOM");
+
             browser
                 .eval(
                     &page,
