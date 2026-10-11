@@ -1249,6 +1249,34 @@ briefing is byte-for-byte unchanged for it.
   (a plain-voice notice when going back to `default`), and is cleared only after
   a turn succeeds. A fresh seat's briefing already carries the persona. A stored
   id the config no longer has is treated as `default` with a warning.
+- **The avatar is display only.** `src/persona_icon.rs` embeds an original
+  built-in SVG per built-in persona (`assets/ui/avatars/`, a coloured circle and
+  an initial or silhouette - never character artwork) plus a generic one for
+  configured ids. `[[talk.personas]] icon` (optional, may override a built-in;
+  on `default` it is the only field allowed, so the briefing for `default` stays
+  byte-for-byte unchanged) is a `data:image/(png|jpeg|gif|webp);base64,` URI or
+  an absolute / `~/` path to a `.png/.jpg/.jpeg/.gif/.webp`, at most 256 KiB
+  (the string, the decoded data, the file). A built-in id may omit `name` and
+  `prompt` and keeps the built-in's. `persona::validate` checks the *shape*
+  only and refuses a bad one (relative path, `..`, other extension, other data
+  type, oversize) with the config; existence and content are judged at serve time.
+- **One serving path.** The client only ever gets server-built URLs
+  (`TalkView::persona_avatar`, `PersonaEntry::avatar`, `&v=` is a fingerprint of
+  the setting); the `icon` string never leaves the server.
+  `GET /api/talks/{id}/avatar?persona=<id>` (`web::talk_avatar`) loads the icon
+  (regular file, size-capped read, strict base64), requires the bytes' magic
+  number to match the declared type (`sniffed_mime`), and answers with
+  `attachment_response` (`nosniff`). Anything else - missing, oversize, spoofed,
+  unreadable config, unknown persona, `builtin=1` (the page's one retry after a
+  load error) - is a `tracing::warn` and the built-in SVG (CSP
+  `default-src 'none'; sandbox`, `nosniff`), never an error. Custom SVG is never
+  served.
+- **Absolute paths are exposed to whoever can reach the deck** (the tailnet; there
+  is no authentication) as the image they name, nothing more. Relative paths are
+  refused because the repository layer is read from `<remote>/<base>` and
+  extracted elsewhere, so they would point at nothing.
+- **Invariant:** `persona::section_base` / `section_for` / `update_block*` never
+  read `Persona::icon`; `an_icon_never_reaches_the_briefing` pins it.
 - Both new `Talk` fields are `#[serde(default)]`; `talk::SCHEMA` is unchanged.
 
 ### Chat defaults are remembered by the browser and checked by the server

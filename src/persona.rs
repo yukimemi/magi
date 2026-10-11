@@ -88,6 +88,9 @@ pub struct Persona {
     pub name: String,
     /// The voice instruction; empty only for [`DEFAULT_ID`].
     pub prompt: String,
+    /// The operator's avatar setting, display only
+    /// ([`crate::persona_icon`]); never read by the briefing functions.
+    pub icon: Option<String>,
 }
 
 impl Persona {
@@ -108,12 +111,14 @@ fn builtins() -> Vec<Persona> {
             } else {
                 format!("{voice} {LANGUAGE}")
             },
+            icon: None,
         })
         .collect()
 }
 
-/// Check `[[talk.personas]]`: non-blank ids, names and prompts, unique ids,
-/// and no redefinition of `default`.
+/// Check `[[talk.personas]]`: non-blank ids, unique ids, an `icon` of a valid
+/// shape, and no redefinition of `default` beyond its `icon`. A built-in's id
+/// may omit `name` and `prompt` (the built-in's are kept); a new id may not.
 pub fn validate(specs: &[PersonaSpec]) -> Result<()> {
     let mut seen = BTreeSet::new();
     for (n, p) in specs.iter().enumerate() {
@@ -122,16 +127,26 @@ pub fn validate(specs: &[PersonaSpec]) -> Result<()> {
         if id.is_empty() {
             bail!("[[talk.personas]] entry {at} has an empty `id`");
         }
+        let named = !p.name.trim().is_empty();
+        let voiced = !p.prompt.trim().is_empty();
         if id == DEFAULT_ID {
-            bail!(
-                "[[talk.personas]] entry {at}: `{DEFAULT_ID}` is the plain voice and cannot be redefined"
-            );
+            if named || voiced || p.icon.is_none() {
+                bail!(
+                    "[[talk.personas]] entry {at}: `{DEFAULT_ID}` is the plain voice and cannot be redefined (only its `icon` may be set)"
+                );
+            }
+        } else if !BUILTINS.iter().any(|(b, _, _)| *b == id) {
+            if !named {
+                bail!("[[talk.personas]] `{id}` has an empty `name`");
+            }
+            if !voiced {
+                bail!("[[talk.personas]] `{id}` has an empty `prompt`");
+            }
         }
-        if p.name.trim().is_empty() {
-            bail!("[[talk.personas]] `{id}` has an empty `name`");
-        }
-        if p.prompt.trim().is_empty() {
-            bail!("[[talk.personas]] `{id}` has an empty `prompt`");
+        if let Some(icon) = &p.icon
+            && let Err(e) = crate::persona_icon::validate_shape(icon)
+        {
+            bail!("[[talk.personas]] `{id}`: {e}");
         }
         if !seen.insert(id.to_owned()) {
             bail!("[[talk.personas]] declares the id `{id}` more than once");
@@ -140,19 +155,37 @@ pub fn validate(specs: &[PersonaSpec]) -> Result<()> {
     Ok(())
 }
 
-/// The built-ins, with the config's entries overriding by id or appended.
+/// The built-ins, with the config's entries overriding by id or appended. An
+/// override that leaves out `name` or `prompt` keeps the built-in's; on
+/// `default` only the `icon` is taken.
 pub fn catalog(personas: &[PersonaSpec]) -> Vec<Persona> {
     let mut out = builtins();
     for p in personas {
-        let entry = Persona {
-            id: p.id.trim().to_owned(),
-            name: p.name.trim().to_owned(),
-            prompt: p.prompt.trim().to_owned(),
-        };
-        match out.iter_mut().find(|e| e.id == entry.id) {
-            Some(slot) if !slot.is_default() => *slot = entry,
-            Some(_) => {}
-            None => out.push(entry),
+        let id = p.id.trim();
+        let icon = p
+            .icon
+            .as_deref()
+            .map(str::trim)
+            .filter(|i| !i.is_empty())
+            .map(str::to_owned);
+        match out.iter_mut().find(|e| e.id == id) {
+            Some(slot) if slot.is_default() => slot.icon = icon,
+            Some(slot) => {
+                let (name, prompt) = (p.name.trim(), p.prompt.trim());
+                if !name.is_empty() {
+                    slot.name = name.to_owned();
+                }
+                if !prompt.is_empty() {
+                    slot.prompt = prompt.to_owned();
+                }
+                slot.icon = icon;
+            }
+            None => out.push(Persona {
+                id: id.to_owned(),
+                name: p.name.trim().to_owned(),
+                prompt: p.prompt.trim().to_owned(),
+                icon,
+            }),
         }
     }
     out
@@ -254,7 +287,13 @@ mod tests {
             id: id.into(),
             name: name.into(),
             prompt: prompt.into(),
+            icon: None,
         }
+    }
+
+    fn with_icon(mut s: PersonaSpec, icon: &str) -> PersonaSpec {
+        s.icon = Some(icon.into());
+        s
     }
 
     #[test]
@@ -300,5 +339,60 @@ mod tests {
         assert!(active(&[], DEFAULT_ID).is_none());
         assert!(active(&[], "nobody").is_none());
         assert_eq!(active(&[], "rei").unwrap().id, "rei");
+    }
+
+    #[test]
+    fn a_built_in_override_may_set_only_an_icon() {
+        let only = with_icon(spec("rei", "", ""), "data:image/png;base64,AAAA");
+        assert!(validate(std::slice::from_ref(&only)).is_ok());
+        let c = catalog(&[only]);
+        let rei = c.iter().find(|p| p.id == "rei").unwrap();
+        let base = builtin_catalog();
+        let plain = base.iter().find(|p| p.id == "rei").unwrap();
+        assert_eq!((&rei.name, &rei.prompt), (&plain.name, &plain.prompt));
+        assert_eq!(rei.icon.as_deref(), Some("data:image/png;base64,AAAA"));
+        // A new id still needs both.
+        assert!(validate(&[with_icon(spec("x", "", ""), "~/a.png")]).is_err());
+    }
+
+    #[test]
+    fn default_takes_an_icon_and_nothing_else() {
+        let abs = "~/d.png";
+        assert!(validate(&[with_icon(spec("default", "", ""), abs)]).is_ok());
+        assert!(validate(&[with_icon(spec("default", "N", ""), abs)]).is_err());
+        assert!(validate(&[with_icon(spec("default", "", "P"), abs)]).is_err());
+        assert!(validate(&[spec("default", "", "")]).is_err());
+        let c = catalog(&[with_icon(spec("default", "", ""), abs)]);
+        assert_eq!(c[0].icon.as_deref(), Some(abs));
+        assert!(c[0].prompt.is_empty());
+    }
+
+    #[test]
+    fn a_bad_icon_shape_is_refused() {
+        for bad in [
+            "rel.png",
+            "/a/../b.png",
+            "/a/b.svg",
+            "data:text/html;base64,AA",
+        ] {
+            let err = validate(&[with_icon(spec("a", "n", "p"), bad)])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("`a`") && err.contains("icon"), "{err}");
+        }
+    }
+
+    #[test]
+    fn an_icon_never_reaches_the_briefing() {
+        let plain = catalog(&[spec("rei", "Rei", "Be curt.")]);
+        let iconed = catalog(&[with_icon(spec("rei", "Rei", "Be curt."), "~/r.png")]);
+        let (a, b) = (&plain[2], &iconed[2]);
+        assert_eq!(section(a), section(b));
+        assert_eq!(section_for(a, Some("Cmdr")), section_for(b, Some("Cmdr")));
+        assert_eq!(update_block(Some(a)), update_block(Some(b)));
+        // The default voice is unchanged by an icon on it.
+        let d = catalog(&[with_icon(spec("default", "", ""), "~/d.png")]);
+        assert!(active(&[with_icon(spec("default", "", ""), "~/d.png")], "").is_none());
+        assert!(d[0].prompt.is_empty());
     }
 }

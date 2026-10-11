@@ -2045,6 +2045,97 @@ async fn chat_persona_select_sits_beside_the_agent_select_without_overlap() {
     }
 }
 
+// The persona avatar sits inside the persona chip and before an agent turn's
+// name; it loads, is a fixed small size, and overlaps nothing.
+#[tokio::test]
+async fn chat_persona_avatars_load_and_do_not_overlap() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
+        );
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let agent = fx.config.agents[0].id.clone();
+    let mut t = talk::begin(&talks, &fx.config, fx.repo.clone(), Some(&agent)).expect("seed talk");
+    talk::record(&mut t, &talks, "Who answers?", Vec::new()).expect("seed turn");
+    t.persona = "rei".to_owned();
+    t.turns.push(talk::Turn {
+        who: talk::Who::Agent,
+        body: "An answer.".to_owned(),
+        at: t.turns[0].at,
+        attachments: Vec::new(),
+        usage: None,
+        breaks: None,
+        posted_by: None,
+    });
+    talks.put(&mut t).expect("seed agent turn");
+    let talk_id = t.id.clone();
+
+    let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
+    let mut browser = cdp::Browser::launch(&chrome)
+        .await
+        .unwrap_or_else(|e| panic!("could not start Chrome at {}: {e}", chrome.display()));
+    let w = Duration::from_secs(30);
+
+    for (width, height, mobile) in [(1280u32, 900u32, false), (390, 844, true)] {
+        let tag = format!("persona avatar @{width}px");
+        let page = browser
+            .open_page(&format!("{base}#/chat/{talk_id}"), width, height, mobile)
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: open: {e}"));
+        browser
+            .wait_for(
+                &page,
+                "(() => { const a = document.querySelector('#talk-persona-box img'); \
+                 const b = document.querySelector('.turn-avatar:not([hidden])'); \
+                 return !!a && !!b && a.complete && a.naturalWidth > 0 && b.complete && b.naturalWidth > 0; })()",
+                w,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: avatars never loaded: {e}"));
+        let got = browser
+            .eval(
+                &page,
+                "(() => { const hit = (a, b) => a.left < b.right - 1 && b.left < a.right - 1 \
+                   && a.top < b.bottom - 1 && b.top < a.bottom - 1; \
+                 const r = (e) => e.getBoundingClientRect(); \
+                 const box = document.getElementById('talk-persona-box'); \
+                 const sel = document.getElementById('talk-persona'); \
+                 const pa = box.querySelector('img'); \
+                 const turn = [...document.querySelectorAll('.turn')].find((x) => x.dataset.who === 'agent'); \
+                 const ta = turn.querySelector('.turn-avatar'); const who = turn.querySelector('.turn-who'); \
+                 const vw = document.documentElement.clientWidth; \
+                 return { src: pa.getAttribute('src'), pw: r(pa).width, tw: r(ta).width, \
+                   selOverlap: hit(r(pa), r(sel)), whoOverlap: hit(r(ta), r(who)), \
+                   inBox: r(pa).left >= r(box).left - 1 && r(pa).right <= r(box).right + 1, \
+                   inTurn: r(ta).right <= r(turn).right + 1 && r(ta).left >= r(turn).left - 1, \
+                   inView: r(pa).right <= vw + 1 && r(ta).right <= vw + 1 }; })()",
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{tag}: eval: {e}"));
+        assert!(
+            got["src"].as_str().unwrap_or("").contains("persona=rei"),
+            "{tag}: {got}"
+        );
+        assert!(got["pw"].as_f64().unwrap_or(0.0) <= 24.0, "{tag}: {got}");
+        assert!(got["tw"].as_f64().unwrap_or(0.0) <= 24.0, "{tag}: {got}");
+        for k in ["selOverlap", "whoOverlap"] {
+            assert_eq!(got[k], false, "{tag}: {k} {got}");
+        }
+        for k in ["inBox", "inTurn", "inView"] {
+            assert_eq!(got[k], true, "{tag}: {k} {got}");
+        }
+    }
+}
+
 // The Chat selectors are remembered per browser and applied to the next new
 // conversation only; the conversation they were changed in keeps its values.
 common::e2e! {

@@ -5004,13 +5004,43 @@ function turnWho(turn) {
 }
 
 /* ---- one conversation -------------------------------------------------- */
+/* A persona avatar. The URL is built by the server (never an icon path or data
+   URI from the config). If it fails to load, retry once with the built-in
+   image, then hide the picture: it is decoration and must not break the page
+   or loop. */
+function avatarImg(cls) {
+  const img = el("img", { class: `persona-avatar ${cls}`, alt: "" });
+  img.hidden = true;
+  img.decoding = "async";
+  img.addEventListener("error", () => {
+    if (!img.dataset.fellBack && img.dataset.src) {
+      img.dataset.fellBack = "1";
+      img.src = `${img.dataset.src}&builtin=1`;
+    } else {
+      img.hidden = true;
+    }
+  });
+  return img;
+}
+
+function setAvatar(img, url) {
+  if (!url) { img.hidden = true; return; }
+  if (img.dataset.src !== url) {
+    img.dataset.src = url;
+    delete img.dataset.fellBack;
+    img.src = url;
+  }
+  img.hidden = false;
+}
+
 function createTurnRow() {
+  const avatar = avatarImg("turn-avatar");
   const who = el("span", { class: "turn-who" });
   const body = el("div", { class: "turn-body" });
   const attachments = el("div", { class: "turn-attachments" });
   const at = el("time", { class: "turn-at" });
-  const row = el("li", { class: "turn" }, who, body, attachments, at);
-  row.refs = { who, body, attachments, at };
+  const row = el("li", { class: "turn" }, avatar, who, body, attachments, at);
+  row.refs = { avatar, who, body, attachments, at };
   return row;
 }
 
@@ -5025,6 +5055,7 @@ function updateTurnRow(row, item) {
   const body = String(turn.body || "");
 
   setAttr(row, "data-who", kind);
+  setAvatar(r.avatar, kind === "agent" ? item.personaAvatar : "");
   setText(r.who, kind === "operator" ? (item.operatorName || "YOU")
     : kind === "system" ? "MAGI" : (item.personaName || "AGENT"));
 
@@ -5576,7 +5607,7 @@ function renderTalk() {
   syncList(
     $("talk-turns"),
     turns.map((turn, i) => ({ turn, md: turnsMd[i], key: String(i), conversationId: talk.id,
-      operatorName: talk.operator_name, personaName: talk.persona_name })),
+      operatorName: talk.operator_name, personaName: talk.persona_name, personaAvatar: talk.persona_avatar })),
     (item) => item.key, createTurnRow, updateTurnRow,
   );
 
@@ -5714,6 +5745,8 @@ async function switchTalkAgent() {
    disabled during a turn, while either change is posting, or once closed. The
    built-in list always arrives, so it does not depend on the roster. */
 let talkPersonaSwitching = false;
+const talkPersonaAvatar = avatarImg("talk-persona-avatar");
+$("talk-persona-box").querySelector(".talk-agent-label").prepend(talkPersonaAvatar);
 
 function renderTalkPersona(talk, busy, loading = false) {
   const box = $("talk-persona-box");
@@ -5721,6 +5754,8 @@ function renderTalkPersona(talk, busy, loading = false) {
   const personas = state.talkDetail.personas || [];
   show(box, loading || personas.length > 0);
   const current = talk.persona || "default";
+  const entry = personas.find((p) => p.id === current);
+  setAvatar(talkPersonaAvatar, talk.persona_avatar || (entry && entry.avatar) || "");
   if (document.activeElement !== select) {
     clear(select);
     const ids = personas.map((p) => p.id);

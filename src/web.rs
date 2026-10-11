@@ -121,6 +121,7 @@ use crate::config::{AgentKind, Config, Update, UpdateMode};
 use crate::md;
 use crate::notices::{Notice, Notices};
 use crate::persona;
+use crate::persona_icon;
 use crate::proc::Quiet as _;
 use crate::queue::{Queue, Source, Task, TaskStatus, title_from};
 use crate::run::{RunState, RunStatus};
@@ -953,6 +954,7 @@ impl Ui {
                 "/api/talks/{id}/attachments/{att}",
                 get(talk_attachment_get),
             )
+            .route("/api/talks/{id}/avatar", get(talk_avatar))
             .route("/api/events", get(events))
             .with_state(Arc::new(self))
     }
@@ -6323,6 +6325,9 @@ struct TalkView {
     operator_name: Option<String>,
     /// The active persona's display name; `None` for the default voice.
     persona_name: Option<String>,
+    /// URL of the avatar for the conversation's persona (the default voice
+    /// included). Server-built; a configured `icon` never reaches the client.
+    persona_avatar: String,
 }
 
 impl TalkView {
@@ -6346,6 +6351,11 @@ impl TalkView {
         let persona_name = persona::find(specs, &talk.persona)
             .filter(|p| !p.is_default())
             .map(|p| p.name);
+        let persona_avatar = avatar_url(
+            &talk.id,
+            &persona::find(specs, &talk.persona)
+                .unwrap_or_else(|| persona::find(specs, persona::DEFAULT_ID).expect("default")),
+        );
         let operator_name = cfg.and_then(|c| c.talk.operator_name()).map(str::to_owned);
         Self {
             turn_bodies_md,
@@ -6353,6 +6363,7 @@ impl TalkView {
             context,
             operator_name,
             persona_name,
+            persona_avatar,
             talk,
         }
     }
@@ -6380,6 +6391,8 @@ struct TalkDetailView {
 struct PersonaEntry {
     id: String,
     name: String,
+    /// Avatar URL, see [`TalkView::persona_avatar`].
+    avatar: String,
 }
 
 /// One roster agent as the talk's agent selector shows it.
@@ -6508,6 +6521,7 @@ async fn talk_detail(
         let personas = persona::catalog(&specs)
             .into_iter()
             .map(|p| PersonaEntry {
+                avatar: avatar_url(&talk.id, &p),
                 id: p.id,
                 name: p.name,
             })
@@ -7439,6 +7453,106 @@ async fn talk_attachment_get(
             )));
         };
         Ok(attachment_response(&meta.mime, data))
+    })
+    .await
+}
+
+/// The avatar URL for one persona of one conversation. `v` is a fingerprint of
+/// the icon setting, so changing it changes the URL.
+fn avatar_url(talk_id: &str, p: &persona::Persona) -> String {
+    let mut id = String::new();
+    for b in p.id.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.".contains(&b) {
+            id.push(char::from(b));
+        } else {
+            id.push_str(&format!("%{b:02X}"));
+        }
+    }
+    format!(
+        "/api/talks/{talk_id}/avatar?persona={id}&v={}",
+        persona_icon::fingerprint(p.icon.as_deref())
+    )
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AvatarQuery {
+    persona: Option<String>,
+    /// Set by the page after the first load failed: skip the `icon`.
+    builtin: Option<String>,
+}
+
+/// Served with every built-in avatar: it is an image, so nothing else may run.
+const AVATAR_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
+
+fn builtin_avatar(id: &str) -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "image/svg+xml"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::CONTENT_SECURITY_POLICY, AVATAR_CSP),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        persona_icon::builtin_svg(id),
+    )
+        .into_response()
+}
+
+/// `GET /api/talks/{id}/avatar?persona=<id>` - a persona's avatar: the
+/// operator's raster `icon` when it resolves and its bytes agree with its
+/// type, the built-in SVG otherwise. Display only; every failure is a warning
+/// and the built-in avatar, never an error response.
+async fn talk_avatar(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    Query(q): Query<AvatarQuery>,
+) -> ApiResult<Response> {
+    blocking(move || {
+        let id = resolve_talk(&ui.talks, &id)?;
+        let talk = ui.talks.get(&id)?;
+        let wanted = q
+            .persona
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .unwrap_or(&talk.persona)
+            .to_owned();
+        let specs = match Config::discover(&talk.repo, None) {
+            Ok((cfg, _)) => cfg.talk.personas,
+            Err(e) => {
+                tracing::warn!("avatar: cannot read the config for talk {id}: {e:#}");
+                Vec::new()
+            }
+        };
+        let Some(found) = persona::find(&specs, &wanted) else {
+            return Ok(builtin_avatar(persona::DEFAULT_ID));
+        };
+        let Some(icon) = found.icon.as_deref().filter(|_| q.builtin.is_none()) else {
+            return Ok(builtin_avatar(&found.id));
+        };
+        match persona_icon::load(icon) {
+            Ok((mime, bytes)) if sniffed_mime(&bytes) == Some(mime) => {
+                let mut res = attachment_response(mime, bytes);
+                res.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    header::HeaderValue::from_static("no-cache"),
+                );
+                Ok(res)
+            }
+            Ok((mime, _)) => {
+                tracing::warn!(
+                    "avatar: icon of persona `{}` is not really {mime}; using the built-in",
+                    found.id
+                );
+                Ok(builtin_avatar(&found.id))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "avatar: icon of persona `{}` unusable ({e:#}); using the built-in",
+                    found.id
+                );
+                Ok(builtin_avatar(&found.id))
+            }
+        }
     })
     .await
 }
@@ -9440,6 +9554,183 @@ mod tests {
         let e = call(2).await.expect_err("closed talk");
         assert_eq!(e.status, StatusCode::CONFLICT, "{}", e.message);
         assert!(e.message.contains("takes no more turns"), "{}", e.message);
+    }
+
+    /// A repo with `extra` appended to the mock agent's config, and a talk in it.
+    async fn avatar_fixture(extra: &str) -> (TempDir, TempDir, Arc<Ui>, String, PathBuf) {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        std::fs::write(
+            repo.join("magi.toml"),
+            format!("{MOCK_AGENT_TOML}\n{extra}"),
+        )
+        .expect("write magi.toml");
+        let home = TempDir::new().expect("temp home");
+        let talks = Talks::at(home.path().join("talks"));
+        let ui = Arc::new(
+            Ui::new(
+                Queue::at(home.path().join("queue")),
+                Questions::at(home.path().join("questions")),
+                talks.clone(),
+                home.path().join("runs"),
+                home.path().to_path_buf(),
+                repo.clone(),
+            )
+            .with_worktrees_root(home.path().join("wt")),
+        );
+        let cfg = config_for(&repo).await.expect("discover config");
+        let talk = talk::begin(&talks, &cfg, repo.clone(), Some("mock")).expect("begin talk");
+        (tmp, home, ui, talk.id, repo)
+    }
+
+    /// `(status, content-type, nosniff, csp, body)` of one avatar request.
+    async fn avatar(
+        ui: &Arc<Ui>,
+        id: &str,
+        persona: Option<&str>,
+        builtin: bool,
+    ) -> (StatusCode, String, bool, bool, Vec<u8>) {
+        let res = talk_avatar(
+            State(Arc::clone(ui)),
+            Path(id.to_owned()),
+            Query(AvatarQuery {
+                persona: persona.map(str::to_owned),
+                builtin: builtin.then(|| "1".to_owned()),
+            }),
+        )
+        .await
+        .expect("an avatar is never an error response");
+        let h = res.headers();
+        let ct = h[header::CONTENT_TYPE].to_str().unwrap().to_owned();
+        let nosniff = h
+            .get(header::X_CONTENT_TYPE_OPTIONS)
+            .is_some_and(|v| v == "nosniff");
+        let csp = h.contains_key(header::CONTENT_SECURITY_POLICY);
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .expect("body")
+            .to_vec();
+        (status, ct, nosniff, csp, body)
+    }
+
+    fn tiny_png() -> Vec<u8> {
+        let mut b = b"\x89PNG\r\n\x1a\n".to_vec();
+        b.extend_from_slice(&[0u8; 32]);
+        b
+    }
+
+    #[tokio::test]
+    async fn builtin_avatars_are_svg_with_a_locked_down_policy() {
+        let (_t, _h, ui, id, _repo) = avatar_fixture("").await;
+        for p in [
+            "default", "magi", "rei", "misato", "ritsuko", "shinji", "asuka", "kaworu",
+        ] {
+            let (status, ct, nosniff, csp, body) = avatar(&ui, &id, Some(p), false).await;
+            assert_eq!(status, StatusCode::OK, "{p}");
+            assert_eq!(ct, "image/svg+xml", "{p}");
+            assert!(nosniff && csp, "{p}");
+            assert!(String::from_utf8(body).unwrap().starts_with("<svg"), "{p}");
+        }
+        // No `persona` means the conversation's own; unknown ones fall back.
+        let own = avatar(&ui, &id, None, false).await;
+        let default = avatar(&ui, &id, Some("default"), false).await;
+        assert_eq!(own.4, default.4);
+        let unknown = avatar(&ui, &id, Some("nobody"), false).await;
+        assert_eq!(unknown.1, "image/svg+xml");
+    }
+
+    #[tokio::test]
+    async fn a_configured_raster_icon_is_served_and_bad_ones_fall_back() {
+        let dir = TempDir::new().expect("icons");
+        let good = dir.path().join("good.png");
+        std::fs::write(&good, tiny_png()).unwrap();
+        let spoof = dir.path().join("spoof.png");
+        std::fs::write(&spoof, b"<html><script>alert(1)</script></html>").unwrap();
+        let big = dir.path().join("big.png");
+        let mut bytes = tiny_png();
+        bytes.resize(persona_icon::ICON_MAX_BYTES + 1, 0);
+        std::fs::write(&big, bytes).unwrap();
+        let missing = dir.path().join("missing.png");
+        let uri = |p: &FsPath| p.to_string_lossy().replace('\\', "/");
+        let extra = format!(
+            "[[talk.personas]]\nid = \"rei\"\nicon = \"{}\"\n\
+             [[talk.personas]]\nid = \"misato\"\nicon = \"{}\"\n\
+             [[talk.personas]]\nid = \"asuka\"\nicon = \"{}\"\n\
+             [[talk.personas]]\nid = \"shinji\"\nicon = \"{}\"\n\
+             [[talk.personas]]\nid = \"kaworu\"\nicon = \"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"\n\
+             [[talk.personas]]\nid = \"magi\"\nicon = \"data:image/png;base64,PGh0bWw+\"\n",
+            uri(&good),
+            uri(&spoof),
+            uri(&big),
+            uri(&missing),
+        );
+        let (_t, _h, ui, id, _repo) = avatar_fixture(&extra).await;
+
+        let (status, ct, nosniff, _, body) = avatar(&ui, &id, Some("rei"), false).await;
+        assert_eq!(
+            (status, ct.as_str(), nosniff),
+            (StatusCode::OK, "image/png", true)
+        );
+        assert_eq!(body, tiny_png());
+        let (_, ct, _, _, _) = avatar(&ui, &id, Some("kaworu"), false).await;
+        assert_eq!(ct, "image/png", "data URI");
+
+        for p in ["misato", "asuka", "shinji", "magi"] {
+            let (status, ct, _, csp, body) = avatar(&ui, &id, Some(p), false).await;
+            assert_eq!(
+                (status, ct.as_str(), csp),
+                (StatusCode::OK, "image/svg+xml", true),
+                "{p}"
+            );
+            assert!(body.starts_with(b"<svg"), "{p}");
+        }
+        // The page's own retry skips the icon.
+        let (_, ct, _, _, _) = avatar(&ui, &id, Some("rei"), true).await;
+        assert_eq!(ct, "image/svg+xml");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_config_still_gets_the_builtin_avatar() {
+        let (_t, _h, ui, id, repo) = avatar_fixture("").await;
+        std::fs::write(
+            repo.join("magi.toml"),
+            "[[talk.personas]]\nid = \"rei\"\nicon = \"/x/evil.svg\"\n",
+        )
+        .unwrap();
+        let (status, ct, nosniff, csp, _) = avatar(&ui, &id, Some("rei"), false).await;
+        assert_eq!(
+            (status, ct.as_str(), nosniff, csp),
+            (StatusCode::OK, "image/svg+xml", true, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_talk_view_carries_server_built_avatar_urls_only() {
+        let (_t, _h, ui, id, _repo) =
+            avatar_fixture("[[talk.personas]]\nid = \"rei\"\nicon = \"~/secret/rei.png\"\n").await;
+        let Json(detail) = talk_detail(State(Arc::clone(&ui)), Path(id.clone()))
+            .await
+            .expect("detail");
+        let json = serde_json::to_string(&detail).unwrap();
+        assert!(
+            !json.contains("secret"),
+            "the icon setting must not leak: {json}"
+        );
+        assert!(
+            detail
+                .view
+                .persona_avatar
+                .starts_with(&format!("/api/talks/{id}/avatar?persona=default&v="))
+        );
+        let rei = detail.personas.iter().find(|p| p.id == "rei").unwrap();
+        let plain = detail.personas.iter().find(|p| p.id == "asuka").unwrap();
+        assert!(rei.avatar.contains("persona=rei&v="));
+        assert_ne!(
+            rei.avatar.split("&v=").nth(1),
+            plain.avatar.split("&v=").nth(1)
+        );
     }
 
     #[tokio::test]
