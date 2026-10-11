@@ -554,7 +554,8 @@ async fn reconcile_external_merges(runs: &Path, home: &Path, disk: &Disk, now: T
                             "Run {id} is blocked with no recorded merge, and checking GitHub \
                              for a merge failed; check by hand."
                         ),
-                    ),
+                    )
+                    .link(crate::notices::Link::Run { id: id.clone() }),
                 );
             }
         }
@@ -1317,6 +1318,17 @@ mod tests {
                 "{id} must be left exactly as it was found"
             );
         }
+        let notices = crate::notices::Notices::at(home.join("notifications")).list();
+        let due_notice = notices
+            .iter()
+            .find(|n| n.key == format!("merged-unrecorded:{due_id}"))
+            .expect("notice for due_id must be raised");
+        assert_eq!(
+            due_notice.link,
+            Some(crate::notices::Link::Run {
+                id: due_id.to_owned(),
+            })
+        );
     }
 
     /// The bug this exists to pin: a first version rotated on

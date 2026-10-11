@@ -889,6 +889,30 @@ mod tests {
     }
 
     #[test]
+    fn adding_link_on_repeat_updates_link_without_relighting_read_or_dismissed() {
+        let now = Timestamp::now();
+        // 1. Read notice
+        let mut read_notice = Notice::warn("task:1", "held");
+        read_notice.mark_read(now);
+        let link_to_add = Link::Task { id: "1".to_owned() };
+        let again = Notice::warn("task:1", "held").link(link_to_add.clone());
+        let relit = read_notice.raise_again(&again, now);
+        assert!(!relit, "link-only update must not page/relight");
+        assert!(read_notice.read_at.is_some(), "read notice stays read");
+        assert_eq!(read_notice.link, Some(link_to_add.clone()));
+
+        // 2. Dismissed notice
+        let mut dismissed_notice = Notice::warn("task:2", "held");
+        dismissed_notice.dismiss(now);
+        let link_to_add_2 = Link::Task { id: "2".to_owned() };
+        let again_2 = Notice::warn("task:2", "held").link(link_to_add_2.clone());
+        let relit_2 = dismissed_notice.raise_again(&again_2, now);
+        assert!(!relit_2, "link-only update must not page/relight");
+        assert!(dismissed_notice.dismissed_at.is_some(), "tombstone holds");
+        assert_eq!(dismissed_notice.link, Some(link_to_add_2));
+    }
+
+    #[test]
     fn identical_raises_share_one_file() {
         let (_d, s) = store();
         for _ in 0..5 {
