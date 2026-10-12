@@ -804,6 +804,14 @@ impl Ui {
         }))
     }
 
+    fn queued_generation(&self, id: &str) -> u64 {
+        let live = self
+            .talk_turns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        live.queued.get(id).copied().unwrap_or(0)
+    }
+
     /// The shared turn slots, for the upgrade hand-over to wait on.
     fn turns(&self) -> Arc<Mutex<TalkTurns>> {
         Arc::clone(&self.talk_turns)
@@ -7043,7 +7051,50 @@ async fn talk_pending_resume(
 /// check observes the advance and drains again; otherwise it releases the
 /// claim while holding the same lock. This keeps the release/arrival handoff
 /// atomic without holding the global claim mutex across filesystem I/O.
-async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn: TalkTurnGuard) {
+async fn drain_loop(talk: Talk, talks: Talks, cfg: Config, id: String, turn: TalkTurnGuard) {
+    drain_loop_started(talk, talks, cfg, id, turn, None).await;
+}
+
+/// A settings response must not report idle while its claim is still held.
+/// Wait until the first drain either releases the claim or promotes a draft.
+/// The task owns the guard even if the HTTP handler is cancelled while waiting.
+async fn settle_settings_turn(
+    talk: Talk,
+    talks: Talks,
+    cfg: Config,
+    id: String,
+    turn: TalkTurnGuard,
+    observed: u64,
+) -> bool {
+    if talk.pending.is_empty() && talk.pending_attachments.is_empty() {
+        let turns = Arc::clone(&turn.turns);
+        let mut live = turns.lock().unwrap_or_else(PoisonError::into_inner);
+        if live.queued.get(&id).copied().unwrap_or(0) == observed {
+            // Release under the arrival lock; a later `/say` takes its own claim.
+            turn.release(&mut live);
+            return false;
+        }
+    }
+    let (started, settled) = tokio::sync::oneshot::channel();
+    tokio::spawn(drain_loop_started(
+        talk,
+        talks,
+        cfg,
+        id,
+        turn,
+        Some(started),
+    ));
+    settled.await.unwrap_or(false)
+}
+
+async fn drain_loop_started(
+    mut talk: Talk,
+    talks: Talks,
+    cfg: Config,
+    id: String,
+    turn: TalkTurnGuard,
+    mut started: Option<tokio::sync::oneshot::Sender<bool>>,
+) {
     let live_set = Arc::clone(&turn.turns);
     // `Option` rather than binding `turn` directly to a `_turn` that lives
     // for the whole function: releasing it has to happen by calling
@@ -7141,6 +7192,9 @@ async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn:
                 break;
             }
         };
+        if let Some(started) = started.take() {
+            let _ = started.send(true);
+        }
         let responded = match turn.as_ref() {
             Some(turn) => turn.respond(&mut talk, &talks, &cfg, &drained).await,
             None => Err(anyhow::anyhow!("the turn guard was released")),
@@ -7148,6 +7202,10 @@ async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn:
         if let Err(e) = responded {
             tracing::warn!("talk {id} turn failed: {e:#}");
         }
+    }
+    drop(turn);
+    if let Some(started) = started {
+        let _ = started.send(false);
     }
 }
 
@@ -7312,8 +7370,9 @@ async fn talk_agent(
     };
     // A `/say` that landed while this held the claim saw the talk busy and
     // left a durable draft, trusting the claim's owner to drain it. So the
-    // claim, once taken, goes to `drain_loop` whatever the outcome - it releases at once
-    // when nothing is queued - rather than being dropped here.
+    // claim is settled whatever the outcome. Release an empty draft's claim
+    // before replying; queued drafts continue independently of the handler.
+    let observed = ui.queued_generation(&id);
     let fresh = {
         let ui = Arc::clone(&ui);
         let id = id.clone();
@@ -7321,11 +7380,7 @@ async fn talk_agent(
     };
     let draining = match fresh {
         Ok(talk) => {
-            let draining = talk.status.open()
-                && (!talk.pending.is_empty() || !talk.pending_attachments.is_empty());
-            let talks = ui.talks.clone();
-            tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
-            draining
+            settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard, observed).await
         }
         Err(_) => false,
     };
@@ -7400,7 +7455,8 @@ async fn talk_persona(
         })
         .await
     };
-    // As in `talk_agent`: a taken claim goes to `drain_loop` whatever happened.
+    // As in `talk_agent`: settle the claim before replying, even on refusal.
+    let observed = ui.queued_generation(&id);
     let fresh = {
         let ui = Arc::clone(&ui);
         let id = id.clone();
@@ -7408,11 +7464,7 @@ async fn talk_persona(
     };
     let draining = match fresh {
         Ok(talk) => {
-            let draining = talk.status.open()
-                && (!talk.pending.is_empty() || !talk.pending_attachments.is_empty());
-            let talks = ui.talks.clone();
-            tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
-            draining
+            settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard, observed).await
         }
         Err(_) => false,
     };
@@ -7484,7 +7536,8 @@ async fn talk_implementers(
         })
         .await
     };
-    // As in `talk_agent`: a taken claim goes to `drain_loop` whatever happened.
+    // As in `talk_agent`: settle the claim before replying, even on refusal.
+    let observed = ui.queued_generation(&id);
     let fresh = {
         let ui = Arc::clone(&ui);
         let id = id.clone();
@@ -7492,11 +7545,7 @@ async fn talk_implementers(
     };
     let draining = match fresh {
         Ok(talk) => {
-            let draining = talk.status.open()
-                && (!talk.pending.is_empty() || !talk.pending_attachments.is_empty());
-            let talks = ui.talks.clone();
-            tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
-            draining
+            settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard, observed).await
         }
         Err(_) => false,
     };
@@ -9832,6 +9881,14 @@ mod tests {
         let saved = talks.get(&id).expect("reload");
         assert_eq!(saved.agent, "second");
         assert_eq!(saved.turns.len(), 1);
+        assert!(!view.thinking);
+        assert!(!ui.is_thinking(&id), "idle response must release the claim");
+        for agent in ["mock", "second"] {
+            let Json(view) = call(agent).await.expect("immediate consecutive change");
+            assert_eq!(view.talk.agent, agent);
+            assert!(!view.thinking);
+            assert!(!ui.is_thinking(&id));
+        }
 
         let detail = talk_detail(State(Arc::clone(&ui)), Path(id.clone()))
             .await
@@ -9903,6 +9960,14 @@ mod tests {
         let Json(view) = call(3).await.expect("switch");
         assert_eq!(view.talk.implementers, 3);
         assert!(talks.get(&id).expect("reload").implementers_dirty);
+        assert!(!view.thinking);
+        assert!(!ui.is_thinking(&id), "idle response must release the claim");
+        for n in [1, 2, 3] {
+            let Json(view) = call(n).await.expect("immediate consecutive change");
+            assert_eq!(view.talk.implementers, n);
+            assert!(!view.thinking);
+            assert!(!ui.is_thinking(&id));
+        }
 
         let mut closed = talks.get(&id).expect("reload");
         talk::close(&mut closed, &talks).expect("close");
@@ -10118,6 +10183,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_settings_turn_releases_inline_only_for_unchanged_generation() {
+        let (_t, _h, ui, id, repo) = avatar_fixture("").await;
+        let cfg = config_for(&repo).await.unwrap();
+        for arrived in [false, true] {
+            let turn = ui.begin_talk_turn(&id).unwrap().unwrap();
+            let observed = ui.queued_generation(&id);
+            let talk = ui.talks.get(&id).unwrap();
+            if arrived {
+                assert!(ui.begin_queued_talk_turn(&id).unwrap().is_none());
+            }
+            let mut settling = std::pin::pin!(settle_settings_turn(
+                talk,
+                ui.talks.clone(),
+                cfg.clone(),
+                id.clone(),
+                turn,
+                observed
+            ));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let first = std::future::Future::poll(settling.as_mut(), &mut cx);
+            assert_eq!(first.is_pending(), arrived);
+            if arrived {
+                assert!(!settling.await);
+            }
+            assert!(!ui.is_thinking(&id));
+        }
+    }
+
+    #[tokio::test]
     async fn talk_persona_round_trips_and_refuses_unknown_busy_or_closed() {
         let tmp = TempDir::new().expect("tempdir");
         let repo = tmp.path().join("repo");
@@ -10181,6 +10275,13 @@ mod tests {
         let Json(view) = call("gendo").await.expect("switch to a configured persona");
         assert_eq!(view.talk.persona, "gendo");
         assert_eq!(talks.get(&id).expect("reload").persona, "gendo");
+        assert!(!ui.is_thinking(&id), "idle response must release the claim");
+        // No intervening I/O or sleep may be needed before another change.
+        for chosen in ["default", "gendo", "rei", "gendo"] {
+            let Json(view) = call(chosen).await.expect("immediate consecutive change");
+            assert!(!view.thinking);
+            assert!(!ui.is_thinking(&id));
+        }
 
         let detail = talk_detail(State(Arc::clone(&ui)), Path(id.clone()))
             .await

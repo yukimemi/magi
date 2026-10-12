@@ -457,14 +457,24 @@ function seconds(ms) {
 
 /* ---- shared pieces ----------------------------------------------------- */
 function chip(status, table) {
+  const node = el("span", { class: "chip" });
+  updateChip(node, status, table);
+  return node;
+}
+
+function updateChip(node, status, table) {
   const meta = table[status] || { glyph: "\u25cc", tone: "ink" };
-  return el("span", {
-    class: "chip",
-    "data-status": status,
-    "data-glyph": meta.glyph,
-    "data-flight": meta.flight ? "1" : null,
-    text: status,
-  });
+  setAttr(node, "data-status", status);
+  setAttr(node, "data-glyph", meta.glyph);
+  setAttr(node, "data-flight", meta.flight ? "1" : null);
+  setText(node, status);
+}
+
+/* Preserve the mouse target across refreshes, including between press and
+   release. Replacing a chip can discard the click even though its row survives. */
+function setChip(slot, status, table) {
+  if (slot.firstChild) updateChip(slot.firstChild, status, table);
+  else slot.append(chip(status, table));
 }
 
 function toneOf(status, table) {
@@ -1422,11 +1432,7 @@ function updateRunCard(row, run) {
   setAttr(r.card, "data-tone", tone);
   setAttr(row, "data-tone", tone);
 
-  /* The chip is replaced rather than mutated: it is one element and its
-     pseudo-element glyph is attribute-driven, so this cannot reflow siblings. */
-  const next = chip(status, RUN_STATUS);
-  if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
-  else r.chipSlot.append(next);
+  setChip(r.chipSlot, status, RUN_STATUS);
 
   const at = when(run.updated_at || run.created_at);
   setText(r.whenSlot, at.text);
@@ -2358,9 +2364,7 @@ function updateTaskCard(row, task) {
   setAttr(r.permalink, "aria-label", `Link to task ${task.id}`);
   setAttr(r.historyLink, "href", `#/tasks/${encodeURIComponent(task.id)}`);
 
-  const next = chip(status, TASK_STATUS);
-  if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
-  else r.chipSlot.append(next);
+  setChip(r.chipSlot, status, TASK_STATUS);
 
   const priority = Number(task.priority) || 0;
   setText(r.priority, priority > 0 ? `priority +${priority}` : `priority ${priority}`);
@@ -4608,9 +4612,7 @@ function updateAskCard(row, question, { compact = false } = {}) {
     : "");
   show(r.band, merge);
 
-  const next = chip(status, QUESTION_STATUS);
-  if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
-  else r.chipSlot.append(next);
+  setChip(r.chipSlot, status, QUESTION_STATUS);
 
   const settledAt = !open && question.answered_at ? question.answered_at : question.asked_at;
   const at = when(settledAt);
@@ -5328,9 +5330,7 @@ function updateTalkCard(row, talk) {
   setAttr(r.card, "data-tone", tone);
   setAttr(row, "data-tone", tone);
 
-  const next = chip(status, TALK_STATUS);
-  if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
-  else r.chipSlot.append(next);
+  setChip(r.chipSlot, status, TALK_STATUS);
   show(r.thinking, talkIsThinking(talk));
 
   /* LINE-style at-a-glance: a numbered badge plus a bolder title, both gone
@@ -5544,9 +5544,7 @@ function createTalkTaskRow() {
 function updateTalkTaskRow(row, task) {
   const r = row.refs;
   const status = String(task.status_str || task.status || "");
-  const next = chip(status, TASK_STATUS);
-  if (r.chipSlot.firstChild) r.chipSlot.firstChild.replaceWith(next);
-  else r.chipSlot.append(next);
+  setChip(r.chipSlot, status, TASK_STATUS);
   setText(r.title, `${task.title || task.id} · ${shortId(task.id)}`);
   /* Every row opens the task detail page, whether or not a run exists yet:
      it reaches all of the task's attempts and runs, and its target does not
@@ -9491,6 +9489,7 @@ async function loadTask(id, { background = false } = {}) {
 
 function renderTask() {
   const { id, task, error } = state.taskDetail;
+  setAttr($("view-task"), "data-task-id", task ? task.id : null);
   const head = $("task-status");
   clear(head);
   if (!task) {
