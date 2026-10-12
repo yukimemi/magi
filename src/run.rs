@@ -1769,6 +1769,34 @@ pub struct ActiveSeat {
     pub total: Option<usize>,
 }
 
+/// What a wave is waiting for before it may spawn its agents.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceWait {
+    /// Node whose seats wait.
+    pub node: String,
+    /// What is awaited, e.g. `shared build cache`.
+    pub kind: String,
+    /// Who holds it, as far as known.
+    pub holder: String,
+    /// When the wait began.
+    pub since: Timestamp,
+    /// The wait's own bound, seconds (`[graph] timeout_resource_wait`).
+    pub limit_secs: u64,
+}
+
+/// A resumable stop caused by an infrastructure wait that ran out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceBlock {
+    /// Node whose agents were not started.
+    pub node: String,
+    /// What stayed busy.
+    pub kind: String,
+    /// Why the wait ended, in words.
+    pub detail: String,
+    /// When it ended.
+    pub at: Timestamp,
+}
+
 impl ActiveSeat {
     /// Seconds since this attempt was sent.
     #[must_use]
@@ -2125,6 +2153,18 @@ pub struct RunState {
     /// the second is a leftover. Cleared by the resume that carries it on.
     #[serde(default)]
     pub parked: bool,
+    /// Seats of `node` are waiting, before any agent is spawned, for a shared
+    /// resource (the build cache's lease). While this is `Some` the seats in
+    /// [`Self::active`] are *not* running: their countdown has not started.
+    /// Cleared the moment the wait ends, whichever way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_wait: Option<ResourceWait>,
+    /// The run stopped because a shared resource stayed busy past
+    /// `[graph] timeout_resource_wait`. Not an agent failure: no agent was
+    /// spawned, no seat history, handover or quota loss was recorded, and a
+    /// resume asks the same agent again. Cleared by the resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_block: Option<ResourceBlock>,
     /// The run that took this run's worktree over, when one did — see
     /// [`crate::handover`]. `Some` means the worktree is gone on purpose and
     /// the run can no longer be resumed from it ([`Self::released`]).
@@ -2355,6 +2395,8 @@ impl RunState {
             passes: Vec::new(),
             next_pass_task_entry: false,
             parked: false,
+            resource_wait: None,
+            resource_block: None,
             released_to: None,
             released_branches: Vec::new(),
             seeds: Vec::new(),
@@ -2565,6 +2607,25 @@ impl RunState {
                 total: None,
             },
         );
+    }
+
+    /// The wave's pre-spawn wait is over: restart the clock of every seat of
+    /// this batch so `started_at` means "the CLI is being spawned now".
+    pub fn seats_spawning(&mut self, node: &str, attempt: usize) {
+        self.resource_wait = None;
+        let now = Timestamp::now();
+        for a in self.active.values_mut() {
+            if a.task.is_none() && a.node == node && a.attempt == attempt {
+                a.started_at = now;
+            }
+        }
+    }
+
+    /// `seat` holds its parallelism permit and its CLI is being spawned now.
+    pub fn seat_spawned(&mut self, seat: &str) {
+        if let Some(a) = self.active.get_mut(seat) {
+            a.started_at = Timestamp::now();
+        }
     }
 
     /// Record that `seat` has answered, whatever the answer was.

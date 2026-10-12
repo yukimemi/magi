@@ -638,6 +638,42 @@ candidates onto the winner. Decisions are pure and live in `src/graft.rs`.
 - Everything after is unchanged: the review loop and `verify.gate` see the
   grafted tree like any other.
 
+### An agent's timeout starts at spawn; waiting for infrastructure is not the agent
+
+`agent::invoke` starts `Invocation::timeout` only once the CLI is spawned, and
+nothing before that may be charged to it. The old `graph::wave` carved the shared
+cache lease wait out of every job (`timeout.saturating_sub(waited)`), so a
+contended cache left the agent zero time, read as `timed out`, and walked the
+fixer chain (graft: sonnet -> sol -> astra) over a wait that was not the agent's.
+
+- **Two clocks.** An agent's `timeout_*` is its running time. The pre-spawn waits
+  have their own bound, `[graph] timeout_resource_wait` (default 1800 s): the
+  wave's cache lease and, as `resource + longest timeout x jobs`, a parallelism
+  permit. The lease wait polls `Pause` every 5 s, so a park is honoured at once.
+- **Expiry is `AgentOutcome::ResourceBlocked`, not `Failed`.** No agent was
+  spawned, so it never enters `FailClass`, `seat_history`, `QuotaLoss` or a
+  handover; `ask_fixer_among` and `ask_json_wave` do not advance on it. A wave
+  never runs a writing seat without the lease (no unmanaged cache writes).
+- **The run stops resumably.** `RunState::resource_block` (`#[serde(default)]`,
+  `run::SCHEMA` unchanged) makes the node return before it records anything
+  (the review round, graft record and judgements are not written, so the resume
+  repeats exactly that step with the same agent and seat); the run is `Blocked`.
+  `daemon::settle_and_diagnose` refunds the attempt and holds the task with a
+  machine hold prefixed `cache::RESOURCE_HOLD` (`[resource] `); `triage` releases
+  it when the lease is free. A park request outranks it (the run stays parked).
+- **Visible.** `RunState::resource_wait` is set while seats wait; `report::active_seats`
+  (and so the web run page) says "waiting for the shared build cache (holder)" and
+  prints no countdown. A seat's `started_at` is re-stamped at spawn
+  (`seats_spawning`, `seat_spawned`).
+- **Separate wall-clock budgets on purpose**: the node/run budgets, `verify.e2e` /
+  `gate` (`with_cache_lease` takes the lease inside the command budget; its expiry is
+  already `CommandOutcome::resource_blocked`), `dupes` / `github_text` `JUDGE_BUDGET`
+  (an overall 15 s for a whole check), `retry_budget` (a nudge's quarter),
+  `talk_wait_bound`, `land::WAIT_CEILING`. `land`, `rebase`, `bump`, talk, deputy,
+  waiter and conduct invoke without waiting for anything before spawn.
+- Known gaps: a parallelism-slot wait still shows the seat as running; an operator-
+  requested fix records a resource block as an unreported fix instead of holding.
+
 ### A reviewer seat remembers who failed it across review rounds
 
 `RunState::seat_history` (`run::SeatHistory`, `#[serde(default)]`, so

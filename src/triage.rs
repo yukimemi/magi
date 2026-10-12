@@ -401,6 +401,18 @@ fn is_disk_hold(task: &Task) -> bool {
 /// still in force. `None` means this hold's cause is not one this module
 /// knows how to re-check at all, and a human has to look.
 fn machine_cause_resolved(task: &Task, cfg: &Config) -> Option<bool> {
+    if task
+        .hold_reason
+        .as_deref()
+        .is_some_and(|r| r.starts_with(crate::cache::RESOURCE_HOLD))
+    {
+        // The shared build cache's lease: free again (or no cache at all)
+        // means the same run can resume.
+        return Some(
+            cfg.cache_dir()
+                .is_none_or(|dir| !crate::cache::in_use(&crate::run::home(), &dir)),
+        );
+    }
     if !is_disk_hold(task) {
         return None;
     }

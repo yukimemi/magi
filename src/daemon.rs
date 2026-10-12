@@ -1421,6 +1421,27 @@ fn settle_and_diagnose(
 ) {
     let p = phrases(&state.config.graph.language);
     let attempts_before = task.attempts;
+    // A run that stopped because a shared resource stayed busy was never a
+    // failure of the task or of any agent: nothing was asked. The attempt is
+    // refunded and the task is held by the machine, under a reason `triage`
+    // can re-check, so the same run resumes with the same agents once the
+    // resource is free. A park request still wins (it is the operator's).
+    if let Some(block) = state.resource_block.as_ref().filter(|_| !verdict.parked) {
+        task.last_error = Some(detail.to_owned());
+        task.diagnostic = None;
+        task.attempts = task.attempts.saturating_sub(1);
+        task.hold_machine(Some(format!(
+            "{}{} stayed busy past the resource-wait limit before `{}` could start; \
+             no agent was asked and no attempt was spent",
+            crate::cache::RESOURCE_HOLD,
+            block.kind,
+            block.node
+        )));
+        if let Some(pass) = state.passes.last() {
+            task.record_pass(&state.id, pass.index, attempts_before, None);
+        }
+        return;
+    }
     settle_in(task, verdict, detail, max_attempts, p);
     // Written here, where the refund (or not) is decided, so the history is a
     // fact and not a later guess from the run's status.
@@ -4311,6 +4332,60 @@ mod tests {
             PathBuf::from("/repo"),
             Source::Human,
         )
+    }
+
+    /// A run that stopped on an infrastructure wait asked no agent anything:
+    /// the task is held by the machine under a `[resource]` reason (resumable,
+    /// re-checked by triage), and the attempt it started is given back.
+    #[test]
+    fn a_resource_blocked_run_holds_its_task_and_spends_no_attempt() {
+        let mut state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234".to_owned(),
+            "task".to_owned(),
+            Config::default(),
+        );
+        state.status = RunStatus::Blocked;
+        state.resource_block = Some(crate::run::ResourceBlock {
+            node: "graft".to_owned(),
+            kind: "shared build cache".to_owned(),
+            detail: "timed out".to_owned(),
+            at: jiff::Timestamp::now(),
+        });
+        let mut t = task();
+        t.start("20260902-000000-aaaa".to_owned());
+        assert_eq!(t.attempts, 1);
+        let verdict = Verdict {
+            status: RunStatus::Blocked,
+            left_pr: false,
+            quota_hit: false,
+            parked: false,
+            no_viable_candidates: false,
+        };
+        settle_and_diagnose(&mut t, verdict, "blocked", 2, &state);
+        assert_eq!(t.status, TaskStatus::Held);
+        assert_eq!(t.attempts, 0, "the attempt is refunded");
+        assert!(t.hold_reason.as_deref().unwrap().starts_with("[resource] "));
+        assert!(
+            !t.operator_held(),
+            "a machine hold, released without a human"
+        );
+
+        // A park request outranks it: still the operator's doing.
+        let mut p = task();
+        p.start("20260902-000000-bbbb".to_owned());
+        settle_and_diagnose(
+            &mut p,
+            Verdict {
+                parked: true,
+                ..verdict
+            },
+            "parked",
+            2,
+            &state,
+        );
+        assert_eq!(p.status, TaskStatus::Parked);
     }
 
     #[test]
