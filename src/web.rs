@@ -91,6 +91,9 @@
 //! answers immediately rather than waiting, because the wait is measured in
 //! tens of minutes and the operator is holding a phone.
 
+#[cfg(test)]
+pub(crate) mod request_cost;
+
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -1829,6 +1832,8 @@ async fn blocking<T>(job: impl FnOnce() -> ApiResult<T> + Send + 'static) -> Api
 where
     T: Send + 'static,
 {
+    #[cfg(test)]
+    let job = request_cost::carry(job);
     match tokio::task::spawn_blocking(job).await {
         Ok(result) => result,
         Err(e) => Err(ApiError::internal(format!("filesystem task failed: {e}"))),
@@ -8163,7 +8168,10 @@ mod tests {
                 .expect("bind loopback");
             let addr = listener.local_addr().expect("local addr");
             tokio::spawn(async move {
-                let _ = axum::serve(listener, ui.router()).await;
+                let router = ui
+                    .router()
+                    .layer(axum::middleware::from_fn(request_cost::observe));
+                let _ = axum::serve(listener, router).await;
             });
             addr
         }
@@ -8216,6 +8224,307 @@ mod tests {
         async fn post_bytes(&self, path: &str, headers: &[(&str, &str)], body: &[u8]) -> Res {
             request_bytes(self.addr, path, headers, body).await
         }
+    }
+
+    /// Real tracking refs exercise the successful discovery path (including
+    /// extraction), rather than counting cheap failures on a placeholder repo.
+    async fn performance_repositories() -> (TempDir, [PathBuf; 2]) {
+        let tmp = TempDir::new().unwrap();
+        let mut repos = Vec::new();
+        for name in ["one", "two"] {
+            let repo = tmp.path().join(name);
+            let origin = tmp.path().join(format!("{name}.git"));
+            std::fs::create_dir_all(&repo).unwrap();
+            crate::git::git(&repo, &["init", "-b", "main"])
+                .await
+                .unwrap();
+            std::fs::write(
+                repo.join("magi.toml"),
+                format!("{MOCK_AGENT_TOML}\n[repos]\nroots = []\n[update]\nmode = \"off\"\n[verify]\ne2e = []\ngate = []\n"),
+            )
+            .unwrap();
+            crate::git::git(&repo, &["add", "magi.toml"]).await.unwrap();
+            crate::git::git(
+                &repo,
+                &[
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "-m",
+                    "fixture",
+                ],
+            )
+            .await
+            .unwrap();
+            crate::git::git(tmp.path(), &["init", "--bare", origin.to_str().unwrap()])
+                .await
+                .unwrap();
+            crate::git::git(
+                &repo,
+                &["remote", "add", "origin", origin.to_str().unwrap()],
+            )
+            .await
+            .unwrap();
+            crate::git::git(&repo, &["push", "origin", "main"])
+                .await
+                .unwrap();
+            crate::git::git(
+                &repo,
+                &[
+                    "symbolic-ref",
+                    "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/main",
+                ],
+            )
+            .await
+            .unwrap();
+            let (cfg, _) = Config::discover(&repo, None).unwrap();
+            assert!(cfg.agents.iter().any(|a| a.id == "mock"));
+            repos.push(repo);
+        }
+        let repos: [PathBuf; 2] = repos.try_into().unwrap();
+        (tmp, repos)
+    }
+
+    async fn performance_fixture() -> (TempDir, [PathBuf; 2], Fixture) {
+        let (tmp, repos) = performance_repositories().await;
+        let machine = tmp.path().join("machine.toml");
+        std::fs::write(&machine, "").unwrap();
+        let fx = Fixture::with_repo_and_machine(repos[0].clone(), machine).await;
+        (tmp, repos, fx)
+    }
+
+    fn seed_performance(
+        fx: &Fixture,
+        repos: &[PathBuf; 2],
+        questions: usize,
+        runs: usize,
+        items: usize,
+    ) {
+        // Saving states directly never starts a run or changes MAGI_HOME.
+        for i in fx.questions().list().len()..questions {
+            let mut question = Question::new(
+                "20261001-000000-0000".into(),
+                "implement".into(),
+                "impl-A".into(),
+                format!("question {i}"),
+                "context".into(),
+                vec!["yes".into(), "no".into()],
+            );
+            question.id = format!("20261003-000000-{i:04x}");
+            fx.questions().put(&mut question).unwrap();
+        }
+        for i in run_ids(&fx.runs()).len()..runs {
+            write_run_repo(
+                &fx.runs(),
+                &format!("20261001-000000-{i:04x}"),
+                RunStatus::Ready,
+                repos[i % 2].to_str().unwrap(),
+            );
+        }
+        for i in fx.talks().list().len()..items {
+            let id = seed_talk(fx, &format!("20261002-000000-{i:04x}"), "open");
+            let mut talk = fx.talks().get(&id).unwrap();
+            talk.repo = repos[i % 2].clone();
+            fx.talks().put(&mut talk).unwrap();
+            let mut task = crate::queue::Task::new(
+                format!("task {i}"),
+                "instruction".into(),
+                repos[i % 2].clone(),
+                crate::queue::Source::Agent {
+                    run: id,
+                    node: crate::queue::CHAT_NODE.into(),
+                },
+            );
+            task.id = format!("20261004-000000-{i:04x}");
+            fx.queue().put(&mut task).unwrap();
+            // Notices has a production retention cap; seed up to that cap.
+            if i < crate::notices::CAP {
+                Notices::at(fx.home.path().join("notifications"))
+                    .raise(Notice::info(&format!("notice-{i}"), "notification"))
+                    .unwrap();
+            }
+        }
+        assert_eq!(fx.questions().list().len(), questions);
+        assert_eq!(run_ids(&fx.runs()).len(), runs);
+        assert_eq!(fx.talks().list().len(), items);
+        assert_eq!(fx.queue().list().len(), items);
+        assert_eq!(
+            Notices::at(fx.home.path().join("notifications"))
+                .list()
+                .len(),
+            items.min(crate::notices::CAP)
+        );
+    }
+
+    fn request_counts(res: &Res) -> (usize, usize) {
+        assert_eq!(res.status, 200, "{}", res.body);
+        (
+            res.header("x-test-discoveries").unwrap().parse().unwrap(),
+            res.header("x-test-git").unwrap().parse().unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn list_request_cost_is_independent_of_record_count() {
+        let (_tmp, repos, fx) = performance_fixture().await;
+        let mut previous = None;
+        for n in [4, 60] {
+            seed_performance(&fx, &repos, n, n, n);
+            let mut costs = Vec::new();
+            for (path, discoveries) in [
+                ("/api/questions", 1),
+                ("/api/talks", 2),
+                ("/api/health", 1),
+                ("/api/stats", 1),
+            ] {
+                // Equal cold extraction caches at both scales; this also
+                // bounds first-request cost instead of only warmed requests.
+                for repo in &repos {
+                    let cache = repo.join(".git/magi/config");
+                    if cache.exists() {
+                        std::fs::remove_dir_all(cache).unwrap();
+                    }
+                }
+                let cost = request_counts(&fx.get(path).await);
+                eprintln!("{path} N={n}: discoveries={} git={}", cost.0, cost.1);
+                assert_eq!(cost.0, discoveries, "{path}, N={n}");
+                assert!(cost.1 > 0 && cost.1 <= 40, "{path}: {cost:?}");
+                costs.push(cost);
+            }
+            if let Some(previous) = previous {
+                assert_eq!(costs, previous);
+            }
+            previous = Some(costs);
+        }
+        // runs reads shared row inputs and probes process liveness; queue
+        // builds one blocker inventory; notifications reads its own store.
+        // None discovers configuration or spawns git per item.
+    }
+
+    /// The same handler path without transport, so the deterministic cause
+    /// can also be checked in environments that prohibit binding sockets.
+    #[tokio::test]
+    async fn list_handler_cost_without_transport() {
+        let (_tmp, repos) = performance_repositories().await;
+        let fx = Fixture {
+            home: TempDir::new().unwrap(),
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        };
+        let ui = Arc::new(
+            Ui::new(
+                fx.queue(),
+                fx.questions(),
+                fx.talks(),
+                fx.runs(),
+                fx.home.path().to_path_buf(),
+                repos[0].clone(),
+            )
+            .with_worktrees_root(fx.home.path().join("wt")),
+        );
+        let mut previous = None;
+        for (n, runs, items) in [(4, 4, 4), (60, 60, 60), (200, 300, 400)] {
+            seed_performance(&fx, &repos, n, runs, items);
+            let mut costs = Vec::new();
+            for endpoint in ["questions", "talks", "health", "stats"] {
+                for repo in &repos {
+                    let cache = repo.join(".git/magi/config");
+                    if cache.exists() {
+                        std::fs::remove_dir_all(cache).unwrap();
+                    }
+                }
+                let (_, cost) = request_cost::measure(async {
+                    match endpoint {
+                        "questions" => {
+                            let _ = questions_list(State(ui.clone())).await.unwrap();
+                        }
+                        "talks" => {
+                            let _ = talks_list(
+                                State(ui.clone()),
+                                Query(ListQuery {
+                                    limit: None,
+                                    ids: None,
+                                }),
+                            )
+                            .await
+                            .unwrap();
+                        }
+                        "health" => {
+                            let _ = health(State(ui.clone())).await.unwrap();
+                        }
+                        _ => {
+                            let _ = stats_get(State(ui.clone()), Query(StatsQuery::default()))
+                                .await
+                                .unwrap();
+                        }
+                    }
+                })
+                .await;
+                eprintln!("{endpoint} handler N={n}: {cost:?}");
+                assert_eq!(
+                    cost.0,
+                    if endpoint == "talks" { 2 } else { 1 },
+                    "{endpoint}"
+                );
+                assert!(cost.1 > 0 && cost.1 <= 40, "{endpoint}: {cost:?}");
+                costs.push(cost);
+            }
+            if let Some(previous) = previous {
+                assert_eq!(costs, previous);
+            }
+            previous = Some(costs);
+        }
+    }
+
+    #[tokio::test]
+    async fn list_request_cost_scopes_do_not_mix() {
+        let (_tmp, repos, fx) = performance_fixture().await;
+        seed_performance(&fx, &repos, 10, 0, 10);
+        let (questions, talks, notices) = tokio::join!(
+            fx.get("/api/questions"),
+            fx.get("/api/talks"),
+            fx.get("/api/notifications")
+        );
+        assert_eq!(request_counts(&questions).0, 1);
+        assert_eq!(request_counts(&talks).0, 2);
+        assert_eq!(request_counts(&notices), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn list_endpoints_large_home_ceiling() {
+        let (_tmp, repos, fx) = performance_fixture().await;
+        seed_performance(&fx, &repos, 200, 300, 400);
+        let mut failures = Vec::new();
+        // app.js boot/change loads plus the initial dashboard, settings and
+        // repo picker. SSE is a persistent stream, not a bounded GET.
+        for path in [
+            "/",
+            "/app.js",
+            "/app.css",
+            "/api/questions",
+            "/api/runs?limit=300",
+            "/api/queue",
+            "/api/talks",
+            "/api/notifications",
+            "/api/health",
+            "/api/stats",
+            "/api/loop",
+            "/api/settings",
+            "/api/repos",
+        ] {
+            let start = std::time::Instant::now();
+            let result = tokio::time::timeout(Duration::from_secs(5), fx.get(path)).await;
+            let elapsed = start.elapsed();
+            eprintln!("{path}: {elapsed:?}");
+            match result {
+                Ok(res) if res.status == 200 && elapsed <= Duration::from_secs(5) => {}
+                Ok(res) => failures.push(format!("{path}: status {}, {elapsed:?}", res.status)),
+                Err(_) => failures.push(format!("{path}: exceeded 5 seconds ({elapsed:?})")),
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
     struct Res {

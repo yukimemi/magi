@@ -1753,6 +1753,8 @@ impl Config {
     /// stands (see the module doc); use [`Config::discover_fetched`] where a
     /// stale ref would matter.
     pub fn discover(repo: &Path, explicit: Option<&Path>) -> Result<(Self, Vec<PathBuf>)> {
+        #[cfg(test)]
+        crate::web::request_cost::discovery();
         if let Some(p) = explicit {
             let paths = vec![p.to_path_buf()];
             return Ok((Self::load_layers(&paths)?, paths));
@@ -2297,6 +2299,8 @@ const REPO_MARKER: &str = ".magi-repo";
 
 fn git_out(repo: &Path, args: &[&str]) -> Option<String> {
     use crate::proc::Quiet as _;
+    #[cfg(test)]
+    crate::web::request_cost::git();
     let out = std::process::Command::new("git")
         .args(args)
         .quiet()
@@ -2421,6 +2425,8 @@ fn declares_include(text: &str) -> bool {
 /// repository layer resolve against the same commit.
 fn extract_tree(repo: &Path, sha: &str, dest: &Path) -> Result<()> {
     use crate::proc::Quiet as _;
+    #[cfg(test)]
+    crate::web::request_cost::git();
     let mut archive = std::process::Command::new("git")
         .args(["archive", "--format=tar", sha])
         .quiet()

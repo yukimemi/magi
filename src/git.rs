@@ -31,6 +31,8 @@ impl GitOut {
 /// Run `git` in `cwd` with `args`, returning the captured output regardless of
 /// exit status.
 pub async fn git_raw(cwd: &Path, args: &[&str]) -> Result<GitOut> {
+    #[cfg(test)]
+    crate::web::request_cost::git();
     let out = Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -63,6 +65,8 @@ pub async fn git_raw(cwd: &Path, args: &[&str]) -> Result<GitOut> {
 /// running at the deadline is killed on drop.
 pub async fn fetch_origin(cwd: &Path, timeout: std::time::Duration) -> Result<()> {
     let url = git(cwd, &["remote", "get-url", "origin"]).await?;
+    #[cfg(test)]
+    crate::web::request_cost::git();
     let fut = Command::new("git")
         .args([
             "fetch",
