@@ -128,6 +128,8 @@ pub enum Section {
         judges: Vec<JudgeRow>,
         /// One line per deliberation turn.
         deliberation: Vec<String>,
+        /// Full deliberation arguments grouped by round.
+        rounds: Vec<DeliberationRoundView>,
         /// Final votes.
         votes: Vec<VoteRow>,
     },
@@ -294,6 +296,30 @@ pub struct VoteRow {
     pub vote: String,
     /// Moved after deliberation.
     pub changed: bool,
+}
+
+/// One turn in a deliberation round.
+#[derive(Debug, Serialize)]
+pub struct DeliberationTurnView {
+    /// Judge seat number.
+    pub judge: usize,
+    /// Agent.
+    pub agent: String,
+    /// Candidate the judge tentatively backed at the end of the turn.
+    pub tentative: Option<String>,
+    /// Raw argument body.
+    pub body: String,
+    /// Parsed markdown tree of the argument.
+    pub body_md: Vec<crate::md::Node>,
+}
+
+/// One round of deliberation.
+#[derive(Debug, Serialize)]
+pub struct DeliberationRoundView {
+    /// 1-based round number.
+    pub round: usize,
+    /// Turns in this round.
+    pub turns: Vec<DeliberationTurnView>,
 }
 
 /// The count.
@@ -951,6 +977,24 @@ pub fn build(state: &RunState, live: Liveness) -> RunReportView {
                         .collect()
                 })
                 .unwrap_or_default(),
+            rounds: state
+                .deliberation
+                .iter()
+                .map(|r| DeliberationRoundView {
+                    round: r.round,
+                    turns: r
+                        .turns
+                        .iter()
+                        .map(|t| DeliberationTurnView {
+                            judge: t.judge,
+                            agent: t.agent.clone(),
+                            tentative: t.tentative.map(|c| c.to_string()),
+                            body: t.body.clone(),
+                            body_md: crate::md::to_nodes(&t.body, &crate::md::ImageBase::None),
+                        })
+                        .collect(),
+                })
+                .collect(),
             votes: state
                 .votes
                 .iter()
