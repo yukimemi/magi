@@ -492,7 +492,14 @@ fn reconcile(dir: &Path, talks: &Talks) -> Result<()> {
             Some("result unknown: supervisor was lost; job will not be restarted".to_owned());
         save(dir, &job)?;
     }
-    let gone = || !talks.list().iter().any(|t| t.id == job.talk);
+    // Listing omits unreadable records, so it cannot prove deletion. Only
+    // a missing path settles delivery; read/parse/permission errors retry.
+    let gone = || {
+        matches!(
+            std::fs::symlink_metadata(talks.path_of(&job.talk)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        )
+    };
     let mut t = match talks.get(&job.talk) {
         Ok(t) if t.status.open() => t,
         Ok(_) => {

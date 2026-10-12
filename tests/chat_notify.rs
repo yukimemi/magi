@@ -596,6 +596,50 @@ async fn watch_recovers_a_delivery_interruption_without_a_duplicate_draft() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn watch_retries_an_unreadable_talk_after_store_reload() {
+    let _home = common::home_lock().await;
+    let w = world();
+    assert!(watch(&w, 2, &["true"], "chat").status.success());
+    // Wait for the result and released supervisor lease without delivering
+    // yet, so the first sweep must exercise the unreadable-record branch.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if watch_records(&w).iter().all(|(_, record)| {
+            let pid = u32::try_from(record["supervisor"][0].as_u64().expect("supervisor pid"))
+                .expect("pid");
+            !record["result"].is_null() && magi::proc::pid_status(pid) == Some(false)
+        }) {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "watch still running");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let path = w.talks.path_of(&w.talk_id);
+    let original = std::fs::read(&path).expect("original talk");
+    // Malformed JSON deterministically exercises a read failure even when
+    // permissions cannot be restricted by the test's operating account.
+    std::fs::write(&path, "{").expect("make talk unreadable");
+    assert!(w.talks.get(&w.talk_id).is_err());
+    assert!(w.talks.list().is_empty());
+    magi::chat_watch::sweep(w.tmp.path(), &w.talks);
+    assert_eq!(watch_records(&w)[0].1["delivered"], false);
+    std::fs::write(path, original).expect("restore talk");
+    let reloaded = Talks::at(w.tmp.path().join("talks"));
+    magi::chat_watch::sweep(w.tmp.path(), &reloaded);
+    let draft = await_watch(&w);
+    assert_eq!(
+        draft
+            .matches(magi::prompt::CHAT_WATCH_NOTICE_HEADING)
+            .count(),
+        1
+    );
+    assert_eq!(watch_records(&w)[0].1["delivered"], true);
+    magi::chat_watch::sweep(w.tmp.path(), &reloaded);
+    assert_eq!(drafts(&w), draft);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn watch_supervisor_loss_is_reported_without_reexecuting_the_command() {
     let _home = common::home_lock().await;
     let w = world();
