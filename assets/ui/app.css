@@ -1878,7 +1878,10 @@ details.panel > summary + * { margin-top: var(--s2); }
   border-bottom-left-radius: var(--radius-sm);
 }
 .turn[data-who="agent"] .turn-who { color: var(--ink-3); }
-.turn-avatar:not([hidden]) + .turn-who { display: inline-block; vertical-align: middle; }
+.turn-avatar:not([hidden]) + .turn-who {
+  display: inline-block; vertical-align: middle;
+  max-width: calc(100% - 22px - var(--s2));
+}
 .turn[data-who="agent"] .md { color: var(--ink); font-size: var(--t4); }
 /* magi itself speaking: the interviewing agent timed out, failed or ran out
    of quota. It is not the model talking and must not be read as an answer. */

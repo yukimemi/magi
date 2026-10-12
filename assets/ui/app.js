@@ -5140,7 +5140,8 @@ function updateTurnRow(row, item) {
   const body = String(turn.body || "");
 
   setAttr(row, "data-who", kind);
-  setAvatar(r.avatar, kind === "agent" ? item.personaAvatar : "");
+  setAvatar(r.avatar, kind === "agent" ? item.personaAvatar
+    : kind === "operator" ? item.operatorAvatar : "");
   setText(r.who, kind === "operator" ? (item.operatorName || "YOU")
     : kind === "system" ? "MAGI" : (item.personaName || "AGENT"));
 
@@ -5731,7 +5732,8 @@ function renderTalk() {
       const messages = turn.messages && turn.messages.length ? turn.messages : [turn];
       return messages.map((message, j) => ({ turn: { ...turn, ...message }, md: turnsMd[i], key: `${i}-${j}`, conversationId: talk.id,
         replyTarget: i < talkTurns(talk).length ? { turn: i, message: j } : null,
-        operatorName: talk.operator_name, personaName: talk.persona_name, personaAvatar: talk.persona_avatar }));
+        operatorName: talk.operator_name, operatorAvatar: talk.operator_avatar,
+        personaName: talk.persona_name, personaAvatar: talk.persona_avatar }));
     }),
     (item) => item.key, createTurnRow, updateTurnRow,
   );

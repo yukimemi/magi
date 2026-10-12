@@ -2360,10 +2360,9 @@ async fn chat_persona_select_sits_beside_the_agent_select_without_overlap() {
     }
 }
 
-// The persona avatar sits inside the persona chip and before an agent turn's
-// name; it loads, is a fixed small size, and overlaps nothing.
+// Persona and operator avatars load without overflowing either chat layout.
 #[tokio::test]
-async fn chat_persona_avatars_load_and_do_not_overlap() {
+async fn chat_avatars_load_and_do_not_overlap() {
     let Some(chrome) = cdp::find_chrome() else {
         assert!(
             std::env::var_os("CI").is_none(),
@@ -2380,7 +2379,13 @@ async fn chat_persona_avatars_load_and_do_not_overlap() {
     let talks = Talks::at(home.join("talks"));
     let agent = fx.config.agents[0].id.clone();
     let mut t = talk::begin(&talks, &fx.config, fx.repo.clone(), Some(&agent)).expect("seed talk");
-    talk::record(&mut t, &talks, "Who answers?", Vec::new()).expect("seed turn");
+    talk::record(
+        &mut t,
+        &talks,
+        &"A long operator message with wrapping text. ".repeat(12),
+        Vec::new(),
+    )
+    .expect("seed turn");
     t.persona = "rei".to_owned();
     t.turns.push(talk::Turn {
         who: talk::Who::Agent,
@@ -2402,7 +2407,7 @@ async fn chat_persona_avatars_load_and_do_not_overlap() {
     let w = Duration::from_secs(30);
 
     for (width, height, mobile) in [(1280u32, 900u32, false), (390, 844, true)] {
-        let tag = format!("persona avatar @{width}px");
+        let tag = format!("chat avatars @{width}px");
         let page = browser
             .open_page(&format!("{base}#/chat/{talk_id}"), width, height, mobile)
             .await
@@ -2411,44 +2416,82 @@ async fn chat_persona_avatars_load_and_do_not_overlap() {
             .wait_for(
                 &page,
                 "(() => { const a = document.querySelector('#talk-persona-box img'); \
-                 const b = document.querySelector('.turn-avatar:not([hidden])'); \
-                 return !!a && !!b && a.complete && a.naturalWidth > 0 && b.complete && b.naturalWidth > 0; })()",
+                 const b = document.querySelector('.turn[data-who=agent] .turn-avatar'); \
+                 const c = document.querySelector('.turn[data-who=operator] .turn-avatar'); \
+                 return [a, b, c].every((img) => img && !img.hidden && img.complete && img.naturalWidth > 0); })()",
                 w,
             )
             .await
             .unwrap_or_else(|e| panic!("{tag}: avatars never loaded: {e}"));
-        let got = browser
+        // Exercise a configured long name without changing the fixture's config layers.
+        browser
             .eval(
                 &page,
-                "(() => { const hit = (a, b) => a.left < b.right - 1 && b.left < a.right - 1 \
-                   && a.top < b.bottom - 1 && b.top < a.bottom - 1; \
-                 const r = (e) => e.getBoundingClientRect(); \
-                 const box = document.getElementById('talk-persona-box'); \
-                 const sel = document.getElementById('talk-persona'); \
-                 const pa = box.querySelector('img'); \
-                 const turn = [...document.querySelectorAll('.turn')].find((x) => x.dataset.who === 'agent'); \
-                 const ta = turn.querySelector('.turn-avatar'); const who = turn.querySelector('.turn-who'); \
-                 const vw = document.documentElement.clientWidth; \
-                 return { src: pa.getAttribute('src'), pw: r(pa).width, tw: r(ta).width, \
-                   selOverlap: hit(r(pa), r(sel)), whoOverlap: hit(r(ta), r(who)), \
-                   inBox: r(pa).left >= r(box).left - 1 && r(pa).right <= r(box).right + 1, \
-                   inTurn: r(ta).right <= r(turn).right + 1 && r(ta).left >= r(turn).left - 1, \
-                   inView: r(pa).right <= vw + 1 && r(ta).right <= vw + 1 }; })()",
+                "document.querySelector('.turn[data-who=operator] .turn-who').textContent = 'OperatorWithAVeryLongDisplayName'.repeat(6); true",
             )
             .await
-            .unwrap_or_else(|e| panic!("{tag}: eval: {e}"));
-        assert!(
-            got["src"].as_str().unwrap_or("").contains("persona=rei"),
-            "{tag}: {got}"
-        );
-        assert!(got["pw"].as_f64().unwrap_or(0.0) <= 24.0, "{tag}: {got}");
-        assert!(got["tw"].as_f64().unwrap_or(0.0) <= 24.0, "{tag}: {got}");
-        for k in ["selOverlap", "whoOverlap"] {
-            assert_eq!(got[k], false, "{tag}: {k} {got}");
+            .unwrap();
+        for theme in ["light", "dark"] {
+            browser
+                .eval(
+                    &page,
+                    &format!("document.documentElement.dataset.theme = '{theme}'; true"),
+                )
+                .await
+                .unwrap();
+            let got = browser
+                .eval(
+                    &page,
+                    "(() => { const hit = (a, b) => a.left < b.right - 1 && b.left < a.right - 1 \
+                       && a.top < b.bottom - 1 && b.top < a.bottom - 1; \
+                     const r = (e) => e.getBoundingClientRect(); \
+                     const inside = (a, b) => a.left >= b.left - 1 && a.right <= b.right + 1; \
+                     const box = document.getElementById('talk-persona-box'); \
+                     const sel = document.getElementById('talk-persona'); \
+                     const pa = box.querySelector('img'); \
+                     const vw = document.documentElement.clientWidth; \
+                     const turns = ['agent', 'operator'].map((kind) => { \
+                       const turn = document.querySelector('.turn[data-who=' + kind + ']'); \
+                       const img = turn.querySelector('.turn-avatar'); const who = turn.querySelector('.turn-who'); \
+                       return { kind, src: img.getAttribute('src'), width: r(img).width, \
+                         overlap: hit(r(img), r(who)), beside: r(who).left >= r(img).right - 1, inTurn: inside(r(img), r(turn)) && inside(r(who), r(turn)), \
+                         inView: r(turn).left >= -1 && r(turn).right <= vw + 1, \
+                         fits: turn.scrollWidth <= turn.clientWidth + 1 }; \
+                     }); \
+                     return { src: pa.getAttribute('src'), pw: r(pa).width, turns, \
+                       selOverlap: hit(r(pa), r(sel)), inBox: inside(r(pa), r(box)), \
+                       inView: r(pa).left >= -1 && r(pa).right <= vw + 1 }; })()",
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{tag} {theme}: eval: {e}"));
+            assert!(
+                got["src"].as_str().unwrap_or("").contains("persona=rei"),
+                "{tag}: {got}"
+            );
+            assert!(got["pw"].as_f64().unwrap_or(0.0) <= 24.0, "{tag}: {got}");
+            assert_eq!(got["selOverlap"], false, "{tag}: {got}");
+            for k in ["inBox", "inView"] {
+                assert_eq!(got[k], true, "{tag}: {k} {got}");
+            }
+            for turn in got["turns"].as_array().unwrap() {
+                let src = turn["src"].as_str().unwrap();
+                assert!(
+                    if turn["kind"] == "operator" {
+                        src.starts_with("/avatars/operator.svg?v=")
+                    } else {
+                        src.contains("persona=rei")
+                    },
+                    "{tag}: {turn}"
+                );
+                let width = turn["width"].as_f64().unwrap();
+                assert!(width > 0.0 && width <= 24.0, "{tag}: {turn}");
+                assert_eq!(turn["overlap"], false, "{tag}: {turn}");
+                for k in ["beside", "inTurn", "inView", "fits"] {
+                    assert_eq!(turn[k], true, "{tag}: {k} {turn}");
+                }
+            }
         }
-        for k in ["inBox", "inTurn", "inView"] {
-            assert_eq!(got[k], true, "{tag}: {k} {got}");
-        }
+        browser.close_page(&page).await;
     }
 }
 

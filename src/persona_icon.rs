@@ -44,6 +44,11 @@ pub fn builtin_svg(id: &str) -> &'static str {
     }
 }
 
+/// The operator's fixed display avatar; independent of the persona roster.
+pub fn operator_svg() -> &'static str {
+    include_str!("../assets/ui/avatars/operator.svg")
+}
+
 /// The mime a `data:` icon declares and its payload, when the prefix is an
 /// accepted one.
 fn data_prefix(icon: &str) -> Option<(&'static str, &str)> {
