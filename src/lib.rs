@@ -55,6 +55,7 @@ pub mod notices;
 pub mod persona;
 pub mod persona_icon;
 mod pr_head;
+pub mod pr_outcome;
 pub mod proc;
 pub mod prompt;
 pub mod queue;

@@ -6163,6 +6163,7 @@ impl Runner {
         let passed = outcomes.iter().all(CommandOutcome::ok);
         self.state.gate = outcomes;
         self.state.gate_ran = true;
+        self.state.gate_head = git::rev_parse(&winner.worktree, "HEAD").await.ok();
         if !passed {
             self.state.status = RunStatus::Blocked;
             let spent = self.state.gate_fixes.len();
@@ -6543,7 +6544,12 @@ impl Runner {
         facts: Option<&BranchFacts>,
         posting: bool,
     ) -> Result<Option<PrMessage>> {
-        let mut pr = pr_message_raw(&self.state, winner.label, facts);
+        let final_head = git::rev_parse(&winner.worktree, "HEAD").await.ok();
+        let head = match final_head.as_deref() {
+            Some(h) => crate::pr_outcome::FinalHead::At(h),
+            None => crate::pr_outcome::FinalHead::Unknown,
+        };
+        let mut pr = pr_message_raw(&self.state, winner.label, facts, head);
         if !posting {
             let identity = crate::scrub::Identity::current();
             return Ok(Some(PrMessage {
@@ -9539,7 +9545,12 @@ fn pr_message(state: &RunState, winner: char) -> PrMessage {
 /// `facts` is ignored for a run that implements a task.
 #[cfg(test)]
 fn pr_message_with(state: &RunState, winner: char, facts: Option<&BranchFacts>) -> PrMessage {
-    let raw = pr_message_raw(state, winner, facts);
+    let raw = pr_message_raw(
+        state,
+        winner,
+        facts,
+        crate::pr_outcome::FinalHead::Unreported,
+    );
     let id = crate::scrub::Identity::current();
     PrMessage {
         title: crate::scrub::scrub(&raw.title, &id),
@@ -9547,7 +9558,12 @@ fn pr_message_with(state: &RunState, winner: char, facts: Option<&BranchFacts>) 
     }
 }
 
-fn pr_message_raw(state: &RunState, winner: char, facts: Option<&BranchFacts>) -> PrMessage {
+fn pr_message_raw(
+    state: &RunState,
+    winner: char,
+    facts: Option<&BranchFacts>,
+    head: crate::pr_outcome::FinalHead<'_>,
+) -> PrMessage {
     let summary = state
         .candidates
         .iter()
@@ -9586,26 +9602,10 @@ fn pr_message_raw(state: &RunState, winner: char, facts: Option<&BranchFacts>) -
     }
 
     // The last round is usually a clean verification pass with no fix of its
-    // own, so every round's notes are read, not just the final one's.
-    let notes: Vec<(usize, &str)> = state
-        .reviews
-        .iter()
-        .filter_map(|r| {
-            let n = r.fix.as_ref()?.notes.trim();
-            (!n.is_empty()).then_some((r.round, n))
-        })
-        .collect();
-    if !notes.is_empty() {
-        body.push_str("## Review fixes\n\n");
-        if let [(_, only)] = notes.as_slice() {
-            body.push_str(only);
-            body.push_str("\n\n");
-        } else {
-            for (round, n) in &notes {
-                body.push_str(&format!("### Round {round}\n\n{n}\n\n"));
-            }
-        }
-    }
+    // own, so every round's notes are read, not just the final one's. Sentences
+    // the final state contradicts are left out (see `pr_outcome`).
+    body.push_str(&crate::pr_outcome::review_fixes(state, head).0);
+    body.push_str(&crate::pr_outcome::final_verification(state, head));
     let fix = state.reviews.iter().rev().find_map(|r| r.fix.as_ref());
 
     let open = state.open_findings();
@@ -12789,6 +12789,112 @@ mod tests {
         assert!(body.contains("### Round 1\n\nfirst fix"), "{body}");
         assert!(body.contains("### Round 3\n\nsecond fix"), "{body}");
         assert!(!body.contains("### Round 2"), "{body}");
+    }
+
+    const FINAL: &str = "abcdef1234567890";
+
+    fn passing_round(round: usize, verified: Option<&str>) -> ReviewRound {
+        let mut r = round_with_notes(round, None);
+        r.verified_head = verified.map(str::to_owned);
+        r
+    }
+
+    fn ok_gate(state: &mut RunState, head: Option<&str>) {
+        state.gate = vec![CommandOutcome {
+            command: "gate".to_owned(),
+            code: Some(0),
+            output_tail: String::new(),
+            duration_ms: 0,
+            resource_blocked: false,
+        }];
+        state.gate_ran = true;
+        state.gate_head = head.map(str::to_owned);
+    }
+
+    fn body_at(state: &RunState) -> String {
+        pr_message_raw(state, 'A', None, crate::pr_outcome::FinalHead::At(FINAL)).body
+    }
+
+    const SANDBOXED: &str = "Handled the PATH case.\nI could not commit because of the sandbox. HTTP tests could not run in the sandbox.";
+
+    #[test]
+    fn rescued_commit_and_later_verification_override_the_fixers_limits() {
+        let mut state = review_state(&["feat: x"]);
+        state.reviews = vec![
+            round_with_notes(1, Some(SANDBOXED)),
+            passing_round(2, Some(FINAL)),
+        ];
+        ok_gate(&mut state, Some(FINAL));
+        let body = body_at(&state);
+        assert!(body.contains("Handled the PATH case."), "{body}");
+        assert!(!body.contains("could not commit"), "{body}");
+        assert!(!body.contains("could not run"), "{body}");
+        assert!(
+            body.contains("The fix is committed on the branch"),
+            "{body}"
+        );
+        assert!(body.contains("2 statement(s)"), "{body}");
+        assert!(
+            body.contains("Tests (`verify.e2e`): passed on the final commit"),
+            "{body}"
+        );
+        assert!(
+            body.contains("Gate (`verify.gate`): passed on the final commit"),
+            "{body}"
+        );
+        // The raw report is untouched in the record.
+        assert!(
+            state.reviews[0]
+                .fix
+                .as_ref()
+                .unwrap()
+                .notes
+                .contains("could not commit")
+        );
+    }
+
+    #[test]
+    fn unresolved_commit_and_test_limits_stay_and_nothing_claims_success() {
+        let mut state = review_state(&["feat: x"]);
+        let mut r1 = round_with_notes(1, Some(SANDBOXED));
+        r1.fix.as_mut().unwrap().committed = false;
+        let mut r2 = passing_round(2, Some(FINAL));
+        r2.e2e[0].code = Some(1);
+        state.reviews = vec![r1, r2];
+        let body = body_at(&state);
+        assert!(body.contains("could not commit"), "{body}");
+        assert!(body.contains("could not run"), "{body}");
+        assert!(body.contains("This round produced no commit"), "{body}");
+        assert!(body.contains("Tests (`verify.e2e`): FAILED"), "{body}");
+        assert!(body.contains("Gate (`verify.gate`): not run"), "{body}");
+        assert!(!body.contains("passed"), "{body}");
+    }
+
+    #[test]
+    fn verification_on_an_earlier_commit_does_not_supersede_test_limits() {
+        let mut state = review_state(&["feat: x"]);
+        state.reviews = vec![
+            round_with_notes(1, Some(SANDBOXED)),
+            passing_round(2, Some("0123456789abcdef")),
+        ];
+        ok_gate(&mut state, Some("0123456789abcdef"));
+        let body = body_at(&state);
+        assert!(body.contains("HTTP tests could not run"), "{body}");
+        // The commit claim is still settled by the structured record.
+        assert!(!body.contains("could not commit"), "{body}");
+        assert!(
+            body.contains("passed on an earlier commit (`0123456`)"),
+            "{body}"
+        );
+        assert!(!body.contains("passed on the final commit"), "{body}");
+
+        // A gate recorded before `gate_head` existed is "not recorded".
+        ok_gate(&mut state, None);
+        let body = body_at(&state);
+        assert!(
+            body.contains("passed on a commit that was not recorded"),
+            "{body}"
+        );
     }
 
     #[test]
