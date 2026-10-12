@@ -944,14 +944,15 @@ impl Task {
         &self.runs[..self.runs.len() - 1]
     }
 
-    /// The attempt right after `run` in this task's history, if there is one.
+    /// The attempt right after the last occurrence of `run`, if there is one.
+    /// Resuming records the same run again; it cannot supersede itself.
     ///
     /// The one place "a later attempt replaced this run" is decided:
     /// [`Queue::superseded`] and [`Queue::superseded_by`] (the web UI's
     /// note) read it, and so does [`Task::earlier_attempts`], so what is shown
     /// and what `crate::handover` acts on cannot disagree.
     pub fn successor_of(&self, run: &str) -> Option<&String> {
-        let pos = self.runs.iter().position(|r| r == run)?;
+        let pos = self.runs.iter().rposition(|r| r == run)?;
         self.runs.get(pos + 1)
     }
 
@@ -2785,6 +2786,25 @@ mod tests {
         assert_eq!(t.successor_of("aaaa"), Some(&"bbbb".to_owned()));
         assert_eq!(t.successor_of("bbbb"), None);
         assert_eq!(t.successor_of("zzzz"), None);
+    }
+
+    #[test]
+    fn resumed_runs_are_superseded_only_after_their_last_occurrence() {
+        let (_dir, q) = queue();
+        let mut t = task("resumed");
+        for (runs, successor) in [
+            (vec!["aaaa", "aaaa"], None),
+            (vec!["aaaa", "bbbb", "aaaa"], None),
+            (vec!["aaaa", "aaaa", "bbbb"], Some("bbbb")),
+            (vec!["aaaa", "bbbb", "aaaa", "cccc"], Some("cccc")),
+        ] {
+            t.runs = runs.into_iter().map(str::to_owned).collect();
+            q.put(&mut t).unwrap();
+
+            assert_eq!(t.successor_of("aaaa").map(String::as_str), successor);
+            assert_eq!(q.superseded_by("aaaa").as_deref(), successor);
+            assert_eq!(q.superseded().get("aaaa").map(String::as_str), successor);
+        }
     }
 
     #[test]

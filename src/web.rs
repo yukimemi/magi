@@ -15029,6 +15029,14 @@ mod tests {
         state.driver_exited = true;
         state.event("github-text", "waiting for the owner");
         state.save_under(f.home.path()).unwrap();
+        let mut task = Task::new(
+            "resumed task".to_owned(),
+            "do it".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        task.runs = vec![id.to_owned(), id.to_owned()];
+        f.queue().put(&mut task).unwrap();
         let store = f.questions();
         let mut q = Question::new(
             id.to_owned(),
@@ -15045,6 +15053,15 @@ mod tests {
             assert_eq!(list[0]["display_status"], expected);
             assert_eq!(detail["display_status"], expected);
             assert_eq!(detail["waiting"], list[0]["waiting"]);
+            assert_eq!(list[0]["badge_status"], expected);
+            assert_eq!(detail["badge_status"], expected);
+            assert!(list[0]["superseded_by"].is_null());
+            assert!(detail["superseded_by"].is_null());
+            let task_detail = f.get(&format!("/api/tasks/{}", task.id)).await.json();
+            let history = task_detail["history"].as_array().unwrap();
+            assert_eq!(history.len(), 2);
+            assert!(history[0]["badge"].is_null());
+            assert_eq!(history[1]["badge"], expected);
             q.status = ask::QuestionStatus::Answered;
             store.put(&mut q).unwrap();
         }
