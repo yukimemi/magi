@@ -574,6 +574,44 @@ pub fn run(state: &RunState) -> String {
                 writeln!(s, "  {} {why}{size}", yellow("rolled back:"))
             }
         };
+        if let Some(a) = &g.agent {
+            let chain: Vec<String> = state
+                .handovers
+                .iter()
+                .filter(|h| h.node == "graft")
+                .map(|h| format!("{} -> {}", h.from, h.to))
+                .collect();
+            let via = if chain.is_empty() {
+                String::new()
+            } else {
+                format!("  (handovers: {})", chain.join(", "))
+            };
+            let _ = writeln!(s, "  by {a}{via}");
+        }
+        if !g.requested.is_empty() {
+            let view = crate::report_view::build(state, Liveness::Unknown);
+            if let Some(crate::report_view::Section::Graft { graft, .. }) = view
+                .sections
+                .iter()
+                .find(|x| matches!(x, crate::report_view::Section::Graft { .. }))
+            {
+                let _ = writeln!(
+                    s,
+                    "  requested {}  confirmed adopted {}  rejected {}  unconfirmed {}",
+                    graft.requested.len(),
+                    graft.adopted_count,
+                    graft.rejected_count,
+                    graft.unconfirmed_count
+                );
+            }
+        }
+        if let Some(n) = g
+            .adoption
+            .as_ref()
+            .and_then(|a| a.notes.lines().find(|l| !l.trim().is_empty()))
+        {
+            let _ = writeln!(s, "  fixer notes: {}", n.trim());
+        }
     }
 
     if !state.reviews.is_empty() {

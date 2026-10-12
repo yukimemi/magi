@@ -942,6 +942,12 @@ fn context_tokens(kind: AgentKind, stdout: &str) -> Option<u64> {
     }
 }
 
+/// The answer text of a stored `<stem>.out`, through the same per-CLI
+/// extraction a live call uses. Never the raw event stream.
+pub(crate) fn answer_text(kind: AgentKind, stdout: &str) -> String {
+    extract_answer(kind, stdout).text
+}
+
 fn extract_answer(kind: AgentKind, stdout: &str) -> Extracted {
     match kind {
         AgentKind::Claude => {

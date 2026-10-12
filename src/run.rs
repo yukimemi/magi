@@ -867,6 +867,57 @@ pub struct GraftRecord {
     pub agent: Option<String>,
     /// How it ended.
     pub outcome: GraftOutcome,
+    /// The strengths the fixer was asked to port, with the ids the prompt
+    /// gave them. Empty on a record written before they were kept.
+    #[serde(default)]
+    pub requested: Vec<GraftStrength>,
+    /// What the fixer reported it did with them; `None` when it gave no usable
+    /// report (see `adoption_error`) or the record predates this field.
+    #[serde(default)]
+    pub adoption: Option<GraftAdoption>,
+    /// Why `adoption` is absent although the fixer answered.
+    #[serde(default)]
+    pub adoption_error: Option<String>,
+}
+
+/// One strength a judge attributed to a losing candidate, as the graft
+/// prompt listed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraftStrength {
+    /// Id in the prompt, e.g. `A1`.
+    pub id: String,
+    /// The candidate it was observed in.
+    pub source: char,
+    /// The strength, already blind-sanitized.
+    pub text: String,
+}
+
+/// The fixer's own account of a graft round. It is a claim, not a check: the
+/// diff is what actually changed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraftAdoption {
+    /// Ids (or texts) the fixer says it ported.
+    #[serde(default)]
+    pub addressed: Vec<String>,
+    /// Ids (or texts) it declined, with the reason.
+    #[serde(default)]
+    pub rejected: Vec<GraftRejection>,
+    /// The report's `notes`.
+    #[serde(default)]
+    pub notes: String,
+    /// The reasoning that preceded the report.
+    #[serde(default)]
+    pub reasoning: String,
+}
+
+/// A strength the fixer declined.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraftRejection {
+    /// Id or text as the fixer wrote it.
+    pub id: String,
+    /// Its argument.
+    #[serde(default)]
+    pub why: String,
 }
 
 /// The fixer's response to a round.
