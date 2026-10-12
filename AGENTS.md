@@ -2647,8 +2647,9 @@ fallback; a language-withheld field becomes neutral.
   using the same excerpt limit and fences; its local artifact holds the full
   pair. `use rewrite` saves
   `GithubTextChoice::Rewrite` before posting and uses both saved fields without
-  another gate, including a title that was not originally withheld. Adopted PR
-  titles use `set_pr_title_verbatim` too. A missing rewrite falls back, as do
+  another gate, including a title that was not originally withheld. Adopted PRs
+  update both fields through `set_pr_text_verbatim`, even when the title already
+  matches; an edit failure blocks the run. A missing rewrite falls back, as do
   silence, timeout and abandonment. Restart and retry reuse the saved pair;
   no text is copied into event messages or notifications.
 - **A deputy may settle `post original` or `use rewrite` only under the

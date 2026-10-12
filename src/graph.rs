@@ -7017,41 +7017,56 @@ impl Runner {
                         PrPlan::Adopt { url, title } => {
                             self.state
                                 .event("merge", format!("Pr: adopted open pull request {url}"));
-                            if title != pr.title
-                                && (!is_review_run(&self.state)
-                                    || leaked
-                                        .as_deref()
-                                        .is_some_and(|l| should_retitle(&title, &pr.title, l)))
-                                && let Err(e) =
-                                    if self.state.github_text.as_ref().is_some_and(|g| {
-                                        g.resolved
-                                            && ((g.title
-                                                && g.choice == Some(GithubTextChoice::Original))
-                                                || (g.choice == Some(GithubTextChoice::Rewrite)
-                                                    && g.rewrite.is_some()))
-                                    }) {
-                                        // The owner chose to post this title unmodified.
-                                        land::set_pr_title_verbatim(
-                                            &winner.worktree,
-                                            &url,
-                                            &pr.title,
-                                        )
-                                        .await
-                                    } else {
-                                        land::set_pr_title(
-                                            &mut self.state,
-                                            &winner.worktree,
-                                            &url,
-                                            &pr.title,
-                                        )
-                                        .await
-                                    }
-                            {
-                                tracing::warn!("could not refresh title of {url}: {e:#}");
-                                self.state
-                                    .event("merge", format!("Pr: title refresh failed: {e:#}"));
+                            if self.state.github_text.as_ref().is_some_and(|g| {
+                                g.resolved
+                                    && g.choice == Some(GithubTextChoice::Rewrite)
+                                    && g.rewrite.is_some()
+                            }) {
+                                // The owner chose the entire pair, even if the
+                                // existing title already matches or was edited.
+                                land::set_pr_text_verbatim(
+                                    &winner.worktree,
+                                    &url,
+                                    &pr.title,
+                                    &pr.body,
+                                )
+                                .await
+                                .map(|()| url)
+                            } else {
+                                if title != pr.title
+                                    && (!is_review_run(&self.state)
+                                        || leaked
+                                            .as_deref()
+                                            .is_some_and(|l| should_retitle(&title, &pr.title, l)))
+                                    && let Err(e) =
+                                        if self.state.github_text.as_ref().is_some_and(|g| {
+                                            g.resolved
+                                                && g.title
+                                                && g.choice == Some(GithubTextChoice::Original)
+                                        }) {
+                                            // The owner chose to post this title unmodified.
+                                            land::set_pr_title_verbatim(
+                                                &winner.worktree,
+                                                &url,
+                                                &pr.title,
+                                            )
+                                            .await
+                                        } else {
+                                            land::set_pr_title(
+                                                &mut self.state,
+                                                &winner.worktree,
+                                                &url,
+                                                &pr.title,
+                                            )
+                                            .await
+                                        }
+                                {
+                                    tracing::warn!("could not refresh title of {url}: {e:#}");
+                                    self.state
+                                        .event("merge", format!("Pr: title refresh failed: {e:#}"));
+                                }
+                                Ok(url)
                             }
-                            Ok(url)
                         }
                         PrPlan::Stop(why) => Err(anyhow::anyhow!(why)),
                     };

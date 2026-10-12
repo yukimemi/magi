@@ -2159,6 +2159,30 @@ pub async fn set_pr_title_verbatim(repo: &Path, url: &str, title: &str) -> Resul
     edit_pr_title(repo, url, title).await
 }
 
+/// Post both fields of the owner's chosen rewrite to an adopted pull request,
+/// unmodified and without the posting gate.
+pub async fn set_pr_text_verbatim(repo: &Path, url: &str, title: &str, body: &str) -> Result<()> {
+    let (ok, _) = gh(
+        repo,
+        &[
+            "pr".to_owned(),
+            "edit".to_owned(),
+            url.to_owned(),
+            "--title".to_owned(),
+            title.to_owned(),
+            "--body".to_owned(),
+            body.to_owned(),
+        ],
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("could not run gh pr edit for the chosen rewrite"))?;
+    if !ok {
+        // Command output may echo the chosen text; keep it out of run events.
+        bail!("gh pr edit failed while posting the chosen rewrite");
+    }
+    Ok(())
+}
+
 async fn edit_pr_title(repo: &Path, url: &str, title: &str) -> Result<()> {
     let (ok, out) = gh(
         repo,
