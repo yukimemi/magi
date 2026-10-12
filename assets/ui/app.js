@@ -4708,15 +4708,23 @@ function renderPostingComparison(parent, view) {
       }
       section.append(heading);
       const pre = el("pre", { class: "posting-text" });
+      let content = pre;
+      if (field.replacement_group && fragments === field.original) {
+        // The language rule replaces the entire original, including any
+        // individually marked sensitive triggers nested inside this group.
+        content = pairNode("span", field.replacement_group.id);
+        content.append(marker(field.replacement_group.id));
+        pre.append(content);
+      }
       for (const fragment of fragments) {
         if (fragment.pair == null) {
-          pre.append(document.createTextNode(fragment.text));
+          content.append(document.createTextNode(fragment.text));
         } else {
           const span = pairNode("span", fragment.pair);
           span.append(marker(fragment.pair));
           span.append(el("span", { text: fragment.text }));
           if (fragment.text === "") span.append(el("span", { class: "posting-removed", text: " (removed)" }));
-          pre.append(span);
+          content.append(span);
         }
       }
       section.append(pre);

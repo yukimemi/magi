@@ -75,14 +75,47 @@ test('whole-field fallback lists individually highlighted original triggers as g
   assert.ok(pres[0].textContent.includes('#2secret-one'));
   assert.ok(pres[0].textContent.includes('#3secret-two'));
   assert.equal(pres[1].textContent, '#1Neutral fallback.');
+  const originalGroup = pres[0].children[0];
+  const fallbackGroup = pres[1].children[0];
+  assert.equal(originalGroup.className, 'posting-pair');
+  assert.equal(originalGroup.children[0].textContent, '#1');
+  assert.ok(originalGroup.children[1].textContent.startsWith('日本語の説明です。'));
+  assert.equal(originalGroup['--pair-hue'], fallbackGroup['--pair-hue']);
+  const languageRule = nodes.find(n => n.tag === 'li' && n.children[0]?.textContent === '#1');
+  assert.equal(originalGroup['--pair-hue'], languageRule['--pair-hue']);
+  assert.equal(originalGroup.children.slice(1).map(n => n.className === 'posting-pair'
+    ? n.children[1].textContent : n.textContent).join(''),
+  '日本語の説明です。 First key: secret-one\nMore context. Second key: secret-two');
   const headings = nodes.filter(n => n.className === 'posting-label');
   assert.ok(headings[0].textContent.includes('whole-field replacement #1'));
   assert.ok(headings[1].textContent.includes('includes original triggers #2#3'));
   for (const id of [2, 3]) {
-    const originalSpan = pres[0].children.find(n => n.children[0]?.textContent === `#${id}`);
+    const originalSpan = originalGroup.children.find(n => n.children[0]?.textContent === `#${id}`);
     const groupBadge = headings[1].children.find(n => n.children[0]?.textContent === `#${id}`);
     const rule = nodes.find(n => n.tag === 'li' && n.children[0]?.textContent === `#${id}`);
     assert.equal(originalSpan['--pair-hue'], groupBadge['--pair-hue']);
     assert.equal(originalSpan['--pair-hue'], rule['--pair-hue']);
   }
+});
+
+
+test('language group also encloses a sensitive trigger containing the language violation', () => {
+  const text = 'password=日本語の説明です。 <script>literal</script>';
+  const root = new Node('div');
+  render(root, { before_md: [], after_md: [], fields: [{
+    name: 'Description', replacement_group: { id: 1, triggers: [2] },
+    pairs: [[1, 'body-language: whole field replaced'], [2, 'sensitive-data']],
+    original: [{ text, pair: 2 }], changed: [{ text: 'Neutral fallback.', pair: 1 }],
+  }] });
+  const pres = descend(root).filter(n => n.tag === 'pre');
+  const group = pres[0].children[0];
+  const trigger = group.children[1];
+  assert.equal(group.className, 'posting-pair');
+  assert.equal(group.children[0].textContent, '#1');
+  assert.equal(trigger.className, 'posting-pair');
+  assert.equal(trigger.children[0].textContent, '#2');
+  assert.equal(trigger.children[1].textContent, text);
+  assert.equal(group['--pair-hue'], pres[1].children[0]['--pair-hue']);
+  assert.notEqual(group['--pair-hue'], trigger['--pair-hue']);
+  assert.equal(descend(root).filter(n => n.tag === 'script').length, 0);
 });

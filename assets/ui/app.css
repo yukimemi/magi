@@ -2838,7 +2838,8 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
 .posting-rules li { margin-block: .5rem; padding: .35rem .5rem; border-left: 3px solid hsl(var(--pair-hue) 65% 45%); }
 .posting-pair { color: var(--ink); background: hsl(var(--pair-hue) 65% 50% / .16); }
 .posting-text { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); background: var(--sunk); line-height: 1.8; }
-.posting-text > .posting-pair { border-bottom: 2px solid hsl(var(--pair-hue) 65% 45%); padding-block: .1em; }
+/* Paint each nested trigger over the same base to preserve its distinct hue. */
+.posting-text .posting-pair { background: linear-gradient(hsl(var(--pair-hue) 65% 50% / .16), hsl(var(--pair-hue) 65% 50% / .16)), var(--sunk); border-bottom: 2px solid hsl(var(--pair-hue) 65% 45%); padding-block: .1em; }
 .posting-marker { display: inline-block; font-size: .75em; font-weight: 750; border: 1px solid currentColor; border-radius: .2em; padding: 0 .2em; margin-inline: .2em; line-height: 1.4; vertical-align: baseline; }
 .posting-label { font-size: .85em; color: var(--ink-2); margin-bottom: .35rem; }
 .posting-removed { font-style: italic; }
