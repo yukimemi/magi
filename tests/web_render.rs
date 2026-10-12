@@ -195,6 +195,20 @@ async fn serve(
     runs_root: std::path::PathBuf,
     repo: &std::path::Path,
 ) -> String {
+    serve_with_queue_probe(home, queue, talks, runs_root, repo, false).await
+}
+
+// Expose the live module's functions only for the pointer/refresh regression.
+// Running client_harness here would install a second client with independent
+// health/loop state, whose renderLoop changes the same header's geometry.
+async fn serve_with_queue_probe(
+    home: &std::path::Path,
+    queue: Queue,
+    talks: Talks,
+    runs_root: std::path::PathBuf,
+    repo: &std::path::Path,
+    probe: bool,
+) -> String {
     let worktrees = home.join("wt").join("magi");
     std::fs::create_dir_all(&worktrees).unwrap();
     let ui = magi::web::Ui::new(
@@ -210,8 +224,30 @@ async fn serve(
         .await
         .expect("bind loopback");
     let base = format!("http://{}/", listener.local_addr().unwrap());
+    let router = ui.router().layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| async move {
+            if probe && request.uri().path() == "/app.js" {
+                use axum::response::IntoResponse;
+                let source = include_str!("../assets/ui/app.js");
+                let source = source
+                    .trim_end()
+                    .strip_suffix("boot();")
+                    .expect("client boot entry");
+                return (
+                    [(axum::http::header::CONTENT_TYPE, "text/javascript")],
+                    format!(
+                        "{source}\nwindow.deck = {{ setChip, RUN_STATUS, TASK_STATUS, \
+                         QUESTION_STATUS, TALK_STATUS, loadQueue }};\n\
+                         window.queueReady = boot();"
+                    ),
+                )
+                    .into_response();
+            }
+            next.run(request).await
+        },
+    ));
     tokio::spawn(async move {
-        let _ = axum::serve(listener, ui.router()).await;
+        let _ = axum::serve(listener, router).await;
     });
     base
 }
@@ -1122,7 +1158,7 @@ async fn queue_row_click_previews_task_in_split_pane() {
     run.save_under(&home).expect("seed run");
     let ids = seed_tasks(&queue, &fx.repo, &run.id);
 
-    let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
+    let base = serve_with_queue_probe(&home, queue, talks, home.join("runs"), &fx.repo, true).await;
     let mut browser = cdp::Browser::launch(&chrome)
         .await
         .unwrap_or_else(|e| panic!("could not start Chrome at {}: {e}", chrome.display()));
@@ -1141,7 +1177,10 @@ async fn queue_row_click_previews_task_in_split_pane() {
             .collect::<Vec<_>>()
             .join(" && ");
         browser.wait_for(&page, &all, w).await.expect("rows");
-        client_harness(&mut browser, &page).await;
+        browser
+            .eval(&page, "window.queueReady")
+            .await
+            .expect("live client boot completed");
         let chips = browser
             .eval(
                 &page,
