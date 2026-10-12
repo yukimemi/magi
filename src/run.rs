@@ -2059,6 +2059,10 @@ pub struct RunState {
     /// `false` and is migrated in [`migrate_schema`].
     #[serde(default)]
     pub gate_ran: bool,
+    /// The winner's commit the recorded `gate` ran against. `None` on a record
+    /// from before this existed, which reads as "commit unknown".
+    #[serde(default)]
+    pub gate_head: Option<String>,
     /// Fix rounds a failing gate has already spent, oldest first. Persisted
     /// right after each fixer call so a resumed run spends only what is left
     /// of `graph.gate_fix_rounds` instead of starting the budget over.
@@ -2375,6 +2379,7 @@ impl RunState {
             reviews: Vec::new(),
             gate: Vec::new(),
             gate_ran: false,
+            gate_head: None,
             gate_fixes: Vec::new(),
             rebase_fixes: Vec::new(),
             graft: None,
