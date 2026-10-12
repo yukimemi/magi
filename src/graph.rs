@@ -6588,57 +6588,13 @@ impl Runner {
             );
             let mut rewritten = false;
             let mut rejected_rewrite = None;
-            if has_language
-                && let Some(spec) = self
-                    .state
-                    .config
-                    .agents
-                    .iter()
-                    .find(|a| a.id == winner.agent)
-                    .cloned()
+            if has_language && let Some(text) = self.rewrite_pr_text(winner, &pr, &violations).await
             {
-                let key = format!("impl-{}", winner.label);
-                let seat = self.seat(&key, &spec.id);
-                let prompt = format!(
-                    "Rewrite only the following pull request description. The posting gate reported {violations:?}. Write English prose and remove all machine or operator identifying data and secrets. Do not edit files or run commands. Return TITLE: followed by the title, then the complete Markdown body. Preserve the magi run marker.\n\nTITLE: {}\n{}",
-                    pr.title, pr.body
-                );
-                let job = SeatJob {
-                    spec,
-                    seat,
-                    cwd: winner.worktree.clone(),
-                    prompt,
-                    timeout: retry_budget(
-                        Duration::from_secs(self.state.config.graph.timeout_implement),
-                        true,
-                    ),
-                    allow_write: false,
-                    sessions: self.state.config.graph.sessions,
-                    artifacts: agent::artifacts_dir(&self.state.dir()),
-                    stem: "github-text-rewrite".to_owned(),
-                    handover: None,
-                };
-                let prompts = self.state.config.prompts.clone();
-                let cache = self.state.config.cache_dir();
-                let run = self.state.id.clone();
-                let ctx = WaveCtx {
-                    run: &run,
-                    node: "github-text",
-                    prompts: &prompts,
-                    cache: cache.as_deref(),
-                    round: None,
-                    carry_seats: false,
-                    pauses: Some((&self.pause, &self.interrupt)),
-                };
-                let (seat, outcome) =
-                    run_one(job, Arc::clone(&self.sem), &ctx, &mut self.state, 1).await;
-                self.state.seats.insert(seat.key.clone(), seat);
-                if let AgentOutcome::Ok(output) = outcome
-                    && let Some(title) = summary_title(&output.text)
-                {
+                let output = text;
+                if let Some(title) = summary_title(&output) {
                     // Judge the redacted candidate that will actually be posted.
                     // Sensitive data alone must not discard a useful rewrite.
-                    let raw_body = summary_without_title(&output.text);
+                    let raw_body = summary_without_title(&output);
                     let clean_title = crate::scrub::scrub(&title, &identity);
                     let mut body = crate::scrub::scrub(&raw_body, &identity);
                     let redacted = clean_title != title || body != raw_body;
@@ -6714,6 +6670,111 @@ impl Runner {
         let (title, body) =
             crate::github_text::prepare_with(&mut self.state, &pr.title, &pr.body, decision);
         Ok(Some(PrMessage { title, body }))
+    }
+
+    /// One read-only rewrite request for a withheld description. The
+    /// implementer's own conversation is reused only when it exists and can be
+    /// resumed; otherwise the `[roles] language_judge` chain (or the default
+    /// pick) writes it in a separate conversation. The prompt carries the whole
+    /// text, so no agent needs any memory. Each agent is asked at most once and
+    /// the chain advances on an error, quota, unusable answer or a reply with
+    /// no `TITLE:` line. Nothing is recorded as a handover.
+    async fn rewrite_pr_text(
+        &mut self,
+        winner: &Candidate,
+        pr: &PrMessage,
+        violations: &[crate::github_text::Violation],
+    ) -> Option<String> {
+        let prompt = format!(
+            "Rewrite only the following pull request description into English. The posting gate reported {violations:?}. Keep every substantive detail (file names, commands, numbers, findings, code blocks and <details> sections) and translate the prose. Remove all machine or operator identifying data and secrets. Do not edit files or run commands. Return TITLE: followed by the title, then the complete Markdown body. Preserve the magi run marker.\n\nTITLE: {}\n{}",
+            pr.title, pr.body
+        );
+        let sessions = self.state.config.graph.sessions;
+        let timeout_full = Duration::from_secs(self.state.config.graph.timeout_implement);
+        // (spec, seat, resumed)
+        let mut attempts: Vec<(AgentSpec, SeatState, bool)> = Vec::new();
+        let key = format!("impl-{}", winner.label);
+        if let Some(spec) = self
+            .state
+            .config
+            .agents
+            .iter()
+            .find(|a| a.id == winner.agent)
+            .cloned()
+            && let Some(existing) = self.state.seats.get(&key)
+            && existing.agent == spec.id
+            && agent::has_session(spec.kind, existing, sessions)
+        {
+            attempts.push((spec, existing.clone(), true));
+        } else {
+            let chain = agent::pick_chain(
+                &self.state.config.agents,
+                self.state.config.roles.language_judge.as_ref(),
+                &agent::installed,
+                "language_judge",
+            );
+            match chain {
+                Ok(chain) => {
+                    for spec in chain {
+                        let seat = crate::fixer::seat_for(
+                            &mut self.state,
+                            "github-text-rewrite",
+                            &spec.id,
+                        );
+                        attempts.push((spec, seat, false));
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("no agent for the description rewrite: {e:#}");
+                    self.state
+                        .event("github-text", "no rewrite agent available");
+                    return None;
+                }
+            }
+        }
+        let prompts = self.state.config.prompts.clone();
+        let cache = self.state.config.cache_dir();
+        let run = self.state.id.clone();
+        for (i, (spec, seat, resumed)) in attempts.into_iter().enumerate() {
+            let job = SeatJob {
+                spec: spec.clone(),
+                seat,
+                cwd: winner.worktree.clone(),
+                prompt: prompt.clone(),
+                timeout: retry_budget(timeout_full, resumed),
+                allow_write: false,
+                sessions,
+                artifacts: agent::artifacts_dir(&self.state.dir()),
+                stem: if i == 0 {
+                    "github-text-rewrite".to_owned()
+                } else {
+                    format!("github-text-rewrite-{}", spec.id)
+                },
+                handover: None,
+            };
+            let ctx = WaveCtx {
+                run: &run,
+                node: "github-text",
+                prompts: &prompts,
+                cache: cache.as_deref(),
+                round: None,
+                carry_seats: false,
+                pauses: Some((&self.pause, &self.interrupt)),
+            };
+            let (seat, outcome) =
+                run_one(job, Arc::clone(&self.sem), &ctx, &mut self.state, 1).await;
+            self.state.seats.insert(seat.key.clone(), seat);
+            match outcome {
+                AgentOutcome::Ok(o)
+                    if !agent::output_advances(&o) && summary_title(&o.text).is_some() =>
+                {
+                    return Some(o.text);
+                }
+                AgentOutcome::ResourceBlocked(_) => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Abandon the standing posting-gate question, if any.
@@ -13057,7 +13118,7 @@ mod tests {
                 accepted
             );
             assert_eq!(
-                runner.state.seats["impl-A"].turns, 1,
+                runner.state.seats["github-text-rewrite"].turns, 1,
                 "only one rewrite invocation"
             );
             assert!(runner.state.events.iter().any(|e| e.node == "github-text"));
@@ -13079,6 +13140,179 @@ mod tests {
                         .contains(&format!("magi:run/{}", runner.state.id))
                 );
             }
+        }
+    }
+
+    fn scripted(id: &str, reply: &str) -> AgentSpec {
+        let mut a = spec(id);
+        a.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf '%s' \"$REWRITE_REPLY\"".into(),
+        ];
+        a.env.insert("REWRITE_REPLY".into(), reply.into());
+        a
+    }
+
+    const JA_SUMMARY: &str = "TITLE: fix: retries\n日本語の説明を書きます。";
+    const EN_REWRITE: &str = "TITLE: fix: retries\nAdd retries in `src/net.rs` for 3 failed requests.\n\n<details>kept</details>";
+
+    fn rewrite_runner(dir: &Path, review_only: bool, agents: Vec<AgentSpec>) -> Runner {
+        let mut runner = runner_at(RunStatus::Gating);
+        runner.state = state_with_summary("add retries", JA_SUMMARY);
+        if review_only {
+            runner.state.candidates[0].agent = EXISTING_BRANCH.to_owned();
+        }
+        runner.state.repo = dir.to_owned();
+        runner.state.candidates[0].worktree = dir.to_owned();
+        runner.state.config.agents = agents;
+        runner
+    }
+
+    fn gate_questions(runner: &Runner) -> usize {
+        ask::Questions::open()
+            .list()
+            .into_iter()
+            .filter(|q| q.run == runner.state.id && q.node == crate::github_text::ASK_NODE)
+            .count()
+    }
+
+    #[tokio::test]
+    async fn review_only_description_is_rewritten_by_the_language_judge_role() {
+        crate::run::pin_test_home();
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = rewrite_runner(
+            dir.path(),
+            true,
+            vec![scripted("alpha", "nope"), scripted("beta", EN_REWRITE)],
+        );
+        runner.state.config.roles.language_judge =
+            Some(crate::config::AgentChoice::Chain(vec!["beta".into()]));
+        let winner = runner.state.candidates[0].clone();
+        let msg = runner
+            .guarded_pr_message(&winner, None, true)
+            .await
+            .unwrap()
+            .expect("an English rewrite posts without asking");
+        assert!(msg.body.contains("`src/net.rs` for 3 failed requests"));
+        assert!(msg.body.contains("<details>kept</details>"));
+        assert!(msg.body.contains(&format!("magi:run/{}", runner.state.id)));
+        assert_eq!(gate_questions(&runner), 0);
+        assert!(runner.state.github_text.is_none());
+        assert!(!runner.state.seats.contains_key("impl-A"));
+        assert_eq!(runner.state.seats["github-text-rewrite"].turns, 1);
+    }
+
+    #[tokio::test]
+    async fn rewrite_without_an_implementer_session_uses_the_role_not_the_seat() {
+        crate::run::pin_test_home();
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = rewrite_runner(
+            dir.path(),
+            false,
+            vec![scripted("alpha", "nope"), scripted("beta", EN_REWRITE)],
+        );
+        runner.state.config.roles.language_judge =
+            Some(crate::config::AgentChoice::One("beta".into()));
+        runner.state.seats.insert(
+            "impl-A".into(),
+            SeatState::new("impl-A", "alpha", runner.state.seed),
+        );
+        let winner = runner.state.candidates[0].clone();
+        let msg = runner
+            .guarded_pr_message(&winner, None, true)
+            .await
+            .unwrap()
+            .expect("rewritten");
+        assert!(msg.body.contains("<details>kept</details>"));
+        assert_eq!(runner.state.seats["impl-A"].turns, 0);
+        assert_eq!(runner.state.seats["github-text-rewrite"].turns, 1);
+        assert_eq!(runner.state.seats["github-text-rewrite"].agent, "beta");
+    }
+
+    #[tokio::test]
+    async fn rewrite_reuses_a_resumable_implementer_session() {
+        crate::run::pin_test_home();
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = rewrite_runner(
+            dir.path(),
+            false,
+            vec![scripted("alpha", EN_REWRITE), scripted("beta", "nope")],
+        );
+        runner.state.config.roles.language_judge =
+            Some(crate::config::AgentChoice::One("beta".into()));
+        let mut seat = SeatState::new("impl-A", "alpha", runner.state.seed);
+        seat.turns = 1;
+        runner.state.seats.insert("impl-A".into(), seat);
+        let winner = runner.state.candidates[0].clone();
+        runner
+            .guarded_pr_message(&winner, None, true)
+            .await
+            .unwrap()
+            .expect("rewritten");
+        assert_eq!(runner.state.seats["impl-A"].turns, 2);
+        assert!(!runner.state.seats.contains_key("github-text-rewrite"));
+    }
+
+    #[tokio::test]
+    async fn rewrite_chain_advances_past_a_failing_or_unparsable_agent() {
+        crate::run::pin_test_home();
+        let dir = tempfile::tempdir().unwrap();
+        let mut broken = spec("bad");
+        broken.command = vec!["false".into()];
+        let mut runner = rewrite_runner(
+            dir.path(),
+            true,
+            vec![
+                broken,
+                scripted("noformat", "Add retries."),
+                scripted("good", EN_REWRITE),
+            ],
+        );
+        runner.state.config.roles.language_judge = Some(crate::config::AgentChoice::Chain(vec![
+            "bad".into(),
+            "noformat".into(),
+            "good".into(),
+        ]));
+        let winner = runner.state.candidates[0].clone();
+        let msg = runner
+            .guarded_pr_message(&winner, None, true)
+            .await
+            .unwrap()
+            .expect("the third agent rewrites");
+        assert!(msg.body.contains("`src/net.rs`"));
+        assert_eq!(runner.state.seats["github-text-rewrite"].agent, "good");
+        assert!(runner.state.handovers.is_empty(), "no handover is recorded");
+    }
+
+    #[tokio::test]
+    async fn unsuccessful_review_only_rewrites_ask_the_owner_and_never_post_the_original() {
+        crate::run::pin_test_home();
+        // (agents, role): still Japanese; no TITLE; nothing resolvable.
+        for (agents, role, saved) in [
+            (
+                vec![scripted("beta", "TITLE: fix: retries\n日本語の説明です。")],
+                Some("beta"),
+                true,
+            ),
+            (vec![scripted("beta", "Add retries.")], Some("beta"), false),
+            (Vec::new(), None, false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut runner = rewrite_runner(dir.path(), true, agents);
+            runner.state.config.roles.language_judge =
+                role.map(|r| crate::config::AgentChoice::One(r.into()));
+            let winner = runner.state.candidates[0].clone();
+            let first = runner
+                .guarded_pr_message(&winner, None, true)
+                .await
+                .unwrap();
+            assert!(first.is_none(), "withheld text parks the run");
+            assert!(runner.state.parked);
+            assert_eq!(gate_questions(&runner), 1);
+            let g = runner.state.github_text.as_ref().unwrap();
+            assert_eq!(g.rewrite.is_some(), saved);
+            assert!(g.choice.is_none() && !g.resolved, "nothing posts unasked");
         }
     }
 
@@ -13185,7 +13419,7 @@ mod tests {
             .unwrap();
         assert_eq!(again.title, message.title);
         assert_eq!(again.body, message.body);
-        assert_eq!(runner.state.seats["impl-A"].turns, 1);
+        assert_eq!(runner.state.seats["github-text-rewrite"].turns, 1);
         assert!(
             !runner
                 .state
