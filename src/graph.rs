@@ -7407,22 +7407,24 @@ impl Runner {
                         None
                     }
                 };
+                let (detail, comparison) = gt::question_content(
+                    &w,
+                    &pr.title,
+                    &pr.body,
+                    &self.state.id,
+                    rejected.as_deref(),
+                    artifact.as_deref(),
+                    g.rewrite.as_ref(),
+                );
                 let mut q = ask::Question::new(
                     self.state.id.clone(),
                     gt::ASK_NODE.to_owned(),
                     gt::ASK_SEAT.to_owned(),
                     gt::question_summary(&self.state.config.graph.language, &w),
-                    gt::question_detail(
-                        &w,
-                        &pr.title,
-                        &pr.body,
-                        &self.state.id,
-                        rejected.as_deref(),
-                        artifact.as_deref(),
-                        g.rewrite.as_ref(),
-                    ),
+                    detail,
                     gt::question_choices(&w, g.rewrite.as_ref()),
                 );
+                q.posting_comparison = Some(comparison);
                 q.answer_timeout = timeout;
                 // Recorded before it is written: a stop in between leaves a
                 // record naming a question the resume then files again.
@@ -14257,6 +14259,12 @@ mod tests {
         assert_eq!(retry.rewrite.as_ref(), Some(&rewrite));
         let q = store.get(retry.question.as_ref().unwrap()).unwrap();
         assert!(q.detail.contains("REWRITE") && q.detail.contains(&rewrite.title));
+        assert!(
+            q.posting_comparison
+                .as_ref()
+                .unwrap()
+                .matches_detail(&q.detail)
+        );
         store
             .update(&q.id, |q| {
                 q.answer(ask::Answer::Choice(crate::github_text::USE_REWRITE.into()))

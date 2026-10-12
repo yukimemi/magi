@@ -2830,3 +2830,15 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
 .turn-actions .btn, .reply-preview .btn { min-height: 44px; }
 .turn.reply-highlight { outline: 2px solid var(--gold); outline-offset: 3px; }
 .queued-message { margin-top: .5rem; }
+
+/* Posting comparisons retain the theme's text color over a quiet tint.
+   Numbered borders connect explanations and spans without relying on hue. */
+.posting-comparison { min-width: 0; margin-block: 1.25rem; }
+.posting-rules { padding-left: 0; list-style: none; }
+.posting-rules li { margin-block: .5rem; padding: .35rem .5rem; border-left: 3px solid hsl(var(--pair-hue) 65% 45%); }
+.posting-pair { color: var(--ink); background: hsl(var(--pair-hue) 65% 50% / .16); }
+.posting-text { white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); background: var(--sunk); line-height: 1.8; }
+.posting-text > .posting-pair { border-bottom: 2px solid hsl(var(--pair-hue) 65% 45%); padding-block: .1em; }
+.posting-marker { display: inline-block; font-size: .75em; font-weight: 750; border: 1px solid currentColor; border-radius: .2em; padding: 0 .2em; margin-inline: .2em; line-height: 1.4; vertical-align: baseline; }
+.posting-label { font-size: .85em; color: var(--ink-2); margin-bottom: .35rem; }
+.posting-removed { font-style: italic; }

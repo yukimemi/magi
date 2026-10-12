@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::agent;
 use crate::config::Config;
@@ -395,6 +395,308 @@ pub fn fallback_text(w: &Withheld, title: &str, body: &str, run_id: &str) -> (St
     (t, b)
 }
 
+/// Local display metadata, kept separate from every posting payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostingComparison {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) markdown: String,
+    pub(crate) fields: Vec<ComparisonField>,
+    pub(crate) excerpt: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ComparisonField {
+    pub(crate) name: String,
+    pub(crate) original: String,
+    pub(crate) changed: String,
+    pub(crate) pairs: Vec<SpanPair>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SpanPair {
+    pub(crate) id: usize,
+    pub(crate) explanation: String,
+    pub(crate) original: std::ops::Range<usize>,
+    pub(crate) changed: std::ops::Range<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ComparisonView {
+    pub(crate) name: String,
+    pub(crate) original: Vec<SpanFragment>,
+    pub(crate) changed: Vec<SpanFragment>,
+    pub(crate) pairs: Vec<(usize, String)>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SpanFragment {
+    pub(crate) text: String,
+    pub(crate) pair: Option<usize>,
+}
+
+impl PostingComparison {
+    pub(crate) fn matches_detail(&self, detail: &str) -> bool {
+        let render = |artifact| {
+            self.fields.iter().map(|field| format!(
+            "\n## {}\n\nORIGINAL (exactly as the agent wrote it, not redacted):\n\n{}\n\nFALLBACK (posted on `{USE_FALLBACK}`):\n\n{}\n",
+            field.name, fenced(&shown(&field.original, artifact)), fenced(&shown(&field.changed, artifact)),
+        )).collect::<String>()
+        };
+        detail.get(self.start..self.end) == Some(self.markdown.as_str())
+            && self.markdown == render(self.excerpt)
+    }
+}
+
+impl ComparisonField {
+    /// Validate both UTF-8 ranges and all unchanged intervals before displaying a link.
+    pub(crate) fn view(&self, excerpt: bool) -> Option<ComparisonView> {
+        let mut original = Vec::new();
+        let mut changed = Vec::new();
+        let (mut a, mut b) = (0, 0);
+        for pair in &self.pairs {
+            let left = self.original.get(a..pair.original.start)?;
+            let right = self.changed.get(b..pair.changed.start)?;
+            if left != right || pair.id == 0 {
+                return None;
+            }
+            original.push(SpanFragment {
+                text: left.into(),
+                pair: None,
+            });
+            changed.push(SpanFragment {
+                text: right.into(),
+                pair: None,
+            });
+            original.push(SpanFragment {
+                text: self.original.get(pair.original.clone())?.into(),
+                pair: Some(pair.id),
+            });
+            changed.push(SpanFragment {
+                text: self.changed.get(pair.changed.clone())?.into(),
+                pair: Some(pair.id),
+            });
+            a = pair.original.end;
+            b = pair.changed.end;
+        }
+        let left = self.original.get(a..)?;
+        let right = self.changed.get(b..)?;
+        if left != right {
+            return None;
+        }
+        original.push(SpanFragment {
+            text: left.into(),
+            pair: None,
+        });
+        changed.push(SpanFragment {
+            text: right.into(),
+            pair: None,
+        });
+        let cutoff = |text: &str| {
+            if excerpt {
+                text.char_indices()
+                    .nth(SHOWN_MAX_CHARS)
+                    .map_or(text.len(), |(i, _)| i)
+            } else {
+                text.len()
+            }
+        };
+        let (acut, bcut) = (cutoff(&self.original), cutoff(&self.changed));
+        let clip = |fragments: Vec<SpanFragment>, cut: usize, full_len: usize| {
+            let mut out = Vec::new();
+            let mut offset = 0;
+            for mut fragment in fragments {
+                let end = offset + fragment.text.len();
+                if offset > cut || (offset == cut && cut < full_len) {
+                    break;
+                }
+                if end > cut {
+                    fragment.text.truncate(cut - offset);
+                }
+                out.push(fragment);
+                offset = end;
+            }
+            if cut < full_len {
+                out.push(SpanFragment {
+                    text: "\n… (truncated; the full text is in the artifact file)".into(),
+                    pair: None,
+                });
+            }
+            out
+        };
+        let explain = |p: &SpanPair| {
+            let mut explanation = p.explanation.clone();
+            for (side, range, cut, len) in [
+                ("original", &p.original, acut, self.original.len()),
+                ("fallback", &p.changed, bcut, self.changed.len()),
+            ] {
+                if cut < len && range.end > cut {
+                    explanation.push_str(&format!(
+                        " ({side} span {} excerpt; see full artifact)",
+                        if range.start >= cut {
+                            "omitted from"
+                        } else {
+                            "continues beyond"
+                        }
+                    ));
+                }
+            }
+            explanation
+        };
+        Some(ComparisonView {
+            name: self.name.clone(),
+            original: clip(original, acut, self.original.len()),
+            changed: clip(changed, bcut, self.changed.len()),
+            pairs: self.pairs.iter().map(|p| (p.id, explain(p))).collect(),
+        })
+    }
+}
+
+/// Map a boundary through actual edits. A boundary inside a replacement expands
+/// to its enclosing span, so a second-stage edit never invents a partial match.
+fn boundary(pos: usize, edits: &[crate::scrub::Edit], reverse: bool, end: bool) -> usize {
+    let mut from_end = 0;
+    let mut to_end = 0;
+    for edit in edits {
+        let (from, to) = if reverse {
+            (&edit.changed, &edit.original)
+        } else {
+            (&edit.original, &edit.changed)
+        };
+        if pos < from.start {
+            break;
+        }
+        if pos == from.start {
+            return to.start;
+        }
+        if pos < from.end {
+            return if end { to.end } else { to.start };
+        }
+        from_end = from.end;
+        to_end = to.end;
+    }
+    to_end + (pos - from_end)
+}
+
+fn redacted_pairs(text: &str, id: &Identity) -> (String, Vec<SpanPair>) {
+    let (middle, first) = crate::scrub::scrub_with_edits(text, id);
+    let (changed, second) = crate::scrub::scrub_with_edits(&middle, &Identity::default());
+    let mut ranges: Vec<_> = first
+        .iter()
+        .map(|e| (e.original.clone(), e.kind.to_owned()))
+        .collect();
+    ranges.extend(second.iter().map(|e| {
+        (
+            boundary(e.original.start, &first, true, false)
+                ..boundary(e.original.end, &first, true, true),
+            e.kind.to_owned(),
+        )
+    }));
+    ranges.sort_by_key(|(r, _)| r.start);
+    let mut merged: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for (range, kind) in ranges {
+        if let Some((last, label)) = merged.last_mut()
+            && range.start < last.end
+        {
+            last.end = last.end.max(range.end);
+            if !label.split(" / ").any(|k| k == kind) {
+                label.push_str(&format!(" / {kind}"));
+            }
+        } else {
+            merged.push((range, kind));
+        }
+    }
+    let pairs = merged
+        .into_iter()
+        .map(|(original, kind)| {
+            let start = boundary(
+                boundary(original.start, &first, false, false),
+                &second,
+                false,
+                false,
+            );
+            let end = boundary(
+                boundary(original.end, &first, false, true),
+                &second,
+                false,
+                true,
+            );
+            let line = text[..original.start].matches('\n').count() + 1;
+            SpanPair {
+                id: 0,
+                explanation: format!("sensitive-data: line {line}: {kind}"),
+                original,
+                changed: start..end,
+            }
+        })
+        .collect();
+    (changed, pairs)
+}
+
+fn comparison_fields(
+    w: &Withheld,
+    title: &str,
+    body: &str,
+    run_id: &str,
+    rewrite: bool,
+) -> Vec<ComparisonField> {
+    let (ct, cb) = fallback_text(w, title, body, run_id);
+    let mut fields = Vec::new();
+    let mut next = 1;
+    for (on, name, category, text, fallback) in [
+        (w.title || rewrite, "Title", "title-language", title, ct),
+        (w.body || rewrite, "Description", "body-language", body, cb),
+    ] {
+        if !on {
+            continue;
+        }
+        let pairs = if w.categories.iter().any(|c| c == category) {
+            let mut explanation = format!(
+                "{category}: whole field replaced; no word-level translation correspondence. {}",
+                diagnose(
+                    &[category.to_owned()],
+                    if name == "Title" { text } else { "" },
+                    if name == "Description" { text } else { "" }
+                )
+                .join(" ")
+            );
+            if w.categories.iter().any(|c| c == "sensitive-data") {
+                let (_, sensitive) = redacted_pairs(text, &Identity::current());
+                if !sensitive.is_empty() {
+                    explanation.push_str(&format!(" sensitive-data: {} affected spans included in the whole-field replacement.", sensitive.len()));
+                }
+            }
+            vec![SpanPair {
+                id: 0,
+                explanation,
+                original: 0..text.len(),
+                changed: 0..fallback.len(),
+            }]
+        } else {
+            let (redacted, pairs) = redacted_pairs(text, &Identity::current());
+            if redacted != fallback {
+                continue;
+            }
+            pairs
+        };
+        let pairs = pairs
+            .into_iter()
+            .map(|mut p| {
+                p.id = next;
+                next += 1;
+                p
+            })
+            .collect();
+        fields.push(ComparisonField {
+            name: name.into(),
+            original: text.into(),
+            changed: fallback,
+            pairs,
+        });
+    }
+    fields
+}
+
 /// Longest snippet shown for one trigger, in characters.
 const SNIPPET_CHARS: usize = 160;
 /// Most triggers listed per rule and field.
@@ -489,11 +791,17 @@ pub fn diagnose(categories: &[String], title: &str, body: &str) -> Vec<String> {
                             .to_owned(),
                     );
                 }
+                let omitted = hits.len().saturating_sub(MAX_TRIGGERS);
                 for i in hits.into_iter().take(MAX_TRIGGERS) {
                     out.push(match snippet(lines[i]) {
                         Some(s) => format!("- body-language: description line {}: `{s}`", map[i]),
                         None => format!("- body-language: description line {} (not shown)", map[i]),
                     });
+                }
+                if omitted > 0 {
+                    out.push(format!(
+                        "- body-language: {omitted} additional triggering lines not listed"
+                    ));
                 }
             }
             "sensitive-data" => {
@@ -547,6 +855,18 @@ pub fn question_detail(
     artifact: Option<&Path>,
     rewrite: Option<&crate::run::GithubTextRewrite>,
 ) -> String {
+    question_content(w, title, body, run_id, rejected, artifact, rewrite).0
+}
+
+pub(crate) fn question_content(
+    w: &Withheld,
+    title: &str,
+    body: &str,
+    run_id: &str,
+    rejected: Option<&[String]>,
+    artifact: Option<&Path>,
+    rewrite: Option<&crate::run::GithubTextRewrite>,
+) -> (String, PostingComparison) {
     let mut s = String::new();
     if let Some(cats) = rejected {
         s.push_str(&format!(
@@ -592,6 +912,7 @@ pub fn question_detail(
         ));
     }
     s.push_str("\nSilence falls back to the FALLBACK text when the answer timeout passes.\n");
+    let comparison_start = s.len();
     let (ct, cb) = fallback_text(w, title, body, run_id);
     let has_artifact = artifact.is_some();
     for (on, name, orig, changed) in [
@@ -613,6 +934,7 @@ pub fn question_detail(
             fenced(&shown(changed, has_artifact)),
         ));
     }
+    let comparison_end = s.len();
     if let Some(r) = rewrite {
         s.push_str(&rewrite_version(r, has_artifact));
     }
@@ -622,7 +944,14 @@ pub fn question_detail(
             p.display()
         ));
     }
-    s
+    let comparison = PostingComparison {
+        start: comparison_start,
+        end: comparison_end,
+        markdown: s[comparison_start..comparison_end].into(),
+        fields: comparison_fields(w, title, body, run_id, rewrite.is_some()),
+        excerpt: has_artifact,
+    };
+    (s, comparison)
 }
 
 /// Display the saved pair and its remaining failures from the same values used to post.
@@ -1541,5 +1870,177 @@ mod owner_question_tests {
             "修正: 再試行を追加"
         );
         assert!(vet_title("修正: token=abcdefghijklmnop0123456789", None, false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod posting_comparison_tests {
+    use super::*;
+
+    fn field(text: &str, identity: &Identity) -> ComparisonField {
+        let (changed, mut pairs) = redacted_pairs(text, identity);
+        for (i, pair) in pairs.iter_mut().enumerate() {
+            pair.id = i + 1;
+        }
+        ComparisonField {
+            name: "Description".into(),
+            original: text.into(),
+            changed,
+            pairs,
+        }
+    }
+
+    #[test]
+    fn posting_comparison_repeated_tokens_unicode_and_literal_replacements() {
+        let token = "ghp_abcdefghijklmnop";
+        let text = format!("é <&> [redacted-token] {token} and {token} 終");
+        let f = field(&text, &Identity::default());
+        assert_eq!(f.pairs.len(), 2);
+        assert_ne!(f.pairs[0].id, f.pairs[1].id);
+        for p in &f.pairs {
+            assert_eq!(&f.original[p.original.clone()], token);
+            assert_eq!(&f.changed[p.changed.clone()], "[redacted-token]");
+        }
+        let v = f.view(false).unwrap();
+        assert_eq!(
+            v.original
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<String>(),
+            text
+        );
+        assert_eq!(
+            v.changed
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<String>(),
+            scrub(&text, &Identity::default())
+        );
+        assert!(v.original[0].text.contains("[redacted-token]"));
+    }
+
+    #[test]
+    fn posting_comparison_composes_second_pass_positions() {
+        let identity = Identity {
+            user: "machine".into(),
+            ..Identity::default()
+        };
+        let text = "é machine/var/private-data and machine/var/private-data";
+        let (middle, first) = crate::scrub::scrub_with_edits(text, &identity);
+        let (_, second) = crate::scrub::scrub_with_edits(&middle, &Identity::default());
+        assert!(!first.is_empty() && !second.is_empty());
+        let f = field(text, &identity);
+        assert_eq!(
+            f.changed,
+            scrub(&scrub(text, &identity), &Identity::default())
+        );
+        assert_eq!(f.pairs.len(), 4);
+        assert!(f.view(false).is_some());
+        // A boundary within replacement text maps to the entire original match.
+        let edit = &first[0];
+        assert_eq!(
+            boundary(edit.changed.start + 1, &first, true, false),
+            edit.original.start
+        );
+        assert_eq!(
+            boundary(edit.changed.start + 1, &first, true, true),
+            edit.original.end
+        );
+    }
+
+    #[test]
+    fn posting_comparison_deletion_and_invalid_ranges() {
+        let mut f = ComparisonField {
+            name: "Title".into(),
+            original: "é delete keep".into(),
+            changed: "é keep".into(),
+            pairs: vec![SpanPair {
+                id: 1,
+                explanation: "removed".into(),
+                original: 3..10,
+                changed: 3..3,
+            }],
+        };
+        let view = f.view(false).unwrap();
+        assert!(
+            view.changed
+                .iter()
+                .any(|p| p.pair == Some(1) && p.text.is_empty())
+        );
+        f.pairs[0].original.start = 1;
+        assert!(
+            f.view(false).is_none(),
+            "mid-codepoint range must fail closed"
+        );
+        f.pairs[0].original.start = 3;
+        f.changed = "é other".into();
+        assert!(f.view(false).is_none(), "unchanged intervals must agree");
+    }
+
+    #[test]
+    fn posting_comparison_whole_field_fallback_keeps_posting_behavior() {
+        let title = "修正: 再試行";
+        let body = "日本語の説明です。 token=private-value";
+        let w = Withheld::from_check(&check(title, body), title, body).unwrap();
+        let (detail, comparison) = question_content(&w, title, body, "run", None, None, None);
+        assert_eq!(
+            detail,
+            question_detail(&w, title, body, "run", None, None, None)
+        );
+        assert!(comparison.matches_detail(&detail));
+        let (ct, cb) = fallback_text(&w, title, body, "run");
+        assert_eq!(comparison.fields[0].changed, ct);
+        assert_eq!(comparison.fields[1].changed, cb);
+        for f in &comparison.fields {
+            assert_eq!(f.pairs.len(), 1);
+            assert_eq!(f.pairs[0].original, 0..f.original.len());
+            assert_eq!(f.pairs[0].changed, 0..f.changed.len());
+            assert!(f.pairs[0].explanation.contains("whole field"));
+            assert!(f.view(false).is_some());
+        }
+        assert_eq!(
+            question_choices(&w, None),
+            [USE_FALLBACK, POST_ORIGINAL, USE_MY_TEXT]
+        );
+    }
+
+    #[test]
+    fn posting_comparison_keeps_all_occurrences_beyond_markdown_limits() {
+        let body = format!("{} {}", "Plain text. ".repeat(500), "192.0.2.1 ".repeat(5));
+        let w = Withheld::from_check(&check("fix: x", &body), "fix: x", &body).unwrap();
+        let (detail, comparison) = question_content(
+            &w,
+            "fix: x",
+            &body,
+            "r",
+            None,
+            Some(Path::new("artifact.md")),
+            None,
+        );
+        assert!(detail.contains("truncated"));
+        assert!(comparison.matches_detail(&detail));
+        let f = &comparison.fields[0];
+        assert_eq!(
+            f.pairs.len(),
+            5,
+            "diagnostic limits do not hide comparison pairs"
+        );
+        assert_eq!(f.original, body);
+        let view = f.view(true).unwrap();
+        assert_eq!(
+            view.original
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<String>(),
+            shown(&body, true)
+        );
+        assert!(
+            view.pairs
+                .iter()
+                .all(|(_, e)| e.contains("omitted from excerpt"))
+        );
+        let mut corrupt = comparison.clone();
+        corrupt.fields[0].original.insert(0, 'x');
+        assert!(!corrupt.matches_detail(&detail));
     }
 }

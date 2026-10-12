@@ -56,7 +56,8 @@ use crate::run::RunStatus;
 /// "no conversation yet" rather than "unreadable", and a strict equality check
 /// would turn every bump into an upgrade that breaks reading yesterday's
 /// question files.
-pub const SCHEMA: u32 = 7;
+/// Schema 8 adds optional local posting comparison data. Older questions use Markdown.
+pub const SCHEMA: u32 = 8;
 
 /// How often the wait re-reads the question file.
 ///
@@ -485,6 +486,9 @@ pub struct Question {
     /// The reasoning behind the question, as markdown. May be long, may be
     /// empty. Rendered as text nodes by the UI, never as markup.
     pub detail: String,
+    /// Display-only comparison; never used to decide or construct a post.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub posting_comparison: Option<crate::github_text::PostingComparison>,
     /// The admissible answers. **Empty means free text** - that one condition
     /// is the whole difference between the two kinds of question, on disk, in
     /// the UI, and in [`Question::answer`]'s validation.
@@ -611,6 +615,7 @@ impl Question {
             seat,
             summary,
             detail,
+            posting_comparison: None,
             choices,
             actions: std::collections::BTreeMap::new(),
             panel: false,
@@ -2093,7 +2098,7 @@ mod tests {
             ],
             "the on-disk field set is a contract with the front end"
         );
-        assert_eq!(open["schema"], 7);
+        assert_eq!(open["schema"], 8);
         assert_eq!(open["thread"], serde_json::json!([]));
         assert_eq!(open["id"], "20260902-231501-ab12");
         assert_eq!(open["run"], "20260902-201256-9fb7");

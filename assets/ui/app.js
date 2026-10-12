@@ -4669,6 +4669,51 @@ function createAskCard() {
   return row;
 }
 
+/* All posting text is assigned to textContent. Pair markers live outside the
+   text fragments and never become part of the original or fallback payload. */
+function renderPostingComparison(parent, view) {
+  const before = el("div");
+  renderMd(before, view.before_md);
+  parent.append(before);
+  for (const field of view.fields) {
+    const section = el("section", { class: "posting-comparison" });
+    section.append(el("h3", { text: field.name }));
+    const pairNode = (tag, id) => {
+      const node = el(tag, { class: "posting-pair" });
+      node.style.setProperty("--pair-hue", String(((id - 1) * 137.508 + 25) % 360));
+      return node;
+    };
+    const marker = id => el("span", { class: "posting-marker", text: `#${id}` });
+    const rules = el("ul", { class: "posting-rules" });
+    for (const [id, explanation] of field.pairs) {
+      const rule = pairNode("li", id);
+      rule.append(marker(id), document.createTextNode(` ${explanation}`));
+      rules.append(rule);
+    }
+    section.append(rules);
+    for (const [label, fragments] of [["ORIGINAL", field.original], ["FALLBACK · use fallback", field.changed]]) {
+      section.append(el("p", { class: "posting-label", text: label }));
+      const pre = el("pre", { class: "posting-text" });
+      for (const fragment of fragments) {
+        if (fragment.pair == null) {
+          pre.append(document.createTextNode(fragment.text));
+        } else {
+          const span = pairNode("span", fragment.pair);
+          span.append(marker(fragment.pair));
+          span.append(el("span", { text: fragment.text }));
+          if (fragment.text === "") span.append(el("span", { class: "posting-removed", text: " (removed)" }));
+          pre.append(span);
+        }
+      }
+      section.append(pre);
+    }
+    parent.append(section);
+  }
+  const after = el("div");
+  renderMd(after, view.after_md);
+  parent.append(after);
+}
+
 function updateAskCard(row, question, { compact = false } = {}) {
   const r = row.refs;
   const status = String(question.status || "open");
@@ -4810,7 +4855,8 @@ function updateAskCard(row, question, { compact = false } = {}) {
     clear(r.detail);
     if (detail) {
       const body = el("div", { class: "md" });
-      renderMd(body, question.detail_md);
+      if (question.posting_view) renderPostingComparison(body, question.posting_view);
+      else renderMd(body, question.detail_md);
       r.detail.append(open
         ? body
         : el("details", { class: "advanced" }, el("summary", { text: "Context" }), body));
