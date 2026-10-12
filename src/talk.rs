@@ -3641,8 +3641,7 @@ mod tests {
         )
         .expect("reply");
         let lease = talks.claim_turn(&talk.id).expect("claim").expect("lease");
-        lease
-            .respond(&mut talk, &talks, &cfg, "answer")
+        respond(&lease, &mut talk, &talks, &cfg, "answer")
             .await
             .expect("respond");
         assert!(
@@ -3654,8 +3653,7 @@ mod tests {
         );
         assert_eq!(talk.turns[1].body, "answer");
         record_reply(&mut talk, &talks, "followup", Vec::new(), Some(target)).expect("reply");
-        lease
-            .respond(&mut talk, &talks, &cfg, "followup")
+        respond(&lease, &mut talk, &talks, &cfg, "followup")
             .await
             .expect("respond");
         assert!(
