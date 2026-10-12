@@ -55,6 +55,7 @@ fn fixture() -> Fixture {
     // must read the stored turns.
     let owner = |body: &str| talk::Turn {
         breaks: Some(Vec::new()),
+        messages: Vec::new(),
         posted_by: None,
         who: talk::Who::Operator,
         body: body.into(),

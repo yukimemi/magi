@@ -6710,6 +6710,7 @@ async fn talk_detail(
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct NewTalkTurn {
+    reply_to: Option<talk::ReplyTarget>,
     text: String,
     attachments: Vec<String>,
 }
@@ -6717,6 +6718,8 @@ struct NewTalkTurn {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EditTalkPending {
+    #[serde(default)]
+    message: Option<usize>,
     text: String,
     expected_text: String,
     expected_attachments: Vec<String>,
@@ -6837,6 +6840,7 @@ async fn talk_say(
                 let ui = Arc::clone(&ui);
                 let id = id.clone();
                 let said = body.text.clone();
+                let reply_to = body.reply_to.clone();
                 async move {
                     let written = blocking({
                         let ui = Arc::clone(&ui);
@@ -6857,9 +6861,13 @@ async fn talk_say(
                                 let _ = gate.reached.send(());
                                 let _ = gate.release.recv();
                             }
-                            if let Err(error) =
-                                talk::queue(&mut talk, &ui.talks, &said, attachments)
-                            {
+                            if let Err(error) = talk::queue_reply(
+                                &mut talk,
+                                &ui.talks,
+                                &said,
+                                attachments,
+                                reply_to,
+                            ) {
                                 if let Ok(fresh) = ui.talks.get(&id) {
                                     if !fresh.status.open() {
                                         return Err(ApiError::conflict(format!(
@@ -6869,7 +6877,13 @@ async fn talk_say(
                                         )));
                                     }
                                 }
-                                return Err(ApiError::from(error));
+                                return Err(
+                                    if error.to_string().contains("invalid reply target") {
+                                        ApiError::bad_request("invalid reply target")
+                                    } else {
+                                        ApiError::from(error)
+                                    },
+                                );
                             }
                             // The turn that looked busy a moment ago can have
                             // finished, found nothing to drain and given up the
@@ -6952,12 +6966,15 @@ async fn talk_say(
         let talks = talks.clone();
         let id = id.clone();
         let said = body.text.clone();
+        let reply_to = body.reply_to.clone();
         let mut talk = talk.clone();
         async move {
             let recorded = blocking({
                 let talks = talks.clone();
                 move || {
-                    if let Err(error) = talk::record(&mut talk, &talks, &said, attachments) {
+                    if let Err(error) =
+                        talk::record_reply(&mut talk, &talks, &said, attachments, reply_to)
+                    {
                         if let Ok(fresh) = talks.get(&talk.id) {
                             if !fresh.status.open() {
                                 return Err(ApiError::conflict(format!(
@@ -6967,7 +6984,11 @@ async fn talk_say(
                                 )));
                             }
                         }
-                        return Err(ApiError::from(error));
+                        return Err(if error.to_string().contains("invalid reply target") {
+                            ApiError::bad_request("invalid reply target")
+                        } else {
+                            ApiError::from(error)
+                        });
                     }
                     // `record` mutates `talk` in place to the freshly persisted
                     // state (status, pending, and the just-appended operator
@@ -7284,12 +7305,13 @@ async fn talk_pending_edit(
                     talk.status.as_str()
                 )));
             }
-            if !talk::edit_pending_text(
+            if !talk::edit_pending_message(
                 &mut talk,
                 &ui.talks,
                 &body.text,
                 &body.expected_text,
                 &body.expected_attachments,
+                body.message,
             )? {
                 return Err(ApiError::conflict(
                     "queued message changed; reload it before editing",
@@ -10762,6 +10784,7 @@ mod tests {
                 State(Arc::clone(&ui)),
                 Path(id.clone()),
                 Ok(Json(NewTalkTurn {
+                    reply_to: None,
                     text: "what does the queue module do?".to_owned(),
                     attachments: Vec::new(),
                 })),
@@ -10877,6 +10900,7 @@ mod tests {
                 State(Arc::clone(&ui)),
                 Path(id.clone()),
                 Ok(Json(NewTalkTurn {
+                    reply_to: None,
                     text: "what does the queue module do?".to_owned(),
                     attachments: Vec::new(),
                 })),
@@ -15341,6 +15365,7 @@ mod tests {
         let mut on_disk = f.talks().get(&talk).expect("get seeded talk");
         on_disk.turns.push(crate::talk::Turn {
             breaks: Some(Vec::new()),
+            messages: Vec::new(),
             posted_by: None,
             who: crate::talk::Who::Operator,
             body: "a new turn".to_owned(),
@@ -16647,6 +16672,7 @@ mod tests {
                 State(Arc::clone(&ui)),
                 Path(id.clone()),
                 Ok(Json(NewTalkTurn {
+                    reply_to: None,
                     text: "another message".to_owned(),
                     attachments: Vec::new(),
                 })),
