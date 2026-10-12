@@ -764,6 +764,7 @@ async fn run_detail_tabs_landing_and_strip_hold_at_both_widths_and_themes() {
         agent: "agent-1".to_owned(),
         ranking: vec!['A', 'B'],
         reasons: std::collections::BTreeMap::new(),
+        strengths: std::collections::BTreeMap::new(),
         confidence: Some(8),
         order: vec![0, 1],
         failed: None,
