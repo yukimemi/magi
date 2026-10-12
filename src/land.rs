@@ -3521,6 +3521,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                         // either merges or stops depending on what it says
                         // by then.
                         ApprovalGate::Pending => {
+                            state.end_pass_parked(crate::run::ParkCause::Question);
                             state.parked = true;
                             state.event(
                                 "land",

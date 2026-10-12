@@ -343,8 +343,8 @@ impl Stop {
     /// killing the process loses whatever the seats in flight had not written.
     /// Parking costs at most the node in progress and leaves the run
     /// resumable.
-    pub fn park(&self) {
-        self.pause.park();
+    pub fn park(&self, cause: crate::run::ParkCause) {
+        self.pause.park_for(cause);
         self.stop();
     }
 
@@ -1420,7 +1420,17 @@ fn settle_and_diagnose(
     state: &RunState,
 ) {
     let p = phrases(&state.config.graph.language);
+    let attempts_before = task.attempts;
     settle_in(task, verdict, detail, max_attempts, p);
+    // Written here, where the refund (or not) is decided, so the history is a
+    // fact and not a later guess from the run's status.
+    if let Some(pass) = state.passes.last() {
+        let parked = match &pass.end {
+            Some(crate::run::PassEnd::Parked { cause }) => Some(cause.clone()),
+            _ => None,
+        };
+        task.record_pass(&state.id, pass.index, attempts_before, parked);
+    }
     if task.status == TaskStatus::Held {
         task.diagnostic = diagnostic(state);
         note_open_question(task, &state.id, p);
@@ -6268,6 +6278,54 @@ mod tests {
         reclaim(&mut t, Some(run_state(RunStatus::Blocked)), 2, "en");
         assert_eq!(t.status, TaskStatus::Failed);
         assert!(t.status.runnable());
+    }
+
+    #[test]
+    fn a_settled_parked_pass_records_its_cause_and_the_refund() {
+        let mut t = task();
+        t.start("20260904-000000-4043".to_owned());
+        assert_eq!(t.attempts, 1);
+        let mut run = run_state(RunStatus::Implementing);
+        run.id = "20260904-000000-4043".to_owned();
+        run.begin_pass();
+        let cause = crate::run::ParkCause::Upgrade {
+            from: "0.121.0".to_owned(),
+            to: Some("0.121.1".to_owned()),
+        };
+        run.end_pass_parked(cause.clone());
+        run.parked = true;
+        let verdict = Verdict {
+            status: run.status,
+            left_pr: false,
+            quota_hit: false,
+            parked: true,
+            no_viable_candidates: false,
+        };
+        settle_and_diagnose(&mut t, verdict, "parked", 2, &run);
+        assert_eq!(t.attempts, 0);
+        assert_eq!(t.passes.len(), 1);
+        assert_eq!(t.passes[0].cost, crate::queue::PassCost::Refunded);
+        assert_eq!(t.passes[0].parked, Some(cause));
+        assert_eq!(t.passes[0].pass_index, 0);
+
+        // A resumed pass that then fails spends its attempt, and the earlier
+        // pass's entry is untouched.
+        t.start("20260904-000000-4043".to_owned());
+        run.begin_pass();
+        run.status = RunStatus::Failed;
+        let verdict = Verdict {
+            status: RunStatus::Failed,
+            left_pr: false,
+            quota_hit: false,
+            parked: false,
+            no_viable_candidates: false,
+        };
+        settle_and_diagnose(&mut t, verdict, "failed", 2, &run);
+        assert_eq!(t.passes.len(), 2);
+        assert_eq!(t.passes[0].cost, crate::queue::PassCost::Refunded);
+        assert_eq!(t.passes[1].cost, crate::queue::PassCost::Spent);
+        assert_eq!(t.passes[1].pass_index, 1);
+        assert_eq!(t.attempts, 1);
     }
 
     #[test]

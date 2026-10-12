@@ -112,9 +112,13 @@ use crate::ask::Questions;
 /// blocking or answers, and defaulting those fields is exactly as good a
 /// reading as a value that build never had a chance to write.
 ///
+/// 15: added [`Task::passes`], what each settled pass over a run did to the
+/// attempt budget and why it stopped. Field-only, `#[serde(default)]`; a task
+/// from before this has no entry for its earlier passes, which stay unknown.
+///
 /// 14: record whether a task count edit's overrides inherit daemon options.
 /// Old overrides default to isolated command-line settings, including empty ones.
-pub const SCHEMA: u32 = 14;
+pub const SCHEMA: u32 = 15;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -498,6 +502,12 @@ pub struct Task {
     /// [`Task::chat_notice_due`]. Never cleared by a release or requeue.
     #[serde(default)]
     pub chat_notice: Option<ChatNotice>,
+    /// Append-only: one entry per pass over a run that the loop settled. A
+    /// resumed run is one run with several passes, and `attempts` counts
+    /// claims net of refunds, so the two are not the same number; this says
+    /// which pass cost what. Kept across a release.
+    #[serde(default)]
+    pub passes: Vec<TaskPass>,
     /// When the task was filed.
     pub created_at: Timestamp,
     /// Last change to this file.
@@ -510,6 +520,34 @@ pub(crate) fn is_done_notice_key(key: &str) -> bool {
         || key
             .strip_prefix("done#")
             .is_some_and(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// What a settled pass did to the attempt budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PassCost {
+    /// The attempt stays counted.
+    Spent,
+    /// The attempt was handed back.
+    Refunded,
+}
+
+/// One settled pass over a run. See [`Task::passes`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskPass {
+    /// The run the pass belongs to.
+    pub run: String,
+    /// [`crate::run::RunPass::index`] in that run.
+    pub pass_index: usize,
+    /// What it did to the budget.
+    pub cost: PassCost,
+    /// `attempts` once this pass was settled.
+    pub attempts_after: usize,
+    /// When the loop settled it.
+    pub settled_at: Timestamp,
+    /// Why the pass parked, when it did.
+    #[serde(default)]
+    pub parked: Option<crate::run::ParkCause>,
 }
 
 /// What became of a completion notice. See [`Task::chat_notice`].
@@ -705,6 +743,7 @@ impl Task {
             held_at: None,
             park_reason: None,
             chat_notice: None,
+            passes: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -1001,6 +1040,38 @@ impl Task {
         self.park_reason = Some(why.into());
         // The variant and field are schema 11; stamp it so an older build
         // refuses the record instead of half-reading it.
+        self.schema = self.schema.max(SCHEMA);
+    }
+
+    /// Record a settled pass. `attempts_before` is the count just before the
+    /// settle, so a refund is read off what actually changed, not inferred.
+    pub fn record_pass(
+        &mut self,
+        run: &str,
+        pass_index: usize,
+        attempts_before: usize,
+        parked: Option<crate::run::ParkCause>,
+    ) {
+        if self
+            .passes
+            .iter()
+            .any(|p| p.run == run && p.pass_index == pass_index)
+        {
+            return;
+        }
+        let cost = if self.attempts < attempts_before {
+            PassCost::Refunded
+        } else {
+            PassCost::Spent
+        };
+        self.passes.push(TaskPass {
+            run: run.to_owned(),
+            pass_index,
+            cost,
+            attempts_after: self.attempts,
+            settled_at: Timestamp::now(),
+            parked,
+        });
         self.schema = self.schema.max(SCHEMA);
     }
 
@@ -1699,6 +1770,15 @@ impl Queue {
             for run in stored.runs {
                 if !task.runs.contains(&run) {
                     task.runs.push(run);
+                }
+            }
+            for p in stored.passes {
+                if !task
+                    .passes
+                    .iter()
+                    .any(|q| q.run == p.run && q.pass_index == p.pass_index)
+                {
+                    task.passes.push(p);
                 }
             }
             // A completion notice already recorded is never rewound by an

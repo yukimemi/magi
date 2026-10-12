@@ -617,7 +617,7 @@ impl Ui {
             return Ok(());
         }
         if park {
-            live.stop.park();
+            live.stop.park(crate::run::ParkCause::Operator);
             tracing::info!("the loop was asked to park; the run stops at its next node boundary");
         } else {
             live.stop.stop();
@@ -826,7 +826,7 @@ impl Ui {
     /// not waiting is the point of upgrading from a phone. `None` means
     /// nothing was in flight, which is worth saying so the operator is not
     /// told a run is parking when none is.
-    fn park_for_upgrade(&self) -> ApiResult<Option<String>> {
+    fn park_for_upgrade(&self, from: &str, to: Option<&str>) -> ApiResult<Option<String>> {
         let parking = {
             let mut state = self.lock_loop();
             // Decided here, before the park: by the time the handover fires
@@ -848,7 +848,10 @@ impl Ui {
                 return Ok(None);
             };
             let busy = live.stop.busy_now();
-            live.stop.park();
+            live.stop.park(crate::run::ParkCause::Upgrade {
+                from: from.to_owned(),
+                to: to.map(|t| t.trim_start_matches('v').to_owned()),
+            });
             state.rev += 1;
             busy
         };
@@ -2667,7 +2670,7 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
 
     // Parked before anything is replaced: a successor that came up while a
     // run was mid-node would find a run nobody is driving.
-    let parked = ui.park_for_upgrade()?;
+    let parked = ui.park_for_upgrade(&from, Some(latest.tag_name.as_str()))?;
     let detail = match &parked {
         // Honest about the wait. A park takes effect at the *next* node
         // boundary, so a run mid-implement finishes that wave first - up to
@@ -3051,6 +3054,9 @@ struct RunDetailView {
     /// run recorded before origins existed. `origin` itself (flattened in
     /// with `state`) is `null` in that case.
     origin_label: String,
+    /// Each recorded pass over this run, with the cause it stopped for. Empty
+    /// for a run from before passes were kept: its earlier passes are unknown.
+    pass_views: Vec<PassView>,
 }
 
 /// A task named from a run's detail page.
@@ -3375,6 +3381,7 @@ impl RunDetailView {
         );
         Self {
             stop_reason,
+            pass_views: state.passes.iter().map(|p| PassView::of(p, None)).collect(),
             instruction_md: md::to_nodes(&state.instruction, &md::ImageBase::None),
             prose_md: run_prose_md(&state),
             origin_label: crate::run::origin_label(state.origin.as_ref()),
@@ -4392,8 +4399,65 @@ struct TaskRunView {
     exit: RunExit,
     /// What the pass did to the task's attempt budget.
     attempt: AttemptCost,
+    /// Edge wording for leaving this entry; names the recorded cause when
+    /// there is one.
+    exit_label: String,
+    /// The position of a later entry for the same run: this entry is an
+    /// earlier pass of it.
+    later_pass: Option<usize>,
+    /// Which pass over the run this entry is (1-based) and how many entries
+    /// the task lists for the run. Counted from the list, so known even for
+    /// a legacy record.
+    pass_n: usize,
+    passes_of_run: usize,
+    /// What the run recorded about this pass; `None` for a record from before
+    /// passes were kept, whose cause stays unknown.
+    pass: Option<PassView>,
     /// The branch a review-only run reopened.
     branch: Option<String>,
+}
+
+/// One recorded pass over a run, for the wire.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct PassView {
+    index: usize,
+    resumed: bool,
+    started_at: Timestamp,
+    ended_at: Option<Timestamp>,
+    /// `open`, `parked` or `unrecorded`.
+    end: &'static str,
+    cause: Option<crate::run::ParkCause>,
+    /// One line: why it stopped, or that nobody recorded why.
+    label: String,
+    /// What the task recorded for this pass; `None` when it was not settled
+    /// (or settled by a build that kept no record).
+    cost: Option<crate::queue::PassCost>,
+}
+
+impl PassView {
+    fn of(p: &crate::run::RunPass, settled: Option<&crate::queue::TaskPass>) -> Self {
+        use crate::run::PassEnd;
+        let (end, cause, label) = match &p.end {
+            None => ("open", None, "still open".to_owned()),
+            Some(PassEnd::Parked { cause }) => ("parked", Some(cause.clone()), cause.label()),
+            Some(PassEnd::Unrecorded) => (
+                "unrecorded",
+                None,
+                "stopped without recording why (a crash, a kill or a restart; not known)"
+                    .to_owned(),
+            ),
+        };
+        Self {
+            index: p.index,
+            resumed: p.resumed,
+            started_at: p.started_at,
+            ended_at: p.ended_at,
+            end,
+            cause,
+            label,
+            cost: settled.map(|t| t.cost),
+        }
+    }
 }
 
 /// How one pass over a run ended, as far as the task's life is concerned.
@@ -4532,6 +4596,11 @@ struct TaskDetailView {
     /// told otherwise; the loop's own flag is not visible from here.
     max_attempts: usize,
     history: Vec<TaskRunView>,
+    /// Entries in `history`: passes over runs, not distinct runs and not
+    /// attempts consumed (`task.attempts`).
+    passes_total: usize,
+    /// Distinct runs those passes belong to.
+    runs_distinct: usize,
     flow: FlowView,
     /// Set for a follow-up task; see [`followup_origin`].
     followup_origin: Option<FollowUpOrigin>,
@@ -4543,8 +4612,8 @@ struct TaskDetailView {
 
 const ATTEMPTS_NOTE: &str = "Attempts count how many times the loop claimed this task since it was last released, \
 and releasing a task resets the count while keeping every run. An attempt is also handed back when a run stalled \
-on an agent rate limit or was parked for an upgrade. A resumed run still counts as an attempt (it appears again \
-in the list), so the runs listed can outnumber the attempts shown only after a release or a handed-back attempt.";
+on an agent rate limit or was parked for an upgrade. A resumed run appears again in the list as another pass over the same run, so \
+the entries listed can outnumber the attempts shown after a release or a handed-back attempt.";
 
 /// The branch a review-only run reopened, read off the instruction
 /// `Runner::open_review` writes.
@@ -4554,6 +4623,7 @@ fn review_branch_of(instruction: &str) -> Option<&str> {
 }
 
 /// Where an entry sits in a task's run list.
+#[derive(Default)]
 struct RunSlot<'a> {
     /// 1-based position.
     n: usize,
@@ -4564,6 +4634,13 @@ struct RunSlot<'a> {
     /// The previous distinct run and how it ended, for the retry note.
     prior: Option<(&'a str, RunStatus)>,
     last: bool,
+    /// This pass as the run recorded it, when it did.
+    pass: Option<&'a crate::run::RunPass>,
+    /// What the task recorded when it settled this pass.
+    settled: Option<&'a crate::queue::TaskPass>,
+    /// 1-based position among the task's entries for this run, and their count.
+    pass_n: usize,
+    passes_of_run: usize,
 }
 
 /// Describe one entry of a task's run list. Pure: everything it needs is on
@@ -4575,6 +4652,10 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
         resumed_later,
         prior,
         last,
+        pass,
+        settled,
+        pass_n,
+        passes_of_run,
     } = at;
     let short = run::short_of(id).to_owned();
     let Some(s) = state else {
@@ -4595,6 +4676,11 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
             pr: None,
             exit: RunExit::Unreadable,
             attempt: AttemptCost::Unknown,
+            exit_label: RunExit::Unreadable.edge_label(None),
+            later_pass: resumed_later,
+            pass_n,
+            passes_of_run,
+            pass: None,
             branch: None,
         };
     };
@@ -4656,7 +4742,33 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
             other => format!("In progress ({}).", other.display_label()),
         }
     };
-    let why = if let Some(k) = resumed_later {
+    let view = pass.map(|p| PassView::of(p, settled));
+    let recorded_end = view
+        .as_ref()
+        .filter(|v| matches!(v.end, "parked" | "unrecorded"));
+    let cost_words = match view.as_ref().and_then(|v| v.cost) {
+        Some(crate::queue::PassCost::Refunded) => "its attempt was handed back",
+        Some(crate::queue::PassCost::Spent) => "its attempt stayed counted",
+        None => "whether its attempt was handed back was not recorded",
+    };
+    let pass_note = if passes_of_run > 1 {
+        format!(
+            " This is pass {pass_n} of {passes_of_run} over run {short}: one run, resumed, not {passes_of_run} separate runs."
+        )
+    } else {
+        String::new()
+    };
+    let why = if let (Some(k), Some(v)) = (resumed_later, recorded_end) {
+        // The run recorded this pass's end when it happened.
+        let cause = match v.end {
+            "parked" => format!("It was stopped on purpose: {}.", v.label),
+            _ => format!("It {}.", v.label),
+        };
+        format!(
+            " {cause} {}; pass #{k} resumed the same run.{pass_note}",
+            capitalise(cost_words)
+        )
+    } else if let Some(k) = resumed_later {
         // A run is only picked up again while it is unfinished, so an earlier
         // pass of a repeated id stopped short; the record keeps only the run's
         // latest status, which is left to the pass that carried it on.
@@ -4672,8 +4784,15 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
             " This pass stopped before the run finished ({cause}); whether its attempt was handed back is unknown. Pass #{k} resumed the same run, and the status shown is the run's current one."
         )
     } else if s.parked {
-        " Parked by the operator at a node boundary; the attempt was handed back and the run resumes."
-            .to_owned()
+        match recorded_end.and_then(|v| v.cause.as_ref()) {
+            Some(cause) => format!(
+                " Parked at a node boundary ({}); {} and the run resumes.{pass_note}",
+                cause.label(),
+                cost_words
+            ),
+            None => " Parked at a node boundary; the attempt was handed back and the run resumes."
+                .to_owned(),
+        }
     } else if !status.done()
         || matches!(
             status,
@@ -4696,7 +4815,36 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
     } else {
         " It spent an attempt, and the task moved on to the next run.".to_owned()
     };
-    let exit = RunExit::of(Some(s), resumed_later.is_some(), resumed);
+    let mut exit = RunExit::of(Some(s), resumed_later.is_some(), resumed);
+    let mut attempt = exit.cost();
+    let mut exit_label = None;
+    if let Some(v) = recorded_end.filter(|_| resumed_later.is_some() || s.parked) {
+        let spent = match v.cost {
+            Some(crate::queue::PassCost::Refunded) => ", attempt refunded",
+            Some(crate::queue::PassCost::Spent) => ", attempt counted",
+            None if resumed_later.is_some() => ", refund not recorded",
+            None => ", attempt refunded",
+        };
+        attempt = match v.cost {
+            Some(crate::queue::PassCost::Refunded) => AttemptCost::Refunded,
+            Some(crate::queue::PassCost::Spent) => AttemptCost::Spent,
+            None if resumed_later.is_some() => AttemptCost::Unknown,
+            None => attempt,
+        };
+        if v.end == "parked" {
+            exit = RunExit::Parked;
+            exit_label = Some(match v.cause.as_ref() {
+                Some(c @ crate::run::ParkCause::Upgrade { .. }) => {
+                    format!("parked for {}{spent}", c.label())
+                }
+                Some(c) => format!("parked ({}){spent}", c.label()),
+                None => format!("parked{spent}"),
+            });
+        } else {
+            exit_label = Some(format!("stopped without a recorded cause{spent}"));
+        }
+    }
+    let exit_label = exit_label.unwrap_or_else(|| exit.edge_label(Some(status.as_str())));
     TaskRunView {
         n,
         id: id.to_owned(),
@@ -4710,9 +4858,21 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
         created_at: Some(s.created_at),
         pr: s.pr.as_ref().map(|p| p.url.clone()),
         exit,
-        attempt: exit.cost(),
+        attempt,
+        exit_label,
+        later_pass: resumed_later,
+        pass_n,
+        passes_of_run,
+        pass: view,
         branch: branch.map(str::to_owned),
     }
+}
+
+fn capitalise(s: &str) -> String {
+    let mut c = s.chars();
+    c.next().map_or_else(String::new, |f| {
+        f.to_uppercase().collect::<String>() + c.as_str()
+    })
 }
 
 /// One box of the task's flowchart.
@@ -4754,6 +4914,10 @@ struct FlowView {
     /// Attempts the task has counted since it was last released.
     attempts: usize,
     max_attempts: usize,
+    /// Entries in the run list (passes), and how many distinct runs they are.
+    /// Neither is the number of attempts consumed.
+    passes: usize,
+    runs: usize,
 }
 
 /// Turn a task and its described runs into the flowchart's boxes and arrows.
@@ -4846,7 +5010,7 @@ fn task_flow(
     }
     nodes.push(node("start", "start", "Task queued".to_owned()));
     let mut prev = "start".to_owned();
-    let mut prev_exit: Option<(RunExit, Option<&str>)> = None;
+    let mut prev_exit: Option<(RunExit, String, AttemptCost)> = None;
     for (i, h) in history.iter().enumerate() {
         let key = format!("run-{}", h.n);
         let mut n = node(&key, "run", format!("Run {}", h.short));
@@ -4861,6 +5025,9 @@ fn task_flow(
         match h.exit {
             RunExit::Unreadable => n.note = Some("unreadable"),
             RunExit::Interrupted => n.note = Some("interrupted"),
+            // An earlier pass the run recorded as parked: the status shown
+            // would be the run's current one, not this pass's.
+            RunExit::Parked if h.later_pass.is_some() => n.note = Some("parked"),
             _ => {
                 n.status = h.status;
                 if h.provisional {
@@ -4877,9 +5044,10 @@ fn task_flow(
             _ if i > 0 => Some("retry".to_owned()),
             _ => None,
         };
+        let attempt = prev_exit.as_ref().map_or(AttemptCost::None, |p| p.2);
         let label = match (prev_exit, into) {
-            (Some((e, st)), Some(i)) => format!("{} \u{2192} {i}", e.edge_label(st)),
-            (Some((e, st)), None) => e.edge_label(st),
+            (Some((_, l, _)), Some(i)) => format!("{l} \u{2192} {i}"),
+            (Some((_, l, _)), None) => l,
             (None, Some(i)) => i,
             (None, None) => "claimed".to_owned(),
         };
@@ -4887,9 +5055,9 @@ fn task_flow(
             from: prev.clone(),
             to: key.clone(),
             label,
-            attempt: prev_exit.map_or(AttemptCost::None, |(e, _)| e.cost()),
+            attempt,
         });
-        prev_exit = Some((h.exit, h.status));
+        prev_exit = Some((h.exit, h.exit_label.clone(), h.attempt));
         prev = key;
         nodes.push(n);
     }
@@ -4902,13 +5070,12 @@ fn task_flow(
             format!("no run yet \u{2192} {}", task.status.as_str()),
             AttemptCost::None,
         ),
-        Some((e, st)) if e.explains(task.status) => (
-            format!("{} \u{2192} {}", e.edge_label(st), task.status.as_str()),
-            e.cost(),
-        ),
-        Some((e, _)) => (
+        Some((e, l, cost)) if e.explains(task.status) => {
+            (format!("{l} \u{2192} {}", task.status.as_str()), cost)
+        }
+        Some((_, _, cost)) => (
             format!("closed by hand: task is {}", task.status.as_str()),
-            e.cost(),
+            cost,
         ),
     };
     edges.push(FlowEdge {
@@ -4922,7 +5089,20 @@ fn task_flow(
         edges,
         attempts: task.attempts,
         max_attempts,
+        passes: history.len(),
+        runs: distinct_runs(&task.runs),
     }
+}
+
+/// How many different run ids a task's run list names.
+fn distinct_runs(runs: &[String]) -> usize {
+    let mut seen: Vec<&str> = Vec::new();
+    for r in runs {
+        if !seen.contains(&r.as_str()) {
+            seen.push(r);
+        }
+    }
+    seen.len()
 }
 
 /// Describe every entry of `task.runs`, in order, reading each run's record
@@ -4933,8 +5113,23 @@ fn task_history(task: &Task, read: impl Fn(&str) -> Option<RunState>) -> Vec<Tas
     let mut prior: Option<(&str, RunStatus)> = None;
     for (i, run_id) in task.runs.iter().enumerate() {
         let state = read(run_id);
-        let resumed = seen.contains(&run_id.as_str());
+        let k = seen.iter().filter(|r| **r == run_id.as_str()).count();
+        let resumed = k > 0;
         seen.push(run_id);
+        let total = task.runs.iter().filter(|r| *r == run_id).count();
+        // The run keeps one record per pass from the build that added them
+        // on; earlier entries of the list have none and stay unknown. The
+        // records are the tail of the list, so align from the end, and give
+        // up when the run claims more passes than the task lists.
+        let pass = state.as_ref().and_then(|s| {
+            let offset = total.checked_sub(s.passes.len())?;
+            s.passes.get(k.checked_sub(offset)?)
+        });
+        let settled = pass.and_then(|p| {
+            task.passes
+                .iter()
+                .find(|t| t.run == *run_id && t.pass_index == p.index)
+        });
         history.push(task_run_view(
             run_id,
             state.as_ref(),
@@ -4947,6 +5142,10 @@ fn task_history(task: &Task, read: impl Fn(&str) -> Option<RunState>) -> Vec<Tas
                     .map(|off| i + off + 2),
                 prior,
                 last: i + 1 == task.runs.len(),
+                pass,
+                settled,
+                pass_n: k + 1,
+                passes_of_run: total,
             },
             task,
         ));
@@ -4983,6 +5182,8 @@ async fn task_detail(
             max_attempts,
             flow,
             followup_origin: origin,
+            passes_total: history.len(),
+            runs_distinct: distinct_runs(&task.runs),
             history,
             runs_unreadable,
             attempts_note: ATTEMPTS_NOTE,
@@ -11975,6 +12176,7 @@ mod tests {
                 resumed_later: None,
                 prior: None,
                 last: true,
+                ..RunSlot::default()
             },
             &task,
         );
@@ -11994,6 +12196,7 @@ mod tests {
                 resumed_later: Some(2),
                 prior: None,
                 last: false,
+                ..RunSlot::default()
             },
             &task,
         )
@@ -12033,6 +12236,7 @@ mod tests {
             resumed_later: None,
             prior: None,
             last: true,
+            ..RunSlot::default()
         };
         let task = flow_task(&["20260902-140501-aaaa"]);
         let parked = flow_run(RunStatus::Implementing, |s| s.parked = true);
@@ -12045,6 +12249,215 @@ mod tests {
         let v = task_run_view("20260902-140501-aaaa", Some(&spent), slot(), &task);
         assert_eq!(v.attempt, AttemptCost::Spent);
         assert!(v.outcome.contains("spent an attempt"), "{}", v.outcome);
+    }
+
+    fn recorded_pass(index: usize, end: Option<crate::run::PassEnd>) -> crate::run::RunPass {
+        crate::run::RunPass {
+            index,
+            started_at: Timestamp::now(),
+            resumed: index > 0,
+            ended_at: end.as_ref().map(|_| Timestamp::now()),
+            end,
+        }
+    }
+
+    fn parked(cause: crate::run::ParkCause) -> Option<crate::run::PassEnd> {
+        Some(crate::run::PassEnd::Parked { cause })
+    }
+
+    fn upgrade_cause() -> crate::run::ParkCause {
+        crate::run::ParkCause::Upgrade {
+            from: "0.121.0".to_owned(),
+            to: Some("0.121.1".to_owned()),
+        }
+    }
+
+    fn settled_pass(
+        run: &str,
+        index: usize,
+        cost: crate::queue::PassCost,
+    ) -> crate::queue::TaskPass {
+        crate::queue::TaskPass {
+            run: run.to_owned(),
+            pass_index: index,
+            cost,
+            attempts_after: 1,
+            settled_at: Timestamp::now(),
+            parked: None,
+        }
+    }
+
+    const RUN_X: &str = "20261011-223708-4334";
+
+    #[test]
+    fn an_upgrade_pause_and_its_resume_are_two_passes_of_one_run_and_one_attempt() {
+        use crate::queue::PassCost;
+        let run = flow_run(RunStatus::Implementing, |s| {
+            s.passes = vec![
+                recorded_pass(0, parked(upgrade_cause())),
+                recorded_pass(1, None),
+            ];
+        });
+        let mut task = flow_task(&[RUN_X, RUN_X]);
+        task.attempts = 1;
+        task.passes = vec![settled_pass(RUN_X, 0, PassCost::Refunded)];
+        let h = task_history(&task, |_| Some(run.clone()));
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].kind, "competition");
+        assert_eq!(h[1].kind, "resume");
+        assert_eq!(
+            (h[0].exit, h[0].attempt),
+            (RunExit::Parked, AttemptCost::Refunded)
+        );
+        assert!(
+            h[0].outcome.contains("upgrade 0.121.0 \u{2192} 0.121.1"),
+            "{}",
+            h[0].outcome
+        );
+        assert!(h[0].outcome.contains("handed back"), "{}", h[0].outcome);
+        assert!(
+            h[0].outcome.contains("pass #2 resumed the same run"),
+            "{}",
+            h[0].outcome
+        );
+        assert!(
+            h[0].outcome.contains("pass 1 of 2 over run"),
+            "{}",
+            h[0].outcome
+        );
+        assert!(!h[0].outcome.contains("not recorded"), "{}", h[0].outcome);
+        assert_eq!(
+            h[0].exit_label,
+            "parked for upgrade 0.121.0 \u{2192} 0.121.1, attempt refunded"
+        );
+        let f = task_flow(&task, &h, 2, None);
+        // Two passes of one run, one of two attempts consumed.
+        assert_eq!((f.passes, f.runs, f.attempts, f.max_attempts), (2, 1, 1, 2));
+        assert_eq!(f.edges[1].attempt, AttemptCost::Refunded);
+        assert!(
+            f.edges[1].label.contains("upgrade 0.121.0"),
+            "{}",
+            f.edges[1].label
+        );
+        assert!(
+            f.edges[1].label.contains("resume the same run"),
+            "{}",
+            f.edges[1].label
+        );
+        assert_eq!(f.nodes[1].note, Some("parked"));
+    }
+
+    #[test]
+    fn an_upgrade_whose_target_was_not_known_says_so() {
+        let run = flow_run(RunStatus::Implementing, |s| {
+            s.passes = vec![
+                recorded_pass(
+                    0,
+                    parked(crate::run::ParkCause::Upgrade {
+                        from: "0.121.0".to_owned(),
+                        to: None,
+                    }),
+                ),
+                recorded_pass(1, None),
+            ];
+        });
+        let task = flow_task(&[RUN_X, RUN_X]);
+        let h = task_history(&task, |_| Some(run.clone()));
+        assert!(
+            h[0].outcome.contains("upgrade from 0.121.0"),
+            "{}",
+            h[0].outcome
+        );
+        // No settle record: the refund is not claimed.
+        assert_eq!(h[0].attempt, AttemptCost::Unknown);
+    }
+
+    #[test]
+    fn each_pass_keeps_its_own_cause_across_several_resumes() {
+        use crate::queue::PassCost;
+        use crate::run::ParkCause;
+        let run = flow_run(RunStatus::Implementing, |s| {
+            s.passes = vec![
+                recorded_pass(0, parked(upgrade_cause())),
+                recorded_pass(
+                    1,
+                    parked(ParkCause::Interrupt {
+                        reason: "task a1b2 asked to run first".to_owned(),
+                    }),
+                ),
+                recorded_pass(2, parked(ParkCause::Operator)),
+                recorded_pass(3, None),
+            ];
+        });
+        let mut task = flow_task(&[RUN_X, RUN_X, RUN_X, RUN_X]);
+        task.attempts = 1;
+        task.passes = (0..3)
+            .map(|i| settled_pass(RUN_X, i, PassCost::Refunded))
+            .collect();
+        let h = task_history(&task, |_| Some(run.clone()));
+        assert!(h[0].outcome.contains("upgrade 0.121.0"), "{}", h[0].outcome);
+        assert!(
+            h[1].outcome.contains("task a1b2 asked to run first"),
+            "{}",
+            h[1].outcome
+        );
+        assert!(!h[1].outcome.contains("upgrade"), "{}", h[1].outcome);
+        assert!(
+            h[2].outcome.contains("operator asked the loop to park"),
+            "{}",
+            h[2].outcome
+        );
+        assert!(h[3].outcome.is_empty() || !h[3].outcome.contains("upgrade"));
+        let f = task_flow(&task, &h, 2, None);
+        assert_eq!((f.passes, f.runs, f.attempts), (4, 1, 1));
+    }
+
+    #[test]
+    fn a_pass_the_next_one_found_open_is_unrecorded_never_an_upgrade() {
+        let run = flow_run(RunStatus::Implementing, |s| {
+            s.passes = vec![
+                recorded_pass(0, Some(crate::run::PassEnd::Unrecorded)),
+                recorded_pass(1, None),
+            ];
+        });
+        let task = flow_task(&[RUN_X, RUN_X]);
+        let h = task_history(&task, |_| Some(run.clone()));
+        assert_eq!(h[0].exit, RunExit::Interrupted);
+        assert_eq!(h[0].attempt, AttemptCost::Unknown);
+        assert!(
+            h[0].outcome.contains("without recording why"),
+            "{}",
+            h[0].outcome
+        );
+        assert!(!h[0].outcome.contains("upgrade"), "{}", h[0].outcome);
+        assert_eq!(h[0].pass.as_ref().map(|p| p.end), Some("unrecorded"));
+    }
+
+    #[test]
+    fn a_record_from_before_passes_stays_unknown_even_next_to_recorded_ones() {
+        use crate::queue::PassCost;
+        // Three entries, but the run only began keeping passes at the last
+        // two: the first is legacy and must not be given a cause.
+        let run = flow_run(RunStatus::Implementing, |s| {
+            s.passes = vec![
+                recorded_pass(0, parked(upgrade_cause())),
+                recorded_pass(1, None),
+            ];
+        });
+        let mut task = flow_task(&[RUN_X, RUN_X, RUN_X]);
+        task.passes = vec![settled_pass(RUN_X, 0, PassCost::Refunded)];
+        let h = task_history(&task, |_| Some(run.clone()));
+        assert!(h[0].pass.is_none());
+        assert_eq!(h[0].exit, RunExit::Interrupted);
+        assert_eq!(h[0].attempt, AttemptCost::Unknown);
+        assert!(h[0].outcome.contains("not recorded"), "{}", h[0].outcome);
+        assert!(!h[0].outcome.contains("upgrade"), "{}", h[0].outcome);
+        assert!(h[1].outcome.contains("upgrade 0.121.0"), "{}", h[1].outcome);
+        // A run with no passes at all is entirely unknown.
+        let legacy = flow_run(RunStatus::Implementing, |_| {});
+        let h = task_history(&flow_task(&[RUN_X, RUN_X]), |_| Some(legacy.clone()));
+        assert!(h.iter().all(|v| v.pass.is_none()));
+        assert!(h[0].outcome.contains("not recorded"), "{}", h[0].outcome);
     }
 
     #[tokio::test]
@@ -17648,7 +18061,7 @@ mod tests {
         let home = TempDir::new().expect("temp home");
         let ui = idle_ui(&home);
         ui.start_loop(None).expect("start");
-        ui.park_for_upgrade().expect("park");
+        ui.park_for_upgrade("0.1.0", Some("0.1.1")).expect("park");
         // The idle loop sees the park and ends before the handover fires.
         for _ in 0..500 {
             if !ui.loop_view(None).running {
@@ -17670,8 +18083,10 @@ mod tests {
         let home = TempDir::new().expect("temp home");
         let ui = idle_ui(&home);
         ui.start_loop(None).expect("start");
-        ui.park_for_upgrade().expect("first park");
-        ui.park_for_upgrade().expect("second park");
+        ui.park_for_upgrade("0.1.0", Some("0.1.1"))
+            .expect("first park");
+        ui.park_for_upgrade("0.1.0", Some("0.1.1"))
+            .expect("second park");
         assert!(handed_over(&home, ui).await);
     }
 
@@ -17680,7 +18095,7 @@ mod tests {
         let home = TempDir::new().expect("temp home");
         let ui = idle_ui(&home);
         ui.start_loop(None).expect("start");
-        ui.park_for_upgrade().expect("park");
+        ui.park_for_upgrade("0.1.0", Some("0.1.1")).expect("park");
         ui.stop_loop(None, false).expect("stop");
         assert!(!handed_over(&home, ui).await);
     }
@@ -17689,7 +18104,7 @@ mod tests {
     async fn an_idle_loop_stays_stopped_across_the_handover() {
         let home = TempDir::new().expect("temp home");
         let ui = idle_ui(&home);
-        ui.park_for_upgrade().expect("park");
+        ui.park_for_upgrade("0.1.0", Some("0.1.1")).expect("park");
         assert!(!handed_over(&home, ui).await);
 
         let successor = idle_ui(&home);
@@ -17703,7 +18118,7 @@ mod tests {
         let ui = idle_ui(&home);
         ui.start_loop(None).expect("start");
         ui.stop_loop(None, false).expect("stop");
-        ui.park_for_upgrade().expect("park");
+        ui.park_for_upgrade("0.1.0", Some("0.1.1")).expect("park");
         assert!(!handed_over(&home, ui).await);
     }
 
