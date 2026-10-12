@@ -195,19 +195,24 @@ async fn serve(
     runs_root: std::path::PathBuf,
     repo: &std::path::Path,
 ) -> String {
-    serve_with_queue_probe(home, queue, talks, runs_root, repo, false).await
+    serve_with_client_probe(home, queue, talks, runs_root, repo, ClientProbe::None).await
 }
 
-// Expose the live module's functions only for the pointer/refresh regression.
-// Running client_harness here would install a second client with independent
-// health/loop state, whose renderLoop changes the same header's geometry.
-async fn serve_with_queue_probe(
+enum ClientProbe {
+    None,
+    Queue,
+    Settings,
+}
+
+// Expose the live module's functions without installing a second client that
+// could render the same DOM from independent state.
+async fn serve_with_client_probe(
     home: &std::path::Path,
     queue: Queue,
     talks: Talks,
     runs_root: std::path::PathBuf,
     repo: &std::path::Path,
-    probe: bool,
+    probe: ClientProbe,
 ) -> String {
     let worktrees = home.join("wt").join("magi");
     std::fs::create_dir_all(&worktrees).unwrap();
@@ -224,9 +229,16 @@ async fn serve_with_queue_probe(
         .await
         .expect("bind loopback");
     let base = format!("http://{}/", listener.local_addr().unwrap());
+    let exports = match probe {
+        ClientProbe::None => None,
+        ClientProbe::Queue => {
+            Some("setChip, RUN_STATUS, TASK_STATUS, QUESTION_STATUS, TALK_STATUS, loadQueue")
+        }
+        ClientProbe::Settings => Some("settingsState, renderSettings, loadSettings, saveSettings"),
+    };
     let router = ui.router().layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| async move {
-            if probe && request.uri().path() == "/app.js" {
+            if let Some(exports) = exports.filter(|_| request.uri().path() == "/app.js") {
                 use axum::response::IntoResponse;
                 let source = include_str!("../assets/ui/app.js");
                 let source = source
@@ -236,8 +248,7 @@ async fn serve_with_queue_probe(
                 return (
                     [(axum::http::header::CONTENT_TYPE, "text/javascript")],
                     format!(
-                        "{source}\nwindow.deck = {{ setChip, RUN_STATUS, TASK_STATUS, \
-                         QUESTION_STATUS, TALK_STATUS, loadQueue }};\n\
+                        "{source}\nwindow.deck = {{ {exports} }};\n\
                          window.queueReady = boot();"
                     ),
                 )
@@ -1221,7 +1232,15 @@ async fn queue_row_click_previews_task_in_split_pane() {
     run.save_under(&home).expect("seed run");
     let ids = seed_tasks(&queue, &fx.repo, &run.id);
 
-    let base = serve_with_queue_probe(&home, queue, talks, home.join("runs"), &fx.repo, true).await;
+    let base = serve_with_client_probe(
+        &home,
+        queue,
+        talks,
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Queue,
+    )
+    .await;
     let mut browser = cdp::Browser::launch(&chrome)
         .await
         .unwrap_or_else(|e| panic!("could not start Chrome at {}: {e}", chrome.display()));
@@ -1646,12 +1665,13 @@ async fn machine_settings_context_and_overrides_fit_phone_and_desktop() {
     let guard = common::home_lock().await;
     let fx = common::fixture(guard, common::Judges::Unanimous, false);
     let home = fx.tmp.path().join("magi-home");
-    let base = serve(
+    let base = serve_with_client_probe(
         &home,
         Queue::at(home.join("queue")),
         Talks::at(home.join("talks")),
         home.join("runs"),
         &fx.repo,
+        ClientProbe::Settings,
     )
     .await;
     let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
@@ -1660,9 +1680,8 @@ async fn machine_settings_context_and_overrides_fit_phone_and_desktop() {
             .open_page(&format!("{base}#/settings"), width, 900, width == 390)
             .await
             .expect("page");
-        // The shipped client also loads Settings on arrival. Let its final
-        // render finish before the harness replaces the same DOM; otherwise
-        // that response can overwrite the synthetic overrides mid-check.
+        // Inspect the live client's state, so there is only one settings
+        // renderer and one request sequence throughout these interactions.
         browser
             .wait_for(
                 &page,
@@ -1670,10 +1689,8 @@ async fn machine_settings_context_and_overrides_fit_phone_and_desktop() {
                 Duration::from_secs(30),
             )
             .await
-            .expect("initial settings loaded before the client harness");
-        client_harness(&mut browser, &page).await;
+            .expect("live client settings loaded before checking geometry and states");
         let result = browser.eval(&page, r#"(async () => {
-          await deck.loadSettings();
           const s = deck.settingsState;
           const data = structuredClone(s.data);
           if (data.error || !data.roles.length) return ['fixture config did not load'];
