@@ -221,6 +221,85 @@ use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 /// so a run is never mistaken for one whose origin was known and empty.
 pub const SCHEMA: u32 = 13;
 
+/// Why a pass over a run stopped at a node boundary, recorded when it
+/// happened. Never inferred afterwards: `upgrade.json` is overwritten by the
+/// next upgrade and an event line is prose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ParkCause {
+    /// `magi web` / `magi serve` replaced its own binary. `to` is `None` when
+    /// the target release was not known at the time.
+    Upgrade {
+        /// The version that was running.
+        from: String,
+        /// The release it was replaced with, when known.
+        #[serde(default)]
+        to: Option<String>,
+    },
+    /// The operator asked the loop to park (`/api/loop`).
+    Operator,
+    /// The interrupt scheduler parked this run so another task runs first.
+    Interrupt {
+        /// What the scheduler gave as the reason.
+        reason: String,
+    },
+    /// The run waits for the owner's answer (merge approval, withheld text).
+    Question,
+    /// A park whose requester did not say why.
+    Unspecified,
+}
+
+impl ParkCause {
+    /// One line for an event or the UI.
+    #[must_use]
+    pub fn label(&self) -> String {
+        match self {
+            Self::Upgrade { from, to: Some(to) } => format!("upgrade {from} \u{2192} {to}"),
+            Self::Upgrade { from, to: None } => format!("upgrade from {from}"),
+            Self::Operator => "operator asked the loop to park".to_owned(),
+            Self::Interrupt { reason } => reason.clone(),
+            Self::Question => "waiting for the owner's answer".to_owned(),
+            Self::Unspecified => "park requested, reason not stated".to_owned(),
+        }
+    }
+}
+
+/// How a pass ended, when the process that drove it said so.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "how", rename_all = "snake_case")]
+pub enum PassEnd {
+    /// Parked at a node boundary on purpose.
+    Parked {
+        /// Why it parked.
+        cause: ParkCause,
+    },
+    /// The next pass found this one still open: it stopped without saying so
+    /// (a crash, a kill). Says nothing about why.
+    Unrecorded,
+}
+
+/// One pass over a run: the run is the same, the process driving it is not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunPass {
+    /// Position in [`RunState::passes`].
+    pub index: usize,
+    /// When the process took the run over.
+    pub started_at: Timestamp,
+    /// The run already had work on disk when this pass began.
+    pub resumed: bool,
+    /// When the pass ended, if it did.
+    #[serde(default)]
+    pub ended_at: Option<Timestamp>,
+    /// `None` while open (or still driving).
+    #[serde(default)]
+    pub end: Option<PassEnd>,
+    /// The pass was one the task loop (or `magi run`) counted as an entry of
+    /// `Task::runs`. A resume from the web button or `magi run --resume`
+    /// without a task is a pass too, but no entry of the task's list.
+    #[serde(default)]
+    pub task_entry: bool,
+}
+
 /// What an unrecorded origin reads as, wherever one is shown.
 pub const ORIGIN_UNKNOWN: &str = "origin unknown (started before origins were recorded)";
 
@@ -1976,6 +2055,17 @@ pub struct RunState {
     /// Stray foreign lockfiles a rescue commit left out, one entry per path.
     #[serde(default)]
     pub withheld: Vec<Withheld>,
+    /// One entry per time a process took this run over (`Runner::execute`),
+    /// oldest first. Append-only: a later resume closes the pass before it
+    /// and never rewrites what that pass recorded. A run from before this
+    /// existed has none for its earlier passes, which stay "not recorded".
+    /// Additive, so `SCHEMA` is not bumped.
+    #[serde(default)]
+    pub passes: Vec<RunPass>,
+    /// Set by whoever is about to execute this run on a task's behalf, read
+    /// and cleared by the next [`RunState::begin_pass`]. Never persisted.
+    #[serde(skip)]
+    pub next_pass_task_entry: bool,
     /// Parked at a node boundary, waiting to be resumed.
     ///
     /// A run that is neither finished nor being worked on is otherwise
@@ -2211,6 +2301,8 @@ impl RunState {
             seat_epoch: 0,
             seat_history: BTreeMap::new(),
             withheld: Vec::new(),
+            passes: Vec::new(),
+            next_pass_task_entry: false,
             parked: false,
             released_to: None,
             released_branches: Vec::new(),
@@ -2332,6 +2424,39 @@ impl RunState {
                 node: node.to_owned(),
                 at: Timestamp::now(),
             });
+        }
+    }
+
+    /// Open a pass for the process that is about to drive this run. A pass
+    /// left open by an earlier process is closed as [`PassEnd::Unrecorded`];
+    /// one that recorded its own end is never touched.
+    pub fn begin_pass(&mut self) {
+        let now = Timestamp::now();
+        if let Some(last) = self.passes.last_mut()
+            && last.end.is_none()
+        {
+            last.end = Some(PassEnd::Unrecorded);
+            last.ended_at = Some(now);
+        }
+        let resumed = !self.passes.is_empty() || !self.candidates.is_empty();
+        self.passes.push(RunPass {
+            index: self.passes.len(),
+            started_at: now,
+            resumed,
+            ended_at: None,
+            end: None,
+            task_entry: std::mem::take(&mut self.next_pass_task_entry),
+        });
+    }
+
+    /// Close the open pass as parked for `cause`. A pass that already has an
+    /// end keeps it (the first reason wins).
+    pub fn end_pass_parked(&mut self, cause: ParkCause) {
+        if let Some(last) = self.passes.last_mut()
+            && last.end.is_none()
+        {
+            last.end = Some(PassEnd::Parked { cause });
+            last.ended_at = Some(Timestamp::now());
         }
     }
 
@@ -3180,6 +3305,68 @@ pub fn read_artifact(run: &RunState, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    fn pass_state() -> RunState {
+        RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "0123456789abcdef".to_owned(),
+            "Do it".to_owned(),
+            Config::default(),
+        )
+    }
+
+    #[test]
+    fn passes_append_and_a_resume_never_rewrites_an_earlier_cause() {
+        let mut s = pass_state();
+        s.begin_pass();
+        assert!(!s.passes[0].resumed);
+        s.end_pass_parked(ParkCause::Upgrade {
+            from: "0.1.0".to_owned(),
+            to: Some("0.1.1".to_owned()),
+        });
+        s.begin_pass();
+        s.end_pass_parked(ParkCause::Operator);
+        // A second request for the same boundary does not relabel it.
+        s.end_pass_parked(ParkCause::Question);
+        s.begin_pass();
+        assert_eq!(s.passes.len(), 3);
+        assert!(s.passes[1].resumed);
+        assert_eq!(
+            s.passes[0].end,
+            Some(PassEnd::Parked {
+                cause: ParkCause::Upgrade {
+                    from: "0.1.0".to_owned(),
+                    to: Some("0.1.1".to_owned()),
+                }
+            })
+        );
+        assert_eq!(
+            s.passes[1].end,
+            Some(PassEnd::Parked {
+                cause: ParkCause::Operator
+            })
+        );
+        assert_eq!(s.passes[2].end, None);
+    }
+
+    #[test]
+    fn a_pass_left_open_is_closed_as_unrecorded_by_the_next() {
+        let mut s = pass_state();
+        s.begin_pass();
+        s.begin_pass();
+        assert_eq!(s.passes[0].end, Some(PassEnd::Unrecorded));
+        assert!(s.passes[0].ended_at.is_some());
+        assert_eq!(s.passes[1].end, None);
+    }
+
+    #[test]
+    fn a_state_written_before_passes_loads_with_none() {
+        let s = pass_state();
+        let mut v = serde_json::to_value(&s).unwrap();
+        v.as_object_mut().unwrap().remove("passes");
+        let back: RunState = serde_json::from_value(v).unwrap();
+        assert!(back.passes.is_empty());
+    }
     #[test]
     fn test_home_is_private_stable_and_unique_per_process() {
         // Child mode: report this process's home and stop.

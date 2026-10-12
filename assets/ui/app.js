@@ -6990,6 +6990,7 @@ function renderRunDetail() {
   renderReviews(run);
   renderQuota(run);
   renderHandovers(run);
+  renderPasses(run);
   renderTimeline(run);
   renderRunTaskEntry(run);
   renderRunActions(run);
@@ -8444,6 +8445,28 @@ function renderQuota(run) {
   }
 }
 
+/* One line per pass the run recorded. A run from before passes were kept has
+   none, and its earlier passes stay unknown rather than guessed. */
+function renderPasses(run) {
+  const passes = Array.isArray(run.pass_views) ? run.pass_views : [];
+  show($("run-passes-panel"), passes.length > 0);
+  if (passes.length === 0) return;
+  setText($("run-passes-count"), plural(passes.length, "pass", "passes"));
+  const list = $("run-passes");
+  clear(list);
+  passes.forEach((p, i) => {
+    const next = passes[i + 1];
+    const how = p.resumed ? "resumed" : "started";
+    const ended = p.end === "open" ? "in progress or finished" : p.label;
+    list.append(el("li", {},
+      el("span", { class: "seat", text: `#${p.index + 1}` }),
+      el("span", { text: `${how} ${clock(p.started_at)}` }),
+      linkify(el("span"), p.end === "open" ? ended : `stopped: ${ended}`),
+      el("span", { text: next ? `continued by pass #${next.index + 1} at ${clock(next.started_at)}` : "" }),
+    ));
+  });
+}
+
 function renderHandovers(run) {
   const moves = Array.isArray(run.handovers) ? run.handovers : [];
   show($("run-handovers-panel"), moves.length > 0);
@@ -9680,7 +9703,12 @@ function renderTask() {
   renderTaskActions(task);
 
   const history = Array.isArray(task.history) ? task.history : [];
-  setText($("task-attempts-count"), history.length ? `${history.length} run${history.length === 1 ? "" : "s"}` : "");
+  const passesTotal = Number(task.passes_total) || history.length;
+  const runsDistinct = Number(task.runs_distinct) || history.length;
+  /* Passes over runs are history; attempts used is a separate number. */
+  setText($("task-attempts-count"), history.length
+    ? `${plural(passesTotal, "pass", "passes")} over ${plural(runsDistinct, "run", "runs")} \u00b7 ${spent} of ${task.max_attempts} attempts used`
+    : "");
   setText($("task-attempts-note"), `${task.attempts_note || ""} (Budget shown is the default of ${task.max_attempts}; a loop started with a different limit uses its own.)`);
   const unreadable = Number(task.runs_unreadable) || 0;
   setText($("task-unreadable"), unreadable
@@ -9704,6 +9732,7 @@ function renderTask() {
       el("span", { class: "tag", "data-tone": "ink", text: h.kind }),
     );
     if (h.provisional) top.append(el("span", { class: "tag", "data-tone": "rust", text: "provisional" }));
+    if (h.passes_of_run > 1) top.append(el("span", { class: "tag", "data-tone": "ink", text: `pass ${h.pass_n} of ${h.passes_of_run}` }));
     const li = el("li", {}, top, el("div", { class: "task-run-desc", text: h.description }));
     if (h.outcome) li.append(el("div", { class: "task-run-out", text: h.outcome }));
     if (h.pr) li.append(el("a", { href: h.pr, target: "_blank", rel: "noopener noreferrer", text: "Pull request" }));
@@ -9744,7 +9773,7 @@ function renderTaskFlow(flow) {
   clear(list);
   const nodes = flow && Array.isArray(flow.nodes) ? flow.nodes : [];
   setText($("task-flow-summary"), flow
-    ? `${nodes.filter((n) => n.kind === "run").length} runs \u00b7 ${flow.attempts} of ${flow.max_attempts} attempts counted`
+    ? `${plural(flow.passes, "pass", "passes")} over ${plural(flow.runs, "run", "runs")} \u00b7 ${flow.attempts} of ${flow.max_attempts} attempts counted`
     : "");
   if (!flow) return;
   const edgeTo = new Map((flow.edges || []).map((e) => [e.to, e]));

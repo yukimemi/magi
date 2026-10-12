@@ -49,9 +49,9 @@ use crate::run::{
     BaseSync, Candidate, CommandOutcome, ContinuationOutcome, ContinuationRecord,
     DeliberationRound, DeliberationTurn, E2eStatus, FailClass, FixRecord, GateFixRecord,
     GithubTextChoice, GraftOutcome, GraftRecord, Handover, JobRecord, JobStatus, Judgement,
-    MergeOutcome, OperatorFixFinding, OperatorFixOutcome, OperatorFixRequest, Origin, QuotaLoss,
-    ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, SeatHistory, Tally,
-    VoteRecord, tail, write_artifact,
+    MergeOutcome, OperatorFixFinding, OperatorFixOutcome, OperatorFixRequest, Origin, ParkCause,
+    QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, SeatHistory,
+    Tally, VoteRecord, tail, write_artifact,
 };
 use crate::verdict::{
     self, FinalVote, Finding, FixReport, Position, Proposal, Ranking, Review, ReviewRevote,
@@ -207,7 +207,7 @@ enum AgentOutcome {
 /// afterward - so it mints a fresh, unshared [`Pause`] per run instead of
 /// reusing the daemon-wide one.
 #[derive(Debug, Clone, Default)]
-pub struct Pause(Arc<AtomicBool>, Arc<Mutex<Option<String>>>);
+pub struct Pause(Arc<AtomicBool>, Arc<Mutex<Option<ParkCause>>>);
 
 impl Pause {
     /// A pause nobody has asked for yet.
@@ -227,12 +227,20 @@ impl Pause {
     /// a binary swap. The first reason recorded wins; a park already in
     /// flight is not relabelled by a second, unrelated request.
     pub fn park_because(&self, reason: impl Into<String>) {
+        self.park_for(ParkCause::Interrupt {
+            reason: reason.into(),
+        });
+    }
+
+    /// [`Pause::park`], recording the structured cause. The first cause
+    /// recorded wins, like [`Pause::park_because`].
+    pub fn park_for(&self, cause: ParkCause) {
         let mut reason_guard = self
             .1
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if reason_guard.is_none() {
-            *reason_guard = Some(reason.into());
+            *reason_guard = Some(cause);
         }
         drop(reason_guard);
         self.park();
@@ -247,6 +255,12 @@ impl Pause {
     /// Why the park was asked for, when the caller used [`Pause::park_because`].
     #[must_use]
     pub fn reason(&self) -> Option<String> {
+        self.cause().map(|c| c.label())
+    }
+
+    /// The structured cause, when one was recorded.
+    #[must_use]
+    pub fn cause(&self) -> Option<ParkCause> {
         self.1
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1006,6 +1020,7 @@ impl Runner {
         self.state.driver_pid = Some(pid);
         self.state.driver_started_at = crate::proc::process_started_at(pid);
         self.state.driver_exited = false;
+        self.state.begin_pass();
         self.state.save()?;
         Ok(())
     }
@@ -1131,7 +1146,8 @@ impl Runner {
         if !self.pause.parked() && !self.interrupt.parked() {
             return Ok(false);
         }
-        let why = match self.interrupt.reason().or_else(|| self.pause.reason()) {
+        let cause = self.interrupt.cause().or_else(|| self.pause.cause());
+        let why = match cause.as_ref().map(ParkCause::label) {
             Some(reason) => format!(
                 "parked after `{}` ({reason}) — resume to carry on from here",
                 self.state.status.as_str()
@@ -1142,6 +1158,8 @@ impl Runner {
             ),
         };
         self.state.event("park", why);
+        self.state
+            .end_pass_parked(cause.unwrap_or(ParkCause::Unspecified));
         self.state.parked = true;
         self.state.save()?;
         Ok(true)
@@ -6802,6 +6820,7 @@ impl Runner {
 
     fn park_on_github_text(&mut self, g: &crate::run::GithubTextAsk) -> Result<()> {
         self.state.github_text = Some(g.clone());
+        self.state.end_pass_parked(ParkCause::Question);
         self.state.parked = true;
         self.state.event(
             "github-text",
@@ -10285,6 +10304,31 @@ mod tests {
             "expected the interrupt reason in {:?}",
             last.message
         );
+    }
+
+    /// The cause is stored on the pass when it parks, and the first cause a
+    /// shared pause was given is the one that stays.
+    #[test]
+    fn park_here_records_the_structured_cause_and_the_first_one_wins() {
+        crate::run::pin_test_home();
+        let mut runner = runner_at(RunStatus::Implementing);
+        runner.state.begin_pass();
+        let shutdown = Pause::new();
+        runner.on_pause(shutdown.clone());
+        let upgrade = ParkCause::Upgrade {
+            from: "0.121.0".to_owned(),
+            to: Some("0.121.1".to_owned()),
+        };
+        shutdown.park_for(upgrade.clone());
+        shutdown.park_for(ParkCause::Operator);
+
+        assert!(runner.park_here().expect("park_here"));
+        assert_eq!(
+            runner.state.passes[0].end,
+            Some(crate::run::PassEnd::Parked { cause: upgrade })
+        );
+        let last = runner.state.events.last().expect("a park event");
+        assert!(last.message.contains("0.121.0"), "{}", last.message);
     }
 
     /// `watch_interrupt` and `on_pause` are genuinely independent: an ordinary

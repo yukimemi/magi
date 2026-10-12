@@ -2680,3 +2680,32 @@ The operator avatar is display only and has no configuration. Its dedicated
 same policy as built-in persona SVGs. `TalkView.operator_avatar` carries its
 fingerprinted URL for both saved and optimistic turns. It is not a persona and
 must not be added to the persona roster or briefing.
+
+### Passes: why a run stopped is recorded when it happens
+
+A resume is another **pass** over the same run, not a new run, and a refunded
+attempt is not a failed one. The cause is written down at the moment it
+occurs, never reconstructed from `upgrade.json`, `web.log` or `park` event
+prose (the first is overwritten by the next upgrade, the rest cannot be
+annotated after a resume).
+
+- **Two records, one each side.** `RunState::passes` (`run::RunPass`, appended
+  by `RunState::begin_pass` in `Runner::claim_driver`, closed by
+  `end_pass_parked` in `park_here` and the two "waiting for the owner" parks)
+  says why the pass stopped (`run::ParkCause`: `Upgrade{from, to}`,
+  `Operator`, `Interrupt`, `Question`, `Unspecified`). `Task::passes`
+  (`queue::TaskPass`, written by `daemon::settle_and_diagnose`) says what the
+  settle did to the budget; the refund is read off `attempts` before and after,
+  never inferred from the status. `queue::SCHEMA` 15; `run::SCHEMA` is
+  unchanged (additive, `#[serde(default)]`).
+- **The cause comes from the requester.** `Stop::park` takes a `ParkCause`;
+  `web::park_for_upgrade` passes the running version and the release it is
+  installing (`to` is `None` when unknown, shown as "from X"). `Pause` keeps
+  the first cause it is given.
+- **Unknown stays unknown.** A pass the next process finds still open is closed
+  as `PassEnd::Unrecorded` (a crash, a kill): it is never shown as an upgrade.
+  A run from before passes existed has none for its earlier entries;
+  `web::task_history` aligns records to the tail of `Task::runs` and leaves
+  the rest as "cause not recorded, refund unknown".
+- The Attempts panel counts three different things: entries (passes), distinct
+  runs, and attempts consumed (`Task::attempts`). Do not merge them.
