@@ -208,7 +208,7 @@ fn pending_is_only_notices(t: &talk::Talk) -> bool {
         body.is_char_boundary(s)
             && body
                 .get(s..)
-                .is_some_and(|m| crate::prompt::is_completion_notice(m))
+                .is_some_and(crate::prompt::is_completion_notice)
     })
 }
 
