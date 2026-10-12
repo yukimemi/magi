@@ -2094,12 +2094,15 @@ async fn unreachable_banner_waits_out_transient_failures() {
           out.loopPreservesActionError = shown()
             && document.getElementById('alert').textContent === actionError;
           await deck.loadHealth();
-          window.fetch = async () => new Response(JSON.stringify({ error: 'server failed' }), { status: 500 });
+          /* Keep JSON parsing in the promise chain drained by tick. A native
+             Response body stream can finish after its setTimeout callback. */
+          window.fetch = async () => ({ ok: false, status: 500,
+            json: async () => ({ error: 'server failed' }) });
           clock += 10000;
           await tick();
           out.talkHttpImmediate = shown()
             && document.getElementById('alert').textContent.includes('server failed');
-          window.fetch = async () => new Response('{}', { status: 404 });
+          window.fetch = async () => ({ ok: false, status: 404, json: async () => ({}) });
           clock += 10000;
           await tick();
           out.talkGone = deck.state.talkDetail.gone === true
