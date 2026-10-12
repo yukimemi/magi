@@ -142,6 +142,15 @@ fn refers(entry: &str, s: &GraftStrength) -> bool {
     if first.eq_ignore_ascii_case(&s.id) {
         return true;
     }
+    // A prompt from before ids tagged nothing, so a fixer answered with the
+    // candidate's bare label: that covers the strengths taken from it.
+    let bare = entry.trim_matches(|c: char| !c.is_alphanumeric());
+    let mut chars = bare.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        if c.eq_ignore_ascii_case(&s.source) {
+            return true;
+        }
+    }
     let (e, t) = (squash(entry), squash(&s.text));
     e.len() >= 12 && t.len() >= 12 && (e.contains(&t) || t.contains(&e))
 }
@@ -303,6 +312,22 @@ mod tests {
         let v = parse_prompt(PROMPT);
         assert_eq!(standing(&v[0], &a), Standing::Adopted);
         assert_eq!(standing(&v[1], &a), Standing::Unreported);
+    }
+
+    #[test]
+    fn a_bare_candidate_label_covers_that_sources_strengths() {
+        let a = GraftAdoption {
+            addressed: vec!["A".to_owned()],
+            ..GraftAdoption::default()
+        };
+        let v = parse_prompt(PROMPT);
+        assert_eq!(standing(&v[0], &a), Standing::Adopted);
+        assert_eq!(standing(&v[1], &a), Standing::Adopted);
+        assert_eq!(standing(&v[2], &a), Standing::Unreported);
+        let (a, _) = adoption_of(
+            "done\n\n```json\n{\"addressed\":[\"A\"],\"rejected\":[],\"notes\":\"\"}\n```",
+        );
+        assert_eq!(standing(&v[0], &a.unwrap()), Standing::Adopted);
     }
 
     #[test]
