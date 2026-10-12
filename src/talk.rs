@@ -181,23 +181,51 @@ fn resolve_reply(talk: &Talk, target: Option<ReplyTarget>) -> Result<Option<Repl
 }
 
 /// Quotes are prompt-only: stored text remains suitable for titles and decisions.
-fn message_prompt(turn: &Turn) -> String {
+fn message_prompt(turn: &Turn, talk: &Talk, store: &Talks) -> String {
     if turn.messages.is_empty() {
         return turn.body.clone();
     }
     turn.messages
         .iter()
         .map(|message| match &message.reply {
-            Some(reply) => format!(
-                "[Reply to {:?}: {}]\n{}",
-                reply.who,
-                reply.excerpt.lines().collect::<Vec<_>>().join(" "),
-                message.body
-            ),
+            Some(reply) => {
+                let mut quote = format!(
+                    "[Reply to {:?}: {}]",
+                    reply.who,
+                    reply.excerpt.lines().collect::<Vec<_>>().join(" "),
+                );
+                if let Some(target) = talk.turns.get(reply.target.turn) {
+                    let attachments: &[Attachment] = if target.messages.is_empty() {
+                        &target.attachments
+                    } else if let Some(message) = target.messages.get(reply.target.message) {
+                        &message.attachments
+                    } else {
+                        &[]
+                    };
+                    for attachment in attachments {
+                        if let Some(path) = store.attachment_path(&talk.id, attachment) {
+                            quote.push_str(&format!(
+                                "\nReplied-to image: {} ({})",
+                                path.display(),
+                                attachment.mime
+                            ));
+                        }
+                    }
+                }
+                format!("{quote}\n{}", message.body)
+            }
             None => message.body.clone(),
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Plain text sends already have lossless boundaries in `breaks`. Keep the
+/// old wire format unless per-send replies or attachment ownership need metadata.
+fn messages_need_no_metadata(messages: &[Message]) -> bool {
+    messages
+        .iter()
+        .all(|message| message.reply.is_none() && message.attachments.is_empty())
 }
 
 /// One message in the conversation.
@@ -679,7 +707,20 @@ impl Talks {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
         t.updated_at = Timestamp::now();
-        let body = serde_json::to_string_pretty(t).context("serialize talk")?;
+        // Keep ordinary text conversations readable by older strict readers.
+        // The API retains messages; disk can recover them losslessly from breaks.
+        let mut persisted = t.clone();
+        for turn in &mut persisted.turns {
+            if turn.attachments.is_empty() && messages_need_no_metadata(&turn.messages) {
+                turn.messages.clear();
+            }
+        }
+        if persisted.pending_attachments.is_empty()
+            && messages_need_no_metadata(&persisted.pending_messages)
+        {
+            persisted.pending_messages.clear();
+        }
+        let body = serde_json::to_string_pretty(&persisted).context("serialize talk")?;
         let path = self.path_of(&t.id);
         let tmp = path.with_extension("json.tmp");
         write_atomic(&tmp, &path, &body)
@@ -1987,7 +2028,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         .turns
         .last()
         .filter(|t| t.who == Who::Operator && t.body == text)
-        .map(message_prompt)
+        .map(|turn| message_prompt(turn, talk, store))
         .unwrap_or_else(|| text.to_owned());
     let prompt_turns = talk.turns.len();
     talk.posts_read_through = Some(posts_read_through(talk));
@@ -2417,7 +2458,10 @@ fn transcript(talk: &Talk, store: &Talks) -> String {
             Who::Agent if t.body.starts_with(MAGI_NOTE) => "magi",
             Who::Agent => "you",
         };
-        out.push_str(&format!("\n## {who}\n\n{}\n", message_prompt(t).trim()));
+        out.push_str(&format!(
+            "\n## {who}\n\n{}\n",
+            message_prompt(t, talk, store).trim()
+        ));
         out.push_str(&attachment_note(store, &talk.id, &t.attachments));
     }
     out
@@ -2724,7 +2768,45 @@ pub fn tasks_of(queue: &Queue, talk_id: &str) -> Vec<Task> {
 
 fn read_path(path: &Path) -> Result<Talk> {
     let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))
+    let mut talk: Talk =
+        serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
+    for turn in &mut talk.turns {
+        if turn.who == Who::Operator && turn.messages.is_empty() && turn.attachments.is_empty() {
+            turn.messages = plain_messages(&turn.body, turn.breaks.as_deref());
+        }
+    }
+    if talk.pending_messages.is_empty() && talk.pending_attachments.is_empty() {
+        talk.pending_messages = plain_messages(&talk.pending, talk.pending_breaks.as_deref());
+    }
+    Ok(talk)
+}
+
+/// Rebuild only explicitly recorded boundaries; legacy paragraphs stay intact.
+fn plain_messages(body: &str, breaks: Option<&[usize]>) -> Vec<Message> {
+    let Some(breaks) = breaks else {
+        return Vec::new();
+    };
+    if body.is_empty() {
+        return Vec::new();
+    }
+    let mut messages = Vec::new();
+    let mut start = 0;
+    for end in breaks
+        .iter()
+        .copied()
+        .chain(std::iter::once(body.len() + 2))
+    {
+        let Some(text) = end.checked_sub(2).and_then(|end| body.get(start..end)) else {
+            return Vec::new();
+        };
+        messages.push(Message {
+            body: text.to_owned(),
+            attachments: Vec::new(),
+            reply: None,
+        });
+        start = end;
+    }
+    messages
 }
 
 /// How many times [`write_atomic`] retries a failed write-then-rename before
@@ -3558,6 +3640,108 @@ mod tests {
     }
 
     #[test]
+    fn reply_plain_text_sends_keep_the_old_wire_format() {
+        let (tmp, talks) = store();
+        let cfg = config(mock_agent(tmp.path(), REPLY, env("reply")));
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        record(&mut talk, &talks, "original", Vec::new()).expect("record");
+        queue(&mut talk, &talks, "first", Vec::new()).expect("queue");
+        queue(&mut talk, &talks, "second", Vec::new()).expect("queue");
+        let wire: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(talks.path_of(&talk.id)).unwrap())
+                .unwrap();
+        assert!(wire.get("pending_messages").is_none());
+        assert!(wire["turns"][0].get("messages").is_none());
+        drain(&mut talk, &talks).expect("drain");
+        let saved = talks.get(&talk.id).expect("reload");
+        assert_eq!(saved.turns[1].body, "first\n\nsecond");
+        assert_eq!(saved.turns[1].breaks, Some(vec![7]));
+        let wire: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(talks.path_of(&saved.id)).unwrap())
+                .unwrap();
+        // This is the full field set accepted by origin/main's strict Turn reader.
+        for turn in wire["turns"].as_array().expect("turns") {
+            for field in turn.as_object().expect("turn").keys() {
+                assert!(
+                    [
+                        "who",
+                        "body",
+                        "at",
+                        "attachments",
+                        "usage",
+                        "breaks",
+                        "posted_by"
+                    ]
+                    .contains(&field.as_str()),
+                    "unknown field for old readers: {field}"
+                );
+            }
+        }
+        record_reply(
+            &mut talk,
+            &talks,
+            "reply",
+            Vec::new(),
+            Some(ReplyTarget {
+                turn: 1,
+                message: 1,
+            }),
+        )
+        .expect("reply to reloaded plain text");
+        assert_eq!(
+            talk.turns[2].messages[0].reply.as_ref().unwrap().excerpt,
+            "second"
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_image_identity_reaches_fresh_and_followup_prompts_after_reload() {
+        let (tmp, talks) = store();
+        let cfg = config(mock_agent(tmp.path(), ECHO, BTreeMap::new()));
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        let first = talks
+            .put_attachment(&talk.id, "image/png", "first.png", b"first")
+            .expect("first");
+        let second = talks
+            .put_attachment(&talk.id, "image/png", "second.png", b"second")
+            .expect("second");
+        let first_path = talks.attachment_path(&talk.id, &first).unwrap();
+        let second_path = talks.attachment_path(&talk.id, &second).unwrap();
+        // Two attachment-only sends share one turn but retain their ownership.
+        queue(&mut talk, &talks, "", vec![first]).expect("queue first");
+        queue(&mut talk, &talks, "", vec![second]).expect("queue second");
+        drain(&mut talk, &talks).expect("drain");
+        let lease = talks.claim_turn(&talk.id).expect("claim").expect("lease");
+        for (message, selected, other) in [
+            (0, &first_path, &second_path),
+            (1, &second_path, &first_path),
+        ] {
+            record_reply(
+                &mut talk,
+                &talks,
+                "describe this",
+                Vec::new(),
+                Some(ReplyTarget { turn: 0, message }),
+            )
+            .expect("reply");
+            talk = talks.get(&talk.id).expect("reload");
+            let quote = message_prompt(talk.turns.last().unwrap(), &talk, &talks);
+            assert!(quote.contains(selected.to_str().unwrap()));
+            assert!(!quote.contains(other.to_str().unwrap()));
+            respond(&lease, &mut talk, &talks, &cfg, "describe this")
+                .await
+                .expect("respond");
+            assert!(
+                talk.turns
+                    .last()
+                    .unwrap()
+                    .body
+                    .contains(&format!("Replied-to image: {}", selected.display()))
+            );
+        }
+    }
+
+    #[test]
     fn reply_sends_survive_queue_edit_drain_reload_and_legacy_records() {
         let (tmp, talks) = store();
         let cfg = config(mock_agent(tmp.path(), REPLY, env("reply")));
@@ -3583,7 +3767,7 @@ mod tests {
         let reply = saved.turns[1].messages[0].reply.as_ref().expect("reply");
         assert_eq!(reply.target, target);
         assert_eq!(reply.excerpt, "猫".repeat(240));
-        assert!(message_prompt(&saved.turns[1]).contains("[Reply to Operator:"));
+        assert!(message_prompt(&saved.turns[1], &saved, &talks).contains("[Reply to Operator:"));
         assert!(transcript(&saved, &talks).contains("[Reply to Operator:"));
         queue_reply(
             &mut talk,
