@@ -116,6 +116,90 @@ pub struct Attachment {
     pub bytes: u64,
 }
 
+/// Stable transcript location: a turn and a send within that turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplyTarget {
+    /// Zero-based index in the append-only transcript.
+    pub turn: usize,
+    /// Zero-based send index; legacy turns have only index zero.
+    pub message: usize,
+}
+
+/// Server-generated, bounded snapshot; never recursively quotes replies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reply {
+    /// Original message location.
+    pub target: ReplyTarget,
+    /// Original speaker.
+    pub who: Who,
+    /// At most 240 Unicode characters of the original text.
+    pub excerpt: String,
+}
+
+/// One accepted send, retained even when the queue combines multiple sends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Message {
+    /// Unmodified message text.
+    pub body: String,
+    /// Images belonging to this send.
+    pub attachments: Vec<Attachment>,
+    /// Optional reply snapshot.
+    pub reply: Option<Reply>,
+}
+
+fn resolve_reply(talk: &Talk, target: Option<ReplyTarget>) -> Result<Option<Reply>> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
+    let turn = talk
+        .turns
+        .get(target.turn)
+        .context("invalid reply target")?;
+    let (body, attachments) = if turn.messages.is_empty() {
+        if target.message != 0 {
+            bail!("invalid reply target");
+        }
+        (&turn.body, &turn.attachments)
+    } else {
+        let message = turn
+            .messages
+            .get(target.message)
+            .context("invalid reply target")?;
+        (&message.body, &message.attachments)
+    };
+    let excerpt = if body.trim().is_empty() {
+        format!("{} attachment(s)", attachments.len())
+    } else {
+        body.chars().take(240).collect()
+    };
+    Ok(Some(Reply {
+        target,
+        who: turn.who,
+        excerpt,
+    }))
+}
+
+/// Quotes are prompt-only: stored text remains suitable for titles and decisions.
+fn message_prompt(turn: &Turn) -> String {
+    if turn.messages.is_empty() {
+        return turn.body.clone();
+    }
+    turn.messages
+        .iter()
+        .map(|message| match &message.reply {
+            Some(reply) => format!(
+                "[Reply to {:?}: {}]\n{}",
+                reply.who,
+                reply.excerpt.lines().collect::<Vec<_>>().join(" "),
+                message.body
+            ),
+            None => message.body.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 /// One message in the conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -144,6 +228,9 @@ pub struct Turn {
     /// not an operator turn) and readers fall back to paragraphs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub breaks: Option<Vec<usize>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Individual sends; empty for legacy turns.
+    pub messages: Vec<Message>,
     /// The run id of the task seat that appended this agent turn with
     /// `magi talk post`. Only ever set on such a turn; the chat's own CLI
     /// session has not seen it, so [`posts_since_last_reply`] replays it in
@@ -347,6 +434,9 @@ pub struct Talk {
     /// Message boundaries inside [`Self::pending`], as [`Turn::breaks`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_breaks: Option<Vec<usize>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Individual sends waiting to be drained.
+    pub pending_messages: Vec<Message>,
     /// May a failed turn fall back through the rest of `[roles] chatter`?
     /// True only while the agent was chosen by that chain; an explicit
     /// `--agent` or an operator's switch pins the conversation to its agent
@@ -1269,6 +1359,7 @@ pub fn begin_with(
     let mut talk = Talk {
         posts_read_through: Some(0),
         pending_breaks: None,
+        pending_messages: Vec::new(),
         schema: SCHEMA,
         id: new_id(),
         repo,
@@ -1303,6 +1394,17 @@ pub fn record(
     text: &str,
     attachments: Vec<Attachment>,
 ) -> Result<String> {
+    record_reply(talk, store, text, attachments, None)
+}
+
+/// Record a send with a reply validated under the persistence lock.
+pub fn record_reply(
+    talk: &mut Talk,
+    store: &Talks,
+    text: &str,
+    attachments: Vec<Attachment>,
+    target: Option<ReplyTarget>,
+) -> Result<String> {
     // `web::talk_say` reads the talk, then awaits config discovery before
     // calling this - a gap a concurrent `POST /api/talks/{id}/close` can land
     // in. The guard held for the rest of this function is what actually closes
@@ -1318,11 +1420,14 @@ pub fn record(
     let Ok(fresh) = store.get(&talk.id) else {
         bail!("talk {} was deleted", talk.short());
     };
+    let reply = resolve_reply(&fresh, target)?;
+    talk.turns = fresh.turns;
     talk.status = fresh.status;
     // Do not let this older handle overwrite a draft accepted while it was
     // waiting for configuration discovery.
     talk.pending = fresh.pending;
     talk.pending_breaks = fresh.pending_breaks;
+    talk.pending_messages = fresh.pending_messages;
     talk.pending_attachments = fresh.pending_attachments;
     talk.notified = fresh.notified;
     if !talk.status.open() {
@@ -1340,6 +1445,11 @@ pub fn record(
         who: Who::Operator,
         body: text.to_owned(),
         at: Timestamp::now(),
+        messages: vec![Message {
+            body: text.to_owned(),
+            attachments: attachments.clone(),
+            reply,
+        }],
         attachments,
         usage: None,
         breaks: Some(Vec::new()),
@@ -1356,7 +1466,18 @@ pub fn queue(
     text: &str,
     attachments: Vec<Attachment>,
 ) -> Result<()> {
-    queue_keyed(talk, store, text, attachments, None, &|_| false).map(|_| ())
+    queue_reply(talk, store, text, attachments, None)
+}
+
+/// Queue a send with its own reply relationship and attachments.
+pub fn queue_reply(
+    talk: &mut Talk,
+    store: &Talks,
+    text: &str,
+    attachments: Vec<Attachment>,
+    target: Option<ReplyTarget>,
+) -> Result<()> {
+    queue_keyed(talk, store, text, attachments, None, &|_| false, target).map(|_| ())
 }
 
 /// [`queue`] for a message that must be accepted at most once: `key` is
@@ -1376,7 +1497,7 @@ pub(crate) fn queue_once_matching(
     key: &str,
     previous: &dyn Fn(&str) -> bool,
 ) -> Result<bool> {
-    queue_keyed(talk, store, text, Vec::new(), Some(key), previous)
+    queue_keyed(talk, store, text, Vec::new(), Some(key), previous, None)
 }
 
 fn queue_keyed(
@@ -1386,6 +1507,7 @@ fn queue_keyed(
     attachments: Vec<Attachment>,
     key: Option<&str>,
     previous: &dyn Fn(&str) -> bool,
+    target: Option<ReplyTarget>,
 ) -> Result<bool> {
     let text = text.trim();
     if text.is_empty() && attachments.is_empty() {
@@ -1409,6 +1531,21 @@ fn queue_keyed(
         }
         fresh.notified.push(key.to_owned());
     }
+    let reply = resolve_reply(&fresh, target)?;
+    if fresh.pending_messages.is_empty()
+        && (!fresh.pending.is_empty() || !fresh.pending_attachments.is_empty())
+    {
+        fresh.pending_messages.push(Message {
+            body: fresh.pending.clone(),
+            attachments: fresh.pending_attachments.clone(),
+            reply: None,
+        });
+    }
+    fresh.pending_messages.push(Message {
+        body: text.to_owned(),
+        attachments: attachments.clone(),
+        reply,
+    });
     if !text.is_empty() {
         if fresh.pending.is_empty() {
             fresh.pending = text.to_owned();
@@ -1453,6 +1590,7 @@ pub fn post(store: &Talks, talk_id: &str, body: &str, by: &str) -> Result<()> {
         attachments: Vec::new(),
         usage: None,
         breaks: None,
+        messages: Vec::new(),
         posted_by: Some(by.to_owned()),
     });
     store.put(&mut fresh)
@@ -1503,6 +1641,7 @@ pub fn drain(talk: &mut Talk, store: &Talks) -> Result<Option<String>> {
     let text = std::mem::take(&mut fresh.pending);
     let attachments = std::mem::take(&mut fresh.pending_attachments);
     let breaks = fresh.pending_breaks.take();
+    let messages = std::mem::take(&mut fresh.pending_messages);
     fresh.turns.push(Turn {
         who: Who::Operator,
         body: text.clone(),
@@ -1510,6 +1649,7 @@ pub fn drain(talk: &mut Talk, store: &Talks) -> Result<Option<String>> {
         attachments,
         usage: None,
         breaks,
+        messages,
         posted_by: None,
     });
     store.put(&mut fresh)?;
@@ -1589,6 +1729,7 @@ pub fn close(talk: &mut Talk, store: &Talks) -> Result<()> {
     // A closed conversation must not replay a draft if it is reopened later.
     fresh.pending.clear();
     fresh.pending_breaks = None;
+    fresh.pending_messages.clear();
     fresh.pending_attachments.clear();
     store.put(&mut fresh)?;
     *talk = fresh;
@@ -1643,6 +1784,7 @@ pub fn switch_agent(talk: &mut Talk, store: &Talks, spec: &AgentSpec) -> Result<
     fresh.fallback = false;
     fresh.turns.push(Turn {
         breaks: None,
+        messages: Vec::new(),
         posted_by: None,
         who: Who::Agent,
         body: format!("{MAGI_NOTE}agent changed from {from} to {}", spec.id),
@@ -1687,6 +1829,7 @@ pub fn switch_persona(talk: &mut Talk, store: &Talks, id: &str) -> Result<bool> 
     };
     fresh.turns.push(Turn {
         breaks: None,
+        messages: Vec::new(),
         posted_by: None,
         who: Who::Agent,
         body: format!(
@@ -1711,6 +1854,7 @@ pub fn clear_pending(talk: &mut Talk, store: &Talks) -> Result<()> {
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
     fresh.pending.clear();
     fresh.pending_breaks = None;
+    fresh.pending_messages.clear();
     fresh.pending_attachments.clear();
     store.put(&mut fresh)?;
     *talk = fresh;
@@ -1734,6 +1878,7 @@ pub fn clear_pending_if_matches(
     }
     fresh.pending.clear();
     fresh.pending_breaks = None;
+    fresh.pending_messages.clear();
     fresh.pending_attachments.clear();
     store.put(&mut fresh)?;
     *talk = fresh;
@@ -1750,6 +1895,18 @@ pub fn edit_pending_text(
     expected_text: &str,
     expected_attachments: &[String],
 ) -> Result<bool> {
+    edit_pending_message(talk, store, text, expected_text, expected_attachments, None)
+}
+
+/// Edit one queued send while retaining its reply and attachments.
+pub fn edit_pending_message(
+    talk: &mut Talk,
+    store: &Talks,
+    text: &str,
+    expected_text: &str,
+    expected_attachments: &[String],
+    message: Option<usize>,
+) -> Result<bool> {
     let _guard = store.guard()?;
     let mut fresh = store
         .get(&talk.id)
@@ -1758,8 +1915,50 @@ pub fn edit_pending_text(
         *talk = fresh;
         return Ok(false);
     }
-    fresh.pending = text.trim().to_owned();
-    fresh.pending_breaks = Some(Vec::new());
+    if let Some(index) = message {
+        let edited = fresh
+            .pending_messages
+            .get_mut(index)
+            .context("invalid queued message")?;
+        if text.trim().is_empty() && edited.attachments.is_empty() {
+            fresh.pending_messages.remove(index);
+        } else {
+            edited.body = text.trim().to_owned();
+        }
+        fresh.pending.clear();
+        fresh.pending_breaks = Some(Vec::new());
+        fresh.pending_attachments.clear();
+        for message in &fresh.pending_messages {
+            if !message.body.is_empty() {
+                if !fresh.pending.is_empty() {
+                    fresh.pending.push_str("\n\n");
+                    fresh
+                        .pending_breaks
+                        .as_mut()
+                        .expect("initialized")
+                        .push(fresh.pending.len());
+                }
+                fresh.pending.push_str(&message.body);
+            }
+            fresh
+                .pending_attachments
+                .extend(message.attachments.clone());
+        }
+    } else {
+        if fresh.pending_messages.len() > 1
+            && fresh.pending_messages.iter().any(|m| m.reply.is_some())
+        {
+            bail!("edit queued replies individually");
+        }
+        let reply = fresh.pending_messages.first().and_then(|m| m.reply.clone());
+        fresh.pending_messages = vec![Message {
+            body: text.trim().to_owned(),
+            attachments: fresh.pending_attachments.clone(),
+            reply,
+        }];
+        fresh.pending = text.trim().to_owned();
+        fresh.pending_breaks = Some(Vec::new());
+    }
     store.put(&mut fresh)?;
     *talk = fresh;
     Ok(true)
@@ -1784,6 +1983,12 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // Freeze both boundaries before invoking the CLI. Failure notes must not
     // hide unread posts in old records, and posts arriving during any attempt
     // (including fallback) were absent from this snapshot's prompt.
+    let text = talk
+        .turns
+        .last()
+        .filter(|t| t.who == Who::Operator && t.body == text)
+        .map(message_prompt)
+        .unwrap_or_else(|| text.to_owned());
     let prompt_turns = talk.turns.len();
     talk.posts_read_through = Some(posts_read_through(talk));
     let spec = cfg
@@ -2009,6 +2214,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     let outcome = outcome.expect("a chain holds at least one agent");
     let note = |why: String| Turn {
         breaks: None,
+        messages: Vec::new(),
         posted_by: None,
         who: Who::Agent,
         body: format!("{MAGI_NOTE}{why}"),
@@ -2054,6 +2260,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         Ok(out) => (
             Turn {
                 breaks: None,
+                messages: Vec::new(),
                 posted_by: None,
                 who: Who::Agent,
                 body: out.text.trim().to_owned(),
@@ -2101,6 +2308,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // would overwrite the durable draft when the reply is appended below.
     talk.pending = fresh.pending;
     talk.pending_breaks = fresh.pending_breaks;
+    talk.pending_messages = fresh.pending_messages;
     talk.pending_attachments = fresh.pending_attachments;
     talk.notified = fresh.notified;
     // A `magi talk post` landed while the CLI ran: this handle predates it.
@@ -2209,7 +2417,7 @@ fn transcript(talk: &Talk, store: &Talks) -> String {
             Who::Agent if t.body.starts_with(MAGI_NOTE) => "magi",
             Who::Agent => "you",
         };
-        out.push_str(&format!("\n## {who}\n\n{}\n", t.body.trim()));
+        out.push_str(&format!("\n## {who}\n\n{}\n", message_prompt(t).trim()));
         out.push_str(&attachment_note(store, &talk.id, &t.attachments));
     }
     out
@@ -2356,6 +2564,7 @@ pub fn switch_implementers(talk: &mut Talk, store: &Talks, n: u8) -> Result<bool
     fresh.implementers_dirty = true;
     fresh.turns.push(Turn {
         breaks: None,
+        messages: Vec::new(),
         posted_by: None,
         who: Who::Agent,
         body: format!("{MAGI_NOTE}implementers changed from {from} to {n}"),
@@ -2699,6 +2908,7 @@ mod tests {
         Talk {
             posts_read_through: None,
             pending_breaks: None,
+            pending_messages: Vec::new(),
             schema: SCHEMA,
             id: "20260904-014455-ab12".to_owned(),
             repo: PathBuf::from("."),
@@ -2722,6 +2932,7 @@ mod tests {
     fn reply(body: &str, usage: Option<(u64, &str, Option<&str>)>) -> Turn {
         Turn {
             breaks: None,
+            messages: Vec::new(),
             posted_by: None,
             who: Who::Agent,
             body: body.to_owned(),
@@ -2949,6 +3160,7 @@ mod tests {
         let mut talk = Talk {
             posts_read_through: None,
             pending_breaks: None,
+            pending_messages: Vec::new(),
             schema: SCHEMA,
             id: "20260904-014455-ab12".to_owned(),
             repo: tmp.path().to_owned(),
@@ -3343,6 +3555,116 @@ mod tests {
         std::fs::write(&lock, "").expect("empty lock");
         age_file(&lock);
         assert!(TurnLock::take(&lease).expect("take").is_some());
+    }
+
+    #[test]
+    fn reply_sends_survive_queue_edit_drain_reload_and_legacy_records() {
+        let (tmp, talks) = store();
+        let cfg = config(mock_agent(tmp.path(), REPLY, env("reply")));
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        record(&mut talk, &talks, &"猫".repeat(300), Vec::new()).expect("record");
+        // Old records omit the new metadata entirely.
+        talk.turns[0].messages.clear();
+        talks.put(&mut talk).expect("legacy save");
+        let target = ReplyTarget {
+            turn: 0,
+            message: 0,
+        };
+        queue_reply(&mut talk, &talks, "first", Vec::new(), Some(target.clone())).expect("first");
+        queue_reply(&mut talk, &talks, "second", Vec::new(), None).expect("second");
+        assert!(
+            edit_pending_message(&mut talk, &talks, "edited", "first\n\nsecond", &[], Some(0))
+                .expect("edit")
+        );
+        drain(&mut talk, &talks).expect("drain");
+        let saved = talks.get(&talk.id).expect("reload");
+        assert_eq!(saved.turns[1].body, "edited\n\nsecond");
+        assert_eq!(saved.turns[1].messages.len(), 2);
+        let reply = saved.turns[1].messages[0].reply.as_ref().expect("reply");
+        assert_eq!(reply.target, target);
+        assert_eq!(reply.excerpt, "猫".repeat(240));
+        assert!(message_prompt(&saved.turns[1]).contains("[Reply to Operator:"));
+        assert!(transcript(&saved, &talks).contains("[Reply to Operator:"));
+        queue_reply(
+            &mut talk,
+            &talks,
+            "third",
+            Vec::new(),
+            Some(ReplyTarget {
+                turn: 1,
+                message: 1,
+            }),
+        )
+        .expect("specific send");
+        assert_eq!(
+            talk.pending_messages[0]
+                .reply
+                .as_ref()
+                .expect("reply")
+                .excerpt,
+            "second"
+        );
+        clear_pending(&mut talk, &talks).expect("clear");
+        assert!(talk.pending_messages.is_empty());
+        assert!(
+            record_reply(
+                &mut talk,
+                &talks,
+                "invalid",
+                Vec::new(),
+                Some(ReplyTarget {
+                    turn: 1,
+                    message: 2
+                })
+            )
+            .is_err()
+        );
+        assert_eq!(talks.get(&talk.id).expect("reload").turns.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn reply_quotes_reach_fresh_and_followup_prompts_without_changing_body() {
+        let (tmp, talks) = store();
+        let cfg = config(mock_agent(tmp.path(), ECHO, BTreeMap::new()));
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        record(&mut talk, &talks, "original", Vec::new()).expect("record");
+        let target = ReplyTarget {
+            turn: 0,
+            message: 0,
+        };
+        record_reply(
+            &mut talk,
+            &talks,
+            "answer",
+            Vec::new(),
+            Some(target.clone()),
+        )
+        .expect("reply");
+        let lease = talks.claim_turn(&talk.id).expect("claim").expect("lease");
+        lease
+            .respond(&mut talk, &talks, &cfg, "answer")
+            .await
+            .expect("respond");
+        assert!(
+            talk.turns
+                .last()
+                .expect("response")
+                .body
+                .contains("[Reply to Operator: original]\nanswer")
+        );
+        assert_eq!(talk.turns[1].body, "answer");
+        record_reply(&mut talk, &talks, "followup", Vec::new(), Some(target)).expect("reply");
+        lease
+            .respond(&mut talk, &talks, &cfg, "followup")
+            .await
+            .expect("respond");
+        assert!(
+            talk.turns
+                .last()
+                .expect("response")
+                .body
+                .contains("[Reply to Operator: original]\nfollowup")
+        );
     }
 
     #[test]
@@ -4797,6 +5119,7 @@ mod tests {
             let mut t = Talk {
                 posts_read_through: None,
                 pending_breaks: None,
+                pending_messages: Vec::new(),
                 schema: SCHEMA,
                 id: id.to_owned(),
                 repo: tmp.path().to_owned(),

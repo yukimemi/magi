@@ -683,6 +683,7 @@ const state = {
      reload. A conversation absent from this map has never been opened, so
      every agent turn in it counts as unread. */
   talkReads: loadCollapsed(TALK_READS_KEY),
+  talkReply: null,
   talkDetail: { id: null, talk: null, roster: [], personas: [] },
   /* Images picked, pasted or dropped for the *next* `talk-say`, not yet part
      of any turn. Each item is `{ localId, previewUrl, name, status,
@@ -5120,9 +5121,11 @@ function createTurnRow() {
   const who = el("span", { class: "turn-who" });
   const body = el("div", { class: "turn-body" });
   const attachments = el("div", { class: "turn-attachments" });
+  const reply = el("div", { class: "turn-reply" });
+  const actions = el("div", { class: "turn-actions" });
   const at = el("time", { class: "turn-at" });
-  const row = el("li", { class: "turn" }, avatar, who, body, attachments, at);
-  row.refs = { avatar, who, body, attachments, at };
+  const row = el("li", { class: "turn" }, avatar, who, reply, body, attachments, at, actions);
+  row.refs = { avatar, who, reply, body, attachments, at, actions };
   return row;
 }
 
@@ -5146,7 +5149,7 @@ function updateTurnRow(row, item) {
      nodes, never as markup: the rule that no API data is ever assigned as
      HTML holds everywhere outside the sandboxed panel frame, and a model that
      writes a script tag into a fence has to see the characters of one. */
-  const key = `${kind}:${body.length}`;
+  const key = `${kind}:${body}`;
   if (row.dataset.turnKey !== key) {
     row.dataset.turnKey = key;
     clear(r.body);
@@ -5180,6 +5183,33 @@ function updateTurnRow(row, item) {
       }, el("img", { src: url, alt: "", loading: "lazy" }));
       r.attachments.append(thumb);
     }
+  }
+
+  clear(r.reply);
+  clear(r.actions);
+  if (item.replyTarget) {
+    row.id = `talk-message-${item.replyTarget.turn}-${item.replyTarget.message}`;
+    r.actions.append(el("button", { class: "btn btn-quiet", type: "button", text: "Reply",
+      "aria-label": `Reply to ${r.who.textContent}`,
+      onclick: () => {
+        state.talkReply = { id: item.conversationId, target: item.replyTarget,
+          who: r.who.textContent, excerpt: Array.from(body).slice(0, 240).join("") || `${atts.length} attachment(s)` };
+        renderTalkReply();
+        $("f-talk-say").focus();
+      } }));
+  }
+  if (turn.reply) {
+    const reply = turn.reply;
+    r.reply.append(el("button", { class: "reply-quote", type: "button",
+      text: `${reply.who === "operator" ? (item.operatorName || "YOU") : (item.personaName || "AGENT")}: ${reply.excerpt}`,
+      onclick: () => {
+        const target = document.getElementById(`talk-message-${reply.target.turn}-${reply.target.message}`);
+        if (target) {
+          target.scrollIntoView({ block: "center", behavior: "smooth" });
+          target.classList.add("reply-highlight");
+          setTimeout(() => target.classList.remove("reply-highlight"), 1800);
+        }
+      } }));
   }
 
   const at = when(turn.at);
@@ -5611,7 +5641,20 @@ function updateTalkTaskRow(row, task) {
   setAttr(r.link, "href", `#/tasks/${encodeURIComponent(task.id)}`);
 }
 
+function renderTalkReply() {
+  const box = $("talk-reply-preview");
+  const reply = state.talkReply;
+  clear(box);
+  show(box, Boolean(reply && reply.id === state.talkDetail.id));
+  if (!reply || reply.id !== state.talkDetail.id) return;
+  append(box, [el("span", { text: `Reply to ${reply.who}: ${reply.excerpt}` }),
+    el("button", { class: "btn btn-quiet", type: "button", text: "Cancel reply",
+      onclick: () => { state.talkReply = null; renderTalkReply(); } })]);
+}
+
 function renderTalk() {
+  if (state.talkReply && state.talkReply.id !== state.talkDetail.id) state.talkReply = null;
+  renderTalkReply();
   const talk = state.talkDetail.talk;
   const wait = talk ? state.talkWaits.get(talk.id) : undefined;
   const busy = Boolean(wait) || Boolean(talk && talk.thinking);
@@ -5684,8 +5727,12 @@ function renderTalk() {
   const turnsMd = talkTurnsMd(talk);
   syncList(
     $("talk-turns"),
-    turns.map((turn, i) => ({ turn, md: turnsMd[i], key: String(i), conversationId: talk.id,
-      operatorName: talk.operator_name, personaName: talk.persona_name, personaAvatar: talk.persona_avatar })),
+    turns.flatMap((turn, i) => {
+      const messages = turn.messages && turn.messages.length ? turn.messages : [turn];
+      return messages.map((message, j) => ({ turn: { ...turn, ...message }, md: turnsMd[i], key: `${i}-${j}`, conversationId: talk.id,
+        replyTarget: i < talkTurns(talk).length ? { turn: i, message: j } : null,
+        operatorName: talk.operator_name, personaName: talk.persona_name, personaAvatar: talk.persona_avatar }));
+    }),
     (item) => item.key, createTurnRow, updateTurnRow,
   );
 
@@ -5927,12 +5974,18 @@ function renderTalkPending(talk) {
   if (!text && attachments.length === 0) return;
   append(box, [
     el("p", { class: "panel-note", text: "Queued for the next reply" }),
-    text ? el("pre", { class: "talk-pending-text", text }) : null,
+    text && !(talk.pending_messages || []).length ? el("pre", { class: "talk-pending-text", text }) : null,
     attachments.length ? el("p", { class: "frame-note", text: `${plural(attachments.length, "attachment", "attachments")} queued` }) : null,
     !busy ? el("button", { class: "btn", type: "button", text: "Resume queued draft", onclick: resumeTalkPending }) : null,
     el("button", { class: "btn btn-quiet", type: "button", text: "Clear", onclick: clearTalkPending }),
-    el("button", { class: "btn btn-quiet", type: "button", text: "Edit text", onclick: editTalkPending }),
+    !(talk.pending_messages && talk.pending_messages.length) ? el("button", { class: "btn btn-quiet", type: "button", text: "Edit text", onclick: editTalkPending }) : null,
   ]);
+  (talk.pending_messages || []).forEach((message, index) => {
+    box.append(el("div", { class: "queued-message" },
+      message.reply ? el("p", { class: "reply-quote", text: `Reply to ${message.reply.who}: ${message.reply.excerpt}` }) : null,
+      el("p", { class: "turn-text", text: message.body || `${message.attachments.length} attachment(s)` }),
+      el("button", { class: "btn btn-quiet", type: "button", text: "Edit text", onclick: () => editTalkPending(index) })));
+  });
 }
 
 async function resumeTalkPending() {
@@ -5954,7 +6007,8 @@ async function resumeTalkPending() {
   }
 }
 
-async function editTalkPending() {
+async function editTalkPending(messageIndex) {
+  if (!Number.isInteger(messageIndex)) messageIndex = null;
   const id = state.talkDetail.id;
   const talk = state.talkDetail.talk;
   if (!id || !talk) return;
@@ -5962,10 +6016,11 @@ async function editTalkPending() {
   const expectedAttachments = Array.isArray(talk.pending_attachments)
     ? talk.pending_attachments.map((attachment) => attachment.id)
     : [];
-  const text = window.prompt("Edit queued text", expectedText);
-  if (text === null || text === expectedText) return;
+  const currentText = messageIndex === null ? expectedText : talk.pending_messages[messageIndex].body;
+  const text = window.prompt("Edit queued text", currentText);
+  if (text === null || text === currentText) return;
   try {
-    const next = await postJson(API.talkPendingEdit(id), { text, expected_text: expectedText, expected_attachments: expectedAttachments });
+    const next = await postJson(API.talkPendingEdit(id), { text, message: messageIndex, expected_text: expectedText, expected_attachments: expectedAttachments });
     if (state.talkDetail.id === id) {
       state.talkDetail.talk = next;
       trackTalkThinking(next);
@@ -6250,6 +6305,8 @@ async function sendTalkTurn(event) {
   }
 
   talkError("");
+  const submissionReply = state.talkReply;
+  state.talkReply = null;
   const submissionAttachments = takeTalkAttachments(id);
   const before = talkTurns(state.talkDetail.talk).length;
   const ownsTurn = !state.talkWaits.has(id) && !(state.talkDetail.talk && state.talkDetail.talk.thinking);
@@ -6267,6 +6324,7 @@ async function sendTalkTurn(event) {
     const queued = await postJson(API.talkSay(id), {
       text,
       attachments: submissionAttachments.map((item) => item.serverId),
+      reply_to: submissionReply ? submissionReply.target : null,
     });
     /* This 202 was received after the local wait was created, so it is the
        matching observation that makes a later fresh false useful for
@@ -6283,6 +6341,7 @@ async function sendTalkTurn(event) {
     ok();
   } catch (error) {
     restoreTalkSubmission(id, text, submissionAttachments);
+    if (state.talkDetail.id === id && !state.talkReply) state.talkReply = submissionReply;
     if (ownsTurn) endTalkTurn(id);
     talkError(`The message may not have been sent: ${error.message}`);
     await loadTalk(id);

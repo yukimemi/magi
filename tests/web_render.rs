@@ -2372,6 +2372,7 @@ async fn chat_persona_avatars_load_and_do_not_overlap() {
         attachments: Vec::new(),
         usage: None,
         breaks: None,
+        messages: Vec::new(),
         posted_by: None,
     });
     talks.put(&mut t).expect("seed agent turn");

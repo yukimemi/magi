@@ -1158,6 +1158,7 @@ mod tests {
         let queued = store.get(&talk.id).unwrap().pending;
         let owner_turn = |body: &str| talk::Turn {
             breaks: Some(Vec::new()),
+            messages: Vec::new(),
             who: talk::Who::Operator,
             body: body.into(),
             at: Timestamp::now(),
@@ -1248,6 +1249,7 @@ mod tests {
 
         let owner_turn = |body: &str| talk::Turn {
             breaks: Some(Vec::new()),
+            messages: Vec::new(),
             posted_by: None,
             who: talk::Who::Operator,
             body: body.into(),
