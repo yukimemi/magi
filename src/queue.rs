@@ -111,7 +111,10 @@ use crate::ask::Questions;
 /// by a build that only knew about schema 1 has nothing to say about
 /// blocking or answers, and defaulting those fields is exactly as good a
 /// reading as a value that build never had a chance to write.
-pub const SCHEMA: u32 = 13;
+///
+/// 14: record whether a task count edit's overrides inherit daemon options.
+/// Old overrides default to isolated command-line settings, including empty ones.
+pub const SCHEMA: u32 = 14;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,8 +470,9 @@ pub struct Task {
     /// The command-line choices (`--merge`, `-c`, `--seed`, ...) of the
     /// `magi run` / `magi review` that filed this task, applied on top of the
     /// repository's config by whoever executes it - a daemon included - so
-    /// handing the task over does not change what it does. `None` for every
-    /// task filed any other way. `#[serde(default)]`.
+    /// handing the task over does not change what it does. A count edit on an
+    /// ordinary queue task explicitly inherits daemon options instead.
+    /// `#[serde(default)]`.
     #[serde(default)]
     pub overrides: Option<RunOverrides>,
     /// The branch an explicit `magi review <branch>` asked to review. Unlike
@@ -532,6 +536,10 @@ pub struct ChatNotice {
 /// Command-line choices carried by a task. See [`Task::overrides`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunOverrides {
+    /// Count edits on ordinary queued tasks inherit the loop's config and merge.
+    /// False for direct-run overrides and old records, even when otherwise empty.
+    #[serde(default)]
+    pub inherit_daemon_options: bool,
     /// `--merge`: `none`, `local` or `pr`.
     #[serde(default)]
     pub merge: Option<String>,
@@ -556,13 +564,6 @@ pub struct RunOverrides {
 }
 
 impl RunOverrides {
-    /// Only a seat count: inherit the daemon's config and merge choices.
-    pub fn count_only(&self) -> bool {
-        let mut rest = self.clone();
-        rest.candidates = None;
-        rest == Self::default()
-    }
-
     /// Lay `other` over these: every choice `other` made wins, the rest stay.
     pub fn merge_over(&mut self, other: &RunOverrides) {
         macro_rules! take {
@@ -1260,10 +1261,22 @@ impl Task {
     pub fn set_implementers(&mut self, count: u8, config: &crate::config::Config) -> Result<()> {
         self.check_implementers_editable()?;
         crate::talk::check_implementers(count, config).map_err(anyhow::Error::msg)?;
+        self.stamp_schema();
         self.solo = count == 1;
-        let mut overrides = self.overrides.clone().unwrap_or_default();
+        let mut overrides = self.overrides.clone().unwrap_or_else(|| RunOverrides {
+            inherit_daemon_options: true,
+            ..Default::default()
+        });
         overrides.candidates = (count > 1).then_some(usize::from(count));
-        self.overrides = (overrides != RunOverrides::default()).then_some(overrides);
+        let mut settings = overrides.clone();
+        settings.inherit_daemon_options = false;
+        // Some(empty) is a direct-run setting too: retain its isolation on Solo.
+        self.overrides = if overrides.inherit_daemon_options && settings == RunOverrides::default()
+        {
+            None
+        } else {
+            Some(overrides)
+        };
         Ok(())
     }
 
@@ -2641,18 +2654,6 @@ mod tests {
             assert!(t.set_implementers(1, &cfg).is_err());
             assert_eq!(serde_json::to_value(&t).unwrap(), before);
         }
-        let count = RunOverrides {
-            candidates: Some(2),
-            ..Default::default()
-        };
-        assert!(count.count_only());
-        assert!(
-            !RunOverrides {
-                merge: Some("none".into()),
-                ..count
-            }
-            .count_only()
-        );
     }
 
     /// A queue of its own, with no process-global state - which is the point of

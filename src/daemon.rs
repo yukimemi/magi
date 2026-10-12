@@ -2778,7 +2778,7 @@ async fn attempt(
     // failure here is the network's or the operator's, not the task's: hold
     // without spending an attempt, never fall back to a possibly stale copy.
     let explicit = match &task.overrides {
-        Some(o) if !o.count_only() => o.config.as_deref(),
+        Some(o) if !o.inherit_daemon_options => o.config.as_deref(),
         Some(_) => opts.config.as_deref(),
         None => opts.config.as_deref(),
     };
@@ -3317,7 +3317,9 @@ fn starter_with_implementers(
     proposed: Starter,
 ) -> Starter {
     if previous.is_some_and(|s| !implementers_match(task, s)) {
-        Starter::Start
+        task.review_of
+            .as_ref()
+            .map_or(Starter::Start, |branch| Starter::Review(branch.clone()))
     } else {
         proposed
     }
@@ -3346,7 +3348,7 @@ fn prepare_for(repo: &Path, opts: &Opts, task: &Task) -> Result<Config> {
         merge: None,
         ..opts.clone()
     };
-    let mut config = prepare(repo, if o.count_only() { opts } else { &own })?;
+    let mut config = prepare(repo, if o.inherit_daemon_options { opts } else { &own })?;
     o.apply(&mut config);
     Ok(config)
 }
@@ -6718,7 +6720,7 @@ mod tests {
     }
 
     #[test]
-    fn task_implementers_count_only_inherits_daemon_config_and_merge() {
+    fn task_implementers_edit_inherits_daemon_config_and_merge() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("explicit.toml");
         std::fs::write(&path, "[graph]\nimplementers = 3\njudges = 1\n").unwrap();
@@ -6728,10 +6730,12 @@ mod tests {
             ..Default::default()
         };
         let mut t = task();
-        t.overrides = Some(crate::queue::RunOverrides {
-            candidates: Some(2),
-            ..Default::default()
-        });
+        t.set_implementers(
+            2,
+            &toml::from_str("[[agents]]\nid = 'mock'\nkind = 'command'\ncommand = ['true']\n")
+                .unwrap(),
+        )
+        .unwrap();
         let cfg = prepare_for(dir.path(), &opts, &t).unwrap();
         assert_eq!(cfg.graph.implementers, 2);
         assert_eq!(cfg.graph.judges, 1);
@@ -6742,6 +6746,109 @@ mod tests {
         assert_eq!(cfg.graph.implementers, 1);
         assert_eq!(cfg.graph.judges, 1);
         assert_eq!(cfg.merge.mode, MergeMode::None);
+    }
+
+    #[test]
+    fn task_implementers_direct_overrides_stay_isolated_after_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(
+            repo.join("magi.toml"),
+            "[graph]\njudges = 2\n[merge]\nmode = 'none'\n",
+        )
+        .unwrap();
+        let daemon_config = dir.path().join("daemon.toml");
+        std::fs::write(
+            &daemon_config,
+            "[graph]\njudges = 1\n[merge]\nmode = 'pr'\n",
+        )
+        .unwrap();
+        let opts = Opts {
+            config: Some(daemon_config),
+            merge: Some("pr".into()),
+            ..Default::default()
+        };
+        let q = Queue::at(dir.path().join("queue"));
+        let validation: Config =
+            toml::from_str("[[agents]]\nid = 'mock'\nkind = 'command'\ncommand = ['true']\n")
+                .unwrap();
+        // No provenance field on legacy direct tasks: both shapes stay isolated.
+        for record in ["{}", r#"{"candidates":2}"#] {
+            let overrides = serde_json::from_str(record).unwrap();
+            let filing = crate::direct::Filing {
+                instruction: "work".into(),
+                title: "direct".into(),
+                repo: repo.clone(),
+                source: crate::queue::Source::Human,
+                solo: false,
+                overrides,
+                review_of: None,
+            };
+            let filed =
+                crate::direct::file(&q, dir.path(), Timestamp::now(), 1, filing, true).unwrap();
+            let crate::direct::Filed::Standalone {
+                mut task,
+                claim: _claim,
+            } = filed
+            else {
+                panic!("local filing")
+            };
+            let before = prepare_for(&repo, &opts, &task).unwrap();
+            assert_eq!(before.graph.judges, 2, "daemon --config must not leak");
+            assert_eq!(
+                before.merge.mode,
+                MergeMode::None,
+                "daemon --merge must not leak"
+            );
+            for n in [2, 1, 2] {
+                task.set_implementers(n, &validation).unwrap();
+                q.put(&mut task).unwrap();
+                task = q.get(&task.id).unwrap();
+                assert!(!task.overrides.as_ref().unwrap().inherit_daemon_options);
+                let mut cfg = prepare_for(&repo, &opts, &task).unwrap();
+                apply_task_implementers(&mut cfg, &task);
+                assert_eq!(cfg.graph.implementers, usize::from(n));
+                assert_eq!(cfg.graph.judges, 2);
+                assert_eq!(cfg.merge.mode, MergeMode::None);
+            }
+        }
+    }
+
+    #[test]
+    fn task_implementers_mismatch_keeps_explicit_reviews_review_only() {
+        let cfg: Config =
+            toml::from_str("[[agents]]\nid = 'mock'\nkind = 'command'\ncommand = ['true']\n")
+                .unwrap();
+        let mut t = task();
+        t.review_of = Some("review-target".into());
+        t.hold_manual(Some("retry".into()));
+        let mut previous = RunState::new(
+            PathBuf::from("/repo"),
+            "main".into(),
+            "abc1234".into(),
+            "review".into(),
+            cfg.clone(),
+        );
+        previous.config.graph.implementers = 2;
+        for count in [1, 3] {
+            t.set_implementers(count, &cfg).unwrap();
+            t.release();
+            assert_eq!(t.review_of.as_deref(), Some("review-target"));
+            for proposed in [
+                Starter::Resume(previous.id.clone()),
+                Starter::Review("recovery-target".into()),
+            ] {
+                assert_eq!(
+                    starter_with_implementers(&t, Some(&previous), proposed),
+                    Starter::Review("review-target".into())
+                );
+            }
+            let mut configured = cfg.clone();
+            apply_task_implementers(&mut configured, &t);
+            assert_eq!(configured.graph.implementers, usize::from(count));
+            assert_eq!(previous.config.graph.implementers, 2);
+        }
     }
 
     #[test]

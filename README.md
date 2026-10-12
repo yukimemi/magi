@@ -316,7 +316,11 @@ or task actions sheet. This changes only that task, preserving its ID,
 instruction, attachments, creation metadata and run history. Running and other
 states cannot be changed. Switching to or from Solo may start a fresh run when
 an earlier run used a different count; earlier candidate work is not reused in
-that case. Conversation preferences and repository defaults are unchanged.
+that case. Explicit `magi review` tasks remain reviews of their requested branch.
+Count edits on tasks without run overrides continue inheriting the daemon's
+options. Existing run overrides, including empty and count-only ones, retain
+configuration isolation across Solo changes. Conversation preferences and
+repository defaults are unchanged.
 
 ### Agents file their own work
 

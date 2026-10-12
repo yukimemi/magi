@@ -1222,6 +1222,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     review_rounds: opts.review_rounds,
                     seed: opts.seed,
                     config: opts.config.as_deref().map(|c| absolute_path(c, &cwd)),
+                    inherit_daemon_options: false,
                 };
                 return run_existing_task(&queue, task_id, patch, None).await;
             }
@@ -1235,6 +1236,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 review_rounds: opts.review_rounds,
                 seed: opts.seed,
                 config: opts.config.as_deref().map(|c| absolute_path(c, &cwd)),
+                inherit_daemon_options: false,
             };
             let repo = resolve_repo(&repo, &cwd, Some(&text)).await?;
             let (mut cfg, from) =
@@ -1292,6 +1294,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     review_rounds,
                     seed: None,
                     config: config.as_deref().map(|c| absolute_path(c, &cwd)),
+                    inherit_daemon_options: false,
                 };
                 return run_existing_task(&queue, task_id, patch, Some(branch)).await;
             }
@@ -1304,6 +1307,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 review_rounds,
                 seed: None,
                 config: config.as_deref().map(|c| absolute_path(c, &cwd)),
+                inherit_daemon_options: false,
             };
             let (mut cfg, from) =
                 Config::discover_fetched(&repo, overrides.config.as_deref()).await?;
@@ -3707,6 +3711,7 @@ async fn run_existing_task(
     }
     let mut overrides = task.overrides.take().unwrap_or_default();
     overrides.merge_over(&patch);
+    overrides.inherit_daemon_options = false;
     task.overrides = Some(overrides);
     if let Some(branch) = review {
         task.review_of = Some(branch);
