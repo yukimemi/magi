@@ -889,7 +889,16 @@ fn run_claims(
             pr: None,
         })
         .collect();
-    if live_pr && let Some(branch) = &view.pr_head {
+    // A run whose own pull request already merged or closed no longer holds
+    // the task head; it is history, not an owner (it is never superseded).
+    let settled = view
+        .pr
+        .as_ref()
+        .is_some_and(|p| p.state == "merged" || p.state == "closed");
+    if live_pr
+        && !settled
+        && let Some(branch) = &view.pr_head
+    {
         out.push(Claim {
             owner: owner.clone(),
             id: id.clone(),

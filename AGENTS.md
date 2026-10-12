@@ -1073,9 +1073,23 @@ lease and existing candidates.
 The old run must be terminal with a proven stopped driver and no daemon claim;
 unknown liveness refuses takeover. Auto-merge is disabled before replacing the
 head. Successful publication saves the new run's pushed SHA and PR record,
-then marks predecessors `pr_taken_over_by` (idempotently); their PR records
-remain history and lifecycle writes still propagate to them. Reports and the
+then marks *transferring* predecessors `pr_taken_over_by` (idempotently); their PR
+records remain history and lifecycle writes still propagate to them. Reports and the
 web show them as superseded, and they cannot re-enter the graph or land.
+
+**Two sets of predecessors.** Every terminal, stopped run sharing the task head
+and git-common-dir is scanned, locked and liveness-checked (an active or unknown
+driver still refuses publication), and its `pr_pushed_head` is a candidate for
+the push lease. Only a predecessor whose recorded PR is the *same open PR* being
+published (`pr_head::transfers_ownership`: same url, state not merged/closed) is
+superseded. A merged or closed run, a run pointing at another PR, and a run with
+no PR record (ownership unknown, including `pr_publication_pending`) stay history:
+no `pr_taken_over_by`, no takeover comment, no deputy-task supersession. The lease
+no longer depends on `updated_at` order: with no own `pr_pushed_head`, a remote
+head equal to any scanned predecessor's recorded push is accepted as the explicit
+`--force-with-lease` value. Accepted trade-off: a person who resets the head to a
+SHA magi once pushed can be overwritten. `dupes` drops the task-head claim of a run
+whose own PR is merged/closed, since such a run is no longer superseded.
 A takeover comment preserves the link between attempts. Writes are not atomic
 with the push: a saved push lease permits a subsequent publication retry;
 an unrecorded successful push fails closed rather than guessing ownership.

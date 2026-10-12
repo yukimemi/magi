@@ -76,10 +76,10 @@ pub(crate) fn ensure_owner(state: &RunState) -> Result<()> {
 
 /// The remote is absent, exactly the head we last published, or already at the
 /// tip being pushed (an idempotent re-push).
-fn lease_for(remote: Option<&str>, expected: Option<&str>, local: &str) -> Result<String> {
+fn lease_for(remote: Option<&str>, expected: &[&str], local: &str) -> Result<String> {
     match remote {
         None => Ok(String::new()),
-        Some(head) if Some(head) == expected || head == local => Ok(head.to_owned()),
+        Some(head) if expected.contains(&head) || head == local => Ok(head.to_owned()),
         Some(_) => bail!("public head moved or has no recorded lease; refusing to overwrite it"),
     }
 }
@@ -141,6 +141,15 @@ async fn predecessors(
     Ok(previous)
 }
 
+/// Whether `old` is handing over ownership of the open pull request `url`.
+/// Merged or closed records, other pull requests and records with no pull
+/// request (ownership unknown) stay history and are never superseded.
+fn transfers_ownership(old: &RunState, url: &str) -> bool {
+    old.pr
+        .as_ref()
+        .is_some_and(|p| p.url == url && p.state != "merged" && p.state != "closed")
+}
+
 pub(crate) async fn publish(
     state: &mut RunState,
     winner: &Candidate,
@@ -151,15 +160,16 @@ pub(crate) async fn publish(
     let head = state.task_pr_branch().context("missing task public head")?;
     let home = run::home();
     let previous = predecessors(state, &home, &head).await?;
-    let expected = state.pr_pushed_head.as_deref().or_else(|| {
-        previous
-            .last()
-            .and_then(|(s, _)| s.pr_pushed_head.as_deref())
-    });
-    let posted_title = state
-        .pr_posted_title
-        .clone()
-        .or_else(|| previous.last().and_then(|(s, _)| s.pr_posted_title.clone()));
+    // The lease is the head this run pushed, else any head a live-checked
+    // predecessor pushed: merged runs are not superseded, so "latest by
+    // updated_at" is not a reliable pusher.
+    let expected: Vec<&str> = match state.pr_pushed_head.as_deref() {
+        Some(h) => vec![h],
+        None => previous
+            .iter()
+            .filter_map(|(s, _)| s.pr_pushed_head.as_deref())
+            .collect(),
+    };
     // Query before any mutation: ambiguous or unreadable PR lists cannot create duplicates.
     let found = land::find_open_pr(&winner.worktree, &head, &state.base_branch).await?;
     if let land::OpenPr::Many(_) = found {
@@ -168,7 +178,15 @@ pub(crate) async fn publish(
     let remote = state.config.merge.remote.clone();
     let remote_head = git::remote_head(&winner.worktree, &remote, &head).await?;
     let local_tip = git::rev_parse(&winner.worktree, &winner.branch).await?;
-    let expected = lease_for(remote_head.as_deref(), expected, &local_tip)?;
+    let expected = lease_for(remote_head.as_deref(), &expected, &local_tip)?;
+    let posted_title = state.pr_posted_title.clone().or_else(|| match &found {
+        land::OpenPr::One { url, .. } => previous
+            .iter()
+            .rev()
+            .find(|(s, _)| transfers_ownership(s, url))
+            .and_then(|(s, _)| s.pr_posted_title.clone()),
+        _ => None,
+    });
     if let land::OpenPr::One { ref url, .. } = found {
         let (ok, raw) = land::gh(
             &winner.worktree,
@@ -277,36 +295,35 @@ pub(crate) async fn publish(
         if old.pr_taken_over_by.as_deref() == Some(state.id.as_str()) {
             continue;
         }
-        if old.pr.as_ref().is_some_and(|p| p.url == url) {
-            crate::followup::supersede_deputy_tasks(
-                &mut old,
-                &url,
-                &crate::queue::Queue::at(home.join("queue")),
-                &state.id,
-            );
+        if !transfers_ownership(&old, &url) {
+            continue;
         }
+        crate::followup::supersede_deputy_tasks(
+            &mut old,
+            &url,
+            &crate::queue::Queue::at(home.join("queue")),
+            &state.id,
+        );
         old.pr_taken_over_by = Some(state.id.clone());
         old.event(
             "merge",
             format!("pull request superseded by run {}", state.short()),
         );
         old.save_under(&home)?;
-        if old.pr.as_ref().is_some_and(|p| p.url == url) {
-            let comment = format!(
-                "Run {} replaced the head with {tip}, superseding run {}. Review and CI history remain on this pull request.",
-                state.short(),
-                old.short()
-            );
-            // Best effort: the head is already published and recorded, and a
-            // failed note must not turn a landed update into a failed step.
-            if let Err(e) = checked_gh(
-                &winner.worktree,
-                &["pr", "comment", &url, "--body", &comment],
-            )
-            .await
-            {
-                tracing::warn!("takeover comment on {url} failed: {e:#}");
-            }
+        let comment = format!(
+            "Run {} replaced the head with {tip}, superseding run {}. Review and CI history remain on this pull request.",
+            state.short(),
+            old.short()
+        );
+        // Best effort: the head is already published and recorded, and a
+        // failed note must not turn a landed update into a failed step.
+        if let Err(e) = checked_gh(
+            &winner.worktree,
+            &["pr", "comment", &url, "--body", &comment],
+        )
+        .await
+        {
+            tracing::warn!("takeover comment on {url} failed: {e:#}");
         }
     }
     state.event("merge", format!("published task head {head}: {url}"));
@@ -328,11 +345,12 @@ mod tests {
 
     #[test]
     fn public_head_lease_refuses_unknown_or_moved_remote() {
-        assert_eq!(lease_for(None, None, "l").unwrap(), "");
-        assert_eq!(lease_for(Some("a"), Some("a"), "l").unwrap(), "a");
-        assert!(lease_for(Some("b"), Some("a"), "l").is_err());
-        assert!(lease_for(Some("a"), None, "l").is_err());
+        assert_eq!(lease_for(None, &[], "l").unwrap(), "");
+        assert_eq!(lease_for(Some("a"), &["a"], "l").unwrap(), "a");
+        assert_eq!(lease_for(Some("b"), &["a", "b"], "l").unwrap(), "b");
+        assert!(lease_for(Some("b"), &["a"], "l").is_err());
+        assert!(lease_for(Some("a"), &[], "l").is_err());
         // Already at the tip being pushed: allowed even with no record.
-        assert_eq!(lease_for(Some("l"), None, "l").unwrap(), "l");
+        assert_eq!(lease_for(Some("l"), &[], "l").unwrap(), "l");
     }
 }
