@@ -12,6 +12,8 @@
 //! relative paths, URLs, `std::io::Error`, `v1.2.3` and `@handle` all pass.
 //! Dotted IPv4-shaped section references after `§`, `section`, `sec.` or
 //! `clause` also pass; the exception never applies to IPv6.
+//! A few conventional public system paths also pass the absolute-path rule;
+//! configured homes and known identity words within them are still scrubbed.
 
 /// The local facts worth hiding. `Default` is "nothing known", which leaves only
 /// the pattern-based rules.
@@ -397,9 +399,32 @@ fn absolute_path(rest: &str, prev: Option<char>) -> Option<(usize, &'static str)
         let n = run(rest, |c| {
             !c.is_whitespace() && !matches!(c, '`' | '"' | '\'' | '<' | '>')
         });
+        if unix && public_system_path(&rest[..n]) {
+            return None;
+        }
         return Some((n, "[redacted-path]"));
     }
     None
+}
+
+fn public_system_path(path: &str) -> bool {
+    // Exact public locations, with no variable account/host/checkout/mount slot:
+    // /etc/hosts is the standard host table; /usr/local/bin is the command
+    // directory and foo a literal example command; /var/log/syslog is the
+    // standard system log; /var/run/kanade/agent.sock is the documented service
+    // endpoint. Do not generalize to arbitrary command, log or service names:
+    // those may identify an operator even when Identity does not know the name.
+    // Home rules retain priority and other identity rules still scan these paths.
+    // Ignore prose punctuation only for this check, preserving the original
+    // redaction boundary. Exact matching rejects traversal and extra levels.
+    matches!(
+        path.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']']),
+        "/etc/hosts"
+            | "/usr/local/bin"
+            | "/usr/local/bin/foo"
+            | "/var/log/syslog"
+            | "/var/run/kanade/agent.sock"
+    )
 }
 
 fn email(rest: &str) -> Option<(usize, &'static str)> {
@@ -609,6 +634,152 @@ mod tests {
         assert_eq!(s("at C:/Users/Bob/proj"), "at ~/proj");
         assert_eq!(s("/root/x and /root."), "~/x and ~.");
         assert_eq!(s("/srv/people/alice/wt/a"), "~/wt/a");
+    }
+
+    #[test]
+    fn public_system_paths_pass_scrub_and_locate() {
+        for path in [
+            "/run/kanade/agent.sock",
+            "/var/run/kanade/agent.sock",
+            "/etc/hosts",
+            "/usr/local/bin",
+            "/usr/local/bin/foo",
+            "/var/log/syslog",
+        ] {
+            for text in [
+                path.to_owned(),
+                format!("uses `{path}` on this platform"),
+                format!("uses \"{path}\" on this platform"),
+                format!("See ({path}), then {path}."),
+            ] {
+                assert_eq!(s(&text), text, "{text}");
+                assert!(locate(&text, &id()).is_empty(), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn private_paths_and_non_public_shapes_still_redact() {
+        let identity = Identity::default();
+        for path in [
+            "/Volumes/disk-name/project",
+            "/Volumes/disk name/project",
+            "/srv/people/alice/wt/a",
+            "/tmp/checkout/build",
+            "/private/var/folders/ab/account/build",
+            "/var/folders/ab/account/build",
+            "/mnt/disk/project",
+            "/usr/home/bob/project",
+            "/opt/checkout/build",
+            "/etc/hosts/private",
+            "/etc/hostname",
+            "/etc/hosts-backup",
+            "/usr/local/bin/foo/private",
+            "/usr/local/bin/../private",
+            "/usr/local/bin/..",
+            "/usr/local/bin/./foo",
+            "/usr/local/bin//foo",
+            "/usr/local/bin/foo/",
+            "/var/log/../private",
+            "/var/log/service/private",
+            "/var/run/agent.sock",
+            "/var/run/service/agent.pid",
+            "/var/run/service/.sock",
+            "/var/run/../agent.sock",
+            "/var/run/service/../agent.sock",
+            "/var/run//agent.sock",
+            r"/var/log/foo\private",
+            r"C:\build\checkout",
+        ] {
+            assert!(
+                scrub(path, &identity).starts_with("[redacted-path]"),
+                "{path}"
+            );
+            assert_eq!(locate(path, &identity), vec![(1, "path")], "{path}");
+        }
+        for (text, expected) in [
+            ("/Users/bob/src/x", "~/src/x"),
+            ("/home/bob/.config", "~/.config"),
+            ("C:/Users/Bob/proj", "~/proj"),
+            (r"C:\Users\Bob\proj", r"~\proj"),
+            ("/srv/people/alice/wt/a", "~/wt/a"),
+        ] {
+            assert_eq!(s(text), expected, "{text}");
+            assert_eq!(locate(text, &id()), vec![(1, "home-path")], "{text}");
+        }
+        // The existing whitespace consumption boundary stays unchanged.
+        assert_eq!(
+            scrub("/Volumes/disk name/project", &identity),
+            "[redacted-path] name/project"
+        );
+        for text in [
+            "/unknown/checkout/build",
+            "/api/v1/runs",
+            "/run/service/agent.sock",
+        ] {
+            assert_eq!(scrub(text, &identity), text);
+            assert!(locate(text, &identity).is_empty());
+        }
+    }
+
+    #[test]
+    fn public_paths_keep_home_and_identity_rules_and_do_not_rescan() {
+        let identity = Identity {
+            home: "/usr/local/bin".into(),
+            ..id()
+        };
+        assert_eq!(scrub("/usr/local/bin/foo", &identity), "~/foo");
+        assert_eq!(
+            locate("/usr/local/bin/foo", &identity),
+            vec![(1, "home-path")]
+        );
+        for path in [
+            "/usr/local/bin/alice",
+            "/usr/local/bin/alice-build",
+            "/usr/local/bin/bob",
+            "/var/log/buildbox.log",
+            "/var/log/alice-build.log",
+            "/var/run/alice/agent.sock",
+            "/var/run/alice-agent/agent.sock",
+            "/var/run/bob/agent.sock",
+            "/var/log/box.local",
+        ] {
+            for identity in [id(), Identity::default()] {
+                assert_eq!(scrub(path, &identity), "[redacted-path]", "{path}");
+                assert_eq!(locate(path, &identity), vec![(1, "path")], "{path}");
+            }
+        }
+        let identity = Identity {
+            user: "foo".into(),
+            host: "kanade".into(),
+            ..Identity::default()
+        };
+        for (text, expected, kind) in [
+            (
+                "/usr/local/bin/foo",
+                "/usr/local/bin/[redacted-user]",
+                "user",
+            ),
+            (
+                "/var/run/kanade/agent.sock",
+                "/var/run/[redacted-host]/agent.sock",
+                "host",
+            ),
+        ] {
+            assert_eq!(scrub(text, &identity), expected);
+            assert_eq!(locate(text, &identity), vec![(1, kind)]);
+        }
+        let identity = Identity {
+            user: "redacted".into(),
+            host: "redacted-path".into(),
+            ..Identity::default()
+        };
+        let text = "/tmp/checkout redacted /usr/local/bin/foo";
+        assert_eq!(
+            scrub(text, &identity),
+            "[redacted-path] [redacted-user] /usr/local/bin/foo"
+        );
+        assert_eq!(locate(text, &identity), vec![(1, "path"), (1, "user")]);
     }
 
     #[test]
