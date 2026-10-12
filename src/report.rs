@@ -1138,10 +1138,23 @@ pub fn run(state: &RunState) -> String {
 /// cleared it from disk yet — see that type's own docs for why an entry
 /// alone is not proof of anything.
 pub fn active_seats(state: &RunState, live: Liveness) -> String {
-    if state.active.is_empty() {
-        return String::new();
-    }
     let mut s = String::new();
+    // A run that stopped on an infrastructure wait says so: no agent failed
+    // and none was asked, and a resume asks the same ones.
+    if let Some(b) = &state.resource_block {
+        let _ = writeln!(
+            s,
+            "\n{}\n  {}: {} stayed busy past the resource-wait limit; no agent was started \
+             ({}). Resume to ask the same agents again.",
+            bold("waiting on a resource"),
+            b.node,
+            b.kind,
+            b.detail
+        );
+    }
+    if state.active.is_empty() {
+        return s;
+    }
     let _ = writeln!(s, "\n{}", bold("running now"));
     let now = jiff::Timestamp::now();
     match live {
@@ -1181,6 +1194,20 @@ pub fn active_seats(state: &RunState, live: Liveness) -> String {
         } else {
             String::new()
         };
+        // Before the CLI is spawned there is no agent budget to count down.
+        if let Some(w) = state.resource_wait.as_ref().filter(|w| w.node == a.node) {
+            let _ = writeln!(
+                s,
+                "  {:<12} {:<12}{retry}  waiting for the {} ({}), {}s of {}s; agent not started yet",
+                seat,
+                a.node,
+                w.kind,
+                w.holder,
+                (now.as_second() - w.since.as_second()).max(0),
+                w.limit_secs
+            );
+            continue;
+        }
         let _ = writeln!(
             s,
             "  {:<12} {:<12}{retry}  {}s elapsed, {}s left of {}s",

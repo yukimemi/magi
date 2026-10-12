@@ -178,6 +178,12 @@ enum AgentOutcome {
     Dropped(AgentOutput),
     /// Any other failure: a timeout, a bad exit code, an empty reply.
     Failed(String),
+    /// The agent was never spawned: a shared resource it needs (the build
+    /// cache's lease) stayed busy past `[graph] timeout_resource_wait`, or the
+    /// wait was abandoned because the run is parking. Not a failure of the
+    /// agent: it must not advance a fallback chain, enter seat history, cost
+    /// quota or spend an attempt. [`RunState::resource_block`] says why.
+    ResourceBlocked(String),
 }
 
 /// A request to park the run at its next node boundary.
@@ -985,6 +991,8 @@ impl Runner {
         // and a card cannot claim a run is waiting to be resumed while the
         // agents are already working.
         self.state.parked = false;
+        self.state.resource_wait = None;
+        self.state.resource_block = None;
         // Any seat this state still lists as answering belongs to whatever
         // process last drove this run — this one included, if it crashed
         // mid-wave. Cleared and flushed immediately, before anything else
@@ -1132,6 +1140,28 @@ impl Runner {
         Ok(())
     }
 
+    /// A wave could not start its agents because a shared resource stayed busy
+    /// (see [`RunState::resource_block`]): end the node without recording any
+    /// result, leaving the run `Blocked` and resumable. No seat history,
+    /// handover, quota loss or candidate state was written for it.
+    fn stop_for_resource(&mut self) -> Result<()> {
+        // A wait abandoned because the run is parking stays a park.
+        if self.state.resource_block.is_some() && !(self.pause.parked() || self.interrupt.parked())
+        {
+            self.state.status = RunStatus::Blocked;
+        }
+        self.state.save()
+    }
+
+    /// Stop walking the graph if a node ended on a resource block.
+    fn resource_halt(&mut self) -> Result<bool> {
+        if self.state.resource_block.is_none() {
+            return Ok(false);
+        }
+        self.stop_for_resource()?;
+        Ok(true)
+    }
+
     /// Park here if asked to, recording it in the run's own timeline.
     ///
     /// Returns whether the caller should stop walking the graph. The state is
@@ -1139,6 +1169,11 @@ impl Runner {
     /// the operator's card says why a run that is neither finished nor moving
     /// is sitting where it is.
     fn park_here(&mut self) -> Result<bool> {
+        let parking = self.pause.parked() || self.interrupt.parked();
+        if !parking && self.state.resource_block.is_some() {
+            self.stop_for_resource()?;
+            return Ok(true);
+        }
         // Either handle asking is enough - see `Pause`'s own doc for why
         // they are never the same one. `interrupt` is checked second so a
         // reason it carries is preferred in the message below over a plain
@@ -1210,6 +1245,9 @@ impl Runner {
         // Before the losers are folded: their branches are what the graft
         // reads from.
         self.graft().await?;
+        if self.resource_halt()? {
+            return Ok(());
+        }
         self.fold_losers().await?;
         // Before review starts, and again right before the gate: a run's
         // review rounds can themselves take long enough for the base to move
@@ -1220,6 +1258,9 @@ impl Runner {
             return Ok(());
         }
         self.review_loop().await?;
+        if self.resource_halt()? {
+            return Ok(());
+        }
         self.sync_to_base().await?;
         if self.state.status == RunStatus::AlreadyInBase {
             return Ok(());
@@ -1560,6 +1601,7 @@ impl Runner {
         let cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
             carry_seats: false,
+            pauses: Some((&self.pause, &self.interrupt)),
             run: &run_id,
             node: "advise",
             prompts: &prompts,
@@ -1578,6 +1620,9 @@ impl Runner {
             &|p: &Proposal| p.validate(),
         )
         .await;
+        if self.state.resource_block.is_some() {
+            return self.stop_for_resource();
+        }
         self.state.quota.extend(quota_losses);
 
         let mut records = Vec::with_capacity(results.len());
@@ -1843,6 +1888,7 @@ impl Runner {
         let cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
             carry_seats: false,
+            pauses: Some((&self.pause, &self.interrupt)),
             run: &run_id,
             node: "implement",
             prompts: &prompts,
@@ -1850,12 +1896,18 @@ impl Runner {
             round: None,
         };
         let mut results = wave(jobs, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
+        if wave_blocked(&results) {
+            return self.stop_for_resource();
+        }
         self.resume_undelivered(&mut results, &sent, &prompts, &run_id)
             .await;
         self.resume_seat_handovers(&mut results, &mut sent, &prompts, &run_id)
             .await;
         self.resume_unconfirmed_commands(&mut results, &sent, &prompts, &run_id)
             .await;
+        if self.state.resource_block.is_some() {
+            return self.stop_for_resource();
+        }
 
         for (&i, (_wi, seat, out)) in todo.iter().zip(results) {
             let seat_key = seat.key.clone();
@@ -1919,7 +1971,9 @@ impl Runner {
                         None,
                     )
                 }
-                AgentOutcome::Failed(e) => (String::new(), 0, Some(e), None),
+                AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => {
+                    (String::new(), 0, Some(e), None)
+                }
             };
 
             // Rescue anything the agent edited but never committed: an
@@ -2082,6 +2136,7 @@ impl Runner {
             let cache = self.state.config.cache_dir();
             let ctx = WaveCtx {
                 carry_seats: false,
+                pauses: Some((&self.pause, &self.interrupt)),
                 run: run_id,
                 node: "implement",
                 prompts,
@@ -2264,6 +2319,7 @@ impl Runner {
                 let cache = self.state.config.cache_dir();
                 let ctx = WaveCtx {
                     carry_seats: false,
+                    pauses: Some((&self.pause, &self.interrupt)),
                     run: run_id,
                     node: "implement",
                     prompts,
@@ -2351,6 +2407,7 @@ impl Runner {
             let cache = self.state.config.cache_dir();
             let ctx = WaveCtx {
                 carry_seats: false,
+                pauses: Some((&self.pause, &self.interrupt)),
                 run: run_id,
                 node: "implement",
                 prompts,
@@ -2463,6 +2520,7 @@ impl Runner {
             let cache = self.state.config.cache_dir();
             let ctx = WaveCtx {
                 carry_seats: false,
+                pauses: Some((&self.pause, &self.interrupt)),
                 run: run_id,
                 node: "fix",
                 prompts,
@@ -2551,6 +2609,20 @@ impl Runner {
                     last_err = format!("the CLI dropped the stream ({why})");
                 }
                 AgentOutcome::Failed(e) => last_err = e,
+                // The continuation was never started; the report stays lost
+                // and the caller records that, without any handover.
+                AgentOutcome::ResourceBlocked(e) => {
+                    return (
+                        seat,
+                        None,
+                        Some(format!("the continuation was not started: {e}")),
+                        ContinuationRecord {
+                            attempts: attempts.saturating_sub(1),
+                            cumulative_wait_ms,
+                            outcome: ContinuationOutcome::NoSession,
+                        },
+                    );
+                }
             }
         }
     }
@@ -2713,6 +2785,7 @@ impl Runner {
         let cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
             carry_seats: false,
+            pauses: Some((&self.pause, &self.interrupt)),
             run: &run_id,
             node: "judge",
             prompts: &prompts,
@@ -2730,6 +2803,9 @@ impl Runner {
             &move |r: &Ranking| r.validate(&labels_for_check),
         )
         .await;
+        if self.state.resource_block.is_some() {
+            return self.stop_for_resource();
+        }
         self.state.quota.extend(quota_losses);
 
         for (j, (seat, res, _attempts)) in results.into_iter().enumerate() {
@@ -2868,6 +2944,7 @@ impl Runner {
                 let cache = self.state.config.cache_dir();
                 let ctx = WaveCtx {
                     carry_seats: false,
+                    pauses: Some((&self.pause, &self.interrupt)),
                     run: &run_id,
                     node: "deliberate",
                     prompts: &prompts,
@@ -3010,6 +3087,7 @@ impl Runner {
         let cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
             carry_seats: false,
+            pauses: Some((&self.pause, &self.interrupt)),
             run: &run_id,
             node: "vote",
             prompts: &prompts,
@@ -3030,6 +3108,9 @@ impl Runner {
             },
         )
         .await;
+        if self.state.resource_block.is_some() {
+            return self.stop_for_resource();
+        }
         self.state.quota.extend(quota_losses);
 
         for (&j, (seat, res, _attempts)) in seats_at.iter().zip(results) {
@@ -3354,6 +3435,7 @@ impl Runner {
         let cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
             carry_seats: false,
+            pauses: Some((&self.pause, &self.interrupt)),
             run: &run_id,
             node: "judge",
             prompts: &prompts,
@@ -3371,6 +3453,10 @@ impl Runner {
             &move |r: &Ranking| r.validate(&labels_for_check),
         )
         .await;
+        if self.state.resource_block.is_some() {
+            self.stop_for_resource()?;
+            return Ok(false);
+        }
 
         // Refresh the judgement of every seat that ranked again.
         let mut recovered: BTreeSet<usize> = BTreeSet::new();
@@ -3433,6 +3519,7 @@ impl Runner {
         let vote_cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
             carry_seats: false,
+            pauses: Some((&self.pause, &self.interrupt)),
             run: &run_id,
             node: "vote",
             prompts: &prompts,
@@ -3453,6 +3540,10 @@ impl Runner {
             },
         )
         .await;
+        if self.state.resource_block.is_some() {
+            self.stop_for_resource()?;
+            return Ok(false);
+        }
         for (&j, (seat, res, _attempts)) in vote_pos.iter().zip(votes) {
             let agent_id = seat.agent.clone();
             self.state.seats.insert(seat.key.clone(), seat);
@@ -3699,6 +3790,16 @@ impl Runner {
                 }
             })
             .await;
+        // Never spawned: nothing changed (`HEAD == pre` is confirmed), so the
+        // record goes back to "not started" - not `RolledBack`, which would
+        // settle it - and the run stops resumably. The seat, the chain and
+        // the quota are untouched.
+        if matches!(out, AgentOutcome::ResourceBlocked(_)) {
+            Self::graft_restore(&wt, &pre).await?;
+            self.state.graft = None;
+            self.state.save()?;
+            return self.stop_for_resource();
+        }
         let mut why: Option<String> = None;
         match &out {
             AgentOutcome::Ok(o) if agent::output_advances(o) => {
@@ -3715,7 +3816,7 @@ impl Runner {
                 });
                 why = Some("rate limited (quota)".to_owned());
             }
-            AgentOutcome::Failed(e) => {
+            AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => {
                 why = Some(format!(
                     "the fixer failed: {}",
                     e.lines()
@@ -4657,6 +4758,9 @@ impl Runner {
                 fix.failed = Some("rate limited (quota); fixer could not run".to_owned());
             }
             AgentOutcome::Failed(e) => fix.failed = Some(e),
+            AgentOutcome::ResourceBlocked(e) => {
+                fix.failed = Some(format!("the fixer was not started: {e}"));
+            }
         }
         if fix.continuation.is_none() {
             fix.continuation = Some(ContinuationRecord::not_needed());
@@ -4873,6 +4977,7 @@ impl Runner {
             }
             let ctx = WaveCtx {
                 carry_seats: false,
+                pauses: Some((&self.pause, &self.interrupt)),
                 run: &run_id,
                 node,
                 prompts: &prompts,
@@ -4881,8 +4986,11 @@ impl Runner {
             };
             let (seat, out) =
                 run_one(job.clone(), Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
+            // A resource block never advances the chain: the chosen agent
+            // was not asked, so it must be the one asked again on resume.
             let advances = match &out {
                 AgentOutcome::Ok(o) => agent::output_advances(o),
+                AgentOutcome::ResourceBlocked(_) => false,
                 _ => true,
             };
             if let Some(next) = ids.get(i + 1)
@@ -5085,6 +5193,7 @@ impl Runner {
             let review_cache = self.state.config.cache_dir();
             let ctx = WaveCtx {
                 carry_seats: true,
+                pauses: Some((&self.pause, &self.interrupt)),
                 run: &run_id,
                 node: "review",
                 prompts: &prompts,
@@ -5102,6 +5211,9 @@ impl Runner {
                 &|_: &Review| Ok(()),
             )
             .await;
+            if self.state.resource_block.is_some() {
+                return self.stop_for_resource();
+            }
             // Counted before the move below: how many of *this* round's
             // reviewer seats were lost to their own rate limit, as opposed to
             // a crash, a timeout, or unparsable output — see `round_is_clean`.
@@ -5277,6 +5389,7 @@ impl Runner {
                 let recon_cache = self.state.config.cache_dir();
                 let recon_ctx = WaveCtx {
                     carry_seats: true,
+                    pauses: Some((&self.pause, &self.interrupt)),
                     run: &run_id,
                     node: "review",
                     prompts: &prompts,
@@ -5294,6 +5407,9 @@ impl Runner {
                     &|_: &ReviewRevote| Ok(()),
                 )
                 .await;
+                if self.state.resource_block.is_some() {
+                    return self.stop_for_resource();
+                }
                 self.state.quota.extend(recon_quota_losses);
 
                 for (&r, (seat, res, _attempts)) in seats_at.iter().zip(recon_results) {
@@ -5595,6 +5711,11 @@ impl Runner {
                     handover: None,
                 })
                 .await;
+            // Not asked: the round is not recorded (so a resume repeats it),
+            // no fixer was handed over to, and the seat is left as it was.
+            if matches!(out, AgentOutcome::ResourceBlocked(_)) {
+                return self.stop_for_resource();
+            }
             let agent_id = seat.agent.clone();
 
             let mut fix = FixRecord {
@@ -5676,7 +5797,7 @@ impl Runner {
                     });
                     fix.failed = Some("rate limited (quota); fixer could not run".to_owned());
                 }
-                AgentOutcome::Failed(e) => fix.failed = Some(e),
+                AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => fix.failed = Some(e),
             }
             fix.continuation = Some(continuation);
             self.state.seats.insert(final_seat.key.clone(), final_seat);
@@ -6305,6 +6426,11 @@ impl Runner {
                 handover: None,
             })
             .await;
+        // The fixer was never asked: no round is spent (nothing is recorded)
+        // and a later reentry asks the same agent again.
+        if matches!(out, AgentOutcome::ResourceBlocked(_)) {
+            return Ok(GateFix::Defer);
+        }
         let mut record = GateFixRecord {
             agent: seat.agent.clone(),
             failed,
@@ -6332,7 +6458,7 @@ impl Runner {
                 });
                 record.error = Some("rate limited (quota); fixer could not run".to_owned());
             }
-            AgentOutcome::Failed(e) => record.error = Some(e),
+            AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => record.error = Some(e),
         }
         self.state.seats.insert(seat.key.clone(), seat);
         if let Ok(r) = git::rescue_commit(
@@ -6502,6 +6628,7 @@ impl Runner {
                     cache: cache.as_deref(),
                     round: None,
                     carry_seats: false,
+                    pauses: Some((&self.pause, &self.interrupt)),
                 };
                 let (seat, outcome) =
                     run_one(job, Arc::clone(&self.sem), &ctx, &mut self.state, 1).await;
@@ -7545,6 +7672,9 @@ impl FailClass {
             AgentOutcome::Dropped(_) => Some(Self::Other("dropped".to_owned())),
             AgentOutcome::Failed(e) if e == TIMED_OUT => Some(Self::Timeout),
             AgentOutcome::Failed(e) => Some(Self::Other(failure_signature(e))),
+            // Not a failure of the agent. Callers check for it first; `None`
+            // here means "no class to hand over on".
+            AgentOutcome::ResourceBlocked(_) => None,
         }
     }
 
@@ -7611,7 +7741,9 @@ fn fail_reason(out: &AgentOutcome) -> String {
                 .map(|d| d.why.as_str())
                 .unwrap_or("it ended without delivering its answer")
         ),
-        AgentOutcome::Failed(e) => e.lines().next().unwrap_or("").chars().take(160).collect(),
+        AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => {
+            e.lines().next().unwrap_or("").chars().take(160).collect()
+        }
     }
 }
 
@@ -7722,6 +7854,9 @@ struct WaveCtx<'a> {
     /// only): start-of-round priority and handover choice read
     /// [`RunState::seat_history`], and every answer or failure writes it.
     carry_seats: bool,
+    /// The run's park / interrupt requests, so a wait for a shared resource
+    /// can be abandoned the moment the operator asks to park.
+    pauses: Option<(&'a Pause, &'a Pause)>,
 }
 
 /// Run one job, honouring the parallelism budget.
@@ -7758,6 +7893,7 @@ async fn wave(
         cache,
         round,
         carry_seats: _,
+        pauses,
     } = *ctx;
     for job in &jobs {
         state.seat_started(node, &job.seat.key, job.timeout, attempt);
@@ -7785,35 +7921,80 @@ async fn wave(
     // record is still invalidated below either way, so the next tracked
     // caller (`e2e`/`gate`) never trusts a match it cannot vouch for.
     let jobs_had_a_writer = jobs.iter().any(|j| j.allow_write);
-    let wait_started = Instant::now();
+    // The wait for the lease has its own bound, `timeout_resource_wait`; it is
+    // never borrowed from a job's agent budget (and never charged to it either,
+    // see below). The agent's clock starts in `agent::invoke`, at spawn.
+    let resource_limit = Duration::from_secs(state.config.graph.timeout_resource_wait);
     let cache_guard = if let Some(cache_dir) = cache {
         if jobs_had_a_writer {
             let owner = crate::cache::Owner::here(run, node, "*", Path::new("(wave)"), "");
-            let budget = jobs
-                .iter()
-                .map(|j| j.timeout)
-                .max()
-                .unwrap_or(Duration::from_secs(60));
-            acquire_cache_lease(state, cache_dir, &owner, budget, node)
-                .await
-                .ok()
+            let cancel = move || pauses.is_some_and(|(a, b)| a.parked() || b.parked());
+            match acquire_cache_lease(state, cache_dir, &owner, resource_limit, node, &cancel).await
+            {
+                Ok(Some(g)) => Some(g),
+                // Parking: leave without spawning anything. The run parks at
+                // the next boundary and the seats are asked afresh on resume.
+                Ok(None) => {
+                    state.resource_block = Some(crate::run::ResourceBlock {
+                        node: node.to_owned(),
+                        kind: "shared build cache".to_owned(),
+                        detail: "the run is parking".to_owned(),
+                        at: Timestamp::now(),
+                    });
+                    return block_wave(
+                        jobs,
+                        state,
+                        node,
+                        attempt,
+                        "parked while waiting for the shared build cache",
+                    );
+                }
+                Err(e) => {
+                    // Writing seats may not build into a cache this run does
+                    // not hold, and an agent that cannot be given one is not
+                    // asked at all: the run stops resumably instead.
+                    let why = format!("{e:#}");
+                    state.resource_block = Some(crate::run::ResourceBlock {
+                        node: node.to_owned(),
+                        kind: "shared build cache".to_owned(),
+                        detail: why.clone(),
+                        at: Timestamp::now(),
+                    });
+                    state.event(
+                        "resource",
+                        format!("{node}: no agent was started - {why}; resume to ask the same agents again"),
+                    );
+                    return block_wave(jobs, state, node, attempt, &why);
+                }
+            }
         } else {
             None
         }
     } else {
         None
     };
-    // Carved out of each job's own budget, not added on top of it: a seat
-    // that waited behind the lease must not also get its full timeout
-    // afterward, or a run contended on the cache could double the time it
-    // spends per wave. `saturating_sub` floors at zero rather than
-    // wrapping - a job whose whole budget was spent waiting starts with
-    // none left, which is the honest number, not a free minimum.
-    let waited_for_lease = wait_started.elapsed();
+    // Every job keeps its whole budget: the wait above was not the agent's.
+    // Restart the seats' clocks so "started" means "being spawned now".
+    state.seats_spawning(node, attempt);
+    if let Err(e) = state.save() {
+        tracing::warn!("could not persist the start of a wave: {e:#}");
+    }
+    // Queueing behind this wave's own seats for a parallelism slot is normal
+    // (each of them is bounded by its own agent timeout); only a wait beyond
+    // all of them plus the resource limit means the slots never came back.
+    let slot_limit = resource_limit
+        + jobs
+            .iter()
+            .map(|j| j.timeout)
+            .max()
+            .unwrap_or_default()
+            .saturating_mul(jobs.len() as u32);
     let mut set = tokio::task::JoinSet::new();
+    // Seats announce themselves here the moment they hold a parallelism
+    // permit, i.e. just before their CLI is spawned.
+    let (spawned_tx, mut spawned_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let overlay = prompts.overlay(node);
     for (i, mut job) in jobs.into_iter().enumerate() {
-        job.timeout = job.timeout.saturating_sub(waited_for_lease);
         job.prompt = prompt::with_overlay(job.prompt, overlay.clone());
         if cache.is_some() {
             job.prompt.push('\n');
@@ -7843,8 +8024,25 @@ async fn wave(
         let cache = cache
             .filter(|_| job.allow_write && cache_guard.is_some())
             .map(Path::to_path_buf);
+        let spawned_tx = spawned_tx.clone();
         set.spawn(async move {
-            let _permit = sem.acquire().await;
+            // A wait for a parallelism slot is scheduling, not the agent: it
+            // is bounded by its own limit and ends as a resource block, never
+            // as a timeout of the agent that was not started.
+            let _permit = match tokio::time::timeout(slot_limit, sem.acquire()).await {
+                Ok(p) => p,
+                Err(_) => {
+                    return (
+                        i,
+                        job.seat,
+                        AgentOutcome::ResourceBlocked(format!(
+                            "no parallel slot became free within {}s",
+                            slot_limit.as_secs()
+                        )),
+                    );
+                }
+            };
+            spawned_tx.send(job.seat.key.clone()).ok();
             let mut seat = job.seat;
             let out = agent::invoke(
                 &job.spec,
@@ -7887,8 +8085,23 @@ async fn wave(
             (i, seat, out)
         });
     }
+    drop(spawned_tx);
     let mut collected: Vec<Option<(usize, SeatState, AgentOutcome)>> = Vec::new();
-    while let Some(joined) = set.join_next().await {
+    loop {
+        let joined = tokio::select! {
+            Some(key) = spawned_rx.recv() => {
+                // The clock of this seat starts now, not when it queued.
+                state.seat_spawned(&key);
+                if let Err(e) = state.save() {
+                    tracing::warn!("could not persist a seat's start: {e:#}");
+                }
+                continue;
+            }
+            joined = set.join_next() => joined,
+        };
+        let Some(joined) = joined else {
+            break;
+        };
         let (i, seat, out) = match joined {
             Ok(v) => v,
             // No seat to clear: a panicked task never reported which one it
@@ -7900,6 +8113,17 @@ async fn wave(
             }
         };
         state.seat_finished(&seat.key);
+        if let AgentOutcome::ResourceBlocked(why) = &out
+            && state.resource_block.is_none()
+        {
+            state.resource_block = Some(crate::run::ResourceBlock {
+                node: node.to_owned(),
+                kind: "parallel slot".to_owned(),
+                detail: why.clone(),
+                at: Timestamp::now(),
+            });
+            state.event("resource", format!("{node}: no agent was started - {why}"));
+        }
         record_jobs(state, node, round, &seat.key, &out);
         if let Err(e) = state.save() {
             tracing::warn!("could not persist a seat's completion: {e:#}");
@@ -7962,7 +8186,7 @@ fn record_jobs(
 ) {
     let commands: &[agent::CommandEvidence] = match out {
         AgentOutcome::Ok(o) | AgentOutcome::Quota(o) | AgentOutcome::Dropped(o) => &o.commands,
-        AgentOutcome::Failed(_) => &[],
+        AgentOutcome::Failed(_) | AgentOutcome::ResourceBlocked(_) => &[],
     };
     let checked_at = Timestamp::now();
     for c in commands {
@@ -8312,6 +8536,12 @@ where
         let mut still = Vec::new();
         for (&i, (_wi, seat, out)) in pending.iter().zip(results) {
             seats[i] = seat;
+            // No agent was asked: nothing to hand over, nudge, remember or
+            // charge. The caller sees `resource_block` and stops the node.
+            if let AgentOutcome::ResourceBlocked(why) = &out {
+                done[i] = Some(Err(anyhow::anyhow!("{why}")));
+                continue;
+            }
             let class = FailClass::of(&out);
             // A dropped stream is nudged first (the conversation is still
             // there to pick up); only a seat whose nudges are spent hands over.
@@ -8392,7 +8622,9 @@ where
                         .unwrap_or("the CLI ended the stream without delivering its answer");
                     Err(anyhow::anyhow!("the CLI dropped the stream ({why})"))
                 }
-                AgentOutcome::Failed(e) => Err(anyhow::anyhow!(e)),
+                AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => {
+                    Err(anyhow::anyhow!(e))
+                }
             };
             let quota = class == Some(FailClass::Quota);
             let failed = parsed.is_err();
@@ -8452,6 +8684,36 @@ where
         .collect()
 }
 
+/// Did the wave end without asking any agent (see [`block_wave`])?
+fn wave_blocked(results: &[(usize, SeatState, AgentOutcome)]) -> bool {
+    results
+        .iter()
+        .any(|(_, _, o)| matches!(o, AgentOutcome::ResourceBlocked(_)))
+}
+
+/// Settle a wave that never spawned anything: every job answers
+/// [`AgentOutcome::ResourceBlocked`], its seat leaves `active`, and nothing
+/// else about the seat (session, history, quota) is touched.
+fn block_wave(
+    jobs: Vec<SeatJob>,
+    state: &mut RunState,
+    node: &str,
+    attempt: usize,
+    why: &str,
+) -> Vec<(usize, SeatState, AgentOutcome)> {
+    state.resource_wait = None;
+    state
+        .active
+        .retain(|_, a| !(a.node == node && a.attempt == attempt));
+    if let Err(e) = state.save() {
+        tracing::warn!("could not persist a resource-blocked wave: {e:#}");
+    }
+    jobs.into_iter()
+        .enumerate()
+        .map(|(i, j)| (i, j.seat, AgentOutcome::ResourceBlocked(why.to_owned())))
+        .collect()
+}
+
 /// Acquire the shared build cache's lease, waiting out contention within
 /// `budget` (never past it — see AGENTS.md's build-cache section on why an
 /// unbounded wait is never acceptable).
@@ -8470,11 +8732,12 @@ async fn acquire_cache_lease(
     owner: &crate::cache::Owner,
     budget: Duration,
     context: &str,
-) -> Result<crate::cache::Guard> {
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<crate::cache::Guard>> {
     let home = crate::run::home();
     let started = Instant::now();
     let busy = match crate::cache::try_acquire(&home, cache_dir, owner) {
-        Ok(crate::cache::AcquireOutcome::Acquired(g)) => return Ok(g),
+        Ok(crate::cache::AcquireOutcome::Acquired(g)) => return Ok(Some(g)),
         Ok(crate::cache::AcquireOutcome::Busy(busy)) => busy,
         Err(e) => {
             state.event(
@@ -8495,11 +8758,30 @@ async fn acquire_cache_lease(
             busy.describe()
         ),
     );
+    // Seats of this node are waiting, not running: say so, so the countdown a
+    // reader sees only ever measures an agent that has been spawned.
+    state.resource_wait = Some(crate::run::ResourceWait {
+        node: context.to_owned(),
+        kind: "shared build cache".to_owned(),
+        holder: busy.describe(),
+        since: Timestamp::now(),
+        limit_secs: budget.as_secs(),
+    });
     if let Err(e) = state.save() {
         tracing::warn!("could not persist a cache wait: {e:#}");
     }
     let remaining = budget.saturating_sub(started.elapsed());
-    match crate::cache::wait_for(&home, cache_dir, owner, remaining, Duration::from_secs(5)).await {
+    let waited = crate::cache::wait_for_unless(
+        &home,
+        cache_dir,
+        owner,
+        remaining,
+        Duration::from_secs(5),
+        cancel,
+    )
+    .await;
+    state.resource_wait = None;
+    match waited {
         Ok(g) => Ok(g),
         Err(e) => {
             state.event("verify", format!("{context}: {e:#}"));
@@ -8554,7 +8836,11 @@ where
     let home = crate::run::home();
     let owner = crate::cache::Owner::here(&state.id, node, seat, worktree, head);
     let started = Instant::now();
-    let guard = match acquire_cache_lease(state, cache_dir, &owner, budget, context).await {
+    let guard = match acquire_cache_lease(state, cache_dir, &owner, budget, context, &|| false)
+        .await
+        .and_then(|g| {
+            g.ok_or_else(|| anyhow::anyhow!("the wait for the build cache was cancelled"))
+        }) {
         Ok(g) => g,
         Err(e) => {
             return (
@@ -13318,3 +13604,189 @@ impl std::fmt::Display for GraftRestoreFailed {
 }
 
 impl std::error::Error for GraftRestoreFailed {}
+
+/// The pre-spawn waits (shared build cache, parallelism slot) are infrastructure,
+/// not the agent: they never draw on an agent's own timeout, and running out of
+/// them never reads as an agent failure.
+#[cfg(test)]
+mod resource_wait_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn sh(id: &str, script: &str) -> AgentSpec {
+        AgentSpec {
+            id: id.to_owned(),
+            kind: crate::config::AgentKind::Command,
+            model: None,
+            command: vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+            extra_args: Vec::new(),
+            env: BTreeMap::new(),
+            prompt_delivery: None,
+        }
+    }
+
+    fn job(spec: AgentSpec, dir: &Path, timeout: Duration) -> SeatJob {
+        SeatJob {
+            seat: SeatState::new("impl-A", &spec.id, 1),
+            spec,
+            cwd: dir.to_path_buf(),
+            prompt: "do it".to_owned(),
+            timeout,
+            allow_write: true,
+            sessions: false,
+            artifacts: dir.join("art"),
+            stem: "impl-A".to_owned(),
+            handover: None,
+        }
+    }
+
+    fn state(resource_wait_secs: u64) -> RunState {
+        let mut config = Config::default();
+        config.graph.timeout_resource_wait = resource_wait_secs;
+        RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234".to_owned(),
+            "task".to_owned(),
+            config,
+        )
+    }
+
+    fn hold(cache: &Path) -> crate::cache::Guard {
+        let owner = crate::cache::Owner::here("other-run", "e2e", "e2e", cache, "deadbeef");
+        match crate::cache::try_acquire(&crate::run::home(), cache, &owner).expect("io") {
+            crate::cache::AcquireOutcome::Acquired(g) => g,
+            crate::cache::AcquireOutcome::Busy(b) => panic!("lease was not free: {b:?}"),
+        }
+    }
+
+    async fn run(
+        jobs: Vec<SeatJob>,
+        sem: Arc<Semaphore>,
+        cache: Option<&Path>,
+        st: &mut RunState,
+    ) -> Vec<(usize, SeatState, AgentOutcome)> {
+        let prompts = Prompts::default();
+        let ctx = WaveCtx {
+            run: "r",
+            node: "implement",
+            prompts: &prompts,
+            cache,
+            round: None,
+            carry_seats: false,
+            pauses: None,
+        };
+        wave(jobs, sem, &ctx, st, 0).await
+    }
+
+    #[tokio::test]
+    async fn a_cache_wait_longer_than_the_agent_budget_leaves_the_budget_whole() {
+        crate::run::pin_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("target-a");
+        let guard = hold(&cache);
+        // Held for longer than the agent's whole 1s budget.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            guard.release();
+        });
+        let mut st = state(60);
+        let results = run(
+            vec![job(
+                sh("alpha", "echo ok"),
+                tmp.path(),
+                Duration::from_secs(1),
+            )],
+            Arc::new(Semaphore::new(1)),
+            Some(&cache),
+            &mut st,
+        )
+        .await;
+        assert!(
+            matches!(results[0].2, AgentOutcome::Ok(_)),
+            "the wait must not be charged to the agent"
+        );
+        assert!(st.resource_block.is_none());
+        assert!(st.handovers.is_empty() && st.seat_history.is_empty() && st.quota.is_empty());
+        assert!(st.resource_wait.is_none() && st.active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_expired_cache_wait_blocks_without_asking_or_rotating_the_agent() {
+        crate::run::pin_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("target-b");
+        let _held = hold(&cache);
+        let mut st = state(1);
+        let results = run(
+            vec![job(
+                sh("alpha", "echo ok"),
+                tmp.path(),
+                Duration::from_secs(1),
+            )],
+            Arc::new(Semaphore::new(1)),
+            Some(&cache),
+            &mut st,
+        )
+        .await;
+        let (_, seat, out) = &results[0];
+        assert!(matches!(out, AgentOutcome::ResourceBlocked(_)));
+        assert!(wave_blocked(&results));
+        assert_eq!(seat.agent, "alpha", "the chosen agent is kept");
+        assert_eq!(seat.turns, 0, "nothing was asked");
+        assert!(
+            !tmp.path().join("art").join("impl-A.prompt.md").exists(),
+            "no agent was spawned"
+        );
+        assert!(FailClass::of(out).is_none(), "not a failure class");
+        let block = st.resource_block.as_ref().expect("recorded for the resume");
+        assert_eq!(block.kind, "shared build cache");
+        assert!(st.handovers.is_empty() && st.seat_history.is_empty() && st.quota.is_empty());
+        assert!(st.active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_semaphore_with_no_permits_ends_as_a_bounded_resource_block() {
+        crate::run::pin_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = state(1);
+        let results = run(
+            vec![job(
+                sh("alpha", "echo ok"),
+                tmp.path(),
+                Duration::from_secs(1),
+            )],
+            Arc::new(Semaphore::new(0)),
+            None,
+            &mut st,
+        )
+        .await;
+        assert!(matches!(results[0].2, AgentOutcome::ResourceBlocked(_)));
+        assert_eq!(st.resource_block.as_ref().unwrap().kind, "parallel slot");
+        assert!(!tmp.path().join("art").join("impl-A.prompt.md").exists());
+    }
+
+    #[tokio::test]
+    async fn an_agent_that_really_hangs_still_times_out_and_hands_over() {
+        crate::run::pin_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut st = state(60);
+        let results = run(
+            vec![job(
+                sh("alpha", "sleep 30"),
+                tmp.path(),
+                Duration::from_secs(1),
+            )],
+            Arc::new(Semaphore::new(1)),
+            None,
+            &mut st,
+        )
+        .await;
+        let out = &results[0].2;
+        assert!(matches!(out, AgentOutcome::Failed(e) if e == TIMED_OUT));
+        let class = FailClass::of(out).expect("a failure");
+        assert_eq!(class, FailClass::Timeout);
+        assert!(should_hand_over(None, &class), "existing handover policy");
+        assert!(st.resource_block.is_none());
+    }
+}

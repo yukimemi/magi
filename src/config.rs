@@ -407,6 +407,15 @@ pub struct Graph {
     /// commands, checking their output - actually needs rather than what a
     /// person waiting on a phone can tolerate.
     pub timeout_talk: u64,
+    /// Longest an agent seat may wait, before it is spawned, for something
+    /// that is not the agent itself (today: the shared build cache's lease),
+    /// seconds.
+    ///
+    /// A separate clock from every `timeout_*` above: those start when the CLI
+    /// is spawned and never include this wait. Expiry is a resource block (a
+    /// resumable hold that spends no attempt and rotates no agent), not an
+    /// agent timeout.
+    pub timeout_resource_wait: u64,
     /// Retries for an agent invocation that fails or returns nothing usable.
     pub retries: usize,
     /// Root for candidate / judge worktrees. Defaults to `~/wt/magi`.
@@ -548,6 +557,7 @@ impl Default for Graph {
             timeout_verify: None,
             timeout_fix: 1800,
             timeout_talk: 3600,
+            timeout_resource_wait: 1800,
             retries: 1,
             worktree_root: None,
             land: true,
@@ -2171,7 +2181,11 @@ impl Config {
              timeout_review = 1200\n\
              # Optional independent E2E/final-gate timeout; uncomment to keep\n\
              # verification independent if timeout_review changes later.\n\
-             # timeout_verify = 1200\n\n\
+             # timeout_verify = 1200\n\
+             # Longest a seat waits for the shared build cache before it is\n\
+             # spawned. Never counted against an agent's own timeout; expiry\n\
+             # holds the run (resumable) instead of failing the agent.\n\
+             # timeout_resource_wait = 1800\n\n\
              # What the chat calls you (persona address and the Chat's turn label).\n\
              # [talk]\n\
              # operator_name = \"Commander\"\n\n\

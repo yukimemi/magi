@@ -413,6 +413,11 @@ pub fn in_use(home: &Path, cache_dir: &Path) -> bool {
     matches!(classify(&path), Status::Active(_) | Status::Unknown)
 }
 
+/// Prefix of the machine hold a task gets when its run stopped because this
+/// lease stayed busy past `[graph] timeout_resource_wait`. `triage` reads it to
+/// release the task once the lease is free; keep both in sync.
+pub const RESOURCE_HOLD: &str = "[resource] ";
+
 /// Acquire the lease for `cache_dir`, waiting out contention rather than
 /// failing on the first busy owner — but never past `budget`, and the wait
 /// comes out of that same budget rather than a second, unbounded one. A
@@ -428,11 +433,32 @@ pub async fn wait_for(
     budget: Duration,
     poll: Duration,
 ) -> Result<Guard> {
+    match wait_for_unless(home, cache_dir, owner, budget, poll, &|| false).await? {
+        Some(g) => Ok(g),
+        None => bail!("the wait for the build cache was cancelled"),
+    }
+}
+
+/// [`wait_for`] that also gives up, with `Ok(None)`, as soon as `cancel`
+/// returns true. `cancel` is looked at once per `poll`, so a park request is
+/// honoured within a poll interval instead of after the whole budget. The
+/// lease is never held on that path: nothing was acquired.
+pub async fn wait_for_unless(
+    home: &Path,
+    cache_dir: &Path,
+    owner: &Owner,
+    budget: Duration,
+    poll: Duration,
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<Guard>> {
     let start = std::time::Instant::now();
     loop {
         match try_acquire(home, cache_dir, owner)? {
-            AcquireOutcome::Acquired(g) => return Ok(g),
+            AcquireOutcome::Acquired(g) => return Ok(Some(g)),
             AcquireOutcome::Busy(busy) => {
+                if cancel() {
+                    return Ok(None);
+                }
                 let elapsed = start.elapsed();
                 if elapsed >= budget {
                     bail!(
