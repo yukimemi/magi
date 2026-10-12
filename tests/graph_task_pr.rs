@@ -212,3 +212,83 @@ async fn driver_claim_and_publication_takeover_share_an_ownership_lock() {
     assert_eq!(RunState::load(&first.id).unwrap().pr_taken_over_by.as_deref(), Some(resumed.state.id.as_str()));
 }
 }
+
+fn pr_config(fx: &mut common::Fixture) {
+    fx.config.merge.mode = MergeMode::Pr;
+    fx.config.graph.land = false;
+    fx.config.graph.implementers = 1;
+    fx.config.graph.reviewers = 1;
+}
+
+fn comments(forge: &Path) -> usize {
+    std::fs::read_to_string(forge.join("calls"))
+        .unwrap()
+        .lines()
+        .filter(|l| *l == "pr comment")
+        .count()
+}
+
+common::e2e! {
+async fn a_merged_predecessor_is_history_and_does_not_block_a_new_pull_request() {
+    let home = home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    let forge = forge(fx.tmp.path());
+    pr_config(&mut fx);
+    let first = attempt(&fx.repo, &fx.config).await;
+    let mut merged = RunState::load(&first.id).unwrap();
+    merged.pr.as_mut().unwrap().state = "merged".into();
+    merged.save().unwrap();
+    std::fs::remove_file(forge.join("open")).unwrap();
+    let second = attempt(&fx.repo, &fx.config).await;
+    let old = RunState::load(&first.id).unwrap();
+    assert!(old.pr_taken_over_by.is_none());
+    assert_eq!(old.pr.as_ref().unwrap().state, "merged");
+    assert_eq!(old.status, first.status);
+    assert_eq!(comments(&forge), 0);
+    assert_eq!(git::remote_head(&fx.repo, "origin", second.pr_branch().unwrap()).await.unwrap(), second.pr_pushed_head);
+}
+}
+
+common::e2e! {
+async fn a_predecessor_with_another_pull_request_is_not_superseded() {
+    let home = home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    let forge = forge(fx.tmp.path());
+    pr_config(&mut fx);
+    let first = attempt(&fx.repo, &fx.config).await;
+    let mut other = RunState::load(&first.id).unwrap();
+    other.pr.as_mut().unwrap().url = "https://github.com/example/repo/pull/99".into();
+    other.pr.as_mut().unwrap().number = 99;
+    other.save().unwrap();
+    attempt(&fx.repo, &fx.config).await;
+    let old = RunState::load(&first.id).unwrap();
+    assert!(old.pr_taken_over_by.is_none());
+    assert_eq!(old.pr.as_ref().unwrap().number, 99);
+    assert_eq!(comments(&forge), 0);
+}
+}
+
+common::e2e! {
+async fn lease_survives_a_merged_run_when_a_later_run_takes_over_the_open_pull_request() {
+    let home = home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    let forge = forge(fx.tmp.path());
+    pr_config(&mut fx);
+    let first = attempt(&fx.repo, &fx.config).await;
+    let mut merged = RunState::load(&first.id).unwrap();
+    merged.pr.as_mut().unwrap().state = "merged".into();
+    merged.save().unwrap();
+    std::fs::remove_file(forge.join("open")).unwrap();
+    // A new pull request on the existing head: the lease comes from the merged run's push.
+    let second = attempt(&fx.repo, &fx.config).await;
+    // The merged record is touched later (write-through / repair) and must not matter.
+    let mut touched = RunState::load(&first.id).unwrap();
+    touched.event("merge", "repaired");
+    touched.save().unwrap();
+    let third = attempt(&fx.repo, &fx.config).await;
+    assert!(RunState::load(&first.id).unwrap().pr_taken_over_by.is_none());
+    assert_eq!(RunState::load(&second.id).unwrap().pr_taken_over_by.as_deref(), Some(third.id.as_str()));
+    assert_eq!(comments(&forge), 1);
+    assert_eq!(git::remote_head(&fx.repo, "origin", third.pr_branch().unwrap()).await.unwrap(), third.pr_pushed_head);
+}
+}
