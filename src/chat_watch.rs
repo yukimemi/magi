@@ -222,7 +222,9 @@ pub fn start(
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0000_0008 | 0x0000_0200); // Detached, new process group.
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: no console to inherit,
+        // and the calling agent's terminal must not end supervision.
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
     }
     let mut supervisor = match cmd.spawn() {
         Ok(child) => child,
