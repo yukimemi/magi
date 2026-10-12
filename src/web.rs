@@ -7043,7 +7043,40 @@ async fn talk_pending_resume(
 /// check observes the advance and drains again; otherwise it releases the
 /// claim while holding the same lock. This keeps the release/arrival handoff
 /// atomic without holding the global claim mutex across filesystem I/O.
-async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn: TalkTurnGuard) {
+async fn drain_loop(talk: Talk, talks: Talks, cfg: Config, id: String, turn: TalkTurnGuard) {
+    drain_loop_started(talk, talks, cfg, id, turn, None).await;
+}
+
+/// A settings response must not report idle while its claim is still held.
+/// Wait until the first drain either releases the claim or promotes a draft.
+/// The task owns the guard even if the HTTP handler is cancelled while waiting.
+async fn settle_settings_turn(
+    talk: Talk,
+    talks: Talks,
+    cfg: Config,
+    id: String,
+    turn: TalkTurnGuard,
+) -> bool {
+    let (started, settled) = tokio::sync::oneshot::channel();
+    tokio::spawn(drain_loop_started(
+        talk,
+        talks,
+        cfg,
+        id,
+        turn,
+        Some(started),
+    ));
+    settled.await.unwrap_or(false)
+}
+
+async fn drain_loop_started(
+    mut talk: Talk,
+    talks: Talks,
+    cfg: Config,
+    id: String,
+    turn: TalkTurnGuard,
+    mut started: Option<tokio::sync::oneshot::Sender<bool>>,
+) {
     let live_set = Arc::clone(&turn.turns);
     // `Option` rather than binding `turn` directly to a `_turn` that lives
     // for the whole function: releasing it has to happen by calling
@@ -7141,6 +7174,9 @@ async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn:
                 break;
             }
         };
+        if let Some(started) = started.take() {
+            let _ = started.send(true);
+        }
         let responded = match turn.as_ref() {
             Some(turn) => turn.respond(&mut talk, &talks, &cfg, &drained).await,
             None => Err(anyhow::anyhow!("the turn guard was released")),
@@ -7148,6 +7184,10 @@ async fn drain_loop(mut talk: Talk, talks: Talks, cfg: Config, id: String, turn:
         if let Err(e) = responded {
             tracing::warn!("talk {id} turn failed: {e:#}");
         }
+    }
+    drop(turn);
+    if let Some(started) = started {
+        let _ = started.send(false);
     }
 }
 
@@ -7312,21 +7352,16 @@ async fn talk_agent(
     };
     // A `/say` that landed while this held the claim saw the talk busy and
     // left a durable draft, trusting the claim's owner to drain it. So the
-    // claim, once taken, goes to `drain_loop` whatever the outcome - it releases at once
-    // when nothing is queued - rather than being dropped here.
+    // claim, once taken, goes to the drainer whatever the outcome. Wait for
+    // its first drain to release an idle claim before replying; queued drafts
+    // continue independently of the handler.
     let fresh = {
         let ui = Arc::clone(&ui);
         let id = id.clone();
         blocking(move || Ok(ui.talks.get(&id)?)).await
     };
     let draining = match fresh {
-        Ok(talk) => {
-            let draining = talk.status.open()
-                && (!talk.pending.is_empty() || !talk.pending_attachments.is_empty());
-            let talks = ui.talks.clone();
-            tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
-            draining
-        }
+        Ok(talk) => settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard).await,
         Err(_) => false,
     };
     let talk = switched?;
@@ -7400,20 +7435,14 @@ async fn talk_persona(
         })
         .await
     };
-    // As in `talk_agent`: a taken claim goes to `drain_loop` whatever happened.
+    // As in `talk_agent`: settle the claim before replying, even on refusal.
     let fresh = {
         let ui = Arc::clone(&ui);
         let id = id.clone();
         blocking(move || Ok(ui.talks.get(&id)?)).await
     };
     let draining = match fresh {
-        Ok(talk) => {
-            let draining = talk.status.open()
-                && (!talk.pending.is_empty() || !talk.pending_attachments.is_empty());
-            let talks = ui.talks.clone();
-            tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
-            draining
-        }
+        Ok(talk) => settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard).await,
         Err(_) => false,
     };
     let talk = switched?;
@@ -7484,20 +7513,14 @@ async fn talk_implementers(
         })
         .await
     };
-    // As in `talk_agent`: a taken claim goes to `drain_loop` whatever happened.
+    // As in `talk_agent`: settle the claim before replying, even on refusal.
     let fresh = {
         let ui = Arc::clone(&ui);
         let id = id.clone();
         blocking(move || Ok(ui.talks.get(&id)?)).await
     };
     let draining = match fresh {
-        Ok(talk) => {
-            let draining = talk.status.open()
-                && (!talk.pending.is_empty() || !talk.pending_attachments.is_empty());
-            let talks = ui.talks.clone();
-            tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
-            draining
-        }
+        Ok(talk) => settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard).await,
         Err(_) => false,
     };
     let talk = switched?;
@@ -9832,6 +9855,14 @@ mod tests {
         let saved = talks.get(&id).expect("reload");
         assert_eq!(saved.agent, "second");
         assert_eq!(saved.turns.len(), 1);
+        assert!(!view.thinking);
+        assert!(!ui.is_thinking(&id), "idle response must release the claim");
+        for agent in ["mock", "second"] {
+            let Json(view) = call(agent).await.expect("immediate consecutive change");
+            assert_eq!(view.talk.agent, agent);
+            assert!(!view.thinking);
+            assert!(!ui.is_thinking(&id));
+        }
 
         let detail = talk_detail(State(Arc::clone(&ui)), Path(id.clone()))
             .await
@@ -9903,6 +9934,14 @@ mod tests {
         let Json(view) = call(3).await.expect("switch");
         assert_eq!(view.talk.implementers, 3);
         assert!(talks.get(&id).expect("reload").implementers_dirty);
+        assert!(!view.thinking);
+        assert!(!ui.is_thinking(&id), "idle response must release the claim");
+        for n in [1, 2, 3] {
+            let Json(view) = call(n).await.expect("immediate consecutive change");
+            assert_eq!(view.talk.implementers, n);
+            assert!(!view.thinking);
+            assert!(!ui.is_thinking(&id));
+        }
 
         let mut closed = talks.get(&id).expect("reload");
         talk::close(&mut closed, &talks).expect("close");
@@ -10181,6 +10220,13 @@ mod tests {
         let Json(view) = call("gendo").await.expect("switch to a configured persona");
         assert_eq!(view.talk.persona, "gendo");
         assert_eq!(talks.get(&id).expect("reload").persona, "gendo");
+        assert!(!ui.is_thinking(&id), "idle response must release the claim");
+        // No intervening I/O or sleep may be needed before another change.
+        for chosen in ["default", "gendo", "rei", "gendo"] {
+            let Json(view) = call(chosen).await.expect("immediate consecutive change");
+            assert!(!view.thinking);
+            assert!(!ui.is_thinking(&id));
+        }
 
         let detail = talk_detail(State(Arc::clone(&ui)), Path(id.clone()))
             .await

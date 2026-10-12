@@ -1141,6 +1141,44 @@ async fn queue_row_click_previews_task_in_split_pane() {
             .collect::<Vec<_>>()
             .join(" && ");
         browser.wait_for(&page, &all, w).await.expect("rows");
+        client_harness(&mut browser, &page).await;
+        let chips = browser
+            .eval(
+                &page,
+                r#"(() => {
+                  const failures = [];
+                  for (const name of ['RUN_STATUS', 'TASK_STATUS', 'QUESTION_STATUS', 'TALK_STATUS']) {
+                    const slot = document.createElement('span');
+                    let original;
+                    for (const [status, meta] of Object.entries(deck[name])) {
+                      deck.setChip(slot, status, deck[name]);
+                      original ||= slot.firstChild;
+                      const node = slot.firstChild;
+                      if (node !== original || node.textContent !== status
+                        || node.dataset.status !== status || node.dataset.glyph !== meta.glyph
+                        || node.getAttribute('data-flight') !== (meta.flight ? '1' : null)) failures.push(`${name}: ${status}`);
+                    }
+                  }
+                  return failures;
+                })()"#,
+            )
+            .await
+            .expect("chip transitions");
+        assert_eq!(
+            chips,
+            serde_json::json!([]),
+            "{tag}: stale chip attributes: {chips}"
+        );
+        browser
+            .eval(
+                &page,
+                "window.queueInput = []; for (const kind of ['mousedown', 'mouseup', 'click']) \
+                 document.addEventListener(kind, e => queueInput.push({ kind, \
+                 id: e.target.closest('[data-task-id]')?.dataset.taskId, \
+                 target: e.target.className, x: e.clientX, y: e.clientY }), true);",
+            )
+            .await
+            .expect("capture queue input");
         browser
             .eval(
                 &page,
@@ -1191,18 +1229,28 @@ async fn queue_row_click_previews_task_in_split_pane() {
                 .eval(
                     &page,
                     &format!(
-                        "(() => {{ const row = document.querySelector('li.card[data-task-id=\"{id}\"]'); \
-                         if (!row) return null; row.scrollIntoView({{ block: 'center' }}); \
-                         const c = row.querySelector('.card-top .chip, .card-top > span'); \
-                         if (!c) return null; const r = c.getBoundingClientRect(); \
-                         const x = r.left + r.width / 2, y = r.top + r.height / 2; \
-                         const t = document.elementFromPoint(x, y); \
-                         return {{ x, y, inRow: !!t && row.contains(t), title: row.querySelector('.card-title').innerText }}; }})()"
+                        "(async () => {{ const row = document.querySelector('li.card[data-task-id=\"{id}\"]'); \
+                         if (!row) return null; row.scrollIntoView({{ block: 'center', behavior: 'instant' }}); \
+                         let previous = null; \
+                         for (let n = 0; n < 120; n++) {{ \
+                           await new Promise(resolve => requestAnimationFrame(resolve)); \
+                           const c = row.querySelector('.card-top .chip'); \
+                           if (!c) return null; const r = c.getBoundingClientRect(); \
+                           const x = r.left + r.width / 2, y = r.top + r.height / 2; \
+                           const t = document.elementFromPoint(x, y); \
+                           const point = {{ x, y, inRow: !!t && c.contains(t), \
+                             hit: t?.closest('[data-task-id]')?.dataset.taskId, \
+                             scroll: document.getElementById('view-queue').scrollTop }}; \
+                           if (previous && previous.x === x && previous.y === y \
+                             && previous.scroll === point.scroll && point.inRow && point.hit === '{id}') {{ \
+                             window.queueInput = []; window.pressedChip = c; return {{ ...point, stable: true }}; \
+                           }} previous = point; \
+                         }} return {{ ...previous, stable: false }}; }})()"
                     ),
                 )
                 .await
                 .unwrap_or_else(|e| panic!("{tag}: locate {id}: {e}"));
-            if point.is_null() || point["inRow"] != true {
+            if point.is_null() || point["inRow"] != true || point["stable"] != true {
                 failures.push(format!(
                     "{tag}: {id}: no clickable chip inside the row: {point}"
                 ));
@@ -1220,19 +1268,51 @@ async fn queue_row_click_previews_task_in_split_pane() {
                     )
                     .await
                     .expect("mouse");
+                if kind == "mousePressed" {
+                    // Exercise the ordinary refresh while the button is held,
+                    // rather than hoping a stream update hits this short gap.
+                    let refresh = browser
+                        .eval(
+                            &page,
+                            "(async () => { await deck.loadQueue(); \
+                             const r = pressedChip.getBoundingClientRect(); \
+                             return { connected: pressedChip.isConnected, \
+                               x: r.left + r.width / 2, y: r.top + r.height / 2, \
+                               input: queueInput }; })()",
+                        )
+                        .await
+                        .expect("refresh during press");
+                    assert_eq!(
+                        refresh["connected"], true,
+                        "{tag}: {id}: pressed chip replaced: {refresh}"
+                    );
+                    assert_eq!(
+                        refresh["x"], point["x"],
+                        "{tag}: {id}: chip moved: {refresh}"
+                    );
+                    assert_eq!(
+                        refresh["y"], point["y"],
+                        "{tag}: {id}: chip moved: {refresh}"
+                    );
+                }
+            }
+            let input = browser
+                .eval(&page, "queueInput")
+                .await
+                .expect("input trace");
+            for kind in ["mousedown", "mouseup", "click"] {
+                assert!(
+                    input
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|e| e["kind"] == kind && e["id"] == *id),
+                    "{tag}: {id}: missing {kind} on the clicked row: {input}"
+                );
             }
             let want = format!("#/tasks/{id}");
-            // The previous task's heading stays until this one's detail
-            // arrives, so wait for this task's own title when it has one.
-            let title = point["title"].as_str().unwrap_or_default();
-            let own = if title.is_empty() || title.starts_with("Instruction for") {
-                "true".to_owned()
-            } else {
-                format!(
-                    "document.getElementById('task-h').textContent.includes({})",
-                    Value::from(title)
-                )
-            };
+            // Identity, not the heading, proves this detail belongs to the
+            // clicked row (titles need not be unique in a real queue).
             let shown = format!(
                 "location.hash === {want:?} \
                  && !document.getElementById('view-task').hidden \
@@ -1240,7 +1320,7 @@ async fn queue_row_click_previews_task_in_split_pane() {
                  && !document.getElementById('task-h').textContent.includes('Loading task') \
                  && !document.getElementById('task-h').textContent.includes('could not be loaded') \
                  && document.getElementById('task-h').textContent.trim() !== '' \
-                 && {own}"
+                 && document.getElementById('view-task').dataset.taskId === {id:?}"
             );
             if browser
                 .wait_for(&page, &shown, Duration::from_secs(5))
@@ -1251,6 +1331,7 @@ async fn queue_row_click_previews_task_in_split_pane() {
                     .eval(
                         &page,
                         "({ hash: location.hash, task: document.getElementById('view-task').hidden, \
+                           id: document.getElementById('view-task').dataset.taskId, input: queueInput, \
                            empty: document.getElementById('split-empty').hidden, \
                            h: document.getElementById('task-h').textContent })",
                     )
@@ -1444,7 +1525,7 @@ async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
             r#"(async () => {
       const source = await (await fetch('/app.js')).text();
       window.deck = new Function(source.replace('queue: "/api/queue"', 'queue: "/api/queue?test_client=1"').replace(/\nboot\(\);\s*$/, `
-        return { settingsState, renderSettings, loadSettings, saveSettings, linkify, truncateLabel, state, loadHealth, loadLoop, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter, reviewPassed, voteTag, reviewStamp };
+        return { setChip, RUN_STATUS, TASK_STATUS, QUESTION_STATUS, TALK_STATUS, settingsState, renderSettings, loadSettings, saveSettings, linkify, truncateLabel, state, loadHealth, loadLoop, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter, reviewPassed, voteTag, reviewStamp };
       `))();
       await Promise.all([deck.loadQueue(), deck.loadRuns(), deck.loadTalks()]);
     })()"#,
