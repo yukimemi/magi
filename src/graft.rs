@@ -61,6 +61,23 @@ pub struct Plan {
     pub strengths: Vec<(char, String, Vec<String>)>,
 }
 
+/// The strengths of a plan with the ids the prompt shows (`A1`, `A2`, ...).
+pub fn requested(plan: &Plan) -> Vec<crate::run::GraftStrength> {
+    plan.strengths
+        .iter()
+        .flat_map(|&(label, _, ref items)| {
+            items
+                .iter()
+                .enumerate()
+                .map(move |(i, text)| crate::run::GraftStrength {
+                    id: format!("{label}{}", i + 1),
+                    source: label,
+                    text: text.clone(),
+                })
+        })
+        .collect()
+}
+
 /// Decide whether the graft runs and with what input. Pure.
 pub fn plan(state: &RunState) -> Result<Plan, Skip> {
     if !state.config.graph.graft_runner_up {
@@ -272,6 +289,9 @@ mod tests {
             limit: None,
             agent: None,
             outcome: GraftOutcome::RolledBack("no change".to_owned()),
+            requested: Vec::new(),
+            adoption: None,
+            adoption_error: None,
         });
         assert_eq!(plan(&s), Err(Skip::AlreadyDone));
     }

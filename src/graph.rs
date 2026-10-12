@@ -3654,6 +3654,9 @@ impl Runner {
             limit: Some(limit),
             agent: None,
             outcome: GraftOutcome::Running,
+            requested: graft::requested(&plan),
+            adoption: None,
+            adoption_error: None,
         });
         self.state.event(
             "graft",
@@ -3770,6 +3773,11 @@ impl Runner {
                 }
             }
         }
+        let (adoption, adoption_error) = match &out {
+            AgentOutcome::Ok(o) => crate::graft_report::adoption_of(&o.text),
+            _ => (None, None),
+        };
+        let requested = graft::requested(&plan);
         let outcome = match why {
             None => {
                 self.state.event(
@@ -3799,6 +3807,9 @@ impl Runner {
             limit: Some(limit),
             agent: Some(agent_id),
             outcome,
+            requested,
+            adoption,
+            adoption_error,
         });
         self.state.save()?;
         Ok(())

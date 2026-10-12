@@ -907,6 +907,7 @@ impl Ui {
             .route("/api/runs/{id}", get(run_detail).delete(run_delete))
             .route("/api/runs/{id}/report", get(run_report))
             .route("/api/runs/{id}/report.json", get(run_report_json))
+            .route("/api/runs/{id}/graft.diff", get(run_graft_diff))
             .route("/api/runs/{id}/fold", post(run_fold))
             .route("/api/runs/{id}/fold-merged", post(run_fold_merged))
             .route("/api/runs/{id}/resume", post(run_resume))
@@ -3778,13 +3779,88 @@ async fn run_report_json(
         let id = resolve_run(&ui.runs, &id)?;
         let state = read_run(&ui.runs, &id)?;
         let daemon_claims = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
-        Ok(crate::report_view::build(
+        // Only a record that lacks the structured details reads `artifacts/`.
+        let recovered = state.graft.as_ref().map(|_| {
+            crate::graft_report::recover(&state, &crate::agent::artifacts_dir(&state.dir()))
+        });
+        Ok(crate::report_view::build_with(
             &state,
             state.liveness(daemon_claims),
+            recovered.as_ref(),
         ))
     })
     .await?;
     Ok(Json(view))
+}
+
+/// Most of a graft diff the route returns.
+const GRAFT_DIFF_MAX: usize = 400 * 1024;
+/// How long `git diff` may run.
+const GRAFT_DIFF_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// The graft's own patch: recorded `pre` against recorded `post`. Both SHAs
+/// come from the run record, never from the request.
+async fn run_graft_diff(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let (repo, pre, post) = blocking(move || {
+        let id = resolve_run(&ui.runs, &id)?;
+        let state = read_run(&ui.runs, &id)?;
+        let g = state
+            .graft
+            .as_ref()
+            .ok_or_else(|| ApiError::not_found("this run has no graft"))?;
+        let post = g
+            .post
+            .clone()
+            .ok_or_else(|| ApiError::not_found("the graft recorded no post-graft commit"))?;
+        Ok((state.repo.clone(), g.pre.clone(), post))
+    })
+    .await?;
+    let hex = |s: &str| (4..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit());
+    if !hex(&pre) || !hex(&post) {
+        return Err(ApiError::not_found("the recorded commits are not valid"));
+    }
+    let out = tokio::time::timeout(
+        GRAFT_DIFF_TIMEOUT,
+        crate::git::git_raw(
+            &repo,
+            &[
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "-M",
+                &pre,
+                &post,
+                "--",
+            ],
+        ),
+    )
+    .await
+    .map_err(|_| ApiError::not_found("git diff timed out"))?
+    .map_err(|e| ApiError::not_found(format!("git diff failed: {e:#}")))?;
+    if out.code != Some(0) {
+        return Err(ApiError::not_found(
+            "the recorded commits are no longer in the repository",
+        ));
+    }
+    let mut body = out.stdout;
+    if body.len() > GRAFT_DIFF_MAX {
+        let mut cut = GRAFT_DIFF_MAX;
+        while !body.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        body.truncate(cut);
+        body.push_str("\n... diff truncated ...");
+    }
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        body,
+    ))
 }
 
 /// A task as the UI sees it.

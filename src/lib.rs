@@ -45,6 +45,7 @@ pub mod followup;
 pub mod git;
 pub mod github_text;
 pub mod graft;
+pub mod graft_report;
 pub mod graph;
 pub mod handover;
 pub mod land;

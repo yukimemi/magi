@@ -1231,8 +1231,8 @@ pub fn graft(
             s,
             "\n## From candidate {label} (branch `{branch}`, read-only)\n\n"
         );
-        for item in items {
-            let _ = writeln!(s, "- {item}");
+        for (i, item) in items.iter().enumerate() {
+            let _ = writeln!(s, "- [{label}{}] {item}", i + 1);
         }
     }
     let _ = write!(
@@ -1254,8 +1254,11 @@ pub fn graft(
          # Output\n\n\
          Your reasoning first, then exactly one fenced json block, last:\n\n\
          ```json\n\
-         {{\"addressed\":[],\"rejected\":[],\"notes\":\"what was ported\"}}\n\
-         ```"
+         {{\"addressed\":[\"A1\"],\"rejected\":[{{\"id\":\"A2\",\"why\":\"reason\"}}],\"notes\":\"what was ported\"}}\n\
+         ```\n\n\
+         `addressed` lists the ids (the bracketed `A1`-style tags above) you \
+         actually ported; `rejected` lists the ids you skipped, each with why. \
+         Never list an id you did not port."
     );
     s.push('\n');
     s.push_str(&lang(language));

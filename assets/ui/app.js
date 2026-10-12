@@ -26,6 +26,7 @@ const API = {
   foldMergedRun: (id) => `/api/runs/${encodeURIComponent(id)}/fold-merged`,
   resumeRun: (id) => `/api/runs/${encodeURIComponent(id)}/resume`,
   report: (id) => `/api/runs/${encodeURIComponent(id)}/report`,
+  graftDiff: (id) => `/api/runs/${encodeURIComponent(id)}/graft.diff`,
   reportJson: (id) => `/api/runs/${encodeURIComponent(id)}/report.json`,
   queue: "/api/queue",
   search: (scope, q) => `/api/search?scope=${scope}&q=${encodeURIComponent(q)}`,
@@ -6649,6 +6650,72 @@ function rlines(lines) {
   return el("ul", { class: "rlist" }, (lines || []).map((l) => el("li", { class: "rrow", text: l })));
 }
 
+const GRAFT_STATE = {
+  adopted: ["adopted", "ok", "The fixer's report names this as ported. The diff is what actually changed."],
+  rejected: ["declined", "warn", "The fixer chose not to port this."],
+  unreported: ["not confirmed", "warn", "The fixer's report does not mention this; it may not have been ported."],
+  unknown: ["unknown", "neutral", "No fixer report is available to confirm this."],
+};
+const GRAFT_UNAVAILABLE = {
+  artifact_missing: "the stored artifact is missing",
+  unreadable_output: "the stored output could not be read",
+  no_post_commit: "no post-graft commit was recorded",
+  legacy_record: "this run was recorded before graft details were kept",
+};
+
+/* Everything here is agent-authored text, so it only ever reaches the DOM
+   through `text` / `textContent` or the server's markdown tree. */
+function renderGraft(runId, g) {
+  const lines = g.lines != null ? `${g.lines} changed lines${g.limit != null ? ` (limit ${g.limit})` : ""}`
+    : g.limit != null ? `limit ${g.limit} changed lines` : null;
+  const diffBox = el("pre", { class: "rpre", text: "" });
+  const diff = g.diff_available
+    ? el("details", { class: "rout" }, el("summary", { text: "graft diff" }), diffBox)
+    : null;
+  if (diff) {
+    let loaded = false;
+    diff.addEventListener("toggle", () => {
+      if (!diff.open || loaded) return;
+      loaded = true;
+      diffBox.textContent = "loading…";
+      request(API.graftDiff(runId)).then((r) => r.text())
+        .then((t) => { diffBox.textContent = t || "(empty diff)"; })
+        .catch((e) => { loaded = false; diffBox.textContent = `diff unavailable: ${e.message}`; });
+    });
+  }
+  const unavailable = (g.unavailable || []).map((u) =>
+    `${u.what}: ${GRAFT_UNAVAILABLE[u.reason] || u.reason}`);
+  return [
+    el("p", { class: "rmeta", text: [
+      g.agent ? `ported by ${g.agent}` : "no agent answered",
+      g.winner ? `onto winner ${g.winner}` : null,
+      (g.sources || []).length ? `from ${g.sources.join(", ")}` : null,
+      lines,
+    ].filter(Boolean).join(" · ") }),
+    g.reason ? el("p", { class: "rmeta rwarn", text: `rolled back: ${g.reason}` }) : null,
+    (g.handovers || []).length ? rlines(g.handovers.map((h) => `handover ${h.from} → ${h.to}${h.reason ? `: ${h.reason}` : ""}`)) : null,
+    (g.requested || []).length
+      ? el("div", { class: "rblock" },
+        el("p", { class: "rmeta", text: `requested ${g.requested.length} · confirmed adopted ${g.adopted_count} · declined ${g.rejected_count} · unconfirmed ${g.unconfirmed_count}` }),
+        el("ul", { class: "rlist" }, g.requested.map((r) => {
+          const st = GRAFT_STATE[r.state] || GRAFT_STATE.unknown;
+          return el("li", { class: "rrow" },
+            rtag(st[0], st[1], st[2]),
+            el("strong", { text: `${r.id}` }),
+            el("span", { class: "rwide", text: r.text }),
+            r.why ? el("span", { class: "rmeta", text: `why: ${r.why}` }) : null);
+        })))
+      : null,
+    (g.notes_md || []).length
+      ? el("details", { class: "rout" }, el("summary", { text: "what the fixer says it ported" }), mdBlock("rturn-body", g.notes_md)) : null,
+    (g.reasoning_md || []).length
+      ? el("details", { class: "rout" }, el("summary", { text: "fixer reasoning" }), mdBlock("rturn-body", g.reasoning_md)) : null,
+    diff,
+    g.recovered ? el("p", { class: "rmeta", text: "Details recovered from the run's stored prompt and output." }) : null,
+    unavailable.length ? rlines(unavailable.map((u) => `unavailable — ${u}`)) : null,
+  ];
+}
+
 const SEV_LABEL = { blocker: "Major", major: "Major", minor: "Minor", nit: "Nit" };
 const SEV_TONE = { blocker: "fail", major: "fail", minor: "warn", nit: "neutral" };
 const FINDING_STATE = {
@@ -6761,6 +6828,9 @@ function renderSection(runId, s) {
     }
     case "notes":
       return card([rtag(String((s.lines || []).length), s.tone)], rlines(s.lines));
+    case "graft":
+      return card([rtag(String(s.graft.outcome || "").replace(/_/g, " "), s.graft.outcome === "applied" ? "ok" : "warn")],
+        ...renderGraft(runId, s.graft));
     case "review": {
       const rounds = s.rounds || [];
       return card([rtag(plural(rounds.length, "round", "rounds"), "neutral")],

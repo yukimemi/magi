@@ -151,6 +151,14 @@ pub enum Section {
         /// One line each.
         lines: Vec<String>,
     },
+    /// The graft round: runner-up strengths ported onto the winner.
+    Graft {
+        /// Title, tone and default state.
+        #[serde(flatten)]
+        head: Head,
+        /// The round.
+        graft: GraftView,
+    },
     /// Review + verification, grouped by round.
     Review {
         /// Title, tone and default state.
@@ -897,9 +905,214 @@ fn jobs_section(state: &RunState) -> Option<Section> {
     })
 }
 
+/// One strength the judges asked to port and where it stands.
+#[derive(Debug, Serialize)]
+pub struct GraftStrengthView {
+    /// Id the prompt gave it.
+    pub id: String,
+    /// Candidate it came from.
+    pub source: String,
+    /// The strength.
+    pub text: String,
+    /// `adopted` (the fixer's report names it), `rejected`, `unreported` (a
+    /// report exists and omits it) or `unknown` (no report to check against).
+    pub state: &'static str,
+    /// The fixer's reason, for a rejection.
+    pub why: Option<String>,
+}
+
+/// One seat change during the graft.
+#[derive(Debug, Serialize)]
+pub struct GraftHandoverView {
+    /// Agent that failed.
+    pub from: String,
+    /// Agent that took over.
+    pub to: String,
+    /// Why.
+    pub reason: String,
+}
+
+/// The graft card.
+#[derive(Debug, Serialize)]
+pub struct GraftView {
+    /// `applied`, `rolled_back` or `unfinished`.
+    pub outcome: &'static str,
+    /// The rollback reason.
+    pub reason: Option<String>,
+    /// The agent that actually answered the round.
+    pub agent: Option<String>,
+    /// Seat changes, oldest first.
+    pub handovers: Vec<GraftHandoverView>,
+    /// The winning candidate.
+    pub winner: Option<String>,
+    /// Candidates the strengths came from.
+    pub sources: Vec<String>,
+    /// Changed lines the graft introduced (supporting information).
+    pub lines: Option<usize>,
+    /// The size limit.
+    pub limit: Option<usize>,
+    /// What the judges asked for, with what the fixer's report confirms.
+    pub requested: Vec<GraftStrengthView>,
+    /// Counts of confirmed, rejected and unconfirmed requests.
+    pub adopted_count: usize,
+    /// Rejected by the fixer.
+    pub rejected_count: usize,
+    /// Neither adopted nor rejected in the report, or no report.
+    pub unconfirmed_count: usize,
+    /// The fixer's own summary of what it ported, as markdown nodes.
+    pub notes_md: Vec<crate::md::Node>,
+    /// The fixer's reasoning before its report, as markdown nodes.
+    pub reasoning_md: Vec<crate::md::Node>,
+    /// Details came from `artifacts/` rather than the run record.
+    pub recovered: bool,
+    /// Details that could not be shown.
+    pub unavailable: Vec<crate::graft_report::Unavailable>,
+    /// Both commits are known, so `GET .../graft.diff` can answer.
+    pub diff_available: bool,
+    /// Abbreviated pre-graft commit.
+    pub pre: String,
+    /// Abbreviated post-graft commit.
+    pub post: Option<String>,
+}
+
+fn graft_view(
+    state: &RunState,
+    g: &crate::run::GraftRecord,
+    rec: Option<&crate::graft_report::Recovered>,
+) -> GraftView {
+    use crate::graft_report::{Standing, Unavailable, standing};
+    use crate::run::GraftOutcome;
+    let mut unavailable: Vec<Unavailable> = Vec::new();
+    let mut recovered = false;
+    let requested_src: Vec<_> = if g.requested.is_empty() {
+        match rec {
+            Some(r) => {
+                recovered |= !r.requested.is_empty();
+                r.requested.clone()
+            }
+            None => Vec::new(),
+        }
+    } else {
+        g.requested.clone()
+    };
+    let adoption = match (&g.adoption, rec) {
+        (Some(a), _) => Some(a.clone()),
+        (None, Some(r)) if g.adoption_error.is_none() => {
+            recovered |= r.adoption.is_some();
+            r.adoption.clone()
+        }
+        _ => None,
+    };
+    if let Some(r) = rec {
+        unavailable.extend(r.unavailable.iter().cloned());
+    }
+    if let Some(e) = &g.adoption_error {
+        unavailable.push(Unavailable {
+            what: "adoption",
+            reason: e.clone(),
+        });
+    }
+    if g.requested.is_empty() && requested_src.is_empty() && rec.is_none() {
+        unavailable.push(Unavailable {
+            what: "requested",
+            reason: "legacy_record".to_owned(),
+        });
+    }
+    if adoption.is_none() && g.adoption_error.is_none() && rec.is_none() {
+        unavailable.push(Unavailable {
+            what: "adoption",
+            reason: "legacy_record".to_owned(),
+        });
+    }
+    let requested: Vec<GraftStrengthView> = requested_src
+        .iter()
+        .map(|s| {
+            let (st, why) = match adoption.as_ref().map(|a| standing(s, a)) {
+                None => ("unknown", None),
+                Some(Standing::Adopted) => ("adopted", None),
+                Some(Standing::Rejected(w)) => ("rejected", Some(w).filter(|w| !w.is_empty())),
+                Some(Standing::Unreported) => ("unreported", None),
+            };
+            GraftStrengthView {
+                id: s.id.clone(),
+                source: s.source.to_string(),
+                text: s.text.clone(),
+                state: st,
+                why,
+            }
+        })
+        .collect();
+    let count = |st: &str| requested.iter().filter(|r| r.state == st).count();
+    let (adopted_count, rejected_count) = (count("adopted"), count("rejected"));
+    let mut sources: Vec<String> = requested.iter().map(|r| r.source.clone()).collect();
+    sources.dedup();
+    let (outcome, reason) = match &g.outcome {
+        GraftOutcome::Applied => ("applied", None),
+        GraftOutcome::Running => ("unfinished", None),
+        GraftOutcome::RolledBack(w) => ("rolled_back", Some(w.clone())),
+    };
+    let md = |t: &str| {
+        if t.trim().is_empty() {
+            Vec::new()
+        } else {
+            crate::md::to_nodes(t, &crate::md::ImageBase::None)
+        }
+    };
+    let short = |c: &str| c.chars().take(12).collect::<String>();
+    if outcome == "applied" && g.post.is_none() {
+        unavailable.push(Unavailable {
+            what: "diff",
+            reason: "no_post_commit".to_owned(),
+        });
+    }
+    GraftView {
+        outcome,
+        reason,
+        agent: g.agent.clone(),
+        handovers: state
+            .handovers
+            .iter()
+            .filter(|h| h.node == "graft")
+            .map(|h| GraftHandoverView {
+                from: h.from.clone(),
+                to: h.to.clone(),
+                reason: h.reason.clone(),
+            })
+            .collect(),
+        winner: state.tally.as_ref().map(|t| t.winner.to_string()),
+        sources,
+        lines: g.lines,
+        limit: g.limit,
+        unconfirmed_count: requested.len() - adopted_count - rejected_count,
+        adopted_count,
+        rejected_count,
+        requested,
+        notes_md: adoption.as_ref().map(|a| md(&a.notes)).unwrap_or_default(),
+        reasoning_md: adoption
+            .as_ref()
+            .map(|a| md(&a.reasoning))
+            .unwrap_or_default(),
+        recovered,
+        unavailable,
+        diff_available: g.post.is_some(),
+        pre: short(&g.pre),
+        post: g.post.as_deref().map(short),
+    }
+}
+
 /// Build the view. `live` is [`RunState::liveness`], exactly what the text
 /// route passes to `report::active_seats`.
 pub fn build(state: &RunState, live: Liveness) -> RunReportView {
+    build_with(state, live, None)
+}
+
+/// [`build`] with the graft details recovered from `artifacts/` (see
+/// [`crate::graft_report::recover`]); `None` shows only what the record holds.
+pub fn build_with(
+    state: &RunState,
+    live: Liveness,
+    graft: Option<&crate::graft_report::Recovered>,
+) -> RunReportView {
     let mut sections: Vec<Section> = Vec::new();
     let met_quorum = state.tally.as_ref().is_none_or(|t| t.met_quorum);
 
@@ -1081,6 +1294,19 @@ pub fn build(state: &RunState, live: Liveness) -> RunReportView {
             })
             .collect(),
     ));
+
+    if let Some(g) = &state.graft {
+        let view = graft_view(state, g, graft);
+        let tone = match view.outcome {
+            "applied" if view.unconfirmed_count == 0 && !view.requested.is_empty() => Tone::Ok,
+            "applied" => Tone::Neutral,
+            _ => Tone::Warn,
+        };
+        sections.push(Section::Graft {
+            head: head("graft", tone, true),
+            graft: view,
+        });
+    }
 
     if !state.reviews.is_empty() {
         let n = state.reviews.len();
@@ -1543,5 +1769,150 @@ mod tests {
             .as_str()
             .expect("tail");
         assert!(tail.len() < 2_100, "output is bounded: {}", tail.len());
+    }
+    fn graft_json(s: &RunState, rec: Option<&crate::graft_report::Recovered>) -> serde_json::Value {
+        let json = serde_json::to_value(build_with(s, Liveness::Unknown, rec)).expect("json");
+        json["sections"]
+            .as_array()
+            .expect("a")
+            .iter()
+            .find(|x| x["kind"] == "graft")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    fn graft_record(outcome: crate::run::GraftOutcome) -> crate::run::GraftRecord {
+        use crate::run::{GraftAdoption, GraftRejection, GraftStrength};
+        crate::run::GraftRecord {
+            pre: "aaaaaaaaaaaaaaaa".to_owned(),
+            post: Some("bbbbbbbbbbbbbbbb".to_owned()),
+            lines: Some(25),
+            limit: Some(227),
+            agent: Some("astra".to_owned()),
+            outcome,
+            requested: vec![
+                GraftStrength {
+                    id: "A1".into(),
+                    source: 'A',
+                    text: "Build Persona directly in the test".into(),
+                },
+                GraftStrength {
+                    id: "A2".into(),
+                    source: 'A',
+                    text: "Cache the lookup".into(),
+                },
+                GraftStrength {
+                    id: "A3".into(),
+                    source: 'A',
+                    text: "Rename the helper".into(),
+                },
+            ],
+            adoption: Some(GraftAdoption {
+                addressed: vec!["A1".into()],
+                rejected: vec![GraftRejection {
+                    id: "A2".into(),
+                    why: "too large".into(),
+                }],
+                notes: "ported <script>alert(1)</script>".into(),
+                reasoning: "thinking".into(),
+            }),
+            adoption_error: None,
+        }
+    }
+
+    #[test]
+    fn an_applied_graft_separates_requested_from_confirmed() {
+        let mut s = state();
+        s.graft = Some(graft_record(crate::run::GraftOutcome::Applied));
+        s.handovers.push(crate::run::Handover {
+            at: jiff::Timestamp::now(),
+            node: "graft".into(),
+            seat: "graft".into(),
+            from: "sonnet".into(),
+            to: "astra".into(),
+            reason: "timed out".into(),
+        });
+        let g = &graft_json(&s, None)["graft"];
+        assert_eq!(g["outcome"], "applied");
+        assert_eq!(g["agent"], "astra");
+        assert_eq!(g["handovers"][0]["from"], "sonnet");
+        assert_eq!(g["lines"], 25);
+        assert_eq!(g["limit"], 227);
+        let st: Vec<_> = g["requested"]
+            .as_array()
+            .expect("a")
+            .iter()
+            .map(|r| r["state"].as_str().expect("s").to_owned())
+            .collect();
+        assert_eq!(st, ["adopted", "rejected", "unreported"]);
+        assert_eq!(g["requested"][1]["why"], "too large");
+        assert_eq!(g["adopted_count"], 1);
+        assert_eq!(g["unconfirmed_count"], 1);
+        assert_eq!(g["diff_available"], true);
+    }
+
+    #[test]
+    fn a_rolled_back_graft_carries_its_reason_and_no_diff() {
+        let mut s = state();
+        let mut g = graft_record(crate::run::GraftOutcome::RolledBack("too big".into()));
+        g.post = None;
+        s.graft = Some(g);
+        let v = graft_json(&s, None);
+        assert_eq!(v["graft"]["outcome"], "rolled_back");
+        assert_eq!(v["graft"]["reason"], "too big");
+        assert_eq!(v["graft"]["diff_available"], false);
+        assert_eq!(v["tone"], "warn");
+    }
+
+    #[test]
+    fn a_legacy_record_says_unavailable_and_claims_nothing() {
+        let mut s = state();
+        let mut g = graft_record(crate::run::GraftOutcome::Applied);
+        g.requested.clear();
+        g.adoption = None;
+        s.graft = Some(g);
+        let v = graft_json(&s, None);
+        let reasons: Vec<_> = v["graft"]["unavailable"]
+            .as_array()
+            .expect("a")
+            .iter()
+            .map(|u| u["reason"].as_str().expect("s"))
+            .collect();
+        assert_eq!(reasons, ["legacy_record", "legacy_record"]);
+        assert_eq!(v["graft"]["requested"].as_array().expect("a").len(), 0);
+        assert_eq!(v["graft"]["adopted_count"], 0);
+    }
+
+    #[test]
+    fn recovered_details_fill_a_legacy_record_and_are_marked() {
+        let mut s = state();
+        let mut g = graft_record(crate::run::GraftOutcome::Applied);
+        let requested = std::mem::take(&mut g.requested);
+        let adoption = g.adoption.take();
+        s.graft = Some(g);
+        let rec = crate::graft_report::Recovered {
+            requested,
+            adoption,
+            unavailable: Vec::new(),
+        };
+        let g = &graft_json(&s, Some(&rec))["graft"];
+        assert_eq!(g["recovered"], true);
+        assert_eq!(g["requested"][0]["state"], "adopted");
+    }
+
+    #[test]
+    fn agent_text_stays_text_in_the_view() {
+        let mut s = state();
+        let mut g = graft_record(crate::run::GraftOutcome::Applied);
+        g.requested[0].text = "<img src=x onerror=alert(1)>".into();
+        s.graft = Some(g);
+        let v = graft_json(&s, None);
+        assert_eq!(
+            v["graft"]["requested"][0]["text"],
+            "<img src=x onerror=alert(1)>"
+        );
+        // Prose goes through the markdown tree, which has no raw-HTML node.
+        let notes = v["graft"]["notes_md"].to_string();
+        assert!(!notes.contains("\"html\""), "{notes}");
     }
 }
