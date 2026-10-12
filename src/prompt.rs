@@ -1485,6 +1485,44 @@ pub fn question_resumed(
     s
 }
 
+/// Heading of the whole-change summary prompt (the end-to-end mock greps it).
+pub const CHANGE_SUMMARY_HEADING: &str = "# Describe a change for its pull request";
+
+/// Ask a read-only agent to describe the whole change between `base` and
+/// `head` for a reviewer who has seen neither the task nor the conversation.
+/// The commit list and diff stat are orientation only; the agent must read the
+/// diff itself and the code around it.
+pub fn change_summary(base: &str, head: &str, subjects: &[String], stat: &str) -> String {
+    let mut commits = String::new();
+    for s in subjects {
+        let _ = writeln!(commits, "- {}", s.trim());
+    }
+    format!(
+        "{CHANGE_SUMMARY_HEADING}\n\n\
+         You are writing the description of a pull request that has not been opened yet. \
+         The reader is a reviewer who has not seen the task, the review or any conversation.\n\n\
+         Do not edit files, commit, or run anything that changes the repository. \
+         You are in a checkout of the change. Read the complete diff with \
+         `git diff {base} {head}` (use `git diff --stat {base} {head}` to list the files, \
+         then read every file's hunks), and open the surrounding code in the files it touches \
+         so you understand what the change does in context. The commit subjects and the \
+         stat below are orientation, not a substitute for reading the diff.\n\n\
+         Commits ({base}..{head}):\n{commits}\n\
+         Diff stat:\n```\n{stat}\n```\n\n\
+         Write in English. Explain the concrete problem the change addresses, the behavior \
+         that results, and the material implementation details the diff supports, by area. \
+         Describe the whole change, not only fixes made late in its history. State only what \
+         the diff and the code show; if something is unclear, say it is unclear rather than \
+         guessing. Do not say whether tests or checks passed: validation is added \
+         separately from magi's own records. You may list limitations or follow-ups the code \
+         itself reveals. Do not name any model, vendor or person, and include no local paths, \
+         hostnames or secrets; refer to files by repository-relative path.\n\n\
+         Reply with exactly this shape and nothing else:\n\
+         TITLE: <conventional-commit style title, under 72 characters>\n\
+         <the Markdown description>"
+    )
+}
+
 /// Heading of the deputy prompt, which the end-to-end mock agent greps for.
 pub const DEPUTY_HEADING: &str = "You are the conductor's deputy";
 

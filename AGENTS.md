@@ -2760,3 +2760,19 @@ annotated after a resume).
   the rest as "cause not recorded, refund unknown".
 - The Attempts panel counts three different things: entries (passes), distinct
   runs, and attempts consumed (`Task::attempts`). Do not merge them.
+
+### A review-only run's pull request describes the final diff
+
+`graph::Runner::summarize_change` (called from `guarded_pr_message` only when a
+pull request is about to be posted for a review-only run) asks a read-only seat
+(`[roles] synthesizer` chain, seat `change-summary`, prompt
+`prompt::change_summary`) to read `git diff <merge base> <final head>` and the
+surrounding code and describe the whole change. The result is
+`RunState::change_summary`, valid only for the exact (final head, merge base
+with `<remote>/<base>`) it was written from: any other pair discards it and asks
+again. Validation, review fixes and open findings still come from the structured
+records (`pr_outcome`), never from the agent. When no agent answers, the body
+says so explicitly (`ChangeNote::Unavailable`) instead of presenting the commit
+list as a description; the failure is not persisted, so a resume retries. The
+text still goes through the posting gate and keeps the run marker. A head that
+moves after publication (a land fix round) does not edit the posted description.

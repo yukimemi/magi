@@ -1409,6 +1409,22 @@ pub struct LandApproval {
     pub head: String,
 }
 
+/// A substantive description of a review-only run's whole change, written by a
+/// read-only agent from the final diff. It is valid only for the exact pair
+/// (`head`, `base`) it was written from; a different final commit or base
+/// makes it stale and it is regenerated, never reused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeSummary {
+    /// The final commit the diff was read at.
+    pub head: String,
+    /// The merge base of the resolved remote base and `head`.
+    pub base: String,
+    /// Title, sanitized.
+    pub title: String,
+    /// Body, sanitized, without the run marker.
+    pub body: String,
+}
+
 /// The owner question filed when the posting gate withheld a pull request
 /// title or description, and how it ended. One record per rejected text
 /// (`fingerprint`); see `github_text` for the flow.
@@ -2104,6 +2120,10 @@ pub struct RunState {
     /// withheld any. While `resolved` is `None` the run is parked on it.
     #[serde(default)]
     pub github_text: Option<GithubTextAsk>,
+    /// The whole-change description of a review-only run, tied to the final
+    /// commit and base it was written from. `None` until one was produced.
+    #[serde(default)]
+    pub change_summary: Option<ChangeSummary>,
     /// Outcomes of the `verify.pre_gate` commands from the latest time they
     /// ran on the winner. Informational only: a failure here never blocks the
     /// run, the gate stays the single arbiter. Overwritten on each pass.
@@ -2388,6 +2408,7 @@ impl RunState {
             land_reruns: None,
             land_approval: None,
             github_text: None,
+            change_summary: None,
             pre_gate: Vec::new(),
             pre_gate_commit: None,
             merge: None,

@@ -6549,7 +6549,19 @@ impl Runner {
             Some(h) => crate::pr_outcome::FinalHead::At(h),
             None => crate::pr_outcome::FinalHead::Unknown,
         };
-        let mut pr = pr_message_raw(&self.state, winner.label, facts, head);
+        // Only a pull request that is about to be posted pays for a summary.
+        let summarized = if posting && is_review_run(&self.state) {
+            Some(self.summarize_change(winner, final_head.as_deref()).await)
+        } else {
+            None
+        };
+        let note = match (&summarized, &self.state.change_summary) {
+            (Some(Ok(())), Some(c)) => ChangeNote::Summary(c),
+            (Some(Err(why)), _) => ChangeNote::Unavailable(why),
+            (Some(Ok(())), None) => ChangeNote::Unavailable("no summary was recorded"),
+            (None, _) => ChangeNote::NotAsked,
+        };
+        let mut pr = pr_message_raw(&self.state, winner.label, facts, head, note);
         if !posting {
             let identity = crate::scrub::Identity::current();
             return Ok(Some(PrMessage {
@@ -6676,6 +6688,153 @@ impl Runner {
         let (title, body) =
             crate::github_text::prepare_with(&mut self.state, &pr.title, &pr.body, decision);
         Ok(Some(PrMessage { title, body }))
+    }
+
+    /// Describe the whole change of a review-only run from its final diff.
+    ///
+    /// The summary is tied to the final commit and to the merge base of the
+    /// resolved remote base; a record for any other pair is dropped and the
+    /// agent asked again, so a description never outlives the diff it was
+    /// written from. The seat is read-only and the prompt tells it to read the
+    /// diff and the code around it. `[roles] synthesizer` selects the agents
+    /// (unset: the default pick), each asked at most once, advancing on an
+    /// error, quota, unusable answer or a reply with no `TITLE:` line. `Err`
+    /// carries the reason it is unavailable; nothing is invented then.
+    async fn summarize_change(
+        &mut self,
+        winner: &Candidate,
+        head: Option<&str>,
+    ) -> std::result::Result<(), String> {
+        let Some(head) = head else {
+            return Err("the final commit could not be read".to_owned());
+        };
+        let remote = self.state.config.merge.remote.clone();
+        let tracking = format!("{remote}/{}", self.state.base_branch);
+        if !git::rev_exists(&winner.worktree, &tracking).await {
+            return Err(format!("the remote base `{tracking}` could not be read"));
+        }
+        let base = match git::merge_base(&winner.worktree, &tracking, head).await {
+            Ok(b) if !b.is_empty() => b,
+            _ => return Err("the merge base with the remote base could not be read".to_owned()),
+        };
+        if self
+            .state
+            .change_summary
+            .as_ref()
+            .is_some_and(|c| c.head == head && c.base == base)
+        {
+            return Ok(());
+        }
+        if self.state.change_summary.take().is_some() {
+            self.state.event(
+                "pr-summary",
+                "the final commit or base changed; the earlier change summary was discarded",
+            );
+        }
+        let chain = match agent::pick_chain(
+            &self.state.config.agents,
+            self.state.config.roles.synthesizer.as_ref(),
+            &agent::installed,
+            "synthesizer",
+        ) {
+            Ok(chain) => chain,
+            Err(e) => {
+                tracing::warn!("no agent for the change summary: {e:#}");
+                self.state.event("pr-summary", "no summary agent available");
+                return Err("no agent was available to summarize it".to_owned());
+            }
+        };
+        let subjects = git::subjects(&winner.worktree, &base, head)
+            .await
+            .unwrap_or_default();
+        let stat = git::diff_stat(&winner.worktree, &base, head)
+            .await
+            .unwrap_or_default();
+        let stat: String = stat.chars().take(6_000).collect();
+        let prompt = crate::prompt::change_summary(&base, head, &subjects, stat.trim());
+        let sessions = self.state.config.graph.sessions;
+        let timeout = Duration::from_secs(self.state.config.graph.timeout_implement);
+        let prompts = self.state.config.prompts.clone();
+        let cache = self.state.config.cache_dir();
+        let run = self.state.id.clone();
+        for (i, spec) in chain.into_iter().enumerate() {
+            let seat = crate::fixer::seat_for(&mut self.state, "change-summary", &spec.id);
+            let job = SeatJob {
+                spec: spec.clone(),
+                seat,
+                cwd: winner.worktree.clone(),
+                prompt: prompt.clone(),
+                timeout,
+                allow_write: false,
+                sessions,
+                artifacts: agent::artifacts_dir(&self.state.dir()),
+                stem: if i == 0 {
+                    "change-summary".to_owned()
+                } else {
+                    format!("change-summary-{}", spec.id)
+                },
+                handover: None,
+            };
+            let ctx = WaveCtx {
+                run: &run,
+                node: "pr-summary",
+                prompts: &prompts,
+                cache: cache.as_deref(),
+                round: None,
+                carry_seats: false,
+                pauses: Some((&self.pause, &self.interrupt)),
+            };
+            let (seat, outcome) =
+                run_one(job, Arc::clone(&self.sem), &ctx, &mut self.state, 1).await;
+            self.state.seats.insert(seat.key.clone(), seat);
+            let text = match outcome {
+                AgentOutcome::Ok(o) if !agent::output_advances(&o) => o.text,
+                AgentOutcome::ResourceBlocked(_) => {
+                    return Err("a shared resource was busy".to_owned());
+                }
+                _ => continue,
+            };
+            let blind = &self.state.config.blind;
+            let Some(title) = summary_title(&text) else {
+                continue;
+            };
+            let body: String = summary_without_title(&text)
+                .lines()
+                .filter(|l| !l.contains("magi:run/"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let body = blind::sanitize_prose(body.trim(), blind);
+            let title = blind::sanitize_prose(&title, blind);
+            if body.trim().is_empty() || title.trim().is_empty() {
+                continue;
+            }
+            // The branch must still be the one the agent was shown.
+            if git::rev_parse(&winner.worktree, "HEAD")
+                .await
+                .ok()
+                .as_deref()
+                != Some(head)
+            {
+                return Err("the branch moved while the summary was written".to_owned());
+            }
+            self.state.change_summary = Some(crate::run::ChangeSummary {
+                head: head.to_owned(),
+                base,
+                title,
+                body,
+            });
+            self.state.event(
+                "pr-summary",
+                format!("change summary written by {} for the final diff", spec.id),
+            );
+            if let Err(e) = self.state.save() {
+                tracing::warn!("could not save the change summary: {e:#}");
+            }
+            return Ok(());
+        }
+        self.state
+            .event("pr-summary", "no agent produced a change summary");
+        Err("the summarizing agents were unavailable or gave no usable answer".to_owned())
     }
 
     /// One read-only rewrite request for a withheld description. The
@@ -9550,6 +9709,7 @@ fn pr_message_with(state: &RunState, winner: char, facts: Option<&BranchFacts>) 
         winner,
         facts,
         crate::pr_outcome::FinalHead::Unreported,
+        ChangeNote::NotAsked,
     );
     let id = crate::scrub::Identity::current();
     PrMessage {
@@ -9558,11 +9718,25 @@ fn pr_message_with(state: &RunState, winner: char, facts: Option<&BranchFacts>) 
     }
 }
 
+/// What the description of a review-only run may say about the change itself.
+#[derive(Debug, Clone, Copy)]
+enum ChangeNote<'a> {
+    /// No summary was asked for (a preview, a non-publishing merge mode, or an
+    /// implementing run, whose implementer wrote its own): the description is
+    /// built as it always was.
+    NotAsked,
+    /// A summary written from the final diff.
+    Summary(&'a crate::run::ChangeSummary),
+    /// A summary was asked for and could not be produced; the text says why.
+    Unavailable(&'a str),
+}
+
 fn pr_message_raw(
     state: &RunState,
     winner: char,
     facts: Option<&BranchFacts>,
     head: crate::pr_outcome::FinalHead<'_>,
+    change: ChangeNote<'_>,
 ) -> PrMessage {
     let summary = state
         .candidates
@@ -9573,7 +9747,13 @@ fn pr_message_raw(
     // The fallback is the operator's own words and may not be English; GitHub
     // text always is, so a non-English task gets a neutral title instead.
     let review = is_review_run(state);
-    let title = if review {
+    let generated_title = match change {
+        ChangeNote::Summary(c) if review && !c.title.trim().is_empty() => Some(c.title.clone()),
+        _ => None,
+    };
+    let title = if let Some(t) = generated_title {
+        t
+    } else if review {
         facts
             .and_then(|f| english_subject(&f.commits.first()?.0))
             .or_else(|| review_title(state))
@@ -9595,6 +9775,21 @@ fn pr_message_raw(
 
     let mut body = String::new();
     let what = summary_without_title(summary);
+    if review {
+        match change {
+            ChangeNote::Summary(c) => {
+                body.push_str("## Summary\n\n");
+                body.push_str(c.body.trim());
+                body.push_str("\n\n");
+            }
+            ChangeNote::Unavailable(why) => body.push_str(&format!(
+                "## Summary\n\nNo description of what this change does could be generated ({why}). \
+                 The commit list and diff stat below only list what the branch carries; they do not \
+                 explain it.\n\n"
+            )),
+            ChangeNote::NotAsked => {}
+        }
+    }
     if !what.is_empty() {
         body.push_str("## Summary\n\n");
         body.push_str(&what);
@@ -12632,6 +12827,173 @@ mod tests {
         assert_eq!(leaked_subjects(&state, "feat/own").await, None);
     }
 
+    /// A review-only run whose winner is `feat/own`, checked out in `repo`,
+    /// with `origin/main` one commit behind it, and a summarizing agent that
+    /// prints whatever `reply` holds.
+    struct SummaryFixture {
+        _tmp: tempfile::TempDir,
+        repo: PathBuf,
+        reply: PathBuf,
+        runner: Runner,
+    }
+
+    fn summary_fixture() -> SummaryFixture {
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let origin = tmp.path().join("origin.git");
+        let g = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .quiet()
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        g(&["init", "-q", "--bare", origin.to_str().unwrap()]);
+        g(&["remote", "add", "origin", origin.to_str().unwrap()]);
+        g(&["push", "-q", "origin", "main"]);
+        g(&["checkout", "-q", "-b", "feat/own"]);
+        std::fs::write(repo.join("own.txt"), "own\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-q", "-m", "feat(own): add the own file"]);
+        let reply = tmp.path().join("reply.txt");
+        std::fs::write(
+            &reply,
+            "TITLE: feat(own): add the own file\nAdds `own.txt` so the first summary is read.",
+        )
+        .unwrap();
+        let mut runner = runner_at(RunStatus::Gating);
+        let mut state = review_state(&["feat(own): add the own file"]);
+        state.repo = repo.clone();
+        state.base_branch = "main".to_owned();
+        state.candidates[0].branch = "feat/own".to_owned();
+        state.candidates[0].worktree = repo.clone();
+        let mut author = spec("alpha");
+        author.command = vec!["sh".into(), "-c".into(), "cat \"$REPLY_FILE\"".into()];
+        author
+            .env
+            .insert("REPLY_FILE".into(), reply.to_string_lossy().into_owned());
+        state.config.agents = vec![author];
+        runner.state = state;
+        SummaryFixture {
+            _tmp: tmp,
+            repo,
+            reply,
+            runner,
+        }
+    }
+
+    async fn posted(f: &mut SummaryFixture) -> PrMessage {
+        let winner = f.runner.state.candidates[0].clone();
+        f.runner
+            .guarded_pr_message(&winner, None, true)
+            .await
+            .unwrap()
+            .expect("an English description never parks")
+    }
+
+    #[tokio::test]
+    async fn a_review_only_run_with_no_fixer_gets_a_summary_of_the_final_diff() {
+        let mut f = summary_fixture();
+        let m = posted(&mut f).await;
+        assert_eq!(m.title, "feat(own): add the own file");
+        assert!(
+            m.body
+                .contains("## Summary\n\nAdds `own.txt` so the first summary is read."),
+            "{}",
+            m.body
+        );
+        assert!(!m.body.contains("## Review fixes"), "{}", m.body);
+        assert!(m.body.contains("## Commits under review"), "{}", m.body);
+        assert!(m.body.contains(&format!("magi:run/{}", f.runner.state.id)));
+        let head = git::rev_parse(&f.repo, "HEAD").await.unwrap();
+        let base = git::rev_parse(&f.repo, "origin/main").await.unwrap();
+        let kept = f.runner.state.change_summary.as_ref().unwrap();
+        assert_eq!(
+            (kept.head.as_str(), kept.base.as_str()),
+            (head.as_str(), base.as_str())
+        );
+        assert!(!f.runner.state.seats["change-summary"].key.is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_fixes_come_after_the_whole_change_summary() {
+        let mut f = summary_fixture();
+        f.runner.state.reviews = vec![
+            round_with_notes(1, Some("handled the PATH case")),
+            round_with_notes(2, None),
+        ];
+        let m = posted(&mut f).await;
+        let summary = m.body.find("## Summary").expect("summary");
+        let fixes = m.body.find("## Review fixes").expect("review fixes");
+        assert!(summary < fixes, "{}", m.body);
+        assert!(m.body.contains("handled the PATH case"), "{}", m.body);
+        assert!(m.body.contains("## Final verification"), "{}", m.body);
+    }
+
+    #[tokio::test]
+    async fn a_changed_final_diff_invalidates_the_earlier_summary() {
+        let mut f = summary_fixture();
+        let first = posted(&mut f).await;
+        let first_head = f.runner.state.change_summary.clone().unwrap().head;
+        // The same head reuses the record: a different reply is not read.
+        std::fs::write(&f.reply, "TITLE: feat(own): other\nNot read yet.").unwrap();
+        let again = posted(&mut f).await;
+        assert_eq!((again.title, again.body), (first.title, first.body));
+
+        let g = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&f.repo)
+                .quiet()
+                .output()
+                .expect("spawn git");
+            assert!(out.status.success(), "git {args:?}");
+        };
+        std::fs::write(f.repo.join("more.txt"), "more\n").unwrap();
+        g(&["add", "-A"]);
+        g(&["commit", "-q", "-m", "fix(own): handle more"]);
+        let second = posted(&mut f).await;
+        let kept = f.runner.state.change_summary.clone().unwrap();
+        assert_ne!(kept.head, first_head);
+        assert!(second.body.contains("Not read yet."), "{}", second.body);
+        assert!(!second.body.contains("so the first summary is read"));
+        assert_eq!(second.title, "feat(own): other");
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_summary_is_stated_and_never_invented() {
+        let mut f = summary_fixture();
+        std::fs::write(&f.reply, "no title line here").unwrap();
+        let m = posted(&mut f).await;
+        assert!(
+            m.body
+                .contains("No description of what this change does could be generated"),
+            "{}",
+            m.body
+        );
+        assert!(m.body.contains("do not \nexplain it") || m.body.contains("do not explain it"));
+        assert!(f.runner.state.change_summary.is_none());
+        assert!(m.body.contains("## Commits under review"), "{}", m.body);
+        // A preview asks nobody and claims nothing.
+        let winner = f.runner.state.candidates[0].clone();
+        let preview = f
+            .runner
+            .guarded_pr_message(&winner, None, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!preview.body.contains("## Summary"), "{}", preview.body);
+    }
+
     #[test]
     fn pr_message_review_single_commit_uses_its_subject() {
         let state = review_state(&["feat(nats): per-role user"]);
@@ -12812,7 +13174,14 @@ mod tests {
     }
 
     fn body_at(state: &RunState) -> String {
-        pr_message_raw(state, 'A', None, crate::pr_outcome::FinalHead::At(FINAL)).body
+        pr_message_raw(
+            state,
+            'A',
+            None,
+            crate::pr_outcome::FinalHead::At(FINAL),
+            ChangeNote::NotAsked,
+        )
+        .body
     }
 
     const SANDBOXED: &str = "Handled the PATH case.\nI could not commit because of the sandbox. HTTP tests could not run in the sandbox.";
