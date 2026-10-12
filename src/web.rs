@@ -16567,6 +16567,114 @@ mod tests {
         );
     }
 
+    fn consult_question(ui: &Ui) -> Question {
+        let mut q = Question::new(
+            "20260901-000000-consult".to_owned(),
+            "implement".to_owned(),
+            "impl-A".to_owned(),
+            "Which backend?".to_owned(),
+            String::new(),
+            vec!["SQLite".to_owned(), "Redis".to_owned()],
+        );
+        ui.questions.put(&mut q).expect("question");
+        q
+    }
+
+    fn consult_snapshot(ui: &Ui, q: &Question, id: &str) -> (Vec<u8>, Vec<u8>) {
+        (
+            std::fs::read(ui.questions.path_of(&q.id)).expect("question snapshot"),
+            std::fs::read(ui.talks.path_of(id)).expect("talk snapshot"),
+        )
+    }
+
+    #[tokio::test]
+    async fn consult_cli_starter_is_refused_while_web_holds_the_turn() {
+        let (_tmp, _home, ui, id, _repo) = avatar_fixture("").await;
+        let q = consult_question(&ui);
+        let talk = ui.talks.get(&id).expect("talk");
+        let guard = ui.begin_talk_turn(&id).expect("web claim").expect("free");
+        let before = consult_snapshot(&ui, &q, &id);
+        let cli_talks = Talks::at(ui.home.join("talks"));
+        assert_eq!(
+            crate::consult::start_turn(&ui.questions, &cli_talks, &q, &talk, &stub_config())
+                .await
+                .expect("CLI starter"),
+            crate::consult::Started::Busy
+        );
+        assert_eq!(consult_snapshot(&ui, &q, &id), before);
+        assert!(ui.is_thinking(&id));
+        drop(guard);
+        assert!(cli_talks.claim_turn(&id).expect("claim").is_some());
+    }
+
+    #[tokio::test]
+    async fn web_starter_is_refused_while_consult_cli_runs_the_turn() {
+        let (tmp, _home, ui, id, _repo) = avatar_fixture("").await;
+        let q = consult_question(&ui);
+        let talk = ui.talks.get(&id).expect("talk");
+        let started = tmp.path().join("started");
+        let release = tmp.path().join("release");
+        let script = tmp.path().join("consult-agent.sh");
+        std::fs::write(
+            &script,
+            "cat >/dev/null\n: > \"$STARTED\"\ni=0\nwhile [ ! -f \"$RELEASE\" ]; do\n  i=$((i + 1))\n  [ \"$i\" -lt 3000 ] || exit 7\n  sleep 0.01\ndone\nprintf ok\n",
+        )
+        .expect("script");
+        let mut cfg = stub_config();
+        cfg.agents[0].id = "mock".to_owned();
+        cfg.agents[0].command = vec!["sh".to_owned(), script.to_string_lossy().into_owned()];
+        cfg.agents[0].env = std::collections::BTreeMap::from([
+            ("STARTED".to_owned(), started.to_string_lossy().into_owned()),
+            ("RELEASE".to_owned(), release.to_string_lossy().into_owned()),
+        ]);
+        let questions = ui.questions.clone();
+        let cli_talks = Talks::at(ui.home.join("talks"));
+        let cli_q = q.clone();
+        let turn = tokio::spawn(async move {
+            crate::consult::start_turn(&questions, &cli_talks, &cli_q, &talk, &cfg).await
+        });
+        let ready = tokio::time::timeout(Duration::from_secs(30), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        // Always release and join the agent, even if readiness or the web
+        // request fails, so a failed assertion cannot leave a turn behind.
+        let refusal = if ready.is_ok() {
+            let before = consult_snapshot(&ui, &q, &id);
+            let result = talk_say(
+                State(Arc::clone(&ui)),
+                Path(id.clone()),
+                Ok(Json(NewTalkTurn {
+                    text: "another message".to_owned(),
+                    attachments: Vec::new(),
+                })),
+            )
+            .await;
+            Some((result, before, consult_snapshot(&ui, &q, &id)))
+        } else {
+            None
+        };
+        std::fs::write(&release, "").expect("release agent");
+        let done = turn.await.expect("join CLI turn");
+        ready.expect("agent started before deadline");
+        let (result, before, after) = refusal.expect("web request");
+        let error = result.expect_err("web must refuse the CLI's turn");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(error.message.contains("a turn is already running"));
+        assert_eq!(
+            after, before,
+            "refusal preserves question, draft and history"
+        );
+        assert_eq!(done.expect("CLI turn"), crate::consult::Started::Answered);
+        let guard = ui
+            .begin_talk_turn(&id)
+            .expect("web claim")
+            .expect("free again");
+        drop(guard);
+    }
+
     #[test]
     fn a_dropped_guard_releases_the_lease_before_the_in_process_slot() {
         let home = TempDir::new().expect("temp home");

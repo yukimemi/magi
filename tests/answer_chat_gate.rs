@@ -138,3 +138,55 @@ fn a_chat_merge_quoting_the_owner_is_accepted() {
     let q = f.questions.get(&f.qid).expect("question");
     assert_eq!(q.status, QuestionStatus::Answered);
 }
+
+#[test]
+fn ask_chat_busy_exits_unsuccessfully_without_changing_state() {
+    let f = fixture();
+    let talks = Talks::at(f.tmp.path().join("talks"));
+    let mut q = f.questions.get(&f.qid).expect("question");
+    q.consult = None;
+    f.questions.put(&mut q).expect("unconsulted question");
+    let mut task = magi::queue::Task::new(
+        "consult-task".to_owned(),
+        "Do it".to_owned(),
+        f.tmp.path().to_path_buf(),
+        magi::queue::Source::Agent {
+            run: f.talk_id.clone(),
+            node: magi::queue::CHAT_NODE.to_owned(),
+        },
+    );
+    task.start(q.run.clone());
+    magi::queue::Queue::at(f.tmp.path().join("queue"))
+        .put(&mut task)
+        .expect("chat task");
+    std::fs::write(
+        f.tmp.path().join("magi.toml"),
+        "[[agents]]\nid = \"mock\"\nkind = \"command\"\ncommand = [\"true\"]\n",
+    )
+    .expect("isolated config");
+    let question_before = std::fs::read(f.questions.path_of(&q.id)).unwrap();
+    let talk_before = std::fs::read(talks.path_of(&f.talk_id)).unwrap();
+    let _lease = talks
+        .claim_turn(&f.talk_id)
+        .unwrap()
+        .expect("held elsewhere");
+    let out = Command::new(env!("CARGO_BIN_EXE_magi"))
+        .args(["answer", &q.id, "--ask-chat"])
+        .env("MAGI_HOME", f.tmp.path())
+        .env("MAGI_CONFIG_DIR", f.tmp.path().join("config"))
+        .env_remove("MAGI_RUN")
+        .env_remove("MAGI_NODE")
+        .output()
+        .expect("run CLI starter");
+    assert!(!out.status.success());
+    let error = String::from_utf8_lossy(&out.stderr);
+    assert!(error.contains("a turn is already running"), "{error}");
+    assert_eq!(
+        std::fs::read(f.questions.path_of(&q.id)).unwrap(),
+        question_before
+    );
+    assert_eq!(
+        std::fs::read(talks.path_of(&f.talk_id)).unwrap(),
+        talk_before
+    );
+}

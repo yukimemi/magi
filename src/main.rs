@@ -2636,7 +2636,7 @@ async fn answer_cmd(
                 talk.short()
             ),
             magi::consult::Started::Busy => bail!(
-                "chat {} is running a turn in another process; nothing was changed, try again later",
+                "chat {}: a turn is already running in another process; nothing was changed, try again later",
                 talk.short()
             ),
             magi::consult::Started::Nothing => {
