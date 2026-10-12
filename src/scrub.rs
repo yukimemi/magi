@@ -12,8 +12,12 @@
 //! relative paths, URLs, `std::io::Error`, `v1.2.3` and `@handle` all pass.
 //! Dotted IPv4-shaped section references after `§`, `section`, `sec.` or
 //! `clause` also pass; the exception never applies to IPv6.
+//! Valid IPv4 and IPv6 loopback literals pass the IP rule, including ports
+//! on IPv4 and bracketed addresses; other sensitive-data rules still apply.
 //! A few conventional public system paths also pass the absolute-path rule;
 //! configured homes and known identity words within them are still scrubbed.
+
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// The local facts worth hiding. `Default` is "nothing known", which leaves only
 /// the pattern-based rules.
@@ -160,8 +164,12 @@ fn match_at(before: &str, rest: &str, id: &Identity) -> Option<(usize, &'static 
             prev.is_none_or(|p| !p.is_ascii_alphanumeric() && p != '.' && p != ':')
                 .then(|| {
                     ipv4(rest)
-                        .filter(|_| !section_reference(before))
-                        .or_else(|| ipv6(rest))
+                        .filter(|(len, _)| {
+                            !section_reference(before) && !loopback_literal(rest, *len, prev, false)
+                        })
+                        .or_else(|| {
+                            ipv6(rest).filter(|(len, _)| !loopback_literal(rest, *len, prev, true))
+                        })
                 })
                 .flatten()
         })
@@ -556,6 +564,48 @@ fn ipv6(rest: &str) -> Option<(usize, &'static str)> {
     Some((n, "[redacted-ip]"))
 }
 
+/// Only strict, complete loopback literals get an exception. Keep the legacy
+/// detectors (and their replacement spans) for everything else, including
+/// malformed shapes. In particular, an IPv6 detector can stop at the first
+/// dot of an IPv4-embedded address: that prefix must not earn an exception.
+fn loopback_literal(rest: &str, len: usize, prev: Option<char>, v6: bool) -> bool {
+    let address = &rest[..len];
+    let loopback = if v6 {
+        address.parse::<Ipv6Addr>().is_ok_and(|ip| ip.is_loopback())
+    } else {
+        address.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_loopback())
+    };
+    if !loopback {
+        return false;
+    }
+    let mut tail = &rest[len..];
+    let bracketed = prev == Some('[');
+    if bracketed {
+        let Some(after) = tail.strip_prefix(']') else {
+            return false;
+        };
+        tail = after;
+    }
+    // Bare IPv6 colons belong to the address (or trailing punctuation), never
+    // a port. IPv4 and bracketed literals may carry a decimal socket port.
+    if (!v6 || bracketed)
+        && let Some(port) = tail.strip_prefix(':')
+    {
+        let n = run(port, |c| c.is_ascii_digit());
+        if n == 0 || port[..n].parse::<u16>().is_err() {
+            return false;
+        }
+        tail = &port[n..];
+    }
+    let mut chars = tail.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphanumeric() || matches!(c, '_' | '%') => false,
+        Some('.') if chars.next().is_some_and(|c| c.is_ascii_alphanumeric()) => false,
+        Some(':') if !v6 || bracketed => false,
+        _ => true,
+    }
+}
+
 /// Plain words (and the bare mDNS suffix) that show up as a hostname or account
 /// name on some machines but are ordinary prose everywhere. Matched against the
 /// whole trimmed value only, so `devbox.local` is still a hostname.
@@ -881,15 +931,83 @@ mod tests {
     fn emails_ips_and_tokens() {
         assert_eq!(s("mail dev.x+y@example.co.uk!"), "mail [redacted-email]!");
         assert_eq!(s("host 192.168.0.12:8080"), "host [redacted-ip]:8080");
-        assert_eq!(
-            s("v6 fe80::1 and ::1"),
-            "v6 [redacted-ip] and [redacted-ip]"
-        );
+        assert_eq!(s("v6 fe80::1 and ::1"), "v6 [redacted-ip] and ::1");
         assert_eq!(s("full 2001:db8:0:0:0:0:0:1."), "full [redacted-ip].");
         assert_eq!(
             s("tok ghp_abcdefghijklmnopqrstuv end"),
             "tok [redacted-token] end"
         );
+    }
+
+    #[test]
+    fn loopback_literals_pass_scrub_and_locate() {
+        for text in [
+            "Start a test router on 127.0.0.1:0",
+            "127.0.0.0 127.255.255.255",
+            "127.1.2.3:65535",
+            "[127.0.0.1]:0",
+            "http://127.0.0.1:0/test",
+            "::1",
+            "0:0:0:0:0:0:0:1",
+            "0000:0000:0000:0000:0000:0000:0000:0001",
+            "[::1]:0 [0:0:0:0:0:0:0:1]:8080",
+            "http://[::1]:0/test",
+            "(127.0.0.1), `::1`. [::1]",
+        ] {
+            assert_eq!(s(text), text, "{text}");
+            assert!(locate(text, &id()).is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn loopback_exception_requires_complete_valid_literals() {
+        for (text, expected) in [
+            ("126.255.255.255", "[redacted-ip]"),
+            ("128.0.0.0", "[redacted-ip]"),
+            ("127.00.0.1", "[redacted-ip]"),
+            ("127.0.0.01", "[redacted-ip]"),
+            ("::1:8080", "[redacted-ip]"),
+            ("::1.2.3.4", "[redacted-ip].2.3.4"),
+            ("::ffff:127.0.0.1", "[redacted-ip].0.0.1"),
+            ("::1%zone", "[redacted-ip]%zone"),
+            ("::1_suffix", "[redacted-ip]_suffix"),
+            ("::1.abc", "[redacted-ip].abc"),
+            ("[::1", "[[redacted-ip]"),
+            ("[::1]:65536", "[[redacted-ip]]:65536"),
+            ("[::1]:0.10.0.0.1", "[[redacted-ip]]:0.10.0.0.1"),
+            ("127.0.0.1:65536", "[redacted-ip]:65536"),
+            ("127.0.0.1:0:10.0.0.1", "[redacted-ip]:0:10.0.0.1"),
+        ] {
+            assert_eq!(s(text), expected, "{text}");
+            assert_eq!(locate(text, &id()), vec![(1, "ip")], "{text}");
+        }
+    }
+
+    #[test]
+    fn loopback_exception_keeps_adjacent_sensitive_matches() {
+        for separator in [" ", ",", ";", "-", "\n"] {
+            for (local, remote) in [("127.0.0.1:0", "10.0.0.1"), ("[::1]:0", "fe80::1")] {
+                let text = format!("{local}{separator}{remote}{separator}{local}");
+                assert_eq!(
+                    s(&text),
+                    format!("{local}{separator}[redacted-ip]{separator}{local}")
+                );
+                let line = 1 + separator.matches('\n').count();
+                assert_eq!(locate(&text, &id()), vec![(line, "ip")], "{text}");
+            }
+        }
+        let text = "127.0.0.1:0 [::1]:0 alice token=secret";
+        assert_eq!(
+            s(text),
+            "127.0.0.1:0 [::1]:0 [redacted-user] [redacted-token]"
+        );
+        assert_eq!(locate(text, &id()), vec![(1, "user"), (1, "token")]);
+        let identity = Identity {
+            user: "127".into(),
+            ..Identity::default()
+        };
+        assert_eq!(scrub("127.0.0.1:0", &identity), "[redacted-user].0.0.1:0");
+        assert_eq!(locate("127.0.0.1:0", &identity), vec![(1, "user")]);
     }
 
     #[test]
@@ -969,8 +1087,8 @@ mod tests {
             ),
             (
                 "§fe80::1\nsection ::1\nclause 2001:db8:0:0:0:0:0:1",
-                "§[redacted-ip]\nsection [redacted-ip]\nclause [redacted-ip]",
-                vec![(1, "ip"), (2, "ip"), (3, "ip")],
+                "§[redacted-ip]\nsection ::1\nclause [redacted-ip]",
+                vec![(1, "ip"), (3, "ip")],
             ),
         ] {
             assert_eq!(s(text), expected, "{text}");
