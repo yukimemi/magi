@@ -25,7 +25,7 @@ use anyhow::{Result, bail};
 use jiff::Timestamp;
 
 use crate::config::Config;
-use crate::prompt::{CHAT_TASK_NOTICE_HEADING, ChatTaskNotice, chat_task_notice};
+use crate::prompt::{ChatTaskNotice, chat_task_notice};
 use crate::queue::{ChatNotice, ChatNoticeOutcome, Queue, Task, TaskStatus};
 use crate::talk::{self, Talks};
 
@@ -195,7 +195,6 @@ pub fn talks_to_start(talks: &Talks) -> Vec<String> {
 /// Is the draft made of completion notices alone? A notice appended to an
 /// operator's unsent draft must not start that draft on the daemon's initiative.
 fn pending_is_only_notices(t: &talk::Talk) -> bool {
-    let head = format!("# {CHAT_TASK_NOTICE_HEADING}\n");
     let body = &t.pending;
     if body.is_empty() || !t.pending_attachments.is_empty() {
         return false;
@@ -205,9 +204,12 @@ fn pending_is_only_notices(t: &talk::Talk) -> bool {
     };
     let mut starts = vec![0];
     starts.extend_from_slice(cuts);
-    starts
-        .iter()
-        .all(|&s| body.is_char_boundary(s) && body.get(s..).is_some_and(|m| m.starts_with(&head)))
+    starts.iter().all(|&s| {
+        body.is_char_boundary(s)
+            && body
+                .get(s..)
+                .is_some_and(crate::prompt::is_completion_notice)
+    })
 }
 
 /// Start the chat's turn for every talk owed a notice, under the talk's own

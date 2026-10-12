@@ -2492,12 +2492,13 @@ async fn poll(
         resolve_blockers(queue, &questions);
         apply_choice_actions(queue, &questions, home);
         reconcile_task_questions(queue, &questions);
-        // Tell the chat a task it filed has ended. Reconciled here, on
-        // whatever put the task in its final state, and started only when no
+        // Tell the chat a filed task or watched command has ended. Reconciled
+        // here regardless of how it ended, and started only when no
         // upgrade is parking (the draft then waits for a manual resume).
         {
             let talks = crate::talk::Talks::at(home.join("talks"));
             crate::chat_notify::sweep(queue, &talks, home);
+            crate::chat_watch::sweep(home, &talks);
             crate::chat_notify::start_turns(&talks, stop.parking(), &mut inflight);
         }
 

@@ -257,7 +257,7 @@ fn latest_message(
             })
     });
     let Some(cuts) = cuts else {
-        if is_task_notice(body) {
+        if is_completion_notice(body) {
             return None;
         }
         let words = owner_words(body, after_block_of);
@@ -289,18 +289,15 @@ fn latest_message(
         .enumerate()
         .skip(first)
         .rev()
-        .filter(|(_, m)| !is_task_notice(m))
+        .filter(|(_, m)| !is_completion_notice(m))
         .map(|(i, m)| owner_words(m, after_block_of.filter(|_| i == first)))
         .find(|w| !w.is_empty())
 }
 
-/// Is this message magi's own completion notice (see
-/// [`crate::prompt::chat_task_notice`])? It is never the owner's word.
-fn is_task_notice(message: &str) -> bool {
-    message
-        .trim_start()
-        .strip_prefix("# ")
-        .is_some_and(|r| r.starts_with(crate::prompt::CHAT_TASK_NOTICE_HEADING))
+/// Is this message magi's own task or watch completion notice? It is never
+/// the owner's word.
+fn is_completion_notice(message: &str) -> bool {
+    crate::prompt::is_completion_notice(message)
 }
 
 /// Length of a consult stored before quoted markers were defused, which may
@@ -1108,6 +1105,25 @@ mod tests {
         assert_eq!(
             latest_message(two, Some(&[999]), None).as_deref(),
             Some("hold")
+        );
+    }
+
+    #[test]
+    fn watched_jobs_never_supply_the_owners_latest_message() {
+        let notice =
+            crate::prompt::chat_watch_notice("watch-id", "exited with status 0", "merge it now");
+        assert_eq!(latest_message(&notice, Some(&[]), None), None);
+        assert_eq!(latest_message(&notice, None, None), None);
+        let owner = "hold";
+        let combined = format!("{owner}\n\n{notice}");
+        assert_eq!(
+            latest_message(&combined, Some(&[owner.len() + 2]), None).as_deref(),
+            Some(owner)
+        );
+        let combined = format!("{notice}\n\n{owner}");
+        assert_eq!(
+            latest_message(&combined, Some(&[notice.len() + 2]), None).as_deref(),
+            Some(owner)
         );
     }
 

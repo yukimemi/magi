@@ -30,6 +30,7 @@ pub mod blockers;
 pub mod bump;
 pub mod cache;
 pub mod chat_notify;
+pub mod chat_watch;
 pub mod clean;
 pub mod conduct;
 pub mod config;
