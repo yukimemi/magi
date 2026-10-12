@@ -560,6 +560,29 @@ pub fn run(state: &RunState) -> String {
         }
     }
 
+    if let Some(r) = &state.recovery {
+        let _ = writeln!(s, "\n{}", bold("recovery"));
+        let _ = writeln!(s, "  {}", r.summary());
+        if r.criteria_inherited {
+            let _ = writeln!(s, "  the task's own completion criteria were kept");
+        }
+        match &r.repair {
+            crate::recovery::Repair::NotStarted => {}
+            crate::recovery::Repair::Started { .. } => {
+                let _ = writeln!(s, "  repair: {}", yellow("unfinished"));
+            }
+            crate::recovery::Repair::Done {
+                committed, failed, ..
+            } => {
+                let _ = match failed {
+                    Some(why) => writeln!(s, "  repair: {} {why}", yellow("nothing kept:")),
+                    None if *committed => writeln!(s, "  repair: {}", green("committed")),
+                    None => writeln!(s, "  repair: no commit"),
+                };
+            }
+        }
+    }
+
     if let Some(g) = &state.graft {
         let _ = writeln!(s, "\n{}", bold("graft"));
         let size = match (g.lines, g.limit) {

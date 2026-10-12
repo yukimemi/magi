@@ -715,6 +715,7 @@ impl Runner {
             earlier: Vec::new(),
             home: crate::run::home(),
             choice: None,
+            task_instruction: None,
         });
         let released = crate::handover::release(&repo, branch, &state.id, &takeover).await?;
         if let Some(released) = &released {
@@ -754,14 +755,57 @@ impl Runner {
                 break;
             }
         }
-        let opened =
-            Self::open_review(&repo, branch, state, roles, max_parallel, base_commit).await;
+        let opened = Self::open_review(
+            &repo,
+            branch,
+            state,
+            roles,
+            max_parallel,
+            base_commit,
+            &takeover,
+        )
+        .await;
         if opened.is_err()
             && let Some(released) = &released
         {
             released.restore(&repo, branch).await;
         }
         opened
+    }
+
+    /// What the newest earlier attempt that reviewed `branch` leaves for this
+    /// run (see [`crate::recovery`]). `None` for a hand-run review, which has
+    /// no earlier attempts. Reads the earlier record only: ownership of its
+    /// worktree and branch is [`crate::handover`]'s business.
+    async fn inherit(
+        repo: &Path,
+        branch: &str,
+        base_commit: &str,
+        takeover: &crate::handover::Takeover,
+    ) -> Option<crate::recovery::RecoveryRecord> {
+        use crate::recovery::{Relation, assess};
+        let newest = takeover.earlier.last()?;
+        let mut chosen = None;
+        for id in takeover.earlier.iter().rev() {
+            if let Ok(old) = RunState::load_under(id, &takeover.home)
+                && !old.reviews.is_empty()
+                && (old.winner().is_some_and(|w| w.branch == branch)
+                    || old.pr_head.as_deref() == Some(branch))
+            {
+                chosen = Some(old);
+                break;
+            }
+        }
+        let tip = git::rev_parse(repo, &format!("refs/heads/{branch}"))
+            .await
+            .unwrap_or_default();
+        let relation = match chosen.as_ref().and_then(|o| o.reviews.last()) {
+            Some(last) if last.head == tip => Relation::Same,
+            Some(last) if git::is_ancestor(repo, &last.head, &tip).await => Relation::Descendant,
+            _ => Relation::Diverged,
+        };
+        let from = chosen.as_ref().map_or(newest.as_str(), |o| o.id.as_str());
+        Some(assess(from, chosen.as_ref(), base_commit, relation))
     }
 
     /// The half of [`Runner::review_taking_over`] that can fail after an
@@ -773,6 +817,7 @@ impl Runner {
         roles: ResolvedRoles,
         max_parallel: usize,
         base_commit: String,
+        takeover: &crate::handover::Takeover,
     ) -> Result<Self> {
         sync_review_branch(repo, branch, &state.config.merge.remote, &base_commit).await?;
         // The commit subjects are the closest thing to a task statement that
@@ -788,16 +833,35 @@ impl Runner {
         let log = git::log_oneline(repo, &start, branch)
             .await
             .unwrap_or_default();
-        let instruction = format!(
+        let log_text = if log.trim().is_empty() {
+            "(no commit messages)"
+        } else {
+            log.trim()
+        };
+        let mut instruction = format!(
             "Review the work already on branch `{branch}`. There is no task \
              statement: what the change claims to do is whatever its commits \
-             say.\n\n{}",
-            if log.trim().is_empty() {
-                "(no commit messages)"
-            } else {
-                log.trim()
-            }
+             say.\n\n{log_text}"
         );
+        // A retry of a task whose earlier attempt left reviews behind carries
+        // that attempt's evidence, and the task's own statement with it: the
+        // completion criteria are the task's, not whatever the commits claim.
+        if let Some(mut rec) = Self::inherit(repo, branch, &base_commit, takeover).await {
+            if let Some(task) = takeover
+                .task_instruction
+                .as_deref()
+                .filter(|t| !t.trim().is_empty())
+                && rec.reviewed_head.is_some()
+            {
+                instruction = format!(
+                    "{}\n\n# Work already on branch `{branch}` (commit subjects)\n\n{log_text}",
+                    task.trim()
+                );
+                rec.criteria_inherited = true;
+            }
+            state.event("recovery", rec.summary());
+            state.recovery = Some(rec);
+        }
         state.instruction = instruction;
         state.reviewed_commits = Some(
             git::subjects(repo, &start, branch)
@@ -5032,6 +5096,173 @@ impl Runner {
         last.expect("the fixer chain always has an entry")
     }
 
+    /// The one repair a verification-only failure earns (see
+    /// [`crate::recovery`]), before the first review round of a run that took
+    /// a branch over.
+    ///
+    /// Saved as started *before* the fixer is called, so a resume never
+    /// repairs twice; a start found on re-entry is rolled back to the commit
+    /// it began from. A failed or unusable fixer leaves the tree as it was and
+    /// the review goes on over it, so the first round's own verification
+    /// reports the failure again. The failure is never carried into a round as
+    /// a result: verification is re-run on whatever commit this leaves.
+    async fn recovery_repair(&mut self, winner: &Candidate) -> Result<()> {
+        use crate::recovery::{Mode, Repair};
+        if !self.state.reviews.is_empty() {
+            return Ok(());
+        }
+        let Some(mut rec) = self.state.recovery.clone() else {
+            return Ok(());
+        };
+        if rec.mode != Mode::VerifyRepair {
+            return Ok(());
+        }
+        let wt = winner.worktree.clone();
+        let head = git::rev_parse(&wt, "HEAD").await?;
+        match rec.repair.clone() {
+            Repair::Done { .. } => return Ok(()),
+            Repair::Started { before } => {
+                // Interrupted: the unfinished edits are not trusted.
+                let restored = git::restore_to(&wt, &before).await;
+                rec.repair = Repair::Done {
+                    before: before.clone(),
+                    after: before,
+                    committed: false,
+                    failed: Some(match restored {
+                        Ok(()) => "interrupted; rolled back".to_owned(),
+                        Err(e) => format!("interrupted; rollback failed: {e:#}"),
+                    }),
+                };
+                self.state
+                    .event("recovery", "the repair was interrupted and rolled back");
+                self.state.recovery = Some(rec);
+                self.state.save()?;
+                return Ok(());
+            }
+            Repair::NotStarted => {}
+        }
+        if crate::recovery::recheck(&mut rec, &head) {
+            self.state.event("recovery", rec.summary());
+            self.state.recovery = Some(rec);
+            self.state.save()?;
+            return Ok(());
+        }
+        rec.repair = Repair::Started {
+            before: head.clone(),
+        };
+        self.state.recovery = Some(rec.clone());
+        self.state.save()?;
+
+        let language = self.state.config.graph.language.clone();
+        let sessions = self.state.config.graph.sessions;
+        let artifacts = agent::artifacts_dir(&self.state.dir());
+        let fix_prompt = prompt::recovery_fix(
+            &self.state.instruction,
+            &rec,
+            self.state.config.graph.review_rounds,
+            &language,
+        );
+        let timeout = Duration::from_secs(self.state.config.graph.timeout_fix);
+        self.state.event(
+            "recovery",
+            format!(
+                "repair: the fixer starts from the failed verification on {}",
+                short(&head)
+            ),
+        );
+        let (_job, seat, out) = self
+            .ask_fixer(winner, "fix", None, |spec, seat| SeatJob {
+                prompt: fix_prompt.clone(),
+                spec,
+                seat,
+                cwd: wt.clone(),
+                timeout,
+                allow_write: true,
+                sessions,
+                artifacts: artifacts.clone(),
+                stem: "fix-recovery".to_owned(),
+                handover: None,
+            })
+            .await;
+        let failed = match &out {
+            AgentOutcome::Ok(_) => None,
+            AgentOutcome::Quota(o) => {
+                self.state.quota.push(QuotaLoss {
+                    seat: seat.key.clone(),
+                    node: "fix".to_owned(),
+                    at: Timestamp::now(),
+                    reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
+                });
+                Some("rate limited (quota); the fixer could not run".to_owned())
+            }
+            AgentOutcome::Dropped(_) => Some("the CLI dropped the stream".to_owned()),
+            AgentOutcome::Failed(e) => Some(e.clone()),
+        };
+        self.state.seats.insert(seat.key.clone(), seat);
+        let failed = match failed {
+            // The agent's partial edits are not kept.
+            Some(why) => {
+                if let Err(e) = git::restore_to(&wt, &head).await {
+                    return self
+                        .stop_recovery(rec, &head, format!("{why}; restore failed: {e:#}"))
+                        .await;
+                }
+                Some(why)
+            }
+            None => {
+                if let Ok(r) = git::rescue_commit(
+                    &wt,
+                    "magi: recovery repair of the failed verification (uncommitted work)",
+                )
+                .await
+                {
+                    self.state.note_withheld("fix", &r.withheld);
+                }
+                None
+            }
+        };
+        let after = git::rev_parse(&wt, "HEAD").await?;
+        self.state.event(
+            "recovery",
+            match &failed {
+                Some(why) => format!("repair: nothing kept ({why})"),
+                None if after != head => {
+                    format!("repair: committed {}", short(&after))
+                }
+                None => "repair: the fixer made no commit".to_owned(),
+            },
+        );
+        rec.repair = Repair::Done {
+            before: head.clone(),
+            committed: after != head,
+            after,
+            failed,
+        };
+        self.state.recovery = Some(rec);
+        self.state.save()?;
+        Ok(())
+    }
+
+    /// A repair whose rollback could not be confirmed: the run is blocked and
+    /// resumable, and the unconfirmed state is never reviewed.
+    async fn stop_recovery(
+        &mut self,
+        mut rec: crate::recovery::RecoveryRecord,
+        head: &str,
+        why: String,
+    ) -> Result<()> {
+        // `Started` stays recorded: a resume retries the restore.
+        rec.repair = crate::recovery::Repair::Started {
+            before: head.to_owned(),
+        };
+        self.state.recovery = Some(rec);
+        self.state
+            .event("recovery", format!("repair could not be undone: {why}"));
+        self.state.status = RunStatus::Blocked;
+        self.state.save()?;
+        bail!("recovery repair could not be rolled back: {why}")
+    }
+
     async fn review_loop(&mut self) -> Result<()> {
         // A base that would not rebase is a person's decision, not a review
         // round: nothing here would change the answer, and reviewers and a
@@ -5100,6 +5331,8 @@ impl Runner {
                 .await;
         }
 
+        self.recovery_repair(&winner).await?;
+
         let repo = self.state.repo.clone();
         let root = self.state.worktree_root();
         let language = self.state.config.graph.language.clone();
@@ -5127,6 +5360,25 @@ impl Runner {
                 .reviews
                 .last()
                 .and_then(|r| r.verification_summary(&head));
+            // Only the first round of a run that took a branch over: later
+            // rounds have this run's own history.
+            let prior_section = match (&self.state.recovery, round) {
+                (Some(rec), 1) if self.state.reviews.is_empty() => {
+                    let since = match (rec.mode, rec.reviewed_head.as_deref()) {
+                        (crate::recovery::Mode::VerifyRepair, Some(reviewed)) => {
+                            Some(crate::recovery::head_of(
+                                &git::diff(&winner.worktree, reviewed, "HEAD")
+                                    .await
+                                    .unwrap_or_default(),
+                                crate::recovery::SINCE_DIFF_MAX,
+                            ))
+                        }
+                        _ => None,
+                    };
+                    Some(prompt::recovery_review(rec, since.as_deref()))
+                }
+                _ => None,
+            };
 
             // Each reviewer gets its own detached checkout of exactly this
             // commit: nobody can perturb the winner's tree, and the fixer can
@@ -5159,6 +5411,7 @@ impl Runner {
                         stat: &stat,
                         patch: &patch,
                         verification: prev_verification.as_ref(),
+                        prior: prior_section.as_deref(),
                         reviewers: reviewers.len(),
                         round,
                         rounds: max_rounds,

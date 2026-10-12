@@ -43,6 +43,10 @@ pub struct Takeover {
     /// applied once the earlier worktree is released (git refuses to move a
     /// branch that is checked out).
     pub choice: Option<crate::reconcile::Choice>,
+    /// The task's own statement. Used instead of the commit-log stand-in when
+    /// the earlier attempt's evidence is inherited, so the completion
+    /// criteria survive the retry.
+    pub task_instruction: Option<String>,
 }
 
 /// The operator has to decide: the takeover was refused, and the text says why.

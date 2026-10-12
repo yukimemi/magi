@@ -59,6 +59,7 @@ pub mod proc;
 pub mod prompt;
 pub mod queue;
 pub mod rebase;
+pub mod recovery;
 pub mod reconcile;
 pub mod refs;
 pub mod release_local;

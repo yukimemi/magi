@@ -2073,6 +2073,11 @@ pub struct RunState {
     /// reason worth keeping. `None` for a run that never reached it.
     #[serde(default)]
     pub graft: Option<GraftRecord>,
+    /// What this run inherited from the attempt it took over, and why (see
+    /// [`crate::recovery`]). `None` for a run that took nothing over.
+    /// Additive and `#[serde(default)]`, so `SCHEMA` stays put.
+    #[serde(default)]
+    pub recovery: Option<crate::recovery::RecoveryRecord>,
     /// Set at the review loop's hand-off when the last round ended with a
     /// blocking finding still open *and* a reviewer's final vote was reject
     /// (see [`ReviewRound::contested_handoff`]). `land` reads it to ask the
@@ -2378,6 +2383,7 @@ impl RunState {
             gate_fixes: Vec::new(),
             rebase_fixes: Vec::new(),
             graft: None,
+            recovery: None,
             contested_handoff: None,
             land_armed_head: None,
             land_reruns: None,
