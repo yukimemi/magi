@@ -6127,6 +6127,7 @@ mod tests {
         state.parked = true;
         state.config.graph.answer_timeout = 60;
         state.github_text = Some(crate::run::GithubTextAsk {
+            rewrite: None,
             fingerprint: "f".into(),
             title: true,
             body: false,

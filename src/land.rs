@@ -2153,7 +2153,8 @@ pub async fn set_pr_title(state: &mut RunState, repo: &Path, url: &str, title: &
 }
 
 /// [`set_pr_title`] for a title the owner explicitly chose to post unmodified
-/// (`github_text::POST_ORIGINAL`): the posting gate is skipped on purpose.
+/// (`github_text::POST_ORIGINAL` or `github_text::USE_REWRITE`): the posting
+/// gate is skipped on purpose.
 pub async fn set_pr_title_verbatim(repo: &Path, url: &str, title: &str) -> Result<()> {
     edit_pr_title(repo, url, title).await
 }

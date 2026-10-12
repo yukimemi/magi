@@ -1284,7 +1284,7 @@ pub struct LandApproval {
 /// (`fingerprint`); see `github_text` for the flow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GithubTextAsk {
-    /// Hash of the rejected title and body; the text itself is never stored.
+    /// Hash of the rejected original title and body.
     pub fingerprint: String,
     /// The title is withheld.
     pub title: bool,
@@ -1310,6 +1310,20 @@ pub struct GithubTextAsk {
     /// written before this field existed (read as the neutral text).
     #[serde(default)]
     pub choice: Option<GithubTextChoice>,
+    /// Final rejected rewrite, kept locally for display and an explicit override.
+    #[serde(default)]
+    pub rewrite: Option<GithubTextRewrite>,
+}
+
+/// A usable rewrite that still failed the posting gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubTextRewrite {
+    /// Final title after redaction.
+    pub title: String,
+    /// Final description after redaction and run marker insertion.
+    pub body: String,
+    /// Stable rule categories, never sensitive values.
+    pub failed: Vec<String>,
 }
 
 /// How a withheld pull request text was settled.
@@ -1323,6 +1337,8 @@ pub enum GithubTextChoice {
     MyTitle,
     /// The original text of every withheld field, past the posting gate.
     Original,
+    /// The saved rewrite title and body, unmodified, past the posting gate.
+    Rewrite,
 }
 
 /// A review hand-off the panel did not agree to: findings that hold the merge
