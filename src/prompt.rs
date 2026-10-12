@@ -1747,6 +1747,22 @@ pub const CHANGE_SUMMARY_HEADING: &str = "# Describe a change for its pull reque
 /// The commit list and diff stat are orientation only; the agent must read the
 /// diff itself and the code around it.
 pub fn change_summary(base: &str, head: &str, subjects: &[String], stat: &str) -> String {
+    change_summary_in(base, head, subjects, stat, "en")
+}
+
+/// [`change_summary`] with `[graph] github_language`.
+pub fn change_summary_in(
+    base: &str,
+    head: &str,
+    subjects: &[String],
+    stat: &str,
+    github_language: &str,
+) -> String {
+    let language = if is_english(github_language) {
+        "English"
+    } else {
+        language_name(github_language)
+    };
     let mut commits = String::new();
     for s in subjects {
         let _ = writeln!(commits, "- {}", s.trim());
@@ -1763,7 +1779,7 @@ pub fn change_summary(base: &str, head: &str, subjects: &[String], stat: &str) -
          stat below are orientation, not a substitute for reading the diff.\n\n\
          Commits ({base}..{head}):\n{commits}\n\
          Diff stat:\n```\n{stat}\n```\n\n\
-         Write in English. Explain the concrete problem the change addresses, the behavior \
+         Write the TITLE line and the Markdown description in {language}. Explain the concrete problem the change addresses, the behavior \
          that results, and the material implementation details the diff supports, by area. \
          Describe the whole change, not only fixes made late in its history. State only what \
          the diff and the code show; if something is unclear, say it is unclear rather than \
@@ -3863,6 +3879,23 @@ mod tests {
         assert!(WORK_IN_PLACE_RULE.contains("jj workspace"));
         assert!(WORK_IN_PLACE_RULE.contains("git worktree"));
     }
+    #[test]
+    fn change_summary_uses_the_github_language_for_title_and_description() {
+        let english = change_summary("base", "head", &[], "stat");
+        assert!(english.contains("Write the TITLE line and the Markdown description in English."));
+        for language in ["en", ""] {
+            assert_eq!(
+                change_summary_in("base", "head", &[], "stat", language),
+                english
+            );
+        }
+        let japanese = change_summary_in("base", "head", &[], "stat", "ja");
+        assert!(
+            japanese.contains("Write the TITLE line and the Markdown description in Japanese.")
+        );
+        assert!(!japanese.contains("in English"));
+    }
+
     #[test]
     fn github_language_defaults_to_the_fixed_english_rule() {
         assert_eq!(github_rule("ja", "en"), github_english("ja"));

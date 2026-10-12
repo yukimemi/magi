@@ -7057,7 +7057,13 @@ impl Runner {
             .await
             .unwrap_or_default();
         let stat: String = stat.chars().take(6_000).collect();
-        let prompt = crate::prompt::change_summary(&base, head, &subjects, stat.trim());
+        let prompt = crate::prompt::change_summary_in(
+            &base,
+            head,
+            &subjects,
+            stat.trim(),
+            &self.state.config.graph.github_language,
+        );
         let sessions = self.state.config.graph.sessions;
         let timeout = Duration::from_secs(self.state.config.graph.timeout_implement);
         let prompts = self.state.config.prompts.clone();
@@ -13266,6 +13272,34 @@ mod tests {
             (head.as_str(), base.as_str())
         );
         assert!(!f.runner.state.seats["change-summary"].key.is_empty());
+    }
+
+    #[tokio::test]
+    async fn review_only_summary_receives_the_configured_github_language() {
+        let mut f = summary_fixture();
+        f.runner.state.config.graph.github_language = "ja".into();
+        let captured = f.repo.join("summary-prompt.txt");
+        let author = &mut f.runner.state.config.agents[0];
+        author.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "cat > \"$PROMPT_FILE\"; cat \"$REPLY_FILE\"".into(),
+        ];
+        author.env.insert(
+            "PROMPT_FILE".into(),
+            captured.to_string_lossy().into_owned(),
+        );
+        std::fs::write(
+            &f.reply,
+            "TITLE: feat(own): ファイルを追加\nown.txt を追加します。",
+        )
+        .unwrap();
+        let m = posted(&mut f).await;
+        let prompt = std::fs::read_to_string(captured).unwrap();
+        assert!(prompt.contains("Write the TITLE line and the Markdown description in Japanese."));
+        assert!(!prompt.contains("in English"));
+        assert_eq!(m.title, "feat(own): ファイルを追加");
+        assert!(m.body.contains("own.txt を追加します。"));
     }
 
     #[tokio::test]
