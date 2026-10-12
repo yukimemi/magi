@@ -1583,7 +1583,7 @@ function isLiveAttempt(run) {
 function displayedRunStatus(run) {
   /* The server's verdict that a later attempt replaced a run nobody drives
      any more: it wins over everything, `waiting` included. */
-  if (run.badge_status === "superseded") return "superseded";
+  if (run.badge_status === "superseded" || run.badge_status === "stale") return run.badge_status;
   if (run.waiting) return "waiting";
   if (run.unmerged_by_design) return "unmerged";
   if (run.display_status) return run.display_status;
@@ -6989,7 +6989,7 @@ function renderRunDetail() {
      is the state the operator has to act on. */
   const summary = (state.runs || []).find((r) => r.id === run.id);
   const parkedNow = Boolean(summary && isWaiting(summary)) || openFor(run.id).length > 0;
-  const status = parkedNow && run.badge_status !== "superseded" ? "waiting" : displayedRunStatus(run);
+  const status = parkedNow && run.badge_status !== "superseded" && run.badge_status !== "stale" ?"waiting" : displayedRunStatus(run);
   const meta = RUN_STATUS[status] || {};
 
   const head = $("run-status");

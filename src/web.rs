@@ -2899,7 +2899,11 @@ fn run_badge_status(
     if superseded {
         return "superseded".to_owned();
     }
-    // Dead runs already read `stale` (or `parked`) in `display_status`.
+    // `magi show` calls every dead non-terminal run STALE, an open question or
+    // a recorded park included, so the badge does too.
+    if live == crate::run::Liveness::Dead {
+        return "stale".to_owned();
+    }
     display_status.to_owned()
 }
 
@@ -14955,6 +14959,7 @@ mod tests {
             (RunStatus::Gating, false, Dead, true, "superseded"),
             (RunStatus::Gating, false, Unknown, true, "superseded"),
             (RunStatus::Gating, true, Dead, true, "superseded"),
+            (RunStatus::Gating, true, Dead, false, "stale"),
             (RunStatus::Gating, false, Unknown, false, "gating"),
             (RunStatus::Gating, false, Live, true, "gating"),
             (RunStatus::Gating, true, Live, true, "waiting"),
