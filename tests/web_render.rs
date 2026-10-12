@@ -719,6 +719,119 @@ async fn followup_task_links_back_to_its_parent() {
     }
 }
 
+/// `Task::urgent` shows as an URGENT tag on the Queue card and the task page,
+/// whatever the priority or status; a non-urgent task never carries one.
+#[tokio::test]
+async fn urgent_tasks_carry_a_visible_badge() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI is set but no Chrome/Chromium was found (set MAGI_CHROME)"
+        );
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+
+    let mut seeded = Vec::new();
+    for (title, status, urgent, priority) in [
+        ("Urgent queued task", TaskStatus::Queued, true, 0),
+        ("Urgent held task", TaskStatus::Held, true, 0),
+        ("Plain boosted task", TaskStatus::Queued, false, 1),
+    ] {
+        let mut t = Task::new(
+            title.to_owned(),
+            format!("Instruction for: {title}"),
+            fx.repo.clone(),
+            Source::Human,
+        );
+        t.status = status;
+        t.urgent = urgent;
+        t.priority = priority;
+        if status == TaskStatus::Held {
+            t.hold_reason = Some("held by hand".to_owned());
+        }
+        queue.put(&mut t).expect("seed task");
+        seeded.push((t.id.clone(), title, urgent));
+    }
+
+    let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
+    let mut browser = cdp::Browser::launch(&chrome)
+        .await
+        .unwrap_or_else(|e| panic!("could not start Chrome at {}: {e}", chrome.display()));
+    for &(w, h, mobile) in &VIEWPORTS {
+        let page = browser
+            .open_page(&format!("{base}#/queue"), w, h, mobile)
+            .await
+            .expect("open queue");
+        browser
+            .wait_for(
+                &page,
+                "document.querySelectorAll('.task-card').length >= 3",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("queue @{w}px: {e}"));
+        for (_, title, urgent) in &seeded {
+            let out = browser
+                .eval(
+                    &page,
+                    &format!(
+                        "(() => {{ const c = [...document.querySelectorAll('.task-card')].find((e) => \
+                           e.querySelector('.card-title')?.textContent === {title:?}); \
+                           if (!c) return null; \
+                           const vis = (e) => !!e && e.getClientRects().length > 0; \
+                           const u = c.querySelector('.tag-urgent'); \
+                           return {{ urgent: vis(u), text: u ? getComputedStyle(u).textTransform + ':' + u.textContent : '', \
+                             chip: vis(c.querySelector('.chip')) }}; }})()"
+                    ),
+                )
+                .await
+                .expect("read card");
+            let tag = format!("@{w}px {title}: {out}");
+            assert!(!out.is_null(), "{tag}");
+            assert_eq!(out["urgent"], *urgent, "{tag}");
+            if *urgent {
+                assert_eq!(out["text"], "uppercase:urgent", "{tag}");
+            }
+            assert_eq!(out["chip"], true, "{tag}");
+        }
+        browser.close_page(&page).await;
+
+        for (id, title, urgent) in &seeded {
+            let page = browser
+                .open_page(&format!("{base}#/tasks/{id}"), w, h, mobile)
+                .await
+                .expect("open task");
+            browser
+                .wait_for(
+                    &page,
+                    "!!document.querySelector('#task-status .chip')",
+                    Duration::from_secs(30),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("task @{w}px: {e}"));
+            let out = browser
+                .eval(
+                    &page,
+                    "(() => { const u = document.querySelectorAll('#task-status .tag-urgent'); \
+                       return { count: u.length, visible: u.length > 0 && u[0].getClientRects().length > 0 }; })()",
+                )
+                .await
+                .expect("read task");
+            let tag = format!("task @{w}px {title}: {out}");
+            assert_eq!(out["count"], u64::from(*urgent), "{tag}");
+            assert_eq!(out["visible"], *urgent, "{tag}");
+            browser.close_page(&page).await;
+        }
+    }
+}
+
 #[tokio::test]
 async fn blocked_run_header_shows_the_failed_gate_reason() {
     let Some(chrome) = cdp::find_chrome() else {

@@ -18546,6 +18546,22 @@ mod tests {
         assert_eq!(v["source_link"]["href"], "#/runs/20260901-000000-aaaa");
     }
 
+    #[test]
+    fn task_view_serializes_urgent_flag() {
+        let mut t = Task::new(
+            "t".to_owned(),
+            "t".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        let v = serde_json::to_value(TaskView::from(t.clone())).expect("json");
+        assert_eq!(v["urgent"], false, "{v}");
+        t.urgent = true;
+        let v = serde_json::to_value(TaskView::from(t)).expect("json");
+        assert_eq!(v["urgent"], true, "{v}");
+        assert!(APP_JS.contains("task.urgent === true"));
+    }
+
     #[tokio::test]
     async fn a_blocked_run_reports_the_task_finishing_elsewhere() {
         let fx = Fixture::start().await;

@@ -1466,6 +1466,10 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 }
 .tag[data-tone="teal"] { background: var(--tint-teal); color: var(--on-teal); }
 .tag[data-tone="rust"] { background: var(--tint-rust); color: var(--on-rust); }
+.tag.tag-urgent {
+  background: var(--on-rust); color: var(--tint-rust); border-color: var(--on-rust);
+  font-weight: 800; flex: none; white-space: nowrap;
+}
 .tag[data-tone="ink"]  { background: var(--tint-ink);  color: var(--on-ink); }
 .tag[data-tone="gold"] { background: var(--tint-gold); color: var(--on-gold); }
 .tag[data-tone="blue"] { background: var(--tint-blue); color: var(--on-blue); }
