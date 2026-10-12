@@ -1368,6 +1368,8 @@ function applyLoop(view) {
 async function loadLoop({ background = false } = {}) {
   try {
     applyLoop(await getJson(API.loop));
+    resetUnreachable();
+    clearUnreachableBanner();
   } catch (error) {
     failFor(background, `Could not read the loop: ${error.message}`, error);
   }
@@ -6066,7 +6068,7 @@ function tickTalkWaits() {
   for (const [id, wait] of state.talkWaits) {
     if (now - wait.lastPoll >= 10000) {
       wait.lastPoll = now;
-      loadTalk(id);
+      loadTalk(id, { background: true });
     }
   }
 

@@ -1729,7 +1729,7 @@ async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
             r#"(async () => {
       const source = await (await fetch('/app.js')).text();
       window.deck = new Function(source.replace('queue: "/api/queue"', 'queue: "/api/queue?test_client=1"').replace(/\nboot\(\);\s*$/, `
-        return { setChip, RUN_STATUS, TASK_STATUS, QUESTION_STATUS, TALK_STATUS, settingsState, renderSettings, loadSettings, saveSettings, linkify, truncateLabel, state, loadHealth, loadLoop, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter, reviewPassed, voteTag, reviewStamp };
+        return { setChip, RUN_STATUS, TASK_STATUS, QUESTION_STATUS, TALK_STATUS, settingsState, renderSettings, loadSettings, saveSettings, linkify, truncateLabel, state, loadHealth, loadLoop, loadTalk, tickTalkWaits, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter, reviewPassed, voteTag, reviewStamp };
       `))();
       await Promise.all([deck.loadQueue(), deck.loadRuns(), deck.loadTalks()]);
     })()"#,
@@ -2047,6 +2047,68 @@ async fn unreachable_banner_waits_out_transient_failures() {
         out.storeQuiet = !shown();
         await deck.loadLoop({ background: true });
         out.loopQuiet = !shown();
+        const detail = deck.state.talkDetail;
+        const waits = deck.state.talkWaits;
+        try {
+          window.fetch = native;
+          await deck.loadLoop({ background: true });
+          deck.state.talkDetail = { id: 'waiting-chat', talk: null };
+          deck.state.talkWaits = new Map(['waiting-chat', 'other-conversation'].map(id =>
+            [id, { lastPoll: clock - 10000, waitFrom: clock, generation: 1 }]));
+          let polls = 0;
+          window.fetch = async () => { polls++; throw new TypeError('Failed to fetch'); };
+          /* tickTalkWaits does not await its requests. Drain the promise chain
+             before inspecting the banner or replacing the fetch stub. */
+          const tick = async () => {
+            deck.tickTalkWaits();
+            await new Promise(resolve => setTimeout(resolve, 0));
+          };
+          await tick();
+          out.talkFirstQuiet = !shown();
+          out.talkPolls = polls;
+          out.talkFailures = deck.unreachable.failures;
+          await deck.loadHealth();
+          clock += 10000;
+          await deck.loadHealth();
+          await tick();
+          out.talkEarlyQuiet = !shown();
+          out.parallelFailures = deck.unreachable.failures;
+          clock += 10000;
+          await tick();
+          out.talkPersisted = shown();
+          out.talkBannerKind = document.getElementById('alert').getAttribute('data-kind');
+          window.fetch = native;
+          await deck.loadLoop({ background: true });
+          out.loopRecovered = !shown();
+          out.loopFailures = deck.unreachable.failures;
+          out.loopSince = deck.unreachable.since;
+          window.fetch = async () => { throw new TypeError('Failed to fetch'); };
+          clock += 10000;
+          await tick();
+          out.talkFreshGrace = !shown() && deck.unreachable.since === clock;
+          await deck.loadTalk('waiting-chat');
+          out.talkExplicit = shown();
+          const actionError = document.getElementById('alert').textContent;
+          window.fetch = native;
+          await deck.loadLoop({ background: true });
+          out.loopPreservesActionError = shown()
+            && document.getElementById('alert').textContent === actionError;
+          await deck.loadHealth();
+          window.fetch = async () => new Response(JSON.stringify({ error: 'server failed' }), { status: 500 });
+          clock += 10000;
+          await tick();
+          out.talkHttpImmediate = shown()
+            && document.getElementById('alert').textContent.includes('server failed');
+          window.fetch = async () => new Response('{}', { status: 404 });
+          clock += 10000;
+          await tick();
+          out.talkGone = deck.state.talkDetail.gone === true
+            && deck.state.talkWaits.size === 0 && !shown();
+        } finally {
+          deck.state.talkDetail = detail;
+          deck.state.talkWaits = waits;
+        }
+        window.fetch = async () => { throw new TypeError('Failed to fetch'); };
         await deck.loadStats();
         out.statsExplicit = shown();
         window.fetch = native;
@@ -2113,6 +2175,21 @@ async fn unreachable_banner_waits_out_transient_failures() {
     assert_eq!(r["offlineHides"], true);
     assert_eq!(r["storeQuiet"], true);
     assert_eq!(r["loopQuiet"], true);
+    assert_eq!(r["talkFirstQuiet"], true);
+    assert_eq!(r["talkPolls"], 2);
+    assert_eq!(r["talkFailures"], 0);
+    assert_eq!(r["talkEarlyQuiet"], true);
+    assert_eq!(r["parallelFailures"], 2);
+    assert_eq!(r["talkPersisted"], true);
+    assert_eq!(r["talkBannerKind"], "unreachable");
+    assert_eq!(r["loopRecovered"], true);
+    assert_eq!(r["loopFailures"], 0);
+    assert!(r["loopSince"].is_null());
+    assert_eq!(r["talkFreshGrace"], true);
+    assert_eq!(r["talkExplicit"], true);
+    assert_eq!(r["loopPreservesActionError"], true);
+    assert_eq!(r["talkHttpImmediate"], true);
+    assert_eq!(r["talkGone"], true);
     assert_eq!(r["statsExplicit"], true);
     assert_eq!(r["successResets"], true);
     assert_eq!(r["cleared"], true);
