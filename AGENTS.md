@@ -2724,12 +2724,15 @@ fallback; a language-withheld field becomes neutral.
   for: title, description`). The detail is readable by the Generic deputy (an
   agent CLI); accepted, because the agent wrote the text in the first place.
 - **Web comparison metadata is display-only.** `Question::posting_comparison`
-  (ask schema 8, optional for older questions) records actual scrub edit ranges,
+  (ask schema 9, optional for older questions) records actual scrub edit ranges,
   composed across both redaction passes. `QuestionView` checks UTF-8 boundaries,
   unchanged intervals and the generated Markdown comparison before exposing
   fragments. The UI uses text nodes and matching numbered markers, keeps the
   artifact excerpt limit, and identifies omitted spans. Language fallbacks link
-  the whole field to one replacement group. Never use these ranges or markers
+  the whole field to one replacement group, while retaining each sensitive
+  trigger as a separately numbered original span. The fallback lists those
+  markers as group members, without implying a separate replacement span.
+  Never use these ranges or markers
   to construct a post or interpret an answer. The renderer regression check is
   `node --test tests/posting_comparison.mjs` (no installed packages needed).
 - **The run parks, the daemon resumes it.** `merge` returns before pushing or

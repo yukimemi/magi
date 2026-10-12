@@ -53,3 +53,36 @@ test('posting pairs render literal text, matching markers, distinct colors and r
   assert.notEqual(pairs[0]['--pair-hue'], pairs[1]['--pair-hue']);
   assert.ok(nodes.some(n => n.className === 'posting-removed' && n.textContent === ' (removed)'));
 });
+
+
+test('whole-field fallback lists individually highlighted original triggers as group members', () => {
+  const root = new Node('div');
+  render(root, {
+    before_md: [], after_md: [],
+    fields: [{ name: 'Description', replacement_group: { id: 1, triggers: [2, 3] },
+      pairs: [[1, 'body-language: whole field replaced'],
+        [2, 'sensitive-data: included in whole-field replacement #1'],
+        [3, 'sensitive-data: included in whole-field replacement #1']],
+      original: [{ text: '日本語の説明です。 First key: ', pair: null },
+        { text: 'secret-one', pair: 2 }, { text: '\nMore context. Second key: ', pair: null },
+        { text: 'secret-two', pair: 3 }],
+      changed: [{ text: 'Neutral fallback.', pair: 1 }],
+    }],
+  });
+  const nodes = descend(root);
+  const pres = nodes.filter(n => n.tag === 'pre');
+  assert.equal(pres.length, 2);
+  assert.ok(pres[0].textContent.includes('#2secret-one'));
+  assert.ok(pres[0].textContent.includes('#3secret-two'));
+  assert.equal(pres[1].textContent, '#1Neutral fallback.');
+  const headings = nodes.filter(n => n.className === 'posting-label');
+  assert.ok(headings[0].textContent.includes('whole-field replacement #1'));
+  assert.ok(headings[1].textContent.includes('includes original triggers #2#3'));
+  for (const id of [2, 3]) {
+    const originalSpan = pres[0].children.find(n => n.children[0]?.textContent === `#${id}`);
+    const groupBadge = headings[1].children.find(n => n.children[0]?.textContent === `#${id}`);
+    const rule = nodes.find(n => n.tag === 'li' && n.children[0]?.textContent === `#${id}`);
+    assert.equal(originalSpan['--pair-hue'], groupBadge['--pair-hue']);
+    assert.equal(originalSpan['--pair-hue'], rule['--pair-hue']);
+  }
+});

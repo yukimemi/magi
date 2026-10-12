@@ -6351,6 +6351,11 @@ fn posting_view(question: &Question, base: &md::ImageBase) -> Option<PostingView
             .iter()
             .flat_map(|f| &f.pairs)
             .any(|p| !ids.insert(p.id))
+        || comparison
+            .fields
+            .iter()
+            .flat_map(|f| &f.original_triggers)
+            .any(|t| !ids.insert(t.id))
     {
         return None;
     }
@@ -15670,6 +15675,57 @@ mod tests {
         );
         q.detail.insert(0, 'x');
         assert!(QuestionView::of(q, &store, false).posting_view.is_none());
+    }
+
+    #[test]
+    fn posting_comparison_whole_field_view_carries_unique_trigger_groups() {
+        let store = ask::Questions::at(PathBuf::from("unused"));
+        let body = "日本語の説明です。\nghp_abcdefghijklmnop\nMore context.\nghp_abcdefghijklmnop";
+        let gt = crate::github_text::Withheld::from_check(
+            &crate::github_text::check("fix: x", body),
+            "fix: x",
+            body,
+        )
+        .unwrap();
+        let (detail, comparison) =
+            crate::github_text::question_content(&gt, "fix: x", body, "r", None, None, None);
+        let mut q = Question::new(
+            "r".into(),
+            "github-text".into(),
+            "posting-gate".into(),
+            "s".into(),
+            detail,
+            Vec::new(),
+        );
+        q.posting_comparison = Some(comparison);
+        let value = serde_json::to_value(QuestionView::of(q.clone(), &store, false)).unwrap();
+        let field = &value["posting_view"]["fields"][0];
+        let group = &field["replacement_group"];
+        let triggers = group["triggers"].as_array().unwrap();
+        assert_eq!(triggers.len(), 2);
+        assert_ne!(triggers[0], triggers[1]);
+        for id in triggers {
+            assert!(
+                field["original"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|f| &f["pair"] == id)
+            );
+            assert!(
+                !field["changed"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|f| &f["pair"] == id)
+            );
+        }
+        q.posting_comparison.as_mut().unwrap().fields[0].original_triggers[0].id =
+            group["id"].as_u64().unwrap() as usize;
+        assert!(
+            QuestionView::of(q, &store, false).posting_view.is_none(),
+            "group and trigger IDs cannot collide"
+        );
     }
 
     #[test]

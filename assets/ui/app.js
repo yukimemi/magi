@@ -4692,7 +4692,21 @@ function renderPostingComparison(parent, view) {
     }
     section.append(rules);
     for (const [label, fragments] of [["ORIGINAL", field.original], ["FALLBACK · use fallback", field.changed]]) {
-      section.append(el("p", { class: "posting-label", text: label }));
+      const heading = el("p", { class: "posting-label", text: label });
+      if (field.replacement_group) {
+        const group = field.replacement_group;
+        const badge = id => {
+          const node = pairNode("span", id);
+          node.append(marker(id));
+          return node;
+        };
+        heading.append(document.createTextNode(" · whole-field replacement "), badge(group.id));
+        if (fragments === field.changed) {
+          heading.append(document.createTextNode(" · includes original triggers "));
+          for (const id of group.triggers) heading.append(badge(id));
+        }
+      }
+      section.append(heading);
       const pre = el("pre", { class: "posting-text" });
       for (const fragment of fragments) {
         if (fragment.pair == null) {

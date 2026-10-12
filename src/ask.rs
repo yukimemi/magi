@@ -57,7 +57,8 @@ use crate::run::RunStatus;
 /// would turn every bump into an upgrade that breaks reading yesterday's
 /// question files.
 /// Schema 8 adds optional local posting comparison data. Older questions use Markdown.
-pub const SCHEMA: u32 = 8;
+/// Schema 9 preserves individual original triggers inside whole-field replacements.
+pub const SCHEMA: u32 = 9;
 
 /// How often the wait re-reads the question file.
 ///
@@ -2098,7 +2099,7 @@ mod tests {
             ],
             "the on-disk field set is a contract with the front end"
         );
-        assert_eq!(open["schema"], 8);
+        assert_eq!(open["schema"], 9);
         assert_eq!(open["thread"], serde_json::json!([]));
         assert_eq!(open["id"], "20260902-231501-ab12");
         assert_eq!(open["run"], "20260902-201256-9fb7");

@@ -411,6 +411,9 @@ pub(crate) struct ComparisonField {
     pub(crate) original: String,
     pub(crate) changed: String,
     pub(crate) pairs: Vec<SpanPair>,
+    /// Individual original locations inside a whole-field replacement.
+    #[serde(default)]
+    pub(crate) original_triggers: Vec<OriginalTrigger>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -421,12 +424,26 @@ pub(crate) struct SpanPair {
     pub(crate) changed: std::ops::Range<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OriginalTrigger {
+    pub(crate) id: usize,
+    pub(crate) explanation: String,
+    pub(crate) original: std::ops::Range<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct ReplacementGroup {
+    pub(crate) id: usize,
+    pub(crate) triggers: Vec<usize>,
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct ComparisonView {
     pub(crate) name: String,
     pub(crate) original: Vec<SpanFragment>,
     pub(crate) changed: Vec<SpanFragment>,
     pub(crate) pairs: Vec<(usize, String)>,
+    pub(crate) replacement_group: Option<ReplacementGroup>,
 }
 
 #[derive(Debug, Serialize)]
@@ -492,6 +509,41 @@ impl ComparisonField {
             text: right.into(),
             pair: None,
         });
+        let replacement_group = if self.original_triggers.is_empty() {
+            None
+        } else {
+            let group = self.pairs.first()?;
+            if self.pairs.len() != 1
+                || group.original != (0..self.original.len())
+                || group.changed != (0..self.changed.len())
+            {
+                return None;
+            }
+            original.clear();
+            let mut offset = 0;
+            for trigger in &self.original_triggers {
+                if trigger.id == 0 || trigger.original.is_empty() {
+                    return None;
+                }
+                original.push(SpanFragment {
+                    text: self.original.get(offset..trigger.original.start)?.into(),
+                    pair: None,
+                });
+                original.push(SpanFragment {
+                    text: self.original.get(trigger.original.clone())?.into(),
+                    pair: Some(trigger.id),
+                });
+                offset = trigger.original.end;
+            }
+            original.push(SpanFragment {
+                text: self.original.get(offset..)?.into(),
+                pair: None,
+            });
+            Some(ReplacementGroup {
+                id: group.id,
+                triggers: self.original_triggers.iter().map(|t| t.id).collect(),
+            })
+        };
         let cutoff = |text: &str| {
             if excerpt {
                 text.char_indices()
@@ -543,11 +595,32 @@ impl ComparisonField {
             }
             explanation
         };
+        let mut explanations: Vec<_> = self.pairs.iter().map(|p| (p.id, explain(p))).collect();
+        if let Some(group) = &replacement_group {
+            explanations.extend(self.original_triggers.iter().map(|trigger| {
+                let mut explanation = format!(
+                    "{}; included in whole-field replacement #{} (no separate replacement span)",
+                    trigger.explanation, group.id
+                );
+                if acut < self.original.len() && trigger.original.end > acut {
+                    explanation.push_str(&format!(
+                        " (original span {} excerpt; see full artifact)",
+                        if trigger.original.start >= acut {
+                            "omitted from"
+                        } else {
+                            "continues beyond"
+                        }
+                    ));
+                }
+                (trigger.id, explanation)
+            }));
+        }
         Some(ComparisonView {
             name: self.name.clone(),
             original: clip(original, acut, self.original.len()),
             changed: clip(changed, bcut, self.changed.len()),
-            pairs: self.pairs.iter().map(|p| (p.id, explain(p))).collect(),
+            pairs: explanations,
+            replacement_group,
         })
     }
 }
@@ -650,6 +723,7 @@ fn comparison_fields(
         if !on {
             continue;
         }
+        let mut original_triggers = Vec::new();
         let pairs = if w.categories.iter().any(|c| c == category) {
             let mut explanation = format!(
                 "{category}: whole field replaced; no word-level translation correspondence. {}",
@@ -663,7 +737,15 @@ fn comparison_fields(
             if w.categories.iter().any(|c| c == "sensitive-data") {
                 let (_, sensitive) = redacted_pairs(text, &Identity::current());
                 if !sensitive.is_empty() {
-                    explanation.push_str(&format!(" sensitive-data: {} affected spans included in the whole-field replacement.", sensitive.len()));
+                    explanation.push_str(" Individual sensitive-data triggers are marked in the original and included in this whole-field replacement.");
+                    original_triggers = sensitive
+                        .into_iter()
+                        .map(|pair| OriginalTrigger {
+                            id: 0,
+                            explanation: pair.explanation,
+                            original: pair.original,
+                        })
+                        .collect();
                 }
             }
             vec![SpanPair {
@@ -687,11 +769,16 @@ fn comparison_fields(
                 p
             })
             .collect();
+        for trigger in &mut original_triggers {
+            trigger.id = next;
+            next += 1;
+        }
         fields.push(ComparisonField {
             name: name.into(),
             original: text.into(),
             changed: fallback,
             pairs,
+            original_triggers,
         });
     }
     fields
@@ -1887,6 +1974,7 @@ mod posting_comparison_tests {
             original: text.into(),
             changed,
             pairs,
+            original_triggers: Vec::new(),
         }
     }
 
@@ -1960,6 +2048,7 @@ mod posting_comparison_tests {
                 original: 3..10,
                 changed: 3..3,
             }],
+            original_triggers: Vec::new(),
         };
         let view = f.view(false).unwrap();
         assert!(
@@ -2002,6 +2091,120 @@ mod posting_comparison_tests {
             question_choices(&w, None),
             [USE_FALLBACK, POST_ORIGINAL, USE_MY_TEXT]
         );
+    }
+
+    #[test]
+    fn language_fallback_preserves_individual_sensitive_trigger_markers() {
+        let body = "日本語の説明です。\n\nFirst key: ghp_abcdefghijklmnop\n\nMore context.\n\nSecond key: ghp_abcdefghijklmnop\n";
+        let w = Withheld::from_check(&check("fix: x", body), "fix: x", body).unwrap();
+        assert!(w.categories.iter().any(|c| c == "body-language"));
+        assert!(w.categories.iter().any(|c| c == "sensitive-data"));
+        let (detail, comparison) = question_content(&w, "fix: x", body, "r", None, None, None);
+        assert!(comparison.matches_detail(&detail));
+        let f = &comparison.fields[0];
+        assert_eq!(f.changed, fallback_text(&w, "fix: x", body, "r").1);
+        assert_eq!(f.original_triggers.len(), 2);
+        let view = f.view(false).unwrap();
+        let group = view.replacement_group.as_ref().unwrap();
+        assert_eq!(group.id, f.pairs[0].id);
+        assert_eq!(group.triggers.len(), 2);
+        assert_ne!(group.triggers[0], group.triggers[1]);
+        assert!(!group.triggers.contains(&group.id));
+        assert_eq!(
+            view.original
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>(),
+            body
+        );
+        assert_eq!(
+            view.changed
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>(),
+            f.changed
+        );
+        for (i, trigger) in f.original_triggers.iter().enumerate() {
+            assert_eq!(&body[trigger.original.clone()], "ghp_abcdefghijklmnop");
+            assert_eq!(trigger.id, group.triggers[i]);
+            let highlighted = view
+                .original
+                .iter()
+                .find(|s| s.pair == Some(trigger.id))
+                .unwrap();
+            assert_eq!(highlighted.text, "ghp_abcdefghijklmnop");
+            assert!(
+                view.changed.iter().all(|s| s.pair != Some(trigger.id)),
+                "no fictional local replacement span"
+            );
+            let explanation = view.pairs.iter().find(|(id, _)| *id == trigger.id).unwrap();
+            assert!(
+                explanation
+                    .1
+                    .contains(&format!("whole-field replacement #{}", group.id))
+            );
+            assert!(explanation.1.contains("no separate replacement span"));
+        }
+        let mut invalid = f.clone();
+        invalid.original_triggers[1].original = invalid.original_triggers[0].original.clone();
+        assert!(
+            invalid.view(false).is_none(),
+            "overlapping original triggers fail closed"
+        );
+        invalid = f.clone();
+        invalid.original_triggers[0].original.start = 1;
+        assert!(
+            invalid.view(false).is_none(),
+            "invalid UTF-8 trigger boundary fails closed"
+        );
+        // Old comparison records omit the additive trigger metadata.
+        let mut legacy = serde_json::to_value(f).unwrap();
+        legacy.as_object_mut().unwrap().remove("original_triggers");
+        assert!(
+            serde_json::from_value::<ComparisonField>(legacy)
+                .unwrap()
+                .view(false)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn language_fallback_marks_sensitive_triggers_omitted_by_excerpt() {
+        let body = format!(
+            "日本語の説明です。\n{}ghp_abcdefghijklmnop",
+            " ".repeat(SHOWN_MAX_CHARS)
+        );
+        let w = Withheld::from_check(&check("fix: x", &body), "fix: x", &body).unwrap();
+        let (detail, comparison) = question_content(
+            &w,
+            "fix: x",
+            &body,
+            "r",
+            None,
+            Some(Path::new("artifact.md")),
+            None,
+        );
+        assert!(comparison.matches_detail(&detail));
+        let f = &comparison.fields[0];
+        let view = f.view(true).unwrap();
+        let trigger = &f.original_triggers[0];
+        assert_eq!(
+            view.original
+                .iter()
+                .map(|s| s.text.as_str())
+                .collect::<String>(),
+            shown(&body, true)
+        );
+        assert!(view.original.iter().all(|s| s.pair != Some(trigger.id)));
+        assert!(
+            view.pairs
+                .iter()
+                .find(|(id, _)| *id == trigger.id)
+                .unwrap()
+                .1
+                .contains("omitted from excerpt")
+        );
+        assert_eq!(view.replacement_group.unwrap().triggers, [trigger.id]);
     }
 
     #[test]
