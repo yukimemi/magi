@@ -777,6 +777,21 @@
       <p class="hint">Opens with what is already there. Add to it, or replace it outright — either way this is the whole instruction a run will read.</p>
       <textarea id="task-edit-instruction" rows="10"></textarea>
     </div>
+    <div class="field">
+      <label for="task-edit-implementers">Implementers</label>
+      <select id="task-edit-implementers" aria-describedby="task-edit-implementers-hint">
+        <option value="" disabled>Repository default</option>
+        <option value="1">Solo (1)</option>
+        <option value="2">2</option>
+        <option value="3">3</option>
+      </select>
+      <p class="hint" id="task-edit-implementers-hint">Changing the count may start a new run instead of reusing earlier candidate work. Only queued or held tasks can change implementers.</p>
+    </div>
+    <div class="field">
+      <strong>Attempts</strong>
+      <p class="hint" id="task-edit-attempts"></p>
+      <a id="task-edit-history">View attempt history</a>
+    </div>
     <p class="form-error" id="task-edit-error" role="alert" hidden></p>
     <button class="btn btn-gold" type="button" id="task-edit-save">Save</button>
   </div>
