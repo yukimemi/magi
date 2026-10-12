@@ -715,6 +715,13 @@ enum TaskCmd {
         /// Task id or unambiguous prefix/suffix.
         id: String,
     },
+    /// Change a queued or held task's implementers (1 = Solo; old work may restart).
+    Implementers {
+        /// Task id or unambiguous prefix/suffix.
+        id: String,
+        /// Number of implementers (1..=3).
+        count: u8,
+    },
     /// Change how urgently a queued or held task should run next.
     ///
     /// Refused once the task is running: priority only affects which task the
@@ -2996,6 +3003,17 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             Ok(())
         }
 
+        TaskCmd::Implementers { id, count } => {
+            let resolved = q.resolve_id(&id)?;
+            let _claim = q
+                .claim(&resolved)
+                .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
+            let mut t = q.get(&resolved)?;
+            t.change_implementers(count)?;
+            q.put(&mut t)?;
+            println!("{} implementers now {count} - {}", t.short(), t.title);
+            Ok(())
+        }
         TaskCmd::Priority { id, priority } => {
             let resolved = q.resolve_id(&id)?;
             // Claimed the same way the phone's edit routes are: a `.lock`
@@ -4952,6 +4970,87 @@ mod tests {
             }) => assert_eq!(attach, [PathBuf::from("a.png")]),
             other => panic!("expected TaskCmd::Edit, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn task_implementers_cli_saves_only_the_existing_task() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("explicit.toml"),
+            "[[agents]]\nid = 'mock'\nkind = 'command'\ncommand = ['true']\n",
+        )
+        .unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut task = Task::new(
+            "seats".into(),
+            "keep this".into(),
+            dir.path().to_path_buf(),
+            magi::queue::Source::Human,
+        );
+        task.overrides = Some(magi::queue::RunOverrides {
+            config: Some(dir.path().join("explicit.toml")),
+            ..Default::default()
+        });
+        q.put(&mut task).unwrap();
+        for count in [2, 1, 2] {
+            task_cmd_on(
+                TaskCmd::Implementers {
+                    id: task.id.clone(),
+                    count,
+                },
+                q.clone(),
+            )
+            .await
+            .unwrap();
+            let saved = q.get(&task.id).unwrap();
+            assert_eq!(saved.implementers(), Some(usize::from(count)));
+            assert_eq!(saved.created_at, task.created_at);
+            assert_eq!(saved.instruction, task.instruction);
+        }
+        let claim = q.claim(&task.id).unwrap();
+        assert!(
+            task_cmd_on(
+                TaskCmd::Implementers {
+                    id: task.id.clone(),
+                    count: 1
+                },
+                q.clone()
+            )
+            .await
+            .is_err()
+        );
+        drop(claim);
+        task.status = magi::queue::TaskStatus::Done;
+        q.put(&mut task).unwrap();
+        assert!(
+            task_cmd_on(
+                TaskCmd::Implementers {
+                    id: task.id.clone(),
+                    count: 1
+                },
+                q.clone()
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn task_implementers_cli_parses_and_rejects_overflow() {
+        match Cli::try_parse_from(["magi", "task", "implementers", "abcd", "1"])
+            .unwrap()
+            .command
+        {
+            Some(Command::Task {
+                command: TaskCmd::Implementers { id, count },
+            }) => {
+                assert_eq!(id, "abcd");
+                assert_eq!(count, 1);
+            }
+            other => panic!("unexpected command {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["magi", "task", "implementers", "abcd", "256"]).is_err());
+        assert!(Cli::try_parse_from(["magi", "task", "implementers", "abcd", "-1"]).is_err());
     }
 
     #[tokio::test]
