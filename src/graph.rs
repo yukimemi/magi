@@ -5187,8 +5187,21 @@ impl Runner {
                 handover: None,
             })
             .await;
+        // Never spawned: nothing changed, so the repair goes back to "not
+        // started" and the run stops resumably, as for a graft.
+        if matches!(out, AgentOutcome::ResourceBlocked(_)) {
+            if let Err(e) = Self::graft_restore(&wt, &head).await {
+                return self
+                    .stop_recovery(rec, &head, format!("resource wait; restore failed: {e:#}"))
+                    .await;
+            }
+            rec.repair = Repair::NotStarted;
+            self.state.recovery = Some(rec);
+            self.state.save()?;
+            return self.stop_for_resource();
+        }
         let failed = match &out {
-            AgentOutcome::Ok(_) => None,
+            AgentOutcome::Ok(_) | AgentOutcome::ResourceBlocked(_) => None,
             AgentOutcome::Quota(o) => {
                 self.state.quota.push(QuotaLoss {
                     seat: seat.key.clone(),
