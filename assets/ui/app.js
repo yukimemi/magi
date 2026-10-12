@@ -2270,8 +2270,15 @@ function renderRuns() {
 }
 
 /* ---- queue ------------------------------------------------------------- */
+/* The badge for `Task::urgent`. Keyed on the field itself, never on priority:
+   an urgent task can sit at priority 0. */
+function urgentTag() {
+  return el("span", { class: "tag tag-urgent", "data-tone": "rust", text: "urgent" });
+}
+
 function createTaskCard() {
   const chipSlot = el("span");
+  const urgent = urgentTag();
   const priority = el("span", { class: "tag", "data-tone": "ink" });
   const permalink = el("a", { class: "card-permalink" });
   /* `solo` runs one implementer straight into review instead of the usual
@@ -2317,7 +2324,7 @@ function createTaskCard() {
     historyLink, runLink, priorityBox, implementersBox, editBtn, holdBox, doneBox, deleteBox);
 
   const card = el("li", { class: "card task-card" },
-    el("div", { class: "card-top" }, chipSlot, priority, solo, followup, permalink, whenSlot),
+    el("div", { class: "card-top" }, chipSlot, urgent, priority, solo, followup, permalink, whenSlot),
     title, meta, note, snippet, error, instruction, answers, actions,
   );
   /* Tapping the card body opens the task page; anything interactive inside it
@@ -2348,7 +2355,7 @@ function createTaskCard() {
     openTask();
   });
   card.refs = {
-    card, chipSlot, priority, solo, followup, permalink, whenSlot, title, source, repo, attempts,
+    card, chipSlot, urgent, priority, solo, followup, permalink, whenSlot, title, source, repo, attempts,
     outcome, note, snippet, error, instruction, answers, answersList, runLink, historyLink,
     priorityDown, priorityUp, implementersBox, editBtn, holdBox, doneBox, deleteBox,
   };
@@ -2371,6 +2378,8 @@ function updateTaskCard(row, task) {
   setAttr(r.historyLink, "href", `#/tasks/${encodeURIComponent(task.id)}`);
 
   setChip(r.chipSlot, status, TASK_STATUS);
+
+  show(r.urgent, task.urgent === true);
 
   const priority = Number(task.priority) || 0;
   setText(r.priority, priority > 0 ? `priority +${priority}` : `priority ${priority}`);
@@ -9737,6 +9746,7 @@ function renderTask() {
   }
   const status = String(task.status_str || task.status || "");
   head.append(chip(status, TASK_STATUS));
+  if (task.urgent === true) head.append(urgentTag());
   setText($("task-h"), task.title || shortId(task.id));
   const repoName = typeof task.repo === "string" ? task.repo.split(/[\\/]/).filter(Boolean).pop() : "";
   const spent = Number(task.attempts) || 0;
