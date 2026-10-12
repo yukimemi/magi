@@ -804,6 +804,14 @@ impl Ui {
         }))
     }
 
+    fn queued_generation(&self, id: &str) -> u64 {
+        let live = self
+            .talk_turns
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        live.queued.get(id).copied().unwrap_or(0)
+    }
+
     /// The shared turn slots, for the upgrade hand-over to wait on.
     fn turns(&self) -> Arc<Mutex<TalkTurns>> {
         Arc::clone(&self.talk_turns)
@@ -7056,7 +7064,17 @@ async fn settle_settings_turn(
     cfg: Config,
     id: String,
     turn: TalkTurnGuard,
+    observed: u64,
 ) -> bool {
+    if talk.pending.is_empty() && talk.pending_attachments.is_empty() {
+        let turns = Arc::clone(&turn.turns);
+        let mut live = turns.lock().unwrap_or_else(PoisonError::into_inner);
+        if live.queued.get(&id).copied().unwrap_or(0) == observed {
+            // Release under the arrival lock; a later `/say` takes its own claim.
+            turn.release(&mut live);
+            return false;
+        }
+    }
     let (started, settled) = tokio::sync::oneshot::channel();
     tokio::spawn(drain_loop_started(
         talk,
@@ -7352,16 +7370,18 @@ async fn talk_agent(
     };
     // A `/say` that landed while this held the claim saw the talk busy and
     // left a durable draft, trusting the claim's owner to drain it. So the
-    // claim, once taken, goes to the drainer whatever the outcome. Wait for
-    // its first drain to release an idle claim before replying; queued drafts
-    // continue independently of the handler.
+    // claim is settled whatever the outcome. Release an empty draft's claim
+    // before replying; queued drafts continue independently of the handler.
+    let observed = ui.queued_generation(&id);
     let fresh = {
         let ui = Arc::clone(&ui);
         let id = id.clone();
         blocking(move || Ok(ui.talks.get(&id)?)).await
     };
     let draining = match fresh {
-        Ok(talk) => settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard).await,
+        Ok(talk) => {
+            settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard, observed).await
+        }
         Err(_) => false,
     };
     let talk = switched?;
@@ -7436,13 +7456,16 @@ async fn talk_persona(
         .await
     };
     // As in `talk_agent`: settle the claim before replying, even on refusal.
+    let observed = ui.queued_generation(&id);
     let fresh = {
         let ui = Arc::clone(&ui);
         let id = id.clone();
         blocking(move || Ok(ui.talks.get(&id)?)).await
     };
     let draining = match fresh {
-        Ok(talk) => settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard).await,
+        Ok(talk) => {
+            settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard, observed).await
+        }
         Err(_) => false,
     };
     let talk = switched?;
@@ -7514,13 +7537,16 @@ async fn talk_implementers(
         .await
     };
     // As in `talk_agent`: settle the claim before replying, even on refusal.
+    let observed = ui.queued_generation(&id);
     let fresh = {
         let ui = Arc::clone(&ui);
         let id = id.clone();
         blocking(move || Ok(ui.talks.get(&id)?)).await
     };
     let draining = match fresh {
-        Ok(talk) => settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard).await,
+        Ok(talk) => {
+            settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard, observed).await
+        }
         Err(_) => false,
     };
     let talk = switched?;
@@ -10154,6 +10180,35 @@ mod tests {
             rei.avatar.split("&v=").nth(1),
             plain.avatar.split("&v=").nth(1)
         );
+    }
+
+    #[tokio::test]
+    async fn empty_settings_turn_releases_inline_only_for_unchanged_generation() {
+        let (_t, _h, ui, id, repo) = avatar_fixture("").await;
+        let cfg = config_for(&repo).await.unwrap();
+        for arrived in [false, true] {
+            let turn = ui.begin_talk_turn(&id).unwrap().unwrap();
+            let observed = ui.queued_generation(&id);
+            let talk = ui.talks.get(&id).unwrap();
+            if arrived {
+                assert!(ui.begin_queued_talk_turn(&id).unwrap().is_none());
+            }
+            let mut settling = std::pin::pin!(settle_settings_turn(
+                talk,
+                ui.talks.clone(),
+                cfg.clone(),
+                id.clone(),
+                turn,
+                observed
+            ));
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            let first = std::future::Future::poll(settling.as_mut(), &mut cx);
+            assert_eq!(first.is_pending(), arrived);
+            if arrived {
+                assert!(!settling.await);
+            }
+            assert!(!ui.is_thinking(&id));
+        }
     }
 
     #[tokio::test]
