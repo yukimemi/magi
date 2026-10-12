@@ -2899,9 +2899,10 @@ fn run_badge_status(
     if superseded {
         return "superseded".to_owned();
     }
-    // `magi show` calls every dead non-terminal run STALE, an open question or
-    // a recorded park included, so the badge does too.
-    if live == crate::run::Liveness::Dead {
+    // A dead run's `display_status` is `stale`, except that a deliberate park
+    // and an open owner question keep their own word: neither is a crash, and
+    // the question still needs an answer. Anything else dead reads `stale`.
+    if live == crate::run::Liveness::Dead && !matches!(display_status, "parked" | "waiting") {
         return "stale".to_owned();
     }
     display_status.to_owned()
@@ -5325,7 +5326,9 @@ fn mark_badges(ui: &Ui, task: &Task, history: &mut [TaskRunView]) {
         let waiting = !ui.questions.open_for(&h.id).is_empty();
         let display = run_display_status(&state, waiting, live);
         let word = run_badge_status(&state, &display, live, task.successor_of(&h.id).is_some());
-        if matches!(word.as_str(), "stale" | "superseded") {
+        if matches!(word.as_str(), "stale" | "superseded")
+            || (live == crate::run::Liveness::Dead && matches!(word.as_str(), "parked" | "waiting"))
+        {
             h.badge = Some(word);
         }
     }
@@ -14959,7 +14962,7 @@ mod tests {
             (RunStatus::Gating, false, Dead, true, "superseded"),
             (RunStatus::Gating, false, Unknown, true, "superseded"),
             (RunStatus::Gating, true, Dead, true, "superseded"),
-            (RunStatus::Gating, true, Dead, false, "stale"),
+            (RunStatus::Gating, true, Dead, false, "waiting"),
             (RunStatus::Gating, false, Unknown, false, "gating"),
             (RunStatus::Gating, false, Live, true, "gating"),
             (RunStatus::Gating, true, Live, true, "waiting"),
