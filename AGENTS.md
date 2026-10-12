@@ -2548,6 +2548,7 @@ reply that is not `{"title_english": bool, "body_english": bool}` all yield
 `None`, and the built-in heuristics decide as before. No API key and no HTTP
 dependency, so offline tests and CI are unaffected.
 
+- The same role also writes the one description rewrite when no resumable implementer conversation exists (review-only runs, or a seat with no session): `graph::Runner::rewrite_pr_text` resolves it with `agent::pick_chain` (unset = default pick), in a separate `github-text-rewrite` seat, advancing on error, quota, unusable output or a reply with no `TITLE:` line. A classification-only wrapper therefore ends in the owner question. No handover is recorded; the result is re-checked by the gate.
 - The wrapper receives the prompt through `{prompt_file}` and prints the JSON
   object on stdout (a code fence or earlier log lines are tolerated).
 - Only prose goes out (code, quotes and `<details>` are dropped) and only after
