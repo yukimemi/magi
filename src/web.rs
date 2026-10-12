@@ -2801,6 +2801,10 @@ struct RunSummary {
     /// Distinguishes parked runs, crashes, and waiting states from raw node statuses.
     #[serde(default)]
     display_status: String,
+    /// What the status badge shows: `display_status`, or `superseded` for a
+    /// non-live run a later attempt replaced. See [`run_badge_status`].
+    #[serde(default)]
+    badge_status: String,
     /// Who started the run, as the one label every surface shares; the
     /// "origin unknown" wording when the record predates origins.
     origin_label: String,
@@ -2815,6 +2819,7 @@ impl RunSummary {
             done: state.status.done(),
             unmerged_by_design: state.unmerged_by_design(),
             display_status: run_display_status(state, waiting, live),
+            badge_status: run_display_status(state, waiting, live),
             instruction: state.instruction.clone(),
             title: title_from(&state.instruction, TITLE_MAX),
             repo: state.repo.display().to_string(),
@@ -2873,6 +2878,29 @@ fn run_display_status(state: &RunState, waiting: bool, live: crate::run::Livenes
         return "stale".to_owned();
     }
     status_word(state.status)
+}
+
+/// The word a run's status badge shows: `display_status`, except that a
+/// non-terminal run which is not provably live and was replaced by a later
+/// attempt reads `superseded`, and a confirmed-dead one reads `stale`.
+///
+/// Same judgement `magi show` uses (`RunState::liveness`, the task's
+/// successor); a live driver, `Unknown` liveness and terminal runs keep their
+/// own word, so superseded never claims more than "not live".
+fn run_badge_status(
+    state: &RunState,
+    display_status: &str,
+    live: crate::run::Liveness,
+    superseded: bool,
+) -> String {
+    if state.status.done() || live == crate::run::Liveness::Live {
+        return display_status.to_owned();
+    }
+    if superseded {
+        return "superseded".to_owned();
+    }
+    // Dead runs already read `stale` (or `parked`) in `display_status`.
+    display_status.to_owned()
 }
 
 /// `?limit=`, clamped by the handler.
@@ -2973,6 +3001,12 @@ where
                 .map(String::as_str)
                 .map(crate::run::short_of)
                 .map(str::to_owned);
+            row.badge_status = run_badge_status(
+                &state,
+                &row.display_status,
+                live,
+                row.superseded_by.is_some(),
+            );
             row
         })
         .collect()
@@ -3021,6 +3055,9 @@ struct RunDetailView {
     /// Same derived presentation status as [`RunSummary::display_status`].
     #[serde(default)]
     display_status: String,
+    /// Same field and meaning as [`RunSummary::badge_status`].
+    #[serde(default)]
+    badge_status: String,
     /// Same field and meaning as [`RunSummary::done`]: whether the status is
     /// terminal. The client's `landView` keys on it, and the flattened state
     /// has no such field, so without it a finished run's stale `open` PR
@@ -3209,6 +3246,8 @@ struct RunBrief {
     status: Option<&'static str>,
     /// The task-page wording for how that pass ended.
     outcome: String,
+    /// See [`TaskRunView::badge`]; always `None` here (no liveness at hand).
+    badge: Option<String>,
 }
 
 /// The task's overall outcome as seen from `this_run`'s page, classified with
@@ -3225,6 +3264,7 @@ fn task_outcome(
         short: h.short.clone(),
         status: h.status,
         outcome: h.exit.edge_label(h.status),
+        badge: h.badge.clone(),
     };
     let is_latest = task.runs.last().is_none_or(|r| r == this_run);
     let latest = if is_latest {
@@ -3380,6 +3420,7 @@ impl RunDetailView {
             &state,
             latest_attempt.as_ref().map(|a| (a.id.as_str(), a.status)),
         );
+        let badge_status = run_badge_status(&state, &display_status, live, superseded_by.is_some());
         Self {
             stop_reason,
             pass_views: state.passes.iter().map(|p| PassView::of(p, None)).collect(),
@@ -3390,6 +3431,7 @@ impl RunDetailView {
             unmerged_by_design: state.unmerged_by_design(),
             waiting,
             display_status,
+            badge_status,
             done: state.status.done(),
             superseded_by,
             latest_attempt,
@@ -4491,6 +4533,9 @@ struct TaskRunView {
     pass: Option<PassView>,
     /// The branch a review-only run reopened.
     branch: Option<String>,
+    /// The badge word when it differs from `status` (`stale` / `superseded`);
+    /// filled by the task route, which can see liveness and later attempts.
+    badge: Option<String>,
 }
 
 /// One recorded pass over a run, for the wire.
@@ -4758,6 +4803,7 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
             passes_of_run,
             pass: None,
             branch: None,
+            badge: None,
         };
     };
     let branch = review_branch_of(&s.instruction);
@@ -4941,6 +4987,7 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
         passes_of_run,
         pass: view,
         branch: branch.map(str::to_owned),
+        badge: None,
     }
 }
 
@@ -4973,6 +5020,8 @@ struct FlowNode {
     decided: bool,
     readable: bool,
     href: Option<String>,
+    /// Overrides `status` as the badge word (`stale` / `superseded`).
+    badge: Option<String>,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -5022,6 +5071,7 @@ fn task_flow(
         decided: false,
         readable: true,
         href: None,
+        badge: None,
     };
     let mut nodes = Vec::new();
     let mut edges: Vec<FlowEdge> = Vec::new();
@@ -5106,6 +5156,7 @@ fn task_flow(
             RunExit::Parked if h.later_pass.is_some() => n.note = Some("parked"),
             _ => {
                 n.status = h.status;
+                n.badge = h.badge.clone();
                 if h.provisional {
                     n.note = Some("no verdict");
                 }
@@ -5244,6 +5295,38 @@ fn task_history(task: &Task, read: impl Fn(&str) -> Option<RunState>) -> Vec<Tas
     history
 }
 
+/// Fill [`TaskRunView::badge`] for attempts that are no longer being driven.
+/// An earlier pass of a resumed run keeps no badge (it has no status box).
+fn mark_badges(ui: &Ui, task: &Task, history: &mut [TaskRunView]) {
+    if history.iter().all(|h| h.exit == RunExit::Interrupted) {
+        return;
+    }
+    let (_, claimed, _) = run_row_inputs(ui);
+    let probe = std::cell::RefCell::new(crate::proc::ProcProbe::real());
+    for h in history
+        .iter_mut()
+        .filter(|h| h.readable && h.exit != RunExit::Interrupted)
+    {
+        let Ok(state) = read_run(&ui.runs, &h.id) else {
+            continue;
+        };
+        if state.status.done() {
+            continue;
+        }
+        let live = state.liveness_with(
+            claimed.contains(&h.id),
+            |p| probe.borrow_mut().status(p),
+            |p| probe.borrow_mut().started_at(p),
+        );
+        let waiting = !ui.questions.open_for(&h.id).is_empty();
+        let display = run_display_status(&state, waiting, live);
+        let word = run_badge_status(&state, &display, live, task.successor_of(&h.id).is_some());
+        if matches!(word.as_str(), "stale" | "superseded") {
+            h.badge = Some(word);
+        }
+    }
+}
+
 async fn task_detail(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
@@ -5255,7 +5338,8 @@ async fn task_detail(
             .get(&id)
             .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
         let inv = crate::blockers::Inventory::new(ui.queue.list(), &ui.questions.list());
-        let history = task_history(&task, |id| read_run(&ui.runs, id).ok());
+        let mut history = task_history(&task, |id| read_run(&ui.runs, id).ok());
+        mark_badges(&ui, &task, &mut history);
         let runs_unreadable = history.iter().filter(|h| !h.readable).count();
         let max_attempts = daemon::Opts::default().max_attempts;
         let origin = task.followup.as_ref().map(|fu| {
@@ -14854,6 +14938,77 @@ mod tests {
         state.parked = false;
         state.events.clear();
         assert_eq!(run_display_status(&state, false, Dead), "stale");
+    }
+
+    #[test]
+    fn badge_status_prefers_superseded_then_stale_and_spares_live_and_terminal() {
+        use crate::run::Liveness::{Dead, Live, Unknown};
+        let mut state = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "abc".to_owned(),
+            "Badge".to_owned(),
+            Config::default(),
+        );
+        for (status, waiting, live, superseded, expected) in [
+            (RunStatus::Gating, false, Dead, false, "stale"),
+            (RunStatus::Gating, false, Dead, true, "superseded"),
+            (RunStatus::Gating, false, Unknown, true, "superseded"),
+            (RunStatus::Gating, true, Dead, true, "superseded"),
+            (RunStatus::Gating, false, Unknown, false, "gating"),
+            (RunStatus::Gating, false, Live, true, "gating"),
+            (RunStatus::Gating, true, Live, true, "waiting"),
+            (RunStatus::Merged, false, Dead, true, "merged"),
+            (RunStatus::Blocked, false, Dead, true, "blocked"),
+        ] {
+            state.status = status;
+            let display = run_display_status(&state, waiting, live);
+            assert_eq!(
+                run_badge_status(&state, &display, live, superseded),
+                expected,
+                "{status:?}/{live:?}/superseded={superseded}"
+            );
+        }
+    }
+
+    #[test]
+    fn summarize_and_detail_expose_badge_status() {
+        use crate::run::Liveness::Dead;
+        let mut state = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".to_owned(),
+            "abc".to_owned(),
+            "Badge".to_owned(),
+            Config::default(),
+        );
+        state.status = RunStatus::Gating;
+        let none = HashSet::new();
+        let id = state.id.clone();
+        let mut by = HashMap::new();
+        let rows = summarize(
+            [state.clone()],
+            &none,
+            &none,
+            &by,
+            |_| Some(false),
+            |_| None,
+        );
+        // No driver recorded: liveness is not provably dead, so the node stays.
+        assert_eq!(rows[0].badge_status, rows[0].display_status);
+        by.insert(id, "20260901-000000-913b".to_owned());
+        let detail = RunDetailView::of(
+            state.clone(),
+            false,
+            Dead,
+            Some("913b".to_owned()),
+            None,
+            None,
+        );
+        assert_eq!(detail.badge_status, "superseded");
+        let json = serde_json::to_value(&detail).unwrap();
+        assert_eq!(json["badge_status"], "superseded");
+        let detail = RunDetailView::of(state, false, Dead, None, None, None);
+        assert_eq!(detail.badge_status, "stale");
     }
 
     #[tokio::test]

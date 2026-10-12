@@ -1581,6 +1581,9 @@ function isLiveAttempt(run) {
 }
 
 function displayedRunStatus(run) {
+  /* The server's verdict that a later attempt replaced a run nobody drives
+     any more: it wins over everything, `waiting` included. */
+  if (run.badge_status === "superseded") return "superseded";
   if (run.waiting) return "waiting";
   if (run.unmerged_by_design) return "unmerged";
   if (run.display_status) return run.display_status;
@@ -6986,7 +6989,7 @@ function renderRunDetail() {
      is the state the operator has to act on. */
   const summary = (state.runs || []).find((r) => r.id === run.id);
   const parkedNow = Boolean(summary && isWaiting(summary)) || openFor(run.id).length > 0;
-  const status = parkedNow ? "waiting" : displayedRunStatus(run);
+  const status = parkedNow && run.badge_status !== "superseded" ? "waiting" : displayedRunStatus(run);
   const meta = RUN_STATUS[status] || {};
 
   const head = $("run-status");
@@ -9807,7 +9810,7 @@ function renderTask() {
   for (const h of history) {
     const top = el("div", { class: "task-run-top" },
       el("span", { class: "task-run-n", text: `#${h.n}` }),
-      h.status ? chip(h.status, RUN_STATUS) : el("span", { class: "tag", text: "unreadable" }),
+      h.status ? chip(h.badge || h.status, RUN_STATUS) : el("span", { class: "tag", text: "unreadable" }),
       el("a", { href: `#/queue/${encodeURIComponent(task.id)}/runs/${encodeURIComponent(h.id)}`, text: `Run ${h.short}`, title: h.id }),
       el("span", { class: "tag", "data-tone": "ink", text: h.kind }),
     );
@@ -9866,7 +9869,7 @@ function renderTaskFlow(flow) {
       list.append(li);
     }
     const top = el("div", { class: "flow-top" }, el("strong", { text: n.label }));
-    if (n.status) top.append(chip(n.status, n.status_of === "task" ? TASK_STATUS : RUN_STATUS));
+    if (n.status) top.append(chip(n.badge || n.status, n.status_of === "task" ? TASK_STATUS : RUN_STATUS));
     if (n.note) top.append(el("span", { class: "tag", "data-tone": n.note === "no verdict" ? "rust" : "ink", text: n.note }));
     if (n.run_kind && n.run_kind !== "unknown") top.append(el("span", { class: "tag", "data-tone": "ink", text: n.run_kind }));
     if (n.kind === "chat") top.append(el("span", { class: "tag", "data-tone": "ink", text: "chat" }));
