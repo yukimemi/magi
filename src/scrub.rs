@@ -597,11 +597,19 @@ fn loopback_literal(rest: &str, len: usize, prev: Option<char>, v6: bool) -> boo
         }
         tail = &port[n..];
     }
+    // The detector trims a single trailing IPv6 colon as punctuation. Check
+    // what follows it too, so it cannot hide a malformed address continuation.
+    if v6
+        && !bracketed
+        && let Some(after) = tail.strip_prefix(':')
+    {
+        tail = after;
+    }
     let mut chars = tail.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphanumeric() || matches!(c, '_' | '%') => false,
         Some('.') if chars.next().is_some_and(|c| c.is_ascii_alphanumeric()) => false,
-        Some(':') if !v6 || bracketed => false,
+        Some(':') => false,
         _ => true,
     }
 }
@@ -953,6 +961,7 @@ mod tests {
             "[::1]:0 [0:0:0:0:0:0:0:1]:8080",
             "http://[::1]:0/test",
             "(127.0.0.1), `::1`. [::1]",
+            "::1: local socket",
         ] {
             assert_eq!(s(text), text, "{text}");
             assert!(locate(text, &id()).is_empty(), "{text}");
@@ -980,6 +989,18 @@ mod tests {
         ] {
             assert_eq!(s(text), expected, "{text}");
             assert_eq!(locate(text, &id()), vec![(1, "ip")], "{text}");
+        }
+    }
+
+    #[test]
+    fn loopback_exception_checks_after_trimmed_ipv6_colon() {
+        let identity = Identity::default();
+        for (text, expected) in [
+            ("::1:.10.0.0.1", "[redacted-ip]:.10.0.0.1"),
+            ("::1:%zone", "[redacted-ip]:%zone"),
+        ] {
+            assert_eq!(scrub(text, &identity), expected, "{text}");
+            assert_eq!(locate(text, &identity), vec![(1, "ip")], "{text}");
         }
     }
 
