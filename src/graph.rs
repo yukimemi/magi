@@ -1904,6 +1904,7 @@ impl Runner {
         self.state.status = RunStatus::Implementing;
 
         let language = self.state.config.graph.language.clone();
+        let github_language = self.state.config.graph.github_language.clone();
         let timeout = Duration::from_secs(self.state.config.graph.timeout_implement);
         let sessions = self.state.config.graph.sessions;
         let artifacts = agent::artifacts_dir(&self.state.dir());
@@ -1931,10 +1932,11 @@ impl Runner {
             jobs.push(SeatJob {
                 spec,
                 seat,
-                prompt: prompt::implement(
+                prompt: prompt::implement_in(
                     &instruction,
                     &worktree.to_string_lossy(),
                     &language,
+                    &github_language,
                     brief.as_deref(),
                     &attachments,
                 ),
@@ -2296,6 +2298,7 @@ impl Runner {
     ) {
         let instruction = seeded_instruction(&self.state);
         let language = self.state.config.graph.language.clone();
+        let github_language = self.state.config.graph.github_language.clone();
         let brief = self
             .state
             .advice
@@ -2381,10 +2384,11 @@ impl Runner {
                 job.spec = next.clone();
                 let mut retry = job.clone();
                 retry.seat = new_seat;
-                retry.prompt = prompt::implement(
+                retry.prompt = prompt::implement_in(
                     &instruction,
                     &job.cwd.to_string_lossy(),
                     &language,
+                    &github_language,
                     brief.as_deref(),
                     &attachments,
                 );
@@ -4737,13 +4741,14 @@ impl Runner {
                 detail: f.detail.clone(),
             })
             .collect();
-        let fix_prompt = prompt::operator_fix(
+        let fix_prompt = prompt::operator_fix_in(
             &self.state.instruction,
             &finding_list,
             reason,
             &stale_details,
             &head_at_request,
             &language,
+            &self.state.config.graph.github_language,
         );
         let timeout = Duration::from_secs(self.state.config.graph.timeout_fix);
         let (job, seat, out) = self
@@ -5448,6 +5453,7 @@ impl Runner {
                         competed: self.state.tally.as_ref().is_some_and(|t| t.rankings > 0),
                         lens: Lens::for_seat(r),
                         language: &language,
+                        github_language: &self.state.config.graph.github_language,
                     }),
                     spec,
                     seat,
@@ -5968,13 +5974,14 @@ impl Runner {
                 .filter(|f| f.severity.blocks())
                 .cloned()
                 .collect();
-            let fix_prompt = prompt::fix(
+            let fix_prompt = prompt::fix_in(
                 &self.state.instruction,
                 &blocking_findings,
                 this_round_verification.as_ref(),
                 round,
                 max_rounds,
                 &language,
+                &self.state.config.graph.github_language,
             );
             let timeout = Duration::from_secs(self.state.config.graph.timeout_fix);
             let before = git::rev_parse(&winner.worktree, "HEAD").await?;
@@ -6678,12 +6685,13 @@ impl Runner {
         let attempt = spent + 1;
         let failed: Vec<CommandOutcome> = outcomes.iter().filter(|o| !o.ok()).cloned().collect();
         let base = self.landing_base();
-        let fix_prompt = prompt::gate_fix(
+        let fix_prompt = prompt::gate_fix_in(
             &self.state.instruction,
             &failed,
             attempt,
             cap,
             &self.state.config.graph.language,
+            &self.state.config.graph.github_language,
         );
         let timeout = Duration::from_secs(self.state.config.graph.timeout_fix);
         let sessions = self.state.config.graph.sessions;
@@ -6873,7 +6881,8 @@ impl Runner {
             return self.settle_withheld(winner, &pr, known).await;
         }
         let mut decision = self.judge_pr_language(&winner.worktree, &pr).await;
-        let mut violations = crate::github_text::check_with(&pr.title, &pr.body, decision);
+        let mut violations =
+            crate::github_text::check_for(&self.state.config.graph, &pr.title, &pr.body, decision);
         let identity = crate::scrub::Identity::current();
         if (crate::scrub::scrub(&pr.title, &identity) != pr.title
             || crate::scrub::scrub(&pr.body, &identity) != pr.body)
@@ -6918,7 +6927,12 @@ impl Runner {
                         body: body.clone(),
                     };
                     let redecision = self.judge_pr_language(&winner.worktree, &rewrite).await;
-                    let mut failed = crate::github_text::check_with(&title, &body, redecision);
+                    let mut failed = crate::github_text::check_for(
+                        &self.state.config.graph,
+                        &title,
+                        &body,
+                        redecision,
+                    );
                     if (!crate::github_text::shareable(&title)
                         || !crate::github_text::shareable(&body))
                         && !failed.contains(&crate::github_text::Violation::SensitiveData)
@@ -7342,7 +7356,11 @@ impl Runner {
                             };
                             self.judge_pr_language(&winner.worktree, &candidate).await
                         };
-                        match gt::vet_title(&text, decision) {
+                        match gt::vet_title(
+                            &text,
+                            decision,
+                            self.state.config.graph.github_english(),
+                        ) {
                             Ok(title) => {
                                 g.resolved = true;
                                 g.chosen_title = Some(title);
@@ -7503,6 +7521,9 @@ impl Runner {
         pr: &PrMessage,
     ) -> Option<crate::github_text::LanguageDecision> {
         self.state.config.roles.language_judge.as_ref()?;
+        if !self.state.config.graph.language_gate() {
+            return None;
+        }
         let decision =
             crate::github_text::judge_language(&self.state.config, cwd, &pr.title, &pr.body).await;
         self.state.event(
@@ -9749,7 +9770,7 @@ const PR_TITLE_MAX: usize = 240;
 /// runs on the kept text before any mark is added, so only what GitHub will
 /// show is judged: an English opening followed by non-ASCII far past the cut
 /// still passes.
-fn english_title(text: &str, max: usize) -> Option<String> {
+fn english_title(text: &str, max: usize, ascii_only: bool) -> Option<String> {
     let line = queue::first_line(text)?;
     let chars: Vec<char> = line.chars().collect();
     let (kept, mark) = if chars.len() <= max {
@@ -9772,7 +9793,13 @@ fn english_title(text: &str, max: usize) -> Option<String> {
         let head = head.trim_end_matches(|c: char| c.is_whitespace() || ",;:-".contains(c));
         (head.to_owned(), "...")
     };
-    if kept.is_empty() || !kept.is_ascii() || !kept.chars().any(|c| c.is_ascii_alphabetic()) {
+    if kept.is_empty() {
+        return None;
+    }
+    if ascii_only && (!kept.is_ascii() || !kept.chars().any(|c| c.is_ascii_alphabetic())) {
+        return None;
+    }
+    if !ascii_only && !kept.chars().any(char::is_alphabetic) {
         return None;
     }
     Some(format!("{kept}{mark}"))
@@ -9880,14 +9907,23 @@ fn is_review_run(state: &RunState) -> bool {
 /// prompt, which says nothing about the change. GitHub text is English, so a
 /// non-ASCII or blank subject yields `None` and the caller's neutral title.
 fn review_title(state: &RunState) -> Option<String> {
-    english_subject(state.reviewed_commits.as_ref()?.first()?)
+    english_subject(
+        state.reviewed_commits.as_ref()?.first()?,
+        state.config.graph.github_english(),
+    )
 }
 
 /// `raw` as a pull request title, or `None` when it is blank, not English
 /// (GitHub text is), or one of magi's own candidate commit subjects.
-fn english_subject(raw: &str) -> Option<String> {
+fn english_subject(raw: &str, ascii_only: bool) -> Option<String> {
     let raw = raw.trim();
-    if raw.is_empty() || !raw.is_ascii() || !raw.chars().any(|c| c.is_ascii_alphabetic()) {
+    if raw.is_empty() {
+        return None;
+    }
+    if ascii_only && (!raw.is_ascii() || !raw.chars().any(|c| c.is_ascii_alphabetic())) {
+        return None;
+    }
+    if !ascii_only && !raw.chars().any(char::is_alphabetic) {
         return None;
     }
     let title = queue::title_from(raw, PR_TITLE_MAX);
@@ -10057,7 +10093,9 @@ fn pr_message_raw(
         t
     } else if review {
         facts
-            .and_then(|f| english_subject(&f.commits.first()?.0))
+            .and_then(|f| {
+                english_subject(&f.commits.first()?.0, state.config.graph.github_english())
+            })
             .or_else(|| review_title(state))
             .or_else(|| {
                 state
@@ -10065,13 +10103,17 @@ fn pr_message_raw(
                     .iter()
                     .find(|c| c.label == winner)
                     .filter(|c| !c.branch.starts_with("magi/"))
-                    .and_then(|c| english_subject(&c.branch))
+                    .and_then(|c| english_subject(&c.branch, state.config.graph.github_english()))
             })
             .unwrap_or_else(|| neutral_title(state, winner))
     } else {
         summary_title(summary).unwrap_or_else(|| {
-            english_title(&state.instruction, PR_TITLE_MAX)
-                .unwrap_or_else(|| neutral_title(state, winner))
+            english_title(
+                &state.instruction,
+                PR_TITLE_MAX,
+                state.config.graph.github_english(),
+            )
+            .unwrap_or_else(|| neutral_title(state, winner))
         })
     };
 
@@ -13746,6 +13788,14 @@ mod tests {
         for line in ["日本語のタスク ".repeat(80), "1234 ".repeat(100)] {
             assert!(long_title_of(&line).starts_with("chore: land"), "{line}");
         }
+    }
+
+    #[test]
+    fn pr_message_keeps_a_japanese_title_when_github_language_is_japanese() {
+        let mut state = state_with_summary("再試行を追加する", "- nothing");
+        assert!(pr_message(&state, 'A').title.starts_with("chore: land"));
+        state.config.graph.github_language = "ja".into();
+        assert_eq!(pr_message(&state, 'A').title, "再試行を追加する");
     }
 
     #[test]

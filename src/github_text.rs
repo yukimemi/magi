@@ -31,6 +31,21 @@ pub fn check(title: &str, body: &str) -> Vec<Violation> {
     check_with(title, body, None)
 }
 
+/// [`check_with`] for a configured graph: when `[graph] github_language` is not
+/// English the title / body language violations are dropped, nothing else.
+pub fn check_for(
+    graph: &crate::config::Graph,
+    title: &str,
+    body: &str,
+    decision: Option<LanguageDecision>,
+) -> Vec<Violation> {
+    let mut v = check_with(title, body, decision);
+    if !crate::lang::is_english(&graph.github_language) {
+        v.retain(|x| *x == Violation::SensitiveData);
+    }
+    v
+}
+
 /// A model's verdict on whether a title and a body's prose are English.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -230,11 +245,11 @@ pub fn prepare_with(
     let id = Identity::current();
     let clean_title = scrub(title, &id);
     let clean_body = scrub(body, &id);
-    let violations = check_with(title, body, decision);
+    let violations = check_for(&state.config.graph, title, body, decision);
     if clean_title != title || clean_body != body {
         state.event("github-text", "sensitive data removed before posting");
     }
-    let language = state.config.graph.github_text_guard;
+    let language = state.config.graph.language_gate();
     let title = if language && violations.contains(&Violation::TitleLanguage) {
         state.event("github-text", "title replaced with neutral English text");
         NEUTRAL_TITLE.to_owned()
@@ -660,6 +675,7 @@ pub fn deputy_brief() -> String {
 pub fn vet_title(
     text: &str,
     decision: Option<LanguageDecision>,
+    enforce_language: bool,
 ) -> std::result::Result<String, Vec<&'static str>> {
     let Some(title) = text.lines().map(str::trim).find(|l| !l.is_empty()) else {
         return Err(vec!["empty"]);
@@ -671,7 +687,7 @@ pub fn vet_title(
     if !shareable(title) {
         bad.push(category(Violation::SensitiveData));
     }
-    if check_with(title, "", decision).contains(&Violation::TitleLanguage) {
+    if enforce_language && check_with(title, "", decision).contains(&Violation::TitleLanguage) {
         bad.push(category(Violation::TitleLanguage));
     }
     if bad.is_empty() {
@@ -777,7 +793,7 @@ pub async fn judge_language(
     title: &str,
     body: &str,
 ) -> Option<LanguageDecision> {
-    if !cfg.graph.github_text_guard || cfg.roles.language_judge.is_none() {
+    if !cfg.graph.language_gate() || cfg.roles.language_judge.is_none() {
         return None;
     }
     match ask_judge(cfg, cwd, title, body).await {
@@ -1047,6 +1063,25 @@ mod tests {
     }
 
     #[test]
+    fn prepare_keeps_japanese_text_when_github_language_is_japanese_but_still_redacts() {
+        let mut state = RunState::new(
+            ".".into(),
+            "main".into(),
+            "abc".into(),
+            "task".into(),
+            crate::config::Config::default(),
+        );
+        state.config.graph.github_language = "ja".into();
+        let (title, body) = prepare(
+            &mut state,
+            "修正: 再試行を追加",
+            "日本語の説明を書きます。 token=secret",
+        );
+        assert_eq!(title, "修正: 再試行を追加");
+        assert!(body.contains("日本語") && !body.contains("secret"));
+    }
+
+    #[test]
     fn github_text_fixed_fallback_passes() {
         assert!(check(NEUTRAL_TITLE, NEUTRAL_BODY).is_empty());
     }
@@ -1188,6 +1223,9 @@ mod review_round_tests {
         let mut off = judge_cfg(Some("jev"), json);
         off.graph.github_text_guard = false;
         assert_eq!(judge_language(&off, &dir, "Fix", "Body").await, None);
+        let mut ja = judge_cfg(Some("jev"), json);
+        ja.graph.github_language = "ja".into();
+        assert_eq!(judge_language(&ja, &dir, "Fix", "Body").await, None);
     }
 
     #[tokio::test]
@@ -1435,22 +1473,22 @@ mod owner_question_tests {
     #[test]
     fn vet_title_applies_the_same_gate() {
         assert_eq!(
-            vet_title("\n  fix: retry failed requests \nignored", None).unwrap(),
+            vet_title("\n  fix: retry failed requests \nignored", None, true).unwrap(),
             "fix: retry failed requests"
         );
-        assert_eq!(vet_title("  ", None).unwrap_err(), ["empty"]);
+        assert_eq!(vet_title("  ", None, true).unwrap_err(), ["empty"]);
         assert!(
-            vet_title("修正: 再試行を追加", None)
+            vet_title("修正: 再試行を追加", None, true)
                 .unwrap_err()
                 .contains(&"title-language")
         );
         assert!(
-            vet_title("fix: token=abcdefghijklmnop0123456789", None)
+            vet_title("fix: token=abcdefghijklmnop0123456789", None, true)
                 .unwrap_err()
                 .contains(&"sensitive-data")
         );
         assert!(
-            vet_title(&"a ".repeat(150), None)
+            vet_title(&"a ".repeat(150), None, true)
                 .unwrap_err()
                 .contains(&"too-long")
         );
@@ -1482,5 +1520,26 @@ mod owner_question_tests {
         let q = question(None, &[]);
         assert!(!expired(&q, 3600));
         assert!(expired(&q, 0));
+    }
+
+    #[test]
+    fn check_for_drops_only_the_language_violations_for_a_non_english_github_language() {
+        let mut g = crate::config::Graph::default();
+        let (title, body) = ("修正: 再試行を追加", "失敗したリクエストを再試行します。");
+        let en = check_for(&g, title, body, None);
+        assert!(en.contains(&Violation::TitleLanguage) && en.contains(&Violation::BodyLanguage));
+        g.github_language = "ja".into();
+        assert!(check_for(&g, title, body, None).is_empty());
+        let leak = "token=abcdefghijklmnop0123456789 を使う";
+        assert_eq!(check_for(&g, title, leak, None), [Violation::SensitiveData]);
+    }
+
+    #[test]
+    fn vet_title_skips_the_language_check_when_not_enforced() {
+        assert_eq!(
+            vet_title("修正: 再試行を追加", None, false).unwrap(),
+            "修正: 再試行を追加"
+        );
+        assert!(vet_title("修正: token=abcdefghijklmnop0123456789", None, false).is_err());
     }
 }

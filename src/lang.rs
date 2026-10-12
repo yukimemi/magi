@@ -5,6 +5,12 @@
 //! a code or a name, so the Japanese spellings are matched loosely; anything
 //! else falls back to English rather than shipping a guess.
 
+/// Is this the default, where nothing needs saying? Empty, `en` or `english`.
+pub fn is_english(language: &str) -> bool {
+    let l = language.trim();
+    l.is_empty() || l.eq_ignore_ascii_case("en") || l.eq_ignore_ascii_case("english")
+}
+
 /// Whether `language` names Japanese: `ja`, `jp`, `japanese` or `日本語`,
 /// trimmed and case-insensitive.
 pub fn is_japanese(language: &str) -> bool {

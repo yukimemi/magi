@@ -130,6 +130,7 @@ pub async fn rebase_with_fixer(
             round,
             cap,
             language: &state.config.graph.language,
+            github_language: &state.config.graph.github_language,
         });
         let prompt_text = if state.config.cache_dir().is_some() {
             format!("{prompt_text}\n\n{}", prompt::build_cache_note("fix", true))
