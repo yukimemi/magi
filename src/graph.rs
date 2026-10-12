@@ -5348,6 +5348,9 @@ impl Runner {
         }
 
         self.recovery_repair(&winner).await?;
+        if self.resource_halt()? {
+            return Ok(());
+        }
 
         let repo = self.state.repo.clone();
         let root = self.state.worktree_root();
