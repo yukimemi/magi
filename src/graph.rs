@@ -7949,6 +7949,9 @@ async fn wave(
                         "parked while waiting for the shared build cache",
                     );
                 }
+                // An unreadable lease is not contention: keep the old
+                // fallback (no shared cache for this wave's seats).
+                Err(e) if e.downcast_ref::<CacheCheckError>().is_some() => None,
                 Err(e) => {
                     // Writing seats may not build into a cache this run does
                     // not hold, and an agent that cannot be given one is not
@@ -8747,7 +8750,7 @@ async fn acquire_cache_lease(
             if let Err(e2) = state.save() {
                 tracing::warn!("could not persist a cache-check failure: {e2:#}");
             }
-            return Err(e);
+            return Err(anyhow::Error::new(CacheCheckError(format!("{e:#}"))));
         }
     };
     state.event(
@@ -8792,6 +8795,21 @@ async fn acquire_cache_lease(
         }
     }
 }
+
+/// The lease state could not be read at all (unreadable lease file, a
+/// permission problem). Unlike a busy lease that outlasts its bound, nothing is
+/// known to be contended, so a wave degrades to running without a shared cache
+/// instead of stopping on a hold that [`crate::triage`] could never release.
+#[derive(Debug)]
+struct CacheCheckError(String);
+
+impl std::fmt::Display for CacheCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CacheCheckError {}
 
 /// Run `body` — a verify command batch — while holding the shared build
 /// cache's lease, so this run's own full verification (`e2e`, `gate`) can
