@@ -6479,7 +6479,13 @@ impl Runner {
                 if let AgentOutcome::Ok(output) = outcome
                     && let Some(title) = summary_title(&output.text)
                 {
-                    let mut body = summary_without_title(&output.text);
+                    // Judge the redacted candidate that will actually be posted.
+                    // Sensitive data alone must not discard a useful rewrite.
+                    let raw_body = summary_without_title(&output.text);
+                    let clean_title = crate::scrub::scrub(&title, &identity);
+                    let mut body = crate::scrub::scrub(&raw_body, &identity);
+                    let redacted = clean_title != title || body != raw_body;
+                    let title = clean_title;
                     let rewrite = PrMessage {
                         title: title.clone(),
                         body: body.clone(),
@@ -6499,6 +6505,12 @@ impl Runner {
                         rewritten = true;
                         self.state
                             .event("github-text", "description rewrite passed");
+                        if redacted {
+                            self.state.event(
+                                "github-text",
+                                "sensitive data removed from description rewrite",
+                            );
+                        }
                     }
                 }
             }
@@ -12543,7 +12555,23 @@ mod tests {
                 "TITLE: fix: retries\n日本語の説明をもう一度書きます。",
                 false,
             ),
-            ("TITLE: fix: retries\nUse token=secret", false),
+            (
+                "TITLE: fix: retries\nAdd retries for failed requests. Use token=secret",
+                true,
+            ),
+            (
+                "TITLE: fix: retries\nAdd retries for failed requests. Example: password=\"prefix\\\"secret tail\"",
+                true,
+            ),
+            (
+                "TITLE: fix: retries token=secret\nAdd retries for failed requests. Example: password=\"日本語の秘密secret\"",
+                true,
+            ),
+            (
+                "TITLE: fix: retries\n日本語の説明です。 token=secret",
+                false,
+            ),
+            ("TITLE: fix: retries\n", false),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let mut runner = runner_at(RunStatus::Gating);
@@ -12602,6 +12630,9 @@ mod tests {
                 again
             };
             assert!(crate::github_text::check(&message.title, &message.body).is_empty());
+            assert!(!message.body.contains("secret"));
+            assert!(!message.body.contains("prefix"));
+            assert!(!message.title.contains("secret"));
             assert_eq!(
                 message.body.contains("Add retries for failed requests."),
                 accepted
@@ -12611,6 +12642,16 @@ mod tests {
                 "only one rewrite invocation"
             );
             assert!(runner.state.events.iter().any(|e| e.node == "github-text"));
+            if accepted {
+                assert!(runner.state.github_text.is_none());
+                assert!(!runner.state.parked);
+                assert!(!message.body.contains(crate::github_text::NEUTRAL_BODY));
+                assert!(
+                    message
+                        .body
+                        .contains(&format!("magi:run/{}", runner.state.id))
+                );
+            }
             if !accepted {
                 assert!(message.body.contains(crate::github_text::NEUTRAL_BODY));
                 assert!(

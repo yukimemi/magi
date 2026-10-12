@@ -295,7 +295,10 @@ fn quoted_credential(rest: &str) -> Option<(usize, &'static str)> {
         else {
             continue;
         };
-        let Some(after_quote) = after.strip_prefix(['"', '\'']) else {
+        let Some(after_quote) = after
+            .strip_prefix("\\\"")
+            .or_else(|| after.strip_prefix(['"', '\'']))
+        else {
             continue;
         };
         let t = after_quote.trim_start();
@@ -304,16 +307,11 @@ fn quoted_credential(rest: &str) -> Option<(usize, &'static str)> {
         };
         let t = t.trim_start();
         // A quoted value runs to its closing quote and may hold spaces or commas.
-        let n = match t.chars().next() {
-            Some(q @ ('"' | '\'')) => {
-                let inner = &t[1..];
-                let end = quoted_end(inner, q).unwrap_or(inner.len());
-                1 + end + usize::from(end < inner.len())
-            }
-            _ => run(t, |c| {
+        let n = quoted_value_len(t).unwrap_or_else(|| {
+            run(t, |c| {
                 !c.is_whitespace() && !matches!(c, '`' | '<' | '>' | ',' | '}')
-            }),
-        };
+            })
+        });
         let value = t;
         if n > 0 {
             return Some((rest.len() - value.len() + n, "[redacted-token]"));
@@ -333,6 +331,32 @@ fn quoted_end(inner: &str, q: char) -> Option<usize> {
         }
     }
     None
+}
+
+/// Include the delimiters and all escaped content, even in a JSON-encoded
+/// representation whose delimiters are themselves escaped. An unclosed value
+/// consumes the rest rather than leaving a secret's suffix behind.
+fn quoted_value_len(value: &str) -> Option<usize> {
+    if let Some(inner) = value.strip_prefix("\\\"") {
+        let mut slashes = 0;
+        for (i, c) in inner.char_indices() {
+            if c == '\\' {
+                slashes += 1;
+                continue;
+            }
+            // One JSON encoding layer doubles backslashes. A delimiter has
+            // 4k+1 slashes; an escaped quote within the value has 4k+3.
+            if c == '"' && slashes % 4 == 1 {
+                return Some(2 + i + 1);
+            }
+            slashes = 0;
+        }
+        return Some(value.len());
+    }
+    let q = value.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+    let inner = &value[1..];
+    let end = quoted_end(inner, q).unwrap_or(inner.len());
+    Some(1 + end + usize::from(end < inner.len()))
 }
 
 fn credential(rest: &str) -> Option<(usize, &'static str)> {
@@ -357,15 +381,25 @@ fn credential(rest: &str) -> Option<(usize, &'static str)> {
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(key))
         {
             let tail = &rest[key.len()..];
-            let padding = tail.len() - tail.trim_start_matches([' ', '\'', '"']).len();
+            let padding = tail.len() - tail.trim_start_matches(' ').len();
             let value = &tail[padding..];
-            let n = run(value, |c| {
-                !c.is_whitespace() && !matches!(c, '`' | '<' | '>' | '"' | '\'')
+            let n = quoted_value_len(value).unwrap_or_else(|| {
+                run(value, |c| {
+                    !c.is_whitespace() && !matches!(c, '`' | '<' | '>' | '"' | '\'')
+                })
             });
             let contextual = matches!(key, "password " | "token " | "api key ");
-            let entropy = n >= 20
-                && value[..n].bytes().any(|b| b.is_ascii_digit())
-                && value[..n].bytes().any(|b| b.is_ascii_alphabetic());
+            let entropy_value = value.trim_start_matches(['\'', '"']);
+            let entropy_len = run(entropy_value, |c| {
+                !c.is_whitespace() && !matches!(c, '`' | '<' | '>' | '"' | '\'')
+            });
+            let entropy = entropy_len >= 20
+                && entropy_value[..entropy_len]
+                    .bytes()
+                    .any(|b| b.is_ascii_digit())
+                && entropy_value[..entropy_len]
+                    .bytes()
+                    .any(|b| b.is_ascii_alphabetic());
             if n > 0 && (!contextual || entropy) {
                 return Some((key.len() + padding + n, "[redacted-token]"));
             }
@@ -624,6 +658,67 @@ mod tests {
         // No closing quote: everything after is removed.
         let out = s(r#"{"password":"abc\"hunter2"#);
         assert!(!out.contains("hunter2"), "{out}");
+    }
+
+    #[test]
+    fn unquoted_keys_redact_the_whole_quoted_value() {
+        for text in [
+            r#"password="prefix\"secret tail" safe"#,
+            r#"token: "prefix\\\"secret tail" safe"#,
+            r#"api_key='prefix\'secret tail' safe"#,
+            r#"password="prefix\\" safe"#,
+            r#"password="prefix\"secret tail"#,
+        ] {
+            let out = s(text);
+            assert!(!out.contains("prefix") && !out.contains("secret"), "{out}");
+            if text.ends_with(" safe") {
+                assert_eq!(out, "[redacted-token] safe");
+            } else {
+                assert_eq!(out, "[redacted-token]");
+            }
+        }
+        // Context words keep their existing entropy requirement.
+        assert_eq!(
+            s(r#"token "ordinary words" safe"#),
+            r#"token "ordinary words" safe"#
+        );
+        assert_eq!(
+            s(r#"token "abcdefghijklmnopq1" safe"#),
+            r#"token "abcdefghijklmnopq1" safe"#
+        );
+        assert_eq!(
+            s(r#"token "abcdefghijklmnopqrst1\"secret tail" safe"#),
+            "[redacted-token] safe"
+        );
+    }
+
+    #[test]
+    fn json_encoded_credentials_redact_escaped_delimiters_and_content() {
+        for slashes in 0..5 {
+            for secret in [
+                format!("prefix{}\"secret tail", "\\".repeat(slashes)),
+                format!("prefix secret{}", "\\".repeat(slashes)),
+            ] {
+                let json = format!(
+                    "{{\"password\":{},\"note\":\"safe\"}}",
+                    serde_json::to_string(&secret).unwrap()
+                );
+                let encoded = serde_json::to_string(&json).unwrap();
+                for text in [json, encoded] {
+                    let out = s(&text);
+                    assert!(!out.contains("prefix") && !out.contains("secret"), "{out}");
+                    assert!(out.contains("safe"), "{out}");
+                }
+            }
+        }
+        for text in [
+            r#"{\"token\": \"prefix\\\"secret tail"#,
+            r#"password=\"prefix\\\"secret tail"#,
+        ] {
+            let out = s(text);
+            assert!(out.ends_with("[redacted-token]"), "{out}");
+            assert!(!out.contains("prefix") && !out.contains("secret"), "{out}");
+        }
     }
 
     #[test]
