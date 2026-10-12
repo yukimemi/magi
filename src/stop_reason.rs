@@ -53,15 +53,21 @@ pub(crate) fn of(state: &RunState, latest: Option<(&str, RunStatus)>) -> Option<
         (blocking > 0).then(|| format!("{blocking} open Major-or-above review finding(s)."))
     })
     .or_else(|| {
-        (matches!(state.status, RunStatus::Stalled | RunStatus::Failed)
-            && state.viable().is_empty()
-            && !state.quota.is_empty())
-        .then(|| {
-            format!(
-                "Quota loss: {} seat(s); no viable candidates remain.",
-                state.quota.len()
-            )
-        })
+        if state.quota.is_empty() {
+            return None;
+        }
+        let seats = state.quota.len();
+        match state.status {
+            // A stall is a lost quorum; the lost seats explain it even when
+            // viable candidates remain.
+            RunStatus::Stalled => Some(format!(
+                "Quota loss: {seats} seat(s); the judging panel lost its quorum."
+            )),
+            RunStatus::Failed if state.viable().is_empty() => Some(format!(
+                "Quota loss: {seats} seat(s); no viable candidates remain."
+            )),
+            _ => None,
+        }
     })
     .or_else(|| {
         state
@@ -264,6 +270,12 @@ mod tests {
         }]))
         .unwrap();
         assert_eq!(of(&s, None).unwrap(), "The graph could not complete.");
+        // Viable candidates but a collapsed panel: still quota.
+        s.status = RunStatus::Stalled;
+        assert_eq!(
+            of(&s, None).unwrap(),
+            "Quota loss: 1 seat(s); the judging panel lost its quorum."
+        );
     }
 
     #[test]
