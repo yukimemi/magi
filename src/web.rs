@@ -6296,6 +6296,7 @@ struct QuestionView {
     #[serde(flatten)]
     question: Question,
     detail_md: Vec<md::Node>,
+    posting_view: Option<PostingView>,
     /// Each thread turn's body, parsed; same order as `question.thread`.
     thread_bodies_md: Vec<Vec<md::Node>>,
     /// Each thread turn's deputy note, parsed (`None` for a turn without
@@ -6331,6 +6332,45 @@ struct QuestionView {
     origin_chat_closed: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct PostingView {
+    before_md: Vec<md::Node>,
+    after_md: Vec<md::Node>,
+    fields: Vec<crate::github_text::ComparisonView>,
+}
+
+fn posting_view(question: &Question, base: &md::ImageBase) -> Option<PostingView> {
+    let comparison = question.posting_comparison.as_ref()?;
+    if !comparison.matches_detail(&question.detail) {
+        return None;
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    if comparison.fields.is_empty()
+        || comparison
+            .fields
+            .iter()
+            .flat_map(|f| &f.pairs)
+            .any(|p| !ids.insert(p.id))
+        || comparison
+            .fields
+            .iter()
+            .flat_map(|f| &f.original_triggers)
+            .any(|t| !ids.insert(t.id))
+    {
+        return None;
+    }
+    let fields = comparison
+        .fields
+        .iter()
+        .map(|f| f.view(comparison.excerpt))
+        .collect::<Option<Vec<_>>>()?;
+    Some(PostingView {
+        before_md: md::to_nodes(question.detail.get(..comparison.start)?, base),
+        after_md: md::to_nodes(question.detail.get(comparison.end..)?, base),
+        fields,
+    })
+}
+
 impl QuestionView {
     /// The view of `question`, reading who is waiting on it from `store`.
     ///
@@ -6342,6 +6382,7 @@ impl QuestionView {
         let holder = holder_of(&question, store.read_lease(&question.id).as_ref());
         Self {
             detail_md: md::to_nodes(&question.detail, &base),
+            posting_view: posting_view(&question, &base),
             thread_bodies_md: question
                 .thread
                 .iter()
@@ -15576,6 +15617,115 @@ mod tests {
         let p = run_prose_md(&state);
         assert!(p.advice_md.is_none());
         assert!(p.candidate_summaries_md.is_empty() && p.reviews_md.is_empty());
+    }
+
+    #[test]
+    fn posting_comparison_view_validates_metadata_and_supports_legacy_questions() {
+        let store = ask::Questions::at(PathBuf::from("unused"));
+        let gt = crate::github_text::Withheld {
+            title: false,
+            body: true,
+            categories: vec!["sensitive-data".into()],
+        };
+        let body = "<img src=x onerror=alert(1)> & 192.0.2.1";
+        let (detail, comparison) =
+            crate::github_text::question_content(&gt, "fix: x", body, "r", None, None, None);
+        let mut q = Question::new(
+            "r".into(),
+            "github-text".into(),
+            "posting-gate".into(),
+            "s".into(),
+            detail,
+            Vec::new(),
+        );
+        assert!(
+            QuestionView::of(q.clone(), &store, false)
+                .posting_view
+                .is_none()
+        );
+        q.posting_comparison = Some(comparison);
+        let view = QuestionView::of(q.clone(), &store, false);
+        let field = &view.posting_view.unwrap().fields[0];
+        assert_eq!(
+            field
+                .original
+                .iter()
+                .map(|f| f.text.as_str())
+                .collect::<String>(),
+            body
+        );
+        assert!(field.original[0].text.starts_with("<img"));
+        let original_question: Question =
+            serde_json::from_str(&serde_json::to_string(&q).unwrap()).unwrap();
+        assert_eq!(original_question, q);
+        q.posting_comparison.as_mut().unwrap().fields[0].pairs[0]
+            .original
+            .start = 1;
+        assert!(
+            QuestionView::of(q.clone(), &store, false)
+                .posting_view
+                .is_none()
+        );
+        q.posting_comparison = original_question.posting_comparison;
+        q.detail.push_str("extra context");
+        assert!(
+            QuestionView::of(q.clone(), &store, false)
+                .posting_view
+                .is_some()
+        );
+        q.detail.insert(0, 'x');
+        assert!(QuestionView::of(q, &store, false).posting_view.is_none());
+    }
+
+    #[test]
+    fn posting_comparison_whole_field_view_carries_unique_trigger_groups() {
+        let store = ask::Questions::at(PathBuf::from("unused"));
+        let body = "日本語の説明です。\nghp_abcdefghijklmnop\nMore context.\nghp_abcdefghijklmnop";
+        let gt = crate::github_text::Withheld::from_check(
+            &crate::github_text::check("fix: x", body),
+            "fix: x",
+            body,
+        )
+        .unwrap();
+        let (detail, comparison) =
+            crate::github_text::question_content(&gt, "fix: x", body, "r", None, None, None);
+        let mut q = Question::new(
+            "r".into(),
+            "github-text".into(),
+            "posting-gate".into(),
+            "s".into(),
+            detail,
+            Vec::new(),
+        );
+        q.posting_comparison = Some(comparison);
+        let value = serde_json::to_value(QuestionView::of(q.clone(), &store, false)).unwrap();
+        let field = &value["posting_view"]["fields"][0];
+        let group = &field["replacement_group"];
+        let triggers = group["triggers"].as_array().unwrap();
+        assert_eq!(triggers.len(), 2);
+        assert_ne!(triggers[0], triggers[1]);
+        for id in triggers {
+            assert!(
+                field["original"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|f| &f["pair"] == id)
+            );
+            assert!(
+                !field["changed"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|f| &f["pair"] == id)
+            );
+        }
+        q.posting_comparison.as_mut().unwrap().fields[0].original_triggers[0].id =
+            group["id"].as_u64().unwrap() as usize;
+        assert!(
+            QuestionView::of(q, &store, false).posting_view.is_none(),
+            "group and trigger IDs cannot collide"
+        );
     }
 
     #[test]

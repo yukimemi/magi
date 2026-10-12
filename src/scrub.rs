@@ -95,11 +95,35 @@ fn run(s: &str, f: impl Fn(char) -> bool) -> usize {
 
 /// Replace machine- and operator-identifying data in `text`. Pure.
 pub fn scrub(text: &str, id: &Identity) -> String {
+    scan(text, id, |_| {})
+}
+
+/// Actual replacements from the shared scanner; byte ranges in input and output.
+#[derive(Debug, Clone)]
+pub(crate) struct Edit {
+    pub(crate) original: std::ops::Range<usize>,
+    pub(crate) changed: std::ops::Range<usize>,
+    pub(crate) kind: &'static str,
+}
+
+pub(crate) fn scrub_with_edits(text: &str, id: &Identity) -> (String, Vec<Edit>) {
+    let mut edits = Vec::new();
+    let out = scan(text, id, |edit| edits.push(edit));
+    (out, edits)
+}
+
+fn scan(text: &str, id: &Identity, mut record: impl FnMut(Edit)) -> String {
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < text.len() {
         if let Some((len, rep)) = match_at(&text[..i], &text[i..], id) {
+            let start = out.len();
             out.push_str(rep);
+            record(Edit {
+                original: i..i + len,
+                changed: start..out.len(),
+                kind: replacement_kind(rep),
+            });
             i += len;
         } else {
             let c = text[i..].chars().next().expect("i is on a char boundary");
@@ -110,6 +134,16 @@ pub fn scrub(text: &str, id: &Identity) -> String {
     out
 }
 
+fn replacement_kind(rep: &'static str) -> &'static str {
+    match rep {
+        "~" => "home-path",
+        r => r
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_start_matches("redacted-"),
+    }
+}
+
 /// Where [`scrub`] would replace something: `(line, kind)` per match, lines
 /// counted from 1. Never carries the matched text. Pure.
 pub fn locate(text: &str, id: &Identity) -> Vec<(usize, &'static str)> {
@@ -118,13 +152,7 @@ pub fn locate(text: &str, id: &Identity) -> Vec<(usize, &'static str)> {
     let mut line = 1;
     while i < text.len() {
         if let Some((len, rep)) = match_at(&text[..i], &text[i..], id) {
-            let kind = match rep {
-                "~" => "home-path",
-                r => r
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .trim_start_matches("redacted-"),
-            };
+            let kind = replacement_kind(rep);
             hits.push((line, kind));
             line += text[i..i + len].matches('\n').count();
             i += len;
