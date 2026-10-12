@@ -15057,7 +15057,7 @@ mod tests {
             assert_eq!(detail["badge_status"], expected);
             assert!(list[0]["superseded_by"].is_null());
             assert!(detail["superseded_by"].is_null());
-            let task_detail = f.get(&format!("/api/tasks/{}", task.id)).await.json();
+            let task_detail = f.get(&format!("/api/queue/{}", task.id)).await.json();
             let history = task_detail["history"].as_array().unwrap();
             assert_eq!(history.len(), 2);
             assert!(history[0]["badge"].is_null());
