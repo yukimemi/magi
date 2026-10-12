@@ -221,7 +221,11 @@ fn pr_config(fx: &mut common::Fixture) {
 }
 
 fn comments(forge: &Path) -> usize {
-    std::fs::read_to_string(forge.join("calls")).unwrap().lines().filter(|l| *l == "pr comment").count()
+    std::fs::read_to_string(forge.join("calls"))
+        .unwrap()
+        .lines()
+        .filter(|l| *l == "pr comment")
+        .count()
 }
 
 common::e2e! {
