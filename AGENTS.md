@@ -2599,23 +2599,24 @@ fallback; a language-withheld field becomes neutral.
 - **The question** (`github_text::ASK_NODE` `github-text`, seat `posting-gate`)
   has no `cwd`, `answer_timeout` set, and a fixed `asked_at + answer_timeout`
   clock (`deputy::fixed_clock`), so the waiter ignores it and a Generic deputy
-  may serve it. Choices: `use fallback` (post the CHANGED text),
+  may serve it. Choices: `use fallback` (post the FALLBACK text),
   `post original` (post the ORIGINAL text of every withheld field,
-  whatever rule fired, past the gate) and, when the title is withheld,
-  `use my text` (the replacement title is the owner's latest operator say,
+  whatever rule fired, past the gate), `use rewrite` when a usable rejected
+  rewrite exists (post both saved fields unmodified, past the gate), and, when
+  the title is withheld, `use my text` (the replacement title is the owner's latest operator say,
   sent before picking the choice; no new `Question` field, `ask::SCHEMA`
   unchanged). The detail is English, keeps the "What triggered each rule"
   diagnosis, and shows for each withheld field the ORIGINAL text exactly as the
-  agent wrote it next to the CHANGED text, in fences longer than any backtick
+  agent wrote it next to the FALLBACK text, in fences longer than any backtick
   run in the text. `github_text::fallback_text` is the one function that
-  produces CHANGED, for the display and for the posting alike. The original is
+  produces FALLBACK, for the display and for the posting alike. The original is
   **not** redacted or hidden in the question (the old "shown only if `scrub`
   leaves it unchanged" rule is gone; do not bring it back): it is shown up to
   `SHOWN_MAX_CHARS` when the artifact file holds the full text, in full when
   that file could not be written. The artifact
-  (`github-text-<fingerprint>.md`, ORIGINAL and CHANGED, unredacted) stays in the
-  run directory. The retry question after a rejected replacement title compares
-  the same original and names only the replacement's categories. Only the
+  (`github-text-<fingerprint>.md`, ORIGINAL, FALLBACK and optional REWRITE,
+  full text) stays in the run directory. The retry question after a rejected
+  replacement title compares the same original and names only the replacement's categories. Only the
   summary line follows `[graph] language`. Nothing of this reaches a remote
   surface: `ask::notify` / notices send the summary only, and the event log
   never records the text (only field names, e.g. `posting the original text
@@ -2626,7 +2627,7 @@ fallback; a language-withheld field becomes neutral.
   `github-text` question for such a run (told apart from a land approval by
   `RunState::github_text`, not by status), abandons it at the deadline, and
   resumes as soon as it is answered. Silence, abandonment and `use fallback`
-  all end in the CHANGED text, so an unattended run still finishes and only
+  all end in the FALLBACK text, so an unattended run still finishes and only
   the withheld field is replaced. Needs `magi serve`: a run started in-process
   with no loop alive waits in `daemon::run_claimed` (claim held, `land_resume_state` polled every 15 s) and finishes itself at the answer or the deadline; only Ctrl-C leaves it parked for a later `magi serve`.
 - **`post original` overrides the gate, for the fields it was chosen for.**
@@ -2638,23 +2639,36 @@ fallback; a language-withheld field becomes neutral.
   re-scrub that `set_pr_title` applies. The original is not stored in the run
   state: `settle_withheld` is only entered with a matching fingerprint, so `pr`
   is the text that was asked about.
-- **A deputy may settle `post original` only under the irreversible-choice
-  guard.** `deputy::destructive` names it by *label* (not position: the retry
-  question has the same choices, but never rely on order), so `--settle` needs a
+- **Rejected rewrites stay available.** `GithubTextAsk::rewrite` stores an optional
+  `GithubTextRewrite` with `title`, `body` and `failed` rule categories, after
+  scrubbing and run marker insertion. Empty or malformed output and agent failure
+  leave no rewrite. The English question shows REWRITE with remaining rules and
+  diagnostics. When a rewrite exists all three versions show both fields,
+  using the same excerpt limit and fences; its local artifact holds the full
+  pair. `use rewrite` saves
+  `GithubTextChoice::Rewrite` before posting and uses both saved fields without
+  another gate, including a title that was not originally withheld. Adopted PRs
+  update both fields through `set_pr_text_verbatim`, even when the title already
+  matches; an edit failure blocks the run. A missing rewrite falls back, as do
+  silence, timeout and abandonment. Restart and retry reuse the saved pair;
+  no text is copied into event messages or notifications.
+- **A deputy may settle `post original` or `use rewrite` only under the
+  irreversible-choice guard.** `deputy::destructive` names it by *label* (not
+  position: the retry question has the same choices, but never rely on order), so `--settle` needs a
   verbatim quote of the owner's latest message that passes `land::unhedged`.
   `github_text::deputy_brief` is appended to the Generic brief for this node and
   says publishing is irreversible and doubt means asking back with `--thread`.
   A consulted chat is held to the same rule: `consult::validate_answer` requires
   `--quote` from the owner's latest message, passing `land::unhedged`, for
-  `post original` (`use fallback` stays unguarded).
+  `post original` and `use rewrite` (`use fallback` stays unguarded).
 - **A replacement goes through the same gate** (`github_text::vet_title`, with
   the `language_judge` when configured). Sensitive data is rejected, never
   redacted into text the owner did not write. A failing reply gets one more
   question naming the categories; the second failure falls back.
 - **Once, and across restarts.** `RunState::github_text` (`GithubTextAsk`,
   `#[serde(default)]`, `run::SCHEMA` unchanged) holds the fingerprint of the
-  rejected text, the question id, `asks` (max 2) and `resolved`. The question
-  id is saved before the question is written; `resolved` is saved before the
-  pull request is opened. A resume with the same fingerprint skips the judge
-  and the rewrite and asks nothing new; a different text retires the old
-  question and starts over.
+  rejected text, the question id, `asks` (max 2) and `resolved`. The rejected
+  rewrite, when available, is saved with the question id before the question is
+  written; `resolved` is saved before the pull request is opened. A resume with
+  the same fingerprint skips the judge and the rewrite and asks nothing new;
+  a different text retires the old question and starts over.

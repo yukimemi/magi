@@ -2153,9 +2153,34 @@ pub async fn set_pr_title(state: &mut RunState, repo: &Path, url: &str, title: &
 }
 
 /// [`set_pr_title`] for a title the owner explicitly chose to post unmodified
-/// (`github_text::POST_ORIGINAL`): the posting gate is skipped on purpose.
+/// (`github_text::POST_ORIGINAL` or `github_text::USE_REWRITE`): the posting
+/// gate is skipped on purpose.
 pub async fn set_pr_title_verbatim(repo: &Path, url: &str, title: &str) -> Result<()> {
     edit_pr_title(repo, url, title).await
+}
+
+/// Post both fields of the owner's chosen rewrite to an adopted pull request,
+/// unmodified and without the posting gate.
+pub async fn set_pr_text_verbatim(repo: &Path, url: &str, title: &str, body: &str) -> Result<()> {
+    let (ok, _) = gh(
+        repo,
+        &[
+            "pr".to_owned(),
+            "edit".to_owned(),
+            url.to_owned(),
+            "--title".to_owned(),
+            title.to_owned(),
+            "--body".to_owned(),
+            body.to_owned(),
+        ],
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("could not run gh pr edit for the chosen rewrite"))?;
+    if !ok {
+        // Command output may echo the chosen text; keep it out of run events.
+        bail!("gh pr edit failed while posting the chosen rewrite");
+    }
+    Ok(())
 }
 
 async fn edit_pr_title(repo: &Path, url: &str, title: &str) -> Result<()> {

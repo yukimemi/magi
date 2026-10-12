@@ -6432,6 +6432,7 @@ impl Runner {
                 },
             );
             let mut rewritten = false;
+            let mut rejected_rewrite = None;
             if has_language
                 && let Some(spec) = self
                     .state
@@ -6486,21 +6487,34 @@ impl Runner {
                     let mut body = crate::scrub::scrub(&raw_body, &identity);
                     let redacted = clean_title != title || body != raw_body;
                     let title = clean_title;
+                    let marker = format!("magi:run/{}", self.state.id);
+                    if !body.trim().is_empty() && !body.contains(&marker) {
+                        body.push_str(&format!("\n\n{marker}"));
+                    }
                     let rewrite = PrMessage {
                         title: title.clone(),
                         body: body.clone(),
                     };
                     let redecision = self.judge_pr_language(&winner.worktree, &rewrite).await;
-                    if !body.trim().is_empty()
-                        && crate::github_text::check_with(&title, &body, redecision).is_empty()
-                        && crate::github_text::shareable(&title)
-                        && crate::github_text::shareable(&body)
+                    let mut failed = crate::github_text::check_with(&title, &body, redecision);
+                    if (!crate::github_text::shareable(&title)
+                        || !crate::github_text::shareable(&body))
+                        && !failed.contains(&crate::github_text::Violation::SensitiveData)
                     {
+                        failed.push(crate::github_text::Violation::SensitiveData);
+                    }
+                    if !title.trim().is_empty() && !body.trim().is_empty() && !failed.is_empty() {
+                        rejected_rewrite = Some(crate::run::GithubTextRewrite {
+                            title: title.clone(),
+                            body: body.clone(),
+                            failed: failed
+                                .iter()
+                                .map(|v| crate::github_text::category(*v).to_owned())
+                                .collect(),
+                        });
+                    }
+                    if !title.trim().is_empty() && !body.trim().is_empty() && failed.is_empty() {
                         decision = redecision;
-                        let marker = format!("magi:run/{}", self.state.id);
-                        if !body.contains(&marker) {
-                            body.push_str(&format!("\n\n{marker}"));
-                        }
                         pr = PrMessage { title, body };
                         rewritten = true;
                         self.state
@@ -6526,6 +6540,7 @@ impl Runner {
                     // question no longer describes anything.
                     self.retire_github_text_question("the withheld text changed");
                     let record = crate::run::GithubTextAsk {
+                        rewrite: rejected_rewrite,
                         fingerprint: raw_fp,
                         title: w.title,
                         body: w.body,
@@ -6619,6 +6634,15 @@ impl Runner {
                         g.chosen_title = None;
                         g.choice = Some(GithubTextChoice::Original);
                     }
+                    gt::Reply::Rewrite => {
+                        g.resolved = true;
+                        g.chosen_title = None;
+                        g.choice = Some(if g.rewrite.is_some() {
+                            GithubTextChoice::Rewrite
+                        } else {
+                            GithubTextChoice::Fallback
+                        });
+                    }
                     gt::Reply::Title(text) => {
                         let first = text
                             .lines()
@@ -6656,7 +6680,7 @@ impl Runner {
             }
             if let Some(rejected) = ask_again {
                 // A retry (after a rejected replacement title) is still about
-                // the original text: the same ORIGINAL / CHANGED comparison.
+                // the original text: the same ORIGINAL / FALLBACK comparison.
                 let w = gt::Withheld {
                     title: g.title,
                     body: g.body,
@@ -6667,7 +6691,7 @@ impl Runner {
                 let artifact = match crate::run::write_artifact(
                     &self.state,
                     &gt::artifact_name(&gt::fingerprint(&pr.title, &pr.body)),
-                    &gt::artifact_text(&w, &pr.title, &pr.body, &self.state.id),
+                    &gt::artifact_text(&w, &pr.title, &pr.body, &self.state.id, g.rewrite.as_ref()),
                 ) {
                     Ok(p) => Some(p),
                     Err(e) => {
@@ -6687,8 +6711,9 @@ impl Runner {
                         &self.state.id,
                         rejected.as_deref(),
                         artifact.as_deref(),
+                        g.rewrite.as_ref(),
                     ),
-                    gt::question_choices(&w),
+                    gt::question_choices(&w, g.rewrite.as_ref()),
                 );
                 q.answer_timeout = timeout;
                 // Recorded before it is written: a stop in between leaves a
@@ -6728,6 +6753,8 @@ impl Runner {
                         _ => "description",
                     }
                 )
+            } else if g.choice == Some(GithubTextChoice::Rewrite) && g.rewrite.is_some() {
+                "posting the saved rewrite title and description".to_owned()
             } else if resolved.is_some() {
                 "posting the owner's replacement title".to_owned()
             } else {
@@ -6736,6 +6763,14 @@ impl Runner {
         );
         self.state.github_text = Some(g.clone());
         self.state.save()?;
+        if g.choice == Some(GithubTextChoice::Rewrite)
+            && let Some(r) = g.rewrite.as_ref()
+        {
+            return Ok(Some(PrMessage {
+                title: r.title.clone(),
+                body: r.body.clone(),
+            }));
+        }
         let w = gt::Withheld {
             title: g.title,
             body: g.body,
@@ -6982,39 +7017,56 @@ impl Runner {
                         PrPlan::Adopt { url, title } => {
                             self.state
                                 .event("merge", format!("Pr: adopted open pull request {url}"));
-                            if title != pr.title
-                                && (!is_review_run(&self.state)
-                                    || leaked
-                                        .as_deref()
-                                        .is_some_and(|l| should_retitle(&title, &pr.title, l)))
-                                && let Err(e) =
-                                    if self.state.github_text.as_ref().is_some_and(|g| {
-                                        g.resolved
-                                            && g.title
-                                            && g.choice == Some(GithubTextChoice::Original)
-                                    }) {
-                                        // The owner chose to post the original title.
-                                        land::set_pr_title_verbatim(
-                                            &winner.worktree,
-                                            &url,
-                                            &pr.title,
-                                        )
-                                        .await
-                                    } else {
-                                        land::set_pr_title(
-                                            &mut self.state,
-                                            &winner.worktree,
-                                            &url,
-                                            &pr.title,
-                                        )
-                                        .await
-                                    }
-                            {
-                                tracing::warn!("could not refresh title of {url}: {e:#}");
-                                self.state
-                                    .event("merge", format!("Pr: title refresh failed: {e:#}"));
+                            if self.state.github_text.as_ref().is_some_and(|g| {
+                                g.resolved
+                                    && g.choice == Some(GithubTextChoice::Rewrite)
+                                    && g.rewrite.is_some()
+                            }) {
+                                // The owner chose the entire pair, even if the
+                                // existing title already matches or was edited.
+                                land::set_pr_text_verbatim(
+                                    &winner.worktree,
+                                    &url,
+                                    &pr.title,
+                                    &pr.body,
+                                )
+                                .await
+                                .map(|()| url)
+                            } else {
+                                if title != pr.title
+                                    && (!is_review_run(&self.state)
+                                        || leaked
+                                            .as_deref()
+                                            .is_some_and(|l| should_retitle(&title, &pr.title, l)))
+                                    && let Err(e) =
+                                        if self.state.github_text.as_ref().is_some_and(|g| {
+                                            g.resolved
+                                                && g.title
+                                                && g.choice == Some(GithubTextChoice::Original)
+                                        }) {
+                                            // The owner chose to post this title unmodified.
+                                            land::set_pr_title_verbatim(
+                                                &winner.worktree,
+                                                &url,
+                                                &pr.title,
+                                            )
+                                            .await
+                                        } else {
+                                            land::set_pr_title(
+                                                &mut self.state,
+                                                &winner.worktree,
+                                                &url,
+                                                &pr.title,
+                                            )
+                                            .await
+                                        }
+                                {
+                                    tracing::warn!("could not refresh title of {url}: {e:#}");
+                                    self.state
+                                        .event("merge", format!("Pr: title refresh failed: {e:#}"));
+                                }
+                                Ok(url)
                             }
-                            Ok(url)
                         }
                         PrPlan::Stop(why) => Err(anyhow::anyhow!(why)),
                     };
@@ -12608,6 +12660,14 @@ mod tests {
                     .collect();
                 assert_eq!(asked.len(), 1);
                 assert!(!asked[0].detail.contains("secret"));
+                let rewrite = runner.state.github_text.as_ref().unwrap().rewrite.as_ref();
+                assert_eq!(rewrite.is_some(), !reply.ends_with('\n'));
+                assert_eq!(
+                    asked[0]
+                        .choices
+                        .contains(&crate::github_text::USE_REWRITE.to_owned()),
+                    rewrite.is_some()
+                );
                 // Silence: the question lapses and the neutral text is used,
                 // without a second rewrite call or a second question.
                 store
@@ -12661,6 +12721,162 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn github_text_rejected_rewrite_survives_retry_and_posts_verbatim() {
+        crate::run::pin_test_home();
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = runner_at(RunStatus::Gating);
+        runner.state =
+            state_with_summary("add retries", "TITLE: 日本語のタイトル\n日本語の説明です。");
+        runner.state.repo = dir.path().to_owned();
+        runner.state.candidates[0].worktree = dir.path().to_owned();
+        let mut author = spec("alpha");
+        author.command = vec![
+            "sh".into(),
+            "-c".into(),
+            "printf '%s' \"$REWRITE_REPLY\"".into(),
+        ];
+        author.env.insert(
+            "REWRITE_REPLY".into(),
+            format!(
+                "TITLE: fix: rewritten title\n{}\n日本語の説明です。",
+                "English sentence. ".repeat(600)
+            ),
+        );
+        runner.state.config.agents = vec![author];
+        let winner = runner.state.candidates[0].clone();
+        assert!(
+            runner
+                .guarded_pr_message(&winner, None, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let record = runner.state.github_text.clone().unwrap();
+        let rewrite = record.rewrite.clone().unwrap();
+        assert_eq!(rewrite.failed, ["body-language"]);
+        assert!(
+            rewrite
+                .body
+                .ends_with(&format!("magi:run/{}", runner.state.id))
+        );
+        let store = ask::Questions::open();
+        let q = store.get(record.question.as_ref().unwrap()).unwrap();
+        assert!(
+            q.choices
+                .contains(&crate::github_text::USE_REWRITE.to_owned())
+        );
+        for label in [
+            "ORIGINAL",
+            "FALLBACK",
+            "REWRITE",
+            "Rules still failed: body-language",
+            "truncated",
+        ] {
+            assert!(q.detail.contains(label), "{label}");
+        }
+        let artifact = std::fs::read_to_string(crate::run::artifact_path(
+            &runner.state,
+            &crate::github_text::artifact_name(&record.fingerprint),
+        ))
+        .unwrap();
+        assert!(artifact.contains(&rewrite.title) && artifact.contains(&rewrite.body));
+        // Restart from serialized state, then retry after a bad owner title.
+        runner.state =
+            serde_json::from_str(&serde_json::to_string(&runner.state).unwrap()).unwrap();
+        store
+            .update(&q.id, |q| {
+                q.say("まだ日本語")?;
+                q.answer(ask::Answer::Choice(crate::github_text::USE_MY_TEXT.into()))
+            })
+            .unwrap();
+        assert!(
+            runner
+                .guarded_pr_message(&winner, None, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let retry = runner.state.github_text.as_ref().unwrap();
+        assert_eq!(retry.rewrite.as_ref(), Some(&rewrite));
+        let q = store.get(retry.question.as_ref().unwrap()).unwrap();
+        assert!(q.detail.contains("REWRITE") && q.detail.contains(&rewrite.title));
+        store
+            .update(&q.id, |q| {
+                q.answer(ask::Answer::Choice(crate::github_text::USE_REWRITE.into()))
+            })
+            .unwrap();
+        let message = runner
+            .guarded_pr_message(&winner, None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.title, rewrite.title);
+        assert_eq!(message.body, rewrite.body);
+        assert_eq!(
+            runner.state.github_text.as_ref().unwrap().choice,
+            Some(GithubTextChoice::Rewrite)
+        );
+        let again = runner
+            .guarded_pr_message(&winner, None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.title, message.title);
+        assert_eq!(again.body, message.body);
+        assert_eq!(runner.state.seats["impl-A"].turns, 1);
+        assert!(
+            !runner
+                .state
+                .events
+                .iter()
+                .any(|e| e.message.contains(&rewrite.title)
+                    || e.message.contains("English sentence."))
+        );
+    }
+
+    #[tokio::test]
+    async fn github_text_rewrite_choice_without_saved_text_falls_back() {
+        crate::run::pin_test_home();
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = runner_at(RunStatus::Gating);
+        runner.state = state_with_summary("add retries", "TITLE: fix: retries\n日本語の説明です。");
+        runner.state.repo = dir.path().to_owned();
+        runner.state.candidates[0].worktree = dir.path().to_owned();
+        let winner = runner.state.candidates[0].clone();
+        assert!(
+            runner
+                .guarded_pr_message(&winner, None, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let record = runner.state.github_text.as_ref().unwrap();
+        assert!(record.rewrite.is_none());
+        // Records written before the additive field deserialize with no rewrite.
+        let mut old = serde_json::to_value(record).unwrap();
+        old.as_object_mut().unwrap().remove("rewrite");
+        let old: crate::run::GithubTextAsk = serde_json::from_value(old).unwrap();
+        assert!(old.rewrite.is_none());
+        let id = record.question.clone().unwrap();
+        ask::Questions::open()
+            .update(&id, |q| {
+                q.choices.push(crate::github_text::USE_REWRITE.into());
+                q.answer(ask::Answer::Choice(crate::github_text::USE_REWRITE.into()))
+            })
+            .unwrap();
+        let message = runner
+            .guarded_pr_message(&winner, None, true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(message.body.contains(crate::github_text::NEUTRAL_BODY));
+        assert_eq!(
+            runner.state.github_text.as_ref().unwrap().choice,
+            Some(GithubTextChoice::Fallback)
+        );
     }
 
     #[tokio::test]

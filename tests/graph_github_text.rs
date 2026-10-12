@@ -4,7 +4,7 @@
 //! a restart that reloads the `RunState` from disk.
 //!
 //! `gh` is a shell script on `PATH` that logs its arguments and answers just
-//! enough of `pr list` / `pr create`; anything else exits 1, so a stray call
+//! enough of `pr list` / `pr create` / `pr edit`; anything else exits 1, so a stray call
 //! can never reach a real forge.
 #![cfg(unix)]
 
@@ -26,8 +26,11 @@ const FAKE_GH: &str = r#"#!/bin/sh
   for a in "$@"; do printf '%s\n' "$a"; done
 } >> "$FAKE_GH_LOG"
 case "$1 $2" in
-  "pr list") echo '[]' ;;
+  "pr list")
+    if [ -f "$FAKE_GH_PR_FILE" ]; then cat "$FAKE_GH_PR_FILE"; else echo '[]'; fi ;;
   "pr create") echo 'https://github.com/example/repo/pull/1' ;;
+  "pr edit")
+    if [ -f "$FAKE_GH_EDIT_FAIL_FILE" ]; then printf '%s\n' "$@" >&2; exit 1; fi ;;
   *) echo "fake gh: unsupported: $*" >&2; exit 1 ;;
 esac
 "#;
@@ -50,6 +53,8 @@ fn install_fake_gh(dir: &Path) -> PathBuf {
     unsafe {
         std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
         std::env::set_var("FAKE_GH_LOG", &log);
+        std::env::set_var("FAKE_GH_PR_FILE", log.with_extension("pr.json"));
+        std::env::set_var("FAKE_GH_EDIT_FAIL_FILE", log.with_extension("edit-fail"));
     }
     log
 }
@@ -115,7 +120,7 @@ async fn park_on_question(fx: &mut common::Fixture, log: &Path) -> String {
     assert!(asked[0].status.open());
     // The question is for the owner's eyes only: it carries the original.
     assert!(asked[0].detail.contains("abcdef0123456789"));
-    assert!(asked[0].detail.contains("ORIGINAL") && asked[0].detail.contains("CHANGED"));
+    assert!(asked[0].detail.contains("ORIGINAL") && asked[0].detail.contains("FALLBACK"));
     assert!(
         asked[0]
             .choices
@@ -211,6 +216,94 @@ async fn silence_past_answer_timeout_opens_the_pull_request_with_redacted_text()
     assert_eq!(runner.state.status, RunStatus::Merged);
     assert!(runner.state.github_text.as_ref().unwrap().resolved);
     assert_eq!(withheld_questions(&run_id).len(), 1, "asked once");
+}
+}
+
+common::e2e! {
+async fn use_rewrite_posts_both_saved_fields_after_restart_without_the_gate() {
+    let home = home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    let log = install_fake_gh(fx.tmp.path());
+    let run_id = park_on_question(&mut fx, &log).await;
+    // Seed a rejected rewrite to isolate the posting/resume path from the
+    // implementation CLI. Unit tests exercise generation and question display.
+    let mut state = RunState::load(&run_id).unwrap();
+    let rewrite = magi::run::GithubTextRewrite {
+        title: "日本語のリライトタイトル".into(),
+        body: format!("日本語のリライト本文です。\n\nmagi:run/{run_id}"),
+        failed: vec!["title-language".into(), "body-language".into()],
+    };
+    let g = state.github_text.as_mut().unwrap();
+    assert!(!g.title, "the original title was not withheld");
+    g.rewrite = Some(rewrite.clone());
+    let id = g.question.clone().unwrap();
+    state.save().unwrap();
+    ask::Questions::open().update(&id, |q| {
+        q.choices.push(magi::github_text::USE_REWRITE.into());
+        q.answer(Answer::Choice(magi::github_text::USE_REWRITE.into()))
+    }).unwrap();
+    let mut runner = Runner::resume(&run_id).expect("resume");
+    runner.execute().await.expect("execute");
+    let made = creates(&log);
+    assert_eq!(made.len(), 1, "calls: {:?}", gh_calls(&log));
+    assert_eq!(arg_after(&made[0], "--title"), rewrite.title);
+    let at = made[0].iter().position(|a| a == "--body").unwrap();
+    assert_eq!(made[0][at + 1..].join("\n"), rewrite.body);
+    assert_eq!(runner.state.github_text.as_ref().unwrap().choice, Some(magi::run::GithubTextChoice::Rewrite));
+    assert_eq!(runner.state.status, RunStatus::Merged);
+    assert!(!runner.state.events.iter().any(|e| e.message.contains(&rewrite.title) || e.message.contains("リライト本文")));
+}
+}
+
+common::e2e! {
+async fn use_rewrite_updates_adopted_pr_and_blocks_on_edit_failure() {
+    for (same_title, fail) in [(false, false), (true, false), (true, true)] {
+        let home = home_lock().await;
+        let mut fx = fixture(home, Judges::Unanimous, false);
+        let log = install_fake_gh(fx.tmp.path());
+        let run_id = park_on_question(&mut fx, &log).await;
+        let mut state = RunState::load(&run_id).unwrap();
+        let rewrite = magi::run::GithubTextRewrite {
+            title: "日本語のリライトタイトル".into(),
+            body: format!("日本語のリライト本文です。\n\nmagi:run/{run_id}"),
+            failed: vec!["title-language".into(), "body-language".into()],
+        };
+        let g = state.github_text.as_mut().unwrap();
+        assert!(!g.title, "the original title was not withheld");
+        g.rewrite = Some(rewrite.clone());
+        let id = g.question.clone().unwrap();
+        state.save().unwrap();
+        // An operator opens the PR while the posting question is standing.
+        let open = serde_json::json!([{
+            "url": "https://github.com/example/repo/pull/1",
+            "title": if same_title { &rewrite.title } else { "fix: existing title" },
+            "baseRefName": "main",
+            "isCrossRepository": false,
+        }]);
+        std::fs::write(log.with_extension("pr.json"), open.to_string()).unwrap();
+        if fail {
+            std::fs::write(log.with_extension("edit-fail"), "").unwrap();
+        }
+        ask::Questions::open().update(&id, |q| {
+            q.choices.push(magi::github_text::USE_REWRITE.into());
+            q.answer(Answer::Choice(magi::github_text::USE_REWRITE.into()))
+        }).unwrap();
+        let mut runner = Runner::resume(&run_id).expect("resume");
+        runner.execute().await.expect("execute");
+        assert!(creates(&log).is_empty(), "adopt without a duplicate PR");
+        let edits: Vec<_> = gh_calls(&log).into_iter()
+            .filter(|c| c.starts_with(&["pr".to_owned(), "edit".to_owned()])).collect();
+        assert_eq!(edits.len(), 1, "calls: {:?}", gh_calls(&log));
+        assert_eq!(arg_after(&edits[0], "--title"), rewrite.title);
+        let at = edits[0].iter().position(|a| a == "--body").unwrap();
+        assert_eq!(edits[0][at + 1..].join("\n"), rewrite.body);
+        assert_eq!(runner.state.status, if fail { RunStatus::Blocked } else { RunStatus::Merged });
+        assert_eq!(runner.state.merge.as_ref().unwrap().ok, !fail);
+        // The failed command echoes all arguments. Neither events nor the
+        // merge outcome may retain that text.
+        assert!(!runner.state.events.iter().any(|e| e.message.contains(&rewrite.title) || e.message.contains("リライト本文")));
+        assert!(!runner.state.merge.as_ref().unwrap().detail.contains("リライト"));
+    }
 }
 }
 

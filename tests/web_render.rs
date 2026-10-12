@@ -1660,6 +1660,17 @@ async fn machine_settings_context_and_overrides_fit_phone_and_desktop() {
             .open_page(&format!("{base}#/settings"), width, 900, width == 390)
             .await
             .expect("page");
+        // The shipped client also loads Settings on arrival. Let its final
+        // render finish before the harness replaces the same DOM; otherwise
+        // that response can overwrite the synthetic overrides mid-check.
+        browser
+            .wait_for(
+                &page,
+                "!!document.querySelector('#settings-body .set-role') && document.getElementById('settings-repo')?.disabled === false",
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("initial settings loaded before the client harness");
         client_harness(&mut browser, &page).await;
         let result = browser.eval(&page, r#"(async () => {
           await deck.loadSettings();
