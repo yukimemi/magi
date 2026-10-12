@@ -72,8 +72,8 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// Dropping it kills the process (`kill_on_drop`), so a failed assertion cannot
 /// leave a browser behind.
 pub struct Browser {
-    _child: Child,
-    _profile: tempfile::TempDir,
+    child: Child,
+    profile: tempfile::TempDir,
     ws: Socket,
     next_id: u64,
     /// Events that arrived while a command was waiting for its answer, as
@@ -125,8 +125,8 @@ impl Browser {
         let outcome = Self::connect(&mut child, profile.path()).await;
         match outcome {
             Ok(ws) => Ok(Self {
-                _child: child,
-                _profile: profile,
+                child,
+                profile,
                 ws,
                 next_id: 0,
                 events: Vec::new(),
@@ -205,7 +205,10 @@ impl Browser {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             let Some(v) = self.read(left).await? else {
-                return Err(format!("{method}: no answer within {CALL_TIMEOUT:?}"));
+                return Err(format!(
+                    "{method}: no answer within {CALL_TIMEOUT:?}; {}",
+                    self.diagnostics(session)
+                ));
             };
             if v.get("id").and_then(Value::as_u64) == Some(id) {
                 if let Some(err) = v.get("error") {
@@ -214,6 +217,32 @@ impl Browser {
                 return Ok(v["result"].clone());
             }
         }
+    }
+
+    // A renderer can stop answering while the browser's socket stays open.
+    // Preserve the evidence before Drop kills Chrome and deletes its profile;
+    // the method name alone cannot distinguish a crash from a startup hang.
+    fn diagnostics(&mut self, session: Option<&str>) -> String {
+        let process = match self.child.try_wait() {
+            Ok(Some(status)) => format!("exited: {status}"),
+            Ok(None) => "running".to_owned(),
+            Err(error) => format!("status unavailable: {error}"),
+        };
+        let events = self
+            .events
+            .iter()
+            .filter(|(s, _)| s.is_none() || s.as_deref() == session)
+            .rev()
+            .take(10)
+            .map(|(_, event)| event.to_string())
+            .collect::<Vec<_>>();
+        let stderr = std::fs::read_to_string(self.profile.path().join("chrome-stderr.log"))
+            .unwrap_or_else(|error| format!("stderr unavailable: {error}"));
+        format!(
+            "Chrome {process}; recent events (newest first): {}; Chrome stderr tail: {}",
+            tail_lines(&events.join("\n"), 10),
+            tail_lines(&stderr, STDERR_LINES),
+        )
     }
 
     /// Read one message within `within`. Events are stored; the first
