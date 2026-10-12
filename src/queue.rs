@@ -111,7 +111,10 @@ use crate::ask::Questions;
 /// by a build that only knew about schema 1 has nothing to say about
 /// blocking or answers, and defaulting those fields is exactly as good a
 /// reading as a value that build never had a chance to write.
-pub const SCHEMA: u32 = 13;
+///
+/// 14: record whether a task count edit's overrides inherit daemon options.
+/// Old overrides default to isolated command-line settings, including empty ones.
+pub const SCHEMA: u32 = 14;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -467,8 +470,9 @@ pub struct Task {
     /// The command-line choices (`--merge`, `-c`, `--seed`, ...) of the
     /// `magi run` / `magi review` that filed this task, applied on top of the
     /// repository's config by whoever executes it - a daemon included - so
-    /// handing the task over does not change what it does. `None` for every
-    /// task filed any other way. `#[serde(default)]`.
+    /// handing the task over does not change what it does. A count edit on an
+    /// ordinary queue task explicitly inherits daemon options instead.
+    /// `#[serde(default)]`.
     #[serde(default)]
     pub overrides: Option<RunOverrides>,
     /// The branch an explicit `magi review <branch>` asked to review. Unlike
@@ -532,6 +536,10 @@ pub struct ChatNotice {
 /// Command-line choices carried by a task. See [`Task::overrides`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunOverrides {
+    /// Count edits on ordinary queued tasks inherit the loop's config and merge.
+    /// False for direct-run overrides and old records, even when otherwise empty.
+    #[serde(default)]
+    pub inherit_daemon_options: bool,
     /// `--merge`: `none`, `local` or `pr`.
     #[serde(default)]
     pub merge: Option<String>,
@@ -1214,6 +1222,61 @@ impl Task {
             );
         }
         self.interrupt = interrupt;
+        Ok(())
+    }
+
+    /// Explicit implementer choice, with Solo taking precedence for old records.
+    pub fn implementers(&self) -> Option<usize> {
+        if self.solo {
+            Some(1)
+        } else {
+            self.overrides.as_ref().and_then(|o| o.candidates)
+        }
+    }
+
+    /// Validate against this task's configuration and change only its seat count.
+    /// Callers must hold the queue claim and reload the task before calling.
+    pub fn change_implementers(&mut self, count: u8) -> Result<()> {
+        self.check_implementers_editable()?;
+        let explicit = self.overrides.as_ref().and_then(|o| o.config.as_deref());
+        let (mut config, _) = crate::config::Config::discover(&self.repo, explicit)?;
+        if let Some(o) = &self.overrides {
+            o.apply(&mut config);
+        }
+        self.set_implementers(count, &config)
+    }
+
+    fn check_implementers_editable(&self) -> Result<()> {
+        if !matches!(self.status, TaskStatus::Queued | TaskStatus::Held) {
+            bail!(
+                "task {} is {}; only queued or held tasks can change implementers",
+                self.short(),
+                self.status.as_str()
+            );
+        }
+        Ok(())
+    }
+
+    /// Normalize Solo and candidate overrides without altering task history.
+    pub fn set_implementers(&mut self, count: u8, config: &crate::config::Config) -> Result<()> {
+        self.check_implementers_editable()?;
+        crate::talk::check_implementers(count, config).map_err(anyhow::Error::msg)?;
+        self.stamp_schema();
+        self.solo = count == 1;
+        let mut overrides = self.overrides.clone().unwrap_or_else(|| RunOverrides {
+            inherit_daemon_options: true,
+            ..Default::default()
+        });
+        overrides.candidates = (count > 1).then_some(usize::from(count));
+        let mut settings = overrides.clone();
+        settings.inherit_daemon_options = false;
+        // Some(empty) is a direct-run setting too: retain its isolation on Solo.
+        self.overrides = if overrides.inherit_daemon_options && settings == RunOverrides::default()
+        {
+            None
+        } else {
+            Some(overrides)
+        };
         Ok(())
     }
 
@@ -2524,6 +2587,73 @@ mod tests {
                 parked: 1,
             }
         );
+    }
+
+    #[test]
+    fn task_implementers_persist_normalized_without_losing_history() {
+        let (_dir, q) = queue();
+        let mut t = task("keep me");
+        t.hold_manual(Some("waiting".into()));
+        t.runs.push("earlier-run".into());
+        t.attachments.push("reference.txt".into());
+        let cfg: crate::config::Config =
+            toml::from_str("[[agents]]\nid = 'mock'\nkind = 'command'\ncommand = ['true']\n")
+                .unwrap();
+        q.put(&mut t).unwrap();
+        let original = serde_json::to_value(&t).unwrap();
+        for n in [2, 1, 2] {
+            t.set_implementers(n, &cfg).unwrap();
+            q.put(&mut t).unwrap();
+            t = q.get(&t.id).unwrap();
+            assert_eq!(t.implementers(), Some(usize::from(n)));
+            assert_eq!(t.solo, n == 1);
+            if n == 1 {
+                assert!(t.overrides.is_none());
+            }
+            let mut actual = serde_json::to_value(&t).unwrap();
+            for field in ["solo", "overrides", "updated_at"] {
+                actual[field] = original[field].clone();
+            }
+            assert_eq!(actual, original);
+        }
+        t.overrides.as_mut().unwrap().judges = Some(2);
+        t.set_implementers(1, &cfg).unwrap();
+        assert_eq!(t.overrides.as_ref().unwrap().judges, Some(2));
+        assert_eq!(t.overrides.as_ref().unwrap().candidates, None);
+    }
+
+    #[test]
+    fn task_implementers_old_records_keep_inheritance_until_changed() {
+        let mut value = serde_json::to_value(task("old task")).unwrap();
+        value.as_object_mut().unwrap().remove("solo");
+        value.as_object_mut().unwrap().remove("overrides");
+        let mut old: Task = serde_json::from_value(value).unwrap();
+        assert_eq!(old.implementers(), None);
+        old.set_implementers(1, &crate::config::Config::default())
+            .unwrap();
+        assert!(old.solo);
+        assert!(old.overrides.is_none());
+    }
+
+    #[test]
+    fn task_implementers_reject_invalid_counts_and_states() {
+        let cfg = crate::config::Config::default();
+        let mut t = task("unchanged");
+        for n in [0, 4, 255] {
+            assert!(t.set_implementers(n, &cfg).is_err());
+        }
+        for status in [
+            TaskStatus::Running,
+            TaskStatus::Done,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Parked,
+        ] {
+            t.status = status;
+            let before = serde_json::to_value(&t).unwrap();
+            assert!(t.set_implementers(1, &cfg).is_err());
+            assert_eq!(serde_json::to_value(&t).unwrap(), before);
+        }
     }
 
     /// A queue of its own, with no process-global state - which is the point of

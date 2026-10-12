@@ -914,6 +914,7 @@ impl Ui {
             .route("/api/queue/{id}/hold", post(queue_hold))
             .route("/api/queue/{id}/release", post(queue_release))
             .route("/api/queue/{id}/priority", post(queue_priority))
+            .route("/api/queue/{id}/implementers", post(queue_implementers))
             .route("/api/queue/{id}/edit", post(queue_edit))
             .route("/api/queue/{id}/done", post(queue_done))
             .route("/api/questions", get(questions_list))
@@ -5462,6 +5463,21 @@ async fn queue_release(
         Ok(())
     })
     .await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImplementersBody {
+    implementers: u8,
+}
+
+async fn queue_implementers(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<ImplementersBody>, JsonRejection>,
+) -> ApiResult<Json<TaskView>> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    mutate(ui, id, move |t| t.change_implementers(body.implementers)).await
 }
 
 /// The body of `POST /api/queue/{id}/priority`.
@@ -11821,6 +11837,75 @@ mod tests {
         // `magi task list` both use - GET /api/queue must agree with it
         // immediately, not just once the loop claims the task.
         assert_eq!(names[0], older.id, "the raised task now sorts first");
+    }
+
+    #[tokio::test]
+    async fn task_implementers_api_persists_and_refuses_claimed_or_finished_tasks() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("magi.toml"), MOCK_AGENT_TOML).unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let ui = Arc::new(Ui::new(
+            q.clone(),
+            Questions::at(dir.path().join("questions")),
+            Talks::at(dir.path().join("talks")),
+            dir.path().join("runs"),
+            dir.path().to_path_buf(),
+            repo.clone(),
+        ));
+        let mut t = Task::new(
+            "seats".into(),
+            "keep instruction".into(),
+            repo,
+            Source::Human,
+        );
+        t.runs.push("prior-run".into());
+        t.hold_manual(Some("waiting".into()));
+        q.put(&mut t).unwrap();
+        let change = |count| {
+            queue_implementers(
+                State(ui.clone()),
+                Path(t.id.clone()),
+                Ok(Json(ImplementersBody {
+                    implementers: count,
+                })),
+            )
+        };
+        for count in [2, 1, 2] {
+            let response = change(count).await.unwrap();
+            assert_eq!(response.0.task.implementers(), Some(usize::from(count)));
+            let saved = q.get(&t.id).unwrap();
+            assert_eq!(saved.implementers(), Some(usize::from(count)));
+            assert_eq!(saved.runs, t.runs);
+            assert_eq!(saved.instruction, t.instruction);
+        }
+        for count in [0, 4] {
+            assert_eq!(
+                change(count).await.err().unwrap().status,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert!(serde_json::from_str::<ImplementersBody>(r#"{"implementers":256}"#).is_err());
+        let claim = q.claim(&t.id).unwrap();
+        assert_eq!(change(1).await.err().unwrap().status, StatusCode::CONFLICT);
+        drop(claim);
+        for status in [
+            TaskStatus::Running,
+            TaskStatus::Done,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Parked,
+        ] {
+            let mut stored = q.get(&t.id).unwrap();
+            stored.status = status;
+            q.put(&mut stored).unwrap();
+            assert_eq!(
+                change(1).await.err().unwrap().status,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(q.get(&t.id).unwrap().implementers(), Some(2));
+        }
     }
 
     #[tokio::test]

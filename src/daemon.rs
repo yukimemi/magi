@@ -1976,7 +1976,7 @@ fn land_resume_state(task: &Task) -> LandResume {
     let Ok(state) = RunState::load(run_id) else {
         return LandResume::NotLanding;
     };
-    if !state.parked {
+    if !implementers_match(task, &state) || !state.parked {
         return LandResume::NotLanding;
     }
     // Parked in `land` on the merge approval, or at `merge` on the owner's
@@ -2778,7 +2778,8 @@ async fn attempt(
     // failure here is the network's or the operator's, not the task's: hold
     // without spending an attempt, never fall back to a possibly stale copy.
     let explicit = match &task.overrides {
-        Some(o) => o.config.as_deref(),
+        Some(o) if !o.inherit_daemon_options => o.config.as_deref(),
+        Some(_) => opts.config.as_deref(),
         None => opts.config.as_deref(),
     };
     if let Err(e) = Config::discover_fetched(&repo, explicit).await {
@@ -2801,7 +2802,7 @@ async fn attempt(
             return Vec::new();
         }
     };
-    apply_solo(&mut config, task);
+    apply_task_implementers(&mut config, task);
     let p = phrases(&config.graph.language);
     let start_failed = p.could_not_start;
 
@@ -2866,9 +2867,10 @@ async fn attempt(
         None => false,
     };
     // An explicit `magi review <branch>` is reviewed whatever happens to the
-    // branch: it never falls back to a competition (`Task::review_of`). An
+    // branch unless an explicit implementer change requires fresh work. An
     // unfinished run of the same task still wins, so a retry resumes.
-    let starter = match (&review_branch, &unfinished, &task.review_of) {
+    let previous = task.runs.last().and_then(|id| RunState::load(id).ok());
+    let proposed = match (&review_branch, &unfinished, &task.review_of) {
         (None, None, Some(branch)) => Starter::Review(branch.clone()),
         _ => choose_starter(
             review_branch.as_deref(),
@@ -2876,6 +2878,7 @@ async fn attempt(
             unfinished.as_deref(),
         ),
     };
+    let starter = starter_with_implementers(task, previous.as_ref(), proposed);
     // Absolute paths of the files the task was filed with, re-read from the
     // task now so a file attached while it was held reaches a resumed run
     // too. A stored name whose file has gone is an error before any agent is
@@ -3301,18 +3304,31 @@ fn cooldown_until(quota: &[QuotaLoss], now: Timestamp) -> Option<Timestamp> {
     )
 }
 
-/// Cut this attempt's candidate count to one when the task asked to run
-/// alone.
-///
-/// Pure and separate from [`attempt`] so the one thing this feature changes -
-/// which `candidates` a `solo` task's run is built with - can be asserted
-/// without minting a run: `attempt` drives `graph::Runner`, which spawns real
-/// agent CLIs, and no test may do that. `config` is mutated in place, taken by
-/// value from the caller's own copy, so a repository's `magi.toml` on disk is
-/// never touched - only the `Config` this one attempt hands to `Runner::start`.
-fn apply_solo(config: &mut Config, task: &Task) {
-    if task.solo {
-        config.graph.implementers = 1;
+/// An explicit task count must agree with a run before any resume.
+fn implementers_match(task: &Task, state: &RunState) -> bool {
+    task.implementers()
+        .is_none_or(|n| n == state.config.graph.implementers)
+}
+
+/// Never resume or take over candidate work built for a different seat count.
+fn starter_with_implementers(
+    task: &Task,
+    previous: Option<&RunState>,
+    proposed: Starter,
+) -> Starter {
+    if previous.is_some_and(|s| !implementers_match(task, s)) {
+        task.review_of
+            .as_ref()
+            .map_or(Starter::Start, |branch| Starter::Review(branch.clone()))
+    } else {
+        proposed
+    }
+}
+
+/// Apply this task's explicit count to the new attempt, without changing defaults.
+fn apply_task_implementers(config: &mut Config, task: &Task) {
+    if let Some(n) = task.implementers() {
+        config.graph.implementers = n;
     }
 }
 
@@ -3332,7 +3348,7 @@ fn prepare_for(repo: &Path, opts: &Opts, task: &Task) -> Result<Config> {
         merge: None,
         ..opts.clone()
     };
-    let mut config = prepare(repo, &own)?;
+    let mut config = prepare(repo, if o.inherit_daemon_options { opts } else { &own })?;
     o.apply(&mut config);
     Ok(config)
 }
@@ -6704,6 +6720,182 @@ mod tests {
     }
 
     #[test]
+    fn task_implementers_edit_inherits_daemon_config_and_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("explicit.toml");
+        std::fs::write(&path, "[graph]\nimplementers = 3\njudges = 1\n").unwrap();
+        let opts = Opts {
+            config: Some(path),
+            merge: Some("none".into()),
+            ..Default::default()
+        };
+        let mut t = task();
+        t.set_implementers(
+            2,
+            &toml::from_str("[[agents]]\nid = 'mock'\nkind = 'command'\ncommand = ['true']\n")
+                .unwrap(),
+        )
+        .unwrap();
+        let cfg = prepare_for(dir.path(), &opts, &t).unwrap();
+        assert_eq!(cfg.graph.implementers, 2);
+        assert_eq!(cfg.graph.judges, 1);
+        assert_eq!(cfg.merge.mode, MergeMode::None);
+        t.set_implementers(1, &cfg).unwrap();
+        let mut cfg = prepare_for(dir.path(), &opts, &t).unwrap();
+        apply_task_implementers(&mut cfg, &t);
+        assert_eq!(cfg.graph.implementers, 1);
+        assert_eq!(cfg.graph.judges, 1);
+        assert_eq!(cfg.merge.mode, MergeMode::None);
+    }
+
+    #[test]
+    fn task_implementers_direct_overrides_stay_isolated_after_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(
+            repo.join("magi.toml"),
+            "[graph]\njudges = 2\n[merge]\nmode = 'none'\n",
+        )
+        .unwrap();
+        let daemon_config = dir.path().join("daemon.toml");
+        std::fs::write(
+            &daemon_config,
+            "[graph]\njudges = 1\n[merge]\nmode = 'pr'\n",
+        )
+        .unwrap();
+        let opts = Opts {
+            config: Some(daemon_config),
+            merge: Some("pr".into()),
+            ..Default::default()
+        };
+        let q = Queue::at(dir.path().join("queue"));
+        let validation: Config =
+            toml::from_str("[[agents]]\nid = 'mock'\nkind = 'command'\ncommand = ['true']\n")
+                .unwrap();
+        // No provenance field on legacy direct tasks: both shapes stay isolated.
+        for record in ["{}", r#"{"candidates":2}"#] {
+            let overrides = serde_json::from_str(record).unwrap();
+            let filing = crate::direct::Filing {
+                instruction: "work".into(),
+                title: "direct".into(),
+                repo: repo.clone(),
+                source: crate::queue::Source::Human,
+                solo: false,
+                overrides,
+                review_of: None,
+            };
+            let filed =
+                crate::direct::file(&q, dir.path(), Timestamp::now(), 1, filing, true).unwrap();
+            let crate::direct::Filed::Standalone {
+                mut task,
+                claim: _claim,
+            } = filed
+            else {
+                panic!("local filing")
+            };
+            let before = prepare_for(&repo, &opts, &task).unwrap();
+            assert_eq!(before.graph.judges, 2, "daemon --config must not leak");
+            assert_eq!(
+                before.merge.mode,
+                MergeMode::None,
+                "daemon --merge must not leak"
+            );
+            for n in [2, 1, 2] {
+                task.set_implementers(n, &validation).unwrap();
+                q.put(&mut task).unwrap();
+                task = q.get(&task.id).unwrap();
+                assert!(!task.overrides.as_ref().unwrap().inherit_daemon_options);
+                let mut cfg = prepare_for(&repo, &opts, &task).unwrap();
+                apply_task_implementers(&mut cfg, &task);
+                assert_eq!(cfg.graph.implementers, usize::from(n));
+                assert_eq!(cfg.graph.judges, 2);
+                assert_eq!(cfg.merge.mode, MergeMode::None);
+            }
+        }
+    }
+
+    #[test]
+    fn task_implementers_mismatch_keeps_explicit_reviews_review_only() {
+        let cfg: Config =
+            toml::from_str("[[agents]]\nid = 'mock'\nkind = 'command'\ncommand = ['true']\n")
+                .unwrap();
+        let mut t = task();
+        t.review_of = Some("review-target".into());
+        t.hold_manual(Some("retry".into()));
+        let mut previous = RunState::new(
+            PathBuf::from("/repo"),
+            "main".into(),
+            "abc1234".into(),
+            "review".into(),
+            cfg.clone(),
+        );
+        previous.config.graph.implementers = 2;
+        for count in [1, 3] {
+            t.set_implementers(count, &cfg).unwrap();
+            t.release();
+            assert_eq!(t.review_of.as_deref(), Some("review-target"));
+            for proposed in [
+                Starter::Resume(previous.id.clone()),
+                Starter::Review("recovery-target".into()),
+            ] {
+                assert_eq!(
+                    starter_with_implementers(&t, Some(&previous), proposed),
+                    Starter::Review("review-target".into())
+                );
+            }
+            let mut configured = cfg.clone();
+            apply_task_implementers(&mut configured, &t);
+            assert_eq!(configured.graph.implementers, usize::from(count));
+            assert_eq!(previous.config.graph.implementers, 2);
+        }
+    }
+
+    #[test]
+    fn task_implementers_dispatch_and_resume_agree() {
+        let mut t = task();
+        let cfg: crate::config::Config =
+            toml::from_str("[[agents]]\nid = 'mock'\nkind = 'command'\ncommand = ['true']\n")
+                .unwrap();
+        let mut run = RunState::new(
+            PathBuf::from("/repo"),
+            "main".into(),
+            "abc1234".into(),
+            "work".into(),
+            cfg.clone(),
+        );
+        run.config.graph.implementers = 2;
+        for n in [2, 1, 3, 2] {
+            t.set_implementers(n, &cfg).unwrap();
+            let mut dispatched = cfg.clone();
+            apply_task_implementers(&mut dispatched, &t);
+            assert_eq!(dispatched.graph.implementers, usize::from(n));
+            assert_eq!(implementers_match(&t, &run), n == 2);
+            for proposed in [
+                Starter::Resume(run.id.clone()),
+                Starter::Review("old-branch".into()),
+            ] {
+                let expected = if n == 2 {
+                    proposed.clone()
+                } else {
+                    Starter::Start
+                };
+                assert_eq!(
+                    starter_with_implementers(&t, Some(&run), proposed),
+                    expected
+                );
+            }
+            assert_eq!(
+                run.config.graph.implementers, 2,
+                "history must not be rewritten"
+            );
+        }
+        t.solo = false;
+        t.overrides = None;
+        assert!(implementers_match(&t, &run));
+    }
+
+    #[test]
     fn a_solo_task_runs_with_one_candidate_and_a_plain_task_keeps_the_configs() {
         // Three seats said out loud. What `solo` promises is one candidate
         // *whatever the config asks for*, so the contrast has to be a number
@@ -6714,14 +6906,14 @@ mod tests {
         solo_cfg.graph.implementers = 3;
         let mut solo_task = task();
         solo_task.solo = true;
-        apply_solo(&mut solo_cfg, &solo_task);
+        apply_task_implementers(&mut solo_cfg, &solo_task);
         assert_eq!(solo_cfg.graph.implementers, 1);
 
         let mut plain_cfg = Config::default();
         plain_cfg.graph.implementers = 3;
         let plain_task = task();
         assert!(!plain_task.solo);
-        apply_solo(&mut plain_cfg, &plain_task);
+        apply_task_implementers(&mut plain_cfg, &plain_task);
         assert_eq!(
             plain_cfg.graph.implementers, 3,
             "a task that did not ask to run alone keeps the config's candidates"

@@ -38,6 +38,7 @@ const API = {
   deleteTask: (id) => `/api/queue/${encodeURIComponent(id)}`,
   hold: (id) => `/api/queue/${encodeURIComponent(id)}/hold`,
   release: (id) => `/api/queue/${encodeURIComponent(id)}/release`,
+  implementers: (id) => `/api/queue/${encodeURIComponent(id)}/implementers`,
   priority: (id) => `/api/queue/${encodeURIComponent(id)}/priority`,
   editTask: (id) => `/api/queue/${encodeURIComponent(id)}/edit`,
   doneTask: (id) => `/api/queue/${encodeURIComponent(id)}/done`,
@@ -2303,12 +2304,13 @@ function createTaskCard() {
   const priorityDown = el("button", { class: "btn btn-quiet btn-step", type: "button", text: "−" });
   const priorityUp = el("button", { class: "btn btn-quiet btn-step", type: "button", text: "+" });
   const priorityBox = el("span", { class: "task-priority-box" }, priorityDown, priorityUp);
+  const implementersBox = el("div", { class: "task-implementers" });
   const editBtn = el("button", { class: "btn btn-quiet", type: "button", text: "Edit" });
   const holdBox = el("span", { class: "task-hold-box" });
   const doneBox = el("span", { class: "task-done-box" });
   const deleteBox = el("span", { class: "task-delete-box" });
   const actions = el("div", { class: "card-actions" },
-    historyLink, runLink, priorityBox, editBtn, holdBox, doneBox, deleteBox);
+    historyLink, runLink, priorityBox, implementersBox, editBtn, holdBox, doneBox, deleteBox);
 
   const card = el("li", { class: "card task-card" },
     el("div", { class: "card-top" }, chipSlot, priority, solo, followup, permalink, whenSlot),
@@ -2344,7 +2346,7 @@ function createTaskCard() {
   card.refs = {
     card, chipSlot, priority, solo, followup, permalink, whenSlot, title, source, repo, attempts,
     outcome, note, snippet, error, instruction, answers, answersList, runLink, historyLink,
-    priorityDown, priorityUp, editBtn, holdBox, doneBox, deleteBox,
+    priorityDown, priorityUp, implementersBox, editBtn, holdBox, doneBox, deleteBox,
   };
   return card;
 }
@@ -2496,6 +2498,7 @@ function updateTaskCard(row, task) {
      claim; a running task has already left that pool (see
      `Task::set_priority`'s doc), so the buttons are disabled rather than
      left to round-trip a 4xx. */
+  renderTaskImplementers(r.implementersBox, task);
   const priorityNow = Number(task.priority) || 0;
   r.priorityDown.disabled = status === "running";
   r.priorityUp.disabled = status === "running";
@@ -2724,6 +2727,61 @@ async function refreshTask(id) {
   const jobs = [loadQueue()];
   if (state.taskDetail.id === id) jobs.push(loadTask(id));
   await Promise.all(jobs);
+}
+
+const taskImplementersPending = new Set();
+const taskImplementersMessages = new Map();
+
+function renderTaskImplementers(box, task, host = null) {
+  if (box.dataset.saving === "true") return;
+  clear(box);
+  const editable = ["queued", "held"].includes(String(task.status_str || task.status));
+  let current = task.solo ? 1 : task.overrides?.candidates;
+  const select = el("select", { "aria-label": `Implementers for ${task.title || task.id}` });
+  if (!current) select.append(el("option", { value: "", text: "Repository default", disabled: true }));
+  for (const n of [1, 2, 3]) select.append(el("option", { value: String(n), text: n === 1 ? "Solo (1)" : String(n) }));
+  select.value = current ? String(current) : "";
+  select.disabled = !editable || taskImplementersPending.has(task.id);
+  const result = el("span", { role: "status", "aria-live": "polite", text: taskImplementersMessages.get(task.id) || "" });
+  const save = el("button", { class: "btn btn-quiet", type: "button", text: "Save implementers", disabled: true });
+  select.onchange = () => { save.disabled = !editable || taskImplementersPending.has(task.id) || select.value === String(current || ""); };
+  save.onclick = async () => {
+    if (taskImplementersPending.has(task.id)) return;
+    taskImplementersPending.add(task.id);
+    const count = Number(select.value);
+    box.dataset.saving = "true";
+    select.disabled = save.disabled = true;
+    taskImplementersMessages.set(task.id, "Saving…");
+    setText(result, "Saving…");
+    try {
+      await postJson(API.implementers(task.id), { implementers: count });
+      current = count;
+      const message = `Saved ${count} implementer${count === 1 ? "" : "s"}.`;
+      taskImplementersMessages.set(task.id, message);
+      setText(result, message);
+      announce(`Task ${shortId(task.id)} implementers set to ${count}.`);
+    } catch (error) {
+      const message = `Could not save implementers: ${error.message}`;
+      taskImplementersMessages.set(task.id, message);
+      setText(result, message);
+      announce(message);
+    } finally {
+      taskImplementersPending.delete(task.id);
+      box.dataset.saving = "false";
+      select.disabled = !editable;
+      save.disabled = !editable || select.value === String(current || "");
+      try {
+        if (host) await host.refresh(task.id);
+        else await refreshTask(task.id);
+      } catch (error) {
+        setText(result, `Could not refresh task: ${error.message}`);
+      }
+    }
+  };
+  box.append(el("label", {}, el("span", { text: "Implementers " }), select), save,
+    el("p", { class: "hint", text: editable
+      ? "Changing the count may start a new run instead of reusing earlier candidate work."
+      : "Only queued or held tasks can change implementers." }), result);
 }
 
 async function changePriority(id, priority, host = null) {
@@ -9724,6 +9782,9 @@ function renderTaskActions(task) {
   );
 
   clear(editBox);
+  const implementersBox = el("div", { class: "task-implementers" });
+  renderTaskImplementers(implementersBox, task, host);
+  editBox.append(implementersBox);
   if (status !== "done") {
     const editable = status === "queued" || status === "held";
     const edit = el("button", {

@@ -50,7 +50,9 @@ impl Filing {
         let mut task = Task::new(self.title, self.instruction, self.repo, self.source);
         task.solo = self.solo;
         task.review_of = self.review_of;
-        task.overrides = Some(self.overrides);
+        let mut overrides = self.overrides;
+        overrides.inherit_daemon_options = false;
+        task.overrides = Some(overrides);
         task
     }
 }
@@ -371,6 +373,15 @@ mod tests {
             .checked_sub(jiff::SignedDuration::from_secs(age_secs))
             .unwrap();
         crate::daemon::write_status_to(&home.join("daemon.json"), &status).unwrap();
+    }
+
+    #[test]
+    fn task_implementers_direct_filing_keeps_options_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut direct = filing(dir.path());
+        direct.overrides.inherit_daemon_options = true;
+        let task = direct.into_task();
+        assert!(!task.overrides.unwrap().inherit_daemon_options);
     }
 
     #[test]
