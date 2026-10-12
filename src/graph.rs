@@ -5123,15 +5123,18 @@ impl Runner {
             Repair::Done { .. } => return Ok(()),
             Repair::Started { before } => {
                 // Interrupted: the unfinished edits are not trusted.
-                let restored = git::restore_to(&wt, &before).await;
+                // An unconfirmed rollback blocks the run with `Started` kept,
+                // so a resume retries it; the tree is never reviewed as is.
+                if let Err(e) = Self::graft_restore(&wt, &before).await {
+                    return self
+                        .stop_recovery(rec, &before, format!("interrupted; rollback failed: {e:#}"))
+                        .await;
+                }
                 rec.repair = Repair::Done {
                     before: before.clone(),
                     after: before,
                     committed: false,
-                    failed: Some(match restored {
-                        Ok(()) => "interrupted; rolled back".to_owned(),
-                        Err(e) => format!("interrupted; rollback failed: {e:#}"),
-                    }),
+                    failed: Some("interrupted; rolled back".to_owned()),
                 };
                 self.state
                     .event("recovery", "the repair was interrupted and rolled back");
