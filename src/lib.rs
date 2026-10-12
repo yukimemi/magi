@@ -70,6 +70,7 @@ pub mod run;
 pub mod scrub;
 pub mod settings;
 pub mod stats;
+mod stop_reason;
 pub mod talk;
 pub mod triage;
 pub mod tui;

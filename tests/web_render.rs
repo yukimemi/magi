@@ -719,6 +719,89 @@ async fn followup_task_links_back_to_its_parent() {
     }
 }
 
+#[tokio::test]
+async fn blocked_run_header_shows_the_failed_gate_reason() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "CI requires Chrome");
+        eprintln!("SKIP web_render: no Chrome/Chromium found");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let mut run = RunState::new(
+        fx.repo.clone(),
+        "main".into(),
+        "abc".into(),
+        "Failed gate".into(),
+        fx.config.clone(),
+    );
+    run.status = RunStatus::Blocked;
+    run.gate_ran = true;
+    run.gate.push(magi::run::CommandOutcome {
+        command: "cargo make check".into(),
+        code: Some(1),
+        output_tail: "failures:\n    web::tests::talks_report_independent_thinking_claims_and_queue_a_second_message\n\ntest result: FAILED. 1813 passed; 1 failed; 0 ignored;".into(),
+        duration_ms: 0,
+        resource_blocked: false,
+    });
+    run.save_under(&home).unwrap();
+    let base = serve(
+        &home,
+        Queue::at(home.join("queue")),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
+    for (width, height, mobile) in [(1280, 900, false), (390, 844, true)] {
+        let page = browser
+            .open_page(&format!("{base}#/runs/{}", run.id), width, height, mobile)
+            .await
+            .unwrap();
+        browser
+            .wait_for(
+                &page,
+                "!!document.querySelector('#run-status .run-stop-reason')",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        let result = browser
+            .eval(
+                &page,
+                r#"(() => {
+            const reason = document.querySelector('#run-status .run-stop-reason');
+            const style = getComputedStyle(reason);
+            return {
+                text: reason.textContent, title: reason.title,
+                previous: reason.previousElementSibling.textContent,
+                oneLine: style.whiteSpace === 'nowrap' && style.textOverflow === 'ellipsis',
+                visible: reason.getBoundingClientRect().width > 0,
+                genericNote: !!document.querySelector('#run-status .card-note')
+            };
+        })()"#,
+            )
+            .await
+            .unwrap();
+        let expected = "Gate failed: cargo make check — web::tests::talks_report_independent_thinking_claims_and_queue_a_second_message (1 failed)";
+        assert_eq!(result["text"], expected);
+        assert_eq!(result["title"], expected);
+        assert!(
+            result["previous"]
+                .as_str()
+                .unwrap()
+                .to_lowercase()
+                .contains("blocked")
+        );
+        assert_eq!(result["oneLine"], true);
+        assert_eq!(result["visible"], true);
+        assert_eq!(result["genericNote"], false);
+        browser.close_page(&page).await;
+    }
+}
+
 /// The run detail: tabs live in the hash and survive a live refresh, the
 /// landing panel never prints a null child, the deliberation strip is slim and
 /// the list pane has no nested scroller. Checked at both widths, in both themes.

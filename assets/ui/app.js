@@ -6943,6 +6943,12 @@ function renderRunDetail() {
   const statusChip = chip(status, RUN_STATUS);
   setAttr(statusChip, "data-superseded", superseded ? "1" : null);
   head.append(statusChip);
+  const stopReason = ["blocked", "stalled", "failed"].includes(status) && run.stop_reason;
+  if (stopReason) {
+    const reason = el("span", { class: "run-stop-reason", title: stopReason });
+    reason.textContent = stopReason;
+    head.append(reason);
+  }
   const parkedAt = parkedNow ? (openFor(run.id)[0] || {}).node || null : null;
   const rail = PHASES.includes(status) || parkedAt
     ? phaseRail(status, parkedAt, activeNote(run))
@@ -6950,7 +6956,7 @@ function renderRunDetail() {
   if (rail) head.append(rail);
   const note = successorNote(latest, inFlight);
   if (note) head.append(note);
-  if (!superseded && meta.note) {
+  if (!superseded && !stopReason && meta.note) {
     head.append(linkify(el("p", { class: "card-note" }), meta.note));
   }
 
