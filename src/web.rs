@@ -967,6 +967,7 @@ impl Ui {
                 get(talk_attachment_get),
             )
             .route("/api/talks/{id}/avatar", get(talk_avatar))
+            .route("/avatars/operator.svg", get(operator_avatar))
             .route("/api/events", get(events))
             .with_state(Arc::new(self))
     }
@@ -6494,6 +6495,8 @@ struct TalkView {
     /// URL of the avatar for the conversation's persona (the default voice
     /// included). Server-built; a configured `icon` never reaches the client.
     persona_avatar: String,
+    /// Fixed operator avatar; display only and independent of repository config.
+    operator_avatar: String,
 }
 
 impl TalkView {
@@ -6530,6 +6533,10 @@ impl TalkView {
             operator_name,
             persona_name,
             persona_avatar,
+            operator_avatar: format!(
+                "/avatars/operator.svg?v={}",
+                persona_icon::fingerprint(Some(persona_icon::operator_svg()))
+            ),
             talk,
         }
     }
@@ -7714,6 +7721,14 @@ struct AvatarQuery {
 const AVATAR_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; sandbox";
 
 fn builtin_avatar(id: &str) -> Response {
+    svg_avatar(persona_icon::builtin_svg(id))
+}
+
+async fn operator_avatar() -> Response {
+    svg_avatar(persona_icon::operator_svg())
+}
+
+fn svg_avatar(svg: &'static str) -> Response {
     (
         [
             (header::CONTENT_TYPE, "image/svg+xml"),
@@ -7721,7 +7736,7 @@ fn builtin_avatar(id: &str) -> Response {
             (header::CONTENT_SECURITY_POLICY, AVATAR_CSP),
             (header::CACHE_CONTROL, "no-cache"),
         ],
-        persona_icon::builtin_svg(id),
+        svg,
     )
         .into_response()
 }
@@ -10389,6 +10404,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn operator_avatar_is_distinct_svg_with_a_locked_down_policy() {
+        let res = operator_avatar().await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.headers()[header::CONTENT_TYPE], "image/svg+xml");
+        assert_eq!(res.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(res.headers()[header::CONTENT_SECURITY_POLICY], AVATAR_CSP);
+        assert_eq!(res.headers()[header::CACHE_CONTROL], "no-cache");
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), persona_icon::operator_svg().as_bytes());
+        assert_ne!(
+            persona_icon::operator_svg(),
+            persona_icon::builtin_svg("default")
+        );
+    }
+
+    #[tokio::test]
     async fn builtin_avatars_are_svg_with_a_locked_down_policy() {
         let (_t, _h, ui, id, _repo) = avatar_fixture("").await;
         for p in [
@@ -10520,6 +10553,14 @@ mod tests {
                 .persona_avatar
                 .starts_with(&format!("/api/talks/{id}/avatar?persona=default&v="))
         );
+        assert_eq!(
+            detail.view.operator_avatar,
+            format!(
+                "/avatars/operator.svg?v={}",
+                persona_icon::fingerprint(Some(persona_icon::operator_svg()))
+            )
+        );
+        assert!(!detail.personas.iter().any(|p| p.id == "operator"));
         let rei = detail.personas.iter().find(|p| p.id == "rei").unwrap();
         let plain = detail.personas.iter().find(|p| p.id == "asuka").unwrap();
         assert!(rei.avatar.contains("persona=rei&v="));

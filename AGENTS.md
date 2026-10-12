@@ -2672,3 +2672,11 @@ fallback; a language-withheld field becomes neutral.
   written; `resolved` is saved before the pull request is opened. A resume with
   the same fingerprint skips the judge and the rewrite and asks nothing new;
   a different text retires the old question and starts over.
+
+### Operator chat avatar
+
+The operator avatar is display only and has no configuration. Its dedicated
+`assets/ui/avatars/operator.svg` is served at `/avatars/operator.svg` with the
+same policy as built-in persona SVGs. `TalkView.operator_avatar` carries its
+fingerprinted URL for both saved and optimistic turns. It is not a persona and
+must not be added to the persona roster or briefing.
