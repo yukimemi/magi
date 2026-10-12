@@ -1082,6 +1082,68 @@ mod tests {
     }
 
     #[test]
+    fn github_text_loopback_preserves_original_and_fallback() {
+        let title = "fix(router): test 127.0.0.1:0 and [::1]:0";
+        let body = format!(
+            "{}> Start a test router on 127.0.0.1:0 and [::1]:0.\n",
+            "Test setup.\n".repeat(21)
+        );
+        let violations = check(title, &body);
+        assert!(violations.is_empty());
+        assert!(Withheld::from_check(&violations, title, &body).is_none());
+        assert!(shareable(title));
+        assert!(shareable(&body));
+        let mut state = RunState::new(
+            ".".into(),
+            "main".into(),
+            "abc".into(),
+            "task".into(),
+            crate::config::Config::default(),
+        );
+        assert_eq!(
+            prepare(&mut state, title, &body),
+            (title.into(), body.clone())
+        );
+        assert!(state.events.is_empty());
+        let w = Withheld {
+            title: false,
+            body: false,
+            categories: vec![],
+        };
+        assert!(diagnose(&["sensitive-data".into()], title, &body).is_empty());
+        assert_eq!(fallback_text(&w, title, &body, "r1"), (title.into(), body));
+    }
+
+    #[test]
+    fn github_text_mixed_loopback_only_redacts_non_loopback() {
+        let title = "fix(router): test local sockets";
+        let body = format!(
+            "{}Start on 127.0.0.1:0 and [::1]:0.\nConnect to 10.0.0.1 and fe80::1.\n",
+            "Test setup.\n".repeat(21)
+        );
+        let violations = check(title, &body);
+        assert_eq!(violations, vec![Violation::SensitiveData]);
+        let w = Withheld::from_check(&violations, title, &body).unwrap();
+        assert!(!w.title);
+        assert!(w.body);
+        let expected = body
+            .replace("10.0.0.1", "[redacted-ip]")
+            .replace("fe80::1", "[redacted-ip]");
+        assert_eq!(
+            fallback_text(&w, title, &body, "r1"),
+            (title.into(), expected)
+        );
+        assert_eq!(
+            crate::scrub::locate(&body, &Identity::default()),
+            vec![(23, "ip"), (23, "ip")]
+        );
+        assert_eq!(
+            diagnose(&w.categories, title, &body),
+            vec!["- sensitive-data: description line 23: ip"]
+        );
+    }
+
+    #[test]
     fn github_text_fixed_fallback_passes() {
         assert!(check(NEUTRAL_TITLE, NEUTRAL_BODY).is_empty());
     }
