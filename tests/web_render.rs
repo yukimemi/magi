@@ -2337,13 +2337,17 @@ async fn chat_remembers_persona_and_implementers_for_new_conversations() {
         )
         .await
         .unwrap_or_else(|e| panic!("start: {e}"));
+    // A loading shell keeps the previous selector values but disables them.
+    // Wait for the new record to render before inspecting its remembered count.
     browser
         .wait_for(
             &page,
             &format!(
                 "(() => {{ const s = document.getElementById('talk-persona'); \
+                 const n = document.getElementById('talk-implementers'); \
                  return location.hash.startsWith('#/chat/') && !location.hash.endsWith('{talk_id}') \
-                   && !!s && s.value === 'rei'; }})()"
+                   && !!s && !s.disabled && s.value === 'rei' \
+                   && !!n && !n.disabled; }})()"
             ),
             w,
         )
