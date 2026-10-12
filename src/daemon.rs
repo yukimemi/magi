@@ -3079,6 +3079,7 @@ async fn attempt(
     // `RunState::quota` is the run's whole history across every resume, so
     // only what this execution added may arm the cooldown or earn a refund.
     let quota_before = runner.state.quota.clone();
+    runner.state.next_pass_task_entry = true;
     let result = runner.execute().await;
     finish_attempt(
         opts.max_attempts,

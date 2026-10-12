@@ -3861,6 +3861,7 @@ async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
     task.start(run_id);
     queue.put(&mut task)?;
     let quota_before = runner.state.quota.clone();
+    runner.state.next_pass_task_entry = true;
     let result = runner.execute().await;
     print!("{}", report::run(&runner.state));
     let (status, left_pr) = (runner.state.status, runner.state.pr.is_some());

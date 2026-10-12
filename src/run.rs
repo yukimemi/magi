@@ -293,6 +293,11 @@ pub struct RunPass {
     /// `None` while open (or still driving).
     #[serde(default)]
     pub end: Option<PassEnd>,
+    /// The pass was one the task loop (or `magi run`) counted as an entry of
+    /// `Task::runs`. A resume from the web button or `magi run --resume`
+    /// without a task is a pass too, but no entry of the task's list.
+    #[serde(default)]
+    pub task_entry: bool,
 }
 
 /// What an unrecorded origin reads as, wherever one is shown.
@@ -2057,6 +2062,10 @@ pub struct RunState {
     /// Additive, so `SCHEMA` is not bumped.
     #[serde(default)]
     pub passes: Vec<RunPass>,
+    /// Set by whoever is about to execute this run on a task's behalf, read
+    /// and cleared by the next [`RunState::begin_pass`]. Never persisted.
+    #[serde(skip)]
+    pub next_pass_task_entry: bool,
     /// Parked at a node boundary, waiting to be resumed.
     ///
     /// A run that is neither finished nor being worked on is otherwise
@@ -2293,6 +2302,7 @@ impl RunState {
             seat_history: BTreeMap::new(),
             withheld: Vec::new(),
             passes: Vec::new(),
+            next_pass_task_entry: false,
             parked: false,
             released_to: None,
             released_branches: Vec::new(),
@@ -2435,6 +2445,7 @@ impl RunState {
             resumed,
             ended_at: None,
             end: None,
+            task_entry: std::mem::take(&mut self.next_pass_task_entry),
         });
     }
 

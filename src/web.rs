@@ -5118,12 +5118,24 @@ fn task_history(task: &Task, read: impl Fn(&str) -> Option<RunState>) -> Vec<Tas
         seen.push(run_id);
         let total = task.runs.iter().filter(|r| *r == run_id).count();
         // The run keeps one record per pass from the build that added them
-        // on; earlier entries of the list have none and stay unknown. The
-        // records are the tail of the list, so align from the end, and give
-        // up when the run claims more passes than the task lists.
+        // on; earlier entries of the list have none and stay unknown. Only
+        // passes the task counted are entries (a web-button resume is a pass
+        // with no entry), so align those from the end of the list, and give
+        // up when the run claims more of them than the task lists.
         let pass = state.as_ref().and_then(|s| {
-            let offset = total.checked_sub(s.passes.len())?;
-            s.passes.get(k.checked_sub(offset)?)
+            let mine: Vec<&crate::run::RunPass> = s
+                .passes
+                .iter()
+                .filter(|p| {
+                    p.task_entry
+                        || task
+                            .passes
+                            .iter()
+                            .any(|t| t.run == *run_id && t.pass_index == p.index)
+                })
+                .collect();
+            let offset = total.checked_sub(mine.len())?;
+            mine.get(k.checked_sub(offset)?).copied()
         });
         let settled = pass.and_then(|p| {
             task.passes
@@ -12258,6 +12270,7 @@ mod tests {
             resumed: index > 0,
             ended_at: end.as_ref().map(|_| Timestamp::now()),
             end,
+            task_entry: true,
         }
     }
 
@@ -12458,6 +12471,39 @@ mod tests {
         let h = task_history(&flow_task(&[RUN_X, RUN_X]), |_| Some(legacy.clone()));
         assert!(h.iter().all(|v| v.pass.is_none()));
         assert!(h[0].outcome.contains("not recorded"), "{}", h[0].outcome);
+    }
+
+    #[test]
+    fn a_resume_outside_the_task_loop_does_not_shift_the_recorded_passes() {
+        use crate::queue::PassCost;
+        // Pass 1 is a web-button resume: a pass of the run, no entry of the
+        // task. The two entries are passes 0 and 2.
+        let mut web = recorded_pass(1, parked(crate::run::ParkCause::Operator));
+        web.task_entry = false;
+        let run = flow_run(RunStatus::Implementing, |s| {
+            s.passes = vec![
+                recorded_pass(0, parked(upgrade_cause())),
+                web.clone(),
+                recorded_pass(2, None),
+            ];
+        });
+        let mut task = flow_task(&[RUN_X, RUN_X]);
+        task.passes = vec![settled_pass(RUN_X, 0, PassCost::Refunded)];
+        let h = task_history(&task, |_| Some(run.clone()));
+        assert!(h[0].outcome.contains("upgrade 0.121.0"), "{}", h[0].outcome);
+        assert!(!h[1].outcome.contains("not recorded"), "{}", h[1].outcome);
+
+        // Legacy first entry, then a web resume that parked for an upgrade,
+        // then the daemon's pass: the legacy entry must stay unknown.
+        let mut web0 = recorded_pass(0, parked(upgrade_cause()));
+        web0.task_entry = false;
+        let run = flow_run(RunStatus::Implementing, |s| {
+            s.passes = vec![web0.clone(), recorded_pass(1, None)];
+        });
+        let h = task_history(&flow_task(&[RUN_X, RUN_X]), |_| Some(run.clone()));
+        assert!(h[0].pass.is_none());
+        assert!(!h[0].outcome.contains("upgrade"), "{}", h[0].outcome);
+        assert!(h[1].pass.is_some());
     }
 
     #[tokio::test]
