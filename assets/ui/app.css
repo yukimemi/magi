@@ -1232,6 +1232,7 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
   text-decoration: underline; text-decoration-color: var(--line-2); text-underline-offset: 3px;
 }
 
+.run-stop-reason { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .run-status { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
 /* `.phase` is `width:100%`, so as a flex item with no basis the rail collapses
    to nothing beside the chip. Give it its own full-width row underneath. */

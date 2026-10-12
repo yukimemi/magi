@@ -2982,6 +2982,7 @@ where
 /// instead.
 #[derive(Debug, Serialize)]
 struct RunDetailView {
+    stop_reason: Option<String>,
     #[serde(flatten)]
     state: RunState,
     instruction_md: Vec<md::Node>,
@@ -3368,7 +3369,12 @@ impl RunDetailView {
         task: Option<TaskRef>,
     ) -> Self {
         let display_status = run_display_status(&state, waiting, live);
+        let stop_reason = crate::stop_reason::of(
+            &state,
+            latest_attempt.as_ref().map(|a| (a.id.as_str(), a.status)),
+        );
         Self {
+            stop_reason,
             instruction_md: md::to_nodes(&state.instruction, &md::ImageBase::None),
             prose_md: run_prose_md(&state),
             origin_label: crate::run::origin_label(state.origin.as_ref()),
@@ -14691,6 +14697,39 @@ mod tests {
         assert!(INDEX_HTML.contains("aria-label=\"Dismiss unreadable-runs warning\""));
         // The subtitle still counts them whatever the banner does.
         assert!(APP_JS.contains("unreadable` : null"));
+    }
+
+    #[test]
+    fn blocked_run_detail_exposes_the_failed_gate_reason() {
+        let mut state = RunState::new(
+            "/repo".into(),
+            "main".into(),
+            "abc".into(),
+            "task".into(),
+            crate::config::Config::default(),
+        );
+        state.status = RunStatus::Blocked;
+        state.gate_ran = true;
+        state.gate.push(crate::run::CommandOutcome {
+            command: "cargo make check".into(),
+            code: Some(1),
+            output_tail: "test web::tests::talks_report_independent_thinking_claims_and_queue_a_second_message ... FAILED\ntest result: FAILED. 1813 passed; 1 failed; 0 ignored;".into(),
+            duration_ms: 0,
+            resource_blocked: false,
+        });
+        let view = RunDetailView::of(
+            state,
+            false,
+            crate::run::Liveness::Unknown,
+            None,
+            None,
+            None,
+        );
+        let value = serde_json::to_value(view).unwrap();
+        assert_eq!(
+            value["stop_reason"],
+            "Gate failed: cargo make check — web::tests::talks_report_independent_thinking_claims_and_queue_a_second_message (1 failed)"
+        );
     }
 
     #[test]
