@@ -1021,6 +1021,33 @@ mod review_round_tests {
         assert!(!crate::scrub::scrub(body, &Identity::default()).contains("hunter2"));
     }
 
+    #[test]
+    fn unmatched_inline_backticks_cannot_hide_body_language() {
+        for body in [
+            "Add `an identifier\n日本語の説明です。",
+            "Add ``an identifier\n日本語の説明です。",
+            "Add `日本語の説明です。",
+            "Add ``日本語の説明です。`",
+            "Add `日本語の説明です。``",
+            "Add `an identifier\n日本語の説明です。`",
+        ] {
+            assert!(
+                check("fix: retries", body).contains(&Violation::BodyLanguage),
+                "{body}"
+            );
+        }
+        let body = "Add `an identifier\n日本語の説明です。";
+        let (text, lines) = prose_mapped(body);
+        assert_eq!(text, "Add an identifier\n日本語の説明です。\n");
+        assert_eq!(lines, [1, 2]);
+        // A matching run still exempts code and leaves following prose checked.
+        assert!(check("fix: retries", "Add ``日本語 ` の識別子``.").is_empty());
+        assert!(
+            check("fix: retries", "Add `code`. 日本語の説明です。")
+                .contains(&Violation::BodyLanguage)
+        );
+    }
+
     fn decision(title: bool, body: bool) -> Option<LanguageDecision> {
         Some(LanguageDecision {
             title_english: title,
