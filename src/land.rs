@@ -4345,7 +4345,10 @@ fn fix_prompt(
         let _ = write!(s, "\n\nWrite all prose in {language}.");
     }
     // After the language line, so the exception is the last word on it.
-    s.push_str(&crate::prompt::github_english(language));
+    s.push_str(&crate::prompt::github_rule(
+        language,
+        &state.config.graph.github_language,
+    ));
     if let Some(overlay) = state.config.prompts.overlay("fix") {
         let _ = write!(s, "\n\n{overlay}");
     }

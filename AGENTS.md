@@ -2573,6 +2573,21 @@ text; this is a gate, not a prompt. `[graph] github_text_guard` defaults to true
 Language checks exempt code and quoted original tasks; sensitive data is always
 scrubbed, including those sections, using the shared rules in `src/scrub.rs`.
 
+`[graph] github_language` (default `"en"`) names the language of pull request /
+issue titles, bodies and GitHub comments, independent of `[graph] language`
+(operator prose). A non-English value is an **intentional, explicit exception**
+to the kata English-text rule and switches off only the language gate:
+`github_text::check_for` drops `TitleLanguage` / `BodyLanguage` (sensitive data
+and scrubbing always stay), `judge_language` spawns nothing, `prepare_with`
+never swaps in `NEUTRAL_*`, `vet_title` skips the language check, and the
+title heuristics (`english_title` / `english_subject`) accept non-ASCII.
+`Graph::language_gate` / `github_english` and `lang::is_english` are the single
+deciders. Prompts use `prompt::github_rule` (English output is byte-identical to
+`github_english`, heading `GITHUB_ENGLISH_HEADING`; otherwise
+`GITHUB_LANGUAGE_HEADING`). Commit messages are always English. Fixed text magi
+writes itself (`NEUTRAL_*`, follow-up and land comments, bump PR body and
+reason prompt) stays English.
+
 ### Jev for the English check is a role, never an HTTP client
 
 `[roles] language_judge` names an agent (normally a `kind = "command"` wrapper

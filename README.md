@@ -794,6 +794,7 @@ review_rounds = 6
 incomplete_review = "block"  # block | warn — a round a seat never answered in
 max_parallel = 4
 language = "en"          # prose language for the agents; "ja" etc.
+github_language = "en"   # language of PR / issue titles, bodies and GitHub comments; anything but English drops the English-only check (commits stay English)
 sessions = true
 timeout_implement = 3600
 # A re-ask that only has to restate an answer the seat already worked out gets

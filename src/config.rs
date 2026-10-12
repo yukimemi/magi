@@ -317,6 +317,12 @@ pub struct Roles {
 pub struct Graph {
     /// Gate GitHub prose before posting. Secret redaction remains mandatory when disabled.
     pub github_text_guard: bool,
+    /// Language of pull request / issue titles, bodies and GitHub comments
+    /// (`en` / `ja` / any language name). Default `en`. Anything but English
+    /// switches off the posting gate's English-only language check for those
+    /// texts (secret redaction stays); commit messages are always English.
+    /// Independent of [`Self::language`], which is for the operator.
+    pub github_language: String,
     /// Parallel implementations of the same task (the number of implementer
     /// seats; pairs with [`Roles::implementers`]). **One by default.**
     ///
@@ -542,6 +548,7 @@ impl Default for Graph {
     fn default() -> Self {
         Self {
             github_text_guard: true,
+            github_language: "en".into(),
             implementers: 1,
             judges: 3,
             deliberate_rounds: 1,
@@ -583,6 +590,17 @@ impl Graph {
     /// compatibility fallback rather than a new 1200-second default.
     pub fn verify_timeout(&self) -> u64 {
         self.timeout_verify.unwrap_or(self.timeout_review)
+    }
+
+    /// Does the posting gate enforce English on GitHub text? The one place
+    /// that decides it: the guard is on *and* `github_language` is English.
+    pub fn language_gate(&self) -> bool {
+        self.github_text_guard && self.github_english()
+    }
+
+    /// Is GitHub text English (the default), whether or not the gate is on?
+    pub fn github_english(&self) -> bool {
+        crate::lang::is_english(&self.github_language)
     }
 }
 
@@ -2159,6 +2177,8 @@ impl Config {
              [graph]\n\
              # Gate GitHub prose; secret redaction is always enabled.\n\
              github_text_guard = true\n\
+             # Language of PR / issue titles, bodies and comments; non-English drops the English-only check (commits stay English).\n\
+             github_language = \"en\"\n\
              implementers = 3\n\
              judges = 3\n\
              deliberate_rounds = 1\n\
@@ -3911,5 +3931,20 @@ mod tests {
             let (cfg, _) = Config::discover(dir.path(), None).unwrap();
             assert_eq!(cfg.graph.implementers, 4);
         }
+    }
+
+    #[test]
+    fn github_language_defaults_to_english_and_accepts_japanese() {
+        let default: Graph = toml::from_str("").unwrap();
+        assert_eq!(default.github_language, "en");
+        assert!(default.github_english() && default.language_gate());
+        let ja: Graph = toml::from_str("github_language = \"ja\"").unwrap();
+        assert!(!ja.github_english() && !ja.language_gate());
+        // Independent of the operator-facing language.
+        let only_ops: Graph = toml::from_str("language = \"ja\"").unwrap();
+        assert!(only_ops.language_gate());
+        let off: Graph = toml::from_str("github_text_guard = false").unwrap();
+        assert!(!off.language_gate() && off.github_english());
+        assert!(Config::starter_toml().contains("github_language = \"en\""));
     }
 }

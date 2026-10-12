@@ -1337,7 +1337,8 @@ async fn after_merge_inner(
         );
     }
     let mut decision = parse_decision(&out.text).context("parse the release-bump decision")?;
-    let mut violations = crate::github_text::check("", &decision.reason);
+    let mut violations =
+        crate::github_text::check_for(&state.config.graph, "", &decision.reason, None);
     // Sensitive-only: span redaction is enough, no rewrite needed.
     violations.retain(|v| *v != crate::github_text::Violation::SensitiveData);
     if violations.is_empty() {
@@ -1377,7 +1378,9 @@ async fn after_merge_inner(
             .filter(|o| o.usable())
             .and_then(|o| parse_decision(&o.text).ok())
             .filter(|d| {
-                d.level == decision.level && crate::github_text::check("", &d.reason).is_empty()
+                d.level == decision.level
+                    && crate::github_text::check_for(&state.config.graph, "", &d.reason, None)
+                        .is_empty()
             })
             .map(|d| d.reason);
         if let Some(reason) = reason {

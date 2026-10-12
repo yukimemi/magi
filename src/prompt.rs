@@ -73,8 +73,7 @@ fn language_name(language: &str) -> &str {
 
 /// Is this the default, where nothing needs saying?
 fn is_english(language: &str) -> bool {
-    let l = language.trim();
-    l.is_empty() || l.eq_ignore_ascii_case("en") || l.eq_ignore_ascii_case("english")
+    crate::lang::is_english(language)
 }
 
 fn lang(language: &str) -> String {
@@ -123,6 +122,31 @@ pub const GITHUB_ENGLISH_HEADING: &str = "# GitHub text is always English";
 /// Prompt-only: an agent that runs `gh` itself is trusted to follow it; magi
 /// cannot enforce it.
 pub fn github_english(language: &str) -> String {
+    github_rule(language, "en")
+}
+
+/// Heading of the rule used when `[graph] github_language` is not English.
+pub const GITHUB_LANGUAGE_HEADING: &str = "# GitHub text language";
+
+/// [`github_english`] for a configured `[graph] github_language`. English is
+/// byte-for-byte the fixed rule above; any other language names it for pull
+/// request / issue titles, bodies and comments, keeps commit messages English
+/// and leaves the quality and confidentiality rules untouched.
+pub fn github_rule(language: &str, github_language: &str) -> String {
+    if !is_english(github_language) {
+        let name = language_name(github_language);
+        let mut s = format!(
+            "\n\n{GITHUB_LANGUAGE_HEADING}\n\n\
+             Pull request titles and bodies (the `TITLE:` line and the whole SUMMARY \
+             included), issue titles and bodies, and comments posted to GitHub are \
+             written in {name}, whatever language the task is written in. Commit \
+             messages are always written in English."
+        );
+        s.push_str(&github_quality_rule());
+        s.push_str(&github_confidential_rule());
+        exempt_operator_prose(&mut s, language, github_language);
+        return s;
+    }
     let mut s = format!(
         "\n\n{GITHUB_ENGLISH_HEADING}\n\n\
          Pull request titles and bodies (the `TITLE:` line and the whole SUMMARY \
@@ -132,7 +156,7 @@ pub fn github_english(language: &str) -> String {
     );
     s.push_str(&github_quality_rule());
     s.push_str(&github_confidential_rule());
-    exempt_operator_prose(&mut s, language);
+    exempt_operator_prose(&mut s, language, "en");
     s
 }
 
@@ -158,6 +182,25 @@ fn github_confidential_rule() -> String {
 /// [`github_english`] for a reviewer: the only thing of theirs that reaches
 /// GitHub is a finding's `title`, which the pull request body lists.
 pub fn github_english_finding_titles(language: &str) -> String {
+    github_finding_titles_rule(language, "en")
+}
+
+/// [`github_rule`] for a reviewer's finding titles.
+pub fn github_finding_titles_rule(language: &str, github_language: &str) -> String {
+    if !is_english(github_language) {
+        let name = language_name(github_language);
+        let mut s = format!(
+            "\n\n{GITHUB_LANGUAGE_HEADING}\n\n\
+             Each finding's `title` can be copied into a pull request description, \
+             so it is written in {name}, whatever language the task is written in. \
+             Any comment or issue you post to GitHub is in {name} too; commit \
+             messages stay English."
+        );
+        s.push_str(&github_quality_rule());
+        s.push_str(&github_confidential_rule());
+        exempt_operator_prose(&mut s, language, github_language);
+        return s;
+    }
     let mut s = format!(
         "\n\n{GITHUB_ENGLISH_HEADING}\n\n\
          Each finding's `title` can be copied into a pull request description, \
@@ -166,11 +209,18 @@ pub fn github_english_finding_titles(language: &str) -> String {
     );
     s.push_str(&github_quality_rule());
     s.push_str(&github_confidential_rule());
-    exempt_operator_prose(&mut s, language);
+    exempt_operator_prose(&mut s, language, "en");
     s
 }
 
-fn exempt_operator_prose(s: &mut String, language: &str) {
+fn exempt_operator_prose(s: &mut String, language: &str, github_language: &str) {
+    // Same language for both: nothing to carve out.
+    if !is_english(language)
+        && language.trim().eq_ignore_ascii_case(github_language.trim())
+        && !is_english(github_language)
+    {
+        return;
+    }
     if !is_english(language) {
         let _ = write!(
             s,
@@ -465,6 +515,18 @@ pub fn implement(
     brief: Option<&str>,
     attachments: &[PathBuf],
 ) -> String {
+    implement_in(instruction, cwd, language, "en", brief, attachments)
+}
+
+/// [`implement`] with `[graph] github_language`.
+pub fn implement_in(
+    instruction: &str,
+    cwd: &str,
+    language: &str,
+    github_language: &str,
+    brief: Option<&str>,
+    attachments: &[PathBuf],
+) -> String {
     let attachments_section = if attachments.is_empty() {
         String::new()
     } else {
@@ -542,7 +604,7 @@ pub fn implement(
          that wrote nothing, not a verified one.\n\n{}{}{}",
         ask_the_owner(language),
         lang(language),
-        github_english(language)
+        github_rule(language, github_language)
     )
 }
 
@@ -803,6 +865,8 @@ pub struct ReviewCtx<'a> {
     pub lens: Lens,
     /// Language for prose.
     pub language: &'a str,
+    /// Language for GitHub-facing text (`[graph] github_language`).
+    pub github_language: &'a str,
 }
 
 /// The "patch under review" section, shared by [`review`] and, when a seat
@@ -841,6 +905,7 @@ pub fn review(ctx: &ReviewCtx<'_>) -> String {
         competed,
         lens,
         language,
+        github_language,
     } = *ctx;
     let mut s = format!(
         "You are one of {reviewers} reviewers of {}. Review round {round} of \
@@ -916,7 +981,7 @@ pub fn review(ctx: &ReviewCtx<'_>) -> String {
     s.push('\n');
     s.push_str(&ask_the_owner(language));
     s.push_str(&lang(language));
-    s.push_str(&github_english_finding_titles(language));
+    s.push_str(&github_finding_titles_rule(language, github_language));
     s
 }
 
@@ -1083,6 +1148,27 @@ pub fn fix(
     rounds: usize,
     language: &str,
 ) -> String {
+    fix_in(
+        instruction,
+        findings,
+        verification,
+        round,
+        rounds,
+        language,
+        "en",
+    )
+}
+
+/// [`fix`] with `[graph] github_language`.
+pub fn fix_in(
+    instruction: &str,
+    findings: &[Finding],
+    verification: Option<&crate::run::VerificationSummary>,
+    round: usize,
+    rounds: usize,
+    language: &str,
+    github_language: &str,
+) -> String {
     let mut s = format!(
         "Your patch was reviewed. Review round {round} of {rounds}.\n\n\
          The reviewers are identified only as Reviewer 1, Reviewer 2, ... Do \
@@ -1144,7 +1230,7 @@ pub fn fix(
     s.push('\n');
     s.push_str(&ask_the_owner(language));
     s.push_str(&lang(language));
-    s.push_str(&github_english(language));
+    s.push_str(&github_rule(language, github_language));
     s
 }
 
@@ -1282,6 +1368,18 @@ pub fn gate_fix(
     cap: usize,
     language: &str,
 ) -> String {
+    gate_fix_in(instruction, failed, attempt, cap, language, "en")
+}
+
+/// [`gate_fix`] with `[graph] github_language`.
+pub fn gate_fix_in(
+    instruction: &str,
+    failed: &[crate::run::CommandOutcome],
+    attempt: usize,
+    cap: usize,
+    language: &str,
+    github_language: &str,
+) -> String {
     let mut s = format!(
         "Your patch failed the verification gate. Gate fix {attempt} of {cap}.\n\n\
          The reviewers had no blocking findings left. What follows is not a \
@@ -1325,7 +1423,7 @@ pub fn gate_fix(
     s.push('\n');
     s.push_str(&ask_the_owner(language));
     s.push_str(&lang(language));
-    s.push_str(&github_english(language));
+    s.push_str(&github_rule(language, github_language));
     s
 }
 
@@ -1422,6 +1520,8 @@ pub struct RebaseConflict<'a> {
     pub cap: usize,
     /// Reply language.
     pub language: &'a str,
+    /// Language for GitHub-facing text (`[graph] github_language`).
+    pub github_language: &'a str,
 }
 
 /// See [`RebaseConflict`].
@@ -1492,7 +1592,7 @@ pub fn rebase_conflict(c: &RebaseConflict<'_>) -> String {
     s.push('\n');
     s.push_str(&ask_the_owner(c.language));
     s.push_str(&lang(c.language));
-    s.push_str(&github_english(c.language));
+    s.push_str(&github_rule(c.language, c.github_language));
     s
 }
 
@@ -1511,6 +1611,27 @@ pub fn operator_fix(
     stale: &[(String, String)],
     current_head: &str,
     language: &str,
+) -> String {
+    operator_fix_in(
+        instruction,
+        findings,
+        reason,
+        stale,
+        current_head,
+        language,
+        "en",
+    )
+}
+
+/// [`operator_fix`] with `[graph] github_language`.
+pub fn operator_fix_in(
+    instruction: &str,
+    findings: &[Finding],
+    reason: &str,
+    stale: &[(String, String)],
+    current_head: &str,
+    language: &str,
+    github_language: &str,
 ) -> String {
     let mut s = format!(
         "An operator has selected the finding(s) below from a saved review and \
@@ -1534,7 +1655,15 @@ pub fn operator_fix(
     // `round`/`rounds` only drive `fix`'s "Review round N of M" display line;
     // there is no round budget for this step, so both are 1 — one pass, not a
     // count of anything.
-    s.push_str(&fix(instruction, findings, None, 1, 1, language));
+    s.push_str(&fix_in(
+        instruction,
+        findings,
+        None,
+        1,
+        1,
+        language,
+        github_language,
+    ));
     s.push_str(
         "\n# Scope\n\nAddress only the finding id(s) listed above. Do not act on \
          any other issue, including one you recall from an earlier round of this \
@@ -1618,6 +1747,22 @@ pub const CHANGE_SUMMARY_HEADING: &str = "# Describe a change for its pull reque
 /// The commit list and diff stat are orientation only; the agent must read the
 /// diff itself and the code around it.
 pub fn change_summary(base: &str, head: &str, subjects: &[String], stat: &str) -> String {
+    change_summary_in(base, head, subjects, stat, "en")
+}
+
+/// [`change_summary`] with `[graph] github_language`.
+pub fn change_summary_in(
+    base: &str,
+    head: &str,
+    subjects: &[String],
+    stat: &str,
+    github_language: &str,
+) -> String {
+    let language = if is_english(github_language) {
+        "English"
+    } else {
+        language_name(github_language)
+    };
     let mut commits = String::new();
     for s in subjects {
         let _ = writeln!(commits, "- {}", s.trim());
@@ -1634,7 +1779,7 @@ pub fn change_summary(base: &str, head: &str, subjects: &[String], stat: &str) -
          stat below are orientation, not a substitute for reading the diff.\n\n\
          Commits ({base}..{head}):\n{commits}\n\
          Diff stat:\n```\n{stat}\n```\n\n\
-         Write in English. Explain the concrete problem the change addresses, the behavior \
+         Write the TITLE line and the Markdown description in {language}. Explain the concrete problem the change addresses, the behavior \
          that results, and the material implementation details the diff supports, by area. \
          Describe the whole change, not only fixes made late in its history. State only what \
          the diff and the code show; if something is unclear, say it is unclear rather than \
@@ -2853,6 +2998,7 @@ mod tests {
             competed,
             lens: Lens::Spec,
             language: "en",
+            github_language: "en",
         }
     }
 
@@ -3687,6 +3833,7 @@ mod tests {
             round: 1,
             cap: 2,
             language: "en",
+            github_language: "en",
         });
         let seats: Vec<(&str, String)> = vec![
             ("implement", implement("t", "/w", "en", None, &[])),
@@ -3731,5 +3878,61 @@ mod tests {
         }
         assert!(WORK_IN_PLACE_RULE.contains("jj workspace"));
         assert!(WORK_IN_PLACE_RULE.contains("git worktree"));
+    }
+    #[test]
+    fn change_summary_uses_the_github_language_for_title_and_description() {
+        let english = change_summary("base", "head", &[], "stat");
+        assert!(english.contains("Write the TITLE line and the Markdown description in English."));
+        for language in ["en", ""] {
+            assert_eq!(
+                change_summary_in("base", "head", &[], "stat", language),
+                english
+            );
+        }
+        let japanese = change_summary_in("base", "head", &[], "stat", "ja");
+        assert!(
+            japanese.contains("Write the TITLE line and the Markdown description in Japanese.")
+        );
+        assert!(!japanese.contains("in English"));
+    }
+
+    #[test]
+    fn github_language_defaults_to_the_fixed_english_rule() {
+        assert_eq!(github_rule("ja", "en"), github_english("ja"));
+        assert_eq!(github_rule("en", ""), github_english("en"));
+        assert_eq!(
+            github_finding_titles_rule("ja", "en"),
+            github_english_finding_titles("ja")
+        );
+        assert!(github_rule("en", "en").contains(GITHUB_ENGLISH_HEADING));
+    }
+
+    #[test]
+    fn a_non_english_github_language_replaces_the_english_rule_in_every_writing_seat() {
+        let ctx = ReviewCtx {
+            github_language: "ja",
+            ..review_ctx(true)
+        };
+        let seats = [
+            ("implement", implement_in("t", "/w", "en", "ja", None, &[])),
+            ("fix", fix_in("t", &[], None, 1, 2, "en", "ja")),
+            ("gate_fix", gate_fix_in("t", &[], 1, 2, "en", "ja")),
+            (
+                "operator_fix",
+                operator_fix_in("t", &[], "why", &[], "abc", "en", "ja"),
+            ),
+            ("review", review(&ctx)),
+        ];
+        for (name, p) in &seats {
+            assert!(p.contains(GITHUB_LANGUAGE_HEADING), "{name}");
+            assert!(!p.contains(GITHUB_ENGLISH_HEADING), "{name}");
+            assert!(p.contains("Japanese"), "{name}");
+            assert!(
+                p.contains("Commit messages are always written in English")
+                    || p.contains("commit messages stay English"),
+                "{name}"
+            );
+            assert!(p.contains("Never put hostnames"), "{name}");
+        }
     }
 }
