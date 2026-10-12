@@ -1039,6 +1039,9 @@ impl Runner {
         // syncing to a newer base here could change the verified commit.
         if self.state.pr_publication_pending {
             self.merge().await?;
+            if self.resource_halt()? {
+                return Ok(());
+            }
             self.state.save()?;
             self.settle_questions();
             return Ok(());
@@ -1091,6 +1094,9 @@ impl Runner {
             && self.state.status == RunStatus::Gating
         {
             self.merge().await?;
+            if self.resource_halt()? {
+                return Ok(());
+            }
             self.state.save()?;
             return Ok(());
         }
@@ -1267,6 +1273,9 @@ impl Runner {
         }
         self.gate().await?;
         self.merge().await?;
+        if self.resource_halt()? {
+            return Ok(());
+        }
         self.state.save()?;
         Ok(())
     }
@@ -6555,6 +6564,17 @@ impl Runner {
         } else {
             None
         };
+        // A busy shared resource is not a permanent cause: publishing an
+        // "unavailable" description would stick (a later head move never
+        // edits the body). Stop before anything is pushed or opened; the
+        // run is `Blocked` and a resume asks the summary again.
+        if self.state.resource_block.is_some() {
+            self.state.event(
+                "pr-summary",
+                "a shared resource was busy; nothing was published, resume to summarize again",
+            );
+            return Ok(None);
+        }
         let note = match (&summarized, &self.state.change_summary) {
             (Some(Ok(())), Some(c)) => ChangeNote::Summary(c),
             (Some(Err(why)), _) => ChangeNote::Unavailable(why),
@@ -6789,7 +6809,17 @@ impl Runner {
             self.state.seats.insert(seat.key.clone(), seat);
             let text = match outcome {
                 AgentOutcome::Ok(o) if !agent::output_advances(&o) => o.text,
-                AgentOutcome::ResourceBlocked(_) => {
+                AgentOutcome::ResourceBlocked(why) => {
+                    // No agent was asked: the run stops resumably before
+                    // anything is published (see `guarded_pr_message`).
+                    if self.state.resource_block.is_none() {
+                        self.state.resource_block = Some(crate::run::ResourceBlock {
+                            node: "pr-summary".to_owned(),
+                            kind: "shared resource".to_owned(),
+                            detail: why,
+                            at: Timestamp::now(),
+                        });
+                    }
                     return Err("a shared resource was busy".to_owned());
                 }
                 _ => continue,
