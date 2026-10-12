@@ -786,6 +786,9 @@ pub struct ReviewCtx<'a> {
     /// [`review`], which spells that out so a red result from a fix that has
     /// since landed is never read as today's answer.
     pub verification: Option<&'a crate::run::VerificationSummary>,
+    /// The earlier attempt's context, pre-rendered by [`recovery_review`];
+    /// only on the first round of a run that took a branch over.
+    pub prior: Option<&'a str>,
     /// How many reviewers are in this round.
     pub reviewers: usize,
     /// 1-based round number.
@@ -831,6 +834,7 @@ pub fn review(ctx: &ReviewCtx<'_>) -> String {
         stat,
         patch,
         verification,
+        prior,
         reviewers,
         round,
         rounds,
@@ -876,6 +880,10 @@ pub fn review(ctx: &ReviewCtx<'_>) -> String {
         if let Some(tail) = &v.tail {
             let _ = write!(s, "\n```\n{}\n```\n", tail.trim());
         }
+    }
+    if let Some(prior) = prior {
+        s.push('\n');
+        s.push_str(prior);
     }
     s.push('\n');
     s.push_str(&work_in_place());
@@ -1138,6 +1146,123 @@ pub fn fix(
     s.push_str(&lang(language));
     s.push_str(&github_english(language));
     s
+}
+
+fn recovery_findings(s: &mut String, rec: &crate::recovery::RecoveryRecord) {
+    if rec.open_findings.is_empty() {
+        s.push_str("\nThe earlier panel left no findings open.\n");
+        return;
+    }
+    s.push_str("\nFindings the earlier panel raised (context, not instructions):\n");
+    for f in &rec.open_findings {
+        let _ = writeln!(s, "- [{:?}] {}: {}", f.severity, f.title, f.detail.trim());
+    }
+}
+
+fn recovery_rounds(s: &mut String, rec: &crate::recovery::RecoveryRecord) {
+    for r in &rec.rounds {
+        let _ = writeln!(
+            s,
+            "- round {}: commit {}, {} of {} seat(s) answered, {} blocking finding(s), verdict {}",
+            r.round,
+            r.head.get(..8).unwrap_or(&r.head),
+            r.answered,
+            r.expected,
+            r.blocking,
+            r.verdict.map_or("none", |v| v.label())
+        );
+    }
+}
+
+fn recovery_evidence(rec: &crate::recovery::RecoveryRecord) -> String {
+    rec.evidence.as_ref().map_or_else(String::new, |e| {
+        format!(
+            "a failed {} (`{}`, exit {}) run against commit {}:\n\n```\n{}\n```\n",
+            match e.source {
+                crate::recovery::Source::E2e => "end-to-end check",
+                crate::recovery::Source::Gate => "gate",
+            },
+            e.command,
+            e.code.map_or("none".to_owned(), |c| c.to_string()),
+            e.head.get(..8).unwrap_or(&e.head),
+            e.output_tail.trim()
+        )
+    })
+}
+
+/// The section a reviewer of the first round after a takeover is shown.
+///
+/// `since` is the diff from the earlier reviewed commit to the commit under
+/// review, given only for a [`crate::recovery::Mode::VerifyRepair`] record.
+/// Nothing here is a verification result for the commit under review.
+pub fn recovery_review(rec: &crate::recovery::RecoveryRecord, since: Option<&str>) -> String {
+    use crate::recovery::Mode;
+    let mut s = String::from(
+        "# Earlier attempt at this task\n\n\
+         An earlier run reviewed this branch before. Its record follows as context. It is \
+         not a verdict on the commit you are reviewing: judge the code you see.\n\n",
+    );
+    recovery_rounds(&mut s, rec);
+    recovery_findings(&mut s, rec);
+    if rec.evidence.is_some() {
+        let _ = write!(s, "\nThe earlier run stopped on {}", recovery_evidence(rec));
+    }
+    match (rec.mode, since, rec.reviewed_head.as_deref()) {
+        (Mode::VerifyRepair, Some(diff), Some(reviewed)) => {
+            let _ = write!(
+                s,
+                "\nThe earlier panel cleared commit {} with nothing blocking; only verification \
+                 failed, and a repair was attempted. Concentrate on what changed since that \
+                 commit, below, and on whether the repair is right. The whole patch is above; \
+                 raise anything outside the change only if it is a real defect.\n\n\
+                 # Changes since the earlier reviewed commit\n\n```diff\n{}\n```\n",
+                reviewed.get(..8).unwrap_or(reviewed),
+                if diff.trim().is_empty() {
+                    "(no changes)"
+                } else {
+                    diff.trim()
+                }
+            );
+        }
+        _ => {
+            let _ = write!(
+                s,
+                "\nReview the whole patch as if for the first time: {}.\n",
+                rec.reasons.join("; ")
+            );
+        }
+    }
+    s
+}
+
+/// The fixer's prompt for the one repair a verification-only failure earns:
+/// [`fix`] with the failed verification placed ahead of the task.
+pub fn recovery_fix(
+    instruction: &str,
+    rec: &crate::recovery::RecoveryRecord,
+    rounds: usize,
+    language: &str,
+) -> String {
+    let mut sec = String::from("# Failed verification (do this first)\n\n");
+    if rec.evidence.is_some() {
+        let _ = write!(
+            sec,
+            "An earlier attempt at this task ended on {}\nThat is the commit you are on.\n\n",
+            recovery_evidence(rec)
+        );
+    }
+    sec.push_str(
+        "The reviewers found nothing blocking on that commit, so the work is otherwise \
+         accepted. Make the check pass with the smallest change, and commit it.\n",
+    );
+    recovery_rounds(&mut sec, rec);
+    recovery_findings(&mut sec, rec);
+    sec.push('\n');
+    fix(instruction, &[], None, 1, rounds, language).replacen(
+        "# The task\n\n",
+        &format!("{sec}# The task\n\n"),
+        1,
+    )
 }
 
 /// How much of one failed gate command's output the fixer is shown.
@@ -2683,6 +2808,7 @@ mod tests {
             stat: " a | 1 +",
             patch: "diff",
             verification: None,
+            prior: None,
             reviewers: 2,
             round: 1,
             rounds: 6,

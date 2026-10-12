@@ -61,6 +61,7 @@ pub mod prompt;
 pub mod queue;
 pub mod rebase;
 pub mod reconcile;
+pub mod recovery;
 pub mod refs;
 pub mod release_local;
 pub mod release_watch;

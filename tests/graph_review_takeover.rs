@@ -92,6 +92,7 @@ fn takeover(earlier: &[&RunState]) -> Takeover {
         earlier: earlier.iter().map(|s| s.id.clone()).collect(),
         home: magi::run::home(),
         choice: None,
+        task_instruction: None,
     }
 }
 

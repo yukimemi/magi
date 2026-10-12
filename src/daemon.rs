@@ -2935,6 +2935,7 @@ async fn attempt(
                 earlier: task.earlier_attempts().to_vec(),
                 home: crate::run::home(),
                 choice: take_divergence_answer(branch, &config.merge.remote, task),
+                task_instruction: Some(instruction_for(task)),
             };
             Runner::review_taking_over(
                 &repo,

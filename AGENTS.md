@@ -674,6 +674,41 @@ fixer chain (graft: sonnet -> sol -> astra) over a wait that was not the agent's
 - Known gaps: a parallelism-slot wait still shows the seat as running; an operator-
   requested fix records a resource block as an unreported fix instead of holding.
 
+### A takeover inherits evidence, never results
+
+`src/recovery.rs`. A task whose earlier run stopped on a failed verification
+used to reopen its branch as a context-free review. `Runner::inherit` (called
+from `open_review`) reads the newest earlier attempt that reviewed the branch
+and `recovery::assess` (pure) records on `RunState::recovery`
+(`#[serde(default)]`, `run::SCHEMA` unchanged) what was inherited and why.
+
+- **Two modes.** `VerifyRepair` only when every condition holds: the last
+  earlier round had zero blocking findings and every seat answered; a failed
+  `e2e` (or a `gate` with no gate fix after it) is recorded with a command, a
+  non-empty output and a `verified_head` equal to that round's head; the branch
+  tip *is* that head (git `is_ancestor`, never the old record's say-so); the
+  base did not move; `generation <= MAX_GENERATION`. Anything else is
+  `FullReview`, and each failed condition is a line in `reasons` (shown in the
+  event log and `magi show`). A timed-out seat is never a clean panel.
+- **Evidence is prompt text.** It is scrubbed and clipped, and is never copied
+  into a `ReviewRound`: round 1 always runs `verify.e2e` on the head it
+  reviews, and the gate on the commit that lands. `recovery::recheck`
+  downgrades a `VerifyRepair` whose branch moved (a base sync) before the
+  repair starts.
+- **One repair, outside `review_rounds`, saved first.** `recovery_repair`
+  records `Repair::Started` before the fixer (`fix` chain, stem
+  `fix-recovery`) is called; a start found on re-entry is rolled back and
+  settled, never retried. A failed fixer's edits are restored; a restore that
+  cannot be confirmed blocks the run. Its prompt (`prompt::recovery_fix`) keeps
+  the `Your patch was reviewed` heading and puts the failure ahead of the task.
+- **The task's statement survives.** `Takeover::task_instruction` replaces the
+  commit-log stand-in only when an earlier review was found
+  (`criteria_inherited`). Round 1 reviewers get `prompt::recovery_review`:
+  a scoped diff since the reviewed commit for `VerifyRepair`, "review the whole
+  patch" with the reasons otherwise.
+- The earlier run is only read: ownership of its worktree stays with
+  `handover`.
+
 ### A reviewer seat remembers who failed it across review rounds
 
 `RunState::seat_history` (`run::SeatHistory`, `#[serde(default)]`, so
