@@ -4410,7 +4410,15 @@ function createQuestionIdentity() {
         await navigator.clipboard.writeText(id);
         if (root.dataset.questionId === id) setText(status, "Copied full ID.");
       } catch {
-        if (root.dataset.questionId === id) setText(status, "Could not copy. Select the full ID to copy it manually.");
+        if (root.dataset.questionId !== id) return;
+        const selection = window.getSelection();
+        if (selection) {
+          const range = document.createRange();
+          range.selectNodeContents(full);
+          selection.removeAllRanges();
+          selection.addRange(range);
+        }
+        setText(status, "Could not copy. Select the full ID to copy it manually.");
       }
     },
   });

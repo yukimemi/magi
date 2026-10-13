@@ -25,14 +25,22 @@ function component() {
   const short = source.match(/^const shortId = .*$/m)[0];
   const helpers = source.slice(source.indexOf('function createQuestionIdentity('), source.indexOf('/* ---- agent-authored panels'));
   const navigator = {};
+  const selection = {
+    node: null,
+    removeAllRanges() { this.node = null; },
+    addRange(range) { this.node = range.node; },
+  };
   const api = runInNewContext(`${el}\n${short}\n${helpers}\n({ createQuestionIdentity, updateQuestionIdentity })`, {
-    document: { createElement: tag => new Node(tag) }, navigator,
+    document: {
+      createElement: tag => new Node(tag),
+      createRange: () => ({ selectNodeContents(node) { this.node = node; } }),
+    }, navigator, window: { getSelection: () => selection },
     append: (node, kids) => node.append(...kids),
     setText: (node, text) => { node.textContent = text; },
     setAttr: (node, key, value) => node.setAttribute(key, value),
   });
   const root = api.createQuestionIdentity();
-  return { ...api, navigator, root, copy: root.children[1].children[1] };
+  return { ...api, navigator, selection, root, copy: root.children[1].children[1] };
 }
 
 const id = '20261012-230524-5d55';
@@ -54,20 +62,24 @@ test('persisted identity remains mounted and expanded through repeated updates',
 });
 
 test('copies the full question ID and only reports success after a successful write', async () => {
-  const { root, navigator, copy, updateQuestionIdentity } = component();
+  const { root, navigator, selection, copy, updateQuestionIdentity } = component();
   updateQuestionIdentity(root, id);
   let copied;
   navigator.clipboard = { writeText: async text => { copied = text; } };
   await copy.click();
   assert.equal(copied, id);
   assert.equal(root.refs.status.textContent, 'Copied full ID.');
+  assert.equal(selection.node, null);
   navigator.clipboard.writeText = async () => { throw new Error('denied'); };
   await copy.click();
   assert.match(root.refs.status.textContent, /Could not copy.*Select the full ID/);
+  assert.equal(selection.node, root.refs.full);
+  selection.removeAllRanges();
   navigator.clipboard = undefined;
   await copy.click();
   assert.match(root.refs.status.textContent, /Could not copy.*Select the full ID/);
   assert.equal(root.refs.full.textContent, id);
+  assert.equal(selection.node, root.refs.full);
 });
 
 test('a pending clipboard write does not label a different question as copied', async () => {
@@ -79,5 +91,18 @@ test('a pending clipboard write does not label a different question as copied', 
   updateQuestionIdentity(root, '20261012-230525-abcd');
   resolve();
   await pending;
+  assert.equal(root.refs.status.textContent, '');
+});
+
+test('a pending copy failure does not select a different question', async () => {
+  const { root, navigator, selection, copy, updateQuestionIdentity } = component();
+  updateQuestionIdentity(root, id);
+  let reject;
+  navigator.clipboard = { writeText: () => new Promise((_, fail) => { reject = fail; }) };
+  const pending = copy.click();
+  updateQuestionIdentity(root, '20261012-230525-abcd');
+  reject(new Error('denied'));
+  await pending;
+  assert.equal(selection.node, null);
   assert.equal(root.refs.status.textContent, '');
 });

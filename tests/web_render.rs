@@ -3508,9 +3508,12 @@ async fn question_identity_disclosure_copy_and_live_updates() {
           navigator.clipboard.writeText = async () => { throw new Error('denied'); };
           copy.click(); await new Promise(r => setTimeout(r, 0));
           check(identity.querySelector('[role=status]').textContent.includes('Select the full ID'), 'copy failure hidden');
+          check(window.getSelection().toString() === q.id, 'failed copy did not select full ID');
+          window.getSelection().removeAllRanges();
           Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
           copy.click(); await new Promise(r => setTimeout(r, 0));
           check(!identity.querySelector('[role=status]').textContent.includes('Copied'), 'false success');
+          check(window.getSelection().toString() === q.id, 'missing clipboard did not select full ID');
           const full = identity.querySelector('code').getBoundingClientRect();
           check(full.right <= innerWidth && full.left >= 0, 'full ID overflow');
           let request;
