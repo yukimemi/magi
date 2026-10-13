@@ -2834,7 +2834,7 @@ never `agent:`.\n\n",
          {\"decisions\":[{\"id\":\"<task id>\",\"blocked_by\":[\"<task or \
          question id>\"],\"reason\":\"<one line>\",\"recovery\":\
          \"requeue|hold|review|done\",\"question\":\"<text, optional>\",\
-         \"choices\":[\"<optional>\"]}]}\n\
+         \"choices\":[\"<optional>\"],\"missing_dependencies\":[\"<alleged absent dependency id, optional>\"]}]}\n\
          ```\n\n\
          Omit any field you have nothing to say for. `\"decisions\":[]` is a \
          valid answer when nothing here needs changing.",

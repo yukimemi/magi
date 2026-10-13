@@ -690,6 +690,13 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
         // A dependency deleted on purpose is released, not held - and before
         // the missing check, so a pass that races the delete (or a claim that
         // made `Queue::remove` skip this task) settles it quietly.
+        let canonical = crate::queue::canonical_blockers(queue, questions, &task.blocked_by);
+        if canonical != task.blocked_by {
+            task.blocked_by = canonical;
+            if queue.put(&mut task).is_err() {
+                continue;
+            }
+        }
         let deleted = queue.apply_deleted_blockers(&mut task);
         if !deleted.is_empty() {
             record(queue, &mut task);
@@ -714,6 +721,12 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
         // A conductor question nobody answered in time is retired by the
         // waiter, and nothing else would ever move the task it blocks.
         if let Some(q) = task.blocked_by.iter().find_map(|id| {
+            if !matches!(
+                crate::queue::dependency(queue, questions, id),
+                crate::queue::Dependency::Question(_)
+            ) {
+                return None;
+            }
             questions.get(id).ok().filter(|q| {
                 q.node == crate::conduct::NODE && q.status == ask::QuestionStatus::Abandoned
             })
@@ -725,14 +738,19 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
         }
         let mut changed = false;
         for id in task.blocked_by.clone() {
-            if let Ok(dep) = queue.get(&id) {
+            let dependency = crate::queue::dependency(queue, questions, &id);
+            if matches!(dependency, crate::queue::Dependency::Task(_)) {
+                let Ok(dep) = queue.get(&id) else {
+                    continue;
+                };
                 if dep.status == TaskStatus::Done {
                     task.unblock(&id);
                     changed = true;
                 }
                 continue;
             }
-            if let Ok(q) = questions.get(&id)
+            if matches!(dependency, crate::queue::Dependency::Question(_))
+                && let Ok(q) = questions.get(&id)
                 && q.status == ask::QuestionStatus::Answered
             {
                 let answer = match &q.answer {
@@ -8473,6 +8491,75 @@ mod tests {
         let mut want = vec![failed.id.clone(), held.id.clone()];
         want.sort_unstable();
         assert_eq!(finished_ids, want);
+    }
+
+    #[test]
+    fn resolve_blockers_does_not_confuse_an_ambiguous_task_with_an_abandoned_question() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = ask::Questions::at(dir.path().join("questions"));
+        let mut dep = task();
+        dep.id = "20260101-000001-cafe".into();
+        dep.succeed();
+        queue.put(&mut dep).unwrap();
+        let mut question = ask::Question::new(
+            "run".into(),
+            crate::conduct::NODE.into(),
+            "conduct".into(),
+            "?".into(),
+            String::new(),
+            vec![],
+        );
+        question.id = "20260101-000002-cafe".into();
+        question.abandon("obsolete");
+        questions.put(&mut question).unwrap();
+        let mut waiting = task();
+        waiting.id = "20260101-000003-ee37".into();
+        waiting.block(vec!["cafe".into()], None);
+        queue.put(&mut waiting).unwrap();
+        resolve_blockers(&queue, &questions);
+        let after = queue.get("ee37").unwrap();
+        assert_eq!(after.status, TaskStatus::Blocked);
+        assert_eq!(after.blocked_by, ["cafe"]);
+        assert!(after.hold_reason.is_none());
+    }
+
+    #[test]
+    fn resolve_blockers_waits_on_short_running_chains_then_releases_done_dependencies() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = ask::Questions::at(dir.path().join("questions"));
+        let mut prerequisite = task();
+        prerequisite.id = "20260101-000001-feb2".into();
+        prerequisite.status = TaskStatus::Running;
+        queue.put(&mut prerequisite).unwrap();
+        let mut dependency = task();
+        dependency.id = "20260101-000002-ca5b".into();
+        dependency.block(vec!["feb2".into()], None);
+        queue.put(&mut dependency).unwrap();
+        let mut waiting = task();
+        waiting.id = "20260101-000003-ee37".into();
+        waiting.block(vec!["ca5b".into()], None);
+        queue.put(&mut waiting).unwrap();
+        resolve_blockers(&queue, &questions);
+        assert_eq!(
+            queue.get("ee37").unwrap().blocked_by,
+            [dependency.id.clone()]
+        );
+        assert_eq!(
+            queue.get("ca5b").unwrap().blocked_by,
+            [prerequisite.id.clone()]
+        );
+        assert!(questions.list().is_empty());
+        prerequisite.succeed();
+        queue.put(&mut prerequisite).unwrap();
+        resolve_blockers(&queue, &questions);
+        assert_eq!(queue.get("ca5b").unwrap().status, TaskStatus::Queued);
+        assert_eq!(queue.get("ee37").unwrap().status, TaskStatus::Blocked);
+        dependency.succeed();
+        queue.put(&mut dependency).unwrap();
+        resolve_blockers(&queue, &questions);
+        assert_eq!(queue.get("ee37").unwrap().status, TaskStatus::Queued);
     }
 
     #[test]

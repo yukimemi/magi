@@ -1481,24 +1481,13 @@ impl Questions {
     /// Expand an id prefix to exactly one question id. The short id the phone
     /// and the reports show is a suffix, so that is accepted too.
     pub fn resolve_id(&self, prefix: &str) -> Result<String> {
-        if self.path_of(prefix).is_file() {
-            return Ok(prefix.to_owned());
-        }
-        let hits: Vec<String> = self
-            .list()
-            .into_iter()
-            .map(|q| q.id)
-            .filter(|id| id.starts_with(prefix) || id.ends_with(prefix))
-            .collect();
-        match hits.len() {
-            1 => Ok(hits.into_iter().next().expect("exactly one hit")),
-            0 => bail!("no question matches `{prefix}`"),
-            _ => bail!(
-                "`{prefix}` matches {} questions: {}",
-                hits.len(),
-                hits.join(", ")
-            ),
-        }
+        crate::queue::resolve_reference(
+            prefix,
+            crate::queue::record_ids(&self.root)?
+                .iter()
+                .map(String::as_str),
+        )?
+        .with_context(|| format!("no question matches `{prefix}`"))
     }
 
     /// Newest modification time in the store, in milliseconds, for change

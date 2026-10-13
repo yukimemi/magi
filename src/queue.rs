@@ -2105,7 +2105,7 @@ impl Queue {
             }
             return Err(e);
         }
-        let (released, still_blocked) = self.release_dependents_of(&resolved);
+        let (released, still_blocked) = self.release_dependents_of(&resolved, questions);
         Ok(Removal {
             id: resolved,
             released,
@@ -2192,11 +2192,17 @@ impl Queue {
     /// [`Task::dependency_deleted`]. Returns the ids released to another
     /// status and those that remain `blocked` on something else. Each
     /// dependent is re-read inside its claim, never written from a stale copy.
-    fn release_dependents_of(&self, dependency: &str) -> (Vec<String>, Vec<String>) {
+    fn release_dependents_of(
+        &self,
+        dependency: &str,
+        questions: &Questions,
+    ) -> (Vec<String>, Vec<String>) {
         let (mut released, mut still_blocked) = (Vec::new(), Vec::new());
         for listed in self.list() {
             if listed.status != TaskStatus::Blocked
-                || !listed.blocked_by.iter().any(|b| b == dependency)
+                || !canonical_blockers(self, questions, &listed.blocked_by)
+                    .iter()
+                    .any(|b| b == dependency)
             {
                 continue;
             }
@@ -2206,6 +2212,7 @@ impl Queue {
             let Ok(mut task) = self.get(&listed.id) else {
                 continue;
             };
+            task.blocked_by = canonical_blockers(self, questions, &task.blocked_by);
             if !task.dependency_deleted(dependency) {
                 continue;
             }
@@ -2313,7 +2320,11 @@ impl Queue {
                 continue;
             };
             if self.path_of(id).exists()
-                || tasks.iter().any(|t| t.blocked_by.iter().any(|b| b == id))
+                || tasks.iter().any(|t| {
+                    t.blocked_by
+                        .iter()
+                        .any(|b| id.starts_with(b) || id.ends_with(b))
+                })
             {
                 continue;
             }
@@ -2463,24 +2474,8 @@ impl Queue {
 
     /// Expand an id prefix to exactly one task id.
     pub fn resolve_id(&self, prefix: &str) -> Result<String> {
-        if self.path_of(prefix).is_file() {
-            return Ok(prefix.to_owned());
-        }
-        let hits: Vec<String> = self
-            .list()
-            .into_iter()
-            .map(|t| t.id)
-            .filter(|id| id.starts_with(prefix) || id.ends_with(prefix))
-            .collect();
-        match hits.len() {
-            1 => Ok(hits.into_iter().next().expect("exactly one hit")),
-            0 => bail!("no task matches `{prefix}`"),
-            _ => bail!(
-                "`{prefix}` matches {} tasks: {}",
-                hits.len(),
-                hits.join(", ")
-            ),
-        }
+        resolve_reference(prefix, record_ids(&self.root)?.iter().map(String::as_str))?
+            .with_context(|| format!("no task matches `{prefix}`"))
     }
 
     /// Change detection token for the queue.
@@ -2620,15 +2615,9 @@ fn read_path(path: &Path) -> Result<Task> {
 /// an existing question file - a dependency deleted (`magi task rm`, or by
 /// hand) while something was still waiting on it.
 ///
-/// Existence is decided by [`Queue::path_of`]/[`Questions::path_of`]
-/// `is_file()` alone, never by [`Queue::get`]/[`Questions::get`] succeeding:
-/// those also fail on a merely unreadable file - mid-write, corrupt, or from
-/// a schema ahead of this build (see [`read_path`]) - and misreading "cannot
-/// read it right now" as "it was deleted" would quarantine a task over a
-/// transient failure. `blocked_by` always carries a full id, written by
-/// `crate::conduct` or `crate::triage` from a real task's or question's own
-/// `id`/`short`, never a prefix a caller typed - so the exact-path check is
-/// complete on its own, with no [`Queue::resolve_id`] fallback needed.
+/// Uses the same exact-first, unique prefix/suffix resolution as task lookup.
+/// Unreadable records, ambiguous references and unavailable directories are
+/// not evidence of absence: those dependencies keep waiting.
 pub fn missing_blockers(
     queue: &Queue,
     questions: &Questions,
@@ -2636,12 +2625,106 @@ pub fn missing_blockers(
 ) -> Vec<String> {
     blocked_by
         .iter()
-        .filter(|id| {
-            !queue.path_of(id).is_file()
-                && !questions.path_of(id).is_file()
-                && !queue.was_deleted(id)
-        })
+        .filter(|id| matches!(dependency(queue, questions, id), Dependency::Missing))
         .cloned()
+        .collect()
+}
+
+/// Authoritative identity of a dependency, independent of record decoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Dependency {
+    Task(String),
+    Question(String),
+    Deleted(String),
+    Missing,
+    Ambiguous,
+    /// Directory could not be inspected; never assume absence.
+    Unavailable,
+}
+
+/// Shared exact-first resolution for disk stores and inventory snapshots.
+pub(crate) fn resolve_reference<'a>(
+    reference: &str,
+    ids: impl Iterator<Item = &'a str>,
+) -> Result<Option<String>> {
+    let ids: Vec<_> = ids.collect();
+    if ids.contains(&reference) {
+        return Ok(Some(reference.to_owned()));
+    }
+    let hits: Vec<_> = ids
+        .into_iter()
+        .filter(|id| id.starts_with(reference) || id.ends_with(reference))
+        .collect();
+    match hits.as_slice() {
+        [] => Ok(None),
+        [id] => Ok(Some((*id).to_owned())),
+        _ => bail!("`{reference}` is ambiguous: {}", hits.join(", ")),
+    }
+}
+
+/// File names remain authoritative even when a record cannot be decoded.
+pub(crate) fn record_ids(root: &Path) -> Result<Vec<String>> {
+    record_ids_with_extension(root, "json")
+}
+
+fn record_ids_with_extension(root: &Path, extension: &str) -> Result<Vec<String>> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut ids = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == extension) {
+            ids.push(
+                path.file_stem()
+                    .context("record has no id")?
+                    .to_str()
+                    .context("non-UTF-8 record id")?
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(ids)
+}
+
+pub(crate) fn dependency(queue: &Queue, questions: &Questions, reference: &str) -> Dependency {
+    let Ok(tasks) = record_ids(queue.root()) else {
+        return Dependency::Unavailable;
+    };
+    let Ok(qs) = record_ids(questions.root()) else {
+        return Dependency::Unavailable;
+    };
+    match resolve_reference(reference, tasks.iter().chain(qs.iter()).map(String::as_str)) {
+        Ok(Some(id)) if tasks.contains(&id) => Dependency::Task(id),
+        Ok(Some(id)) => Dependency::Question(id),
+        Ok(None) => {
+            let Ok(deleted) = record_ids_with_extension(queue.root(), "removed") else {
+                return Dependency::Unavailable;
+            };
+            match resolve_reference(reference, deleted.iter().map(String::as_str)) {
+                Ok(Some(id)) if queue.was_deleted(&id) => Dependency::Deleted(id),
+                Ok(_) => Dependency::Missing,
+                Err(_) => Dependency::Ambiguous,
+            }
+        }
+        Err(_) => Dependency::Ambiguous,
+    }
+}
+
+/// Expand only references whose identity is known. Missing and ambiguous
+/// dependencies retain their original spelling for diagnosis and safe waiting.
+pub(crate) fn canonical_blockers(
+    queue: &Queue,
+    questions: &Questions,
+    ids: &[String],
+) -> Vec<String> {
+    ids.iter()
+        .map(|id| match dependency(queue, questions, id) {
+            Dependency::Task(full) | Dependency::Question(full) | Dependency::Deleted(full) => full,
+            Dependency::Missing | Dependency::Ambiguous | Dependency::Unavailable => id.clone(),
+        })
         .collect()
 }
 
@@ -2731,6 +2814,82 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&legacy).unwrap()).unwrap();
         assert!(reloaded.resume_override.is_none());
         assert_eq!(reloaded.resumption.as_ref().unwrap().generation, 1);
+    }
+
+    #[test]
+    fn removing_a_short_named_dependency_releases_its_waiter() {
+        let (dir, queue) = queue();
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut dep = task("dependency");
+        queue.put(&mut dep).unwrap();
+        let mut waiting = task("waiting");
+        waiting.block(vec![dep.short().to_owned()], None);
+        queue.put(&mut waiting).unwrap();
+        let result = queue.remove(&dep.id, false, &questions).unwrap();
+        assert_eq!(result.released, [waiting.id.clone()]);
+        assert_eq!(queue.get(&waiting.id).unwrap().status, TaskStatus::Queued);
+    }
+
+    #[test]
+    fn dependency_resolution_preserves_ambiguous_unreadable_and_deleted_records() {
+        let (dir, queue) = queue();
+        let questions = Questions::at(dir.path().join("questions"));
+        std::fs::create_dir_all(queue.root()).unwrap();
+        let full = "20260101-000001-cafe";
+        std::fs::write(queue.path_of(full), "invalid json").unwrap();
+        assert_eq!(queue.resolve_id("cafe").unwrap(), full);
+        assert!(queue.get("cafe").is_err());
+        assert_eq!(
+            dependency(&queue, &questions, "cafe"),
+            Dependency::Task(full.into())
+        );
+        assert!(missing_blockers(&queue, &questions, &["cafe".into(), full.into()]).is_empty());
+        std::fs::write(queue.path_of("20260101-000002-cafe"), "invalid json").unwrap();
+        assert!(queue.resolve_id("cafe").is_err());
+        assert_eq!(
+            dependency(&queue, &questions, "cafe"),
+            Dependency::Ambiguous
+        );
+        assert!(missing_blockers(&queue, &questions, &["cafe".into()]).is_empty());
+        assert_eq!(
+            dependency(&queue, &questions, full),
+            Dependency::Task(full.into())
+        );
+        // Question/task collisions must not silently pick one store.
+        std::fs::create_dir_all(questions.root()).unwrap();
+        std::fs::write(questions.path_of("20260101-000003-cafe"), "invalid json").unwrap();
+        assert_eq!(
+            dependency(&queue, &questions, "cafe"),
+            Dependency::Ambiguous
+        );
+        assert_eq!(
+            questions.resolve_id("cafe").unwrap(),
+            "20260101-000003-cafe"
+        );
+        assert_eq!(
+            dependency(&queue, &questions, "absent"),
+            Dependency::Missing
+        );
+        std::fs::remove_dir_all(questions.root()).unwrap();
+        std::fs::write(questions.root(), "not a directory").unwrap();
+        assert_eq!(
+            dependency(&queue, &questions, "absent"),
+            Dependency::Unavailable
+        );
+        assert!(missing_blockers(&queue, &questions, &["absent".into()]).is_empty());
+        std::fs::remove_file(questions.root()).unwrap();
+        std::fs::remove_file(queue.path_of(full)).unwrap();
+        queue.write_tombstone(full).unwrap();
+        assert_eq!(
+            dependency(&queue, &questions, full),
+            Dependency::Deleted(full.into())
+        );
+        assert!(missing_blockers(&queue, &questions, &[full.into()]).is_empty());
+        std::fs::remove_file(queue.path_of("20260101-000002-cafe")).unwrap();
+        assert_eq!(
+            dependency(&queue, &questions, "cafe"),
+            Dependency::Deleted(full.into())
+        );
     }
 
     #[test]

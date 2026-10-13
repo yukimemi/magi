@@ -55,6 +55,25 @@ use crate::queue::{Queue, Task, TaskStatus};
 use crate::run::RunState;
 use crate::verdict;
 
+/// Read all tasks, including blocked/running prerequisites excluded from the
+/// action roster. A filtered roster cannot establish dependency absence.
+fn dependency_context(queue: &Queue, questions: &Questions) -> String {
+    let tasks = queue.list();
+    let inventory = crate::blockers::Inventory::new(tasks.clone(), &questions.list())
+        .with_stores(queue, questions);
+    let mut out = String::from("\n# Authoritative queue dependency states\n");
+    for task in tasks {
+        out.push_str(&format!(
+            "- {}: {} {}\n",
+            task.id,
+            task.status.as_str(),
+            inventory.waits_on(&task).join(", ")
+        ));
+    }
+    out.push_str("Only a verified absent dependency justifies a missing-dependency hold or question. Include every alleged absent reference in `missing_dependencies`; it is checked again before application. Existing running/blocked prerequisites must keep waiting. Use `magi task show <id>` to check an uncertain reference.\n");
+    out
+}
+
 /// Seat name for the conductor's own CLI-side conversation, scoped away from
 /// every other seat magi ever opens - the same rule every other seat follows.
 const SEAT: &str = "conduct";
@@ -106,6 +125,10 @@ pub struct Decision {
     /// (`queued`) task; ignored otherwise.
     #[serde(default)]
     pub blocked_by: Vec<String>,
+    /// References alleged to be absent by a hold/question decision. Rechecked
+    /// against both authoritative stores immediately before applying it.
+    #[serde(default)]
+    pub missing_dependencies: Vec<String>,
     /// One line explaining the block or the recovery.
     #[serde(default)]
     pub reason: Option<String>,
@@ -699,6 +722,22 @@ fn apply_one(
         return Ok(());
     }
 
+    // Never turn a live dependency wait into an owner question, even if an
+    // old model snapshot alleged absence. Unknown includes ambiguity and I/O
+    // failures, neither of which proves that the owner must replace a task.
+    if !d.missing_dependencies.is_empty()
+        && crate::queue::missing_blockers(queue, questions, &d.missing_dependencies).len()
+            != d.missing_dependencies.len()
+    {
+        return Ok(());
+    }
+    if task.status == TaskStatus::Blocked
+        && crate::queue::missing_blockers(queue, questions, &task.blocked_by).is_empty()
+        && (d.question.is_some() || d.recovery == Some(Recovery::Hold))
+    {
+        return Ok(());
+    }
+
     if let Some(text) = &d.question {
         if task.status == TaskStatus::Done {
             return Ok(());
@@ -738,8 +777,21 @@ fn apply_one(
                     &q.choices,
                     &q.actions,
                 )));
+                if let Some(deputy) = q.deputy.as_mut() {
+                    deputy.brief.push_str(&dependency_context(queue, questions));
+                }
                 if task.repo.is_dir() && task.repo != Path::new(".") {
                     q.cwd = Some(task.repo.to_string_lossy().into_owned());
+                }
+                // Building the deputy context can take time. Recheck at the
+                // final write too, so a dependency added during that read does
+                // not turn a stale absence claim into an owner question.
+                if !d.missing_dependencies.is_empty()
+                    && crate::queue::missing_blockers(queue, questions, &d.missing_dependencies)
+                        .len()
+                        != d.missing_dependencies.len()
+                {
+                    return Ok(());
                 }
                 questions.put(&mut q)?;
                 q.id
@@ -751,7 +803,10 @@ fn apply_one(
 
     match task.status {
         TaskStatus::Queued if !d.blocked_by.is_empty() => {
-            task.block(d.blocked_by.clone(), d.reason.clone());
+            task.block(
+                crate::queue::canonical_blockers(queue, questions, &d.blocked_by),
+                d.reason.clone(),
+            );
             queue.put(&mut task)?;
         }
         // See `Decision::recovery`'s doc: the only lever a runnable task has
@@ -1077,7 +1132,7 @@ impl Conductor {
             finished_views.push(finished_view(t, repo, max_attempts).await);
         }
 
-        let body = prompt::with_overlay(
+        let mut body = prompt::with_overlay(
             prompt::conduct(
                 &runnable_views,
                 &stalled_views,
@@ -1086,6 +1141,8 @@ impl Conductor {
             ),
             cfg.prompts.overlay(NODE),
         );
+
+        body.push_str(&dependency_context(queue, questions));
 
         let artifacts = home.join("conduct").join("artifacts");
         // Bound to a local: `Invocation` only borrows the cache path, and the
@@ -1505,6 +1562,85 @@ mod tests {
     }
 
     #[test]
+    fn dependency_decisions_canonicalize_real_references_and_recheck_absence() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut prerequisite = task("prerequisite");
+        prerequisite.status = TaskStatus::Running;
+        queue.put(&mut prerequisite).unwrap();
+        let mut dependency = task("dependency");
+        dependency.block(vec![prerequisite.short().to_owned()], None);
+        queue.put(&mut dependency).unwrap();
+        for reference in [dependency.short().to_owned(), dependency.id.clone()] {
+            let mut waiting = task("waiting");
+            queue.put(&mut waiting).unwrap();
+            apply_one(
+                &queue,
+                &questions,
+                &Decision {
+                    id: waiting.id.clone(),
+                    blocked_by: vec![reference.clone()],
+                    ..Decision::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                queue.get(&waiting.id).unwrap().blocked_by,
+                [dependency.id.clone()]
+            );
+            for recovery in [None, Some(Recovery::Hold)] {
+                apply_one(
+                    &queue,
+                    &questions,
+                    &Decision {
+                        id: waiting.id.clone(),
+                        missing_dependencies: vec![reference.clone()],
+                        question: recovery
+                            .is_none()
+                            .then(|| "replace missing dependency?".into()),
+                        recovery,
+                        ..Decision::default()
+                    },
+                )
+                .unwrap();
+            }
+            assert_eq!(queue.get(&waiting.id).unwrap().status, TaskStatus::Blocked);
+            assert!(questions.list().is_empty());
+        }
+        let context = dependency_context(&queue, &questions);
+        assert!(context.contains(&format!("{}: running", prerequisite.id)));
+        assert!(context.contains(&format!("{}: blocked", dependency.id)));
+        assert!(context.contains(&format!("{} running", prerequisite.short())));
+
+        // A genuine missing reference still reaches the owner, with audit
+        // context for the deputy, while a stale absence claim is ignored even
+        // for a task which has not yet acquired a blocked_by list.
+        let mut queued = task("queued");
+        queue.put(&mut queued).unwrap();
+        let mut decision = Decision {
+            id: queued.id.clone(),
+            missing_dependencies: vec![dependency.short().to_owned()],
+            question: Some("replace missing dependency?".into()),
+            ..Decision::default()
+        };
+        apply_one(&queue, &questions, &decision).unwrap();
+        assert_eq!(queue.get(&queued.id).unwrap().status, TaskStatus::Queued);
+        decision.missing_dependencies = vec!["absent".into()];
+        apply_one(&queue, &questions, &decision).unwrap();
+        let filed = questions.list();
+        assert_eq!(filed.len(), 1);
+        assert!(
+            filed[0]
+                .deputy
+                .as_ref()
+                .unwrap()
+                .brief
+                .contains(&prerequisite.id)
+        );
+    }
+
+    #[test]
     fn outcome_for_carries_every_rounds_findings_and_the_branch_head() {
         crate::run::pin_test_home();
         let dir = tempdir().unwrap();
@@ -1635,6 +1771,7 @@ mod tests {
 
         let verdict = Verdict {
             decisions: vec![Decision {
+                missing_dependencies: Vec::new(),
                 id: a.id.clone(),
                 blocked_by: vec!["20260101-000000-dead".to_owned()],
                 reason: Some("waits on the other task".to_owned()),
@@ -1665,6 +1802,7 @@ mod tests {
 
         let verdict = Verdict {
             decisions: vec![Decision {
+                missing_dependencies: Vec::new(),
                 id: t.id.clone(),
                 blocked_by: Vec::new(),
                 reason: Some("which backend?".to_owned()),
@@ -1786,6 +1924,7 @@ mod tests {
             &questions,
             &Verdict {
                 decisions: vec![Decision {
+                    missing_dependencies: Vec::new(),
                     id: t.id.clone(),
                     blocked_by: Vec::new(),
                     reason: None,
