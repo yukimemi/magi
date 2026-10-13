@@ -2440,9 +2440,8 @@ pub struct ConductTask {
     /// Questions asked about this task and what the operator said back — see
     /// `crate::queue::Task::answers`.
     pub answers: Vec<ConductAnswer>,
-    /// A line saying the operator already answered "resume" to a triage
-    /// question about this task, when `crate::queue::Task::resume_override`
-    /// records one - see that field.
+    /// The latest durable explicit approval, or a legacy transient resume
+    /// override. Historical waiting premises yield to the approved instruction.
     pub operator_resume: Option<String>,
 }
 
@@ -2638,15 +2637,21 @@ pub fn conduct(
     let mut s = String::from(
         "You arrange magi's task queue between polls. You do not implement \
          anything and you do not run `magi ask` yourself — it blocks, and \
-         this call must not. Nothing you write ever changes a task's \
-         priority: it is shown only so you know the order the loop already \
+         this call must not. After an explicit operator resumption, historical \
+         waiting premises are superseded. \
+         Blocking decisions (hold, question, or dependencies) must include an `evidence` array \
+         naming a later owned question, changed dependency, or new failed run id. \
+         A reworded concern without such evidence is reported without blocking. \
+         Nothing you write ever changes a task's priority: it is shown only \
+         so you know the order the loop already \
          runs tasks in.\n\n\
          # Runnable tasks\n\n\
          Decide which of these should wait on another task or on a question \
          you want to ask the operator. Leaving a task out of your reply \
          changes nothing about it.\n\n\
          A task already carrying one or more `answered \"...\": ...` lines \
-         has been through this before. If the operator's own words already \
+         has been through this before. Unless a later explicit resumption \
+         supersedes it, if the operator's own words already \
          settled that it should not compete again - stay held, this is \
          closed, wait for a person - say so with `recovery: hold` instead of \
          filing another `question` that only asks the same thing again: \

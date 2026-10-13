@@ -126,6 +126,9 @@ pub struct Decision {
     /// Fixed answers for `question`, if it has any. Empty means free text.
     #[serde(default)]
     pub choices: Vec<String>,
+    /// Task or question ids carrying independently verifiable new blocking evidence.
+    #[serde(default)]
+    pub evidence: Vec<String>,
 }
 
 /// The conductor's whole reply for one cycle.
@@ -171,13 +174,19 @@ fn view(t: &Task, max_attempts: usize) -> prompt::ConductTask {
                 answer: a.answer.clone(),
             })
             .collect(),
-        operator_resume: t.resume_override.as_ref().map(|o| {
+        operator_resume: t.resumption.as_ref().map(|r| format!(
+            "Explicit operator resumption generation {} via {} at {}. Approved instruction: {}. \
+             The first {} historical answers and prior hold ({:?}) are superseded as waiting premises. \
+             To block again cite evidence ids from a later owned question, changed dependency, or new failed run; \
+             wording alone is insufficient.",
+            r.generation, r.source, r.at, r.instruction, r.answers_through, r.cleared_reason
+        )).or_else(|| t.resume_override.as_ref().map(|o| {
             format!(
                 "the operator explicitly answered \"resume\" at {}; do not hold this \
                  task again for the same reason unless there is new information",
                 o.at
             )
-        }),
+        })),
     }
 }
 
@@ -190,15 +199,88 @@ fn pinned_resume(task: &Task) -> bool {
         .is_some_and(|o| o.pinned_run.is_some())
 }
 
-/// May the conductor's `Recovery::Hold` take effect on `task`, given an
-/// operator's recorded "resume" answer? The conductor is allowed to override
-/// that answer once - and the override is recorded so `crate::triage` can
-/// show the operator the contradiction - but never after the operator
-/// insisted (`forced`), and never a second time.
-///
-/// Returns `false` when the hold must not be applied (nothing to write).
-/// When it returns `true` the override, if any, has been recorded on `task`.
+/// Verify references independently of the model's reason text. Old evidence
+/// cannot become new merely by being described differently.
+fn new_blocking_evidence(
+    queue: &Queue,
+    questions: &Questions,
+    task: &Task,
+    d: &Decision,
+) -> Vec<String> {
+    let Some(r) = &task.resumption else {
+        return Vec::new();
+    };
+    d.evidence
+        .iter()
+        .filter_map(|id| {
+            let version = if let Ok(q) = questions.get(id) {
+                (q.asked_at > r.at
+                    && (q.run == task.id
+                        || task
+                            .runs
+                            .iter()
+                            .skip(r.runs_through)
+                            .any(|run| *run == q.run))
+                    && q.node != NODE
+                    && q.status != crate::ask::QuestionStatus::Abandoned)
+                    .then(|| {
+                        format!(
+                            "question:{id}:{}:{:?}:{}",
+                            q.asked_at,
+                            q.status,
+                            q.resolution().unwrap_or_default()
+                        )
+                    })
+            } else if d.blocked_by.contains(id) {
+                queue
+                    .get(id)
+                    .ok()
+                    .filter(|dep| {
+                        dep.id != task.id && dep.updated_at > r.at && dep.status != TaskStatus::Done
+                    })
+                    .map(|dep| {
+                        format!(
+                            "dependency:{id}:{:?}:{:?}:{:?}",
+                            dep.status, dep.hold_reason, dep.last_error
+                        )
+                    })
+            } else if task.runs.iter().skip(r.runs_through).any(|run| run == id) {
+                RunState::load(id)
+                    .ok()
+                    .filter(|run| {
+                        matches!(
+                            run.status,
+                            crate::run::RunStatus::Failed
+                                | crate::run::RunStatus::Blocked
+                                | crate::run::RunStatus::Stalled
+                        )
+                    })
+                    .map(|run| {
+                        format!(
+                            "run:{id}:{:?}:{}:{}",
+                            run.status,
+                            run.reviews.len(),
+                            task.attempts
+                        )
+                    })
+            } else {
+                None
+            };
+            version.filter(|v| !r.blocking_evidence.contains(v))
+        })
+        .collect()
+}
+
+/// Durable approval is enforced by verified evidence at the mutation boundary.
+/// A pinned run stays protected; legacy transient overrides keep their original
+/// bounded contradiction policy until an explicit new approval replaces it.
 fn may_hold(task: &mut Task, reason: &str) -> bool {
+    if pinned_resume(task) {
+        return false;
+    }
+    if task.resumption.is_some() {
+        return true; // The mutation boundary already verified new evidence.
+    }
     let Some(o) = task.resume_override.as_mut() else {
         return true;
     };
@@ -234,6 +316,9 @@ fn severity_str(s: crate::verdict::Severity) -> &'static str {
 fn surviving_branch(task: &Task) -> Option<String> {
     let last = task.runs.last()?;
     let state = RunState::load(last).ok()?;
+    if !crate::daemon::compatible_run_instruction(&state, task) {
+        return None;
+    }
     state.winner().map(|c| c.branch.clone())
 }
 
@@ -549,11 +634,46 @@ fn repo_for(task: &Task, fallback: &Path) -> PathBuf {
 /// one `running` (stalled) or `failed`/`held`, so a decision that no longer
 /// matches what the task actually is - it moved on between the read that
 /// built the prompt and this write - changes nothing.
-fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
+fn apply_one(
+    queue: &Queue,
+    questions: &Questions,
+    d: &Decision,
+    snapshot: Option<&Task>,
+) -> Result<()> {
     let _claim = queue
         .claim(&d.id)
         .with_context(|| format!("task {} is claimed elsewhere right now", d.id))?;
     let mut task = queue.get(&d.id).context("no such task")?;
+
+    // Compare the actual input, not a generation echoed by the model. Even
+    // question creation must be discarded after an intervening operator edit.
+    if snapshot
+        .is_some_and(|old| serde_json::to_value(old).ok() != serde_json::to_value(&task).ok())
+    {
+        return Ok(());
+    }
+    let blocking =
+        d.question.is_some() || !d.blocked_by.is_empty() || d.recovery == Some(Recovery::Hold);
+    let evidence = new_blocking_evidence(queue, questions, &task, d);
+    if blocking && task.resumption.is_some() && evidence.is_empty() {
+        crate::notices::raise(
+            crate::notices::Notice::warn(
+                &format!("conductor-resumption:{}", task.id),
+                format!(
+                    "Conductor concern after explicit resumption (no verified new evidence): {}; question: {:?}; dependencies: {:?}; evidence: {:?}",
+                    hold_note(d), d.question, d.blocked_by, d.evidence
+                ),
+            )
+            .about([task.id.clone()]),
+        );
+        return Ok(());
+    }
+
+    if blocking {
+        if let Some(r) = task.resumption.as_mut() {
+            r.blocking_evidence.extend(evidence);
+        }
+    }
 
     // A conductor answer is never operator authorization.  In particular,
     // do this before questions and blocking too: either would reclassify a
@@ -562,15 +682,9 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
         return Ok(());
     }
 
-    // `crate::triage` is already running its own question-and-answer cycle
-    // on this hold - see that module's doc on why it never calls
-    // `Task::block`, and `crate::triage::pending_for`'s own doc on why "open"
-    // alone is not enough here: an answered-but-not-yet-applied triage
-    // question is still triage's to finish, since `crate::triage::run_once`
-    // only runs on a fully idle tick and only ever looks at tasks still
-    // `held`. Blocking this task out from under it - even on an unrelated
-    // question - would move it to `Blocked`, and the pending triage answer
-    // would never be read back.
+    // A claimed task may have deferred the pre-scheduling triage sweep.
+    // Leave an open or answered-unapplied question to that sweep rather
+    // than move the task out from under it.
     if task.status == TaskStatus::Held && crate::triage::pending_for(questions, &task) {
         return Ok(());
     }
@@ -713,7 +827,7 @@ fn apply_one(queue: &Queue, questions: &Questions, d: &Decision) -> Result<()> {
 /// rather than losing every other decision in the same reply.
 pub fn apply(queue: &Queue, questions: &Questions, verdict: &Verdict) -> Result<()> {
     for d in &verdict.decisions {
-        if let Err(e) = apply_one(queue, questions, d) {
+        if let Err(e) = apply_one(queue, questions, d, None) {
             tracing::warn!("conductor decision for task {}: {e:#}", d.id);
         }
     }
@@ -1041,7 +1155,19 @@ impl Conductor {
         drop(busy);
         let mut verdict = result?;
         attach_facts(cfg, repo, queue, &mut verdict).await;
-        apply(queue, questions, &verdict)
+        for d in &verdict.decisions {
+            let snapshot = queued
+                .iter()
+                .chain(stalled)
+                .chain(finished)
+                .find(|t| t.id == d.id);
+            if let Some(snapshot) = snapshot {
+                if let Err(e) = apply_one(queue, questions, d, Some(snapshot)) {
+                    tracing::warn!("conductor decision for task {}: {e:#}", d.id);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1190,6 +1316,104 @@ mod tests {
     }
 
     #[test]
+    fn explicit_resumption_supersedes_history_and_rejects_stale_decisions() {
+        crate::run::pin_test_home();
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("recover");
+        t.answers.push(crate::queue::AnsweredQuestion {
+            question: "Inspect remote first?".into(),
+            answer: "Inspect, then await resumption instructions".into(),
+        });
+        t.hold_machine(Some("waiting for remote inspection".into()));
+        queue.put(&mut t).unwrap();
+        let snapshot = queue.get(&t.id).unwrap();
+        t.edit(
+            "recover".into(),
+            "Reuse the measured PR head; fix Clippy; review".into(),
+        )
+        .unwrap();
+        t.release_operator("cli", None);
+        queue.put(&mut t).unwrap();
+        let approval = t.resumption.clone();
+        let d = Decision {
+            id: t.id.clone(),
+            recovery: Some(Recovery::Hold),
+            reason: Some("remote inspection still required".into()),
+            ..Decision::default()
+        };
+        apply_one(&queue, &questions, &d, Some(&snapshot)).unwrap();
+        let stale_question = Decision {
+            question: Some("Inspect remote?".into()),
+            ..d.clone()
+        };
+        apply_one(&queue, &questions, &stale_question, Some(&snapshot)).unwrap();
+        assert!(questions.list().is_empty());
+        for reason in [
+            "waiting for remote inspection",
+            "inspection has not been confirmed",
+        ] {
+            let repeated = Decision {
+                reason: Some(reason.into()),
+                ..d.clone()
+            };
+            apply(
+                &queue,
+                &questions,
+                &Verdict {
+                    decisions: vec![repeated],
+                },
+            )
+            .unwrap();
+            assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
+        }
+        let reloaded = Queue::at(dir.path().join("queue")).get(&t.id).unwrap();
+        assert_eq!(reloaded.resumption, approval);
+        assert_eq!(reloaded.answers, t.answers);
+        let v = view(&reloaded, 3);
+        assert!(v.operator_resume.unwrap().contains("superseded"));
+        let mut dep = task("new prerequisite");
+        dep.hold_machine(Some("new authentication failure".into()));
+        queue.put(&mut dep).unwrap();
+        let new_blocker = Decision {
+            blocked_by: vec![dep.id.clone()],
+            evidence: vec![dep.id.clone()],
+            reason: Some("new prerequisite failed".into()),
+            ..d.clone()
+        };
+        apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![new_blocker.clone()],
+            },
+        )
+        .unwrap();
+        let mut after = queue.get(&t.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Blocked);
+        // Automatic release does not grant fresh operator authority or make
+        // the same unchanged evidence reusable.
+        after.release();
+        queue.put(&mut after).unwrap();
+        apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![new_blocker],
+            },
+        )
+        .unwrap();
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
+        after.start("new-run".into());
+        assert_eq!(after.resumption.as_ref().unwrap().generation, 1);
+        after.hold_manual(Some("operator says wait".into()));
+        queue.put(&mut after).unwrap();
+        apply(&queue, &questions, &Verdict { decisions: vec![d] }).unwrap();
+        assert!(queue.get(&t.id).unwrap().operator_held());
+    }
+
+    #[test]
     fn outcome_for_carries_every_rounds_findings_and_the_branch_head() {
         crate::run::pin_test_home();
         let dir = tempdir().unwrap();
@@ -1326,6 +1550,7 @@ mod tests {
                 recovery: None,
                 question: None,
                 choices: Vec::new(),
+                evidence: Vec::new(),
             }],
         };
         apply(&queue, &questions, &verdict).unwrap();
@@ -1355,6 +1580,7 @@ mod tests {
                 recovery: None,
                 question: Some("Which storage backend?".to_owned()),
                 choices: vec!["SQLite".to_owned(), "Redis".to_owned()],
+                evidence: Vec::new(),
             }],
         };
         apply(&queue, &questions, &verdict).unwrap();
@@ -1475,6 +1701,7 @@ mod tests {
                     recovery: None,
                     question: Some("Which backend?".to_owned()),
                     choices: Vec::new(),
+                    evidence: Vec::new(),
                 }],
             },
         )
@@ -1650,7 +1877,8 @@ mod tests {
     }
 
     #[test]
-    fn a_conductor_rehold_after_a_resume_answer_is_not_asked_again_identically() {
+    fn explicit_resumption_rehold_requires_new_evidence_and_another_answer() {
+        crate::run::pin_test_home();
         let dir = tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
         let questions = Questions::at(dir.path().join("questions"));
@@ -1689,7 +1917,33 @@ mod tests {
         assert_eq!(triage().answered.len(), 1);
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
 
-        // 2. the conductor holds it again - allowed once, and recorded.
+        // Rewording the old cause cannot undo the first explicit answer.
+        apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![hold.clone()],
+            },
+        )
+        .unwrap();
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
+        assert!(triage().asked.is_empty());
+
+        // A new independently filed check can justify a later hold.
+        let mut evidence = Question::new(
+            t.id.clone(),
+            "preflight".into(),
+            "check".into(),
+            "New permission failure".into(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut evidence).unwrap();
+        let hold = Decision {
+            evidence: vec![evidence.id.clone()],
+            reason: Some("new permission check failed".into()),
+            ..hold
+        };
         apply(
             &queue,
             &questions,
@@ -1700,16 +1954,14 @@ mod tests {
         .unwrap();
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
 
-        // 3. triage must say something different, once.
+        // The new hold earns one question identifying the new evidence.
         assert_eq!(triage().asked.len(), 1);
         let second = open().remove(0);
-        assert_ne!(second.summary, first.summary);
-        assert_ne!(second.choices, first.choices);
-        assert!(second.detail.contains("waiting on manual worktree cleanup"));
+        assert!(second.detail.contains("new permission check failed"));
         assert!(triage().asked.is_empty(), "no duplicate question");
         assert_eq!(open().len(), 1);
 
-        // 4. forcing a requeue makes the conductor's hold a no-op.
+        // Another explicit answer supersedes this later hold too.
         let mut q = questions.get(&second.id).unwrap();
         let force = q.choices[0].clone();
         q.answer(Answer::Choice(force)).unwrap();
@@ -1755,6 +2007,7 @@ mod tests {
 
     #[test]
     fn done_recovery_closes_a_held_task_whose_goal_is_already_met() {
+        crate::run::pin_test_home();
         // Reproduces the other half of the reported bug (task 6081): once
         // the operator's answer says the work already happened outside the
         // loop - PR merged, worktree cleaned up - the conductor needs an

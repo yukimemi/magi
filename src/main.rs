@@ -3160,7 +3160,7 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 .claim(&resolved)
                 .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
             let mut t = q.get(&resolved)?;
-            t.release();
+            t.release_operator("cli", None);
             q.put(&mut t)?;
             println!("queued {} {}", t.short(), t.title);
             Ok(())
@@ -3741,7 +3741,7 @@ async fn run_existing_task(
             task.short(),
             task.status.as_str()
         ),
-        TaskStatus::Held | TaskStatus::Done => task.release(),
+        TaskStatus::Held | TaskStatus::Done => task.release_operator("cli-run-task", None),
         TaskStatus::Queued | TaskStatus::Failed | TaskStatus::Parked => {}
     }
     let mut overrides = task.overrides.take().unwrap_or_default();
@@ -3882,9 +3882,14 @@ async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
     if claim.is_none() {
         // The loop resumes it: an attempt at a task whose newest run is
         // unfinished resumes that run (`Runner::resume`), never competes again.
-        if matches!(task.status, TaskStatus::Held | TaskStatus::Done) {
-            task.release();
-        }
+        task.release_operator("cli-run-resume", None);
+        task.resume_override = Some(queue::OperatorResume {
+            question_id: String::new(),
+            at: jiff::Timestamp::now(),
+            conductor_rehold: None,
+            forced: true,
+            pinned_run: Some(run_id.clone()),
+        });
         task.urgent = true;
         queue.put(&mut task)?;
         println!(

@@ -219,7 +219,8 @@ use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 /// `None` ("origin unknown") rather than guessed at — a run from before this
 /// existed must not read as an operator's when nobody knows. The bump exists
 /// so a run is never mistaken for one whose origin was known and empty.
-pub const SCHEMA: u32 = 13;
+/// Schema 14 records authored task criteria separately from generated review context.
+pub const SCHEMA: u32 = 14;
 
 /// Why a pass over a run stopped at a node boundary, recorded when it
 /// happened. Never inferred afterwards: `upgrade.json` is overwritten by the
@@ -1997,6 +1998,9 @@ pub struct RunState {
     pub base_commit: String,
     /// The task, verbatim.
     pub instruction: String,
+    /// Authored task criteria before review scaffolding was generated.
+    #[serde(default)]
+    pub task_instruction: Option<String>,
     /// When the run was created.
     pub created_at: Timestamp,
     /// Last state flush.
@@ -2392,6 +2396,7 @@ impl RunState {
             base_branch,
             base_commit,
             instruction,
+            task_instruction: None,
             created_at: now,
             updated_at: now,
             status: RunStatus::Prep,

@@ -42,6 +42,10 @@ use crate::ask::Questions;
 
 /// On-disk format for a queued task. Bumped when a field's meaning changes.
 ///
+/// 18: retained review criteria snapshots survive operator edits.
+///
+/// 17: durable explicit operator resumption, independent of run startup.
+///
 /// 7: added [`Task::attachments`], names of files copied under
 /// `<id>.attachments/` beside the task file (a field only; `#[serde(default)]`,
 /// so an older record reads as empty and [`read_path`] still accepts it).
@@ -122,7 +126,7 @@ use crate::ask::Questions;
 ///
 /// 16: added [`Task::attempt_limit`], an optional task-specific retry budget.
 /// Field-only, `#[serde(default)]`; old records inherit the daemon limit.
-pub const SCHEMA: u32 = 16;
+pub const SCHEMA: u32 = 18;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -406,6 +410,16 @@ pub struct Task {
     /// *after* the answer. See [`OperatorResume`]. `#[serde(default)]`.
     #[serde(default)]
     pub resume_override: Option<OperatorResume>,
+    /// Latest explicit operator release. Historical answers remain audit evidence;
+    /// this approval takes precedence over their earlier waiting premises.
+    #[serde(default)]
+    pub resumption: Option<Resumption>,
+    /// Earlier explicit approvals retained for audit and instruction suffix matching.
+    #[serde(default)]
+    pub resumption_history: Vec<Resumption>,
+    /// Latest explicit release or manual hold, used to reject delayed answers.
+    #[serde(default)]
+    pub operator_decided_at: Option<Timestamp>,
     /// Set by `crate::conduct` when it chooses `Review` recovery for a task
     /// whose branch survived a blocked run: the branch to reopen with
     /// `crate::graph::Runner::review` instead of competing from scratch.
@@ -419,6 +433,9 @@ pub struct Task {
     /// never reach here.
     #[serde(default)]
     pub review_branch: Option<String>,
+    /// Authored criteria when the retained recovery review was selected.
+    #[serde(default)]
+    pub review_instruction: Option<String>,
     /// A release deliberately starts a new competition instead of resuming
     /// the prior run. History remains as evidence in `runs`.
     #[serde(default)]
@@ -671,6 +688,30 @@ pub struct FollowUp {
     pub generation: u32,
 }
 
+/// Durable scope of an explicit operator resumption, surviving run startup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resumption {
+    /// Monotonic count of explicit resumptions.
+    pub generation: u64,
+    /// Mutation path that applied the approval.
+    pub source: String,
+    /// Answered question, if the approval came from one.
+    pub question_id: Option<String>,
+    /// When this approval was applied.
+    pub at: Timestamp,
+    /// Authored instruction approved at release.
+    pub instruction: String,
+    /// Number of historical answers superseded as waiting premises.
+    pub answers_through: usize,
+    /// Number of runs already present when approval was applied.
+    pub runs_through: usize,
+    /// Previous hold or dependency reason cleared by this release.
+    pub cleared_reason: Option<String>,
+    /// Verified evidence versions already used to block after this approval.
+    #[serde(default)]
+    pub blocking_evidence: Vec<String>,
+}
+
 /// A triage "resume" answer and what became of it. See
 /// [`Task::resume_override`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -739,7 +780,11 @@ impl Task {
             triage_applied: Vec::new(),
             actions_applied: Vec::new(),
             resume_override: None,
+            resumption: None,
+            resumption_history: Vec::new(),
+            operator_decided_at: None,
             review_branch: None,
+            review_instruction: None,
             fresh_start: false,
             interrupt: false,
             urgent: false,
@@ -1103,6 +1148,14 @@ impl Task {
     /// button is reachable on a blocked task, same as "Mark done" - kept
     /// reading as still waiting on a dependency it no longer had any claim on.
     pub fn hold_manual(&mut self, reason: Option<String>) {
+        // A later explicit hold supersedes outstanding triage answers.
+        self.operator_decided_at = Some(Timestamp::now());
+        self.hold_unrequested_retry(reason);
+    }
+
+    /// Keep a hand-started run from retrying automatically, without recording
+    /// an operator decision that could invalidate its outstanding questions.
+    pub(crate) fn hold_unrequested_retry(&mut self, reason: Option<String>) {
         self.park_reason = None;
         self.note_held();
         self.status = TaskStatus::Held;
@@ -1232,6 +1285,7 @@ impl Task {
     pub fn request_review(&mut self, branch: String) {
         self.release();
         self.review_branch = Some(branch);
+        self.review_instruction = Some(self.instruction.clone());
     }
 
     /// Requeue after a conductor chose a new competition. Unlike an ordinary
@@ -1240,6 +1294,7 @@ impl Task {
         self.release();
         // A fresh competition is the opposite of a review of the old branch.
         self.review_branch = None;
+        self.review_instruction = None;
         self.fresh_start = true;
     }
 
@@ -1254,6 +1309,7 @@ impl Task {
     pub fn hold_for_handover(&mut self, branch: Option<String>, reason: String) {
         if branch.is_some() {
             self.review_branch = branch;
+            self.review_instruction = Some(self.instruction.clone());
         }
         self.hold_machine(Some(reason));
     }
@@ -1410,6 +1466,16 @@ impl Task {
                 self.status.as_str()
             );
         }
+        // Older retained reviews have no criteria snapshot yet. Capture the
+        // old instruction before this supported edit can change the target.
+        if self.review_branch.is_some() && self.review_instruction.is_none() {
+            self.review_instruction = Some(self.instruction.clone());
+        }
+        if self.instruction != instruction {
+            // A run selected for earlier criteria is no longer authorized by
+            // this revised instruction. Title-only edits preserve the pin.
+            self.resume_override = None;
+        }
         self.title = title;
         self.instruction = instruction;
         Ok(())
@@ -1444,13 +1510,49 @@ impl Task {
         self.last_error = Some(why);
     }
 
+    /// Release on explicit operator authority, rather than automatic recovery.
+    pub fn release_operator(&mut self, source: &str, question_id: Option<&str>) {
+        if self
+            .resumption
+            .as_ref()
+            .is_some_and(|r| r.instruction != self.instruction)
+        {
+            // Also cover persisted revisions whose earlier approval still
+            // carries a transient pin when this release is applied.
+            self.resume_override = None;
+        }
+        let approval = Resumption {
+            generation: self.resumption.as_ref().map_or(1, |r| r.generation + 1),
+            source: source.to_owned(),
+            question_id: question_id.map(str::to_owned),
+            at: Timestamp::now(),
+            instruction: self.instruction.clone(),
+            answers_through: self.answers.len(),
+            runs_through: self.runs.len(),
+            blocking_evidence: Vec::new(),
+            cleared_reason: self
+                .hold_reason
+                .clone()
+                .or_else(|| self.block_reason.clone()),
+        };
+        self.release();
+        self.operator_decided_at = Some(approval.at);
+        if let Some(previous) = self.resumption.replace(approval) {
+            self.resumption_history.push(previous);
+        }
+    }
+
     /// Put a held or finished task back in line, with its attempt count reset
     /// so a release is a real second chance rather than an instant re-hold.
     /// The run history is kept: attempts reset, evidence does not.
     pub fn release(&mut self) {
         let refused_handover = self.status == TaskStatus::Held
             && self.hold_source == Some(HoldSource::Machine)
-            && self.review_branch.is_some();
+            && self.review_branch.is_some()
+            && self
+                .review_instruction
+                .as_ref()
+                .is_none_or(|i| *i == self.instruction);
         self.status = TaskStatus::Queued;
         self.held_at = None;
         self.attempts = 0;
@@ -1473,6 +1575,7 @@ impl Task {
         // that same branch. Any other release drops it.
         if !refused_handover {
             self.review_branch = None;
+            self.review_instruction = None;
         }
         self.fresh_start = false;
     }
@@ -2595,6 +2698,33 @@ fn new_id() -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn explicit_resumption_is_not_invented_for_legacy_or_automatic_release() {
+        let t = Task::new(
+            "retry".into(),
+            "do it".into(),
+            PathBuf::from("."),
+            Source::Human,
+        );
+        let mut value = serde_json::to_value(&t).unwrap();
+        for field in ["resumption", "resumption_history", "operator_decided_at"] {
+            value.as_object_mut().unwrap().remove(field);
+        }
+        value["schema"] = serde_json::json!(15);
+        let mut legacy: Task = serde_json::from_value(value).unwrap();
+        legacy.hold_machine(Some("automatic retry".into()));
+        legacy.release();
+        assert!(legacy.resumption.is_none());
+        assert!(legacy.resumption_history.is_empty());
+        assert!(legacy.operator_decided_at.is_none());
+        legacy.release_operator("cli", None);
+        legacy.start("run".into());
+        let reloaded: Task =
+            serde_json::from_str(&serde_json::to_string(&legacy).unwrap()).unwrap();
+        assert!(reloaded.resume_override.is_none());
+        assert_eq!(reloaded.resumption.as_ref().unwrap().generation, 1);
+    }
+
+    #[test]
     fn merge_over_lets_the_later_choice_win_and_keeps_the_rest() {
         let mut base = RunOverrides {
             merge: Some("pr".to_owned()),
@@ -3400,6 +3530,35 @@ mod tests {
         // `runs`.
         t.release();
         assert_eq!(t.answers.len(), 1, "the answer is not lost on release");
+    }
+
+    #[test]
+    fn resumption_review_branch_requires_unchanged_authored_criteria() {
+        for source in ["cli", "web"] {
+            let mut t = task("review old candidate");
+            t.request_review("candidate-A".into());
+            t.hold_for_handover(Some("candidate-A".into()), "handover refused".into());
+            let mut unchanged = t.clone();
+            unchanged.release_operator(source, None);
+            assert_eq!(unchanged.review_branch.as_deref(), Some("candidate-A"));
+            t.edit(
+                "review approved head".into(),
+                "Reuse measured PR head B; fix Clippy; review".into(),
+            )
+            .unwrap();
+            t.release_operator(source, None);
+            assert!(t.review_branch.is_none());
+            assert!(t.review_instruction.is_none());
+            // Legacy records capture their old criteria at the supported edit.
+            let mut legacy = unchanged;
+            legacy.review_instruction = None;
+            legacy.hold_for_handover(None, "still checked out".into());
+            legacy
+                .edit("new plan".into(), "Reuse measured PR head B".into())
+                .unwrap();
+            legacy.release_operator(source, None);
+            assert!(legacy.review_branch.is_none());
+        }
     }
 
     #[test]

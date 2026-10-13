@@ -852,6 +852,9 @@ where
     {
         return ActionDecision::Skip;
     }
+    if task.operator_decided_at.is_some_and(|at| at > q.asked_at) {
+        return ActionDecision::Stale;
+    }
     // A question about an earlier attempt must not act on a newer one. A
     // conductor question is keyed by the task id, not a run, so it is exempt.
     if q.node != crate::conduct::NODE && task.runs.last() != Some(&q.run) {
@@ -1081,7 +1084,7 @@ fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
         match decision {
             ActionDecision::Skip => continue,
             ActionDecision::Resume(run) => {
-                task.release();
+                task.release_operator("choice", Some(&q.id));
                 task.resume_override = Some(crate::queue::OperatorResume {
                     question_id: q.id.clone(),
                     at: Timestamp::now(),
@@ -1091,7 +1094,10 @@ fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
                 });
             }
             ActionDecision::Stale => {}
-            ActionDecision::Requeue => task.requeue(),
+            ActionDecision::Requeue => {
+                task.release_operator("choice-requeue", Some(&q.id));
+                task.requeue();
+            }
             ActionDecision::Done => task.succeed(),
             ActionDecision::Refuse(why) => {
                 task.hold_machine(Some(why));
@@ -2571,6 +2577,7 @@ async fn poll(
         // its input reflects the queue's current, already-resolved state.
         resolve_blockers(queue, &questions);
         apply_choice_actions(queue, &questions, home);
+        triage::apply_answers(queue, &questions);
         reconcile_task_questions(queue, &questions);
         // Tell the chat a filed task or watched command has ended. Reconciled
         // here regardless of how it ended, and started only when no
@@ -2895,13 +2902,15 @@ async fn attempt(
     // failure shows it up as `held`/`failed` with the run state unreadable.
     let unfinished = (!task.fresh_start)
         .then(|| unfinished_run(&task.runs, task.short()))
-        .flatten();
+        .flatten()
+        .filter(|id| RunState::load(id).is_ok_and(|run| may_resume_run(&run, task)));
     // `crate::conduct` chose `Review` for this task on an earlier cycle: its
     // branch survived, and this reopens exactly that branch as a
     // review-only pass rather than resuming or competing again. Consumed
     // (cleared) here whichever way this goes, so it never outlives this one
     // attempt - see `queue::Task::review_branch`.
-    let review_branch = task.review_branch.take();
+    let previous = task.runs.last().and_then(|id| RunState::load(id).ok());
+    let review_branch = take_review_branch(task, previous.as_ref());
     let branch_exists = match &review_branch {
         Some(branch) => crate::git::branch_exists(&repo, branch)
             .await
@@ -2911,7 +2920,6 @@ async fn attempt(
     // An explicit `magi review <branch>` is reviewed whatever happens to the
     // branch unless an explicit implementer change requires fresh work. An
     // unfinished run of the same task still wins, so a retry resumes.
-    let previous = task.runs.last().and_then(|id| RunState::load(id).ok());
     let proposed = match (&review_branch, &unfinished, &task.review_of) {
         (None, None, Some(branch)) => Starter::Review(branch.clone()),
         _ => choose_starter(
@@ -3054,6 +3062,7 @@ async fn attempt(
                     // Consumed above by `take`; the answer has to reach a review
                     // of this same branch, so keep pointing the task at it.
                     task.review_branch = Some(d.branch.clone());
+                    task.review_instruction = Some(task.instruction.clone());
                     task.block(vec![q.id.clone()], Some(d.summary()));
                 }
                 Err(put) => {
@@ -3075,6 +3084,7 @@ async fn attempt(
                 && let Starter::Review(branch) = &starter
             {
                 task.review_branch = Some(branch.clone());
+                task.review_instruction = Some(task.instruction.clone());
                 task.last_error = Some(format!("{start_failed}{e:#}"));
                 task.status = crate::queue::TaskStatus::Failed;
                 record(queue, task);
@@ -3086,6 +3096,7 @@ async fn attempt(
             return Vec::new();
         }
     };
+    runner.state.task_instruction = Some(task.instruction.clone());
     // The follow-up depth is fixed now, while the task certainly exists:
     // deleting it later must not reset the cap (`crate::followup`).
     runner.state.followup_generation = Some(task.followup.as_ref().map_or(0, |f| f.generation));
@@ -3189,7 +3200,7 @@ pub fn hold_if_runnable(queue: &Queue, task: &mut Task) {
             || "the run did not finish".to_owned(),
             |e| format!("the run did not finish: {e}"),
         );
-        task.hold_manual(Some(format!(
+        task.hold_unrequested_retry(Some(format!(
             "{why}. It was started by hand, so it is not retried \
              automatically; `magi task release` retries it."
         )));
@@ -4009,6 +4020,62 @@ fn choose_starter(
     }
 }
 
+/// Consume a retained review only while its authored criteria still match.
+fn take_review_branch(task: &mut Task, previous: Option<&RunState>) -> Option<String> {
+    let branch = task.review_branch.take();
+    let instruction = task.review_instruction.take();
+    branch.filter(|branch| match &instruction {
+        Some(authored) => *authored == task.instruction,
+        // Legacy retained branches must agree with their prior run; only an
+        // explicitly pinned review can proceed without recoverable provenance.
+        None => previous.map_or_else(
+            || task.review_of.as_ref() == Some(branch),
+            |run| compatible_run_instruction(run, task),
+        ),
+    })
+}
+
+/// A current explicit pin can select an otherwise incompatible run. Edits
+/// and subsequent approvals invalidate pins selected for earlier criteria.
+fn may_resume_run(run: &RunState, task: &Task) -> bool {
+    task.resume_override
+        .as_ref()
+        .is_some_and(|r| r.pinned_run.as_ref() == Some(&run.id))
+        || compatible_run_instruction(run, task)
+}
+
+/// Review scaffolding is execution context, not evidence of an operator edit.
+pub(crate) fn compatible_run_instruction(run: &RunState, task: &Task) -> bool {
+    if let Some(authored) = &run.task_instruction {
+        return compatible_instruction(authored, task);
+    }
+    if compatible_instruction(&run.instruction, task) {
+        return true;
+    }
+    // Recognize only the existing generated review shapes on legacy runs.
+    // Ordinary authored text with a similar heading is left intact.
+    if run.reviewed_commits.is_some() {
+        if let Some((authored, _)) = run.instruction.split_once("\n\n# Work already on branch `") {
+            return strip_answers_block(authored, task).trim() == task.instruction.trim();
+        }
+        if let Some(branch) = &task.review_of {
+            let canonical = format!(
+                "Review the branch `{branch}` (review-only: no implementation, no judging)."
+            );
+            let generated = format!(
+                "Review the work already on branch `{branch}`. There is no task statement: what the change claims to do is whatever its commits say.\n\n"
+            );
+            return task.instruction == canonical && run.instruction.starts_with(&generated);
+        }
+    }
+    false
+}
+
+/// Compare authored instructions, excluding answer blocks appended by the daemon.
+pub(crate) fn compatible_instruction(old: &str, task: &Task) -> bool {
+    strip_answers_block(old, task) == task.instruction
+}
+
 /// Which repository a task runs in. A task that names none — the normal case
 /// for one filed from a phone — runs in the daemon's own default.
 fn repo_for(task: &Task, fallback: &Path) -> PathBuf {
@@ -4032,14 +4099,25 @@ fn answers_block(task: &Task, count: usize) -> String {
     s
 }
 
-/// Append every answer `crate::conduct` has collected for `task` onto `base`,
-/// in the shape both [`instruction_for`] and [`resumed_instruction`] use.
+/// Render the approval independently of transient task state, so historical
+/// suffixes remain recognizable after another explicit release.
+fn resumption_block(r: &crate::queue::Resumption) -> String {
+    format!(
+        "\n\n# Explicit operator resumption\n\nGeneration {} at {} approved this instruction:\n{}\n\
+         Earlier answers (first {}) are audit history; their waiting premises are superseded by this approval.\n",
+        r.generation, r.at, r.instruction, r.answers_through,
+    )
+}
+
+/// Append audit answers and the latest explicit approval to the instruction.
 fn append_answers(base: &str, task: &Task) -> String {
-    if task.answers.is_empty() {
-        return base.to_owned();
-    }
     let mut s = base.to_owned();
-    s.push_str(&answers_block(task, task.answers.len()));
+    if !task.answers.is_empty() {
+        s.push_str(&answers_block(task, task.answers.len()));
+    }
+    if let Some(r) = &task.resumption {
+        s.push_str(&resumption_block(r));
+    }
     s
 }
 
@@ -4047,6 +4125,17 @@ fn append_answers(base: &str, task: &Task) -> String {
 /// could have appended on an earlier resume. An `ANSWERS_HEADER` written by
 /// the task author is ordinary instruction text, not a block to remove.
 fn strip_answers_block<'a>(instruction: &'a str, task: &Task) -> &'a str {
+    let mut instruction = instruction;
+    for approval in task
+        .resumption
+        .iter()
+        .chain(task.resumption_history.iter().rev())
+    {
+        if let Some(base) = instruction.strip_suffix(&resumption_block(approval)) {
+            instruction = base;
+            break;
+        }
+    }
     for count in (1..=task.answers.len()).rev() {
         let block = answers_block(task, count);
         if let Some(base) = instruction.strip_suffix(&block) {
@@ -4344,6 +4433,205 @@ mod tests {
             PathBuf::from("/repo"),
             Source::Human,
         )
+    }
+
+    #[test]
+    fn revised_resumption_invalidates_old_pins_and_preserves_unchanged_pins() {
+        for source in ["cli", "web"] {
+            let mut t = task();
+            let mut run = run_state(RunStatus::Blocked);
+            run.instruction = "Run A original criteria".into();
+            run.task_instruction = Some(run.instruction.clone());
+            t.start(run.id.clone());
+            t.release_operator("choice", Some("resume-question"));
+            t.resume_override = Some(crate::queue::OperatorResume {
+                question_id: "resume-question".into(),
+                at: Timestamp::now(),
+                conductor_rehold: None,
+                forced: true,
+                pinned_run: Some(run.id.clone()),
+            });
+            t.hold_machine(Some("not enough free space to start a run".into()));
+            let mut unchanged = t.clone();
+            unchanged
+                .edit("title changed".into(), unchanged.instruction.clone())
+                .unwrap();
+            unchanged.release_operator(source, None);
+            assert_eq!(
+                unchanged
+                    .resume_override
+                    .as_ref()
+                    .unwrap()
+                    .pinned_run
+                    .as_deref(),
+                Some(run.id.as_str())
+            );
+            assert!(!compatible_run_instruction(&run, &unchanged));
+            assert!(may_resume_run(&run, &unchanged));
+
+            t.edit(
+                "approved recovery".into(),
+                "Reuse measured PR head B; fix Clippy; review".into(),
+            )
+            .unwrap();
+            assert!(t.resume_override.is_none());
+            t.release_operator(source, None);
+            let reloaded: Task = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+            assert!(reloaded.resume_override.is_none());
+            assert!(!may_resume_run(&run, &reloaded));
+            let unfinished =
+                unfinished_run_with(&reloaded.runs, reloaded.short(), |_| Ok(run.clone()))
+                    .filter(|_| may_resume_run(&run, &reloaded));
+            assert_eq!(
+                choose_starter(None, false, unfinished.as_deref()),
+                Starter::Start
+            );
+            assert!(instruction_for(&reloaded).starts_with("Reuse measured PR head B"));
+            assert_eq!(
+                reloaded.resumption_history[0].question_id.as_deref(),
+                Some("resume-question")
+            );
+
+            // A revision already persisted with the old approval/pin is also
+            // invalidated when the new operator release is recorded.
+            unchanged.instruction = "Reuse measured PR head B".into();
+            unchanged.hold_machine(Some("disk hold".into()));
+            unchanged.release_operator(source, None);
+            assert!(unchanged.resume_override.is_none());
+            assert!(!may_resume_run(&run, &unchanged));
+        }
+    }
+
+    #[test]
+    fn resumption_preserves_generated_review_runs_and_rejects_revised_targets() {
+        let mut t = task();
+        let mut run = run_state(RunStatus::Blocked);
+        t.review_of = Some("approved-head".into());
+        t.instruction =
+            "Review the branch `approved-head` (review-only: no implementation, no judging)."
+                .into();
+        run.instruction = "Review the work already on branch `approved-head`. There is no task statement: what the change claims to do is whatever its commits say.\n\nCommit log".into();
+        run.reviewed_commits = Some(vec!["Commit log".into()]);
+        t.start(run.id.clone());
+        t.hold_machine(Some("interrupted review".into()));
+        t.release_operator("cli", None);
+        assert!(
+            compatible_run_instruction(&run, &t),
+            "legacy explicit review remains resumable"
+        );
+        let unfinished = unfinished_run_with(&t.runs, t.short(), |_| Ok(run.clone()))
+            .filter(|_| compatible_run_instruction(&run, &t));
+        assert_eq!(
+            choose_starter(None, false, unfinished.as_deref()),
+            Starter::Resume(run.id.clone())
+        );
+        run.task_instruction = Some(t.instruction.clone());
+        assert!(compatible_run_instruction(&run, &t));
+        let reloaded: RunState =
+            serde_json::from_str(&serde_json::to_string(&run).unwrap()).unwrap();
+        assert!(compatible_run_instruction(&reloaded, &t));
+        t.edit(
+            "new approved head".into(),
+            "Reuse measured PR head B".into(),
+        )
+        .unwrap();
+        assert!(!compatible_run_instruction(&run, &t));
+
+        // Legacy recovery reviews retain the task criteria ahead of the log.
+        t.review_of = None;
+        t.instruction = "Fix Clippy on approved head".into();
+        run.task_instruction = None;
+        run.instruction = format!(
+            "{}\n\n# Work already on branch `approved-head` (commit subjects)\n\nCommit log",
+            t.instruction
+        );
+        assert!(compatible_run_instruction(&run, &t));
+        t.instruction.push('\n');
+        assert!(
+            compatible_run_instruction(&run, &t),
+            "legacy generated review trimmed the original criteria"
+        );
+        t.hold_for_handover(Some("approved-head".into()), "refused".into());
+        let mut unchanged = t.clone();
+        assert_eq!(
+            take_review_branch(&mut unchanged, Some(&run)).as_deref(),
+            Some("approved-head")
+        );
+        t.edit("new plan".into(), "Reuse measured PR head B".into())
+            .unwrap();
+        assert!(take_review_branch(&mut t, Some(&run)).is_none());
+        assert!(!compatible_run_instruction(&run, &t));
+        t.review_branch = Some("approved-head".into());
+        t.review_instruction = None;
+        assert!(
+            take_review_branch(&mut t, Some(&run)).is_none(),
+            "legacy retained candidate cannot replace a revised approved head"
+        );
+    }
+
+    #[test]
+    fn resumption_actions_survive_automatic_holds_of_hand_started_runs() {
+        crate::run::pin_test_home();
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        for resume in [true, false] {
+            let state = run_state(RunStatus::Blocked);
+            let mut t = task();
+            t.start(state.id.clone());
+            let action = if resume {
+                ask::ChoiceAction::Resume {
+                    run: state.id.clone(),
+                }
+            } else {
+                ask::ChoiceAction::Requeue
+            };
+            let mut q = action_question(&state.id, action);
+            q.status = ask::QuestionStatus::Open;
+            q.answer = None;
+            q.answered_at = None;
+            t.fail("run stopped with a question", 3);
+            hold_if_runnable(&queue, &mut t);
+            assert!(t.operator_decided_at.is_none());
+            assert!(t.operator_held());
+            q.answer(ask::Answer::Choice(q.choices[0].clone())).unwrap();
+            let expected = if resume {
+                ActionDecision::Resume(state.id.clone())
+            } else {
+                ActionDecision::Requeue
+            };
+            assert_eq!(
+                decide_action(&t, &q, phrases("en"), |_| Ok(state.clone())),
+                expected
+            );
+            t.hold_manual(Some("later explicit hold".into()));
+            assert_eq!(
+                decide_action(&t, &q, phrases("en"), |_| Ok(state.clone())),
+                ActionDecision::Stale
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_resumption_keeps_revised_instruction_and_audit_answers() {
+        let mut t = task();
+        t.answers.push(crate::queue::AnsweredQuestion {
+            question: "Inspect the remote?".into(),
+            answer: "Inspect then wait".into(),
+        });
+        let old = instruction_for(&t);
+        assert!(compatible_instruction(&old, &t));
+        t.instruction = "Reuse approved PR head and review".into();
+        t.release_operator("cli", None);
+        assert!(!compatible_instruction(&old, &t));
+        let approved = instruction_for(&t);
+        assert!(approved.contains("waiting premises are superseded"));
+        assert!(compatible_instruction(&approved, &t));
+        assert_eq!(resumed_instruction(&approved, &t), approved);
+        t.release_operator("web", None);
+        assert!(compatible_instruction(&approved, &t));
+        assert_eq!(t.resumption_history.len(), 1);
+        t.start("run".into());
+        assert!(instruction_for(&t).contains("Explicit operator resumption"));
     }
 
     /// A run that stopped on an infrastructure wait asked no agent anything:
