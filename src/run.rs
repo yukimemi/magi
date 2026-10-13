@@ -2020,6 +2020,9 @@ pub struct RunState {
     /// Public pull request head, separate from competition branches.
     #[serde(default)]
     pub pr_head: Option<String>,
+    /// Operator-selected source and original public lease, distinct from repaired HEAD.
+    #[serde(default)]
+    pub pr_recovery: Option<crate::pr_recovery::Selection>,
     /// Last head successfully pushed by this run; never an observed remote tip.
     #[serde(default)]
     pub pr_pushed_head: Option<String>,
@@ -2221,6 +2224,9 @@ pub struct RunState {
     /// candidates; `base_commit` stays the comparison point.
     #[serde(default)]
     pub seeds: Vec<crate::refs::Seed>,
+    /// Candidate preparation stopped before agents ran; requires an explicit source correction.
+    #[serde(default)]
+    pub prep_failure: Option<String>,
     /// Per-seat conversation state.
     #[serde(default)]
     pub seats: BTreeMap<String, SeatState>,
@@ -2404,6 +2410,7 @@ impl RunState {
             config,
             enabled_worktree_config: false,
             pr_head: None,
+            pr_recovery: None,
             pr_pushed_head: None,
             pr_posted_title: None,
             pr_publication_pending: false,
@@ -2446,6 +2453,7 @@ impl RunState {
             released_to: None,
             released_branches: Vec::new(),
             seeds: Vec::new(),
+            prep_failure: None,
             seats: BTreeMap::new(),
             active: BTreeMap::new(),
             driver_pid: None,

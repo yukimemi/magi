@@ -436,6 +436,9 @@ pub struct Task {
     /// Authored criteria when the retained recovery review was selected.
     #[serde(default)]
     pub review_instruction: Option<String>,
+    /// Explicit public implementation selected by the operator; never inferred from prose.
+    #[serde(default)]
+    pub pr_recovery: Option<crate::pr_recovery::Selection>,
     /// A release deliberately starts a new competition instead of resuming
     /// the prior run. History remains as evidence in `runs`.
     #[serde(default)]
@@ -785,6 +788,7 @@ impl Task {
             operator_decided_at: None,
             review_branch: None,
             review_instruction: None,
+            pr_recovery: None,
             fresh_start: false,
             interrupt: false,
             urgent: false,
@@ -904,7 +908,7 @@ impl Task {
         self.stamp_schema();
         self.status = TaskStatus::Running;
         self.attempts += 1;
-        self.runs.push(run);
+        self.link_run(&run);
         self.last_error = None;
         self.park_reason = None;
         self.fresh_start = false;
@@ -4514,6 +4518,18 @@ mod tests {
         let paths = q.attachment_paths(&t);
         assert!(paths[0].is_absolute(), "{}", paths[0].display());
         assert!(paths[0].ends_with(format!("{}.attachments/shot.png", t.id)));
+    }
+
+    #[test]
+    fn repeated_start_records_one_run_and_separate_passes() {
+        let mut t = task("resume");
+        t.start("same-run".into());
+        t.record_pass("same-run", 0, 1, None);
+        t.start("same-run".into());
+        t.record_pass("same-run", 1, 2, None);
+        assert_eq!(t.runs, vec!["same-run"]);
+        assert_eq!(t.attempts, 2);
+        assert_eq!(t.passes.len(), 2);
     }
 
     #[test]

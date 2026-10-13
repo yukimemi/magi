@@ -84,6 +84,14 @@ fn lease_for(remote: Option<&str>, expected: &[&str], local: &str) -> Result<Str
     }
 }
 
+fn selected_lease(remote: Option<&str>, expected: &str) -> Result<String> {
+    if remote == Some(expected) {
+        Ok(expected.to_owned())
+    } else {
+        bail!("selected public head moved or disappeared; refusing to overwrite it")
+    }
+}
+
 async fn predecessors(
     state: &RunState,
     home: &Path,
@@ -106,7 +114,10 @@ async fn predecessors(
         let Ok(view) = serde_json::from_str::<serde_json::Value>(&body) else {
             continue;
         };
-        if view["pr_head"].as_str() != Some(head) {
+        let selected_url = state.pr_recovery.as_ref().map(|s| s.url.as_str());
+        let names_selected_pr =
+            selected_url.is_some() && view["pr"]["url"].as_str() == selected_url;
+        if view["pr_head"].as_str() != Some(head) && !names_selected_pr {
             continue;
         }
         let _lock = owner_lock(home, &id)?;
@@ -141,6 +152,12 @@ async fn predecessors(
     Ok(previous)
 }
 
+/// Refuse startup while a historical publisher is still active or ambiguous.
+pub(crate) async fn check_predecessors(state: &RunState, head: &str) -> Result<()> {
+    predecessors(state, &run::home(), head).await?;
+    Ok(())
+}
+
 /// Whether `old` is handing over ownership of the open pull request `url`.
 /// Merged or closed records, other pull requests and records with no pull
 /// request (ownership unknown) stay history and are never superseded.
@@ -165,6 +182,9 @@ pub(crate) async fn publish(
     // updated_at" is not a reliable pusher.
     let expected: Vec<&str> = match state.pr_pushed_head.as_deref() {
         Some(h) => vec![h],
+        None if state.pr_recovery.is_some() => {
+            vec![state.pr_recovery.as_ref().expect("selected").head.as_str()]
+        }
         None => previous
             .iter()
             .filter_map(|(s, _)| s.pr_pushed_head.as_deref())
@@ -175,10 +195,27 @@ pub(crate) async fn publish(
     if let land::OpenPr::Many(_) = found {
         bail!("several open pull requests name the task head");
     }
+    if let Some(selected) = &state.pr_recovery {
+        selected
+            .verify(
+                &winner.worktree,
+                &state.config.merge.remote,
+                &state.base_branch,
+                state.pr_pushed_head.as_deref().unwrap_or(&selected.head),
+            )
+            .await?;
+    }
     let remote = state.config.merge.remote.clone();
     let remote_head = git::remote_head(&winner.worktree, &remote, &head).await?;
     let local_tip = git::rev_parse(&winner.worktree, &winner.branch).await?;
-    let expected = lease_for(remote_head.as_deref(), &expected, &local_tip)?;
+    let expected = if let Some(selected) = &state.pr_recovery {
+        selected_lease(
+            remote_head.as_deref(),
+            state.pr_pushed_head.as_deref().unwrap_or(&selected.head),
+        )?
+    } else {
+        lease_for(remote_head.as_deref(), &expected, &local_tip)?
+    };
     let posted_title = state.pr_posted_title.clone().or_else(|| match &found {
         land::OpenPr::One { url, .. } => previous
             .iter()
@@ -342,6 +379,17 @@ async fn checked_gh(repo: &Path, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_public_lease_refuses_moves_and_deletion_even_after_validation() {
+        assert_eq!(
+            selected_lease(Some("approved"), "approved").unwrap(),
+            "approved"
+        );
+        assert!(selected_lease(Some("historical-candidate"), "approved").is_err());
+        assert!(selected_lease(Some("repaired-but-unrecorded"), "approved").is_err());
+        assert!(selected_lease(None, "approved").is_err());
+    }
 
     #[test]
     fn public_head_lease_refuses_unknown_or_moved_remote() {
