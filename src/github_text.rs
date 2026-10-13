@@ -401,18 +401,20 @@ pub fn posting_authorized(message: &str, quote: &str, choice: &str) -> bool {
     let evidence = normalize(&message.to_lowercase());
     let evidence_quote = normalize(&quote.to_lowercase());
     let has_instruction = |text: &str| {
-        // Only skip known acknowledgements and the supported explanation of
-        // the original-text choice. Searching arbitrary later sentences would
-        // detach a command from a report introducing it without quotation marks.
-        // Newlines retain that context.
-        text.split(['.', '!', '。', '！'])
-            .find(|sentence| !matches!(sentence.trim(),
-                "" | "ok" | "okay" | "yes" | "いいや、まだ説明が足りない"
-                | "いいや、説明が足りない" | "いいや、まだ説明が不足"
-                | "いいや、説明が不足"))
-            .is_some_and(|sentence| {
+        // Every sentence must be a direct instruction or a known discourse
+        // phrase. A trailing report can qualify an otherwise imperative opening
+        // just as a report header can; neither may be discarded from evidence.
+        let mut instructed = false;
+        let direct = text.split(['.', '!', '。', '！']).all(|sentence| {
             let sentence = sentence.trim();
-            commands.iter().any(|command| {
+            if matches!(sentence,
+                "" | "ok" | "okay" | "yes" | "thanks" | "thank you"
+                | "ありがとう" | "ありがとうございます"
+                | "いいや、まだ説明が足りない" | "いいや、説明が足りない"
+                | "いいや、まだ説明が不足" | "いいや、説明が不足") {
+                return true;
+            }
+            let instruction = commands.iter().any(|command| {
                 sentence.match_indices(command).any(|(at, _)| {
                     let before = sentence[..at].trim();
                     let after = sentence[at + command.len()..].trim();
@@ -451,8 +453,11 @@ pub fn posting_authorized(message: &str, quote: &str, choice: &str) -> bool {
                             })
                         }
                 })
-            })
-        })
+            });
+            instructed |= instruction;
+            instruction
+        });
+        direct && instructed
     };
     has_instruction(&words)
         && has_instruction(&lower)
@@ -471,6 +476,16 @@ pub(crate) fn reported_posting_messages(command: &str) -> Vec<String> {
             "Someone reported the following",
         ] {
             messages.push(format!("{introduction}{separator}{command}."));
+        }
+        for report in [
+            "That is what the log says",
+            "That was the option I saw",
+            "That is what someone wrote",
+            "Those were the instructions in the report",
+            "これはログの文言です",
+        ] {
+            messages.push(format!("{command}{separator}{report}."));
+            messages.push(format!("Yes. {command}{separator}{report}. Thanks."));
         }
     }
     for newline in ["\n", "\r\n"] {
@@ -562,6 +577,12 @@ mod posting_authorization_tests {
             ("I'd like to use the rewrite", USE_REWRITE),
             ("Use only the rewrite text.", USE_REWRITE),
             ("Post original now.", POST_ORIGINAL),
+            ("Yes. Post original. Thank you.", POST_ORIGINAL),
+            ("OK. Use rewrite. Thanks.", USE_REWRITE),
+            (
+                "Post original. Post the original description unchanged.",
+                POST_ORIGINAL,
+            ),
             ("\nPost original\n", POST_ORIGINAL),
             ("Please\npost original", POST_ORIGINAL),
             ("\nUse rewrite\n", USE_REWRITE),
