@@ -635,7 +635,11 @@ fi
 
 # Whole-change description for the pull request: read-only, an English reply.
 if has "Describe a change for its pull request"; then
-  printf 'TITLE: feat(note): create note.txt\nAdds `note.txt` with the seat output.\n'
+  if [ -n "$MOCK_CHANGE_DESCRIPTION" ]; then
+    printf '%s\n' "$MOCK_CHANGE_DESCRIPTION"
+  else
+    printf 'TITLE: feat(note): create note.txt\nAdds `note.txt` with the seat output.\n'
+  fi
   exit 0
 fi
 
