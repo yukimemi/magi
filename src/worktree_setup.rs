@@ -34,6 +34,41 @@ const EXCLUDE: &str = "magi-setup-exclude";
 /// Output kept in an error message.
 const TAIL: usize = 4000;
 
+/// The failing operation, independent of stderr and the disposable worktree.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SetupFailureTarget {
+    /// Copying a configured source into the worktree failed.
+    Copy {
+        /// One-based position in the setup list.
+        step: usize,
+        /// Configured source and destination specification.
+        spec: String,
+    },
+    /// A configured setup command failed.
+    Run {
+        /// One-based position in the setup list.
+        step: usize,
+        /// The command, without its generated output.
+        command: String,
+    },
+    /// Validating and hiding setup products failed.
+    Seal,
+    /// A step did not declare exactly one supported operation.
+    InvalidStep {
+        /// One-based position in the setup list.
+        step: usize,
+    },
+}
+
+/// Typed context retains the original user-facing message and its cause.
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub(crate) struct SetupFailure {
+    pub target: SetupFailureTarget,
+    message: String,
+}
+
 /// Run `cfg.worktree.setup` in `wt`, a worktree of `repo` (the primary checkout).
 ///
 /// A no-op for the default empty list. Idempotent, since a reviewer's worktree
@@ -52,7 +87,13 @@ pub async fn prepare(cfg: &Config, repo: &Path, wt: &Path) -> Result<()> {
             (Some(spec), None) => {
                 let made = copy_step(repo, wt, spec, step.optional)
                     .await
-                    .with_context(|| format!("worktree setup step {n}/{total} ({what}) failed"))?;
+                    .with_context(|| SetupFailure {
+                        target: SetupFailureTarget::Copy {
+                            step: n,
+                            spec: spec.clone(),
+                        },
+                        message: format!("worktree setup step {n}/{total} ({what}) failed"),
+                    })?;
                 copied.extend(made);
             }
             (None, Some(command)) => {
@@ -61,12 +102,29 @@ pub async fn prepare(cfg: &Config, repo: &Path, wt: &Path) -> Result<()> {
                     .unwrap_or_else(|| cfg.graph.verify_timeout());
                 run_step(&cfg.shell(), command, wt, Duration::from_secs(secs))
                     .await
-                    .with_context(|| format!("worktree setup step {n}/{total} ({what}) failed"))?;
+                    .with_context(|| SetupFailure {
+                        target: SetupFailureTarget::Run {
+                            step: n,
+                            command: command.clone(),
+                        },
+                        message: format!("worktree setup step {n}/{total} ({what}) failed"),
+                    })?;
             }
-            _ => bail!("worktree setup step {n}/{total} must set exactly one of copy / run"),
+            _ => {
+                return Err(SetupFailure {
+                    target: SetupFailureTarget::InvalidStep { step: n },
+                    message: format!(
+                        "worktree setup step {n}/{total} must set exactly one of copy / run"
+                    ),
+                }
+                .into());
+            }
         }
     }
-    seal(wt, &copied).await.context("worktree setup")
+    seal(wt, &copied).await.context(SetupFailure {
+        target: SetupFailureTarget::Seal,
+        message: "worktree setup".to_owned(),
+    })
 }
 
 /// `src -> dst`, or just `path` for the same path on both sides.

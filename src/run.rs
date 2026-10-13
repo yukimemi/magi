@@ -1983,6 +1983,29 @@ pub struct LandReruns {
     pub runs: BTreeMap<String, i64>,
 }
 
+/// Machine-recorded preparation failure; prose and ephemeral run paths are
+/// excluded so repeating the same operation preserves notification identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PrepFailure {
+    /// A configured setup operation or sealing its products failed.
+    WorktreeSetup {
+        /// The failed step, absent only for an unclassified setup error.
+        target: Option<crate::worktree_setup::SetupFailureTarget>,
+    },
+    /// Enabling per-worktree Git configuration failed.
+    WorktreeConfig,
+    /// Applying a referenced commit to the planned starting tree failed.
+    CherryPick {
+        /// Original commit being applied.
+        commit: String,
+        /// Stable starting commit, before applying any referenced commits.
+        start: String,
+        /// Original commits successfully applied before this one.
+        applied: Vec<String>,
+    },
+}
+
 /// The whole run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunState {
@@ -2209,6 +2232,9 @@ pub struct RunState {
     /// resume asks the same agent again. Cleared by the resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_block: Option<ResourceBlock>,
+    /// Concrete failed prep operation. Old runs have no structured evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prep_failure_evidence: Option<PrepFailure>,
     /// The run that took this run's worktree over, when one did — see
     /// [`crate::handover`]. `Some` means the worktree is gone on purpose and
     /// the run can no longer be resumed from it ([`Self::released`]).
@@ -2453,6 +2479,7 @@ impl RunState {
             parked: false,
             resource_wait: None,
             resource_block: None,
+            prep_failure_evidence: None,
             released_to: None,
             released_branches: Vec::new(),
             seeds: Vec::new(),

@@ -1520,6 +1520,18 @@ fn failure_event(state: &RunState) -> Option<&crate::run::Event> {
     })
 }
 
+/// Reaching a failed discovery operation is execution evidence. A release
+/// alone does not change a cause; another observed failure after approval
+/// may do so, including a different phase of the same configuration load.
+pub(crate) fn config_notice_cause(task: &Task, error: &anyhow::Error) -> String {
+    serde_json::json!({
+        "kind": "configuration",
+        "failure": error.downcast_ref::<crate::config::DiscoveryFailure>(),
+        "approval": task.resumption.as_ref().map(|r| r.generation),
+    })
+    .to_string()
+}
+
 /// Stable evidence about a stopped graph. A new run id, pass, timestamp or
 /// generated summary says nothing about whether the failure changed. An
 /// approval contributes only when this graph recorded work after it.
@@ -1555,13 +1567,18 @@ pub(crate) fn failure_notice_cause(task: &Task, state: &RunState) -> String {
             r.answered,
         )
     });
-    serde_json::json!({
+    let mut cause = serde_json::json!({
         "kind": "graph", "status": state.status, "stage": stage,
         "base": state.base_commit, "instruction": state.instruction,
         "gate_head": state.gate_head, "gate": commands(&state.gate),
         "review": review, "approval": approval,
-    })
-    .to_string()
+    });
+    if matches!(stage, "prep" | "setup")
+        && let Some(failure) = &state.prep_failure_evidence
+    {
+        cause["prep_failure"] = serde_json::json!(failure);
+    }
+    cause.to_string()
 }
 
 /// If `task` is held with a `magi ask` question still open on `run`, name the
@@ -2937,7 +2954,7 @@ async fn attempt(
     };
     if let Err(e) = Config::discover_fetched(&repo, explicit).await {
         let reason = format!("[config] {e:#}");
-        task.set_hold_notice_cause("config-fetch".to_owned());
+        task.set_hold_notice_cause(config_notice_cause(task, &e));
         task.last_error = Some(reason.clone());
         task.hold_machine(Some(reason.clone()));
         record(queue, task);
@@ -6356,6 +6373,94 @@ mod tests {
         state.gate[0].output_tail = "gate failed".into();
         state.gate_head = Some("different-commit".into());
         assert_ne!(gate, failure_notice_cause(&t, &state));
+    }
+
+    #[test]
+    fn different_prep_operations_and_targets_notify_without_new_approval() {
+        crate::run::pin_test_home();
+        let mut task = task();
+        task.source = crate::queue::Source::Agent {
+            run: "chat".into(),
+            node: crate::queue::CHAT_NODE.into(),
+        };
+        let mut state = run_state(RunStatus::Blocked);
+        state.prep_failure_evidence = Some(crate::run::PrepFailure::WorktreeSetup {
+            target: Some(crate::worktree_setup::SetupFailureTarget::Run {
+                step: 1,
+                command: "bootstrap".into(),
+            }),
+        });
+        state.events.push(crate::run::Event {
+            at: Timestamp::now(),
+            node: "prep".into(),
+            message: "setup failed".into(),
+        });
+        task.start(state.id.clone());
+        settle_and_diagnose(
+            &mut task,
+            unstarted_verdict(RunStatus::Blocked),
+            "setup failed",
+            1,
+            &state,
+        );
+        let setup_key = task.chat_notice_due().expect("first notice");
+        task.chat_notices.push(setup_key.clone());
+        task.requeue();
+        state.id = "another-run".into();
+        state.prep_failure_evidence = Some(crate::run::PrepFailure::CherryPick {
+            commit: "referenced-commit".into(),
+            start: state.base_commit.clone(),
+            applied: Vec::new(),
+        });
+        state.events.push(crate::run::Event {
+            at: Timestamp::now(),
+            node: "prep".into(),
+            message: "cherry-pick failed".into(),
+        });
+        let state: RunState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        task.start(state.id.clone());
+        settle_and_diagnose(
+            &mut task,
+            unstarted_verdict(RunStatus::Blocked),
+            "cannot apply referenced commit",
+            1,
+            &state,
+        );
+        let pick_key = task
+            .chat_notice_due()
+            .expect("different operation must notify");
+        assert_ne!(pick_key, setup_key);
+        task.chat_notices.push(pick_key.clone());
+        let mut repeated = state.clone();
+        repeated.id = "yet-another-run".into();
+        repeated.events.push(crate::run::Event {
+            at: Timestamp::now(),
+            node: "prep".into(),
+            message: "regenerated recovery prose".into(),
+        });
+        task.requeue();
+        task.start(repeated.id.clone());
+        settle_and_diagnose(
+            &mut task,
+            unstarted_verdict(RunStatus::Blocked),
+            "still cannot apply it",
+            1,
+            &repeated,
+        );
+        assert!(
+            task.chat_notice_due().is_none(),
+            "same concrete failure is still once"
+        );
+        repeated.prep_failure_evidence = Some(crate::run::PrepFailure::CherryPick {
+            commit: "different-referenced-commit".into(),
+            start: repeated.base_commit.clone(),
+            applied: Vec::new(),
+        });
+        assert_ne!(
+            failure_notice_cause(&task, &repeated),
+            task.hold_notice_cause.unwrap()
+        );
     }
 
     #[test]

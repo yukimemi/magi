@@ -1525,8 +1525,19 @@ impl Runner {
     /// resume starts over instead of finding candidates and missing seats.
     async fn setup_seat_worktree(&mut self, repo: &Path, wt: &Path, in_prep: bool) -> Result<()> {
         let result = match ensure_setup_config(&mut self.state, repo).await {
-            Ok(()) => worktree_setup::prepare(&self.state.config, repo, wt).await,
-            Err(e) => Err(e),
+            Ok(()) => worktree_setup::prepare(&self.state.config, repo, wt)
+                .await
+                .inspect_err(|e| {
+                    self.state.prep_failure_evidence = Some(crate::run::PrepFailure::WorktreeSetup {
+                        target: e
+                            .downcast_ref::<worktree_setup::SetupFailure>()
+                            .map(|e| e.target.clone()),
+                    });
+                }),
+            Err(e) => {
+                self.state.prep_failure_evidence = Some(crate::run::PrepFailure::WorktreeConfig);
+                Err(e)
+            }
         };
         if let Err(e) = result {
             git::worktree_remove(repo, wt).await.ok();
@@ -1581,6 +1592,7 @@ impl Runner {
         self.rollback_prep(&repo).await;
         self.state.prep_complete = Some(false);
         self.state.status = RunStatus::Prep;
+        self.state.prep_failure_evidence = None;
         self.state.save()?;
         let repo = self.state.repo.clone();
         let base = self.state.base_commit.clone();
@@ -1636,6 +1648,11 @@ impl Runner {
                 git::branch_delete(&repo, &branch).await.ok();
                 self.rollback_prep(&repo).await;
                 self.state.status = RunStatus::Blocked;
+                self.state.prep_failure_evidence = Some(crate::run::PrepFailure::WorktreeSetup {
+                    target: e
+                        .downcast_ref::<worktree_setup::SetupFailure>()
+                        .map(|e| e.target.clone()),
+                });
                 self.state
                     .event("prep", format!("worktree setup failed: {e:#}"));
                 self.state.prep_failure = Some(format!("worktree setup failed: {e:#}"));
@@ -1659,11 +1676,16 @@ impl Runner {
                 folded: false,
             });
             self.state.save()?;
-            for pick in &plan.picks {
+            for (pick_index, pick) in plan.picks.iter().enumerate() {
                 if let Err(e) = git::cherry_pick(&self.state.candidates[index].worktree, pick).await
                 {
                     self.state.status = RunStatus::Blocked;
                     self.state.prep_failure = Some(format!("cannot apply referenced commit: {e}"));
+                    self.state.prep_failure_evidence = Some(crate::run::PrepFailure::CherryPick {
+                        commit: pick.clone(),
+                        start: start.clone(),
+                        applied: plan.picks[..pick_index].to_vec(),
+                    });
                     self.state
                         .event("prep", format!("cannot apply referenced commit: {e}"));
                     self.state.save()?;
