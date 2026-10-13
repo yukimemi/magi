@@ -2152,11 +2152,13 @@ mod tests {
                 "status",
                 "summary",
                 "thread",
+                "triage_generation",
                 "waiter",
             ],
             "the on-disk field set is a contract with the front end"
         );
-        assert_eq!(open["schema"], 9);
+        assert_eq!(open["schema"], 10);
+        assert_eq!(open["triage_generation"], serde_json::Value::Null);
         assert_eq!(open["thread"], serde_json::json!([]));
         assert_eq!(open["id"], "20260902-231501-ab12");
         assert_eq!(open["run"], "20260902-201256-9fb7");
