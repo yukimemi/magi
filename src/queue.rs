@@ -895,6 +895,8 @@ impl Task {
     }
 
     /// Record that a run has started for this task.
+    /// Move an already linked run to the end so it remains the current attempt,
+    /// with one history entry per run and separate pass records for each resume.
     ///
     /// Clears [`Task::interrupt`]: a mark to run ahead of whatever else is
     /// in flight is fulfilled the moment this task actually gets its turn,
@@ -908,7 +910,8 @@ impl Task {
         self.stamp_schema();
         self.status = TaskStatus::Running;
         self.attempts += 1;
-        self.link_run(&run);
+        self.runs.retain(|id| id != &run);
+        self.runs.push(run);
         self.last_error = None;
         self.park_reason = None;
         self.fresh_start = false;
@@ -4518,6 +4521,28 @@ mod tests {
         let paths = q.attachment_paths(&t);
         assert!(paths[0].is_absolute(), "{}", paths[0].display());
         assert!(paths[0].ends_with(format!("{}.attachments/shot.png", t.id)));
+    }
+
+    #[test]
+    fn explicitly_resumed_older_run_becomes_current_without_duplicate_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut t = task("resume");
+        t.start("A".into());
+        t.record_pass("A", 0, 1, None);
+        t.start("B".into());
+        q.put(&mut t).unwrap();
+        assert_eq!(t.runs, vec!["A", "B"]);
+        t.start("A".into());
+        t.record_pass("A", 1, 3, None);
+        q.put(&mut t).unwrap();
+        let saved = q.get(&t.id).unwrap();
+        assert_eq!(saved.runs, vec!["B", "A"]);
+        assert_eq!(saved.runs.last().map(String::as_str), Some("A"));
+        assert_eq!(saved.attempts, 3);
+        assert_eq!(saved.passes.len(), 2);
+        assert_eq!(saved.passes[0].run, "A");
+        assert_eq!(saved.passes[1].run, "A");
     }
 
     #[test]

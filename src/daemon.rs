@@ -9146,6 +9146,45 @@ mod tests {
     }
 
     #[test]
+    fn explicitly_resumed_older_run_remains_the_release_and_question_target() {
+        for parked in [false, true] {
+            let mut t = task();
+            t.start("A".into());
+            t.start("B".into());
+            assert_eq!(t.runs, vec!["A", "B"]);
+            t.start("A".into());
+            let mut resumed = run_state(RunStatus::Blocked);
+            resumed.id = "A".into();
+            resumed.parked = parked;
+            resumed.driver_exited = true;
+            t.hold_machine(Some("resumed run stopped".into()));
+            let q = action_question("A", resume_action("A"));
+            assert_eq!(action_standing(&t, &q), ActionStanding::Pending);
+            assert_eq!(
+                decide_action(&t, &q, &PHRASES_EN, |id| {
+                    assert_eq!(id, "A");
+                    Ok(resumed.clone())
+                }),
+                ActionDecision::Resume("A".into())
+            );
+            assert_eq!(
+                action_standing(&t, &action_question("B", resume_action("B"))),
+                ActionStanding::Stale
+            );
+            t.release_operator("cli", None);
+            let unfinished = unfinished_run_with(&t.runs, t.short(), |id| {
+                assert_eq!(id, "A");
+                Ok(resumed.clone())
+            });
+            assert_eq!(
+                choose_starter(None, false, unfinished.as_deref()),
+                Starter::Resume("A".into())
+            );
+            assert_eq!(t.runs, vec!["B", "A"]);
+        }
+    }
+
+    #[test]
     fn decide_action_resumes_only_the_latest_resumable_run() {
         let t = held_task_with("r1");
         let q = action_question("r1", resume_action("r1"));
