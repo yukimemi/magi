@@ -813,7 +813,7 @@ impl Question {
             // latest message.
             let ok = if label == crate::land::APPROVE {
                 latest.is_some_and(|m| m.contains(quote))
-            } else if label == crate::land::HOLD {
+            } else if label == crate::land::HOLD || label == crate::land::REPAIR {
                 latest.is_some_and(|m| {
                     quote.eq_ignore_ascii_case(label) && m.eq_ignore_ascii_case(label)
                 })
@@ -1327,7 +1327,31 @@ impl Questions {
     /// Load a question by id or unambiguous id prefix.
     pub fn get(&self, id: &str) -> Result<Question> {
         let resolved = self.resolve_id(id)?;
-        read_path(&self.path_of(&resolved))
+        let q = read_path(&self.path_of(&resolved))?;
+        Ok(self.with_repair_choice(q))
+    }
+
+    fn with_repair_choice(&self, q: Question) -> Question {
+        if q.status.open()
+            && q.node == crate::land::APPROVAL_NODE
+            && !q.choices.iter().any(|c| c == crate::land::REPAIR)
+            && let Some(home) = self.root.parent()
+            && let Ok(state) = crate::run::RunState::load_under(&q.run, home)
+            && crate::land::repair_available(&state)
+            && state
+                .land_approval
+                .as_ref()
+                .is_some_and(|a| a.question == q.id)
+        {
+            match self.update(&q.id, |current| {
+                crate::land::upgrade_repair_choice(current, &state);
+                Ok(())
+            }) {
+                Ok((current, ())) => return current,
+                Err(_) => return read_path(&self.path_of(&q.id)).unwrap_or(q),
+            }
+        }
+        q
     }
 
     /// Every question on disk: open first, then newest first.
@@ -1345,6 +1369,7 @@ impl Questions {
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|x| x == "json"))
             .filter_map(|p| read_path(&p).ok())
+            .map(|q| self.with_repair_choice(q))
             .collect();
         all.sort_unstable_by(|a, b| {
             let rank = |q: &Question| u8::from(!q.status.open());
@@ -2901,6 +2926,25 @@ mod tests {
         dep.seat = Some(crate::agent::SeatState::new("deputy-x", "alpha", 1));
         q.deputy = Some(dep);
         q
+    }
+
+    #[test]
+    fn merge_repair_deputy_settle_requires_the_exact_latest_owner_choice() {
+        let mut q = approval_question();
+        q.choices.push(crate::land::REPAIR.into());
+        q.say("maybe fix findings and re-review").unwrap();
+        assert!(
+            q.settle_by_deputy("deputy-x", crate::land::REPAIR, crate::land::REPAIR, None)
+                .is_err()
+        );
+        q.say(crate::land::REPAIR).unwrap();
+        q.settle_by_deputy("deputy-x", crate::land::REPAIR, crate::land::REPAIR, None)
+            .unwrap();
+        assert_eq!(q.resolution().as_deref(), Some(crate::land::REPAIR));
+        assert_eq!(
+            crate::land::approval(q.resolution().as_deref()),
+            crate::land::Approval::Repair
+        );
     }
 
     #[test]

@@ -1977,6 +1977,12 @@ pub fn chat_consult(q: &crate::ask::Question) -> String {
         s.push('\n');
     }
     if q.node == crate::land::APPROVAL_NODE {
+        if q.choices.iter().any(|c| c == crate::land::REPAIR) {
+            s.push_str(&format!(
+                "The third choice `fix findings and re-review` requests one repair and bounded re-review of this same PR, without merging or queuing another task. Only when the owner's entire latest message is exactly that label, run `magi answer {} --reply 'fix findings and re-review' --quote 'fix findings and re-review'`. Otherwise discuss the choice and ask for clarification. The driver performs it and presents new review/gate results for a fresh merge decision.\n\n",
+                q.id,
+            ));
+        }
         s.push_str(&format!(
             "This is an irreversible merge approval. Never answer it yourself. \
              Discuss the decision with the owner and wait for their explicit, clear, \
@@ -2094,6 +2100,9 @@ pub fn deputy(p: &DeputyPrompt<'_>) -> String {
              session, run `magi task list` and report only ids that exist.\n\
              - `hold` settles only when the owner's whole message is that word.\n\n",
         );
+    }
+    if land && choices.iter().any(|c| c == crate::land::REPAIR) {
+        s.push_str("The offered choice `fix findings and re-review` requests one repair and bounded re-review on the same PR, without merging. If the owner's whole latest message is exactly that label, settle that choice with the entire label as `--quote`. Otherwise discuss it with `--thread` and ask them to pick the choice. The existing driver performs this operation; never queue a separate fix task or change the PR yourself. Updated review and gate results require a fresh merge decision.\n\n");
     }
     if kind == crate::deputy::Kind::Release {
         s.push_str(

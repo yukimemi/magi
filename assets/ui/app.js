@@ -4654,6 +4654,9 @@ function renderStakes(row, question) {
       class: "btn", type: "button", text: choice,
       onclick: () => answerQuestion(question.id, { choice }, row),
     }));
+    if (name === "fix findings and re-review") {
+      r.stakes.append(el("p", { class: "hint", text: "Run one repair and bounded re-review on this PR. This does not approve a merge; updated review and gate results require a fresh decision." }));
+    }
   }
 }
 
