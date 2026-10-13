@@ -2834,9 +2834,38 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
 #talk-pending { min-width: 0; max-width: 100%; }
 .talk-pending-text { margin: var(--s2) 0; max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere; }
 
-.task-implementers { flex: 1 1 100%; min-width: 0; }
-.task-implementers label { display: inline-flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
-.task-implementers select { min-height: var(--tap); max-width: 100%; }
+/* Queue controls wrap as groups; confirmations expand inside the card. */
+.task-card-actions { align-items: flex-start; }
+.task-card-actions .btn { min-width: 0; flex: 0 0 auto; }
+.task-card-actions .btn-step { min-width: var(--tap); }
+.task-card-actions .task-priority-box { display: flex; align-items: center; gap: var(--s1); }
+.task-priority-value { font-size: var(--t2); white-space: nowrap; }
+.task-action-menu { margin-left: auto; min-width: 0; max-width: 100%; }
+.task-action-menu > summary { list-style: none; cursor: pointer; }
+.task-action-menu > summary::-webkit-details-marker { display: none; }
+.task-action-menu[open] { flex: 1 1 100%; }
+.task-menu-items { display: flex; flex-direction: column; gap: var(--s2); margin-top: var(--s2); }
+.task-menu-items .btn { width: 100%; }
+.task-menu-items input { width: 100%; min-width: 0; }
+.task-menu-items .stakes-row { display: flex; gap: var(--s2); }
+.task-menu-items .stakes-row .btn { flex: 1 1 0; min-width: 0; }
+#task-edit-sheet .field > input,
+#task-edit-sheet .field > textarea,
+#task-edit-sheet .field > select { width: 100%; min-width: 0; }
+#task-edit-save { width: 100%; }
+@media (min-width: 1080px) {
+  main[data-split] .cards > li.card.task-card { grid-template-columns: minmax(0, 1fr); }
+  main[data-split] .task-card .card-top {
+    display: flex; flex-wrap: wrap; grid-row: 2; grid-column: 1 / -1; gap: var(--s2); margin-top: var(--s2);
+  }
+  main[data-split] .task-card .card-top > :nth-child(-n+4) { margin: 0; }
+  main[data-split] .task-card .card-when { margin: 0 0 0 auto; }
+  main[data-split] .task-card .card-meta {
+    grid-row: 3; grid-column: 1 / -1; display: flex; flex-wrap: wrap;
+    white-space: normal; overflow: visible; max-width: none;
+  }
+  main[data-split] .cards > li.card.task-card > .task-card-actions { display: flex; margin-top: var(--s2); }
+}
 
 /* Replies use the same compact action buttons as the conversation composer. */
 .reply-preview { display: flex; align-items: center; gap: .5rem; padding: .5rem; border-left: 3px solid var(--gold); }

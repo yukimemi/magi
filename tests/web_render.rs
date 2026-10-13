@@ -232,9 +232,9 @@ async fn serve_with_client_probe(
     let base = format!("http://{}/", listener.local_addr().unwrap());
     let exports = match probe {
         ClientProbe::None => None,
-        ClientProbe::Queue => {
-            Some("setChip, RUN_STATUS, TASK_STATUS, QUESTION_STATUS, TALK_STATUS, loadQueue")
-        }
+        ClientProbe::Queue => Some(
+            "setChip, RUN_STATUS, TASK_STATUS, QUESTION_STATUS, TALK_STATUS, loadQueue, openTaskEdit, saveTaskEdit, closeTaskEdit",
+        ),
         ClientProbe::Settings => Some("settingsState, renderSettings, loadSettings, saveSettings"),
         ClientProbe::Questions => {
             Some("state, shortId, renderQuestions, renderAsks, openPanel, closePanel")
@@ -3544,6 +3544,150 @@ async fn question_identity_disclosure_copy_and_live_updates() {
           return true;
         })()"##).await.unwrap();
         assert_eq!(out, true, "question identity @{width}px");
+        browser.close_page(&page).await;
+    }
+}
+
+#[tokio::test]
+async fn queue_compact_controls_and_edit_save_fit_and_preserve_drafts() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP queue controls: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let ids = seed_tasks(&queue, &fx.repo, "run");
+    let original = queue.get(&ids[1]).unwrap();
+    let base = serve_with_client_probe(
+        &home,
+        queue.clone(),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Queue,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    for width in [320, 390, 1280, 1950] {
+        let page = browser
+            .open_page(&format!("{base}#/queue"), width, 900, width < 400)
+            .await
+            .expect("page");
+        browser
+            .wait_for(
+                &page,
+                "!!document.querySelector('.task-card-actions')",
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("queue loaded");
+        let result = browser.eval(&page, &format!(r##"(async () => {{
+          const id = {id};
+          let card = document.querySelector(`#queue-sections li.card[data-task-id="${{id}}"]`);
+          const assert = (ok, message) => {{ if (!ok) throw new Error(message); }};
+          const visible = e => e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().height > 0;
+          const fits = e => {{ const r = e.getBoundingClientRect(), p = card.getBoundingClientRect(); return r.left >= p.left && r.right <= p.right + 1; }};
+          assert(!card.querySelector('select'), 'no inline implementers');
+          const controls = card.querySelector('.task-card-actions');
+          assert([...controls.children].every(visible), 'controls visible on unselected card');
+          assert([...controls.children].every(fits), 'controls fit card');
+          const step = card.querySelectorAll('.btn-step')[1];
+          step.click();
+          await new Promise(r => setTimeout(r, 200));
+          await deck.loadQueue();
+          assert(card.querySelector('.task-priority-value').textContent === 'Priority 1', 'priority changes directly');
+          const menu = card.querySelector('.task-action-menu');
+          menu.querySelector('summary').click();
+          card.querySelector('.task-hold-box button').click();
+          const reason = card.querySelector('.task-hold-box input');
+          reason.value = 'waiting on review'; reason.dispatchEvent(new Event('input'));
+          reason.focus();
+          await deck.loadQueue();
+          assert(card.querySelector('.task-hold-box input') === reason && reason.value === 'waiting on review', 'poll preserves reason node');
+          assert(document.activeElement === reason, 'poll preserves focus');
+          reason.dispatchEvent(new KeyboardEvent('keydown', {{key: 'Escape', bubbles: true}}));
+          assert(!menu.open, 'escape closes menu');
+          menu.querySelector('summary').click();
+          assert(menu.open && reason.value === 'waiting on review', 'reopening preserves confirmation');
+          document.querySelector('#queue-h').click();
+          assert(!menu.open, 'outside click closes menu');
+          menu.querySelector('summary').click();
+          card.querySelectorAll('.task-hold-box button')[1].click();
+          await new Promise(r => setTimeout(r, 200));
+          await deck.loadQueue();
+          card = document.querySelector(`#queue-sections li.card[data-task-id="${{id}}"]`);
+          assert(card.querySelector('.chip').textContent.toLowerCase().includes('held'), 'hold applied');
+          card.querySelector('.task-hold-box button').click();
+          await new Promise(r => setTimeout(r, 200));
+          await deck.loadQueue();
+          card = document.querySelector(`#queue-sections li.card[data-task-id="${{id}}"]`);
+          const task = (await (await fetch(`/api/queue/${{id}}`)).json());
+          deck.openTaskEdit(task);
+          const field = document.querySelector('#task-edit-implementers');
+          assert(field.value === '', 'repository default retained');
+          document.querySelector('#task-edit-title').value = 'Revised task';
+          field.value = '1';
+          await deck.loadQueue();
+          assert(field.value === '1', 'poll preserves edit draft');
+          const dialog = document.querySelector('#task-edit-sheet');
+          for (const e of dialog.querySelectorAll('input, textarea, select, #task-edit-save')) {{
+            const r = e.getBoundingClientRect(), p = dialog.getBoundingClientRect();
+            assert(r.left >= p.left && r.right <= p.right + 1, 'edit field fits sheet');
+          }}
+          const originalFetch = window.fetch;
+          const calls = [];
+          window.fetch = async (url, options) => {{
+            if (options?.method === 'POST') {{
+              calls.push(url);
+              return new Response(JSON.stringify({{error: 'Refused'}}), {{status: 409}});
+            }}
+            return originalFetch(url, options);
+          }};
+          await deck.saveTaskEdit();
+          assert(calls.length === 1 && calls[0].endsWith('/edit'), 'refused edit stops implementers');
+          assert(dialog.open && field.value === '1', 'failure retains draft');
+          window.fetch = async (url, options) => {{
+            if (options?.method === 'POST' && url.endsWith('/implementers')) return new Response(JSON.stringify({{error: 'Count refused'}}), {{status: 409}});
+            return originalFetch(url, options);
+          }};
+          await deck.saveTaskEdit();
+          assert(dialog.open && document.querySelector('#task-edit-error').textContent.includes('Title and instruction saved'), 'partial save explained');
+          calls.length = 0;
+          window.fetch = async (url, options) => {{
+            if (options?.method === 'POST') calls.push(url);
+            return originalFetch(url, options);
+          }};
+          await deck.saveTaskEdit();
+          window.fetch = originalFetch;
+          assert(calls.length === 1 && calls[0].endsWith('/implementers'), 'retry only unsaved field');
+          assert(!dialog.open, 'success closes edit');
+          const saved = (await (await fetch(`/api/queue/${{id}}`)).json());
+          assert(saved.solo && saved.title === 'Revised task', 'combined save persisted');
+          card = document.querySelector(`#queue-sections li.card[data-task-id="${{id}}"]`);
+          card.querySelector('.task-action-menu').open = true;
+          card.querySelector('.task-done-box button').click();
+          assert(card.querySelector('.task-done-box .stakes-confirm'), 'done asks for confirmation');
+          card.querySelectorAll('.task-done-box button')[1].click();
+          await new Promise(r => setTimeout(r, 200));
+          await deck.loadQueue();
+          const done = await (await fetch(`/api/queue/${{id}}`)).json();
+          assert(done.status_str === 'done', 'done keeps task record');
+          card = document.querySelector(`#queue-sections li.card[data-task-id="${{id}}"]`);
+          card.querySelector('.task-action-menu').open = true;
+          card.querySelector('.task-delete-box button').click();
+          assert(card.querySelector('.task-delete-box .stakes-confirm'), 'delete asks for confirmation');
+          card.querySelectorAll('.task-delete-box button')[1].click();
+          await new Promise(r => setTimeout(r, 200));
+          assert((await fetch(`/api/queue/${{id}}`)).status === 404, 'delete removes record');
+          return true;
+        }})()"##, id = Value::from(ids[1].as_str()))).await.expect("queue controls and saves");
+        assert_eq!(result, true, "queue controls at {width}px");
+        // Each viewport starts with the same editable repository-default task.
+        let mut task = original.clone();
+        queue.put(&mut task).unwrap();
         browser.close_page(&page).await;
     }
 }

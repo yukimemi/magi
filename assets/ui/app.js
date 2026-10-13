@@ -2310,21 +2310,32 @@ function createTaskCard() {
   const answers = el("details", { class: "advanced" },
     el("summary", { text: "Resolved questions" }),
     answersList);
-  const runLink = el("a", { class: "btn btn-quiet" });
-  const historyLink = el("a", { class: "btn btn-quiet", text: "Attempts" });
+  const runLink = el("a", { class: "task-run-link" });
+  meta.append(runLink);
   /* Priority is a step, not a typed value: the operator wants "ahead of
      that other one", not to compose a number. +1/-1 both reach the same
      places a competing task's priority already sits. */
   const priorityDown = el("button", { class: "btn btn-quiet btn-step", type: "button", text: "−" });
   const priorityUp = el("button", { class: "btn btn-quiet btn-step", type: "button", text: "+" });
-  const priorityBox = el("span", { class: "task-priority-box" }, priorityDown, priorityUp);
-  const implementersBox = el("div", { class: "task-implementers" });
+  const priorityValue = el("span", { class: "task-priority-value" });
+  const priorityBox = el("span", { class: "task-priority-box" }, priorityDown, priorityValue, priorityUp);
   const editBtn = el("button", { class: "btn btn-quiet", type: "button", text: "Edit" });
   const holdBox = el("span", { class: "task-hold-box" });
   const doneBox = el("span", { class: "task-done-box" });
   const deleteBox = el("span", { class: "task-delete-box" });
-  const actions = el("div", { class: "card-actions" },
-    historyLink, runLink, priorityBox, implementersBox, editBtn, holdBox, doneBox, deleteBox);
+  const actionMenu = el("details", { class: "task-action-menu" },
+    el("summary", { class: "btn btn-quiet", text: "Actions" }),
+    el("div", { class: "task-menu-items" }, holdBox, doneBox, deleteBox));
+  actionMenu.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      actionMenu.open = false;
+      actionMenu.querySelector("summary").focus();
+    }
+  });
+  const actions = el("div", { class: "card-actions task-card-actions" },
+    priorityBox, editBtn, actionMenu);
 
   const card = el("li", { class: "card task-card" },
     el("div", { class: "card-top" }, chipSlot, urgent, priority, solo, followup, permalink, whenSlot),
@@ -2359,8 +2370,8 @@ function createTaskCard() {
   });
   card.refs = {
     card, chipSlot, urgent, priority, solo, followup, permalink, whenSlot, title, source, repo, attempts,
-    outcome, note, snippet, error, instruction, answers, answersList, runLink, historyLink,
-    priorityDown, priorityUp, implementersBox, editBtn, holdBox, doneBox, deleteBox,
+    outcome, note, snippet, error, instruction, answers, answersList, runLink, actionMenu,
+    priorityDown, priorityUp, priorityValue, editBtn, holdBox, doneBox, deleteBox,
   };
   return card;
 }
@@ -2378,7 +2389,7 @@ function updateTaskCard(row, task) {
   setText(r.permalink, shortId(task.id));
   setAttr(r.permalink, "href", `#/queue/${encodeURIComponent(task.id)}`);
   setAttr(r.permalink, "aria-label", `Link to task ${task.id}`);
-  setAttr(r.historyLink, "href", `#/tasks/${encodeURIComponent(task.id)}`);
+  setAttr(r.actionMenu.querySelector("summary"), "aria-label", `Actions for task ${task.title || task.id}`);
 
   setChip(r.chipSlot, status, TASK_STATUS);
 
@@ -2514,7 +2525,7 @@ function updateTaskCard(row, task) {
      claim; a running task has already left that pool (see
      `Task::set_priority`'s doc), so the buttons are disabled rather than
      left to round-trip a 4xx. */
-  renderTaskImplementers(r.implementersBox, task);
+  setText(r.priorityValue, `Priority ${Number(task.priority) || 0}`);
   const priorityNow = Number(task.priority) || 0;
   r.priorityDown.disabled = status === "running";
   r.priorityUp.disabled = status === "running";
@@ -2531,12 +2542,17 @@ function updateTaskCard(row, task) {
     editable ? "" : "Only a queued or held task's instruction can be edited.",
   );
   r.editBtn.onclick = () => openTaskEdit(task);
-  show(r.editBtn, status !== "done");
 
   const host = cardHost(row, task);
-  renderTaskHoldBox(host, task, r.holdBox);
-  renderTaskDoneBox(host, task, r.doneBox);
-  renderTaskDeleteBox(host, task, r.deleteBox);
+  // Keep confirmation nodes intact across polling, including focus and pending buttons.
+  for (const [key, render] of [["hold", renderTaskHoldBox], ["done", renderTaskDoneBox], ["delete", renderTaskDeleteBox]]) {
+    const box = r[`${key}Box`];
+    const signature = `${status}:${host.armed(key)}`;
+    if (box.dataset.signature !== signature) {
+      box.dataset.signature = signature;
+      render(host, task, box);
+    }
+  }
 }
 
 /* The Queue card and the task detail's actions sheet render the same Hold /
@@ -2545,7 +2561,7 @@ function updateTaskCard(row, task) {
      armed(key)    is this two-step control open?
      set(key, on)  open / close it and redraw
      focus()       should a freshly drawn control take focus?
-     reason / setReason   the Hold reason typed so far (sheet only)
+     reason / setReason   the Hold reason typed so far
      refresh(id)   a change landed
      error(msg)    a change was refused
      deleted(id)   the task is gone */
@@ -2555,10 +2571,19 @@ function cardHost(row, task) {
     armed: (key) => row.dataset[`armed${cap(key)}`] === "1",
     set: (key, on) => {
       row.dataset[`armed${cap(key)}`] = on ? "1" : "";
+      row.taskActionFocus = on;
+      if (on) row.refs.actionMenu.open = true;
+      if (key === "hold" && !on) row.taskHoldReason = "";
       const latest = (state.queue || []).find((t) => t.id === task.id) || task;
       updateTaskCard(row, latest);
     },
-    focus: () => true,
+    focus: () => {
+      const focus = row.taskActionFocus;
+      row.taskActionFocus = false;
+      return focus;
+    },
+    reason: () => row.taskHoldReason || "",
+    setReason: (reason) => { row.taskHoldReason = reason; },
     refresh: () => refreshTask(task.id),
     error: (msg) => fail(msg),
     deleted: () => loadQueue(),
@@ -2743,61 +2768,6 @@ async function refreshTask(id) {
   const jobs = [loadQueue()];
   if (state.taskDetail.id === id) jobs.push(loadTask(id));
   await Promise.all(jobs);
-}
-
-const taskImplementersPending = new Set();
-const taskImplementersMessages = new Map();
-
-function renderTaskImplementers(box, task, host = null) {
-  if (box.dataset.saving === "true") return;
-  clear(box);
-  const editable = ["queued", "held"].includes(String(task.status_str || task.status));
-  let current = task.solo ? 1 : task.overrides?.candidates;
-  const select = el("select", { "aria-label": `Implementers for ${task.title || task.id}` });
-  if (!current) select.append(el("option", { value: "", text: "Repository default", disabled: true }));
-  for (const n of [1, 2, 3]) select.append(el("option", { value: String(n), text: n === 1 ? "Solo (1)" : String(n) }));
-  select.value = current ? String(current) : "";
-  select.disabled = !editable || taskImplementersPending.has(task.id);
-  const result = el("span", { role: "status", "aria-live": "polite", text: taskImplementersMessages.get(task.id) || "" });
-  const save = el("button", { class: "btn btn-quiet", type: "button", text: "Save implementers", disabled: true });
-  select.onchange = () => { save.disabled = !editable || taskImplementersPending.has(task.id) || select.value === String(current || ""); };
-  save.onclick = async () => {
-    if (taskImplementersPending.has(task.id)) return;
-    taskImplementersPending.add(task.id);
-    const count = Number(select.value);
-    box.dataset.saving = "true";
-    select.disabled = save.disabled = true;
-    taskImplementersMessages.set(task.id, "Saving…");
-    setText(result, "Saving…");
-    try {
-      await postJson(API.implementers(task.id), { implementers: count });
-      current = count;
-      const message = `Saved ${count} implementer${count === 1 ? "" : "s"}.`;
-      taskImplementersMessages.set(task.id, message);
-      setText(result, message);
-      announce(`Task ${shortId(task.id)} implementers set to ${count}.`);
-    } catch (error) {
-      const message = `Could not save implementers: ${error.message}`;
-      taskImplementersMessages.set(task.id, message);
-      setText(result, message);
-      announce(message);
-    } finally {
-      taskImplementersPending.delete(task.id);
-      box.dataset.saving = "false";
-      select.disabled = !editable;
-      save.disabled = !editable || select.value === String(current || "");
-      try {
-        if (host) await host.refresh(task.id);
-        else await refreshTask(task.id);
-      } catch (error) {
-        setText(result, `Could not refresh task: ${error.message}`);
-      }
-    }
-  };
-  box.append(el("label", {}, el("span", { text: "Implementers " }), select), save,
-    el("p", { class: "hint", text: editable
-      ? "Changing the count may start a new run instead of reusing earlier candidate work."
-      : "Only queued or held tasks can change implementers." }), result);
 }
 
 async function changePriority(id, priority, host = null) {
@@ -10094,9 +10064,6 @@ function renderTaskActions(task) {
   );
 
   clear(editBox);
-  const implementersBox = el("div", { class: "task-implementers" });
-  renderTaskImplementers(implementersBox, task, host);
-  editBox.append(implementersBox);
   if (status !== "done") {
     const editable = status === "queued" || status === "held";
     const edit = el("button", {
@@ -10131,9 +10098,23 @@ function closeTaskActions() {
  * already in it rather than blank - overwriting is how "add a clause" gets
  * typed, but starting from nothing is how the rest of it gets lost. */
 let editingTaskId = null;
+let taskEditBaseline = null;
+let taskEditSaving = false;
 
 function openTaskEdit(task) {
+  if (taskEditSaving) return;
   editingTaskId = task.id;
+  taskEditBaseline = {
+    title: task.title || "", instruction: task.instruction || "",
+    implementers: String(task.solo ? 1 : task.overrides?.candidates || ""),
+  };
+  $("task-edit-implementers").value = taskEditBaseline.implementers;
+  $("task-edit-attempts").textContent = `${Number(task.attempts) || 0} attempts counted. The attempt limit is configured for the daemon, not per task.`;
+  setAttr($("task-edit-history"), "href", `#/tasks/${encodeURIComponent(task.id)}`);
+  $("task-edit-history").onclick = (event) => {
+    if (taskEditSaving) event.preventDefault();
+    else closeTaskEdit();
+  };
   $("task-edit-title").value = task.title || "";
   $("task-edit-instruction").value = task.instruction || "";
   show($("task-edit-error"), false);
@@ -10144,35 +10125,55 @@ function openTaskEdit(task) {
 }
 
 function closeTaskEdit() {
+  if (taskEditSaving) return;
   const dialog = $("task-edit-sheet");
   if (dialog.open) dialog.close();
   editingTaskId = null;
 }
 
 async function saveTaskEdit() {
-  if (!editingTaskId) return;
+  if (!editingTaskId || taskEditSaving) return;
   const id = editingTaskId;
   const title = $("task-edit-title").value.trim();
   const instruction = $("task-edit-instruction").value;
-  if (!title || !instruction.trim()) {
+  const textChanged = title !== taskEditBaseline.title || instruction !== taskEditBaseline.instruction;
+  if (textChanged && (!title || !instruction.trim())) {
     setText($("task-edit-error"), "Give both a title and an instruction.");
     show($("task-edit-error"), true);
     return;
   }
+  const implementers = $("task-edit-implementers").value;
+  const saved = [];
   const button = $("task-edit-save");
   const label = button.textContent;
+  taskEditSaving = true;
+  const fields = [$("task-edit-title"), $("task-edit-instruction"), $("task-edit-implementers"), $("task-edit-close")];
+  fields.forEach((field) => { field.disabled = true; });
   button.disabled = true;
   setText(button, "Saving…");
   try {
-    await postJson(API.editTask(id), { title, instruction });
+    if (textChanged) {
+      await postJson(API.editTask(id), { title, instruction });
+      taskEditBaseline.title = title;
+      taskEditBaseline.instruction = instruction;
+      saved.push("Title and instruction");
+    }
+    if (implementers !== taskEditBaseline.implementers) {
+      await postJson(API.implementers(id), { implementers: Number(implementers) });
+      taskEditBaseline.implementers = implementers;
+      saved.push("Implementers");
+    }
     ok();
     announce(`Task ${shortId(id)} edited.`);
+    taskEditSaving = false;
     closeTaskEdit();
-    await refreshTask(id);
+    try { await refreshTask(id); } catch (error) { fail(`Saved task, but could not refresh: ${error.message}`); }
   } catch (error) {
-    setText($("task-edit-error"), error.message);
+    setText($("task-edit-error"), `${saved.length ? `${saved.join(" and ")} saved. Remaining changes were not saved. ` : "No changes saved by this attempt. "}${error.message}`);
     show($("task-edit-error"), true);
   } finally {
+    taskEditSaving = false;
+    fields.forEach((field) => { field.disabled = false; });
     button.disabled = false;
     setText(button, label);
   }
@@ -10293,6 +10294,14 @@ function wire() {
     $("run-actions-fab").focus({ preventScroll: true });
   });
 
+  document.addEventListener("click", (event) => {
+    for (const menu of document.querySelectorAll(".task-action-menu[open]")) {
+      if (!event.composedPath().includes(menu)) menu.open = false;
+    }
+  });
+  $("task-edit-sheet").addEventListener("cancel", (event) => {
+    if (taskEditSaving) event.preventDefault();
+  });
   $("task-edit-close").addEventListener("click", closeTaskEdit);
   $("task-edit-save").addEventListener("click", saveTaskEdit);
   $("task-edit-sheet").addEventListener("click", (event) => {
