@@ -31,6 +31,7 @@
 //! rather than for another agent.
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -118,7 +119,10 @@ use crate::ask::Questions;
 ///
 /// 14: record whether a task count edit's overrides inherit daemon options.
 /// Old overrides default to isolated command-line settings, including empty ones.
-pub const SCHEMA: u32 = 15;
+///
+/// 16: added [`Task::attempt_limit`], an optional task-specific retry budget.
+/// Field-only, `#[serde(default)]`; old records inherit the daemon limit.
+pub const SCHEMA: u32 = 16;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,6 +305,9 @@ pub struct Task {
     /// How many times this task has been claimed.
     #[serde(default)]
     pub attempts: usize,
+    /// Total attempt budget; `None` inherits the daemon limit.
+    #[serde(default)]
+    pub attempt_limit: Option<NonZeroUsize>,
     /// Runs this task has produced, oldest first.
     #[serde(default)]
     pub runs: Vec<String>,
@@ -719,6 +726,7 @@ impl Task {
             solo: false,
             status: TaskStatus::Queued,
             attempts: 0,
+            attempt_limit: None,
             runs: Vec::new(),
             last_error: None,
             hold_reason: None,
@@ -1002,7 +1010,7 @@ impl Task {
         let why = why.into();
         self.diagnostic = None;
         self.park_reason = None;
-        self.status = if self.attempts >= max_attempts {
+        self.status = if self.attempts >= self.effective_attempt_limit(max_attempts) {
             self.note_held();
             self.hold_source = Some(HoldSource::Machine);
             self.hold_reason = Some(why.clone());
@@ -1308,6 +1316,22 @@ impl Task {
             );
         }
         self.interrupt = interrupt;
+        Ok(())
+    }
+
+    /// Resolve the task override against the running daemon's limit.
+    pub fn effective_attempt_limit(&self, daemon_limit: usize) -> usize {
+        self.attempt_limit.map_or(daemon_limit, NonZeroUsize::get)
+    }
+
+    /// Change the budget without resetting attempts or releasing a hold.
+    /// Callers must hold the queue claim and reload the task before calling.
+    pub fn change_attempt_limit(&mut self, limit: Option<NonZeroUsize>) -> Result<()> {
+        if !matches!(self.status, TaskStatus::Queued | TaskStatus::Held) {
+            bail!("only queued or held tasks can change the attempt limit");
+        }
+        self.stamp_schema();
+        self.attempt_limit = limit;
         Ok(())
     }
 
@@ -2785,6 +2809,40 @@ mod tests {
             PathBuf::from("."),
             Source::Human,
         )
+    }
+
+    #[test]
+    fn attempt_limit_inherits_old_records_and_controls_failure() {
+        let mut t = task("budget");
+        let mut old = serde_json::to_value(&t).unwrap();
+        old.as_object_mut().unwrap().remove("attempt_limit");
+        old["schema"] = serde_json::json!(15);
+        let legacy: Task = serde_json::from_value(old).unwrap();
+        assert_eq!(legacy.attempt_limit, None);
+        assert_eq!(legacy.effective_attempt_limit(2), 2);
+        t.attempts = 2;
+        t.change_attempt_limit(NonZeroUsize::new(3)).unwrap();
+        t.fail("retry", 1);
+        assert_eq!(t.status, TaskStatus::Failed);
+        t.attempts = 3;
+        t.fail("stop", 10);
+        assert_eq!(t.status, TaskStatus::Held);
+        t.change_attempt_limit(None).unwrap();
+        assert_eq!(t.status, TaskStatus::Held);
+        assert_eq!(t.attempts, 3);
+        t.fail("inherit", 4);
+        assert_eq!(t.status, TaskStatus::Failed);
+        for status in [
+            TaskStatus::Running,
+            TaskStatus::Done,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Parked,
+        ] {
+            t.status = status;
+            assert!(t.change_attempt_limit(NonZeroUsize::new(1)).is_err());
+            assert_eq!(t.attempt_limit, None);
+        }
     }
 
     #[test]

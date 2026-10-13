@@ -39,6 +39,7 @@ const API = {
   deleteTask: (id) => `/api/queue/${encodeURIComponent(id)}`,
   hold: (id) => `/api/queue/${encodeURIComponent(id)}/hold`,
   release: (id) => `/api/queue/${encodeURIComponent(id)}/release`,
+  attemptLimit: (id) => `/api/queue/${encodeURIComponent(id)}/attempt-limit`,
   implementers: (id) => `/api/queue/${encodeURIComponent(id)}/implementers`,
   urgent: (id) => `/api/queue/${encodeURIComponent(id)}/urgent`,
   priority: (id) => `/api/queue/${encodeURIComponent(id)}/priority`,
@@ -9985,7 +9986,7 @@ function renderTask() {
   setText($("task-attempts-count"), history.length
     ? `${plural(passesTotal, "pass", "passes")} over ${plural(runsDistinct, "run", "runs")} \u00b7 ${spent} of ${task.max_attempts} attempts used`
     : "");
-  setText($("task-attempts-note"), `${task.attempts_note || ""} (Budget shown is the default of ${task.max_attempts}; a loop started with a different limit uses its own.)`);
+  setText($("task-attempts-note"), `${task.attempts_note || ""} (${task.attempt_limit != null ? `Task limit: ${task.max_attempts}.` : `Budget shown is the default of ${task.max_attempts}; a loop started with a different limit uses its own.`})`);
   const unreadable = Number(task.runs_unreadable) || 0;
   setText($("task-unreadable"), unreadable
     ? `${unreadable} of these runs could not be read by this build and are listed without detail.`
@@ -10211,10 +10212,12 @@ function openTaskEdit(task) {
   editingTaskId = task.id;
   taskEditBaseline = {
     title: task.title || "", instruction: task.instruction || "",
+    attemptLimit: String(task.attempt_limit ?? ""),
     implementers: String(task.solo ? 1 : task.overrides?.candidates || ""),
   };
   $("task-edit-implementers").value = taskEditBaseline.implementers;
-  $("task-edit-attempts").textContent = `${Number(task.attempts) || 0} attempts counted. The attempt limit is configured for the daemon, not per task.`;
+  $("task-edit-attempt-limit").value = taskEditBaseline.attemptLimit;
+  $("task-edit-attempts").textContent = `${Number(task.attempts) || 0} attempts counted. Leave the limit blank to inherit the daemon setting. Changing it does not reset attempts or release a held task.`;
   setAttr($("task-edit-history"), "href", `#/tasks/${encodeURIComponent(task.id)}`);
   $("task-edit-history").onclick = (event) => {
     if (taskEditSaving) event.preventDefault();
@@ -10248,11 +10251,17 @@ async function saveTaskEdit() {
     return;
   }
   const implementers = $("task-edit-implementers").value;
+  const attemptLimit = $("task-edit-attempt-limit").value.trim();
+  if (!$("task-edit-attempt-limit").validity.valid || (attemptLimit !== "" && (!Number.isSafeInteger(Number(attemptLimit)) || Number(attemptLimit) < 1))) {
+    setText($("task-edit-error"), "Use a positive whole number for the attempt limit, or leave it blank.");
+    show($("task-edit-error"), true);
+    return;
+  }
   const saved = [];
   const button = $("task-edit-save");
   const label = button.textContent;
   taskEditSaving = true;
-  const fields = [$("task-edit-title"), $("task-edit-instruction"), $("task-edit-implementers"), $("task-edit-close")];
+  const fields = [$("task-edit-title"), $("task-edit-instruction"), $("task-edit-implementers"), $("task-edit-attempt-limit"), $("task-edit-close")];
   fields.forEach((field) => { field.disabled = true; });
   button.disabled = true;
   setText(button, "Saving…");
@@ -10267,6 +10276,11 @@ async function saveTaskEdit() {
       await postJson(API.implementers(id), { implementers: Number(implementers) });
       taskEditBaseline.implementers = implementers;
       saved.push("Implementers");
+    }
+    if (attemptLimit !== taskEditBaseline.attemptLimit) {
+      await postJson(API.attemptLimit(id), { attempt_limit: attemptLimit === "" ? null : Number(attemptLimit) });
+      taskEditBaseline.attemptLimit = attemptLimit;
+      saved.push("Attempt limit");
     }
     ok();
     announce(`Task ${shortId(id)} edited.`);

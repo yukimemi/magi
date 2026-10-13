@@ -923,6 +923,7 @@ impl Ui {
             .route("/api/queue/{id}/priority", post(queue_priority))
             .route("/api/queue/{id}/urgent", post(queue_urgent))
             .route("/api/queue/{id}/implementers", post(queue_implementers))
+            .route("/api/queue/{id}/attempt-limit", post(queue_attempt_limit))
             .route("/api/queue/{id}/edit", post(queue_edit))
             .route("/api/queue/{id}/done", post(queue_done))
             .route("/api/questions", get(questions_list))
@@ -3264,6 +3265,7 @@ fn task_outcome(
     max_attempts: usize,
     read: impl Fn(&str) -> Option<RunState>,
 ) -> TaskRef {
+    let max_attempts = task.effective_attempt_limit(max_attempts);
     let history = task_history(task, read);
     let brief = |h: &TaskRunView| RunBrief {
         id: h.id.clone(),
@@ -4719,8 +4721,8 @@ impl RunExit {
 struct TaskDetailView {
     #[serde(flatten)]
     task: TaskView,
-    /// The attempt budget `magi serve` / `magi web` start a loop with unless
-    /// told otherwise; the loop's own flag is not visible from here.
+    /// Task override, or the default daemon budget when inherited.
+    /// A separate loop's command-line limit is not visible from here.
     max_attempts: usize,
     history: Vec<TaskRunView>,
     /// Entries in `history`: passes over runs, not distinct runs and not
@@ -5065,6 +5067,7 @@ fn task_flow(
     max_attempts: usize,
     origin: Option<&FollowUpOrigin>,
 ) -> FlowView {
+    let max_attempts = task.effective_attempt_limit(max_attempts);
     let node = |key: &str, kind, label: String| FlowNode {
         key: key.to_owned(),
         kind,
@@ -5349,7 +5352,7 @@ async fn task_detail(
         let mut history = task_history(&task, |id| read_run(&ui.runs, id).ok());
         mark_badges(&ui, &task, &mut history);
         let runs_unreadable = history.iter().filter(|h| !h.readable).count();
-        let max_attempts = daemon::Opts::default().max_attempts;
+        let max_attempts = task.effective_attempt_limit(daemon::Opts::default().max_attempts);
         let origin = task.followup.as_ref().map(|fu| {
             followup_origin(
                 fu,
@@ -5856,6 +5859,24 @@ async fn queue_release(
         Ok(())
     })
     .await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttemptLimitBody {
+    // Required even when clearing: missing fields must not silently erase an override.
+    attempt_limit: serde_json::Value,
+}
+
+async fn queue_attempt_limit(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<AttemptLimitBody>, JsonRejection>,
+) -> ApiResult<Json<TaskView>> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    let limit = serde_json::from_value::<Option<std::num::NonZeroUsize>>(body.attempt_limit)
+        .map_err(|_| ApiError::bad_request("attempt_limit must be a positive integer or null"))?;
+    mutate(ui, id, move |t| t.change_attempt_limit(limit)).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -13110,6 +13131,107 @@ mod tests {
         // `magi task list` both use - GET /api/queue must agree with it
         // immediately, not just once the loop claims the task.
         assert_eq!(names[0], older.id, "the raised task now sorts first");
+    }
+
+    #[tokio::test]
+    async fn task_attempt_limit_api_persists_validates_and_refuses_claims() {
+        let dir = TempDir::new().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let ui = Arc::new(Ui::new(
+            q.clone(),
+            Questions::at(dir.path().join("questions")),
+            Talks::at(dir.path().join("talks")),
+            dir.path().join("runs"),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        ));
+        let mut t = Task::new(
+            "budget".into(),
+            "keep".into(),
+            dir.path().into(),
+            Source::Human,
+        );
+        t.attempts = 2;
+        t.runs.push("prior-run".into());
+        t.hold_manual(Some("waiting".into()));
+        q.put(&mut t).unwrap();
+        let change = |value| {
+            queue_attempt_limit(
+                State(ui.clone()),
+                Path(t.id.clone()),
+                Ok(Json(AttemptLimitBody {
+                    attempt_limit: value,
+                })),
+            )
+        };
+        for value in [
+            serde_json::json!(3),
+            serde_json::Value::Null,
+            serde_json::json!(1),
+        ] {
+            let response = change(value.clone()).await.unwrap();
+            assert_eq!(
+                serde_json::to_value(response.0).unwrap()["attempt_limit"],
+                value
+            );
+            let saved = q.get(&t.id).unwrap();
+            assert_eq!(
+                serde_json::to_value(&saved).unwrap()["attempt_limit"],
+                value
+            );
+            assert_eq!(saved.status, TaskStatus::Held);
+            assert_eq!(saved.attempts, t.attempts);
+            assert_eq!(saved.runs, t.runs);
+            assert_eq!(saved.hold_reason, t.hold_reason);
+            let detail = task_detail(State(ui.clone()), Path(t.id.clone()))
+                .await
+                .unwrap()
+                .0;
+            assert_eq!(detail.max_attempts, saved.effective_attempt_limit(2));
+            assert_eq!(detail.flow.max_attempts, detail.max_attempts);
+            let outcome = task_outcome(&saved, "prior-run", 2, |_| None);
+            assert_eq!(outcome.max_attempts, detail.max_attempts);
+        }
+        for value in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("3"),
+            serde_json::json!(true),
+        ] {
+            assert_eq!(
+                change(value).await.err().unwrap().status,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert!(serde_json::from_str::<AttemptLimitBody>("{}").is_err());
+        let claim = q.claim(&t.id).unwrap();
+        assert_eq!(
+            change(serde_json::json!(4)).await.err().unwrap().status,
+            StatusCode::CONFLICT
+        );
+        drop(claim);
+        for status in [
+            TaskStatus::Running,
+            TaskStatus::Done,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Parked,
+        ] {
+            let mut stored = q.get(&t.id).unwrap();
+            stored.status = status;
+            q.put(&mut stored).unwrap();
+            assert_eq!(
+                change(serde_json::json!(4)).await.err().unwrap().status,
+                StatusCode::BAD_REQUEST
+            );
+            assert_eq!(q.get(&t.id).unwrap().attempt_limit.unwrap().get(), 1);
+        }
+        let mut stored = q.get(&t.id).unwrap();
+        stored.status = TaskStatus::Queued;
+        q.put(&mut stored).unwrap();
+        let _ = change(serde_json::Value::Null).await.unwrap();
+        assert_eq!(q.get(&t.id).unwrap().attempt_limit, None);
     }
 
     #[tokio::test]
