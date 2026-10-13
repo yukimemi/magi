@@ -2227,6 +2227,9 @@ pub struct RunState {
     /// Candidate preparation stopped before agents ran; requires an explicit source correction.
     #[serde(default)]
     pub prep_failure: Option<String>,
+    /// None identifies legacy records; new runs persist preparation completion explicitly.
+    #[serde(default)]
+    pub prep_complete: Option<bool>,
     /// Per-seat conversation state.
     #[serde(default)]
     pub seats: BTreeMap<String, SeatState>,
@@ -2454,6 +2457,7 @@ impl RunState {
             released_branches: Vec::new(),
             seeds: Vec::new(),
             prep_failure: None,
+            prep_complete: Some(false),
             seats: BTreeMap::new(),
             active: BTreeMap::new(),
             driver_pid: None,

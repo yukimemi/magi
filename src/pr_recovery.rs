@@ -22,6 +22,35 @@ pub struct Selection {
     pub approved_at: jiff::Timestamp,
 }
 
+const RETAIN_SOURCES: &str = "retain-recovery-sources";
+
+/// Preserve every historical run's source artifacts before releasing a recovery task.
+/// A sidecar survives stale run-state saves and applies even to older run schemas.
+pub fn retain_sources(task: &crate::queue::Task, home: &Path) -> Result<()> {
+    for id in task.runs.iter().collect::<std::collections::BTreeSet<_>>() {
+        ensure!(
+            crate::run::is_run_id(id),
+            "invalid historical run id; refusing source retention"
+        );
+        let dir = home.join("runs").join(id);
+        ensure!(
+            dir.is_dir(),
+            "historical run {id} is missing; cannot retain its sources"
+        );
+        std::fs::write(dir.join(RETAIN_SOURCES), &task.id)
+            .with_context(|| format!("retaining sources of historical run {id}"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn sources_retained(home: &Path, id: &str) -> bool {
+    home.join("runs")
+        .join(id)
+        .join(RETAIN_SOURCES)
+        .try_exists()
+        .unwrap_or(true)
+}
+
 /// A partially created recovery is retained and linked to its task for inspection.
 #[derive(Debug)]
 pub(crate) struct StartupFailed {

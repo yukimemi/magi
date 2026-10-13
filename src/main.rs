@@ -3216,6 +3216,7 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 Some(&config),
             )
             .await?;
+            magi::pr_recovery::retain_sources(&t, &magi::run::home())?;
             t.release_operator("cli-recover-pr", None);
             t.pr_recovery = Some(selected);
             t.review_branch = None;
@@ -3940,6 +3941,9 @@ async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
         task.short(),
         task.short()
     );
+    if runner.state.prep_failure.is_some() && claim.is_some() {
+        runner.retry_preparation(jiff::Timestamp::now())?;
+    }
     if claim.is_none() {
         // The loop resumes it: an attempt at a task whose newest run is
         // unfinished resumes that run (`Runner::resume`), never competes again.

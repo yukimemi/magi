@@ -2987,7 +2987,14 @@ async fn attempt(
         }
         Starter::Resume(id) => {
             tracing::info!("resuming run {id} rather than competing again");
-            Runner::resume(id).map(|mut r| {
+            Runner::resume(id).and_then(|mut r| {
+                if r.state.prep_failure.is_some() {
+                    let approval = task
+                        .resumption
+                        .as_ref()
+                        .context("preparation retry requires an explicit task release")?;
+                    r.retry_preparation(approval.at)?;
+                }
                 if let Some(instruction) =
                     prepare_instruction(&starter, Some(&r.state.instruction), task)
                 {
@@ -3004,7 +3011,7 @@ async fn attempt(
                 {
                     r.state.config.merge.mode = mode;
                 }
-                r
+                Ok(r)
             })
         }
         Starter::Start => {
