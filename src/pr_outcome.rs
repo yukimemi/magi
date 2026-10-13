@@ -60,7 +60,7 @@ pub fn review_rounds(state: &RunState) -> String {
 /// Evidence for the independent public description. Raw reports are never
 /// input: only open findings and explicit decline reasons need paraphrasing.
 pub fn summary_evidence(state: &RunState, head: FinalHead<'_>) -> String {
-    let open = state.open_findings();
+    let open = state.last_round_findings();
     let declined: Vec<_> = state
         .reviews
         .iter()
@@ -95,7 +95,7 @@ pub fn summary_evidence(state: &RunState, head: FinalHead<'_>) -> String {
 pub fn summary_fingerprint(state: &RunState, evidence: &str) -> String {
     crate::github_text::fingerprint(
         &format!(
-            "public-description-v2:{}",
+            "public-description-v3:{}",
             state.config.graph.github_language
         ),
         evidence,
@@ -104,7 +104,11 @@ pub fn summary_fingerprint(state: &RunState, evidence: &str) -> String {
 
 /// Every finding requiring public context must be covered by the generator.
 pub fn required_finding_ids(state: &RunState) -> Vec<String> {
-    let mut ids: Vec<_> = state.open_findings().iter().map(|f| f.id.clone()).collect();
+    let mut ids: Vec<_> = state
+        .last_round_findings()
+        .iter()
+        .map(|f| f.id.clone())
+        .collect();
     ids.extend(
         state
             .reviews
@@ -115,6 +119,16 @@ pub fn required_finding_ids(state: &RunState) -> Vec<String> {
     ids.sort();
     ids.dedup();
     ids
+}
+
+/// Check the prose before appending structural facts: an ID in the appended
+/// finding list cannot substitute for the generator's explanation of it.
+pub fn covers_required_findings(state: &RunState, prose: &str) -> bool {
+    required_finding_ids(state).iter().all(|id| {
+        prose
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+            .any(|word| word == id)
+    })
 }
 
 fn last_checked(state: &RunState) -> Option<&ReviewRound> {

@@ -6923,6 +6923,17 @@ impl Runner {
                     let mut body = crate::scrub::scrub(&raw_body, &identity);
                     let redacted = clean_title != title || body != raw_body;
                     let title = clean_title;
+                    let complete = crate::pr_outcome::covers_required_findings(&self.state, &body);
+                    if !complete {
+                        self.state.event(
+                            "github-text",
+                            "description rewrite omitted required findings",
+                        );
+                    }
+                    if !body.trim().is_empty() {
+                        body.push_str("\n\n");
+                        body.push_str(&public_pr_evidence(&self.state, head));
+                    }
                     let marker = format!("magi:run/{}", self.state.id);
                     if !body.trim().is_empty() && !body.contains(&marker) {
                         body.push_str(&format!("\n\n{marker}"));
@@ -6944,7 +6955,11 @@ impl Runner {
                     {
                         failed.push(crate::github_text::Violation::SensitiveData);
                     }
-                    if !title.trim().is_empty() && !body.trim().is_empty() && !failed.is_empty() {
+                    if complete
+                        && !title.trim().is_empty()
+                        && !body.trim().is_empty()
+                        && !failed.is_empty()
+                    {
                         rejected_rewrite = Some(crate::run::GithubTextRewrite {
                             title: title.clone(),
                             body: body.clone(),
@@ -6954,7 +6969,11 @@ impl Runner {
                                 .collect(),
                         });
                     }
-                    if !title.trim().is_empty() && !body.trim().is_empty() && failed.is_empty() {
+                    if complete
+                        && !title.trim().is_empty()
+                        && !raw_body.trim().is_empty()
+                        && failed.is_empty()
+                    {
                         decision = redecision;
                         pr = PrMessage { title, body };
                         rewritten = true;
@@ -7149,14 +7168,7 @@ impl Runner {
             if body.trim().is_empty() || title.trim().is_empty() {
                 continue;
             }
-            if crate::pr_outcome::required_finding_ids(&self.state)
-                .iter()
-                .any(|id| {
-                    !body
-                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
-                        .any(|word| word == id)
-                })
-            {
+            if !crate::pr_outcome::covers_required_findings(&self.state, &body) {
                 continue;
             }
             // The branch must still be the one the agent was shown.
@@ -7215,7 +7227,7 @@ impl Runner {
         violations: &[crate::github_text::Violation],
     ) -> Option<String> {
         let prompt = format!(
-            "Rewrite only the following pull request description into English. The posting gate reported {violations:?}. Keep every substantive detail (file names, commands, numbers, findings, code blocks and <details> sections) and translate the prose. Remove all machine or operator identifying data and secrets. Do not edit files or run commands. Return TITLE: followed by the title, then the complete Markdown body. Preserve the magi run marker.\n\nTITLE: {}\n{}",
+            "Rewrite only the following pull request description into English. The posting gate reported {violations:?}. Keep every substantive detail (file names, commands, numbers, findings, code blocks and <details> sections) and translate the prose. Remove all machine or operator identifying data and secrets. Do not edit files or run commands. Return TITLE: followed by the title, then the rewritten description. Include an explanation of every open or declined finding with its exact ID. Omit the generated Review rounds, Final verification and Open review findings sections, the Evidence line and run markers: magi appends those from its records.\n\nTITLE: {}\n{}",
             pr.title, pr.body
         );
         let sessions = self.state.config.graph.sessions;
@@ -10136,22 +10148,7 @@ fn pr_message_raw(
             ),
             ChangeNote::NotAsked => unreachable!(),
         };
-        body.push_str(&crate::pr_outcome::review_rounds(state));
-        body.push_str(&crate::pr_outcome::final_verification(state, head));
-        let open = state.open_findings();
-        if !open.is_empty() {
-            body.push_str("## Open review findings\n\n");
-            for f in open {
-                body.push_str(&format!("- `{}` [{:?}]\n", f.id, f.severity));
-            }
-            body.push('\n');
-        }
-        if let ChangeNote::Summary(c) = change {
-            body.push_str(&format!(
-                "Evidence: final diff `{}`..`{}`; review and verification records from this run.\n",
-                c.base, c.head
-            ));
-        }
+        body.push_str(&public_pr_evidence(state, head));
         body.push_str(&format!(
             "\n---\nmagi:run/{} magi:candidate-{}\n",
             state.id,
@@ -10160,6 +10157,30 @@ fn pr_message_raw(
         return PrMessage { title, body };
     }
     pr_preview(state, winner, facts, head)
+}
+
+/// Append public facts from the run records after every prose generation,
+/// including posting-gate rewrites. The agent cannot drop this provenance.
+fn public_pr_evidence(state: &RunState, head: crate::pr_outcome::FinalHead<'_>) -> String {
+    let mut body = crate::pr_outcome::review_rounds(state);
+    body.push_str(&crate::pr_outcome::final_verification(state, head));
+    let open = state.last_round_findings();
+    if !open.is_empty() {
+        body.push_str("## Open review findings\n\n");
+        for f in open {
+            body.push_str(&format!("- `{}` [{:?}]\n", f.id, f.severity));
+        }
+        body.push('\n');
+    }
+    if let Some(c) = state.change_summary.as_ref()
+        && head == crate::pr_outcome::FinalHead::At(&c.head)
+    {
+        body.push_str(&format!(
+            "Evidence: final diff `{}`..`{}`; review and verification records from this run.\n",
+            c.base, c.head
+        ));
+    }
+    body
 }
 
 /// Local-only preview of the operator's task and candidate summary.
@@ -13320,6 +13341,163 @@ mod tests {
             .expect("an English description never parks")
     }
 
+    fn clean_round_with_minor_findings() -> ReviewRound {
+        let mut round = passing_round(2, None);
+        round.verdict = Some(crate::verdict::ReviewVote::ApproveWithFindings);
+        round.reviews = vec![ReviewRecord {
+            attempts: 0,
+            reviewer: 1,
+            agent: "alpha".into(),
+            summary: "内部レビュー".into(),
+            findings: vec![
+                finding("R2-1-1", Severity::Minor, "未修正の懸念その一"),
+                finding("R2-1-2", Severity::Minor, "未修正の懸念その二"),
+            ],
+            vote: Some(crate::verdict::ReviewVote::ApproveWithFindings),
+            failed: None,
+            duration_ms: 0,
+        }];
+        round
+    }
+
+    #[tokio::test]
+    async fn public_descriptions_cover_minor_findings_from_clean_rounds_in_both_modes() {
+        for review_only in [false, true] {
+            let mut f = summary_fixture();
+            if !review_only {
+                f.runner.state.candidates[0].agent = "alpha".into();
+            }
+            f.runner.state.reviews = vec![clean_round_with_minor_findings()];
+            assert!(f.runner.state.reviews[0].clean);
+            assert!(f.runner.state.reviews[0].fix.is_none());
+            assert!(f.runner.state.open_findings().is_empty());
+            assert_eq!(
+                crate::pr_outcome::required_finding_ids(&f.runner.state),
+                ["R2-1-1", "R2-1-2"]
+            );
+            let head = git::rev_parse(&f.repo, "HEAD").await.unwrap();
+            let evidence = crate::pr_outcome::summary_evidence(
+                &f.runner.state,
+                crate::pr_outcome::FinalHead::At(&head),
+            );
+            assert!(
+                evidence.contains("未修正の懸念その一") && evidence.contains("未修正の懸念その二")
+            );
+            // The ordinary reply omits both IDs: no cached description is adopted.
+            let omitted = posted(&mut f).await;
+            assert!(omitted.body.contains("No description"));
+            assert!(omitted.body.contains("`R2-1-1` [Minor]"));
+            assert!(omitted.body.contains("`R2-1-2` [Minor]"));
+            assert!(f.runner.state.change_summary.is_none());
+            std::fs::write(&f.reply, "TITLE: feat(own): add the own file\nAdds the own file. R2-1-1 [Minor]: improve documentation for callers. R2-1-2 [Minor]: consider the remaining edge case.").unwrap();
+            let described = posted(&mut f).await;
+            assert!(described.body.contains("improve documentation for callers"));
+            assert!(described.body.contains("remaining edge case"));
+            assert!(described.body.contains("## Open review findings"));
+            assert!(!described.body.contains("未修正"));
+        }
+    }
+
+    async fn rewrite_fixture_with_findings(review_only: bool, reply: &str) -> SummaryFixture {
+        let mut f = summary_fixture();
+        if !review_only {
+            f.runner.state.candidates[0].agent = "alpha".into();
+        }
+        let head = git::rev_parse(&f.repo, "HEAD").await.unwrap();
+        let mut fixed = round_with_notes(1, Some("日本語の内部修正報告"));
+        fixed
+            .fix
+            .as_mut()
+            .unwrap()
+            .rejected
+            .push(crate::verdict::Rejection {
+                id: "R1-1-1".into(),
+                why: "呼び出されないコードのため辞退".into(),
+            });
+        let mut clean = clean_round_with_minor_findings();
+        clean.verified_head = Some(head.clone());
+        f.runner.state.reviews = vec![fixed, clean];
+        ok_gate(&mut f.runner.state, Some(&head));
+        std::fs::write(&f.reply, "TITLE: fix: public description\n日本語の公開用説明です。R1-1-1 は辞退。R2-1-1 と R2-1-2 の懸念が残ります。").unwrap();
+        f.runner.state.config.agents.push(scripted("beta", reply));
+        f.runner.state.config.roles.language_judge =
+            Some(crate::config::AgentChoice::One("beta".into()));
+        f
+    }
+
+    #[tokio::test]
+    async fn posting_rewrite_retains_structured_evidence_and_finding_explanations() {
+        for review_only in [false, true] {
+            let mut f = rewrite_fixture_with_findings(review_only,
+                "TITLE: fix: public description\nR1-1-1: declined because no caller reaches this code. R2-1-1 [Minor]: documentation remains incomplete. R2-1-2 [Minor]: an edge case needs follow-up.").await;
+            let m = posted(&mut f).await;
+            let head = git::rev_parse(&f.repo, "HEAD").await.unwrap();
+            let expected =
+                public_pr_evidence(&f.runner.state, crate::pr_outcome::FinalHead::At(&head));
+            assert!(m.body.contains(&expected));
+            assert!(m.body.contains("## Review rounds"));
+            assert!(
+                m.body
+                    .contains("Gate (`verify.gate`): passed on the final commit")
+            );
+            assert!(
+                m.body
+                    .contains("Tests (`verify.e2e`): passed on the final commit")
+            );
+            let c = f.runner.state.change_summary.as_ref().unwrap();
+            assert!(
+                m.body
+                    .contains(&format!("Evidence: final diff `{}`..`{}`", c.base, head))
+            );
+            assert!(m.body.contains(&format!("magi:run/{}", f.runner.state.id)));
+            assert!(crate::pr_outcome::covers_required_findings(
+                &f.runner.state,
+                &m.body
+            ));
+            assert!(m.body.contains("documentation remains incomplete"));
+            assert!(!m.body.contains("内部") && !m.body.contains("辞退"));
+            assert_eq!(f.runner.state.seats["github-text-rewrite"].turns, 1);
+            assert!(f.runner.state.github_text.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn posting_rewrite_missing_required_finding_context_is_not_offered_or_published() {
+        for review_only in [false, true] {
+            for reply in [
+                "TITLE: fix: public description\nA short English description.",
+                "TITLE: fix: public description\nR1-1-1 and R2-1-2 remain; R2-1-1-extra is a different ID.",
+            ] {
+                let mut f = rewrite_fixture_with_findings(review_only, reply).await;
+                let winner = f.runner.state.candidates[0].clone();
+                let posted = f
+                    .runner
+                    .guarded_pr_message(&winner, None, true)
+                    .await
+                    .unwrap();
+                assert!(posted.is_none());
+                assert!(f.runner.state.parked);
+                let withheld = f.runner.state.github_text.as_ref().unwrap();
+                assert!(
+                    withheld.rewrite.is_none(),
+                    "an incomplete rewrite must not be selectable"
+                );
+                let q = ask::Questions::open()
+                    .get(withheld.question.as_ref().unwrap())
+                    .unwrap();
+                assert!(
+                    !q.choices
+                        .contains(&crate::github_text::USE_REWRITE.to_owned())
+                );
+                assert!(
+                    q.detail.contains("R1-1-1")
+                        && q.detail.contains("R2-1-1")
+                        && q.detail.contains("R2-1-2")
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn japanese_reports_stay_local_in_both_public_run_modes() {
         for review_only in [false, true] {
@@ -14247,6 +14425,8 @@ mod tests {
                 assert!(runner.state.github_text.is_none());
                 assert!(!runner.state.parked);
                 assert!(!message.body.contains(crate::github_text::NEUTRAL_BODY));
+                assert!(message.body.contains("## Final verification"));
+                assert!(message.body.contains("Evidence: final diff"));
                 assert!(
                     message
                         .body
