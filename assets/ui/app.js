@@ -4395,7 +4395,9 @@ async function copyText(text) {
   field.setAttribute("inputmode", "none");
   field.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;padding:0;border:0;opacity:0;font-size:16px;pointer-events:none";
   try {
-    document.body.appendChild(field);
+    // A modal makes everything outside it inert, including a body textarea.
+    const host = active?.closest("dialog:modal") || document.querySelector("dialog:modal") || document.body;
+    host.appendChild(field);
     field.focus({ preventScroll: true });
     field.select();
     field.setSelectionRange(0, field.value.length);
@@ -4405,11 +4407,12 @@ async function copyText(text) {
   } finally {
     field.remove();
     if (active && document.activeElement !== active) active.focus({ preventScroll: true });
-    if (inputSelection) active.setSelectionRange(...inputSelection);
     if (selection) {
       selection.removeAllRanges();
       for (const range of ranges) selection.addRange(range);
     }
+    // Restoring DOM ranges can also change a focused input's selection.
+    if (inputSelection) active.setSelectionRange(...inputSelection);
     for (const [node, left, top] of scrollParents) {
       if (node.scrollLeft !== left) node.scrollLeft = left;
       if (node.scrollTop !== top) node.scrollTop = top;

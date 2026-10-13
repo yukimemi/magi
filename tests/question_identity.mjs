@@ -13,7 +13,14 @@ class Node {
     this.listeners = {};
     this.open = false;
   }
-  append(...kids) { this.children.push(...kids); }
+  append(...kids) { for (const kid of kids) kid.parentElement = this; this.children.push(...kids); }
+  appendChild(node) { this.append(node); }
+  closest(selector) {
+    for (let node = this; node; node = node.parentElement) {
+      if (selector === 'dialog:modal' && node.tag === 'dialog' && node.open) return node;
+    }
+    return null;
+  }
   setAttribute(key, value) { this.attributes[key] = value; }
   addEventListener(event, handler) { this.listeners[event] = handler; }
   click() { return this.listeners.click(); }
@@ -38,6 +45,7 @@ function component() {
     scrollTo(x, y) { this.scrollX = x; this.scrollY = y; } };
   const document = {
     body: new Node('body'), activeElement: null,
+    querySelector: () => document.modal ?? null,
     createElement(tag) {
       const node = new Node(tag);
       node.style = {};
@@ -46,7 +54,11 @@ function component() {
       node.setSelectionRange = (start, end, direction) => {
         node.selectionStart = start; node.selectionEnd = end; node.selectionDirection = direction;
       };
-      node.remove = () => { document.body.children = document.body.children.filter(child => child !== node); };
+      node.remove = () => {
+        const parent = node.parentElement;
+        if (parent) parent.children = parent.children.filter(child => child !== node);
+        node.parentElement = null;
+      };
       return node;
     },
     createRange: () => ({ selectNodeContents(node) { this.node = node; }, cloneRange() { return { ...this }; } }),
@@ -137,6 +149,12 @@ for (const mode of ['HTTP', 'API absent', 'API rejects']) {
     input.scrollLeft = 2; input.scrollTop = 7;
     const range = document.createRange(); range.selectNodeContents(root.refs.label);
     selection.addRange(range);
+    const addRange = selection.addRange.bind(selection);
+    selection.addRange = range => {
+      addRange(range);
+      // Browsers can change a focused input's selection when restoring DOM ranges.
+      if (document.activeElement === input) input.setSelectionRange(0, 0);
+    };
     let modernCalls = 0, legacyCalls = 0;
     if (mode !== 'API absent') navigator.clipboard = { writeText: async () => {
       modernCalls++; throw new Error('denied');
@@ -192,5 +210,27 @@ for (const outcome of [false, 'true', 'throws', 'unavailable']) {
     assert.deepEqual([input.selectionStart, input.selectionEnd], [1, 2]);
     assert.match(root.refs.status.textContent, /Could not copy.*Select the full ID/);
     assert.equal(selection.node, root.refs.full);
+  });
+}
+
+for (const focusInside of [true, false]) {
+  test(`fallback uses the active modal and cleans up (focus inside: ${focusInside})`, async () => {
+    const { document, copyText } = component();
+    const modal = document.createElement('dialog'); modal.open = true;
+    document.modal = modal;
+    const button = document.createElement('button');
+    (focusInside ? modal : document.body).appendChild(button);
+    button.focus();
+    document.execCommand = command => {
+      const field = document.activeElement;
+      assert.equal(command, 'copy');
+      assert.equal(field.parentElement, modal, 'copy source must not be inert');
+      assert.equal(field.value, id);
+      return true;
+    };
+    assert.equal(await copyText(id), true);
+    assert.equal(document.activeElement, button);
+    assert.equal(modal.children.some(node => node.tag === 'textarea'), false);
+    assert.equal(document.body.children.some(node => node.tag === 'textarea'), false);
   });
 }

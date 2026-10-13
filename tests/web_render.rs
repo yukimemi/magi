@@ -3568,70 +3568,79 @@ async fn question_identity_disclosure_copy_and_live_updates() {
           dialogId.querySelector('summary').click();
           check(dialogId.open && dialogId.querySelector('code').textContent === merge.id, 'panel full ID missing');
           check(dialogId.querySelector('code').getBoundingClientRect().right <= innerWidth, 'panel ID overflow');
-          deck.closePanel();
+          // Leave the modal open for the trusted fallback click/tap below.
           return true;
         })()"##).await.unwrap();
         assert_eq!(out, true, "question identity @{width}px");
         // Exercise the native legacy command with a trusted click/tap, then
         // read back the clipboard instead of trusting the status message.
-        let point = browser
+        for selector in [
+            "#panel-full-identity .question-identity",
+            "#questions-list .question-identity",
+        ] {
+            let point = browser
             .eval(
                 &page,
-                r#"(() => {
-          const identity = document.querySelector('#questions-list .question-identity');
+                r#"(async () => {
+          Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+          const identity = document.querySelector('__IDENTITY__');
           identity.open = true;
+          // Keep the feedback size stable while measuring fallback side effects.
+          identity.querySelector('[role=status]').textContent = 'Copied full ID.';
           const button = identity.querySelector('button');
-          button.scrollIntoView({ block: 'center' });
+          if (identity.closest('dialog')) window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
+          else button.scrollIntoView({ block: 'center', behavior: 'instant' });
+          await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
           button.focus({ preventScroll: true });
-          window.copyProbe = { id: identity.dataset.questionId, x: scrollX, y: scrollY,
+          window.copyProbe = { selector: '__IDENTITY__', id: identity.dataset.questionId, x: scrollX, y: scrollY,
             height: visualViewport.height, count: document.querySelectorAll('textarea').length };
           const rect = button.getBoundingClientRect();
           return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-        })()"#,
+        })()"#.replace("__IDENTITY__", selector).as_str(),
             )
             .await
             .unwrap();
-        if mobile {
-            browser
-                .call(
-                    Some(&page.session),
-                    "Emulation.setTouchEmulationEnabled",
-                    serde_json::json!({ "enabled": true }),
-                )
-                .await
-                .unwrap();
-            for kind in ["touchStart", "touchEnd"] {
-                let points = if kind == "touchStart" {
-                    serde_json::json!([{ "x": point["x"], "y": point["y"] }])
-                } else {
-                    serde_json::json!([])
-                };
+            if mobile {
                 browser
                     .call(
                         Some(&page.session),
-                        "Input.dispatchTouchEvent",
-                        serde_json::json!({ "type": kind, "touchPoints": points }),
+                        "Emulation.setTouchEmulationEnabled",
+                        serde_json::json!({ "enabled": true }),
                     )
                     .await
                     .unwrap();
-            }
-        } else {
-            for kind in ["mousePressed", "mouseReleased"] {
-                browser
-                    .call(
-                        Some(&page.session),
-                        "Input.dispatchMouseEvent",
-                        serde_json::json!({ "type": kind, "x": point["x"], "y": point["y"],
+                for kind in ["touchStart", "touchEnd"] {
+                    let points = if kind == "touchStart" {
+                        serde_json::json!([{ "x": point["x"], "y": point["y"] }])
+                    } else {
+                        serde_json::json!([])
+                    };
+                    browser
+                        .call(
+                            Some(&page.session),
+                            "Input.dispatchTouchEvent",
+                            serde_json::json!({ "type": kind, "touchPoints": points }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            } else {
+                for kind in ["mousePressed", "mouseReleased"] {
+                    browser
+                        .call(
+                            Some(&page.session),
+                            "Input.dispatchMouseEvent",
+                            serde_json::json!({ "type": kind, "x": point["x"], "y": point["y"],
                         "button": "left", "clickCount": 1 }),
-                    )
-                    .await
-                    .unwrap();
+                        )
+                        .await
+                        .unwrap();
+                }
             }
-        }
-        browser.wait_for(&page,
-            "document.querySelector('#questions-list .question-identity [role=status]').textContent === 'Copied full ID.'",
+            browser.wait_for(&page,
+            &format!("document.querySelector('{selector} [role=status]').textContent === 'Copied full ID.'"),
             Duration::from_secs(5)).await.unwrap();
-        browser
+            browser
             .call(
                 None,
                 "Browser.grantPermissions",
@@ -3641,17 +3650,29 @@ async fn question_identity_disclosure_copy_and_live_updates() {
             )
             .await
             .unwrap();
-        let native_copy = browser.eval(&page, r#"(async () => {
+            let native_copy = browser
+                .eval(
+                    &page,
+                    r#"(async () => {
           delete navigator.clipboard;
           const probe = window.copyProbe;
           const copied = await navigator.clipboard.readText();
           delete window.copyProbe;
-          return copied === probe.id && scrollX === probe.x && scrollY === probe.y
-            && visualViewport.height === probe.height
-            && document.querySelectorAll('textarea').length === probe.count
-            && document.activeElement === document.querySelector('#questions-list .question-identity button');
-        })()"#).await.unwrap();
-        assert_eq!(native_copy, true, "native fallback click/tap @{width}px");
+          const actual = { copied, x: scrollX, y: scrollY, height: visualViewport.height,
+            count: document.querySelectorAll('textarea').length,
+            focused: document.activeElement === document.querySelector(probe.selector + ' button') };
+          if (copied !== probe.id || actual.x !== probe.x || actual.y !== probe.y
+              || actual.height !== probe.height || actual.count !== probe.count || !actual.focused) {
+            throw new Error('native fallback state: ' + JSON.stringify({ probe, actual }));
+          }
+          return true;
+        })()"#,
+                )
+                .await
+                .unwrap();
+            assert_eq!(native_copy, true, "native fallback click/tap @{width}px");
+            browser.eval(&page, "deck.closePanel()").await.unwrap();
+        }
         browser.close_page(&page).await;
     }
 }
