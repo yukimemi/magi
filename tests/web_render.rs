@@ -236,9 +236,9 @@ async fn serve_with_client_probe(
             "setChip, RUN_STATUS, TASK_STATUS, QUESTION_STATUS, TALK_STATUS, loadQueue, openTaskEdit, saveTaskEdit, closeTaskEdit",
         ),
         ClientProbe::Settings => Some("settingsState, renderSettings, loadSettings, saveSettings"),
-        ClientProbe::Questions => {
-            Some("state, shortId, renderQuestions, renderAsks, openPanel, closePanel")
-        }
+        ClientProbe::Questions => Some(
+            "state, shortId, renderQuestions, renderAsks, openPanel, closePanel, focusFirstAsk",
+        ),
     };
     let router = ui.router().layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| async move {
@@ -3479,6 +3479,8 @@ async fn question_identity_disclosure_copy_and_live_updates() {
         assert_eq!(shorts, serde_json::json!(expected));
         let out = browser.eval(&page, r##"(async () => {
           const check = (ok, why) => { if (!ok) throw new Error(why); };
+          await window.queueReady;
+          await new Promise(r => requestAnimationFrame(r));
           const q = { id: '20261012-230524-5d55', run: '20261012-230500-aaaa',
             status: 'open', summary: 'Choose the posting text', detail: '',
             asked_at: '2026-10-12T23:05:24Z', node: 'posting-gate', choices: ['use fallback', 'post original'] };
@@ -3495,6 +3497,11 @@ async fn question_identity_disclosure_copy_and_live_updates() {
           check(getComputedStyle(identity.querySelector('code')).userSelect === 'text', 'manual copy unavailable');
           const tap = identity.querySelector('summary').getBoundingClientRect();
           check(tap.height >= 44, 'small tap target');
+          deck.focusFirstAsk();
+          await new Promise(r => requestAnimationFrame(r));
+          check(document.activeElement === row.querySelector('.ask-summary'), 'initial question focus missing');
+          // A queued route focus must not take focus back from a new answer.
+          deck.focusFirstAsk();
           const draft = rows[1].refs.text; draft.value = 'Keep this draft'; draft.focus();
           deck.state.questions = deck.state.questions.map(q => ({ ...q })); deck.renderQuestions();
           check(row === document.querySelector('#questions-list .ask'), 'row replaced');
@@ -3503,7 +3510,7 @@ async fn question_identity_disclosure_copy_and_live_updates() {
           let copied;
           Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async id => { copied = id; } } });
           const copy = identity.querySelector('button'); copy.click();
-          await new Promise(r => setTimeout(r, 0));
+          await new Promise(r => requestAnimationFrame(r));
           check(copied === q.id && identity.querySelector('[role=status]').textContent === 'Copied full ID.', 'copy failed');
           const realExecCommand = document.execCommand;
           const textareas = document.querySelectorAll('textarea').length;
@@ -3528,7 +3535,8 @@ async fn question_identity_disclosure_copy_and_live_updates() {
           check(legacyCalls === 2, 'missing API fallback was deferred');
           await new Promise(r => setTimeout(r, 0));
           check(identity.querySelector('[role=status]').textContent === 'Copied full ID.', 'missing API fallback failed');
-          check(document.activeElement === draft && draft.selectionStart === 1 && draft.selectionEnd === 4 && draft.selectionDirection === 'backward', 'fallback lost draft selection');
+          check(document.activeElement === draft, 'fallback lost draft focus');
+          check(draft.selectionStart === 1 && draft.selectionEnd === 4 && draft.selectionDirection === 'backward', 'fallback lost draft selection');
           check(document.querySelectorAll('textarea').length === textareas, 'fallback leaked textarea');
           check(scrollX === beforeScroll[0] && scrollY === beforeScroll[1], 'fallback scrolled');
           const afterRect = identity.getBoundingClientRect();

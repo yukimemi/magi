@@ -5231,7 +5231,10 @@ function renderQuestions() {
 /* The operator followed the band here to answer one specific thing; leaving
    the caret at the top of the document would make them find it again. */
 function focusFirstAsk() {
+  const active = document.activeElement;
   requestAnimationFrame(() => {
+    // Do not take focus back after the operator has started answering.
+    if (document.activeElement !== active) return;
     const first = $("questions-list").querySelector('.ask[data-state="open"] .ask-summary');
     if (first) first.focus({ preventScroll: true });
   });
