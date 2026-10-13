@@ -58,7 +58,8 @@ use crate::run::RunStatus;
 /// question files.
 /// Schema 8 adds optional local posting comparison data. Older questions use Markdown.
 /// Schema 9 preserves individual original triggers inside whole-field replacements.
-pub const SCHEMA: u32 = 9;
+/// Schema 10 records the operator decision generation for built-in triage.
+pub const SCHEMA: u32 = 10;
 
 /// How often the wait re-reads the question file.
 ///
@@ -519,6 +520,9 @@ pub struct Question {
     pub status: QuestionStatus,
     /// When the agent asked.
     pub asked_at: Timestamp,
+    /// Operator decision generation when a built-in triage question was filed.
+    #[serde(default)]
+    pub triage_generation: Option<u64>,
     /// When the owner answered, if they did.
     pub answered_at: Option<Timestamp>,
     /// What they said.
@@ -623,6 +627,7 @@ impl Question {
             assets: Vec::new(),
             status: QuestionStatus::Open,
             asked_at: Timestamp::now(),
+            triage_generation: None,
             answered_at: None,
             answer: None,
             thread: Vec::new(),

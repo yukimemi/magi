@@ -852,6 +852,9 @@ where
     {
         return ActionDecision::Skip;
     }
+    if task.operator_decided_at.is_some_and(|at| at > q.asked_at) {
+        return ActionDecision::Stale;
+    }
     // A question about an earlier attempt must not act on a newer one. A
     // conductor question is keyed by the task id, not a run, so it is exempt.
     if q.node != crate::conduct::NODE && task.runs.last() != Some(&q.run) {
@@ -1081,7 +1084,7 @@ fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
         match decision {
             ActionDecision::Skip => continue,
             ActionDecision::Resume(run) => {
-                task.release();
+                task.release_operator("choice", Some(&q.id));
                 task.resume_override = Some(crate::queue::OperatorResume {
                     question_id: q.id.clone(),
                     at: Timestamp::now(),
@@ -1091,7 +1094,10 @@ fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
                 });
             }
             ActionDecision::Stale => {}
-            ActionDecision::Requeue => task.requeue(),
+            ActionDecision::Requeue => {
+                task.release_operator("choice-requeue", Some(&q.id));
+                task.requeue();
+            }
             ActionDecision::Done => task.succeed(),
             ActionDecision::Refuse(why) => {
                 task.hold_machine(Some(why));
@@ -2571,6 +2577,7 @@ async fn poll(
         // its input reflects the queue's current, already-resolved state.
         resolve_blockers(queue, &questions);
         apply_choice_actions(queue, &questions, home);
+        triage::apply_answers(queue, &questions);
         reconcile_task_questions(queue, &questions);
         // Tell the chat a filed task or watched command has ended. Reconciled
         // here regardless of how it ended, and started only when no
@@ -2895,7 +2902,14 @@ async fn attempt(
     // failure shows it up as `held`/`failed` with the run state unreadable.
     let unfinished = (!task.fresh_start)
         .then(|| unfinished_run(&task.runs, task.short()))
-        .flatten();
+        .flatten()
+        .filter(|id| {
+            task.resume_override
+                .as_ref()
+                .is_some_and(|r| r.pinned_run.as_ref() == Some(id))
+                || RunState::load(id)
+                    .is_ok_and(|run| compatible_instruction(&run.instruction, task))
+        });
     // `crate::conduct` chose `Review` for this task on an earlier cycle: its
     // branch survived, and this reopens exactly that branch as a
     // review-only pass rather than resuming or competing again. Consumed
@@ -4009,6 +4023,11 @@ fn choose_starter(
     }
 }
 
+/// Compare authored instructions, excluding answer blocks appended by the daemon.
+pub(crate) fn compatible_instruction(old: &str, task: &Task) -> bool {
+    strip_answers_block(old, task) == task.instruction
+}
+
 /// Which repository a task runs in. A task that names none — the normal case
 /// for one filed from a phone — runs in the daemon's own default.
 fn repo_for(task: &Task, fallback: &Path) -> PathBuf {
@@ -4032,14 +4051,25 @@ fn answers_block(task: &Task, count: usize) -> String {
     s
 }
 
-/// Append every answer `crate::conduct` has collected for `task` onto `base`,
-/// in the shape both [`instruction_for`] and [`resumed_instruction`] use.
+/// Render the approval independently of transient task state, so historical
+/// suffixes remain recognizable after another explicit release.
+fn resumption_block(r: &crate::queue::Resumption) -> String {
+    format!(
+        "\n\n# Explicit operator resumption\n\nGeneration {} at {} approved this instruction:\n{}\n\
+         Earlier answers (first {}) are audit history; their waiting premises are superseded by this approval.\n",
+        r.generation, r.at, r.instruction, r.answers_through,
+    )
+}
+
+/// Append audit answers and the latest explicit approval to the instruction.
 fn append_answers(base: &str, task: &Task) -> String {
-    if task.answers.is_empty() {
-        return base.to_owned();
-    }
     let mut s = base.to_owned();
-    s.push_str(&answers_block(task, task.answers.len()));
+    if !task.answers.is_empty() {
+        s.push_str(&answers_block(task, task.answers.len()));
+    }
+    if let Some(r) = &task.resumption {
+        s.push_str(&resumption_block(r));
+    }
     s
 }
 
@@ -4047,6 +4077,17 @@ fn append_answers(base: &str, task: &Task) -> String {
 /// could have appended on an earlier resume. An `ANSWERS_HEADER` written by
 /// the task author is ordinary instruction text, not a block to remove.
 fn strip_answers_block<'a>(instruction: &'a str, task: &Task) -> &'a str {
+    let mut instruction = instruction;
+    for approval in task
+        .resumption
+        .iter()
+        .chain(task.resumption_history.iter().rev())
+    {
+        if let Some(base) = instruction.strip_suffix(&resumption_block(approval)) {
+            instruction = base;
+            break;
+        }
+    }
     for count in (1..=task.answers.len()).rev() {
         let block = answers_block(task, count);
         if let Some(base) = instruction.strip_suffix(&block) {
@@ -4344,6 +4385,29 @@ mod tests {
             PathBuf::from("/repo"),
             Source::Human,
         )
+    }
+
+    #[test]
+    fn explicit_resumption_keeps_revised_instruction_and_audit_answers() {
+        let mut t = task();
+        t.answers.push(crate::queue::AnsweredQuestion {
+            question: "Inspect the remote?".into(),
+            answer: "Inspect then wait".into(),
+        });
+        let old = instruction_for(&t);
+        assert!(compatible_instruction(&old, &t));
+        t.instruction = "Reuse approved PR head and review".into();
+        t.release_operator("cli", None);
+        assert!(!compatible_instruction(&old, &t));
+        let approved = instruction_for(&t);
+        assert!(approved.contains("waiting premises are superseded"));
+        assert!(compatible_instruction(&approved, &t));
+        assert_eq!(resumed_instruction(&approved, &t), approved);
+        t.release_operator("web", None);
+        assert!(compatible_instruction(&approved, &t));
+        assert_eq!(t.resumption_history.len(), 1);
+        t.start("run".into());
+        assert!(instruction_for(&t).contains("Explicit operator resumption"));
     }
 
     /// A run that stopped on an infrastructure wait asked no agent anything:

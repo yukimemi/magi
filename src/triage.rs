@@ -569,6 +569,7 @@ fn file_question(
         w.detail(task, &why),
         choices,
     );
+    q.triage_generation = Some(task.resumption.as_ref().map_or(0, |r| r.generation));
     questions.put(&mut q).ok()?;
     Some(q)
 }
@@ -808,12 +809,23 @@ fn apply_deps_answer(queue: &Queue, questions: &Questions, q: &Question, now: Ti
     if root.triage_applied(&q.id) {
         return false;
     }
+    if root.operator_decided_at.is_some_and(|at| at > q.asked_at)
+        || q.triage_generation
+            .is_some_and(|g| g != root.resumption.as_ref().map_or(0, |r| r.generation))
+    {
+        root.mark_triage_applied(&q.id);
+        return queue.put(&mut root).is_ok();
+    }
     match interpret_deps_answer(q) {
         DepsAction::Release => {
             if root.status == TaskStatus::Running {
                 return false;
             }
-            root.release();
+            root.answers.push(crate::queue::AnsweredQuestion {
+                question: q.summary.clone(),
+                answer: q.resolution().unwrap_or_default(),
+            });
+            root.release_operator("triage-dependencies", Some(&q.id));
             root.resume_override = Some(OperatorResume {
                 question_id: q.id.clone(),
                 at: now,
@@ -837,8 +849,8 @@ fn apply_deps_answer(queue: &Queue, questions: &Questions, q: &Question, now: Ti
     queue.put(&mut root).is_ok()
 }
 
-/// One question per stuck dependency root, and apply the answers to earlier
-/// ones. See [`crate::blockers`] for what "stuck" means.
+/// One question per stuck dependency root. Answers are applied by the
+/// pre-scheduling sweep. See [`crate::blockers`] for what "stuck" means.
 ///
 /// Not re-asked: a root with an open or answered-unapplied question; one whose
 /// own hold question ([`NODE`]) is still pending; and one whose question was
@@ -849,18 +861,8 @@ fn ask_about_stuck_roots(
     queue: &Queue,
     questions: &Questions,
     config_override: Option<&Path>,
-    now: Timestamp,
     report: &mut Report,
 ) {
-    for q in questions.list() {
-        if q.node == DEPS_NODE
-            && q.status == QuestionStatus::Answered
-            && apply_deps_answer(queue, questions, &q, now)
-        {
-            report.answered.push(q.run.clone());
-        }
-    }
-
     let all = questions.list();
     let inv = crate::blockers::Inventory::new(queue.list(), &all);
     let mut frozen: std::collections::BTreeMap<String, Vec<String>> = Default::default();
@@ -924,10 +926,88 @@ fn ask_about_stuck_roots(
             detail,
             choices,
         );
+        question.triage_generation = Some(root.resumption.as_ref().map_or(0, |r| r.generation));
         if questions.put(&mut question).is_ok() {
             report.asked.push(root.id.clone());
         }
     }
+}
+
+/// Apply settled built-in answers before scheduling or conductor invocation.
+/// Kept separate from diagnosis so queued tasks can recover legacy answers too.
+pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
+    let mut applied = Vec::new();
+    for q in questions.list() {
+        if q.node == DEPS_NODE
+            && q.status == QuestionStatus::Answered
+            && apply_deps_answer(queue, questions, &q, Timestamp::now())
+        {
+            applied.push(q.run.clone());
+        }
+    }
+    for listed in queue.list() {
+        let Some(q) = latest_triage_question(questions, &listed.id) else {
+            continue;
+        };
+        if q.status != QuestionStatus::Answered || already_applied(&listed, &q) {
+            continue;
+        }
+        let Ok(_claim) = queue.claim(&listed.id) else {
+            continue;
+        };
+        let Ok(mut task) = queue.get(&listed.id) else {
+            continue;
+        };
+        if already_applied(&task, &q)
+            || !matches!(task.status, TaskStatus::Held | TaskStatus::Queued)
+        {
+            continue;
+        }
+        let generation = task.resumption.as_ref().map_or(0, |r| r.generation);
+        let newer_decision = q.triage_generation.is_some_and(|g| g != generation)
+            || task.resumption.as_ref().is_some_and(|r| r.at > q.asked_at)
+            || task.held_at.is_some_and(|at| at > q.asked_at)
+            || task.operator_decided_at.is_some_and(|at| at > q.asked_at);
+        // Audit the answer even when a later release or manual hold wins.
+        let resolution = q.resolution().unwrap_or_default();
+        task.answers.push(crate::queue::AnsweredQuestion {
+            question: q.summary.clone(),
+            answer: if newer_decision {
+                format!("{resolution} (superseded by a later operator decision)")
+            } else {
+                resolution
+            },
+        });
+        if !newer_decision {
+            match interpret_answer(&q) {
+                AnswerAction::Resume => {
+                    task.release_operator("triage", Some(&q.id));
+                    task.resume_override = Some(OperatorResume {
+                        question_id: q.id.clone(),
+                        at: Timestamp::now(),
+                        conductor_rehold: None,
+                        forced: true,
+                        pinned_run: None,
+                    });
+                }
+                AnswerAction::KeepHeld => {
+                    let note = keep_held_note(&task, &q, &q.resolution().unwrap_or_default());
+                    task.hold_manual(Some(note));
+                }
+                AnswerAction::Discard => {
+                    if queue.remove(&task.id, false, questions).is_ok() {
+                        applied.push(task.id);
+                    }
+                    continue;
+                }
+            }
+        }
+        task.mark_triage_applied(&q.id);
+        if queue.put(&mut task).is_ok() {
+            applied.push(task.id);
+        }
+    }
+    applied
 }
 
 /// Run one deterministic triage pass over every `held` task in `queue`. No
@@ -944,7 +1024,7 @@ fn ask_about_stuck_roots(
 /// [`already_applied`]), and a task with an open question is left alone too,
 /// so repeated calls with nothing new to say do nothing.
 ///
-/// Also runs [`quarantine_orphaned_blocked`] first, so a `blocked` task whose
+/// Also runs [`quarantine_orphaned_blocked`], so a `blocked` task whose
 /// dependency no longer exists is caught and turned into a fresh `held`
 /// question in this same pass, not left for a later call to notice.
 pub fn run_once(
@@ -954,10 +1034,11 @@ pub fn run_once(
     now: Timestamp,
 ) -> Report {
     let mut report = Report {
+        answered: apply_answers(queue, questions),
         quarantined: quarantine_orphaned_blocked(queue, questions),
         ..Report::default()
     };
-    ask_about_stuck_roots(queue, questions, config_override, now, &mut report);
+    ask_about_stuck_roots(queue, questions, config_override, &mut report);
     for listed in queue.list() {
         if listed.status != TaskStatus::Held {
             continue;
@@ -989,54 +1070,6 @@ pub fn run_once(
         if let Some(q) = latest_triage_question(questions, &task.id) {
             if q.status.open() {
                 // Already asked, still waiting - nothing to do this pass.
-                continue;
-            }
-            if q.status == QuestionStatus::Answered && !already_applied(&task, &q) {
-                match interpret_answer(&q) {
-                    AnswerAction::Resume => {
-                        // A second "resume", to the question about the
-                        // conductor's re-hold, forces it: the conductor may
-                        // not hold this task again. Any other resume records
-                        // the answer so a re-hold can be recognised.
-                        let contradicted = task
-                            .resume_override
-                            .as_ref()
-                            .is_some_and(|o| o.conductor_rehold.is_some());
-                        let record = match task.resume_override.take() {
-                            Some(mut o) if contradicted => {
-                                o.forced = true;
-                                o
-                            }
-                            _ => OperatorResume {
-                                question_id: q.id.clone(),
-                                at: now,
-                                conductor_rehold: None,
-                                forced: false,
-                                pinned_run: None,
-                            },
-                        };
-                        task.release();
-                        task.resume_override = Some(record);
-                        task.mark_triage_applied(&q.id);
-                        if queue.put(&mut task).is_ok() {
-                            report.answered.push(task.id.clone());
-                        }
-                    }
-                    AnswerAction::Discard => {
-                        if queue.remove(&task.id, false, questions).is_ok() {
-                            report.answered.push(task.id.clone());
-                        }
-                    }
-                    AnswerAction::KeepHeld => {
-                        let resolution = q.resolution().unwrap_or_default();
-                        let note = keep_held_note(&task, &q, &resolution);
-                        task.hold_manual(Some(note));
-                        task.mark_triage_applied(&q.id);
-                        if queue.put(&mut task).is_ok() {
-                            report.answered.push(task.id.clone());
-                        }
-                    }
-                }
                 continue;
             }
             // Abandoned, or an already-applied answer: fall through to the
@@ -1164,6 +1197,62 @@ mod tests {
         let config = dir.join("magi.toml");
         std::fs::write(&config, "[disk]\nmin_free_bytes = 0\n").unwrap();
         config
+    }
+
+    #[test]
+    fn explicit_resumption_applies_legacy_queued_triage_once_and_preserves_later_holds() {
+        let (dir, queue, questions) = store();
+        let mut t = task("recover", dir.path().join("repo"));
+        t.hold_machine(Some("inspect first".into()));
+        queue.put(&mut t).unwrap();
+        let mut q = file_question(
+            &questions,
+            &t,
+            Bucket::MachineUnknown,
+            &JA,
+            Timestamp::now(),
+        )
+        .unwrap();
+        assert!(q.actions.is_empty());
+        q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+        questions.put(&mut q).unwrap();
+        // Older release paths queued the task without recording approval.
+        t.release();
+        t.instruction = "Reuse approved PR head".into();
+        queue.put(&mut t).unwrap();
+        assert_eq!(apply_answers(&queue, &questions), [t.id.clone()]);
+        let mut after = queue.get(&t.id).unwrap();
+        assert_eq!(
+            after.resumption.as_ref().unwrap().question_id.as_deref(),
+            Some(q.id.as_str())
+        );
+        assert_eq!(
+            after.resumption.as_ref().unwrap().instruction,
+            t.instruction
+        );
+        assert_eq!(after.answers[0].answer, JA.resume);
+        assert!(after.triage_applied(&q.id));
+        assert!(apply_answers(&Queue::at(dir.path().join("queue")), &questions).is_empty());
+        after.hold_machine(Some("new blocker".into()));
+        queue.put(&mut after).unwrap();
+        let mut late = file_question(
+            &questions,
+            &after,
+            Bucket::MachineUnknown,
+            &EN,
+            Timestamp::now(),
+        )
+        .unwrap();
+        after.hold_manual(Some("keep held now".into()));
+        queue.put(&mut after).unwrap();
+        late.answer(Answer::Choice(late.choices[0].clone()))
+            .unwrap();
+        questions.put(&mut late).unwrap();
+        apply_answers(&queue, &questions);
+        let held = queue.get(&t.id).unwrap();
+        assert!(held.operator_held());
+        assert_eq!(held.hold_reason.as_deref(), Some("keep held now"));
+        assert_eq!(held.resumption.as_ref().unwrap().generation, 1);
     }
 
     #[test]

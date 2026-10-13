@@ -42,6 +42,8 @@ use crate::ask::Questions;
 
 /// On-disk format for a queued task. Bumped when a field's meaning changes.
 ///
+/// 17: durable explicit operator resumption, independent of run startup.
+///
 /// 7: added [`Task::attachments`], names of files copied under
 /// `<id>.attachments/` beside the task file (a field only; `#[serde(default)]`,
 /// so an older record reads as empty and [`read_path`] still accepts it).
@@ -122,7 +124,7 @@ use crate::ask::Questions;
 ///
 /// 16: added [`Task::attempt_limit`], an optional task-specific retry budget.
 /// Field-only, `#[serde(default)]`; old records inherit the daemon limit.
-pub const SCHEMA: u32 = 16;
+pub const SCHEMA: u32 = 17;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -406,6 +408,16 @@ pub struct Task {
     /// *after* the answer. See [`OperatorResume`]. `#[serde(default)]`.
     #[serde(default)]
     pub resume_override: Option<OperatorResume>,
+    /// Latest explicit operator release. Historical answers remain audit evidence;
+    /// this approval takes precedence over their earlier waiting premises.
+    #[serde(default)]
+    pub resumption: Option<Resumption>,
+    /// Earlier explicit approvals retained for audit and instruction suffix matching.
+    #[serde(default)]
+    pub resumption_history: Vec<Resumption>,
+    /// Latest explicit release or manual hold, used to reject delayed answers.
+    #[serde(default)]
+    pub operator_decided_at: Option<Timestamp>,
     /// Set by `crate::conduct` when it chooses `Review` recovery for a task
     /// whose branch survived a blocked run: the branch to reopen with
     /// `crate::graph::Runner::review` instead of competing from scratch.
@@ -671,6 +683,30 @@ pub struct FollowUp {
     pub generation: u32,
 }
 
+/// Durable scope of an explicit operator resumption, surviving run startup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resumption {
+    /// Monotonic count of explicit resumptions.
+    pub generation: u64,
+    /// Mutation path that applied the approval.
+    pub source: String,
+    /// Answered question, if the approval came from one.
+    pub question_id: Option<String>,
+    /// When this approval was applied.
+    pub at: Timestamp,
+    /// Authored instruction approved at release.
+    pub instruction: String,
+    /// Number of historical answers superseded as waiting premises.
+    pub answers_through: usize,
+    /// Number of runs already present when approval was applied.
+    pub runs_through: usize,
+    /// Previous hold or dependency reason cleared by this release.
+    pub cleared_reason: Option<String>,
+    /// Verified evidence versions already used to block after this approval.
+    #[serde(default)]
+    pub blocking_evidence: Vec<String>,
+}
+
 /// A triage "resume" answer and what became of it. See
 /// [`Task::resume_override`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -739,6 +775,9 @@ impl Task {
             triage_applied: Vec::new(),
             actions_applied: Vec::new(),
             resume_override: None,
+            resumption: None,
+            resumption_history: Vec::new(),
+            operator_decided_at: None,
             review_branch: None,
             fresh_start: false,
             interrupt: false,
@@ -1103,6 +1142,8 @@ impl Task {
     /// button is reachable on a blocked task, same as "Mark done" - kept
     /// reading as still waiting on a dependency it no longer had any claim on.
     pub fn hold_manual(&mut self, reason: Option<String>) {
+        // A later explicit hold supersedes outstanding triage answers.
+        self.operator_decided_at = Some(Timestamp::now());
         self.park_reason = None;
         self.note_held();
         self.status = TaskStatus::Held;
@@ -1442,6 +1483,29 @@ impl Task {
         self.hold_source = Some(HoldSource::Machine);
         self.hold_reason = Some(why.clone());
         self.last_error = Some(why);
+    }
+
+    /// Release on explicit operator authority, rather than automatic recovery.
+    pub fn release_operator(&mut self, source: &str, question_id: Option<&str>) {
+        let approval = Resumption {
+            generation: self.resumption.as_ref().map_or(1, |r| r.generation + 1),
+            source: source.to_owned(),
+            question_id: question_id.map(str::to_owned),
+            at: Timestamp::now(),
+            instruction: self.instruction.clone(),
+            answers_through: self.answers.len(),
+            runs_through: self.runs.len(),
+            blocking_evidence: Vec::new(),
+            cleared_reason: self
+                .hold_reason
+                .clone()
+                .or_else(|| self.block_reason.clone()),
+        };
+        self.release();
+        self.operator_decided_at = Some(approval.at);
+        if let Some(previous) = self.resumption.replace(approval) {
+            self.resumption_history.push(previous);
+        }
     }
 
     /// Put a held or finished task back in line, with its attempt count reset
@@ -2594,6 +2658,33 @@ fn new_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_resumption_is_not_invented_for_legacy_or_automatic_release() {
+        let t = Task::new(
+            "retry".into(),
+            "do it".into(),
+            PathBuf::from("."),
+            Source::Human,
+        );
+        let mut value = serde_json::to_value(&t).unwrap();
+        for field in ["resumption", "resumption_history", "operator_decided_at"] {
+            value.as_object_mut().unwrap().remove(field);
+        }
+        value["schema"] = serde_json::json!(15);
+        let mut legacy: Task = serde_json::from_value(value).unwrap();
+        legacy.hold_machine(Some("automatic retry".into()));
+        legacy.release();
+        assert!(legacy.resumption.is_none());
+        assert!(legacy.resumption_history.is_empty());
+        assert!(legacy.operator_decided_at.is_none());
+        legacy.release_operator("cli", None);
+        legacy.start("run".into());
+        let reloaded: Task =
+            serde_json::from_str(&serde_json::to_string(&legacy).unwrap()).unwrap();
+        assert!(reloaded.resume_override.is_none());
+        assert_eq!(reloaded.resumption.as_ref().unwrap().generation, 1);
+    }
+
     #[test]
     fn merge_over_lets_the_later_choice_win_and_keeps_the_rest() {
         let mut base = RunOverrides {

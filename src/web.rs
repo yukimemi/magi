@@ -5855,7 +5855,7 @@ async fn queue_release(
     Path(id): Path<String>,
 ) -> ApiResult<Json<TaskView>> {
     mutate(ui, id, |t| {
-        t.release();
+        t.release_operator("web", None);
         Ok(())
     })
     .await
@@ -12794,6 +12794,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicit_resumption_web_handler_matches_cli_without_a_listener() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let ui = Arc::new(Ui::new(
+            queue.clone(),
+            Questions::at(dir.path().join("questions")),
+            Talks::at(dir.path().join("talks")),
+            dir.path().join("runs"),
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+        ));
+        let mut t = Task::new(
+            "recover".into(),
+            "Inspect".into(),
+            PathBuf::from("."),
+            Source::Human,
+        );
+        t.record_answer("Inspect then resume?".into(), "Inspect then wait".into());
+        t.hold_machine(Some("inspection pending".into()));
+        t.edit("recover".into(), "Reuse approved PR head".into())
+            .unwrap();
+        queue.put(&mut t).unwrap();
+        let mut cli = t.clone();
+        cli.release_operator("cli", None);
+        let Json(reply) = queue_release(State(ui), Path(t.id.clone())).await.unwrap();
+        let reloaded = queue.get(&t.id).unwrap();
+        assert_eq!(reply.task.status, TaskStatus::Queued);
+        assert_eq!(reloaded.answers, t.answers);
+        let mut web = reloaded.resumption.unwrap();
+        let cli = cli.resumption.unwrap();
+        assert_eq!(web.source, "web");
+        web.source = cli.source.clone();
+        web.at = cli.at;
+        assert_eq!(web, cli);
+    }
+
+    #[tokio::test]
     async fn holding_then_releasing_returns_a_task_to_the_loop_with_a_fresh_budget() {
         let f = Fixture::start().await;
         let queue = f.queue();
@@ -12816,6 +12853,16 @@ mod tests {
             .await;
         assert_eq!(released.status, 200);
         assert_eq!(released.json()["status_str"], "queued");
+        assert_eq!(released.json()["resumption"]["source"], "web");
+        assert_eq!(released.json()["resumption"]["instruction"], "Try again");
+        let mut cli = task.clone();
+        cli.release_operator("cli", None);
+        let web = queue.get(&task.id).unwrap().resumption.unwrap();
+        let cli = cli.resumption.unwrap();
+        assert_eq!(web.instruction, cli.instruction);
+        assert_eq!(web.answers_through, cli.answers_through);
+        assert_eq!(web.runs_through, cli.runs_through);
+        assert_eq!(web.cleared_reason, cli.cleared_reason);
         assert_eq!(
             released.json()["attempts"],
             0,
