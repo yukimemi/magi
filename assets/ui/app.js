@@ -40,6 +40,7 @@ const API = {
   hold: (id) => `/api/queue/${encodeURIComponent(id)}/hold`,
   release: (id) => `/api/queue/${encodeURIComponent(id)}/release`,
   implementers: (id) => `/api/queue/${encodeURIComponent(id)}/implementers`,
+  urgent: (id) => `/api/queue/${encodeURIComponent(id)}/urgent`,
   priority: (id) => `/api/queue/${encodeURIComponent(id)}/priority`,
   editTask: (id) => `/api/queue/${encodeURIComponent(id)}/edit`,
   doneTask: (id) => `/api/queue/${encodeURIComponent(id)}/done`,
@@ -2320,12 +2321,13 @@ function createTaskCard() {
   const priorityValue = el("span", { class: "task-priority-value" });
   const priorityBox = el("span", { class: "task-priority-box" }, priorityDown, priorityValue, priorityUp);
   const editBtn = el("button", { class: "btn btn-quiet", type: "button", text: "Edit" });
+  const urgentBox = el("span", { class: "task-urgent-box" });
   const holdBox = el("span", { class: "task-hold-box" });
   const doneBox = el("span", { class: "task-done-box" });
   const deleteBox = el("span", { class: "task-delete-box" });
   const actionMenu = el("details", { class: "task-action-menu" },
     el("summary", { class: "btn btn-quiet", text: "Actions" }),
-    el("div", { class: "task-menu-items" }, holdBox, doneBox, deleteBox));
+    el("div", { class: "task-menu-items" }, urgentBox, holdBox, doneBox, deleteBox));
   actionMenu.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -2371,7 +2373,7 @@ function createTaskCard() {
   card.refs = {
     card, chipSlot, urgent, priority, solo, followup, permalink, whenSlot, title, source, repo, attempts,
     outcome, note, snippet, error, instruction, answers, answersList, runLink, actionMenu,
-    priorityDown, priorityUp, priorityValue, editBtn, holdBox, doneBox, deleteBox,
+    priorityDown, priorityUp, priorityValue, editBtn, urgentBox, holdBox, doneBox, deleteBox,
   };
   return card;
 }
@@ -2525,6 +2527,7 @@ function updateTaskCard(row, task) {
      claim; a running task has already left that pool (see
      `Task::set_priority`'s doc), so the buttons are disabled rather than
      left to round-trip a 4xx. */
+  renderTaskUrgentBox(task, r.urgentBox);
   setText(r.priorityValue, `Priority ${Number(task.priority) || 0}`);
   const priorityNow = Number(task.priority) || 0;
   r.priorityDown.disabled = status === "running";
@@ -2768,6 +2771,46 @@ async function refreshTask(id) {
   const jobs = [loadQueue()];
   if (state.taskDetail.id === id) jobs.push(loadTask(id));
   await Promise.all(jobs);
+}
+
+const urgentPending = new Set();
+
+function renderTaskUrgentBox(task, box, host = null) {
+  clear(box);
+  const status = String(task.status_str || task.status || "");
+  const enabled = task.urgent === true;
+  const button = el("button", {
+    class: "btn btn-quiet", type: "button",
+    text: `Urgent: ${enabled ? "on" : "off"}${urgentPending.has(task.id) ? " (saving…)" : ""}`,
+    disabled: urgentPending.has(task.id) || !["queued", "held"].includes(status),
+    onclick: () => changeUrgent(task.id, !enabled, host),
+  });
+  setAttr(button, "title", "Urgent uses one additional run slot. Only unclaimed queued or held tasks can change it; held tasks stay held.");
+  setAttr(button, "aria-pressed", String(enabled));
+  setAttr(button, "aria-label", `Urgent: ${enabled ? "on" : "off"} for ${task.title || task.id}`);
+  box.append(button);
+}
+
+async function changeUrgent(id, urgent, host = null) {
+  if (urgentPending.has(id)) return;
+  urgentPending.add(id);
+  renderQueue();
+  renderTask();
+  try {
+    const saved = await postJson(API.urgent(id), { urgent });
+    if (state.queue) state.queue = state.queue.map((task) => task.id === id ? saved : task);
+    if (state.taskDetail.id === id) state.taskDetail.task = { ...state.taskDetail.task, ...saved };
+    ok();
+    announce(`Task ${shortId(id)} urgent ${saved.urgent ? "enabled" : "disabled"}.`);
+    await refreshTask(id);
+  } catch (error) {
+    const msg = `Could not change urgent for task ${shortId(id)}: ${error.message}`;
+    if (host) host.error(msg); else fail(msg);
+  } finally {
+    urgentPending.delete(id);
+    renderQueue();
+    renderTask();
+  }
 }
 
 async function changePriority(id, priority, host = null) {
@@ -10082,7 +10125,7 @@ function taskSheetHost(id) {
 }
 
 function renderTaskActions(task) {
-  const boxes = ["priority", "edit", "hold", "done", "delete"].map((k) => $(`task-actions-${k}`));
+  const boxes = ["priority", "urgent", "edit", "hold", "done", "delete"].map((k) => $(`task-actions-${k}`));
   if (!task || task.id !== taskSheet.id) {
     taskSheet.id = task ? task.id : null;
     taskSheet.armed = {};
@@ -10096,12 +10139,13 @@ function renderTaskActions(task) {
     closeTaskActions();
     return;
   }
-  const [priorityBox, editBox, holdBox, doneBox, deleteBox] = boxes;
+  const [priorityBox, urgentBox, editBox, holdBox, doneBox, deleteBox] = boxes;
   const host = taskSheetHost(task.id);
   const status = String(task.status_str || task.status || "");
   const running = status === "running";
   const name = task.title || task.id;
 
+  renderTaskUrgentBox(task, urgentBox, host);
   clear(priorityBox);
   const now = Number(task.priority) || 0;
   const lower = el("button", {

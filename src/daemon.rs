@@ -2377,6 +2377,55 @@ fn permit_kind(priority: bool, urgent: bool) -> PermitKind {
     }
 }
 
+struct DispatchClaim {
+    task: Task,
+    claim: crate::queue::Claim,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// Claim and re-read before choosing a lane: a queue listing may predate an
+/// urgent toggle. All unsuccessful paths release the claim without an attempt.
+fn claim_dispatch(
+    queue: &Queue,
+    candidate: &Task,
+    cooling_down: bool,
+    ordinary: &Arc<tokio::sync::Semaphore>,
+    urgent: &Arc<tokio::sync::Semaphore>,
+) -> Option<DispatchClaim> {
+    let Ok(claim) = queue.claim(&candidate.id) else {
+        tracing::info!("task {} is claimed elsewhere; skipping", candidate.short());
+        return None;
+    };
+    let task = match queue.get(&candidate.id) {
+        Ok(t) if t.status.runnable() => t,
+        Ok(_) => return None,
+        Err(e) => {
+            tracing::warn!("could not re-read task {}: {e:#}", candidate.short());
+            return None;
+        }
+    };
+    let resume = land_resume_state(&task);
+    if resume == LandResume::StillWaiting {
+        return None;
+    }
+    let priority = resume == LandResume::Ready;
+    if !priority && cooling_down {
+        return None;
+    }
+    // Never borrow an ordinary slot when the single urgent slot is busy.
+    // Keep scanning other candidates when either pool has no free slot.
+    let permit = match permit_kind(priority, task.urgent) {
+        PermitKind::None => None,
+        PermitKind::Urgent => Some(Arc::clone(urgent).try_acquire_owned().ok()?),
+        PermitKind::Ordinary => Some(Arc::clone(ordinary).try_acquire_owned().ok()?),
+    };
+    Some(DispatchClaim {
+        task,
+        claim,
+        permit,
+    })
+}
+
 /// Poll the queue until stopped, factored out so [`drive`] owns only setup and
 /// teardown and cannot skip the teardown on an early return.
 ///
@@ -2623,53 +2672,15 @@ async fn poll(
                 break;
             }
 
-            let resume = land_resume_state(&candidate);
-            if resume == LandResume::StillWaiting {
+            let Some(DispatchClaim {
+                mut task,
+                claim,
+                permit,
+            }) = claim_dispatch(queue, &candidate, cooling_down, &sem, &urgent_sem)
+            else {
                 continue;
-            }
-            let priority = resume == LandResume::Ready;
-
-            if !priority && cooling_down {
-                continue;
-            }
-            let permit = match permit_kind(priority, candidate.urgent) {
-                PermitKind::None => None,
-                PermitKind::Urgent => match Arc::clone(&urgent_sem).try_acquire_owned() {
-                    Ok(p) => Some(p),
-                    // The one urgent slot is already spoken for by another
-                    // `--urgent` task's run. Keep looking rather than falling
-                    // back to the ordinary pool - see `PermitKind::Urgent`'s
-                    // own doc - a later candidate might still be an ordinary
-                    // task with a free slot, or another priority resume.
-                    Err(_) => continue,
-                },
-                PermitKind::Ordinary => match Arc::clone(&sem).try_acquire_owned() {
-                    Ok(p) => Some(p),
-                    // No ordinary slot free right now. A later candidate in
-                    // this same list might still be a priority resume or an
-                    // urgent task, so keep looking rather than stopping here.
-                    Err(_) => continue,
-                },
             };
 
-            // A claim we cannot take means another daemon, or a human running
-            // `magi run`, got there first. That is not the task's fault and
-            // must not spend one of its attempts: move to the next candidate
-            // rather than recording a failure.
-            let Ok(claim) = queue.claim(&candidate.id) else {
-                tracing::info!("task {} is claimed elsewhere; skipping", candidate.short());
-                continue;
-            };
-            // Re-read under the claim: the task on disk may have been held or
-            // edited between the listing and the lock.
-            let mut task = match queue.get(&candidate.id) {
-                Ok(t) if t.status.runnable() => t,
-                Ok(_) => continue,
-                Err(e) => {
-                    tracing::warn!("could not re-read task {}: {e:#}", candidate.short());
-                    continue;
-                }
-            };
             let task_id = task.id.clone();
             attempted.push(task_id.clone());
             lock(status).idle = false;
@@ -4432,6 +4443,84 @@ mod tests {
         t.id = id.to_owned();
         t.urgent = true;
         t
+    }
+
+    #[test]
+    fn urgent_dispatch_has_one_extra_slot_and_never_uses_a_stale_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let ordinary = Arc::new(tokio::sync::Semaphore::new(1));
+        let urgent = Arc::new(tokio::sync::Semaphore::new(1));
+        let occupied = Arc::clone(&ordinary).try_acquire_owned().unwrap();
+        let mut first = task();
+        queue.put(&mut first).unwrap();
+        let stale_plain = queue.get(&first.id).unwrap();
+        first.set_urgent(true).unwrap();
+        queue.put(&mut first).unwrap();
+        let dispatched = claim_dispatch(&queue, &stale_plain, false, &ordinary, &urgent).unwrap();
+        let mut second = urgent_task("second");
+        queue.put(&mut second).unwrap();
+        assert!(claim_dispatch(&queue, &second, false, &ordinary, &urgent).is_none());
+        drop(queue.claim(&second.id).unwrap());
+        assert_eq!(queue.get(&second.id).unwrap().attempts, 0);
+        drop(dispatched);
+        let stale_urgent = queue.get(&first.id).unwrap();
+        first.set_urgent(false).unwrap();
+        queue.put(&mut first).unwrap();
+        assert!(claim_dispatch(&queue, &stale_urgent, false, &ordinary, &urgent).is_none());
+        assert_eq!(urgent.available_permits(), 1);
+        drop(queue.claim(&first.id).unwrap());
+        drop(occupied);
+    }
+
+    #[test]
+    fn urgent_dispatch_uses_saved_lane_and_releases_unsuccessful_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let ordinary = Arc::new(tokio::sync::Semaphore::new(1));
+        let urgent = Arc::new(tokio::sync::Semaphore::new(1));
+        let mut t = task();
+        queue.put(&mut t).unwrap();
+        for enabled in [true, false] {
+            let stale = queue.get(&t.id).unwrap();
+            t.set_urgent(enabled).unwrap();
+            queue.put(&mut t).unwrap();
+            assert_ne!(stale.urgent, enabled);
+            let DispatchClaim {
+                task: fresh,
+                claim,
+                permit,
+            } = claim_dispatch(&queue, &stale, false, &ordinary, &urgent).unwrap();
+            assert_eq!(fresh.urgent, enabled);
+            assert_eq!(ordinary.available_permits(), usize::from(enabled));
+            assert_eq!(urgent.available_permits(), usize::from(!enabled));
+            assert!(queue.claim(&t.id).is_err());
+            assert_eq!(fresh.attempts, stale.attempts);
+            drop((claim, permit));
+            assert_eq!(ordinary.available_permits(), 1);
+            assert_eq!(urgent.available_permits(), 1);
+        }
+        t.set_urgent(true).unwrap();
+        queue.put(&mut t).unwrap();
+        let occupied = Arc::clone(&urgent).try_acquire_owned().unwrap();
+        assert!(claim_dispatch(&queue, &t, false, &ordinary, &urgent).is_none());
+        assert_eq!(ordinary.available_permits(), 1, "no ordinary fallback");
+        drop(queue.claim(&t.id).unwrap());
+        assert_eq!(queue.get(&t.id).unwrap().attempts, t.attempts);
+        drop(occupied);
+        assert!(claim_dispatch(&queue, &t, true, &ordinary, &urgent).is_none());
+        drop(queue.claim(&t.id).unwrap());
+        let held = queue.claim(&t.id).unwrap();
+        assert!(claim_dispatch(&queue, &t, false, &ordinary, &urgent).is_none());
+        drop(held);
+        t.status = TaskStatus::Held;
+        queue.put(&mut t).unwrap();
+        assert!(claim_dispatch(&queue, &t, false, &ordinary, &urgent).is_none());
+        drop(queue.claim(&t.id).unwrap());
+        std::fs::remove_file(queue.path_of(&t.id)).unwrap();
+        assert!(claim_dispatch(&queue, &t, false, &ordinary, &urgent).is_none());
+        drop(queue.claim(&t.id).unwrap());
+        assert_eq!(urgent.available_permits(), 1);
     }
 
     /// The land-resume exemption wins outright, whether or not the candidate

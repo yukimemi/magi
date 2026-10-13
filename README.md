@@ -283,6 +283,17 @@ flight is never paused, parked, or restarted to make room. It is not a way to
 raise `[daemon] max_concurrent_runs` for good: that setting, and its default
 of one, is unchanged, and while an urgent task is in flight quota burn can
 briefly reach `max_concurrent_runs + 1` runs at once instead of just one.
+Change an existing task with `magi task urgent <ID>` to enable urgent, or
+`magi task urgent <ID> --clear` to disable it. IDs may be unambiguous short IDs.
+`magi task show <ID>` reports the saved enabled/disabled state. In the Web
+Queue, open **Actions** and press **Urgent: off/on**; the task detail's action
+sheet has the same toggle. The URGENT badge reflects the saved setting.
+Only unclaimed queued or held tasks can change urgent. Changing a held task
+keeps it held, with its reason and attempts intact; release it separately when
+ready. Claimed, running, and other task states are refused; wait for the claim
+to release and requeue or hold the task before retrying. This changes neither
+priority ordering nor the interrupt park/resume request.
+
 Two `--urgent` tasks do not both jump the queue — the second waits for the
 first to leave the urgent slot, same as any other pair of tasks waits for a
 free ordinary one. `--urgent` and `magi task interrupt` (`[daemon]
@@ -300,6 +311,7 @@ default.
 | `magi task add` | file work; text, `--file`, `--issue`, or stdin |
 | `magi task list` | the backlog, newest first |
 | `magi task show <id>` | one task in full |
+| `magi task urgent <id> [--clear]` | enable or disable urgent on an unclaimed queued or held task |
 | `magi task implementers <id> <count>` | change implementers on a queued or held task (1 = Solo, 2–3 = competition) |
 | `magi task hold` / `release` | park work, or give it a real second chance |
 | `magi task done` | mark it finished, for work that landed by a route the loop did not see |

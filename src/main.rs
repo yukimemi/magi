@@ -722,6 +722,14 @@ enum TaskCmd {
         /// Number of implementers (1..=3).
         count: u8,
     },
+    /// Enable the single additional urgent slot for a queued or held task.
+    Urgent {
+        /// Task id or unambiguous prefix/suffix.
+        id: String,
+        /// Disable urgent instead of enabling it.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Change how urgently a queued or held task should run next.
     ///
     /// Refused once the task is running: priority only affects which task the
@@ -2922,9 +2930,10 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             println!("source    {}", t.source.label());
             println!("repo      {}", t.repo.display());
             println!("priority  {}", t.priority);
-            if t.urgent {
-                println!("urgent    yes");
-            }
+            println!(
+                "urgent    {}",
+                if t.urgent { "enabled" } else { "disabled" }
+            );
             println!("attempts  {}", t.attempts);
             let attachments = q.attachment_paths(&t);
             if !attachments.is_empty() {
@@ -3027,6 +3036,23 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             println!("{} implementers now {count} - {}", t.short(), t.title);
             Ok(())
         }
+        TaskCmd::Urgent { id, clear } => {
+            let resolved = q.resolve_id(&id)?;
+            let _claim = q.claim(&resolved).with_context(|| {
+                format!("task {resolved} is claimed; wait until the daemon releases it, then retry while queued or held")
+            })?;
+            let mut t = q.get(&resolved)?;
+            t.set_urgent(!clear)?;
+            q.put(&mut t)?;
+            println!(
+                "{} urgent now {} - {}",
+                t.short(),
+                if t.urgent { "enabled" } else { "disabled" },
+                t.title
+            );
+            Ok(())
+        }
+
         TaskCmd::Priority { id, priority } => {
             let resolved = q.resolve_id(&id)?;
             // Claimed the same way the phone's edit routes are: a `.lock`
@@ -5117,6 +5143,81 @@ mod tests {
         assert_eq!(after.attachments, ["shot.png", "more.png"]);
         assert_eq!(after.instruction, filed.instruction);
         assert_eq!(after.title, filed.title);
+    }
+
+    #[tokio::test]
+    async fn task_urgent_cli_updates_and_refuses_claimed_or_ineligible_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut t = Task::new(
+            "urgent CLI".into(),
+            "keep this".into(),
+            dir.path().into(),
+            Source::Human,
+        );
+        t.attempts = 2;
+        t.priority = 8;
+        t.hold_reason = Some("wait".into());
+        for status in [TaskStatus::Queued, TaskStatus::Held] {
+            t.status = status;
+            q.put(&mut t).unwrap();
+            for clear in [false, false, true, true] {
+                let mut args = vec!["magi", "task", "urgent", t.short()];
+                if clear {
+                    args.push("--clear");
+                }
+                let cli = Cli::try_parse_from(args).unwrap();
+                let Some(Command::Task { command }) = cli.command else {
+                    panic!("task command")
+                };
+                task_cmd_on(command, q.clone()).await.unwrap();
+                let saved = q.get(&t.id).unwrap();
+                let mut before = serde_json::to_value(&t).unwrap();
+                let mut after = serde_json::to_value(&saved).unwrap();
+                before["urgent"] = (!clear).into();
+                before.as_object_mut().unwrap().remove("updated_at");
+                after.as_object_mut().unwrap().remove("updated_at");
+                assert_eq!(after, before);
+            }
+        }
+        t.status = TaskStatus::Queued;
+        q.put(&mut t).unwrap();
+        let claim = q.claim(&t.id).unwrap();
+        let error = task_cmd_on(
+            TaskCmd::Urgent {
+                id: t.id.clone(),
+                clear: false,
+            },
+            q.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("claimed"));
+        assert!(!q.get(&t.id).unwrap().urgent);
+        drop(claim);
+        for status in [
+            TaskStatus::Running,
+            TaskStatus::Done,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Parked,
+        ] {
+            t.status = status;
+            q.put(&mut t).unwrap();
+            for clear in [false, true] {
+                let error = task_cmd_on(
+                    TaskCmd::Urgent {
+                        id: t.id.clone(),
+                        clear,
+                    },
+                    q.clone(),
+                )
+                .await
+                .unwrap_err();
+                assert!(error.to_string().contains(status.as_str()));
+                assert!(!q.get(&t.id).unwrap().urgent);
+            }
+        }
     }
 
     #[test]

@@ -428,8 +428,8 @@ pub struct Task {
     /// anything unless asked to, exactly as before.
     #[serde(default)]
     pub interrupt: bool,
-    /// Marked by `magi task add --urgent`: `crate::daemon::poll` dispatches
-    /// this task through its own one-slot `urgent_sem` the moment it is
+    /// Marked by `magi task add --urgent` or `magi task urgent`.
+    /// `crate::daemon::poll` dispatches this task through its own one-slot `urgent_sem` the moment it is
     /// runnable, in addition to whatever is already running under the
     /// ordinary `[daemon] max_concurrent_runs` pool - never instead of it,
     /// and never by pausing or otherwise touching that run. This is the
@@ -1248,6 +1248,20 @@ impl Task {
             self.review_branch = branch;
         }
         self.hold_machine(Some(reason));
+    }
+
+    /// Change the urgent lane setting without releasing a held task.
+    pub fn set_urgent(&mut self, urgent: bool) -> Result<()> {
+        if !matches!(self.status, TaskStatus::Queued | TaskStatus::Held) {
+            bail!(
+                "task {} is {}; urgent can only change while queued or held; \
+                 wait for the active attempt to finish and requeue or hold the task first",
+                self.short(),
+                self.status.as_str()
+            );
+        }
+        self.urgent = urgent;
+        Ok(())
     }
 
     /// Change how urgently this task should run next.
@@ -3381,6 +3395,40 @@ mod tests {
 
         t.release();
         assert!(!t.fresh_start);
+    }
+
+    #[test]
+    fn urgent_only_changes_queued_or_held_and_preserves_settings() {
+        for status in [
+            TaskStatus::Queued,
+            TaskStatus::Held,
+            TaskStatus::Running,
+            TaskStatus::Done,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Parked,
+        ] {
+            let mut t = task("urgent settings");
+            t.status = status;
+            t.attempts = 2;
+            t.hold_reason = Some("waiting".into());
+            t.priority = 7;
+            t.interrupt = true;
+            let before = serde_json::to_value(&t).unwrap();
+            for urgent in [true, true, false, false] {
+                let result = t.set_urgent(urgent);
+                let mut expected = before.clone();
+                if matches!(status, TaskStatus::Queued | TaskStatus::Held) {
+                    result.unwrap();
+                    expected["urgent"] = urgent.into();
+                } else {
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains(status.as_str()), "{error}");
+                    assert!(error.contains("queued or held"), "{error}");
+                }
+                assert_eq!(serde_json::to_value(&t).unwrap(), expected);
+            }
+        }
     }
 
     #[test]
