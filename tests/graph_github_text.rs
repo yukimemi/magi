@@ -85,9 +85,10 @@ fn arg_after(call: &[String], flag: &str) -> String {
     call[i + 1].clone()
 }
 
-/// The quoted original task carries a credential, so the posting gate
-/// withholds the body (sensitive data) and asks the owner.
-const TASK: &str = "create note.txt, token=abcdef0123456789abcdef";
+/// Internal task text stays local. The independent public generator below
+/// deliberately emits a credential to exercise the final posting gate.
+const TASK: &str = "create note.txt; 内部タスクの報告";
+const PUBLIC_DESCRIPTION: &str = "TITLE: feat(note): create note.txt\nAdds `note.txt` with the seat output. token=abcdef0123456789abcdef";
 
 fn withheld_questions(run: &str) -> Vec<ask::Question> {
     ask::Questions::open()
@@ -103,6 +104,11 @@ async fn park_on_question(fx: &mut common::Fixture, log: &Path) -> String {
     fx.config.graph.land = false;
     fx.config.graph.implementers = 1;
     fx.config.graph.reviewers = 1;
+    for agent in &mut fx.config.agents {
+        agent
+            .env
+            .insert("MOCK_CHANGE_DESCRIPTION".into(), PUBLIC_DESCRIPTION.into());
+    }
     let mut runner = Runner::start(
         &fx.repo,
         TASK.to_owned(),
@@ -115,6 +121,15 @@ async fn park_on_question(fx: &mut common::Fixture, log: &Path) -> String {
     let state = &runner.state;
     assert!(state.parked, "events: {:?}", state.events);
     assert!(state.merge.is_none(), "nothing recorded while parked");
+    let public = state
+        .change_summary
+        .as_ref()
+        .expect("independent public description");
+    assert!(public.body.contains("token=abcdef0123456789abcdef"));
+    assert!(!public.body.contains("内部タスク"));
+    assert!(state.instruction.contains("内部タスク"));
+    assert!(!state.candidates[0].summary.contains("abcdef0123456789"));
+
     let asked = withheld_questions(&state.id);
     assert_eq!(asked.len(), 1);
     assert!(asked[0].status.open());
@@ -328,6 +343,12 @@ async fn post_original_opens_the_pull_request_with_the_unmodified_text() {
     assert_eq!(made.len(), 1, "calls: {:?}", gh_calls(&log));
     // The fake gh logs one line per line of an argument, so look at the call.
     assert!(made[0].join("\n").contains("abcdef0123456789"), "{:?}", made[0]);
+    let body = made[0].join("\n");
+    assert!(!body.contains("内部タスク"));
+    assert!(body.contains("## Final verification"));
+    assert!(body.contains("Evidence: final diff"));
+    assert!(body.contains(&format!("magi:run/{run_id}")));
+
     let g = runner.state.github_text.as_ref().unwrap();
     assert!(g.resolved);
     assert_eq!(g.choice, Some(magi::run::GithubTextChoice::Original));

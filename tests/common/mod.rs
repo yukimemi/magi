@@ -633,6 +633,16 @@ if has "opening a task for magi"; then
   exit 0
 fi
 
+# Whole-change description for the pull request: read-only, an English reply.
+if has "Describe a change for its pull request"; then
+  if [ -n "$MOCK_CHANGE_DESCRIPTION" ]; then
+    printf '%s\n' "$MOCK_CHANGE_DESCRIPTION"
+  else
+    printf 'TITLE: feat(note): create note.txt\nAdds `note.txt` with the seat output.\n'
+  fi
+  exit 0
+fi
+
 # Anything else is the implementation node.
 echo "content from $seat" > note.txt
 git add -A >/dev/null 2>&1

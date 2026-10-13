@@ -11,6 +11,47 @@ use magi::{
 };
 use std::path::Path;
 
+common::e2e! {
+async fn common_change_summary_mock_preserves_head_and_working_tree() {
+    let home = home_lock().await;
+    let fx = fixture(home, Judges::Unanimous, false);
+    std::fs::write(fx.repo.join("note.txt"), "pending work\n").unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["add", "note.txt"])
+        .current_dir(&fx.repo)
+        .status().unwrap().success());
+    let snapshot = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args).current_dir(&fx.repo).output().unwrap();
+        assert!(out.status.success());
+        out.stdout
+    };
+    let head = snapshot(&["rev-parse", "HEAD"]);
+    let status = snapshot(&["status", "--porcelain"]);
+    let staged = snapshot(&["diff", "--cached"]);
+    let prompt_file = fx.tmp.path().join("summary-prompt.md");
+    for subject in ["feat: add note", "fix: adjust note after review"] {
+        let prompt = magi::prompt::change_summary(
+            "origin/main", "HEAD", &[subject.into()], "note.txt | 1 +",
+        );
+        std::fs::write(&prompt_file, prompt).unwrap();
+        let reply = std::process::Command::new("sh")
+            .arg(fx.tmp.path().join("mock-agent.sh"))
+            .env("MAGI_PROMPT_FILE", &prompt_file)
+            .env("MAGI_SEAT", "summary")
+            .env("MAGI_NODE", "change-summary")
+            .current_dir(&fx.repo).output().unwrap();
+        assert!(reply.status.success(), "{:?}", reply);
+        assert_eq!(String::from_utf8(reply.stdout).unwrap(),
+            "TITLE: feat(note): create note.txt\nAdds `note.txt` with the seat output.\n");
+        assert_eq!(snapshot(&["rev-parse", "HEAD"]), head);
+        assert_eq!(snapshot(&["status", "--porcelain"]), status);
+        assert_eq!(snapshot(&["diff", "--cached"]), staged);
+        assert_eq!(std::fs::read_to_string(fx.repo.join("note.txt")).unwrap(), "pending work\n");
+    }
+}
+}
+
 fn forge(dir: &Path) -> std::path::PathBuf {
     let bin = dir.join("forge");
     std::fs::create_dir_all(&bin).unwrap();
