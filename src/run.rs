@@ -1409,16 +1409,19 @@ pub struct LandApproval {
     pub head: String,
 }
 
-/// A substantive description of a review-only run's whole change, written by a
-/// read-only agent from the final diff. It is valid only for the exact pair
-/// (`head`, `base`) it was written from; a different final commit or base
-/// makes it stale and it is regenerated, never reused.
+/// Independent public description of a run's whole change from the final diff.
+/// Valid only for its (`head`, `base`, `evidence`) snapshot; a changed commit,
+/// generation policy, verification result or finding requires regeneration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeSummary {
     /// The final commit the diff was read at.
     pub head: String,
     /// The merge base of the resolved remote base and `head`.
     pub base: String,
+    /// Generation specification and verification/finding evidence fingerprint.
+    /// Missing on older records, which must be regenerated.
+    #[serde(default)]
+    pub evidence: String,
     /// Title, sanitized.
     pub title: String,
     /// Body, sanitized, without the run marker.

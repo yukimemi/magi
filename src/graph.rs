@@ -6839,7 +6839,7 @@ impl Runner {
             None => crate::pr_outcome::FinalHead::Unknown,
         };
         // Only a pull request that is about to be posted pays for a summary.
-        let summarized = if posting && is_review_run(&self.state) {
+        let summarized = if posting {
             Some(self.summarize_change(winner, final_head.as_deref()).await)
         } else {
             None
@@ -6854,6 +6854,11 @@ impl Runner {
                 "a shared resource was busy; nothing was published, resume to summarize again",
             );
             return Ok(None);
+        }
+        if posting && git::rev_parse(&winner.worktree, "HEAD").await.ok() != final_head {
+            anyhow::bail!(
+                "the final commit moved during public description generation; retry before publishing"
+            );
         }
         let note = match (&summarized, &self.state.change_summary) {
             (Some(Ok(())), Some(c)) => ChangeNote::Summary(c),
@@ -6996,7 +7001,7 @@ impl Runner {
         Ok(Some(PrMessage { title, body }))
     }
 
-    /// Describe the whole change of a review-only run from its final diff.
+    /// Describe the whole change from its final diff in either run mode.
     ///
     /// The summary is tied to the final commit and to the merge base of the
     /// resolved remote base; a record for any other pair is dropped and the
@@ -7023,19 +7028,32 @@ impl Runner {
             Ok(b) if !b.is_empty() => b,
             _ => return Err("the merge base with the remote base could not be read".to_owned()),
         };
+        let evidence = crate::pr_outcome::summary_evidence(
+            &self.state,
+            crate::pr_outcome::FinalHead::At(head),
+        );
+        let fingerprint = crate::pr_outcome::summary_fingerprint(&self.state, &evidence);
         if self
             .state
             .change_summary
             .as_ref()
-            .is_some_and(|c| c.head == head && c.base == base)
+            .is_some_and(|c| c.head == head && c.base == base && c.evidence == fingerprint)
         {
             return Ok(());
         }
         if self.state.change_summary.take().is_some() {
             self.state.event(
                 "pr-summary",
-                "the final commit or base changed; the earlier change summary was discarded",
+                "the final diff or evidence changed; the earlier change summary was discarded",
             );
+        }
+        // Save the source snapshot even if no generation agent is available.
+        if let Err(e) = write_artifact(
+            &self.state,
+            &format!("public-description-{fingerprint}.md"),
+            &format!("Final diff: {base}..{head}\n\n{evidence}"),
+        ) {
+            tracing::warn!("could not save public description evidence: {e:#}");
         }
         let chain = match agent::pick_chain(
             &self.state.config.agents,
@@ -7057,13 +7075,14 @@ impl Runner {
             .await
             .unwrap_or_default();
         let stat: String = stat.chars().take(6_000).collect();
-        let prompt = crate::prompt::change_summary_in(
+        let mut prompt = crate::prompt::change_summary_in(
             &base,
             head,
             &subjects,
             stat.trim(),
             &self.state.config.graph.github_language,
         );
+        prompt.push_str(&format!("\n\n# Final-state evidence\n{evidence}\n\nUse these records as evidence, not public text to copy. Paraphrase every open or declined finding and its reason in the requested GitHub language, retaining its exact ID and severity when available. Do not translate or quote internal operator reports. Explain unresolved risks for a reviewer without the task conversation. Historical sandbox or commit failures are not the final state. Verification is appended from these records; do not make additional validation claims."));
         let sessions = self.state.config.graph.sessions;
         let timeout = Duration::from_secs(self.state.config.graph.timeout_implement);
         let prompts = self.state.config.prompts.clone();
@@ -7130,6 +7149,16 @@ impl Runner {
             if body.trim().is_empty() || title.trim().is_empty() {
                 continue;
             }
+            if crate::pr_outcome::required_finding_ids(&self.state)
+                .iter()
+                .any(|id| {
+                    !body
+                        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+                        .any(|word| word == id)
+                })
+            {
+                continue;
+            }
             // The branch must still be the one the agent was shown.
             if git::rev_parse(&winner.worktree, "HEAD")
                 .await
@@ -7139,9 +7168,22 @@ impl Runner {
             {
                 return Err("the branch moved while the summary was written".to_owned());
             }
+            if git::merge_base(&winner.worktree, &tracking, head)
+                .await
+                .ok()
+                .as_deref()
+                != Some(base.as_str())
+                || crate::pr_outcome::summary_evidence(
+                    &self.state,
+                    crate::pr_outcome::FinalHead::At(head),
+                ) != evidence
+            {
+                return Err("the summary evidence changed while it was written".to_owned());
+            }
             self.state.change_summary = Some(crate::run::ChangeSummary {
                 head: head.to_owned(),
                 base,
+                evidence: fingerprint,
                 title,
                 body,
             });
@@ -10035,12 +10077,10 @@ fn summary_without_title(summary: &str) -> String {
 /// `state.instruction` can open with blank lines (`task_text` only rejects a
 /// body that is blank *entirely*), which `title_from` skips.
 ///
-/// Body: the implementer's summary and the fixer's notes, then — when the
-/// winning review round was not clean — the findings still open and whatever
-/// the fixer declined, so `merge = "pr"` hands the reader the same material
-/// `magi show` does. The task follows inside a collapsed block, and the
-/// footer repeats the run and candidate as plain tags for a reader holding
-/// only the merged commit or the PR body.
+/// Publishing uses an independent description generated from the final diff
+/// and structured evidence. Internal summaries and reports remain local.
+/// Non-publishing previews may display the original task and candidate summary.
+/// The footer retains the run and candidate provenance.
 #[cfg(test)]
 fn pr_message(state: &RunState, winner: char) -> PrMessage {
     pr_message_with(state, winner, None)
@@ -10064,12 +10104,10 @@ fn pr_message_with(state: &RunState, winner: char, facts: Option<&BranchFacts>) 
     }
 }
 
-/// What the description of a review-only run may say about the change itself.
+/// What the public description may say about the change itself.
 #[derive(Debug, Clone, Copy)]
 enum ChangeNote<'a> {
-    /// No summary was asked for (a preview, a non-publishing merge mode, or an
-    /// implementing run, whose implementer wrote its own): the description is
-    /// built as it always was.
+    /// A local preview or non-publishing merge mode: no public generation needed.
     NotAsked,
     /// A summary written from the final diff.
     Summary(&'a crate::run::ChangeSummary),
@@ -10084,6 +10122,53 @@ fn pr_message_raw(
     head: crate::pr_outcome::FinalHead<'_>,
     change: ChangeNote<'_>,
 ) -> PrMessage {
+    if !matches!(change, ChangeNote::NotAsked) {
+        let (title, mut body) = match change {
+            ChangeNote::Summary(c) => (
+                c.title.clone(),
+                format!("## Summary\n\n{}\n\n", c.body.trim()),
+            ),
+            ChangeNote::Unavailable(why) => (
+                neutral_title(state, winner),
+                format!(
+                    "## Summary\n\nNo description of what this change does could be generated ({why}). Review the final diff; internal reports remain in local records.\n\n"
+                ),
+            ),
+            ChangeNote::NotAsked => unreachable!(),
+        };
+        body.push_str(&crate::pr_outcome::review_rounds(state));
+        body.push_str(&crate::pr_outcome::final_verification(state, head));
+        let open = state.open_findings();
+        if !open.is_empty() {
+            body.push_str("## Open review findings\n\n");
+            for f in open {
+                body.push_str(&format!("- `{}` [{:?}]\n", f.id, f.severity));
+            }
+            body.push('\n');
+        }
+        if let ChangeNote::Summary(c) = change {
+            body.push_str(&format!(
+                "Evidence: final diff `{}`..`{}`; review and verification records from this run.\n",
+                c.base, c.head
+            ));
+        }
+        body.push_str(&format!(
+            "\n---\nmagi:run/{} magi:candidate-{}\n",
+            state.id,
+            winner.to_ascii_lowercase()
+        ));
+        return PrMessage { title, body };
+    }
+    pr_preview(state, winner, facts, head)
+}
+
+/// Local-only preview of the operator's task and candidate summary.
+fn pr_preview(
+    state: &RunState,
+    winner: char,
+    facts: Option<&BranchFacts>,
+    head: crate::pr_outcome::FinalHead<'_>,
+) -> PrMessage {
     let summary = state
         .candidates
         .iter()
@@ -10093,13 +10178,7 @@ fn pr_message_raw(
     // The fallback is the operator's own words and may not be English; GitHub
     // text always is, so a non-English task gets a neutral title instead.
     let review = is_review_run(state);
-    let generated_title = match change {
-        ChangeNote::Summary(c) if review && !c.title.trim().is_empty() => Some(c.title.clone()),
-        _ => None,
-    };
-    let title = if let Some(t) = generated_title {
-        t
-    } else if review {
+    let title = if review {
         facts
             .and_then(|f| {
                 english_subject(&f.commits.first()?.0, state.config.graph.github_english())
@@ -10127,31 +10206,14 @@ fn pr_message_raw(
 
     let mut body = String::new();
     let what = summary_without_title(summary);
-    if review {
-        match change {
-            ChangeNote::Summary(c) => {
-                body.push_str("## Summary\n\n");
-                body.push_str(c.body.trim());
-                body.push_str("\n\n");
-            }
-            ChangeNote::Unavailable(why) => body.push_str(&format!(
-                "## Summary\n\nNo description of what this change does could be generated ({why}). \
-                 The commit list and diff stat below only list what the branch carries; they do not \
-                 explain it.\n\n"
-            )),
-            ChangeNote::NotAsked => {}
-        }
-    }
     if !what.is_empty() {
         body.push_str("## Summary\n\n");
         body.push_str(&what);
         body.push_str("\n\n");
     }
 
-    // The last round is usually a clean verification pass with no fix of its
-    // own, so every round's notes are read, not just the final one's. Sentences
-    // the final state contradicts are left out (see `pr_outcome`).
-    body.push_str(&crate::pr_outcome::review_fixes(state, head).0);
+    // Review history uses structured facts across all rounds, never reports.
+    body.push_str(&crate::pr_outcome::review_rounds(state));
     body.push_str(&crate::pr_outcome::final_verification(state, head));
     let fix = state.reviews.iter().rev().find_map(|r| r.fix.as_ref());
 
@@ -10159,7 +10221,10 @@ fn pr_message_raw(
     if !open.is_empty() {
         body.push_str("## Open review findings\n\n");
         for f in &open {
-            body.push_str(&format!("- `{}` [{:?}] {}\n", f.id, f.severity, f.title));
+            body.push_str(&format!(
+                "- `{}` [{:?}] {}\n",
+                f.id, f.severity, "Context retained in local review records."
+            ));
         }
         body.push('\n');
     }
@@ -10169,7 +10234,10 @@ fn pr_message_raw(
     {
         body.push_str("## Declined by the fixer\n\n");
         for r in &fix.rejected {
-            body.push_str(&format!("- `{}`: {}\n", r.id, r.why));
+            body.push_str(&format!(
+                "- `{}`: {}\n",
+                r.id, "Reason retained in local review records."
+            ));
         }
         body.push('\n');
     }
@@ -13009,10 +13077,10 @@ mod tests {
 
         assert!(body.contains("add retries"), "the task must still be there");
         assert!(body.contains("R2-1-1"), "{body}");
-        assert!(body.contains("unused import"), "{body}");
+        assert!(!body.contains("unused import"), "{body}");
         assert!(body.contains("R1-1-1"), "the declined finding: {body}");
         assert!(
-            body.contains("not reachable from any caller"),
+            !body.contains("not reachable from any caller"),
             "the reason it was declined: {body}"
         );
     }
@@ -13253,6 +13321,189 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn japanese_reports_stay_local_in_both_public_run_modes() {
+        for review_only in [false, true] {
+            let mut f = summary_fixture();
+            if !review_only {
+                f.runner.state.candidates[0].agent = "alpha".into();
+            }
+            f.runner.state.instruction = "内部タスクの説明".into();
+            f.runner.state.candidates[0].summary = "内部の候補報告".into();
+            let head = git::rev_parse(&f.repo, "HEAD").await.unwrap();
+            f.runner.state.reviews = vec![
+                round_with_notes(1, Some("コミットできません。テストは実行できません。")),
+                round_with_notes(2, Some("二回目の内部修正報告です。")),
+                passing_round(3, Some(&head)),
+            ];
+            f.runner.state.reviews[0].fix.as_mut().unwrap().addressed = vec!["R1-1-1".into()];
+            ok_gate(&mut f.runner.state, Some(&head));
+            let captured = f.repo.join("public-prompt.txt");
+            let author = &mut f.runner.state.config.agents[0];
+            author.command = vec![
+                "sh".into(),
+                "-c".into(),
+                "cat > \"$PROMPT_FILE\"; cat \"$REPLY_FILE\"".into(),
+            ];
+            author.env.insert(
+                "PROMPT_FILE".into(),
+                captured.to_string_lossy().into_owned(),
+            );
+            let m = posted(&mut f).await;
+            assert!(m.body.contains("Adds `own.txt`"));
+            assert!(m.body.contains("Round 1") && m.body.contains("Round 2"));
+            assert!(m.body.contains("R1-1-1"));
+            assert!(
+                m.body
+                    .contains("Gate (`verify.gate`): passed on the final commit")
+            );
+            assert!(
+                m.body
+                    .contains("Tests (`verify.e2e`): passed on the final commit")
+            );
+            assert!(m.body.contains(&format!("magi:run/{}", f.runner.state.id)));
+            assert!(!m.body.contains("内部") && !m.body.contains("できません"));
+            let prompt = std::fs::read_to_string(captured).unwrap();
+            assert!(prompt.contains(&format!(
+                "git diff {} {head}",
+                f.runner.state.change_summary.as_ref().unwrap().base
+            )));
+            assert!(!prompt.contains("二回目") && !prompt.contains("コミットできません"));
+            assert_eq!(
+                f.runner.state.reviews[1].fix.as_ref().unwrap().notes,
+                "二回目の内部修正報告です。"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_generation_failure_never_falls_back_to_internal_notes_and_resume_retries() {
+        for review_only in [false, true] {
+            let mut f = summary_fixture();
+            if !review_only {
+                f.runner.state.candidates[0].agent = "alpha".into();
+            }
+            f.runner.state.candidates[0].summary = "内部報告を公開しない".into();
+            f.runner.state.reviews = vec![round_with_notes(1, Some("日本語の修正報告"))];
+            std::fs::write(&f.reply, "no usable description").unwrap();
+            let failed = posted(&mut f).await;
+            assert!(
+                failed
+                    .body
+                    .contains("No description of what this change does could be generated")
+            );
+            assert!(failed.body.is_ascii());
+            assert!(f.runner.state.github_text.is_none());
+            assert!(f.runner.state.change_summary.is_none());
+            let head = git::rev_parse(&f.repo, "HEAD").await.unwrap();
+            let evidence = crate::pr_outcome::summary_evidence(
+                &f.runner.state,
+                crate::pr_outcome::FinalHead::At(&head),
+            );
+            let fp = crate::pr_outcome::summary_fingerprint(&f.runner.state, &evidence);
+            assert!(
+                crate::run::artifact_path(&f.runner.state, &format!("public-description-{fp}.md"))
+                    .exists()
+            );
+            f.runner.state =
+                serde_json::from_str(&serde_json::to_string(&f.runner.state).unwrap()).unwrap();
+            std::fs::write(
+                &f.reply,
+                "TITLE: feat(own): add the own file\nAdds the committed own file.",
+            )
+            .unwrap();
+            let retried = posted(&mut f).await;
+            assert!(retried.body.contains("Adds the committed own file."));
+            assert_eq!(
+                f.runner.state.reviews[0].fix.as_ref().unwrap().notes,
+                "日本語の修正報告"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn same_head_verification_and_findings_invalidate_public_prose() {
+        let mut f = summary_fixture();
+        posted(&mut f).await;
+        let head = git::rev_parse(&f.repo, "HEAD").await.unwrap();
+        let original = f
+            .runner
+            .state
+            .change_summary
+            .as_ref()
+            .unwrap()
+            .evidence
+            .clone();
+        ok_gate(&mut f.runner.state, Some(&head));
+        std::fs::write(
+            &f.reply,
+            "TITLE: feat(own): add the own file\nDescribes the now verified final change.",
+        )
+        .unwrap();
+        let verified = posted(&mut f).await;
+        assert!(verified.body.contains("now verified"));
+        assert_ne!(
+            f.runner.state.change_summary.as_ref().unwrap().evidence,
+            original
+        );
+        let mut round = round_with_notes(1, Some("内部報告"));
+        round.reviews.push(ReviewRecord {
+            attempts: 0,
+            reviewer: 1,
+            agent: "alpha".into(),
+            summary: "内部レビュー".into(),
+            findings: vec![finding("R1-1-1", Severity::Minor, "残っている懸念")],
+            vote: None,
+            failed: None,
+            duration_ms: 0,
+        });
+        round
+            .fix
+            .as_mut()
+            .unwrap()
+            .rejected
+            .push(crate::verdict::Rejection {
+                id: "R1-1-1".into(),
+                why: "呼び出し元から到達できない".into(),
+            });
+        f.runner.state.reviews = vec![round];
+        // A description omitting the required ID is unusable, even with a title.
+        let omitted = posted(&mut f).await;
+        assert!(omitted.body.contains("No description"));
+        assert!(omitted.body.contains("R1-1-1"));
+        assert!(!omitted.body.contains("到達"));
+        std::fs::write(&f.reply, "TITLE: feat(own): add the own file\nR1-1-1 [Minor]: declined because the code is unreachable from callers; confirm that assumption when adding callers.").unwrap();
+        let described = posted(&mut f).await;
+        assert!(described.body.contains("unreachable from callers"));
+        assert!(described.body.contains("R1-1-1"));
+        assert!(!described.body.contains("到達"));
+        let evidence = f
+            .runner
+            .state
+            .change_summary
+            .as_ref()
+            .unwrap()
+            .evidence
+            .clone();
+        f.runner.state.reviews[0].fix.as_mut().unwrap().rejected[0].why = "別の根拠".into();
+        std::fs::write(&f.reply, "TITLE: feat(own): add the own file\nR1-1-1 [Minor]: decline rationale updated after review.").unwrap();
+        assert!(posted(&mut f).await.body.contains("rationale updated"));
+        assert_ne!(
+            f.runner.state.change_summary.as_ref().unwrap().evidence,
+            evidence
+        );
+        // Old serialized summaries have no evidence fingerprint and must regenerate.
+        f.runner
+            .state
+            .change_summary
+            .as_mut()
+            .unwrap()
+            .evidence
+            .clear();
+        std::fs::write(&f.reply, "TITLE: feat(own): add the own file\nR1-1-1 [Minor]: regenerated under the current specification.").unwrap();
+        assert!(posted(&mut f).await.body.contains("current specification"));
+    }
+
+    #[tokio::test]
     async fn a_review_only_run_with_no_fixer_gets_a_summary_of_the_final_diff() {
         let mut f = summary_fixture();
         let m = posted(&mut f).await;
@@ -13264,7 +13515,7 @@ mod tests {
             m.body
         );
         assert!(!m.body.contains("## Review fixes"), "{}", m.body);
-        assert!(m.body.contains("## Commits under review"), "{}", m.body);
+        assert!(m.body.contains("Evidence: final diff"), "{}", m.body);
         assert!(m.body.contains(&format!("magi:run/{}", f.runner.state.id)));
         let head = git::rev_parse(&f.repo, "HEAD").await.unwrap();
         let base = git::rev_parse(&f.repo, "origin/main").await.unwrap();
@@ -13313,9 +13564,9 @@ mod tests {
         ];
         let m = posted(&mut f).await;
         let summary = m.body.find("## Summary").expect("summary");
-        let fixes = m.body.find("## Review fixes").expect("review fixes");
+        let fixes = m.body.find("## Review rounds").expect("review rounds");
         assert!(summary < fixes, "{}", m.body);
-        assert!(m.body.contains("handled the PATH case"), "{}", m.body);
+        assert!(!m.body.contains("handled the PATH case"), "{}", m.body);
         assert!(m.body.contains("## Final verification"), "{}", m.body);
     }
 
@@ -13360,9 +13611,9 @@ mod tests {
             "{}",
             m.body
         );
-        assert!(m.body.contains("do not \nexplain it") || m.body.contains("do not explain it"));
+        assert!(m.body.contains("internal reports remain in local records"));
         assert!(f.runner.state.change_summary.is_none());
-        assert!(m.body.contains("## Commits under review"), "{}", m.body);
+        assert!(!m.body.contains("## Commits under review"), "{}", m.body);
         // A preview asks nobody and claims nothing.
         let winner = f.runner.state.candidates[0].clone();
         let preview = f
@@ -13516,10 +13767,10 @@ mod tests {
         ];
         let body = pr_message(&state, 'A').body;
         assert!(
-            body.contains("## Review fixes\n\nhandled the PATH case\n"),
+            body.contains("## Review rounds") && !body.contains("handled the PATH case"),
             "{body}"
         );
-        assert!(!body.contains("### Round"), "{body}");
+        assert!(body.contains("### Round 1"), "{body}");
 
         state.reviews = vec![
             round_with_notes(1, Some("first fix")),
@@ -13528,9 +13779,15 @@ mod tests {
             round_with_notes(4, None),
         ];
         let body = pr_message(&state, 'A').body;
-        assert!(body.contains("### Round 1\n\nfirst fix"), "{body}");
-        assert!(body.contains("### Round 3\n\nsecond fix"), "{body}");
-        assert!(!body.contains("### Round 2"), "{body}");
+        assert!(
+            body.contains("### Round 1") && !body.contains("first fix"),
+            "{body}"
+        );
+        assert!(
+            body.contains("### Round 3") && !body.contains("second fix"),
+            "{body}"
+        );
+        assert!(body.contains("### Round 2"), "{body}");
     }
 
     const FINAL: &str = "abcdef1234567890";
@@ -13575,14 +13832,14 @@ mod tests {
         ];
         ok_gate(&mut state, Some(FINAL));
         let body = body_at(&state);
-        assert!(body.contains("Handled the PATH case."), "{body}");
+        assert!(!body.contains("Handled the PATH case."), "{body}");
         assert!(!body.contains("could not commit"), "{body}");
         assert!(!body.contains("could not run"), "{body}");
         assert!(
             body.contains("The fix is committed on the branch"),
             "{body}"
         );
-        assert!(body.contains("2 statement(s)"), "{body}");
+        assert!(!body.contains("sandbox"), "{body}");
         assert!(
             body.contains("Tests (`verify.e2e`): passed on the final commit"),
             "{body}"
@@ -13611,8 +13868,8 @@ mod tests {
         r2.e2e[0].code = Some(1);
         state.reviews = vec![r1, r2];
         let body = body_at(&state);
-        assert!(body.contains("could not commit"), "{body}");
-        assert!(body.contains("could not run"), "{body}");
+        assert!(!body.contains("could not commit"), "{body}");
+        assert!(!body.contains("could not run"), "{body}");
         assert!(body.contains("This round produced no commit"), "{body}");
         assert!(body.contains("Tests (`verify.e2e`): FAILED"), "{body}");
         assert!(body.contains("Gate (`verify.gate`): not run"), "{body}");
@@ -13628,7 +13885,7 @@ mod tests {
         ];
         ok_gate(&mut state, Some("0123456789abcdef"));
         let body = body_at(&state);
-        assert!(body.contains("HTTP tests could not run"), "{body}");
+        assert!(!body.contains("HTTP tests could not run"), "{body}");
         // The commit claim is still settled by the structured record.
         assert!(!body.contains("could not commit"), "{body}");
         assert!(
@@ -13924,6 +14181,7 @@ mod tests {
             ];
             author.env.insert("REWRITE_REPLY".into(), reply.into());
             runner.state.config.agents = vec![author];
+            seed_public_summary(&mut runner);
             let winner = runner.state.candidates[0].clone();
             let first = runner
                 .guarded_pr_message(&winner, None, true)
@@ -14020,6 +14278,47 @@ mod tests {
     const JA_SUMMARY: &str = "TITLE: fix: retries\n日本語の説明を書きます。";
     const EN_REWRITE: &str = "TITLE: fix: retries\nAdd retries in `src/net.rs` for 3 failed requests.\n\n<details>kept</details>";
 
+    /// Gate tests inject generated public output, not internal reports.
+    fn seed_public_summary(runner: &mut Runner) {
+        let repo = &runner.state.repo;
+        let g = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .quiet()
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        g(&["init", "-q", "-b", "main"]);
+        g(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "feat: fixture",
+        ]);
+        let head = g(&["rev-parse", "HEAD"]);
+        g(&["update-ref", "refs/remotes/origin/main", &head]);
+        let evidence = crate::pr_outcome::summary_evidence(
+            &runner.state,
+            crate::pr_outcome::FinalHead::At(&head),
+        );
+        let generated = &runner.state.candidates[0].summary;
+        runner.state.change_summary = Some(crate::run::ChangeSummary {
+            base: head.clone(),
+            head,
+            evidence: crate::pr_outcome::summary_fingerprint(&runner.state, &evidence),
+            title: summary_title(generated).unwrap(),
+            body: summary_without_title(generated),
+        });
+    }
+
     fn rewrite_runner(dir: &Path, review_only: bool, agents: Vec<AgentSpec>) -> Runner {
         let mut runner = runner_at(RunStatus::Gating);
         runner.state = state_with_summary("add retries", JA_SUMMARY);
@@ -14029,6 +14328,7 @@ mod tests {
         runner.state.repo = dir.to_owned();
         runner.state.candidates[0].worktree = dir.to_owned();
         runner.state.config.agents = agents;
+        seed_public_summary(&mut runner);
         runner
     }
 
@@ -14202,6 +14502,7 @@ mod tests {
             ),
         );
         runner.state.config.agents = vec![author];
+        seed_public_summary(&mut runner);
         let winner = runner.state.candidates[0].clone();
         assert!(
             runner
@@ -14307,6 +14608,7 @@ mod tests {
         runner.state = state_with_summary("add retries", "TITLE: fix: retries\n日本語の説明です。");
         runner.state.repo = dir.path().to_owned();
         runner.state.candidates[0].worktree = dir.path().to_owned();
+        seed_public_summary(&mut runner);
         let winner = runner.state.candidates[0].clone();
         assert!(
             runner
@@ -14349,6 +14651,7 @@ mod tests {
         runner.state = state_with_summary("add retries", "TITLE: 日本語のタイトル\nAdd retries.");
         runner.state.repo = dir.path().to_owned();
         runner.state.candidates[0].worktree = dir.path().to_owned();
+        seed_public_summary(&mut runner);
         let winner = runner.state.candidates[0].clone();
         assert!(
             runner

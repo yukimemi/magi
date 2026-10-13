@@ -6,7 +6,7 @@
 //! the description verbatim makes it contradict the final state. These
 //! functions are pure: they read the structured records (`FixRecord::committed`,
 //! `ReviewRound::verified_head`, `RunState::gate` / `gate_head`) and the final
-//! commit, and decide which sentences of a historical report still hold. The
+//! commit, and build public facts without copying historical reports. The
 //! raw report stays in `RunState` and the run's local artifacts untouched.
 //! Everything generated here is English (the GitHub text gate).
 
@@ -15,7 +15,7 @@ use crate::run::{E2eStatus, ReviewRound, RunState};
 /// The commit the pull request will carry, as far as the caller knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FinalHead<'a> {
-    /// Not asked (previews, tests): notes are kept verbatim, no section added.
+    /// Not asked (previews, tests): no verification section added.
     Unreported,
     /// Asked, but it could not be read: nothing is judged verified.
     Unknown,
@@ -27,145 +27,94 @@ fn short(sha: &str) -> &str {
     sha.get(..7).unwrap_or(sha)
 }
 
-/// A sentence that says the fixer could not commit.
-fn is_commit_limit(s: &str) -> bool {
-    let l = s.to_lowercase();
-    [
-        "uncommitted",
-        "not committed",
-        "could not commit",
-        "couldn't commit",
-        "cannot commit",
-        "can't commit",
-        "unable to commit",
-    ]
-    .iter()
-    .any(|p| l.contains(p))
-}
-
-/// A sentence that says tests or checks could not run.
-fn is_test_limit(s: &str) -> bool {
-    let l = s.to_lowercase();
-    let cannot = [
-        "could not run",
-        "couldn't run",
-        "cannot run",
-        "can't run",
-        "unable to run",
-        "not run",
-        "did not run",
-        "sandbox",
-    ]
-    .iter()
-    .any(|p| l.contains(p));
-    cannot
-        && ["test", "http", "network", "sandbox", "check", "build"]
-            .iter()
-            .any(|w| l.contains(w))
-}
-
-/// Split a line into sentences, keeping each one's trailing separator.
-fn sentences(line: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    let bytes = line.as_bytes();
-    for i in 0..bytes.len() {
-        if matches!(bytes[i], b'.' | b';') && bytes.get(i + 1).is_some_and(|b| *b == b' ') {
-            out.push(&line[start..=i + 1]);
-            start = i + 2;
-        }
-    }
-    if start < line.len() {
-        out.push(&line[start..]);
-    }
-    out
-}
-
 fn all_ok(outcomes: &[crate::run::CommandOutcome]) -> bool {
     !outcomes.is_empty() && outcomes.iter().all(|o| o.ok())
 }
 
-/// Did the gate pass on exactly this commit?
-fn gate_passed_at(state: &RunState, head: &str) -> bool {
-    state.gate_ran && all_ok(&state.gate) && state.gate_head.as_deref() == Some(head)
-}
-
-/// Did a round after `round` pass `verify.e2e` on exactly this commit, or the
-/// gate?
-fn verified_after(state: &RunState, round: usize, head: &str) -> bool {
-    gate_passed_at(state, head)
-        || state.reviews.iter().any(|r| {
-            r.round > round
-                && r.e2e_status() == E2eStatus::Passed
-                && r.verified_head.as_deref() == Some(head)
-        })
-}
-
-/// The `## Review fixes` section (empty when no round has notes) and how many
-/// sentences of the fixers' reports the final state contradicts.
-pub fn review_fixes(state: &RunState, head: FinalHead<'_>) -> (String, usize) {
-    let mut kept: Vec<(usize, String)> = Vec::new();
-    let mut dropped = 0;
+/// Public review history contains structured facts only. Operator reports,
+/// finding prose and rejection reasons remain untouched in local records.
+pub fn review_rounds(state: &RunState) -> String {
+    let mut out = String::new();
     for r in &state.reviews {
-        let Some(fix) = r.fix.as_ref() else { continue };
-        let notes = fix.notes.trim();
-        if notes.is_empty() {
-            continue;
+        let Some(fix) = &r.fix else { continue };
+        if out.is_empty() {
+            out.push_str("## Review rounds\n\n");
         }
-        let commit_obsolete = fix.committed && head != FinalHead::Unreported;
-        let test_obsolete = match head {
-            FinalHead::At(h) => verified_after(state, r.round, h),
-            _ => false,
-        };
-        let mut lines = Vec::new();
-        for line in notes.lines() {
-            let mut kept_line = String::new();
-            for s in sentences(line) {
-                let obsolete =
-                    (commit_obsolete && is_commit_limit(s)) || (test_obsolete && is_test_limit(s));
-                if obsolete {
-                    dropped += 1;
-                } else {
-                    kept_line.push_str(s);
-                }
-            }
-            if !kept_line.trim().is_empty() {
-                lines.push(kept_line.trim_end().to_owned());
-            }
+        out.push_str(&format!("### Round {}\n\n", r.round));
+        out.push_str(if fix.committed {
+            "The fix is committed on the branch (including work committed by magi).\n\n"
+        } else {
+            "This round produced no commit.\n\n"
+        });
+        for id in &fix.addressed {
+            out.push_str(&format!("- Addressed: `{id}`\n"));
         }
-        let mut text = lines.join("\n");
-        if head != FinalHead::Unreported {
-            let state_line = if fix.committed {
-                "_The fix is committed on the branch (magi commits any work the fixer left behind)._"
-            } else {
-                "_This round produced no commit._"
-            };
-            text = if text.is_empty() {
-                state_line.to_owned()
-            } else {
-                format!("{text}\n\n{state_line}")
-            };
+        for rejection in &fix.rejected {
+            out.push_str(&format!("- Declined in this round: `{}`\n", rejection.id));
         }
-        kept.push((r.round, text));
+        out.push('\n');
     }
-    if kept.is_empty() {
-        return (String::new(), dropped);
-    }
-    let mut out = String::from("## Review fixes\n\n");
-    if let [(_, only)] = kept.as_slice() {
-        out.push_str(only);
-        out.push_str("\n\n");
-    } else {
-        for (round, text) in &kept {
-            out.push_str(&format!("### Round {round}\n\n{text}\n\n"));
-        }
-    }
-    if dropped > 0 {
-        out.push_str(&format!(
-            "_{dropped} statement(s) from a fixer's sandboxed session about commit or test limits were left out because the final state below supersedes them; the full reports stay in the run's local records._\n\n"
-        ));
-    }
-    (out, dropped)
+    out
+}
+
+/// Evidence for the independent public description. Raw reports are never
+/// input: only open findings and explicit decline reasons need paraphrasing.
+pub fn summary_evidence(state: &RunState, head: FinalHead<'_>) -> String {
+    let open = state.open_findings();
+    let declined: Vec<_> = state
+        .reviews
+        .iter()
+        .filter_map(|r| r.fix.as_ref())
+        .flat_map(|f| &f.rejected)
+        .map(|rejection| {
+            let finding = state
+                .reviews
+                .iter()
+                .flat_map(|r| &r.reviews)
+                .flat_map(|r| &r.findings)
+                .find(|f| f.id == rejection.id);
+            serde_json::json!({"id": rejection.id, "reason": rejection.why,
+                "finding": finding})
+        })
+        .collect();
+    let verification = serde_json::json!({
+        "gate": state.gate.iter().map(|o| (&o.command, o.code, o.resource_blocked)).collect::<Vec<_>>(),
+        "tests": state.reviews.iter().map(|r| (r.round, &r.verified_head,
+            r.e2e.iter().map(|o| (&o.command, o.code, o.resource_blocked)).collect::<Vec<_>>())).collect::<Vec<_>>()
+    });
+    format!(
+        "{}{}\nOpen findings (local source material):\n{}\nDeclined findings (local source material):\n{}\nVerification commands and outcomes:\n{verification}",
+        review_rounds(state),
+        final_verification(state, head),
+        serde_json::to_string(&open).unwrap_or_default(),
+        serde_json::to_string(&declined).unwrap_or_default()
+    )
+}
+
+/// A generation policy change or a new evidence snapshot invalidates old prose.
+pub fn summary_fingerprint(state: &RunState, evidence: &str) -> String {
+    crate::github_text::fingerprint(
+        &format!(
+            "public-description-v2:{}",
+            state.config.graph.github_language
+        ),
+        evidence,
+    )
+}
+
+/// Every finding requiring public context must be covered by the generator.
+pub fn required_finding_ids(state: &RunState) -> Vec<String> {
+    let mut ids: Vec<_> = state.open_findings().iter().map(|f| f.id.clone()).collect();
+    ids.extend(
+        state
+            .reviews
+            .iter()
+            .filter_map(|r| r.fix.as_ref())
+            .flat_map(|f| f.rejected.iter().map(|r| r.id.clone())),
+    );
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 fn last_checked(state: &RunState) -> Option<&ReviewRound> {
@@ -208,7 +157,11 @@ pub fn final_verification(state: &RunState, head: FinalHead<'_>) -> String {
                 ran_on(r.verified_head.as_deref()),
                 r.round
             ),
-            E2eStatus::Failed => format!("- Tests (`verify.e2e`): FAILED in round {}", r.round),
+            E2eStatus::Failed => format!(
+                "- Tests (`verify.e2e`): FAILED {} (round {})",
+                ran_on(r.verified_head.as_deref()),
+                r.round
+            ),
             E2eStatus::Deferred => format!(
                 "- Tests (`verify.e2e`): deferred in round {}, not run",
                 r.round
@@ -225,7 +178,10 @@ pub fn final_verification(state: &RunState, head: FinalHead<'_>) -> String {
     } else if state.gate.is_empty() {
         "- Gate (`verify.gate`): no commands configured".to_owned()
     } else if !all_ok(&state.gate) {
-        "- Gate (`verify.gate`): FAILED".to_owned()
+        format!(
+            "- Gate (`verify.gate`): FAILED {}",
+            ran_on(state.gate_head.as_deref())
+        )
     } else {
         format!(
             "- Gate (`verify.gate`): passed {}",

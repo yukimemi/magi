@@ -2823,18 +2823,25 @@ annotated after a resume).
 - The Attempts panel counts three different things: entries (passes), distinct
   runs, and attempts consumed (`Task::attempts`). Do not merge them.
 
-### A review-only run's pull request describes the final diff
+### Public pull request prose is independent of internal reports
 
-`graph::Runner::summarize_change` (called from `guarded_pr_message` only when a
-pull request is about to be posted for a review-only run) asks a read-only seat
-(`[roles] synthesizer` chain, seat `change-summary`, prompt
-`prompt::change_summary`) to read `git diff <merge base> <final head>` and the
-surrounding code and describe the whole change. The result is
-`RunState::change_summary`, valid only for the exact (final head, merge base
-with `<remote>/<base>`) it was written from: any other pair discards it and asks
-again. Validation, review fixes and open findings still come from the structured
-records (`pr_outcome`), never from the agent. When no agent answers, the body
-says so explicitly (`ChangeNote::Unavailable`) instead of presenting the commit
-list as a description; the failure is not persisted, so a resume retries. The
-text still goes through the posting gate and keeps the run marker. A head that
-moves after publication (a land fix round) does not edit the posted description.
+`graph::Runner::summarize_change` runs in both full and review-only runs before
+posting a PR. The read-only `change-summary` seat uses the synthesizer chain to
+read the final HEAD diff against the merge-base with the remote base and nearby
+code. `pr_outcome::summary_evidence` supplies structured review/verification
+facts, open findings and decline reasons for independent paraphrasing; fixer
+notes and candidate reports are never public body material. Their originals
+remain in RunState and local artifacts in the operator's language.
+
+`ChangeSummary` is reusable only for the same HEAD, merge-base and evidence
+fingerprint (generation specification, GitHub language, verification and
+findings). Missing fingerprints on older records force regeneration. Required
+open/declined finding IDs must appear in the generated description. Evidence
+snapshots are saved locally even when generation fails; failure uses the
+explicit unavailable-description fallback and a resume retries. Shared resource
+blocks hold before publication. The posting gate remains the final language and
+sensitive-data check; its original/rewrite choices refer only to independent
+public prose, never internal reports. Review rounds, verification provenance
+and the run marker are appended from structured records. Local previews may
+still show the task/candidate summary. A later landing fix does not edit an
+already posted description.
