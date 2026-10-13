@@ -1478,8 +1478,8 @@ pub fn record_reply(
             talk.status.as_str()
         );
     }
-    let text = text.trim();
-    if text.is_empty() && attachments.is_empty() {
+    // Keep Markdown indentation in owner evidence; trim only to check emptiness.
+    if text.trim().is_empty() && attachments.is_empty() {
         bail!("nothing to say");
     }
     talk.turns.push(Turn {
@@ -1550,8 +1550,8 @@ fn queue_keyed(
     previous: &dyn Fn(&str) -> bool,
     target: Option<ReplyTarget>,
 ) -> Result<bool> {
-    let text = text.trim();
-    if text.is_empty() && attachments.is_empty() {
+    // Keep Markdown indentation in owner evidence; trim only to check emptiness.
+    if text.trim().is_empty() && attachments.is_empty() {
         bail!("nothing to say");
     }
     let _guard = store.guard()?;
@@ -1964,7 +1964,7 @@ pub fn edit_pending_message(
         if text.trim().is_empty() && edited.attachments.is_empty() {
             fresh.pending_messages.remove(index);
         } else {
-            edited.body = text.trim().to_owned();
+            edited.body = text.to_owned();
         }
         fresh.pending.clear();
         fresh.pending_breaks = Some(Vec::new());
@@ -1993,11 +1993,11 @@ pub fn edit_pending_message(
         }
         let reply = fresh.pending_messages.first().and_then(|m| m.reply.clone());
         fresh.pending_messages = vec![Message {
-            body: text.trim().to_owned(),
+            body: text.to_owned(),
             attachments: fresh.pending_attachments.clone(),
             reply,
         }];
-        fresh.pending = text.trim().to_owned();
+        fresh.pending = text.to_owned();
         fresh.pending_breaks = Some(Vec::new());
     }
     store.put(&mut fresh)?;
@@ -3847,6 +3847,30 @@ mod tests {
                 .body
                 .contains("[Reply to Operator: original]\nfollowup")
         );
+    }
+
+    #[test]
+    fn owner_indentation_survives_record_queue_and_edit() {
+        let (tmp, talks) = store();
+        let cfg = config(mock_agent(tmp.path(), REPLY, env("reply")));
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        for text in ["    Post original", "\tUse rewrite"] {
+            record_reply(&mut talk, &talks, text, Vec::new(), None).unwrap();
+            assert_eq!(
+                talks.get(&talk.id).unwrap().turns.last().unwrap().body,
+                text
+            );
+            queue(&mut talk, &talks, "draft", Vec::new()).unwrap();
+            assert!(edit_pending_message(&mut talk, &talks, text, "draft", &[], Some(0)).unwrap());
+            let saved = talks.get(&talk.id).unwrap();
+            assert_eq!(saved.pending, text);
+            assert_eq!(saved.pending_messages[0].body, text);
+            assert!(edit_pending_message(&mut talk, &talks, text, text, &[], None).unwrap());
+            let saved = talks.get(&talk.id).unwrap();
+            assert_eq!(saved.pending, text);
+            assert_eq!(saved.pending_messages[0].body, text);
+            assert_eq!(drain(&mut talk, &talks).unwrap().as_deref(), Some(text));
+        }
     }
 
     #[test]

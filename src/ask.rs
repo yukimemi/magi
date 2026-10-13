@@ -804,7 +804,13 @@ impl Question {
             .iter()
             .rev()
             .find(|t| t.who == Who::Operator)
-            .map(|t| t.body.trim());
+            .map(|t| {
+                if self.node == crate::github_text::ASK_NODE && !crate::deputy::merge_gated(self) {
+                    t.body.as_str()
+                } else {
+                    t.body.trim()
+                }
+            });
         if crate::deputy::merge_gated(self) {
             // The merge is irreversible and a say is not a decision. `hold` must
             // be the latest message exactly. For `merge`, whether the words are

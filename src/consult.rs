@@ -323,7 +323,7 @@ fn latest_message_for_policy(
         if is_completion_notice(body) {
             return None;
         }
-        let words = owner_words(body, after_block_of);
+        let words = owner_words_for_policy(body, after_block_of, posting);
         // Legacy/invalid boundary records cannot distinguish paragraphs from
         // separate owner replies. Posting must not promote a reported final
         // paragraph into an instruction. Merge keeps its existing policy.
@@ -331,6 +331,9 @@ fn latest_message_for_policy(
             // Keep this as the newest evidence (with no usable quote), so an
             // ambiguous queued reply cannot fall back to an older instruction.
             return Some(String::new());
+        }
+        if posting {
+            return (!words.trim().is_empty()).then_some(words);
         }
         return words
             .rsplit("\n\n")
@@ -361,8 +364,8 @@ fn latest_message_for_policy(
         .skip(first)
         .rev()
         .filter(|(_, m)| !is_completion_notice(m))
-        .map(|(i, m)| owner_words(m, after_block_of.filter(|_| i == first)))
-        .find(|w| !w.is_empty())
+        .map(|(i, m)| owner_words_for_policy(m, after_block_of.filter(|_| i == first), posting))
+        .find(|w| !w.trim().is_empty())
 }
 
 /// Is this message magi's own task or watch completion notice? It is never
@@ -425,7 +428,21 @@ fn legacy_len(rest: &str) -> usize {
 /// between them are kept, in order, even when they contain the phrase. With `after_block_of` (the turn
 /// carrying the hand-over itself) everything up to the end of the last block
 /// naming that question id predates the hand-over and is dropped.
+#[cfg(test)]
 fn owner_words(body: &str, after_block_of: Option<&str>) -> String {
+    owner_words_for_policy(body, after_block_of, false)
+}
+
+fn owner_words_for_policy(body: &str, after_block_of: Option<&str>, posting: bool) -> String {
+    // Remove generated blocks without removing Markdown code indentation from
+    // the owner's evidence. Merge retains its existing whitespace handling.
+    let trim = |text: &str| -> String {
+        if posting {
+            text.trim_matches(['\r', '\n']).to_owned()
+        } else {
+            text.trim().to_owned()
+        }
+    };
     use crate::prompt::{CHAT_CONSULT_END, CHAT_CONSULT_HEADING};
     // A real heading is the generated one: `# ` at a line start, followed by
     // the fixed opening sentence. A heading phrase quoted inside a question's
@@ -442,7 +459,7 @@ fn owner_words(body: &str, after_block_of: Option<&str>) -> String {
         })
         .collect();
     if heads.is_empty() {
-        return body.trim().to_owned();
+        return trim(body);
     }
     // (start, end) of each generated block, the heading's own "# " included.
     // `chat_consult` defuses every marker quoted in a question's text, so the
@@ -480,14 +497,14 @@ fn owner_words(body: &str, after_block_of: Option<&str>) -> String {
     let mut at = from;
     for &(s, e) in &blocks {
         if s >= at {
-            parts.push(body[at..s].trim());
+            parts.push(trim(&body[at..s]));
         }
         at = at.max(e);
     }
-    parts.push(body[at..].trim());
+    parts.push(trim(&body[at..]));
     parts
         .into_iter()
-        .filter(|p| !p.is_empty())
+        .filter(|p| !p.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -1460,7 +1477,11 @@ mod tests {
             .into_iter()
             .chain(crate::github_text::reported_posting_messages(command))
             {
-                talk.pending = reported.clone();
+                talk.pending.clear();
+                talk.pending_messages.clear();
+                store.put(&mut talk).unwrap();
+                talk::queue(&mut talk, &store, &reported, Vec::new()).unwrap();
+                assert_eq!(talk.pending, reported);
                 // Check both current message boundaries and legacy records.
                 for breaks in [Some(Vec::new()), None] {
                     talk.pending_breaks = breaks;
@@ -1471,6 +1492,14 @@ mod tests {
                         assert!(after.status.open());
                         assert!(after.answer.is_none());
                     }
+                }
+                // Drained transcript evidence must retain the same context.
+                talk::drain(&mut talk, &store).unwrap();
+                for quote in [command, reported.as_str()] {
+                    assert!(save(choice, Some(quote), &talk.id).is_err());
+                    let after = questions.get(&q.id).unwrap();
+                    assert!(after.status.open());
+                    assert!(after.answer.is_none());
                 }
             }
             let natural = if choice == POST_ORIGINAL {

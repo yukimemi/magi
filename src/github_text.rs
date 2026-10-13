@@ -401,9 +401,16 @@ pub fn posting_authorized(message: &str, quote: &str, choice: &str) -> bool {
     let evidence = normalize(&message.to_lowercase());
     let evidence_quote = normalize(&quote.to_lowercase());
     let has_instruction = |text: &str| {
-        // A newline is whitespace within the same instruction, not a new
-        // sentence: splitting here would discard a preceding report header.
-        text.split(['.', '!', '。', '！']).any(|sentence| {
+        // Only skip known acknowledgements and the supported explanation of
+        // the original-text choice. Searching arbitrary later sentences would
+        // detach a command from a report introducing it without quotation marks.
+        // Newlines retain that context.
+        text.split(['.', '!', '。', '！'])
+            .find(|sentence| !matches!(sentence.trim(),
+                "" | "ok" | "okay" | "yes" | "いいや、まだ説明が足りない"
+                | "いいや、説明が足りない" | "いいや、まだ説明が不足"
+                | "いいや、説明が不足"))
+            .is_some_and(|sentence| {
             let sentence = sentence.trim();
             commands.iter().any(|command| {
                 sentence.match_indices(command).any(|(at, _)| {
@@ -455,7 +462,17 @@ pub fn posting_authorized(message: &str, quote: &str, choice: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) fn reported_posting_messages(command: &str) -> Vec<String> {
-    let mut messages = Vec::new();
+    let mut messages = vec![format!("    {command}"), format!("\t{command}")];
+    for separator in [". ", ".\n", ".\r\n", "! ", "。\n"] {
+        for introduction in [
+            "The log contains the following instruction",
+            "The log contains the following text",
+            "The log says",
+            "Someone reported the following",
+        ] {
+            messages.push(format!("{introduction}{separator}{command}."));
+        }
+    }
     for newline in ["\n", "\r\n"] {
         messages.extend([
             format!("The log says:{newline}{command}"),
