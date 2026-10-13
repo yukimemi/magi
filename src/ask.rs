@@ -1483,18 +1483,31 @@ impl Questions {
     }
 
     /// How many open questions actually need the owner right now: open, and
-    /// not [`Question::waiting_on_agent`].
+    /// not [`Question::waiting_on_agent`], or the follow-up is exhausted.
     ///
     /// This is the number a notification channel owes - the ask bar, the nav
     /// badge, the document title - because those exist to say "something
-    /// needs you", and a question sitting in `magi ask --thread` limbo does
-    /// not. `count_open` stays as it is for [`Self::open_for`]'s callers,
+    /// needs you". An unread say stops needing the agent once its follow-up
+    /// has spent its starts. `count_open` stays as it is for [`Self::open_for`]'s callers,
     /// where a round trip must not look like the run resumed.
     pub fn count_needs_owner(&self) -> usize {
         self.list()
             .iter()
-            .filter(|q| q.status.open() && !q.waiting_on_agent())
+            .filter(|q| q.status.open() && (!q.waiting_on_agent() || self.deputy_exhausted(q)))
             .count()
+    }
+
+    /// The follow-up spent its starts and its final turn is no longer alive.
+    /// Computed from the lease rather than saved with the question, so the
+    /// owner can decide even when an unread message remains in the thread.
+    pub fn deputy_exhausted(&self, q: &Question) -> bool {
+        q.status.open()
+            && q.deputy
+                .as_ref()
+                .is_some_and(|d| d.starts >= crate::deputy::MAX_STARTS)
+            && !self
+                .read_lease(&q.id)
+                .is_some_and(|l| l.fresh(Timestamp::now()))
     }
 }
 
