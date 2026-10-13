@@ -1387,7 +1387,7 @@ mod tests {
             // No owner reply, nor text from the generated question, is evidence.
             assert!(save(choice, Some(choice), &talk.id).is_err());
             let clear = if choice == POST_ORIGINAL {
-                "いいや、まだ説明が足りない。元の説明で投稿してください。"
+                "元の説明のまま投稿して"
             } else {
                 "Use the rewrite text as it is."
             };
