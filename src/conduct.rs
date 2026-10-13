@@ -316,7 +316,7 @@ fn severity_str(s: crate::verdict::Severity) -> &'static str {
 fn surviving_branch(task: &Task) -> Option<String> {
     let last = task.runs.last()?;
     let state = RunState::load(last).ok()?;
-    if !crate::daemon::compatible_instruction(&state.instruction, task) {
+    if !crate::daemon::compatible_run_instruction(&state, task) {
         return None;
     }
     state.winner().map(|c| c.branch.clone())

@@ -42,6 +42,8 @@ use crate::ask::Questions;
 
 /// On-disk format for a queued task. Bumped when a field's meaning changes.
 ///
+/// 18: retained review criteria snapshots survive operator edits.
+///
 /// 17: durable explicit operator resumption, independent of run startup.
 ///
 /// 7: added [`Task::attachments`], names of files copied under
@@ -124,7 +126,7 @@ use crate::ask::Questions;
 ///
 /// 16: added [`Task::attempt_limit`], an optional task-specific retry budget.
 /// Field-only, `#[serde(default)]`; old records inherit the daemon limit.
-pub const SCHEMA: u32 = 17;
+pub const SCHEMA: u32 = 18;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +433,9 @@ pub struct Task {
     /// never reach here.
     #[serde(default)]
     pub review_branch: Option<String>,
+    /// Authored criteria when the retained recovery review was selected.
+    #[serde(default)]
+    pub review_instruction: Option<String>,
     /// A release deliberately starts a new competition instead of resuming
     /// the prior run. History remains as evidence in `runs`.
     #[serde(default)]
@@ -779,6 +784,7 @@ impl Task {
             resumption_history: Vec::new(),
             operator_decided_at: None,
             review_branch: None,
+            review_instruction: None,
             fresh_start: false,
             interrupt: false,
             urgent: false,
@@ -1144,6 +1150,12 @@ impl Task {
     pub fn hold_manual(&mut self, reason: Option<String>) {
         // A later explicit hold supersedes outstanding triage answers.
         self.operator_decided_at = Some(Timestamp::now());
+        self.hold_unrequested_retry(reason);
+    }
+
+    /// Keep a hand-started run from retrying automatically, without recording
+    /// an operator decision that could invalidate its outstanding questions.
+    pub(crate) fn hold_unrequested_retry(&mut self, reason: Option<String>) {
         self.park_reason = None;
         self.note_held();
         self.status = TaskStatus::Held;
@@ -1273,6 +1285,7 @@ impl Task {
     pub fn request_review(&mut self, branch: String) {
         self.release();
         self.review_branch = Some(branch);
+        self.review_instruction = Some(self.instruction.clone());
     }
 
     /// Requeue after a conductor chose a new competition. Unlike an ordinary
@@ -1281,6 +1294,7 @@ impl Task {
         self.release();
         // A fresh competition is the opposite of a review of the old branch.
         self.review_branch = None;
+        self.review_instruction = None;
         self.fresh_start = true;
     }
 
@@ -1295,6 +1309,7 @@ impl Task {
     pub fn hold_for_handover(&mut self, branch: Option<String>, reason: String) {
         if branch.is_some() {
             self.review_branch = branch;
+            self.review_instruction = Some(self.instruction.clone());
         }
         self.hold_machine(Some(reason));
     }
@@ -1451,6 +1466,11 @@ impl Task {
                 self.status.as_str()
             );
         }
+        // Older retained reviews have no criteria snapshot yet. Capture the
+        // old instruction before this supported edit can change the target.
+        if self.review_branch.is_some() && self.review_instruction.is_none() {
+            self.review_instruction = Some(self.instruction.clone());
+        }
         self.title = title;
         self.instruction = instruction;
         Ok(())
@@ -1514,7 +1534,11 @@ impl Task {
     pub fn release(&mut self) {
         let refused_handover = self.status == TaskStatus::Held
             && self.hold_source == Some(HoldSource::Machine)
-            && self.review_branch.is_some();
+            && self.review_branch.is_some()
+            && self
+                .review_instruction
+                .as_ref()
+                .is_none_or(|i| *i == self.instruction);
         self.status = TaskStatus::Queued;
         self.held_at = None;
         self.attempts = 0;
@@ -1537,6 +1561,7 @@ impl Task {
         // that same branch. Any other release drops it.
         if !refused_handover {
             self.review_branch = None;
+            self.review_instruction = None;
         }
         self.fresh_start = false;
     }
@@ -3491,6 +3516,35 @@ mod tests {
         // `runs`.
         t.release();
         assert_eq!(t.answers.len(), 1, "the answer is not lost on release");
+    }
+
+    #[test]
+    fn resumption_review_branch_requires_unchanged_authored_criteria() {
+        for source in ["cli", "web"] {
+            let mut t = task("review old candidate");
+            t.request_review("candidate-A".into());
+            t.hold_for_handover(Some("candidate-A".into()), "handover refused".into());
+            let mut unchanged = t.clone();
+            unchanged.release_operator(source, None);
+            assert_eq!(unchanged.review_branch.as_deref(), Some("candidate-A"));
+            t.edit(
+                "review approved head".into(),
+                "Reuse measured PR head B; fix Clippy; review".into(),
+            )
+            .unwrap();
+            t.release_operator(source, None);
+            assert!(t.review_branch.is_none());
+            assert!(t.review_instruction.is_none());
+            // Legacy records capture their old criteria at the supported edit.
+            let mut legacy = unchanged;
+            legacy.review_instruction = None;
+            legacy.hold_for_handover(None, "still checked out".into());
+            legacy
+                .edit("new plan".into(), "Reuse measured PR head B".into())
+                .unwrap();
+            legacy.release_operator(source, None);
+            assert!(legacy.review_branch.is_none());
+        }
     }
 
     #[test]

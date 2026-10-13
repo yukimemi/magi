@@ -862,6 +862,7 @@ impl Runner {
             state.event("recovery", rec.summary());
             state.recovery = Some(rec);
         }
+        state.task_instruction = takeover.task_instruction.clone();
         state.instruction = instruction;
         state.reviewed_commits = Some(
             git::subjects(repo, &start, branch)

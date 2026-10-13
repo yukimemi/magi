@@ -964,10 +964,23 @@ pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
             continue;
         }
         let generation = task.resumption.as_ref().map_or(0, |r| r.generation);
-        let newer_decision = q.triage_generation.is_some_and(|g| g != generation)
+        let action = interpret_answer(&q);
+        let mut newer_decision = q.triage_generation.is_some_and(|g| g != generation)
             || task.resumption.as_ref().is_some_and(|r| r.at > q.asked_at)
             || task.held_at.is_some_and(|at| at > q.asked_at)
             || task.operator_decided_at.is_some_and(|at| at > q.asked_at);
+        // A later explicit keep-held answer is itself a newer operator
+        // decision, even when the question predates the release. Resume and
+        // discard still require the question's original scope to match.
+        if matches!(action, AnswerAction::KeepHeld)
+            && q.answered_at.is_some_and(|at| {
+                task.operator_decided_at
+                    .is_none_or(|decision| at > decision)
+                    && task.resumption.as_ref().is_none_or(|r| at > r.at)
+            })
+        {
+            newer_decision = false;
+        }
         // Audit the answer even when a later release or manual hold wins.
         let resolution = q.resolution().unwrap_or_default();
         task.answers.push(crate::queue::AnsweredQuestion {
@@ -979,7 +992,7 @@ pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
             },
         });
         if !newer_decision {
-            match interpret_answer(&q) {
+            match action {
                 AnswerAction::Resume => {
                     task.release_operator("triage", Some(&q.id));
                     task.resume_override = Some(OperatorResume {
@@ -1197,6 +1210,49 @@ mod tests {
         let config = dir.join("magi.toml");
         std::fs::write(&config, "[disk]\nmin_free_bytes = 0\n").unwrap();
         config
+    }
+
+    #[test]
+    fn resumption_later_keep_held_answer_wins_but_an_older_answer_cannot_undo_release() {
+        for source in ["cli", "web"] {
+            for answer_after_release in [true, false] {
+                let (dir, queue, questions) = store();
+                let mut t = task("recovery", dir.path().join("repo"));
+                t.hold_machine(Some("inspect remote first".into()));
+                queue.put(&mut t).unwrap();
+                let mut q = file_question(
+                    &questions,
+                    &t,
+                    Bucket::MachineUnknown,
+                    &JA,
+                    Timestamp::now(),
+                )
+                .unwrap();
+                if !answer_after_release {
+                    q.answer(Answer::Choice(q.choices[1].clone())).unwrap();
+                    questions.put(&mut q).unwrap();
+                }
+                t.release_operator(source, None);
+                queue.put(&mut t).unwrap();
+                if answer_after_release {
+                    q.answer(Answer::Choice(q.choices[1].clone())).unwrap();
+                    questions.put(&mut q).unwrap();
+                }
+                apply_answers(&queue, &questions);
+                let after = queue.get(&t.id).unwrap();
+                assert!(after.triage_applied(&q.id));
+                assert_eq!(after.operator_held(), answer_after_release);
+                assert_eq!(
+                    after.status,
+                    if answer_after_release {
+                        TaskStatus::Held
+                    } else {
+                        TaskStatus::Queued
+                    }
+                );
+                assert!(apply_answers(&queue, &questions).is_empty());
+            }
+        }
     }
 
     #[test]
