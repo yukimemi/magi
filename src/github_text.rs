@@ -311,6 +311,8 @@ fn has_posting_report_context(text: &str) -> bool {
                 | '）'
                 | '['
                 | ']'
+                | '{'
+                | '}'
                 | '【'
                 | '】'
                 | '`'
@@ -455,18 +457,18 @@ pub(crate) fn reported_posting_messages(command: &str) -> Vec<String> {
         ("(", ")"),
         ("（", "）"),
         ("[", "]"),
+        ("{", "}"),
         ("【", "】"),
     ] {
-        for separator in [". ", "\n"] {
-            for ending in [close, ""] {
-                messages.push(format!(
-                    "The log says: {open}Reported{separator}{command}.{ending}"
-                ));
-            }
+        for separator in [". ", "! ", "\n"] {
+            // Closed, unclosed, closing-only and mixed report/instruction forms.
+            messages.extend([
+                format!("The log says: {open}Reported{separator}{command}.{close}"),
+                format!("The log says: {open}Reported{separator}{command}."),
+                format!("Reported{separator}{command}.{close}"),
+                format!("{open}Reported{close}{separator}{command}."),
+            ]);
         }
-        // Closing markers alone and mixed quote/command messages also require clarification.
-        messages.push(format!("Reported. {command}.{close}"));
-        messages.push(format!("{open}Reported{close}. {command}."));
     }
     messages
 }
