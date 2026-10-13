@@ -613,6 +613,49 @@ pub const APPROVE: &str = "merge";
 /// The choice that leaves the pull request open.
 pub const HOLD: &str = "hold";
 
+/// A bounded repair followed by a new review and a fresh owner decision.
+pub const REPAIR: &str = "fix findings and re-review";
+
+/// Independent of the contested handoff's AND condition: either open Major
+/// findings or rejecting final votes qualify once review handed off.
+pub fn repair_available(state: &RunState) -> bool {
+    state.reviews.last().is_some_and(|r| {
+        state.open_findings().iter().any(|f| f.severity.blocks())
+            || r.final_votes()
+                .iter()
+                .any(|(_, _, v)| *v == crate::verdict::ReviewVote::Reject)
+    })
+}
+
+/// Shared choices for web, CLI and consultation questions.
+pub fn approval_choices(state: &RunState) -> Vec<String> {
+    let mut choices = vec![APPROVE.to_owned(), HOLD.to_owned()];
+    if repair_available(state) {
+        choices.push(REPAIR.to_owned());
+    }
+    choices
+}
+
+/// Upgrade an unanswered legacy two-choice question without changing its id,
+/// panel, head binding or any already recorded owner decision.
+pub fn upgrade_repair_choice(q: &mut ask::Question, state: &RunState) -> bool {
+    if q.node == APPROVAL_NODE
+        && q.status.open()
+        && repair_available(state)
+        && state
+            .land_approval
+            .as_ref()
+            .is_some_and(|a| a.question == q.id)
+        && !q.choices.iter().any(|c| c == REPAIR)
+    {
+        q.choices.push(REPAIR.to_owned());
+        q.detail.push_str("\n\n`fix findings and re-review` runs one repair and bounded review on this PR; it does not approve a merge. A fresh decision follows the updated review and gate.");
+        true
+    } else {
+        false
+    }
+}
+
 /// Whether `quote` is a verbatim part of the owner's `message` and nothing in
 /// the whole message carries a hedge, a condition, a negation, a question or a
 /// retraction. Used by `deputy::destructive`.
@@ -757,6 +800,8 @@ pub const DIFF_MAX_LINES: usize = 400;
 pub enum Approval {
     /// The owner said [`APPROVE`]. Merge.
     Merge,
+    /// Repair the existing PR, then ask again; never approval to merge.
+    Repair,
     /// Anything else, including silence. Leave the pull request open.
     Hold,
 }
@@ -771,6 +816,7 @@ pub enum Approval {
 pub fn approval(answer: Option<&str>) -> Approval {
     match answer {
         Some(a) if a.trim().eq_ignore_ascii_case(APPROVE) => Approval::Merge,
+        Some(a) if a.trim() == REPAIR => Approval::Repair,
         _ => Approval::Hold,
     }
 }
@@ -780,6 +826,8 @@ pub fn approval(answer: Option<&str>) -> Approval {
 enum ApprovalGate {
     /// The owner said [`APPROVE`]. Merge.
     Approved,
+    /// The owner explicitly requested repair, without authorizing a merge.
+    Repair,
     /// The owner said anything else, the question timed out, or it was
     /// closed with no decision recorded.
     Held,
@@ -1413,6 +1461,9 @@ pub fn deputy_brief(q: &ask::Question, state: Option<&RunState>) -> String {
          not change files, branches or the pull request.",
         run = q.run
     );
+    if q.choices.iter().any(|c| c == REPAIR) {
+        s.push_str("\n\n`fix findings and re-review` requests one repair and bounded re-review on the existing PR. It never approves a merge. Settle this choice only when the owner's whole latest message is exactly this label; otherwise discuss it with `--thread`. The driver performs the repair; do not edit or queue another task. Updated review and gate results require a fresh merge decision.");
+    }
     let Some(state) = state else {
         s.push_str(
             "\n\nThe run's record could not be read, so the pull request, the panel \
@@ -1506,7 +1557,17 @@ async fn approval_gate(
     }
 
     let q = match reusable {
-        Some(q) => q,
+        Some(mut q) => {
+            if upgrade_repair_choice(&mut q, state) {
+                q = store
+                    .update(&q.id, |current| {
+                        upgrade_repair_choice(current, state);
+                        Ok(())
+                    })?
+                    .0;
+            }
+            q
+        }
         None => {
             let worktree = match state.winner() {
                 Some(w) => w.worktree.clone(),
@@ -1576,8 +1637,11 @@ async fn approval_gate(
                 "land".to_owned(),
                 w.approval_summary(pr.number, subject),
                 w.approval_detail(&pr.url, &state.base_branch, subject, contested),
-                vec![APPROVE.to_owned(), HOLD.to_owned()],
+                approval_choices(state),
             );
+            if fresh.choices.iter().any(|c| c == REPAIR) {
+                fresh.detail.push_str("\n\n`fix findings and re-review` runs one repair and bounded review on this PR; it does not approve a merge. A fresh decision follows the updated review and gate.");
+            }
             store
                 .put_panel(&mut fresh, &html, &[])
                 .context("write the merge approval panel")?;
@@ -1618,7 +1682,30 @@ async fn approval_gate(
         // ever sees an actual decision.
         ask::QuestionStatus::Answered => match approval(q.resolution().as_deref()) {
             Approval::Merge => ApprovalGate::Approved,
-            Approval::Hold => ApprovalGate::Held,
+            Approval::Repair if repair_available(state) => {
+                if !state.merge_repairs.iter().any(|r| r.question == q.id) {
+                    state.merge_repairs.push(crate::run::MergeRepair {
+                        question: q.id.clone(),
+                        head: head.to_owned(),
+                        pr: pr.url.clone(),
+                        reviews: state.reviews.clone(),
+                        gate: state.gate.clone(),
+                        gate_head: state.gate_head.clone(),
+                        gate_fixes: state.gate_fixes.clone(),
+                        pre_gate: state.pre_gate.clone(),
+                        phase: crate::run::MergeRepairPhase::Requested,
+                        failure: None,
+                    });
+                    state.land_approval = None;
+                    state.event(
+                        "repair",
+                        "owner requested fix findings and re-review; merge is not approved",
+                    );
+                    state.save()?;
+                }
+                ApprovalGate::Repair
+            }
+            Approval::Repair | Approval::Hold => ApprovalGate::Held,
         },
     })
 }
@@ -3498,11 +3585,24 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 // review hand-off the panel contested (a blocking finding
                 // open and a reject vote) is asked about all the same.
                 let contested = contested_to_ask(state);
-                if state.config.graph.land_approval || contested.is_some() {
+                if state.config.graph.land_approval
+                    || contested.is_some()
+                    || repair_available(state)
+                    || !state.merge_repairs.is_empty()
+                {
                     match approval_gate(state, &pr, &subject, contested.as_ref(), &seen.head)
                         .await?
                     {
                         ApprovalGate::Approved => {}
+                        ApprovalGate::Repair => {
+                            // The driver consumes the saved request under the existing
+                            // run/task claim. No merge, no second run or task.
+                            if let Err(why) = disarm(forge, state, &repo, pr.number).await {
+                                state.event("repair", format!("auto-merge could not be disabled: {why}; repair preflight will retry"));
+                                state.save()?;
+                            }
+                            return Ok(pr);
+                        }
                         ApprovalGate::Held => {
                             stop(
                                 state,
@@ -4155,7 +4255,14 @@ pub async fn fix_round(
     let ids: Vec<String> = attempts.iter().map(|(s, _)| s.id.clone()).collect();
 
     let prompt = fix_prompt(state, pr, round, budget, reason, logs);
-    let artifacts = agent::artifacts_dir(&state.dir());
+    let mut artifacts = agent::artifacts_dir(&state.dir());
+    if let Some(request) = state
+        .merge_repairs
+        .last()
+        .filter(|r| r.phase == crate::run::MergeRepairPhase::Fixing)
+    {
+        artifacts = artifacts.join(format!("merge-repair-{}", request.question));
+    }
     let prompt = if state.config.cache_dir().is_some() {
         format!("{prompt}\n\n{}", prompt::build_cache_note("fix", true))
     } else {
@@ -4227,13 +4334,22 @@ pub async fn fix_round(
 
     // An agent that edited files but never committed would otherwise push
     // nothing and look like a refusal.
-    if let Ok(r) = git::rescue_commit(
+    match git::rescue_commit(
         &winner.worktree,
         &format!("magi: land round {round} fixes (uncommitted work)"),
     )
     .await
     {
-        state.note_withheld("land", &r.withheld);
+        Ok(r) => state.note_withheld("land", &r.withheld),
+        Err(e)
+            if state
+                .merge_repairs
+                .last()
+                .is_some_and(|r| r.phase == crate::run::MergeRepairPhase::Fixing) =>
+        {
+            return Ok(Fixed::Failed(format!("saving repair commit failed: {e:#}")));
+        }
+        Err(_) => {}
     }
     let after = git::rev_parse(&winner.worktree, "HEAD").await?;
     if after == before {
@@ -4276,6 +4392,61 @@ pub async fn fix_round(
 /// Fetch or create a seat, keeping its conversation across nodes.
 pub(crate) fn seat_of(state: &mut RunState, key: &str, agent: &str) -> SeatState {
     crate::fixer::seat_for(state, key, agent)
+}
+
+/// Recheck the live PR and local worktree before spending the requested fix.
+/// A moved/closed PR is held, never repaired using obsolete evidence.
+pub(crate) async fn repair_preflight(state: &RunState, url: &str, head: &str) -> Result<PrState> {
+    let seen = observe(&state.repo, url).await?;
+    let winner = state.winner().context("no winning branch to repair")?;
+    if seen.pr.state != PrLifecycle::Open || seen.head != head {
+        anyhow::bail!(
+            "PR is closed or its head changed; review the current head before requesting repair again"
+        );
+    }
+    if git::rev_parse(&winner.worktree, "HEAD").await? != head
+        || !git::is_clean(&winner.worktree).await?
+    {
+        anyhow::bail!(
+            "repair worktree is missing, dirty or at a different head; restore the reviewed branch and resume this run"
+        );
+    }
+    // Always disable any forge-side reservation, including one not recorded
+    // by this run. A repair request is never merge authorization.
+    let view = gh(
+        &state.repo,
+        &[
+            "pr".into(),
+            "view".into(),
+            url.into(),
+            "--json".into(),
+            "autoMergeRequest,headRefOid,state,headRefName,baseRefName,isCrossRepository".into(),
+        ],
+    )
+    .await?;
+    if !view.0 {
+        bail!("cannot check auto-merge: {}", view.1);
+    }
+    let live: serde_json::Value = serde_json::from_str(&view.1)?;
+    let public = state.pr_branch().unwrap_or(&winner.branch);
+    if live["state"] != "OPEN"
+        || live["headRefOid"] != head
+        || live["headRefName"] != public
+        || live["baseRefName"] != state.base_branch
+        || live["isCrossRepository"] != false
+    {
+        bail!("PR changed during repair preflight; review its current head explicitly");
+    }
+    let auto_merge = live
+        .get("autoMergeRequest")
+        .context("cannot read the PR auto-merge reservation; repair held")?;
+    if !auto_merge.is_null() {
+        let out = gh(&state.repo, &disable_automerge_argv(seen.pr.number)).await?;
+        if !out.0 {
+            bail!("cannot disable auto-merge; repair held: {}", out.1);
+        }
+    }
+    Ok(seen.pr)
 }
 
 /// What the fixer is told.
@@ -5955,6 +6126,139 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             repo_merge_lock(&a).try_lock().is_ok(),
             "the lock is released once the holder is done"
         );
+    }
+
+    fn repair_state(major: bool, reject: bool) -> RunState {
+        let mut state = landing_state();
+        let mut rec = review_record(1, "alpha", "precise rejection reason");
+        rec.vote = Some(if reject {
+            crate::verdict::ReviewVote::Reject
+        } else {
+            crate::verdict::ReviewVote::Approve
+        });
+        if major {
+            rec.findings = contested().findings;
+        }
+        let mut round = review_round(1, vec![rec]);
+        round.clean = false;
+        round.blocking = usize::from(major);
+        state.reviews.push(round);
+        state.config.graph.review_rounds = 1;
+        state
+    }
+
+    #[test]
+    fn merge_repair_choice_covers_major_only_and_reject_only_without_contested_and() {
+        for (major, reject) in [(true, false), (false, true), (true, true)] {
+            let state = repair_state(major, reject);
+            assert!(repair_available(&state));
+            assert_eq!(approval_choices(&state), [APPROVE, HOLD, REPAIR]);
+        }
+        assert!(!repair_available(&repair_state(false, false)));
+        let mut clean = repair_state(true, false);
+        clean.reviews[0].clean = true;
+        assert_eq!(approval_choices(&clean), [APPROVE, HOLD]);
+        assert_eq!(approval(Some(REPAIR)), Approval::Repair);
+    }
+
+    #[tokio::test]
+    async fn merge_repair_upgrades_legacy_questions_and_snapshots_exact_evidence_once() {
+        let mut state = repair_state(true, false);
+        let pr = green_pr();
+        approval_gate(&mut state, &pr, "feat: x", None, "abc")
+            .await
+            .unwrap();
+        let store = ask::Questions::open();
+        let id = state.land_approval.as_ref().unwrap().question.clone();
+        // Simulate an unanswered two-choice question created by an older build.
+        store
+            .update(&id, |q| {
+                q.choices = vec![APPROVE.into(), HOLD.into()];
+                Ok(())
+            })
+            .unwrap();
+        let upgraded = store.get(&id).unwrap();
+        assert_eq!(upgraded.choices, [APPROVE, HOLD, REPAIR]);
+        assert_eq!(store.get(&id).unwrap().choices, upgraded.choices);
+        assert!(
+            store
+                .list()
+                .iter()
+                .any(|q| q.id == id && q.choices == upgraded.choices)
+        );
+        assert!(
+            crate::prompt::chat_consult(&upgraded).contains("--reply 'fix findings and re-review'")
+        );
+        assert!(deputy_brief(&upgraded, Some(&state)).contains("never approves a merge"));
+        store
+            .update(&id, |q| q.answer(ask::Answer::Choice(REPAIR.into())))
+            .unwrap();
+        let binding = state.land_approval.clone();
+        assert_eq!(
+            approval_gate(&mut state, &pr, "feat: x", None, "abc")
+                .await
+                .unwrap(),
+            ApprovalGate::Repair
+        );
+        assert!(state.land_approval.is_none());
+        assert_eq!(state.merge_repairs.len(), 1);
+        let request = &state.merge_repairs[0];
+        assert_eq!(request.question, id);
+        assert_eq!(request.head, "abc");
+        assert_eq!(request.pr, pr.url);
+        assert_eq!(
+            request.reviews[0].reviews[0].summary,
+            "precise rejection reason"
+        );
+        assert_eq!(request.reviews[0].reviews[0].findings[0].id, "R3-1-1");
+        assert_eq!(
+            request.reviews[0].reviews[0].findings[0].detail,
+            state.reviews[0].reviews[0].findings[0].detail
+        );
+        // A repeated consumption of the same answer never dispatches another repair.
+        state.land_approval = binding;
+        assert_eq!(
+            approval_gate(&mut state, &pr, "feat: x", None, "abc")
+                .await
+                .unwrap(),
+            ApprovalGate::Repair
+        );
+        assert_eq!(state.merge_repairs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn merge_repair_answer_never_merges_and_hold_never_requests_repair() {
+        for choice in [REPAIR, HOLD] {
+            let mut state = repair_state(false, true);
+            let observed = seen("abc", Checks::Green, "CLEAN", false);
+            approval_gate(&mut state, &observed.pr, "feat: x", None, "abc")
+                .await
+                .unwrap();
+            let id = state.land_approval.as_ref().unwrap().question.clone();
+            ask::Questions::open()
+                .update(&id, |q| q.answer(ask::Answer::Choice(choice.into())))
+                .unwrap();
+            let forge = Scripted::new(
+                vec![observed],
+                if choice == REPAIR {
+                    vec![(true, "")]
+                } else {
+                    vec![]
+                },
+            );
+            land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
+                .await
+                .unwrap();
+            assert!(
+                forge
+                    .argvs()
+                    .iter()
+                    .all(|a| a.iter().any(|s| s == "--disable-auto"))
+            );
+            assert!(!forge.calls().contains(&"fix"));
+            assert_eq!(state.merge_repairs.len(), usize::from(choice == REPAIR));
+            assert_ne!(state.status, RunStatus::Merged);
+        }
     }
 
     #[test]

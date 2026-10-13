@@ -428,6 +428,24 @@ in an irreversible decision.
 **Silence is a hold.** An unanswered approval never merges, and neither does
 anything other than the word `merge`.
 
+When review hands off with unresolved Major findings or final rejecting votes,
+the decision also offers **fix findings and re-review**. Selecting it runs one
+repair and a fresh bounded review and gate on the same PR branch, under the
+existing run's ownership. The question ID, head and original review evidence
+are retained in the run's repair history. Even a repair that changes nothing
+is reviewed again. This action invalidates the earlier approval and disables
+auto-merge; updated results always require a fresh owner decision, including
+when `land_approval` is off. **Hold only holds** and never starts a repair.
+The CLI accepts the same choice with
+`magi answer <question-id> --reply "fix findings and re-review"`.
+This command records the choice and prints its execution status. A running
+`magi serve` / `magi web` resumes the existing run; without a daemon, use the
+printed `magi run --resume <run-id>` command to start the repair.
+Repair cycles are capped by `land_rounds`, with each new review bounded by
+`review_rounds`. A changed PR head, dirty worktree, failed repair or interrupted
+fixer holds with recovery guidance in `magi show`; an interrupted fixer is
+never dispatched a second time automatically.
+
 ## Chat: a standing conversation, turn by turn
 
 Chat runs as a **turn-based conversation**: your message, one headless agent

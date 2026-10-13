@@ -871,6 +871,34 @@ pub fn run(state: &RunState) -> String {
         }
     }
 
+    if !state.merge_repairs.is_empty() {
+        let _ = writeln!(s, "\n{}", bold("merge-gate repairs"));
+        for r in &state.merge_repairs {
+            let _ = writeln!(
+                s,
+                "  question {}  head {}  {:?}\n  {}",
+                r.question,
+                crate::run::short_of(&r.head),
+                r.phase,
+                r.pr
+            );
+            if let Some(why) = &r.failure {
+                let _ = writeln!(s, "  held: {why}");
+            }
+            if let Some(round) = r.reviews.last() {
+                for f in round.reviews.iter().flat_map(|rec| &rec.findings) {
+                    let _ = writeln!(s, "  original [{}] {:?}: {}", f.id, f.severity, f.title);
+                }
+                for (seat, _, vote) in round.final_votes() {
+                    let _ = writeln!(s, "  original reviewer #{seat}: {:?}", vote);
+                }
+            }
+        }
+        s.push_str(
+            "  Repair never approves a merge; updated results require a fresh owner decision.\n",
+        );
+    }
+
     if !state.operator_fixes.is_empty() {
         let _ = writeln!(s, "\n{}", bold("operator fix(es)"));
         for (i, req) in state.operator_fixes.iter().enumerate() {

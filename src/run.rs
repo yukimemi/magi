@@ -1501,6 +1501,8 @@ pub struct ContestedHandoff {
     pub rejecters: Vec<(usize, String)>,
 }
 
+pub use crate::review_repair::{Phase as MergeRepairPhase, Request as MergeRepair};
+
 impl ReviewRound {
     /// Each answering seat's final vote: its revote where reconsideration ran
     /// and answered, its initial vote otherwise. The single place this is
@@ -2124,6 +2126,9 @@ pub struct RunState {
     /// or rebase push makes a new head the owner has not seen.
     #[serde(default)]
     pub land_approval: Option<LandApproval>,
+    /// Repair history on this same PR and run; no second task owns the branch.
+    #[serde(default)]
+    pub merge_repairs: Vec<MergeRepair>,
     /// The posting-gate question for this run's pull request text, if the gate
     /// withheld any. While `resolved` is `None` the run is parked on it.
     #[serde(default)]
@@ -2416,6 +2421,7 @@ impl RunState {
             land_armed_head: None,
             land_reruns: None,
             land_approval: None,
+            merge_repairs: Vec::new(),
             github_text: None,
             change_summary: None,
             pre_gate: Vec::new(),

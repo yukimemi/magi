@@ -229,6 +229,9 @@ pub fn validate_answer(
             latest.trim().eq_ignore_ascii_case(crate::land::HOLD)
                 && quote.eq_ignore_ascii_case(crate::land::HOLD)
         }
+        crate::land::REPAIR => {
+            q.choices.iter().any(|c| c == reply) && latest.trim() == reply && quote == reply
+        }
         _ => false,
     };
     if !valid {
@@ -1227,6 +1230,39 @@ mod tests {
         assert!(check(&q, &talk.id, USE_REWRITE, Some("Use the rewrite text")).is_ok());
         // The safe default stays unguarded, as before.
         assert!(check(&q, &talk.id, USE_FALLBACK, None).is_ok());
+    }
+
+    #[test]
+    fn merge_repair_consult_requires_offered_choice_and_exact_latest_owner_request() {
+        use crate::land::{APPROVAL_NODE, APPROVE, HOLD, REPAIR};
+        let (tmp, store, mut talk) = talks();
+        let questions = Questions::at(tmp.path().join("questions"));
+        let mut q = question(APPROVAL_NODE);
+        q.choices = vec![APPROVE.into(), HOLD.into(), REPAIR.into()];
+        questions.put(&mut q).unwrap();
+        begin(&questions, &store, &q, &talk).unwrap();
+        q = questions.get(&q.id).unwrap();
+        assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, REPAIR, Some(REPAIR)).is_err());
+        talk = store.get(&talk.id).unwrap();
+        talk.turns.push(talk::Turn {
+            breaks: Some(Vec::new()),
+            messages: Vec::new(),
+            posted_by: None,
+            who: talk::Who::Operator,
+            body: talk.pending.clone(),
+            at: Timestamp::now(),
+            attachments: Vec::new(),
+            usage: None,
+        });
+        talk.pending = "maybe fix findings and re-review".into();
+        store.put(&mut talk).unwrap();
+        assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, REPAIR, Some(REPAIR)).is_err());
+        talk.pending = REPAIR.into();
+        talk.pending_breaks = Some(Vec::new());
+        store.put(&mut talk).unwrap();
+        assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, REPAIR, Some(REPAIR)).is_ok());
+        q.choices.retain(|c| c != REPAIR);
+        assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, REPAIR, Some(REPAIR)).is_err());
     }
 
     #[test]

@@ -507,7 +507,7 @@ async fn resolve_base(repo: &Path, base_branch: &str, remote: &str) -> Result<St
     )
 }
 
-/// Exclusive claim on one run's `magi fix` step, released on drop — including
+/// Exclusive claim on one run's repair or `magi fix`, released on drop — including
 /// on an early return or a panic.
 ///
 /// `daemon::is_working_on` only sees a heartbeat-publishing daemon; two
@@ -538,7 +538,7 @@ impl FixClaim {
                     Self::create(&path).with_context(|| format!("lock {}", path.display()))
                 } else {
                     bail!(
-                        "another `magi fix` is already running for this run ({} exists)",
+                        "another repair or `magi fix` is already running for this run ({} exists)",
                         path.display()
                     )
                 }
@@ -1006,6 +1006,33 @@ impl Runner {
     /// Blocked / Stalled / Failed, or died with an error, is announced to the
     /// notification centre. Best-effort: see [`crate::notices::raise`].
     pub async fn execute(&mut self) -> Result<()> {
+        // Queue claims cover daemon work; this also serializes manual drivers
+        // consuming a repair answer, including the new review and decision.
+        let _repair_claim = if !self.state.merge_repairs.is_empty()
+            || (self.state.status == RunStatus::Landing && land::repair_available(&self.state))
+        {
+            let claim = FixClaim::acquire(&self.state.dir())?;
+            let disk = RunState::load(&self.state.id)?;
+            let checkpoint = |s: &RunState| {
+                (
+                    s.merge_repairs.len(),
+                    s.merge_repairs
+                        .last()
+                        .map(|r| (r.question.clone(), r.phase)),
+                    s.land_approval
+                        .as_ref()
+                        .map(|a| (a.question.clone(), a.head.clone())),
+                )
+            };
+            if checkpoint(&disk) != checkpoint(&self.state) {
+                bail!(
+                    "repair decision changed since this run was loaded; reload and resume the existing run, never start a second repair"
+                );
+            }
+            Some(claim)
+        } else {
+            None
+        };
         let result = self.execute_graph().await;
         self.mark_driver_exited();
         let ended = if result.is_err() {
@@ -1099,6 +1126,20 @@ impl Runner {
 
     async fn execute_graph(&mut self) -> Result<()> {
         self.claim_driver()?;
+        if self.state.merge_repairs.last().is_some_and(|r| {
+            matches!(
+                r.phase,
+                crate::run::MergeRepairPhase::Requested
+                    | crate::run::MergeRepairPhase::Fixing
+                    | crate::run::MergeRepairPhase::Reviewing
+            )
+        }) {
+            if self.repair_merge_review().await? {
+                self.run_land().await?;
+            }
+            self.settle_questions();
+            return Ok(());
+        }
         // Publication already passed review and gate. Resume only that node:
         // syncing to a newer base here could change the verified commit.
         if self.state.pr_publication_pending {
@@ -3737,16 +3778,9 @@ impl Runner {
     /// Put the winner back on `pre` and confirm it: a failed `reset` (a stale
     /// `index.lock`, say) or a tip that is not `pre` afterwards is an error.
     async fn graft_restore(wt: &Path, pre: &str) -> Result<()> {
-        let restored = git::restore_to(wt, pre).await;
-        let tip = git::rev_parse(wt, "HEAD").await;
-        match (restored, tip) {
-            (Ok(()), Ok(tip)) if tip == pre => Ok(()),
-            (Err(e), _) => Err(GraftRestoreFailed(format!("{e:#}")).into()),
-            (Ok(()), Ok(tip)) => {
-                Err(GraftRestoreFailed(format!("the winner is at {tip}, not {pre}")).into())
-            }
-            (Ok(()), Err(e)) => Err(GraftRestoreFailed(format!("{e:#}")).into()),
-        }
+        crate::recovery::restore_repair(wt, pre)
+            .await
+            .map_err(|e| GraftRestoreFailed(format!("{e:#}")).into())
     }
 
     /// A skip is a run event, recorded once however often the node is re-entered.
@@ -5370,7 +5404,7 @@ impl Runner {
         let root = self.state.worktree_root();
         let language = self.state.config.graph.language.clone();
         let sessions = self.state.config.graph.sessions;
-        let artifacts = agent::artifacts_dir(&self.state.dir());
+        let artifacts = self.merge_repair_artifacts();
         let base = self.landing_base();
         let base_short = short(&base);
         let reviewers = self.roles.reviewers.clone();
@@ -6695,7 +6729,7 @@ impl Runner {
         );
         let timeout = Duration::from_secs(self.state.config.graph.timeout_fix);
         let sessions = self.state.config.graph.sessions;
-        let artifacts = agent::artifacts_dir(&self.state.dir());
+        let artifacts = self.merge_repair_artifacts();
         self.state.event(
             "gate",
             format!("gate failed; gate-fix round {attempt} of {cap}"),
@@ -7915,49 +7949,241 @@ impl Runner {
         }
         // A land failure is not a lost run: the work is on a branch and the
         // pull request is open, which is exactly where a human takes over.
-        match land::land(&mut self.state, &url).await {
-            Ok(pr) if self.state.parked => {
-                // `land` already saved the parked marker; nothing here
-                // overrides `status` back to a terminal value while an
-                // approval is still outstanding.
-                let _ = pr;
-            }
-            Ok(pr) => {
-                self.state.status = match pr.state {
-                    land::PrLifecycle::Merged => RunStatus::Merged,
-                    _ => RunStatus::Blocked,
-                };
-                // Downstream of a confirmed merge only - see
-                // `bump::should_release_bump`'s own doc for why this one
-                // check covers all three of `land`'s success paths.
-                // Best-effort: the run already landed, so a failure here
-                // (the decision call, `gh`, `cargo`) is recorded and never
-                // turns a landed run into a failed one.
-                if bump::should_release_bump(self.state.status)
-                    && let Err(e) = bump::after_merge(&mut self.state, &pr.url).await
+        loop {
+            match land::land(&mut self.state, &url).await {
+                Ok(_)
+                    if self
+                        .state
+                        .merge_repairs
+                        .last()
+                        .is_some_and(|r| r.phase == crate::run::MergeRepairPhase::Requested) =>
                 {
-                    // The event is the run's own record. Not-eligible cases
-                    // (disabled, no `Cargo.toml`, ...) return `Ok`, so an
-                    // `Err` is a bump that was tried and failed:
-                    // `after_merge` itself raises the operator notice for
-                    // that, whether or not a release PR exists yet.
-                    self.state
-                        .event("bump", format!("release bump skipped: {e:#}"));
+                    if self.repair_merge_review().await? {
+                        continue;
+                    }
                 }
-                // Independent of the bump, and best-effort in the same way:
-                // findings the merge left open become follow-up tasks.
-                if self.state.status == RunStatus::Merged {
-                    crate::followup::after_merge(&mut self.state, &pr.url).await;
+                Ok(pr) if self.state.parked => {
+                    // `land` already saved the parked marker; nothing here
+                    // overrides `status` back to a terminal value while an
+                    // approval is still outstanding.
+                    let _ = pr;
                 }
-                self.state.save()?;
+                Ok(pr) => {
+                    self.state.status = match pr.state {
+                        land::PrLifecycle::Merged => RunStatus::Merged,
+                        _ => RunStatus::Blocked,
+                    };
+                    // Downstream of a confirmed merge only - see
+                    // `bump::should_release_bump`'s own doc for why this one
+                    // check covers all three of `land`'s success paths.
+                    // Best-effort: the run already landed, so a failure here
+                    // (the decision call, `gh`, `cargo`) is recorded and never
+                    // turns a landed run into a failed one.
+                    if bump::should_release_bump(self.state.status)
+                        && let Err(e) = bump::after_merge(&mut self.state, &pr.url).await
+                    {
+                        // The event is the run's own record. Not-eligible cases
+                        // (disabled, no `Cargo.toml`, ...) return `Ok`, so an
+                        // `Err` is a bump that was tried and failed:
+                        // `after_merge` itself raises the operator notice for
+                        // that, whether or not a release PR exists yet.
+                        self.state
+                            .event("bump", format!("release bump skipped: {e:#}"));
+                    }
+                    // Independent of the bump, and best-effort in the same way:
+                    // findings the merge left open become follow-up tasks.
+                    if self.state.status == RunStatus::Merged {
+                        crate::followup::after_merge(&mut self.state, &pr.url).await;
+                    }
+                    self.state.save()?;
+                }
+                Err(e) => {
+                    self.state.status = RunStatus::Blocked;
+                    self.state.event("land", format!("gave up: {e}"));
+                    self.state.save()?;
+                }
             }
-            Err(e) => {
-                self.state.status = RunStatus::Blocked;
-                self.state.event("land", format!("gave up: {e}"));
-                self.state.save()?;
-            }
+            break;
         }
         Ok(())
+    }
+
+    /// One repair cycle stays under the existing driver/task claim. An
+    /// interrupted fixer is rolled back and held rather than run twice.
+    async fn repair_merge_review(&mut self) -> Result<bool> {
+        use crate::run::MergeRepairPhase as Phase;
+        crate::pr_head::ensure_owner(&self.state)?;
+        let i = self.state.merge_repairs.len() - 1;
+        let request = self.state.merge_repairs[i].clone();
+        if request.phase == Phase::Fixing {
+            let restored = match self.state.winner() {
+                Some(winner) => {
+                    crate::recovery::restore_repair(&winner.worktree, &request.head).await
+                }
+                None => Err(anyhow::anyhow!("repair has no winning branch")),
+            };
+            let why = match restored {
+                Ok(()) => "repair was interrupted during the fixer and rolled back; inspect its artifacts and the PR head, then run an explicit review".to_owned(),
+                Err(e) => format!("repair was interrupted; rollback failed: {e:#}; restore the reviewed branch before running an explicit review"),
+            };
+            self.hold_merge_repair(i, why)?;
+            return Ok(false);
+        }
+        let failure = if i >= self.state.config.graph.land_rounds
+            || self.state.config.graph.review_rounds == 0
+        {
+            Some("repair generation budget exhausted or review disabled; increase the configured budget and request a new review explicitly".to_owned())
+        } else {
+            None
+        };
+        if let Some(why) = failure {
+            self.hold_merge_repair(i, why)?;
+            return Ok(false);
+        }
+        if request.phase == Phase::Requested {
+            let pr = match land::repair_preflight(&self.state, &request.pr, &request.head).await {
+                Ok(pr) => pr,
+                Err(e) => {
+                    self.hold_merge_repair(i, format!("cannot resume repair: {e:#}; restore the reviewed PR branch and run an explicit review"))?;
+                    return Ok(false);
+                }
+            };
+            self.state.merge_repairs[i].phase = Phase::Fixing;
+            self.state.land_approval = None;
+            self.state.land_armed_head = None;
+            self.state.save()?;
+            // Serialize the exact records, including finding ids/details,
+            // reconsideration reasons, final votes and verification output.
+            let evidence = serde_json::to_string_pretty(&request)?;
+            let reason = format!(
+                "The owner requested fix findings and re-review, without merging. Address the unresolved Major findings and final rejecting votes in this exact review evidence. Do not merge or approve the PR.\n\n{evidence}"
+            );
+            let budget = self.state.config.graph.land_rounds;
+            let result = land::fix_round(&mut self.state, &pr, i + 1, budget, &reason, "").await;
+            match result {
+                Ok(land::Fixed::Committed { .. } | land::Fixed::Declined) => {}
+                Ok(land::Fixed::Failed(why)) => {
+                    self.hold_merge_repair(
+                        i,
+                        format!(
+                            "repair failed: {why}; inspect the branch and run an explicit review"
+                        ),
+                    )?;
+                    return Ok(false);
+                }
+                Err(e) => {
+                    self.hold_merge_repair(
+                        i,
+                        format!(
+                            "repair failed: {e:#}; inspect the branch and run an explicit review"
+                        ),
+                    )?;
+                    return Ok(false);
+                }
+            }
+            // Even no change gets a real new reviewer wave. The previous
+            // evidence remains in the request; a former clean/concluded round
+            // cannot short-circuit the new review or gate.
+            self.begin_merge_repair_review(i)?;
+        }
+        self.review_loop().await?;
+        self.gate().await?;
+        if self.resource_halt()? || self.state.parked {
+            return Ok(false);
+        }
+        if review_conclusion(&self.state.reviews, self.state.config.graph.review_rounds)
+            != Some(RunStatus::Gating)
+            || !self.state.gate_status().ok()
+        {
+            self.hold_merge_repair(i, "updated review or gate did not pass; inspect the new results and resume review explicitly".to_owned())?;
+            return Ok(false);
+        }
+        // Review and gate may have added commits after the initial repair.
+        // Publish exactly their final head to the existing PR, with a lease.
+        let winner = self
+            .state
+            .winner()
+            .cloned()
+            .context("repair has no winning branch")?;
+        let after = git::rev_parse(&winner.worktree, "HEAD").await?;
+        if self.state.gate_head.as_deref() != Some(after.as_str())
+            || !git::is_clean(&winner.worktree).await?
+        {
+            self.hold_merge_repair(i, "repair branch changed after its recorded gate, or the verified head is unknown; nothing was published. Inspect the branch and run an explicit review before requesting a new merge decision".to_owned())?;
+            return Ok(false);
+        }
+        let expected = self
+            .state
+            .pr_pushed_head
+            .as_deref()
+            .unwrap_or(&request.head)
+            .to_owned();
+        let public = self.state.pr_branch().unwrap_or(&winner.branch).to_owned();
+        // Push the checked commit itself: a local ref moving after the check
+        // must not change which commit the forge receives.
+        let lease = format!("--force-with-lease=refs/heads/{public}:{expected}");
+        let refspec = format!("{after}:refs/heads/{public}");
+        let push = git::git_raw(
+            &winner.worktree,
+            &["push", &lease, &self.state.config.merge.remote, &refspec],
+        )
+        .await;
+        match push {
+            Ok(out) if out.ok() => self.state.pr_pushed_head = Some(after),
+            Ok(out) => {
+                self.hold_merge_repair(i, format!("publishing reviewed repair failed: {}; inspect the PR head and resume review explicitly", out.stderr))?;
+                return Ok(false);
+            }
+            Err(e) => {
+                self.hold_merge_repair(i, format!("publishing reviewed repair failed: {e:#}; inspect the PR head and resume review explicitly"))?;
+                return Ok(false);
+            }
+        }
+        self.state.merge_repairs[i].phase = Phase::Complete;
+        self.state.status = RunStatus::Landing;
+        self.state.event(
+            "repair",
+            "new review and gate completed; fresh owner merge decision required",
+        );
+        self.state.save()?;
+        Ok(true)
+    }
+
+    fn merge_repair_artifacts(&self) -> PathBuf {
+        let artifacts = agent::artifacts_dir(&self.state.dir());
+        match self
+            .state
+            .merge_repairs
+            .last()
+            .filter(|r| r.phase == crate::run::MergeRepairPhase::Reviewing)
+        {
+            Some(r) => artifacts.join(format!("merge-repair-{}", r.question)),
+            None => artifacts,
+        }
+    }
+
+    fn begin_merge_repair_review(&mut self, index: usize) -> Result<()> {
+        self.state.reviews.clear();
+        self.state.gate.clear();
+        self.state.gate_ran = false;
+        self.state.gate_head = None;
+        self.state.gate_fixes.clear();
+        self.state.pre_gate.clear();
+        self.state.pre_gate_commit = None;
+        self.state.contested_handoff = None;
+        self.state.land_reruns = None;
+        self.state.land_approval = None;
+        self.state.merge_repairs[index].phase = crate::run::MergeRepairPhase::Reviewing;
+        self.state.status = RunStatus::Reviewing;
+        self.state.save()
+    }
+
+    fn hold_merge_repair(&mut self, index: usize, why: String) -> Result<()> {
+        self.state.merge_repairs[index].phase = crate::run::MergeRepairPhase::Failed;
+        self.state.merge_repairs[index].failure = Some(why.clone());
+        self.state.status = RunStatus::Blocked;
+        self.state.event("repair", why);
+        self.state.save()
     }
 
     // -------------------------------------------------------------- helpers
@@ -11292,6 +11518,117 @@ mod tests {
             sem: Arc::new(Semaphore::new(1)),
             pause: Pause::new(),
             interrupt: Pause::new(),
+        }
+    }
+
+    fn merge_repair_request(phase: crate::run::MergeRepairPhase) -> crate::run::MergeRepair {
+        crate::run::MergeRepair {
+            question: "repair-question".into(),
+            head: "old-head".into(),
+            pr: "https://github.com/o/r/pull/42".into(),
+            reviews: vec![review_round(false, 1, 1, 1, false, true)],
+            gate: vec![outcome(Some(0), false)],
+            gate_head: Some("old-head".into()),
+            gate_fixes: Vec::new(),
+            pre_gate: Vec::new(),
+            phase,
+            failure: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_repair_claim_refuses_concurrent_and_obsolete_drivers() {
+        crate::run::pin_test_home();
+        let mut runner = runner_at(RunStatus::Landing);
+        runner.state.merge_repairs.push(merge_repair_request(
+            crate::run::MergeRepairPhase::Requested,
+        ));
+        runner.state.save().unwrap();
+        let claim = FixClaim::acquire(&runner.state.dir()).unwrap();
+        assert!(
+            runner
+                .execute()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("already running")
+        );
+        assert_eq!(
+            RunState::load(&runner.state.id).unwrap().merge_repairs[0].phase,
+            crate::run::MergeRepairPhase::Requested
+        );
+        drop(claim);
+        let mut disk = runner.state.clone();
+        disk.merge_repairs[0].phase = crate::run::MergeRepairPhase::Complete;
+        disk.save().unwrap();
+        assert!(
+            runner
+                .execute()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("decision changed")
+        );
+        assert_eq!(
+            RunState::load(&runner.state.id).unwrap().merge_repairs[0].phase,
+            crate::run::MergeRepairPhase::Complete
+        );
+    }
+
+    #[test]
+    fn merge_repair_starts_a_real_new_budget_and_preserves_old_evidence() {
+        crate::run::pin_test_home();
+        let mut runner = runner_at(RunStatus::Landing);
+        let request = merge_repair_request(crate::run::MergeRepairPhase::Fixing);
+        runner.state.reviews = request.reviews.clone();
+        runner.state.gate = request.gate.clone();
+        runner.state.gate_ran = true;
+        runner.state.land_approval = Some(crate::run::LandApproval {
+            question: "old".into(),
+            head: "old-head".into(),
+        });
+        runner.state.merge_repairs.push(request);
+        runner.begin_merge_repair_review(0).unwrap();
+        assert_eq!(review_conclusion(&runner.state.reviews, 2), None);
+        assert!(!runner.state.gate_status().ok());
+        assert!(runner.state.land_approval.is_none());
+        let disk = RunState::load(&runner.state.id).unwrap();
+        assert_eq!(disk.merge_repairs[0].reviews[0].blocking, 1);
+        assert!(disk.merge_repairs[0].gate[0].ok());
+        assert_eq!(
+            disk.merge_repairs[0].phase,
+            crate::run::MergeRepairPhase::Reviewing
+        );
+        assert_eq!(disk.merge_repairs[0].pr, "https://github.com/o/r/pull/42");
+        assert!(disk.reviews.is_empty());
+    }
+
+    #[tokio::test]
+    async fn merge_repair_interrupted_fixer_and_exhausted_generation_hold_without_repeating_work() {
+        crate::run::pin_test_home();
+        for phase in [
+            crate::run::MergeRepairPhase::Fixing,
+            crate::run::MergeRepairPhase::Requested,
+        ] {
+            let mut runner = runner_at(RunStatus::Landing);
+            runner.state.config.graph.land_rounds = 0;
+            runner.state.merge_repairs.push(merge_repair_request(phase));
+            runner.state.save().unwrap();
+            assert!(!runner.repair_merge_review().await.unwrap());
+            assert_eq!(runner.state.status, RunStatus::Blocked);
+            assert_eq!(
+                runner.state.merge_repairs[0].phase,
+                crate::run::MergeRepairPhase::Failed
+            );
+            let reason = runner.state.merge_repairs[0].failure.as_ref().unwrap();
+            assert!(
+                reason.contains(if phase == crate::run::MergeRepairPhase::Fixing {
+                    "interrupted"
+                } else {
+                    "budget exhausted"
+                })
+            );
+            assert!(runner.state.merge.is_none());
         }
     }
 

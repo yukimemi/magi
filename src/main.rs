@@ -2668,7 +2668,7 @@ async fn answer_cmd(
         ask::Answer::Choice(reply)
     };
     let tasks = magi::queue::Queue::open().list();
-    store.update(&q.id, |r| {
+    let (q, ()) = store.update(&q.id, |r| {
         if let Some((run, node)) = agent_env() {
             magi::consult::refuse_operator_held(r, &node, &tasks)?;
             let reply = match &answer {
@@ -2686,6 +2686,15 @@ async fn answer_cmd(
         r.answer(answer)
     })?;
     println!("answered {} {}", q.short(), q.summary);
+    if q.node == magi::land::APPROVAL_NODE && q.resolution().as_deref() == Some(magi::land::REPAIR)
+    {
+        println!(
+            "Repair requested; this answer command has not started repair or approved a merge. \
+             A running magi serve / magi web resumes the existing run. Without one, \
+             run `magi run --resume {}` to start repair and re-review; do not create another task or run.",
+            q.run
+        );
+    }
     Ok(())
 }
 
