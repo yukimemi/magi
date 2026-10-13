@@ -158,7 +158,7 @@ fn view(t: &Task, max_attempts: usize) -> prompt::ConductTask {
         priority: t.priority,
         status: t.status.as_str().to_owned(),
         attempts: t.attempts,
-        max_attempts,
+        max_attempts: t.effective_attempt_limit(max_attempts),
         last_error: t.last_error.clone(),
         hold_reason: t.hold_reason.clone(),
         hold_source: t.hold_source.map(|source| source.label().to_owned()),
@@ -1286,6 +1286,17 @@ mod tests {
             .build()
             .unwrap()
             .block_on(f)
+    }
+
+    #[test]
+    fn view_resolves_task_attempt_limit_before_daemon_default() {
+        let mut t = task("budget");
+        assert_eq!(view(&t, 7).max_attempts, 7);
+        t.change_attempt_limit(std::num::NonZeroUsize::new(3))
+            .unwrap();
+        assert_eq!(view(&t, 7).max_attempts, 3);
+        t.change_attempt_limit(None).unwrap();
+        assert_eq!(view(&t, 7).max_attempts, 7);
     }
 
     #[test]
