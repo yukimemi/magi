@@ -6320,6 +6320,9 @@ struct QuestionView {
     /// question at all: false when `daemon.max_deputies = 0` or the config is
     /// unreadable. Separate from `holder`, which says who is listening now.
     deputies_enabled: bool,
+    /// All starts were spent and no live holder remains. Display-only: the
+    /// final attempt increments `starts` before running under its lease.
+    deputy_exhausted: bool,
     /// `question.run` is a task id (conductor / triage questions), not a run
     /// id, so the UI links it to the task page.
     run_is_task: bool,
@@ -6393,6 +6396,7 @@ impl QuestionView {
                 .iter()
                 .map(|t| t.note.as_deref().map(|n| md::to_nodes(n, &base)))
                 .collect(),
+            deputy_exhausted: store.deputy_exhausted(&question),
             waiting_on_agent: question.waiting_on_agent(),
             holder,
             deputies_enabled,
@@ -8387,6 +8391,41 @@ fn pick(ids: Vec<String>, prefix: &str, what: &str) -> ApiResult<String> {
 mod tests {
 
     #[test]
+    fn deputy_exhausted_requires_an_open_question_without_a_live_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = ask::Questions::at(dir.path().join("questions"));
+        let mut q = Question::new(
+            "task".to_owned(),
+            "conduct".to_owned(),
+            "conduct".to_owned(),
+            "choose".to_owned(),
+            String::new(),
+            vec!["keep".to_owned()],
+        );
+        q.deputy = Some(ask::Deputy::new("brief".to_owned()));
+        q.say("why?").unwrap();
+        q.deputy.as_mut().unwrap().starts = crate::deputy::MAX_STARTS - 1;
+        assert!(!QuestionView::of(q.clone(), &store, true).deputy_exhausted);
+        q.deputy.as_mut().unwrap().starts = crate::deputy::MAX_STARTS;
+        store.put(&mut q).unwrap();
+        assert!(QuestionView::of(q.clone(), &store, true).deputy_exhausted);
+        assert_eq!(store.count_needs_owner(), 1);
+        store.beat(&q.id, ask::WaiterKind::Deputy);
+        assert!(!QuestionView::of(q.clone(), &store, true).deputy_exhausted);
+        assert_eq!(store.count_needs_owner(), 0);
+        let mut stale = store.read_lease(&q.id).unwrap();
+        stale.beat_at = jiff::Timestamp::now() - std::time::Duration::from_secs(3600);
+        std::fs::write(store.lease_path(&q.id), serde_json::to_vec(&stale).unwrap()).unwrap();
+        let view = QuestionView::of(q.clone(), &store, true);
+        assert!(view.deputy_exhausted);
+        assert!(view.waiting_on_agent);
+        assert_eq!(view.question.choices, ["keep"]);
+        store.drop_lease(&q.id);
+        q.answer(ask::Answer::Choice("keep".to_owned())).unwrap();
+        assert!(!QuestionView::of(q, &store, true).deputy_exhausted);
+    }
+
+    #[test]
     fn holder_reads_the_lease_not_the_record() {
         let mut q = Question::new(
             "run".to_owned(),
@@ -9960,6 +9999,9 @@ mod tests {
         let a = store.raise(Notice::warn("task:1", "held")).unwrap();
         let b = store.raise(Notice::error("run:2", "blocked")).unwrap();
 
+        store
+            .raise(Notice::warn("deputy:deleted-question", "obsolete warning"))
+            .unwrap();
         let health = fx.get("/api/health").await.json();
         assert_eq!(health["notifications_unread"], 2);
         assert_ne!(

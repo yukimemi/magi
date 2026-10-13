@@ -76,6 +76,35 @@ async fn turn(d: &mut Deputies) {
 }
 
 common::e2e! {
+async fn exhausted_deputies_do_not_create_or_increment_notifications() {
+    let s = scene(home_lock().await);
+    s.store.update(&s.q.id, |q| {
+        q.deputy.as_mut().unwrap().starts = MAX_STARTS;
+        q.say("are you there?")
+    }).unwrap();
+    let notices = magi::notices::Notices::at(s.home.join("notifications"));
+    let key = format!("deputy:{}", s.q.id);
+    let id = magi::notices::id_of(&key);
+    let mut d = deputies(&s, 2);
+    for _ in 0..3 { turn(&mut d).await; }
+    assert!(notices.get(&id).is_err(), "no new warning");
+    let old = notices.raise(magi::notices::Notice::warn(&key, "legacy warning")).unwrap();
+    let mut restarted = deputies(&s, 2);
+    for _ in 0..3 { turn(&mut restarted).await; }
+    let after = notices.get(&id).unwrap();
+    assert_eq!(after.count, old.count);
+    assert_eq!(after.last_at, old.last_at);
+    assert!(log(&s).is_empty(), "retry limit still holds");
+    let q = s.store.get(&s.q.id).unwrap();
+    assert_eq!(q.status, QuestionStatus::Open);
+    assert_eq!(q.choices, s.q.choices);
+    assert_eq!(q.deputy.unwrap().starts, MAX_STARTS);
+    s.store.update(&s.q.id, |q| q.answer(magi::ask::Answer::Choice(q.choices[0].clone()))).unwrap();
+    assert_eq!(s.store.get(&s.q.id).unwrap().status, QuestionStatus::Answered);
+}
+}
+
+common::e2e! {
 async fn a_free_text_reply_reaches_the_deputy_and_is_answered_back() {
     let s = scene(home_lock().await);
     let mut d = deputies(&s, 2);

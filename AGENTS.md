@@ -2845,3 +2845,14 @@ public prose, never internal reports. Review rounds, verification provenance
 and the run marker are appended from structured records. Local previews may
 still show the task/candidate summary. A later landing fix does not edit an
 already posted description.
+
+### Exhausted question follow-ups stay in Questions
+
+`src/deputy.rs` retains `MAX_STARTS` without raising a notification when it is
+spent. `src/ask.rs` computes exhaustion only for open questions with no live
+lease, shared by `QuestionView::deputy_exhausted` in `src/web.rs` and the health
+response's owner count; the last start can still be running.
+`assets/ui/app.js` keeps exhausted questions in the owner's pending list and
+unlocks their choices even with an unread owner message. `src/notices.rs` hides
+legacy `deputy:` warnings from the list and bell and prunes them first;
+`deputy-turn:` failures and other notifications remain independent.

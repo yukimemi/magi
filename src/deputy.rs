@@ -473,7 +473,6 @@ impl Deputies {
                 continue;
             }
             if dep.starts >= MAX_STARTS {
-                self.give_up(&q);
                 continue;
             }
             // Past the deadline the waiter retires the question; a say that
@@ -519,23 +518,6 @@ impl Deputies {
             }
         }
         self.inflight.clear();
-    }
-
-    /// Say once that nobody is listening any more.
-    fn give_up(&self, q: &Question) {
-        notices::raise_in(
-            &self.home,
-            Notice::warn(
-                &format!("deputy:{}", q.id),
-                format!(
-                    "Question {} \"{}\": its follow-up agent ended {MAX_STARTS} times \
-                     without an answer and is not restarted. What you say is recorded \
-                     but nothing will read it; answer with one of the choices instead.",
-                    q.short(),
-                    q.summary
-                ),
-            ),
-        );
     }
 }
 

@@ -44,8 +44,8 @@ use serde::{Deserialize, Serialize};
 /// than this one; every field added later must carry `#[serde(default)]`.
 pub const SCHEMA: u32 = 1;
 
-/// The most notices kept. Older ones are pruned on every write: dismissed
-/// first, then read, then unread, oldest first within each.
+/// The most notices kept. Pruned on every write: obsolete first, then
+/// dismissed, read and unread, oldest first within each.
 pub const CAP: usize = 200;
 
 /// How serious a notice is. Ordered so a rise is a plain comparison.
@@ -263,14 +263,27 @@ impl Notice {
         }
     }
 
-    /// Pruning order: dismissed go first, then read, then unread.
+    /// Legacy exhausted-deputy warnings belong on the question card now.
+    /// Match only this retired namespace, not `deputy-turn:` failures.
+    fn obsolete(&self) -> bool {
+        self.key.starts_with("deputy:")
+    }
+
+    /// Whether this notice belongs in the notification centre and bell.
+    fn visible(&self) -> bool {
+        !self.obsolete() && self.dismissed_at.is_none()
+    }
+
+    /// Pruning order: obsolete, dismissed, read, then unread.
     fn keep_rank(&self) -> u8 {
-        if self.dismissed_at.is_some() {
+        if self.obsolete() {
             0
-        } else if self.read_at.is_some() {
+        } else if self.dismissed_at.is_some() {
             1
-        } else {
+        } else if self.read_at.is_some() {
             2
+        } else {
+            3
         }
     }
 }
@@ -490,17 +503,14 @@ impl Notices {
         all
     }
 
-    /// What the bell lists: everything not dismissed, newest first.
+    /// What the bell lists: visible, current notices, newest first.
     pub fn list(&self) -> Vec<Notice> {
-        self.all()
-            .into_iter()
-            .filter(|n| n.dismissed_at.is_none())
-            .collect()
+        self.all().into_iter().filter(Notice::visible).collect()
     }
 
     /// How many notices are unread.
     pub fn count_unread(&self) -> usize {
-        self.all().iter().filter(|n| n.unread()).count()
+        self.list().iter().filter(|n| n.unread()).count()
     }
 
     /// Mark read, keeping the first read time.
@@ -513,7 +523,7 @@ impl Notices {
     pub fn mark_all_read(&self) -> Result<usize> {
         let now = Timestamp::now();
         let mut changed = 0;
-        for n in self.all().into_iter().filter(Notice::unread) {
+        for n in self.list().into_iter().filter(Notice::unread) {
             // Re-read under the lock: a raise since the scan may have made it
             // a different, still-unread notice, which stays as it is.
             let done = self.update(&n.id, |n| n.mark_read(now));
@@ -829,6 +839,42 @@ pub fn raise_in_with(home: &Path, mut notice: Notice, send: &dyn Fn(Page)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_deputy_warnings_are_hidden_without_hiding_other_namespaces() {
+        let (_dir, s) = store();
+        // No question lookup: these may belong to deleted or settled questions.
+        for key in ["deputy:open", "deputy:answered", "deputy:deleted"] {
+            s.raise(Notice::warn(key, "old exhausted warning")).unwrap();
+        }
+        let keys = ["deputy-turn:open", "deputyish:open", "deputy", "task:open"];
+        for key in keys {
+            s.raise(Notice::warn(key, "still relevant")).unwrap();
+        }
+        assert_eq!(s.list().len(), keys.len());
+        assert_eq!(s.count_unread(), keys.len());
+        assert!(s.list().iter().all(|n| keys.contains(&n.key.as_str())));
+        assert_eq!(s.mark_all_read().unwrap(), keys.len());
+        assert_eq!(s.count_unread(), 0);
+        assert!(s.get(&id_of("deputy:open")).unwrap().unread());
+    }
+
+    #[test]
+    fn obsolete_deputy_warnings_are_pruned_before_current_notices() {
+        let (_dir, s) = store();
+        for i in 0..CAP {
+            let id = s
+                .raise(Notice::info(&format!("current:{i}"), "keep"))
+                .unwrap()
+                .id;
+            s.dismiss(&id).unwrap();
+        }
+        // Even a newer unread legacy warning cannot evict a current tombstone.
+        s.raise(Notice::warn("deputy:old", "obsolete")).unwrap();
+        assert!(s.get(&id_of("deputy:old")).is_err());
+        assert_eq!(s.all().len(), CAP);
+        assert!(s.all().iter().all(|n| n.key.starts_with("current:")));
+    }
 
     fn store() -> (tempfile::TempDir, Notices) {
         let dir = tempfile::tempdir().unwrap();

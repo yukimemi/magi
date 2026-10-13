@@ -4269,12 +4269,13 @@ const openFor = (runId) => openQuestions().filter((q) => q.run === runId);
 
 /* Of the open questions, the ones that actually need the owner right now:
    not the ones the owner has already talked back on and is waiting on the
-   agent's `magi ask --thread` reply to. `status` cannot tell the two apart -
+   agent's `magi ask --thread` reply to, unless that follow-up is exhausted.
+   `status` cannot tell the two apart -
    see `Question.waiting_on_agent` - which is exactly why this is a separate
    filter from `openQuestions` rather than a tweak to it: `openQuestions` is
    still what the Questions page counts as "blocking a run", and a round trip
    is still blocking, just not on the owner. */
-const needsOwnerQuestions = () => openQuestions().filter((q) => q.waiting_on_agent !== true);
+const needsOwnerQuestions = () => openQuestions().filter((q) => q.waiting_on_agent !== true || q.deputy_exhausted === true);
 
 /* Until /api/questions has answered, health's own count is what is known.
    `questions_needs_owner` is health's version of the same filter - see
@@ -4864,12 +4865,14 @@ function updateAskCard(row, question, { compact = false } = {}) {
      merge approval is served by a deputy too, but a say there never merges. */
   const holder = open ? question.holder : null;
   const hasDeputy = Boolean(question.deputy);
-  /* With follow-up agents off nobody will ever answer a say, so the choice
-     buttons must stay usable even while the thread says it is the agent's turn. */
-  const choicesLocked = waitingOnAgent
+  /* An exhausted or disabled follow-up cannot consume an unread say.
+     Keep the choices usable so the owner can still settle the question. */
+  const choicesLocked = waitingOnAgent && question.deputy_exhausted !== true
     && !(holder === "nobody" && hasDeputy && question.deputies_enabled === false);
   let waitingText = "";
-  if (holder === "nobody" && hasDeputy && question.deputies_enabled === false) {
+  if (question.deputy_exhausted === true) {
+    waitingText = "The follow-up agent has used all its attempts and will not restart. Your message is recorded, but the follow-up agent will not read it. Answer with one of the choices to resolve this question.";
+  } else if (holder === "nobody" && hasDeputy && question.deputies_enabled === false) {
     waitingText = "No agent is listening on this question: follow-up agents are disabled or the configuration cannot be read. Your message is recorded, but nothing will read it. Only choosing an option resolves this question.";
   } else if (holder === "nobody" && hasDeputy) {
     waitingText = waitingOnAgent
