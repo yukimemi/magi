@@ -1029,6 +1029,22 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 }
 .panel-ask .ask[data-state="open"] .ask-summary { font-size: var(--t6); }
 
+.question-identity { min-width: 0; font-size: var(--t2); }
+.question-id-short {
+  width: fit-content; min-height: 44px; padding: var(--s2);
+  cursor: pointer; color: var(--ink); font-family: var(--mono);
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+}
+.question-id-short:focus-visible { outline: 2px solid var(--gold-line); }
+.question-id-tools {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2);
+  padding-top: var(--s2); min-width: 0;
+}
+.question-id-full { overflow-wrap: anywhere; user-select: text; min-width: 0; }
+.question-id-tools .btn { min-height: 44px; }
+.question-id-tools [role="status"] { flex-basis: 100%; }
+#panel-full-identity { padding: 0 var(--s4) var(--s2); }
+
 .ask-top { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; }
 .ask-when { margin-left: auto; font-size: var(--t1); color: var(--ink-3); white-space: nowrap; }
 /* align-self keeps the box the width of the text, so the focus ring the ask

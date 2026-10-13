@@ -202,6 +202,7 @@ enum ClientProbe {
     None,
     Queue,
     Settings,
+    Questions,
 }
 
 // Expose the live module's functions without installing a second client that
@@ -235,6 +236,9 @@ async fn serve_with_client_probe(
             Some("setChip, RUN_STATUS, TASK_STATUS, QUESTION_STATUS, TALK_STATUS, loadQueue")
         }
         ClientProbe::Settings => Some("settingsState, renderSettings, loadSettings, saveSettings"),
+        ClientProbe::Questions => {
+            Some("state, shortId, renderQuestions, renderAsks, openPanel, closePanel")
+        }
     };
     let router = ui.router().layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| async move {
@@ -3420,4 +3424,126 @@ async fn dep_graph_labels_are_truncated_by_display_width() {
     assert_eq!(out["half"], true);
     assert_eq!(out["astral"], "𠮷".repeat(10) + "…");
     assert_eq!(out["short"], true);
+}
+
+/// Persisted question IDs stay visible in each treatment and survive the same
+/// keyed reconciliation used by SSE, without taking focus from an answer.
+#[tokio::test]
+async fn question_identity_disclosure_copy_and_live_updates() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "CI requires Chrome");
+        eprintln!("SKIP question identity: no Chrome/Chromium found");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let base = serve_with_client_probe(
+        &home,
+        Queue::at(home.join("queue")),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Questions,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
+    for (width, height, mobile) in [(1280, 900, false), (390, 844, true)] {
+        let page = browser
+            .open_page(&format!("{base}#/questions"), width, height, mobile)
+            .await
+            .unwrap();
+        browser
+            .wait_for(
+                &page,
+                "!!window.deck && deck.state.questions !== null",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        let ids = [
+            "20261012-230524-5d55",
+            "simple",
+            "20261012-230525-abcd",
+            "ending-",
+            "",
+        ];
+        let shorts = browser
+            .eval(
+                &page,
+                &format!("{}.map(deck.shortId)", serde_json::to_string(&ids).unwrap()),
+            )
+            .await
+            .unwrap();
+        let expected: Vec<_> = ids.iter().map(|id| magi::ask::short_id(id)).collect();
+        assert_eq!(shorts, serde_json::json!(expected));
+        let out = browser.eval(&page, r##"(async () => {
+          const check = (ok, why) => { if (!ok) throw new Error(why); };
+          const q = { id: '20261012-230524-5d55', run: '20261012-230500-aaaa',
+            status: 'open', summary: 'Choose the posting text', detail: '',
+            asked_at: '2026-10-12T23:05:24Z', node: 'posting-gate', choices: ['use fallback', 'post original'] };
+          const normal = { ...q, id: '20261012-230525-bbbb', node: 'implement', choices: [] };
+          const merge = { ...q, id: '20261012-230526-cccc', node: 'land-approval', choices: ['merge', 'hold'] };
+          deck.state.questions = [q, normal, merge]; deck.renderQuestions();
+          const rows = [...document.querySelectorAll('#questions-list .ask')];
+          check(rows.length === 3, 'question cards missing');
+          check(rows.map(r => r.querySelector('summary').textContent).join(',') === '#5d55,#bbbb,#cccc', 'wrong short IDs');
+          const row = rows[0], identity = row.querySelector('.question-identity');
+          identity.querySelector('summary').click();
+          check(identity.open, 'tap did not expand');
+          check(identity.querySelector('code').textContent === q.id, 'wrong full ID');
+          check(getComputedStyle(identity.querySelector('code')).userSelect === 'text', 'manual copy unavailable');
+          const tap = identity.querySelector('summary').getBoundingClientRect();
+          check(tap.height >= 44, 'small tap target');
+          const draft = rows[1].refs.text; draft.value = 'Keep this draft'; draft.focus();
+          deck.state.questions = deck.state.questions.map(q => ({ ...q })); deck.renderQuestions();
+          check(row === document.querySelector('#questions-list .ask'), 'row replaced');
+          check(row.querySelector('.question-identity') === identity && identity.open, 'disclosure reset');
+          check(document.activeElement === draft && draft.value === 'Keep this draft', 'draft or focus lost');
+          let copied;
+          Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText: async id => { copied = id; } } });
+          const copy = identity.querySelector('button'); copy.click();
+          await new Promise(r => setTimeout(r, 0));
+          check(copied === q.id && identity.querySelector('[role=status]').textContent === 'Copied full ID.', 'copy failed');
+          navigator.clipboard.writeText = async () => { throw new Error('denied'); };
+          copy.click(); await new Promise(r => setTimeout(r, 0));
+          check(identity.querySelector('[role=status]').textContent.includes('Select the full ID'), 'copy failure hidden');
+          check(window.getSelection().toString() === q.id, 'failed copy did not select full ID');
+          window.getSelection().removeAllRanges();
+          Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+          copy.click(); await new Promise(r => setTimeout(r, 0));
+          check(!identity.querySelector('[role=status]').textContent.includes('Copied'), 'false success');
+          check(window.getSelection().toString() === q.id, 'missing clipboard did not select full ID');
+          const full = identity.querySelector('code').getBoundingClientRect();
+          check(full.right <= innerWidth && full.left >= 0, 'full ID overflow');
+          let request;
+          const realFetch = window.fetch;
+          window.fetch = async (url, options) => {
+            if (url !== '/api/questions/' + q.id + '/answer') return realFetch(url, options);
+            request = { url, body: JSON.parse(options.body) };
+            return new Response(JSON.stringify({ ...q, status: 'answered', answer: request.body }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+          };
+          row.refs.choices.querySelector('button').click();
+          try {
+            const deadline = performance.now() + 5000;
+            while (row.dataset.state !== 'answered' && performance.now() < deadline) {
+              await new Promise(r => setTimeout(r, 10));
+            }
+          } finally { window.fetch = realFetch; }
+          check(request.url.endsWith('/' + q.id + '/answer'), 'answer used short or run ID');
+          check(request.body.choice === 'use fallback' && row.dataset.state === 'answered', 'answer behavior changed');
+          deck.renderAsks({ id: q.run });
+          check(document.querySelectorAll('#run-asks .question-identity').length === 3, 'compact IDs missing');
+          deck.openPanel(merge);
+          const dialogId = document.querySelector('#panel-full-identity .question-identity');
+          check(dialogId.querySelector('summary').textContent === '#cccc', 'approval panel ID missing');
+          dialogId.querySelector('summary').click();
+          check(dialogId.open && dialogId.querySelector('code').textContent === merge.id, 'panel full ID missing');
+          check(dialogId.querySelector('code').getBoundingClientRect().right <= innerWidth, 'panel ID overflow');
+          deck.closePanel();
+          return true;
+        })()"##).await.unwrap();
+        assert_eq!(out, true, "question identity @{width}px");
+        browser.close_page(&page).await;
+    }
 }
