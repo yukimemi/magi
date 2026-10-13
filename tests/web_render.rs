@@ -3586,7 +3586,7 @@ async fn queue_compact_controls_and_edit_save_fit_and_preserve_drafts() {
             .expect("queue loaded");
         let result = browser.eval(&page, &format!(r##"(async () => {{
           const id = {id};
-          let card = document.querySelector(`[data-task-id="${{id}}"]`);
+          let card = document.querySelector(`#queue-sections li.card[data-task-id="${{id}}"]`);
           const assert = (ok, message) => {{ if (!ok) throw new Error(message); }};
           const visible = e => e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().height > 0;
           const fits = e => {{ const r = e.getBoundingClientRect(), p = card.getBoundingClientRect(); return r.left >= p.left && r.right <= p.right + 1; }};
@@ -3618,12 +3618,12 @@ async fn queue_compact_controls_and_edit_save_fit_and_preserve_drafts() {
           card.querySelectorAll('.task-hold-box button')[1].click();
           await new Promise(r => setTimeout(r, 200));
           await deck.loadQueue();
-          card = document.querySelector(`[data-task-id="${{id}}"]`);
+          card = document.querySelector(`#queue-sections li.card[data-task-id="${{id}}"]`);
           assert(card.querySelector('.chip').textContent.toLowerCase().includes('held'), 'hold applied');
           card.querySelector('.task-hold-box button').click();
           await new Promise(r => setTimeout(r, 200));
           await deck.loadQueue();
-          card = document.querySelector(`[data-task-id="${{id}}"]`);
+          card = document.querySelector(`#queue-sections li.card[data-task-id="${{id}}"]`);
           const task = (await (await fetch(`/api/queue/${{id}}`)).json());
           deck.openTaskEdit(task);
           const field = document.querySelector('#task-edit-implementers');
@@ -3666,7 +3666,7 @@ async fn queue_compact_controls_and_edit_save_fit_and_preserve_drafts() {
           assert(!dialog.open, 'success closes edit');
           const saved = (await (await fetch(`/api/queue/${{id}}`)).json());
           assert(saved.solo && saved.title === 'Revised task', 'combined save persisted');
-          card = document.querySelector(`[data-task-id="${{id}}"]`);
+          card = document.querySelector(`#queue-sections li.card[data-task-id="${{id}}"]`);
           card.querySelector('.task-action-menu').open = true;
           card.querySelector('.task-done-box button').click();
           assert(card.querySelector('.task-done-box .stakes-confirm'), 'done asks for confirmation');
@@ -3675,7 +3675,7 @@ async fn queue_compact_controls_and_edit_save_fit_and_preserve_drafts() {
           await deck.loadQueue();
           const done = await (await fetch(`/api/queue/${{id}}`)).json();
           assert(done.status_str === 'done', 'done keeps task record');
-          card = document.querySelector(`[data-task-id="${{id}}"]`);
+          card = document.querySelector(`#queue-sections li.card[data-task-id="${{id}}"]`);
           card.querySelector('.task-action-menu').open = true;
           card.querySelector('.task-delete-box button').click();
           assert(card.querySelector('.task-delete-box .stakes-confirm'), 'delete asks for confirmation');

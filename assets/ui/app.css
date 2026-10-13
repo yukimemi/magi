@@ -2864,7 +2864,7 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
     grid-row: 3; grid-column: 1 / -1; display: flex; flex-wrap: wrap;
     white-space: normal; overflow: visible; max-width: none;
   }
-  main[data-split] .task-card > .task-card-actions { display: flex; margin-top: var(--s2); }
+  main[data-split] .cards > li.card.task-card > .task-card-actions { display: flex; margin-top: var(--s2); }
 }
 
 /* Replies use the same compact action buttons as the conversation composer. */
