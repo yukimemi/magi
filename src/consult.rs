@@ -235,17 +235,19 @@ pub fn validate_answer(
         })
         .context("the question was not delivered to the chat yet")?;
     // A reply still waiting in `pending` is newer than every stored turn.
-    let queued = latest_message(&talk.pending, talk.pending_breaks.as_deref(), None);
+    let queued =
+        latest_message_for_policy(&talk.pending, talk.pending_breaks.as_deref(), None, posting);
     let stored = talk.turns[at..]
         .iter()
         .enumerate()
         .rev()
         .filter(|(_, t)| t.who == talk::Who::Operator)
         .find_map(|(i, t)| {
-            latest_message(
+            latest_message_for_policy(
                 &t.body,
                 t.breaks.as_deref(),
                 (i == 0).then_some(q.id.as_str()),
+                posting,
             )
         });
     let latest = queued
@@ -296,10 +298,20 @@ pub fn validate_answer(
 /// the last paragraph: that can reject a multi-paragraph approval, and can
 /// accept a `hold` that was only the last paragraph of a longer message, which
 /// is harmless because silence is a hold.
+#[cfg(test)]
 fn latest_message(
     body: &str,
     breaks: Option<&[usize]>,
     after_block_of: Option<&str>,
+) -> Option<String> {
+    latest_message_for_policy(body, breaks, after_block_of, false)
+}
+
+fn latest_message_for_policy(
+    body: &str,
+    breaks: Option<&[usize]>,
+    after_block_of: Option<&str>,
+    posting: bool,
 ) -> Option<String> {
     let cuts = breaks.filter(|b| {
         b.windows(2).all(|w| w[0] < w[1])
@@ -312,6 +324,14 @@ fn latest_message(
             return None;
         }
         let words = owner_words(body, after_block_of);
+        // Legacy/invalid boundary records cannot distinguish paragraphs from
+        // separate owner replies. Posting must not promote a reported final
+        // paragraph into an instruction. Merge keeps its existing policy.
+        if posting && words.contains("\n\n") {
+            // Keep this as the newest evidence (with no usable quote), so an
+            // ambiguous queued reply cannot fall back to an older instruction.
+            return Some(String::new());
+        }
         return words
             .rsplit("\n\n")
             .map(str::trim)
@@ -1427,6 +1447,10 @@ mod tests {
             } else {
                 "Use rewrite"
             };
+            // A newer report must also block fallback to an older instruction.
+            let mut earlier = talk.turns[0].clone();
+            earlier.body = clear.into();
+            talk.turns.push(earlier);
             for reported in [
                 format!("The log contains:\n```\n{command}\n```"),
                 format!("The log contains:\n\"\n{command}\n\""),
@@ -1437,12 +1461,16 @@ mod tests {
             .chain(crate::github_text::reported_posting_messages(command))
             {
                 talk.pending = reported.clone();
-                store.put(&mut talk).unwrap();
-                for quote in [command, reported.as_str()] {
-                    assert!(save(choice, Some(quote), &talk.id).is_err());
-                    let after = questions.get(&q.id).unwrap();
-                    assert!(after.status.open());
-                    assert!(after.answer.is_none());
+                // Check both current message boundaries and legacy records.
+                for breaks in [Some(Vec::new()), None] {
+                    talk.pending_breaks = breaks;
+                    store.put(&mut talk).unwrap();
+                    for quote in [command, reported.as_str()] {
+                        assert!(save(choice, Some(quote), &talk.id).is_err());
+                        let after = questions.get(&q.id).unwrap();
+                        assert!(after.status.open());
+                        assert!(after.answer.is_none());
+                    }
                 }
             }
             let natural = if choice == POST_ORIGINAL {

@@ -322,6 +322,11 @@ fn has_posting_report_context(text: &str) -> bool {
         previous = Some(c);
     }
     text.lines().any(|line| {
+        // Markdown's indented code retains reported text even without quote
+        // delimiters. Inspect indentation before trimming it away.
+        if line.starts_with("    ") || line.starts_with('\t') {
+            return true;
+        }
         let line = line.trim_start();
         line.starts_with('>') || line.starts_with("~~~")
     })
@@ -396,7 +401,9 @@ pub fn posting_authorized(message: &str, quote: &str, choice: &str) -> bool {
     let evidence = normalize(&message.to_lowercase());
     let evidence_quote = normalize(&quote.to_lowercase());
     let has_instruction = |text: &str| {
-        text.split(['.', '!', '。', '！', '\n']).any(|sentence| {
+        // A newline is whitespace within the same instruction, not a new
+        // sentence: splitting here would discard a preceding report header.
+        text.split(['.', '!', '。', '！']).any(|sentence| {
             let sentence = sentence.trim();
             commands.iter().any(|command| {
                 sentence.match_indices(command).any(|(at, _)| {
@@ -449,6 +456,14 @@ pub fn posting_authorized(message: &str, quote: &str, choice: &str) -> bool {
 #[cfg(test)]
 pub(crate) fn reported_posting_messages(command: &str) -> Vec<String> {
     let mut messages = Vec::new();
+    for newline in ["\n", "\r\n"] {
+        messages.extend([
+            format!("The log says:{newline}{command}"),
+            format!("The log says{newline}{command}"),
+            format!("The log contains:{newline}{newline}    {command}"),
+            format!("The log contains:{newline}{newline}\t{command}"),
+        ]);
+    }
     for (open, close) in [
         ("'", "'"),
         ("‘", "’"),
@@ -530,6 +545,10 @@ mod posting_authorization_tests {
             ("I'd like to use the rewrite", USE_REWRITE),
             ("Use only the rewrite text.", USE_REWRITE),
             ("Post original now.", POST_ORIGINAL),
+            ("\nPost original\n", POST_ORIGINAL),
+            ("Please\npost original", POST_ORIGINAL),
+            ("\nUse rewrite\n", USE_REWRITE),
+            ("Please\nuse rewrite", USE_REWRITE),
             ("Post the original description unchanged.", POST_ORIGINAL),
             ("Use the rewrite title and body verbatim.", USE_REWRITE),
             ("いいや、元の説明で投稿してください。", POST_ORIGINAL),
