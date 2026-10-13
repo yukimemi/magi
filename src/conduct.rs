@@ -70,7 +70,7 @@ fn dependency_context(queue: &Queue, questions: &Questions) -> String {
             inventory.waits_on(&task).join(", ")
         ));
     }
-    out.push_str("Only a verified absent dependency justifies a missing-dependency hold or question. Include every alleged absent reference in `missing_dependencies`; it is checked again before application. Existing running/blocked prerequisites must keep waiting. Use `magi task show <id>` to check an uncertain reference.\n");
+    out.push_str("Only a verified absent dependency justifies a missing-dependency hold or question. Include every alleged absent reference in `missing_dependencies`; it is checked again before application. Existing running/blocked prerequisites must keep waiting: use `blocked_by`, not a hold or question mentioning them. References in the decision prose are checked even when `missing_dependencies` is omitted. Use `magi task show <id>` to check an uncertain reference.\n");
     out
 }
 
@@ -644,6 +644,53 @@ fn repo_for(task: &Task, fallback: &Path) -> PathBuf {
     }
 }
 
+/// A hold or owner question must not replace a wait on an existing task.
+/// Inspect references in the decision itself as well as its optional metadata:
+/// older replies (and incomplete new replies) omit `missing_dependencies`.
+/// This is deliberately language independent and conservative: a decision
+/// mentioning another persisted task defers to dependency resolution/triage,
+/// rather than trying to interpret whether its prose claims that task missing.
+fn dependency_decision_is_current(
+    queue: &Queue,
+    questions: &Questions,
+    task: &Task,
+    decision: &Decision,
+) -> bool {
+    if crate::queue::missing_blockers(queue, questions, &decision.missing_dependencies).len()
+        != decision.missing_dependencies.len()
+    {
+        return false;
+    }
+    if decision.question.is_none() && decision.recovery != Some(Recovery::Hold) {
+        return true;
+    }
+    // ASCII identifier boundaries also work in Japanese prose, where an
+    // id is usually immediately followed by a particle with no space.
+    let prose_references = decision
+        .reason
+        .iter()
+        .chain(decision.question.iter())
+        .chain(decision.choices.iter())
+        .flat_map(|text| text.split(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
+        // Displayed ids have four characters. Shorter prose words are not
+        // implicit references; structured references accept any supported id.
+        .filter(|reference| reference.len() >= 4);
+    decision
+        .blocked_by
+        .iter()
+        .map(String::as_str)
+        .chain(prose_references)
+        .all(
+            |reference| match crate::queue::dependency(queue, questions, reference) {
+                crate::queue::Dependency::Task(id) => id == task.id,
+                crate::queue::Dependency::Ambiguous
+                | crate::queue::Dependency::Unavailable
+                | crate::queue::Dependency::Deleted(_) => false,
+                _ => true,
+            },
+        )
+}
+
 /// Apply one decision to the queue and the question store.
 ///
 /// Takes the task's own claim before touching it: a model call spans a whole
@@ -725,10 +772,7 @@ fn apply_one(
     // Never turn a live dependency wait into an owner question, even if an
     // old model snapshot alleged absence. Unknown includes ambiguity and I/O
     // failures, neither of which proves that the owner must replace a task.
-    if !d.missing_dependencies.is_empty()
-        && crate::queue::missing_blockers(queue, questions, &d.missing_dependencies).len()
-            != d.missing_dependencies.len()
-    {
+    if !dependency_decision_is_current(queue, questions, &task, d) {
         return Ok(());
     }
     if task.status == TaskStatus::Blocked
@@ -786,11 +830,7 @@ fn apply_one(
                 // Building the deputy context can take time. Recheck at the
                 // final write too, so a dependency added during that read does
                 // not turn a stale absence claim into an owner question.
-                if !d.missing_dependencies.is_empty()
-                    && crate::queue::missing_blockers(queue, questions, &d.missing_dependencies)
-                        .len()
-                        != d.missing_dependencies.len()
-                {
+                if !dependency_decision_is_current(queue, questions, &task, d) {
                     return Ok(());
                 }
                 questions.put(&mut q)?;
@@ -1559,6 +1599,102 @@ mod tests {
             new_blocking_evidence(&queue, &questions, &t, &decision).len(),
             1
         );
+    }
+
+    #[test]
+    fn dependency_decisions_without_absence_metadata_cannot_hold_or_question_existing_tasks() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut prerequisite = task("prerequisite");
+        prerequisite.id = "20261013-192213-feb2".into();
+        prerequisite.status = TaskStatus::Running;
+        queue.put(&mut prerequisite).unwrap();
+        let mut dependency = task("dependency");
+        dependency.id = "20261013-193611-ca5b".into();
+        dependency.block(vec![prerequisite.id.clone()], None);
+        queue.put(&mut dependency).unwrap();
+        for held in [false, true] {
+            for reference in [
+                dependency.short(),
+                dependency.id.as_str(),
+                "20261013-193611",
+            ] {
+                for question in [false, true] {
+                    let mut waiting = task("waiting");
+                    if held {
+                        waiting.hold_machine(Some("previous diagnosis".into()));
+                    }
+                    queue.put(&mut waiting).unwrap();
+                    let before = queue.get(&waiting.id).unwrap();
+                    // Deserialize an accepted reply which truly omits the field,
+                    // rather than supplying an explicitly empty vector.
+                    let mut value = serde_json::json!({
+                        "id": waiting.id,
+                        "reason": format!("依存先{reference}が存在しません"),
+                    });
+                    if question {
+                        value["question"] = serde_json::json!(format!(
+                            "タスク{reference}の後継IDを教えてください。"
+                        ));
+                    } else {
+                        value["recovery"] = serde_json::json!("hold");
+                    }
+                    let decision: Decision = serde_json::from_value(value).unwrap();
+                    apply_one(&queue, &questions, &decision).unwrap();
+                    let after = queue.get(&waiting.id).unwrap();
+                    assert_eq!(after.status, before.status);
+                    assert_eq!(after.hold_reason, before.hold_reason);
+                    assert_eq!(after.updated_at, before.updated_at);
+                    assert!(questions.list().is_empty());
+                }
+            }
+        }
+        // A question-only reply must be checked too, without a reason field.
+        let mut waiting = task("question-only");
+        queue.put(&mut waiting).unwrap();
+        let decision: Decision = serde_json::from_value(serde_json::json!({
+            "id": waiting.id,
+            "question": "タスクca5bの後継IDを教えてください。"
+        }))
+        .unwrap();
+        apply_one(&queue, &questions, &decision).unwrap();
+        assert_eq!(queue.get(&waiting.id).unwrap().status, TaskStatus::Queued);
+        assert!(questions.list().is_empty());
+
+        let structured: Decision = serde_json::from_value(serde_json::json!({
+            "id": waiting.id,
+            "blocked_by": ["ca5b"],
+            "question": "どの後継IDを使いますか。"
+        }))
+        .unwrap();
+        apply_one(&queue, &questions, &structured).unwrap();
+        assert_eq!(queue.get(&waiting.id).unwrap().status, TaskStatus::Queued);
+        assert!(questions.list().is_empty());
+
+        // Unreadable and ambiguous persisted prerequisites do not become
+        // evidence of absence when the optional metadata was omitted either.
+        std::fs::write(queue.path_of(&dependency.id), "invalid json").unwrap();
+        apply_one(&queue, &questions, &decision).unwrap();
+        assert_eq!(queue.get(&waiting.id).unwrap().status, TaskStatus::Queued);
+        let mut collision = task("collision");
+        collision.id = "20261013-193612-ca5b".into();
+        queue.put(&mut collision).unwrap();
+        apply_one(&queue, &questions, &decision).unwrap();
+        assert_eq!(queue.get(&waiting.id).unwrap().status, TaskStatus::Queued);
+        assert!(questions.list().is_empty());
+
+        // A genuinely absent reference remains actionable without metadata.
+        let mut waiting = task("missing prerequisite");
+        queue.put(&mut waiting).unwrap();
+        let decision: Decision = serde_json::from_value(serde_json::json!({
+            "id": waiting.id,
+            "question": "タスクdeadの後継IDを教えてください。"
+        }))
+        .unwrap();
+        apply_one(&queue, &questions, &decision).unwrap();
+        assert_eq!(queue.get(&waiting.id).unwrap().status, TaskStatus::Blocked);
+        assert_eq!(questions.list().len(), 1);
     }
 
     #[test]
