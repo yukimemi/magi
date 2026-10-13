@@ -804,7 +804,13 @@ impl Question {
             .iter()
             .rev()
             .find(|t| t.who == Who::Operator)
-            .map(|t| t.body.trim());
+            .map(|t| {
+                if self.node == crate::github_text::ASK_NODE && !crate::deputy::merge_gated(self) {
+                    t.body.as_str()
+                } else {
+                    t.body.trim()
+                }
+            });
         if crate::deputy::merge_gated(self) {
             // The merge is irreversible and a say is not a decision. `hold` must
             // be the latest message exactly. For `merge`, whether the words are
@@ -830,6 +836,14 @@ impl Question {
                     } else {
                         "the quote must be the instruction itself"
                     }
+                );
+            }
+        } else if self.node == crate::github_text::ASK_NODE
+            && crate::deputy::destructive(self, label)
+        {
+            if !latest.is_some_and(|m| crate::github_text::posting_authorized(m, quote, label)) {
+                bail!(
+                    "posting confirmation requires an explicit, unconditional instruction for the chosen text quoted verbatim from the latest owner message"
                 );
             }
         } else if crate::deputy::destructive(self, label)
@@ -3000,11 +3014,114 @@ mod tests {
             .settle_by_deputy("deputy-x", POST_ORIGINAL, "Post the original text", None)
             .unwrap();
         assert_eq!(clear.resolution().as_deref(), Some(POST_ORIGINAL));
+        let mut japanese = mk();
+        let words = "いいや、まだ説明が足りない。元の説明で投稿してください。";
+        japanese.say(words).unwrap();
+        japanese
+            .settle_by_deputy("deputy-x", POST_ORIGINAL, words, None)
+            .unwrap();
+        let mut unrelated = mk();
+        unrelated.say("Proceed with the task").unwrap();
+        assert!(
+            unrelated
+                .settle_by_deputy("deputy-x", POST_ORIGINAL, "Proceed with the task", None)
+                .is_err()
+        );
+        for words in [
+            "OK, post the original",
+            "Yes, post original",
+            "I'd like to post the original",
+        ] {
+            let mut natural = mk();
+            natural.say(words).unwrap();
+            natural
+                .settle_by_deputy("deputy-x", POST_ORIGINAL, words, None)
+                .unwrap();
+        }
+        for (message, quote) in [
+            (
+                "ログには「元の説明で投稿しました」と記録されています。",
+                "ログには「元の説明で投稿しました」と記録されています。",
+            ),
+            (
+                "ログには「元の説明で投稿してください」と記録されています。",
+                "元の説明で投稿してください",
+            ),
+        ] {
+            let mut descriptive = mk();
+            descriptive.say(message).unwrap();
+            assert!(
+                descriptive
+                    .settle_by_deputy("deputy-x", POST_ORIGINAL, quote, None)
+                    .is_err()
+            );
+            assert!(descriptive.status.open());
+            assert!(descriptive.answer.is_none());
+        }
+        let mut descriptive = mk();
+        let message = "Post original was the option I saw.";
+        descriptive.say(message).unwrap();
+        for quote in [message, "Post original"] {
+            assert!(
+                descriptive
+                    .settle_by_deputy("deputy-x", POST_ORIGINAL, quote, None)
+                    .is_err()
+            );
+            assert!(descriptive.status.open());
+            assert!(descriptive.answer.is_none());
+        }
         // The changed text is the safe default: no extra guard beyond the quote.
         let mut safe = mk();
         safe.say("use the fallback").unwrap();
         safe.settle_by_deputy("deputy-x", USE_FALLBACK, "use the fallback", None)
             .unwrap();
+    }
+
+    #[test]
+    fn posting_deputy_rejects_multiline_quoted_context() {
+        use crate::github_text::{ASK_NODE, ASK_SEAT, POST_ORIGINAL, USE_FALLBACK, USE_REWRITE};
+        for (command, choice) in [
+            ("Post original", POST_ORIGINAL),
+            ("Use rewrite", USE_REWRITE),
+        ] {
+            for message in [
+                format!("The log contains:\n```\n{command}\n```"),
+                format!("The log contains:\n\"\n{command}\n\""),
+                format!("The log says: “Reported. {command}.”"),
+                format!("The log says: “\n{command}\n”"),
+            ]
+            .into_iter()
+            .chain(crate::github_text::reported_posting_messages(command))
+            {
+                let mut q = Question::new(
+                    "run".into(),
+                    ASK_NODE.into(),
+                    ASK_SEAT.into(),
+                    "s".into(),
+                    String::new(),
+                    vec![USE_FALLBACK.into(), choice.into()],
+                );
+                let mut dep = Deputy::new("brief".into());
+                dep.seat = Some(crate::agent::SeatState::new("deputy-x", "alpha", 1));
+                q.deputy = Some(dep);
+                q.say(&message).unwrap();
+                let tmp = tempfile::tempdir().unwrap();
+                let questions = Questions::at(tmp.path().join("questions"));
+                questions.put(&mut q).unwrap();
+                for quote in [command, message.as_str()] {
+                    assert!(
+                        questions
+                            .update(&q.id, |stored| {
+                                stored.settle_by_deputy("deputy-x", choice, quote, None)
+                            })
+                            .is_err()
+                    );
+                    let after = questions.get(&q.id).unwrap();
+                    assert!(after.status.open());
+                    assert!(after.answer.is_none());
+                }
+            }
+        }
     }
 
     #[test]
@@ -3031,12 +3148,30 @@ mod tests {
                 .settle_by_deputy("deputy-x", USE_REWRITE, "Use the rewrite", None)
                 .is_err()
         );
-        let mut clear = mk();
-        clear.say("Use the rewrite text as it is.").unwrap();
-        clear
-            .settle_by_deputy("deputy-x", USE_REWRITE, "Use the rewrite text", None)
-            .unwrap();
-        assert_eq!(clear.resolution().as_deref(), Some(USE_REWRITE));
+        let mut descriptive = mk();
+        let message = "Use rewrite was the option I saw.";
+        descriptive.say(message).unwrap();
+        for quote in [message, "Use rewrite"] {
+            assert!(
+                descriptive
+                    .settle_by_deputy("deputy-x", USE_REWRITE, quote, None)
+                    .is_err()
+            );
+            assert!(descriptive.status.open());
+            assert!(descriptive.answer.is_none());
+        }
+        for words in [
+            "Use the rewrite text as it is.",
+            "I'd like to use the rewrite",
+            "修正版で投稿してください。",
+        ] {
+            let mut clear = mk();
+            clear.say(words).unwrap();
+            clear
+                .settle_by_deputy("deputy-x", USE_REWRITE, words, None)
+                .unwrap();
+            assert_eq!(clear.resolution().as_deref(), Some(USE_REWRITE));
+        }
         // The changed text is the safe default: no extra guard beyond the quote.
         let mut safe = mk();
         safe.say("use the fallback").unwrap();

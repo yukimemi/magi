@@ -278,6 +278,379 @@ pub const USE_MY_TEXT: &str = "use my text";
 /// Choice: post the original text of every withheld field, unmodified, past
 /// the posting gate. Publishing cannot be taken back.
 pub const POST_ORIGINAL: &str = "post original";
+
+/// Reject reported context before sentence splitting can discard its delimiters.
+/// Even an unmatched delimiter requires clarification. Only word-internal
+/// apostrophes (such as "I'd") are exempt from the single-quote check.
+fn has_posting_report_context(text: &str) -> bool {
+    let mut chars = text.chars().peekable();
+    let mut previous = None::<char>;
+    while let Some(c) = chars.next() {
+        if matches!(c, '\'' | '’') {
+            if !(previous.is_some_and(|p| p.is_ascii_alphabetic())
+                && chars.peek().is_some_and(|n| n.is_ascii_alphabetic()))
+            {
+                return true;
+            }
+        } else if matches!(
+            c,
+            '「' | '」'
+                | '『'
+                | '』'
+                | '"'
+                | '“'
+                | '”'
+                | '‘'
+                | '«'
+                | '»'
+                | '‹'
+                | '›'
+                | '('
+                | ')'
+                | '（'
+                | '）'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '【'
+                | '】'
+                | '`'
+        ) {
+            return true;
+        }
+        previous = Some(c);
+    }
+    text.lines().any(|line| {
+        // Markdown's indented code retains reported text even without quote
+        // delimiters. Inspect indentation before trimming it away.
+        if line.starts_with("    ") || line.starts_with('\t') {
+            return true;
+        }
+        let line = line.trim_start();
+        line.starts_with('>') || line.starts_with("~~~")
+    })
+}
+
+/// Posting requires both an instruction identifying the selected text and
+/// unqualified owner evidence. Merge authorization keeps its separate policy.
+pub fn posting_authorized(message: &str, quote: &str, choice: &str) -> bool {
+    // Inspect both original inputs, before normalization or splitting. A supplied
+    // evidence fragment must not escape quotation markers elsewhere in the message.
+    if has_posting_report_context(message) || has_posting_report_context(quote) {
+        return false;
+    }
+    let words = quote.to_lowercase();
+    let lower = message.to_lowercase();
+    if lower
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .any(|w| matches!(w, "or" | "either"))
+        || ["どちら", "どっち", "または", "それとも"]
+            .iter()
+            .any(|w| message.contains(w))
+    {
+        return false;
+    }
+    let commands: &[&str] = match choice {
+        POST_ORIGINAL => &[
+            "post original",
+            "post the original",
+            "post only the original",
+            "use the original",
+            "元の説明で投稿",
+            "元の説明のまま投稿",
+            "元の説明でいい",
+            "元の説明を投稿",
+            "元の文章で投稿",
+            "元の文章を投稿",
+            "元のまま投稿",
+            "原文を投稿",
+        ],
+        USE_REWRITE => &[
+            "use rewrite",
+            "use the rewrite",
+            "use only the rewrite",
+            "post the rewrite",
+            "修正版で投稿",
+            "修正版でいい",
+            "修正版を投稿",
+            "書き直した説明で投稿",
+        ],
+        _ => return false,
+    };
+    // These are discourse/explanation words, not a veto of a subsequent
+    // explicit posting instruction. Negation and conditions still veto it.
+    let normalize = |text: &str| {
+        // Rejecting the fallback is a text choice, not a veto of posting.
+        // Only remove this final clause for an original-text instruction.
+        let text = if choice == POST_ORIGINAL {
+            text.trim_end_matches(['.', '!'])
+                .strip_suffix(", not the fallback")
+                .unwrap_or(text)
+        } else {
+            text
+        };
+        text.trim_start()
+            .strip_prefix("いいや")
+            .unwrap_or(text)
+            .replace("まだ説明が足りない", "説明が足りない")
+            .replace("まだ説明が不足", "説明が不足")
+            .replace("post only the original", "post the original")
+            .replace("use only the rewrite", "use the rewrite")
+    };
+    let evidence = normalize(&message.to_lowercase());
+    let evidence_quote = normalize(&quote.to_lowercase());
+    let has_instruction = |text: &str| {
+        // Every sentence must be a direct instruction or a known discourse
+        // phrase. A trailing report can qualify an otherwise imperative opening
+        // just as a report header can; neither may be discarded from evidence.
+        let mut instructed = false;
+        let direct = text.split(['.', '!', '。', '！']).all(|sentence| {
+            let sentence = sentence.trim();
+            if matches!(sentence,
+                "" | "ok" | "okay" | "yes" | "thanks" | "thank you"
+                | "ありがとう" | "ありがとうございます"
+                | "いいや、まだ説明が足りない" | "いいや、説明が足りない"
+                | "いいや、まだ説明が不足" | "いいや、説明が不足") {
+                return true;
+            }
+            let instruction = commands.iter().any(|command| {
+                sentence.match_indices(command).any(|(at, _)| {
+                    let before = sentence[..at].trim();
+                    let after = sentence[at + command.len()..].trim();
+                    if !command.is_ascii() {
+                        return matches!(before, "" | "はい、" | "うん、" | "いいや、" | "では、" | "それでは、" | "じゃあ、")
+                            && if command.ends_with("でいい") {
+                                matches!(after, "" | "です" | "よ" | "ですよ")
+                            } else {
+                                matches!(after, "して" | "してください" | "して下さい" | "してほしい" | "して欲しい" | "してくれ" | "しましょう" | "します" | "する")
+                            };
+                    }
+                    let before = before.trim_end_matches(',').trim();
+                    let before = before.strip_prefix("ok, ")
+                        .or_else(|| before.strip_prefix("yes, "))
+                        .unwrap_or(before);
+                    matches!(before, "" | "ok" | "okay" | "yes" | "please" | "go ahead and" | "i want you to" | "i authorize you to" | "i'd like to" | "i would like to")
+                        && sentence[at + command.len()..].chars().next().is_none_or(|c| !c.is_ascii_alphabetic())
+                        // Accept a complete instruction: an optional object
+                        // noun and posting modifier, never arbitrary prose
+                        // describing the choice label (including past tense).
+                        && {
+                            let after = if choice == POST_ORIGINAL {
+                                after.strip_suffix(", not the fallback").unwrap_or(after).trim()
+                            } else {
+                                after
+                            };
+                            ["", "text", "description", "title", "body", "title and body"].iter().any(|noun| {
+                                let modifier = if noun.is_empty() {
+                                    Some(after)
+                                } else if after == *noun {
+                                    Some("")
+                                } else {
+                                    after.strip_prefix(*noun).and_then(|rest| rest.strip_prefix(' '))
+                                };
+                                modifier.is_some_and(|m| matches!(m, "" | "as it is" | "as is" | "unchanged" | "unmodified" | "verbatim" | "now" | "please" | "for this pr"))
+                            })
+                        }
+                })
+            });
+            instructed |= instruction;
+            instruction
+        });
+        direct && instructed
+    };
+    has_instruction(&words)
+        && has_instruction(&lower)
+        && message.contains(quote)
+        && crate::land::unhedged(&evidence, &evidence_quote)
+}
+
+#[cfg(test)]
+pub(crate) fn reported_posting_messages(command: &str) -> Vec<String> {
+    let mut messages = vec![format!("    {command}"), format!("\t{command}")];
+    for separator in [". ", ".\n", ".\r\n", "! ", "。\n"] {
+        for introduction in [
+            "The log contains the following instruction",
+            "The log contains the following text",
+            "The log says",
+            "Someone reported the following",
+        ] {
+            messages.push(format!("{introduction}{separator}{command}."));
+        }
+        for report in [
+            "That is what the log says",
+            "That was the option I saw",
+            "That is what someone wrote",
+            "Those were the instructions in the report",
+            "これはログの文言です",
+        ] {
+            messages.push(format!("{command}{separator}{report}."));
+            messages.push(format!("Yes. {command}{separator}{report}. Thanks."));
+        }
+    }
+    for newline in ["\n", "\r\n"] {
+        messages.extend([
+            format!("The log says:{newline}{command}"),
+            format!("The log says{newline}{command}"),
+            format!("The log contains:{newline}{newline}    {command}"),
+            format!("The log contains:{newline}{newline}\t{command}"),
+        ]);
+    }
+    for (open, close) in [
+        ("'", "'"),
+        ("‘", "’"),
+        ("«", "»"),
+        ("‹", "›"),
+        ("(", ")"),
+        ("（", "）"),
+        ("[", "]"),
+        ("{", "}"),
+        ("【", "】"),
+    ] {
+        for separator in [". ", "! ", "\n"] {
+            // Closed, unclosed, closing-only and mixed report/instruction forms.
+            messages.extend([
+                format!("The log says: {open}Reported{separator}{command}.{close}"),
+                format!("The log says: {open}Reported{separator}{command}."),
+                format!("Reported{separator}{command}.{close}"),
+                format!("{open}Reported{close}{separator}{command}."),
+            ]);
+        }
+    }
+    messages
+}
+
+#[cfg(test)]
+mod posting_authorization_tests {
+    use super::*;
+
+    #[test]
+    fn posting_instructions_reject_multiline_quoted_context() {
+        for (command, choice) in [
+            ("Post original", POST_ORIGINAL),
+            ("Use rewrite", USE_REWRITE),
+        ] {
+            for message in [
+                format!("The log contains:\n```\n{command}\n```"),
+                format!("The log contains:\n~~~text\n{command}\n~~~"),
+                format!("The log contains:\n\"\n{command}\n\""),
+                format!("The log says: “Reported. {command}.”"),
+                format!("The log says: “\n{command}\n”"),
+                format!("The log contains:「\n{command}\n」"),
+                format!("The log contains:『\n{command}\n』"),
+                format!("The log contains:\n> {command}"),
+                format!("The log contains: \"Reported. {command}.\""),
+            ] {
+                for quote in [command, message.as_str()] {
+                    assert!(!posting_authorized(&message, quote, choice), "{message}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn posting_instructions_reject_reported_context_before_sentence_splitting() {
+        for (command, choice) in [
+            ("Post original", POST_ORIGINAL),
+            ("Use rewrite", USE_REWRITE),
+        ] {
+            for message in reported_posting_messages(command) {
+                for quote in [command, message.as_str()] {
+                    assert!(
+                        !posting_authorized(&message, quote, choice),
+                        "{message} / {quote}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn posting_instructions_distinguish_scope_from_conditions() {
+        for (message, choice) in [
+            ("Post only the original description.", POST_ORIGINAL),
+            ("OK, post the original", POST_ORIGINAL),
+            ("Yes, post original", POST_ORIGINAL),
+            ("I'd like to post the original", POST_ORIGINAL),
+            ("OK, please use the rewrite", USE_REWRITE),
+            ("Yes, use rewrite", USE_REWRITE),
+            ("I'd like to use the rewrite", USE_REWRITE),
+            ("Use only the rewrite text.", USE_REWRITE),
+            ("Post original now.", POST_ORIGINAL),
+            ("Yes. Post original. Thank you.", POST_ORIGINAL),
+            ("OK. Use rewrite. Thanks.", USE_REWRITE),
+            (
+                "Post original. Post the original description unchanged.",
+                POST_ORIGINAL,
+            ),
+            ("\nPost original\n", POST_ORIGINAL),
+            ("Please\npost original", POST_ORIGINAL),
+            ("\nUse rewrite\n", USE_REWRITE),
+            ("Please\nuse rewrite", USE_REWRITE),
+            ("Post the original description unchanged.", POST_ORIGINAL),
+            ("Use the rewrite title and body verbatim.", USE_REWRITE),
+            ("いいや、元の説明で投稿してください。", POST_ORIGINAL),
+            ("元の説明のまま投稿して", POST_ORIGINAL),
+            ("Post the original, not the fallback.", POST_ORIGINAL),
+        ] {
+            assert!(posting_authorized(message, message, choice), "{message}");
+        }
+        for message in [
+            "Post the original only if checks pass.",
+            "Post original when checks pass.",
+            "Use the rewrite. Only when checks pass.",
+            "いいや、投稿しないで。元の説明で投稿してください。",
+            "元の説明で投稿してください。やっぱり撤回。",
+            "Do not post the original, not the fallback.",
+            "Post the original, not the fallback, if checks pass.",
+            "Post the original, not the fallback. Actually, wait.",
+            "Proceed with the task.",
+            "ログには「元の説明で投稿しました」と記録されています。",
+            "ログには「元の説明で投稿してください」と記録されています。",
+            "元の説明で投稿しました。",
+            "修正版で投稿しました。",
+            "The log says: post original.",
+            "Post original is the label.",
+            "Post original was the option I saw.",
+            "Use rewrite was the option I saw.",
+            "Post original text was the option I saw.",
+            "Use the rewrite describes the option.",
+            "The choice label is post original.",
+            "Someone said use the rewrite.",
+            "Post original or use rewrite.",
+            "元の説明で投稿するか修正版で投稿するかどちらでも。",
+        ] {
+            for choice in [POST_ORIGINAL, USE_REWRITE] {
+                assert!(!posting_authorized(message, message, choice), "{message}");
+            }
+        }
+        assert!(!posting_authorized(
+            "ログには「元の説明で投稿してください」と記録されています。",
+            "元の説明で投稿してください",
+            POST_ORIGINAL,
+        ));
+        for (message, quote, choice) in [
+            (
+                "Post original was the option I saw.",
+                "Post original",
+                POST_ORIGINAL,
+            ),
+            (
+                "Use rewrite was the option I saw.",
+                "Use rewrite",
+                USE_REWRITE,
+            ),
+        ] {
+            assert!(!posting_authorized(message, quote, choice));
+        }
+        // Posting's narrow discourse handling does not alter merge policy.
+        let words = "いいや、元の説明で投稿してください。";
+        assert!(!crate::land::unhedged(words, words));
+        let words = "Post the original, not the fallback.";
+        assert!(!crate::land::unhedged(words, words));
+    }
+}
+
 /// Choice: post the saved rewrite title and body, past the gate.
 pub const USE_REWRITE: &str = "use rewrite";
 /// Longest title accepted from the owner, in characters (GitHub caps at 256).

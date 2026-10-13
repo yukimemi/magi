@@ -539,7 +539,7 @@ enum Command {
         /// The answer: one of the offered choices, or free text.
         #[arg(long, conflicts_with_all = ["list", "say", "ask_chat"])]
         reply: Option<String>,
-        /// Verbatim owner words when answering a consulted merge approval from chat.
+        /// Verbatim latest owner words for a consulted merge approval or guarded posting choice from chat.
         #[arg(long, requires = "reply")]
         quote: Option<String>,
         /// Speak back without deciding: a clarifying question, a request for
