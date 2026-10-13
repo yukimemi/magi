@@ -703,6 +703,10 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
         let missing = crate::queue::missing_blockers(queue, questions, &task.blocked_by);
         if !missing.is_empty() {
             let language = language_of(&task, Path::new("."));
+            let mut ids = missing.clone();
+            ids.sort();
+            ids.dedup();
+            task.set_hold_notice_cause(format!("missing:{}", ids.join(",")));
             task.hold_machine(Some(crate::queue::missing_blocker_hold_reason_in(
                 &task.blocked_by,
                 &missing,
@@ -719,6 +723,7 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
             })
         }) {
             let language = language_of(&task, Path::new("."));
+            task.set_hold_notice_cause(format!("waiting:{}", serde_json::json!([q.id])));
             task.hold_machine(Some(unanswered_question_hold_reason(&q, &language)));
             record(queue, &mut task);
             continue;
@@ -1100,6 +1105,7 @@ fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
             }
             ActionDecision::Done => task.succeed(),
             ActionDecision::Refuse(why) => {
+                task.set_hold_notice_cause(format!("resume-refused:{}", q.id));
                 task.hold_machine(Some(why));
                 notices::raise(
                     Notice::warn(
@@ -1433,6 +1439,7 @@ fn settle_and_diagnose(
     // can re-check, so the same run resumes with the same agents once the
     // resource is free. A park request still wins (it is the operator's).
     if let Some(block) = state.resource_block.as_ref().filter(|_| !verdict.parked) {
+        task.set_hold_notice_cause(format!("resource:{}:{}", block.kind, block.node));
         task.last_error = Some(detail.to_owned());
         task.diagnostic = None;
         task.attempts = task.attempts.saturating_sub(1);
@@ -1448,7 +1455,20 @@ fn settle_and_diagnose(
         }
         return;
     }
+    let previous_cause = task.hold_notice_cause.clone();
+    let evidence_at = failure_event(state).map(|e| e.at);
+    let already_observed = task
+        .hold_notice_evidence_at
+        .is_some_and(|at| evidence_at.is_none_or(|event| event <= at));
     settle_in(task, verdict, detail, max_attempts, p);
+    if matches!(task.status, TaskStatus::Held | TaskStatus::Failed) {
+        if already_observed {
+            task.hold_notice_cause = previous_cause;
+        } else {
+            task.set_hold_notice_cause(failure_notice_cause(task, state));
+            task.hold_notice_evidence_at = evidence_at;
+        }
+    }
     // Written here, where the refund (or not) is decided, so the history is a
     // fact and not a later guess from the run's status.
     if let Some(pass) = state.passes.last() {
@@ -1462,6 +1482,86 @@ fn settle_and_diagnose(
         task.diagnostic = diagnostic(state);
         note_open_question(task, &state.id, p);
     }
+}
+
+/// Command output is execution evidence; common clock and duration tokens
+/// are only presentation metadata. Keep error text and numeric exit codes.
+fn failure_output_evidence(output: &str) -> String {
+    output
+        .split_whitespace()
+        .map(|word| {
+            let token = word.trim_matches(['[', ']', '(', ')', ',', ';']);
+            let timestamp = token.parse::<Timestamp>().is_ok()
+                || token.parse::<jiff::civil::Date>().is_ok()
+                || token.parse::<jiff::civil::Time>().is_ok();
+            let duration = token
+                .strip_suffix("ms")
+                .or_else(|| token.strip_suffix('s'))
+                .is_some_and(|n| n.parse::<f64>().is_ok());
+            if timestamp {
+                "<time>"
+            } else if duration {
+                "<duration>"
+            } else {
+                word
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Creating or taking over a process does not demonstrate new execution.
+fn failure_event(state: &RunState) -> Option<&crate::run::Event> {
+    state.events.iter().rev().find(|e| {
+        !matches!(
+            e.node.as_str(),
+            "start" | "resume" | "seed" | "recovery" | "park"
+        )
+    })
+}
+
+/// Stable evidence about a stopped graph. A new run id, pass, timestamp or
+/// generated summary says nothing about whether the failure changed. An
+/// approval contributes only when this graph recorded work after it.
+pub(crate) fn failure_notice_cause(task: &Task, state: &RunState) -> String {
+    let last = failure_event(state);
+    let stage = last.map(|e| e.node.as_str()).unwrap_or("unknown");
+    let approval = task
+        .resumption
+        .as_ref()
+        .filter(|r| last.is_some_and(|e| e.at > r.at))
+        .map(|r| r.generation);
+    let commands = |outcomes: &[crate::run::CommandOutcome]| {
+        outcomes
+            .iter()
+            .map(|c| {
+                (
+                    c.command.clone(),
+                    c.code,
+                    c.resource_blocked,
+                    (!c.ok() && !c.resource_blocked)
+                        .then(|| failure_output_evidence(&c.output_tail)),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let review = state.reviews.last().map(|r| {
+        (
+            &r.head,
+            &r.verified_head,
+            commands(&r.e2e),
+            r.blocking,
+            r.expected,
+            r.answered,
+        )
+    });
+    serde_json::json!({
+        "kind": "graph", "status": state.status, "stage": stage,
+        "base": state.base_commit, "instruction": state.instruction,
+        "gate_head": state.gate_head, "gate": commands(&state.gate),
+        "review": review, "approval": approval,
+    })
+    .to_string()
 }
 
 /// If `task` is held with a `magi ask` question still open on `run`, name the
@@ -1486,6 +1586,9 @@ fn note_open_question(task: &mut Task, run: &str, p: &Phrases) {
     let Some(q) = open.first() else {
         return;
     };
+    let mut ids = open.iter().map(|q| q.id.clone()).collect::<Vec<_>>();
+    ids.sort();
+    task.set_hold_notice_cause(format!("waiting:{}", serde_json::json!(ids)));
     let base = task.hold_reason.clone().unwrap_or_default();
     task.hold_reason = Some(format!("{base}{}{}", p.waiting_for_answer, q.short()));
 }
@@ -1521,6 +1624,7 @@ fn reclaim(task: &mut Task, last_run: Option<RunState>, max_attempts: usize, lan
             // No run, so no config of its own: `language` is the task's
             // repository's setting, read by the caller.
             let why = phrases(language).no_run_to_recover;
+            task.set_hold_notice_cause("missing-run".to_owned());
             task.last_error = Some(why.to_owned());
             // The phone shows `hold_reason`, so a task held by the machine
             // says why there too and not only in `last_error`.
@@ -2833,6 +2937,7 @@ async fn attempt(
     };
     if let Err(e) = Config::discover_fetched(&repo, explicit).await {
         let reason = format!("[config] {e:#}");
+        task.set_hold_notice_cause("config-fetch".to_owned());
         task.last_error = Some(reason.clone());
         task.hold_machine(Some(reason.clone()));
         record(queue, task);
@@ -2863,6 +2968,7 @@ async fn attempt(
     // space cannot be measured closes the gate too: starting a run blind on a
     // disk that may be full is how the machine ends up with 6.7 GB free.
     if let Some(reason) = disk_gate(&repo, &config) {
+        task.set_hold_notice_cause("disk-space".to_owned());
         task.last_error = Some(reason.clone());
         task.hold_machine(Some(reason.clone()));
         record(queue, task);
@@ -6196,6 +6302,133 @@ mod tests {
         );
         state.status = status;
         state
+    }
+
+    #[test]
+    fn failure_output_keeps_the_error_but_not_clock_or_duration_metadata() {
+        assert_eq!(
+            failure_output_evidence("test failed at [2026-10-14T01:02:03Z] in 0.5s"),
+            failure_output_evidence("test failed at [2026-10-15T03:04:05Z] in 2.7s")
+        );
+        assert_ne!(
+            failure_output_evidence("test failed: expected 2 got 3"),
+            failure_output_evidence("test failed: expected 2 got 4")
+        );
+    }
+
+    #[test]
+    fn failure_notice_evidence_ignores_recovery_prose_and_run_churn() {
+        let mut t = task();
+        let mut state = run_state(RunStatus::Blocked);
+        state.events.push(crate::run::Event {
+            at: Timestamp::now(),
+            node: "prep".into(),
+            message: "cannot apply measured commit".into(),
+        });
+        let first = failure_notice_cause(&t, &state);
+        state.id = "another-startup-run".into();
+        state.events[0].message = "reworded recovery summary".into();
+        state.events[0].at = Timestamp::now();
+        t.attempts += 1;
+        assert_eq!(first, failure_notice_cause(&t, &state));
+        state.events.push(crate::run::Event {
+            at: Timestamp::now(),
+            node: "start".into(),
+            message: "another process was created".into(),
+        });
+        assert_eq!(first, failure_notice_cause(&t, &state));
+        state.events.pop();
+        state.events[0].node = "gate".into();
+        state.gate_head = Some("recovered-commit".into());
+        state.gate.push(crate::run::CommandOutcome {
+            command: "check".into(),
+            code: Some(1),
+            output_tail: "gate failed".into(),
+            duration_ms: 10,
+            resource_blocked: false,
+        });
+        let gate = failure_notice_cause(&t, &state);
+        assert_ne!(first, gate);
+        state.gate[0].duration_ms = 300;
+        assert_eq!(gate, failure_notice_cause(&t, &state));
+        state.gate[0].output_tail = "a different test failed".into();
+        assert_ne!(gate, failure_notice_cause(&t, &state));
+        state.gate[0].output_tail = "gate failed".into();
+        state.gate_head = Some("different-commit".into());
+        assert_ne!(gate, failure_notice_cause(&t, &state));
+    }
+
+    #[test]
+    fn reclaiming_observed_graph_output_preserves_the_unresolved_question_cause() {
+        crate::run::pin_test_home();
+        let mut t = task();
+        let mut state = run_state(RunStatus::Blocked);
+        state.events.push(crate::run::Event {
+            at: Timestamp::now(),
+            node: "prep".into(),
+            message: "conflict".into(),
+        });
+        t.hold_notice_evidence_at = Some(state.events[0].at);
+        t.set_hold_notice_cause("waiting:[\"question-recovery\"]".into());
+        let cause = t.hold_notice_cause.clone();
+        t.requeue();
+        t.start(state.id.clone());
+        settle_and_diagnose(
+            &mut t,
+            unstarted_verdict(RunStatus::Blocked),
+            "regenerated failure summary",
+            1,
+            &state,
+        );
+        assert_eq!(
+            t.hold_notice_cause, cause,
+            "an old graph is not a new failure"
+        );
+        state.events.push(crate::run::Event {
+            at: Timestamp::now(),
+            node: "gate".into(),
+            message: "gate failed after recovery".into(),
+        });
+        settle_and_diagnose(
+            &mut t,
+            unstarted_verdict(RunStatus::Blocked),
+            "new failure",
+            1,
+            &state,
+        );
+        assert_ne!(t.hold_notice_cause, cause, "new work is observed");
+    }
+
+    #[test]
+    fn approval_changes_failure_identity_only_after_new_execution_evidence() {
+        let mut t = task();
+        let mut state = run_state(RunStatus::Blocked);
+        state.events.push(crate::run::Event {
+            at: Timestamp::now(),
+            node: "prep".into(),
+            message: "conflict".into(),
+        });
+        let before = failure_notice_cause(&t, &state);
+        t.release_operator("question", Some("approval"));
+        assert_eq!(
+            before,
+            failure_notice_cause(&t, &state),
+            "approval alone adds no failure"
+        );
+        state.events[0].at = Timestamp::now();
+        assert_ne!(
+            before,
+            failure_notice_cause(&t, &state),
+            "a command failed after approval"
+        );
+        state.events[0].node = "start".into();
+        let startup = failure_notice_cause(&t, &state);
+        t.resumption = None;
+        assert_eq!(
+            startup,
+            failure_notice_cause(&t, &state),
+            "run creation is not work"
+        );
     }
 
     fn candidate(label: char, summary: &str, empty: bool, failed: Option<&str>) -> Candidate {

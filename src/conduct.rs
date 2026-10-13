@@ -650,9 +650,7 @@ fn apply_one(
 
     // Compare the actual input, not a generation echoed by the model. Even
     // question creation must be discarded after an intervening operator edit.
-    if snapshot
-        .is_some_and(|old| serde_json::to_value(old).ok() != serde_json::to_value(&task).ok())
-    {
+    if snapshot.is_some_and(|old| input_fingerprint(old) != input_fingerprint(&task)) {
         return Ok(());
     }
     let blocking =
@@ -673,6 +671,36 @@ fn apply_one(
     }
 
     if blocking {
+        if d.recovery == Some(Recovery::Hold) && !evidence.is_empty() {
+            // Validation above owns authorization. Notification identity uses
+            // only the referenced records, never their regenerated prose.
+            let mut causes = evidence
+                .iter()
+                .filter_map(|proof| {
+                    let mut parts = proof.split(':');
+                    let kind = parts.next()?;
+                    let id = parts.next()?;
+                    match kind {
+                        "question" => Some(format!("waiting:{}", serde_json::json!([id]))),
+                        "dependency" => queue.get(id).ok().map(|dep| {
+                            serde_json::json!(["dependency", id, dep.status, dep.chat_notice_key()])
+                                .to_string()
+                        }),
+                        "run" => RunState::load(id)
+                            .ok()
+                            .map(|run| crate::daemon::failure_notice_cause(&task, &run)),
+                        _ => None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            causes.sort();
+            causes.dedup();
+            if causes.len() == 1 {
+                task.set_hold_notice_cause(causes.remove(0));
+            } else if !causes.is_empty() {
+                task.set_hold_notice_cause(serde_json::json!(["verified", causes]).to_string());
+            }
+        }
         if let Some(r) = task.resumption.as_mut() {
             r.blocking_evidence.extend(evidence);
         }
@@ -790,9 +818,22 @@ fn apply_one(
                 // Decided before `may_hold`, which spends the one override: a
                 // note that adds nothing writes nothing (and so raises no
                 // notice and moves no queue revision).
+                let context = serde_json::json!([
+                    task.hold_notice_cause,
+                    task.answers,
+                    task.instruction,
+                    task.resumption.as_ref().map(|r| &r.blocking_evidence)
+                ])
+                .to_string();
+                if task.status == TaskStatus::Held
+                    && task.conductor_hold_context.as_ref() == Some(&context)
+                {
+                    return Ok(());
+                }
                 if let Some(reason) = reaffirmed_hold_reason(&task, d) {
                     if may_hold(&mut task, &hold_note(d)) {
                         task.hold_machine(Some(reason));
+                        task.conductor_hold_context = Some(context);
                         queue.put(&mut task)?;
                     }
                 }
@@ -909,6 +950,14 @@ fn input_fingerprint(task: &Task) -> String {
     if let Some(o) = v.as_object_mut() {
         o.remove("updated_at");
         o.remove("hold_reason");
+        o.remove("block_reason");
+        o.remove("held_at");
+        o.remove("hold_notice_evidence_at");
+        o.remove("hold_notice_revision");
+        o.remove("chat_notice");
+        o.remove("chat_notices");
+        o.remove("chat_notice_legacy");
+        o.remove("conductor_hold_context");
         if let Some(ro) = o.get_mut("resume_override").and_then(|r| r.as_object_mut()) {
             ro.remove("conductor_rehold");
         }
@@ -2936,20 +2985,64 @@ mod tests {
     }
 
     #[test]
-    fn reholding_with_different_notes_keeps_one_previously_level() {
+    fn paraphrased_hold_reaffirmations_do_not_rewrite_the_same_context() {
         let dir = tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
         let questions = Questions::at(dir.path().join("questions"));
         let mut t = task("held");
         t.hold_machine(Some("original".to_owned()));
+        t.record_answer(
+            "recovery-question".into(),
+            "keep held while considering recovery".into(),
+        );
         queue.put(&mut t).unwrap();
-
-        for i in 0..20 {
-            rehold(&queue, &questions, &t.id, &format!("note {}", i % 2));
+        rehold(
+            &queue,
+            &questions,
+            &t.id,
+            "the operator is considering recovery",
+        );
+        let first = queue.get(&t.id).unwrap();
+        let revision = queue.revision();
+        for note in [
+            "recovery is under consideration",
+            "no further instruction",
+            "continue to hold",
+        ] {
+            rehold(&queue, &questions, &t.id, note);
         }
-        let reason = queue.get(&t.id).unwrap().hold_reason.unwrap();
-        assert_eq!(reason.matches("(previously:").count(), 1, "{reason}");
-        assert!(reason.starts_with("note "), "the new note leads: {reason}");
+        let after = queue.get(&t.id).unwrap();
+        assert_eq!(after.hold_reason, first.hold_reason);
+        assert_eq!(queue.revision(), revision);
+        let mut fresh = after;
+        fresh.record_answer("new-question".into(), "different decision".into());
+        queue.put(&mut fresh).unwrap();
+        rehold(&queue, &questions, &t.id, "new decision is awaiting action");
+        assert!(
+            queue
+                .get(&t.id)
+                .unwrap()
+                .hold_reason
+                .unwrap()
+                .starts_with("new decision")
+        );
+    }
+
+    #[test]
+    fn notification_bookkeeping_does_not_change_conductor_input() {
+        let mut t = task("held");
+        t.hold_machine(Some("waiting".into()));
+        let fingerprint = input_fingerprint(&t);
+        t.chat_notices.push("cause".into());
+        t.chat_notice = Some(crate::queue::ChatNotice {
+            key: "cause".into(),
+            at: jiff::Timestamp::now(),
+            outcome: crate::queue::ChatNoticeOutcome::Posted,
+        });
+        t.updated_at = jiff::Timestamp::now();
+        assert_eq!(input_fingerprint(&t), fingerprint);
+        t.record_answer("question".into(), "resume".into());
+        assert_ne!(input_fingerprint(&t), fingerprint);
     }
 
     #[test]

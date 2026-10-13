@@ -126,7 +126,8 @@ use crate::ask::Questions;
 ///
 /// 16: added [`Task::attempt_limit`], an optional task-specific retry budget.
 /// Field-only, `#[serde(default)]`; old records inherit the daemon limit.
-pub const SCHEMA: u32 = 18;
+/// 19: durable chat outcome causes and an append-only delivery ledger.
+pub const SCHEMA: u32 = 19;
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,6 +531,36 @@ pub struct Task {
     /// [`Task::chat_notice_due`]. Never cleared by a release or requeue.
     #[serde(default)]
     pub chat_notice: Option<ChatNotice>,
+    /// The unresolved hold's identity, independent of its displayed reason.
+    /// Recovery without new execution evidence keeps it, including release.
+    #[serde(default)]
+    pub hold_notice_cause: Option<String>,
+    /// Persisted cause revision for compare-and-save, including a return to
+    /// a previously seen cause. Never part of the delivery key.
+    #[serde(default)]
+    pub hold_notice_revision: u64,
+    /// Latest graph evidence observed for this cause. A watermark, never
+    /// part of notification identity; reclaiming old output cannot replace
+    /// an unresolved question with the graph summary it interrupted.
+    #[serde(default)]
+    pub hold_notice_evidence_at: Option<Timestamp>,
+    /// Structural input of the last conductor hold reaffirmation. Survives
+    /// recovery so another paraphrase does not rewrite the same decision.
+    #[serde(default)]
+    pub conductor_hold_context: Option<String>,
+    /// Exact legacy delivery and its adopted cause. Captured before any
+    /// transition, so a delivery interrupted during upgrade can be repaired
+    /// without mistaking an older hold for a later execution failure.
+    #[serde(default)]
+    pub chat_notice_legacy: Option<(String, String)>,
+    /// All delivered causes, including skipped notices. Unioned on write.
+    #[serde(default)]
+    pub chat_notices: Vec<String>,
+    /// Cause read from disk, used to reject a stale writer's cause update.
+    #[serde(skip)]
+    pub(crate) loaded_hold_notice_cause: Option<String>,
+    #[serde(skip)]
+    pub(crate) loaded_hold_notice_revision: u64,
     /// Append-only: one entry per pass over a run that the loop settled. A
     /// resumed run is one run with several passes, and `attempts` counts
     /// claims net of refunds, so the two are not the same number; this says
@@ -802,6 +833,14 @@ impl Task {
             held_at: None,
             park_reason: None,
             chat_notice: None,
+            hold_notice_cause: None,
+            hold_notice_revision: 0,
+            hold_notice_evidence_at: None,
+            conductor_hold_context: None,
+            chat_notice_legacy: None,
+            chat_notices: Vec::new(),
+            loaded_hold_notice_cause: None,
+            loaded_hold_notice_revision: 0,
             passes: Vec::new(),
             created_at: now,
             updated_at: now,
@@ -830,12 +869,34 @@ impl Task {
         }
     }
 
-    /// Identity of the final state a chat should hear about, or `None` while
-    /// the task is intermediate (queued, running, parked, a failed attempt the
-    /// loop will retry - the last attempt turns into a hold). A hold is keyed
-    /// by when it began and a block by what it waits on. Completion is keyed
-    /// by the task itself, so requeues never report completion twice.
+    /// Identity of a material outcome. Free-form reasons and transition
+    /// timestamps are display facts, never evidence of a new outcome.
     pub fn chat_notice_key(&self) -> Option<String> {
+        match self.status {
+            TaskStatus::Done => Some("done".to_owned()),
+            TaskStatus::Held => {
+                let cause = self.hold_notice_cause.as_deref().unwrap_or("unresolved");
+                Some(match cause.strip_prefix("waiting:") {
+                    Some(ids) => format!("blocked:causes:{ids}"),
+                    None => format!("held:cause:{cause}"),
+                })
+            }
+            TaskStatus::Blocked => {
+                let mut ids = self.blocked_by.clone();
+                ids.sort();
+                ids.dedup();
+                Some(format!(
+                    "blocked:causes:{}",
+                    serde_json::to_string(&ids).expect("ids")
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Exact old-format identity, for migration and a delivery interrupted
+    /// between the talk and task writes. Never matches unrelated old holds.
+    pub(crate) fn legacy_chat_notice_key(&self) -> Option<String> {
         match self.status {
             TaskStatus::Done => Some("done".to_owned()),
             TaskStatus::Held => Some(format!(
@@ -851,18 +912,45 @@ impl Task {
         }
     }
 
-    /// The key of a completion notice owed to the originating chat now, if
-    /// any: filed by a chat, schema 13 or newer, in a final state, and not the
-    /// state already recorded in [`Task::chat_notice`].
+    /// Record machine-verified execution evidence, never model-generated
+    /// recovery wording. Callers must name the stage and target that failed.
+    pub(crate) fn set_hold_notice_cause(&mut self, evidence: String) {
+        self.hold_notice_cause = Some(evidence);
+    }
+
+    /// Preserve the last legacy notice as well as the full delivery history.
+    /// Only an exact current legacy cause is adopted into the new ledger.
+    fn migrate_chat_notices(&mut self) {
+        if let Some(n) = &self.chat_notice {
+            let old = n.key.clone();
+            let unadopted = !self.chat_notices.contains(&old);
+            if unadopted {
+                self.chat_notices.push(old.clone());
+            }
+            if unadopted
+                && self.legacy_chat_notice_key().as_deref() == Some(&old)
+                && let Some(key) = self.chat_notice_key()
+                && !self.chat_notices.contains(&key)
+            {
+                self.chat_notices.push(key);
+            }
+        }
+    }
+
+    /// A final outcome not already delivered to the originating chat.
     pub fn chat_notice_due(&self) -> Option<String> {
         self.filed_by_chat()?;
         if self.schema < 13 {
             return None;
         }
         let key = self.chat_notice_key()?;
-        match &self.chat_notice {
-            Some(n) if n.key == key || (key == "done" && is_done_notice_key(&n.key)) => None,
-            _ => Some(key),
+        let reported = |old: &str| old == key || (key == "done" && is_done_notice_key(old));
+        if self.chat_notices.iter().any(|n| reported(n))
+            || self.chat_notice.as_ref().is_some_and(|n| reported(&n.key))
+        {
+            None
+        } else {
+            Some(key)
         }
     }
 
@@ -1039,6 +1127,9 @@ impl Task {
     }
 
     fn note_held(&mut self) {
+        self.migrate_chat_notices();
+        self.hold_notice_cause
+            .get_or_insert_with(|| "unresolved".to_owned());
         self.stamp_schema();
         if self.status != TaskStatus::Held || self.held_at.is_none() {
             self.held_at = Some(Timestamp::now());
@@ -1072,6 +1163,7 @@ impl Task {
         } else {
             TaskStatus::Failed
         };
+        self.set_hold_notice_cause(format!("failure:{}", why));
         self.last_error = Some(why);
     }
 
@@ -1320,6 +1412,7 @@ impl Task {
             self.review_branch = branch;
             self.review_instruction = Some(self.instruction.clone());
         }
+        self.set_hold_notice_cause(format!("handover:{:?}", self.review_branch));
         self.hold_machine(Some(reason));
     }
 
@@ -1555,6 +1648,7 @@ impl Task {
     /// so a release is a real second chance rather than an instant re-hold.
     /// The run history is kept: attempts reset, evidence does not.
     pub fn release(&mut self) {
+        self.migrate_chat_notices();
         let refused_handover = self.status == TaskStatus::Held
             && self.hold_source == Some(HoldSource::Machine)
             && self.review_branch.is_some()
@@ -1918,6 +2012,28 @@ impl Queue {
     /// [`Queue::put`] for a caller already holding [`Queue::lock_task`].
     fn put_unlocked(&self, task: &mut Task) -> Result<()> {
         if let Ok(stored) = read_path(&self.path_of(&task.id)) {
+            if task.chat_notice_legacy.is_none() {
+                task.chat_notice_legacy = stored.chat_notice_legacy.clone();
+            }
+            for key in &stored.chat_notices {
+                if !task.chat_notices.contains(key) {
+                    task.chat_notices.push(key.clone());
+                }
+            }
+            if stored.hold_notice_cause != task.loaded_hold_notice_cause
+                || stored.hold_notice_revision != task.loaded_hold_notice_revision
+            {
+                task.hold_notice_cause = stored.hold_notice_cause.clone();
+                task.hold_notice_revision = stored.hold_notice_revision;
+                task.hold_notice_evidence_at = stored.hold_notice_evidence_at;
+                task.conductor_hold_context = stored.conductor_hold_context.clone();
+            } else {
+                task.hold_notice_revision = stored.hold_notice_revision
+                    + u64::from(task.hold_notice_cause != stored.hold_notice_cause);
+                task.hold_notice_evidence_at = task
+                    .hold_notice_evidence_at
+                    .max(stored.hold_notice_evidence_at);
+            }
             for run in stored.runs {
                 if !task.runs.contains(&run) {
                     task.runs.push(run);
@@ -1940,6 +2056,13 @@ impl Queue {
                 task.chat_notice = Some(n);
             }
         }
+        task.migrate_chat_notices();
+        if task.schema >= 13 && (task.hold_notice_cause.is_some() || !task.chat_notices.is_empty())
+        {
+            task.stamp_schema();
+        }
+        task.loaded_hold_notice_cause = task.hold_notice_cause.clone();
+        task.loaded_hold_notice_revision = task.hold_notice_revision;
         task.updated_at = Timestamp::now();
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
@@ -2598,7 +2721,7 @@ pub(crate) fn first_line(instruction: &str) -> Option<&str> {
 
 fn read_path(path: &Path) -> Result<Task> {
     let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let task: Task =
+    let mut task: Task =
         serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
     // Greater-than, not not-equal: every field added since schema 1 carries
     // `#[serde(default)]`, so an older task has nothing to say about it and
@@ -2613,6 +2736,41 @@ fn read_path(path: &Path) -> Result<Task> {
             task.schema
         );
     }
+    // Seed only the current legacy outcome. A repeated startup failure has
+    // no newer run record: use its recorded machine error, rather than
+    // attributing it to the latest (older) run. Graph failures carrying their
+    // owned run id can use that run's structured evidence instead.
+    if task.schema < 19
+        && task.hold_notice_cause.is_none()
+        && task.status == TaskStatus::Held
+        && let Some(error) = task.last_error.as_ref()
+    {
+        let graph = task
+            .runs
+            .last()
+            .filter(|id| error.ends_with(&format!("[run {id}]")))
+            .and_then(|id| {
+                path.parent()
+                    .and_then(Path::parent)
+                    .and_then(|home| crate::run::RunState::load_under(id, home).ok())
+            });
+        task.hold_notice_cause = Some(match graph {
+            Some(run) => crate::daemon::failure_notice_cause(&task, &run),
+            None => format!("failure:{error}"),
+        });
+    }
+    if task.schema < 19 && task.hold_notice_evidence_at.is_none() {
+        task.hold_notice_evidence_at = task.held_at;
+    }
+    if task.schema < 19
+        && task.chat_notice_legacy.is_none()
+        && let (Some(old), Some(cause)) = (task.legacy_chat_notice_key(), task.chat_notice_key())
+    {
+        task.chat_notice_legacy = Some((old, cause));
+    }
+    task.migrate_chat_notices();
+    task.loaded_hold_notice_cause = task.hold_notice_cause.clone();
+    task.loaded_hold_notice_revision = task.hold_notice_revision;
     Ok(task)
 }
 
@@ -4803,7 +4961,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_hold_after_a_release_is_a_new_cause() {
+    fn a_release_without_progress_keeps_the_unresolved_hold_cause() {
         let mut t = chat_task();
         t.hold_manual(Some("wait".to_owned()));
         let first = t.chat_notice_due().expect("held");
@@ -4817,8 +4975,8 @@ mod tests {
         t.release();
         std::thread::sleep(std::time::Duration::from_millis(5));
         t.hold_manual(None);
-        let second = t.chat_notice_due().expect("a fresh hold");
-        assert_ne!(first, second);
+        assert_eq!(t.chat_notice_due(), None, "release alone is not progress");
+        assert_eq!(t.chat_notice_key(), Some(first));
     }
 
     #[test]
@@ -4844,6 +5002,31 @@ mod tests {
         held.schema = 12;
         held.hold_machine(Some("config".to_owned()));
         assert!(held.chat_notice_due().is_some(), "held before any start");
+    }
+
+    #[test]
+    fn a_stale_cause_update_is_rejected_even_after_the_cause_returns() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queue = Queue::at(tmp.path().join("queue"));
+        let mut t = chat_task();
+        t.start("run".into());
+        t.fail("original failure", 1);
+        queue.put(&mut t).expect("put");
+        let mut stale = queue.get(&t.id).expect("snapshot");
+        for why in ["different failure", "original failure"] {
+            queue
+                .modify(&t.id, |t| {
+                    t.fail(why, 1);
+                    true
+                })
+                .expect("advance");
+        }
+        let current = queue.get(&t.id).expect("current");
+        stale.fail("obsolete snapshot failure", 1);
+        queue.put(&mut stale).expect("stale save");
+        let after = queue.get(&t.id).expect("after");
+        assert_eq!(after.chat_notice_key(), current.chat_notice_key());
+        assert_eq!(after.hold_notice_revision, current.hold_notice_revision);
     }
 
     #[test]
