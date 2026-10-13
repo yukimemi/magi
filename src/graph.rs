@@ -8106,6 +8106,12 @@ impl Runner {
             .cloned()
             .context("repair has no winning branch")?;
         let after = git::rev_parse(&winner.worktree, "HEAD").await?;
+        if self.state.gate_head.as_deref() != Some(after.as_str())
+            || !git::is_clean(&winner.worktree).await?
+        {
+            self.hold_merge_repair(i, "repair branch changed after its recorded gate, or the verified head is unknown; nothing was published. Inspect the branch and run an explicit review before requesting a new merge decision".to_owned())?;
+            return Ok(false);
+        }
         let expected = self
             .state
             .pr_pushed_head
@@ -8113,12 +8119,13 @@ impl Runner {
             .unwrap_or(&request.head)
             .to_owned();
         let public = self.state.pr_branch().unwrap_or(&winner.branch).to_owned();
-        let push = git::push_as(
+        // Push the checked commit itself: a local ref moving after the check
+        // must not change which commit the forge receives.
+        let lease = format!("--force-with-lease=refs/heads/{public}:{expected}");
+        let refspec = format!("{after}:refs/heads/{public}");
+        let push = git::git_raw(
             &winner.worktree,
-            &self.state.config.merge.remote,
-            &winner.branch,
-            &public,
-            &expected,
+            &["push", &lease, &self.state.config.merge.remote, &refspec],
         )
         .await;
         match push {

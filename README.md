@@ -438,6 +438,9 @@ auto-merge; updated results always require a fresh owner decision, including
 when `land_approval` is off. **Hold only holds** and never starts a repair.
 The CLI accepts the same choice with
 `magi answer <question-id> --reply "fix findings and re-review"`.
+This command records the choice and prints its execution status. A running
+`magi serve` / `magi web` resumes the existing run; without a daemon, use the
+printed `magi run --resume <run-id>` command to start the repair.
 Repair cycles are capped by `land_rounds`, with each new review bounded by
 `review_rounds`. A changed PR head, dirty worktree, failed repair or interrupted
 fixer holds with recovery guidance in `magi show`; an interrupted fixer is

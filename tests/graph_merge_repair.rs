@@ -126,6 +126,14 @@ async fn held_pr(noop: bool, keep_findings: bool) -> (common::Fixture, Runner, S
         "{}",
         String::from_utf8_lossy(&answer.stderr)
     );
+    let acknowledgement = String::from_utf8(answer.stdout).unwrap();
+    assert!(acknowledgement.contains("this answer command has not started repair"));
+    assert!(acknowledgement.contains("Without one"));
+    assert!(acknowledgement.contains(&format!("magi run --resume {}", runner.state.id)));
+    assert!(
+        !fx.tmp.path().join("forge/fixes").exists(),
+        "no daemon or driver is running in this scenario"
+    );
     assert_eq!(
         Questions::open().get(&id).unwrap().resolution().as_deref(),
         Some(REPAIR)
@@ -311,5 +319,35 @@ async fn merge_repair_commit_storage_failure_holds_without_review_or_push() {
     assert!(resumed.state.land_approval.is_none());
     let calls = std::fs::read_to_string(fx.tmp.path().join("forge/calls")).unwrap();
     assert!(calls.lines().filter(|l| l.starts_with("pr merge")).all(|l| l.contains("--disable-auto")));
+}
+}
+
+common::e2e! {
+async fn merge_repair_resume_refuses_a_commit_added_after_the_saved_gate() {
+    let (fx, runner, _) = held_pr(false, false).await;
+    let mut verified = Runner::resume(&runner.state.id).unwrap();
+    verified.execute().await.unwrap();
+    assert_eq!(verified.state.merge_repairs[0].phase, MergeRepairPhase::Complete);
+    let winner = verified.state.winner().unwrap().clone();
+    let checked = magi::git::rev_parse(&winner.worktree, "HEAD").await.unwrap();
+    assert_eq!(verified.state.gate_head.as_deref(), Some(checked.as_str()));
+    let remote_before = magi::git::remote_head(&winner.worktree, "origin", &winner.branch).await.unwrap();
+    // Model an interruption after the gate save, before publication/Complete.
+    let decision = verified.state.land_approval.take().unwrap();
+    Questions::open().update(&decision.question, |q| { q.abandon("simulate an interruption before the new decision"); Ok(()) }).unwrap();
+    verified.state.merge_repairs[0].phase = MergeRepairPhase::Reviewing;
+    verified.state.save().unwrap();
+    magi::git::git(&winner.worktree, &["commit", "--allow-empty", "-m", "fix: unverified later commit"]).await.unwrap();
+    let added = magi::git::rev_parse(&winner.worktree, "HEAD").await.unwrap();
+    assert_ne!(added, checked);
+    let mut resumed = Runner::resume(&verified.state.id).unwrap();
+    resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.status, RunStatus::Blocked);
+    assert_eq!(resumed.state.merge_repairs[0].phase, MergeRepairPhase::Failed);
+    assert!(resumed.state.merge_repairs[0].failure.as_ref().unwrap().contains("changed after its recorded gate"));
+    assert_eq!(magi::git::remote_head(&winner.worktree, "origin", &winner.branch).await.unwrap(), remote_before);
+    assert_eq!(magi::git::rev_parse(&winner.worktree, "HEAD").await.unwrap(), added);
+    assert!(resumed.state.land_approval.is_none());
+    assert_eq!(std::fs::read_to_string(fx.tmp.path().join("forge/fixes")).unwrap().lines().count(), 1);
 }
 }
