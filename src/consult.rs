@@ -154,9 +154,31 @@ pub fn refuse_operator_held(q: &Question, node: &str, tasks: &[crate::queue::Tas
     Ok(())
 }
 
-/// Validate a merge approval answered by a running chat. Terminal answers and
-/// other question types retain their existing behavior. Intent is judged by
-/// the chat; this gate requires evidence from the correct conversation.
+/// Authorization policy is selected by the question's node, never its reply.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum QuestionKind {
+    /// A question without a guarded public decision.
+    Ordinary,
+    /// Approval to merge a change.
+    Merge,
+    /// Confirmation of the text to publish.
+    Posting,
+}
+
+impl QuestionKind {
+    /// Select the policy from the stored question node.
+    pub fn of(q: &Question) -> Self {
+        match q.node.as_str() {
+            crate::land::APPROVAL_NODE => Self::Merge,
+            crate::github_text::ASK_NODE => Self::Posting,
+            _ => Self::Ordinary,
+        }
+    }
+}
+
+/// Validate guarded decisions answered by a running chat. Terminal answers
+/// retain their existing behavior. Merge and posting policies both require
+/// evidence from the correct conversation; posting also checks the selected text.
 pub fn validate_answer(
     q: &Question,
     talks: &Talks,
@@ -165,25 +187,36 @@ pub fn validate_answer(
     reply: &str,
     quote: Option<&str>,
 ) -> Result<()> {
-    // Publishing the original or rejected rewrite of a pull request text is as
-    // irreversible as a merge: it takes the same evidence.
-    let bypass = q.node == crate::github_text::ASK_NODE
-        && matches!(
-            reply,
-            crate::github_text::POST_ORIGINAL | crate::github_text::USE_REWRITE
-        );
-    if !(q.node == crate::land::APPROVAL_NODE || bypass) || node != CHAT_NODE {
+    let kind = QuestionKind::of(q);
+    if node != CHAT_NODE || kind == QuestionKind::Ordinary {
         return Ok(());
     }
+    let posting = kind == QuestionKind::Posting;
+    if posting && !q.choices.iter().any(|c| c == reply) {
+        bail!("posting confirmation requires one of the offered choices");
+    }
+    if posting
+        && !matches!(
+            reply,
+            crate::github_text::POST_ORIGINAL | crate::github_text::USE_REWRITE
+        )
+    {
+        return Ok(());
+    }
+    let subject = if posting {
+        "posting confirmation"
+    } else {
+        "merge approval"
+    };
     let consult = q
         .consult
         .as_ref()
-        .context("merge approval was not handed to a chat")?;
+        .with_context(|| format!("{subject} was not handed to a chat"))?;
     if consult.talk != run {
-        bail!("merge approval belongs to a different chat");
+        bail!("{subject} belongs to a different chat");
     }
     if !q.status.open() {
-        bail!("merge approval is no longer open");
+        bail!("{subject} is no longer open");
     }
     let talk = talks.get(run)?;
     if !talk.status.open() {
@@ -221,9 +254,21 @@ pub fn validate_answer(
     let quote = quote
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .context("chat merge approval requires --quote from the owner's latest message")?;
+        .with_context(|| {
+            format!("chat {subject} requires --quote from the owner's latest message")
+        })?;
+    if posting {
+        if !latest.contains(quote) {
+            bail!("posting confirmation requires a verbatim quote of the latest owner message");
+        }
+        if !crate::github_text::posting_authorized(&latest, quote, reply) {
+            bail!(
+                "posting confirmation requires an explicit, unconditional instruction for the chosen text; ask the owner to clarify"
+            );
+        }
+        return Ok(());
+    }
     let valid = match reply {
-        _ if bypass => crate::land::unhedged(&latest, quote),
         crate::land::APPROVE => latest.contains(quote),
         crate::land::HOLD => {
             latest.trim().eq_ignore_ascii_case(crate::land::HOLD)
@@ -1263,6 +1308,171 @@ mod tests {
         assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, REPAIR, Some(REPAIR)).is_ok());
         q.choices.retain(|c| c != REPAIR);
         assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, REPAIR, Some(REPAIR)).is_err());
+    }
+
+    #[test]
+    fn posting_consult_saves_only_authorized_offered_choices() {
+        use crate::github_text::{ASK_NODE, POST_ORIGINAL, USE_FALLBACK, USE_REWRITE};
+        for choice in [POST_ORIGINAL, USE_REWRITE] {
+            let (tmp, store, mut talk) = talks();
+            let questions = Questions::at(tmp.path().join("questions"));
+            let mut q = question(ASK_NODE);
+            q.choices = vec![USE_FALLBACK.into(), choice.into()];
+            questions.put(&mut q).unwrap();
+            begin(&questions, &store, &q, &talk).unwrap();
+            q = questions.get(&q.id).unwrap();
+            let queued = store.get(&talk.id).unwrap().pending;
+            assert!(queued.contains("public posting confirmation"));
+            assert!(queued.contains("not a merge approval"));
+            assert!(
+                queued.contains("`use fallback` choice can be saved once the owner has chosen it")
+            );
+            assert!(queued.contains("--quote <verbatim owner words>"));
+            assert!(!queued.contains("answer it yourself with"));
+            talk.turns.push(talk::Turn {
+                breaks: Some(Vec::new()),
+                messages: Vec::new(),
+                who: talk::Who::Operator,
+                body: queued,
+                at: Timestamp::now(),
+                attachments: Vec::new(),
+                usage: None,
+                posted_by: None,
+            });
+            talk.pending.clear();
+            store.put(&mut talk).unwrap();
+            let save = |reply: &str, quote: Option<&str>, run: &str| {
+                questions.update(&q.id, |r| {
+                    validate_answer(r, &store, run, CHAT_NODE, reply, quote)?;
+                    r.answer(crate::ask::Answer::Choice(reply.into()))
+                })
+            };
+            // No owner reply, nor text from the generated question, is evidence.
+            assert!(save(choice, Some(choice), &talk.id).is_err());
+            let clear = if choice == POST_ORIGINAL {
+                "元の説明のまま投稿して"
+            } else {
+                "Use the rewrite text as it is."
+            };
+            talk.pending = clear.into();
+            store.put(&mut talk).unwrap();
+            for quote in [None, Some("forged quote")] {
+                let error = save(choice, quote, &talk.id).unwrap_err().to_string();
+                assert!(error.contains("posting confirmation"), "{error}");
+                assert!(
+                    !error.contains("merge") && !error.contains("hold"),
+                    "{error}"
+                );
+            }
+            assert!(save(choice, Some(clear), "another-chat").is_err());
+            let other = if choice == POST_ORIGINAL {
+                USE_REWRITE
+            } else {
+                POST_ORIGINAL
+            };
+            assert!(save(other, Some(clear), &talk.id).is_err());
+            let mut unconsulted = q.clone();
+            unconsulted.consult = None;
+            assert!(
+                validate_answer(
+                    &unconsulted,
+                    &store,
+                    &talk.id,
+                    CHAT_NODE,
+                    choice,
+                    Some(clear)
+                )
+                .is_err()
+            );
+            let mut expired = q.clone();
+            expired.abandon("expired");
+            assert!(
+                validate_answer(&expired, &store, &talk.id, CHAT_NODE, choice, Some(clear))
+                    .is_err()
+            );
+            talk.status = TalkStatus::Closed;
+            store.put(&mut talk).unwrap();
+            assert!(save(choice, Some(clear), &talk.id).is_err());
+            talk.status = TalkStatus::Open;
+            for rejected in [
+                "Post original was the option I saw.",
+                "Use rewrite was the option I saw.",
+                "Post the original, maybe?",
+                "Use the rewrite only if checks pass.",
+                "Post original. Cancel that.",
+                "Do not post original.",
+                "Use the rewrite when checks pass.",
+                "元の説明で投稿してください。ただし検査が通ったら。",
+                "元の説明で投稿しないで。",
+                "まだ元の説明で投稿してください。",
+                "ログには「元の説明で投稿しました」と記録されています。",
+                "ログには「修正版で投稿しました」と記録されています。",
+            ] {
+                talk.pending = rejected.into();
+                store.put(&mut talk).unwrap();
+                let error = save(choice, Some(rejected), &talk.id)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    !error.contains("merge") && !error.contains("hold"),
+                    "{error}"
+                );
+                assert!(save(choice, Some(clear), &talk.id).is_err(), "stale quote");
+                let after = questions.get(&q.id).unwrap();
+                assert!(after.status.open());
+                assert!(after.answer.is_none());
+            }
+            let command = if choice == POST_ORIGINAL {
+                "Post original"
+            } else {
+                "Use rewrite"
+            };
+            for reported in [
+                format!("The log contains:\n```\n{command}\n```"),
+                format!("The log contains:\n\"\n{command}\n\""),
+                format!("The log says: “Reported. {command}.”"),
+                format!("The log says: “\n{command}\n”"),
+            ]
+            .into_iter()
+            .chain(crate::github_text::reported_posting_messages(command))
+            {
+                talk.pending = reported.clone();
+                store.put(&mut talk).unwrap();
+                for quote in [command, reported.as_str()] {
+                    assert!(save(choice, Some(quote), &talk.id).is_err());
+                    let after = questions.get(&q.id).unwrap();
+                    assert!(after.status.open());
+                    assert!(after.answer.is_none());
+                }
+            }
+            let natural = if choice == POST_ORIGINAL {
+                [
+                    "OK, post the original",
+                    "Yes, post original",
+                    "I'd like to post the original",
+                    "元の説明で投稿してください。",
+                ]
+            } else {
+                [
+                    "OK, use the rewrite",
+                    "Yes, use rewrite",
+                    "I'd like to use the rewrite",
+                    "修正版で投稿してください。",
+                ]
+            };
+            for words in natural {
+                talk.pending = words.into();
+                store.put(&mut talk).unwrap();
+                validate_answer(&q, &store, &talk.id, CHAT_NODE, choice, Some(words)).unwrap();
+            }
+            talk.pending = clear.into();
+            store.put(&mut talk).unwrap();
+            save(choice, Some(clear), &talk.id).unwrap();
+            assert_eq!(
+                questions.get(&q.id).unwrap().resolution().as_deref(),
+                Some(choice)
+            );
+        }
     }
 
     #[test]

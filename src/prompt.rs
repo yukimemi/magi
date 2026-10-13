@@ -1976,7 +1976,7 @@ pub fn chat_consult(q: &crate::ask::Question) -> String {
         }
         s.push('\n');
     }
-    if q.node == crate::land::APPROVAL_NODE {
+    if crate::consult::QuestionKind::of(q) == crate::consult::QuestionKind::Merge {
         if q.choices.iter().any(|c| c == crate::land::REPAIR) {
             s.push_str(&format!(
                 "The third choice `fix findings and re-review` requests one repair and bounded re-review of this same PR, without merging or queuing another task. Only when the owner's entire latest message is exactly that label, run `magi answer {} --reply 'fix findings and re-review' --quote 'fix findings and re-review'`. Otherwise discuss the choice and ask for clarification. The driver performs it and presents new review/gate results for a fresh merge decision.\n\n",
@@ -1995,6 +1995,22 @@ pub fn chat_consult(q: &crate::ask::Question) -> String {
              run `magi answer {id} --reply hold --quote hold`. \
              The owner can also decide on the question card. Expired or abandoned \
              approvals cannot be revived. Do not edit the repository.\n",
+            id = q.id,
+        ));
+        return s;
+    }
+    if crate::consult::QuestionKind::of(q) == crate::consult::QuestionKind::Posting {
+        s.push_str(&format!(
+            "This is a public posting confirmation, not a merge approval. Use only an offered choice. \
+             For `post original` or `use rewrite`, never decide yourself: wait for the owner's \
+             explicit, unconditional instruction identifying the chosen text. Then run \
+             `magi answer {id} --reply <offered choice> --quote <verbatim owner words>` \
+             quoting that instruction from the latest owner message in this conversation. \
+             An earlier message, silence, a question, or a conditional instruction does not authorize posting. \
+             Ask for clarification when uncertain; leave the question open. \
+             The safe `use fallback` choice can be saved once the owner has chosen it. \
+             `use my text`, when offered, uses the owner's latest title and must pass the posting gate. \
+             Do not edit the repository.\n",
             id = q.id,
         ));
         return s;

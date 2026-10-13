@@ -2768,12 +2768,20 @@ fallback; a language-withheld field becomes neutral.
 - **A deputy may settle `post original` or `use rewrite` only under the
   irreversible-choice guard.** `deputy::destructive` names it by *label* (not
   position: the retry question has the same choices, but never rely on order), so `--settle` needs a
-  verbatim quote of the owner's latest message that passes `land::unhedged`.
+  verbatim quote of the owner's latest message that passes `github_text::posting_authorized`.
   `github_text::deputy_brief` is appended to the Generic brief for this node and
   says publishing is irreversible and doubt means asking back with `--thread`.
   A consulted chat is held to the same rule: `consult::validate_answer` requires
-  `--quote` from the owner's latest message, passing `land::unhedged`, for
+  `--quote` from the owner's latest message, passing `github_text::posting_authorized`, for
   `post original` and `use rewrite` (`use fallback` stays unguarded).
+  `consult::QuestionKind` selects this policy by node; posting replies must be
+  offered choices. The quote must identify the chosen text explicitly. Posting
+  tolerates a leading Japanese discourse dismissal and specific explanation
+  wording about insufficient detail, while conditions, negation and retraction
+  still reject it. Before sentence splitting, quoted or parenthesized context in
+  either the message or evidence requires clarification, even with unmatched
+  delimiters; only single-quote apostrophes between ASCII letters are exempt.
+  Merge approvals retain their separate quote/hold policy.
 - **A replacement goes through the same gate** (`github_text::vet_title`, with
   the `language_judge` when configured). Sensitive data is rejected, never
   redacted into text the owner did not write. A failing reply gets one more
