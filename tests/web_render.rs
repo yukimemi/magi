@@ -3505,15 +3505,43 @@ async fn question_identity_disclosure_copy_and_live_updates() {
           const copy = identity.querySelector('button'); copy.click();
           await new Promise(r => setTimeout(r, 0));
           check(copied === q.id && identity.querySelector('[role=status]').textContent === 'Copied full ID.', 'copy failed');
+          const realExecCommand = document.execCommand;
+          const textareas = document.querySelectorAll('textarea').length;
+          draft.setSelectionRange(1, 4, 'backward');
+          const beforeScroll = [scrollX, scrollY], beforeRect = identity.getBoundingClientRect();
+          const beforeViewport = [visualViewport.width, visualViewport.height];
+          let legacyCalls = 0;
+          document.execCommand = command => {
+            legacyCalls++;
+            const field = document.activeElement;
+            check(command === 'copy' && field.tagName === 'TEXTAREA' && field.value === q.id, 'wrong fallback content');
+            check(field.readOnly && field.inputMode === 'none', 'fallback can open keyboard');
+            check(field.selectionStart === 0 && field.selectionEnd === q.id.length, 'fallback selection incomplete');
+            check(getComputedStyle(field).position === 'fixed' && getComputedStyle(field).opacity === '0', 'fallback visible');
+            return true;
+          };
           navigator.clipboard.writeText = async () => { throw new Error('denied'); };
           copy.click(); await new Promise(r => setTimeout(r, 0));
-          check(identity.querySelector('[role=status]').textContent.includes('Select the full ID'), 'copy failure hidden');
-          check(window.getSelection().toString() === q.id, 'failed copy did not select full ID');
-          window.getSelection().removeAllRanges();
+          check(legacyCalls === 1 && identity.querySelector('[role=status]').textContent === 'Copied full ID.', 'rejection fallback failed');
           Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
-          copy.click(); await new Promise(r => setTimeout(r, 0));
-          check(!identity.querySelector('[role=status]').textContent.includes('Copied'), 'false success');
-          check(window.getSelection().toString() === q.id, 'missing clipboard did not select full ID');
+          copy.click();
+          check(legacyCalls === 2, 'missing API fallback was deferred');
+          await new Promise(r => setTimeout(r, 0));
+          check(identity.querySelector('[role=status]').textContent === 'Copied full ID.', 'missing API fallback failed');
+          check(document.activeElement === draft && draft.selectionStart === 1 && draft.selectionEnd === 4 && draft.selectionDirection === 'backward', 'fallback lost draft selection');
+          check(document.querySelectorAll('textarea').length === textareas, 'fallback leaked textarea');
+          check(scrollX === beforeScroll[0] && scrollY === beforeScroll[1], 'fallback scrolled');
+          const afterRect = identity.getBoundingClientRect();
+          check(afterRect.x === beforeRect.x && afterRect.y === beforeRect.y && afterRect.width === beforeRect.width && afterRect.height === beforeRect.height, 'fallback changed layout');
+          check(visualViewport.width === beforeViewport[0] && visualViewport.height === beforeViewport[1], 'fallback changed viewport');
+          for (const throws of [false, true]) {
+            document.execCommand = () => { if (throws) throw new Error('blocked'); return false; };
+            copy.click(); await new Promise(r => setTimeout(r, 0));
+            check(identity.querySelector('[role=status]').textContent.includes('Select the full ID'), 'copy failure hidden');
+            check(window.getSelection().toString() === q.id, 'failed copy did not select full ID');
+            check(document.querySelectorAll('textarea').length === textareas, 'failed fallback leaked textarea');
+          }
+          document.execCommand = realExecCommand;
           const full = identity.querySelector('code').getBoundingClientRect();
           check(full.right <= innerWidth && full.left >= 0, 'full ID overflow');
           let request;
@@ -3540,10 +3568,111 @@ async fn question_identity_disclosure_copy_and_live_updates() {
           dialogId.querySelector('summary').click();
           check(dialogId.open && dialogId.querySelector('code').textContent === merge.id, 'panel full ID missing');
           check(dialogId.querySelector('code').getBoundingClientRect().right <= innerWidth, 'panel ID overflow');
-          deck.closePanel();
+          // Leave the modal open for the trusted fallback click/tap below.
           return true;
         })()"##).await.unwrap();
         assert_eq!(out, true, "question identity @{width}px");
+        // Exercise the native legacy command with a trusted click/tap, then
+        // read back the clipboard instead of trusting the status message.
+        for selector in [
+            "#panel-full-identity .question-identity",
+            "#questions-list .question-identity",
+        ] {
+            let point = browser
+            .eval(
+                &page,
+                r#"(async () => {
+          Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+          const identity = document.querySelector('__IDENTITY__');
+          identity.open = true;
+          // Keep the feedback size stable while measuring fallback side effects.
+          identity.querySelector('[role=status]').textContent = 'Copied full ID.';
+          const button = identity.querySelector('button');
+          if (identity.closest('dialog')) window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
+          else button.scrollIntoView({ block: 'center', behavior: 'instant' });
+          await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          button.focus({ preventScroll: true });
+          window.copyProbe = { selector: '__IDENTITY__', id: identity.dataset.questionId, x: scrollX, y: scrollY,
+            height: visualViewport.height, count: document.querySelectorAll('textarea').length };
+          const rect = button.getBoundingClientRect();
+          return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+        })()"#.replace("__IDENTITY__", selector).as_str(),
+            )
+            .await
+            .unwrap();
+            if mobile {
+                browser
+                    .call(
+                        Some(&page.session),
+                        "Emulation.setTouchEmulationEnabled",
+                        serde_json::json!({ "enabled": true }),
+                    )
+                    .await
+                    .unwrap();
+                for kind in ["touchStart", "touchEnd"] {
+                    let points = if kind == "touchStart" {
+                        serde_json::json!([{ "x": point["x"], "y": point["y"] }])
+                    } else {
+                        serde_json::json!([])
+                    };
+                    browser
+                        .call(
+                            Some(&page.session),
+                            "Input.dispatchTouchEvent",
+                            serde_json::json!({ "type": kind, "touchPoints": points }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            } else {
+                for kind in ["mousePressed", "mouseReleased"] {
+                    browser
+                        .call(
+                            Some(&page.session),
+                            "Input.dispatchMouseEvent",
+                            serde_json::json!({ "type": kind, "x": point["x"], "y": point["y"],
+                        "button": "left", "clickCount": 1 }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            browser.wait_for(&page,
+            &format!("document.querySelector('{selector} [role=status]').textContent === 'Copied full ID.'"),
+            Duration::from_secs(5)).await.unwrap();
+            browser
+            .call(
+                None,
+                "Browser.grantPermissions",
+                serde_json::json!({
+                    "origin": base, "permissions": ["clipboardReadWrite", "clipboardSanitizedWrite"]
+                }),
+            )
+            .await
+            .unwrap();
+            let native_copy = browser
+                .eval(
+                    &page,
+                    r#"(async () => {
+          delete navigator.clipboard;
+          const probe = window.copyProbe;
+          const copied = await navigator.clipboard.readText();
+          delete window.copyProbe;
+          const actual = { copied, x: scrollX, y: scrollY, height: visualViewport.height,
+            count: document.querySelectorAll('textarea').length,
+            focused: document.activeElement === document.querySelector(probe.selector + ' button') };
+          if (copied !== probe.id || actual.x !== probe.x || actual.y !== probe.y
+              || actual.height !== probe.height || actual.count !== probe.count || !actual.focused) {
+            throw new Error('native fallback state: ' + JSON.stringify({ probe, actual }));
+          }
+          return true;
+        })()"#,
+                )
+                .await
+                .unwrap();
+            assert_eq!(native_copy, true, "native fallback click/tap @{width}px");
+            browser.eval(&page, "deck.closePanel()").await.unwrap();
+        }
         browser.close_page(&page).await;
     }
 }

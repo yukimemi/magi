@@ -4366,6 +4366,61 @@ function mdBlock(cls, nodes) {
   return box;
 }
 
+/* Keep the legacy path synchronous until execCommand: HTTP copies need the
+   user activation from the click. Callers own their success/failure feedback. */
+async function copyText(text) {
+  try {
+    if (window.isSecureContext && typeof navigator.clipboard?.writeText === "function") {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch { /* A denied modern write may still allow the click's legacy copy. */ }
+
+  const active = document.activeElement;
+  const inputSelection = active && typeof active.selectionStart === "number"
+    ? [active.selectionStart, active.selectionEnd, active.selectionDirection] : null;
+  const selection = window.getSelection();
+  const ranges = [];
+  if (selection) {
+    for (let i = 0; i < selection.rangeCount; i++) ranges.push(selection.getRangeAt(i).cloneRange());
+  }
+  const scrollX = window.scrollX, scrollY = window.scrollY;
+  const scrollParents = [];
+  for (let node = active; node; node = node.parentElement) {
+    scrollParents.push([node, node.scrollLeft, node.scrollTop]);
+  }
+  const field = document.createElement("textarea");
+  field.value = text;
+  field.readOnly = true;
+  field.setAttribute("inputmode", "none");
+  field.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;padding:0;border:0;opacity:0;font-size:16px;pointer-events:none";
+  try {
+    // A modal makes everything outside it inert, including a body textarea.
+    const host = active?.closest("dialog:modal") || document.querySelector("dialog:modal") || document.body;
+    host.appendChild(field);
+    field.focus({ preventScroll: true });
+    field.select();
+    field.setSelectionRange(0, field.value.length);
+    return document.execCommand("copy") === true;
+  } catch {
+    return false;
+  } finally {
+    field.remove();
+    if (active && document.activeElement !== active) active.focus({ preventScroll: true });
+    if (selection) {
+      selection.removeAllRanges();
+      for (const range of ranges) selection.addRange(range);
+    }
+    // Restoring DOM ranges can also change a focused input's selection.
+    if (inputSelection) active.setSelectionRange(...inputSelection);
+    for (const [node, left, top] of scrollParents) {
+      if (node.scrollLeft !== left) node.scrollLeft = left;
+      if (node.scrollTop !== top) node.scrollTop = top;
+    }
+    if (window.scrollX !== scrollX || window.scrollY !== scrollY) window.scrollTo(scrollX, scrollY);
+  }
+}
+
 /* Question identity belongs to the persisted question, independently of its
    task or run. Keep this disclosure mounted across live updates. */
 function createQuestionIdentity() {
@@ -4377,11 +4432,11 @@ function createQuestionIdentity() {
     onclick: async () => {
       const id = root.dataset.questionId;
       setText(status, "");
-      try {
-        await navigator.clipboard.writeText(id);
-        if (root.dataset.questionId === id) setText(status, "Copied full ID.");
-      } catch {
-        if (root.dataset.questionId !== id) return;
+      const copied = await copyText(id);
+      if (root.dataset.questionId !== id) return;
+      if (copied) {
+        setText(status, "Copied full ID.");
+      } else {
         const selection = window.getSelection();
         if (selection) {
           const range = document.createRange();
