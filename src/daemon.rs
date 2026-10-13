@@ -2903,12 +2903,7 @@ async fn attempt(
     let unfinished = (!task.fresh_start)
         .then(|| unfinished_run(&task.runs, task.short()))
         .flatten()
-        .filter(|id| {
-            task.resume_override
-                .as_ref()
-                .is_some_and(|r| r.pinned_run.as_ref() == Some(id))
-                || RunState::load(id).is_ok_and(|run| compatible_run_instruction(&run, task))
-        });
+        .filter(|id| RunState::load(id).is_ok_and(|run| may_resume_run(&run, task)));
     // `crate::conduct` chose `Review` for this task on an earlier cycle: its
     // branch survived, and this reopens exactly that branch as a
     // review-only pass rather than resuming or competing again. Consumed
@@ -4040,6 +4035,15 @@ fn take_review_branch(task: &mut Task, previous: Option<&RunState>) -> Option<St
     })
 }
 
+/// A current explicit pin can select an otherwise incompatible run. Edits
+/// and subsequent approvals invalidate pins selected for earlier criteria.
+fn may_resume_run(run: &RunState, task: &Task) -> bool {
+    task.resume_override
+        .as_ref()
+        .is_some_and(|r| r.pinned_run.as_ref() == Some(&run.id))
+        || compatible_run_instruction(run, task)
+}
+
 /// Review scaffolding is execution context, not evidence of an operator edit.
 pub(crate) fn compatible_run_instruction(run: &RunState, task: &Task) -> bool {
     if let Some(authored) = &run.task_instruction {
@@ -4429,6 +4433,73 @@ mod tests {
             PathBuf::from("/repo"),
             Source::Human,
         )
+    }
+
+    #[test]
+    fn revised_resumption_invalidates_old_pins_and_preserves_unchanged_pins() {
+        for source in ["cli", "web"] {
+            let mut t = task();
+            let mut run = run_state(RunStatus::Blocked);
+            run.instruction = "Run A original criteria".into();
+            run.task_instruction = Some(run.instruction.clone());
+            t.start(run.id.clone());
+            t.release_operator("choice", Some("resume-question"));
+            t.resume_override = Some(crate::queue::OperatorResume {
+                question_id: "resume-question".into(),
+                at: Timestamp::now(),
+                conductor_rehold: None,
+                forced: true,
+                pinned_run: Some(run.id.clone()),
+            });
+            t.hold_machine(Some("not enough free space to start a run".into()));
+            let mut unchanged = t.clone();
+            unchanged
+                .edit("title changed".into(), unchanged.instruction.clone())
+                .unwrap();
+            unchanged.release_operator(source, None);
+            assert_eq!(
+                unchanged
+                    .resume_override
+                    .as_ref()
+                    .unwrap()
+                    .pinned_run
+                    .as_deref(),
+                Some(run.id.as_str())
+            );
+            assert!(!compatible_run_instruction(&run, &unchanged));
+            assert!(may_resume_run(&run, &unchanged));
+
+            t.edit(
+                "approved recovery".into(),
+                "Reuse measured PR head B; fix Clippy; review".into(),
+            )
+            .unwrap();
+            assert!(t.resume_override.is_none());
+            t.release_operator(source, None);
+            let reloaded: Task = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+            assert!(reloaded.resume_override.is_none());
+            assert!(!may_resume_run(&run, &reloaded));
+            let unfinished =
+                unfinished_run_with(&reloaded.runs, reloaded.short(), |_| Ok(run.clone()))
+                    .filter(|_| may_resume_run(&run, &reloaded));
+            assert_eq!(
+                choose_starter(None, false, unfinished.as_deref()),
+                Starter::Start
+            );
+            assert!(instruction_for(&reloaded).starts_with("Reuse measured PR head B"));
+            assert_eq!(
+                reloaded.resumption_history[0].question_id.as_deref(),
+                Some("resume-question")
+            );
+
+            // A revision already persisted with the old approval/pin is also
+            // invalidated when the new operator release is recorded.
+            unchanged.instruction = "Reuse measured PR head B".into();
+            unchanged.hold_machine(Some("disk hold".into()));
+            unchanged.release_operator(source, None);
+            assert!(unchanged.resume_override.is_none());
+            assert!(!may_resume_run(&run, &unchanged));
+        }
     }
 
     #[test]

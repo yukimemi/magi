@@ -1471,6 +1471,11 @@ impl Task {
         if self.review_branch.is_some() && self.review_instruction.is_none() {
             self.review_instruction = Some(self.instruction.clone());
         }
+        if self.instruction != instruction {
+            // A run selected for earlier criteria is no longer authorized by
+            // this revised instruction. Title-only edits preserve the pin.
+            self.resume_override = None;
+        }
         self.title = title;
         self.instruction = instruction;
         Ok(())
@@ -1507,6 +1512,15 @@ impl Task {
 
     /// Release on explicit operator authority, rather than automatic recovery.
     pub fn release_operator(&mut self, source: &str, question_id: Option<&str>) {
+        if self
+            .resumption
+            .as_ref()
+            .is_some_and(|r| r.instruction != self.instruction)
+        {
+            // Also cover persisted revisions whose earlier approval still
+            // carries a transient pin when this release is applied.
+            self.resume_override = None;
+        }
         let approval = Resumption {
             generation: self.resumption.as_ref().map_or(1, |r| r.generation + 1),
             source: source.to_owned(),

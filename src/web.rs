@@ -12812,6 +12812,15 @@ mod tests {
             Source::Human,
         );
         t.record_answer("Inspect then resume?".into(), "Inspect then wait".into());
+        t.start("run-A".into());
+        t.release_operator("choice", Some("resume-question"));
+        t.resume_override = Some(crate::queue::OperatorResume {
+            question_id: "resume-question".into(),
+            at: jiff::Timestamp::now(),
+            conductor_rehold: None,
+            forced: true,
+            pinned_run: Some("run-A".into()),
+        });
         t.hold_machine(Some("inspection pending".into()));
         t.edit("recover".into(), "Reuse approved PR head".into())
             .unwrap();
@@ -12821,6 +12830,7 @@ mod tests {
         let Json(reply) = queue_release(State(ui), Path(t.id.clone())).await.unwrap();
         let reloaded = queue.get(&t.id).unwrap();
         assert_eq!(reply.task.status, TaskStatus::Queued);
+        assert!(reloaded.resume_override.is_none());
         assert_eq!(reloaded.answers, t.answers);
         let mut web = reloaded.resumption.unwrap();
         let cli = cli.resumption.unwrap();

@@ -17,6 +17,15 @@ fn explicit_resumption_cli_release_persists_revised_instruction_and_history() {
         question: "Inspect then resume?".into(),
         answer: "Inspect, then wait for instruction".into(),
     });
+    task.start("run-A".into());
+    task.release_operator("choice", Some("resume-question"));
+    task.resume_override = Some(magi::queue::OperatorResume {
+        question_id: "resume-question".into(),
+        at: jiff::Timestamp::now(),
+        conductor_rehold: None,
+        forced: true,
+        pinned_run: Some("run-A".into()),
+    });
     task.hold_machine(Some("waiting for inspection".into()));
     task.edit(
         "recover".into(),
@@ -37,6 +46,7 @@ fn explicit_resumption_cli_release_persists_revised_instruction_and_history() {
     );
     let reloaded = Queue::at(dir.path().join("queue")).get(&task.id).unwrap();
     assert_eq!(reloaded.status, TaskStatus::Queued);
+    assert!(reloaded.resume_override.is_none());
     assert_eq!(reloaded.answers, task.answers);
     let approval = reloaded.resumption.unwrap();
     assert_eq!(approval.source, "cli");
