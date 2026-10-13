@@ -3519,11 +3519,17 @@ async fn question_identity_disclosure_copy_and_live_updates() {
           let request;
           const realFetch = window.fetch;
           window.fetch = async (url, options) => {
+            if (url !== '/api/questions/' + q.id + '/answer') return realFetch(url, options);
             request = { url, body: JSON.parse(options.body) };
             return new Response(JSON.stringify({ ...q, status: 'answered', answer: request.body }), { status: 200, headers: { 'Content-Type': 'application/json' } });
           };
           row.refs.choices.querySelector('button').click();
-          await new Promise(r => setTimeout(r, 0)); window.fetch = realFetch;
+          try {
+            const deadline = performance.now() + 5000;
+            while (row.dataset.state !== 'answered' && performance.now() < deadline) {
+              await new Promise(r => setTimeout(r, 10));
+            }
+          } finally { window.fetch = realFetch; }
           check(request.url.endsWith('/' + q.id + '/answer'), 'answer used short or run ID');
           check(request.body.choice === 'use fallback' && row.dataset.state === 'answered', 'answer behavior changed');
           deck.renderAsks({ id: q.run });
