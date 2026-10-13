@@ -921,6 +921,7 @@ impl Ui {
             .route("/api/queue/{id}/hold", post(queue_hold))
             .route("/api/queue/{id}/release", post(queue_release))
             .route("/api/queue/{id}/priority", post(queue_priority))
+            .route("/api/queue/{id}/urgent", post(queue_urgent))
             .route("/api/queue/{id}/implementers", post(queue_implementers))
             .route("/api/queue/{id}/edit", post(queue_edit))
             .route("/api/queue/{id}/done", post(queue_done))
@@ -5872,6 +5873,21 @@ async fn queue_implementers(
     mutate(ui, id, move |t| t.change_implementers(body.implementers)).await
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UrgentBody {
+    urgent: bool,
+}
+
+async fn queue_urgent(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<UrgentBody>, JsonRejection>,
+) -> ApiResult<Json<TaskView>> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    mutate(ui, id, move |t| t.set_urgent(body.urgent)).await
+}
+
 /// The body of `POST /api/queue/{id}/priority`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -6033,7 +6049,7 @@ async fn mutate(
         let _claim = ui.queue.claim(&id).map_err(|e| {
             ApiError::conflict(format!(
                 "{e:#} - a daemon is running this task, so it cannot be \
-                 changed from here yet"
+                 changed from here yet; wait until it is released, then retry"
             ))
         })?;
         let mut task = ui.queue.get(&id)?;
@@ -12873,6 +12889,174 @@ mod tests {
         assert!(
             released.json()["hold_reason"].is_null(),
             "a release must clear the reason so the next hold does not inherit it"
+        );
+    }
+
+    #[test]
+    fn urgent_request_requires_a_boolean_and_rejects_unknown_fields() {
+        for urgent in [true, false] {
+            let body: UrgentBody =
+                serde_json::from_value(serde_json::json!({ "urgent": urgent })).unwrap();
+            assert_eq!(body.urgent, urgent);
+        }
+        for input in [
+            r#"{}"#,
+            r#"{"urgent":null}"#,
+            r#"{"urgent":"true"}"#,
+            r#"{"urgent":1}"#,
+            r#"{"urgent":true,"extra":false}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<UrgentBody>(input).is_err(),
+                "{input}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn urgent_handler_saves_and_rejects_claims_without_a_server() {
+        let home = TempDir::new().unwrap();
+        let q = Queue::at(home.path().join("queue"));
+        let ui = Arc::new(Ui::new(
+            q.clone(),
+            Questions::at(home.path().join("questions")),
+            Talks::at(home.path().join("talks")),
+            home.path().join("runs"),
+            home.path().into(),
+            home.path().into(),
+        ));
+        let mut task = Task::new(
+            "urgent handler".into(),
+            "keep".into(),
+            home.path().into(),
+            Source::Human,
+        );
+        for status in [TaskStatus::Queued, TaskStatus::Held] {
+            task.status = status;
+            q.put(&mut task).unwrap();
+            for urgent in [true, true, false, false] {
+                let saved = queue_urgent(
+                    State(Arc::clone(&ui)),
+                    Path(task.short().into()),
+                    Ok(Json(UrgentBody { urgent })),
+                )
+                .await
+                .unwrap();
+                assert_eq!(serde_json::to_value(saved.0).unwrap()["urgent"], urgent);
+                assert_eq!(q.get(&task.id).unwrap().urgent, urgent);
+            }
+        }
+        task.status = TaskStatus::Queued;
+        q.put(&mut task).unwrap();
+        let claim = q.claim(&task.id).unwrap();
+        let error = queue_urgent(
+            State(Arc::clone(&ui)),
+            Path(task.id.clone()),
+            Ok(Json(UrgentBody { urgent: true })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(error.message.contains("released"));
+        drop(claim);
+        for status in [
+            TaskStatus::Running,
+            TaskStatus::Done,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Parked,
+        ] {
+            task.status = status;
+            q.put(&mut task).unwrap();
+            let error = queue_urgent(
+                State(Arc::clone(&ui)),
+                Path(task.id.clone()),
+                Ok(Json(UrgentBody { urgent: false })),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert!(error.message.contains(status.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn urgent_api_updates_preserves_and_validates_tasks() {
+        let f = Fixture::start().await;
+        let q = f.queue();
+        let mut t = Task::new(
+            "urgent API".into(),
+            "unchanged".into(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        t.attempts = 2;
+        t.priority = 9;
+        t.interrupt = true;
+        t.hold_reason = Some("waiting for approval".into());
+        for status in [TaskStatus::Queued, TaskStatus::Held] {
+            t.status = status;
+            q.put(&mut t).unwrap();
+            for urgent in [true, true, false, false] {
+                let response = f
+                    .post(
+                        &format!("/api/queue/{}/urgent", t.short()),
+                        Some(&format!("{{\"urgent\":{urgent}}}")),
+                    )
+                    .await;
+                assert_eq!(response.status, 200, "{}", response.body);
+                assert_eq!(response.json()["urgent"], urgent);
+                let saved = q.get(&t.id).unwrap();
+                let mut before = serde_json::to_value(&t).unwrap();
+                let mut after = serde_json::to_value(saved).unwrap();
+                before["urgent"] = urgent.into();
+                before.as_object_mut().unwrap().remove("updated_at");
+                after.as_object_mut().unwrap().remove("updated_at");
+                assert_eq!(after, before);
+            }
+        }
+        let route = format!("/api/queue/{}/urgent", t.id);
+        for body in [
+            r#"{}"#,
+            r#"{"urgent":null}"#,
+            r#"{"urgent":"true"}"#,
+            r#"{"urgent":1}"#,
+            r#"{"urgent":true,"extra":false}"#,
+            "{",
+        ] {
+            assert_eq!(f.post(&route, Some(body)).await.status, 400);
+        }
+        t.status = TaskStatus::Queued;
+        q.put(&mut t).unwrap();
+        let claim = q.claim(&t.id).unwrap();
+        let response = f.post(&route, Some(r#"{"urgent":true}"#)).await;
+        assert_eq!(response.status, 409, "{}", response.body);
+        assert!(!q.get(&t.id).unwrap().urgent);
+        drop(claim);
+        for status in [
+            TaskStatus::Running,
+            TaskStatus::Done,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Parked,
+        ] {
+            t.status = status;
+            q.put(&mut t).unwrap();
+            for urgent in [true, false] {
+                let response = f
+                    .post(&route, Some(&format!("{{\"urgent\":{urgent}}}")))
+                    .await;
+                assert_eq!(response.status, 400, "{}", response.body);
+                assert!(response.body.contains(status.as_str()));
+                assert!(response.body.contains("queued or held"));
+                assert!(!q.get(&t.id).unwrap().urgent);
+            }
+        }
+        assert_eq!(
+            f.post("/api/queue/missing/urgent", Some(r#"{"urgent":true}"#))
+                .await
+                .status,
+            404
         );
     }
 

@@ -723,6 +723,115 @@ async fn followup_task_links_back_to_its_parent() {
     }
 }
 
+#[tokio::test]
+async fn urgent_toggle_saves_in_queue_and_detail_and_reports_claim_conflicts() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP urgent toggle: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let mut task = Task::new(
+        "Toggle urgent".into(),
+        "Keep instruction".into(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    queue.put(&mut task).unwrap();
+    let base = serve_with_client_probe(
+        &home,
+        queue.clone(),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Queue,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    for width in [320, 1280] {
+        let page = browser
+            .open_page(&format!("{base}#/queue"), width, 900, width < 400)
+            .await
+            .unwrap();
+        browser
+            .wait_for(
+                &page,
+                "!!document.querySelector('.task-urgent-box button')",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        let result = browser.eval(&page, r##"(async () => {
+          const check = (ok, msg) => { if (!ok) throw new Error(msg); };
+          const wait = async f => { const end = performance.now() + 5000; while (!f()) { if (performance.now() > end) throw new Error('toggle timeout'); await new Promise(r => setTimeout(r, 10)); } };
+          const button = () => document.querySelector('.task-urgent-box button');
+          const menu = document.querySelector('.task-action-menu'); menu.open = true;
+          check(button().textContent === 'Urgent: off', 'initial saved state');
+          const r = button().getBoundingClientRect();
+          check(r.left >= 0 && r.right <= innerWidth, 'toggle fits viewport');
+          const realFetch = window.fetch;
+          let release, reached;
+          const gate = new Promise(r => release = r), started = new Promise(r => reached = r);
+          window.fetch = async (url, options) => { if (url.endsWith('/urgent')) { reached(); await gate; } return realFetch(url, options); };
+          try {
+            button().click(); await started;
+            await deck.loadQueue();
+            check(button().disabled, 'pending survives redraw');
+            check(button().getAttribute('aria-pressed') === 'false', 'pending keeps saved state');
+            release();
+            await wait(() => button().getAttribute('aria-pressed') === 'true' && !button().disabled);
+          } finally { release(); window.fetch = realFetch; }
+          await deck.loadQueue();
+          check(!document.querySelector('.tag-urgent').hidden, 'badge after save and reload');
+          const id = document.querySelector('.task-card').dataset.taskId;
+          location.hash = '#/tasks/' + id;
+          await wait(() => document.querySelector('#task-actions-urgent button')?.getAttribute('aria-pressed') === 'true');
+          document.querySelector('#task-actions-fab').click();
+          const toggle = document.querySelector('#task-actions-urgent button');
+          const rect = toggle.getBoundingClientRect(); check(rect.left >= 0 && rect.right <= innerWidth, 'detail toggle fits');
+          toggle.click();
+          await wait(() => document.querySelector('#task-actions-urgent button')?.getAttribute('aria-pressed') === 'false' && !document.querySelector('#task-actions-urgent button').disabled);
+          check(!document.querySelector('#task-status .tag-urgent'), 'detail badge clears');
+          return true;
+        })()"##).await.unwrap();
+        assert_eq!(result, true);
+        assert!(!queue.get(&task.id).unwrap().urgent);
+        let claim = queue.claim(&task.id).unwrap();
+        let result = browser.eval(&page, r##"(async () => {
+          document.querySelector('#task-actions-urgent button').click();
+          const end = performance.now() + 5000;
+          while (document.querySelector('#task-actions-error').hidden) {
+            if (performance.now() > end) throw new Error('no refusal');
+            await new Promise(r => setTimeout(r, 10));
+          }
+          const button = document.querySelector('#task-actions-urgent button');
+          return button.getAttribute('aria-pressed') === 'false' && document.querySelector('#task-actions-error').textContent.includes('released');
+        })()"##).await.unwrap();
+        assert_eq!(result, true, "claim refusal preserves saved display");
+        drop(claim);
+        task.status = TaskStatus::Running;
+        queue.put(&mut task).unwrap();
+        browser
+            .eval(&page, "location.hash = '#/queue'; true")
+            .await
+            .unwrap();
+        browser
+            .wait_for(
+                &page,
+                "document.querySelector('.task-urgent-box button')?.disabled === true",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        task.status = TaskStatus::Queued;
+        queue.put(&mut task).unwrap();
+        browser.close_page(&page).await;
+    }
+}
+
 /// `Task::urgent` shows as an URGENT tag on the Queue card and the task page,
 /// whatever the priority or status; a non-urgent task never carries one.
 #[tokio::test]
