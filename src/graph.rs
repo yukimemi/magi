@@ -3778,16 +3778,9 @@ impl Runner {
     /// Put the winner back on `pre` and confirm it: a failed `reset` (a stale
     /// `index.lock`, say) or a tip that is not `pre` afterwards is an error.
     async fn graft_restore(wt: &Path, pre: &str) -> Result<()> {
-        let restored = git::restore_to(wt, pre).await;
-        let tip = git::rev_parse(wt, "HEAD").await;
-        match (restored, tip) {
-            (Ok(()), Ok(tip)) if tip == pre => Ok(()),
-            (Err(e), _) => Err(GraftRestoreFailed(format!("{e:#}")).into()),
-            (Ok(()), Ok(tip)) => {
-                Err(GraftRestoreFailed(format!("the winner is at {tip}, not {pre}")).into())
-            }
-            (Ok(()), Err(e)) => Err(GraftRestoreFailed(format!("{e:#}")).into()),
-        }
+        crate::recovery::restore_repair(wt, pre)
+            .await
+            .map_err(|e| GraftRestoreFailed(format!("{e:#}")).into())
     }
 
     /// A skip is a run event, recorded once however often the node is re-entered.
@@ -8016,15 +8009,27 @@ impl Runner {
     }
 
     /// One repair cycle stays under the existing driver/task claim. An
-    /// interrupted fixer is ambiguous and is held rather than run twice.
+    /// interrupted fixer is rolled back and held rather than run twice.
     async fn repair_merge_review(&mut self) -> Result<bool> {
         use crate::run::MergeRepairPhase as Phase;
         crate::pr_head::ensure_owner(&self.state)?;
         let i = self.state.merge_repairs.len() - 1;
         let request = self.state.merge_repairs[i].clone();
-        let failure = if request.phase == Phase::Fixing {
-            Some("repair was interrupted during the fixer; inspect its artifacts and branch, then run an explicit review of that branch".to_owned())
-        } else if i >= self.state.config.graph.land_rounds
+        if request.phase == Phase::Fixing {
+            let restored = match self.state.winner() {
+                Some(winner) => {
+                    crate::recovery::restore_repair(&winner.worktree, &request.head).await
+                }
+                None => Err(anyhow::anyhow!("repair has no winning branch")),
+            };
+            let why = match restored {
+                Ok(()) => "repair was interrupted during the fixer and rolled back; inspect its artifacts and the PR head, then run an explicit review".to_owned(),
+                Err(e) => format!("repair was interrupted; rollback failed: {e:#}; restore the reviewed branch before running an explicit review"),
+            };
+            self.hold_merge_repair(i, why)?;
+            return Ok(false);
+        }
+        let failure = if i >= self.state.config.graph.land_rounds
             || self.state.config.graph.review_rounds == 0
         {
             Some("repair generation budget exhausted or review disabled; increase the configured budget and request a new review explicitly".to_owned())

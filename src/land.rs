@@ -4334,13 +4334,22 @@ pub async fn fix_round(
 
     // An agent that edited files but never committed would otherwise push
     // nothing and look like a refusal.
-    if let Ok(r) = git::rescue_commit(
+    match git::rescue_commit(
         &winner.worktree,
         &format!("magi: land round {round} fixes (uncommitted work)"),
     )
     .await
     {
-        state.note_withheld("land", &r.withheld);
+        Ok(r) => state.note_withheld("land", &r.withheld),
+        Err(e)
+            if state
+                .merge_repairs
+                .last()
+                .is_some_and(|r| r.phase == crate::run::MergeRepairPhase::Fixing) =>
+        {
+            return Ok(Fixed::Failed(format!("saving repair commit failed: {e:#}")));
+        }
+        Err(_) => {}
     }
     let after = git::rev_parse(&winner.worktree, "HEAD").await?;
     if after == before {

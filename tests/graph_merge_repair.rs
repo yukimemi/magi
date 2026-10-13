@@ -264,3 +264,52 @@ async fn merge_repair_obsolete_head_answer_is_not_consumed() {
     assert!(!fx.tmp.path().join("forge/fixes").exists());
 }
 }
+
+common::e2e! {
+async fn merge_repair_interruption_rolls_back_commits_and_untracked_edits_without_retry() {
+    let (fx, mut runner, question) = held_pr(false, false).await;
+    let head = runner.state.land_approval.as_ref().unwrap().head.clone();
+    runner.state.merge_repairs.push(magi::run::MergeRepair {
+        question, head: head.clone(), pr: "https://github.com/example/repo/pull/42".into(),
+        reviews: runner.state.reviews.clone(), gate: runner.state.gate.clone(),
+        gate_head: runner.state.gate_head.clone(), gate_fixes: Vec::new(), pre_gate: Vec::new(),
+        phase: MergeRepairPhase::Fixing, failure: None,
+    });
+    runner.state.land_approval = None;
+    runner.state.save().unwrap();
+    let wt = &runner.state.winner().unwrap().worktree;
+    std::fs::write(wt.join("partial.txt"), "unfinished repair").unwrap();
+    magi::git::git(wt, &["add", "partial.txt"]).await.unwrap();
+    magi::git::git(wt, &["commit", "-m", "fix: partial repair"]).await.unwrap();
+    std::fs::write(wt.join("untracked.txt"), "unfinished edit").unwrap();
+    let mut resumed = Runner::resume(&runner.state.id).unwrap();
+    resumed.execute().await.unwrap();
+    assert_eq!(magi::git::rev_parse(wt, "HEAD").await.unwrap(), head);
+    assert!(magi::git::is_clean(wt).await.unwrap());
+    assert!(!wt.join("partial.txt").exists() && !wt.join("untracked.txt").exists());
+    assert_eq!(resumed.state.status, RunStatus::Blocked);
+    assert_eq!(resumed.state.merge_repairs[0].phase, MergeRepairPhase::Failed);
+    assert!(resumed.state.merge_repairs[0].failure.as_ref().unwrap().contains("rolled back"));
+    assert!(resumed.state.land_approval.is_none());
+    assert!(!fx.tmp.path().join("forge/fixes").exists());
+}
+}
+
+common::e2e! {
+async fn merge_repair_commit_storage_failure_holds_without_review_or_push() {
+    let (fx, runner, _) = held_pr(false, false).await;
+    let agent = fx.tmp.path().join("mock-agent.sh");
+    let script = std::fs::read_to_string(&agent).unwrap();
+    std::fs::write(agent, script.replace("echo repaired >> repaired.txt", "touch \"$(git rev-parse --git-path index.lock)\"\necho repaired >> repaired.txt")).unwrap();
+    let mut resumed = Runner::resume(&runner.state.id).unwrap();
+    resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.status, RunStatus::Blocked);
+    assert_eq!(resumed.state.merge_repairs[0].phase, MergeRepairPhase::Failed);
+    assert!(resumed.state.merge_repairs[0].failure.as_ref().unwrap().contains("saving repair commit failed"));
+    assert_eq!(resumed.state.reviews.len(), runner.state.reviews.len());
+    assert_eq!(resumed.state.pr_pushed_head, runner.state.pr_pushed_head);
+    assert!(resumed.state.land_approval.is_none());
+    let calls = std::fs::read_to_string(fx.tmp.path().join("forge/calls")).unwrap();
+    assert!(calls.lines().filter(|l| l.starts_with("pr merge")).all(|l| l.contains("--disable-auto")));
+}
+}

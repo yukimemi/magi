@@ -24,6 +24,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::run::{CommandOutcome, E2eStatus, ReviewRound, RunState};
 
+/// Restore an interrupted repair and confirm its original commit before any review.
+pub(crate) async fn restore_repair(wt: &std::path::Path, before: &str) -> anyhow::Result<()> {
+    crate::git::restore_to(wt, before).await?;
+    let tip = crate::git::rev_parse(wt, "HEAD").await?;
+    anyhow::ensure!(tip == before, "the winner is at {tip}, not {before}");
+    Ok(())
+}
+
 fn short(sha: &str) -> &str {
     sha.get(..8).unwrap_or(sha)
 }

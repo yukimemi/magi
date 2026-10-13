@@ -1501,49 +1501,7 @@ pub struct ContestedHandoff {
     pub rejecters: Vec<(usize, String)>,
 }
 
-/// One owner-requested repair, keyed by the approval question. Old evidence
-/// remains immutable while the active review budget starts afresh on this run.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MergeRepair {
-    /// Approval question that uniquely requested this operation.
-    pub question: String,
-    /// Exact PR head shown to the owner.
-    pub head: String,
-    /// Existing PR URL; repair never creates another PR.
-    pub pr: String,
-    /// Immutable review evidence preceding this repair, including final votes.
-    pub reviews: Vec<ReviewRound>,
-    /// Verification gate evidence preceding this repair.
-    pub gate: Vec<CommandOutcome>,
-    /// Commit the previous gate checked.
-    #[serde(default)]
-    pub gate_head: Option<String>,
-    /// Previous bounded gate repairs, preserved before starting a new budget.
-    #[serde(default)]
-    pub gate_fixes: Vec<GateFixRecord>,
-    /// Previous pre-gate command evidence.
-    #[serde(default)]
-    pub pre_gate: Vec<CommandOutcome>,
-    /// Durable checkpoint used to avoid repeating an interrupted fix.
-    pub phase: MergeRepairPhase,
-    /// Why repair could not continue, with operator recovery guidance.
-    pub failure: Option<String>,
-}
-
-/// Durable stages of a bounded repair at the merge gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MergeRepairPhase {
-    /// Recorded before beginning work.
-    Requested,
-    /// Fixer dispatched; interruption requires inspection, never a blind retry.
-    Fixing,
-    /// Fix finished (including no change); fresh review and gate are underway.
-    Reviewing,
-    /// Updated review and gate completed; a fresh merge decision is required.
-    Complete,
-    /// Repair held with explicit guidance.
-    Failed,
-}
+pub use crate::review_repair::{Phase as MergeRepairPhase, Request as MergeRepair};
 
 impl ReviewRound {
     /// Each answering seat's final vote: its revote where reconsideration ran
