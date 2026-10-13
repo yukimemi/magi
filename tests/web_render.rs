@@ -787,7 +787,7 @@ async fn urgent_toggle_saves_in_queue_and_detail_and_reports_claim_conflicts() {
           await deck.loadQueue();
           check(!document.querySelector('.tag-urgent').hidden, 'badge after save and reload');
           const id = document.querySelector('.task-card').dataset.taskId;
-          location.hash = '#/queue/' + id;
+          location.hash = '#/tasks/' + id;
           await wait(() => document.querySelector('#task-actions-urgent button')?.getAttribute('aria-pressed') === 'true');
           document.querySelector('#task-actions-fab').click();
           const toggle = document.querySelector('#task-actions-urgent button');
