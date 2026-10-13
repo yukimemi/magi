@@ -4395,6 +4395,41 @@ function mdBlock(cls, nodes) {
   return box;
 }
 
+/* Question identity belongs to the persisted question, independently of its
+   task or run. Keep this disclosure mounted across live updates. */
+function createQuestionIdentity() {
+  const label = el("summary", { class: "question-id-short" });
+  const full = el("code", { class: "question-id-full" });
+  const status = el("span", { class: "hint", role: "status" });
+  const copy = el("button", {
+    class: "btn btn-quiet", type: "button", text: "Copy full ID",
+    onclick: async () => {
+      const id = root.dataset.questionId;
+      setText(status, "");
+      try {
+        await navigator.clipboard.writeText(id);
+        if (root.dataset.questionId === id) setText(status, "Copied full ID.");
+      } catch {
+        if (root.dataset.questionId === id) setText(status, "Could not copy. Select the full ID to copy it manually.");
+      }
+    },
+  });
+  const root = el("details", { class: "question-identity" }, label,
+    el("div", { class: "question-id-tools" }, full, copy, status));
+  root.refs = { label, full, status };
+  return root;
+}
+
+function updateQuestionIdentity(root, id) {
+  if (root.dataset.questionId === id) return;
+  root.dataset.questionId = id;
+  root.open = false;
+  setText(root.refs.label, `#${shortId(id)}`);
+  setAttr(root.refs.label, "aria-label", `Question #${shortId(id)}: show full ID`);
+  setText(root.refs.full, id);
+  setText(root.refs.status, "");
+}
+
 /* ---- agent-authored panels --------------------------------------------- *
  * A question may hand over a whole HTML page instead of a paragraph: a table
  * of changed files, a coloured diff, an inline image. This client otherwise
@@ -4515,6 +4550,9 @@ function renderPanel(row, question) {
 function openPanel(question) {
   const dialog = $("panel-full");
   setText($("panel-full-h"), question.summary || `Panel ${shortId(question.id)}`);
+  const identity = createQuestionIdentity();
+  updateQuestionIdentity(identity, question.id);
+  $("panel-full-identity").replaceChildren(identity);
   const body = $("panel-full-body");
   clear(body);
   body.append(panelFrame(question, "Panel, full screen, for"));
@@ -4655,14 +4693,15 @@ function createAskCard() {
   const consultBtn = el("button", { class: "btn ask-consult", type: "button", text: "Ask the chat agent" });
   const consultBox = el("div", { class: "ask-consult-box" }, consultBtn);
 
+  const identity = createQuestionIdentity();
   const row = el("li", { class: "ask" },
     band,
-    el("div", { class: "ask-top" }, chipSlot, whenSlot),
+    el("div", { class: "ask-top" }, chipSlot, whenSlot), identity,
     /* The panel sits above the prose: when there is one, it is the case for
        the decision and the detail is the footnote. */
     summary, where, panelBox, detail, thread, hint, waitingNote, stakes, choices, free, consultBox, sayBox, error, answer, note,
   );
-  row.refs = { chipSlot, whenSlot, summary, runLink, node, seat, where, detail,
+  row.refs = { identity, chipSlot, whenSlot, summary, runLink, node, seat, where, detail,
                hint, choices, text, send, free, error, answerLabel, answerText, answer, note,
                band, panelBox, stakes, thread, waitingNote, sayText, saySend, sayBox,
                consultBtn, consultBox };
@@ -4738,6 +4777,7 @@ function renderPostingComparison(parent, view) {
 
 function updateAskCard(row, question, { compact = false } = {}) {
   const r = row.refs;
+  updateQuestionIdentity(r.identity, question.id);
   const status = String(question.status || "open");
   const open = status === "open";
   const choices = Array.isArray(question.choices) ? question.choices : [];
@@ -4959,7 +4999,7 @@ async function answerQuestion(id, body, row) {
      panel's own controls are not part of the decision, and one of them is
      deliberately disabled when the panel failed to load — re-enabling it
      here would offer a full-screen view of something that is not there. */
-  const buttons = [...row.querySelectorAll("button")].filter((b) => !b.closest(".ask-panel") && !b.closest(".ask-consult-box"));
+  const buttons = [...row.querySelectorAll("button")].filter((b) => !b.closest(".ask-panel") && !b.closest(".ask-consult-box") && !b.closest(".question-identity"));
   const value = typeof body.choice === "string" ? body.choice : String(body.text || "");
 
   if (!value.trim()) {
@@ -10322,7 +10362,10 @@ function wire() {
   /* Escape closes a dialog without a click, so the frame is dropped from the
      close event rather than from the button: a dismissed panel must not go
      on holding a live document. */
-  $("panel-full").addEventListener("close", () => clear($("panel-full-body")));
+  $("panel-full").addEventListener("close", () => {
+    clear($("panel-full-body"));
+    clear($("panel-full-identity"));
+  });
 
   $("attachment-view-close").addEventListener("click", closeAttachmentView);
   $("attachment-view").addEventListener("click", (event) => {
