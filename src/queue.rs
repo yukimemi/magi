@@ -312,7 +312,8 @@ pub struct Task {
     /// Total attempt budget; `None` inherits the daemon limit.
     #[serde(default)]
     pub attempt_limit: Option<NonZeroUsize>,
-    /// Runs this task has produced, oldest first.
+    /// Distinct runs, ordered by their most recent claim. Older records may
+    /// contain repeated ids; execution history lives in the run pass records.
     #[serde(default)]
     pub runs: Vec<String>,
     /// Why the last attempt did not land.
@@ -706,7 +707,8 @@ pub struct Resumption {
     pub instruction: String,
     /// Number of historical answers superseded as waiting premises.
     pub answers_through: usize,
-    /// Number of runs already present when approval was applied.
+    /// Legacy run-list boundary retained for record compatibility. Evidence
+    /// uses approval time and run passes because resumes retain the same id.
     pub runs_through: usize,
     /// Previous hold or dependency reason cleared by this release.
     pub cleared_reason: Option<String>,

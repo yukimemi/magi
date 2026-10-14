@@ -215,12 +215,7 @@ fn new_blocking_evidence(
         .filter_map(|id| {
             let version = if let Ok(q) = questions.get(id) {
                 (q.asked_at > r.at
-                    && (q.run == task.id
-                        || task
-                            .runs
-                            .iter()
-                            .skip(r.runs_through)
-                            .any(|run| *run == q.run))
+                    && (q.run == task.id || task.runs.iter().any(|run| *run == q.run))
                     && q.node != NODE
                     && q.status != crate::ask::QuestionStatus::Abandoned)
                     .then(|| {
@@ -244,23 +239,31 @@ fn new_blocking_evidence(
                             dep.status, dep.hold_reason, dep.last_error
                         )
                     })
-            } else if task.runs.iter().skip(r.runs_through).any(|run| run == id) {
+            } else if task.runs.iter().any(|run| run == id) {
                 RunState::load(id)
                     .ok()
                     .filter(|run| {
-                        matches!(
-                            run.status,
-                            crate::run::RunStatus::Failed
-                                | crate::run::RunStatus::Blocked
-                                | crate::run::RunStatus::Stalled
-                        )
+                        // A resumed run keeps its id. Only a pass started after
+                        // approval (or a newly created legacy run) is new evidence.
+                        run.updated_at > r.at
+                            && run
+                                .passes
+                                .last()
+                                .map_or(run.created_at > r.at, |p| p.started_at > r.at)
+                            && matches!(
+                                run.status,
+                                crate::run::RunStatus::Failed
+                                    | crate::run::RunStatus::Blocked
+                                    | crate::run::RunStatus::Stalled
+                            )
                     })
                     .map(|run| {
                         format!(
-                            "run:{id}:{:?}:{}:{}",
+                            "run:{id}:{:?}:{}:{}:{:?}",
                             run.status,
                             run.reviews.len(),
-                            task.attempts
+                            task.attempts,
+                            run.passes.last().map(|p| (p.index, p.started_at))
                         )
                     })
             } else {
@@ -1411,6 +1414,94 @@ mod tests {
         queue.put(&mut after).unwrap();
         apply(&queue, &questions, &Verdict { decisions: vec![d] }).unwrap();
         assert!(queue.get(&t.id).unwrap().operator_held());
+    }
+
+    #[test]
+    fn resumed_run_evidence_uses_approval_time_not_run_list_offsets() {
+        crate::run::pin_test_home();
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("resume evidence");
+        let mut run = RunState::new(
+            t.repo.clone(),
+            "main".into(),
+            "base".into(),
+            "work".into(),
+            crate::config::Config::default(),
+        );
+        run.begin_pass();
+        run.status = crate::run::RunStatus::Failed;
+        run.save().unwrap();
+        t.start(run.id.clone());
+        // Model legacy duplicate history, which the next start will deduplicate.
+        t.runs.push(run.id.clone());
+        t.release_operator("cli", None);
+        let approval = t.resumption.as_ref().unwrap().at;
+        let decision = Decision {
+            evidence: vec![run.id.clone()],
+            ..Decision::default()
+        };
+        assert!(new_blocking_evidence(&queue, &questions, &t, &decision).is_empty());
+        t.start(run.id.clone());
+        assert_eq!(t.runs.len(), 1);
+        run.begin_pass();
+        run.save().unwrap();
+        assert!(run.passes.last().unwrap().started_at > approval);
+        let evidence = new_blocking_evidence(&queue, &questions, &t, &decision);
+        assert_eq!(evidence.len(), 1);
+        t.resumption.as_mut().unwrap().blocking_evidence = evidence;
+        assert!(new_blocking_evidence(&queue, &questions, &t, &decision).is_empty());
+        run.begin_pass();
+        run.save().unwrap();
+        assert_eq!(
+            new_blocking_evidence(&queue, &questions, &t, &decision).len(),
+            1
+        );
+
+        let mut q = Question::new(
+            run.id.clone(),
+            "review".into(),
+            "check".into(),
+            "New failure".into(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut q).unwrap();
+        let decision = Decision {
+            evidence: vec![q.id.clone()],
+            ..Decision::default()
+        };
+        assert_eq!(
+            new_blocking_evidence(&queue, &questions, &t, &decision).len(),
+            1
+        );
+        q.asked_at = approval;
+        questions.put(&mut q).unwrap();
+        assert!(new_blocking_evidence(&queue, &questions, &t, &decision).is_empty());
+        q.asked_at = jiff::Timestamp::now();
+        q.run = "unrelated".into();
+        questions.put(&mut q).unwrap();
+        assert!(new_blocking_evidence(&queue, &questions, &t, &decision).is_empty());
+
+        let mut fresh = RunState::new(
+            t.repo.clone(),
+            "main".into(),
+            "base".into(),
+            "fresh work".into(),
+            crate::config::Config::default(),
+        );
+        fresh.status = crate::run::RunStatus::Failed;
+        fresh.save().unwrap();
+        t.start(fresh.id.clone());
+        let decision = Decision {
+            evidence: vec![fresh.id.clone()],
+            ..Decision::default()
+        };
+        assert_eq!(
+            new_blocking_evidence(&queue, &questions, &t, &decision).len(),
+            1
+        );
     }
 
     #[test]

@@ -294,9 +294,9 @@ pub struct RunPass {
     /// `None` while open (or still driving).
     #[serde(default)]
     pub end: Option<PassEnd>,
-    /// The pass was one the task loop (or `magi run`) counted as an entry of
-    /// `Task::runs`. A resume from the web button or `magi run --resume`
-    /// without a task is a pass too, but no entry of the task's list.
+    /// The task loop (or `magi run` for a task) counted this pass as a task
+    /// attempt. Resumes keep one distinct id in `Task::runs`, while each
+    /// counted pass belongs in task history. A resume without a task does not.
     #[serde(default)]
     pub task_entry: bool,
 }
