@@ -1260,7 +1260,7 @@ fn tail_chars(s: &str, max: usize) -> String {
 /// Recognise claude's rate-limit error shape, when it is present.
 ///
 /// Recognises `is_error: true` with a session-limit result or the structured
-/// pair `api_error_status: 429`, `api_error: usage_limit_reached`;
+/// pair `api_error_status: 429` (number or string), `api_error: usage_limit_reached`;
 /// every other CLI (and any future shape) returns `None` and is treated as an
 /// ordinary failure — the conservative side.
 fn claude_quota(v: &serde_json::Value) -> Option<Quota> {
@@ -1269,10 +1269,9 @@ fn claude_quota(v: &serde_json::Value) -> Option<Quota> {
         return None;
     }
     let result = v.get("result").and_then(|r| r.as_str()).unwrap_or("");
-    let usage_limit = v
-        .get("api_error_status")
-        .and_then(serde_json::Value::as_u64)
-        == Some(429)
+    let status = v.get("api_error_status");
+    let usage_limit = (status.and_then(serde_json::Value::as_u64) == Some(429)
+        || status.and_then(serde_json::Value::as_str) == Some("429"))
         && v.get("api_error").and_then(serde_json::Value::as_str) == Some("usage_limit_reached");
     if !usage_limit && !result.to_lowercase().contains("session limit") {
         return None;
@@ -2254,18 +2253,19 @@ mod tests {
     #[test]
     fn claude_structured_usage_limit_requires_the_error_and_exact_pair() {
         for kind in [AgentKind::Claude, AgentKind::Command] {
-            assert!(
-                extract(
-                    kind,
-                    r#"{"is_error":true,"api_error_status":429,"api_error":"usage_limit_reached"}"#
-                )
-                .quota
-                .is_some()
-            );
+            for reply in [
+                r#"{"is_error":true,"api_error_status":429,"api_error":"usage_limit_reached"}"#,
+                r#"{"is_error":true,"api_error_status":"429","api_error":"usage_limit_reached"}"#,
+            ] {
+                assert!(extract(kind, reply).quota.is_some(), "{reply}");
+            }
             for reply in [
                 r#"{"is_error":false,"api_error_status":429,"api_error":"usage_limit_reached"}"#,
                 r#"{"is_error":true,"api_error_status":500,"api_error":"usage_limit_reached"}"#,
                 r#"{"is_error":true,"api_error_status":429,"api_error":"other_error"}"#,
+                r#"{"is_error":false,"api_error_status":"429","api_error":"usage_limit_reached"}"#,
+                r#"{"is_error":true,"api_error_status":"500","api_error":"usage_limit_reached"}"#,
+                r#"{"is_error":true,"api_error_status":"429","api_error":"other_error"}"#,
                 r#"{"is_error":true,"api_error":"usage_limit_reached"}"#,
             ] {
                 assert!(extract(kind, reply).quota.is_none(), "{reply}");

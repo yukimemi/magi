@@ -2983,6 +2983,11 @@ mod tests {
                 "0",
                 "rate/quota limit",
             ),
+            (
+                r#"{"is_error":true,"api_error_status":"429","api_error":"usage_limit_reached","level":"minor","reason":"Looks valid."}"#,
+                "0",
+                "rate/quota limit",
+            ),
             ("", "0", "empty output"),
             (
                 "",
