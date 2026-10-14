@@ -2928,7 +2928,15 @@ async fn attempt(
             unfinished.as_deref(),
         ),
     };
-    let starter = starter_with_implementers(task, previous.as_ref(), proposed);
+    let starter = if let Some(selected) = &task.pr_recovery {
+        if selected.check_task(&task.id, &task.instruction).is_ok() {
+            selected_starter(selected, previous.as_ref(), unfinished.as_deref())
+        } else {
+            Starter::Review(selected.branch.clone())
+        }
+    } else {
+        starter_with_implementers(task, previous.as_ref(), proposed)
+    };
     // Absolute paths of the files the task was filed with, re-read from the
     // task now so a file attached while it was held reaches a resumed run
     // too. A stored name whose file has gone is an error before any agent is
@@ -2943,6 +2951,18 @@ async fn attempt(
         }
     };
     let started = match &starter {
+        Starter::Review(_) if task.pr_recovery.is_some() => {
+            let selected = task.pr_recovery.clone().expect("selected recovery");
+            match selected.check_task(&task.id, &task.instruction) {
+                Ok(()) => Runner::recover_pr(&repo, &task.id, selected, config)
+                    .await
+                    .map(|mut r| {
+                        r.state.attachments = attachments.clone();
+                        r
+                    }),
+                Err(e) => Err(e),
+            }
+        }
         Starter::Review(branch) => {
             tracing::info!(
                 "task {} reopens `{branch}` as a review-only pass",
@@ -2967,7 +2987,14 @@ async fn attempt(
         }
         Starter::Resume(id) => {
             tracing::info!("resuming run {id} rather than competing again");
-            Runner::resume(id).map(|mut r| {
+            Runner::resume(id).and_then(|mut r| {
+                if r.state.prep_failure.is_some() {
+                    let approval = task
+                        .resumption
+                        .as_ref()
+                        .context("preparation retry requires an explicit task release")?;
+                    r.retry_preparation(approval.at)?;
+                }
                 if let Some(instruction) =
                     prepare_instruction(&starter, Some(&r.state.instruction), task)
                 {
@@ -2984,7 +3011,7 @@ async fn attempt(
                 {
                     r.state.config.merge.mode = mode;
                 }
-                r
+                Ok(r)
             })
         }
         Starter::Start => {
@@ -3016,6 +3043,19 @@ async fn attempt(
         // A branch an earlier attempt still holds and magi will not release
         // by itself is the operator's call, not a failed attempt: hold the
         // task with the reason, spend nothing, and say so on the bell.
+        Err(e) if task.pr_recovery.is_some() => {
+            task.attempts += 1;
+            if let Some(partial) = e.downcast_ref::<crate::pr_recovery::StartupFailed>() {
+                task.link_run(&partial.run);
+                task.record_pass(&partial.run, 0, task.attempts, None);
+            }
+            task.last_error = Some(format!("{start_failed}{e:#}"));
+            task.hold_unrequested_retry(Some(format!(
+                "Selected public-head recovery could not start: {e:#}. Correct the cause and use `magi task recover-pr` with the approved public head; automatic recovery is stopped."
+            )));
+            record(queue, task);
+            return Vec::new();
+        }
         Err(e) if e.downcast_ref::<crate::handover::Refused>().is_some() => {
             let detail = match e.downcast_ref::<crate::handover::Refused>() {
                 Some(r) => (p.handover_refused)(r),
@@ -3091,7 +3131,10 @@ async fn attempt(
                 return Vec::new();
             }
             task.attempts += 1;
-            task.fail(format!("{start_failed}{e:#}"), opts.max_attempts);
+            task.last_error = Some(format!("{start_failed}{e:#}"));
+            task.hold_unrequested_retry(Some(format!(
+                "Startup failed: {e:#}. Correct the startup source or configuration, then explicitly release the task; automatic recovery is stopped."
+            )));
             record(queue, task);
             return Vec::new();
         }
@@ -3172,6 +3215,11 @@ pub fn finish_attempt(
         no_viable_candidates: state.viable().is_empty(),
     };
     settle_and_diagnose(task, verdict, &detail, max_attempts, state);
+    if state.status == RunStatus::Blocked && state.prep_failure.is_some() {
+        task.hold_unrequested_retry(Some(format!(
+            "Candidate setup failed: {detail}. Select a complete implementation with `magi task recover-pr`, or correct the referenced source before explicitly releasing the task."
+        )));
+    }
     if task.status == TaskStatus::Done {
         supersede_prior_runs(task, &crate::run::home());
     }
@@ -3975,6 +4023,23 @@ enum Starter {
     Start,
 }
 
+/// A selected public implementation overrides every historical candidate and pin.
+fn selected_starter(
+    selected: &crate::pr_recovery::Selection,
+    previous: Option<&RunState>,
+    unfinished: Option<&str>,
+) -> Starter {
+    if let Some(id) = unfinished
+        && previous.is_some_and(|r| {
+            r.id == id && r.pr_recovery.as_ref() == Some(selected) && r.reviewed_commits.is_some()
+        })
+    {
+        Starter::Resume(id.to_owned())
+    } else {
+        Starter::Review(selected.branch.clone())
+    }
+}
+
 /// The owner's answer to this branch's divergence question, consumed from the
 /// task so a later, different divergence asks again. The runner applies it
 /// (see `Runner::review_taking_over`), after the earlier worktree is released.
@@ -4433,6 +4498,63 @@ mod tests {
             PathBuf::from("/repo"),
             Source::Human,
         )
+    }
+
+    #[test]
+    fn selected_public_head_overrides_historical_resume_and_pin() {
+        let mut t = task();
+        let mut old = run_state(RunStatus::Blocked);
+        let selection = crate::pr_recovery::Selection {
+            url: "url".into(),
+            branch: format!("magi/task-{}", t.id),
+            head: "a".repeat(40),
+            instruction: t.instruction.clone(),
+            approved_at: Timestamp::now(),
+        };
+        t.resume_override = Some(crate::queue::OperatorResume {
+            pinned_run: Some(old.id.clone()),
+            question_id: "choice".into(),
+            at: Timestamp::now(),
+            conductor_rehold: None,
+            forced: false,
+        });
+        assert_eq!(
+            selected_starter(&selection, Some(&old), Some(&old.id)),
+            Starter::Review(selection.branch.clone())
+        );
+        old.pr_recovery = Some(selection.clone());
+        assert_eq!(
+            selected_starter(&selection, Some(&old), Some(&old.id)),
+            Starter::Review(selection.branch.clone())
+        );
+        old.reviewed_commits = Some(vec!["implementation".into()]);
+        assert_eq!(
+            selected_starter(&selection, Some(&old), Some(&old.id)),
+            Starter::Resume(old.id.clone())
+        );
+        let mut changed = selection.clone();
+        changed.head = "b".repeat(40);
+        assert_eq!(
+            selected_starter(&changed, Some(&old), Some(&old.id)),
+            Starter::Review(changed.branch)
+        );
+    }
+
+    #[test]
+    fn candidate_transplant_failure_is_one_actionable_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut t = task();
+        let mut state = run_state(RunStatus::Blocked);
+        state.event("prep", "cannot apply referenced commit: conflict");
+        state.prep_failure = Some("conflict".into());
+        t.start(state.id.clone());
+        finish_attempt(3, &q, &mut t, &state, &[], Err(anyhow::anyhow!("conflict")));
+        assert_eq!(t.attempts, 1);
+        assert_eq!(t.status, TaskStatus::Held);
+        assert!(t.operator_held());
+        assert!(!t.status.runnable());
+        assert!(t.hold_reason.as_deref().unwrap().contains("recover-pr"));
     }
 
     #[test]
@@ -7993,13 +8115,10 @@ mod tests {
     /// quiet moment for `poll`'s fully-idle branch to reach the ordinary
     /// `janitor` pass.
     ///
-    /// Reproduced here with a task whose repository is never created:
-    /// `Runner::start` fails at `git::toplevel` in a few milliseconds,
-    /// spawning no agent CLI, so the task keeps failing and re-queuing
-    /// (`Task::fail` with attempts still under the budget leaves it
-    /// `Failed`, which `TaskStatus::runnable` still offers) for as long as
-    /// the loop keeps polling - exactly the "queue with no idle moment"
-    /// this task describes, produced without a real competition.
+    /// Reproduced with a backlog whose repository is never created:
+    /// `Runner::start` fails at `git::toplevel`, spawning no agent CLI.
+    /// Each task is held after one startup failure, but the remaining tasks
+    /// keep the queue busy until an external stop ends the loop.
     #[tokio::test]
     async fn cache_prune_reaches_a_queue_that_never_goes_idle() {
         let dir = tempfile::tempdir().unwrap();
@@ -8012,13 +8131,15 @@ mod tests {
         opts.max_attempts = 1_000;
 
         let queue = Queue::at(dir.path().join("queue"));
-        let mut t = Task::new(
-            "x".to_owned(),
-            "x".to_owned(),
-            opts.repo.clone(),
-            Source::Human,
-        );
-        queue.put(&mut t).unwrap();
+        for i in 0..128 {
+            let mut task = Task::new(
+                format!("queued work {i}"),
+                format!("queued work {i}"),
+                opts.repo.clone(),
+                Source::Human,
+            );
+            queue.put(&mut task).unwrap();
+        }
 
         let home = dir.path().join("home");
         let worktrees = dir.path().join("wt");
@@ -8027,17 +8148,15 @@ mod tests {
         let stopper = {
             let stop = stop.clone();
             let queue = Queue::at(dir.path().join("queue"));
-            let id = t.id.clone();
             tokio::spawn(async move {
-                // Stop once the task has demonstrably been retried, not after
-                // a fixed delay: under a loaded machine 400 ms can pass before
-                // the loop has finished a second attempt.
-                tokio::time::sleep(Duration::from_millis(400)).await;
-                for _ in 0..200 {
-                    if queue.get(&id).is_ok_and(|t| t.attempts >= 2) {
+                // Observe completed work rather than rely on a wall-clock
+                // delay. Every startup failure holds only its own task; the
+                // backlog keeps offering work at the next boundary.
+                for _ in 0..2_000 {
+                    if queue.list().iter().filter(|t| t.attempts == 1).count() >= 2 {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 stop.stop();
             })
@@ -8052,17 +8171,24 @@ mod tests {
         .expect("the loop's own setup and teardown must not fail");
         stopper.await.unwrap();
 
-        let after = queue.get(&t.id).unwrap();
+        let after = queue.list();
+        let completed = after.iter().filter(|t| t.attempts == 1).count();
         assert!(
-            after.attempts >= 2,
-            "the harness must actually have retried more than once, or this is not \
-             exercising a busy queue at all (got {} attempt(s))",
-            after.attempts
+            completed >= 2,
+            "the harness must have processed multiple tasks to exercise a busy queue \
+             (got {completed} completed task(s))"
         );
         assert!(
-            after.status.runnable(),
-            "still under its attempt budget: the queue never reached a natural idle \
-             on its own, only the external stop ended the test"
+            after.iter().any(|t| t.status.runnable()),
+            "unprocessed tasks must remain: the external stop, rather than an \
+             exhausted backlog, must end the test"
+        );
+        assert!(
+            after
+                .iter()
+                .filter(|t| t.attempts > 0)
+                .all(|t| { t.attempts == 1 && t.status == TaskStatus::Held }),
+            "a busy backlog must not retry a task's unchanged startup failure"
         );
 
         assert_eq!(
@@ -9021,6 +9147,45 @@ mod tests {
 
     fn resume_action(run: &str) -> ask::ChoiceAction {
         ask::ChoiceAction::Resume { run: run.into() }
+    }
+
+    #[test]
+    fn explicitly_resumed_older_run_remains_the_release_and_question_target() {
+        for parked in [false, true] {
+            let mut t = task();
+            t.start("A".into());
+            t.start("B".into());
+            assert_eq!(t.runs, vec!["A", "B"]);
+            t.start("A".into());
+            let mut resumed = run_state(RunStatus::Blocked);
+            resumed.id = "A".into();
+            resumed.parked = parked;
+            resumed.driver_exited = true;
+            t.hold_machine(Some("resumed run stopped".into()));
+            let q = action_question("A", resume_action("A"));
+            assert_eq!(action_standing(&t, &q), ActionStanding::Pending);
+            assert_eq!(
+                decide_action(&t, &q, &PHRASES_EN, |id| {
+                    assert_eq!(id, "A");
+                    Ok(resumed.clone())
+                }),
+                ActionDecision::Resume("A".into())
+            );
+            assert_eq!(
+                action_standing(&t, &action_question("B", resume_action("B"))),
+                ActionStanding::Stale
+            );
+            t.release_operator("cli", None);
+            let unfinished = unfinished_run_with(&t.runs, t.short(), |id| {
+                assert_eq!(id, "A");
+                Ok(resumed.clone())
+            });
+            assert_eq!(
+                choose_starter(None, false, unfinished.as_deref()),
+                Starter::Resume("A".into())
+            );
+            assert_eq!(t.runs, vec!["B", "A"]);
+        }
     }
 
     #[test]

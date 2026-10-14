@@ -773,6 +773,94 @@ impl Runner {
         opened
     }
 
+    /// Recover exactly the operator-selected public implementation, without touching old sources.
+    pub async fn recover_pr(
+        repo: &Path,
+        task: &str,
+        selection: crate::pr_recovery::Selection,
+        config: Config,
+    ) -> Result<Self> {
+        selection.check_task(task, &selection.instruction)?;
+        let base_branch =
+            git::merge_base_branch(repo, &config.merge.remote, config.merge.base.as_deref())
+                .await?;
+        let base_commit = resolve_base(repo, &base_branch, &config.merge.remote).await?;
+        selection
+            .verify(repo, &config.merge.remote, &base_branch, &selection.head)
+            .await?;
+        let roles = config.resolve_roles()?;
+        let max_parallel = config.graph.max_parallel.max(1);
+        let mut state = RunState::new(
+            repo.to_path_buf(),
+            base_branch,
+            base_commit.clone(),
+            selection.instruction.clone(),
+            config,
+        );
+        state.origin = Some(crate::run::Origin::queue(task));
+        state.pr_head = Some(selection.branch.clone());
+        state.pr_recovery = Some(selection.clone());
+        crate::pr_head::check_predecessors(&state, &selection.branch).await?;
+        Self::open_selected(repo, state, roles, max_parallel, base_commit, selection).await
+    }
+
+    async fn open_selected(
+        repo: &Path,
+        state: RunState,
+        roles: ResolvedRoles,
+        max_parallel: usize,
+        base_commit: String,
+        selection: crate::pr_recovery::Selection,
+    ) -> Result<Self> {
+        let mut state = state;
+        let branch = state.branch_for('A');
+        git::git(repo, &["branch", &branch, &selection.head]).await?;
+        state.event(
+            "recovery",
+            format!(
+                "selected public implementation {} from {}",
+                selection.head, selection.url
+            ),
+        );
+        let takeover = crate::handover::Takeover {
+            earlier: Vec::new(),
+            home: crate::run::home(),
+            choice: None,
+            task_instruction: Some(selection.instruction.clone()),
+        };
+        state.save()?;
+        let id = state.id.clone();
+        let opened = Self::open_review(
+            repo,
+            &branch,
+            state,
+            roles,
+            max_parallel,
+            base_commit,
+            &takeover,
+        )
+        .await;
+        match opened {
+            Ok(runner) => Ok(runner),
+            Err(e) => {
+                if let Ok(mut partial) = RunState::load(&id) {
+                    partial.status = RunStatus::Blocked;
+                    partial.driver_exited = true;
+                    partial.event(
+                        "recovery",
+                        format!("startup failed; retained source and candidate {branch}: {e:#}"),
+                    );
+                    partial.save()?;
+                }
+                Err(crate::pr_recovery::StartupFailed {
+                    run: id,
+                    cause: format!("{e:#}"),
+                }
+                .into())
+            }
+        }
+    }
+
     /// What the newest earlier attempt that reviewed `branch` leaves for this
     /// run (see [`crate::recovery`]). `None` for a hand-run review, which has
     /// no earlier attempts. Reads the earlier record only: ownership of its
@@ -819,7 +907,9 @@ impl Runner {
         base_commit: String,
         takeover: &crate::handover::Takeover,
     ) -> Result<Self> {
-        sync_review_branch(repo, branch, &state.config.merge.remote, &base_commit).await?;
+        if state.pr_recovery.is_none() {
+            sync_review_branch(repo, branch, &state.config.merge.remote, &base_commit).await?;
+        }
         // The commit subjects are the closest thing to a task statement that
         // existing work carries, and the reviewers are told as much.
         let start = review_base(
@@ -861,6 +951,9 @@ impl Runner {
             }
             state.event("recovery", rec.summary());
             state.recovery = Some(rec);
+        }
+        if let Some(selected) = &state.pr_recovery {
+            instruction = selected.instruction.clone();
         }
         state.task_instruction = takeover.task_instruction.clone();
         state.instruction = instruction;
@@ -962,6 +1055,7 @@ impl Runner {
             uncontested: Some("review-only run: nothing competed".to_owned()),
         });
         state.status = RunStatus::Reviewing;
+        state.prep_complete = Some(true);
         state.event(
             "start",
             format!(
@@ -982,6 +1076,11 @@ impl Runner {
     /// Reopen an existing run.
     pub fn resume(id: &str) -> Result<Self> {
         let state = RunState::load(id)?;
+        if state.pr_recovery.is_some() && state.reviewed_commits.is_none() {
+            bail!(
+                "selected public-head recovery did not finish setup; use `magi task recover-pr` after correcting the cause"
+            );
+        }
         if let Some(to) = &state.released_to {
             bail!(
                 "run {} cannot be resumed: its worktree was released to run {}",
@@ -1206,7 +1305,16 @@ impl Runner {
             self.state.save()?;
             return Ok(());
         }
-        self.prep().await?;
+        if let Err(e) = self.prep().await {
+            self.state.status = RunStatus::Blocked;
+            self.state
+                .prep_failure
+                .get_or_insert_with(|| format!("{e:#}"));
+            self.state
+                .event("prep", format!("preparation stopped: {e:#}"));
+            self.state.save()?;
+            return Err(e);
+        }
         if self.park_here()? {
             return Ok(());
         }
@@ -1310,6 +1418,29 @@ impl Runner {
         self.state.parked = true;
         self.state.save()?;
         Ok(true)
+    }
+
+    /// Only a new explicit operator approval may retry failed preparation.
+    pub fn retry_preparation(&mut self, approval_at: jiff::Timestamp) -> Result<()> {
+        if self.state.prep_failure.is_none() {
+            return Ok(());
+        }
+        let failed_at = self
+            .state
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.node == "prep")
+            .map_or(self.state.updated_at, |event| event.at);
+        anyhow::ensure!(
+            approval_at > failed_at,
+            "preparation retry requires a new explicit release after the failure"
+        );
+        self.state.prep_failure = None;
+        self.state.prep_complete = Some(false);
+        self.state
+            .event("prep-retry", "operator approved retry of preparation");
+        Ok(())
     }
 
     /// Hand the runner the pause `magi serve`'s own shutdown watches.
@@ -1434,10 +1565,23 @@ impl Runner {
     }
 
     async fn prep(&mut self) -> Result<()> {
-        if !self.state.candidates.is_empty() {
+        if let Some(reason) = &self.state.prep_failure {
+            bail!(
+                "candidate preparation previously failed: {reason}; correct the source before retrying"
+            );
+        }
+        if self
+            .state
+            .prep_complete
+            .unwrap_or(!self.state.candidates.is_empty())
+        {
             return Ok(());
         }
+        let repo = self.state.repo.clone();
+        self.rollback_prep(&repo).await;
+        self.state.prep_complete = Some(false);
         self.state.status = RunStatus::Prep;
+        self.state.save()?;
         let repo = self.state.repo.clone();
         let base = self.state.base_commit.clone();
         let plan = refs::plan(&repo, &self.state.seeds).await?;
@@ -1494,17 +1638,9 @@ impl Runner {
                 self.state.status = RunStatus::Blocked;
                 self.state
                     .event("prep", format!("worktree setup failed: {e:#}"));
+                self.state.prep_failure = Some(format!("worktree setup failed: {e:#}"));
                 self.state.save()?;
                 return Err(e);
-            }
-            for pick in &plan.picks {
-                if let Err(e) = git::cherry_pick(&worktree, pick).await {
-                    self.state.status = RunStatus::Blocked;
-                    self.state
-                        .event("prep", format!("cannot apply referenced commit: {e}"));
-                    self.state.save()?;
-                    return Err(e);
-                }
             }
             self.state.candidates.push(Candidate {
                 index,
@@ -1522,6 +1658,18 @@ impl Runner {
                 duration_ms: 0,
                 folded: false,
             });
+            self.state.save()?;
+            for pick in &plan.picks {
+                if let Err(e) = git::cherry_pick(&self.state.candidates[index].worktree, pick).await
+                {
+                    self.state.status = RunStatus::Blocked;
+                    self.state.prep_failure = Some(format!("cannot apply referenced commit: {e}"));
+                    self.state
+                        .event("prep", format!("cannot apply referenced commit: {e}"));
+                    self.state.save()?;
+                    return Err(e);
+                }
+            }
         }
 
         for j in 1..=self.roles.judges.len() {
@@ -1587,6 +1735,7 @@ impl Runner {
                 self.state.base_branch
             ),
         );
+        self.state.prep_complete = Some(true);
         self.state.status = RunStatus::Implementing;
         self.state.save()?;
         Ok(())
@@ -10679,6 +10828,9 @@ pub(crate) async fn gh_pr_create(
 /// directory some other process or test pinned into that `OnceLock` first,
 /// not the one the caller actually resolved its `runs` and `state` from.
 pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> Result<Vec<String>> {
+    if crate::pr_recovery::sources_retained(home, &state.id) {
+        return Ok(Vec::new());
+    }
     let repo = state.repo.clone();
     let root = state.worktree_root();
     let winner = state.tally.as_ref().map(|t| t.winner);
@@ -11460,6 +11612,301 @@ mod tests {
 
     /// A throwaway repo with one commit on `main`, for tests that need `merge`
     /// to make real (and, if it runs at all, real*ly fail*) git calls.
+    #[tokio::test]
+    async fn selected_public_ancestry_survives_obsolete_candidate_and_current_base_sync() {
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let g = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .quiet()
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let base = git::rev_parse(&repo, "HEAD").await.unwrap();
+        g(&["checkout", "-b", "historical"]);
+        std::fs::write(repo.join("implementation"), "incompatible alternative").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-m", "old alternative"]);
+        let obsolete = git::rev_parse(&repo, "HEAD").await.unwrap();
+        g(&["checkout", "-b", "magi/task-selected", &base]);
+        std::fs::write(repo.join("infrastructure"), "prerequisite").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-m", "measurement infrastructure"]);
+        let prerequisite = git::rev_parse(&repo, "HEAD").await.unwrap();
+        std::fs::write(repo.join("implementation"), "measured implementation").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-m", "dependent implementation"]);
+        let head = git::rev_parse(&repo, "HEAD").await.unwrap();
+        g(&["checkout", "main"]);
+        std::fs::write(repo.join("unrelated"), "current main change").unwrap();
+        g(&["add", "."]);
+        g(&["commit", "-m", "unrelated base change"]);
+        let current = git::rev_parse(&repo, "HEAD").await.unwrap();
+        let origin = tmp.path().join("origin.git");
+        g(&[
+            "clone",
+            "--bare",
+            repo.to_str().unwrap(),
+            origin.to_str().unwrap(),
+        ]);
+        g(&["remote", "add", "origin", origin.to_str().unwrap()]);
+        g(&["fetch", "origin"]);
+        let selection = crate::pr_recovery::Selection {
+            url: "https://example.test/project/pull/1".into(),
+            branch: "magi/task-selected".into(),
+            head: head.clone(),
+            instruction: "preserve measured behavior".into(),
+            approved_at: jiff::Timestamp::now(),
+        };
+        let mut template = runner_at(RunStatus::Reviewing);
+        template.state.repo = repo.clone();
+        template.state.base_commit = current.clone();
+        template.state.config.graph.worktree_root = Some(tmp.path().join("worktrees"));
+        template.state.origin = Some(crate::run::Origin::queue("selected"));
+        template.state.pr_head = Some(selection.branch.clone());
+        template.state.pr_recovery = Some(selection.clone());
+        let mut runner =
+            Runner::open_selected(&repo, template.state, template.roles, 1, current, selection)
+                .await
+                .unwrap();
+        let wt = runner.state.winner().unwrap().worktree.clone();
+        assert_eq!(git::rev_parse(&wt, "HEAD").await.unwrap(), head);
+        assert!(git::is_ancestor(&wt, &prerequisite, "HEAD").await);
+        assert!(!git::is_ancestor(&wt, &obsolete, "HEAD").await);
+        assert!(runner.state.seeds.is_empty());
+        assert_eq!(runner.state.instruction, "preserve measured behavior");
+        runner.sync_to_base().await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(wt.join("infrastructure")).unwrap(),
+            "prerequisite"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("implementation")).unwrap(),
+            "measured implementation"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.join("unrelated")).unwrap(),
+            "current main change"
+        );
+        assert_eq!(git::rev_parse(&repo, "historical").await.unwrap(), obsolete);
+        assert_eq!(
+            git::rev_parse(&repo, "magi/task-selected").await.unwrap(),
+            head
+        );
+
+        // A failed selected-source setup stays inspectable, never resumable as a new competition.
+        let mut partial = runner_at(RunStatus::Reviewing);
+        partial.state.repo = repo.clone();
+        partial.state.config.graph.worktree_root = Some(tmp.path().join("failed-worktrees"));
+        partial.state.config.worktree.setup = vec![crate::config::SetupStep {
+            run: Some("exit 1".into()),
+            ..Default::default()
+        }];
+        let selection = runner.state.pr_recovery.clone().unwrap();
+        partial.state.pr_recovery = Some(selection.clone());
+        partial.state.pr_head = Some(selection.branch.clone());
+        partial.state.origin = Some(crate::run::Origin::queue("selected"));
+        let id = partial.state.id.clone();
+        let error = match Runner::open_selected(
+            &repo,
+            partial.state,
+            partial.roles,
+            1,
+            runner.state.base_commit.clone(),
+            selection,
+        )
+        .await
+        {
+            Ok(_) => panic!("setup must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            error
+                .downcast_ref::<crate::pr_recovery::StartupFailed>()
+                .unwrap()
+                .run,
+            id
+        );
+        let failed = RunState::load(&id).unwrap();
+        assert_eq!(failed.status, RunStatus::Blocked);
+        assert_eq!(failed.liveness(false), crate::run::Liveness::Dead);
+        assert!(Runner::resume(&id).is_err());
+        runner.state.status = RunStatus::Ready;
+        runner.state.driver_exited = true;
+        runner.state.save().unwrap();
+        let mut retry = runner_at(RunStatus::Reviewing);
+        retry.state.repo = repo.clone();
+        retry.state.config.graph.worktree_root = Some(tmp.path().join("retry-worktrees"));
+        let mut reselected = runner.state.pr_recovery.clone().unwrap();
+        reselected.approved_at = jiff::Timestamp::now();
+        retry.state.origin = Some(crate::run::Origin::queue("selected"));
+        retry.state.pr_head = Some(reselected.branch.clone());
+        retry.state.pr_recovery = Some(reselected.clone());
+        crate::pr_head::check_predecessors(&retry.state, &reselected.branch)
+            .await
+            .unwrap();
+        let restarted = Runner::open_selected(
+            &repo,
+            retry.state,
+            retry.roles,
+            1,
+            runner.state.base_commit.clone(),
+            reselected,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            git::rev_parse(&restarted.state.winner().unwrap().worktree, "HEAD")
+                .await
+                .unwrap(),
+            head
+        );
+        assert_eq!(git::rev_parse(&repo, "historical").await.unwrap(), obsolete);
+        assert_eq!(
+            git::rev_parse(&repo, "magi/task-selected").await.unwrap(),
+            head
+        );
+    }
+
+    #[tokio::test]
+    async fn preparation_retries_after_explicit_release_and_rebuilds_partial_candidates() {
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let base = git::rev_parse(&repo, "HEAD").await.unwrap();
+        git::git(&repo, &["checkout", "-b", "seed"]).await.unwrap();
+        std::fs::write(repo.join("referenced"), "required commit").unwrap();
+        git::git(&repo, &["add", "."]).await.unwrap();
+        git::git(&repo, &["commit", "-m", "required seed"])
+            .await
+            .unwrap();
+        let seed = git::rev_parse(&repo, "HEAD").await.unwrap();
+        git::git(&repo, &["checkout", "main"]).await.unwrap();
+        let mut runner = runner_at(RunStatus::Prep);
+        runner.state.repo = repo.clone();
+        runner.state.base_commit = base.clone();
+        runner.state.config.graph.worktree_root = Some(tmp.path().join("wt"));
+        runner.state.config.graph.advise = false;
+        runner.state.config.blind.commit_msg_hook = false;
+        runner.state.seeds = vec![refs::Seed {
+            token: seed.clone(),
+            sha: seed.clone(),
+            kind: refs::SeedKind::Unmerged,
+            branch: false,
+            detail: String::new(),
+        }];
+        runner.roles.implementers = vec![spec("one"), spec("two")];
+        runner.roles.judges = vec![spec("judge")];
+        let label = blind::assign_labels(2, runner.state.seed)[0];
+        let branch = runner.state.branch_for(label);
+        let worktree = runner.state.worktree_root().join(format!("cand-{label}"));
+        git::worktree_add_branch(&repo, &worktree, &branch, &base)
+            .await
+            .unwrap();
+        runner.state.candidates.push(Candidate {
+            index: 0,
+            label,
+            agent: "one".into(),
+            branch,
+            worktree,
+            summary: String::new(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: false,
+        });
+        runner.state.save().unwrap();
+        // Reload the checkpoint immediately before its first cherry-pick.
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        assert_eq!(runner.state.prep_complete, Some(false));
+        runner.prep().await.unwrap();
+        assert_eq!(runner.state.prep_complete, Some(true));
+        assert_eq!(runner.state.candidates.len(), 2);
+        for candidate in &runner.state.candidates {
+            assert_eq!(
+                git::tree_of(&candidate.worktree, "HEAD").await.unwrap(),
+                git::tree_of(&repo, &seed).await.unwrap()
+            );
+            assert_eq!(
+                std::fs::read_to_string(candidate.worktree.join("referenced")).unwrap(),
+                "required commit"
+            );
+        }
+        assert!(runner.state.worktree_root().join("judge-1").exists());
+        let heads: Vec<String> = candidate_heads(&runner.state.candidates).await;
+        runner.prep().await.unwrap();
+        assert_eq!(candidate_heads(&runner.state.candidates).await, heads);
+
+        runner.state.prep_complete = Some(false);
+        runner.state.config.worktree.setup = vec![crate::config::SetupStep {
+            run: Some(format!(
+                "test -f '{}'",
+                tmp.path().join("dependency-ready").display()
+            )),
+            ..Default::default()
+        }];
+        assert!(runner.prep().await.is_err());
+        assert!(runner.state.prep_failure.is_some());
+        std::fs::write(tmp.path().join("dependency-ready"), "available").unwrap();
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        assert!(
+            runner.prep().await.is_err(),
+            "correcting the cause alone must not auto-retry"
+        );
+        let failed_at = runner.state.events.last().unwrap().at;
+        assert!(
+            runner.retry_preparation(failed_at).is_err(),
+            "old approvals cannot unlock the hold"
+        );
+        let mut task = crate::queue::Task::new(
+            "retry".into(),
+            "retry setup".into(),
+            repo.clone(),
+            crate::queue::Source::Human,
+        );
+        task.start(runner.state.id.clone());
+        task.hold_machine(Some("setup failed".into()));
+        task.release_operator("cli", None);
+        runner
+            .retry_preparation(task.resumption.as_ref().unwrap().at)
+            .unwrap();
+        runner.prep().await.unwrap();
+        assert!(runner.state.prep_failure.is_none());
+        assert_eq!(runner.state.prep_complete, Some(true));
+        assert_eq!(runner.state.candidates.len(), 2);
+        assert!(runner.state.worktree_root().join("judge-1").exists());
+        for candidate in &runner.state.candidates {
+            assert_eq!(
+                git::tree_of(&candidate.worktree, "HEAD").await.unwrap(),
+                git::tree_of(&repo, &seed).await.unwrap()
+            );
+        }
+    }
+
+    async fn candidate_heads(candidates: &[Candidate]) -> Vec<String> {
+        let mut heads = Vec::new();
+        for candidate in candidates {
+            heads.push(git::rev_parse(&candidate.worktree, "HEAD").await.unwrap());
+        }
+        heads
+    }
+
     fn init_repo(dir: &Path) {
         let run = |args: &[&str]| {
             let out = std::process::Command::new("git")

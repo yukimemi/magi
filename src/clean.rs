@@ -211,6 +211,9 @@ pub async fn fold_due(
         .collect();
     ids.sort_unstable();
     for id in ids {
+        if crate::pr_recovery::sources_retained(home, &id) {
+            continue;
+        }
         if crate::daemon::is_working_on(home, &id, now) {
             continue;
         }
@@ -2134,6 +2137,84 @@ mod tests {
         )
         .unwrap();
         (id.to_owned(), winner_wt)
+    }
+
+    #[tokio::test]
+    async fn recovery_retains_historical_sources_after_success_and_automatic_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let runs = home.join("runs");
+        let wt = home.join("wt");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let mut task = crate::queue::Task::new(
+            "recover".into(),
+            "keep measured behavior".into(),
+            repo.clone(),
+            crate::queue::Source::Human,
+        );
+        let mut sources = Vec::new();
+        for (id, status) in [
+            ("20260801-000000-old1", RunStatus::Blocked),
+            ("20260801-000000-old2", RunStatus::Stalled),
+        ] {
+            let (id, worktree) = due_run_with_winner_worktree(&runs, &wt, &repo, id, status).await;
+            let mut state = RunState::load_under(&id, home).unwrap();
+            state.driver_exited = true;
+            state.save_under(home).unwrap();
+            task.link_run(&id);
+            sources.push((id, worktree));
+        }
+        crate::pr_recovery::retain_sources(&task, home).unwrap();
+        let mut recovered = RunState::new(
+            repo.clone(),
+            "main".into(),
+            "base".into(),
+            task.instruction.clone(),
+            crate::config::Config::default(),
+        );
+        recovered.config.graph.worktree_root = Some(wt.clone());
+        recovered.status = RunStatus::Ready;
+        recovered.driver_exited = true;
+        recovered.save_under(home).unwrap();
+        task.start(recovered.id.clone());
+        task.succeed();
+        crate::daemon::supersede_prior_runs(&task, home);
+        for (id, _) in &sources {
+            assert_eq!(
+                RunState::load_under(id, home).unwrap().status,
+                RunStatus::Superseded
+            );
+        }
+        let disk = Disk::default();
+        let now = Timestamp::now()
+            .checked_add(SignedDuration::from_secs(
+                i64::try_from(disk.fold_grace_secs + 1).unwrap(),
+            ))
+            .unwrap();
+        let (_, unreadable) = fold_due(&runs, home, &wt, &disk, now).await.unwrap();
+        assert_eq!(unreadable, 0);
+        for (id, worktree) in sources {
+            assert!(worktree.exists());
+            assert!(
+                crate::git::branch_exists(&repo, &format!("magi/{id}/A"))
+                    .await
+                    .unwrap()
+            );
+            let mut historical = RunState::load_under(&id, home).unwrap();
+            assert!(!historical.candidates[0].folded);
+            assert!(
+                crate::graph::fold_run(&mut historical, true, home)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                worktree.exists(),
+                "every automatic fold entry preserves retained sources"
+            );
+        }
     }
 
     #[tokio::test]

@@ -5241,26 +5241,18 @@ fn distinct_runs(runs: &[String]) -> usize {
     seen.len()
 }
 
-/// Describe every entry of `task.runs`, in order, reading each run's record
-/// through `read`.
+/// Describe recorded task passes, retaining unrecorded legacy list entries.
 fn task_history(task: &Task, read: impl Fn(&str) -> Option<RunState>) -> Vec<TaskRunView> {
-    let mut history = Vec::with_capacity(task.runs.len());
-    let mut seen: Vec<&str> = Vec::new();
-    let mut prior: Option<(&str, RunStatus)> = None;
-    for (i, run_id) in task.runs.iter().enumerate() {
-        let state = read(run_id);
-        let k = seen.iter().filter(|r| **r == run_id.as_str()).count();
-        let resumed = k > 0;
+    let mut slots = Vec::new();
+    let mut seen = Vec::new();
+    for run_id in &task.runs {
+        if seen.contains(&run_id) {
+            continue;
+        }
         seen.push(run_id);
-        let total = task.runs.iter().filter(|r| *r == run_id).count();
-        // The run keeps one record per pass from the build that added them
-        // on; earlier entries of the list have none and stay unknown. Only
-        // passes the task counted are entries (a web-button resume is a pass
-        // with no entry), so align those from the end of the list, and give
-        // up when the run claims more of them than the task lists.
-        let pass = state.as_ref().and_then(|s| {
-            let mine: Vec<&crate::run::RunPass> = s
-                .passes
+        let state = read(run_id);
+        let mine: Vec<_> = state.as_ref().map_or_else(Vec::new, |s| {
+            s.passes
                 .iter()
                 .filter(|p| {
                     p.task_entry
@@ -5269,14 +5261,54 @@ fn task_history(task: &Task, read: impl Fn(&str) -> Option<RunState>) -> Vec<Tas
                             .iter()
                             .any(|t| t.run == *run_id && t.pass_index == p.index)
                 })
-                .collect();
-            let offset = total.checked_sub(mine.len())?;
-            mine.get(k.checked_sub(offset)?).copied()
+                .cloned()
+                .collect()
         });
+        let legacy_count = task.runs.iter().filter(|r| *r == run_id).count();
+        let total = legacy_count.max(mine.len());
+        let offset = total - mine.len();
+        for k in 0..total {
+            // Legacy repeated entries retain their original positions. When
+            // ids are unique, recorded pass times recover the resume order.
+            let position = task
+                .runs
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| *r == run_id)
+                .nth(k.min(legacy_count - 1))
+                .unwrap()
+                .0;
+            slots.push((
+                run_id,
+                state.clone(),
+                k.checked_sub(offset).and_then(|i| mine.get(i)).cloned(),
+                position,
+            ));
+        }
+    }
+    if distinct_runs(&task.runs) == task.runs.len() && slots.len() > task.runs.len() {
+        slots.sort_by_key(|(_, state, pass, _)| {
+            pass.as_ref()
+                .map(|p| p.started_at)
+                .or_else(|| state.as_ref().map(|s| s.created_at))
+                .map_or((true, task.created_at), |at| (false, at))
+        });
+    } else {
+        slots.sort_by_key(|(_, _, _, position)| *position);
+    }
+    let mut history = Vec::with_capacity(slots.len());
+    let mut seen: Vec<&str> = Vec::new();
+    let mut prior: Option<(&str, RunStatus)> = None;
+    for (i, (run_id, state, pass, _)) in slots.iter().enumerate() {
+        let k = seen.iter().filter(|r| **r == run_id.as_str()).count();
+        let resumed = k > 0;
+        seen.push(run_id);
+        let total = slots.iter().filter(|(id, _, _, _)| id == run_id).count();
+        let pass = pass.as_ref();
         let settled = pass.and_then(|p| {
             task.passes
                 .iter()
-                .find(|t| t.run == *run_id && t.pass_index == p.index)
+                .find(|t| t.run == **run_id && t.pass_index == p.index)
         });
         history.push(task_run_view(
             run_id,
@@ -5284,12 +5316,12 @@ fn task_history(task: &Task, read: impl Fn(&str) -> Option<RunState>) -> Vec<Tas
             RunSlot {
                 n: i + 1,
                 resumed,
-                resumed_later: task.runs[i + 1..]
+                resumed_later: slots[i + 1..]
                     .iter()
-                    .position(|r| r == run_id)
+                    .position(|(id, _, _, _)| id == run_id)
                     .map(|off| i + off + 2),
                 prior,
-                last: i + 1 == task.runs.len(),
+                last: i + 1 == slots.len(),
                 pass,
                 settled,
                 pass_n: k + 1,
@@ -12047,6 +12079,8 @@ mod tests {
         task.start(a.to_owned());
         task.start(b.to_owned());
         task.start(gone.to_owned());
+        // This fixture models an older queue file with repeated run entries.
+        task.runs = [a, a, b, gone].map(str::to_owned).to_vec();
         f.queue().put(&mut task).expect("file the task");
 
         let res = f.get(&format!("/api/queue/{}", task.id)).await;
@@ -12120,6 +12154,8 @@ mod tests {
         for r in runs {
             t.start((*r).to_owned());
         }
+        // Synthetic flows without RunPass records model legacy queue data.
+        t.runs = runs.iter().map(|r| (*r).to_owned()).collect();
         t
     }
 
@@ -12645,6 +12681,52 @@ mod tests {
             f.edges[1].label
         );
         assert_eq!(f.nodes[1].note, Some("parked"));
+    }
+
+    #[test]
+    fn distinct_run_ids_render_all_recorded_passes_in_time_order() {
+        let mut a = flow_run(RunStatus::Implementing, |s| {
+            s.passes = vec![
+                recorded_pass(0, parked(upgrade_cause())),
+                recorded_pass(1, None),
+            ];
+        });
+        let mut b = flow_run(RunStatus::Failed, |s| {
+            s.passes = vec![recorded_pass(0, None)];
+        });
+        a.passes[0].started_at = "2026-10-10T00:00:00Z".parse().unwrap();
+        b.passes[0].started_at = "2026-10-10T01:00:00Z".parse().unwrap();
+        a.passes[1].started_at = "2026-10-10T02:00:00Z".parse().unwrap();
+        let mut task = flow_task(&[]);
+        task.start("a".into());
+        task.start("b".into());
+        task.start("a".into());
+        assert_eq!(task.runs, ["b", "a"]);
+        task.passes = vec![settled_pass("a", 0, crate::queue::PassCost::Refunded)];
+        let h = task_history(&task, |id| {
+            Some(if id == "a" { a.clone() } else { b.clone() })
+        });
+        assert_eq!(
+            h.iter().map(|v| v.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "a"]
+        );
+        assert_eq!(h[0].attempt, AttemptCost::Refunded);
+        assert!(h[0].outcome.contains("upgrade"));
+        assert_eq!(h[2].kind, "resume");
+        assert!(h[2].pass.is_some());
+        // The old repeated-id format must show the same recorded passes.
+        task.runs = vec!["a".into(), "b".into(), "a".into()];
+        let old = task_history(&task, |id| {
+            Some(if id == "a" { a.clone() } else { b.clone() })
+        });
+        assert_eq!(
+            old.iter()
+                .map(|v| (&v.id, &v.kind, v.attempt))
+                .collect::<Vec<_>>(),
+            h.iter()
+                .map(|v| (&v.id, &v.kind, v.attempt))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

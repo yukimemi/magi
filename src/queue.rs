@@ -312,7 +312,8 @@ pub struct Task {
     /// Total attempt budget; `None` inherits the daemon limit.
     #[serde(default)]
     pub attempt_limit: Option<NonZeroUsize>,
-    /// Runs this task has produced, oldest first.
+    /// Distinct runs, ordered by their most recent claim. Older records may
+    /// contain repeated ids; execution history lives in the run pass records.
     #[serde(default)]
     pub runs: Vec<String>,
     /// Why the last attempt did not land.
@@ -436,6 +437,9 @@ pub struct Task {
     /// Authored criteria when the retained recovery review was selected.
     #[serde(default)]
     pub review_instruction: Option<String>,
+    /// Explicit public implementation selected by the operator; never inferred from prose.
+    #[serde(default)]
+    pub pr_recovery: Option<crate::pr_recovery::Selection>,
     /// A release deliberately starts a new competition instead of resuming
     /// the prior run. History remains as evidence in `runs`.
     #[serde(default)]
@@ -703,7 +707,8 @@ pub struct Resumption {
     pub instruction: String,
     /// Number of historical answers superseded as waiting premises.
     pub answers_through: usize,
-    /// Number of runs already present when approval was applied.
+    /// Legacy run-list boundary retained for record compatibility. Evidence
+    /// uses approval time and run passes because resumes retain the same id.
     pub runs_through: usize,
     /// Previous hold or dependency reason cleared by this release.
     pub cleared_reason: Option<String>,
@@ -785,6 +790,7 @@ impl Task {
             operator_decided_at: None,
             review_branch: None,
             review_instruction: None,
+            pr_recovery: None,
             fresh_start: false,
             interrupt: false,
             urgent: false,
@@ -891,6 +897,8 @@ impl Task {
     }
 
     /// Record that a run has started for this task.
+    /// Move an already linked run to the end so it remains the current attempt,
+    /// with one history entry per run and separate pass records for each resume.
     ///
     /// Clears [`Task::interrupt`]: a mark to run ahead of whatever else is
     /// in flight is fulfilled the moment this task actually gets its turn,
@@ -904,6 +912,7 @@ impl Task {
         self.stamp_schema();
         self.status = TaskStatus::Running;
         self.attempts += 1;
+        self.runs.retain(|id| id != &run);
         self.runs.push(run);
         self.last_error = None;
         self.park_reason = None;
@@ -4514,6 +4523,40 @@ mod tests {
         let paths = q.attachment_paths(&t);
         assert!(paths[0].is_absolute(), "{}", paths[0].display());
         assert!(paths[0].ends_with(format!("{}.attachments/shot.png", t.id)));
+    }
+
+    #[test]
+    fn explicitly_resumed_older_run_becomes_current_without_duplicate_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut t = task("resume");
+        t.start("A".into());
+        t.record_pass("A", 0, 1, None);
+        t.start("B".into());
+        q.put(&mut t).unwrap();
+        assert_eq!(t.runs, vec!["A", "B"]);
+        t.start("A".into());
+        t.record_pass("A", 1, 3, None);
+        q.put(&mut t).unwrap();
+        let saved = q.get(&t.id).unwrap();
+        assert_eq!(saved.runs, vec!["B", "A"]);
+        assert_eq!(saved.runs.last().map(String::as_str), Some("A"));
+        assert_eq!(saved.attempts, 3);
+        assert_eq!(saved.passes.len(), 2);
+        assert_eq!(saved.passes[0].run, "A");
+        assert_eq!(saved.passes[1].run, "A");
+    }
+
+    #[test]
+    fn repeated_start_records_one_run_and_separate_passes() {
+        let mut t = task("resume");
+        t.start("same-run".into());
+        t.record_pass("same-run", 0, 1, None);
+        t.start("same-run".into());
+        t.record_pass("same-run", 1, 2, None);
+        assert_eq!(t.runs, vec!["same-run"]);
+        assert_eq!(t.attempts, 2);
+        assert_eq!(t.passes.len(), 2);
     }
 
     #[test]

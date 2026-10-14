@@ -208,6 +208,24 @@ starts meanwhile cannot take it. `--merge`, `-c`, `-j`, `--review-rounds`,
 `--seed` and `--config` ride on the task, so they hold either way. A run that
 fails standalone leaves its task `held` (`magi task release` retries it).
 
+To recover an existing task PR from an implementation the operator has chosen,
+use `magi task recover-pr <task-id> --pr <PR-URL> --head <full-public-SHA>`.
+This queues a single review candidate from the fetched public commit with its
+complete ancestry, preserving the task's instructions. The selection overrides
+historical review branches, resume pins and references extracted from prose.
+The PR must be the unique open PR for `magi/task-<task-id>` in the task's
+repository, targeting the configured base. Active or unknown previous
+publishers prevent takeover; historical source branches and worktrees remain.
+
+Recovery synchronizes through the ordinary current-base path and still needs
+verification, review and owner merge approval. Publication checks ownership
+again and leases the public update to the approved head (or this run's last
+successful push). A moved head requires a new explicit selection. Startup and
+candidate preparation failures leave one actionable hold rather than automatic
+new competitions; correct the cause before releasing or selecting a source
+again. Partially created recoveries are recorded in run history for inspection.
+
+
 `magi run` starts spending money, so an instruction whose first word names a
 subcommand is refused as a probable typo: there is no `magi run show`, and
 without the guard `magi run show 3cbf` opens worktrees and pays agents to

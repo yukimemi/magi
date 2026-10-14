@@ -715,6 +715,14 @@ enum TaskCmd {
         /// Task id or unambiguous prefix/suffix.
         id: String,
     },
+    /// Recover an existing task PR from its explicitly approved public commit.
+    RecoverPr {
+        id: String,
+        #[arg(long)]
+        pr: String,
+        #[arg(long)]
+        head: String,
+    },
     /// Change a queued or held task's implementers (1 = Solo; old work may restart).
     Implementers {
         /// Task id or unambiguous prefix/suffix.
@@ -3166,6 +3174,60 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             Ok(())
         }
 
+        TaskCmd::RecoverPr { id, pr, head } => {
+            let resolved = q.resolve_id(&id)?;
+            let _claim = q
+                .claim(&resolved)
+                .context("task is claimed by a running daemon")?;
+            let mut t = q.get(&resolved)?;
+            anyhow::ensure!(
+                t.status != TaskStatus::Running,
+                "park the running task before selecting a public head"
+            );
+            let selected = magi::pr_recovery::Selection {
+                url: pr,
+                branch: format!("magi/task-{}", t.id),
+                head,
+                instruction: t.instruction.clone(),
+                approved_at: jiff::Timestamp::now(),
+            };
+            selected.check_task(&t.id, &t.instruction)?;
+            let explicit = t.overrides.as_ref().and_then(|o| o.config.as_deref());
+            let (mut config, _) = Config::discover_fetched(&t.repo, explicit).await?;
+            if let Some(overrides) = &t.overrides {
+                overrides.apply(&mut config);
+            }
+            let base = magi::git::merge_base_branch(
+                &t.repo,
+                &config.merge.remote,
+                config.merge.base.as_deref(),
+            )
+            .await?;
+            selected
+                .verify(&t.repo, &config.merge.remote, &base, &selected.head)
+                .await?;
+            refuse_duplicates(
+                &q,
+                &magi::run::home().join("runs"),
+                &t.repo,
+                &t.instruction,
+                Some(&selected.branch),
+                Some(&t.id),
+                Some(&config),
+            )
+            .await?;
+            magi::pr_recovery::retain_sources(&t, &magi::run::home())?;
+            t.release_operator("cli-recover-pr", None);
+            t.pr_recovery = Some(selected);
+            t.review_branch = None;
+            t.review_instruction = None;
+            t.resume_override = None;
+            t.fresh_start = true;
+            q.put(&mut t)?;
+            println!("queued selected public head for {}", t.short());
+            Ok(())
+        }
+
         TaskCmd::Triage { config } => {
             let questions = ask::Questions::open();
             let report =
@@ -3879,6 +3941,9 @@ async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
         task.short(),
         task.short()
     );
+    if runner.state.prep_failure.is_some() && claim.is_some() {
+        runner.retry_preparation(jiff::Timestamp::now())?;
+    }
     if claim.is_none() {
         // The loop resumes it: an attempt at a task whose newest run is
         // unfinished resumes that run (`Runner::resume`), never competes again.
@@ -4938,6 +5003,29 @@ mod tests {
                 "{allowed} must still be able to ask"
             );
         }
+    }
+
+    #[test]
+    fn selected_pr_recovery_cli_requires_explicit_url_and_head() {
+        let parsed = Cli::try_parse_from([
+            "magi",
+            "task",
+            "recover-pr",
+            "t",
+            "--pr",
+            "https://example.test/team/project/pull/1",
+            "--head",
+            "aabb",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Task {
+                command: TaskCmd::RecoverPr { .. }
+            })
+        ));
+        assert!(Cli::try_parse_from(["magi", "task", "recover-pr", "t", "--pr", "url"]).is_err());
+        assert!(Cli::try_parse_from(["magi", "task", "recover-pr", "t", "--head", "sha"]).is_err());
     }
 
     #[test]

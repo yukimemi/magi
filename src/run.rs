@@ -294,9 +294,9 @@ pub struct RunPass {
     /// `None` while open (or still driving).
     #[serde(default)]
     pub end: Option<PassEnd>,
-    /// The pass was one the task loop (or `magi run`) counted as an entry of
-    /// `Task::runs`. A resume from the web button or `magi run --resume`
-    /// without a task is a pass too, but no entry of the task's list.
+    /// The task loop (or `magi run` for a task) counted this pass as a task
+    /// attempt. Resumes keep one distinct id in `Task::runs`, while each
+    /// counted pass belongs in task history. A resume without a task does not.
     #[serde(default)]
     pub task_entry: bool,
 }
@@ -2020,6 +2020,9 @@ pub struct RunState {
     /// Public pull request head, separate from competition branches.
     #[serde(default)]
     pub pr_head: Option<String>,
+    /// Operator-selected source and original public lease, distinct from repaired HEAD.
+    #[serde(default)]
+    pub pr_recovery: Option<crate::pr_recovery::Selection>,
     /// Last head successfully pushed by this run; never an observed remote tip.
     #[serde(default)]
     pub pr_pushed_head: Option<String>,
@@ -2221,6 +2224,12 @@ pub struct RunState {
     /// candidates; `base_commit` stays the comparison point.
     #[serde(default)]
     pub seeds: Vec<crate::refs::Seed>,
+    /// Candidate preparation stopped before agents ran; requires an explicit source correction.
+    #[serde(default)]
+    pub prep_failure: Option<String>,
+    /// None identifies legacy records; new runs persist preparation completion explicitly.
+    #[serde(default)]
+    pub prep_complete: Option<bool>,
     /// Per-seat conversation state.
     #[serde(default)]
     pub seats: BTreeMap<String, SeatState>,
@@ -2404,6 +2413,7 @@ impl RunState {
             config,
             enabled_worktree_config: false,
             pr_head: None,
+            pr_recovery: None,
             pr_pushed_head: None,
             pr_posted_title: None,
             pr_publication_pending: false,
@@ -2446,6 +2456,8 @@ impl RunState {
             released_to: None,
             released_branches: Vec::new(),
             seeds: Vec::new(),
+            prep_failure: None,
+            prep_complete: Some(false),
             seats: BTreeMap::new(),
             active: BTreeMap::new(),
             driver_pid: None,
