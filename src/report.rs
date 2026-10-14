@@ -1102,6 +1102,12 @@ pub fn run(state: &RunState) -> String {
         }
     }
 
+    if !state.bump_decision_attempts.is_empty() {
+        let _ = writeln!(s, "\n{}", bold("release decision attempts"));
+        for (n, attempt) in state.bump_decision_attempts.iter().enumerate() {
+            let _ = writeln!(s, "  {}. {}: {}", n + 1, attempt.agent, attempt.outcome);
+        }
+    }
     if let Some(b) = &state.release_bump {
         let _ = writeln!(s, "\n{}", bold("release bump"));
         if let Some(v) = &b.version {

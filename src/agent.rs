@@ -1259,8 +1259,8 @@ fn tail_chars(s: &str, max: usize) -> String {
 
 /// Recognise claude's rate-limit error shape, when it is present.
 ///
-/// The only output we have observed is the JSON object carrying `is_error:
-/// true` and a `result` mentioning the session limit. We key on exactly that;
+/// Recognises `is_error: true` with a session-limit result or the structured
+/// pair `api_error_status: 429`, `api_error: usage_limit_reached`;
 /// every other CLI (and any future shape) returns `None` and is treated as an
 /// ordinary failure — the conservative side.
 fn claude_quota(v: &serde_json::Value) -> Option<Quota> {
@@ -1269,7 +1269,12 @@ fn claude_quota(v: &serde_json::Value) -> Option<Quota> {
         return None;
     }
     let result = v.get("result").and_then(|r| r.as_str()).unwrap_or("");
-    if !result.to_lowercase().contains("session limit") {
+    let usage_limit = v
+        .get("api_error_status")
+        .and_then(serde_json::Value::as_u64)
+        == Some(429)
+        && v.get("api_error").and_then(serde_json::Value::as_str) == Some("usage_limit_reached");
+    if !usage_limit && !result.to_lowercase().contains("session limit") {
         return None;
     }
     // "…session limit · resets 4:50am (Asia/Tokyo)". The timezone read is not
@@ -1423,8 +1428,8 @@ pub fn installed(spec: &AgentSpec) -> bool {
 }
 
 /// Choose the agent for a seat that stands alone rather than rotating through
-/// the roster: [`crate::talk`]'s standing conversation, [`crate::bump`]'s
-/// release-bump decision, or anything else that needs one agent picked once
+/// the roster: [`crate::talk`]'s standing conversation,
+/// or anything else that needs one agent picked once
 /// rather than a panel filled in.
 ///
 /// `available` is a parameter rather than a call to [`installed`] so the order
@@ -2244,6 +2249,28 @@ mod tests {
         );
         let quota = out.quota.expect("rate limit detected without a reset");
         assert!(quota.reset.is_none(), "unknown reset is kept as unknown");
+    }
+
+    #[test]
+    fn claude_structured_usage_limit_requires_the_error_and_exact_pair() {
+        for kind in [AgentKind::Claude, AgentKind::Command] {
+            assert!(
+                extract(
+                    kind,
+                    r#"{"is_error":true,"api_error_status":429,"api_error":"usage_limit_reached"}"#
+                )
+                .quota
+                .is_some()
+            );
+            for reply in [
+                r#"{"is_error":false,"api_error_status":429,"api_error":"usage_limit_reached"}"#,
+                r#"{"is_error":true,"api_error_status":500,"api_error":"usage_limit_reached"}"#,
+                r#"{"is_error":true,"api_error_status":429,"api_error":"other_error"}"#,
+                r#"{"is_error":true,"api_error":"usage_limit_reached"}"#,
+            ] {
+                assert!(extract(kind, reply).quota.is_none(), "{reply}");
+            }
+        }
     }
 
     #[test]
