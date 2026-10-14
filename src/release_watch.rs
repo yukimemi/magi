@@ -1155,6 +1155,10 @@ impl Watcher {
         for mut t in q.list() {
             if t.runs.contains(&run) {
                 if t.status != crate::queue::TaskStatus::Held {
+                    t.set_hold_notice_cause(serde_json::json!({
+                        "kind": "release", "head": st.head, "url": st.url,
+                        "step": st.job.as_ref().map(|j| (&j.version, &j.commit, j.done, &j.running)),
+                    }).to_string());
                     t.hold_machine(Some(format!("{HOLD_PREFIX}{reason}")));
                     match q.put(&mut t) {
                         Ok(()) => st.held_task = Some(t.id.clone()),

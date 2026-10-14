@@ -677,6 +677,10 @@ fn quarantine_orphaned_blocked(queue: &Queue, questions: &Questions) -> Vec<Stri
             continue;
         }
         let language = crate::lang::of_repo(&repo_for(&task));
+        let mut ids = missing.clone();
+        ids.sort();
+        ids.dedup();
+        task.set_hold_notice_cause(format!("missing:{}", ids.join(",")));
         task.hold_machine(Some(crate::queue::missing_blocker_hold_reason_in(
             &task.blocked_by,
             &missing,

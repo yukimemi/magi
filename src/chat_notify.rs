@@ -116,11 +116,17 @@ fn deliver(
         .unwrap_or_default();
     let text = notice_text(task, &facts);
     let prefix = format!("{}:", task.id);
+    let legacy = task
+        .chat_notice_legacy
+        .as_ref()
+        .filter(|(_, cause)| cause == key)
+        .map(|(old, _)| format!("{prefix}{old}"));
     let previous = |stored: &str| {
-        key == "done"
-            && stored
-                .strip_prefix(&prefix)
-                .is_some_and(crate::queue::is_done_notice_key)
+        legacy.as_deref() == Some(stored)
+            || (key == "done"
+                && stored
+                    .strip_prefix(&prefix)
+                    .is_some_and(crate::queue::is_done_notice_key))
     };
     match talk::queue_once_matching(
         &mut talk,
@@ -158,6 +164,9 @@ pub fn sweep(queue: &Queue, talks: &Talks, home: &Path) -> Vec<String> {
                 Ok((outcome, added)) => {
                     if added {
                         posted.push(talk_id);
+                    }
+                    if !t.chat_notices.contains(&key) {
+                        t.chat_notices.push(key.clone());
                     }
                     t.chat_notice = Some(ChatNotice {
                         key,

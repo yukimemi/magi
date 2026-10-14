@@ -702,3 +702,323 @@ async fn watch_signal_exit_and_quoted_notice_markers_remain_automatic_data() {
     assert!(!report.contains(magi::prompt::CHAT_CONSULT_HEADING));
     assert!(magi::prompt::is_completion_notice(&report));
 }
+
+fn held_chat_task(w: &World) -> Task {
+    let mut task = Task::new(
+        "recover measured work".into(),
+        "keep the existing branch".into(),
+        w.tmp.path().to_owned(),
+        Source::Agent {
+            run: w.talk_id.clone(),
+            node: CHAT_NODE.into(),
+        },
+    );
+    task.start("run-conflict".into());
+    task.fail("cannot apply referenced commit", 1);
+    task.record_answer(
+        "question-recovery".into(),
+        "keep held while considering recovery".into(),
+    );
+    task.hold_machine(Some("the operator will consider recovery".into()));
+    w.queue.put(&mut task).expect("held task");
+    task
+}
+
+/// Mock the scheduler consuming the automatic turn, retaining its durable keys.
+fn consume_automatic_turns(w: &World) -> usize {
+    let ready = chat_notify::talks_to_start(&w.talks);
+    for id in &ready {
+        let mut talk = w.talks.get(id).expect("talk");
+        talk::clear_pending(&mut talk, &w.talks).expect("consume notice");
+    }
+    ready.len()
+}
+
+#[tokio::test]
+async fn unresolved_recovery_reports_once_across_paraphrases_cycles_and_restart() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let task = held_chat_task(&w);
+    let mut turns = 0;
+    let mut drafts_added = 0;
+    for i in 0..8 {
+        if i > 0 {
+            w.queue
+                .modify(&task.id, |t| {
+                    if i % 2 == 0 {
+                        t.requeue();
+                    }
+                    t.hold_machine(Some(format!("recovery is still under consideration ({i})")));
+                    true
+                })
+                .expect("reaffirm");
+        }
+        let queue = Queue::at(w.tmp.path().join("queue"));
+        let talks = Talks::at(w.tmp.path().join("talks"));
+        drafts_added += chat_notify::sweep(&queue, &talks, w.tmp.path()).len();
+        turns += consume_automatic_turns(&w);
+    }
+    assert_eq!(drafts_added, 1);
+    assert_eq!(turns, 1, "no additional automatic chat requests");
+    w.queue
+        .modify(&task.id, |t| {
+            t.succeed();
+            true
+        })
+        .expect("done");
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    assert_eq!(
+        consume_automatic_turns(&w),
+        1,
+        "completion still starts a turn"
+    );
+}
+
+#[tokio::test]
+async fn blocked_causes_are_sets_and_a_new_question_still_notifies() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let task = held_chat_task(&w);
+    for (ids, expected) in [
+        (vec!["question-a", "dependency-a"], 1),
+        (vec!["dependency-a", "question-a", "dependency-a"], 0),
+        (vec!["question-b", "dependency-a"], 1),
+        (vec!["question-a", "dependency-a"], 0),
+    ] {
+        w.queue
+            .modify(&task.id, |t| {
+                t.block(
+                    ids.iter().map(|id| (*id).to_owned()).collect(),
+                    Some(format!("regenerated reason: {ids:?}")),
+                );
+                true
+            })
+            .expect("block");
+        assert_eq!(
+            chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+            expected
+        );
+        assert_eq!(consume_automatic_turns(&w), expected);
+    }
+}
+
+#[tokio::test]
+async fn approved_recovery_alone_is_silent_but_a_different_failure_is_reported() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let task = held_chat_task(&w);
+    chat_notify::sweep(&w.queue, &w.talks, w.tmp.path());
+    consume_automatic_turns(&w);
+    w.queue
+        .modify(&task.id, |t| {
+            t.release_operator("question", Some("approval-recovery"));
+            t.hold_machine(Some("reaffirmed without work".into()));
+            true
+        })
+        .expect("approval");
+    assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
+    w.queue
+        .modify(&task.id, |t| {
+            t.start("run-conflict".into());
+            t.fail("gate command failed on the recovered tree", 1);
+            true
+        })
+        .expect("new failure");
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    assert_eq!(consume_automatic_turns(&w), 1);
+}
+
+#[tokio::test]
+async fn concurrent_stale_recovery_writes_keep_the_delivery_ledger_and_new_cause() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let task = held_chat_task(&w);
+    let mut stale = w.queue.get(&task.id).expect("snapshot");
+    chat_notify::sweep(&w.queue, &w.talks, w.tmp.path());
+    consume_automatic_turns(&w);
+    w.queue
+        .modify(&task.id, |t| {
+            t.start("run-new".into());
+            t.fail("new gate failure", 1);
+            true
+        })
+        .expect("fail");
+    let new_cause = w.queue.get(&task.id).expect("current").hold_notice_cause;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    std::thread::scope(|scope| {
+        let barrier2 = barrier.clone();
+        let queue = &w.queue;
+        scope.spawn(move || {
+            barrier2.wait();
+            stale.hold_machine(Some("old recovery paraphrase".into()));
+            queue.put(&mut stale).expect("stale save");
+        });
+        barrier.wait();
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path());
+    });
+    chat_notify::sweep(&w.queue, &w.talks, w.tmp.path());
+    let current = w.queue.get(&task.id).expect("current");
+    assert_eq!(current.hold_notice_cause, new_cause);
+    assert_eq!(current.chat_notices.len(), 2);
+    assert_eq!(consume_automatic_turns(&w), 1);
+    assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
+}
+
+#[tokio::test]
+async fn exact_legacy_hold_is_adopted_without_replay_and_completion_survives() {
+    let _home = common::home_lock().await;
+    for task_recorded in [false, true] {
+        let w = world();
+        let task = held_chat_task(&w);
+        let legacy = format!("held#{}", task.held_at.expect("held time"));
+        let mut talk = w.talks.get(&w.talk_id).expect("talk");
+        talk::queue_once(
+            &mut talk,
+            &w.talks,
+            "legacy notice",
+            &format!("{}:{legacy}", task.id),
+        )
+        .expect("legacy delivery");
+        talk::clear_pending(&mut talk, &w.talks).expect("already consumed");
+        let path = w.tmp.path().join("queue").join(format!("{}.json", task.id));
+        let mut record = serde_json::to_value(&task).expect("serialize");
+        for field in [
+            "hold_notice_cause",
+            "hold_notice_evidence_at",
+            "chat_notices",
+            "conductor_hold_context",
+        ] {
+            record.as_object_mut().expect("object").remove(field);
+        }
+        record["schema"] = 18.into();
+        if task_recorded {
+            record["chat_notice"] =
+                serde_json::json!({"key":legacy,"at":task.updated_at,"outcome":"posted"});
+        }
+        std::fs::write(path, serde_json::to_vec(&record).expect("json")).expect("legacy task");
+        assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
+        assert_eq!(consume_automatic_turns(&w), 0);
+        w.queue
+            .modify(&task.id, |t| {
+                t.requeue();
+                t.attempts += 1;
+                t.fail("cannot apply referenced commit", 2);
+                t.hold_machine(Some("still unresolved".into()));
+                true
+            })
+            .expect("rehold");
+        assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
+        w.queue
+            .modify(&task.id, |t| {
+                t.succeed();
+                true
+            })
+            .expect("done");
+        assert_eq!(
+            chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+            1
+        );
+    }
+}
+
+common::e2e! {
+    async fn repeated_hold_notices_invoke_the_chat_command_only_once() {
+        let _home = common::home_lock().await;
+        let w = world();
+        magi::run::set_home(w.tmp.path().to_owned());
+        let counter = w.tmp.path().join("automatic-turns");
+        let cfg = Config {
+            agents: vec![AgentSpec {
+                id: "mock".into(), kind: AgentKind::Command, model: None,
+                command: vec!["sh".into(), "-c".into(),
+                    "cat >/dev/null; echo turn >> \"$TURN_COUNTER\"; echo notice-response".into()],
+                extra_args: Vec::new(),
+                env: BTreeMap::from([("TURN_COUNTER".into(), counter.to_string_lossy().into_owned())]),
+                prompt_delivery: None,
+            }],
+            ..Config::default()
+        };
+        let task = held_chat_task(&w);
+        for i in 0..5 {
+            if i > 0 {
+                w.queue.modify(&task.id, |t| {
+                    t.requeue();
+                    t.hold_machine(Some(format!("keep held pending recovery decision {i}")));
+                    true
+                }).expect("rehold");
+            }
+            chat_notify::sweep(&w.queue, &w.talks, w.tmp.path());
+            for id in chat_notify::talks_to_start(&w.talks) {
+                let lease = w.talks.claim_turn(&id).expect("claim").expect("lease");
+                magi::consult::drain_turns(&w.talks, &id, lease, &cfg).await.expect("automatic turn");
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&counter).expect("invocations").lines().count(), 1);
+        let talk = w.talks.get(&w.talk_id).expect("talk");
+        assert_eq!(talk.turns.iter().filter(|t| t.who == talk::Who::Agent).count(), 1);
+        assert!(talk.pending.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn interrupted_hold_delivery_repairs_the_ledger_after_the_turn_was_consumed() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let task = held_chat_task(&w);
+    let key = task.chat_notice_due().expect("due");
+    let mut talk = w.talks.get(&w.talk_id).expect("talk");
+    talk::queue_once(
+        &mut talk,
+        &w.talks,
+        "already delivered",
+        &format!("{}:{key}", task.id),
+    )
+    .expect("delivery");
+    talk::clear_pending(&mut talk, &w.talks).expect("consumed");
+    let queue = Queue::at(w.tmp.path().join("queue"));
+    assert!(chat_notify::sweep(&queue, &w.talks, w.tmp.path()).is_empty());
+    assert!(
+        queue
+            .get(&task.id)
+            .expect("repaired")
+            .chat_notices
+            .contains(&key)
+    );
+    assert_eq!(consume_automatic_turns(&w), 0);
+}
+
+#[tokio::test]
+async fn a_legacy_alias_cannot_swallow_a_later_failure_with_the_same_hold_timestamp() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let task = held_chat_task(&w);
+    let legacy = format!("held#{}", task.held_at.expect("time"));
+    let mut talk = w.talks.get(&w.talk_id).expect("talk");
+    talk::queue_once(
+        &mut talk,
+        &w.talks,
+        "old hold",
+        &format!("{}:{legacy}", task.id),
+    )
+    .expect("legacy");
+    talk::clear_pending(&mut talk, &w.talks).expect("consumed");
+    w.queue
+        .modify(&task.id, |t| {
+            t.chat_notice_legacy = Some((legacy, t.chat_notice_key().expect("cause")));
+            t.fail("a different failure on the same held run", 1);
+            true
+        })
+        .expect("new failure");
+    assert_eq!(w.queue.get(&task.id).expect("task").held_at, task.held_at);
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    assert_eq!(consume_automatic_turns(&w), 1);
+}

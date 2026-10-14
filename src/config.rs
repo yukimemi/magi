@@ -44,6 +44,95 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
+/// The operation that failed while discovering configuration, assigned at
+/// the operation boundary rather than inferred from its displayed message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DiscoveryStage {
+    ResolveBase,
+    Fetch,
+    ResolveLayers,
+    Read,
+    Parse,
+    Render,
+    Include,
+    Validate,
+}
+
+/// Concrete discovery evidence. The original error remains the displayed
+/// reason and source; only operation, target and I/O kind identify the cause.
+#[derive(Debug, Serialize, thiserror::Error)]
+#[error("{source}")]
+pub(crate) struct DiscoveryFailure {
+    pub stage: DiscoveryStage,
+    pub targets: Vec<String>,
+    pub io_kind: Option<String>,
+    #[serde(skip)]
+    #[source]
+    source: anyhow::Error,
+}
+
+impl DiscoveryFailure {
+    fn wrap(source: anyhow::Error, stage: DiscoveryStage, targets: Vec<String>) -> anyhow::Error {
+        let io_kind = source
+            .downcast_ref::<std::io::Error>()
+            .map(|e| format!("{:?}", e.kind()))
+            .or_else(|| match source.downcast_ref::<teravars::Error>() {
+                Some(teravars::Error::Io(e)) => Some(format!("{:?}", e.kind())),
+                _ => None,
+            });
+        Self {
+            stage,
+            targets,
+            io_kind,
+            source,
+        }
+        .into()
+    }
+}
+
+/// Cache directories contain a commit and sometimes a temporary extraction
+/// name. Name the original layer instead of making those incidental paths
+/// part of a persistent notification key.
+fn discovery_targets(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| {
+            let logical = path
+                .ancestors()
+                .find_map(|dir| {
+                    let repo = std::fs::read_to_string(dir.join(REPO_MARKER)).ok()?;
+                    let relative = path.strip_prefix(dir).ok()?;
+                    let root = PathBuf::from(repo.trim());
+                    Some(if dir.file_name().is_some_and(|name| name == ".magi") {
+                        root.join(".magi").join(relative)
+                    } else {
+                        root.join(relative)
+                    })
+                })
+                .unwrap_or_else(|| path.clone());
+            logical.to_string_lossy().into_owned()
+        })
+        .collect()
+}
+
+fn discovery_load_error(paths: &[PathBuf], error: anyhow::Error) -> anyhow::Error {
+    let stage = match error.downcast_ref::<teravars::Error>() {
+        Some(teravars::Error::Io(_)) => DiscoveryStage::Read,
+        // teravars also reports TOML parsing as Extract during its vars
+        // and include passes; the enum discriminant is machine evidence.
+        Some(teravars::Error::Toml(_) | teravars::Error::Extract(_)) => DiscoveryStage::Parse,
+        Some(teravars::Error::IncludeCycle { .. } | teravars::Error::IncludeConflict { .. }) => {
+            DiscoveryStage::Include
+        }
+        Some(_) => DiscoveryStage::Render,
+        None if error.downcast_ref::<toml::de::Error>().is_some() => DiscoveryStage::Parse,
+        None if error.downcast_ref::<std::io::Error>().is_some() => DiscoveryStage::Read,
+        None => DiscoveryStage::Validate,
+    };
+    DiscoveryFailure::wrap(error, stage, discovery_targets(paths))
+}
+
 /// Which CLI drives an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -1785,13 +1874,20 @@ impl Config {
         crate::web::request_cost::discovery();
         if let Some(p) = explicit {
             let paths = vec![p.to_path_buf()];
-            return Ok((Self::load_layers(&paths)?, paths));
+            let config = Self::load_layers(&paths).map_err(|e| discovery_load_error(&paths, e))?;
+            return Ok((config, paths));
         }
-        let paths = Self::layers_checked(repo)?;
+        let paths = Self::layers_checked(repo).map_err(|e| {
+            let target = resolve_remote_base(repo)
+                .map(|(remote, base)| format!("{remote}/{base}"))
+                .unwrap_or_else(|_| repo.to_string_lossy().into_owned());
+            DiscoveryFailure::wrap(e, DiscoveryStage::ResolveLayers, vec![target])
+        })?;
         if paths.is_empty() {
             return Ok((Self::autodetected(), paths));
         }
-        Ok((Self::load_layers(&paths)?, paths))
+        let config = Self::load_layers(&paths).map_err(|e| discovery_load_error(&paths, e))?;
+        Ok((config, paths))
     }
 
     /// [`Config::discover`] after `git fetch <remote> <base>`: for every path
@@ -1805,15 +1901,38 @@ impl Config {
             // `<remote>/HEAD`; learn it here (refs/remotes only) so an
             // ordinary start recovers instead of failing in `discover`.
             let (remote, cfg_base) = probe_remote_base(repo);
-            let base = crate::git::merge_base_branch(repo, &remote, cfg_base.as_deref()).await?;
+            let base = crate::git::merge_base_branch(repo, &remote, cfg_base.as_deref())
+                .await
+                .map_err(|e| {
+                    DiscoveryFailure::wrap(
+                        e,
+                        DiscoveryStage::ResolveBase,
+                        vec![format!(
+                            "{remote}/{}",
+                            cfg_base.as_deref().unwrap_or("<default>")
+                        )],
+                    )
+                })?;
             let out = crate::git::fetch(repo, &remote, &base)
                 .await
-                .with_context(|| format!("fetching {remote}/{base} to read magi.toml"))?;
+                .with_context(|| format!("fetching {remote}/{base} to read magi.toml"))
+                .map_err(|e| {
+                    DiscoveryFailure::wrap(
+                        e,
+                        DiscoveryStage::Fetch,
+                        vec![format!("{remote}/{base}")],
+                    )
+                })?;
             if !out.ok() {
-                bail!(
+                let error = anyhow::anyhow!(
                     "cannot read magi.toml: `git fetch {remote} {base}` failed ({});                      refusing to use the local checkout's copy, which may be stale",
                     out.stderr.lines().next().unwrap_or("").trim()
                 );
+                return Err(DiscoveryFailure::wrap(
+                    error,
+                    DiscoveryStage::Fetch,
+                    vec![format!("{remote}/{base}")],
+                ));
             }
             if cfg_base.is_none() {
                 crate::git::ensure_remote_head(repo, &remote, &base).await;
@@ -3906,6 +4025,98 @@ mod tests {
         }
 
         #[test]
+        fn a_fetch_failure_then_approved_parse_failure_posts_distinct_notices() {
+            let (tmp, repo) = fixture("[graph\n", "[graph]\ncandidates = 2\n");
+            let origin = tmp.path().join("o.git");
+            let offline = tmp.path().join("offline.git");
+            std::fs::rename(&origin, &offline).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let fetch_error = rt
+                .block_on(Config::discover_fetched(&repo, None))
+                .unwrap_err();
+            assert_eq!(
+                fetch_error
+                    .downcast_ref::<DiscoveryFailure>()
+                    .unwrap()
+                    .stage,
+                DiscoveryStage::Fetch
+            );
+
+            let talks = crate::talk::Talks::at(tmp.path().join("talks"));
+            let cfg = Config {
+                agents: vec![AgentSpec {
+                    id: "test".into(),
+                    kind: AgentKind::Command,
+                    model: None,
+                    command: vec!["true".into()],
+                    extra_args: Vec::new(),
+                    env: BTreeMap::new(),
+                    prompt_delivery: None,
+                }],
+                ..Config::default()
+            };
+            let talk = crate::talk::begin(&talks, &cfg, repo.clone(), Some("test")).unwrap();
+            let queue = crate::queue::Queue::at(tmp.path().join("queue"));
+            let mut task = crate::queue::Task::new(
+                "load configuration".into(),
+                "load configuration".into(),
+                repo.clone(),
+                crate::queue::Source::Agent {
+                    run: talk.id.clone(),
+                    node: crate::queue::CHAT_NODE.into(),
+                },
+            );
+            task.set_hold_notice_cause(crate::daemon::config_notice_cause(&task, &fetch_error));
+            task.hold_machine(Some(format!("{fetch_error:#}")));
+            queue.put(&mut task).unwrap();
+            assert_eq!(
+                crate::chat_notify::sweep(&queue, &talks, tmp.path()),
+                vec![talk.id.clone()]
+            );
+            let fetch_key = task.chat_notice_key();
+            let mut current_talk = talks.get(&talk.id).unwrap();
+            crate::talk::clear_pending(&mut current_talk, &talks).unwrap();
+
+            std::fs::rename(&offline, &origin).unwrap();
+            task = queue.get(&task.id).unwrap();
+            task.release_operator("question", Some("approve-config-recovery"));
+            let parse_error = rt
+                .block_on(Config::discover_fetched(&repo, None))
+                .unwrap_err();
+            let evidence = parse_error.downcast_ref::<DiscoveryFailure>().unwrap();
+            assert_eq!(evidence.stage, DiscoveryStage::Parse);
+            assert_eq!(
+                evidence.targets,
+                vec![repo.join("magi.toml").to_string_lossy().into_owned()]
+            );
+            task.set_hold_notice_cause(crate::daemon::config_notice_cause(&task, &parse_error));
+            task.hold_machine(Some(format!("{parse_error:#}")));
+            assert_ne!(task.chat_notice_key(), fetch_key);
+            queue.put(&mut task).unwrap();
+            assert_eq!(
+                crate::chat_notify::sweep(&queue, &talks, tmp.path()),
+                vec![talk.id.clone()]
+            );
+            current_talk = talks.get(&talk.id).unwrap();
+            crate::talk::clear_pending(&mut current_talk, &talks).unwrap();
+
+            let queue = crate::queue::Queue::at(tmp.path().join("queue"));
+            task = queue.get(&task.id).unwrap();
+            task.requeue();
+            let same_error = rt
+                .block_on(Config::discover_fetched(&repo, None))
+                .unwrap_err();
+            task.set_hold_notice_cause(crate::daemon::config_notice_cause(&task, &same_error));
+            task.hold_machine(Some("configuration is still malformed".into()));
+            queue.put(&mut task).unwrap();
+            assert!(crate::chat_notify::sweep(&queue, &talks, tmp.path()).is_empty());
+            assert!(crate::chat_notify::talks_to_start(&talks).is_empty());
+        }
+
+        #[test]
         fn discover_fetched_survives_a_fetch_that_leaves_no_origin_head() {
             // Never-fetched remote + followRemoteHEAD=never: fetch creates
             // origin/trunk but not origin/HEAD, which discovery then re-reads.
@@ -3931,6 +4142,49 @@ mod tests {
             let (cfg, _) = Config::discover(dir.path(), None).unwrap();
             assert_eq!(cfg.graph.implementers, 4);
         }
+    }
+
+    #[test]
+    fn discovery_errors_distinguish_read_parse_render_and_validation_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("magi.toml");
+        let read = Config::discover(tmp.path(), Some(&path)).unwrap_err();
+        assert_eq!(
+            read.downcast_ref::<DiscoveryFailure>().unwrap().stage,
+            DiscoveryStage::Read
+        );
+        for (body, stage) in [
+            ("[graph\n", DiscoveryStage::Parse),
+            (
+                "[graph]\nimplementers = {{ vars.missing }}\n",
+                DiscoveryStage::Render,
+            ),
+            (
+                "[worktree]\nsetup = [{ run = \"true\", optional = true }]\n",
+                DiscoveryStage::Validate,
+            ),
+        ] {
+            std::fs::write(&path, body).unwrap();
+            let error = Config::discover(tmp.path(), Some(&path)).unwrap_err();
+            let failure = error.downcast_ref::<DiscoveryFailure>().unwrap();
+            assert_eq!(failure.stage, stage, "{error:#}");
+            assert_eq!(failure.targets, vec![path.to_string_lossy().into_owned()]);
+        }
+        std::fs::write(&path, "[graph\n").unwrap();
+        let other = tmp.path().join("other.toml");
+        std::fs::write(&other, "[graph\n").unwrap();
+        let first = Config::discover(tmp.path(), Some(&path)).unwrap_err();
+        let second = Config::discover(tmp.path(), Some(&other)).unwrap_err();
+        let task = crate::queue::Task::new(
+            "load".into(),
+            "load".into(),
+            tmp.path().into(),
+            crate::queue::Source::Human,
+        );
+        assert_ne!(
+            crate::daemon::config_notice_cause(&task, &first),
+            crate::daemon::config_notice_cause(&task, &second)
+        );
     }
 
     #[test]
