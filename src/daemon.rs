@@ -6403,6 +6403,7 @@ mod tests {
         state
     }
 
+    #[cfg(unix)]
     fn notification_scene(root: &Path, repo: PathBuf) -> (Config, Queue, crate::talk::Talks, Task) {
         crate::run::pin_test_home();
         let cfg = Config {
@@ -6437,6 +6438,7 @@ mod tests {
         (cfg, queue, talks, task)
     }
 
+    #[cfg(unix)]
     async fn notification_repo(root: &Path) -> PathBuf {
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
@@ -6471,6 +6473,7 @@ mod tests {
         repo
     }
 
+    #[cfg(unix)]
     fn consume_notice_drafts(talks: &crate::talk::Talks) -> usize {
         let ready = crate::chat_notify::talks_to_start(talks);
         for id in &ready {
