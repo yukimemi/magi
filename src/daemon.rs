@@ -8115,13 +8115,10 @@ mod tests {
     /// quiet moment for `poll`'s fully-idle branch to reach the ordinary
     /// `janitor` pass.
     ///
-    /// Reproduced here with a task whose repository is never created:
-    /// `Runner::start` fails at `git::toplevel` in a few milliseconds,
-    /// spawning no agent CLI, so the task keeps failing and re-queuing
-    /// (`Task::fail` with attempts still under the budget leaves it
-    /// `Failed`, which `TaskStatus::runnable` still offers) for as long as
-    /// the loop keeps polling - exactly the "queue with no idle moment"
-    /// this task describes, produced without a real competition.
+    /// Reproduced with a backlog whose repository is never created:
+    /// `Runner::start` fails at `git::toplevel`, spawning no agent CLI.
+    /// Each task is held after one startup failure, but the remaining tasks
+    /// keep the queue busy until an external stop ends the loop.
     #[tokio::test]
     async fn cache_prune_reaches_a_queue_that_never_goes_idle() {
         let dir = tempfile::tempdir().unwrap();
@@ -8134,13 +8131,15 @@ mod tests {
         opts.max_attempts = 1_000;
 
         let queue = Queue::at(dir.path().join("queue"));
-        let mut t = Task::new(
-            "x".to_owned(),
-            "x".to_owned(),
-            opts.repo.clone(),
-            Source::Human,
-        );
-        queue.put(&mut t).unwrap();
+        for i in 0..128 {
+            let mut task = Task::new(
+                format!("queued work {i}"),
+                format!("queued work {i}"),
+                opts.repo.clone(),
+                Source::Human,
+            );
+            queue.put(&mut task).unwrap();
+        }
 
         let home = dir.path().join("home");
         let worktrees = dir.path().join("wt");
@@ -8149,17 +8148,15 @@ mod tests {
         let stopper = {
             let stop = stop.clone();
             let queue = Queue::at(dir.path().join("queue"));
-            let id = t.id.clone();
             tokio::spawn(async move {
-                // Stop once the task has demonstrably been retried, not after
-                // a fixed delay: under a loaded machine 400 ms can pass before
-                // the loop has finished a second attempt.
-                tokio::time::sleep(Duration::from_millis(400)).await;
-                for _ in 0..200 {
-                    if queue.get(&id).is_ok_and(|t| t.attempts >= 2) {
+                // Observe completed work rather than rely on a wall-clock
+                // delay. Every startup failure holds only its own task; the
+                // backlog keeps offering work at the next boundary.
+                for _ in 0..2_000 {
+                    if queue.list().iter().filter(|t| t.attempts == 1).count() >= 2 {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 stop.stop();
             })
@@ -8174,17 +8171,24 @@ mod tests {
         .expect("the loop's own setup and teardown must not fail");
         stopper.await.unwrap();
 
-        let after = queue.get(&t.id).unwrap();
+        let after = queue.list();
+        let completed = after.iter().filter(|t| t.attempts == 1).count();
         assert!(
-            after.attempts >= 2,
-            "the harness must actually have retried more than once, or this is not \
-             exercising a busy queue at all (got {} attempt(s))",
-            after.attempts
+            completed >= 2,
+            "the harness must have processed multiple tasks to exercise a busy queue \
+             (got {completed} completed task(s))"
         );
         assert!(
-            after.status.runnable(),
-            "still under its attempt budget: the queue never reached a natural idle \
-             on its own, only the external stop ended the test"
+            after.iter().any(|t| t.status.runnable()),
+            "unprocessed tasks must remain: the external stop, rather than an \
+             exhausted backlog, must end the test"
+        );
+        assert!(
+            after
+                .iter()
+                .filter(|t| t.attempts > 0)
+                .all(|t| { t.attempts == 1 && t.status == TaskStatus::Held }),
+            "a busy backlog must not retry a task's unchanged startup failure"
         );
 
         assert_eq!(
