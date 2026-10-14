@@ -2894,7 +2894,8 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             let waiting_on_triage = triage::open_task_ids(&questions_store);
             // Built from the full listing, not the filtered one: a `done`
             // dependency must still read as resolved rather than missing.
-            let inventory = magi::blockers::Inventory::new(q.list(), &questions_store.list());
+            let inventory = magi::blockers::Inventory::new(q.list(), &questions_store.list())
+                .with_stores(&q, &questions_store);
             for t in &tasks {
                 let attempts = if t.attempts > 0 {
                     format!(" x{}", t.attempts)
@@ -2980,7 +2981,8 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                     })
                     .collect();
                 println!("blocked on {}", annotated.join(", "));
-                let inventory = magi::blockers::Inventory::new(q.list(), &questions_store.list());
+                let inventory = magi::blockers::Inventory::new(q.list(), &questions_store.list())
+                    .with_stores(&q, &questions_store);
                 let chain = inventory.waits_on(&t);
                 if !chain.is_empty() {
                     println!("chain     {}", chain.join(", "));

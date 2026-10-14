@@ -663,6 +663,13 @@ fn quarantine_orphaned_blocked(queue: &Queue, questions: &Questions) -> Vec<Stri
         if task.status != TaskStatus::Blocked {
             continue;
         }
+        let canonical = crate::queue::canonical_blockers(queue, questions, &task.blocked_by);
+        if canonical != task.blocked_by {
+            task.blocked_by = canonical;
+            if queue.put(&mut task).is_err() {
+                continue;
+            }
+        }
         let deleted = queue.apply_deleted_blockers(&mut task);
         if !deleted.is_empty() && queue.put(&mut task).is_ok() {
             for id in &deleted {
@@ -864,7 +871,7 @@ fn ask_about_stuck_roots(
     report: &mut Report,
 ) {
     let all = questions.list();
-    let inv = crate::blockers::Inventory::new(queue.list(), &all);
+    let inv = crate::blockers::Inventory::new(queue.list(), &all).with_stores(queue, questions);
     let mut frozen: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for (id, roots) in inv.stuck() {
         for root in roots {
@@ -1309,6 +1316,79 @@ mod tests {
         assert!(held.operator_held());
         assert_eq!(held.hold_reason.as_deref(), Some("keep held now"));
         assert_eq!(held.resumption.as_ref().unwrap().generation, 1);
+    }
+
+    #[test]
+    fn unreadable_and_ambiguous_dependency_records_never_trigger_missing_questions() {
+        let (dir, queue, questions) = store();
+        let mut waiting = task("waiting", dir.path().join("repo"));
+        waiting.block(vec!["cafe".into()], None);
+        queue.put(&mut waiting).unwrap();
+        std::fs::write(queue.path_of("20260101-000001-cafe"), "invalid json").unwrap();
+        let report = run_once(&queue, &questions, None, Timestamp::now());
+        assert!(report.quarantined.is_empty() && report.asked.is_empty());
+        assert_eq!(queue.get(&waiting.id).unwrap().status, TaskStatus::Blocked);
+
+        // Restore the alias to test an ambiguous legacy dependency as well.
+        waiting.blocked_by = vec!["cafe".into()];
+        queue.put(&mut waiting).unwrap();
+        std::fs::write(queue.path_of("20260101-000002-cafe"), "invalid json").unwrap();
+        let report = run_once(&queue, &questions, None, Timestamp::now());
+        assert!(report.quarantined.is_empty() && report.asked.is_empty());
+        assert_eq!(queue.get(&waiting.id).unwrap().blocked_by, ["cafe"]);
+        assert!(questions.list().is_empty());
+    }
+
+    #[test]
+    fn existing_short_and_full_dependency_chains_keep_waiting_without_questions() {
+        for short in [true, false] {
+            let (dir, queue, questions) = store();
+            let mut prerequisite = task("prerequisite", dir.path().join("repo"));
+            prerequisite.status = TaskStatus::Running;
+            queue.put(&mut prerequisite).unwrap();
+            let mut dependency = task("dependency", prerequisite.repo.clone());
+            dependency.block(vec![prerequisite.short().to_owned()], None);
+            queue.put(&mut dependency).unwrap();
+            let mut waiting = task("waiting", prerequisite.repo.clone());
+            let reference = if short {
+                dependency.short().to_owned()
+            } else {
+                dependency.id.clone()
+            };
+            waiting.block(
+                vec![reference.clone()],
+                Some("preserve instructions".into()),
+            );
+            queue.put(&mut waiting).unwrap();
+
+            assert_eq!(queue.get(&reference).unwrap().id, dependency.id);
+            assert!(
+                crate::queue::missing_blockers(&queue, &questions, &waiting.blocked_by).is_empty()
+            );
+            let inventory = crate::blockers::Inventory::new(queue.list(), &questions.list())
+                .with_stores(&queue, &questions);
+            assert_eq!(
+                inventory.waits_on(&waiting),
+                [format!(
+                    "{} (blocked → {} running)",
+                    dependency.short(),
+                    prerequisite.short()
+                )]
+            );
+            assert!(inventory.stuck().is_empty());
+            let report = run_once(&queue, &questions, None, Timestamp::now());
+            assert!(report.quarantined.is_empty());
+            assert!(report.asked.is_empty());
+            assert!(questions.list().is_empty());
+            let after = queue.get(&waiting.id).unwrap();
+            assert_eq!(after.status, TaskStatus::Blocked);
+            assert_eq!(after.blocked_by, [dependency.id.clone()]);
+            assert_eq!(after.instruction, waiting.instruction);
+            assert_eq!(
+                queue.get(&dependency.id).unwrap().blocked_by,
+                [prerequisite.id.clone()]
+            );
+        }
     }
 
     #[test]

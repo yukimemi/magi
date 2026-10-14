@@ -35,12 +35,16 @@ const CHAIN_DEPTH: usize = 4;
 pub struct Inventory {
     tasks: BTreeMap<String, Task>,
     questions: BTreeMap<String, QuestionStatus>,
+    records: BTreeSet<String>,
+    unavailable: bool,
 }
 
 enum Dep<'a> {
     Task(&'a Task),
     Question(QuestionStatus),
     Missing,
+    Ambiguous,
+    Unreadable,
 }
 
 type Roots = Option<BTreeSet<String>>;
@@ -54,19 +58,52 @@ impl Inventory {
     /// Build the snapshot. Callers take `queue.list()` and `questions.list()`
     /// once, so a listing over many tasks never rescans the disk per task.
     pub fn new(tasks: Vec<Task>, questions: &[Question]) -> Self {
+        let records = tasks
+            .iter()
+            .map(|t| t.id.clone())
+            .chain(questions.iter().map(|q| q.id.clone()))
+            .collect();
         Self {
+            records,
+            unavailable: false,
             tasks: tasks.into_iter().map(|t| (t.id.clone(), t)).collect(),
             questions: questions.iter().map(|q| (q.id.clone(), q.status)).collect(),
         }
     }
 
+    /// Include undecodable records in existence checks. An incomplete snapshot
+    /// can describe a state as unknown, but cannot prove a dependency missing.
+    pub fn with_stores(
+        mut self,
+        queue: &crate::queue::Queue,
+        questions: &crate::ask::Questions,
+    ) -> Self {
+        match (
+            crate::queue::record_ids(queue.root()),
+            crate::queue::record_ids(questions.root()),
+        ) {
+            (Ok(tasks), Ok(qs)) => self.records.extend(tasks.into_iter().chain(qs)),
+            _ => self.unavailable = true,
+        }
+        self
+    }
+
     fn dep(&self, id: &str) -> Dep<'_> {
+        if self.unavailable {
+            return Dep::Unreadable;
+        }
+        let resolved = crate::queue::resolve_reference(id, self.records.iter().map(String::as_str));
+        let id = match &resolved {
+            Ok(Some(id)) => id.as_str(),
+            Ok(None) => return Dep::Missing,
+            Err(_) => return Dep::Ambiguous,
+        };
         if let Some(t) = self.tasks.get(id) {
             Dep::Task(t)
         } else if let Some(s) = self.questions.get(id) {
             Dep::Question(*s)
         } else {
-            Dep::Missing
+            Dep::Unreadable
         }
     }
 
@@ -75,7 +112,7 @@ impl Inventory {
         match self.dep(id) {
             Dep::Task(t) => t.status == TaskStatus::Done,
             Dep::Question(s) => s == QuestionStatus::Answered,
-            Dep::Missing => false,
+            Dep::Missing | Dep::Ambiguous | Dep::Unreadable => false,
         }
     }
 
@@ -100,10 +137,10 @@ impl Inventory {
                 Dep::Task(t) => match t.status {
                     TaskStatus::Done => {}
                     TaskStatus::Held => {
-                        roots.insert(b.clone());
+                        roots.insert(t.id.clone());
                     }
                     TaskStatus::Blocked => {
-                        if let Some(pos) = path.iter().position(|p| p == b) {
+                        if let Some(pos) = path.iter().position(|p| p == &t.id) {
                             // A cycle: its smallest id speaks for all of it, so
                             // every entry point names the same root.
                             if let Some(min) = path[pos..].iter().min() {
@@ -111,7 +148,7 @@ impl Inventory {
                             }
                             cyclic = true;
                         } else {
-                            let (sub, c) = self.walk(b, path, memo);
+                            let (sub, c) = self.walk(&t.id, path, memo);
                             cyclic |= c;
                             match sub {
                                 Some(r) => roots.extend(r),
@@ -127,7 +164,7 @@ impl Inventory {
                     }
                 },
                 Dep::Question(QuestionStatus::Answered) => {}
-                Dep::Question(_) | Dep::Missing => moving = true,
+                Dep::Question(_) | Dep::Missing | Dep::Ambiguous | Dep::Unreadable => moving = true,
             }
         }
         path.pop();
@@ -182,19 +219,21 @@ impl Inventory {
     fn chain(&self, id: &str, seen: &mut Vec<String>) -> String {
         match self.dep(id) {
             Dep::Missing => "missing".to_owned(),
+            Dep::Ambiguous => "ambiguous".to_owned(),
+            Dep::Unreadable => "state unknown".to_owned(),
             Dep::Question(s) => format!("question {}", s.as_str()),
             Dep::Task(t) => {
                 let mut out = t.status.as_str().to_owned();
                 if t.status != TaskStatus::Blocked {
                     return out;
                 }
-                if seen.iter().any(|s| s == id) {
+                if seen.iter().any(|s| s == &t.id) {
                     return format!("{out}, cycle");
                 }
                 if seen.len() > CHAIN_DEPTH {
                     return format!("{out} → …");
                 }
-                seen.push(id.to_owned());
+                seen.push(t.id.clone());
                 if let Some(next) = t.blocked_by.iter().find(|b| !self.resolved(b)) {
                     out.push_str(&format!(" → {} {}", short(next), self.chain(next, seen)));
                 }
@@ -205,7 +244,10 @@ impl Inventory {
 
     /// The task with this id, if it is one.
     pub fn task(&self, id: &str) -> Option<&Task> {
-        self.tasks.get(id)
+        match self.dep(id) {
+            Dep::Task(task) => Some(task),
+            _ => None,
+        }
     }
 }
 
@@ -230,6 +272,32 @@ mod tests {
 
     fn inv(tasks: Vec<Task>) -> Inventory {
         Inventory::new(tasks, &[])
+    }
+
+    #[test]
+    fn mixed_alias_cycles_use_canonical_roots_and_unreadable_records_are_unknown() {
+        let mut a = t("aaaa", TaskStatus::Blocked, &["bbbb"]);
+        a.blocked_by = vec!["bbbb".into()];
+        let mut b = t("bbbb", TaskStatus::Blocked, &["aaaa"]);
+        b.blocked_by = vec!["aaaa".into()];
+        let inventory = inv(vec![a.clone(), b]);
+        assert_eq!(inventory.stuck().len(), 2);
+        assert!(
+            inventory
+                .stuck()
+                .values()
+                .all(|roots| roots.iter().eq(["2026-aaaa"].iter()))
+        );
+        assert!(inventory.waits_on(&a)[0].contains("cycle"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let queue = crate::queue::Queue::at(dir.path().join("queue"));
+        let questions = crate::ask::Questions::at(dir.path().join("questions"));
+        std::fs::create_dir_all(queue.root()).unwrap();
+        std::fs::write(queue.path_of("2026-bbbb"), "invalid json").unwrap();
+        let inventory = inv(vec![a.clone()]).with_stores(&queue, &questions);
+        assert_eq!(inventory.waits_on(&a), ["bbbb (state unknown)"]);
+        assert!(inventory.stuck().is_empty());
     }
 
     #[test]
