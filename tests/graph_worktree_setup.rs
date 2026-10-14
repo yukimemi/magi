@@ -6,7 +6,7 @@ use common::{Judges, fixture};
 use magi::config::SetupStep;
 use magi::graph::Runner;
 use magi::run::{PrepFailure, RunStatus};
-use magi::worktree_setup::SetupFailureTarget;
+use magi::worktree_setup::{SetupFailureEvidence, SetupFailureTarget};
 
 fn copy(spec: &str) -> SetupStep {
     SetupStep {
@@ -68,6 +68,7 @@ async fn a_failing_step_blocks_the_run_and_names_the_step() {
     assert_eq!(runner.state.status, RunStatus::Blocked);
     assert_eq!(runner.state.prep_failure_evidence, Some(PrepFailure::WorktreeSetup {
         target: Some(SetupFailureTarget::Run { step: 1, command: "echo no-bootstrap >&2; exit 7".into() }),
+        evidence: Some(SetupFailureEvidence::Exit { code: Some(7), output: "no-bootstrap".into() }),
     }));
     assert!(
         runner.state.events.iter().any(|e| e.message.contains("worktree setup failed")
@@ -116,9 +117,9 @@ async fn setup_then_cherry_pick_failures_record_distinct_durable_targets() {
     let mut first = Runner::start(&fx.repo, instruction.clone(), fx.config.clone(), magi::run::Origin::operator())
         .await.unwrap();
     first.execute().await.expect_err("missing setup source");
-    assert_eq!(first.state.prep_failure_evidence, Some(PrepFailure::WorktreeSetup {
-        target: Some(SetupFailureTarget::Copy { step: 1, spec: "fixture-gate.txt -> .setup-gate".into() }),
-    }));
+    assert!(matches!(&first.state.prep_failure_evidence, Some(PrepFailure::WorktreeSetup {
+        target: Some(SetupFailureTarget::Copy { step: 1, spec }), evidence: Some(_),
+    }) if spec == "fixture-gate.txt -> .setup-gate"));
     std::fs::write(fx.repo.join("fixture-gate.txt"), "ready\n").unwrap();
     let mut second = Runner::start(&fx.repo, instruction, fx.config.clone(), magi::run::Origin::operator())
         .await.unwrap();

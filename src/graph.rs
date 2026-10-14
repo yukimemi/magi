@@ -1528,11 +1528,15 @@ impl Runner {
             Ok(()) => worktree_setup::prepare(&self.state.config, repo, wt)
                 .await
                 .inspect_err(|e| {
-                    self.state.prep_failure_evidence = Some(crate::run::PrepFailure::WorktreeSetup {
-                        target: e
-                            .downcast_ref::<worktree_setup::SetupFailure>()
-                            .map(|e| e.target.clone()),
-                    });
+                    self.state.prep_failure_evidence =
+                        Some(crate::run::PrepFailure::WorktreeSetup {
+                            target: e
+                                .downcast_ref::<worktree_setup::SetupFailure>()
+                                .map(|e| e.target.clone()),
+                            evidence: e
+                                .downcast_ref::<worktree_setup::SetupFailure>()
+                                .map(|e| e.evidence.clone()),
+                        });
                 }),
             Err(e) => {
                 self.state.prep_failure_evidence = Some(crate::run::PrepFailure::WorktreeConfig);
@@ -1652,6 +1656,9 @@ impl Runner {
                     target: e
                         .downcast_ref::<worktree_setup::SetupFailure>()
                         .map(|e| e.target.clone()),
+                    evidence: e
+                        .downcast_ref::<worktree_setup::SetupFailure>()
+                        .map(|e| e.evidence.clone()),
                 });
                 self.state
                     .event("prep", format!("worktree setup failed: {e:#}"));

@@ -1992,6 +1992,9 @@ pub enum PrepFailure {
     WorktreeSetup {
         /// The failed step, absent only for an unclassified setup error.
         target: Option<crate::worktree_setup::SetupFailureTarget>,
+        /// Observed result; absent on runs written before it was recorded.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<crate::worktree_setup::SetupFailureEvidence>,
     },
     /// Enabling per-worktree Git configuration failed.
     WorktreeConfig,

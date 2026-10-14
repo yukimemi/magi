@@ -61,12 +61,87 @@ pub enum SetupFailureTarget {
     },
 }
 
+/// Observed execution result, without elapsed time or temporary paths.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SetupFailureEvidence {
+    /// A filesystem operation failed.
+    Io {
+        /// Stable I/O error category.
+        category: String,
+    },
+    /// The command exited unsuccessfully, including a signal exit.
+    Exit {
+        /// Exit code, absent for a signal exit.
+        code: Option<i32>,
+        /// Normalized combined output.
+        output: String,
+    },
+    /// The command exceeded its budget.
+    Timeout {
+        /// Normalized combined output before termination.
+        output: String,
+    },
+    /// Starting or waiting for the command failed.
+    Process {
+        /// The operation: spawn or wait.
+        operation: String,
+        /// Stable I/O error category.
+        category: String,
+    },
+    /// A setup invariant failed outside an I/O or command result.
+    Invariant {
+        /// Machine error text with temporary paths removed.
+        detail: String,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct RunStepFailure {
+    evidence: SetupFailureEvidence,
+    message: String,
+}
+
 /// Typed context retains the original user-facing message and its cause.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub(crate) struct SetupFailure {
     pub target: SetupFailureTarget,
+    pub evidence: SetupFailureEvidence,
     message: String,
+}
+
+impl SetupFailure {
+    fn context(
+        error: anyhow::Error,
+        target: SetupFailureTarget,
+        wt: &Path,
+        message: String,
+    ) -> anyhow::Error {
+        let evidence = if let Some(result) = error.downcast_ref::<RunStepFailure>() {
+            result.evidence.clone()
+        } else if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            SetupFailureEvidence::Io {
+                category: format!("{:?}", io.kind()),
+            }
+        } else {
+            SetupFailureEvidence::Invariant {
+                detail: setup_output(&error.root_cause().to_string(), wt),
+            }
+        };
+        error.context(Self {
+            target,
+            evidence,
+            message,
+        })
+    }
+}
+
+fn setup_output(output: &str, wt: &Path) -> String {
+    crate::daemon::failure_output_evidence(
+        &output.replace(wt.to_string_lossy().as_ref(), "<worktree>"),
+    )
 }
 
 /// Run `cfg.worktree.setup` in `wt`, a worktree of `repo` (the primary checkout).
@@ -87,12 +162,16 @@ pub async fn prepare(cfg: &Config, repo: &Path, wt: &Path) -> Result<()> {
             (Some(spec), None) => {
                 let made = copy_step(repo, wt, spec, step.optional)
                     .await
-                    .with_context(|| SetupFailure {
-                        target: SetupFailureTarget::Copy {
-                            step: n,
-                            spec: spec.clone(),
-                        },
-                        message: format!("worktree setup step {n}/{total} ({what}) failed"),
+                    .map_err(|e| {
+                        SetupFailure::context(
+                            e,
+                            SetupFailureTarget::Copy {
+                                step: n,
+                                spec: spec.clone(),
+                            },
+                            wt,
+                            format!("worktree setup step {n}/{total} ({what}) failed"),
+                        )
                     })?;
                 copied.extend(made);
             }
@@ -102,17 +181,24 @@ pub async fn prepare(cfg: &Config, repo: &Path, wt: &Path) -> Result<()> {
                     .unwrap_or_else(|| cfg.graph.verify_timeout());
                 run_step(&cfg.shell(), command, wt, Duration::from_secs(secs))
                     .await
-                    .with_context(|| SetupFailure {
-                        target: SetupFailureTarget::Run {
-                            step: n,
-                            command: command.clone(),
-                        },
-                        message: format!("worktree setup step {n}/{total} ({what}) failed"),
+                    .map_err(|e| {
+                        SetupFailure::context(
+                            e,
+                            SetupFailureTarget::Run {
+                                step: n,
+                                command: command.clone(),
+                            },
+                            wt,
+                            format!("worktree setup step {n}/{total} ({what}) failed"),
+                        )
                     })?;
             }
             _ => {
                 return Err(SetupFailure {
                     target: SetupFailureTarget::InvalidStep { step: n },
+                    evidence: SetupFailureEvidence::Invariant {
+                        detail: "exactly one of copy / run is required".into(),
+                    },
                     message: format!(
                         "worktree setup step {n}/{total} must set exactly one of copy / run"
                     ),
@@ -121,9 +207,8 @@ pub async fn prepare(cfg: &Config, repo: &Path, wt: &Path) -> Result<()> {
             }
         }
     }
-    seal(wt, &copied).await.context(SetupFailure {
-        target: SetupFailureTarget::Seal,
-        message: "worktree setup".to_owned(),
+    seal(wt, &copied).await.map_err(|e| {
+        SetupFailure::context(e, SetupFailureTarget::Seal, wt, "worktree setup".to_owned())
     })
 }
 
@@ -259,26 +344,50 @@ async fn run_step(shell: &[String], command: &str, wt: &Path, timeout: Duration)
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("spawn `{}` for `{command}`", shell[0]))?;
+    let mut child = cmd.spawn().map_err(|e| RunStepFailure {
+        evidence: SetupFailureEvidence::Process {
+            operation: "spawn".into(),
+            category: format!("{:?}", e.kind()),
+        },
+        message: format!("spawn `{}` for `{command}`: {e}", shell[0]),
+    })?;
     let pid = child.id();
     let waited = tokio::time::timeout(timeout, child.wait()).await;
     let body = || tail(&std::fs::read_to_string(&log).unwrap_or_default()).to_owned();
     let result = match waited {
         Ok(Ok(status)) if status.success() => Ok(()),
-        Ok(Ok(status)) => Err(anyhow::anyhow!(
-            "`{command}` exited with {status}\n{}",
-            body()
-        )),
-        Ok(Err(e)) => Err(anyhow::anyhow!("`{command}` could not be awaited: {e}")),
+        Ok(Ok(status)) => {
+            let output = body();
+            Err(RunStepFailure {
+                evidence: SetupFailureEvidence::Exit {
+                    code: status.code(),
+                    output: setup_output(&output, wt),
+                },
+                message: format!("`{command}` exited with {status}\n{output}"),
+            }
+            .into())
+        }
+        Ok(Err(e)) => Err(RunStepFailure {
+            evidence: SetupFailureEvidence::Process {
+                operation: "wait".into(),
+                category: format!("{:?}", e.kind()),
+            },
+            message: format!("`{command}` could not be awaited: {e}"),
+        }
+        .into()),
         Err(_) => {
             kill_tree(pid, &mut child).await;
-            Err(anyhow::anyhow!(
-                "`{command}` timed out after {}s\n{}",
-                timeout.as_secs(),
-                body()
-            ))
+            let output = body();
+            Err(RunStepFailure {
+                evidence: SetupFailureEvidence::Timeout {
+                    output: setup_output(&output, wt),
+                },
+                message: format!(
+                    "`{command}` timed out after {}s\n{output}",
+                    timeout.as_secs()
+                ),
+            }
+            .into())
         }
     };
     std::fs::remove_file(&log).ok();
