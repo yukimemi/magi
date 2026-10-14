@@ -215,7 +215,7 @@ fn new_blocking_evidence(
         .filter_map(|id| {
             let version = if let Ok(q) = questions.get(id) {
                 (q.asked_at > r.at
-                    && (q.run == task.id || task.runs.iter().any(|run| *run == q.run))
+                    && (q.run == task.id || task.runs.contains(&q.run))
                     && q.node != NODE
                     && q.status != crate::ask::QuestionStatus::Abandoned)
                     .then(|| {
