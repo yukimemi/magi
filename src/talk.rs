@@ -49,7 +49,7 @@
 //! own home.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -634,7 +634,7 @@ impl Talks {
     /// The file lock is never skipped: a cycle that cannot get it within
     /// longer than the lock's own expiry fails instead of writing unguarded.
     fn guard(&self) -> Result<StoreGuard<'_>> {
-        let mutex = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let answer = self.answer_guard()?;
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
         let path = self.root.join(".store.turn");
@@ -643,7 +643,7 @@ impl Talks {
             if let Some(file) = TurnLock::take(&path)? {
                 return Ok(StoreGuard {
                     _file: file,
-                    _mutex: mutex,
+                    _answer: answer,
                 });
             }
             if std::time::Instant::now() >= deadline {
@@ -651,6 +651,63 @@ impl Talks {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Try both conversation locks without waiting under a question lock.
+    fn try_guard(&self) -> Result<Option<StoreGuard<'_>>> {
+        let Some(answer) = self.try_answer_guard()? else {
+            return Ok(None);
+        };
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("create {}", self.root.display()))?;
+        Ok(
+            TurnLock::take(&self.root.join(".store.turn"))?.map(|file| StoreGuard {
+                _file: file,
+                _answer: answer,
+            }),
+        )
+    }
+
+    /// Freeze owner evidence until an answer has been persisted. Callers under
+    /// a question lock must use [`Self::try_answer_guard`] instead: waiting here
+    /// can outlive the question lock's expiry. Retain the guard through
+    /// `Questions::update`'s write to prevent a retraction race.
+    pub fn answer_guard(&self) -> Result<AnswerGuard<'_>> {
+        let deadline = std::time::Instant::now() + TAKEOVER_LOCK_TTL * 2;
+        loop {
+            if let Some(guard) = self.try_answer_guard()? {
+                return Ok(guard);
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!("conversation evidence is locked by another process");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Acquire owner evidence without waiting while a question lock is held.
+    /// On contention, release the question lock before retrying, then reload
+    /// the question so another answer cannot be overwritten by an old snapshot.
+    pub fn try_answer_guard(&self) -> Result<Option<AnswerGuard<'_>>> {
+        let mutex = match self.lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(err)) => err.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        };
+        // Keep temporary lock files separate from transcripts so answering
+        // seats can synchronize without permission to alter owner evidence.
+        let root = self.answer_lock_root();
+        std::fs::create_dir_all(&root).context("create conversation evidence lock directory")?;
+        let path = root.join("store.turn");
+        Ok(TurnLock::take(&path)?.map(|file| AnswerGuard {
+            _file: file,
+            _mutex: mutex,
+        }))
+    }
+
+    /// Writable synchronization files, separate from conversation evidence.
+    pub fn answer_lock_root(&self) -> PathBuf {
+        self.root.join(".answer-lock")
     }
 
     /// Directory holding the conversation files.
@@ -970,6 +1027,12 @@ impl Talks {
 /// What [`Talks::guard`] hands out: the in-process mutex plus the
 /// cross-process file lock. The file lock is released first.
 struct StoreGuard<'a> {
+    _file: TurnLock,
+    _answer: AnswerGuard<'a>,
+}
+
+/// Holds conversation updates until the corresponding question write completes.
+pub struct AnswerGuard<'a> {
     _file: TurnLock,
     _mutex: MutexGuard<'a, ()>,
 }
@@ -1713,9 +1776,55 @@ fn queue_keyed(
             fresh.status.as_str()
         );
     }
+    if !append_pending(&mut fresh, text, attachments, key, previous, source)? {
+        *talk = fresh;
+        return Ok(false);
+    }
+    store.put(&mut fresh)?;
+    *talk = fresh;
+    Ok(true)
+}
+
+/// Dispatch consultation under both store locks, including reopening, without
+/// ever waiting while the caller holds the question lock. None means retry
+/// after releasing that lock and rechecking the question's current state.
+pub(crate) fn try_queue_consult(
+    store: &Talks,
+    id: &str,
+    text: &str,
+    display: Option<crate::prompt::NoticeDisplay>,
+) -> Result<Option<()>> {
+    let Some(_guard) = store.try_guard()? else {
+        return Ok(None);
+    };
+    let mut fresh = store.get(id).context("read consultation destination")?;
+    fresh.status = TalkStatus::Open;
+    append_pending(
+        &mut fresh,
+        text,
+        Vec::new(),
+        None,
+        &|_| false,
+        (None, Sender::Magi, display),
+    )?;
+    store.put(&mut fresh)?;
+    Ok(Some(()))
+}
+
+fn append_pending(
+    fresh: &mut Talk,
+    text: &str,
+    attachments: Vec<Attachment>,
+    key: Option<(&str, Option<&crate::chat_notify::CompletionReference>)>,
+    previous: &dyn Fn(&str) -> bool,
+    source: (
+        Option<ReplyTarget>,
+        Sender,
+        Option<crate::prompt::NoticeDisplay>,
+    ),
+) -> Result<bool> {
     if let Some((key, reference)) = key {
         if fresh.notified.iter().any(|k| k == key || previous(k)) {
-            *talk = fresh;
             return Ok(false);
         }
         fresh.notified.push(key.to_owned());
@@ -1724,7 +1833,7 @@ fn queue_keyed(
         }
     }
     let (target, provenance, display) = source;
-    let reply = resolve_reply(&fresh, target)?;
+    let reply = resolve_reply(fresh, target)?;
     if fresh.pending_messages.is_empty()
         && (!fresh.pending.is_empty() || !fresh.pending_attachments.is_empty())
     {
@@ -1756,8 +1865,6 @@ fn queue_keyed(
         }
     }
     fresh.pending_attachments.extend(attachments);
-    store.put(&mut fresh)?;
-    *talk = fresh;
     Ok(true)
 }
 
@@ -2252,11 +2359,11 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // has no store to consult, and must not abort the turn on `run::home()`.
     let questions =
         crate::run::try_home().map(|home| crate::ask::Questions::at(home.join("questions")));
-    let consulted = questions
-        .as_ref()
-        .is_some_and(|q| crate::consult::pending_consults(q, &talk.id));
+    let consulted = questions.as_ref().is_some_and(|q| {
+        crate::consult::pending_consults(q, &talk.id) || crate::consult::authorized_holds(q, talk)
+    });
     let consult_roots: Vec<PathBuf> = match &questions {
-        Some(q) if consulted => vec![q.root().to_path_buf()],
+        Some(q) if consulted => vec![q.root().to_path_buf(), store.answer_lock_root()],
         _ => Vec::new(),
     };
 
@@ -2876,6 +2983,19 @@ pub fn briefing_for(
          up, not an instruction to file - answer it yourself with `magi \
          list`, `magi show <id>`, `magi task list`, or the like, the same way \
          you would answer any other question in this conversation.\n\n\
+         # Answering existing questions\n\n\
+         A consultation destination does not restrict an explicit owner hold. \
+         For a guarded hold, the latest owner message may be `<question-id>: hold`, \
+         or explicitly instruct you to answer each immediately preceding recommendation \
+         (for example, `それぞれ回答して` or `answer each as recommended`). \
+         Present recommendations as one row per question: `<question-id>: hold` \
+         or `| <question-id> | hold | reason |`. Use full IDs or unique short IDs. \
+         Then run `magi answer <question-id> --reply hold --quote <entire latest owner message>`. \
+         This limited question-store write is available even for a question consulted \
+         elsewhere or never consulted. It never authorizes merge, public posting, PR closure, \
+         repair or another driver. For those actions retain the specific confirmation and \
+         supported execution requirements; report exactly what confirmation is missing. \
+         Recommendations, thanks alone and generated messages are not owner instructions.\n\n\
          # When the operator wants something done\n\n\
          Run:\n\n\
          magi task add {flag} --repo {repo} <instruction>\n\n\
@@ -5408,6 +5528,124 @@ mod tests {
             on_disk.turns
         );
         let _ = &cfg; // config kept only to build the agent above
+    }
+
+    #[test]
+    fn consultation_queue_does_not_wait_on_either_conversation_lock() {
+        for evidence in [true, false] {
+            let (tmp, talks) = store();
+            let cfg = config(mock_agent(tmp.path(), REPLY, env("hi")));
+            let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).unwrap();
+            close(&mut talk, &talks).unwrap();
+            let answer = evidence.then(|| talks.answer_guard().unwrap());
+            let file = (!evidence).then(|| {
+                TurnLock::take(&talks.root.join(".store.turn"))
+                    .unwrap()
+                    .unwrap()
+            });
+            assert!(
+                try_queue_consult(&talks, &talk.id, "consultation", None)
+                    .unwrap()
+                    .is_none()
+            );
+            let saved = talks.get(&talk.id).unwrap();
+            assert_eq!(saved.status, TalkStatus::Closed);
+            assert!(saved.pending_messages.is_empty());
+            drop(file);
+            drop(answer);
+            assert!(
+                try_queue_consult(&talks, &talk.id, "consultation", None)
+                    .unwrap()
+                    .is_some()
+            );
+            let saved = talks.get(&talk.id).unwrap();
+            assert_eq!(saved.status, TalkStatus::Open);
+            assert_eq!(saved.pending, "consultation");
+            assert_eq!(saved.pending_messages.len(), 1);
+            assert_eq!(saved.pending_messages[0].sender, Some(Sender::Magi));
+        }
+    }
+
+    #[test]
+    fn evidence_try_lock_does_not_wait_for_either_store_handle() {
+        let (tmp, talks) = store();
+        let guard = talks.answer_guard().unwrap();
+        // The same handle contends on the mutex, another on the file lock.
+        assert!(talks.try_answer_guard().unwrap().is_none());
+        let other = Talks::at(tmp.path().join("talks"));
+        assert!(other.try_answer_guard().unwrap().is_none());
+        drop(guard);
+        assert!(other.try_answer_guard().unwrap().is_some());
+    }
+
+    #[test]
+    fn owner_retraction_waits_until_the_authorized_question_is_persisted() {
+        use crate::ask::{Answer, Question, Questions};
+        use std::sync::mpsc;
+
+        let (tmp, talks) = store();
+        let cfg = config(mock_agent(tmp.path(), REPLY, env("hi")));
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).unwrap();
+        let questions = Questions::at(tmp.path().join("questions"));
+        let mut q = Question::new(
+            "run".into(),
+            crate::land::APPROVAL_NODE.into(),
+            "land".into(),
+            "Merge?".into(),
+            String::new(),
+            vec!["merge".into(), "hold".into()],
+        );
+        questions.put(&mut q).unwrap();
+        let instruction = format!("{}: hold", q.id);
+        record(&mut talk, &talks, &instruction, vec![]).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let mut writer = None;
+            let (saved, guard) = questions
+                .update(&q.id, |q| {
+                    let guard = talks.try_answer_guard()?.context("evidence is busy")?;
+                    q.answer_authority = crate::consult::authorize_answer(
+                        q,
+                        &talks,
+                        &questions,
+                        &talk.id,
+                        crate::queue::CHAT_NODE,
+                        "hold",
+                        Some(&instruction),
+                    )?;
+                    assert!(q.answer_authority.is_some());
+                    let talks = talks.clone();
+                    let mut snapshot = talk.clone();
+                    writer = Some(scope.spawn(move || {
+                        started_tx.send(()).unwrap();
+                        queue(&mut snapshot, &talks, "wait", vec![]).unwrap();
+                        finished_tx.send(()).unwrap();
+                    }));
+                    started_rx.recv().unwrap();
+                    assert!(matches!(
+                        finished_rx.recv_timeout(Duration::from_millis(100)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ));
+                    q.answer(Answer::Choice("hold".into()))?;
+                    // Match the CLI: return this guard through the atomic write.
+                    Ok(guard)
+                })
+                .unwrap();
+            assert_eq!(saved.resolution().as_deref(), Some("hold"));
+            assert_eq!(
+                questions.get(&q.id).unwrap().resolution().as_deref(),
+                Some("hold")
+            );
+            assert!(matches!(
+                finished_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            drop(guard);
+            writer.unwrap().join().unwrap();
+            finished_rx.recv().unwrap();
+        });
+        assert_eq!(talks.get(&talk.id).unwrap().pending, "wait");
     }
 
     #[test]

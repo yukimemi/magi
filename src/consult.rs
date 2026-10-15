@@ -112,31 +112,44 @@ pub fn begin(questions: &Questions, talks: &Talks, q: &Question, talk: &Talk) ->
     if !fresh {
         return Ok(false);
     }
-    let mut talk = talk.clone();
-    // A closed origin chat is reopened (idempotent) before the question is
-    // queued; `close` dropped its drafts, so only the question is sent.
-    if !talk.status.open()
-        && let Err(e) = talk::reopen(&mut talk, talks)
-    {
-        let _ = questions.update(&q.id, |r| {
-            r.consult = None;
-            Ok(())
+    // Serialize dispatch with answers, but never wait for conversation locks
+    // under the expiring question lock. Each retry reloads the latest question.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let dispatch = loop {
+        let mut busy = false;
+        let updated = questions.update(&q.id, |r| {
+            if !r.status.open() || r.consult != q.consult {
+                return Ok(false);
+            }
+            if talk::try_queue_consult(
+                talks,
+                &talk.id,
+                &crate::prompt::chat_consult(r),
+                Some(crate::prompt::chat_consult_display(r)),
+            )?
+            .is_none()
+            {
+                busy = true;
+                bail!("the conversation store is locked by another process");
+            }
+            Ok(true)
         });
-        return Err(e).context("reopen the chat");
-    }
-    if let Err(e) = talk::queue_magi_display(
-        &mut talk,
-        talks,
-        &crate::prompt::chat_consult(&q),
-        Some(crate::prompt::chat_consult_display(&q)),
-    ) {
+        if busy && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        break updated;
+    };
+    if let Err(e) = dispatch {
         let _ = questions.update(&q.id, |r| {
-            r.consult = None;
+            if r.status.open() && r.consult == q.consult {
+                r.consult = None;
+            }
             Ok(())
         });
         return Err(e).context("queue the question into the chat");
     }
-    Ok(true)
+    Ok(dispatch?.1)
 }
 
 /// Refuse a chat's answer to a merge approval whose task the operator held, as
@@ -171,6 +184,354 @@ pub enum QuestionKind {
     Merge,
     /// Confirmation of the text to publish.
     Posting,
+}
+
+/// Owner evidence retained with an answer, independent of its consultation destination.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AnswerAuthority {
+    /// Conversation containing the instruction.
+    pub talk: String,
+    /// Zero-based persisted turn position.
+    pub turn: usize,
+    /// Zero-based send position within that turn.
+    pub message: usize,
+    /// Full instruction, not a substring selected by the assistant.
+    pub instruction: String,
+    /// Stable fingerprint of the complete instruction.
+    pub instruction_fingerprint: String,
+    /// Immediately preceding persona reply, for a batch instruction.
+    pub recommendation_turn: Option<usize>,
+    /// Fingerprint of the complete persona reply used as the batch manifest.
+    pub recommendation_fingerprint: Option<String>,
+    /// Exact decision covered by this evidence.
+    pub question: String,
+    /// Exact offered choice; this evidence path only authorizes hold.
+    pub choice: String,
+}
+
+/// Validate an answer under the question lock. The caller must also retain
+/// [`Talks::answer_guard`] from before this read until the answer is persisted.
+/// Consultation is a delivery route, not the source of authority for an
+/// explicit, independently bound owner hold.
+pub fn authorize_answer(
+    q: &Question,
+    talks: &Talks,
+    questions: &Questions,
+    run: &str,
+    node: &str,
+    reply: &str,
+    quote: Option<&str>,
+) -> Result<Option<AnswerAuthority>> {
+    if node == CHAT_NODE && QuestionKind::of(q) == QuestionKind::Merge && reply == crate::land::HOLD
+    {
+        if q.actions.contains_key(crate::land::HOLD) {
+            bail!("hold cannot execute a question action");
+        }
+        let talk = talks.get(run)?;
+        if let Some(evidence) = hold_authority(q, questions, &talk, quote) {
+            return Ok(Some(evidence));
+        }
+        if q.consult.as_ref().is_none_or(|c| c.talk != run) {
+            bail!(
+                "hold requires --quote of the entire latest owner send, either `<question-id>: hold` \
+                 or an explicit instruction to answer each immediately preceding question-by-question \
+                 recommendation; the persisted send and exact question/hold binding must be current"
+            );
+        }
+        // Keep legacy same-chat single-word holds, as well as its merge and
+        // repair policies. A batch instruction never expands those policies.
+    }
+    validate_answer(q, talks, run, node, reply, quote)?;
+    Ok(None)
+}
+
+/// Whether this turn needs the limited question-store write grant. This uses
+/// the same evidence check as the CLI; the CLI rechecks against fresh records.
+pub fn authorized_holds(questions: &Questions, talk: &Talk) -> bool {
+    let quote = current_instruction(talk).map(|(_, _, body)| body);
+    questions.list().iter().any(|q| {
+        QuestionKind::of(q) == QuestionKind::Merge
+            && hold_authority(q, questions, talk, quote).is_some()
+    })
+}
+
+fn current_instruction(talk: &Talk) -> Option<(usize, usize, &str)> {
+    // A newer queued send can retract the instruction. Wait until it is
+    // drained rather than letting the running seat use older words. Explicitly
+    // generated sends neither authorize nor retract an owner instruction.
+    let queued_owner = (!talk.pending.is_empty() || !talk.pending_messages.is_empty())
+        && (talk.pending_messages.is_empty()
+            || talk
+                .pending_messages
+                .iter()
+                .any(|m| m.sender != Some(talk::Sender::Magi)));
+    if !talk.status.open() || queued_owner {
+        return None;
+    }
+    for (index, turn) in talk.turns.iter().enumerate().rev() {
+        if talk::sender(turn, None) == talk::Sender::Magi {
+            continue;
+        }
+        // A persona reply consumes the conversational turn. Never reuse an
+        // older instruction just because a generated post followed that reply.
+        if turn.who != talk::Who::Operator || turn.posted_by.is_some() {
+            return None;
+        }
+        let latest = turn
+            .messages
+            .iter()
+            .enumerate()
+            .rfind(|(_, send)| talk::sender(turn, Some(send)) == talk::Sender::Operator);
+        let Some((message, send)) = latest else {
+            if !turn.messages.is_empty()
+                && turn
+                    .messages
+                    .iter()
+                    .all(|m| m.sender == Some(talk::Sender::Magi))
+            {
+                continue;
+            }
+            return None;
+        };
+        // Older real sends can be reconstructed from recorded boundaries,
+        // never from a guessed last paragraph. The whole-message grammar also
+        // excludes generated legacy wrappers.
+        if send.sender.is_none()
+            && (turn.breaks.is_none()
+                || turn
+                    .messages
+                    .iter()
+                    .map(|m| m.body.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+                    != turn.body)
+        {
+            return None;
+        }
+        return Some((index, message, &send.body));
+    }
+    None
+}
+
+fn hold_authority(
+    q: &Question,
+    questions: &Questions,
+    talk: &Talk,
+    quote: Option<&str>,
+) -> Option<AnswerAuthority> {
+    if !q.status.open()
+        || !q.choices.iter().any(|c| c == crate::land::HOLD)
+        || q.actions.contains_key(crate::land::HOLD)
+    {
+        return None;
+    }
+    let (turn, message, instruction) = current_instruction(talk)?;
+    if quote.map(str::trim) != Some(instruction.trim()) || talk.turns[turn].at < q.asked_at {
+        return None;
+    }
+    let direct = direct_hold(instruction, q, questions);
+    let recommendation_turn = if direct {
+        None
+    } else {
+        if !batch_instruction(instruction) {
+            return None;
+        }
+        let index = turn.checked_sub(1)?;
+        let recommendation = &talk.turns[index];
+        if recommendation.who != talk::Who::Agent
+            || talk::sender(recommendation, None) != talk::Sender::Persona
+            || recommendation.posted_by.is_some()
+            || recommendation.at < q.asked_at
+            || !recommended_hold(&recommendation.body, q, questions)
+        {
+            return None;
+        }
+        Some(index)
+    };
+    Some(AnswerAuthority {
+        talk: talk.id.clone(),
+        turn,
+        message,
+        instruction: instruction.to_owned(),
+        instruction_fingerprint: crate::github_text::fingerprint("", instruction),
+        recommendation_turn,
+        recommendation_fingerprint: recommendation_turn
+            .map(|i| crate::github_text::fingerprint("", &talk.turns[i].body)),
+        question: q.id.clone(),
+        choice: crate::land::HOLD.into(),
+    })
+}
+
+fn batch_instruction(text: &str) -> bool {
+    // Whole-message grammar: substrings in conditional, reported, quoted or
+    // retracted instructions cannot match. Keep this deliberately bounded.
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let compact = compact.trim_end_matches(['!', '！', '。', '.', 'ー']);
+    let compact = compact
+        .strip_prefix("ありがと！")
+        .or_else(|| compact.strip_prefix("ありがとう！"))
+        .unwrap_or(compact);
+    matches!(
+        compact,
+        "じゃあそれぞれ回答して" | "それぞれ回答して" | "それぞれ回答してください"
+    ) || matches!(
+        text.trim()
+            .trim_end_matches(['.', '!'])
+            .to_ascii_lowercase()
+            .as_str(),
+        "answer each as recommended" | "answer all as recommended"
+    )
+}
+
+fn refers_to(reference: &str, q: &Question, questions: &Questions) -> bool {
+    reference == q.id
+        || (reference.len() >= 4
+            && reference == q.short()
+            && questions.resolve_id(reference).is_ok_and(|id| id == q.id))
+}
+
+fn direct_hold(text: &str, q: &Question, questions: &Questions) -> bool {
+    // One complete instruction, binding both the question and the offered
+    // choice. Other actions (including closing the PR) are never inferred.
+    let Some((reference, choice)) = text.trim().split_once(':') else {
+        return false;
+    };
+    refers_to(reference.trim().trim_matches('`'), q, questions) && choice.trim() == "hold"
+}
+
+fn recommended_hold(body: &str, q: &Question, questions: &Questions) -> bool {
+    // Supported list/table rows: `<id>: hold`, `<id> → hold`, or `| <id> | hold |`.
+    // A row must select exactly one offered choice, rather than list options.
+    // Repeated or conflicting rows are ambiguous even if one recommends hold.
+    let mut rows = Vec::new();
+    // Use the same Markdown parser as the transcript renderer. Quoted lazy
+    // continuations, nested fences and indented examples are not recommendations.
+    use comrak::nodes::NodeValue;
+    let arena = comrak::Arena::new();
+    let mut options = comrak::Options::default();
+    options.extension.table = true;
+    let document = comrak::parse_document(&arena, body, &options);
+    let lines: Vec<_> = body.lines().collect();
+    let mut eligible = std::collections::BTreeSet::new();
+    for node in document.descendants() {
+        let data = node.data.borrow();
+        if node
+            .ancestors()
+            .any(|n| matches!(n.data.borrow().value, NodeValue::BlockQuote))
+        {
+            continue;
+        }
+        // A heading, introduction or trailing paragraph may qualify several
+        // rows without naming any question. Do not guess its scope: batch
+        // authority requires the whole unquoted recommendation to be clear.
+        if matches!(
+            data.value,
+            NodeValue::Heading(_) | NodeValue::Paragraph | NodeValue::TableRow(_)
+        ) && lines
+            .get(data.sourcepos.start.line - 1..data.sourcepos.end.line)
+            .is_some_and(|block| conditional_recommendation(&block.join(" ")))
+        {
+            return false;
+        }
+        if matches!(
+            data.value,
+            NodeValue::Paragraph | NodeValue::TableRow(false)
+        ) {
+            eligible.extend(data.sourcepos.start.line..=data.sourcepos.end.line);
+        }
+    }
+    for (index, line) in body.lines().enumerate() {
+        if !eligible.contains(&(index + 1)) {
+            continue;
+        }
+        let line = line.trim();
+        let tokens: Vec<&str> = line
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+            .collect();
+        if !tokens.iter().any(|r| refers_to(r, q, questions)) {
+            continue;
+        }
+        if line.starts_with('|') {
+            let cells: Vec<_> = line
+                .trim_matches('|')
+                .split('|')
+                .map(|c| c.trim().trim_matches('`'))
+                .collect();
+            let references = cells.iter().filter(|c| refers_to(c, q, questions)).count();
+            let other_question = cells
+                .iter()
+                .any(|c| c.len() >= 4 && questions.resolve_id(c).is_ok_and(|id| id != q.id));
+            let choices: Vec<_> = cells
+                .iter()
+                .filter(|c| q.choices.iter().any(|choice| choice == **c))
+                .collect();
+            rows.push(!other_question && references == 1 && choices == [&crate::land::HOLD]);
+            continue;
+        }
+        let row = line.trim_start_matches(['-', '*', ' ']);
+        let row = row.trim_start_matches('`');
+        let end = row
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+            .unwrap_or(row.len());
+        let (reference, rest) = row.split_at(end);
+        let rest = rest.trim_start_matches('`').trim_start();
+        let choice = rest
+            .strip_prefix(':')
+            .or_else(|| rest.strip_prefix('→'))
+            .or_else(|| rest.strip_prefix('|'))
+            .map(str::trim);
+        rows.push(
+            refers_to(reference, q, questions)
+                && choice.is_some_and(|choice| {
+                    // Consume the entire choice. A pipe is an alternative,
+                    // not an excuse to discard it. The one supported trailing
+                    // action is separate from the hold and grants no closure.
+                    matches!(choice.trim_matches('`'), "hold" | "hold、その後PRを閉じる")
+                }),
+        );
+    }
+    rows == [true]
+}
+
+fn conditional_recommendation(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    lower.split(|c: char| !c.is_ascii_alphabetic()).any(|word| {
+        matches!(
+            word,
+            "if" | "unless"
+                | "when"
+                | "maybe"
+                | "conditional"
+                | "otherwise"
+                | "only"
+                | "except"
+                | "or"
+                | "either"
+                | "provided"
+                | "assuming"
+                | "depending"
+        )
+    }) || [
+        "ただし",
+        "場合",
+        "なら",
+        "たら",
+        "限り",
+        "のみ",
+        "かも",
+        "次第",
+        "条件",
+        "または",
+        "もしくは",
+        "あるいは",
+        "れば",
+        "とき",
+        "際",
+        "時だけ",
+        "必要に応じて",
+    ]
+    .iter()
+    .any(|word| line.contains(word))
 }
 
 impl QuestionKind {
@@ -283,6 +644,12 @@ pub fn validate_answer(
             );
         }
         return Ok(());
+    }
+    if reply == crate::land::APPROVE && batch_instruction(&latest) {
+        bail!(
+            "a batch answer instruction authorizes hold only; merging requires a separate explicit \
+             confirmation of this specific reviewed PR and head through the existing approval driver"
+        );
     }
     let valid = if reply == crate::land::APPROVE {
         match &q.merge_target {
@@ -1132,7 +1499,13 @@ mod tests {
             Some(talk.id.as_str())
         );
 
-        let queued = store.get(&talk.id).unwrap().pending;
+        let destination = store.get(&talk.id).unwrap();
+        assert_eq!(destination.pending_messages.len(), 1);
+        assert_eq!(
+            destination.pending_messages[0].display,
+            Some(crate::prompt::chat_consult_display(&q))
+        );
+        let queued = destination.pending;
         assert_eq!(
             queued.matches(&q.id).count(),
             2 + 1,

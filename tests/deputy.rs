@@ -429,11 +429,34 @@ async fn a_say_on_a_merge_approval_gets_a_deputy_and_never_the_waiter() {
 fn script(s: &Scene, lines: &[&str]) {
     let bin = env!("CARGO_BIN_EXE_magi");
     let mut body = format!("export MAGI_HOME='{}'\n", s.home.display());
+    body.push_str(": > deputy-action-status\n: > deputy-action-output\n");
     for l in lines {
+        body.push_str("if {\n");
         body.push_str(&l.replace("MAGI", &format!("'{bin}'")));
-        body.push_str(" || true\n");
+        body.push_str(
+            "\n} >> deputy-action-output 2>&1; then\n\
+             echo 0 >> deputy-action-status\n\
+             else\n\
+             echo \"$?\" >> deputy-action-status\n\
+             fi\n",
+        );
     }
     std::fs::write(s.fx.repo.join("deputy-actions.sh"), body).unwrap();
+}
+
+/// Check the nested CLI itself before asserting its persisted effects. The
+/// mock continues after expected refusals, but successful-action tests must
+/// report the CLI's real failure rather than only a missing answer or task.
+fn assert_actions_succeeded(s: &Scene, count: usize) {
+    let statuses = std::fs::read_to_string(s.fx.repo.join("deputy-action-status"))
+        .expect("the deputy must run its action script");
+    let output = std::fs::read_to_string(s.fx.repo.join("deputy-action-output")).unwrap();
+    let statuses: Vec<_> = statuses.lines().collect();
+    assert_eq!(statuses.len(), count, "not all CLI commands ran: {output}");
+    assert!(
+        statuses.iter().all(|status| *status == "0"),
+        "nested CLI exit statuses {statuses:?}:\n{output}"
+    );
 }
 
 const FOLLOW_UP: &str = "MAGI task add --hold 'applies after the pull request merges' \
@@ -457,6 +480,7 @@ async fn a_clear_merge_with_a_follow_up_request_merges_and_files_the_tasks() {
     ]);
 
     turn(&mut deputies(&s, 2)).await;
+    assert_actions_succeeded(&s, 2);
 
     let q = s.store.get(&land.id).unwrap();
     assert_eq!(q.status, QuestionStatus::Answered, "{:?}", q.thread);
@@ -506,6 +530,7 @@ async fn a_settle_note_naming_the_filed_task_lands_on_the_thread() {
     ]);
 
     turn(&mut deputies(&s, 2)).await;
+    assert_actions_succeeded(&s, 2);
 
     let q = s.store.get(&land.id).unwrap();
     assert_eq!(q.status, QuestionStatus::Answered, "{:?}", q.thread);
@@ -528,6 +553,7 @@ async fn a_release_merge_settle_can_say_the_follow_ups_were_not_queued() {
     ]);
 
     turn(&mut deputies(&s, 2)).await;
+    assert_actions_succeeded(&s, 1);
 
     assert!(follow_ups(&s).is_empty());
     let q = s.store.get(&land.id).unwrap();
@@ -572,6 +598,7 @@ async fn a_follow_up_request_alone_files_the_tasks_without_merging() {
     script(&s, &[FOLLOW_UP]);
 
     turn(&mut deputies(&s, 2)).await;
+    assert_actions_succeeded(&s, 1);
 
     let q = s.store.get(&land.id).unwrap();
     assert_eq!(q.status, QuestionStatus::Open, "no merge was asked for");
