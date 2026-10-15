@@ -13,10 +13,10 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::{Fixture, Judges, e2e, fixture, home_lock};
-use magi::land;
 use magi::queue::{Queue, Source, Task, TaskStatus};
 use magi::run::{ReviewRecord, ReviewRound, RunState};
 use magi::verdict::{Finding, ReviewVote, Severity};
+use magi::{followup, land};
 
 const PR: &str = "https://github.com/example/repo/pull/7";
 
@@ -282,12 +282,15 @@ async fn a_deputy_task_is_superseded_by_the_automatic_followup_when_release_is_o
     std::fs::write(&sc.state_file, "MERGED").unwrap();
     correct(&sc.id).await.expect("merged pull request is recorded");
 
-    let auto = q
+    let automatic: Vec<_> = q
         .list()
         .into_iter()
-        .find(|t| t.followup.as_ref().is_some_and(|f| f.run == sc.id))
-        .expect("the automatic follow-up was filed");
+        .filter(|t| t.followup.as_ref().is_some_and(|f| f.run == sc.id))
+        .collect();
+    assert_eq!(automatic.len(), 1, "one automatic follow-up was filed");
+    let auto = &automatic[0];
     assert_ne!(auto.id, sc.matching);
+    assert_eq!(auto.status, TaskStatus::Queued);
     let matching = q.get(&sc.matching).unwrap();
     assert_eq!(matching.status, TaskStatus::Held);
     assert!(
@@ -301,5 +304,52 @@ async fn a_deputy_task_is_superseded_by_the_automatic_followup_when_release_is_o
     let reason = matching.hold_reason.clone();
     correct(&sc.id).await.expect("second pass");
     assert_eq!(q.get(&sc.matching).unwrap().hold_reason, reason);
+    assert_eq!(q.list().len(), 4, "the second pass files no duplicate");
+}
+}
+
+e2e! {
+async fn a_restart_recovers_deputy_releases_written_before_the_run_was_saved() {
+    let home = home_lock().await;
+    let fx = fixture(home, Judges::Unanimous, false);
+    let sc = scene(&fx, true, true);
+    std::fs::write(&sc.state_file, "MERGED").unwrap();
+
+    // Confirm the merge, then stop between the queue write and the caller's
+    // run save. Only the queue remembers which deputy tasks were released.
+    {
+        let mut state = RunState::load(&sc.id).unwrap();
+        land::land(&mut state, PR).await.expect("confirmed merge");
+        followup::settle_deputy_tasks(&mut state, PR, &Queue::open(), true);
+        assert_eq!(sorted(state.deputy_followups), both(&sc));
+    }
+
+    let mut state = RunState::load(&sc.id).unwrap();
+    assert!(state.deputy_followups.is_empty());
+    let q = Queue::open();
+    for id in [&sc.unrelated, &sc.matching] {
+        let task = q.get(id).unwrap();
+        assert_eq!(task.status, TaskStatus::Queued);
+        let stamp = task.followup.unwrap();
+        assert_eq!(stamp.run, sc.id);
+        assert_eq!(stamp.pr, PR);
+        assert_eq!(stamp.generation, 1);
+    }
+    let before = serde_json::to_value(q.list()).unwrap();
+
+    followup::after_merge(&mut state, PR).await;
+    assert_eq!(sorted(state.deputy_followups.clone()), both(&sc));
+    assert!(state.followups.is_empty(), "the deputy already covers the finding");
+    assert!(state.followup_commented);
+    state.save().unwrap();
+    assert_eq!(serde_json::to_value(Queue::open().list()).unwrap(), before);
+    assert_eq!(comments(&sc.log), 1);
+
+    // Restart again through the normal entry point: recovery was persisted,
+    // and neither queue entries nor the follow-up comment are duplicated.
+    correct(&sc.id).await.expect("second restart");
+    assert_eq!(sorted(RunState::load(&sc.id).unwrap().deputy_followups), both(&sc));
+    assert_eq!(serde_json::to_value(Queue::open().list()).unwrap(), before);
+    assert_eq!(comments(&sc.log), 1);
 }
 }
