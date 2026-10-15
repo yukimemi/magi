@@ -663,7 +663,7 @@ fn quarantine_orphaned_blocked(queue: &Queue, questions: &Questions) -> Vec<Stri
         if task.status != TaskStatus::Blocked {
             continue;
         }
-        let deleted = queue.apply_deleted_blockers(&mut task);
+        let deleted = queue.apply_deleted_blockers(&mut task, questions);
         if !deleted.is_empty() && queue.put(&mut task).is_ok() {
             for id in &deleted {
                 queue.note_dependency_deleted(&task, id);
@@ -777,9 +777,9 @@ fn deps_texts(w: &Wording, root: &Task, dependants: &[&Task]) -> (String, String
 /// Detach every `blocked` task that names `root` directly: drop that one id
 /// from its `blocked_by` (`Task::unblock`), so a dependant with another
 /// unresolved blocker keeps waiting on it. Idempotent.
-fn detach_dependants(queue: &Queue, root: &str) {
+fn detach_dependants(queue: &Queue, questions: &Questions, root: &str) {
     for listed in queue.list() {
-        if listed.status != TaskStatus::Blocked || !listed.blocked_by.iter().any(|b| b == root) {
+        if listed.status != TaskStatus::Blocked || !listed.blocked_by.iter().any(|b| matches!(crate::queue::dependency(queue, questions, b), crate::queue::Dependency::Task(id) if id == root)) {
             continue;
         }
         let Ok(_claim) = queue.claim(&listed.id) else {
@@ -791,7 +791,12 @@ fn detach_dependants(queue: &Queue, root: &str) {
         if t.status != TaskStatus::Blocked {
             continue;
         }
-        t.unblock(root);
+        for id in t.blocked_by.clone() {
+            if matches!(crate::queue::dependency(queue, questions, &id), crate::queue::Dependency::Task(full) if full == root)
+            {
+                t.unblock(&id);
+            }
+        }
         let _ = queue.put(&mut t);
     }
 }
@@ -835,10 +840,10 @@ fn apply_deps_answer(queue: &Queue, questions: &Questions, q: &Question, now: Ti
             });
         }
         DepsAction::Discard => {
-            detach_dependants(queue, &root.id);
+            detach_dependants(queue, questions, &root.id);
             return queue.remove(&root.id, false, questions).is_ok();
         }
-        DepsAction::Detach => detach_dependants(queue, &root.id),
+        DepsAction::Detach => detach_dependants(queue, questions, &root.id),
         // Matches no offered choice, so there is nothing to apply. Left unmarked:
         // marking it applied would read as "settled", and the next stuck check
         // would file an identical question at once. Unmarked, it stays an
@@ -864,7 +869,7 @@ fn ask_about_stuck_roots(
     report: &mut Report,
 ) {
     let all = questions.list();
-    let inv = crate::blockers::Inventory::new(queue.list(), &all);
+    let inv = crate::blockers::Inventory::load(queue, questions);
     let mut frozen: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for (id, roots) in inv.stuck() {
         for root in roots {
@@ -888,10 +893,23 @@ fn ask_about_stuck_roots(
     }
 
     for (root_id, dependant_ids) in &frozen {
-        let Some(root) = inv.task(root_id) else {
+        let Ok(_claim) = queue.claim(root_id) else {
             continue;
         };
-        let dependants: Vec<&Task> = dependant_ids.iter().filter_map(|d| inv.task(d)).collect();
+        // Recheck the chain immediately before asking: an earlier inventory
+        // may have seen a held prerequisite that has since started running.
+        let current = crate::blockers::Inventory::load(queue, questions);
+        let Some(root) = current.task(root_id) else {
+            continue;
+        };
+        let dependants: Vec<&Task> = dependant_ids
+            .iter()
+            .filter_map(|d| current.task(d))
+            .filter(|t| current.stuck_roots(t).contains(root_id))
+            .collect();
+        if dependants.is_empty() {
+            continue;
+        }
         let latest = all
             .iter()
             .filter(|q| q.node == DEPS_NODE && q.run == *root_id)
@@ -1391,6 +1409,25 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn dependency_resolution_detaches_legacy_short_refs_without_dropping_other_waits() {
+        let (dir, queue, questions) = store();
+        let mut root = task("root", dir.path().join("repo"));
+        root.id = "20261013-193611-ca5b".into();
+        root.hold_machine(Some("needs owner decision".into()));
+        queue.put(&mut root).unwrap();
+        let mut other = task("other", dir.path().join("repo"));
+        other.id = "20261013-192213-feb2".into();
+        queue.put(&mut other).unwrap();
+        let mut waiting = task("waiting", dir.path().join("repo"));
+        waiting.block(vec!["ca5b".into(), other.id.clone()], None);
+        queue.put(&mut waiting).unwrap();
+        detach_dependants(&queue, &questions, &root.id);
+        let after = queue.get(&waiting.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Blocked);
+        assert_eq!(after.blocked_by, [other.id]);
     }
 
     #[test]

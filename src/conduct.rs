@@ -657,6 +657,15 @@ fn apply_one(
     }
     let blocking =
         d.question.is_some() || !d.blocked_by.is_empty() || d.recovery == Some(Recovery::Hold);
+    // An existing dependency (including unreadable/ambiguous state) belongs
+    // to the deterministic resolver. Never replace safe waiting with a
+    // question based on a historical missing-task claim.
+    if blocking
+        && task.status == TaskStatus::Blocked
+        && crate::queue::missing_blockers(queue, questions, &task.blocked_by).is_empty()
+    {
+        return Ok(());
+    }
     let evidence = new_blocking_evidence(queue, questions, &task, d);
     if blocking && task.resumption.is_some() && evidence.is_empty() {
         crate::notices::raise(
@@ -751,7 +760,9 @@ fn apply_one(
 
     match task.status {
         TaskStatus::Queued if !d.blocked_by.is_empty() => {
-            task.block(d.blocked_by.clone(), d.reason.clone());
+            let mut ids = d.blocked_by.clone();
+            crate::queue::normalize_blockers(queue, questions, &mut ids);
+            task.block(ids, d.reason.clone());
             queue.put(&mut task)?;
         }
         // See `Decision::recovery`'s doc: the only lever a runnable task has
@@ -1077,6 +1088,9 @@ impl Conductor {
             finished_views.push(finished_view(t, repo, max_attempts).await);
         }
 
+        let queue_revision = queue.revision();
+        let question_queue = Queue::at(questions.root().to_path_buf());
+        let question_revision = question_queue.revision();
         let body = prompt::with_overlay(
             prompt::conduct(
                 &runnable_views,
@@ -1087,6 +1101,10 @@ impl Conductor {
             cfg.prompts.overlay(NODE),
         );
 
+        let body = format!(
+            "{body}\n\n{}",
+            crate::queue::dependency_facts(queue, questions)
+        );
         let artifacts = home.join("conduct").join("artifacts");
         // Bound to a local: `Invocation` only borrows the cache path, and the
         // `Option<PathBuf>` `cache_dir()` returns has to outlive that borrow.
@@ -1158,7 +1176,18 @@ impl Conductor {
         drop(busy);
         let mut verdict = result?;
         attach_facts(cfg, repo, queue, &mut verdict).await;
+        // Validate before this batch's own writes move the revisions. Each
+        // application still re-reads the task and dependencies under its claim.
+        let dependencies_unchanged =
+            queue.revision() == queue_revision && question_queue.revision() == question_revision;
         for d in &verdict.decisions {
+            if !dependencies_unchanged
+                && (d.question.is_some()
+                    || !d.blocked_by.is_empty()
+                    || d.recovery == Some(Recovery::Hold))
+            {
+                continue;
+            }
             let snapshot = queued
                 .iter()
                 .chain(stalled)
@@ -1622,6 +1651,36 @@ mod tests {
         assert_eq!(v.answers.len(), 1);
         assert_eq!(v.answers[0].question, "Which backend?");
         assert_eq!(v.answers[0].answer, "SQLite");
+    }
+
+    #[test]
+    fn dependency_resolution_decision_normalizes_short_ids_and_preserves_waiting() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut dep = task("prerequisite");
+        dep.id = "20261013-193611-ca5b".into();
+        dep.start("existing-run".into());
+        queue.put(&mut dep).unwrap();
+        let mut waiting = task("waiting");
+        queue.put(&mut waiting).unwrap();
+        let d = Decision {
+            id: waiting.id.clone(),
+            blocked_by: vec!["ca5b".into()],
+            ..Decision::default()
+        };
+        apply_one(&queue, &questions, &d, None).unwrap();
+        waiting = queue.get(&waiting.id).unwrap();
+        assert_eq!(waiting.blocked_by, [dep.id.clone()]);
+        let stale = Decision {
+            id: waiting.id.clone(),
+            question: Some("Missing prerequisite?".into()),
+            reason: Some("ca5b is missing".into()),
+            ..Decision::default()
+        };
+        apply_one(&queue, &questions, &stale, Some(&waiting)).unwrap();
+        assert!(questions.list().is_empty());
+        assert_eq!(queue.get(&waiting.id).unwrap().blocked_by, [dep.id]);
     }
 
     #[test]
