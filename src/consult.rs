@@ -279,16 +279,16 @@ pub fn validate_answer(
         }
         return Ok(());
     }
-    let valid = match reply {
-        crate::land::APPROVE => latest.contains(quote),
-        crate::land::HOLD => {
-            latest.trim().eq_ignore_ascii_case(crate::land::HOLD)
-                && quote.eq_ignore_ascii_case(crate::land::HOLD)
+    let valid = if reply == crate::land::APPROVE {
+        match &q.merge_target {
+            Some(target) => {
+                latest.trim() == format!("merge {}", target.head) && quote == latest.trim()
+            }
+            None => latest.contains(quote),
         }
-        crate::land::REPAIR => {
-            q.choices.iter().any(|c| c == reply) && latest.trim() == reply && quote == reply
-        }
-        _ => false,
+    } else {
+        q.choices.iter().any(|c| c == reply)
+            && crate::merge_decision::exact_owner_choice(reply, &latest, quote)
     };
     if !valid {
         bail!(

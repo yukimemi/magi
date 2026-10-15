@@ -2109,6 +2109,9 @@ pub fn chat_consult(q: &crate::ask::Question) -> String {
         s.push('\n');
     }
     if crate::consult::QuestionKind::of(q) == crate::consult::QuestionKind::Merge {
+        if let Some(target) = &q.merge_target {
+            s.push_str(&format!("This card names PR {} at head `{}`. To approve through chat, the owner's whole latest message and your --quote must be exactly `merge {}`; a consultation or a general instruction to merge is insufficient. Stop, repair and replacement require the exact offered choice token as the whole latest message and quote. `withdraw: close PR and end task` confirms BOTH PR closure and task termination. `reimplement:<agent-id>` retires the old execution and closes its PR before a new attempt with that configured implementer; no fallback implementer is allowed. The driver applies these decisions; never queue another task yourself.\n\n", target.pr, target.head, target.head));
+        }
         if q.choices.iter().any(|c| c == crate::land::REPAIR) {
             s.push_str(&format!(
                 "The third choice `fix findings and re-review` requests one repair and bounded re-review of this same PR, without merging or queuing another task. Only when the owner's entire latest message is exactly that label, run `magi answer {} --reply 'fix findings and re-review' --quote 'fix findings and re-review'`. Otherwise discuss the choice and ask for clarification. The driver performs it and presents new review/gate results for a fresh merge decision.\n\n",

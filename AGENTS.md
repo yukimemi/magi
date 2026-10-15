@@ -2889,3 +2889,16 @@ new reply excerpts use those facts too. Legacy compatibility requires MAGI sende
 provenance or an exact `CompletionReference.notice` match and a complete known
 template; unknown bodies and operator prose remain literal. Watched output is
 untrusted text in an expandable element; links use the existing safe URL renderer.
+
+### Approval decisions and replacement implementations
+
+Approval choice tokens are stable; `Question::merge_target` holds the displayed
+PR/head independently of localized labels. Stop actions survive head movement;
+merge consent does not. Closed owner decisions retire the old execution even
+before a replacement run exists. Replacement ownership stays in the same queue
+task, with `Task::replacement` and `RunState::replaces` linking the attempts.
+`graph.selected_implementer` pins both the implementation seats and their
+fallback roster; it does not change reviewer, advisor or fixer assignments.
+Append inherited review context **after** `Runner::start_naming` resolves seeds:
+review evidence contains commit SHAs and must not seed the old patch into a
+replacement implementation.

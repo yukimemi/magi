@@ -629,42 +629,61 @@ pub fn repair_available(state: &RunState) -> bool {
 
 /// Shared choices for web, CLI and consultation questions.
 pub fn approval_choices(state: &RunState) -> Vec<String> {
-    let mut choices = vec![APPROVE.to_owned(), HOLD.to_owned()];
-    if repair_available(state) {
-        choices.push(REPAIR.to_owned());
-    }
+    let mut choices = vec![
+        APPROVE.to_owned(),
+        HOLD.to_owned(),
+        REPAIR.to_owned(),
+        crate::merge_decision::WITHDRAW.to_owned(),
+    ];
+    choices.extend(
+        state
+            .config
+            .agents
+            .iter()
+            .map(|a| format!("{}{id}", crate::merge_decision::REIMPLEMENT, id = a.id)),
+    );
     choices
 }
 
-/// Upgrade legacy choices and their resume action without changing the id,
-/// panel, head binding or any already recorded owner decision. An earlier
-/// repair answer also gains the action so interrupted handoffs can reconcile.
+/// Extend unanswered legacy cards in place. Answered cards keep their choices;
+/// a legacy repair answer gains only its missing dispatch action.
 pub fn upgrade_repair_choice(q: &mut ask::Question, state: &RunState) -> bool {
-    if q.node == APPROVAL_NODE
-        && (q.status.open() || q.resolution().as_deref() == Some(REPAIR))
-        && repair_available(state)
-        && state
+    if q.node != APPROVAL_NODE
+        || !state
             .land_approval
             .as_ref()
             .is_some_and(|a| a.question == q.id)
     {
-        let mut changed = false;
-        if q.status.open() && !q.choices.iter().any(|c| c == REPAIR) {
-            q.choices.push(REPAIR.to_owned());
-            q.detail.push_str("\n\n`fix findings and re-review` runs one repair and bounded review on this PR; it does not approve a merge. A fresh decision follows the updated review and gate.");
-            changed = true;
-        }
-        let action = ask::ChoiceAction::Resume {
-            run: state.id.clone(),
-        };
-        if q.actions.get(REPAIR) != Some(&action) {
-            q.actions.insert(REPAIR.to_owned(), action);
-            changed = true;
-        }
-        changed
-    } else {
-        false
+        return false;
     }
+    let before = (q.choices.clone(), q.actions.clone(), q.merge_target.clone());
+    if q.status.open() {
+        for choice in approval_choices(state) {
+            if !q.choices.contains(&choice) {
+                q.choices.push(choice);
+            }
+        }
+        if q.merge_target.is_none() {
+            q.merge_target = state.pr.as_ref().map(|pr| crate::merge_decision::Target {
+                pr: pr.url.clone(),
+                head: state.land_approval.as_ref().unwrap().head.clone(),
+                language: state.config.graph.language.clone(),
+            });
+        }
+    }
+    for choice in q.choices.clone() {
+        if (q.status.open() && crate::merge_decision::stops(&choice))
+            || (choice == REPAIR && (q.status.open() || q.resolution().as_deref() == Some(REPAIR)))
+        {
+            q.actions.insert(
+                choice,
+                ask::ChoiceAction::Resume {
+                    run: state.id.clone(),
+                },
+            );
+        }
+    }
+    before != (q.choices.clone(), q.actions.clone(), q.merge_target.clone())
 }
 
 /// Whether `quote` is a verbatim part of the owner's `message` and nothing in
@@ -1472,6 +1491,9 @@ pub fn deputy_brief(q: &ask::Question, state: Option<&RunState>) -> String {
          not change files, branches or the pull request.",
         run = q.run
     );
+    if let Some(target) = &q.merge_target {
+        s.push_str(&format!("\n\nThis decision names PR {} at head `{}`. Merge through chat requires the owner's latest whole message and quote to be exactly `merge {}`. Discussion alone never approves. For hold, repair, withdrawal or replacement, use the exact offered token from the owner's latest whole message. Withdrawal explicitly closes the PR and ends the task. Replacement closes the old PR before dispatching a new attempt with the selected implementer; do not start a separate task yourself.", target.pr, target.head, target.head));
+    }
     if q.choices.iter().any(|c| c == REPAIR) {
         s.push_str("\n\n`fix findings and re-review` requests one repair and bounded re-review on the existing PR. It never approves a merge. Settle this choice only when the owner's whole latest message is exactly this label; otherwise discuss it with `--thread`. The driver performs the repair; do not edit or queue another task. Updated review and gate results require a fresh merge decision.");
     }
@@ -1546,11 +1568,18 @@ async fn approval_gate(
     // for another head - or none recorded at all, as for a question filed
     // before heads were tracked - is never reused: a fix or rebase push made
     // a commit the owner has not seen, and their word does not carry over.
-    let reusable = state
-        .land_approval
-        .as_ref()
-        .filter(|a| a.head.eq_ignore_ascii_case(head))
-        .and_then(|a| store.list().into_iter().find(|q| q.id == a.question));
+    let reusable = state.land_approval.as_ref().and_then(|a| {
+        store
+            .list()
+            .into_iter()
+            .find(|q| q.id == a.question)
+            .filter(|q| {
+                a.head.eq_ignore_ascii_case(head)
+                    || q.resolution()
+                        .as_deref()
+                        .is_some_and(crate::merge_decision::stops)
+            })
+    });
     if reusable.is_none() {
         for stale in store
             .list()
@@ -1650,6 +1679,11 @@ async fn approval_gate(
                 w.approval_detail(&pr.url, &state.base_branch, subject, contested),
                 approval_choices(state),
             );
+            fresh.merge_target = Some(crate::merge_decision::Target {
+                pr: pr.url.clone(),
+                head: head.clone(),
+                language: state.config.graph.language.clone(),
+            });
             if fresh.choices.iter().any(|c| c == REPAIR) {
                 fresh.actions.insert(
                     REPAIR.to_owned(),
@@ -1658,6 +1692,16 @@ async fn approval_gate(
                     },
                 );
                 fresh.detail.push_str("\n\n`fix findings and re-review` runs one repair and bounded review on this PR; it does not approve a merge. A fresh decision follows the updated review and gate.");
+            }
+            for choice in fresh.choices.clone() {
+                if crate::merge_decision::stops(&choice) {
+                    fresh.actions.insert(
+                        choice,
+                        ask::ChoiceAction::Resume {
+                            run: state.id.clone(),
+                        },
+                    );
+                }
             }
             store
                 .put_panel(&mut fresh, &html, &[])
@@ -1699,7 +1743,7 @@ async fn approval_gate(
         // ever sees an actual decision.
         ask::QuestionStatus::Answered => match approval(q.resolution().as_deref()) {
             Approval::Merge => ApprovalGate::Approved,
-            Approval::Repair if repair_available(state) => {
+            Approval::Repair if !state.reviews.is_empty() => {
                 if !state.merge_repairs.iter().any(|r| r.question == q.id) {
                     state.merge_repairs.push(crate::run::MergeRepair {
                         question: q.id.clone(),
@@ -3008,6 +3052,23 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
 /// so a test can script what the pull request looks like from one observation
 /// to the next. Comments, logs and rebases stay on `gh` and `git` directly.
 trait Forge {
+    async fn close(&self, repo: &Path, pr_url: &str, comment: &str) -> Result<()> {
+        let (ok, out) = gh(
+            repo,
+            &[
+                "pr".into(),
+                "close".into(),
+                pr_url.into(),
+                "--comment".into(),
+                comment.into(),
+            ],
+        )
+        .await?;
+        if !ok {
+            bail!("PR closure failed: {out}");
+        }
+        Ok(())
+    }
     async fn view(&self, repo: &Path, pr_url: &str) -> Result<Seen>;
     async fn merge(&self, repo: &Path, argv: &[String]) -> Result<(bool, String)>;
     async fn poll(&self);
@@ -3296,6 +3357,157 @@ async fn stop_disarmed<F: Forge>(
     }
 }
 
+/// Check the persisted card again around awaits that can outlive an owner tap.
+fn owner_requested_stop(state: &RunState) -> Result<bool> {
+    let Some(binding) = &state.land_approval else {
+        return Ok(false);
+    };
+    let q = ask::Questions::open().get(&binding.question)?;
+    Ok(q.run == state.id
+        && q.node == APPROVAL_NODE
+        && q.resolution()
+            .as_deref()
+            .is_some_and(crate::merge_decision::stops))
+}
+
+/// Read stop choices before checks, repair or rebase. These are about stopping
+/// ownership, so a changed head never cancels them as it cancels merge consent.
+async fn owner_stop<F: Forge>(state: &mut RunState, pr: &mut PrState, forge: &F) -> Result<bool> {
+    use crate::merge_decision as md;
+    let Some(binding) = &state.land_approval else {
+        return Ok(false);
+    };
+    let q = ask::Questions::open().get(&binding.question)?;
+    let Some(choice) = q.resolution().filter(|c| md::stops(c)) else {
+        return Ok(false);
+    };
+    if q.run != state.id || q.node != APPROVAL_NODE {
+        bail!("stop decision names another run");
+    }
+    let target = q.merge_target.clone().unwrap_or_else(|| md::Target {
+        pr: pr.url.clone(),
+        head: binding.head.clone(),
+        language: state.config.graph.language.clone(),
+    });
+    if target.pr != pr.url {
+        bail!("stop decision names another PR");
+    }
+    if state.merge_decision.is_none() {
+        state.merge_decision = Some(md::Decision {
+            question: q.id.clone(),
+            target,
+            choice: choice.clone(),
+            closed: false,
+            replacement_run: None,
+            replacement_pr: None,
+        });
+        state.save()?;
+    }
+    let repo = state.repo.clone();
+    // Always disable, including arms left by an older driver.
+    if let Err(e) = disarm(forge, state, &repo, pr.number).await {
+        stop(state, &repo, pr, &format!("owner stop requested, but auto-merge could not be disabled: {e}; no repair or replacement started")).await?;
+        return Ok(true);
+    }
+    if choice.eq_ignore_ascii_case(HOLD) {
+        stop(
+            state,
+            &repo,
+            pr,
+            "owner held the decision: PR left open; no further repair or merge work",
+        )
+        .await?;
+        return Ok(true);
+    }
+    if md::selected_agent(&choice).is_some()
+        || state
+            .origin
+            .as_ref()
+            .and_then(|o| o.task.as_ref())
+            .is_some()
+    {
+        let owners: Vec<_> = crate::queue::Queue::open()
+            .list()
+            .into_iter()
+            .filter(|task| task.runs.last() == Some(&state.id))
+            .collect();
+        let owner = (owners.len() == 1).then(|| &owners[0]);
+        if !owner.is_some_and(|task| {
+            task.runs.last() == Some(&state.id)
+                && (!task
+                    .operator_decided_at
+                    .is_some_and(|at| at > q.answered_at.unwrap_or(q.asked_at))
+                    || task.resumption.as_ref().is_some_and(|release| {
+                        release.question_id.as_deref() == Some(q.id.as_str())
+                            && task.operator_decided_at == Some(release.at)
+                    }))
+        }) {
+            stop(state, &repo, pr, "replacement requires the current original queue task owner and an unsuperseded answer; PR left open").await?;
+            return Ok(true);
+        }
+    }
+    if pr.state == PrLifecycle::Merged {
+        stop(
+            state,
+            &repo,
+            pr,
+            "PR already merged; withdrawal/replacement cannot be applied",
+        )
+        .await?;
+        return Ok(true);
+    }
+    let comment = format!(
+        "{MARKER}\nOwner decision on question {}: {}. Previous attempt: `{}`. Original instruction and review history remain in the task record.",
+        q.id, choice, state.id
+    );
+    if pr.state == PrLifecycle::Open {
+        if let Err(e) = forge.close(&repo, &pr.url, &comment).await {
+            stop(
+                state,
+                &repo,
+                pr,
+                &format!(
+                    "owner requested closure but it failed: {e}; task held, no replacement started"
+                ),
+            )
+            .await?;
+            return Ok(true);
+        }
+    }
+    let confirmed = forge.view(&repo, &pr.url).await?;
+    if confirmed.pr.state != PrLifecycle::Closed {
+        stop(
+            state,
+            &repo,
+            pr,
+            "PR closure was not confirmed; task held, no replacement started",
+        )
+        .await?;
+        return Ok(true);
+    }
+    *pr = confirmed.pr;
+    state.merge_decision.as_mut().unwrap().closed = true;
+    if let Some(record) = &mut state.pr {
+        record.state = "closed".into();
+    }
+    state.status = RunStatus::Superseded;
+    state.merge = Some(MergeOutcome {
+        mode: MergeMode::Pr,
+        ok: false,
+        detail: format!("owner decision: {choice}; PR closure confirmed"),
+        empty: false,
+    });
+    state.event(
+        "land",
+        format!(
+            "{} applied: PR closure confirmed; old execution retired",
+            choice
+        ),
+    );
+    state.save()?;
+    Ok(true)
+}
+
 async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> Result<PrState> {
     crate::pr_head::ensure_owner(state)?;
     let repo = state.repo.clone();
@@ -3345,6 +3557,11 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
             red_at_merge: Vec::new(),
         });
         state.save()?;
+
+        crate::pr_head::ensure_owner(state)?;
+        if owner_stop(state, &mut pr, forge).await? {
+            return Ok(pr);
+        }
 
         if std::mem::take(&mut resumed_armed) && pr.state == PrLifecycle::Open {
             // An approval already given for the same head is reused, so
@@ -3691,6 +3908,38 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 let out = {
                     let merge_lock = repo_merge_lock(&repo);
                     let _merge_slot = merge_lock.lock().await;
+                    crate::pr_head::ensure_owner(state)?;
+                    if let Some(task_id) = state
+                        .origin
+                        .as_ref()
+                        .and_then(|origin| origin.task.as_ref())
+                    {
+                        let task = crate::queue::Queue::open()
+                            .get(task_id)
+                            .context("cannot verify the task owner immediately before merge")?;
+                        if task.runs.last() != Some(&state.id)
+                            || task.operator_held()
+                            || task.status == crate::queue::TaskStatus::Done
+                        {
+                            bail!(
+                                "task ownership or an operator hold superseded this merge approval"
+                            );
+                        }
+                    }
+                    if let Some(binding) = &state.land_approval {
+                        let current = ask::Questions::open().get(&binding.question)?;
+                        if current.run != state.id
+                            || !binding.head.eq_ignore_ascii_case(&observed_head)
+                            || approval(current.resolution().as_deref()) != Approval::Merge
+                            || current.merge_target.as_ref().is_some_and(|t| {
+                                t.pr != pr.url || !t.head.eq_ignore_ascii_case(&observed_head)
+                            })
+                        {
+                            bail!(
+                                "merge decision is stale or no longer authorizes the reviewed head"
+                            );
+                        }
+                    }
                     forge.merge(&repo, &argv).await?
                 };
                 if out.0 {
@@ -3837,6 +4086,9 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 // that conflicts all over again.
                 let remote = state.config.merge.remote.clone();
                 git::fetch(&repo, &remote, &base).await.ok();
+                if owner_stop(state, &mut pr, forge).await? {
+                    return Ok(pr);
+                }
                 let scratch = state.dir().join("rebase");
                 let onto = format!("{remote}/{base}");
                 let rebased =
@@ -3845,6 +4097,9 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                         Ok(crate::rebase::Rebased::Stopped(why)) => Ok(Some(why)),
                         Err(e) => Err(e),
                     };
+                if owner_stop(state, &mut pr, forge).await? {
+                    return Ok(pr);
+                }
                 match rebased {
                     Ok(None) => {
                         let pushed = {
@@ -3938,7 +4193,14 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
 
                 let logs = failing_logs(&repo, &seen.failing_urls).await;
                 let was_red = pr.checks == Checks::Red;
-                match forge.fix(state, &pr, round, budget, &reason, &logs).await? {
+                if owner_stop(state, &mut pr, forge).await? {
+                    return Ok(pr);
+                }
+                let fixed = forge.fix(state, &pr, round, budget, &reason, &logs).await?;
+                if owner_stop(state, &mut pr, forge).await? {
+                    return Ok(pr);
+                }
+                match fixed {
                     Fixed::Committed { head } => {
                         // Whatever the next look shows may still be the
                         // previous head; see `awaiting_new_head`.
@@ -4294,6 +4556,9 @@ pub async fn fix_round(
     // exhausted chain ends as a single failed fixer does.
     let mut last = None;
     for (i, (spec, seat_key)) in attempts.into_iter().enumerate() {
+        if owner_requested_stop(state)? {
+            return Ok(Fixed::Declined);
+        }
         let mut seat = seat_of(state, &seat_key, &spec.id);
         let stem = if i == 0 {
             format!("land-{round}")
@@ -4349,6 +4614,10 @@ pub async fn fix_round(
         Err(e) => return Ok(Fixed::Failed(format!("{e:#}"))),
     }
 
+    if owner_requested_stop(state)? {
+        return Ok(Fixed::Declined);
+    }
+
     // An agent that edited files but never committed would otherwise push
     // nothing and look like a refusal.
     match git::rescue_commit(
@@ -4373,6 +4642,10 @@ pub async fn fix_round(
         return Ok(Fixed::Declined);
     }
 
+    if owner_requested_stop(state)? {
+        return Ok(Fixed::Declined);
+    }
+    crate::pr_head::ensure_owner(state)?;
     let remote = state.config.merge.remote.clone();
     let public_head = state.pr_branch().unwrap_or(&winner.branch).to_owned();
     let push = if state.pr_head.is_some() {
@@ -6169,12 +6442,12 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         for (major, reject) in [(true, false), (false, true), (true, true)] {
             let state = repair_state(major, reject);
             assert!(repair_available(&state));
-            assert_eq!(approval_choices(&state), [APPROVE, HOLD, REPAIR]);
+            assert_eq!(&approval_choices(&state)[..3], [APPROVE, HOLD, REPAIR]);
         }
         assert!(!repair_available(&repair_state(false, false)));
         let mut clean = repair_state(true, false);
         clean.reviews[0].clean = true;
-        assert_eq!(approval_choices(&clean), [APPROVE, HOLD]);
+        assert_eq!(&approval_choices(&clean)[..3], [APPROVE, HOLD, REPAIR]);
         assert_eq!(approval(Some(REPAIR)), Approval::Repair);
     }
 
@@ -6195,7 +6468,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             })
             .unwrap();
         let upgraded = store.get(&id).unwrap();
-        assert_eq!(upgraded.choices, [APPROVE, HOLD, REPAIR]);
+        assert_eq!(upgraded.choices, approval_choices(&state));
         assert_eq!(store.get(&id).unwrap().choices, upgraded.choices);
         assert!(
             store
@@ -6269,14 +6542,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             ask::Questions::open()
                 .update(&id, |q| q.answer(ask::Answer::Choice(choice.into())))
                 .unwrap();
-            let forge = Scripted::new(
-                vec![observed],
-                if choice == REPAIR {
-                    vec![(true, "")]
-                } else {
-                    vec![]
-                },
-            );
+            let forge = Scripted::new(vec![observed], vec![(true, "")]);
             land_with(&mut state, "https://github.com/o/r/pull/42", &forge)
                 .await
                 .unwrap();
@@ -6334,7 +6600,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             .collect();
         assert_eq!(filed.len(), 1, "exactly one question is filed");
         assert_eq!(filed[0].node, APPROVAL_NODE);
-        assert_eq!(filed[0].choices, vec![APPROVE.to_owned(), HOLD.to_owned()]);
+        assert_eq!(filed[0].choices, approval_choices(&state));
         assert!(filed[0].status.open());
 
         // A second visit - standing in for a resumed run whose slot the
@@ -6405,7 +6671,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             messages: Vec::new(),
             posted_by: None,
             who: crate::talk::Who::Operator,
-            body: "Merge this pull request now".into(),
+            body: "merge abc".into(),
             at: Timestamp::now(),
             attachments: Vec::new(),
             usage: None,
@@ -6417,7 +6683,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             &talk.id,
             crate::queue::CHAT_NODE,
             APPROVE,
-            Some("Merge this pull request now"),
+            Some("merge abc"),
         )
         .unwrap();
         q.answer(ask::Answer::Choice(APPROVE.to_owned())).unwrap();

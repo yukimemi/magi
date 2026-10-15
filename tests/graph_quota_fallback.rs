@@ -264,3 +264,71 @@ async fn a_later_candidate_slots_fallback_chain_stops_at_the_rosters_tail_withou
     assert_eq!(slot1.agent, "beta", "{slot1:?}");
 }
 }
+
+common::e2e! {
+async fn replacement_implementer_pin_refuses_quota_fallback_and_holds_task() {
+    let home = common::home_lock().await;
+    let mut fx = fixture_with_quota_on_agents(home, &["alpha"], &["impl-A"]);
+    fx.config.graph.selected_implementer = Some("alpha".into());
+    let mut runner = Runner::start(&fx.repo, "create note.txt".into(), fx.config.clone(), magi::run::Origin::operator()).await.unwrap();
+    let result = runner.execute().await;
+    assert!(result.is_err());
+    assert_eq!(runner.state.candidates.len(), 1);
+    assert_eq!(runner.state.candidates[0].agent, "alpha");
+    assert!(runner.state.handovers.is_empty(), "configured beta/gamma must not substitute for the pin");
+    assert_eq!(runner.state.quota.len(), 1);
+    let mut task = magi::queue::Task::new("Replacement".into(), "create note.txt".into(), fx.repo.clone(), magi::queue::Source::Human);
+    task.replacement = Some(magi::merge_decision::Replacement {
+        question: "old-question".into(), run: "old-run".into(), pr: "https://github.com/example/repo/pull/42".into(),
+        agent: "alpha".into(), context: "prior findings".into(),
+    });
+    task.start(runner.state.id.clone());
+    let queue = magi::queue::Queue::open();
+    queue.put(&mut task).unwrap();
+    magi::daemon::finish_attempt(3, &queue, &mut task, &runner.state, &[], result);
+    assert_eq!(task.status, magi::queue::TaskStatus::Held);
+    assert!(task.operator_held());
+    assert!(task.hold_reason.as_ref().unwrap().contains("alpha"));
+    assert!(task.hold_reason.as_ref().unwrap().contains("No other implementer"));
+}
+}
+
+common::e2e! {
+async fn selected_implementer_controls_initial_dispatch_and_saved_resume() {
+    let home = common::home_lock().await;
+    let mut fx = fixture_with_quota_on_agents(home, &["alpha"], &["impl-A"]);
+    fx.config.graph.selected_implementer = Some("beta".into());
+    let mut runner = Runner::start(&fx.repo, "create note.txt".into(), fx.config.clone(), magi::run::Origin::operator()).await.unwrap();
+    runner.execute().await.unwrap();
+    assert_eq!(runner.state.candidates.len(), 1);
+    assert_eq!(runner.state.candidates[0].agent, "beta");
+    assert!(runner.state.handovers.is_empty());
+    let mut disk = magi::run::RunState::load(&runner.state.id).unwrap();
+    assert_eq!(disk.config.graph.selected_implementer.as_deref(), Some("beta"));
+    disk.candidates[0].agent = "alpha".into();
+    disk.save().unwrap();
+    assert!(Runner::resume(&disk.id).is_err(), "a saved seat must not bypass the implementer pin");
+}
+}
+
+common::e2e! {
+async fn selected_implementer_quota_cannot_publish_a_seeded_partial_patch() {
+    let home = common::home_lock().await;
+    let mut fx = fixture_with_quota_on_agents(home, &["alpha"], &["impl-A"]);
+    let mut initial = fx.config.clone();
+    for agent in &mut initial.agents { agent.env.remove("MOCK_QUOTA_SEAT"); }
+    let mut old = Runner::start(&fx.repo, "create note.txt".into(), initial, magi::run::Origin::operator()).await.unwrap();
+    old.execute().await.unwrap();
+    let winner = old.state.winner().unwrap();
+    let head = magi::git::rev_parse(&winner.worktree, "HEAD").await.unwrap();
+    fx.config.graph.selected_implementer = Some("alpha".into());
+    let mut replacement = Runner::start(&fx.repo, format!("Reimplement {head}; create note.txt"), fx.config.clone(), magi::run::Origin::operator()).await.unwrap();
+    assert!(replacement.execute().await.is_err());
+    assert_eq!(replacement.state.status, magi::run::RunStatus::Blocked);
+    assert!(replacement.state.candidates[0].commits > 0, "the inherited patch alone cannot stand in for the selected implementer");
+    assert_eq!(replacement.state.quota.len(), 1);
+    assert!(replacement.state.reviews.is_empty());
+    assert!(replacement.state.pr.is_none());
+    assert!(replacement.state.handovers.is_empty());
+}
+}

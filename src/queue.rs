@@ -447,6 +447,9 @@ pub struct Task {
     /// the prior run. History remains as evidence in `runs`.
     #[serde(default)]
     pub fresh_start: bool,
+    /// Explicit replacement selection; persists through dispatch and resume.
+    #[serde(default)]
+    pub replacement: Option<crate::merge_decision::Replacement>,
     /// Marked by an operator (`magi task interrupt`) to ask `magi serve` to
     /// run this one ahead of whatever it already has in flight, once
     /// `[daemon] pause_for_interrupts` is on - see
@@ -818,6 +821,7 @@ impl Task {
             review_instruction: None,
             pr_recovery: None,
             fresh_start: false,
+            replacement: None,
             interrupt: false,
             urgent: false,
             attachments: Vec::new(),

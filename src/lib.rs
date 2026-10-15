@@ -51,6 +51,7 @@ pub mod handover;
 pub mod land;
 pub mod lang;
 pub mod md;
+pub mod merge_decision;
 pub mod notices;
 pub mod persona;
 pub mod persona_icon;

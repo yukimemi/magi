@@ -1076,6 +1076,7 @@ impl Runner {
     /// Reopen an existing run.
     pub fn resume(id: &str) -> Result<Self> {
         let state = RunState::load(id)?;
+        crate::pr_head::ensure_owner(&state)?;
         if state.pr_recovery.is_some() && state.reviewed_commits.is_none() {
             bail!(
                 "selected public-head recovery did not finish setup; use `magi task recover-pr` after correcting the cause"
@@ -1089,6 +1090,13 @@ impl Runner {
             );
         }
         let roles = state.config.resolve_roles()?;
+        if let Some(id) = &state.config.graph.selected_implementer
+            && state.candidates.iter().any(|c| c.agent != *id)
+        {
+            bail!(
+                "replacement implementer pin does not match the saved candidates; task must stay held"
+            );
+        }
         let max_parallel = state.config.graph.max_parallel.max(1);
         Ok(Self {
             state,
@@ -1108,7 +1116,10 @@ impl Runner {
     pub async fn execute(&mut self) -> Result<()> {
         // Queue claims cover daemon work; this also serializes manual drivers
         // consuming a repair answer, including the new review and decision.
-        let _repair_claim = if !self.state.merge_repairs.is_empty()
+        let _repair_claim = if self.state.config.graph.selected_implementer.is_some()
+            || self.state.land_approval.is_some()
+            || self.state.merge_decision.is_some()
+            || !self.state.merge_repairs.is_empty()
             || (self.state.status == RunStatus::Landing && land::repair_available(&self.state))
         {
             let claim = FixClaim::acquire(&self.state.dir())?;
@@ -1226,6 +1237,26 @@ impl Runner {
 
     async fn execute_graph(&mut self) -> Result<()> {
         self.claim_driver()?;
+        if self
+            .state
+            .merge_decision
+            .as_ref()
+            .is_some_and(|decision| !decision.closed)
+            && self.state.status != RunStatus::Landing
+        {
+            bail!(
+                "owner stop decision is held; inspect the existing PR and request an explicit fresh review/decision before further work"
+            );
+        }
+        if self.state.config.graph.selected_implementer.is_some()
+            && self.state.status == RunStatus::Blocked
+            && self.state.tally.is_none()
+        {
+            bail!(
+                "selected implementation is held; explicitly release the owning task to retry it"
+            );
+        }
+
         if self.state.merge_repairs.last().is_some_and(|r| {
             matches!(
                 r.phase,
@@ -2175,6 +2206,10 @@ impl Runner {
             return self.stop_for_resource();
         }
 
+        let selected_failed = self.state.config.graph.selected_implementer.is_some()
+            && results
+                .iter()
+                .any(|(_, _, out)| FailClass::of(out).is_some());
         for (&i, (_wi, seat, out)) in todo.iter().zip(results) {
             let seat_key = seat.key.clone();
             // A quota fallback (`resume_seat_handovers`) may have handed this
@@ -2311,6 +2346,14 @@ impl Runner {
             self.state.save()?;
         }
 
+        if selected_failed {
+            self.state.status = RunStatus::Blocked;
+            self.state.event("implement", "selected implementer failed or hit quota; holding without fallback, review or publication");
+            self.state.save()?;
+            bail!(
+                "selected implementer unavailable or quota-limited; restore availability and explicitly release the task"
+            );
+        }
         self.after_implement()
     }
 
@@ -8117,6 +8160,10 @@ impl Runner {
                     // overrides `status` back to a terminal value while an
                     // approval is still outstanding.
                     let _ = pr;
+                }
+                Ok(_) if self.state.merge_decision.as_ref().is_some_and(|d| d.closed) => {
+                    self.state.status = RunStatus::Superseded;
+                    self.state.save()?;
                 }
                 Ok(pr) => {
                     self.state.status = match pr.state {

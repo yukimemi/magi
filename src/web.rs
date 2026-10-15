@@ -10006,6 +10006,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merge_decision_api_persists_exact_target_and_selected_action() {
+        let fx = Fixture {
+            home: TempDir::new().unwrap(),
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        };
+        for choice in [
+            crate::land::HOLD,
+            crate::merge_decision::WITHDRAW,
+            "reimplement:beta",
+        ] {
+            let mut q = Question::new(
+                "old-run".into(),
+                crate::land::APPROVAL_NODE.into(),
+                "land".into(),
+                "Decision".into(),
+                "Review findings".into(),
+                vec![
+                    "merge".into(),
+                    "hold".into(),
+                    crate::merge_decision::WITHDRAW.into(),
+                    "reimplement:beta".into(),
+                ],
+            );
+            q.merge_target = Some(crate::merge_decision::Target {
+                pr: "https://github.com/example/repo/pull/42".into(),
+                head: "exact-reviewed-head".into(),
+                language: "ja".into(),
+            });
+            fx.questions().put(&mut q).unwrap();
+            let ui = Arc::new(Ui::new(
+                fx.queue(),
+                fx.questions(),
+                fx.talks(),
+                fx.runs(),
+                fx.home.path().into(),
+                std::path::PathBuf::from("."),
+            ));
+            let response = question_answer(
+                State(ui.clone()),
+                Path(q.id.clone()),
+                Ok(Json(NewAnswer {
+                    choice: Some(choice.into()),
+                    text: None,
+                })),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.0.question.resolution().as_deref(), Some(choice));
+            let disk = fx.questions().get(&q.id).unwrap();
+            assert_eq!(disk.merge_target, q.merge_target);
+            assert_eq!(disk.resolution().as_deref(), Some(choice));
+            assert!(
+                question_answer(
+                    State(ui),
+                    Path(q.id.clone()),
+                    Ok(Json(NewAnswer {
+                        choice: Some("merge".into()),
+                        text: None
+                    }))
+                )
+                .await
+                .is_err(),
+                "an already settled decision cannot turn into merge approval"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn legacy_merge_repair_api_resumes_the_parked_owner_once() {
         let fx = Fixture {
             home: TempDir::new().unwrap(),
@@ -10063,10 +10131,7 @@ mod tests {
         .unwrap();
         assert_eq!(response.0.question.id, q.id);
         let upgraded = fx.questions().get(&q.id).unwrap();
-        assert_eq!(
-            upgraded.choices,
-            [crate::land::APPROVE, crate::land::HOLD, crate::land::REPAIR]
-        );
+        assert_eq!(upgraded.choices, crate::land::approval_choices(&state));
         assert!(upgraded.detail.starts_with("Original evidence"));
         let claim = fx.queue().claim(&task.id).unwrap();
         crate::daemon::apply_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());

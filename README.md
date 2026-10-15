@@ -1079,3 +1079,49 @@ magi home directory; it does not rewrite repository or machine configuration.
 The picker resizes images to at most 384 pixels per side. PNG, JPEG, GIF, and
 WebP inputs are accepted; uploaded icons are limited to 256 KiB (including the
 data URI). Invalid or unavailable saved images fall back to the built-in icon.
+
+### Choosing the next action at the merge gate
+
+The approval card offers five actions (localized for `graph.language = "ja"`):
+
+| Action | Result |
+| --- | --- |
+| Fix findings and re-review / 指摘を修正して再レビュー | One bounded repair and fresh review on the **same PR, branch, run and task**. Previous findings and gate evidence remain in repair history. A new decision is required; this action never approves merging. |
+| Reimplement with selected agent / 選択した agent で再実装 | Select a configured implementer explicitly. The old execution retires and auto-merge is disabled; closure of the old PR must be confirmed before the **same task** starts a new attempt and PR. The original instruction, attachments and review context survive. |
+| Hold decision and stop work / 判断を保留して作業を停止 | Leaves the PR open, blocks the run and manually holds the queue task. Stops repair, rebasing and merge work, including when the PR head changed. It is not a request for repair. |
+| Withdraw: close PR and end task / 取り下げ | A second confirmation explicitly closes the PR and terminates the task. History remains. Failed or unconfirmed closure holds the task instead of declaring it done. |
+| Merge this pull request / マージを承認 | A second confirmation approves only the displayed head, including the outstanding findings shown in the review panel. A changed head needs a fresh decision. |
+
+CLI answers use stable tokens, independently of translated button labels:
+
+```sh
+magi answer <question-id> --reply 'fix findings and re-review'
+magi answer <question-id> --reply 'reimplement:<configured-agent-id>'
+magi answer <question-id> --reply hold
+magi answer <question-id> --reply 'withdraw: close PR and end task'
+magi answer <question-id> --reply merge
+```
+
+`merge` and `hold` remain compatible with older cards and CLI clients. Open
+legacy cards are extended in place, keeping their question ID and displayed
+head. Answered cards retain their choices and decision history.
+
+The daemon resumes the existing parked owner to apply the answer. Answering
+alone does not dispatch an agent. Without a running daemon, explicitly resume
+the existing owning task/run; do not file a second repair or replacement task.
+The replacement implementer selection is persisted and enforced in both initial
+dispatch and implementation fallback. It applies to implementation seats;
+reviewers, advisors and repair/fixer roles retain their configured assignments.
+A missing or quota-limited selected implementer leaves the task manually held,
+without substituting another implementer. Restore availability and explicitly
+release the held task to retry. Ambiguous previous-driver ownership or a crash
+between minting a replacement and linking it to the queue also holds for manual
+inspection rather than starting a concurrent attempt. The run records link the
+old question, attempt, PR and replacement attempt/PR.
+
+Standing chat and deputy consultation leave the card unanswered while discussing
+it. For a new card, chat approval requires the owner's exact latest message
+`merge <displayed-full-head>` and that same complete quote. Stop, repair,
+withdrawal and replacement require the exact offered token as the latest whole
+message. Silence, discussion, repair authorization and stale approvals never
+permit a merge.

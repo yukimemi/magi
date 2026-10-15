@@ -2702,6 +2702,16 @@ async fn answer_cmd(
         r.answer(answer)
     })?;
     println!("answered {} {}", q.short(), q.summary);
+    if q.node == magi::land::APPROVAL_NODE
+        && q.resolution()
+            .as_deref()
+            .is_some_and(magi::merge_decision::stops)
+    {
+        println!(
+            "Decision recorded; the existing owner must resume to apply it. This answer command has not closed a PR, dispatched replacement work or approved a merge. A running magi serve / magi web resumes the parked owner; otherwise use `magi run --resume {}`. Do not create another task.",
+            q.run
+        );
+    }
     if q.node == magi::land::APPROVAL_NODE && q.resolution().as_deref() == Some(magi::land::REPAIR)
     {
         println!(
