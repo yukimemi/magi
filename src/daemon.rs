@@ -1157,7 +1157,16 @@ pub(crate) fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &
             }
             ActionDecision::Done => task.succeed(),
             ActionDecision::Refuse(why) => {
-                task.hold_machine(Some(why));
+                if task.operator_held() {
+                    // A rejected answer does not release the operator's hold
+                    // or reclassify it as recoverable by the conductor.
+                    task.hold_reason = Some(match task.hold_reason.take() {
+                        Some(reason) => format!("{reason}\n\n{why}"),
+                        None => why,
+                    });
+                } else {
+                    task.hold_machine(Some(why));
+                }
                 notices::raise(
                     Notice::warn(
                         &format!("action:{}", q.id),
@@ -9496,6 +9505,80 @@ mod tests {
             ),
             ActionDecision::Skip
         );
+    }
+
+    #[test]
+    fn merge_repair_rejected_after_manual_hold_keeps_the_conductor_guard() {
+        crate::run::pin_test_home();
+        for legacy in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let queue = Queue::at(dir.path().join("queue"));
+            let questions = Questions::at(dir.path().join("questions"));
+            let run = "20260101-000000-hold";
+            let mut task = held_task_with(run);
+            task.status = TaskStatus::Parked;
+            let mut q = ask::Question::new(
+                run.into(),
+                land::APPROVAL_NODE.into(),
+                "land".into(),
+                "Repair?".into(),
+                String::new(),
+                vec![land::REPAIR.into()],
+            );
+            q.actions.insert(land::REPAIR.into(), resume_action(run));
+            q.answer(ask::Answer::Choice(land::REPAIR.into())).unwrap();
+            // Deterministically order the answer before the actual manual hold.
+            q.asked_at = "2026-01-01T00:00:00Z".parse().unwrap();
+            q.answered_at = Some("2026-01-01T00:00:01Z".parse().unwrap());
+            questions.put(&mut q).unwrap();
+            task.hold_manual(Some("Keep this PR paused".into()));
+            if legacy {
+                task.hold_source = None;
+            }
+            queue.put(&mut task).unwrap();
+
+            apply_choice_actions(&queue, &questions, dir.path());
+            let after = queue.get(&task.id).unwrap();
+            assert!(after.operator_held());
+            assert_eq!(after.hold_source, task.hold_source);
+            assert_eq!(after.operator_decided_at, task.operator_decided_at);
+            assert_eq!(after.runs, task.runs);
+            assert_eq!(after.instruction, task.instruction);
+            assert!(after.resume_override.is_none());
+            assert!(after.action_applied(&q.id));
+            let reason = after.hold_reason.as_deref().unwrap();
+            assert!(reason.starts_with("Keep this PR paused"));
+            assert!(reason.contains("later operator decision"));
+            assert!(reason.contains(&format!("magi task release {}", task.id)));
+
+            for recovery in [
+                crate::conduct::Recovery::Review,
+                crate::conduct::Recovery::Requeue,
+            ] {
+                crate::conduct::apply(
+                    &queue,
+                    &questions,
+                    &crate::conduct::Verdict {
+                        decisions: vec![crate::conduct::Decision {
+                            id: task.id.clone(),
+                            recovery: Some(recovery),
+                            ..Default::default()
+                        }],
+                    },
+                )
+                .unwrap();
+            }
+            // Reconciliation is idempotent, and automatic recovery cannot
+            // reopen this owner after it observes the rejected repair answer.
+            apply_choice_actions(&queue, &questions, dir.path());
+            let still_held = queue.get(&task.id).unwrap();
+            assert!(still_held.operator_held());
+            assert_eq!(still_held.hold_reason, after.hold_reason);
+            assert_eq!(still_held.runs, task.runs);
+            assert!(still_held.review_branch.is_none());
+            assert!(!still_held.fresh_start);
+            assert!(queue.next_runnable().is_none());
+        }
     }
 
     #[test]
