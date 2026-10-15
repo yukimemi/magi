@@ -8698,6 +8698,74 @@ mod tests {
     }
 
     #[test]
+    fn dependency_resolution_preserves_independent_consent_and_holds_after_completion() {
+        for held in [false, true] {
+            for question in [false, true] {
+                for reference in ["ca5b", "20261013-193611-ca5b"] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let queue = Queue::at(dir.path().join("queue"));
+                    let questions = ask::Questions::at(dir.path().join("questions"));
+                    let mut prerequisite = task();
+                    prerequisite.id = "20261013-193611-ca5b".into();
+                    prerequisite.start("existing-run".into());
+                    queue.put(&mut prerequisite).unwrap();
+                    let mut waiting = task();
+                    waiting.id = "20261013-202849-ee37".into();
+                    if held {
+                        waiting.hold_machine(Some("waiting for separate consent".into()));
+                    }
+                    queue.put(&mut waiting).unwrap();
+                    let reason = "Deleting saved data requires separate owner consent";
+                    crate::conduct::apply(
+                        &queue,
+                        &questions,
+                        &crate::conduct::Verdict {
+                            decisions: vec![crate::conduct::Decision {
+                                id: waiting.id.clone(),
+                                blocked_by: vec![reference.into()],
+                                question: question.then(|| "May the saved data be deleted?".into()),
+                                recovery: (!question).then_some(crate::conduct::Recovery::Hold),
+                                reason: Some(reason.into()),
+                                ..crate::conduct::Decision::default()
+                            }],
+                        },
+                    )
+                    .unwrap();
+                    let before = queue.get(&waiting.id).unwrap();
+                    if question {
+                        assert_eq!(before.status, TaskStatus::Blocked);
+                        let q = questions.get(&before.blocked_by[0]).unwrap();
+                        assert_eq!(q.summary, "May the saved data be deleted?");
+                        assert!(q.status.open());
+                    } else {
+                        assert_eq!(before.status, TaskStatus::Held);
+                        let recorded_reason = before.hold_reason.as_deref().unwrap();
+                        assert!(recorded_reason.starts_with(reason));
+                        if held {
+                            assert!(recorded_reason.contains("waiting for separate consent"));
+                        }
+                    }
+                    prerequisite.succeed();
+                    queue.put(&mut prerequisite).unwrap();
+                    resolve_blockers(&queue, &questions);
+                    let after = queue.get(&waiting.id).unwrap();
+                    assert_eq!(after.status, before.status);
+                    assert_eq!(after.blocked_by, before.blocked_by);
+                    assert_eq!(after.hold_reason, before.hold_reason);
+                    assert_eq!(after.instruction, waiting.instruction);
+                    if question {
+                        assert!(questions.get(&after.blocked_by[0]).unwrap().status.open());
+                    }
+                    assert!(
+                        queue.next_runnable().is_none(),
+                        "dependency completion is not consent"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn resolve_blockers_clears_a_done_dependency_and_keeps_an_unresolved_one() {
         let dir = tempfile::tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));

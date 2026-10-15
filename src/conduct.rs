@@ -103,27 +103,32 @@ pub struct Decision {
     /// Task id, expected to be copied verbatim from what it was shown.
     pub id: String,
     /// Ids this task should be blocked on. Meaningful only for a runnable
-    /// (`queued`) task, or a machine-held task whose question/hold conflicts
-    /// with references that still exist. Ignored otherwise.
+    /// (`queued`) task, or a machine-held task whose missing-only decision
+    /// can be disproved against the queue. Ignored otherwise.
     #[serde(default)]
     pub blocked_by: Vec<String>,
+    /// Dependencies claimed missing as the sole reason for this question or
+    /// hold. Must name references in `blocked_by`. Empty (including legacy
+    /// replies) means the question/hold may have an independent purpose and
+    /// must be preserved. Never set for decisions needing separate consent.
+    #[serde(default)]
+    pub missing_dependencies: Vec<String>,
     /// One line explaining the block or the recovery.
     #[serde(default)]
     pub reason: Option<String>,
     /// Recovery for a stalled or finished task. For a runnable (`queued`)
-    /// one, only [`Recovery::Hold`] has any effect - and only when
-    /// `blocked_by` is empty, since a `queued` task with something to wait on
-    /// is handled by that field instead - holding a task the operator has
-    /// already said should not compete again without filing another
-    /// `question` that only restates the same answer. `Requeue`, `Review`,
+    /// one, only [`Recovery::Hold`] has any effect. An independent hold takes
+    /// precedence over `blocked_by`, so dependency completion cannot release it.
+    /// Use a hold when the operator already said the task must not compete,
+    /// rather than asking a `question` that restates that answer. `Requeue`, `Review`,
     /// and `Done` have no meaning for a task that is already in line.
     #[serde(default)]
     pub recovery: Option<Recovery>,
     /// A question for the operator. When present, [`apply`] files it (unless
     /// one is already open for this task) and blocks the task on its id
-    /// instead of acting on `blocked_by` or `recovery`. On queued or machine-held
-    /// tasks, explicit dependencies that are not proven missing take precedence
-    /// so a stale missing-task claim cannot create an unnecessary question.
+    /// instead of acting on `blocked_by` or `recovery`. Only a missing-only
+    /// decision explicitly marked by [`Self::missing_dependencies`] may be
+    /// replaced with dependency waiting after disproving its missing claims.
     #[serde(default)]
     pub question: Option<String>,
     /// Fixed answers for `question`, if it has any. Empty means free text.
@@ -702,13 +707,23 @@ fn apply_one(
         return Ok(());
     }
 
-    // Resolve explicit prerequisite references at application time. A question
-    // or hold cannot override safe dependency waiting on a queued/machine-held
-    // task merely because the model claims that an existing record is missing.
-    // Unknown or ambiguous references must also wait; genuine absence keeps
-    // the ordinary question/hold path below.
+    // Only an explicit missing-only claim can justify replacing a question
+    // or hold. Existing prerequisites alone say nothing about independent
+    // consent, destructive-operation questions, or other reasons to stay held.
     if matches!(task.status, TaskStatus::Queued | TaskStatus::Held)
-        && !d.blocked_by.is_empty()
+        && !d.missing_dependencies.is_empty()
+        && d.missing_dependencies.iter().all(|id| {
+            let claim = crate::queue::dependency(queue, questions, id);
+            matches!(
+                &claim,
+                crate::queue::Dependency::Task(_)
+                    | crate::queue::Dependency::Question(_)
+                    | crate::queue::Dependency::Deleted(_)
+            ) && d
+                .blocked_by
+                .iter()
+                .any(|blocker| crate::queue::dependency(queue, questions, blocker) == claim)
+        })
         && (d.question.is_some() || d.recovery == Some(Recovery::Hold))
         && crate::queue::missing_blockers(queue, questions, &d.blocked_by).is_empty()
     {
@@ -770,12 +785,6 @@ fn apply_one(
     }
 
     match task.status {
-        TaskStatus::Queued if !d.blocked_by.is_empty() => {
-            let mut ids = d.blocked_by.clone();
-            crate::queue::normalize_blockers(queue, questions, &mut ids);
-            task.block(ids, d.reason.clone());
-            queue.put(&mut task)?;
-        }
         // See `Decision::recovery`'s doc: the only lever a runnable task has
         // besides `blocked_by` is holding it outright, for a task whose
         // answers already say it should not compete again.
@@ -784,6 +793,12 @@ fn apply_one(
                 task.hold_machine(d.reason.clone());
                 queue.put(&mut task)?;
             }
+        }
+        TaskStatus::Queued if !d.blocked_by.is_empty() => {
+            let mut ids = d.blocked_by.clone();
+            crate::queue::normalize_blockers(queue, questions, &mut ids);
+            task.block(ids, d.reason.clone());
+            queue.put(&mut task)?;
         }
         TaskStatus::Running => match d.recovery {
             Some(Recovery::Requeue) if pinned_resume(&task) => {}
@@ -1408,6 +1423,8 @@ mod tests {
         let new_blocker = Decision {
             blocked_by: vec![dep.id.clone()],
             evidence: vec![dep.id.clone()],
+            // Exercise dependency waiting, without inheriting a separate hold.
+            recovery: None,
             reason: Some("new prerequisite failed".into()),
             ..d.clone()
         };
@@ -1667,8 +1684,14 @@ mod tests {
                         waiting.hold_machine(Some("dependency could not be located".into()));
                     }
                     queue.put(&mut waiting).unwrap();
+                    let missing_reference = if reference == "ca5b" {
+                        dep.id.as_str()
+                    } else {
+                        "ca5b"
+                    };
                     let reply = serde_json::json!({"decisions": [{
                         "id": waiting.id, "blocked_by": [reference],
+                        "missing_dependencies": [missing_reference],
                         "question": question.then_some("ca5b is missing; where is its replacement?"),
                         "recovery": (!question).then_some("hold"),
                         "reason": "ca5b is missing"
@@ -1714,6 +1737,7 @@ mod tests {
         queue.put(&mut waiting).unwrap();
         let reply = serde_json::json!({"decisions": [{
             "id": waiting.id, "blocked_by": ["not-present"],
+            "missing_dependencies": ["not-present"],
             "question": "Which prerequisite replaces the missing task?"
         }]})
         .to_string();
@@ -1831,6 +1855,7 @@ printf '%s\n' "$MOCK_REPLY"
                 question: None,
                 choices: Vec::new(),
                 evidence: Vec::new(),
+                missing_dependencies: Vec::new(),
             }],
         };
         apply(&queue, &questions, &verdict).unwrap();
@@ -1861,6 +1886,7 @@ printf '%s\n' "$MOCK_REPLY"
                 question: Some("Which storage backend?".to_owned()),
                 choices: vec!["SQLite".to_owned(), "Redis".to_owned()],
                 evidence: Vec::new(),
+                missing_dependencies: Vec::new(),
             }],
         };
         apply(&queue, &questions, &verdict).unwrap();
@@ -1982,6 +2008,7 @@ printf '%s\n' "$MOCK_REPLY"
                     question: Some("Which backend?".to_owned()),
                     choices: Vec::new(),
                     evidence: Vec::new(),
+                    missing_dependencies: Vec::new(),
                 }],
             },
         )
