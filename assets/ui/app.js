@@ -4673,25 +4673,28 @@ function renderStakes(row, question) {
   /* Keep consultation outside the rebuilt approval controls. */
   row.insertBefore(r.consultBox, r.stakes.nextSibling);
   const armed = row.dataset.armed === "1";
+  const ja = question.merge_target?.language === "ja";
+  const label = (en, jp) => ja ? jp : en;
+  const target = question.merge_target;
   clear(r.stakes);
+  if (target) r.stakes.append(el("p", { class: "hint", text: `${target.pr} · ${target.head}` }));
 
-  r.stakes.append(el("p", { class: "stakes-what" },
-    "Merging closes this run: the branch goes into ",
-    el("span", { class: "ask-seat", text: "the base branch" }),
-    " and magi has no undo for it.",
-  ));
+  r.stakes.append(el("p", { class: "stakes-what", text: label(
+    "Merging closes this run: the branch goes into the base branch and magi has no undo for it.",
+    "マージすると、この変更がベース branch に入り実行が完了します。元に戻す操作はありません。",
+  ) }));
 
   if (armed) {
     const cancel = el("button", {
-      class: "btn btn-quiet", type: "button", text: "Cancel",
+      class: "btn btn-quiet", type: "button", text: label("Cancel", "キャンセル"),
       onclick: () => { row.dataset.armed = ""; renderStakes(row, question); },
     });
     r.stakes.append(el("div", { class: "stakes-confirm" },
-      el("p", { class: "stakes-warn", text: "Tapping merge now merges it." }),
+      el("p", { class: "stakes-warn", text: label("Confirm this reviewed head, including outstanding findings. Tapping merge now merges it.", "未解決の指摘と表示 head を確認しました。この head をマージします。") }),
       el("div", { class: "stakes-row" },
         cancel,
         el("button", {
-          class: "btn btn-gold", type: "button", text: "Yes, merge now",
+          class: "btn btn-gold", type: "button", text: label("Yes, merge now", "確認した head をマージする"),
           onclick: () => answerQuestion(question.id, { choice: choiceNamed(question, "merge") }, row),
         }),
       ),
@@ -4701,31 +4704,69 @@ function renderStakes(row, question) {
     requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
   } else {
     r.stakes.append(el("button", {
-      class: "btn btn-gold stakes-arm", type: "button", text: "Merge this pull request\u2026",
-      onclick: () => { row.dataset.armed = "1"; renderStakes(row, question); },
+      class: "btn btn-gold stakes-arm", type: "button", text: label("Merge this pull request\u2026", "指摘を確認して、この head のマージを承認…"),
+      onclick: () => { row.dataset.withdrawArmed = ""; row.dataset.armed = "1"; renderStakes(row, question); },
     }));
   }
 
   /* Hold is the safe answer, so it keeps a full target and a real edge
      instead of being demoted to a text link nobody can hit. */
-  r.stakes.append(el("button", {
-    class: "btn btn-quiet stakes-hold", type: "button", text: "Hold \u2014 do not merge",
+  const holdBlock = el("div", { class: "stakes-action" });
+  r.stakes.append(holdBlock);
+  holdBlock.append(el("button", {
+    class: "btn btn-quiet stakes-hold", type: "button", text: label(target ? "Hold decision and stop work" : "Hold \u2014 do not merge", "判断を保留して作業を停止"),
     onclick: () => answerQuestion(question.id, { choice: choiceNamed(question, "hold") }, row),
   }));
 
-  /* A land-approval question that also offered something else keeps those
-     options: the two-step guard is for merge, not a reason to hide a choice
-     the agent asked for. */
+  holdBlock.append(el("p", { class: "hint", text: label("Hold leaves the PR open and stops work. It does not request repairs.", "保留は PR を開いたまま作業を止めます。修復や再レビューは行いません。") }));
+  const replacements = [];
   for (const choice of Array.isArray(question.choices) ? question.choices : []) {
     const name = String(choice).toLowerCase();
     if (name === "merge" || name === "hold") continue;
-    r.stakes.append(el("button", {
-      class: "btn", type: "button", text: choice,
+    if (name.startsWith("reimplement:")) { replacements.push(choice); continue; }
+    if (name === "withdraw: close pr and end task") {
+      const withdrawBlock = el("div", { class: "stakes-action" });
+      r.stakes.append(withdrawBlock);
+      if (row.dataset.withdrawArmed === "1") {
+        const cancel = el("button", { class: "btn btn-quiet", type: "button", text: label("Cancel withdrawal", "取り下げをキャンセル"),
+          onclick: () => { row.dataset.withdrawArmed = ""; renderStakes(row, question); } });
+        withdrawBlock.append(el("p", { class: "stakes-warn", text: label("Close this PR and terminate this task? History is retained; no replacement starts.", "この PR を閉じてタスクを終了しますか？ 履歴は残り、再実装は始まりません。") }), cancel,
+          el("button", { class: "btn", type: "button", text: label("Confirm: close PR and end task", "確認：PR を閉じてタスクを終了"),
+            onclick: () => answerQuestion(question.id, { choice }, row) }));
+        requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
+      } else {
+        withdrawBlock.append(el("button", { class: "btn", type: "button", text: label("Withdraw: close PR and end task…", "取り下げ：PR を閉じてタスクを終了…"),
+          onclick: () => { row.dataset.armed = ""; row.dataset.withdrawArmed = "1"; renderStakes(row, question); } }));
+      }
+      continue;
+    }
+    const repair = name === "fix findings and re-review";
+    const actionBlock = el("div", { class: "stakes-action" });
+    r.stakes.append(actionBlock);
+    actionBlock.append(el("button", {
+      class: "btn", type: "button", text: repair && target ? label("Fix findings and re-review", "指摘を修正して再レビュー") : choice,
       onclick: () => answerQuestion(question.id, { choice }, row),
     }));
-    if (name === "fix findings and re-review") {
-      r.stakes.append(el("p", { class: "hint", text: "Run one repair and bounded re-review on this PR. This does not approve a merge; updated review and gate results require a fresh decision." }));
-    }
+    if (repair) actionBlock.append(el("p", { class: "hint", text: label("Run one repair and bounded re-review on this PR. This does not approve a merge; updated review and gate results require a fresh decision.", "同じ PR・branch で指摘を修正し、回数を制限して再レビューします。マージは承認せず、結果を見て改めて判断します。") }));
+  }
+  if (!replacements.length && target) {
+    r.stakes.append(el("div", { class: "stakes-action" },
+      el("button", { class: "btn", type: "button", disabled: true,
+        text: label("Reimplement: no configured agent available", "再実装：選択できる agent が未設定") })));
+  }
+  if (replacements.length) {
+    const select = el("select", { class: "stakes-agent-select", "aria-label": label("Implementer agent for replacement", "再実装を担当する agent") },
+      el("option", { value: "", text: label("Select implementer…", "担当 agent を選択…") }),
+      ...replacements.map(choice => el("option", { value: choice, text: choice.slice("reimplement:".length) })));
+    select.value = row.dataset.replacementChoice || "";
+    select.addEventListener("change", () => { row.dataset.replacementChoice = select.value; });
+    const start = el("button", { class: "btn", type: "button", text: label("Reimplement with selected agent", "選択した agent で再実装"),
+      onclick: () => {
+        if (replacements.includes(select.value)) answerQuestion(question.id, { choice: select.value }, row);
+      } });
+    r.stakes.append(el("div", { class: "stakes-action" },
+      el("div", { class: "stakes-agent-row" }, select, start),
+      el("p", { class: "hint", text: label("Closes the old PR and retires its execution before a new attempt and PR. Only the selected implementer may implement; if unavailable or quota-limited, the task is held without substitution.", "旧実行を終了し、旧 PR の閉鎖を確認してから、新しい attempt・PR で再実装します。選択 agent が利用不能・上限到達なら代替せず保留します。") })));
   }
 }
 
@@ -5021,6 +5062,8 @@ function updateAskCard(row, question, { compact = false } = {}) {
   if (row.dataset.choiceKey !== choiceKey) {
     row.dataset.choiceKey = choiceKey;
     row.dataset.armed = "";
+    row.dataset.withdrawArmed = "";
+    row.dataset.replacementChoice = "";
     clear(r.choices);
     clear(r.stakes);
     if (merge) {

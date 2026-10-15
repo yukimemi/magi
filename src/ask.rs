@@ -59,7 +59,8 @@ use crate::run::RunStatus;
 /// Schema 8 adds optional local posting comparison data. Older questions use Markdown.
 /// Schema 9 preserves individual original triggers inside whole-field replacements.
 /// Schema 10 records the operator decision generation for built-in triage.
-pub const SCHEMA: u32 = 10;
+/// Schema 11 binds merge decisions to the displayed PR and head.
+pub const SCHEMA: u32 = 11;
 
 /// How often the wait re-reads the question file.
 ///
@@ -495,6 +496,9 @@ pub struct Question {
     /// is the whole difference between the two kinds of question, on disk, in
     /// the UI, and in [`Question::answer`]'s validation.
     pub choices: Vec<String>,
+    /// Exact PR and head displayed to the owner. Absent on legacy questions.
+    #[serde(default)]
+    pub merge_target: Option<crate::merge_decision::Target>,
     /// What the daemon does when a given choice is answered, keyed by the
     /// choice's exact text. Empty for an ordinary question. A key is always
     /// one of [`Question::choices`]; `#[serde(default)]` so older files read.
@@ -626,6 +630,7 @@ impl Question {
             detail,
             posting_comparison: None,
             choices,
+            merge_target: None,
             actions: std::collections::BTreeMap::new(),
             panel: false,
             assets: Vec::new(),
@@ -828,13 +833,12 @@ impl Question {
             // all magi checks is that the quote is a verbatim part of that
             // latest message.
             let ok = if label == crate::land::APPROVE {
-                latest.is_some_and(|m| m.contains(quote))
-            } else if label == crate::land::HOLD || label == crate::land::REPAIR {
-                latest.is_some_and(|m| {
-                    quote.eq_ignore_ascii_case(label) && m.eq_ignore_ascii_case(label)
+                latest.is_some_and(|m| match &self.merge_target {
+                    Some(target) => m == format!("merge {}", target.head) && quote == m,
+                    None => m.contains(quote),
                 })
             } else {
-                false
+                latest.is_some_and(|m| crate::merge_decision::exact_owner_choice(label, m, quote))
             };
             if !ok {
                 bail!(
@@ -1358,23 +1362,18 @@ impl Questions {
     fn with_repair_choice(&self, q: Question) -> Question {
         if (q.status.open() || q.resolution().as_deref() == Some(crate::land::REPAIR))
             && q.node == crate::land::APPROVAL_NODE
-            && (!q.choices.iter().any(|c| c == crate::land::REPAIR)
-                || q.actions.get(crate::land::REPAIR)
-                    != Some(&ChoiceAction::Resume { run: q.run.clone() }))
             && let Some(home) = self.root.parent()
             && let Ok(state) = crate::run::RunState::load_under(&q.run, home)
-            && crate::land::repair_available(&state)
-            && state
-                .land_approval
-                .as_ref()
-                .is_some_and(|a| a.question == q.id)
         {
-            match self.update(&q.id, |current| {
-                crate::land::upgrade_repair_choice(current, &state);
-                Ok(())
-            }) {
-                Ok((current, ())) => return current,
-                Err(_) => return read_path(&self.path_of(&q.id)).unwrap_or(q),
+            let mut upgraded = q.clone();
+            if crate::land::upgrade_repair_choice(&mut upgraded, &state) {
+                match self.update(&q.id, |current| {
+                    crate::land::upgrade_repair_choice(current, &state);
+                    Ok(())
+                }) {
+                    Ok((current, ())) => return current,
+                    Err(_) => return read_path(&self.path_of(&q.id)).unwrap_or(q),
+                }
             }
         }
         q
@@ -2141,6 +2140,7 @@ mod tests {
                 "deputy",
                 "detail",
                 "id",
+                "merge_target",
                 "node",
                 "panel",
                 "run",
@@ -2154,7 +2154,8 @@ mod tests {
             ],
             "the on-disk field set is a contract with the front end"
         );
-        assert_eq!(open["schema"], 10);
+        assert_eq!(open["schema"], 11);
+        assert_eq!(open["merge_target"], serde_json::Value::Null);
         assert_eq!(open["triage_generation"], serde_json::Value::Null);
         assert_eq!(open["thread"], serde_json::json!([]));
         assert_eq!(open["id"], "20260902-231501-ab12");
@@ -2190,6 +2191,41 @@ mod tests {
         // And it survives the round trip a reader actually performs.
         let body = serde_json::to_string(&q).unwrap();
         assert_eq!(serde_json::from_str::<Question>(&body).unwrap(), q);
+    }
+
+    #[test]
+    fn merge_target_persists_and_schema_10_questions_remain_readable() {
+        let (_dir, store) = store();
+        let mut q = approval_question();
+        q.merge_target = Some(crate::merge_decision::Target {
+            pr: "https://github.com/example/repo/pull/42".into(),
+            head: "reviewed-head".into(),
+            language: "ja".into(),
+        });
+        store.put(&mut q).unwrap();
+        let saved = store.get(&q.id).unwrap();
+        assert_eq!(saved, q);
+        let mut body = serde_json::to_value(&saved).unwrap();
+        assert_eq!(body["schema"], 11);
+        assert_eq!(
+            body["merge_target"],
+            serde_json::json!({
+                "pr": "https://github.com/example/repo/pull/42",
+                "head": "reviewed-head",
+                "language": "ja"
+            })
+        );
+
+        // Earlier merge/hold cards have no target field. Read the actual
+        // on-disk shape through the store, including its schema guard.
+        body["schema"] = serde_json::json!(10);
+        body.as_object_mut().unwrap().remove("merge_target");
+        std::fs::write(store.path_of(&q.id), serde_json::to_vec(&body).unwrap()).unwrap();
+        let legacy = store.get(&q.id).unwrap();
+        assert_eq!(legacy.schema, 10);
+        assert!(legacy.merge_target.is_none());
+        assert_eq!(legacy.choices, q.choices);
+        assert_eq!(legacy.status, q.status);
     }
 
     #[test]
@@ -2944,6 +2980,50 @@ mod tests {
         dep.seat = Some(crate::agent::SeatState::new("deputy-x", "alpha", 1));
         q.deputy = Some(dep);
         q
+    }
+
+    #[test]
+    fn merge_decision_deputy_requires_current_head_confirmation_and_exact_stop_tokens() {
+        for choice in [
+            crate::land::HOLD,
+            crate::land::REPAIR,
+            crate::merge_decision::WITHDRAW,
+            "reimplement:beta",
+        ] {
+            let mut q = approval_question();
+            q.node = crate::land::APPROVAL_NODE.into();
+            q.choices = vec!["merge".into(), choice.into()];
+            q.merge_target = Some(crate::merge_decision::Target {
+                pr: "PR 42".into(),
+                head: "abc".into(),
+                language: "en".into(),
+            });
+            q.say(format!("Should we choose {choice}?")).unwrap();
+            assert!(
+                q.settle_by_deputy("deputy-x", choice, choice, None)
+                    .is_err()
+            );
+            q.say(choice).unwrap();
+            q.settle_by_deputy("deputy-x", choice, choice, None)
+                .unwrap();
+            assert_eq!(q.resolution().as_deref(), Some(choice));
+        }
+        let mut q = approval_question();
+        q.node = crate::land::APPROVAL_NODE.into();
+        q.choices = vec!["merge".into(), "hold".into()];
+        q.merge_target = Some(crate::merge_decision::Target {
+            pr: "PR 42".into(),
+            head: "new-head".into(),
+            language: "en".into(),
+        });
+        q.say("merge old-head").unwrap();
+        assert!(
+            q.settle_by_deputy("deputy-x", "merge", "merge old-head", None)
+                .is_err()
+        );
+        q.say("merge new-head").unwrap();
+        q.settle_by_deputy("deputy-x", "merge", "merge new-head", None)
+            .unwrap();
     }
 
     #[test]

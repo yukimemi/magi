@@ -400,6 +400,9 @@ pub struct Graph {
     /// no two first choices to reconcile and `vote` returns early.
     #[serde(alias = "candidates")]
     pub implementers: usize,
+    /// Durable owner selection for a replacement implementation. No fallback.
+    #[serde(default)]
+    pub selected_implementer: Option<String>,
     /// Independent judges.
     pub judges: usize,
     /// Deliberation rounds when the judges' first choices disagree.
@@ -594,6 +597,7 @@ impl Default for Graph {
             github_text_guard: true,
             github_language: "en".into(),
             implementers: 1,
+            selected_implementer: None,
             judges: 3,
             deliberate_rounds: 1,
             reviewers: 3,
@@ -2100,8 +2104,17 @@ impl Config {
                  magi.toml."
             );
         }
+        let pinned = self
+            .graph
+            .selected_implementer
+            .as_ref()
+            .map(|id| self.agent(id).cloned())
+            .transpose()?;
         Ok(ResolvedRoles {
-            implementers: self.rotate(&self.roles.implementers, self.graph.implementers, 0)?,
+            implementers: match &pinned {
+                Some(agent) => vec![agent.clone()],
+                None => self.rotate(&self.roles.implementers, self.graph.implementers, 0)?,
+            },
             judges: self.rotate(&self.roles.judges, self.graph.judges, 1)?,
             reviewers: self.rotate(&self.roles.reviewers, self.graph.reviewers, 0)?,
             fixer: match self.roles.fixer.as_ref() {
@@ -2137,7 +2150,10 @@ impl Config {
                 _ => crate::agent::pick(&self.agents, None, &crate::agent::installed)
                     .unwrap_or_else(|_| self.agents[0].clone()),
             },
-            implementer_roster: self.full_roster(&self.roles.implementers)?,
+            implementer_roster: match pinned {
+                Some(agent) => vec![agent],
+                None => self.full_roster(&self.roles.implementers)?,
+            },
             judge_roster: self.full_roster(&self.roles.judges)?,
             reviewer_roster: self.full_roster(&self.roles.reviewers)?,
         })

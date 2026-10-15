@@ -873,19 +873,26 @@ where
         return ActionDecision::Stale;
     }
     let repair = q.node == land::APPROVAL_NODE && q.resolution().as_deref() == Some(land::REPAIR);
-    // Repair is an explicit new decision on an existing approval card. A
+    let stopping = q.node == land::APPROVAL_NODE
+        && q.resolution()
+            .as_deref()
+            .is_some_and(crate::merge_decision::stops);
+    // Repair and stop actions are new decisions on an existing approval card. A
     // manual hold before that answer must not discard it just because the
     // card predates the hold. Keep the older policy for other choice actions.
-    let decision_at = if repair {
+    let decision_at = if repair || stopping {
         q.answered_at.unwrap_or(q.asked_at)
     } else {
         q.asked_at
     };
     if task.operator_decided_at.is_some_and(|at| at > decision_at) {
-        return if repair {
+        return if repair || stopping {
             ActionDecision::Refuse(format!(
-                "repair answer {} was superseded by a later operator decision; the task stays held. Inspect `magi show {}`; if repair is still wanted, explicitly release the existing owner with `magi task release {}`",
-                q.id, q.run, task.id
+                "{} answer {} was superseded by a later operator decision; the task stays held. Inspect `magi show {}`; if this action is still wanted, explicitly release the existing owner with `magi task release {}`",
+                if repair { "repair" } else { "stop" },
+                q.id,
+                q.run,
+                task.id
             ))
         } else {
             ActionDecision::Stale
@@ -902,6 +909,22 @@ where
                 ));
             }
             match load(run) {
+                Ok(s) if stopping => {
+                    if s.merge_decision.as_ref().is_some_and(|d| d.closed)
+                        || !s
+                            .land_approval
+                            .as_ref()
+                            .is_some_and(|binding| binding.question == q.id)
+                    {
+                        ActionDecision::Stale
+                    } else if s.liveness(false) == Liveness::Live {
+                        ActionDecision::Skip
+                    } else if s.status == RunStatus::Landing && !s.released() {
+                        ActionDecision::Resume(run.clone())
+                    } else {
+                        ActionDecision::Refuse("Owner stop decision cannot resume its original landing execution; inspect the existing run. No replacement or merge was started.".into())
+                    }
+                }
                 Ok(s)
                     if q.node == land::APPROVAL_NODE
                         && q.resolution().as_deref() == Some(land::REPAIR) =>
@@ -916,7 +939,7 @@ where
                         ActionDecision::Skip
                     } else if s.status != RunStatus::Landing
                         || s.released()
-                        || !land::repair_available(&s)
+                        || s.reviews.is_empty()
                         || !implementers_match(task, &s)
                         || !s
                             .land_approval
@@ -1110,13 +1133,17 @@ pub(crate) fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &
             continue;
         }
         let Some(listed) = task_of_question(&tasks, &q) else {
-            if q.node == land::APPROVAL_NODE && q.resolution().as_deref() == Some(land::REPAIR) {
+            if q.node == land::APPROVAL_NODE
+                && q.resolution().as_deref().is_some_and(|choice| {
+                    choice == land::REPAIR || crate::merge_decision::stops(choice)
+                })
+            {
                 notices::raise_in(
                     home,
                     Notice::warn(
                         &format!("repair-owner:{}", q.id),
                         format!(
-                            "Repair is waiting: no task owns run {}. Inspect `magi show {}` and restore its original queue owner; do not file a competing repair task.",
+                            "Approval action is waiting: no task owns run {}. Inspect `magi show {}` and restore its original queue owner; do not file a competing task.",
                             q.run, q.run
                         ),
                     ),
@@ -1513,6 +1540,55 @@ fn settle_and_diagnose(
     state: &RunState,
 ) {
     let p = phrases(&state.config.graph.language);
+    // Shared by normal completion and crash recovery, under the task claim.
+    // No new attempt can own the task until the old driver has exited.
+    if let Some(d) = &state.merge_decision {
+        use crate::merge_decision as md;
+        if task.runs.last().is_some_and(|id| id != &state.id) {
+            return;
+        }
+        if d.choice == md::WITHDRAW && d.closed {
+            task.succeed();
+        } else if let Some(agent) = md::selected_agent(&d.choice).filter(|_| d.closed) {
+            if state.liveness(false) != Liveness::Dead {
+                task.hold_manual(Some("Previous driver is still live; replacement held until it exits. Release the task after checking the driver.".into()));
+                return;
+            }
+            let replacement = md::Replacement {
+                question: d.question.clone(),
+                run: state.id.clone(),
+                pr: d.target.pr.clone(),
+                agent: agent.to_owned(),
+                context: format!(
+                    "Previous PR: {}. Previous run: {}. Owner requested a new implementation.\nReview evidence:\n{}",
+                    d.target.pr,
+                    state.id,
+                    serde_json::to_string(&state.reviews).unwrap_or_default()
+                ),
+            };
+            task.requeue();
+            task.pr_recovery = None;
+            task.review_of = None;
+            task.replacement = Some(replacement);
+        } else {
+            task.hold_manual(Some(if d.choice.eq_ignore_ascii_case(land::HOLD) {
+                format!("Decision held by owner; no further repair or merge work. {}", state.merge.as_ref().map_or("", |m| m.detail.as_str()))
+            } else { format!("PR closure was not confirmed. Task held; inspect the existing run before starting replacement work. {}", state.merge.as_ref().map_or("", |m| m.detail.as_str())) }));
+        }
+        task.mark_action_applied(&d.question);
+        if let Some(pass) = state.passes.last() {
+            task.record_pass(&state.id, pass.index, task.attempts, None);
+        }
+        return;
+    }
+    if let Some(replacement) = &task.replacement
+        && !state.parked
+        && (state.viable().is_empty()
+            || (state.status == RunStatus::Blocked && state.tally.is_none()))
+    {
+        task.hold_manual(Some(format!("Selected implementer `{}` was unavailable, failed or hit quota before producing a viable implementation. No other implementer was dispatched. Inspect the run, restore availability, then explicitly release this task.", replacement.agent)));
+        return;
+    }
     let attempts_before = task.attempts;
     // A run that stopped because a shared resource stayed busy was never a
     // failure of the task or of any agent: nothing was asked. The attempt is
@@ -2127,7 +2203,24 @@ fn land_resume_state(task: &Task) -> LandResume {
     let Ok(state) = RunState::load(run_id) else {
         return LandResume::NotLanding;
     };
-    if !implementers_match(task, &state) || !state.parked {
+    if !state.parked {
+        return LandResume::NotLanding;
+    }
+    if state.status == RunStatus::Landing
+        && state.land_approval.as_ref().is_some_and(|binding| {
+            ask::Questions::open()
+                .get(&binding.question)
+                .is_ok_and(|q| {
+                    q.run == state.id
+                        && q.resolution()
+                            .as_deref()
+                            .is_some_and(crate::merge_decision::stops)
+                })
+        })
+    {
+        return LandResume::Ready;
+    }
+    if !implementers_match(task, &state) {
         return LandResume::NotLanding;
     }
     // Parked in `land` on the merge approval, or at `merge` on the owner's
@@ -2946,6 +3039,67 @@ async fn attempt(
         repo.display()
     );
 
+    // A stop spends no agent resources and uses the saved landing owner.
+    // Current roster edits, missing attachments or a failed config fetch must
+    // never turn it into a new implementation, or prevent a PR from closing.
+    if let Some(previous) = task.runs.last().and_then(|id| RunState::load(id).ok())
+        && previous
+            .merge_decision
+            .as_ref()
+            .is_some_and(|decision| !decision.closed)
+        && previous.status != RunStatus::Landing
+        && !crate::merge_decision::resumable_hold(&previous)
+    {
+        task.hold_unrequested_retry(Some(format!("The existing owner stop decision remains held. Inspect run {} and its PR; request an explicit fresh review/decision before further work. No replacement or merge was started.", previous.id)));
+        record(queue, task);
+        return Vec::new();
+    }
+    let stop_owner = task
+        .runs
+        .last()
+        .and_then(|id| RunState::load(id).ok())
+        .filter(|state| {
+            crate::merge_decision::resumable_hold(state)
+                || state.status == RunStatus::Landing
+                    && state.land_approval.as_ref().is_some_and(|binding| {
+                        Questions::open().get(&binding.question).is_ok_and(|q| {
+                            q.run == state.id
+                                && q.resolution()
+                                    .as_deref()
+                                    .is_some_and(crate::merge_decision::stops)
+                        })
+                    })
+        });
+    if let Some(owner) = stop_owner {
+        let mut runner = match Runner::resume(&owner.id) {
+            Ok(runner) => runner,
+            Err(e) => {
+                task.hold_manual(Some(format!("Cannot stop the existing landing owner: {e:#}. No replacement or merge was started.")));
+                record(queue, task);
+                return Vec::new();
+            }
+        };
+        runner.on_pause(stop.pause());
+        runner.watch_interrupt(interrupt_pause);
+        let quota_before = runner.state.quota.clone();
+        task.start(owner.id.clone());
+        record(queue, task);
+        lock(status).current.push(Current {
+            task: task.id.clone(),
+            run: owner.id,
+        });
+        runner.state.next_pass_task_entry = true;
+        let result = runner.execute().await;
+        return finish_attempt(
+            opts.max_attempts,
+            queue,
+            task,
+            &runner.state,
+            &quota_before,
+            result,
+        );
+    }
+
     // The repository's magi.toml comes from `<remote>/<base>`, fetched now. A
     // failure here is the network's or the operator's, not the task's: hold
     // without spending an attempt, never fall back to a possibly stale copy.
@@ -2980,6 +3134,41 @@ async fn attempt(
         }
     };
     apply_task_implementers(&mut config, task);
+    if let Some(replacement) = &task.replacement {
+        let safe = RunState::load(&replacement.run).is_ok_and(|old| {
+            old.liveness(false) == Liveness::Dead
+                && old.merge_decision.as_ref().is_some_and(|d| {
+                    d.closed
+                        && d.question == replacement.question
+                        && d.replacement_run.as_ref().is_none_or(|run| {
+                            task.runs.last() == Some(run)
+                                && RunState::load(run).is_ok_and(|current| {
+                                    current.replaces.as_ref().is_some_and(|pin| {
+                                        pin.question == replacement.question
+                                            && pin.agent == replacement.agent
+                                    })
+                                })
+                        })
+                })
+        });
+        if !safe {
+            task.hold_manual(Some("Replacement ownership cannot be confirmed, or a replacement run was already minted before a crash. Inspect the task and its linked runs; no second replacement was started.".into()));
+            record(queue, task);
+            return Vec::new();
+        }
+        match config.agent(&replacement.agent) {
+            Ok(agent) if crate::agent::installed(agent) => {}
+            _ => {
+                task.hold_manual(Some(format!("Selected implementer `{}` is unavailable or no longer configured. No substitute was dispatched. Restore it and explicitly release the task.", replacement.agent)));
+                record(queue, task);
+                return Vec::new();
+            }
+        }
+        config.graph.implementers = 1;
+        config.graph.land_approval = true;
+        config.merge.mode = MergeMode::Pr;
+        config.graph.selected_implementer = Some(replacement.agent.clone());
+    }
     let p = phrases(&config.graph.language);
     let start_failed = p.could_not_start;
 
@@ -3057,7 +3246,33 @@ async fn attempt(
             unfinished.as_deref(),
         ),
     };
-    let starter = if let Some(selected) = &task.pr_recovery {
+    let retry_selected = task.replacement.is_some()
+        && task.resumption.is_some()
+        && !task.fresh_start
+        && previous.as_ref().is_some_and(|run| {
+            run.replaces.is_some()
+                && ((run.status == RunStatus::Failed && run.viable().is_empty())
+                    || (run.status == RunStatus::Blocked && run.tally.is_none()))
+        });
+    let stop_pin = task
+        .resume_override
+        .as_ref()
+        .filter(|pin| {
+            Questions::open().get(&pin.question_id).is_ok_and(|q| {
+                q.node == land::APPROVAL_NODE
+                    && q.resolution()
+                        .as_deref()
+                        .is_some_and(crate::merge_decision::stops)
+            })
+        })
+        .and_then(|pin| pin.pinned_run.clone());
+    let starter = if let Some(run) = stop_pin {
+        // Stop actions resume their exact owner even after seat-count edits;
+        // they must never fall through to implementation or a takeover.
+        Starter::Resume(run)
+    } else if retry_selected {
+        Starter::Resume(previous.as_ref().unwrap().id.clone())
+    } else if let Some(selected) = &task.pr_recovery {
         if selected.check_task(&task.id, &task.instruction).is_ok() {
             selected_starter(selected, previous.as_ref(), unfinished.as_deref())
         } else {
@@ -3081,6 +3296,14 @@ async fn attempt(
             "repair owner cannot resume; inspect `magi show {run}` and restore the existing run before `magi task release {}`; no replacement task was started",
             task.id
         )));
+        record(queue, task);
+        return Vec::new();
+    }
+    if task.replacement.is_some()
+        && previous.as_ref().is_some_and(|run| run.replaces.is_some())
+        && starter != Starter::Resume(previous.as_ref().unwrap().id.clone())
+    {
+        task.hold_manual(Some("The selected replacement already has an attempt. It cannot be resumed safely; inspect its saved pin and restore the existing run. No additional replacement was started.".into()));
         record(queue, task);
         return Vec::new();
     }
@@ -3140,6 +3363,17 @@ async fn attempt(
         Starter::Resume(id) => {
             tracing::info!("resuming run {id} rather than competing again");
             Runner::resume(id).and_then(|mut r| {
+                if retry_selected {
+                    // The explicit queue release retries this same pinned
+                    // implementation, preserving the attempt and worktrees.
+                    for candidate in &mut r.state.candidates {
+                        candidate.failed = None;
+                        candidate.empty = false;
+                        candidate.commits = 0;
+                    }
+                    r.state.status = RunStatus::Implementing;
+                    r.state.event("implement", "owner released the held selected implementer; retrying the same attempt without fallback");
+                }
                 if r.state.prep_failure.is_some() {
                     let approval = task
                         .resumption
@@ -3153,9 +3387,13 @@ async fn attempt(
                     r.state.instruction = instruction;
                 }
                 r.state.attachments = attachments.clone();
-                // The merge choice of a hand-started task still holds when the
-                // run it resumes was started under another one.
-                if let Some(mode) = task
+                if task.replacement.is_some() {
+                    r.state.config.merge.mode = MergeMode::Pr;
+                    r.state.config.graph.land_approval = true;
+                }
+                // A replacement always publishes a new PR and asks for a new
+                // decision. Other runs retain their original merge override.
+                if task.replacement.is_none() && let Some(mode) = task
                     .overrides
                     .as_ref()
                     .and_then(|o| o.merge.as_deref())
@@ -3298,6 +3536,35 @@ async fn attempt(
             return Vec::new();
         }
     };
+    if let Some(replacement) = &task.replacement {
+        if matches!(starter, Starter::Start) {
+            runner.state.instruction.push_str(&format!(
+                "\n\n# Replacement review context\n{}",
+                replacement.context
+            ));
+        }
+        runner.state.replaces = Some(replacement.clone());
+        runner.state.config.graph.selected_implementer = Some(replacement.agent.clone());
+        if let Ok(mut old) = RunState::load(&replacement.run)
+            && let Some(d) = &mut old.merge_decision
+        {
+            d.replacement_run = Some(runner.state.id.clone());
+            old.event(
+                "replacement",
+                format!(
+                    "replacement run {} owns the next attempt; old PR remains closed",
+                    runner.state.id
+                ),
+            );
+            if let Err(e) = old.save() {
+                task.hold_manual(Some(format!(
+                    "Could not link replacement history: {e}; no agents dispatched"
+                )));
+                record(queue, task);
+                return Vec::new();
+            }
+        }
+    }
     runner.state.task_instruction = Some(task.instruction.clone());
     // The follow-up depth is fixed now, while the task certainly exists:
     // deleting it later must not reset the cap (`crate::followup`).
@@ -3373,6 +3640,14 @@ pub fn finish_attempt(
         // `Stalled` quota loss; see `settle`'s doc table.
         no_viable_candidates: state.viable().is_empty(),
     };
+    if let Some(replacement) = &state.replaces
+        && let Some(pr) = &state.pr
+        && let Ok(mut old) = RunState::load(&replacement.run)
+        && let Some(d) = &mut old.merge_decision
+    {
+        d.replacement_pr = Some(pr.url.clone());
+        let _ = old.save();
+    }
     settle_and_diagnose(task, verdict, &detail, max_attempts, state);
     if state.status == RunStatus::Blocked && state.prep_failure.is_some() {
         task.hold_unrequested_retry(Some(format!(
@@ -3402,7 +3677,10 @@ pub fn hold_if_runnable(queue: &Queue, task: &mut Task) {
     // the deadline) the moment a loop serves the queue, via `land_resume_state`.
     // Holding it would keep it from ever being a candidate.
     let waits_on_owner = withheld_text_wait(task).is_some();
-    if task.status.runnable() && !waits_on_owner {
+    if task.status.runnable()
+        && !waits_on_owner
+        && !(task.fresh_start && task.replacement.is_some())
+    {
         let why = task.last_error.clone().map_or_else(
             || "the run did not finish".to_owned(),
             |e| format!("the run did not finish: {e}"),
@@ -3568,8 +3846,16 @@ fn cooldown_until(quota: &[QuotaLoss], now: Timestamp) -> Option<Timestamp> {
 
 /// An explicit task count must agree with a run before any resume.
 fn implementers_match(task: &Task, state: &RunState) -> bool {
-    task.implementers()
-        .is_none_or(|n| n == state.config.graph.implementers)
+    task.replacement.as_ref().map_or_else(
+        || {
+            task.implementers()
+                .is_none_or(|n| n == state.config.graph.implementers)
+        },
+        |replacement| {
+            state.config.graph.selected_implementer.as_deref() == Some(&replacement.agent)
+                && state.config.graph.implementers == 1
+        },
+    )
 }
 
 /// Never resume or take over candidate work built for a different seat count.

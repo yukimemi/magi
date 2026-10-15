@@ -17,13 +17,21 @@ fn forge(dir: &Path, branch: &str) {
     let script = bin.join("gh");
     std::fs::write(&script, r#"#!/bin/sh
 printf '%s\n' "$*" >> "$REPAIR_FORGE/calls"
+pr_state=OPEN
+if test -f "$REPAIR_FORGE/closed"; then pr_state=CLOSED; fi
 sha=$(git ls-remote --refs origin "refs/heads/$REPAIR_BRANCH" 2>/dev/null | cut -f1)
 case "$1 $2" in
- 'pr view') printf '{"url":"https://github.com/example/repo/pull/42","number":42,"state":"OPEN","title":"feat: existing work","reviews":[],"comments":[],"mergeStateStatus":"CLEAN","headRefOid":"%s","baseRefName":"main","autoMergeRequest":null,"headRefName":"%s","isCrossRepository":false}\n' "$sha" "$REPAIR_BRANCH" ;;
+ 'pr view') printf '{"url":"https://github.com/example/repo/pull/42","number":42,"state":"%s","title":"feat: existing work","reviews":[],"comments":[],"mergeStateStatus":"CLEAN","headRefOid":"%s","baseRefName":"main","autoMergeRequest":null,"headRefName":"%s","isCrossRepository":false}\n' "$pr_state" "$sha" "$REPAIR_BRANCH" ;;
  'api graphql') printf '{"data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{"oid":"%s","statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false},"nodes":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}}}}]}}}}}\n' "$sha" ;;
  'api repos/{owner}/{repo}/pulls/42/comments') echo '[]' ;;
- 'pr merge') case "$*" in *--disable-auto*) exit 0 ;; *) exit 99 ;; esac ;;
+ 'pr merge') case "$*" in *--disable-auto*)
+   if test -f "$REPAIR_FORGE/late-answer"; then
+     rm "$REPAIR_FORGE/late-answer"
+     (unset MAGI_RUN MAGI_NODE; MAGI_HOME="$REPAIR_HOME" "$REPAIR_CLI" answer "$REPAIR_LATE_QUESTION" --reply "$REPAIR_LATE_CHOICE") > "$REPAIR_FORGE/late-answer-result" 2>&1 || exit 97
+   fi
+   exit 0 ;; *) exit 99 ;; esac ;;
  'pr comment') exit 0 ;;
+ 'pr close') test ! -f "$REPAIR_FORGE/refuse-close" || exit 7; touch "$REPAIR_FORGE/closed" ;;
  *) exit 98 ;;
 esac
 "#).unwrap();
@@ -35,6 +43,8 @@ esac
         std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
         std::env::set_var("REPAIR_FORGE", &bin);
         std::env::set_var("REPAIR_BRANCH", branch);
+        std::env::set_var("REPAIR_CLI", env!("CARGO_BIN_EXE_magi"));
+        std::env::set_var("REPAIR_HOME", magi::run::home());
     }
     let agent = dir.join("mock-agent.sh");
     let original = std::fs::read_to_string(&agent).unwrap();
@@ -55,6 +65,14 @@ fi
 }
 
 async fn held_pr(noop: bool, keep_findings: bool) -> (common::Fixture, Runner, String) {
+    held_pr_choice(noop, keep_findings, REPAIR).await
+}
+
+async fn held_pr_choice(
+    noop: bool,
+    keep_findings: bool,
+    choice: &str,
+) -> (common::Fixture, Runner, String) {
     let home = common::home_lock().await;
     let fx = common::fixture_that_never_clears(home, 1);
     let mut runner = Runner::start(
@@ -124,7 +142,7 @@ async fn held_pr(noop: bool, keep_findings: bool) -> (common::Fixture, Runner, S
             .any(|c| c == REPAIR)
     );
     let answer = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
-        .args(["answer", &id, "--reply", REPAIR])
+        .args(["answer", &id, "--reply", choice])
         .env("MAGI_HOME", magi::run::home())
         .env_remove("MAGI_RUN")
         .env_remove("MAGI_NODE")
@@ -136,19 +154,21 @@ async fn held_pr(noop: bool, keep_findings: bool) -> (common::Fixture, Runner, S
         String::from_utf8_lossy(&answer.stderr)
     );
     let acknowledgement = String::from_utf8(answer.stdout).unwrap();
-    assert!(acknowledgement.contains("this answer command has not started repair"));
-    assert!(acknowledgement.contains("Without one"));
-    assert!(acknowledgement.contains(&format!("magi run --resume {}", runner.state.id)));
+    if choice == REPAIR {
+        assert!(acknowledgement.contains("this answer command has not started repair"));
+        assert!(acknowledgement.contains("Without one"));
+        assert!(acknowledgement.contains(&format!("magi run --resume {}", runner.state.id)));
+    }
     assert!(
         !fx.tmp.path().join("forge/fixes").exists(),
         "no daemon or driver is running in this scenario"
     );
     assert_eq!(
         Questions::open().get(&id).unwrap().resolution().as_deref(),
-        Some(REPAIR)
+        Some(choice)
     );
     let duplicate = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
-        .args(["answer", &id, "--reply", REPAIR])
+        .args(["answer", &id, "--reply", choice])
         .env("MAGI_HOME", magi::run::home())
         .env_remove("MAGI_RUN")
         .env_remove("MAGI_NODE")
@@ -448,5 +468,443 @@ async fn merge_repair_resume_refuses_a_commit_added_after_the_saved_gate() {
     assert_eq!(magi::git::rev_parse(&winner.worktree, "HEAD").await.unwrap(), added);
     assert!(resumed.state.land_approval.is_none());
     assert_eq!(std::fs::read_to_string(fx.tmp.path().join("forge/fixes")).unwrap().lines().count(), 1);
+}
+}
+
+async fn decision_owner(runner: &mut Runner, fx: &common::Fixture) -> magi::queue::Task {
+    let mut task = magi::queue::Task::new(
+        "Existing PR".into(),
+        runner.state.instruction.clone(),
+        fx.repo.clone(),
+        magi::queue::Source::Human,
+    );
+    task.runs.push(runner.state.id.clone());
+    task.status = magi::queue::TaskStatus::Parked;
+    runner.state.origin = Some(Origin::queue(&task.id));
+    runner.state.save().unwrap();
+    magi::queue::Queue::open().put(&mut task).unwrap();
+    task
+}
+
+async fn serve_decision(fx: &common::Fixture, state: &RunState) {
+    let config = fx.tmp.path().join("decision.toml");
+    let mut cfg = state.config.clone();
+    cfg.disk.min_free_bytes = 0;
+    cfg.disk.auto_fold = false;
+    std::fs::write(&config, toml::to_string(&cfg).unwrap()).unwrap();
+    magi::daemon::serve_until(
+        magi::daemon::Opts {
+            repo: fx.repo.clone(),
+            config: Some(config),
+            once: true,
+            worktrees_root: Some(fx.tmp.path().join("worktrees")),
+            ..Default::default()
+        },
+        magi::daemon::Stop::new(),
+    )
+    .await
+    .unwrap();
+}
+
+common::e2e! {
+async fn decision_cli_hold_survives_head_change_and_daemon_settles_manual_hold() {
+    let (fx, mut runner, question) = held_pr_choice(false, false, "hold").await;
+    let task = decision_owner(&mut runner, &fx).await;
+    let w = runner.state.winner().unwrap();
+    std::fs::write(w.worktree.join("external.txt"), "changed after card").unwrap();
+    magi::git::commit_all(&w.worktree, "fix: change after decision").await.unwrap();
+    assert!(magi::git::push(&w.worktree, "origin", &w.branch).await.unwrap().ok());
+    serve_decision(&fx, &runner.state).await;
+    let disk = RunState::load(&runner.state.id).unwrap();
+    let owner = magi::queue::Queue::open().get(&task.id).unwrap();
+    assert_eq!(disk.status, RunStatus::Blocked);
+    assert_eq!(owner.status, magi::queue::TaskStatus::Held);
+    assert!(owner.operator_held());
+    assert!(owner.action_applied(&question));
+    assert_eq!(disk.pr.as_ref().unwrap().state, "open");
+    assert!(disk.merge_repairs.is_empty());
+    assert!(!fx.tmp.path().join("forge/fixes").exists());
+    assert!(!fx.tmp.path().join("forge/closed").exists());
+    assert_eq!(Questions::open().get(&question).unwrap().resolution().as_deref(), Some("hold"));
+}
+}
+
+common::e2e! {
+async fn decision_cli_withdraw_closes_and_terminates_only_after_confirmation() {
+    let (fx, mut runner, question) = held_pr_choice(false, false, magi::merge_decision::WITHDRAW).await;
+    let task = decision_owner(&mut runner, &fx).await;
+    serve_decision(&fx, &runner.state).await;
+    let disk = RunState::load(&runner.state.id).unwrap();
+    let owner = magi::queue::Queue::open().get(&task.id).unwrap();
+    assert_eq!(owner.status, magi::queue::TaskStatus::Done);
+    assert_eq!(disk.pr.as_ref().unwrap().state, "closed");
+    assert!(disk.merge_decision.as_ref().unwrap().closed);
+    assert!(owner.action_applied(&question));
+    assert!(Runner::resume(&disk.id).is_err(), "retired execution must never resume");
+    assert_eq!(owner.instruction, task.instruction);
+    assert_eq!(owner.runs, task.runs);
+}
+}
+
+common::e2e! {
+async fn decision_withdraw_failure_holds_without_terminating_or_repairing() {
+    let (fx, mut runner, _) = held_pr_choice(false, false, magi::merge_decision::WITHDRAW).await;
+    let task = decision_owner(&mut runner, &fx).await;
+    std::fs::write(fx.tmp.path().join("forge/refuse-close"), "").unwrap();
+    serve_decision(&fx, &runner.state).await;
+    let disk = RunState::load(&runner.state.id).unwrap();
+    let owner = magi::queue::Queue::open().get(&task.id).unwrap();
+    assert_eq!(owner.status, magi::queue::TaskStatus::Held);
+    assert!(owner.operator_held());
+    assert!(!disk.merge_decision.as_ref().unwrap().closed);
+    assert_eq!(disk.pr.as_ref().unwrap().state, "open");
+    assert!(!fx.tmp.path().join("forge/fixes").exists());
+}
+}
+
+common::e2e! {
+async fn decision_reimplementation_retires_owner_before_requeue_and_preserves_selection() {
+    let (fx, mut runner, question) = held_pr_choice(false, false, "reimplement:beta").await;
+    let task = decision_owner(&mut runner, &fx).await;
+    serve_decision(&fx, &runner.state).await;
+    let disk = RunState::load(&runner.state.id).unwrap();
+    let owner = magi::queue::Queue::open().get(&task.id).unwrap();
+    assert_eq!(owner.status, magi::queue::TaskStatus::Queued);
+    assert!(owner.fresh_start);
+    let pin = owner.replacement.as_ref().unwrap();
+    assert_eq!(pin.agent, "beta");
+    assert_eq!(pin.question, question);
+    assert_eq!(pin.run, disk.id);
+    assert!(pin.context.contains("Review evidence"));
+    assert_eq!(owner.instruction, task.instruction);
+    assert!(disk.driver_exited);
+    assert!(disk.merge_decision.as_ref().unwrap().closed);
+    assert!(Runner::resume(&disk.id).is_err());
+    // Replaying crash recovery must not mint an attempt or acquire ownership.
+    let mut replay = owner.clone();
+    magi::daemon::finish_attempt(3, &magi::queue::Queue::open(), &mut replay, &disk, &[], Ok(()));
+    assert_eq!(replay.runs, task.runs);
+    assert_eq!(replay.replacement.as_ref().unwrap().agent, "beta");
+    let mut next = disk.clone();
+    next.replaces = Some(pin.clone());
+    assert_ne!(next.task_pr_branch(), disk.task_pr_branch(), "new PR uses a distinct public branch");
+    // Real daemon dispatch must keep the pin even though other agents work.
+    let mut dispatch = runner.state.clone();
+    for agent in &mut dispatch.config.agents {
+        if agent.id == "beta" { agent.env.insert("MOCK_QUOTA_SEAT".into(), "impl-A".into()); }
+    }
+    serve_decision(&fx, &dispatch).await;
+    let after = magi::queue::Queue::open().get(&task.id).unwrap();
+    assert_eq!(after.status, magi::queue::TaskStatus::Held, "error={:?}; hold={:?}; runs={:?}; pin={:?}", after.last_error, after.hold_reason, after.runs, after.replacement);
+    assert!(after.operator_held());
+    assert_eq!(after.runs.len(), 2);
+    let replacement = RunState::load(after.runs.last().unwrap()).unwrap();
+    assert_eq!(replacement.candidates.len(), 1);
+    assert_eq!(replacement.candidates[0].agent, "beta");
+    assert!(replacement.handovers.is_empty());
+    assert_eq!(replacement.task_instruction.as_deref(), Some(task.instruction.as_str()));
+    assert!(replacement.config.graph.land_approval);
+    let old = RunState::load(&disk.id).unwrap();
+    assert_eq!(old.merge_decision.as_ref().unwrap().replacement_run.as_deref(), Some(replacement.id.as_str()));
+    // Explicit release after quota recovery retries the same pinned attempt.
+    let mut recovered = replacement.clone();
+    for agent in &mut recovered.config.agents { agent.env.remove("MOCK_QUOTA_SEAT"); }
+    recovered.config.merge.mode = MergeMode::None;
+    recovered.save().unwrap();
+    let mut released = after.clone();
+    released.release_operator("quota-restored", None);
+    magi::queue::Queue::open().put(&mut released).unwrap();
+    serve_decision(&fx, &runner.state).await;
+    let done = magi::queue::Queue::open().get(&task.id).unwrap();
+    assert_eq!(done.runs, after.runs, "release must not mint another replacement");
+    let resumed = RunState::load(&replacement.id).unwrap();
+    assert_eq!(resumed.candidates[0].agent, "beta");
+    assert!(resumed.candidates[0].commits > 0);
+    assert!(resumed.handovers.is_empty());
+
+}
+}
+
+common::e2e! {
+async fn decision_replacement_missing_agent_holds_before_minting_an_attempt() {
+    let (fx, mut runner, _) = held_pr_choice(false, false, "reimplement:beta").await;
+    let task = decision_owner(&mut runner, &fx).await;
+    serve_decision(&fx, &runner.state).await;
+    let mut dispatch = runner.state.clone();
+    dispatch.config.agents.retain(|agent| agent.id != "beta");
+    serve_decision(&fx, &dispatch).await;
+    let after = magi::queue::Queue::open().get(&task.id).unwrap();
+    assert_eq!(after.status, magi::queue::TaskStatus::Held, "error={:?}; hold={:?}; runs={:?}; pin={:?}", after.last_error, after.hold_reason, after.runs, after.replacement);
+    assert!(after.operator_held());
+    assert_eq!(after.runs, task.runs);
+    assert!(after.hold_reason.as_ref().unwrap().contains("beta"));
+    assert!(after.hold_reason.as_ref().unwrap().contains("unavailable"));
+}
+}
+
+common::e2e! {
+async fn decision_cli_stale_merge_answer_never_authorizes_a_changed_head() {
+    let (fx, mut runner, question) = held_pr_choice(false, false, "merge").await;
+    let task = decision_owner(&mut runner, &fx).await;
+    let w = runner.state.winner().unwrap();
+    std::fs::write(w.worktree.join("after-approval.txt"), "new head").unwrap();
+    magi::git::commit_all(&w.worktree, "fix: move head after approval").await.unwrap();
+    assert!(magi::git::push(&w.worktree, "origin", &w.branch).await.unwrap().ok());
+    serve_decision(&fx, &runner.state).await;
+    let disk = RunState::load(&runner.state.id).unwrap();
+    assert!(disk.parked);
+    assert_ne!(disk.land_approval.as_ref().unwrap().question, question);
+    assert_ne!(disk.status, RunStatus::Merged);
+    assert_eq!(magi::queue::Queue::open().get(&task.id).unwrap().runs, task.runs);
+    let calls = std::fs::read_to_string(fx.tmp.path().join("forge/calls")).unwrap();
+    assert!(calls.lines().filter(|l| l.starts_with("pr merge")).all(|l| l.contains("--disable-auto")));
+}
+}
+
+common::e2e! {
+async fn decision_withdraw_answer_resumes_a_manually_held_owner_only_to_close() {
+    let (fx, mut runner, question) = held_pr_choice(false, false, magi::merge_decision::WITHDRAW).await;
+    let mut task = decision_owner(&mut runner, &fx).await;
+    Questions::open().update(&question, |q| {
+        q.status = magi::ask::QuestionStatus::Open;
+        q.answer = None;
+        q.answered_at = None;
+        Ok(())
+    }).unwrap();
+    task.hold_manual(Some("Decision deferred".into()));
+    task.set_implementers(2, &runner.state.config).unwrap();
+    magi::queue::Queue::open().put(&mut task).unwrap();
+    let answer = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
+        .args(["answer", &question, "--reply", magi::merge_decision::WITHDRAW])
+        .env("MAGI_HOME", magi::run::home()).env_remove("MAGI_RUN").env_remove("MAGI_NODE")
+        .output().unwrap();
+    assert!(answer.status.success(), "{}", String::from_utf8_lossy(&answer.stderr));
+    serve_decision(&fx, &runner.state).await;
+    let owner = magi::queue::Queue::open().get(&task.id).unwrap();
+    assert_eq!(owner.status, magi::queue::TaskStatus::Done, "{:?}", owner.hold_reason);
+    assert_eq!(owner.runs, task.runs);
+    assert!(RunState::load(&runner.state.id).unwrap().merge_decision.unwrap().closed);
+    assert!(!fx.tmp.path().join("forge/fixes").exists());
+}
+}
+
+common::e2e! {
+async fn decision_replacement_crash_checkpoint_does_not_start_a_second_attempt() {
+    let (fx, mut runner, _) = held_pr_choice(false, false, "reimplement:beta").await;
+    let task = decision_owner(&mut runner, &fx).await;
+    serve_decision(&fx, &runner.state).await;
+    let mut old = RunState::load(&runner.state.id).unwrap();
+    // A driver minted the next run and crashed before linking the task.
+    old.merge_decision.as_mut().unwrap().replacement_run = Some("unlinked-attempt".into());
+    old.save().unwrap();
+    serve_decision(&fx, &runner.state).await;
+    let owner = magi::queue::Queue::open().get(&task.id).unwrap();
+    assert_eq!(owner.status, magi::queue::TaskStatus::Held);
+    assert!(owner.operator_held());
+    assert_eq!(owner.runs, task.runs);
+    assert!(owner.hold_reason.as_ref().unwrap().contains("ownership"));
+    assert!(Runner::resume(&old.id).is_err());
+}
+}
+
+fn run_cli(fx: &common::Fixture, args: &[&str]) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
+        .args(args)
+        .current_dir(&fx.repo)
+        .env("MAGI_HOME", magi::run::home())
+        .env_remove("MAGI_RUN")
+        .env_remove("MAGI_NODE")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn approval_gate_late_stop(choice: &str) {
+    let (fx, mut runner, question) = held_pr_choice(false, false, choice).await;
+    let task = decision_owner(&mut runner, &fx).await;
+    Questions::open()
+        .update(&question, |q| {
+            q.status = magi::ask::QuestionStatus::Open;
+            q.answer = None;
+            q.answered_at = None;
+            Ok(())
+        })
+        .unwrap();
+    // The first owner_stop sees an open card. Disarming this saved arm is
+    // the await between that read and approval_gate reading the card again.
+    runner.state.land_armed_head = Some(runner.state.land_approval.as_ref().unwrap().head.clone());
+    runner.state.save().unwrap();
+    std::fs::write(fx.tmp.path().join("forge/late-answer"), "").unwrap();
+    // SAFETY: this test owns an isolated child; the callback runs after these writes.
+    unsafe {
+        std::env::set_var("REPAIR_LATE_QUESTION", &question);
+        std::env::set_var("REPAIR_LATE_CHOICE", choice);
+    }
+    run_cli(&fx, &["run", "--resume", &runner.state.id]);
+    let disk = RunState::load(&runner.state.id).unwrap();
+    let owner = magi::queue::Queue::open().get(&task.id).unwrap();
+    assert!(
+        !fx.tmp.path().join("forge/late-answer").exists(),
+        "CLI answer callback did not run"
+    );
+    assert_eq!(
+        Questions::open()
+            .get(&question)
+            .unwrap()
+            .resolution()
+            .as_deref(),
+        Some(choice)
+    );
+    let decision = disk
+        .merge_decision
+        .as_ref()
+        .expect("late stop must be consumed");
+    assert_eq!(decision.question, question);
+    assert_eq!(decision.choice, choice);
+    assert!(
+        decision.closed,
+        "closure must be confirmed before settling the action"
+    );
+    assert_eq!(disk.pr.as_ref().unwrap().state, "closed");
+    assert_eq!(owner.runs, task.runs);
+    if choice == magi::merge_decision::WITHDRAW {
+        assert_eq!(owner.status, magi::queue::TaskStatus::Done);
+    } else {
+        assert_eq!(owner.status, magi::queue::TaskStatus::Queued);
+        assert_eq!(owner.replacement.as_ref().unwrap().agent, "beta");
+    }
+    assert!(!fx.tmp.path().join("forge/fixes").exists());
+    let calls = std::fs::read_to_string(fx.tmp.path().join("forge/calls")).unwrap();
+    assert!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("pr merge"))
+            .all(|line| line.contains("--disable-auto"))
+    );
+}
+
+common::e2e! {
+async fn decision_review_late_withdraw_at_approval_gate_closes_the_pr() {
+    approval_gate_late_stop(magi::merge_decision::WITHDRAW).await;
+}
+}
+
+common::e2e! {
+async fn decision_review_late_reimplementation_at_approval_gate_requeues_the_owner() {
+    approval_gate_late_stop("reimplement:beta").await;
+}
+}
+
+async fn resume_after_hold(via_daemon: bool) {
+    let (fx, mut runner, old_question) = held_pr_choice(false, false, "hold").await;
+    let task = decision_owner(&mut runner, &fx).await;
+    serve_decision(&fx, &runner.state).await;
+    let queue = magi::queue::Queue::open();
+    let held = RunState::load(&runner.state.id).unwrap();
+    assert_eq!(held.status, RunStatus::Blocked);
+    assert!(held.merge_decision.is_some());
+    assert!(queue.get(&task.id).unwrap().operator_held());
+    // A quiet daemon cannot undo the owner's hold by itself.
+    serve_decision(&fx, &held).await;
+    assert!(queue.get(&task.id).unwrap().operator_held());
+    assert_eq!(
+        RunState::load(&held.id)
+            .unwrap()
+            .land_approval
+            .as_ref()
+            .unwrap()
+            .question,
+        old_question
+    );
+    if via_daemon {
+        run_cli(&fx, &["task", "release", &task.id]);
+        serve_decision(&fx, &held).await;
+    } else {
+        run_cli(&fx, &["run", "--resume", &held.id]);
+    }
+    let resumed = RunState::load(&held.id).unwrap();
+    let owner = queue.get(&task.id).unwrap();
+    assert_eq!(resumed.status, RunStatus::Landing, "{:?}", resumed.events);
+    assert!(resumed.parked);
+    assert!(resumed.merge_decision.is_none());
+    let fresh = resumed.land_approval.as_ref().unwrap();
+    assert_ne!(fresh.question, old_question);
+    assert!(
+        Questions::open()
+            .get(&fresh.question)
+            .unwrap()
+            .status
+            .open()
+    );
+    assert_eq!(
+        Questions::open()
+            .get(&old_question)
+            .unwrap()
+            .resolution()
+            .as_deref(),
+        Some("hold")
+    );
+    assert_eq!(owner.runs, task.runs, "resume must keep the same attempt");
+    assert_eq!(owner.status, magi::queue::TaskStatus::Parked);
+    assert_eq!(
+        resumed.pr.as_ref().unwrap().url,
+        held.pr.as_ref().unwrap().url
+    );
+    assert_eq!(resumed.reviews.len(), held.reviews.len());
+    assert_eq!(resumed.gate_head, held.gate_head);
+    assert!(resumed.merge_repairs.is_empty());
+    assert!(!fx.tmp.path().join("forge/fixes").exists());
+    assert!(!fx.tmp.path().join("forge/closed").exists());
+    let calls = std::fs::read_to_string(fx.tmp.path().join("forge/calls")).unwrap();
+    assert!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("pr merge"))
+            .all(|line| line.contains("--disable-auto"))
+    );
+}
+
+common::e2e! {
+async fn decision_review_task_release_after_hold_requests_a_fresh_decision() {
+    resume_after_hold(true).await;
+}
+}
+
+common::e2e! {
+async fn decision_review_cli_resume_after_hold_requests_a_fresh_decision() {
+    resume_after_hold(false).await;
+}
+}
+
+common::e2e! {
+async fn decision_cli_hold_release_invalidates_prior_merge_consent_on_daemon_resume() {
+    let (fx, mut runner, old_question) = held_pr_choice(false, false, "merge").await;
+    let task = decision_owner(&mut runner, &fx).await;
+    // The daemon has not consumed the merge answer. Hold and release through
+    // the real CLI while it is stopped, without changing the reviewed head.
+    run_cli(&fx, &["task", "hold", &task.id]);
+    run_cli(&fx, &["task", "release", &task.id]);
+    serve_decision(&fx, &runner.state).await;
+
+    let resumed = RunState::load(&runner.state.id).unwrap();
+    let fresh = resumed.land_approval.as_ref().unwrap();
+    assert_ne!(fresh.question, old_question, "{:?}", resumed.events);
+    assert_eq!(fresh.head, runner.state.land_approval.as_ref().unwrap().head);
+    assert!(Questions::open().get(&fresh.question).unwrap().status.open());
+    assert_eq!(Questions::open().get(&old_question).unwrap().resolution().as_deref(), Some("merge"));
+    assert_eq!(resumed.status, RunStatus::Landing);
+    assert!(resumed.parked);
+    let owner = magi::queue::Queue::open().get(&task.id).unwrap();
+    assert_eq!(owner.runs, task.runs);
+    assert_eq!(owner.status, magi::queue::TaskStatus::Parked);
+    assert!(!fx.tmp.path().join("forge/fixes").exists());
+    assert!(!fx.tmp.path().join("forge/closed").exists());
+    let calls = std::fs::read_to_string(fx.tmp.path().join("forge/calls")).unwrap();
+    assert!(calls.lines().filter(|line| line.starts_with("pr merge")).all(|line| line.contains("--disable-auto")));
 }
 }

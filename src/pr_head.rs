@@ -61,6 +61,13 @@ fn try_lock_file(file: &std::fs::File) -> std::io::Result<()> {
 
 pub(crate) fn ensure_owner(state: &RunState) -> Result<()> {
     let disk = run::try_home().and_then(|home| RunState::load_under(&state.id, &home).ok());
+    if state.merge_decision.as_ref().is_some_and(|d| d.closed)
+        || disk
+            .as_ref()
+            .is_some_and(|s| s.merge_decision.as_ref().is_some_and(|d| d.closed))
+    {
+        bail!("this execution was retired by an owner decision; resume the current task instead");
+    }
     if let Some(next) = state
         .pr_taken_over_by
         .as_ref()
@@ -175,6 +182,16 @@ pub(crate) async fn publish(
 ) -> Result<String> {
     ensure_owner(state)?;
     let head = state.task_pr_branch().context("missing task public head")?;
+    let replacement_body;
+    let body = if let Some(previous) = &state.replaces {
+        replacement_body = format!(
+            "{body}\n\nReimplements {} in a new attempt (`{}`), following owner decision `{}`. The previous pull request remains closed; its approvals do not apply here.",
+            previous.pr, state.id, previous.question
+        );
+        replacement_body.as_str()
+    } else {
+        body
+    };
     let home = run::home();
     let previous = predecessors(state, &home, &head).await?;
     // The lease is the head this run pushed, else any head a live-checked
@@ -361,6 +378,29 @@ pub(crate) async fn publish(
         .await
         {
             tracing::warn!("takeover comment on {url} failed: {e:#}");
+        }
+    }
+    if let Some(previous) = &state.replaces {
+        if let Ok(mut old) = RunState::load(&previous.run)
+            && let Some(decision) = &mut old.merge_decision
+        {
+            decision.replacement_pr = Some(url.clone());
+            old.save()?;
+        }
+        let comment = format!(
+            "Replacement attempt `{}` opened {url}, following owner decision `{}`. This PR remains closed; its approvals do not authorize the replacement.",
+            state.id, previous.question
+        );
+        if let Err(e) = checked_gh(
+            &winner.worktree,
+            &["pr", "comment", &previous.pr, "--body", &comment],
+        )
+        .await
+        {
+            state.event(
+                "replacement",
+                format!("could not link the old PR to {url}: {e:#}"),
+            );
         }
     }
     state.event("merge", format!("published task head {head}: {url}"));

@@ -2139,6 +2139,12 @@ pub struct RunState {
     /// Repair history on this same PR and run; no second task owns the branch.
     #[serde(default)]
     pub merge_repairs: Vec<MergeRepair>,
+    /// Owner stop/withdraw/replacement checkpoint, independent of PR head movement.
+    #[serde(default)]
+    pub merge_decision: Option<crate::merge_decision::Decision>,
+    /// Previous attempt replaced by this run; its PR is never reused.
+    #[serde(default)]
+    pub replaces: Option<crate::merge_decision::Replacement>,
     /// The posting-gate question for this run's pull request text, if the gate
     /// withheld any. While `resolved` is `None` the run is parked on it.
     #[serde(default)]
@@ -2443,6 +2449,8 @@ impl RunState {
             land_reruns: None,
             land_approval: None,
             merge_repairs: Vec::new(),
+            merge_decision: None,
+            replaces: None,
             github_text: None,
             change_summary: None,
             pre_gate: Vec::new(),
@@ -2523,7 +2531,11 @@ impl RunState {
             }
         }
         let task = self.origin.as_ref()?.task.as_ref()?;
-        let branch = format!("magi/task-{task}");
+        let branch = if let Some(replaces) = &self.replaces {
+            format!("magi/task-{task}-{}", replaces.question)
+        } else {
+            format!("magi/task-{task}")
+        };
         std::process::Command::new("git")
             .quiet()
             .args(["check-ref-format", "--branch", &branch])
