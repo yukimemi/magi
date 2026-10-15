@@ -239,12 +239,19 @@ fn new_blocking_evidence(
                     .get(id)
                     .ok()
                     .filter(|dep| {
-                        dep.id != task.id && dep.updated_at > r.at && dep.status != TaskStatus::Done
+                        dep.id != task.id
+                            && dep.status != TaskStatus::Done
+                            && (dep.created_at > r.at
+                                || dep.held_at.is_some_and(|at| at > r.at)
+                                || dep.operator_decided_at.is_some_and(|at| at > r.at)
+                                || dep.passes.iter().any(|p| p.settled_at > r.at))
                     })
                     .map(|dep| {
                         format!(
                             "dependency:{id}:{:?}:{:?}:{:?}",
-                            dep.status, dep.hold_reason, dep.last_error
+                            dep.status,
+                            dep.chat_notice_key(),
+                            dep.hold_notice_cause
                         )
                     })
             } else if task.runs.iter().any(|run| run == id) {
@@ -267,11 +274,9 @@ fn new_blocking_evidence(
                     })
                     .map(|run| {
                         format!(
-                            "run:{id}:{:?}:{}:{}:{:?}",
+                            "run:{id}:{:?}:{:?}",
                             run.status,
-                            run.reviews.len(),
-                            task.attempts,
-                            run.passes.last().map(|p| (p.index, p.started_at))
+                            run.passes.last().map(|p| p.index)
                         )
                     })
             } else {
@@ -658,9 +663,7 @@ fn apply_one(
 
     // Compare the actual input, not a generation echoed by the model. Even
     // question creation must be discarded after an intervening operator edit.
-    if snapshot
-        .is_some_and(|old| serde_json::to_value(old).ok() != serde_json::to_value(&task).ok())
-    {
+    if snapshot.is_some_and(|old| decision_input(old) != decision_input(&task)) {
         return Ok(());
     }
     let blocking =
@@ -680,6 +683,16 @@ fn apply_one(
         return Ok(());
     }
 
+    if blocking && !evidence.is_empty() {
+        let mut cause = evidence.clone();
+        cause.sort();
+        cause.dedup();
+        task.notice_cause(
+            &format!("conductor-evidence:{}", cause.join(",")),
+            None,
+            None,
+        );
+    }
     if blocking {
         if let Some(r) = task.resumption.as_mut() {
             r.blocking_evidence.extend(evidence);
@@ -763,6 +776,33 @@ fn apply_one(
         if task.status == TaskStatus::Done {
             return Ok(());
         }
+        let mut held = task.clone();
+        held.status = TaskStatus::Held;
+        let targets: BTreeSet<_> = d
+            .blocked_by
+            .iter()
+            .filter_map(|id| {
+                if let Ok(dep) = queue.get(id) {
+                    Some(format!("task:{id}:{:?}", dep.chat_notice_key()))
+                } else if questions.get(id).is_ok() {
+                    Some(format!("question:{id}"))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let context = serde_json::to_string(&(&task.instruction, held.chat_notice_key(), targets))?;
+        // An answer alone does not justify asking the same decision again.
+        // New producer evidence, an instruction edit or a different dependency
+        // target can open another question; rewording cannot.
+        if questions.list().iter().any(|q| {
+            q.node == NODE
+                && q.run == task.id
+                && q.status == crate::ask::QuestionStatus::Answered
+                && q.decision_context.as_ref() == Some(&context)
+        }) {
+            return Ok(());
+        }
         // `Question::run` is a task id for conductor questions, but ordinary
         // graph questions use it as a run id. A coincidental equality must
         // not block this task on an answer meant for another node.
@@ -772,13 +812,6 @@ fn apply_one(
             .find(|q| q.status.open() && q.node == NODE && q.run == task.id)
         {
             Some(existing) => existing.id,
-            // No cap on settled answers: a question the operator can answer
-            // is never refused. The task goes `Blocked` and at most one
-            // conductor question is open at a time (reused above), so each
-            // further question costs one human answer. Run attempts are
-            // bounded by `max_attempts` and the queue's attempt accounting.
-            // A model rewording the same question can still recur once per
-            // answer; that cost falls on the operator, by choice.
             None => {
                 let mut q = Question::new(
                     task.id.clone(),
@@ -788,6 +821,7 @@ fn apply_one(
                     d.reason.clone().unwrap_or_default(),
                     d.choices.clone(),
                 );
+                q.decision_context = Some(context);
                 // The wait is handed to a deputy (`crate::deputy`), so a
                 // free-text reply reaches an agent that knows why this was
                 // asked. The conductor still never blocks: this only records
@@ -966,10 +1000,20 @@ pub struct Conductor {
 /// without the fields the conductor itself rewrites (`updated_at`,
 /// `hold_reason`, the recorded re-hold). Independent of how the model words a
 /// repeated decision.
-fn input_fingerprint(task: &Task) -> String {
+fn decision_input(task: &Task) -> serde_json::Value {
     let mut v = serde_json::to_value(task).unwrap_or_default();
     if let Some(o) = v.as_object_mut() {
+        o.remove("chat_notice");
+        o.remove("chat_notices");
+        // A delivery write changes only bookkeeping, not the decision input.
         o.remove("updated_at");
+    }
+    v
+}
+
+fn input_fingerprint(task: &Task) -> String {
+    let mut v = decision_input(task);
+    if let Some(o) = v.as_object_mut() {
         o.remove("hold_reason");
         if let Some(ro) = o.get_mut("resume_override").and_then(|r| r.as_object_mut()) {
             ro.remove("conductor_rehold");
@@ -1283,6 +1327,27 @@ mod tests {
             std::path::PathBuf::from("."),
             Source::Human,
         )
+    }
+
+    #[test]
+    fn delivery_bookkeeping_does_not_restart_conductor_deliberation() {
+        let mut t = task("waiting");
+        t.hold_machine(Some("waiting for recovery".into()));
+        let before = input_fingerprint(&t);
+        let snapshot = decision_input(&t);
+        t.chat_notice = Some(crate::queue::ChatNotice {
+            key: t.chat_notice_key().unwrap(),
+            at: jiff::Timestamp::now(),
+            outcome: crate::queue::ChatNoticeOutcome::Posted,
+        });
+        t.chat_notices.push(t.chat_notice_key().unwrap());
+        t.updated_at = jiff::Timestamp::now();
+        assert_eq!(before, input_fingerprint(&t));
+        assert_eq!(snapshot, decision_input(&t));
+        t.hold_reason = Some("recovery remains under consideration".into());
+        assert_eq!(before, input_fingerprint(&t));
+        t.record_answer("a different question".into(), "a new decision".into());
+        assert_ne!(before, input_fingerprint(&t));
     }
 
     const BROKEN: &str = "#!/bin/sh\ncat >/dev/null\nexit 3\n";
@@ -2624,6 +2689,44 @@ printf '%s\n' "$MOCK_REPLY"
         let again = questions.list();
         assert_eq!(again.len(), 1, "the open question is reused");
         assert_eq!(again[0].id, filed[0].id);
+    }
+
+    #[test]
+    fn answered_conductor_question_needs_changed_facts_before_reasking() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("recovery decision");
+        t.hold_machine(Some("out of attempts".into()));
+        queue.put(&mut t).unwrap();
+        let mut d = Decision {
+            id: t.id.clone(),
+            question: Some("Consider recovery?".into()),
+            ..Decision::default()
+        };
+        apply_one(&queue, &questions, &d, None).unwrap();
+        let mut q = questions.list().pop().unwrap();
+        q.answer(crate::ask::Answer::Text("keep held".into()))
+            .unwrap();
+        questions.put(&mut q).unwrap();
+        queue
+            .modify(&t.id, |task| {
+                task.unblock(&q.id);
+                task.hold_machine(Some("recovery remains under consideration".into()));
+                true
+            })
+            .unwrap();
+        d.question = Some("Should we keep waiting on recovery?".into());
+        apply_one(&queue, &questions, &d, None).unwrap();
+        assert_eq!(questions.list().len(), 1, "no repeated operator turn");
+        queue
+            .modify(&t.id, |task| {
+                task.instruction = "recover a different approved source".into();
+                true
+            })
+            .unwrap();
+        apply_one(&queue, &questions, &d, None).unwrap();
+        assert_eq!(questions.list().len(), 2, "new decision target");
     }
 
     #[test]

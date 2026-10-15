@@ -703,6 +703,10 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
         let missing = crate::queue::missing_blockers(queue, questions, &task.blocked_by);
         if !missing.is_empty() {
             let language = language_of(&task, Path::new("."));
+            let mut cause = missing.clone();
+            cause.sort();
+            cause.dedup();
+            task.notice_cause(&format!("missing-blockers:{}", cause.join(",")), None, None);
             task.hold_machine(Some(crate::queue::missing_blocker_hold_reason_in(
                 &task.blocked_by,
                 &missing,
@@ -724,6 +728,7 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
             })
         }) {
             let language = language_of(&task, Path::new("."));
+            task.notice_cause(&format!("unanswered-question:{}", q.id), None, None);
             task.hold_machine(Some(unanswered_question_hold_reason(&q, &language)));
             record(queue, &mut task);
             continue;
@@ -1175,6 +1180,7 @@ pub(crate) fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &
                         None => why,
                     });
                 } else {
+                    task.notice_cause(&format!("resume-refused:{}", q.id), None, None);
                     task.hold_machine(Some(why));
                 }
                 notices::raise(
@@ -1514,6 +1520,11 @@ fn settle_and_diagnose(
     // can re-check, so the same run resumes with the same agents once the
     // resource is free. A park request still wins (it is the operator's).
     if let Some(block) = state.resource_block.as_ref().filter(|_| !verdict.parked) {
+        task.notice_cause(
+            &format!("resource:{}:{}", block.kind, block.node),
+            None,
+            None,
+        );
         task.last_error = Some(detail.to_owned());
         task.diagnostic = None;
         task.attempts = task.attempts.saturating_sub(1);
@@ -1529,7 +1540,14 @@ fn settle_and_diagnose(
         }
         return;
     }
+    let unresolved = task.hold_notice_cause.clone();
     settle_in(task, verdict, detail, max_attempts, p);
+    if state.prep_failure.is_some() {
+        // Minting a run whose candidates could not be prepared is not work
+        // on a newly approved attempt. Keep the unresolved outcome anchor.
+        task.hold_notice_cause = unresolved;
+        task.startup_notice_cause("startup-candidates");
+    }
     // Written here, where the refund (or not) is decided, so the history is a
     // fact and not a later guess from the run's status.
     if let Some(pass) = state.passes.last() {
@@ -1540,6 +1558,13 @@ fn settle_and_diagnose(
         task.record_pass(&state.id, pass.index, attempts_before, parked);
     }
     if task.status == TaskStatus::Held {
+        if state.prep_failure.is_none() {
+            task.notice_cause(
+                label(verdict.status),
+                Some(&state.id),
+                state.passes.last().map(|p| p.index),
+            );
+        }
         task.diagnostic = diagnostic(state);
         note_open_question(task, &state.id, p);
     }
@@ -1567,6 +1592,13 @@ fn note_open_question(task: &mut Task, run: &str, p: &Phrases) {
     let Some(q) = open.first() else {
         return;
     };
+    let mut decisions: Vec<_> = open.iter().map(|q| q.id.as_str()).collect();
+    decisions.sort_unstable();
+    task.notice_cause(
+        &format!("questions:{}", decisions.join(",")),
+        Some(run),
+        None,
+    );
     let base = task.hold_reason.clone().unwrap_or_default();
     task.hold_reason = Some(format!("{base}{}{}", p.waiting_for_answer, q.short()));
 }
@@ -1605,6 +1637,7 @@ fn reclaim(task: &mut Task, last_run: Option<RunState>, max_attempts: usize, lan
             task.last_error = Some(why.to_owned());
             // The phone shows `hold_reason`, so a task held by the machine
             // says why there too and not only in `last_error`.
+            task.notice_cause("missing-run", None, None);
             task.hold_machine(Some(why.to_owned()));
         }
     }
@@ -2923,6 +2956,7 @@ async fn attempt(
     };
     if let Err(e) = Config::discover_fetched(&repo, explicit).await {
         let reason = format!("[config] {e:#}");
+        task.notice_cause("config-fetch", None, None);
         task.last_error = Some(reason.clone());
         task.hold_machine(Some(reason.clone()));
         record(queue, task);
@@ -2936,6 +2970,7 @@ async fn attempt(
             // Without that, a task naming a repository that does not exist
             // would be retried at every poll for as long as the daemon lives.
             task.attempts += 1;
+            task.startup_notice_cause("startup-config");
             task.fail(format!("config: {e:#}"), opts.max_attempts);
             record(queue, task);
             return Vec::new();
@@ -2953,6 +2988,7 @@ async fn attempt(
     // space cannot be measured closes the gate too: starting a run blind on a
     // disk that may be full is how the machine ends up with 6.7 GB free.
     if let Some(reason) = disk_gate(&repo, &config) {
+        task.notice_cause("disk-space", None, None);
         task.last_error = Some(reason.clone());
         task.hold_machine(Some(reason.clone()));
         record(queue, task);
@@ -3036,6 +3072,8 @@ async fn attempt(
         })
         && starter != Starter::Resume(run.clone())
     {
+        let run = run.clone();
+        task.notice_cause("repair-owner", Some(&run), None);
         task.hold_machine(Some(format!(
             "repair owner cannot resume; inspect `magi show {run}` and restore the existing run before `magi task release {}`; no replacement task was started",
             task.id
@@ -3051,6 +3089,7 @@ async fn attempt(
         Ok(a) => a,
         Err(e) => {
             task.attempts += 1;
+            task.startup_notice_cause("startup-attachments");
             task.fail(format!("{start_failed}{e:#}"), opts.max_attempts);
             record(queue, task);
             return Vec::new();
@@ -3150,6 +3189,7 @@ async fn attempt(
         // by itself is the operator's call, not a failed attempt: hold the
         // task with the reason, spend nothing, and say so on the bell.
         Err(e) if task.pr_recovery.is_some() => {
+            task.startup_notice_cause("startup-public-head");
             task.attempts += 1;
             if let Some(partial) = e.downcast_ref::<crate::pr_recovery::StartupFailed>() {
                 task.link_run(&partial.run);
@@ -3167,6 +3207,7 @@ async fn attempt(
                 Some(r) => (p.handover_refused)(r),
                 None => format!("{e:#}"),
             };
+            task.startup_notice_cause("startup-handover");
             let reason = format!("{start_failed}{detail}");
             task.last_error = Some(reason.clone());
             // Consumed above by `take`; keep it so the released task retries
@@ -3214,6 +3255,7 @@ async fn attempt(
                 Err(put) => {
                     tracing::warn!("could not file the divergence question: {put:#}");
                     task.attempts += 1;
+                    task.startup_notice_cause("startup-question-store");
                     task.fail(format!("{start_failed}{e:#}"), opts.max_attempts);
                 }
             }
@@ -3238,6 +3280,7 @@ async fn attempt(
             }
             task.attempts += 1;
             task.last_error = Some(format!("{start_failed}{e:#}"));
+            task.startup_notice_cause("startup-source");
             task.hold_unrequested_retry(Some(format!(
                 "Startup failed: {e:#}. Correct the startup source or configuration, then explicitly release the task; automatic recovery is stopped."
             )));
@@ -4661,6 +4704,55 @@ mod tests {
         assert!(t.operator_held());
         assert!(!t.status.runnable());
         assert!(t.hold_reason.as_deref().unwrap().contains("recover-pr"));
+        let first = t.chat_notice_key().unwrap();
+        t.chat_notices.push(first.clone());
+        t.release_operator("test", None);
+        state.id = "another-unprepared-run".into();
+        t.start(state.id.clone());
+        finish_attempt(
+            3,
+            &q,
+            &mut t,
+            &state,
+            &[],
+            Err(anyhow::anyhow!("still conflicts")),
+        );
+        assert_eq!(
+            t.chat_notice_key().as_ref(),
+            Some(&first),
+            "no work happened"
+        );
+        t.release_operator("test", None);
+        state.prep_failure = None;
+        state.status = RunStatus::Failed;
+        state.begin_pass();
+        t.start(state.id.clone());
+        finish_attempt(
+            1,
+            &q,
+            &mut t,
+            &state,
+            &[],
+            Err(anyhow::anyhow!("new gate failure")),
+        );
+        let failure = t.chat_notice_key().unwrap();
+        assert_ne!(failure, first, "approved recovery reached a real failure");
+        t.release_operator("test", None);
+        state.begin_pass();
+        t.start(state.id.clone());
+        finish_attempt(
+            1,
+            &q,
+            &mut t,
+            &state,
+            &[],
+            Err(anyhow::anyhow!("new failure on resume")),
+        );
+        assert_ne!(
+            t.chat_notice_key().as_ref(),
+            Some(&failure),
+            "a new settled pass"
+        );
     }
 
     #[test]

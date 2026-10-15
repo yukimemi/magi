@@ -530,6 +530,13 @@ pub struct Task {
     /// [`Task::chat_notice_due`]. Never cleared by a release or requeue.
     #[serde(default)]
     pub chat_notice: Option<ChatNotice>,
+    /// Delivery ledger, unioned under the task lock even on stale writes.
+    #[serde(default)]
+    pub chat_notices: Vec<String>,
+    /// Structured producer identity of the unresolved hold. Requeues and prose
+    /// updates retain it; a settled run or a distinct startup stage replaces it.
+    #[serde(default)]
+    pub hold_notice_cause: Option<NoticeCause>,
     /// Append-only: one entry per pass over a run that the loop settled. A
     /// resumed run is one run with several passes, and `attempts` counts
     /// claims net of refunds, so the two are not the same number; this says
@@ -540,6 +547,17 @@ pub struct Task {
     pub created_at: Timestamp,
     /// Last change to this file.
     pub updated_at: Timestamp,
+}
+
+/// Facts a producer can independently attest about a held outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NoticeCause {
+    /// Processing stage or verified external evidence.
+    pub stage: String,
+    /// An actual run that reached settlement; absent for preflight failures.
+    pub run: Option<String>,
+    /// The settled pass, so a resumed run can report a new failure.
+    pub pass: Option<usize>,
 }
 
 /// Current and legacy completion keys; legacy run counts contain only digits.
@@ -802,6 +820,8 @@ impl Task {
             held_at: None,
             park_reason: None,
             chat_notice: None,
+            chat_notices: Vec::new(),
+            hold_notice_cause: None,
             passes: Vec::new(),
             created_at: now,
             updated_at: now,
@@ -830,15 +850,50 @@ impl Task {
         }
     }
 
-    /// Identity of the final state a chat should hear about, or `None` while
-    /// the task is intermediate (queued, running, parked, a failed attempt the
-    /// loop will retry - the last attempt turns into a hold). A hold is keyed
-    /// by when it began and a block by what it waits on. Completion is keyed
-    /// by the task itself, so requeues never report completion twice.
+    /// Identity of a material outcome. Prose and wall-clock times are never
+    /// evidence. Dependencies are a set; held causes survive intermediate states.
     pub fn chat_notice_key(&self) -> Option<String> {
         match self.status {
             TaskStatus::Done => Some("done".to_owned()),
-            TaskStatus::Held => Some(format!(
+            TaskStatus::Held => {
+                let cause = self
+                    .hold_notice_cause
+                    .clone()
+                    .unwrap_or_else(|| self.unresolved_hold_cause());
+                Some(format!(
+                    "cause:{}",
+                    serde_json::to_string(&cause).expect("cause")
+                ))
+            }
+            TaskStatus::Blocked => {
+                let ids: std::collections::BTreeSet<_> = self.blocked_by.iter().collect();
+                // Only new verified blocking evidence versions the dependency
+                // set. Freezing an unrelated hold on release must not do so.
+                let evidence = self
+                    .hold_notice_cause
+                    .as_ref()
+                    .filter(|c| c.stage.starts_with("conductor-evidence:"));
+                Some(format!(
+                    "dependencies:{}",
+                    serde_json::to_string(&(ids, evidence)).expect("ids")
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    fn unresolved_hold_cause(&self) -> NoticeCause {
+        NoticeCause {
+            stage: "hold".into(),
+            run: self.runs.last().cloned(),
+            pass: None,
+        }
+    }
+
+    /// Exact old delivery identity, only for reconciling an existing record.
+    pub(crate) fn legacy_chat_notice_key(&self) -> Option<String> {
+        let key = match self.status {
+            TaskStatus::Held if self.hold_notice_cause.is_none() => Some(format!(
                 "held#{}",
                 self.held_at.map(|t| t.to_string()).unwrap_or_default()
             )),
@@ -848,20 +903,97 @@ impl Task {
                 self.block_reason.as_deref().unwrap_or_default()
             )),
             _ => None,
+        };
+        key.filter(|key| self.legacy_notice_matches(key))
+    }
+
+    pub(crate) fn legacy_notice_matches(&self, key: &str) -> bool {
+        match self.status {
+            TaskStatus::Held if self.hold_notice_cause.is_none() => key
+                .strip_prefix("held#")
+                .is_some_and(|time| time.is_empty() || time.parse::<Timestamp>().is_ok()),
+            TaskStatus::Blocked
+                if self
+                    .hold_notice_cause
+                    .as_ref()
+                    .is_none_or(|c| !c.stage.starts_with("conductor-evidence:")) =>
+            {
+                key.strip_prefix("blocked#").is_some_and(|tail| {
+                    let Some((ids, _)) = tail.split_once('#') else {
+                        return false;
+                    };
+                    let old: std::collections::BTreeSet<_> =
+                        ids.split(',').filter(|id| !id.is_empty()).collect();
+                    let current: std::collections::BTreeSet<_> =
+                        self.blocked_by.iter().map(String::as_str).collect();
+                    old == current
+                })
+            }
+            _ => false,
         }
     }
 
-    /// The key of a completion notice owed to the originating chat now, if
-    /// any: filed by a chat, schema 13 or newer, in a final state, and not the
-    /// state already recorded in [`Task::chat_notice`].
+    fn import_chat_notice(&mut self) {
+        if let Some(n) = &self.chat_notice {
+            let key = if is_done_notice_key(&n.key) {
+                "done".to_owned()
+            } else if self.legacy_notice_matches(&n.key) {
+                self.chat_notice_key().unwrap_or_else(|| n.key.clone())
+            } else {
+                n.key.clone()
+            };
+            if !self.chat_notices.contains(&key) {
+                self.chat_notices.push(key);
+            }
+        }
+    }
+
+    /// A producer records the processing stage and actual run/pass, never the
+    /// error's rendered prose. No run means startup made no implementation progress.
+    pub(crate) fn notice_cause(&mut self, stage: &str, run: Option<&str>, pass: Option<usize>) {
+        self.import_chat_notice();
+        self.hold_notice_cause = Some(NoticeCause {
+            stage: stage.to_owned(),
+            run: run.map(str::to_owned),
+            pass,
+        });
+    }
+
+    /// Startup retries cannot replace an unresolved run outcome without doing
+    /// work. Distinct startup stages can still explain a newly encountered blocker.
+    pub(crate) fn startup_notice_cause(&mut self, stage: &str) {
+        match self.hold_notice_cause.as_ref() {
+            Some(cause) if !cause.stage.starts_with("startup-") => return,
+            None if self
+                .chat_notice
+                .as_ref()
+                .is_some_and(|n| !is_done_notice_key(&n.key)) =>
+            {
+                return;
+            }
+            _ => {}
+        }
+        self.notice_cause(stage, None, None);
+    }
+
+    /// A chat-filed task owes each material final outcome at most one notice.
     pub fn chat_notice_due(&self) -> Option<String> {
         self.filed_by_chat()?;
         if self.schema < 13 {
             return None;
         }
         let key = self.chat_notice_key()?;
+        if self.chat_notices.contains(&key) {
+            return None;
+        }
         match &self.chat_notice {
-            Some(n) if n.key == key || (key == "done" && is_done_notice_key(&n.key)) => None,
+            Some(n)
+                if n.key == key
+                    || (key == "done" && is_done_notice_key(&n.key))
+                    || self.legacy_notice_matches(&n.key) =>
+            {
+                None
+            }
             _ => Some(key),
         }
     }
@@ -1040,7 +1172,12 @@ impl Task {
 
     fn note_held(&mut self) {
         self.stamp_schema();
-        if self.status != TaskStatus::Held || self.held_at.is_none() {
+        let continuing = self.status == TaskStatus::Held
+            || (self.status == TaskStatus::Blocked
+                && (self.blocked_from == Some(TaskStatus::Held)
+                    || (self.blocked_from.is_none()
+                        && (self.hold_reason.is_some() || self.hold_source.is_some()))));
+        if !continuing || self.held_at.is_none() {
             self.held_at = Some(Timestamp::now());
         }
     }
@@ -1062,6 +1199,10 @@ impl Task {
     /// reason blank.
     pub fn fail(&mut self, why: impl Into<String>, max_attempts: usize) {
         let why = why.into();
+        if self.status == TaskStatus::Running {
+            let run = self.runs.last().cloned();
+            self.notice_cause("run-failed", run.as_deref(), Some(self.attempts));
+        }
         self.diagnostic = None;
         self.park_reason = None;
         self.status = if self.attempts >= self.effective_attempt_limit(max_attempts) {
@@ -1555,6 +1696,14 @@ impl Task {
     /// so a release is a real second chance rather than an instant re-hold.
     /// The run history is kept: attempts reset, evidence does not.
     pub fn release(&mut self) {
+        // Freeze the unresolved cause before a recovery can mint a run without
+        // doing work. Approval and timestamps alone are not new outcomes.
+        self.import_chat_notice();
+        if self.hold_notice_cause.is_none()
+            && matches!(self.status, TaskStatus::Held | TaskStatus::Blocked)
+        {
+            self.hold_notice_cause = Some(self.unresolved_hold_cause());
+        }
         let refused_handover = self.status == TaskStatus::Held
             && self.hold_source == Some(HoldSource::Machine)
             && self.review_branch.is_some()
@@ -1917,7 +2066,13 @@ impl Queue {
 
     /// [`Queue::put`] for a caller already holding [`Queue::lock_task`].
     fn put_unlocked(&self, task: &mut Task) -> Result<()> {
-        if let Ok(stored) = read_path(&self.path_of(&task.id)) {
+        if let Ok(mut stored) = read_path(&self.path_of(&task.id)) {
+            stored.import_chat_notice();
+            for key in stored.chat_notices {
+                if !task.chat_notices.contains(&key) {
+                    task.chat_notices.push(key);
+                }
+            }
             for run in stored.runs {
                 if !task.runs.contains(&run) {
                     task.runs.push(run);
@@ -1940,6 +2095,7 @@ impl Queue {
                 task.chat_notice = Some(n);
             }
         }
+        task.import_chat_notice();
         task.updated_at = Timestamp::now();
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
@@ -4932,6 +5088,124 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_hold_keeps_its_anchor_but_a_new_run_starts_a_new_hold() {
+        let mut t = chat_task();
+        t.hold_machine(Some("waiting".into()));
+        let old: Timestamp = "2020-01-01T00:00:00Z".parse().unwrap();
+        t.held_at = Some(old);
+        t.block(vec!["decision".into()], None);
+        t.hold_machine(Some("same waiting decision".into()));
+        assert_eq!(t.held_at, Some(old));
+        t.start("real-new-run".into());
+        t.fail("new failure", 1);
+        assert_ne!(
+            t.held_at,
+            Some(old),
+            "old answers cannot approve a new hold"
+        );
+    }
+
+    #[test]
+    fn legacy_delivery_survives_upgrade_and_a_no_progress_run_link() {
+        let (_dir, queue) = queue();
+        let mut t = chat_task();
+        t.start("old-run".into());
+        t.hold_machine(Some("operator is considering recovery".into()));
+        t.chat_notice = Some(ChatNotice {
+            key: format!("held#{}", t.held_at.unwrap()),
+            at: Timestamp::now(),
+            outcome: ChatNoticeOutcome::Posted,
+        });
+        let mut raw = serde_json::to_value(&t).unwrap();
+        raw.as_object_mut().unwrap().remove("chat_notices");
+        raw.as_object_mut().unwrap().remove("hold_notice_cause");
+        std::fs::create_dir_all(queue.path_of(&t.id).parent().unwrap()).unwrap();
+        std::fs::write(queue.path_of(&t.id), serde_json::to_string(&raw).unwrap()).unwrap();
+        assert_eq!(queue.get(&t.id).unwrap().chat_notice_due(), None);
+        queue
+            .modify(&t.id, |task| {
+                task.requeue();
+                task.link_run("unprepared-run");
+                task.startup_notice_cause("startup-source");
+                task.fail("same unresolved preflight", 0);
+                true
+            })
+            .unwrap();
+        assert_eq!(queue.get(&t.id).unwrap().chat_notice_due(), None);
+        queue
+            .modify(&t.id, |task| {
+                task.succeed();
+                true
+            })
+            .unwrap();
+        assert_eq!(
+            queue.get(&t.id).unwrap().chat_notice_due().as_deref(),
+            Some("done")
+        );
+    }
+
+    #[test]
+    fn a_dependency_wait_does_not_change_when_released_and_blocked_again() {
+        let mut t = chat_task();
+        t.block(vec!["a".into(), "b".into()], Some("waiting".into()));
+        let key = t.chat_notice_key().unwrap();
+        t.chat_notices.push(key);
+        t.release();
+        t.block(
+            vec!["b".into(), "a".into(), "a".into()],
+            Some("still waiting on prerequisites".into()),
+        );
+        assert_eq!(t.chat_notice_due(), None);
+        t.block(
+            vec!["new-question".into()],
+            Some("different decision".into()),
+        );
+        assert!(t.chat_notice_due().is_some());
+    }
+
+    #[test]
+    fn structured_causes_preserve_no_progress_retries_and_report_new_passes() {
+        let mut t = chat_task();
+        t.hold_machine(Some("startup source missing".into()));
+        t.startup_notice_cause("startup-source");
+        let first = t.chat_notice_key().unwrap();
+        t.chat_notices.push(first.clone());
+        t.release_operator("test", None);
+        t.startup_notice_cause("startup-source");
+        t.hold_machine(Some("same source cannot be read".into()));
+        assert_eq!(t.chat_notice_due(), None);
+        t.startup_notice_cause("startup-config");
+        assert!(t.chat_notice_due().is_some(), "different startup stage");
+        t.notice_cause("failed", Some("existing-run"), Some(0));
+        let run_failure = t.chat_notice_key().unwrap();
+        t.chat_notices.push(run_failure.clone());
+        t.release_operator("test", None);
+        t.startup_notice_cause("startup-source");
+        t.hold_machine(Some("no new work happened".into()));
+        assert_eq!(t.chat_notice_due(), None);
+        t.notice_cause("failed", Some("existing-run"), Some(1));
+        assert!(t.chat_notice_due().is_some(), "a real resumed pass failed");
+        assert_ne!(t.chat_notice_key().unwrap(), run_failure);
+    }
+
+    #[test]
+    fn legacy_hold_baseline_does_not_replay_or_hide_new_failures_and_completion() {
+        let mut t = chat_task();
+        t.hold_machine(Some("still waiting".into()));
+        t.chat_notice = Some(ChatNotice {
+            key: "held#2026-10-14T00:00:00Z".into(),
+            at: Timestamp::now(),
+            outcome: ChatNoticeOutcome::Posted,
+        });
+        assert_eq!(t.chat_notice_due(), None, "old hold baseline");
+        t.import_chat_notice();
+        t.notice_cause("failed", Some("new-run"), Some(0));
+        assert!(t.chat_notice_due().is_some(), "new producer evidence");
+        t.succeed();
+        assert_eq!(t.chat_notice_due().as_deref(), Some("done"));
+    }
+
+    #[test]
     fn a_chat_notice_is_due_only_for_a_final_state_and_only_once() {
         let mut t = chat_task();
         assert_eq!(t.chat_notice_due(), None, "queued");
@@ -4981,7 +5255,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_hold_after_a_release_is_a_new_cause() {
+    fn a_release_without_progress_keeps_the_unresolved_notice_cause() {
         let mut t = chat_task();
         t.hold_manual(Some("wait".to_owned()));
         let first = t.chat_notice_due().expect("held");
@@ -4995,8 +5269,7 @@ mod tests {
         t.release();
         std::thread::sleep(std::time::Duration::from_millis(5));
         t.hold_manual(None);
-        let second = t.chat_notice_due().expect("a fresh hold");
-        assert_ne!(first, second);
+        assert_eq!(t.chat_notice_due(), None, "no progress, same cause");
     }
 
     #[test]

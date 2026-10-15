@@ -708,3 +708,114 @@ async fn watch_signal_exit_and_quoted_notice_markers_remain_automatic_data() {
     assert!(!report.contains(magi::prompt::CHAT_CONSULT_HEADING));
     assert!(magi::prompt::is_completion_notice(&report));
 }
+
+#[tokio::test]
+async fn unresolved_hold_survives_prose_recovery_restart_and_stale_writes() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let mut t = Task::new(
+        "recover existing work".into(),
+        "keep the approved source".into(),
+        w.tmp.path().into(),
+        Source::Agent {
+            run: w.talk_id.clone(),
+            node: CHAT_NODE.into(),
+        },
+    );
+    t.start("existing-run".into());
+    t.fail("operator will consider recovery", 1);
+    w.queue.put(&mut t).unwrap();
+    let mut stale = t.clone();
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    let mut delivered = w.talks.get(&w.talk_id).unwrap();
+    talk::clear_pending(&mut delivered, &w.talks).unwrap();
+    assert!(chat_notify::talks_to_start(&w.talks).is_empty());
+    let original = drafts(&w);
+    // The conductor held a snapshot while delivery appended its ledger.
+    stale.hold_machine(Some("keep waiting while recovery is considered".into()));
+    std::thread::scope(|scope| {
+        scope.spawn(|| w.queue.put(&mut stale).unwrap());
+        scope.spawn(|| {
+            assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
+        });
+    });
+    for reason in [
+        "still awaiting the same recovery",
+        "operator has not released it",
+    ] {
+        w.queue
+            .modify(&t.id, |task| {
+                task.requeue();
+                // A startup failure before a new run is not implementation progress.
+                task.fail("preflight still refuses the same source", 0);
+                task.hold_machine(Some(reason.into()));
+                true
+            })
+            .unwrap();
+        let reloaded = Queue::at(w.tmp.path().join("queue"));
+        assert!(chat_notify::sweep(&reloaded, &w.talks, w.tmp.path()).is_empty());
+        assert_eq!(drafts(&w), original);
+        assert!(
+            chat_notify::talks_to_start(&w.talks).is_empty(),
+            "no automatic reply turn"
+        );
+    }
+    w.queue
+        .modify(&t.id, |task| {
+            task.block(
+                vec!["new-decision".into()],
+                Some("needs a different decision".into()),
+            );
+            true
+        })
+        .unwrap();
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    let question_draft = drafts(&w);
+    w.queue
+        .modify(&t.id, |task| {
+            task.block(
+                vec!["new-decision".into(), "new-decision".into()],
+                Some("rephrased question context".into()),
+            );
+            true
+        })
+        .unwrap();
+    assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
+    assert_eq!(drafts(&w), question_draft);
+    w.queue
+        .modify(&t.id, |task| {
+            task.hold_machine(Some("same underlying hold after blocking".into()));
+            true
+        })
+        .unwrap();
+    assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
+    w.queue
+        .modify(&t.id, |task| {
+            task.release_operator("test", None);
+            task.start("meaningful-new-run".into());
+            task.fail("new implementation failure", 1);
+            true
+        })
+        .unwrap();
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    w.queue
+        .modify(&t.id, |task| {
+            task.succeed();
+            true
+        })
+        .unwrap();
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
+}

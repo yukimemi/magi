@@ -563,10 +563,15 @@ fn deliver(
     let text = notice_text(task, &facts);
     let prefix = format!("{}:", task.id);
     let previous = |stored: &str| {
-        key == "done"
-            && stored
-                .strip_prefix(&prefix)
-                .is_some_and(crate::queue::is_done_notice_key)
+        stored.strip_prefix(&prefix).is_some_and(|old| {
+            (key == "done" && crate::queue::is_done_notice_key(old))
+                || task.legacy_chat_notice_key().as_deref() == Some(old)
+                || (task.status == TaskStatus::Blocked && task.legacy_notice_matches(old))
+                || task
+                    .chat_notice
+                    .as_ref()
+                    .is_some_and(|n| n.key == old && task.legacy_notice_matches(old))
+        })
     };
     match talk::queue_once_matching(
         &mut talk,
@@ -609,6 +614,9 @@ pub fn sweep(queue: &Queue, talks: &Talks, home: &Path) -> Vec<String> {
                 Ok((outcome, added)) => {
                     if added {
                         posted.push(talk_id);
+                    }
+                    if !t.chat_notices.contains(&key) {
+                        t.chat_notices.push(key.clone());
                     }
                     t.chat_notice = Some(ChatNotice {
                         key,
