@@ -1581,7 +1581,12 @@ impl Config {
                 if error.downcast_ref::<ConfigFailure>().is_some() {
                     error
                 } else {
-                    error.context(ConfigFailure::layers("config-merge", paths))
+                    // Keep the actionable refusal visible to plain Display
+                    // callers while retaining the structured failure identity.
+                    let message = error.to_string();
+                    error
+                        .context(ConfigFailure::layers("config-merge", paths))
+                        .context(message)
                 }
             })?;
         }
@@ -3606,8 +3611,12 @@ mod tests {
         std::fs::write(&repo, "[roles]\nimplementers = [\"oc\"]\n").unwrap();
 
         let err = Config::load_layers(&[machine.clone(), repo.clone()])
-            .expect_err("two layers naming one array must not merge silently")
-            .to_string();
+            .expect_err("two layers naming one array must not merge silently");
+        assert_eq!(
+            err.downcast_ref::<ConfigFailure>().unwrap().stage,
+            "config-merge"
+        );
+        let err = err.to_string();
         assert!(err.contains("roles.implementers"), "{err}");
         // Both files are named: the fix is to delete one of them, and the
         // operator has to know which two to choose between.
@@ -3786,8 +3795,12 @@ mod tests {
         std::fs::write(&repo, "[notify]\ncommand = [\"curl\", \"-X\"]\n").unwrap();
 
         let err = Config::load_layers(&[machine.clone(), repo.clone()])
-            .expect_err("an argv split across layers must not concatenate")
-            .to_string();
+            .expect_err("an argv split across layers must not concatenate");
+        assert_eq!(
+            err.downcast_ref::<ConfigFailure>().unwrap().stage,
+            "config-merge"
+        );
+        let err = err.to_string();
         assert!(err.contains("notify.command"), "{err}");
         assert!(err.contains("machine.toml"), "{err}");
         assert!(err.contains("magi.toml"), "{err}");
