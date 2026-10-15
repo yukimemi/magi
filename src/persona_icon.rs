@@ -202,6 +202,11 @@ fn decode_base64(s: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Dedicated sender artwork, independent of the persona named magi.
+pub fn magi_svg() -> &'static str {
+    include_str!("../assets/ui/avatars/magi-sender.svg")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,9 +267,4 @@ mod tests {
         assert_eq!(fingerprint(None), fingerprint(Some(" ")));
         assert_ne!(fingerprint(Some("/a.png")), fingerprint(Some("/b.png")));
     }
-}
-
-/// Dedicated sender artwork, independent of the persona named magi.
-pub fn magi_svg() -> &'static str {
-    include_str!("../assets/ui/avatars/magi-sender.svg")
 }

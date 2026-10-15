@@ -5729,7 +5729,7 @@ mod tests {
         let mut talk = talks.get(&talk.id).unwrap();
         let turn = talk.turns.last().unwrap();
         assert_eq!(turn.who, Who::Operator);
-        assert_eq!(sender(turn, turn.messages.get(0)), Sender::Operator);
+        assert_eq!(sender(turn, turn.messages.first()), Sender::Operator);
         assert_eq!(sender(turn, turn.messages.get(1)), Sender::Magi);
         let reply = resolve_reply(
             &talk,
