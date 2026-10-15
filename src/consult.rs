@@ -124,7 +124,12 @@ pub fn begin(questions: &Questions, talks: &Talks, q: &Question, talk: &Talk) ->
         });
         return Err(e).context("reopen the chat");
     }
-    if let Err(e) = talk::queue_magi(&mut talk, talks, &crate::prompt::chat_consult(&q)) {
+    if let Err(e) = talk::queue_magi_display(
+        &mut talk,
+        talks,
+        &crate::prompt::chat_consult(&q),
+        Some(crate::prompt::chat_consult_display(&q)),
+    ) {
         let _ = questions.update(&q.id, |r| {
             r.consult = None;
             Ok(())

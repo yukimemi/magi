@@ -6986,6 +6986,9 @@ struct TalkView {
     #[serde(flatten)]
     talk: Talk,
     turn_bodies_md: Vec<Vec<md::Node>>,
+    /// Display-only Markdown, indexed by turn then message (legacy turns have one).
+    turn_messages_md: Vec<Vec<Option<Vec<md::Node>>>>,
+    pending_messages_md: Vec<Option<Vec<md::Node>>>,
     /// Whether [`Ui::begin_talk_turn`] currently holds this talk's turn in
     /// this server process.
     ///
@@ -7138,6 +7141,37 @@ impl TalkView {
             .iter()
             .map(|turn| md::to_nodes(&turn.body, &md::ImageBase::None))
             .collect();
+        let turn_messages_md = talk
+            .turns
+            .iter()
+            .map(|turn| {
+                if turn.messages.is_empty() {
+                    vec![notice_markdown(talk::sender(turn, None), &turn.body, None)]
+                } else {
+                    turn.messages
+                        .iter()
+                        .map(|message| {
+                            notice_markdown(
+                                message.sender.unwrap_or(talk::Sender::Operator),
+                                &message.body,
+                                message.display.as_ref(),
+                            )
+                        })
+                        .collect()
+                }
+            })
+            .collect();
+        let pending_messages_md = talk
+            .pending_messages
+            .iter()
+            .map(|message| {
+                notice_markdown(
+                    message.sender.unwrap_or(talk::Sender::Operator),
+                    &message.body,
+                    message.display.as_ref(),
+                )
+            })
+            .collect();
         let specs = cfg.map_or(&[][..], |c| &c.talk.personas[..]);
         let persona_name = persona::find(specs, &talk.persona)
             .filter(|p| !p.is_default())
@@ -7150,6 +7184,8 @@ impl TalkView {
         let operator_name = cfg.and_then(|c| c.talk.operator_name()).map(str::to_owned);
         Self {
             turn_bodies_md,
+            turn_messages_md,
+            pending_messages_md,
             thinking,
             context,
             operator_name,
@@ -7163,6 +7199,30 @@ impl TalkView {
             talk,
         }
     }
+}
+
+/// Parse only the user-facing representation of an explicitly identified MAGI send.
+fn notice_markdown(
+    sender: talk::Sender,
+    body: &str,
+    display: Option<&crate::prompt::NoticeDisplay>,
+) -> Option<Vec<md::Node>> {
+    if sender != talk::Sender::Magi {
+        return None;
+    }
+    let text = if let Some(display) = display {
+        display.facts.as_str()
+    } else {
+        // Unknown completion templates may contain internal directives. Never
+        // promote their agent input to the Markdown display surface.
+        if crate::prompt::is_completion_notice(body)
+            || body.starts_with(&format!("# {}\n", crate::prompt::CHAT_CONSULT_HEADING))
+        {
+            return None;
+        }
+        body.strip_prefix("magi: ").unwrap_or(body)
+    };
+    Some(md::to_nodes(text, &md::ImageBase::None))
 }
 
 /// `GET /api/talks/{id}`'s answer: a [`TalkView`] plus the queue tasks this
@@ -11414,6 +11474,10 @@ mod tests {
             Some(talk::Sender::Magi)
         );
         assert_eq!(view.talk.turns[3].sender, Some(talk::Sender::Persona));
+        assert_eq!(view.turn_messages_md[0].len(), 1);
+        assert!(view.turn_messages_md[0][0].is_none());
+        assert!(view.turn_messages_md[1][0].is_none());
+        assert!(view.turn_messages_md[1][1].is_some());
     }
 
     #[tokio::test]
@@ -11452,6 +11516,12 @@ mod tests {
             "operator copy stays literal"
         );
         assert_eq!(view.talk.pending_messages[0].display, Some(display.clone()));
+        assert!(view.turn_messages_md[0][0].is_none());
+        let queued_md = view.pending_messages_md[0].clone();
+        assert_eq!(
+            queued_md,
+            Some(md::to_nodes(&display.facts, &md::ImageBase::None))
+        );
         talk::drain(&mut conversation, &ui.talks).unwrap();
         talk::record_reply(
             &mut conversation,
@@ -11473,6 +11543,7 @@ mod tests {
         saved.turns[1].messages[0].display = None; // old MAGI send
         ui.talks.put(&mut saved).unwrap();
         let view = TalkView::with_config(ui.talks.get(&id).unwrap(), false, None, &ui.home);
+        assert_eq!(view.turn_messages_md[1][0], queued_md);
         assert_eq!(view.talk.turns[1].messages[0].display, Some(display));
         assert!(
             !view.talk.turns[2].messages[0]
@@ -11483,6 +11554,108 @@ mod tests {
                 .contains("automatic report")
         );
         assert_eq!(ui.talks.get(&id).unwrap().turns[1].messages[0].body, body);
+    }
+
+    #[tokio::test]
+    async fn consultation_display_hides_directives_in_queue_and_history() {
+        for node in [
+            "implement",
+            crate::land::APPROVAL_NODE,
+            crate::github_text::ASK_NODE,
+        ] {
+            let (_tmp, _home, ui, id, _) = avatar_fixture("").await;
+            let mut question = Question::new(
+                "run-123".into(),
+                node.into(),
+                "seat-1".into(),
+                "Which backend?".into(),
+                "## Context\n\nUse `storage`.\n\n<script>literal</script>".into(),
+                vec!["SQLite".into(), "Redis".into()],
+            );
+            ui.questions.put(&mut question).unwrap();
+            let body = crate::prompt::chat_consult(&question);
+            let mut conversation = ui.talks.get(&id).unwrap();
+            talk::record(&mut conversation, &ui.talks, &body, vec![]).unwrap();
+            assert!(
+                crate::consult::begin(&ui.questions, &ui.talks, &question, &conversation).unwrap()
+            );
+            conversation = ui.talks.get(&id).unwrap();
+            assert_eq!(conversation.pending_messages[0].body, body);
+            assert!(body.contains("magi answer"));
+            let mut legacy_pending = conversation.clone();
+            legacy_pending.pending_messages[0].display = None;
+            let legacy_view = TalkView::with_config(legacy_pending, false, None, &ui.home);
+            let legacy_md = serde_json::to_string(&legacy_view.pending_messages_md[0]).unwrap();
+            assert!(legacy_md.contains("Question consultation"));
+            assert!(!legacy_md.contains("magi answer"));
+            let view = TalkView::with_config(conversation.clone(), false, None, &ui.home);
+            assert!(
+                view.turn_messages_md[0][0].is_none(),
+                "operator copy stays literal"
+            );
+            let queued_md = view.pending_messages_md[0].clone().unwrap();
+            let rendered = serde_json::to_string(&queued_md).unwrap();
+            for visible in [
+                "Which backend?",
+                "Context",
+                "storage",
+                "SQLite",
+                "Redis",
+                "<script>literal</script>",
+            ] {
+                assert!(rendered.contains(visible), "missing {visible}");
+            }
+            for directive in [
+                "What to do",
+                "magi answer",
+                "Never answer it yourself",
+                "Do not edit the repository",
+            ] {
+                assert!(!rendered.contains(directive), "exposed {directive}");
+            }
+            assert_eq!(
+                view.talk.pending_messages[0].display,
+                Some(crate::prompt::chat_consult_display(&question))
+            );
+            talk::drain(&mut conversation, &ui.talks).unwrap();
+            let view = TalkView::with_config(conversation.clone(), false, None, &ui.home);
+            assert_eq!(view.turn_messages_md[1][0], Some(queued_md));
+            assert_eq!(conversation.turns[1].messages[0].body, body);
+
+            // Historical consultations lack a snapshot: show a safe placeholder
+            // rather than parsing instructions or reconstructing mutable facts.
+            conversation.turns[1].messages[0].display = None;
+            let view = TalkView::with_config(conversation, false, None, &ui.home);
+            let legacy = serde_json::to_string(&view.turn_messages_md[1][0]).unwrap();
+            assert!(legacy.contains("Question consultation"));
+            assert!(!legacy.contains("magi answer"));
+            assert!(notice_markdown(talk::Sender::Magi, &body, None).is_none());
+        }
+    }
+
+    #[test]
+    fn notification_markdown_uses_only_visible_facts_and_explicit_provenance() {
+        let facts = "# Update\n\n- `task` [PR](https://example.org)\n\n```sh\necho ok\n```\n\n<script>alert(1)</script>\n\n[bad](javascript:alert(1))";
+        let (body, mut display) =
+            crate::prompt::chat_watch_report("watch-123", "failed", "<script>untrusted</script>");
+        display.facts = facts.into();
+        let nodes = notice_markdown(talk::Sender::Magi, &body, Some(&display)).unwrap();
+        assert_eq!(nodes, md::to_nodes(facts, &md::ImageBase::None));
+        let json = serde_json::to_string(&nodes).unwrap();
+        for kind in ["heading", "bullet_list", "code", "link", "code_block"] {
+            assert!(json.contains(&format!("\"type\":\"{kind}\"")));
+        }
+        assert!(json.contains("<script>alert(1)</script>"));
+        assert!(!json.contains("javascript:"));
+        assert!(!json.contains("Tell the operator"));
+        assert!(!json.contains("untrusted"));
+        assert!(notice_markdown(talk::Sender::Operator, facts, None).is_none());
+        assert!(notice_markdown(talk::Sender::Operator, &body, Some(&display)).is_none());
+        assert!(notice_markdown(talk::Sender::Magi, &body, None).is_none());
+        assert_eq!(
+            notice_markdown(talk::Sender::Magi, "magi: # Status", None).unwrap(),
+            md::to_nodes("# Status", &md::ImageBase::None),
+        );
     }
 
     #[tokio::test]

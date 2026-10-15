@@ -1663,6 +1663,16 @@ pub(crate) fn queue_notice(
 
 /// Queue an injected message without changing its input role or lease handling.
 pub fn queue_magi(talk: &mut Talk, store: &Talks, text: &str) -> Result<()> {
+    queue_magi_display(talk, store, text, None)
+}
+
+/// Save a user-facing snapshot alongside an injected message's agent input.
+pub(crate) fn queue_magi_display(
+    talk: &mut Talk,
+    store: &Talks,
+    text: &str,
+    display: Option<crate::prompt::NoticeDisplay>,
+) -> Result<()> {
     queue_keyed(
         talk,
         store,
@@ -1670,7 +1680,7 @@ pub fn queue_magi(talk: &mut Talk, store: &Talks, text: &str) -> Result<()> {
         Vec::new(),
         None,
         &|_| false,
-        (None, Sender::Magi, None),
+        (None, Sender::Magi, display),
     )
     .map(|_| ())
 }
