@@ -1957,7 +1957,9 @@ mod tests {
         queue.put(&mut unrelated).unwrap();
         // Make the old and new revision distinguishable without relying on
         // the filesystem clock advancing while the mock process starts.
-        std::fs::File::open(queue.path_of(&unrelated.id))
+        std::fs::File::options()
+            .write(true)
+            .open(queue.path_of(&unrelated.id))
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
             .unwrap();
