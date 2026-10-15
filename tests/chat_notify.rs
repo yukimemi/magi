@@ -819,3 +819,121 @@ async fn unresolved_hold_survives_prose_recovery_restart_and_stale_writes() {
     );
     assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
 }
+
+#[tokio::test]
+async fn question_targets_control_automatic_turns_independently_of_labels() {
+    use magi::ask::{Answer, Questions};
+    use magi::conduct::{
+        self, Decision, QuestionDecision, QuestionOperation, QuestionTarget, Verdict,
+    };
+    let _home = common::home_lock().await;
+    for choices in [vec!["yes".to_owned(), "no".to_owned()], Vec::new()] {
+        let w = world();
+        let questions = Questions::at(w.tmp.path().join("questions"));
+        let mut t = Task::new(
+            "recover existing work".into(),
+            "consider recovery".into(),
+            w.tmp.path().into(),
+            Source::Agent {
+                run: w.talk_id.clone(),
+                node: CHAT_NODE.into(),
+            },
+        );
+        t.runs = vec!["source-run-a".into(), "source-run-b".into()];
+        t.hold_machine(Some("recovery is under consideration".into()));
+        w.queue.put(&mut t).unwrap();
+        assert_eq!(
+            chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+            1
+        );
+        let mut talk = w.talks.get(&w.talk_id).unwrap();
+        talk::clear_pending(&mut talk, &w.talks).unwrap();
+        let mut d = Decision {
+            id: t.id.clone(),
+            question: Some("Recover from source A?".into()),
+            choices: choices.clone(),
+            question_decision: Some(QuestionDecision {
+                operation: QuestionOperation::Recover,
+                target: QuestionTarget::Run {
+                    id: "source-run-a".into(),
+                },
+            }),
+            ..Decision::default()
+        };
+        conduct::apply(
+            &w.queue,
+            &questions,
+            &Verdict {
+                decisions: vec![d.clone()],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+            1
+        );
+        talk = w.talks.get(&w.talk_id).unwrap();
+        talk::clear_pending(&mut talk, &w.talks).unwrap();
+        let mut q = questions.list().pop().unwrap();
+        q.answer(if choices.is_empty() {
+            Answer::Text("keep held".into())
+        } else {
+            Answer::Choice("no".into())
+        })
+        .unwrap();
+        questions.put(&mut q).unwrap();
+        w.queue
+            .modify(&t.id, |task| {
+                task.record_answer(q.summary.clone(), "keep held".into());
+                task.unblock(&q.id);
+                true
+            })
+            .unwrap();
+        assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
+        d.question = Some("Use source A for recovery, or continue waiting?".into());
+        if !choices.is_empty() {
+            d.choices = vec!["recover using source A".into(), "remain on hold".into()];
+        }
+        let queue = Queue::at(w.tmp.path().join("queue"));
+        let questions = Questions::at(w.tmp.path().join("questions"));
+        conduct::apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![d.clone()],
+            },
+        )
+        .unwrap();
+        assert_eq!(questions.list().len(), 1);
+        assert!(chat_notify::sweep(&queue, &w.talks, w.tmp.path()).is_empty());
+        assert!(drafts(&w).is_empty());
+        assert!(chat_notify::talks_to_start(&w.talks).is_empty());
+        let previous_decision = d.question_decision.take();
+        conduct::apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![d.clone()],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            questions.list().len(),
+            1,
+            "omitted metadata is not a new decision"
+        );
+        d.question_decision = previous_decision;
+        d.question = Some("Recover from source B?".into());
+        d.choices = choices;
+        d.question_decision.as_mut().unwrap().target = QuestionTarget::Run {
+            id: "source-run-b".into(),
+        };
+        conduct::apply(&queue, &questions, &Verdict { decisions: vec![d] }).unwrap();
+        assert_eq!(questions.list().len(), 2);
+        assert_eq!(chat_notify::sweep(&queue, &w.talks, w.tmp.path()).len(), 1);
+        assert_eq!(
+            chat_notify::talks_to_start(&w.talks),
+            vec![w.talk_id.clone()]
+        );
+    }
+}

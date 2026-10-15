@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, Invocation, SeatState};
 use crate::ask::{Deputy, Question, Questions};
@@ -96,6 +96,93 @@ pub enum Recovery {
     Done,
 }
 
+/// The operation for which the operator's decision is requested. These are
+/// fixed protocol values, independent of the language of the displayed choices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QuestionOperation {
+    /// Choose an existing implementation as the recovery source.
+    Recover,
+    /// Continue an existing run from its saved state.
+    Resume,
+    /// Authorize repairing existing work before continuing.
+    Repair,
+    /// Confirm that the task may be closed as complete.
+    Complete,
+    /// Request an operator inspection of the target.
+    Inspect,
+    /// Request a configuration change for the target.
+    Configure,
+}
+
+/// The concrete object of an operator decision. Sources resolve to commit ids;
+/// runs must belong to this task. A generated prose label is never an identity.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum QuestionTarget {
+    /// The task itself, for decisions without a more specific recorded object.
+    Task,
+    /// A run already owned by this task.
+    Run {
+        /// Full recorded run id.
+        id: String,
+    },
+    /// A recovery source which the repository can resolve to a commit.
+    Source {
+        /// Existing branch name or commit reference, never a display label.
+        reference: String,
+    },
+}
+
+/// The structured meaning of a question, separate from its displayed wording.
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuestionDecision {
+    /// The concrete type of operator decision requested.
+    pub operation: QuestionOperation,
+    /// The recorded object the decision concerns.
+    pub target: QuestionTarget,
+}
+
+impl QuestionDecision {
+    fn identity(&self, task: &Task) -> Result<(QuestionOperation, String)> {
+        let target = match &self.target {
+            QuestionTarget::Task => format!("task:{}", task.id),
+            QuestionTarget::Run { id } => {
+                anyhow::ensure!(
+                    task.runs.contains(id),
+                    "question target is not this task's run"
+                );
+                format!("run:{id}")
+            }
+            QuestionTarget::Source { reference } => {
+                use crate::proc::Quiet as _;
+                let output = std::process::Command::new("git")
+                    .args([
+                        "rev-parse",
+                        "--verify",
+                        "--end-of-options",
+                        &format!("{reference}^{{commit}}"),
+                    ])
+                    .current_dir(&task.repo)
+                    .quiet()
+                    .output()
+                    .context("resolve question source")?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "question source cannot be resolved"
+                );
+                let commit = String::from_utf8(output.stdout)?.trim().to_owned();
+                anyhow::ensure!(
+                    !commit.is_empty() && commit.bytes().all(|c| c.is_ascii_hexdigit()),
+                    "invalid question source commit"
+                );
+                format!("source:{commit}")
+            }
+        };
+        Ok((self.operation, target))
+    }
+}
+
 /// The conductor's decision for one task. Deliberately has no `priority`
 /// field: see this module's doc.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -134,6 +221,10 @@ pub struct Decision {
     /// Fixed answers for `question`, if it has any. Empty means free text.
     #[serde(default)]
     pub choices: Vec<String>,
+    /// Stable operation and concrete target of a question. Missing on legacy
+    /// decisions: those share the task's existing cause, regardless of prose.
+    #[serde(default)]
+    pub question_decision: Option<QuestionDecision>,
     /// Task or question ids carrying independently verifiable new blocking evidence.
     #[serde(default)]
     pub evidence: Vec<String>,
@@ -793,11 +884,14 @@ fn apply_one(
                 }
             })
             .collect();
-        // Choices are the actual answer contract, not explanatory prose. A
-        // different source approval must remain a different operator decision.
-        let choices: BTreeSet<_> = d.choices.iter().collect();
-        let context =
-            serde_json::to_string(&(&task.instruction, held.chat_notice_key(), targets, choices))?;
+        let decision = d
+            .question_decision
+            .as_ref()
+            .map(|q| q.identity(&task))
+            .transpose()?;
+        let context_value =
+            serde_json::json!([&task.instruction, held.chat_notice_key(), targets, decision]);
+        let context = serde_json::to_string(&context_value)?;
         // An answer alone does not justify asking the same decision again.
         // New producer evidence, an instruction edit or a different dependency
         // target can open another question; rewording cannot.
@@ -805,7 +899,24 @@ fn apply_one(
             q.node == NODE
                 && q.run == task.id
                 && q.status == crate::ask::QuestionStatus::Answered
-                && q.decision_context.as_ref() == Some(&context)
+                && q.decision_context.as_ref().is_some_and(|stored| {
+                    if stored == &context {
+                        return true;
+                    }
+                    // Missing metadata cannot manufacture a new target. This
+                    // also baselines older contexts whose last item was labels.
+                    d.question_decision.is_none()
+                        && serde_json::from_str::<serde_json::Value>(stored)
+                            .ok()
+                            .and_then(|v| {
+                                v.as_array().map(|items| {
+                                    items.len() == 4
+                                        && items[..3]
+                                            == context_value.as_array().expect("context")[..3]
+                                })
+                            })
+                            == Some(true)
+                })
         }) {
             return Ok(());
         }
@@ -2145,6 +2256,7 @@ printf '%s\n' "$MOCK_REPLY"
                 recovery: None,
                 question: None,
                 choices: Vec::new(),
+                question_decision: None,
                 evidence: Vec::new(),
                 missing_dependencies: Vec::new(),
             }],
@@ -2176,6 +2288,7 @@ printf '%s\n' "$MOCK_REPLY"
                 recovery: None,
                 question: Some("Which storage backend?".to_owned()),
                 choices: vec!["SQLite".to_owned(), "Redis".to_owned()],
+                question_decision: None,
                 evidence: Vec::new(),
                 missing_dependencies: Vec::new(),
             }],
@@ -2298,6 +2411,7 @@ printf '%s\n' "$MOCK_REPLY"
                     recovery: None,
                     question: Some("Which backend?".to_owned()),
                     choices: Vec::new(),
+                    question_decision: None,
                     evidence: Vec::new(),
                     missing_dependencies: Vec::new(),
                 }],
@@ -2737,17 +2851,54 @@ printf '%s\n' "$MOCK_REPLY"
     }
 
     #[test]
+    fn question_source_identity_resolves_aliases_and_rejects_invented_targets() {
+        let dir = tempdir().unwrap();
+        init_repo_with_branch(dir.path(), "source-a");
+        let mut t = task("source decision");
+        t.repo = dir.path().into();
+        let decision = |reference: &str| QuestionDecision {
+            operation: QuestionOperation::Recover,
+            target: QuestionTarget::Source {
+                reference: reference.into(),
+            },
+        };
+        assert_eq!(
+            decision("source-a").identity(&t).unwrap(),
+            decision("refs/heads/source-a").identity(&t).unwrap()
+        );
+        assert_ne!(
+            decision("source-a").identity(&t).unwrap(),
+            decision("main").identity(&t).unwrap()
+        );
+        assert!(decision("invented-source-label").identity(&t).is_err());
+        let unrelated = QuestionDecision {
+            operation: QuestionOperation::Resume,
+            target: QuestionTarget::Run {
+                id: "unrelated-run".into(),
+            },
+        };
+        assert!(unrelated.identity(&t).is_err());
+    }
+
+    #[test]
     fn answered_conductor_question_needs_changed_facts_before_reasking() {
         let dir = tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
         let questions = Questions::at(dir.path().join("questions"));
         let mut t = task("recovery decision");
         t.hold_machine(Some("out of attempts".into()));
+        t.runs = vec!["source-run-a".into(), "source-run-b".into()];
         queue.put(&mut t).unwrap();
         let mut d = Decision {
             id: t.id.clone(),
             question: Some("Recover from source A?".into()),
             choices: vec!["approve source A".into(), "keep held".into()],
+            question_decision: Some(QuestionDecision {
+                operation: QuestionOperation::Recover,
+                target: QuestionTarget::Run {
+                    id: "source-run-a".into(),
+                },
+            }),
             ..Decision::default()
         };
         apply_one(&queue, &questions, &d, None).unwrap();
@@ -2763,10 +2914,14 @@ printf '%s\n' "$MOCK_REPLY"
             })
             .unwrap();
         d.question = Some("Should we keep waiting on recovery?".into());
+        d.choices = vec!["recover using source A".into(), "remain on hold".into()];
         apply_one(&queue, &questions, &d, None).unwrap();
         assert_eq!(questions.list().len(), 1, "no repeated operator turn");
         d.question = Some("Recover from source B?".into());
-        d.choices = vec!["approve source B".into(), "keep held".into()];
+        // The labels can remain identical while the approval target changes.
+        d.question_decision.as_mut().unwrap().target = QuestionTarget::Run {
+            id: "source-run-b".into(),
+        };
         apply_one(&queue, &questions, &d, None).unwrap();
         assert_eq!(
             questions.list().len(),
