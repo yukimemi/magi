@@ -106,6 +106,7 @@ fn run_snapshot(v: &serde_json::Value) -> serde_json::Value {
         "gate_ran": v["gate_ran"], "gate_head": v["gate_head"],
         "gate": command_facts(&v["gate"]), "last_review": review,
         "pr": v["pr"], "merge": v["merge"],
+        "base_sync": {"already_in": v.pointer("/base_sync/already_in")},
         "release_bump": {"pr_url":v.pointer("/release_bump/pr_url"),
             "problem":v.pointer("/release_bump/problem"),
             "action_required":v.pointer("/release_bump/action_required") }
@@ -238,6 +239,14 @@ fn operator_action(
     if matches!(questions, Evidence::Unavailable(_)) {
         return "Open decisions could not be verified: report the failed questions lookup.".into();
     }
+    if v["status"] == "already_in_base" {
+        // This terminal proof can precede review/gate execution in this run.
+        // Historical verification and this run's PR lifecycle do not undo it.
+        return match serde_json::from_value::<crate::already::Evidence>(v["base_sync"]["already_in"].clone()) {
+            Ok(proof) if !proof.tip.is_empty() => "No operator action remains for this task: the whole change is already in the base. Report the recorded proof method, base tip and matching commits; this does not mean this run merged a PR.".into(),
+            _ => "Run recorded already_in_base, but base_sync.already_in proof is missing or unreadable. Report this specific unavailable evidence without inventing a remaining merge decision.".into(),
+        };
+    }
     if !matches!(v["status"].as_str(), Some("ready" | "merged" | "landing")) {
         return "Run did not record successful execution: report its saved status and remaining decision, even if the PR was subsequently merged.".into();
     }
@@ -272,12 +281,10 @@ fn operator_action(
     }
     if let Evidence::Known(p) = pr
         && let Some(head) = p["head"].as_str().filter(|h| !h.is_empty())
-        && [v["gate_head"].as_str(), review["verified_head"].as_str()]
-            .into_iter()
-            .flatten()
-            .any(|verified| !verified.is_empty() && verified != head)
+        && let Some(verified) = v["gate_head"].as_str().filter(|h| !h.is_empty())
+        && verified != head
     {
-        return "PR head differs from a saved verification commit. Report both commits and the verification gap; do not claim the current PR was verified or that no action remains.".into();
+        return "PR head differs from the saved final gate commit. Report both commits and the verification gap; do not claim the current PR was verified or that no action remains.".into();
     }
     match pr {
         Evidence::Known(p) if p["state"] == "MERGED" => "No operator action remains for this task; report the verified merge and any verification limitations separately.".into(),
@@ -758,6 +765,68 @@ mod tests {
         assert_eq!(v["implementer"], "worker");
         assert_eq!(v["gate_head"], "abc");
         assert_eq!(v["last_review"]["verified_head"], "abc");
+    }
+
+    #[test]
+    fn outcome_already_in_base_reports_proven_delivery_without_requiring_a_gate_or_pr() {
+        use serde_json::json;
+        let proof = json!({"proof":"patch_id", "tip":"base-tip", "commits":["matching-commit"]});
+        let run = json!({"status":"already_in_base", "base_sync":{"already_in":proof},
+            "gate_ran":false, "reviews":[]});
+        let snapshot = run_snapshot(&run);
+        assert_eq!(snapshot["base_sync"]["already_in"], proof);
+        let unavailable_pr = Evidence::Unavailable("run.json has no PR URL".into());
+        let none = Evidence::Known(vec![]);
+        let action = operator_action(
+            &outcome_task(),
+            &Evidence::Known(snapshot.clone()),
+            &unavailable_pr,
+            &none,
+        );
+        assert!(action.starts_with("No operator action remains"), "{action}");
+        assert!(action.contains("already in the base"));
+        assert!(action.contains("does not mean this run merged a PR"));
+        let mut missing = snapshot.clone();
+        missing["base_sync"]["already_in"] = json!(null);
+        assert!(
+            operator_action(
+                &outcome_task(),
+                &Evidence::Known(missing),
+                &unavailable_pr,
+                &none
+            )
+            .contains("proof is missing or unreadable")
+        );
+        let mut release = snapshot;
+        release["release_bump"]["action_required"] = json!("Approve release");
+        assert!(
+            operator_action(
+                &outcome_task(),
+                &Evidence::Known(release),
+                &unavailable_pr,
+                &none
+            )
+            .contains("Approve release")
+        );
+    }
+
+    #[test]
+    fn outcome_final_gate_covers_pr_head_after_review_head_advanced() {
+        let mut run = successful_run();
+        run["reviews"][0]["verified_head"] = serde_json::json!("older-review-head");
+        let snapshot = run_snapshot(&run);
+        assert_eq!(
+            snapshot["last_review"]["verified_head"],
+            "older-review-head"
+        );
+        let current = Evidence::Known(serde_json::json!({"state":"MERGED", "head":"abc"}));
+        let action = operator_action(
+            &outcome_task(),
+            &Evidence::Known(snapshot),
+            &current,
+            &Evidence::Known(vec![]),
+        );
+        assert!(action.starts_with("No operator action remains"), "{action}");
     }
 
     #[test]
