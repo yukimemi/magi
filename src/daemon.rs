@@ -3048,6 +3048,7 @@ async fn attempt(
             .as_ref()
             .is_some_and(|decision| !decision.closed)
         && previous.status != RunStatus::Landing
+        && !crate::merge_decision::resumable_hold(&previous)
     {
         task.hold_unrequested_retry(Some(format!("The existing owner stop decision remains held. Inspect run {} and its PR; request an explicit fresh review/decision before further work. No replacement or merge was started.", previous.id)));
         record(queue, task);
@@ -3058,15 +3059,16 @@ async fn attempt(
         .last()
         .and_then(|id| RunState::load(id).ok())
         .filter(|state| {
-            state.status == RunStatus::Landing
-                && state.land_approval.as_ref().is_some_and(|binding| {
-                    Questions::open().get(&binding.question).is_ok_and(|q| {
-                        q.run == state.id
-                            && q.resolution()
-                                .as_deref()
-                                .is_some_and(crate::merge_decision::stops)
+            crate::merge_decision::resumable_hold(state)
+                || state.status == RunStatus::Landing
+                    && state.land_approval.as_ref().is_some_and(|binding| {
+                        Questions::open().get(&binding.question).is_ok_and(|q| {
+                            q.run == state.id
+                                && q.resolution()
+                                    .as_deref()
+                                    .is_some_and(crate::merge_decision::stops)
+                        })
                     })
-                })
         });
     if let Some(owner) = stop_owner {
         let mut runner = match Runner::resume(&owner.id) {

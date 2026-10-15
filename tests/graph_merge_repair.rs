@@ -24,7 +24,12 @@ case "$1 $2" in
  'pr view') printf '{"url":"https://github.com/example/repo/pull/42","number":42,"state":"%s","title":"feat: existing work","reviews":[],"comments":[],"mergeStateStatus":"CLEAN","headRefOid":"%s","baseRefName":"main","autoMergeRequest":null,"headRefName":"%s","isCrossRepository":false}\n' "$pr_state" "$sha" "$REPAIR_BRANCH" ;;
  'api graphql') printf '{"data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{"oid":"%s","statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false},"nodes":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}}}}]}}}}}\n' "$sha" ;;
  'api repos/{owner}/{repo}/pulls/42/comments') echo '[]' ;;
- 'pr merge') case "$*" in *--disable-auto*) exit 0 ;; *) exit 99 ;; esac ;;
+ 'pr merge') case "$*" in *--disable-auto*)
+   if test -f "$REPAIR_FORGE/late-answer"; then
+     rm "$REPAIR_FORGE/late-answer"
+     (unset MAGI_RUN MAGI_NODE; MAGI_HOME="$REPAIR_HOME" "$REPAIR_CLI" answer "$REPAIR_LATE_QUESTION" --reply "$REPAIR_LATE_CHOICE") > "$REPAIR_FORGE/late-answer-result" 2>&1 || exit 97
+   fi
+   exit 0 ;; *) exit 99 ;; esac ;;
  'pr comment') exit 0 ;;
  'pr close') test ! -f "$REPAIR_FORGE/refuse-close" || exit 7; touch "$REPAIR_FORGE/closed" ;;
  *) exit 98 ;;
@@ -38,6 +43,8 @@ esac
         std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
         std::env::set_var("REPAIR_FORGE", &bin);
         std::env::set_var("REPAIR_BRANCH", branch);
+        std::env::set_var("REPAIR_CLI", env!("CARGO_BIN_EXE_magi"));
+        std::env::set_var("REPAIR_HOME", magi::run::home());
     }
     let agent = dir.join("mock-agent.sh");
     let original = std::fs::read_to_string(&agent).unwrap();
@@ -697,5 +704,179 @@ async fn decision_replacement_crash_checkpoint_does_not_start_a_second_attempt()
     assert_eq!(owner.runs, task.runs);
     assert!(owner.hold_reason.as_ref().unwrap().contains("ownership"));
     assert!(Runner::resume(&old.id).is_err());
+}
+}
+
+fn run_cli(fx: &common::Fixture, args: &[&str]) {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
+        .args(args)
+        .current_dir(&fx.repo)
+        .env("MAGI_HOME", magi::run::home())
+        .env_remove("MAGI_RUN")
+        .env_remove("MAGI_NODE")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+async fn approval_gate_late_stop(choice: &str) {
+    let (fx, mut runner, question) = held_pr_choice(false, false, choice).await;
+    let task = decision_owner(&mut runner, &fx).await;
+    Questions::open()
+        .update(&question, |q| {
+            q.status = magi::ask::QuestionStatus::Open;
+            q.answer = None;
+            q.answered_at = None;
+            Ok(())
+        })
+        .unwrap();
+    // The first owner_stop sees an open card. Disarming this saved arm is
+    // the await between that read and approval_gate reading the card again.
+    runner.state.land_armed_head = Some(runner.state.land_approval.as_ref().unwrap().head.clone());
+    runner.state.save().unwrap();
+    std::fs::write(fx.tmp.path().join("forge/late-answer"), "").unwrap();
+    // SAFETY: this test owns an isolated child; the callback runs after these writes.
+    unsafe {
+        std::env::set_var("REPAIR_LATE_QUESTION", &question);
+        std::env::set_var("REPAIR_LATE_CHOICE", choice);
+    }
+    run_cli(&fx, &["run", "--resume", &runner.state.id]);
+    let disk = RunState::load(&runner.state.id).unwrap();
+    let owner = magi::queue::Queue::open().get(&task.id).unwrap();
+    assert!(
+        !fx.tmp.path().join("forge/late-answer").exists(),
+        "CLI answer callback did not run"
+    );
+    assert_eq!(
+        Questions::open()
+            .get(&question)
+            .unwrap()
+            .resolution()
+            .as_deref(),
+        Some(choice)
+    );
+    let decision = disk
+        .merge_decision
+        .as_ref()
+        .expect("late stop must be consumed");
+    assert_eq!(decision.question, question);
+    assert_eq!(decision.choice, choice);
+    assert!(
+        decision.closed,
+        "closure must be confirmed before settling the action"
+    );
+    assert_eq!(disk.pr.as_ref().unwrap().state, "closed");
+    assert_eq!(owner.runs, task.runs);
+    if choice == magi::merge_decision::WITHDRAW {
+        assert_eq!(owner.status, magi::queue::TaskStatus::Done);
+    } else {
+        assert_eq!(owner.status, magi::queue::TaskStatus::Queued);
+        assert_eq!(owner.replacement.as_ref().unwrap().agent, "beta");
+    }
+    assert!(!fx.tmp.path().join("forge/fixes").exists());
+    let calls = std::fs::read_to_string(fx.tmp.path().join("forge/calls")).unwrap();
+    assert!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("pr merge"))
+            .all(|line| line.contains("--disable-auto"))
+    );
+}
+
+common::e2e! {
+async fn decision_review_late_withdraw_at_approval_gate_closes_the_pr() {
+    approval_gate_late_stop(magi::merge_decision::WITHDRAW).await;
+}
+}
+
+common::e2e! {
+async fn decision_review_late_reimplementation_at_approval_gate_requeues_the_owner() {
+    approval_gate_late_stop("reimplement:beta").await;
+}
+}
+
+async fn resume_after_hold(via_daemon: bool) {
+    let (fx, mut runner, old_question) = held_pr_choice(false, false, "hold").await;
+    let task = decision_owner(&mut runner, &fx).await;
+    serve_decision(&fx, &runner.state).await;
+    let queue = magi::queue::Queue::open();
+    let held = RunState::load(&runner.state.id).unwrap();
+    assert_eq!(held.status, RunStatus::Blocked);
+    assert!(held.merge_decision.is_some());
+    assert!(queue.get(&task.id).unwrap().operator_held());
+    // A quiet daemon cannot undo the owner's hold by itself.
+    serve_decision(&fx, &held).await;
+    assert!(queue.get(&task.id).unwrap().operator_held());
+    assert_eq!(
+        RunState::load(&held.id)
+            .unwrap()
+            .land_approval
+            .as_ref()
+            .unwrap()
+            .question,
+        old_question
+    );
+    if via_daemon {
+        run_cli(&fx, &["task", "release", &task.id]);
+        serve_decision(&fx, &held).await;
+    } else {
+        run_cli(&fx, &["run", "--resume", &held.id]);
+    }
+    let resumed = RunState::load(&held.id).unwrap();
+    let owner = queue.get(&task.id).unwrap();
+    assert_eq!(resumed.status, RunStatus::Landing, "{:?}", resumed.events);
+    assert!(resumed.parked);
+    assert!(resumed.merge_decision.is_none());
+    let fresh = resumed.land_approval.as_ref().unwrap();
+    assert_ne!(fresh.question, old_question);
+    assert!(
+        Questions::open()
+            .get(&fresh.question)
+            .unwrap()
+            .status
+            .open()
+    );
+    assert_eq!(
+        Questions::open()
+            .get(&old_question)
+            .unwrap()
+            .resolution()
+            .as_deref(),
+        Some("hold")
+    );
+    assert_eq!(owner.runs, task.runs, "resume must keep the same attempt");
+    assert_eq!(owner.status, magi::queue::TaskStatus::Parked);
+    assert_eq!(
+        resumed.pr.as_ref().unwrap().url,
+        held.pr.as_ref().unwrap().url
+    );
+    assert_eq!(resumed.reviews.len(), held.reviews.len());
+    assert_eq!(resumed.gate_head, held.gate_head);
+    assert!(resumed.merge_repairs.is_empty());
+    assert!(!fx.tmp.path().join("forge/fixes").exists());
+    assert!(!fx.tmp.path().join("forge/closed").exists());
+    let calls = std::fs::read_to_string(fx.tmp.path().join("forge/calls")).unwrap();
+    assert!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("pr merge"))
+            .all(|line| line.contains("--disable-auto"))
+    );
+}
+
+common::e2e! {
+async fn decision_review_task_release_after_hold_requests_a_fresh_decision() {
+    resume_after_hold(true).await;
+}
+}
+
+common::e2e! {
+async fn decision_review_cli_resume_after_hold_requests_a_fresh_decision() {
+    resume_after_hold(false).await;
 }
 }

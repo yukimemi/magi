@@ -1244,6 +1244,24 @@ impl Runner {
             .is_some_and(|decision| !decision.closed)
             && self.state.status != RunStatus::Landing
         {
+            if crate::merge_decision::resumable_hold(&self.state) {
+                self.state.merge = Some(MergeOutcome {
+                    mode: MergeMode::Pr,
+                    ok: false,
+                    detail: self
+                        .state
+                        .merge_decision
+                        .as_ref()
+                        .unwrap()
+                        .target
+                        .pr
+                        .clone(),
+                    empty: false,
+                });
+                self.run_land().await?;
+                self.settle_questions();
+                return Ok(());
+            }
             bail!(
                 "owner stop decision is held; inspect the existing PR and request an explicit fresh review/decision before further work"
             );

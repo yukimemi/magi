@@ -3510,6 +3510,7 @@ async fn owner_stop<F: Forge>(state: &mut RunState, pr: &mut PrState, forge: &F)
 
 async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> Result<PrState> {
     crate::pr_head::ensure_owner(state)?;
+    let reopening_hold = crate::merge_decision::resumable_hold(state);
     let repo = state.repo.clone();
     let budget = state.config.graph.land_rounds;
     let mut round = 0usize;
@@ -3559,6 +3560,37 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
         state.save()?;
 
         crate::pr_head::ensure_owner(state)?;
+        if reopening_hold {
+            anyhow::ensure!(
+                pr.state == PrLifecycle::Open,
+                "held PR is no longer open; cannot request a fresh decision"
+            );
+            // An explicit resume authorizes a fresh question only. Preserve the
+            // answered card, and never enter repair/rebase/merge on this pass.
+            disarm(forge, state, &repo, pr.number)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let previous = state.merge_decision.take();
+            let binding = state.land_approval.take();
+            state.config.graph.land_approval = true;
+            let subject = merge_subject(
+                crate::graph::landing_title(state, &seen.title),
+                &crate::graph::landing_subject_source(state),
+            );
+            let contested = contested_to_ask(state);
+            if let Err(error) =
+                approval_gate(state, &pr, &subject, contested.as_ref(), &seen.head).await
+            {
+                state.merge_decision = previous;
+                state.land_approval = binding;
+                return Err(error);
+            }
+            state.end_pass_parked(crate::run::ParkCause::Question);
+            state.parked = true;
+            state.event("land", format!("explicit resume reopened held decision {}; parked awaiting a fresh owner answer", previous.as_ref().map(|d| d.question.as_str()).unwrap_or_default()));
+            state.save()?;
+            return Ok(pr);
+        }
         if owner_stop(state, &mut pr, forge).await? {
             return Ok(pr);
         }
@@ -3838,6 +3870,11 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                             return Ok(pr);
                         }
                         ApprovalGate::Held => {
+                            // Another entry point may have saved a stop after
+                            // the first read above. Apply its durable action.
+                            if owner_stop(state, &mut pr, forge).await? {
+                                return Ok(pr);
+                            }
                             stop(
                                 state,
                                 &repo,

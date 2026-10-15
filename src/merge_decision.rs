@@ -66,6 +66,15 @@ pub fn stops(choice: &str) -> bool {
         || selected_agent(choice).is_some()
 }
 
+/// Only an applied hold can be reopened by an explicit run/task resume.
+/// Failed closure and replacement decisions retain their stop checkpoint.
+pub(crate) fn resumable_hold(state: &crate::run::RunState) -> bool {
+    state.status == crate::run::RunStatus::Blocked
+        && state.merge_decision.as_ref().is_some_and(|decision| {
+            !decision.closed && decision.choice.eq_ignore_ascii_case(crate::land::HOLD)
+        })
+}
+
 /// Chat consultation may request a stop/repair only with the exact latest
 /// choice. Closing a PR explicitly names the consequence in its token.
 pub fn exact_owner_choice(choice: &str, message: &str, quote: &str) -> bool {

@@ -1109,6 +1109,11 @@ head. Answered cards retain their choices and decision history.
 The daemon resumes the existing parked owner to apply the answer. Answering
 alone does not dispatch an agent. Without a running daemon, explicitly resume
 the existing owning task/run; do not file a second repair or replacement task.
+After an applied hold, explicitly run `magi task release <task-id>` with the
+daemon running, or `magi run --resume <run-id>`. This keeps the same run and PR,
+retains the old answered card, and parks at a fresh decision card before any
+repair, rebase or merge. Resuming does not approve a merge.
+
 The replacement implementer selection is persisted and enforced in both initial
 dispatch and implementation fallback. It applies to implementation seats;
 reviewers, advisors and repair/fixer roles retain their configured assignments.
