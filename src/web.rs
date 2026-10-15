@@ -1829,7 +1829,12 @@ impl From<anyhow::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = serde_json::json!({ "error": self.message });
+        let mut body = serde_json::json!({ "error": self.message });
+        if self.status == StatusCode::UNPROCESSABLE_ENTITY
+            && self.message.starts_with("question_text_unavailable")
+        {
+            body["code"] = serde_json::json!("question_text_unavailable");
+        }
         (self.status, Json(body)).into_response()
     }
 }
@@ -6399,6 +6404,7 @@ struct QuestionView {
     /// All starts were spent and no live holder remains. Display-only: the
     /// final attempt increments `starts` before running under its lease.
     deputy_exhausted: bool,
+    text_delivery: crate::question_delivery::Availability,
     /// `question.run` is a task id (conductor / triage questions), not a run
     /// id, so the UI links it to the task page.
     run_is_task: bool,
@@ -6454,7 +6460,7 @@ impl QuestionView {
     /// The view of `question`, reading who is waiting on it from `store`.
     ///
     /// `holder` needs the lease sidecar, which is why this is not a `From`.
-    fn of(question: Question, store: &ask::Questions, deputies_enabled: bool) -> Self {
+    fn of(question: Question, store: &ask::Questions, cfg: Option<&Config>) -> Self {
         let base = md::ImageBase::QuestionPanel {
             id: question.id.clone(),
         };
@@ -6475,7 +6481,8 @@ impl QuestionView {
             deputy_exhausted: store.deputy_exhausted(&question),
             waiting_on_agent: question.waiting_on_agent(),
             holder,
-            deputies_enabled,
+            deputies_enabled: deputies_enabled(cfg, &question),
+            text_delivery: crate::question_delivery::availability(store, &question, cfg),
             run_is_task: question.run_names_task(),
             origin_chat: None,
             origin_chat_closed: false,
@@ -6520,10 +6527,7 @@ fn question_views(
     }
     let cfg = load();
     qs.into_iter()
-        .map(|q| {
-            let on = deputies_enabled(cfg.as_ref(), &q);
-            QuestionView::of(q, store, on)
-        })
+        .map(|q| QuestionView::of(q, store, cfg.as_ref()))
         .collect()
 }
 
@@ -6540,7 +6544,10 @@ fn holder_of(q: &Question, lease: Option<&ask::Lease>) -> Option<&'static str> {
     if !q.status.open() {
         return None;
     }
-    if q.cwd.is_none() && q.deputy.is_none() {
+    if q.cwd.is_none()
+        && q.deputy.is_none()
+        && lease.is_none_or(|l| !l.fresh(jiff::Timestamp::now()))
+    {
         return crate::deputy::kind_of(q).map(|_| "nobody");
     }
     Some(match lease.filter(|l| l.fresh(jiff::Timestamp::now())) {
@@ -6665,17 +6672,33 @@ async fn question_answer(
         // `Question::answer` owns the rules - an unoffered choice, free text on
         // a multiple-choice question, an empty reply - so the route does not
         // restate them and cannot drift from the CLI's behaviour.
+        let cfg = deputy_config(&ui.repo);
         let (q, ()) = ui
             .questions
-            .update(&q.id, |r| r.answer(answer))
-            .map_err(ApiError::bad_request_from)?;
-        let on = deputies_enabled(deputy_config(&ui.repo).as_ref(), &q);
+            .update(&q.id, |r| {
+                if matches!(&answer, Answer::Text(_)) && r.free_text() {
+                    crate::question_delivery::require(&ui.questions, r, cfg.as_ref())?;
+                }
+                r.answer(answer)
+            })
+            .map_err(question_text_error)?;
         let (tasks, talks) = (ui.queue.list(), ui.talks.list());
         Ok(Json(
-            QuestionView::of(q, &ui.questions, on).with_origin(&tasks, &talks),
+            QuestionView::of(q, &ui.questions, cfg.as_ref()).with_origin(&tasks, &talks),
         ))
     })
     .await
+}
+
+/// A dedicated status avoids the client's settled-question 409 handling.
+fn question_text_error(e: anyhow::Error) -> ApiError {
+    let unavailable = e.to_string().starts_with("question_text_unavailable");
+    let error = ApiError::bad_request_from(e);
+    if unavailable {
+        error.with_status(StatusCode::UNPROCESSABLE_ENTITY)
+    } else {
+        error
+    }
 }
 
 /// The body of `POST /api/questions/{id}/say`.
@@ -6718,14 +6741,20 @@ async fn question_say(
         }
         // `Question::say` owns the one rule that matters here - an empty
         // message tells the agent nothing - so the route does not restate it.
+        let cfg = deputy_config(&ui.repo);
         let (q, ()) = ui
             .questions
-            .update(&q.id, |r| r.say(body.body))
-            .map_err(ApiError::bad_request_from)?;
-        let on = deputies_enabled(deputy_config(&ui.repo).as_ref(), &q);
+            .update(&q.id, |r| {
+                if body.body.trim().is_empty() {
+                    return r.say(body.body);
+                }
+                crate::question_delivery::require(&ui.questions, r, cfg.as_ref())?;
+                r.say(body.body)
+            })
+            .map_err(question_text_error)?;
         let (tasks, talks) = (ui.queue.list(), ui.talks.list());
         Ok(Json(
-            QuestionView::of(q, &ui.questions, on).with_origin(&tasks, &talks),
+            QuestionView::of(q, &ui.questions, cfg.as_ref()).with_origin(&tasks, &talks),
         ))
     })
     .await
@@ -6790,8 +6819,8 @@ async fn question_consult(
                 None
             };
             let q = ui.questions.get(&q.id)?;
-            let on = deputies_enabled(deputy_config(&ui.repo).as_ref(), &q);
-            let view = QuestionView::of(q, &ui.questions, on).with_origin(&tasks, &talks);
+            let cfg = deputy_config(&ui.repo);
+            let view = QuestionView::of(q, &ui.questions, cfg.as_ref()).with_origin(&tasks, &talks);
             Ok((view, claim))
         }
     })
@@ -8777,24 +8806,24 @@ mod tests {
         q.deputy = Some(ask::Deputy::new("brief".to_owned()));
         q.say("why?").unwrap();
         q.deputy.as_mut().unwrap().starts = crate::deputy::MAX_STARTS - 1;
-        assert!(!QuestionView::of(q.clone(), &store, true).deputy_exhausted);
+        assert!(!QuestionView::of(q.clone(), &store, Some(&Config::default())).deputy_exhausted);
         q.deputy.as_mut().unwrap().starts = crate::deputy::MAX_STARTS;
         store.put(&mut q).unwrap();
-        assert!(QuestionView::of(q.clone(), &store, true).deputy_exhausted);
+        assert!(QuestionView::of(q.clone(), &store, Some(&Config::default())).deputy_exhausted);
         assert_eq!(store.count_needs_owner(), 1);
         store.beat(&q.id, ask::WaiterKind::Deputy);
-        assert!(!QuestionView::of(q.clone(), &store, true).deputy_exhausted);
+        assert!(!QuestionView::of(q.clone(), &store, Some(&Config::default())).deputy_exhausted);
         assert_eq!(store.count_needs_owner(), 0);
         let mut stale = store.read_lease(&q.id).unwrap();
         stale.beat_at = jiff::Timestamp::now() - std::time::Duration::from_secs(3600);
         std::fs::write(store.lease_path(&q.id), serde_json::to_vec(&stale).unwrap()).unwrap();
-        let view = QuestionView::of(q.clone(), &store, true);
+        let view = QuestionView::of(q.clone(), &store, Some(&Config::default()));
         assert!(view.deputy_exhausted);
         assert!(view.waiting_on_agent);
         assert_eq!(view.question.choices, ["keep"]);
         store.drop_lease(&q.id);
         q.answer(ask::Answer::Choice("keep".to_owned())).unwrap();
-        assert!(!QuestionView::of(q, &store, true).deputy_exhausted);
+        assert!(!QuestionView::of(q, &store, Some(&Config::default())).deputy_exhausted);
     }
 
     #[test]
@@ -8871,8 +8900,8 @@ mod tests {
         assert_eq!(holder_of(&m, None), Some("nobody"));
         assert_eq!(
             holder_of(&m, Some(&fresh)),
-            Some("nobody"),
-            "a lease with no deputy is not a listener"
+            Some("asker"),
+            "a live explicit wait is a listener even before a deputy is attached"
         );
         m.deputy = Some(ask::Deputy::new("brief".to_owned()));
         assert_eq!(holder_of(&m, Some(&deputy)), Some("deputy"));
@@ -10573,9 +10602,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn question_text_handler_admission_without_transport() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let mut q = Question::new(
+            "task".into(),
+            crate::land::APPROVAL_NODE.into(),
+            "land".into(),
+            "May this PR merge?".into(),
+            String::new(),
+            vec!["hold".into()],
+        );
+        q.deputy = Some(ask::Deputy::new("reviewed head".into()));
+        q.deputy.as_mut().unwrap().starts = crate::deputy::MAX_STARTS;
+        ui.questions.put(&mut q).unwrap();
+        let say = || {
+            Ok(Json(NewSay {
+                body: "Explain the findings".into(),
+            }))
+        };
+        let rejected = question_say(State(ui.clone()), Path(q.id.clone()), say())
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(ui.questions.get(&q.id).unwrap().thread.is_empty());
+        ui.questions.beat(&q.id, ask::WaiterKind::Deputy);
+        let Json(view) = question_say(State(ui.clone()), Path(q.id.clone()), say())
+            .await
+            .unwrap();
+        assert_eq!(view.text_delivery.state, "live");
+        assert!(view.question.waiter.is_none());
+        assert!(view.question.cwd.is_none());
+        let before = std::fs::read(ui.questions.path_of(&q.id)).unwrap();
+        ui.questions.drop_lease(&q.id);
+        let rejected = question_say(State(ui.clone()), Path(q.id.clone()), say())
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(std::fs::read(ui.questions.path_of(&q.id)).unwrap(), before);
+        let _ = question_answer(
+            State(ui.clone()),
+            Path(q.id.clone()),
+            Ok(Json(NewAnswer {
+                choice: Some("hold".into()),
+                text: None,
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ui.questions.get(&q.id).unwrap().resolution().as_deref(),
+            Some("hold")
+        );
+    }
+
+    #[tokio::test]
+    async fn question_text_delivery_rechecks_after_render_and_keeps_choices_usable() {
+        let fx = Fixture::start().await;
+        let store = fx.questions();
+        let id = ask(&fx, "May this PR merge?", &["merge", "hold"]);
+        store
+            .update(&id, |q| {
+                q.node = crate::land::APPROVAL_NODE.to_owned();
+                q.deputy = Some(ask::Deputy::new("approval".to_owned()));
+                q.deputy.as_mut().unwrap().starts = crate::deputy::MAX_STARTS;
+                Ok(())
+            })
+            .unwrap();
+        let path = format!("/api/questions/{id}/say");
+        let refused = fx.post(&path, Some(r#"{"body":"close the PR"}"#)).await;
+        assert_eq!(refused.status, 422, "{}", refused.body);
+        assert!(
+            refused.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("deputy_exhausted")
+        );
+        assert!(store.get(&id).unwrap().thread.is_empty());
+
+        // A final live deputy is usable even with no ordinary waiter/cwd.
+        store.beat(&id, ask::WaiterKind::Deputy);
+        let view = fx.get("/api/questions").await.json();
+        assert_eq!(view[0]["text_delivery"]["state"], "live");
+        let accepted = fx
+            .post(&path, Some(r#"{"body":"explain the findings"}"#))
+            .await;
+        assert_eq!(accepted.status, 200, "{}", accepted.body);
+        let before = std::fs::read(store.path_of(&id)).unwrap();
+
+        // The recipient exits between rendering and sending. Rejection must
+        // preserve previously accepted text, the answer and delivery cursor.
+        store.drop_lease(&id);
+        let refused = fx.post(&path, Some(r#"{"body":"close the PR"}"#)).await;
+        assert_eq!(refused.status, 422, "{}", refused.body);
+        assert_eq!(std::fs::read(store.path_of(&id)).unwrap(), before);
+        let held = fx
+            .post(
+                &format!("/api/questions/{id}/answer"),
+                Some(r#"{"choice":"hold"}"#),
+            )
+            .await;
+        assert_eq!(held.status, 200, "{}", held.body);
+        assert_eq!(store.get(&id).unwrap().thread.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn question_text_delivery_refuses_absent_recipients_at_both_text_routes() {
+        let fx = Fixture::start().await;
+        let id = ask(&fx, "No seat", &[]);
+        let store = fx.questions();
+        let before = std::fs::read(store.path_of(&id)).unwrap();
+        for (suffix, body) in [
+            ("say", r#"{"body":"hello"}"#),
+            ("answer", r#"{"text":"hello"}"#),
+        ] {
+            let res = fx
+                .post(&format!("/api/questions/{id}/{suffix}"), Some(body))
+                .await;
+            assert_eq!(res.status, 422, "{}", res.body);
+            assert_eq!(std::fs::read(store.path_of(&id)).unwrap(), before);
+        }
+    }
+
+    #[tokio::test]
     async fn saying_something_appends_a_turn_without_answering() {
         let fx = Fixture::start().await;
         let id = ask(&fx, "Which backend?", &["SQLite", "Redis"]);
+        fx.questions().beat(&id, ask::WaiterKind::Asker);
         let path = format!("/api/questions/{id}/say");
 
         let res = fx
@@ -10761,6 +10914,7 @@ mod tests {
         let fx = Fixture::start().await;
         let store = fx.questions();
         let id = ask(&fx, "Which backend?", &["SQLite", "Redis"]);
+        store.beat(&id, ask::WaiterKind::Asker);
         assert_eq!(
             fx.get("/api/health").await.json()["questions_needs_owner"],
             1
@@ -10865,6 +11019,7 @@ mod tests {
     async fn a_free_text_question_takes_text_and_not_a_choice() {
         let fx = Fixture::start().await;
         let id = ask(&fx, "What should the flag be called?", &[]);
+        fx.questions().beat(&id, ask::WaiterKind::Asker);
         let path = format!("/api/questions/{id}/answer");
 
         assert_eq!(
@@ -17362,12 +17517,12 @@ mod tests {
             Vec::new(),
         );
         assert!(
-            QuestionView::of(q.clone(), &store, false)
+            QuestionView::of(q.clone(), &store, None)
                 .posting_view
                 .is_none()
         );
         q.posting_comparison = Some(comparison);
-        let view = QuestionView::of(q.clone(), &store, false);
+        let view = QuestionView::of(q.clone(), &store, None);
         let field = &view.posting_view.unwrap().fields[0];
         assert_eq!(
             field
@@ -17385,19 +17540,19 @@ mod tests {
             .original
             .start = 1;
         assert!(
-            QuestionView::of(q.clone(), &store, false)
+            QuestionView::of(q.clone(), &store, None)
                 .posting_view
                 .is_none()
         );
         q.posting_comparison = original_question.posting_comparison;
         q.detail.push_str("extra context");
         assert!(
-            QuestionView::of(q.clone(), &store, false)
+            QuestionView::of(q.clone(), &store, None)
                 .posting_view
                 .is_some()
         );
         q.detail.insert(0, 'x');
-        assert!(QuestionView::of(q, &store, false).posting_view.is_none());
+        assert!(QuestionView::of(q, &store, None).posting_view.is_none());
     }
 
     #[test]
@@ -17421,7 +17576,7 @@ mod tests {
             Vec::new(),
         );
         q.posting_comparison = Some(comparison);
-        let value = serde_json::to_value(QuestionView::of(q.clone(), &store, false)).unwrap();
+        let value = serde_json::to_value(QuestionView::of(q.clone(), &store, None)).unwrap();
         let field = &value["posting_view"]["fields"][0];
         let group = &field["replacement_group"];
         let triggers = group["triggers"].as_array().unwrap();
@@ -17446,7 +17601,7 @@ mod tests {
         q.posting_comparison.as_mut().unwrap().fields[0].original_triggers[0].id =
             group["id"].as_u64().unwrap() as usize;
         assert!(
-            QuestionView::of(q, &store, false).posting_view.is_none(),
+            QuestionView::of(q, &store, None).posting_view.is_none(),
             "group and trigger IDs cannot collide"
         );
     }
@@ -17465,7 +17620,7 @@ mod tests {
         );
         q.say("plain words").unwrap();
         q.reply("use **this**", Vec::new()).unwrap();
-        let v = serde_json::to_value(QuestionView::of(q, &store, false)).unwrap();
+        let v = serde_json::to_value(QuestionView::of(q, &store, None)).unwrap();
         let bodies = &v["thread_bodies_md"];
         assert_eq!(bodies.as_array().unwrap().len(), 2);
         assert!(!bodies[0].to_string().contains("strong"));
@@ -17491,7 +17646,7 @@ mod tests {
             at: jiff::Timestamp::now(),
             note: Some("filed `abc123` _Fix [R1-1]_ (held; `magi task release abc123`)".to_owned()),
         });
-        let v = serde_json::to_value(QuestionView::of(q, &store, false)).unwrap();
+        let v = serde_json::to_value(QuestionView::of(q, &store, None)).unwrap();
         let notes = &v["thread_notes_md"];
         assert_eq!(notes.as_array().unwrap().len(), 2);
         assert!(notes[0].is_null());

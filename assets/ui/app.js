@@ -4986,51 +4986,18 @@ function updateAskCard(row, question, { compact = false } = {}) {
   }
   show(r.thread, turns.length > 0);
 
-  /* Who is honestly on the other end. `holder` comes from the lease beside the
-     question: "asker" is the agent's own `magi ask`, "deputy" is the follow-up
-     seat magi serve runs for a conductor question, "daemon" is `magi serve`
-     resuming the agent's session, "nobody" means nothing is listening right
-     now. "Waiting for the agent" is only said when one of the first three is
-     actually attached; otherwise the note names who is not listening. The
-     merge approval is served by a deputy too, but a say there never merges. */
-  const holder = open ? question.holder : null;
-  const hasDeputy = Boolean(question.deputy);
-  /* An exhausted or disabled follow-up cannot consume an unread say.
-     Keep the choices usable so the owner can still settle the question. */
-  const choicesLocked = waitingOnAgent && question.deputy_exhausted !== true
-    && !(holder === "nobody" && hasDeputy && question.deputies_enabled === false);
-  let waitingText = "";
-  if (question.deputy_exhausted === true) {
-    waitingText = "The follow-up agent has used all its attempts and will not restart. Your message is recorded, but the follow-up agent will not read it. Answer with one of the choices to resolve this question.";
-  } else if (holder === "nobody" && hasDeputy && question.deputies_enabled === false) {
-    waitingText = "No agent is listening on this question: follow-up agents are disabled or the configuration cannot be read. Your message is recorded, but nothing will read it. Only choosing an option resolves this question.";
-  } else if (holder === "nobody" && hasDeputy) {
-    waitingText = waitingOnAgent
-      ? "The follow-up agent for this question is not running right now. magi serve will wake it with your message; if it cannot, you will be told."
-      : "The follow-up agent for this question is not running right now. magi serve will wake it when you reply.";
-  } else if (holder === "nobody" && question.node === "conduct") {
-    waitingText = "No agent is listening on this question. Your message is recorded, but nothing will read it until magi serve attaches a follow-up agent. Tapping a choice still decides it.";
-  } else if (holder === "nobody" && question.node === "land-approval") {
-    waitingText = "No agent is listening on this merge approval. Your message is recorded, but nothing will read it until magi serve attaches a follow-up agent. Only tapping merge, or writing the single word merge, merges; silence holds.";
-  } else if (holder === "nobody") {
-    waitingText = waitingOnAgent
-      ? "The agent that asked is no longer waiting. magi will resume its session with your message when magi serve picks it up; if it cannot, you will be told."
-      : "The agent that asked is no longer waiting. Your answer or message will be delivered by resuming its session when magi serve picks it up.";
-  } else if (holder === "daemon") {
-    waitingText = "magi is delivering this to the agent's session. There is nothing to decide until it replies.";
-  } else if (holder === "deputy") {
-    waitingText = waitingOnAgent
-      ? "The follow-up agent for this question is reading your message. There is nothing to decide until it replies."
-      : (question.node === "land-approval"
-        ? "A follow-up agent is listening on this merge approval and will answer if you write back. Only tapping merge, or writing the single word merge, merges; silence holds."
-        : "A follow-up agent is listening on this question for the conductor and will answer if you write back.");
-  } else if (waitingOnAgent && (holder === "asker")) {
-    waitingText = "Waiting for the agent to reply. There is nothing to decide until it does.";
-  } else if (waitingOnAgent) {
-    waitingText = "Nobody is attached to this question to reply. Your message is recorded.";
-  }
-  if (open && merge && question.consult) {
-    waitingText = "Waiting for your explicit merge confirmation in the originating chat. Silence holds; nothing merges while you discuss it. You can also decide on this card.";
+  /* Delivery availability is shared with server-side text admission. Decision
+     choices retain their own authorization when no recipient can reply. */
+  const delivery = question.text_delivery;
+  const textUnavailable = delivery?.state === "unavailable";
+  const choicesLocked = waitingOnAgent && !textUnavailable;
+  let waitingText = delivery?.message || "";
+  const undeliveredText = (question.thread || []).slice(question.delivered_turns || 0)
+    .some((turn) => turn.who === "operator");
+  if (undeliveredText && textUnavailable) {
+    waitingText += question.merge_target?.language === "ja"
+      ? " 以前のメッセージは保存されていますが、未配送です。"
+      : " Previously saved messages remain recorded and undelivered.";
   }
   setText(r.waitingNote, waitingText);
   show(r.waitingNote, waitingText !== "");
@@ -5049,8 +5016,8 @@ function updateAskCard(row, question, { compact = false } = {}) {
     ? "Asked the chat agent"
     : question.origin_chat_closed ? "Reopen chat and ask" : "Ask the chat agent");
   r.consultBtn.onclick = () => consultChat(question.id, row);
-  r.sayText.disabled = waitingOnAgent;
-  r.saySend.disabled = waitingOnAgent;
+  r.sayText.disabled = waitingOnAgent || textUnavailable;
+  r.saySend.disabled = waitingOnAgent || textUnavailable;
 
   /* The detail is immutable for a given question, so it is parsed once. An
      open question shows it outright — it is the case for the decision. A
@@ -5113,8 +5080,8 @@ function updateAskCard(row, question, { compact = false } = {}) {
   // the agent has not replied yet, deciding is not an option: the
   // controls stay visible - the owner can still see what was on offer - but
   // disabled, with `waitingNote` above saying why.
-  r.text.disabled = waitingOnAgent;
-  r.send.disabled = waitingOnAgent;
+  r.text.disabled = waitingOnAgent || textUnavailable;
+  r.send.disabled = waitingOnAgent || textUnavailable;
   for (const btn of r.choices.querySelectorAll("button")) btn.disabled = choicesLocked && !(merge && question.consult);
   for (const btn of r.stakes.querySelectorAll("button")) btn.disabled = choicesLocked && !(merge && question.consult);
 
@@ -5172,6 +5139,12 @@ async function answerQuestion(id, body, row) {
       await loadQuestions();
       return;
     }
+    if (error.status === 422) {
+      await loadQuestions();
+      setText(r.error, error.message);
+      show(r.error, true);
+      return;
+    }
     setText(r.error, error.message);
     show(r.error, true);
   }
@@ -5197,10 +5170,7 @@ async function sayToQuestion(id, text, row) {
     const said = await postJson(API.questionSay(id), { body: value });
     reflectQuestion(said);
     r.sayText.value = "";
-    const heard = said && ["asker", "deputy", "daemon"].includes(said.holder);
-    announce(heard
-      ? "Sent. Waiting for the agent to reply."
-      : "Sent. It is recorded, but no agent is listening right now.");
+    announce(said.text_delivery?.message || "Sent. Waiting for the agent to reply.");
     ok();
   } catch (error) {
     if (error.status === 409) {
@@ -5209,8 +5179,10 @@ async function sayToQuestion(id, text, row) {
       await loadQuestions();
       return;
     }
+    if (error.status === 422) await loadQuestions();
     setText(r.error, error.message);
     show(r.error, true);
+    if (error.status === 422) return; // Keep the draft and refreshed availability.
     r.sayText.disabled = false;
     r.saySend.disabled = false;
   }

@@ -7,7 +7,7 @@ import { test } from 'node:test';
 const source = readFileSync(new URL('../assets/ui/app.js', import.meta.url), 'utf8');
 const pending = source.slice(source.indexOf('const needsOwnerQuestions ='),
   source.indexOf('\n', source.indexOf('const needsOwnerQuestions =')));
-const note = source.slice(source.indexOf('  const holder = open ? question.holder'),
+const note = source.slice(source.indexOf('  const delivery = question.text_delivery;'),
   source.indexOf('  r.saySend.onclick ='));
 const controls = source.slice(source.indexOf('  for (const btn of r.choices.querySelectorAll'),
   source.indexOf('  const given = question.answer'));
@@ -36,21 +36,23 @@ const question = {
   status: 'open', node: 'conduct', deputy: { starts: 3 },
   holder: 'nobody', deputies_enabled: true, deputy_exhausted: true,
   waiting_on_agent: true, choices: ['keep', 'discard'],
+  thread: [{ who: 'operator' }], delivered_turns: 0,
+  text_delivery: { state: 'unavailable', reason: 'deputy_exhausted', message: 'Free-text replies are unavailable: the deputy has used all its starts.' },
 };
 
 test('exhausted follow-ups keep choices usable and need the owner despite an unread say', () => {
   const view = render(question);
   assert.equal(view.choice.disabled, false);
   assert.equal(view.pending, 1);
-  assert.match(view.note, /will not restart/);
-  assert.match(view.note, /Answer with one of the choices/);
+  assert.match(view.note, /used all its starts/);
+  assert.match(view.note, /recorded and undelivered/);
 });
 
 test('the active final attempt stays locked and waits for the agent', () => {
-  const view = render({ ...question, holder: 'deputy', deputy_exhausted: false });
+  const view = render({ ...question, holder: 'deputy', deputy_exhausted: false, text_delivery: { state: 'live', message: 'Waiting for the agent to reply.' } });
   assert.equal(view.choice.disabled, true);
   assert.equal(view.pending, 0);
-  assert.match(view.note, /reading your message/);
+  assert.match(view.note, /Waiting for the agent/);
   assert.doesNotMatch(view.note, /will not restart/);
 });
 

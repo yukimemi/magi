@@ -2915,3 +2915,16 @@ fallback roster; it does not change reviewer, advisor or fixer assignments.
 Append inherited review context **after** `Runner::start_naming` resolves seeds:
 review evidence contains commit SHAs and must not seed the old patch into a
 replacement implementation.
+
+### Question text admission shares delivery recovery
+
+`src/question_delivery.rs` checks question leases before deputy start budgets:
+the final allowed start can still be live without any ordinary waiter/cwd.
+Without a lease, deputy dispatch predicates and `waiter::Waiter::can_resume`
+plus a daemon heartbeat or live upgrade handover lease determine recovery.
+Operator text ingress must call `question_delivery::require` inside the
+question update lock before writing. `ask --thread` without an agent identity
+is an operator message, never an agent reply. Explicit chat consultations and
+agent replies retain their own authorization. A delivery rejection uses HTTP
+422 / `question_text_unavailable`, preserving drafts and all previously saved
+text; decision choices are independent of delivery availability.

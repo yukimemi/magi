@@ -2267,6 +2267,14 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
     let mut q = match thread {
         Some(id) => {
             let resolved = store.resolve_id(&id)?;
+            if run.is_empty() || seat == "operator" {
+                store.update(&resolved, |q| {
+                    magi::question_delivery::require(&store, q, Some(&cfg))?;
+                    q.say(thread_message(&summary, &detail))
+                })?;
+                println!("sent to {}", ask::short_id(&resolved));
+                return Ok(());
+            }
             let html = match &panel {
                 Some(path) => Some(
                     std::fs::read_to_string(path)
@@ -2665,7 +2673,12 @@ async fn answer_cmd(
     if let Some(body) = say {
         // Not a decision: the question stays open and the run stays parked,
         // waiting on the agent's `magi ask --thread` rather than on the owner.
-        store.update(&q.id, |r| r.say(body))?;
+        let repo = std::env::current_dir()?;
+        let cfg = Config::discover(&repo, None).ok().map(|(cfg, _)| cfg);
+        store.update(&q.id, |r| {
+            magi::question_delivery::require(&store, r, cfg.as_ref())?;
+            r.say(body)
+        })?;
         println!("sent to {} — waiting for the agent's reply", q.short());
         return Ok(());
     }
@@ -2718,6 +2731,11 @@ async fn answer_cmd(
                     reply,
                     quote.as_deref(),
                 )?;
+            }
+            if seat.is_none() && matches!(&answer, ask::Answer::Text(_)) && r.free_text() {
+                let repo = std::env::current_dir()?;
+                let cfg = Config::discover(&repo, None).ok().map(|(cfg, _)| cfg);
+                magi::question_delivery::require(&store, r, cfg.as_ref())?;
             }
             r.answer(answer.clone())?;
             // Returning the guard retains it through Questions::update's atomic

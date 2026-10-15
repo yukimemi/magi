@@ -1147,6 +1147,17 @@ between minting a replacement and linking it to the queue also holds for manual
 inspection rather than starting a concurrent attempt. The run records link the
 old question, attempt, PR and replacement attempt/PR.
 
+Question free-text replies require a live recipient or one the running daemon
+can automatically recover. The card distinguishes listening, waiting for startup
+or restart/capacity, and unavailable recipients. It disables only text submission
+when the deputy has exhausted its start budget, is disabled/unavailable, or the
+asking seat cannot resume. The server and terminal text commands check again
+before saving; a stale card cannot submit into a dead thread. Rejected drafts
+remain in the input, and earlier saved messages remain in the question history,
+marked undelivered when no recipient can read them. Offered decisions and the
+explicit originating-chat consultation route keep their existing authorization;
+delivery availability never authorizes merging or closing a PR.
+
 Standing chat and deputy consultation leave the card unanswered while discussing
 it. For a new card, chat approval requires the owner's exact latest message
 `merge <displayed-full-head>` and that same complete quote. Stop, repair,

@@ -312,6 +312,11 @@ impl Waiter {
         }
     }
 
+    /// Admission uses the very same target resolution as actual delivery.
+    pub fn can_resume(&self, q: &Question) -> bool {
+        self.target(q).is_ok()
+    }
+
     /// Work out how to resume the seat, or why it cannot be.
     fn target(&self, q: &Question) -> std::result::Result<Target, String> {
         let cwd = q
