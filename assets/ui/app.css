@@ -1870,6 +1870,26 @@ details.panel > summary + * { margin-top: var(--s2); }
 /* Hold is not a lesser option, it is the safe one, so it keeps a full target
    and a real edge rather than being demoted to a text link. */
 .stakes-hold { align-self: stretch; }
+/* Keep each decision and its explanation together on narrow cards. */
+.stakes-action {
+  display: flex; flex-direction: column; gap: var(--s2); min-width: 0;
+  padding: var(--s2);
+  background: var(--surface);
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+}
+.stakes-action > .btn { align-self: stretch; }
+.stakes-action .hint { margin: 0; }
+.stakes-agent-row {
+  display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2);
+  min-width: 0;
+}
+.stakes-agent-select {
+  flex: 1 1 120px; min-width: 0; max-width: 100%; min-height: var(--tap);
+  padding: 0 var(--s2);
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  background: var(--surface); color: var(--ink); font: inherit;
+}
+.stakes-agent-row > .btn { flex: 2 1 auto; min-width: 0; }
 
 /* ---- conversation turns -------------------------------------------------- *
  * The standing chat's transcript. A turn takes tens of seconds because a real

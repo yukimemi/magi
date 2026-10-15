@@ -75,3 +75,24 @@ test('Japanese card distinguishes stopping, repair and task withdrawal', () => {
     '取り下げ：PR を閉じてタスクを終了…', '選択した agent で再実装',
     '指摘を確認して、この head のマージを承認…']) assert.ok(button(label), label);
 });
+
+
+test('replacement groups its selector, action and explanation and retains selection on redraw', () => {
+  const { row, q, render, answers, all } = controls();
+  q.choices.push('reimplement:alpha', 'reimplement:beta');
+  render(row, q);
+  const block = row.refs.stakes.children.find(n => n.class === 'stakes-action'
+    && all(n).some(child => child.tag === 'select'));
+  assert.ok(block);
+  const agentRow = block.children.find(n => n.class === 'stakes-agent-row');
+  assert.deepEqual(agentRow.children.map(n => n.tag), ['select', 'button']);
+  assert.ok(block.children.some(n => n.class === 'hint' && n.text.includes('Only the selected implementer')));
+  const select = agentRow.children[0];
+  assert.equal(select.class, 'stakes-agent-select');
+  assert.deepEqual(select.children.map(n => n.value), ['', 'reimplement:alpha', 'reimplement:beta']);
+  select.value = 'reimplement:beta';
+  select.change();
+  render(row, q);
+  assert.equal(all(row.refs.stakes).find(n => n.tag === 'select').value, 'reimplement:beta');
+  assert.equal(answers.length, 0);
+});

@@ -4711,44 +4711,51 @@ function renderStakes(row, question) {
 
   /* Hold is the safe answer, so it keeps a full target and a real edge
      instead of being demoted to a text link nobody can hit. */
-  r.stakes.append(el("button", {
+  const holdBlock = el("div", { class: "stakes-action" });
+  r.stakes.append(holdBlock);
+  holdBlock.append(el("button", {
     class: "btn btn-quiet stakes-hold", type: "button", text: label(target ? "Hold decision and stop work" : "Hold \u2014 do not merge", "判断を保留して作業を停止"),
     onclick: () => answerQuestion(question.id, { choice: choiceNamed(question, "hold") }, row),
   }));
 
-  r.stakes.append(el("p", { class: "hint", text: label("Hold leaves the PR open and stops work. It does not request repairs.", "保留は PR を開いたまま作業を止めます。修復や再レビューは行いません。") }));
+  holdBlock.append(el("p", { class: "hint", text: label("Hold leaves the PR open and stops work. It does not request repairs.", "保留は PR を開いたまま作業を止めます。修復や再レビューは行いません。") }));
   const replacements = [];
   for (const choice of Array.isArray(question.choices) ? question.choices : []) {
     const name = String(choice).toLowerCase();
     if (name === "merge" || name === "hold") continue;
     if (name.startsWith("reimplement:")) { replacements.push(choice); continue; }
     if (name === "withdraw: close pr and end task") {
+      const withdrawBlock = el("div", { class: "stakes-action" });
+      r.stakes.append(withdrawBlock);
       if (row.dataset.withdrawArmed === "1") {
         const cancel = el("button", { class: "btn btn-quiet", type: "button", text: label("Cancel withdrawal", "取り下げをキャンセル"),
           onclick: () => { row.dataset.withdrawArmed = ""; renderStakes(row, question); } });
-        r.stakes.append(el("p", { class: "stakes-warn", text: label("Close this PR and terminate this task? History is retained; no replacement starts.", "この PR を閉じてタスクを終了しますか？ 履歴は残り、再実装は始まりません。") }), cancel,
+        withdrawBlock.append(el("p", { class: "stakes-warn", text: label("Close this PR and terminate this task? History is retained; no replacement starts.", "この PR を閉じてタスクを終了しますか？ 履歴は残り、再実装は始まりません。") }), cancel,
           el("button", { class: "btn", type: "button", text: label("Confirm: close PR and end task", "確認：PR を閉じてタスクを終了"),
             onclick: () => answerQuestion(question.id, { choice }, row) }));
         requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
       } else {
-        r.stakes.append(el("button", { class: "btn", type: "button", text: label("Withdraw: close PR and end task…", "取り下げ：PR を閉じてタスクを終了…"),
+        withdrawBlock.append(el("button", { class: "btn", type: "button", text: label("Withdraw: close PR and end task…", "取り下げ：PR を閉じてタスクを終了…"),
           onclick: () => { row.dataset.armed = ""; row.dataset.withdrawArmed = "1"; renderStakes(row, question); } }));
       }
       continue;
     }
     const repair = name === "fix findings and re-review";
-    r.stakes.append(el("button", {
+    const actionBlock = el("div", { class: "stakes-action" });
+    r.stakes.append(actionBlock);
+    actionBlock.append(el("button", {
       class: "btn", type: "button", text: repair && target ? label("Fix findings and re-review", "指摘を修正して再レビュー") : choice,
       onclick: () => answerQuestion(question.id, { choice }, row),
     }));
-    if (repair) r.stakes.append(el("p", { class: "hint", text: label("Run one repair and bounded re-review on this PR. This does not approve a merge; updated review and gate results require a fresh decision.", "同じ PR・branch で指摘を修正し、回数を制限して再レビューします。マージは承認せず、結果を見て改めて判断します。") }));
+    if (repair) actionBlock.append(el("p", { class: "hint", text: label("Run one repair and bounded re-review on this PR. This does not approve a merge; updated review and gate results require a fresh decision.", "同じ PR・branch で指摘を修正し、回数を制限して再レビューします。マージは承認せず、結果を見て改めて判断します。") }));
   }
   if (!replacements.length && target) {
-    r.stakes.append(el("button", { class: "btn", type: "button", disabled: true,
-      text: label("Reimplement: no configured agent available", "再実装：選択できる agent が未設定") }));
+    r.stakes.append(el("div", { class: "stakes-action" },
+      el("button", { class: "btn", type: "button", disabled: true,
+        text: label("Reimplement: no configured agent available", "再実装：選択できる agent が未設定") })));
   }
   if (replacements.length) {
-    const select = el("select", { "aria-label": label("Implementer agent for replacement", "再実装を担当する agent") },
+    const select = el("select", { class: "stakes-agent-select", "aria-label": label("Implementer agent for replacement", "再実装を担当する agent") },
       el("option", { value: "", text: label("Select implementer…", "担当 agent を選択…") }),
       ...replacements.map(choice => el("option", { value: choice, text: choice.slice("reimplement:".length) })));
     select.value = row.dataset.replacementChoice || "";
@@ -4757,7 +4764,9 @@ function renderStakes(row, question) {
       onclick: () => {
         if (replacements.includes(select.value)) answerQuestion(question.id, { choice: select.value }, row);
       } });
-    r.stakes.append(select, start, el("p", { class: "hint", text: label("Closes the old PR and retires its execution before a new attempt and PR. Only the selected implementer may implement; if unavailable or quota-limited, the task is held without substitution.", "旧実行を終了し、旧 PR の閉鎖を確認してから、新しい attempt・PR で再実装します。選択 agent が利用不能・上限到達なら代替せず保留します。") }));
+    r.stakes.append(el("div", { class: "stakes-action" },
+      el("div", { class: "stakes-agent-row" }, select, start),
+      el("p", { class: "hint", text: label("Closes the old PR and retires its execution before a new attempt and PR. Only the selected implementer may implement; if unavailable or quota-limited, the task is held without substitution.", "旧実行を終了し、旧 PR の閉鎖を確認してから、新しい attempt・PR で再実装します。選択 agent が利用不能・上限到達なら代替せず保留します。") })));
   }
 }
 
