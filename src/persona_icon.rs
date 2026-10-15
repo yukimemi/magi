@@ -263,3 +263,8 @@ mod tests {
         assert_ne!(fingerprint(Some("/a.png")), fingerprint(Some("/b.png")));
     }
 }
+
+/// Dedicated sender artwork, independent of the persona named magi.
+pub fn magi_svg() -> &'static str {
+    include_str!("../assets/ui/avatars/magi-sender.svg")
+}

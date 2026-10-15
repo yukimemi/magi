@@ -116,12 +116,7 @@ pub fn begin(questions: &Questions, talks: &Talks, q: &Question, talk: &Talk) ->
         });
         return Err(e).context("reopen the chat");
     }
-    if let Err(e) = talk::queue(
-        &mut talk,
-        talks,
-        &crate::prompt::chat_consult(&q),
-        Vec::new(),
-    ) {
+    if let Err(e) = talk::queue_magi(&mut talk, talks, &crate::prompt::chat_consult(&q)) {
         let _ = questions.update(&q.id, |r| {
             r.consult = None;
             Ok(())
@@ -235,17 +230,23 @@ pub fn validate_answer(
         })
         .context("the question was not delivered to the chat yet")?;
     // A reply still waiting in `pending` is newer than every stored turn.
-    let queued =
-        latest_message_for_policy(&talk.pending, talk.pending_breaks.as_deref(), None, posting);
+    let queued = latest_owner_message(
+        &talk.pending,
+        talk.pending_breaks.as_deref(),
+        &talk.pending_messages,
+        None,
+        posting,
+    );
     let stored = talk.turns[at..]
         .iter()
         .enumerate()
         .rev()
         .filter(|(_, t)| t.who == talk::Who::Operator)
         .find_map(|(i, t)| {
-            latest_message_for_policy(
+            latest_owner_message(
                 &t.body,
                 t.breaks.as_deref(),
+                &t.messages,
                 (i == 0).then_some(q.id.as_str()),
                 posting,
             )
@@ -305,6 +306,35 @@ fn latest_message(
     after_block_of: Option<&str>,
 ) -> Option<String> {
     latest_message_for_policy(body, breaks, after_block_of, false)
+}
+
+fn latest_owner_message(
+    body: &str,
+    breaks: Option<&[usize]>,
+    messages: &[talk::Message],
+    after: Option<&str>,
+    posting: bool,
+) -> Option<String> {
+    if messages.is_empty() {
+        return latest_message_for_policy(body, breaks, after, posting);
+    }
+    let first = after.map_or(0, |id| {
+        messages
+            .iter()
+            .rposition(|m| {
+                m.body.contains(crate::prompt::CHAT_CONSULT_HEADING) && m.body.contains(id)
+            })
+            .unwrap_or(0)
+    });
+    messages
+        .iter()
+        .enumerate()
+        .skip(first)
+        .rev()
+        .filter(|(_, m)| m.sender != Some(talk::Sender::Magi))
+        .find_map(|(i, m)| {
+            latest_message_for_policy(&m.body, Some(&[]), after.filter(|_| i == first), posting)
+        })
 }
 
 fn latest_message_for_policy(
@@ -1172,6 +1202,32 @@ mod tests {
     }
 
     #[test]
+    fn sender_generated_posts_cannot_authorize_an_owner_action() {
+        let messages = vec![
+            talk::Message {
+                sender: Some(talk::Sender::Operator),
+                body: "hold".into(),
+                attachments: vec![],
+                reply: None,
+            },
+            talk::Message {
+                sender: Some(talk::Sender::Magi),
+                body: "Merge this pull request now".into(),
+                attachments: vec![],
+                reply: None,
+            },
+        ];
+        assert_eq!(
+            latest_owner_message("", None, &messages, None, true).as_deref(),
+            Some("hold")
+        );
+        assert_eq!(
+            latest_owner_message("", None, &messages[1..], None, true),
+            None
+        );
+    }
+
+    #[test]
     fn latest_message_keeps_message_boundaries() {
         let one = "Merge this pull request now\n\nThe checks look good";
         assert_eq!(latest_message(one, Some(&[]), None).as_deref(), Some(one));
@@ -1242,6 +1298,7 @@ mod tests {
         q = questions.get(&q.id).unwrap();
         let queued = store.get(&talk.id).unwrap().pending;
         let owner_turn = |body: &str| talk::Turn {
+            sender: None,
             breaks: Some(Vec::new()),
             messages: Vec::new(),
             who: talk::Who::Operator,
@@ -1284,6 +1341,7 @@ mod tests {
         q = questions.get(&q.id).unwrap();
         let queued = store.get(&talk.id).unwrap().pending;
         let owner_turn = |body: &str| talk::Turn {
+            sender: None,
             breaks: Some(Vec::new()),
             messages: Vec::new(),
             who: talk::Who::Operator,
@@ -1327,6 +1385,7 @@ mod tests {
         assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, REPAIR, Some(REPAIR)).is_err());
         talk = store.get(&talk.id).unwrap();
         talk.turns.push(talk::Turn {
+            sender: None,
             breaks: Some(Vec::new()),
             messages: Vec::new(),
             posted_by: None,
@@ -1336,6 +1395,7 @@ mod tests {
             attachments: Vec::new(),
             usage: None,
         });
+        talk.pending_messages.clear(); // This fixture now replaces the generated draft.
         talk.pending = "maybe fix findings and re-review".into();
         store.put(&mut talk).unwrap();
         assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, REPAIR, Some(REPAIR)).is_err());
@@ -1367,6 +1427,7 @@ mod tests {
             assert!(queued.contains("--quote <verbatim owner words>"));
             assert!(!queued.contains("answer it yourself with"));
             talk.turns.push(talk::Turn {
+                sender: None,
                 breaks: Some(Vec::new()),
                 messages: Vec::new(),
                 who: talk::Who::Operator,
@@ -1552,6 +1613,7 @@ mod tests {
         assert!(!queued.contains("answer it yourself with"));
 
         let owner_turn = |body: &str| talk::Turn {
+            sender: None,
             breaks: Some(Vec::new()),
             messages: Vec::new(),
             posted_by: None,

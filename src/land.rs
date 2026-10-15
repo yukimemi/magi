@@ -6400,6 +6400,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         q = store.get(&q.id).unwrap();
         assert!(q.answer.is_none());
         talk.turns.push(crate::talk::Turn {
+            sender: None,
             breaks: Some(Vec::new()),
             messages: Vec::new(),
             posted_by: None,

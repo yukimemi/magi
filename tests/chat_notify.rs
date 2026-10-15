@@ -74,6 +74,7 @@ async fn a_finished_task_is_reported_once_however_often_it_is_swept() {
     assert_eq!(first, vec![w.talk_id.clone()]);
     let draft = drafts(&w);
     let saved = w.talks.get(&w.talk_id).expect("saved talk");
+    assert_eq!(saved.pending_messages[0].sender, Some(talk::Sender::Magi));
     assert_eq!(saved.completion_notices.len(), 1);
     let reference = &saved.completion_notices[0];
     assert_eq!(reference.task, t.id);
@@ -413,6 +414,10 @@ async fn watch_reports_once_after_reload_and_preserves_cwd_arguments_and_environ
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let draft = drafts(&w);
+    assert_eq!(
+        w.talks.get(&w.talk_id).unwrap().pending_messages[0].sender,
+        Some(talk::Sender::Magi)
+    );
     assert!(draft.contains("literal; $argument"));
     assert!(draft.contains("stderr-tail"));
     assert_eq!(

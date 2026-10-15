@@ -1785,8 +1785,8 @@ details.panel > summary + * { margin-top: var(--s2); }
 .frame-fail {
   display: flex; flex-direction: column; gap: var(--s2);
   padding: var(--s3);
-  background: var(--tint-rust); color: var(--on-rust);
-  border: 1px dashed currentColor; border-radius: var(--radius-sm);
+  background: var(--tint-gold); color: var(--on-gold);
+  border: 1px solid currentColor; border-radius: var(--radius-sm);
   font-size: var(--t3); font-weight: 600;
 }
 .frame-fail .hint { color: inherit; font-weight: 400; }
@@ -1904,12 +1904,11 @@ details.panel > summary + * { margin-top: var(--s2); }
   max-width: calc(100% - 22px - var(--s2));
 }
 .turn[data-who="agent"] .md { color: var(--ink); font-size: var(--t4); }
-/* magi itself speaking: the interviewing agent timed out, failed or ran out
-   of quota. It is not the model talking and must not be read as an answer. */
+/* MAGI posts: automatic updates and system notices share a dedicated palette. */
 .turn[data-who="system"] {
   align-self: stretch; max-width: none;
-  background: var(--tint-rust); color: var(--on-rust);
-  border: 1px dashed currentColor;
+  background: var(--tint-gold); color: var(--on-gold);
+  border: 1px solid currentColor;
   font-weight: 600;
 }
 .turn-at { display: block; margin-top: var(--s1); font-size: var(--t1); }
@@ -2888,3 +2887,8 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
 .posting-marker { display: inline-block; font-size: .75em; font-weight: 750; border: 1px solid currentColor; border-radius: .2em; padding: 0 .2em; margin-inline: .2em; line-height: 1.4; vertical-align: baseline; }
 .posting-label { font-size: .85em; color: var(--ink-2); margin-bottom: .35rem; }
 .posting-removed { font-style: italic; }
+
+.magi-pending { background: var(--tint-gold); color: var(--on-gold); padding: var(--s3); border-radius: var(--radius-sm); }
+.magi-icon-settings input { display: block; max-width: 100%; margin-block: var(--s3); min-height: 44px; }
+.magi-icon-settings button { min-height: 44px; }
+.magi-icon-preview { display: block; width: 80px; height: 80px; object-fit: cover; border-radius: 16px; }

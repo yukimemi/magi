@@ -2777,6 +2777,7 @@ async fn chat_avatars_load_and_do_not_overlap() {
     .expect("seed turn");
     t.persona = "rei".to_owned();
     t.turns.push(talk::Turn {
+        sender: None,
         who: talk::Who::Agent,
         body: "An answer.".to_owned(),
         at: t.turns[0].at,
@@ -2787,6 +2788,8 @@ async fn chat_avatars_load_and_do_not_overlap() {
         posted_by: None,
     });
     talks.put(&mut t).expect("seed agent turn");
+    talk::queue_once(&mut t, &talks, "An automatic report.", "report").unwrap();
+    talk::drain(&mut t, &talks).unwrap();
     let talk_id = t.id.clone();
 
     let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
@@ -2807,7 +2810,8 @@ async fn chat_avatars_load_and_do_not_overlap() {
                 "(() => { const a = document.querySelector('#talk-persona-box img'); \
                  const b = document.querySelector('.turn[data-who=agent] .turn-avatar'); \
                  const c = document.querySelector('.turn[data-who=operator] .turn-avatar'); \
-                 return [a, b, c].every((img) => img && !img.hidden && img.complete && img.naturalWidth > 0); })()",
+                 const d = document.querySelector('.turn[data-who=system] .turn-avatar'); \
+                 return [a, b, c, d].every((img) => img && !img.hidden && img.complete && img.naturalWidth > 0); })()",
                 w,
             )
             .await
@@ -2839,7 +2843,7 @@ async fn chat_avatars_load_and_do_not_overlap() {
                      const sel = document.getElementById('talk-persona'); \
                      const pa = box.querySelector('img'); \
                      const vw = document.documentElement.clientWidth; \
-                     const turns = ['agent', 'operator'].map((kind) => { \
+                     const turns = ['agent', 'operator', 'system'].map((kind) => { \
                        const turn = document.querySelector('.turn[data-who=' + kind + ']'); \
                        const img = turn.querySelector('.turn-avatar'); const who = turn.querySelector('.turn-who'); \
                        return { kind, src: img.getAttribute('src'), width: r(img).width, \
@@ -2867,6 +2871,8 @@ async fn chat_avatars_load_and_do_not_overlap() {
                 assert!(
                     if turn["kind"] == "operator" {
                         src.starts_with("/avatars/operator.svg?v=")
+                    } else if turn["kind"] == "system" {
+                        src.starts_with("/avatars/magi?v=")
                     } else {
                         src.contains("persona=rei")
                     },
@@ -3936,4 +3942,84 @@ async fn queue_compact_controls_and_edit_save_fit_and_preserve_drafts() {
         queue.put(&mut task).unwrap();
         browser.close_page(&page).await;
     }
+}
+
+#[tokio::test]
+async fn magi_icon_settings_preview_save_reload_and_reset_on_phone() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP MAGI icon settings: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let base = serve(
+        &home,
+        Queue::at(home.join("queue")),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
+    let page = browser
+        .open_page(&format!("{base}#/settings"), 390, 844, true)
+        .await
+        .unwrap();
+    let timeout = Duration::from_secs(30);
+    browser
+        .wait_for(
+            &page,
+            "!!document.querySelector('.magi-icon-settings input')",
+            timeout,
+        )
+        .await
+        .unwrap();
+    let result = browser.eval(&page, r#"(async () => {
+      const panel = () => document.querySelector('.magi-icon-settings');
+      const original = (await (await fetch('/api/magi-icon')).json()).avatar;
+      const canvas = document.createElement('canvas'); canvas.width = 24; canvas.height = 24;
+      canvas.getContext('2d').fillRect(0, 0, 24, 24);
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+      const input = panel().querySelector('input');
+      const transfer = new DataTransfer(); transfer.items.add(new File([blob], 'phone.png', {type:'image/png'}));
+      input.files = transfer.files; input.dispatchEvent(new Event('change'));
+      const until = async f => { for(let i=0;i<200;i++) { if(f()) return; await new Promise(r=>setTimeout(r,25)); } throw new Error('UI timeout'); };
+      await until(() => panel().querySelector('img').src.startsWith('data:'));
+      if ((await (await fetch('/api/magi-icon')).json()).avatar !== original) throw new Error('preview saved before Save');
+      panel().querySelector('button').click();
+      await until(() => panel().textContent.includes('MAGI icon saved.'));
+      const saved = (await (await fetch('/api/magi-icon')).json()).avatar;
+      if (saved === original || !panel().querySelector('img').getAttribute('src').includes(saved)) throw new Error('saved preview did not refresh');
+      const rect = panel().getBoundingClientRect();
+      if (rect.right > document.documentElement.clientWidth + 1 || panel().scrollWidth > panel().clientWidth + 1) throw new Error('phone overflow');
+      return saved;
+    })()"#).await.unwrap();
+    browser.close_page(&page).await;
+    let page = browser
+        .open_page(&format!("{base}#/settings"), 390, 844, true)
+        .await
+        .unwrap();
+    browser
+        .wait_for(
+            &page,
+            &format!(
+                "document.querySelector('.magi-icon-preview')?.getAttribute('src') === {}",
+                result
+            ),
+            timeout,
+        )
+        .await
+        .unwrap();
+    browser
+        .eval(
+            &page,
+            "document.querySelectorAll('.magi-icon-settings button')[1].click(); true",
+        )
+        .await
+        .unwrap();
+    browser.wait_for(&page, "document.querySelector('.magi-icon-settings').textContent.includes('Built-in MAGI icon restored.')", timeout).await.unwrap();
+    assert!(!home.join("magi-icon.data").exists());
+    browser.close_page(&page).await;
 }
