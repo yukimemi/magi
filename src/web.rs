@@ -7018,6 +7018,73 @@ impl TalkView {
     /// As [`Self::new`], with the config already in hand (the list reads one
     /// per repository, not one per conversation).
     fn with_config(mut talk: Talk, thinking: bool, cfg: Option<&Config>, home: &FsPath) -> Self {
+        // This owned value is the display DTO; never write it back to the talk store.
+        let snapshot = talk.clone();
+        for (index, turn) in talk.turns.iter_mut().enumerate() {
+            let original = &snapshot.turns[index];
+            if turn.messages.is_empty() {
+                if let Some(display) = talk::notice_display(&snapshot, original, None) {
+                    turn.messages.push(talk::Message {
+                        sender: Some(talk::Sender::Magi),
+                        body: original.body.clone(),
+                        display: Some(display),
+                        attachments: original.attachments.clone(),
+                        reply: None,
+                    });
+                }
+            } else {
+                for (i, message) in turn.messages.iter_mut().enumerate() {
+                    message.display =
+                        talk::notice_display(&snapshot, original, original.messages.get(i));
+                    if message.display.is_some() {
+                        message.sender = Some(talk::Sender::Magi);
+                    }
+                }
+            }
+        }
+        for message in &mut talk.pending_messages {
+            if message.display.is_none()
+                && (message.sender == Some(talk::Sender::Magi)
+                    || snapshot
+                        .completion_notices
+                        .iter()
+                        .any(|r| r.notice == message.body))
+            {
+                message.display = crate::prompt::legacy_notice_display(&message.body);
+                if message.display.is_some() {
+                    message.sender = Some(talk::Sender::Magi);
+                }
+            }
+        }
+        if talk.pending_messages.is_empty()
+            && snapshot
+                .completion_notices
+                .iter()
+                .any(|r| r.notice == talk.pending)
+            && let Some(display) = crate::prompt::legacy_notice_display(&talk.pending)
+        {
+            talk.pending_messages.push(talk::Message {
+                sender: Some(talk::Sender::Magi),
+                display: Some(display),
+                body: talk.pending.clone(),
+                attachments: talk.pending_attachments.clone(),
+                reply: None,
+            });
+        }
+        let excerpts: Vec<Vec<Option<String>>> = talk
+            .turns
+            .iter()
+            .map(|turn| {
+                turn.messages
+                    .iter()
+                    .map(|m| {
+                        m.display
+                            .as_ref()
+                            .map(|d| d.facts.chars().take(240).collect())
+                    })
+                    .collect()
+            })
+            .collect();
         for turn in &mut talk.turns {
             let provenance = talk::sender(turn, None);
             turn.sender = Some(provenance);
@@ -7047,6 +7114,13 @@ impl TalkView {
             .chain(talk.pending_messages.iter_mut())
             .filter_map(|m| m.reply.as_mut())
         {
+            if let Some(Some(excerpt)) = excerpts
+                .get(reply.target.turn)
+                .and_then(|ms| ms.get(reply.target.message))
+            {
+                reply.excerpt = excerpt.clone();
+                reply.sender = Some(talk::Sender::Magi);
+            }
             if reply.sender.is_none() {
                 reply.sender = senders
                     .get(reply.target.turn)
@@ -11233,6 +11307,120 @@ mod tests {
             Some(talk::Sender::Magi)
         );
         assert_eq!(view.talk.turns[3].sender, Some(talk::Sender::Persona));
+    }
+
+    #[tokio::test]
+    async fn notification_display_survives_queue_history_and_reply_without_changing_input() {
+        let (_tmp, _home, ui, id, _) = avatar_fixture("").await;
+        let mut conversation = ui.talks.get(&id).unwrap();
+        let (body, display) = crate::prompt::chat_watch_report("watch-123", "failed", "output");
+        talk::record(&mut conversation, &ui.talks, &body, vec![]).unwrap();
+        talk::queue_notice(
+            &mut conversation,
+            &ui.talks,
+            &body,
+            "watch:123",
+            &|_| false,
+            None,
+            display.clone(),
+        )
+        .unwrap();
+        assert!(
+            !talk::queue_notice(
+                &mut conversation,
+                &ui.talks,
+                &body,
+                "watch:123",
+                &|_| false,
+                None,
+                display.clone()
+            )
+            .unwrap()
+        );
+        let saved = ui.talks.get(&id).unwrap();
+        assert_eq!(saved.pending_messages[0].display, Some(display.clone()));
+        let view = TalkView::with_config(saved, false, None, &ui.home);
+        assert!(
+            view.talk.turns[0].messages[0].display.is_none(),
+            "operator copy stays literal"
+        );
+        assert_eq!(view.talk.pending_messages[0].display, Some(display.clone()));
+        talk::drain(&mut conversation, &ui.talks).unwrap();
+        talk::record_reply(
+            &mut conversation,
+            &ui.talks,
+            "Explain",
+            vec![],
+            Some(talk::ReplyTarget {
+                turn: 1,
+                message: 0,
+            }),
+        )
+        .unwrap();
+        let mut saved = ui.talks.get(&id).unwrap();
+        assert_eq!(saved.turns[1].messages[0].body, body);
+        assert_eq!(saved.turns[1].messages[0].display, Some(display.clone()));
+        let reply = saved.turns[2].messages[0].reply.as_mut().unwrap();
+        assert!(!reply.excerpt.contains("automatic report"));
+        reply.excerpt = body.chars().take(240).collect(); // old saved quote
+        saved.turns[1].messages[0].display = None; // old MAGI send
+        ui.talks.put(&mut saved).unwrap();
+        let view = TalkView::with_config(ui.talks.get(&id).unwrap(), false, None, &ui.home);
+        assert_eq!(view.talk.turns[1].messages[0].display, Some(display));
+        assert!(
+            !view.talk.turns[2].messages[0]
+                .reply
+                .as_ref()
+                .unwrap()
+                .excerpt
+                .contains("automatic report")
+        );
+        assert_eq!(ui.talks.get(&id).unwrap().turns[1].messages[0].body, body);
+    }
+
+    #[tokio::test]
+    async fn notification_display_recovers_exact_legacy_completion_references() {
+        let (_tmp, _home, ui, id, _) = avatar_fixture("").await;
+        let mut conversation = ui.talks.get(&id).unwrap();
+        let (body, display) = crate::prompt::chat_task_report(&crate::prompt::ChatTaskNotice {
+            id: "task-123",
+            title: "Change",
+            status: "done",
+            reason: None,
+            run: Some("run-123"),
+            pr: None,
+            summary: Some("Merge state unknown"),
+        });
+        talk::record(&mut conversation, &ui.talks, &body, vec![]).unwrap();
+        conversation.turns[0].sender = None;
+        conversation.turns[0].messages.clear();
+        conversation.turns[0].breaks = None;
+        conversation.pending = body.clone();
+        conversation
+            .completion_notices
+            .push(crate::chat_notify::CompletionReference {
+                task: "task-123".into(),
+                run: Some("run-123".into()),
+                notice: body.clone(),
+            });
+        ui.talks.put(&mut conversation).unwrap();
+        let view = TalkView::with_config(ui.talks.get(&id).unwrap(), false, None, &ui.home);
+        assert_eq!(
+            view.talk.turns[0].messages[0].display,
+            Some(display.clone())
+        );
+        assert_eq!(view.talk.pending_messages[0].display, Some(display));
+        assert_eq!(
+            view.talk.turns[0].messages[0].sender,
+            Some(talk::Sender::Magi)
+        );
+        assert!(ui.talks.get(&id).unwrap().turns[0].messages.is_empty());
+        conversation.completion_notices[0]
+            .notice
+            .push_str("different");
+        let view = TalkView::with_config(conversation, false, None, &ui.home);
+        assert!(view.talk.turns[0].messages.is_empty());
+        assert!(view.talk.pending_messages.is_empty());
     }
 
     #[tokio::test]

@@ -4031,3 +4031,92 @@ async fn magi_icon_settings_preview_save_reload_and_reset_on_phone() {
     assert!(!home.join("magi-icon.data").exists());
     browser.close_page(&page).await;
 }
+
+#[tokio::test]
+async fn chat_notification_display_hides_machine_context_on_phone_and_desktop() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP notification display: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let mut conversation = talk::begin(&talks, &fx.config, fx.repo.clone(), None).unwrap();
+    talk::record(&mut conversation, &talks, "Report the result", vec![]).unwrap();
+    let mut task = Task::new(
+        "Notification example".into(),
+        "Change".into(),
+        fx.repo.clone(),
+        Source::Agent {
+            run: conversation.id.clone(),
+            node: magi::queue::CHAT_NODE.into(),
+        },
+    );
+    task.start("example-run".into());
+    task.succeed();
+    queue.put(&mut task).unwrap();
+    magi::chat_notify::sweep(&queue, &talks, &home);
+    talk::drain(&mut conversation, &talks).unwrap();
+    let watch = magi::prompt::chat_watch_notice(
+        "watch-123",
+        "exit status 7",
+        "<script>untrusted output</script>",
+    );
+    talk::queue_once(&mut conversation, &talks, &watch, "old-watch").unwrap();
+    talk::drain(&mut conversation, &talks).unwrap();
+    talk::record_reply(
+        &mut conversation,
+        &talks,
+        "Explain that",
+        vec![],
+        Some(talk::ReplyTarget {
+            turn: 1,
+            message: 0,
+        }),
+    )
+    .unwrap();
+    talk::queue_once(&mut conversation, &talks, &watch, "queued-watch").unwrap();
+    let id = conversation.id;
+    let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("launch browser");
+    for (width, height, mobile) in [(1280, 900, false), (390, 844, true)] {
+        let page = browser
+            .open_page(&format!("{base}#/chat/{id}"), width, height, mobile)
+            .await
+            .unwrap();
+        browser
+            .wait_for(
+                &page,
+                "document.querySelectorAll('.notification-facts').length === 3",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        let result = browser.eval(&page, r##"(() => {
+          const assert = (ok, message) => { if (!ok) throw new Error(message); };
+          const text = document.querySelector('#talk-turns').innerText + document.querySelector('#talk-pending').innerText;
+          assert(!/automatic report|not a message from the operator|Tell the operator|Do not file new tasks/.test(text), 'machine context hidden');
+          const report = document.querySelector('#talk-message-1-0');
+          assert(report.dataset.who === 'system', 'MAGI bubble');
+          assert(report.innerText.includes('MAGI') && report.innerText.includes('done'), 'sender and status');
+          assert(report.querySelector('a[href^="#/tasks/"]'), 'task link');
+          const output = document.querySelector('#talk-message-2-0 details');
+          assert(output && !output.open && !output.querySelector('script'), 'output collapsed and escaped');
+          output.open = true;
+          assert(output.innerText.includes('<script>untrusted output</script>'), 'literal output');
+          report.querySelector('button').click();
+          const excerpt = document.querySelector('#talk-reply-preview').innerText;
+          assert(excerpt.includes('MAGI') && !excerpt.includes('automatic report'), 'composer excerpt');
+          for (const card of document.querySelectorAll('.notification-facts')) {
+            const r = card.getBoundingClientRect();
+            assert(r.left >= 0 && r.right <= innerWidth + 1 && card.scrollWidth <= card.clientWidth + 1, 'facts fit viewport');
+          }
+          return true;
+        })()"##).await.expect("notification display assertions");
+        assert_eq!(result, true, "notifications at {width}px");
+        browser.close_page(&page).await;
+    }
+}

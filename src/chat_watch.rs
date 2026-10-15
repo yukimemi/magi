@@ -514,12 +514,20 @@ fn reconcile(dir: &Path, talks: &Talks) -> Result<()> {
         }
         Err(e) => return Err(e),
     };
-    let text = crate::prompt::chat_watch_notice(
+    let (text, display) = crate::prompt::chat_watch_report(
         &job.id,
         job.result.as_deref().unwrap_or("unknown"),
         &job.tail,
     );
-    if let Err(e) = talk::queue_once(&mut t, talks, &text, &format!("watch:{}:finished", job.id)) {
+    if let Err(e) = talk::queue_notice(
+        &mut t,
+        talks,
+        &text,
+        &format!("watch:{}:finished", job.id),
+        &|_| false,
+        None,
+        display,
+    ) {
         match talks.get(&job.talk) {
             Ok(t) if !t.status.open() => {}
             Err(_) if gone() => {}
