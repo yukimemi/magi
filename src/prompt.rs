@@ -1972,8 +1972,23 @@ fn task_report_with(
 }
 
 /// Strict compatibility reader, called only after provenance has been verified.
-/// Unknown templates and ambiguous multiline facts retain their original text.
+/// Unknown completion templates retain their original text; old consultations
+/// use a generic placeholder because no display snapshot was saved.
 pub fn legacy_notice_display(body: &str) -> Option<NoticeDisplay> {
+    // Old consultations did not save display facts. Do not guess the boundary
+    // between arbitrary question detail and agent directives, or read mutable
+    // question state to recreate a historical notification. The caller verifies
+    // MAGI provenance before reaching this compatibility path.
+    if body.starts_with(&format!(
+        "# {CHAT_CONSULT_HEADING}\n\nThe operator passed you a question"
+    )) {
+        return Some(NoticeDisplay {
+            facts: "# Question consultation\n\nA question was passed to this conversation. See the question card for details.".into(),
+            output: None,
+            task: None,
+            run: None,
+        });
+    }
     let task_prefix = format!(
         "# {CHAT_TASK_NOTICE_HEADING}\n\nThis is an automatic report from magi, not a message from the operator. A task filed from this conversation reached a final state.\n\n"
     );
@@ -2080,6 +2095,35 @@ pub fn defuse(text: &str) -> String {
         out = out.replace(marker, &quiet);
     }
     out
+}
+
+/// User-facing consultation snapshot, without the instructions sent to the agent.
+pub fn chat_consult_display(q: &crate::ask::Question) -> NoticeDisplay {
+    let mut facts = format!(
+        "# Question consultation\n\n## {}\n\nQuestion: `{}`\n\n",
+        q.summary, q.id
+    );
+    if !q.detail.trim().is_empty() {
+        facts.push_str(q.detail.trim());
+        facts.push_str("\n\n");
+    }
+    if q.free_text() {
+        facts.push_str("This question wants free text.\n");
+    } else {
+        facts.push_str("Choices:\n\n");
+        for choice in &q.choices {
+            facts.push_str(&format!("- {choice}\n"));
+        }
+    }
+    NoticeDisplay {
+        facts: clip(
+            &crate::scrub::scrub(&facts, &crate::scrub::Identity::current()),
+            8192,
+        ),
+        output: None,
+        task: None,
+        run: None,
+    }
 }
 
 /// The operator turn that puts an open question in front of the chat agent.

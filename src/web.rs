@@ -7215,7 +7215,9 @@ fn notice_markdown(
     } else {
         // Unknown completion templates may contain internal directives. Never
         // promote their agent input to the Markdown display surface.
-        if crate::prompt::is_completion_notice(body) {
+        if crate::prompt::is_completion_notice(body)
+            || body.starts_with(&format!("# {}\n", crate::prompt::CHAT_CONSULT_HEADING))
+        {
             return None;
         }
         body.strip_prefix("magi: ").unwrap_or(body)
@@ -11552,6 +11554,83 @@ mod tests {
                 .contains("automatic report")
         );
         assert_eq!(ui.talks.get(&id).unwrap().turns[1].messages[0].body, body);
+    }
+
+    #[tokio::test]
+    async fn consultation_display_hides_directives_in_queue_and_history() {
+        for node in [
+            "implement",
+            crate::land::APPROVAL_NODE,
+            crate::github_text::ASK_NODE,
+        ] {
+            let (_tmp, _home, ui, id, _) = avatar_fixture("").await;
+            let mut question = Question::new(
+                "run-123".into(),
+                node.into(),
+                "seat-1".into(),
+                "Which backend?".into(),
+                "## Context\n\nUse `storage`.\n\n<script>literal</script>".into(),
+                vec!["SQLite".into(), "Redis".into()],
+            );
+            ui.questions.put(&mut question).unwrap();
+            let body = crate::prompt::chat_consult(&question);
+            let mut conversation = ui.talks.get(&id).unwrap();
+            talk::record(&mut conversation, &ui.talks, &body, vec![]).unwrap();
+            assert!(
+                crate::consult::begin(&ui.questions, &ui.talks, &question, &conversation).unwrap()
+            );
+            conversation = ui.talks.get(&id).unwrap();
+            assert_eq!(conversation.pending_messages[0].body, body);
+            assert!(body.contains("magi answer"));
+            let mut legacy_pending = conversation.clone();
+            legacy_pending.pending_messages[0].display = None;
+            let legacy_view = TalkView::with_config(legacy_pending, false, None, &ui.home);
+            let legacy_md = serde_json::to_string(&legacy_view.pending_messages_md[0]).unwrap();
+            assert!(legacy_md.contains("Question consultation"));
+            assert!(!legacy_md.contains("magi answer"));
+            let view = TalkView::with_config(conversation.clone(), false, None, &ui.home);
+            assert!(
+                view.turn_messages_md[0][0].is_none(),
+                "operator copy stays literal"
+            );
+            let queued_md = view.pending_messages_md[0].clone().unwrap();
+            let rendered = serde_json::to_string(&queued_md).unwrap();
+            for visible in [
+                "Which backend?",
+                "Context",
+                "storage",
+                "SQLite",
+                "Redis",
+                "<script>literal</script>",
+            ] {
+                assert!(rendered.contains(visible), "missing {visible}");
+            }
+            for directive in [
+                "What to do",
+                "magi answer",
+                "Never answer it yourself",
+                "Do not edit the repository",
+            ] {
+                assert!(!rendered.contains(directive), "exposed {directive}");
+            }
+            assert_eq!(
+                view.talk.pending_messages[0].display,
+                Some(crate::prompt::chat_consult_display(&question))
+            );
+            talk::drain(&mut conversation, &ui.talks).unwrap();
+            let view = TalkView::with_config(conversation.clone(), false, None, &ui.home);
+            assert_eq!(view.turn_messages_md[1][0], Some(queued_md));
+            assert_eq!(conversation.turns[1].messages[0].body, body);
+
+            // Historical consultations lack a snapshot: show a safe placeholder
+            // rather than parsing instructions or reconstructing mutable facts.
+            conversation.turns[1].messages[0].display = None;
+            let view = TalkView::with_config(conversation, false, None, &ui.home);
+            let legacy = serde_json::to_string(&view.turn_messages_md[1][0]).unwrap();
+            assert!(legacy.contains("Question consultation"));
+            assert!(!legacy.contains("magi answer"));
+            assert!(notice_markdown(talk::Sender::Magi, &body, None).is_none());
+        }
     }
 
     #[test]
