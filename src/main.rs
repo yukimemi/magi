@@ -2684,24 +2684,38 @@ async fn answer_cmd(
         ask::Answer::Choice(reply)
     };
     let tasks = magi::queue::Queue::open().list();
-    let (q, ()) = store.update(&q.id, |r| {
-        if let Some((run, node)) = agent_env() {
-            magi::consult::refuse_operator_held(r, &node, &tasks)?;
+    let talks = magi::talk::Talks::open();
+    let seat = agent_env();
+    let (q, evidence_guard) = store.update(&q.id, |r| {
+        let evidence_guard = seat
+            .as_ref()
+            .filter(|(_, node)| {
+                node == magi::queue::CHAT_NODE
+                    && magi::consult::QuestionKind::of(r) != magi::consult::QuestionKind::Ordinary
+            })
+            .map(|_| talks.answer_guard())
+            .transpose()?;
+        if let Some((run, node)) = &seat {
+            magi::consult::refuse_operator_held(r, node, &tasks)?;
             let reply = match &answer {
                 ask::Answer::Choice(s) | ask::Answer::Text(s) => s,
             };
             r.answer_authority = magi::consult::authorize_answer(
                 r,
-                &magi::talk::Talks::open(),
+                &talks,
                 &store,
-                &run,
-                &node,
+                run,
+                node,
                 reply,
                 quote.as_deref(),
             )?;
         }
-        r.answer(answer)
+        r.answer(answer)?;
+        // Returning the guard retains it through Questions::update's atomic
+        // write; dropping it in this closure would leave a retraction race.
+        Ok(evidence_guard)
     })?;
+    drop(evidence_guard);
     println!("answered {} {}", q.short(), q.summary);
     if q.node == magi::land::APPROVAL_NODE
         && q.resolution()

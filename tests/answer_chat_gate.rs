@@ -605,6 +605,7 @@ fn generated_sends_do_not_replace_the_latest_real_owner_instruction() {
         } else if mode == "coalesced" {
             t.turns[0].body.push_str("\n\nmerge it now");
             t.turns[0].messages.push(talk::Message {
+                display: None,
                 sender: Some(talk::Sender::Magi),
                 body: "merge it now".into(),
                 attachments: vec![],
@@ -629,4 +630,57 @@ fn generated_sends_do_not_replace_the_latest_real_owner_instruction() {
         assert_eq!(evidence.turn, 0);
         assert_eq!(evidence.message, 0);
     }
+}
+
+#[test]
+fn batch_holds_reject_entire_ambiguous_or_conditional_recommendations() {
+    for template in [
+        "- {}: hold | merge",
+        "- {}: hold\n  ただしチェック失敗時のみ",
+        "- {}: hold\n  or merge",
+        "- {}: `hold` | `merge`",
+        "- {}: hold、ただしチェック失敗時のみ",
+        "- {}: hold、チェック失敗なら",
+        "- {}: hold、その後PRを閉じる、ただしチェック失敗時のみ",
+        "| Question | Choice | Reason |\n| --- | --- | --- |\n| {} | hold | only if checks fail |",
+        "| Question | Choice | Reason |\n| --- | --- | --- |\n| {} | hold | ただしチェック失敗時のみ |",
+    ] {
+        let f = fixture();
+        let words = "answer each as recommended";
+        let run = standing_owner(&f, words, Some(&template.replace("{}", &f.qid)));
+        assert_untouched(&f, &hold(&f, &run, words));
+    }
+}
+
+#[test]
+fn cli_waits_for_the_conversation_evidence_lock_before_reading_owner_intent() {
+    let f = fixture();
+    let words = format!("{}: hold", f.qid);
+    let run = standing_owner(&f, &words, None);
+    let talks = Talks::at(f.tmp.path().join("talks"));
+    let guard = talks.answer_guard().unwrap();
+    std::thread::scope(|scope| {
+        let answer = scope.spawn(|| hold(&f, &run, &words));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let lock = f.questions.root().join(format!("{}.lock", f.qid));
+        while !lock.exists() && !answer.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            lock.exists(),
+            "the CLI must first acquire the question lock"
+        );
+        assert!(
+            !answer.is_finished(),
+            "the CLI must also wait for conversation updates"
+        );
+        assert!(f.questions.get(&f.qid).unwrap().status.open());
+        drop(guard);
+        let out = answer.join().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    });
 }

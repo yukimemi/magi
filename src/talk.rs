@@ -634,7 +634,7 @@ impl Talks {
     /// The file lock is never skipped: a cycle that cannot get it within
     /// longer than the lock's own expiry fails instead of writing unguarded.
     fn guard(&self) -> Result<StoreGuard<'_>> {
-        let mutex = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let answer = self.answer_guard()?;
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
         let path = self.root.join(".store.turn");
@@ -643,7 +643,7 @@ impl Talks {
             if let Some(file) = TurnLock::take(&path)? {
                 return Ok(StoreGuard {
                     _file: file,
-                    _mutex: mutex,
+                    _answer: answer,
                 });
             }
             if std::time::Instant::now() >= deadline {
@@ -651,6 +651,36 @@ impl Talks {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Freeze owner evidence until an answer has been persisted. Acquire this
+    /// after the question lock, and retain it through `Questions::update`'s
+    /// write, using the same lock order as consultation dispatch.
+    pub fn answer_guard(&self) -> Result<AnswerGuard<'_>> {
+        let mutex = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        // Keep temporary lock files separate from transcripts so answering
+        // seats can synchronize without permission to alter owner evidence.
+        let root = self.answer_lock_root();
+        std::fs::create_dir_all(&root).context("create conversation evidence lock directory")?;
+        let path = root.join("store.turn");
+        let deadline = std::time::Instant::now() + TAKEOVER_LOCK_TTL * 2;
+        loop {
+            if let Some(file) = TurnLock::take(&path)? {
+                return Ok(AnswerGuard {
+                    _file: file,
+                    _mutex: mutex,
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!("conversation evidence is locked by another process");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Writable synchronization files, separate from conversation evidence.
+    pub fn answer_lock_root(&self) -> PathBuf {
+        self.root.join(".answer-lock")
     }
 
     /// Directory holding the conversation files.
@@ -970,6 +1000,12 @@ impl Talks {
 /// What [`Talks::guard`] hands out: the in-process mutex plus the
 /// cross-process file lock. The file lock is released first.
 struct StoreGuard<'a> {
+    _file: TurnLock,
+    _answer: AnswerGuard<'a>,
+}
+
+/// Holds conversation updates until the corresponding question write completes.
+pub struct AnswerGuard<'a> {
     _file: TurnLock,
     _mutex: MutexGuard<'a, ()>,
 }
@@ -2256,7 +2292,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         crate::consult::pending_consults(q, &talk.id) || crate::consult::authorized_holds(q, talk)
     });
     let consult_roots: Vec<PathBuf> = match &questions {
-        Some(q) if consulted => vec![q.root().to_path_buf()],
+        Some(q) if consulted => vec![q.root().to_path_buf(), store.answer_lock_root()],
         _ => Vec::new(),
     };
 
@@ -5421,6 +5457,76 @@ mod tests {
             on_disk.turns
         );
         let _ = &cfg; // config kept only to build the agent above
+    }
+
+    #[test]
+    fn owner_retraction_waits_until_the_authorized_question_is_persisted() {
+        use crate::ask::{Answer, Question, Questions};
+        use std::sync::mpsc;
+
+        let (tmp, talks) = store();
+        let cfg = config(mock_agent(tmp.path(), REPLY, env("hi")));
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).unwrap();
+        let questions = Questions::at(tmp.path().join("questions"));
+        let mut q = Question::new(
+            "run".into(),
+            crate::land::APPROVAL_NODE.into(),
+            "land".into(),
+            "Merge?".into(),
+            String::new(),
+            vec!["merge".into(), "hold".into()],
+        );
+        questions.put(&mut q).unwrap();
+        let instruction = format!("{}: hold", q.id);
+        record(&mut talk, &talks, &instruction, vec![]).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let mut writer = None;
+            let (saved, guard) = questions
+                .update(&q.id, |q| {
+                    let guard = talks.answer_guard()?;
+                    q.answer_authority = crate::consult::authorize_answer(
+                        q,
+                        &talks,
+                        &questions,
+                        &talk.id,
+                        crate::queue::CHAT_NODE,
+                        "hold",
+                        Some(&instruction),
+                    )?;
+                    assert!(q.answer_authority.is_some());
+                    let talks = talks.clone();
+                    let mut snapshot = talk.clone();
+                    writer = Some(scope.spawn(move || {
+                        started_tx.send(()).unwrap();
+                        queue(&mut snapshot, &talks, "wait", vec![]).unwrap();
+                        finished_tx.send(()).unwrap();
+                    }));
+                    started_rx.recv().unwrap();
+                    assert!(matches!(
+                        finished_rx.recv_timeout(Duration::from_millis(100)),
+                        Err(mpsc::RecvTimeoutError::Timeout)
+                    ));
+                    q.answer(Answer::Choice("hold".into()))?;
+                    // Match the CLI: return this guard through the atomic write.
+                    Ok(guard)
+                })
+                .unwrap();
+            assert_eq!(saved.resolution().as_deref(), Some("hold"));
+            assert_eq!(
+                questions.get(&q.id).unwrap().resolution().as_deref(),
+                Some("hold")
+            );
+            assert!(matches!(
+                finished_rx.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ));
+            drop(guard);
+            writer.unwrap().join().unwrap();
+            finished_rx.recv().unwrap();
+        });
+        assert_eq!(talks.get(&talk.id).unwrap().pending, "wait");
     }
 
     #[test]

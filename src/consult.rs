@@ -201,8 +201,10 @@ pub struct AnswerAuthority {
     pub choice: String,
 }
 
-/// Validate an answer under the question lock. Consultation is a delivery route,
-/// not the source of authority for an explicit, independently bound owner hold.
+/// Validate an answer under the question lock. The caller must also retain
+/// [`Talks::answer_guard`] from before this read until the answer is persisted.
+/// Consultation is a delivery route, not the source of authority for an
+/// explicit, independently bound owner hold.
 pub fn authorize_answer(
     q: &Question,
     talks: &Talks,
@@ -401,7 +403,9 @@ fn recommended_hold(body: &str, q: &Question, questions: &Questions) -> bool {
     let mut options = comrak::Options::default();
     options.extension.table = true;
     let document = comrak::parse_document(&arena, body, &options);
+    let lines: Vec<_> = body.lines().collect();
     let mut eligible = std::collections::BTreeSet::new();
+    let mut qualified = std::collections::BTreeSet::new();
     for node in document.descendants() {
         let data = node.data.borrow();
         if matches!(
@@ -412,6 +416,12 @@ fn recommended_hold(body: &str, q: &Question, questions: &Questions) -> bool {
             .any(|n| matches!(n.data.borrow().value, NodeValue::BlockQuote))
         {
             eligible.extend(data.sourcepos.start.line..=data.sourcepos.end.line);
+            if lines
+                .get(data.sourcepos.start.line - 1..data.sourcepos.end.line)
+                .is_some_and(|block| conditional_recommendation(&block.join(" ")))
+            {
+                qualified.extend(data.sourcepos.start.line..=data.sourcepos.end.line);
+            }
         }
     }
     for (index, line) in body.lines().enumerate() {
@@ -423,6 +433,10 @@ fn recommended_hold(body: &str, q: &Question, questions: &Questions) -> bool {
             .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
             .collect();
         if !tokens.iter().any(|r| refers_to(r, q, questions)) {
+            continue;
+        }
+        if qualified.contains(&(index + 1)) || conditional_recommendation(line) {
+            rows.push(false);
             continue;
         }
         if line.starts_with('|') {
@@ -457,17 +471,55 @@ fn recommended_hold(body: &str, q: &Question, questions: &Questions) -> bool {
         rows.push(
             refers_to(reference, q, questions)
                 && choice.is_some_and(|choice| {
-                    let choice = choice
-                        .split(['|', '、'])
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .trim_matches('`');
-                    choice == crate::land::HOLD
+                    // Consume the entire choice. A pipe is an alternative,
+                    // not an excuse to discard it. The one supported trailing
+                    // action is separate from the hold and grants no closure.
+                    matches!(choice.trim_matches('`'), "hold" | "hold、その後PRを閉じる")
                 }),
         );
     }
     rows == [true]
+}
+
+fn conditional_recommendation(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    lower.split(|c: char| !c.is_ascii_alphabetic()).any(|word| {
+        matches!(
+            word,
+            "if" | "unless"
+                | "when"
+                | "maybe"
+                | "conditional"
+                | "otherwise"
+                | "only"
+                | "except"
+                | "or"
+                | "either"
+                | "provided"
+                | "assuming"
+                | "depending"
+        )
+    }) || [
+        "ただし",
+        "場合",
+        "なら",
+        "たら",
+        "限り",
+        "のみ",
+        "かも",
+        "次第",
+        "条件",
+        "または",
+        "もしくは",
+        "あるいは",
+        "れば",
+        "とき",
+        "際",
+        "時だけ",
+        "必要に応じて",
+    ]
+    .iter()
+    .any(|word| line.contains(word))
 }
 
 impl QuestionKind {
