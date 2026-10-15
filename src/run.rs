@@ -2297,6 +2297,9 @@ pub struct RunState {
     /// having one to report. See [`ReleaseBump`].
     #[serde(default)]
     pub release_bump: Option<ReleaseBump>,
+    /// Decision history also survives failures before a release outcome exists.
+    #[serde(default)]
+    pub bump_decision_attempts: Vec<crate::bump::DecisionAttempt>,
     /// The last look at how far the winner's tree trailed the landing base,
     /// and the rebase(s) tried to close that gap. `None` until the tree has a
     /// winner to check.
@@ -2465,6 +2468,7 @@ impl RunState {
             driver_exited: false,
             pr: None,
             release_bump: None,
+            bump_decision_attempts: Vec::new(),
             base_sync: None,
             advice: None,
             advise_attempted: false,

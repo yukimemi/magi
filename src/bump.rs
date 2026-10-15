@@ -36,12 +36,204 @@ use crate::proc::Quiet as _;
 use crate::run::{self, RunState, RunStatus};
 use crate::verdict;
 
+/// One bounded release decision attempt, independent of a release PR outcome.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecisionAttempt {
+    /// Configured agent id tried in this attempt.
+    pub agent: String,
+    /// Sanitized failure classification or successful decision.
+    pub outcome: String,
+}
+
+/// Consume the configured chain once. A parsed decision ends failover; reason
+/// rewriting happens afterwards and cannot change the selected level.
+async fn ask_decision(
+    state: &mut RunState,
+    repo: &Path,
+    prompt: &str,
+    timeout: Duration,
+) -> Result<(AgentSpec, SeatState, BumpDecision)> {
+    let chain = agent::pick_chain(
+        &state.config.agents,
+        state.config.roles.chatter.as_ref(),
+        &agent::installed,
+        "chatter (release-bump decision)",
+    )?;
+    // Keep the whole chain within the existing decision budget. In
+    // particular, failover must not outlive the marker lock's stale ceiling.
+    let attempt_timeout = timeout / u32::try_from(chain.len()).unwrap_or(u32::MAX);
+    let artifacts = agent::artifacts_dir(&state.dir());
+    let cache = state.config.cache_dir();
+    let mut failures = Vec::new();
+    for (n, spec) in chain.iter().enumerate() {
+        let mut seat = crate::graph::handover_seat("bump", &spec.id, state.next_seat_seed());
+        // Include the persisted attempt count so a resumed decision cannot
+        // overwrite earlier evidence, including the first attempt's output.
+        let attempt = state.bump_decision_attempts.len() + 1;
+        let stem = format!("bump-decision-{attempt}");
+        state.event(
+            "bump",
+            format!("decision attempt {attempt}: trying {} ({stem})", spec.id),
+        );
+        let outcome = agent::invoke(
+            spec,
+            &mut seat,
+            &Invocation {
+                cwd: repo,
+                prompt,
+                timeout: attempt_timeout,
+                allow_write: false,
+                unsandboxed: false,
+                sessions: false,
+                artifacts: &artifacts,
+                stem: &stem,
+                run: &state.id,
+                node: "bump",
+                cache_dir: cache.as_deref(),
+                attachments: &[],
+                writable: &[],
+            },
+        )
+        .await;
+        let parsed = if agent::chain_advances(&outcome) {
+            None
+        } else {
+            outcome
+                .as_ref()
+                .ok()
+                .and_then(|out| parse_decision(&out.text).ok())
+        };
+        // Fixed classifications avoid copying CLI output, secrets or local
+        // paths into events, reports, or the surfaced failure message.
+        let (class, reason) = match &outcome {
+            Ok(out) if out.quota_exhausted() => {
+                (run::FailClass::Quota, "rate/quota limit".to_owned())
+            }
+            Ok(out) if out.timed_out => (run::FailClass::Timeout, "timed out".to_owned()),
+            Ok(out) if out.exit_code != Some(0) => (
+                run::FailClass::Other("cli".into()),
+                format!("CLI exit {:?}", out.exit_code),
+            ),
+            Ok(out) if out.text.trim().is_empty() => (
+                run::FailClass::Other("empty".into()),
+                "empty output".to_owned(),
+            ),
+            Err(_) => (
+                run::FailClass::Other("cli".into()),
+                "CLI invocation failed; inspect attempt artifacts".to_owned(),
+            ),
+            _ => (
+                run::FailClass::Other("json".into()),
+                "invalid decision JSON or missing reason".to_owned(),
+            ),
+        };
+        let status = if parsed.is_some() {
+            "valid decision"
+        } else {
+            &reason
+        };
+        state.bump_decision_attempts.push(DecisionAttempt {
+            agent: spec.id.clone(),
+            outcome: status.to_owned(),
+        });
+        state.event(
+            "bump",
+            format!("decision attempt {attempt}: {}: {status}", spec.id),
+        );
+        if let Some(decision) = parsed {
+            return Ok((spec.clone(), seat, decision));
+        }
+        failures.push(format!("{}: {reason}", spec.id));
+        if let Some(next) = chain.get(n + 1) {
+            crate::graph::record_handover(
+                state, "bump", "bump", &spec.id, &next.id, &class, &reason,
+            );
+        }
+    }
+    bail!(
+        "release-bump decision exhausted {} eligible agent(s): {}. Check CLI subscription limits, availability and bump-decision attempt artifacts; adjust [roles] chatter or retry after recovery. No release PR was created by this decision",
+        chain.len(),
+        failures.join("; ")
+    )
+}
+
+/// Validate only the reason after a decision is settled; no retry can replace
+/// its level, even when a rewrite returns a different decision or fails.
+async fn guard_reason(
+    state: &mut RunState,
+    repo: &Path,
+    prompt: &str,
+    spec: &AgentSpec,
+    seat: &mut SeatState,
+    decision: &mut BumpDecision,
+) {
+    let artifacts = agent::artifacts_dir(&state.dir());
+    let mut violations =
+        crate::github_text::check_for(&state.config.graph, "", &decision.reason, None);
+    // Sensitive-only: span redaction is enough, no rewrite needed.
+    violations.retain(|v| *v != crate::github_text::Violation::SensitiveData);
+    if violations.is_empty() {
+        decision.reason = crate::scrub::scrub(&decision.reason, &crate::scrub::Identity::current());
+    }
+    if state.config.graph.github_text_guard && !violations.is_empty() {
+        state.event(
+            "github-text",
+            format!("release reason rejected: {violations:?}; requesting one rewrite"),
+        );
+        let rewrite = format!(
+            "{prompt}\n\nYour release reason failed the GitHub text gate: {violations:?}. Return the same decision JSON with an English reason containing no local identity or secrets. Previous reason: {}",
+            decision.reason
+        );
+        let retry = agent::invoke(
+            spec,
+            seat,
+            &Invocation {
+                cwd: repo,
+                prompt: &rewrite,
+                timeout: crate::graph::retry_budget(DECISION_TIMEOUT, true),
+                allow_write: false,
+                unsandboxed: false,
+                sessions: false,
+                artifacts: &artifacts,
+                stem: "bump-rewrite",
+                run: &state.id,
+                node: "bump",
+                cache_dir: state.config.cache_dir().as_deref(),
+                attachments: &[],
+                writable: &[],
+            },
+        )
+        .await;
+        let reason = retry
+            .ok()
+            .filter(|o| o.usable())
+            .and_then(|o| parse_decision(&o.text).ok())
+            .filter(|d| {
+                d.level == decision.level
+                    && crate::github_text::check_for(&state.config.graph, "", &d.reason, None)
+                        .is_empty()
+            })
+            .map(|d| d.reason);
+        if let Some(reason) = reason {
+            decision.reason = reason;
+            state.event("github-text", "release reason rewrite passed");
+        } else {
+            decision.reason = "The merged change requires a release.".to_owned();
+            state.event(
+                "github-text",
+                "release reason rewrite unavailable or rejected; using neutral text",
+            );
+        }
+    }
+}
+
 /// How long the decision call may run.
 ///
 /// It reads a diffstat, a subject line and a version string, and returns
 /// three words and a sentence - nowhere near the budget an implement wave
 /// gets, so a fixed, generous constant is simpler than a new config knob for
-/// a call this small.
+/// a call this small. This is the total CLI budget, divided equally among
+/// eligible candidates so failover cannot extend the release critical section.
 const DECISION_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Does this run's final status mean the merge this call is downstream of
@@ -1293,107 +1485,9 @@ async fn after_merge_inner(
         .unwrap_or_default();
     let prompt = decision_prompt(&subject, &state.instruction, &stat, &files, &base_version);
 
-    // No dedicated role for this one-off decision. Borrows `[roles] chatter`
-    // - the nearest surviving single-agent-seat preference - rather than
-    // falling straight to `agent::pick`'s own default order, so an operator
-    // who has already named a preferred seat there is not silently
-    // overridden for this decision too.
-    let spec: AgentSpec = agent::pick(
-        &state.config.agents,
-        crate::config::primary(state.config.roles.chatter.as_ref()),
-        &agent::installed,
-    )
-    .context("choose an agent for the release-bump decision")?;
-    let mut seat = SeatState::new("bump", &spec.id, state.seed);
-    let artifacts = agent::artifacts_dir(&state.dir());
-    let out = agent::invoke(
-        &spec,
-        &mut seat,
-        &Invocation {
-            cwd: &repo,
-            prompt: &prompt,
-            timeout: DECISION_TIMEOUT,
-            // The decision reads a diffstat and writes a verdict; it must
-            // never touch a file.
-            allow_write: false,
-            unsandboxed: false,
-            sessions: false,
-            artifacts: &artifacts,
-            stem: "bump-decision",
-            run: &state.id,
-            node: "bump",
-            cache_dir: state.config.cache_dir().as_deref(),
-            attachments: &[],
-            writable: &[],
-        },
-    )
-    .await
-    .context("ask an agent how big the merged change was")?;
-    if !out.usable() {
-        bail!(
-            "the release-bump decision produced nothing usable (exit {:?}, timed out: {})",
-            out.exit_code,
-            out.timed_out
-        );
-    }
-    let mut decision = parse_decision(&out.text).context("parse the release-bump decision")?;
-    let mut violations =
-        crate::github_text::check_for(&state.config.graph, "", &decision.reason, None);
-    // Sensitive-only: span redaction is enough, no rewrite needed.
-    violations.retain(|v| *v != crate::github_text::Violation::SensitiveData);
-    if violations.is_empty() {
-        decision.reason = crate::scrub::scrub(&decision.reason, &crate::scrub::Identity::current());
-    }
-    if state.config.graph.github_text_guard && !violations.is_empty() {
-        state.event(
-            "github-text",
-            format!("release reason rejected: {violations:?}; requesting one rewrite"),
-        );
-        let rewrite = format!(
-            "{prompt}\n\nYour release reason failed the GitHub text gate: {violations:?}. Return the same decision JSON with an English reason containing no local identity or secrets. Previous reason: {}",
-            decision.reason
-        );
-        let retry = agent::invoke(
-            &spec,
-            &mut seat,
-            &Invocation {
-                cwd: &repo,
-                prompt: &rewrite,
-                timeout: crate::graph::retry_budget(DECISION_TIMEOUT, true),
-                allow_write: false,
-                unsandboxed: false,
-                sessions: false,
-                artifacts: &artifacts,
-                stem: "bump-rewrite",
-                run: &state.id,
-                node: "bump",
-                cache_dir: state.config.cache_dir().as_deref(),
-                attachments: &[],
-                writable: &[],
-            },
-        )
-        .await;
-        let reason = retry
-            .ok()
-            .filter(|o| o.usable())
-            .and_then(|o| parse_decision(&o.text).ok())
-            .filter(|d| {
-                d.level == decision.level
-                    && crate::github_text::check_for(&state.config.graph, "", &d.reason, None)
-                        .is_empty()
-            })
-            .map(|d| d.reason);
-        if let Some(reason) = reason {
-            decision.reason = reason;
-            state.event("github-text", "release reason rewrite passed");
-        } else {
-            decision.reason = "The merged change requires a release.".to_owned();
-            state.event(
-                "github-text",
-                "release reason rewrite unavailable or rejected; using neutral text",
-            );
-        }
-    }
+    let (spec, mut seat, mut decision) =
+        ask_decision(state, &repo, &prompt, DECISION_TIMEOUT).await?;
+    guard_reason(state, &repo, &prompt, &spec, &mut seat, &mut decision).await;
 
     if let Some(p) = pending {
         return match pending_action(p.level, decision.level) {
@@ -2836,6 +2930,214 @@ mod tests {
         );
         s.status = RunStatus::Merged;
         s
+    }
+
+    #[cfg(unix)]
+    fn decision_cli(id: &str, reply: &str, exit: &str) -> AgentSpec {
+        AgentSpec {
+            id: id.into(),
+            kind: crate::config::AgentKind::Command,
+            model: None,
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                concat!(
+                    "if [ \"$STATUS\" = timeout ]; then exec sleep 5; fi; ",
+                    "printf '%s' \"$REPLY\"; exit \"$STATUS\""
+                )
+                .into(),
+            ],
+            extra_args: Vec::new(),
+            env: std::collections::BTreeMap::from([
+                ("REPLY".into(), reply.into()),
+                ("STATUS".into(), exit.into()),
+            ]),
+            prompt_delivery: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn decision_state(agents: Vec<AgentSpec>, preferences: &[&str]) -> RunState {
+        let mut state = merged_state();
+        state.config.agents = agents;
+        state.config.roles.chatter = Some(crate::config::AgentChoice::Chain(
+            preferences.iter().map(|s| (*s).to_owned()).collect(),
+        ));
+        state
+    }
+
+    #[cfg(unix)]
+    const VALID_DECISION: &str = r#"{"level":"minor","reason":"Adds a feature."}"#;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn decision_failover_handles_each_unusable_cli_outcome() {
+        for (reply, exit, expected) in [
+            (
+                r#"{"is_error":true,"api_error_status":429,"api_error":"usage_limit_reached"}"#,
+                "1",
+                "rate/quota limit",
+            ),
+            (
+                r#"{"is_error":true,"api_error_status":429,"api_error":"usage_limit_reached","level":"minor","reason":"Looks valid."}"#,
+                "0",
+                "rate/quota limit",
+            ),
+            (
+                r#"{"is_error":true,"api_error_status":"429","api_error":"usage_limit_reached","level":"minor","reason":"Looks valid."}"#,
+                "0",
+                "rate/quota limit",
+            ),
+            ("", "0", "empty output"),
+            (
+                "",
+                "spawn",
+                "CLI invocation failed; inspect attempt artifacts",
+            ),
+            ("not JSON", "0", "invalid decision JSON or missing reason"),
+            (VALID_DECISION, "1", "CLI exit Some(1)"),
+            ("", "timeout", "timed out"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut state = decision_state(
+                vec![
+                    decision_cli("first", reply, exit),
+                    decision_cli("second", VALID_DECISION, "0"),
+                ],
+                &["first", "second"],
+            );
+            if exit == "spawn" {
+                state.config.agents[0].command = vec!["magi-test-no-such-decision-cli".into()];
+            }
+            let (spec, seat, decision) =
+                ask_decision(&mut state, dir.path(), "decide", Duration::from_millis(200))
+                    .await
+                    .unwrap();
+            assert_eq!(spec.id, "second");
+            assert_eq!(decision.level, BumpLevel::Minor);
+            assert_eq!(state.bump_decision_attempts.len(), 2);
+            assert_eq!(state.bump_decision_attempts[0].outcome, expected);
+            assert_eq!(state.handovers.len(), 1);
+            assert_eq!(state.handovers[0].to, "second");
+            assert_ne!(
+                seat.claude_session,
+                SeatState::new("bump", "first", state.seed).claude_session
+            );
+            let report = crate::report::run(&state);
+            assert!(report.contains(expected), "{report}");
+            assert!(report.contains("second: valid decision"), "{report}");
+            assert!(state.release_bump.is_none());
+            let artifacts = agent::artifacts_dir(&state.dir());
+            if exit != "spawn" {
+                assert!(artifacts.join("bump-decision-1.out").exists());
+            }
+            assert!(artifacts.join("bump-decision-2.out").exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn decision_chain_respects_preferences_and_stops_on_first_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = decision_state(
+            vec![
+                decision_cli("first", "bad", "1"),
+                decision_cli("second", VALID_DECISION, "0"),
+            ],
+            &["missing", "second", "second", "first"],
+        );
+        let (spec, _, _) = ask_decision(&mut state, dir.path(), "decide", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(spec.id, "second");
+        assert_eq!(state.bump_decision_attempts.len(), 1);
+        assert!(state.handovers.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn decision_chain_consumes_same_failure_classes_and_preserves_unset_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = decision_state(
+            vec![
+                decision_cli("first", "bad", "0"),
+                decision_cli("second", "bad", "0"),
+                decision_cli("third", VALID_DECISION, "0"),
+            ],
+            &["first", "second", "third"],
+        );
+        let (spec, _, _) = ask_decision(&mut state, dir.path(), "decide", Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(spec.id, "third");
+        assert_eq!(state.bump_decision_attempts.len(), 3);
+        assert_eq!(state.handovers.len(), 2);
+        // No configured fallback list means the existing single default pick.
+        state.config.roles.chatter = None;
+        let err = ask_decision(&mut state, dir.path(), "decide", Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exhausted 1 eligible agent(s)"));
+        assert_eq!(state.bump_decision_attempts.len(), 4);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn decision_reason_rewrite_failure_preserves_the_selected_level() {
+        let dir = tempfile::tempdir().unwrap();
+        for reply in ["invalid", r#"{"level":"patch","reason":"Fixes a defect."}"#] {
+            let mut state = merged_state();
+            state.config.graph.github_text_guard = true;
+            state.config.graph.github_language = "en".into();
+            let spec = decision_cli("chosen", reply, "0");
+            let mut seat = SeatState::new("bump", &spec.id, state.seed);
+            let mut decision =
+                parse_decision(r#"{"level":"minor","reason":"新しい機能を追加しました。"}"#)
+                    .unwrap();
+            guard_reason(
+                &mut state,
+                dir.path(),
+                "decide",
+                &spec,
+                &mut seat,
+                &mut decision,
+            )
+            .await;
+            assert_eq!(decision.level, BumpLevel::Minor);
+            assert_eq!(decision.reason, "The merged change requires a release.");
+            assert!(state.handovers.is_empty());
+            assert!(state.bump_decision_attempts.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn decision_exhaustion_is_bounded_reported_and_leaves_no_release_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = decision_state(
+            vec![
+                decision_cli("first", "bad", "0"),
+                decision_cli("second", "", "0"),
+            ],
+            &["first", "first", "second", "second"],
+        );
+        let err = ask_decision(&mut state, dir.path(), "decide", Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exhausted 2 eligible agent(s)"), "{err}");
+        assert!(err.contains("first: invalid decision JSON"), "{err}");
+        assert!(err.contains("second: empty output"), "{err}");
+        assert!(err.contains("[roles] chatter"), "{err}");
+        assert_eq!(state.bump_decision_attempts.len(), 2);
+        assert_eq!(state.handovers.len(), 1);
+        assert!(state.release_bump.is_none());
+        let report = crate::report::run(&state);
+        assert!(report.contains("first: invalid decision JSON"));
+        assert!(report.contains("second: empty output"));
+        let restored: RunState =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(restored.bump_decision_attempts.len(), 2);
     }
 
     #[test]
