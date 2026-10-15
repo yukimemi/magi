@@ -163,6 +163,7 @@ fn open_questions(home: &Path, run: &str) -> Result<Vec<serde_json::Value>> {
 
 /// A bounded read-only observation; dropping a timed-out child kills it.
 async fn current_pr(repo: &Path, url: &str) -> Result<serde_json::Value> {
+    use crate::proc::Quiet as _;
     use anyhow::Context;
     let mut command = tokio::process::Command::new("gh");
     command
@@ -175,6 +176,7 @@ async fn current_pr(repo: &Path, url: &str) -> Result<serde_json::Value> {
         ])
         .current_dir(repo)
         .env_remove("GH_REPO")
+        .quiet()
         .kill_on_drop(true)
         .stdin(std::process::Stdio::null());
     let output = tokio::time::timeout(std::time::Duration::from_secs(8), command.output())
