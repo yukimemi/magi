@@ -585,6 +585,9 @@ pub struct Question {
     /// that the chat was asked, so a second tap does not post it twice.
     #[serde(default)]
     pub consult: Option<ChatConsult>,
+    /// Persisted owner evidence for a standing conversation answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_authority: Option<crate::consult::AnswerAuthority>,
     /// Independent task facts behind a conductor question. Answered questions
     /// with unchanged facts must not be regenerated just to ask again.
     #[serde(default)]
@@ -647,6 +650,7 @@ impl Question {
             answer_delivered: false,
             deputy: None,
             consult: None,
+            answer_authority: None,
             decision_context: None,
         }
     }

@@ -2252,9 +2252,9 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // has no store to consult, and must not abort the turn on `run::home()`.
     let questions =
         crate::run::try_home().map(|home| crate::ask::Questions::at(home.join("questions")));
-    let consulted = questions
-        .as_ref()
-        .is_some_and(|q| crate::consult::pending_consults(q, &talk.id));
+    let consulted = questions.as_ref().is_some_and(|q| {
+        crate::consult::pending_consults(q, &talk.id) || crate::consult::authorized_holds(q, talk)
+    });
     let consult_roots: Vec<PathBuf> = match &questions {
         Some(q) if consulted => vec![q.root().to_path_buf()],
         _ => Vec::new(),
@@ -2876,6 +2876,19 @@ pub fn briefing_for(
          up, not an instruction to file - answer it yourself with `magi \
          list`, `magi show <id>`, `magi task list`, or the like, the same way \
          you would answer any other question in this conversation.\n\n\
+         # Answering existing questions\n\n\
+         A consultation destination does not restrict an explicit owner hold. \
+         For a guarded hold, the latest owner message may be `<question-id>: hold`, \
+         or explicitly instruct you to answer each immediately preceding recommendation \
+         (for example, `それぞれ回答して` or `answer each as recommended`). \
+         Present recommendations as one row per question: `<question-id>: hold` \
+         or `| <question-id> | hold | reason |`. Use full IDs or unique short IDs. \
+         Then run `magi answer <question-id> --reply hold --quote <entire latest owner message>`. \
+         This limited question-store write is available even for a question consulted \
+         elsewhere or never consulted. It never authorizes merge, public posting, PR closure, \
+         repair or another driver. For those actions retain the specific confirmation and \
+         supported execution requirements; report exactly what confirmation is missing. \
+         Recommendations, thanks alone and generated messages are not owner instructions.\n\n\
          # When the operator wants something done\n\n\
          Run:\n\n\
          magi task add {flag} --repo {repo} <instruction>\n\n\

@@ -2690,9 +2690,10 @@ async fn answer_cmd(
             let reply = match &answer {
                 ask::Answer::Choice(s) | ask::Answer::Text(s) => s,
             };
-            magi::consult::validate_answer(
+            r.answer_authority = magi::consult::authorize_answer(
                 r,
                 &magi::talk::Talks::open(),
+                &store,
                 &run,
                 &node,
                 reply,
@@ -2731,6 +2732,12 @@ fn print_question_record(q: &ask::Question) {
     println!("      status: {:?}", q.status);
     if let Some(answer) = &q.answer {
         println!("      answer: {answer:?}");
+    }
+    if let Some(authority) = &q.answer_authority {
+        println!(
+            "      authorized by chat {} turn {} message {} ({})",
+            authority.talk, authority.turn, authority.message, authority.instruction_fingerprint
+        );
     }
     for t in &q.thread {
         let who = if t.who == ask::Who::Operator {

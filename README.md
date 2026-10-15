@@ -458,6 +458,25 @@ in an irreversible decision.
 **Silence is a hold.** An unanswered approval never merges, and neither does
 anything other than the word `merge`.
 
+A standing conversation can record an explicitly requested **hold** even when
+the question was consulted elsewhere or never handed to a chat. The latest
+owner send can name the question directly (`<question-id>: hold`), or explicitly
+authorize the immediately preceding question-by-question recommendations
+(`それぞれ回答して`, including `ありがと！じゃあそれぞれ回答してー！`, or
+`answer each as recommended`). Recommendations use list rows such as
+`` `<question-id>`: hold `` or table rows such as
+`` | `<question-id>` | `hold` | reason | ``. Unique short question IDs work too.
+The assistant runs `magi answer <question-id> --reply hold --quote <whole owner message>`;
+the CLI checks the persisted sender, message boundaries, timing and exact binding
+again under the question lock. The answer retains its authorizing conversation,
+instruction and recommendation references, while keeping the original consultation
+as history. A newer queued message prevents using the older instruction.
+Thanks alone, recommendations alone, generated notices, conditional instructions
+and repeated or conflicting recommendation rows do not authorize an answer.
+This batch path covers hold only: it cannot approve merge, public posting, repair
+or PR closure. Those actions still require their existing specific confirmation
+and supported execution state. A manually held task stays held.
+
 When review hands off with unresolved Major findings or final rejecting votes,
 the decision also offers **fix findings and re-review**. Selecting it runs one
 repair and a fresh bounded review and gate on the same PR branch, under the
