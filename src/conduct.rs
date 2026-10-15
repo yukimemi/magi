@@ -103,7 +103,8 @@ pub struct Decision {
     /// Task id, expected to be copied verbatim from what it was shown.
     pub id: String,
     /// Ids this task should be blocked on. Meaningful only for a runnable
-    /// (`queued`) task; ignored otherwise.
+    /// (`queued`) task, or a machine-held task whose question/hold conflicts
+    /// with references that still exist. Ignored otherwise.
     #[serde(default)]
     pub blocked_by: Vec<String>,
     /// One line explaining the block or the recovery.
@@ -120,7 +121,9 @@ pub struct Decision {
     pub recovery: Option<Recovery>,
     /// A question for the operator. When present, [`apply`] files it (unless
     /// one is already open for this task) and blocks the task on its id
-    /// instead of acting on `blocked_by` or `recovery`.
+    /// instead of acting on `blocked_by` or `recovery`. On queued or machine-held
+    /// tasks, explicit dependencies that are not proven missing take precedence
+    /// so a stale missing-task claim cannot create an unnecessary question.
     #[serde(default)]
     pub question: Option<String>,
     /// Fixed answers for `question`, if it has any. Empty means free text.
@@ -657,15 +660,6 @@ fn apply_one(
     }
     let blocking =
         d.question.is_some() || !d.blocked_by.is_empty() || d.recovery == Some(Recovery::Hold);
-    // An existing dependency (including unreadable/ambiguous state) belongs
-    // to the deterministic resolver. Never replace safe waiting with a
-    // question based on a historical missing-task claim.
-    if blocking
-        && task.status == TaskStatus::Blocked
-        && crate::queue::missing_blockers(queue, questions, &task.blocked_by).is_empty()
-    {
-        return Ok(());
-    }
     let evidence = new_blocking_evidence(queue, questions, &task, d);
     if blocking && task.resumption.is_some() && evidence.is_empty() {
         crate::notices::raise(
@@ -706,6 +700,23 @@ fn apply_one(
     let pinned = pinned_resume(&task);
     if pinned && (d.question.is_some() || !d.blocked_by.is_empty()) {
         return Ok(());
+    }
+
+    // Resolve explicit prerequisite references at application time. A question
+    // or hold cannot override safe dependency waiting on a queued/machine-held
+    // task merely because the model claims that an existing record is missing.
+    // Unknown or ambiguous references must also wait; genuine absence keeps
+    // the ordinary question/hold path below.
+    if matches!(task.status, TaskStatus::Queued | TaskStatus::Held)
+        && !d.blocked_by.is_empty()
+        && (d.question.is_some() || d.recovery == Some(Recovery::Hold))
+        && crate::queue::missing_blockers(queue, questions, &d.blocked_by).is_empty()
+    {
+        let mut ids = d.blocked_by.clone();
+        crate::queue::normalize_blockers(queue, questions, &mut ids);
+        let reason = format!("Waiting on dependencies: {}", ids.join(", "));
+        task.block(ids, Some(reason));
+        return queue.put(&mut task);
     }
 
     if let Some(text) = &d.question {
@@ -1088,9 +1099,6 @@ impl Conductor {
             finished_views.push(finished_view(t, repo, max_attempts).await);
         }
 
-        let queue_revision = queue.revision();
-        let question_queue = Queue::at(questions.root().to_path_buf());
-        let question_revision = question_queue.revision();
         let body = prompt::with_overlay(
             prompt::conduct(
                 &runnable_views,
@@ -1176,18 +1184,7 @@ impl Conductor {
         drop(busy);
         let mut verdict = result?;
         attach_facts(cfg, repo, queue, &mut verdict).await;
-        // Validate before this batch's own writes move the revisions. Each
-        // application still re-reads the task and dependencies under its claim.
-        let dependencies_unchanged =
-            queue.revision() == queue_revision && question_queue.revision() == question_revision;
         for d in &verdict.decisions {
-            if !dependencies_unchanged
-                && (d.question.is_some()
-                    || !d.blocked_by.is_empty()
-                    || d.recovery == Some(Recovery::Hold))
-            {
-                continue;
-            }
             let snapshot = queued
                 .iter()
                 .chain(stalled)
@@ -1653,8 +1650,98 @@ mod tests {
         assert_eq!(v.answers[0].answer, "SQLite");
     }
 
-    #[test]
-    fn dependency_resolution_decision_normalizes_short_ids_and_preserves_waiting() {
+    #[tokio::test]
+    async fn dependency_resolution_rechecks_questions_in_the_production_conductor_path() {
+        for held in [false, true] {
+            for reference in ["ca5b", "20261013-193611-ca5b"] {
+                for question in [false, true] {
+                    let dir = tempdir().unwrap();
+                    let queue = Queue::at(dir.path().join("queue"));
+                    let questions = Questions::at(dir.path().join("questions"));
+                    let mut dep = task("prerequisite");
+                    dep.id = "20261013-193611-ca5b".into();
+                    dep.start("existing-run".into());
+                    queue.put(&mut dep).unwrap();
+                    let mut waiting = task("waiting");
+                    if held {
+                        waiting.hold_machine(Some("dependency could not be located".into()));
+                    }
+                    queue.put(&mut waiting).unwrap();
+                    let reply = serde_json::json!({"decisions": [{
+                        "id": waiting.id, "blocked_by": [reference],
+                        "question": question.then_some("ca5b is missing; where is its replacement?"),
+                        "recovery": (!question).then_some("hold"),
+                        "reason": "ca5b is missing"
+                    }]}).to_string();
+                    let cfg = config(mock_agent(dir.path(), REPLY, env(&reply)));
+                    let (queued, finished) = if held {
+                        (vec![], vec![waiting.clone()])
+                    } else {
+                        (vec![waiting.clone()], vec![])
+                    };
+                    Conductor::new()
+                        .run_once(
+                            &cfg,
+                            dir.path(),
+                            &queue,
+                            &questions,
+                            dir.path(),
+                            &queued,
+                            &[],
+                            &finished,
+                            2,
+                        )
+                        .await
+                        .unwrap();
+                    let after = queue.get(&waiting.id).unwrap();
+                    assert_eq!(after.status, TaskStatus::Blocked);
+                    assert_eq!(after.blocked_by, [dep.id]);
+                    assert_eq!(after.blocked_from, Some(waiting.status));
+                    assert!(!after.block_reason.unwrap().contains("missing"));
+                    assert!(questions.list().is_empty());
+                    assert_eq!(after.instruction, waiting.instruction);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dependency_resolution_genuine_missing_reference_still_asks() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut waiting = task("missing prerequisite");
+        queue.put(&mut waiting).unwrap();
+        let reply = serde_json::json!({"decisions": [{
+            "id": waiting.id, "blocked_by": ["not-present"],
+            "question": "Which prerequisite replaces the missing task?"
+        }]})
+        .to_string();
+        let cfg = config(mock_agent(dir.path(), REPLY, env(&reply)));
+        Conductor::new()
+            .run_once(
+                &cfg,
+                dir.path(),
+                &queue,
+                &questions,
+                dir.path(),
+                &[waiting.clone()],
+                &[],
+                &[],
+                2,
+            )
+            .await
+            .unwrap();
+        let after = queue.get(&waiting.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Blocked);
+        assert_eq!(
+            questions.get(&after.blocked_by[0]).unwrap().summary,
+            "Which prerequisite replaces the missing task?"
+        );
+    }
+
+    #[tokio::test]
+    async fn dependency_resolution_keeps_decisions_during_unrelated_task_progress() {
         let dir = tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
         let questions = Questions::at(dir.path().join("questions"));
@@ -1662,25 +1749,68 @@ mod tests {
         dep.id = "20261013-193611-ca5b".into();
         dep.start("existing-run".into());
         queue.put(&mut dep).unwrap();
+        let mut unrelated = task("unrelated work");
+        unrelated.start("other-run".into());
+        queue.put(&mut unrelated).unwrap();
+        // Make the old and new revision distinguishable without relying on
+        // the filesystem clock advancing while the mock process starts.
+        std::fs::File::open(queue.path_of(&unrelated.id))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
+        unrelated.succeed();
         let mut waiting = task("waiting");
+        let mut asking = task("needs a product decision");
+        let mut holding = task("must stay held");
         queue.put(&mut waiting).unwrap();
-        let d = Decision {
-            id: waiting.id.clone(),
-            blocked_by: vec!["ca5b".into()],
-            ..Decision::default()
-        };
-        apply_one(&queue, &questions, &d, None).unwrap();
-        waiting = queue.get(&waiting.id).unwrap();
-        assert_eq!(waiting.blocked_by, [dep.id.clone()]);
-        let stale = Decision {
-            id: waiting.id.clone(),
-            question: Some("Missing prerequisite?".into()),
-            reason: Some("ca5b is missing".into()),
-            ..Decision::default()
-        };
-        apply_one(&queue, &questions, &stale, Some(&waiting)).unwrap();
-        assert!(questions.list().is_empty());
-        assert_eq!(queue.get(&waiting.id).unwrap().blocked_by, [dep.id]);
+        queue.put(&mut asking).unwrap();
+        queue.put(&mut holding).unwrap();
+        let reply = serde_json::json!({"decisions": [
+            {"id": waiting.id, "blocked_by": ["ca5b"], "reason": "wait for implementation"},
+            {"id": asking.id, "question": "Which behavior do you want?"},
+            {"id": holding.id, "recovery": "hold", "reason": "already implemented elsewhere"}
+        ]})
+        .to_string();
+        let mut vars = env(&reply);
+        vars.insert(
+            "UNRELATED_PATH".into(),
+            queue.path_of(&unrelated.id).to_string_lossy().into_owned(),
+        );
+        vars.insert(
+            "UNRELATED_RECORD".into(),
+            serde_json::to_string(&unrelated).unwrap(),
+        );
+        let script = r#"#!/bin/sh
+cat >/dev/null
+printf '%s' "$UNRELATED_RECORD" > "$UNRELATED_PATH"
+printf '%s\n' "$MOCK_REPLY"
+"#;
+        let cfg = config(mock_agent(dir.path(), script, vars));
+        Conductor::new()
+            .run_once(
+                &cfg,
+                dir.path(),
+                &queue,
+                &questions,
+                dir.path(),
+                &[waiting.clone(), asking.clone(), holding.clone()],
+                &[],
+                &[],
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(queue.get(&unrelated.id).unwrap().status, TaskStatus::Done);
+        let after = queue.get(&waiting.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Blocked);
+        assert_eq!(after.blocked_by, [dep.id]);
+        let asked = queue.get(&asking.id).unwrap();
+        assert_eq!(asked.status, TaskStatus::Blocked);
+        assert_eq!(
+            questions.get(&asked.blocked_by[0]).unwrap().summary,
+            "Which behavior do you want?"
+        );
+        assert_eq!(queue.get(&holding.id).unwrap().status, TaskStatus::Held);
     }
 
     #[test]

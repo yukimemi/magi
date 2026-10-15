@@ -35,13 +35,15 @@ const CHAIN_DEPTH: usize = 4;
 pub struct Inventory {
     tasks: BTreeMap<String, Task>,
     questions: BTreeMap<String, QuestionStatus>,
-    ids: Option<Vec<String>>,
+    ids: Vec<String>,
+    complete: bool,
 }
 
 enum Dep<'a> {
     Task(&'a Task),
     Question(QuestionStatus),
     Missing,
+    Unknown,
 }
 
 type Roots = Option<BTreeSet<String>>;
@@ -55,15 +57,14 @@ impl Inventory {
     /// Build the snapshot. Callers take `queue.list()` and `questions.list()`
     /// once, so a listing over many tasks never rescans the disk per task.
     pub fn new(tasks: Vec<Task>, questions: &[Question]) -> Self {
-        let ids = Some(
-            tasks
-                .iter()
-                .map(|t| t.id.clone())
-                .chain(questions.iter().map(|q| q.id.clone()))
-                .collect(),
-        );
+        let ids = tasks
+            .iter()
+            .map(|t| t.id.clone())
+            .chain(questions.iter().map(|q| q.id.clone()))
+            .collect();
         Self {
             ids,
+            complete: true,
             tasks: tasks.into_iter().map(|t| (t.id.clone(), t)).collect(),
             questions: questions.iter().map(|q| (q.id.clone(), q.status)).collect(),
         }
@@ -73,33 +74,45 @@ impl Inventory {
     /// alone cannot prove uniqueness or absence.
     pub fn load(queue: &crate::queue::Queue, questions: &crate::ask::Questions) -> Self {
         let mut inventory = Self::new(queue.list(), &questions.list());
-        inventory.ids = (|| -> anyhow::Result<Vec<String>> {
+        let ids = (|| -> anyhow::Result<Vec<String>> {
             let mut ids = crate::queue::record_ids(queue.root(), "json")?;
             ids.extend(crate::queue::record_ids(questions.root(), "json")?);
             ids.extend(crate::queue::record_ids(queue.root(), "removed")?);
             ids.sort();
             ids.dedup();
             Ok(ids)
-        })()
-        .ok();
+        })();
+        match ids {
+            Ok(ids) => inventory.ids = ids,
+            Err(_) => inventory.complete = false,
+        }
         inventory
     }
 
     fn dep(&self, id: &str) -> Dep<'_> {
-        let Some(ids) = &self.ids else {
-            return Dep::Missing;
-        };
-        let crate::queue::Reference::Found(full) =
-            crate::queue::resolve_reference(id, ids.iter().map(String::as_str))
-        else {
-            return Dep::Missing;
-        };
-        if let Some(t) = self.tasks.get(&full) {
-            Dep::Task(t)
-        } else if let Some(s) = self.questions.get(&full) {
-            Dep::Question(*s)
-        } else {
-            Dep::Missing
+        // A partial scan does not invalidate readable exact records. It does
+        // prevent proving that a prefix/suffix is unique across both stores.
+        if let Some(t) = self.tasks.get(id) {
+            return Dep::Task(t);
+        }
+        if let Some(s) = self.questions.get(id) {
+            return Dep::Question(*s);
+        }
+        if !self.complete {
+            return Dep::Unknown;
+        }
+        match crate::queue::resolve_reference(id, self.ids.iter().map(String::as_str)) {
+            crate::queue::Reference::Found(full) => {
+                if let Some(t) = self.tasks.get(&full) {
+                    Dep::Task(t)
+                } else if let Some(s) = self.questions.get(&full) {
+                    Dep::Question(*s)
+                } else {
+                    Dep::Unknown
+                }
+            }
+            crate::queue::Reference::Missing => Dep::Missing,
+            crate::queue::Reference::Ambiguous => Dep::Unknown,
         }
     }
 
@@ -108,7 +121,7 @@ impl Inventory {
         match self.dep(id) {
             Dep::Task(t) => t.status == TaskStatus::Done,
             Dep::Question(s) => s == QuestionStatus::Answered,
-            Dep::Missing => false,
+            Dep::Missing | Dep::Unknown => false,
         }
     }
 
@@ -160,7 +173,7 @@ impl Inventory {
                     }
                 },
                 Dep::Question(QuestionStatus::Answered) => {}
-                Dep::Question(_) | Dep::Missing => moving = true,
+                Dep::Question(_) | Dep::Missing | Dep::Unknown => moving = true,
             }
         }
         path.pop();
@@ -214,7 +227,8 @@ impl Inventory {
 
     fn chain(&self, id: &str, seen: &mut Vec<String>) -> String {
         match self.dep(id) {
-            Dep::Missing => "unavailable or ambiguous".to_owned(),
+            Dep::Missing => "missing".to_owned(),
+            Dep::Unknown => "unavailable or ambiguous".to_owned(),
             Dep::Question(s) => format!("question {}", s.as_str()),
             Dep::Task(t) => {
                 let mut out = t.status.as_str().to_owned();
@@ -266,6 +280,50 @@ mod tests {
 
     fn inv(tasks: Vec<Task>) -> Inventory {
         Inventory::new(tasks, &[])
+    }
+
+    #[test]
+    fn dependency_resolution_partial_scan_keeps_readable_exact_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = crate::queue::Queue::at(dir.path().join("queue"));
+        let questions = crate::ask::Questions::at(dir.path().join("questions"));
+        let mut running = t("feb2", TaskStatus::Running, &[]);
+        let mut middle = t("ca5b", TaskStatus::Blocked, &["feb2"]);
+        let mut waiting = t("ee37", TaskStatus::Blocked, &["ca5b"]);
+        let mut held = t("held", TaskStatus::Held, &[]);
+        let mut short_wait = t("short", TaskStatus::Blocked, &[]);
+        short_wait.blocked_by = vec!["held".into()];
+        for task in [
+            &mut running,
+            &mut middle,
+            &mut waiting,
+            &mut held,
+            &mut short_wait,
+        ] {
+            queue.put(task).unwrap();
+        }
+        // Reading the queue succeeds, while scanning the question store fails.
+        std::fs::write(questions.root(), "not a directory").unwrap();
+        let inventory = Inventory::load(&queue, &questions);
+        assert!(!inventory.complete);
+        assert!(inventory.ids.contains(&running.id));
+        assert_eq!(
+            inventory.task(&running.id).unwrap().status,
+            TaskStatus::Running
+        );
+        assert_eq!(
+            inventory.waits_on(&waiting),
+            ["ca5b (blocked → feb2 running)"]
+        );
+        assert_eq!(
+            inventory.waits_on(&short_wait),
+            ["held (unavailable or ambiguous)"]
+        );
+        assert!(
+            inventory.stuck().is_empty(),
+            "partial scans cannot prove short-id uniqueness"
+        );
+        assert!(matches!(inventory.dep("not-seen"), Dep::Unknown));
     }
 
     #[test]
