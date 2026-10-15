@@ -120,8 +120,11 @@ async fn retry_public_head_updates_the_existing_open_pull_request() {
     assert_eq!(first.pr.as_ref().unwrap().number, second.pr.as_ref().unwrap().number);
     let old = RunState::load(&first.id).unwrap();
     assert_eq!(old.pr_taken_over_by.as_deref(), Some(second.id.as_str()));
-    let mut resumed = Runner::resume(&old.id).unwrap();
-    assert!(resumed.execute().await.is_err());
+    let error = Runner::resume(&old.id).err().expect("a superseded run cannot reopen");
+    assert!(
+        error.to_string().contains("pull request ownership was superseded"),
+        "{error:#}",
+    );
     let calls = std::fs::read_to_string(forge.join("calls")).unwrap();
     assert_eq!(calls.lines().filter(|l| *l == "pr create").count(), 1);
     assert_eq!(calls.lines().filter(|l| *l == "pr edit").count(), 1);
