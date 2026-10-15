@@ -9795,6 +9795,9 @@ mod tests {
         });
         state.save_under(fx.home.path()).unwrap();
         fx.questions().put(&mut q).unwrap();
+        // A later repair answer on this old card supersedes this manual hold.
+        task.hold_manual(Some("Pause this PR".into()));
+        fx.queue().put(&mut task).unwrap();
         // POST directly, without a preceding GET: validation must see the
         // same durable upgrade that the card, CLI and chat see.
         let ui = Arc::new(Ui::new(

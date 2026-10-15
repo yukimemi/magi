@@ -268,6 +268,24 @@ async fn merge_repair_legacy_cli_answer_dispatches_through_parked_task_owner() {
     runner.state.origin = Some(Origin::queue(&task.id));
     runner.state.save().unwrap();
     queue.put(&mut task).unwrap();
+    // Recreate an unanswered legacy card, then hold its parked owner before
+    // the operator selects repair through the real CLI.
+    Questions::open().update(&old_question, |q| {
+        q.status = magi::ask::QuestionStatus::Open;
+        q.answer = None;
+        q.answered_at = None;
+        q.choices = vec!["merge".into(), "hold".into()];
+        q.actions.clear();
+        Ok(())
+    }).unwrap();
+    task.hold_manual(Some("Pause this PR".into()));
+    queue.put(&mut task).unwrap();
+    let answer = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
+        .args(["answer", &old_question, "--reply", REPAIR])
+        .env("MAGI_HOME", magi::run::home())
+        .env_remove("MAGI_RUN").env_remove("MAGI_NODE")
+        .output().unwrap();
+    assert!(answer.status.success(), "{}", String::from_utf8_lossy(&answer.stderr));
     let config = fx.tmp.path().join("dispatch.toml");
     let mut cfg = runner.state.config.clone();
     cfg.disk.min_free_bytes = 0;

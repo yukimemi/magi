@@ -852,13 +852,29 @@ where
     {
         return ActionDecision::Skip;
     }
-    if task.operator_decided_at.is_some_and(|at| at > q.asked_at) {
-        return ActionDecision::Stale;
-    }
     // A question about an earlier attempt must not act on a newer one. A
     // conductor question is keyed by the task id, not a run, so it is exempt.
     if q.node != crate::conduct::NODE && task.runs.last() != Some(&q.run) {
         return ActionDecision::Stale;
+    }
+    let repair = q.node == land::APPROVAL_NODE && q.resolution().as_deref() == Some(land::REPAIR);
+    // Repair is an explicit new decision on an existing approval card. A
+    // manual hold before that answer must not discard it just because the
+    // card predates the hold. Keep the older policy for other choice actions.
+    let decision_at = if repair {
+        q.answered_at.unwrap_or(q.asked_at)
+    } else {
+        q.asked_at
+    };
+    if task.operator_decided_at.is_some_and(|at| at > decision_at) {
+        return if repair {
+            ActionDecision::Refuse(format!(
+                "repair answer {} was superseded by a later operator decision; the task stays held. Inspect `magi show {}`; if repair is still wanted, explicitly release the existing owner with `magi task release {}`",
+                q.id, q.run, task.id
+            ))
+        } else {
+            ActionDecision::Stale
+        };
     }
     match action {
         ask::ChoiceAction::Requeue => ActionDecision::Requeue,
@@ -1084,7 +1100,7 @@ pub(crate) fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &
                     home,
                     Notice::warn(
                         &format!("repair-owner:{}", q.id),
-                        &format!(
+                        format!(
                             "Repair is waiting: no task owns run {}. Inspect `magi show {}` and restore its original queue owner; do not file a competing repair task.",
                             q.run, q.run
                         ),
@@ -9281,6 +9297,28 @@ mod tests {
             decide_action(&task, &q, &PHRASES_EN, |_| Ok(state.clone())),
             ActionDecision::Resume(state.id.clone())
         );
+        q.asked_at = "2026-01-01T00:00:00Z".parse().unwrap();
+        q.answered_at = Some("2026-01-01T00:00:20Z".parse().unwrap());
+        task.operator_decided_at = Some("2026-01-01T00:00:10Z".parse().unwrap());
+        assert_eq!(
+            decide_action(&task, &q, &PHRASES_EN, |_| Ok(state.clone())),
+            ActionDecision::Resume(state.id.clone()),
+            "a repair answer newer than the manual hold resumes the existing owner"
+        );
+        task.operator_decided_at = Some("2026-01-01T00:00:30Z".parse().unwrap());
+        for answered_at in [q.answered_at, None] {
+            let mut older = q.clone();
+            older.answered_at = answered_at;
+            let refused = decide_action(&task, &older, &PHRASES_EN, |_| {
+                panic!("a later manual hold must prevent dispatch")
+            });
+            let ActionDecision::Refuse(reason) = refused else {
+                panic!("expected an actionable refusal, got {refused:?}");
+            };
+            assert!(reason.contains("later operator decision"));
+            assert!(reason.contains(&format!("magi task release {}", task.id)));
+        }
+        task.operator_decided_at = None;
         let mut superseded = state.clone();
         superseded.land_approval.as_mut().unwrap().question = "fresh-decision".into();
         assert_eq!(
@@ -9304,6 +9342,7 @@ mod tests {
             ActionDecision::Refuse(_)
         ));
         task.runs.push("replacement".into());
+        task.operator_decided_at = Some("2026-01-01T00:00:30Z".parse().unwrap());
         assert_eq!(
             decide_action(&task, &q, &PHRASES_EN, |_| panic!(
                 "old owner must not load"
