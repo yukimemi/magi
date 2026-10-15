@@ -648,7 +648,11 @@ pub fn talks_to_start(talks: &Talks) -> Vec<String> {
 fn pending_is_only_notices(t: &talk::Talk) -> bool {
     if t.pending_messages.iter().any(|m| m.sender.is_some()) {
         return t.pending_messages.iter().all(|m| {
-            m.sender == Some(talk::Sender::Magi)
+            // Legacy sends retain their old notice-only scheduling rule when
+            // a new report joins the draft. This does not change authorship;
+            // an explicit operator sender always prevents automatic resume.
+            (m.sender == Some(talk::Sender::Magi)
+                || (m.sender.is_none() && t.pending_breaks.is_some()))
                 && m.attachments.is_empty()
                 && crate::prompt::is_completion_notice(&m.body)
         });
