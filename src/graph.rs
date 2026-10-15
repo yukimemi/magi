@@ -10331,7 +10331,7 @@ fn summary_title(summary: &str) -> Option<String> {
 const REVIEW_PROMPT_OPENING: &str = "Review the work already on branch";
 
 /// Marker `open_review` gives a candidate that nothing in the roster wrote.
-const EXISTING_BRANCH: &str = "(existing branch)";
+pub(crate) const EXISTING_BRANCH: &str = "(existing branch)";
 
 /// Does this run review work that already existed, rather than implement a
 /// task? Runs recorded before `reviewed_commits` existed carry only the

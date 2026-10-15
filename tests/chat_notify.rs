@@ -73,6 +73,12 @@ async fn a_finished_task_is_reported_once_however_often_it_is_swept() {
     let first = chat_notify::sweep(&w.queue, &w.talks, w.tmp.path());
     assert_eq!(first, vec![w.talk_id.clone()]);
     let draft = drafts(&w);
+    let saved = w.talks.get(&w.talk_id).expect("saved talk");
+    assert_eq!(saved.completion_notices.len(), 1);
+    let reference = &saved.completion_notices[0];
+    assert_eq!(reference.task, t.id);
+    assert_eq!(reference.run.as_deref(), Some("20260902-000000-aaaa"));
+    assert_eq!(reference.notice, draft);
     assert!(draft.contains(magi::prompt::CHAT_TASK_NOTICE_HEADING));
     assert!(draft.contains(&t.id));
     assert!(draft.contains("done"));

@@ -2864,3 +2864,15 @@ response's owner count; the last start can still be running.
 unlocks their choices even with an unread owner message. `src/notices.rs` hides
 legacy `deputy:` warnings from the list and bell and prunes them first;
 `deputy-turn:` failures and other notifications remain independent.
+
+### Completion reports refresh evidence before speaking
+
+`chat_notify::sweep` queues the automatic notice together with its structured
+`CompletionReference` in the same talk write as the deduplication key. The sweep
+stays local and synchronous. `talk::turn` refreshes task/run ownership, the latest
+run, open questions and a bounded read-only PR observation before constructing
+any fresh, resumed or fallback prompt; it holds no store lock during the lookup.
+Saved PR state is historical, and a failed forge lookup never proves an open PR.
+Reports distinguish execution, PR creation, approval and merge; post-merge release
+actions and incomplete verification stay visible. Automatic events authorize
+reporting and read-only investigation, never new tasks or repository edits.

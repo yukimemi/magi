@@ -494,6 +494,9 @@ pub struct Talk {
     /// post twice; never pruned by a drain or a close.
     #[serde(default)]
     pub notified: Vec<String>,
+    /// Automatic notice references, saved atomically with their draft and key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub completion_notices: Vec<crate::chat_notify::CompletionReference>,
     /// When the conversation was opened.
     pub created_at: Timestamp,
     /// Last change to this file.
@@ -1415,6 +1418,7 @@ pub fn begin_with(
         implementers,
         implementers_dirty: false,
         notified: Vec::new(),
+        completion_notices: Vec::new(),
         created_at: now,
         updated_at: now,
         seat: SeatState::new(SEAT, &spec.id, crate::rng::entropy()),
@@ -1526,7 +1530,7 @@ pub fn queue_reply(
 /// after a crash (or a second sweep) finds the key and queues nothing.
 /// Returns whether this call queued it.
 pub fn queue_once(talk: &mut Talk, store: &Talks, text: &str, key: &str) -> Result<bool> {
-    queue_once_matching(talk, store, text, key, &|_| false)
+    queue_once_matching(talk, store, text, key, &|_| false, None)
 }
 
 /// Accept a key once, also recognizing older equivalent keys under the same
@@ -1537,8 +1541,17 @@ pub(crate) fn queue_once_matching(
     text: &str,
     key: &str,
     previous: &dyn Fn(&str) -> bool,
+    reference: Option<&crate::chat_notify::CompletionReference>,
 ) -> Result<bool> {
-    queue_keyed(talk, store, text, Vec::new(), Some(key), previous, None)
+    queue_keyed(
+        talk,
+        store,
+        text,
+        Vec::new(),
+        Some((key, reference)),
+        previous,
+        None,
+    )
 }
 
 fn queue_keyed(
@@ -1546,7 +1559,7 @@ fn queue_keyed(
     store: &Talks,
     text: &str,
     attachments: Vec<Attachment>,
-    key: Option<&str>,
+    key: Option<(&str, Option<&crate::chat_notify::CompletionReference>)>,
     previous: &dyn Fn(&str) -> bool,
     target: Option<ReplyTarget>,
 ) -> Result<bool> {
@@ -1565,12 +1578,15 @@ fn queue_keyed(
             fresh.status.as_str()
         );
     }
-    if let Some(key) = key {
+    if let Some((key, reference)) = key {
         if fresh.notified.iter().any(|k| k == key || previous(k)) {
             *talk = fresh;
             return Ok(false);
         }
         fresh.notified.push(key.to_owned());
+        if let Some(reference) = reference {
+            fresh.completion_notices.push(reference.clone());
+        }
     }
     let reply = resolve_reply(&fresh, target)?;
     if fresh.pending_messages.is_empty()
@@ -2030,6 +2046,8 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         .filter(|t| t.who == Who::Operator && t.body == text)
         .map(|turn| message_prompt(turn, talk, store))
         .unwrap_or_else(|| text.to_owned());
+    let evidence = crate::chat_notify::response_evidence(talk).await;
+    let text = format!("{text}{evidence}");
     let prompt_turns = talk.turns.len();
     talk.posts_read_through = Some(posts_read_through(talk));
     let spec = cfg
@@ -3028,6 +3046,7 @@ mod tests {
             implementers: 1,
             implementers_dirty: false,
             notified: Vec::new(),
+            completion_notices: Vec::new(),
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
             seat: SeatState::new(SEAT, agent, 1),
@@ -3280,6 +3299,7 @@ mod tests {
             implementers: 1,
             implementers_dirty: false,
             notified: Vec::new(),
+            completion_notices: Vec::new(),
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
             seat: SeatState::new(SEAT, "sonnet", 7),
@@ -4156,6 +4176,90 @@ mod tests {
             ids.iter().map(|s| (*s).to_owned()).collect(),
         ));
         cfg
+    }
+
+    #[tokio::test]
+    async fn completion_evidence_reaches_fresh_resumed_and_fallback_prompts() {
+        for fallback in [false, true] {
+            let (tmp, talks) = store();
+            let cfg = if fallback {
+                chain_config(
+                    vec![
+                        counting_agent(tmp.path(), "a", "cat >/dev/null\nexit 3"),
+                        counting_agent(tmp.path(), "b", "cat"),
+                    ],
+                    &["a", "b"],
+                )
+            } else {
+                config(mock_agent(tmp.path(), ECHO, BTreeMap::new()))
+            };
+            let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).unwrap();
+            let lease = talks.claim_turn(&talk.id).unwrap().unwrap();
+            for n in 0..2 {
+                let text = format!(
+                    "# {}\n\n- Task: `unavailable-{n}`",
+                    crate::prompt::CHAT_TASK_NOTICE_HEADING
+                );
+                let reference = crate::chat_notify::CompletionReference {
+                    task: format!("unavailable-{n}"),
+                    run: None,
+                    notice: text.clone(),
+                };
+                let key = format!("unavailable-{n}:done");
+                assert!(
+                    queue_once_matching(
+                        &mut talk,
+                        &talks,
+                        &text,
+                        &key,
+                        &|_| false,
+                        Some(&reference)
+                    )
+                    .unwrap()
+                );
+                assert!(
+                    !queue_once_matching(
+                        &mut talk,
+                        &talks,
+                        &text,
+                        &key,
+                        &|_| false,
+                        Some(&reference)
+                    )
+                    .unwrap()
+                );
+                talk = talks.get(&talk.id).unwrap();
+                assert_eq!(talk.completion_notices.len(), n + 1);
+                let text = drain(&mut talk, &talks).unwrap().unwrap();
+                respond(&lease, &mut talk, &talks, &cfg, &text)
+                    .await
+                    .unwrap();
+                let reply = &talk.turns.last().unwrap().body;
+                assert!(reply.contains("# Verified outcome evidence"), "{reply}");
+                assert!(reply.contains("Outcome evidence unavailable"));
+                assert!(reply.contains("Do not file new tasks or edit repositories solely"));
+                assert!(reply.contains("Explicitly say when no action remains"));
+            }
+            record(&mut talk, &talks, "ordinary follow-up", vec![]).unwrap();
+            assert!(
+                crate::chat_notify::response_evidence(&talk)
+                    .await
+                    .is_empty(),
+                "history does not trigger lookups"
+            );
+            record(
+                &mut talk,
+                &talks,
+                &format!("# {}\n\nlegacy", crate::prompt::CHAT_TASK_NOTICE_HEADING),
+                vec![],
+            )
+            .unwrap();
+            assert!(
+                crate::chat_notify::response_evidence(&talk)
+                    .await
+                    .contains("Legacy notification has no structured task/run reference")
+            );
+        }
     }
 
     #[tokio::test]
@@ -5363,6 +5467,7 @@ mod tests {
                 implementers: 1,
                 implementers_dirty: false,
                 notified: Vec::new(),
+                completion_notices: Vec::new(),
                 created_at: Timestamp::now(),
                 updated_at: Timestamp::now(),
                 seat: SeatState::new(SEAT, "mock", 7),
