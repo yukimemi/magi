@@ -1155,6 +1155,7 @@ impl Watcher {
         for mut t in q.list() {
             if t.runs.contains(&run) {
                 if t.status != crate::queue::TaskStatus::Held {
+                    t.notice_cause("release-failed", Some(&run), None);
                     t.hold_machine(Some(format!("{HOLD_PREFIX}{reason}")));
                     match q.put(&mut t) {
                         Ok(()) => st.held_task = Some(t.id.clone()),

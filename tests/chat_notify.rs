@@ -708,3 +708,334 @@ async fn watch_signal_exit_and_quoted_notice_markers_remain_automatic_data() {
     assert!(!report.contains(magi::prompt::CHAT_CONSULT_HEADING));
     assert!(magi::prompt::is_completion_notice(&report));
 }
+
+#[tokio::test]
+async fn unresolved_hold_survives_prose_recovery_restart_and_stale_writes() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let mut t = Task::new(
+        "recover existing work".into(),
+        "keep the approved source".into(),
+        w.tmp.path().into(),
+        Source::Agent {
+            run: w.talk_id.clone(),
+            node: CHAT_NODE.into(),
+        },
+    );
+    t.start("existing-run".into());
+    t.fail("operator will consider recovery", 1);
+    w.queue.put(&mut t).unwrap();
+    let mut stale = t.clone();
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    let mut delivered = w.talks.get(&w.talk_id).unwrap();
+    talk::clear_pending(&mut delivered, &w.talks).unwrap();
+    assert!(chat_notify::talks_to_start(&w.talks).is_empty());
+    let original = drafts(&w);
+    // The conductor held a snapshot while delivery appended its ledger.
+    stale.hold_machine(Some("keep waiting while recovery is considered".into()));
+    std::thread::scope(|scope| {
+        scope.spawn(|| w.queue.put(&mut stale).unwrap());
+        scope.spawn(|| {
+            assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
+        });
+    });
+    for reason in [
+        "still awaiting the same recovery",
+        "operator has not released it",
+    ] {
+        w.queue
+            .modify(&t.id, |task| {
+                task.requeue();
+                // A startup failure before a new run is not implementation progress.
+                task.fail("preflight still refuses the same source", 0);
+                task.hold_machine(Some(reason.into()));
+                true
+            })
+            .unwrap();
+        let reloaded = Queue::at(w.tmp.path().join("queue"));
+        assert!(chat_notify::sweep(&reloaded, &w.talks, w.tmp.path()).is_empty());
+        assert_eq!(drafts(&w), original);
+        assert!(
+            chat_notify::talks_to_start(&w.talks).is_empty(),
+            "no automatic reply turn"
+        );
+    }
+    w.queue
+        .modify(&t.id, |task| {
+            task.block(
+                vec!["new-decision".into()],
+                Some("needs a different decision".into()),
+            );
+            true
+        })
+        .unwrap();
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    let question_draft = drafts(&w);
+    w.queue
+        .modify(&t.id, |task| {
+            task.block(
+                vec!["new-decision".into(), "new-decision".into()],
+                Some("rephrased question context".into()),
+            );
+            true
+        })
+        .unwrap();
+    assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
+    assert_eq!(drafts(&w), question_draft);
+    w.queue
+        .modify(&t.id, |task| {
+            task.hold_machine(Some("same underlying hold after blocking".into()));
+            true
+        })
+        .unwrap();
+    assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
+    w.queue
+        .modify(&t.id, |task| {
+            task.release_operator("test", None);
+            task.start("meaningful-new-run".into());
+            task.fail("new implementation failure", 1);
+            true
+        })
+        .unwrap();
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    w.queue
+        .modify(&t.id, |task| {
+            task.succeed();
+            true
+        })
+        .unwrap();
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
+}
+
+#[tokio::test]
+async fn question_targets_control_automatic_turns_independently_of_labels() {
+    use magi::ask::{Answer, Questions};
+    use magi::conduct::{
+        self, Decision, QuestionDecision, QuestionOperation, QuestionTarget, Verdict,
+    };
+    let _home = common::home_lock().await;
+    for choices in [vec!["yes".to_owned(), "no".to_owned()], Vec::new()] {
+        let w = world();
+        let questions = Questions::at(w.tmp.path().join("questions"));
+        let mut t = Task::new(
+            "recover existing work".into(),
+            "consider recovery".into(),
+            w.tmp.path().into(),
+            Source::Agent {
+                run: w.talk_id.clone(),
+                node: CHAT_NODE.into(),
+            },
+        );
+        t.runs = vec!["source-run-a".into(), "source-run-b".into()];
+        t.hold_machine(Some("recovery is under consideration".into()));
+        w.queue.put(&mut t).unwrap();
+        assert_eq!(
+            chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+            1
+        );
+        let mut talk = w.talks.get(&w.talk_id).unwrap();
+        talk::clear_pending(&mut talk, &w.talks).unwrap();
+        let mut d = Decision {
+            id: t.id.clone(),
+            question: Some("Recover from source A?".into()),
+            choices: choices.clone(),
+            question_decision: Some(QuestionDecision {
+                operation: QuestionOperation::Recover,
+                target: QuestionTarget::Run {
+                    id: "source-run-a".into(),
+                },
+            }),
+            ..Decision::default()
+        };
+        conduct::apply(
+            &w.queue,
+            &questions,
+            &Verdict {
+                decisions: vec![d.clone()],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+            1
+        );
+        talk = w.talks.get(&w.talk_id).unwrap();
+        talk::clear_pending(&mut talk, &w.talks).unwrap();
+        let mut q = questions.list().pop().unwrap();
+        q.answer(if choices.is_empty() {
+            Answer::Text("keep held".into())
+        } else {
+            Answer::Choice("no".into())
+        })
+        .unwrap();
+        questions.put(&mut q).unwrap();
+        w.queue
+            .modify(&t.id, |task| {
+                task.record_answer(q.summary.clone(), "keep held".into());
+                task.unblock(&q.id);
+                true
+            })
+            .unwrap();
+        assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
+        d.question = Some("Use source A for recovery, or continue waiting?".into());
+        if !choices.is_empty() {
+            d.choices = vec!["recover using source A".into(), "remain on hold".into()];
+        }
+        let queue = Queue::at(w.tmp.path().join("queue"));
+        let questions = Questions::at(w.tmp.path().join("questions"));
+        conduct::apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![d.clone()],
+            },
+        )
+        .unwrap();
+        assert_eq!(questions.list().len(), 1);
+        assert!(chat_notify::sweep(&queue, &w.talks, w.tmp.path()).is_empty());
+        assert!(drafts(&w).is_empty());
+        assert!(chat_notify::talks_to_start(&w.talks).is_empty());
+        let previous_decision = d.question_decision.take();
+        conduct::apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![d.clone()],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            questions.list().len(),
+            1,
+            "omitted metadata is not a new decision"
+        );
+        d.question_decision = previous_decision;
+        d.question = Some("Recover from source B?".into());
+        d.choices = choices;
+        d.question_decision.as_mut().unwrap().target = QuestionTarget::Run {
+            id: "source-run-b".into(),
+        };
+        conduct::apply(&queue, &questions, &Verdict { decisions: vec![d] }).unwrap();
+        assert_eq!(questions.list().len(), 2);
+        assert_eq!(chat_notify::sweep(&queue, &w.talks, w.tmp.path()).len(), 1);
+        assert_eq!(
+            chat_notify::talks_to_start(&w.talks),
+            vec![w.talk_id.clone()]
+        );
+    }
+}
+
+#[tokio::test]
+async fn different_settings_on_one_task_require_distinct_decisions_and_chat_turns() {
+    use magi::ask::{Answer, Questions};
+    use magi::conduct::{self, Decision, QuestionTarget, Verdict};
+    let _home = common::home_lock().await;
+    let w = world();
+    std::fs::write(
+        w.tmp.path().join("settings.toml"),
+        "[storage]\nbackend = 'SQLite'\n[deployment]\nregion = 'east'\n",
+    )
+    .unwrap();
+    let questions = Questions::at(w.tmp.path().join("questions"));
+    let mut t = Task::new(
+        "configure service".into(),
+        "choose service settings".into(),
+        w.tmp.path().into(),
+        Source::Agent {
+            run: w.talk_id.clone(),
+            node: CHAT_NODE.into(),
+        },
+    );
+    t.hold_machine(Some("configuration decisions needed".into()));
+    w.queue.put(&mut t).unwrap();
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    let mut held_talk = w.talks.get(&w.talk_id).unwrap();
+    talk::clear_pending(&mut held_talk, &w.talks).unwrap();
+    let mut d: Decision = serde_json::from_value(serde_json::json!({
+        "id": t.id,
+        "question": "Which storage backend?",
+        "choices": ["SQLite", "Redis"],
+        "question_decision": {
+            "operation": "configure",
+            "target": {"kind": "setting", "path": "settings.toml", "keys": ["storage", "backend"]}
+        }
+    }))
+    .unwrap();
+    let apply = |decision: &Decision| {
+        conduct::apply(
+            &w.queue,
+            &questions,
+            &Verdict {
+                decisions: vec![decision.clone()],
+            },
+        )
+        .unwrap();
+    };
+    apply(&d);
+    assert_eq!(questions.list().len(), 1);
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    let mut talk = w.talks.get(&w.talk_id).unwrap();
+    talk::clear_pending(&mut talk, &w.talks).unwrap();
+    let mut q = questions.list().pop().unwrap();
+    q.answer(Answer::Choice("SQLite".into())).unwrap();
+    questions.put(&mut q).unwrap();
+    w.queue
+        .modify(&t.id, |task| {
+            task.unblock(&q.id);
+            task.hold_machine(Some("configuration decisions needed".into()));
+            true
+        })
+        .unwrap();
+    let unchanged = w.queue.get(&t.id).unwrap();
+    d.question = Some("Please select the storage engine".into());
+    apply(&d);
+    assert_eq!(questions.list().len(), 1, "rewording is the same decision");
+    assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
+    assert!(chat_notify::talks_to_start(&w.talks).is_empty());
+
+    // The next decision changes neither the task instruction nor held cause.
+    d.question = Some("Which deployment region?".into());
+    d.choices = vec!["east".into(), "west".into()];
+    d.question_decision.as_mut().unwrap().target = QuestionTarget::Setting {
+        path: "settings.toml".into(),
+        keys: vec!["deployment".into(), "region".into()],
+    };
+    apply(&d);
+    assert_eq!(
+        questions.list().len(),
+        2,
+        "new field requires another decision"
+    );
+    let after = w.queue.get(&t.id).unwrap();
+    assert_eq!(after.instruction, unchanged.instruction);
+    assert_eq!(after.hold_notice_cause, unchanged.hold_notice_cause);
+    assert_eq!(after.status, magi::queue::TaskStatus::Blocked);
+    assert_ne!(after.blocked_by, vec![q.id]);
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    assert_eq!(
+        chat_notify::talks_to_start(&w.talks),
+        vec![w.talk_id.clone()]
+    );
+}

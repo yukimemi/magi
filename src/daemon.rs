@@ -703,6 +703,10 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
         let missing = crate::queue::missing_blockers(queue, questions, &task.blocked_by);
         if !missing.is_empty() {
             let language = language_of(&task, Path::new("."));
+            let mut cause = missing.clone();
+            cause.sort();
+            cause.dedup();
+            task.notice_cause(&format!("missing-blockers:{}", cause.join(",")), None, None);
             task.hold_machine(Some(crate::queue::missing_blocker_hold_reason_in(
                 &task.blocked_by,
                 &missing,
@@ -724,6 +728,7 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
             })
         }) {
             let language = language_of(&task, Path::new("."));
+            task.notice_cause(&format!("unanswered-question:{}", q.id), None, None);
             task.hold_machine(Some(unanswered_question_hold_reason(&q, &language)));
             record(queue, &mut task);
             continue;
@@ -1175,6 +1180,7 @@ pub(crate) fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &
                         None => why,
                     });
                 } else {
+                    task.notice_cause(&format!("resume-refused:{}", q.id), None, None);
                     task.hold_machine(Some(why));
                 }
                 notices::raise(
@@ -1514,6 +1520,11 @@ fn settle_and_diagnose(
     // can re-check, so the same run resumes with the same agents once the
     // resource is free. A park request still wins (it is the operator's).
     if let Some(block) = state.resource_block.as_ref().filter(|_| !verdict.parked) {
+        task.notice_cause(
+            &format!("resource:{}:{}", block.kind, block.node),
+            None,
+            None,
+        );
         task.last_error = Some(detail.to_owned());
         task.diagnostic = None;
         task.attempts = task.attempts.saturating_sub(1);
@@ -1529,7 +1540,14 @@ fn settle_and_diagnose(
         }
         return;
     }
+    let unresolved = task.hold_notice_cause.clone();
     settle_in(task, verdict, detail, max_attempts, p);
+    if state.prep_failure.is_some() {
+        // Minting a run whose candidates could not be prepared is not work
+        // on a newly approved attempt. Keep the unresolved outcome anchor.
+        task.hold_notice_cause = unresolved;
+        task.startup_notice_cause("startup-candidates");
+    }
     // Written here, where the refund (or not) is decided, so the history is a
     // fact and not a later guess from the run's status.
     if let Some(pass) = state.passes.last() {
@@ -1540,6 +1558,13 @@ fn settle_and_diagnose(
         task.record_pass(&state.id, pass.index, attempts_before, parked);
     }
     if task.status == TaskStatus::Held {
+        if state.prep_failure.is_none() {
+            task.notice_cause(
+                label(verdict.status),
+                Some(&state.id),
+                state.passes.last().map(|p| p.index),
+            );
+        }
         task.diagnostic = diagnostic(state);
         note_open_question(task, &state.id, p);
     }
@@ -1567,6 +1592,13 @@ fn note_open_question(task: &mut Task, run: &str, p: &Phrases) {
     let Some(q) = open.first() else {
         return;
     };
+    let mut decisions: Vec<_> = open.iter().map(|q| q.id.as_str()).collect();
+    decisions.sort_unstable();
+    task.notice_cause(
+        &format!("questions:{}", decisions.join(",")),
+        Some(run),
+        None,
+    );
     let base = task.hold_reason.clone().unwrap_or_default();
     task.hold_reason = Some(format!("{base}{}{}", p.waiting_for_answer, q.short()));
 }
@@ -1605,6 +1637,7 @@ fn reclaim(task: &mut Task, last_run: Option<RunState>, max_attempts: usize, lan
             task.last_error = Some(why.to_owned());
             // The phone shows `hold_reason`, so a task held by the machine
             // says why there too and not only in `last_error`.
+            task.notice_cause("missing-run", None, None);
             task.hold_machine(Some(why.to_owned()));
         }
     }
@@ -2923,6 +2956,7 @@ async fn attempt(
     };
     if let Err(e) = Config::discover_fetched(&repo, explicit).await {
         let reason = format!("[config] {e:#}");
+        record_config_failure(task, &e);
         task.last_error = Some(reason.clone());
         task.hold_machine(Some(reason.clone()));
         record(queue, task);
@@ -2936,7 +2970,11 @@ async fn attempt(
             // Without that, a task naming a repository that does not exist
             // would be retried at every poll for as long as the daemon lives.
             task.attempts += 1;
-            task.fail(format!("config: {e:#}"), opts.max_attempts);
+            task.fail_startup(
+                "startup-config",
+                format!("config: {e:#}"),
+                opts.max_attempts,
+            );
             record(queue, task);
             return Vec::new();
         }
@@ -2953,6 +2991,7 @@ async fn attempt(
     // space cannot be measured closes the gate too: starting a run blind on a
     // disk that may be full is how the machine ends up with 6.7 GB free.
     if let Some(reason) = disk_gate(&repo, &config) {
+        task.notice_cause("disk-space", None, None);
         task.last_error = Some(reason.clone());
         task.hold_machine(Some(reason.clone()));
         record(queue, task);
@@ -3036,6 +3075,8 @@ async fn attempt(
         })
         && starter != Starter::Resume(run.clone())
     {
+        let run = run.clone();
+        task.notice_cause("repair-owner", Some(&run), None);
         task.hold_machine(Some(format!(
             "repair owner cannot resume; inspect `magi show {run}` and restore the existing run before `magi task release {}`; no replacement task was started",
             task.id
@@ -3051,7 +3092,12 @@ async fn attempt(
         Ok(a) => a,
         Err(e) => {
             task.attempts += 1;
-            task.fail(format!("{start_failed}{e:#}"), opts.max_attempts);
+            task.fail_startup_target(
+                "startup-attachments",
+                e.name.clone(),
+                format!("{start_failed}{e:#}"),
+                opts.max_attempts,
+            );
             record(queue, task);
             return Vec::new();
         }
@@ -3150,6 +3196,7 @@ async fn attempt(
         // by itself is the operator's call, not a failed attempt: hold the
         // task with the reason, spend nothing, and say so on the bell.
         Err(e) if task.pr_recovery.is_some() => {
+            task.startup_notice_cause("startup-public-head");
             task.attempts += 1;
             if let Some(partial) = e.downcast_ref::<crate::pr_recovery::StartupFailed>() {
                 task.link_run(&partial.run);
@@ -3167,6 +3214,7 @@ async fn attempt(
                 Some(r) => (p.handover_refused)(r),
                 None => format!("{e:#}"),
             };
+            task.startup_notice_cause("startup-handover");
             let reason = format!("{start_failed}{detail}");
             task.last_error = Some(reason.clone());
             // Consumed above by `take`; keep it so the released task retries
@@ -3214,7 +3262,11 @@ async fn attempt(
                 Err(put) => {
                     tracing::warn!("could not file the divergence question: {put:#}");
                     task.attempts += 1;
-                    task.fail(format!("{start_failed}{e:#}"), opts.max_attempts);
+                    task.fail_startup(
+                        "startup-question-store",
+                        format!("{start_failed}{e:#}"),
+                        opts.max_attempts,
+                    );
                 }
             }
             record(queue, task);
@@ -3238,6 +3290,7 @@ async fn attempt(
             }
             task.attempts += 1;
             task.last_error = Some(format!("{start_failed}{e:#}"));
+            task.startup_notice_cause("startup-source");
             task.hold_unrequested_retry(Some(format!(
                 "Startup failed: {e:#}. Correct the startup source or configuration, then explicitly release the task; automatic recovery is stopped."
             )));
@@ -4342,15 +4395,34 @@ fn resumed_instruction(old_instruction: &str, task: &Task) -> String {
     append_answers(strip_answers_block(old_instruction, task), task)
 }
 
+/// Preserve the producer's verified boundary and target, independent of prose.
+fn record_config_failure(task: &mut Task, error: &anyhow::Error) {
+    let failure = error.downcast_ref::<crate::config::ConfigFailure>();
+    task.notice_cause(failure.map_or("config-load", |f| f.stage), None, None);
+    if let Some(cause) = task.hold_notice_cause.as_mut() {
+        cause.target = failure.map(|f| f.target.clone());
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("attachment `{name}` is recorded on the task but {path} is missing")]
+struct MissingAttachment {
+    name: String,
+    path: PathBuf,
+}
+
 /// The task's attachments as absolute paths, each checked to still exist.
-fn task_attachments(queue: &Queue, task: &Task) -> Result<Vec<PathBuf>> {
+fn task_attachments(
+    queue: &Queue,
+    task: &Task,
+) -> std::result::Result<Vec<PathBuf>, MissingAttachment> {
     let paths = queue.attachment_paths(task);
     for (name, path) in task.attachments.iter().zip(&paths) {
         if !path.is_file() {
-            bail!(
-                "attachment `{name}` is recorded on the task but {} is missing",
-                path.display()
-            );
+            return Err(MissingAttachment {
+                name: name.clone(),
+                path: path.clone(),
+            });
         }
     }
     Ok(paths)
@@ -4661,6 +4733,55 @@ mod tests {
         assert!(t.operator_held());
         assert!(!t.status.runnable());
         assert!(t.hold_reason.as_deref().unwrap().contains("recover-pr"));
+        let first = t.chat_notice_key().unwrap();
+        t.chat_notices.push(first.clone());
+        t.release_operator("test", None);
+        state.id = "another-unprepared-run".into();
+        t.start(state.id.clone());
+        finish_attempt(
+            3,
+            &q,
+            &mut t,
+            &state,
+            &[],
+            Err(anyhow::anyhow!("still conflicts")),
+        );
+        assert_eq!(
+            t.chat_notice_key().as_ref(),
+            Some(&first),
+            "no work happened"
+        );
+        t.release_operator("test", None);
+        state.prep_failure = None;
+        state.status = RunStatus::Failed;
+        state.begin_pass();
+        t.start(state.id.clone());
+        finish_attempt(
+            1,
+            &q,
+            &mut t,
+            &state,
+            &[],
+            Err(anyhow::anyhow!("new gate failure")),
+        );
+        let failure = t.chat_notice_key().unwrap();
+        assert_ne!(failure, first, "approved recovery reached a real failure");
+        t.release_operator("test", None);
+        state.begin_pass();
+        t.start(state.id.clone());
+        finish_attempt(
+            1,
+            &q,
+            &mut t,
+            &state,
+            &[],
+            Err(anyhow::anyhow!("new failure on resume")),
+        );
+        assert_ne!(
+            t.chat_notice_key().as_ref(),
+            Some(&failure),
+            "a new settled pass"
+        );
     }
 
     #[test]
@@ -9012,6 +9133,108 @@ mod tests {
         std::fs::remove_file(&paths[0]).unwrap();
         let err = task_attachments(&q, &t).unwrap_err().to_string();
         assert!(err.contains("shot.png"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn config_failure_notices_distinguish_boundaries_and_targets_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue_path = dir.path().join("queue");
+        let queue = Queue::at(queue_path.clone());
+        let mut t = task();
+        t.source = Source::Agent {
+            run: "originating-chat".into(),
+            node: crate::queue::CHAT_NODE.into(),
+        };
+        let fetch = anyhow::anyhow!("network unavailable").context(crate::config::ConfigFailure {
+            stage: "config-fetch",
+            target: "origin/main".into(),
+        });
+        record_config_failure(&mut t, &fetch);
+        t.hold_machine(Some(format!("{fetch:#}")));
+        let fetch_key = t.chat_notice_due().unwrap();
+        t.chat_notices.push(fetch_key.clone());
+        queue.put(&mut t).unwrap();
+
+        let queue = Queue::at(queue_path);
+        let mut t = queue.get(&t.id).unwrap();
+        let a = dir.path().join("a.toml");
+        let b = dir.path().join("b.toml");
+        for (path, text, new_cause) in [
+            (&a, "[graph", true),
+            (&a, "[verify", false),
+            (&a, "[graph]\nimplementers = 'invalid-type'", true),
+            (&b, "[graph]\nimplementers = 'invalid-type'", true),
+        ] {
+            t.release_operator("test", None);
+            std::fs::write(path, text).unwrap();
+            let error = Config::discover_fetched(dir.path(), Some(path))
+                .await
+                .unwrap_err();
+            record_config_failure(&mut t, &error);
+            t.hold_machine(Some(format!("{error:#}")));
+            let due = t.chat_notice_due();
+            assert_eq!(due.is_some(), new_cause, "{error:#}");
+            if let Some(key) = due {
+                assert_ne!(key, fetch_key);
+                t.chat_notices.push(key);
+            }
+        }
+        t.succeed();
+        assert_eq!(t.chat_notice_due().as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn different_missing_attachments_have_distinct_persisted_notice_causes() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue_path = dir.path().join("queue");
+        let queue = Queue::at(queue_path.clone());
+        let mut t = task();
+        t.source = crate::queue::Source::Agent {
+            run: "originating-chat".into(),
+            node: crate::queue::CHAT_NODE.into(),
+        };
+        let a = dir.path().join("a.png");
+        let b = dir.path().join("b.png");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        queue.attach(&mut t, &[a, b]).unwrap();
+        let paths = task_attachments(&queue, &t).unwrap();
+        for path in &paths {
+            std::fs::remove_file(path).unwrap();
+        }
+        let missing = task_attachments(&queue, &t).unwrap_err();
+        t.attempts += 1;
+        let reason = missing.to_string();
+        t.fail_startup_target("startup-attachments", missing.name, reason, 1);
+        let first = t.chat_notice_due().expect("first attachment notice");
+        t.chat_notices.push(first.clone());
+        queue.put(&mut t).unwrap();
+
+        let queue = Queue::at(queue_path.clone());
+        let mut t = queue.get(&t.id).unwrap();
+        assert!(t.chat_notice_due().is_none(), "restart does not replay");
+        t.release_operator("test", None);
+        t.attempts += 1;
+        let missing = task_attachments(&queue, &t).unwrap_err();
+        t.fail_startup_target(
+            "startup-attachments",
+            missing.name,
+            "same missing attachment with regenerated wording",
+            1,
+        );
+        assert!(t.chat_notice_due().is_none(), "same object stays quiet");
+
+        std::fs::write(&paths[0], "restored").unwrap();
+        t.release_operator("test", None);
+        t.attempts += 1;
+        let missing = task_attachments(&queue, &t).unwrap_err();
+        let reason = missing.to_string();
+        t.fail_startup_target("startup-attachments", missing.name, reason, 1);
+        let second = t
+            .chat_notice_due()
+            .expect("different attachment must notify");
+        assert_ne!(first, second);
+        assert!(t.hold_reason.as_ref().unwrap().contains("b.png"));
     }
 
     #[test]

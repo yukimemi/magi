@@ -203,6 +203,7 @@ enum ClientProbe {
     Queue,
     Settings,
     Questions,
+    Connection,
 }
 
 // Expose the live module's functions without installing a second client that
@@ -230,6 +231,7 @@ async fn serve_with_client_probe(
         .await
         .expect("bind loopback");
     let base = format!("http://{}/", listener.local_addr().unwrap());
+    let boot = !matches!(probe, ClientProbe::Connection);
     let exports = match probe {
         ClientProbe::None => None,
         ClientProbe::Queue => Some(
@@ -238,6 +240,9 @@ async fn serve_with_client_probe(
         ClientProbe::Settings => Some("settingsState, renderSettings, loadSettings, saveSettings"),
         ClientProbe::Questions => Some(
             "state, shortId, renderQuestions, renderAsks, openPanel, closePanel, focusFirstAsk",
+        ),
+        ClientProbe::Connection => Some(
+            "state, loadHealth, loadLoop, loadTalk, tickTalkWaits, loadStats, resumeConnection, onPageShow, unreachable, loadQueue",
         ),
     };
     let router = ui.router().layer(axum::middleware::from_fn(
@@ -253,7 +258,8 @@ async fn serve_with_client_probe(
                     [(axum::http::header::CONTENT_TYPE, "text/javascript")],
                     format!(
                         "{source}\nwindow.deck = {{ {exports} }};\n\
-                         window.queueReady = boot();"
+                         window.queueReady = {};",
+                        if boot { "boot()" } else { "Promise.resolve()" }
                     ),
                 )
                     .into_response();
@@ -2221,12 +2227,15 @@ async fn unreachable_banner_waits_out_transient_failures() {
     let fx = common::fixture(guard, common::Judges::Unanimous, false);
     let home = fx.tmp.path().join("magi-home");
     let queue = Queue::at(home.join("queue"));
-    let base = serve(
+    // No boot timers or stream: their successful reads could clear the same
+    // banner while this test is driving failures with a controlled clock.
+    let base = serve_with_client_probe(
         &home,
         queue,
         Talks::at(home.join("talks")),
         home.join("runs"),
         &fx.repo,
+        ClientProbe::Connection,
     )
     .await;
     let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
@@ -2237,12 +2246,11 @@ async fn unreachable_banner_waits_out_transient_failures() {
     browser
         .wait_for(
             &page,
-            "!!document.getElementById('alert')",
+            "!!window.deck && !!document.getElementById('alert')",
             Duration::from_secs(30),
         )
         .await
         .expect("page loaded");
-    client_harness(&mut browser, &page).await;
     let r = browser
         .eval(
             &page,

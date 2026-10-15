@@ -581,6 +581,10 @@ pub struct Question {
     /// that the chat was asked, so a second tap does not post it twice.
     #[serde(default)]
     pub consult: Option<ChatConsult>,
+    /// Independent task facts behind a conductor question. Answered questions
+    /// with unchanged facts must not be regenerated just to ask again.
+    #[serde(default)]
+    pub decision_context: Option<String>,
 }
 
 /// A question the owner passed to the chat conversation its task came from.
@@ -638,6 +642,7 @@ impl Question {
             answer_delivered: false,
             deputy: None,
             consult: None,
+            decision_context: None,
         }
     }
 
@@ -2131,6 +2136,7 @@ mod tests {
                 "choices",
                 "consult",
                 "cwd",
+                "decision_context",
                 "delivered_turns",
                 "deputy",
                 "detail",

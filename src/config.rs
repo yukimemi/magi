@@ -44,6 +44,50 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
+/// Independently observed configuration failure boundary and its input target.
+/// Rendered error wording is diagnostic only, never a notification identity.
+#[derive(Debug, thiserror::Error)]
+#[error("{stage}: {target}")]
+pub(crate) struct ConfigFailure {
+    pub(crate) stage: &'static str,
+    pub(crate) target: String,
+}
+
+impl ConfigFailure {
+    fn render(error: &teravars::Error, paths: &[PathBuf]) -> Self {
+        let stage = match error {
+            teravars::Error::Io(_) => "config-read",
+            teravars::Error::Toml(_) | teravars::Error::Extract(_) => "config-parse",
+            teravars::Error::Render(_) => "config-template",
+            teravars::Error::IncludeCycle { .. } | teravars::Error::IncludeConflict { .. } => {
+                "config-include"
+            }
+            _ => "config-render",
+        };
+        Self::layers(stage, paths)
+    }
+
+    fn layers(stage: &'static str, paths: &[PathBuf]) -> Self {
+        let targets: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                // Cache directories include a commit id. The input file, rather
+                // than its extraction location, identifies a loading failure.
+                path.ancestors()
+                    .find(|p| p.join(REPO_MARKER).is_file())
+                    .and_then(|root| path.strip_prefix(root).ok())
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        Self {
+            stage,
+            target: serde_json::to_string(&targets).expect("config paths"),
+        }
+    }
+}
+
 /// Which CLI drives an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -1533,18 +1577,34 @@ impl Config {
         let mut engine = teravars::Engine::default();
         let ctx = Self::render_ctx(paths);
         if paths.len() > 1 {
-            Self::refuse_split_arrays(paths, &mut engine, &ctx)?;
+            Self::refuse_split_arrays(paths, &mut engine, &ctx).map_err(|error| {
+                if error.downcast_ref::<ConfigFailure>().is_some() {
+                    error
+                } else {
+                    // Keep the actionable refusal visible to plain Display
+                    // callers while retaining the structured failure identity.
+                    let message = error.to_string();
+                    error
+                        .context(ConfigFailure::layers("config-merge", paths))
+                        .context(message)
+                }
+            })?;
         }
-        let merged = teravars::load_merged(paths, &mut engine, &ctx).with_context(|| {
-            format!(
-                "rendering config via teravars: {}",
-                paths
-                    .iter()
-                    .map(|p| p.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })?;
+        let merged = teravars::load_merged(paths, &mut engine, &ctx)
+            .map_err(|error| {
+                let cause = ConfigFailure::render(&error, paths);
+                anyhow::Error::new(error).context(cause)
+            })
+            .with_context(|| {
+                format!(
+                    "rendering config via teravars: {}",
+                    paths
+                        .iter()
+                        .map(|p| p.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
         let mut table = merged.config;
         Self::normalize_renamed_keys(paths, &mut engine, &ctx, &mut table)?;
         // `[vars]` is teravars' own input, already resolved into the render
@@ -1556,7 +1616,8 @@ impl Config {
         let detect_agents = !table.contains_key("agents");
         let mut cfg: Self = toml::Value::Table(table)
             .try_into()
-            .context("deserializing magi config")?;
+            .context("deserializing magi config")
+            .context(ConfigFailure::layers("config-deserialize", paths))?;
         crate::persona::validate(&cfg.talk.personas)?;
         cfg.worktree.validate()?;
         if let Some(name) = cfg.talk.operator_name() {
@@ -1595,6 +1656,10 @@ impl Config {
         let mut winner: Option<toml::Value> = None;
         for path in paths {
             let one = teravars::load_merged([path], engine, ctx)
+                .map_err(|error| {
+                    let cause = ConfigFailure::render(&error, std::slice::from_ref(path));
+                    anyhow::Error::new(error).context(cause)
+                })
                 .with_context(|| format!("rendering {}", path.display()))?;
             let Some(toml::Value::Table(g)) = one.config.get("graph") else {
                 continue;
@@ -1649,6 +1714,10 @@ impl Config {
         let mut seen: std::collections::BTreeMap<String, PathBuf> = Default::default();
         for path in paths {
             let one = teravars::load_merged([path], engine, ctx)
+                .map_err(|error| {
+                    let cause = ConfigFailure::render(&error, std::slice::from_ref(path));
+                    anyhow::Error::new(error).context(cause)
+                })
                 .with_context(|| format!("rendering {}", path.display()))?;
             for key in array_keys(&one.config, "") {
                 if array_merge_policy(&key) == ArrayMerge::Append {
@@ -1805,21 +1874,39 @@ impl Config {
             // `<remote>/HEAD`; learn it here (refs/remotes only) so an
             // ordinary start recovers instead of failing in `discover`.
             let (remote, cfg_base) = probe_remote_base(repo);
-            let base = crate::git::merge_base_branch(repo, &remote, cfg_base.as_deref()).await?;
+            let base = crate::git::merge_base_branch(repo, &remote, cfg_base.as_deref())
+                .await
+                .with_context(|| ConfigFailure {
+                    stage: "config-base",
+                    target: remote.clone(),
+                })?;
             let out = crate::git::fetch(repo, &remote, &base)
                 .await
-                .with_context(|| format!("fetching {remote}/{base} to read magi.toml"))?;
+                .with_context(|| format!("fetching {remote}/{base} to read magi.toml"))
+                .with_context(|| ConfigFailure {
+                    stage: "config-fetch",
+                    target: format!("{remote}/{base}"),
+                })?;
             if !out.ok() {
-                bail!(
+                return Err(anyhow::anyhow!(
                     "cannot read magi.toml: `git fetch {remote} {base}` failed ({});                      refusing to use the local checkout's copy, which may be stale",
                     out.stderr.lines().next().unwrap_or("").trim()
-                );
+                )).context(ConfigFailure { stage: "config-fetch", target: format!("{remote}/{base}") });
             }
             if cfg_base.is_none() {
                 crate::git::ensure_remote_head(repo, &remote, &base).await;
             }
         }
-        Self::discover(repo, explicit)
+        Self::discover(repo, explicit).map_err(|error| {
+            if error.downcast_ref::<ConfigFailure>().is_some() {
+                error
+            } else {
+                error.context(ConfigFailure {
+                    stage: "config-load",
+                    target: explicit.unwrap_or(repo).to_string_lossy().into_owned(),
+                })
+            }
+        })
     }
 
     /// [`Config::layers`], but an unreadable remote ref is an error.
@@ -3524,8 +3611,12 @@ mod tests {
         std::fs::write(&repo, "[roles]\nimplementers = [\"oc\"]\n").unwrap();
 
         let err = Config::load_layers(&[machine.clone(), repo.clone()])
-            .expect_err("two layers naming one array must not merge silently")
-            .to_string();
+            .expect_err("two layers naming one array must not merge silently");
+        assert_eq!(
+            err.downcast_ref::<ConfigFailure>().unwrap().stage,
+            "config-merge"
+        );
+        let err = err.to_string();
         assert!(err.contains("roles.implementers"), "{err}");
         // Both files are named: the fix is to delete one of them, and the
         // operator has to know which two to choose between.
@@ -3704,8 +3795,12 @@ mod tests {
         std::fs::write(&repo, "[notify]\ncommand = [\"curl\", \"-X\"]\n").unwrap();
 
         let err = Config::load_layers(&[machine.clone(), repo.clone()])
-            .expect_err("an argv split across layers must not concatenate")
-            .to_string();
+            .expect_err("an argv split across layers must not concatenate");
+        assert_eq!(
+            err.downcast_ref::<ConfigFailure>().unwrap().stage,
+            "config-merge"
+        );
+        let err = err.to_string();
         assert!(err.contains("notify.command"), "{err}");
         assert!(err.contains("machine.toml"), "{err}");
         assert!(err.contains("magi.toml"), "{err}");
@@ -3721,6 +3816,26 @@ mod tests {
 
         let cfg = Config::load(&path).expect("single layer must still load");
         assert_eq!(cfg.verify.gate, ["cargo make check".to_owned()]);
+    }
+
+    #[test]
+    fn layered_parse_failures_name_the_failing_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.toml");
+        let b = dir.path().join("b.toml");
+        std::fs::write(&a, "[graph").unwrap();
+        std::fs::write(&b, "[verify").unwrap();
+        let paths = [a.clone(), b.clone()];
+        let first = Config::load_layers(&paths).unwrap_err();
+        let first_cause = first.downcast_ref::<ConfigFailure>().unwrap();
+        assert_eq!(first_cause.stage, "config-parse");
+        assert_eq!(first_cause.target, serde_json::to_string(&[&a]).unwrap());
+        std::fs::write(&a, "").unwrap();
+        let second = Config::load_layers(&paths).unwrap_err();
+        let second_cause = second.downcast_ref::<ConfigFailure>().unwrap();
+        assert_eq!(second_cause.stage, "config-parse");
+        assert_eq!(second_cause.target, serde_json::to_string(&[&b]).unwrap());
+        assert_ne!(first_cause.target, second_cause.target);
     }
 
     #[test]
@@ -3903,6 +4018,37 @@ mod tests {
                 .block_on(Config::discover_fetched(&repo, None))
                 .unwrap_err();
             assert!(format!("{err:#}").contains("fetch"), "{err:#}");
+        }
+
+        #[test]
+        fn fetch_and_remote_parse_failures_have_distinct_verified_causes() {
+            let (tmp, repo) = fixture("[graph\ncandidates = 2\n", "");
+            let remote = tmp.path().join("o.git");
+            let offline = tmp.path().join("offline.git");
+            std::fs::rename(&remote, &offline).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let fetch = rt
+                .block_on(Config::discover_fetched(&repo, None))
+                .unwrap_err();
+            let fetch_cause = fetch.downcast_ref::<ConfigFailure>().unwrap();
+            assert_eq!(fetch_cause.stage, "config-fetch");
+            assert_eq!(fetch_cause.target, "origin/trunk");
+
+            std::fs::rename(&offline, &remote).unwrap();
+            let parse = rt
+                .block_on(Config::discover_fetched(&repo, None))
+                .unwrap_err();
+            let parse_cause = parse.downcast_ref::<ConfigFailure>().unwrap();
+            assert_eq!(parse_cause.stage, "config-parse");
+            assert!(parse_cause.target.contains("magi.toml"));
+            assert!(
+                !parse_cause.target.contains("/magi/config/"),
+                "cache commit paths are incidental"
+            );
+            assert_ne!(fetch_cause.stage, parse_cause.stage);
         }
 
         #[test]

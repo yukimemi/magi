@@ -2821,7 +2821,19 @@ pub fn conduct(
          wait behind it. Instead, put the question in `question` (and \
          `choices`, if it is multiple choice) on a decision — magi files it \
          without blocking and blocks that task on its id. If a task already \
-         has an unanswered question of yours, do not ask it again. Here no blocked \
+         has an unanswered question of yours, do not ask it again. With every question, \
+         supply `question_decision`: an `operation` from `recover`, `resume`, \
+         `repair`, `complete`, `inspect`, `configure`, and a structured `target`. \
+         For a recovery source use `{\"kind\":\"source\",\"reference\":\"<existing branch or commit>\"}`; \
+         for an owned run use `{\"kind\":\"run\",\"id\":\"<recorded run id>\"}`; \
+         for a configuration decision use `{\"kind\":\"setting\",\"path\":\"<repo-relative TOML file>\",\"keys\":[\"<table>\",\"<key>\"]}` \
+         naming the existing setting being decided (for example storage.backend versus deployment.region). \
+         For a task-wide decision use `{\"kind\":\"task\"}`. Copy concrete identifiers \
+         from the recorded facts; never invent a prose identity or vary the operation \
+         just to re-ask. Source references are verified and normalized to commits. \
+         Question text and choice labels are display only, and rewording them must \
+         not change the decision target. This metadata grants no recovery authority. \
+         Here no blocked \
 process continues with the answer: your next cycle's decision and the \
 daemon carry it out, so a choice's actor label is `daemon:` or `operator:`, \
 never `agent:`.\n\n",
@@ -2843,7 +2855,7 @@ never `agent:`.\n\n",
          {\"decisions\":[{\"id\":\"<task id>\",\"blocked_by\":[\"<task or \
          question id>\"],\"missing_dependencies\":[\"<id, only for a missing-only decision>\"],\"reason\":\"<one line>\",\"recovery\":\
          \"requeue|hold|review|done\",\"question\":\"<text, optional>\",\
-         \"choices\":[\"<optional>\"]}]}\n\
+         \"choices\":[\"<optional>\"],\"question_decision\":{\"operation\":\"recover\",\"target\":{\"kind\":\"source\",\"reference\":\"<existing branch or commit>\"}}}]}\n\
          ```\n\n\
          Omit any field you have nothing to say for. `\"decisions\":[]` is a \
          valid answer when nothing here needs changing.",
