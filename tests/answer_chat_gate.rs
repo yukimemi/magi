@@ -724,6 +724,71 @@ fn cli_reloads_a_concurrently_settled_question_after_evidence_contention() {
 }
 
 #[test]
+fn consultation_waiting_for_evidence_cannot_undo_a_manual_cli_hold() {
+    let f = fixture();
+    let talks = Talks::at(f.tmp.path().join("talks"));
+    let mut destination = talks.get(&f.talk_id).unwrap();
+    talk::close(&mut destination, &talks).unwrap();
+    f.questions
+        .update(&f.qid, |q| {
+            q.consult = None;
+            Ok(())
+        })
+        .unwrap();
+    let q = f.questions.get(&f.qid).unwrap();
+    let guard = talks.answer_guard().unwrap();
+    std::thread::scope(|scope| {
+        let dispatch = scope.spawn(|| magi::consult::begin(&f.questions, &talks, &q, &destination));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while f.questions.get(&f.qid).unwrap().consult.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "consultation did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Direct operator answers require no chat evidence. Dispatch must let
+        // this command settle without waiting for a question lock to expire.
+        let started = std::time::Instant::now();
+        let out = Command::new(env!("CARGO_BIN_EXE_magi"))
+            .args(["answer", &f.qid, "--reply", "hold"])
+            .env("MAGI_HOME", f.tmp.path())
+            .env("MAGI_CONFIG_DIR", f.tmp.path().join("config"))
+            .env_remove("MAGI_RUN")
+            .env_remove("MAGI_NODE")
+            .output()
+            .unwrap();
+        let elapsed = started.elapsed();
+        let settled = f.questions.get(&f.qid).unwrap();
+        drop(guard);
+        let dispatched = dispatch.join().unwrap().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "question lock was retained: {elapsed:?}"
+        );
+        assert!(!dispatched, "a settled question must not be dispatched");
+        assert_eq!(settled.resolution().as_deref(), Some("hold"));
+        assert_eq!(
+            serde_json::to_value(f.questions.get(&f.qid).unwrap()).unwrap(),
+            serde_json::to_value(settled).unwrap()
+        );
+        let destination = talks.get(&destination.id).unwrap();
+        assert_eq!(destination.status, talk::TalkStatus::Closed);
+        assert!(destination.pending.is_empty());
+        assert!(destination.pending_messages.is_empty());
+        assert!(!magi::consult::pending_consults(
+            &f.questions,
+            &destination.id
+        ));
+    });
+}
+
+#[test]
 fn batch_holds_validate_surrounding_headings_and_paragraphs() {
     for (template, accepted) in [
         ("## チェックが失敗した場合のみ\n\n- {}: hold", false),
@@ -797,5 +862,36 @@ fn a_direct_owner_hold_does_not_inherit_conditions_from_assistant_prose() {
             .unwrap()
             .recommendation_turn
             .is_none()
+    );
+}
+
+#[test]
+fn chat_merge_preserves_the_recorded_head_confirmation_requirement() {
+    let f = fixture();
+    f.questions
+        .update(&f.qid, |q| {
+            q.merge_target = Some(magi::merge_decision::Target {
+                pr: "https://github.com/example/repo/pull/42".into(),
+                head: "reviewed-head".into(),
+                language: "ja".into(),
+            });
+            Ok(())
+        })
+        .unwrap();
+    assert_untouched(&f, &answer(&f, &f.talk_id, Some("merge it now")));
+    let talks = Talks::at(f.tmp.path().join("talks"));
+    let mut t = talks.get(&f.talk_id).unwrap();
+    talk::queue(&mut t, &talks, "merge stale-head", vec![]).unwrap();
+    assert_untouched(&f, &answer(&f, &f.talk_id, Some("merge stale-head")));
+    talk::queue(&mut t, &talks, "merge reviewed-head", vec![]).unwrap();
+    let out = answer(&f, &f.talk_id, Some("merge reviewed-head"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        f.questions.get(&f.qid).unwrap().resolution().as_deref(),
+        Some("merge")
     );
 }

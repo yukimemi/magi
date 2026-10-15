@@ -653,6 +653,21 @@ impl Talks {
         }
     }
 
+    /// Try both conversation locks without waiting under a question lock.
+    fn try_guard(&self) -> Result<Option<StoreGuard<'_>>> {
+        let Some(answer) = self.try_answer_guard()? else {
+            return Ok(None);
+        };
+        std::fs::create_dir_all(&self.root)
+            .with_context(|| format!("create {}", self.root.display()))?;
+        Ok(
+            TurnLock::take(&self.root.join(".store.turn"))?.map(|file| StoreGuard {
+                _file: file,
+                _answer: answer,
+            }),
+        )
+    }
+
     /// Freeze owner evidence until an answer has been persisted. Callers under
     /// a question lock must use [`Self::try_answer_guard`] instead: waiting here
     /// can outlive the question lock's expiry. Retain the guard through
@@ -1761,9 +1776,55 @@ fn queue_keyed(
             fresh.status.as_str()
         );
     }
+    if !append_pending(&mut fresh, text, attachments, key, previous, source)? {
+        *talk = fresh;
+        return Ok(false);
+    }
+    store.put(&mut fresh)?;
+    *talk = fresh;
+    Ok(true)
+}
+
+/// Dispatch consultation under both store locks, including reopening, without
+/// ever waiting while the caller holds the question lock. None means retry
+/// after releasing that lock and rechecking the question's current state.
+pub(crate) fn try_queue_consult(
+    store: &Talks,
+    id: &str,
+    text: &str,
+    display: Option<crate::prompt::NoticeDisplay>,
+) -> Result<Option<()>> {
+    let Some(_guard) = store.try_guard()? else {
+        return Ok(None);
+    };
+    let mut fresh = store.get(id).context("read consultation destination")?;
+    fresh.status = TalkStatus::Open;
+    append_pending(
+        &mut fresh,
+        text,
+        Vec::new(),
+        None,
+        &|_| false,
+        (None, Sender::Magi, display),
+    )?;
+    store.put(&mut fresh)?;
+    Ok(Some(()))
+}
+
+fn append_pending(
+    fresh: &mut Talk,
+    text: &str,
+    attachments: Vec<Attachment>,
+    key: Option<(&str, Option<&crate::chat_notify::CompletionReference>)>,
+    previous: &dyn Fn(&str) -> bool,
+    source: (
+        Option<ReplyTarget>,
+        Sender,
+        Option<crate::prompt::NoticeDisplay>,
+    ),
+) -> Result<bool> {
     if let Some((key, reference)) = key {
         if fresh.notified.iter().any(|k| k == key || previous(k)) {
-            *talk = fresh;
             return Ok(false);
         }
         fresh.notified.push(key.to_owned());
@@ -1772,7 +1833,7 @@ fn queue_keyed(
         }
     }
     let (target, provenance, display) = source;
-    let reply = resolve_reply(&fresh, target)?;
+    let reply = resolve_reply(fresh, target)?;
     if fresh.pending_messages.is_empty()
         && (!fresh.pending.is_empty() || !fresh.pending_attachments.is_empty())
     {
@@ -1804,8 +1865,6 @@ fn queue_keyed(
         }
     }
     fresh.pending_attachments.extend(attachments);
-    store.put(&mut fresh)?;
-    *talk = fresh;
     Ok(true)
 }
 
@@ -5469,6 +5528,42 @@ mod tests {
             on_disk.turns
         );
         let _ = &cfg; // config kept only to build the agent above
+    }
+
+    #[test]
+    fn consultation_queue_does_not_wait_on_either_conversation_lock() {
+        for evidence in [true, false] {
+            let (tmp, talks) = store();
+            let cfg = config(mock_agent(tmp.path(), REPLY, env("hi")));
+            let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).unwrap();
+            close(&mut talk, &talks).unwrap();
+            let answer = evidence.then(|| talks.answer_guard().unwrap());
+            let file = (!evidence).then(|| {
+                TurnLock::take(&talks.root.join(".store.turn"))
+                    .unwrap()
+                    .unwrap()
+            });
+            assert!(
+                try_queue_consult(&talks, &talk.id, "consultation", None)
+                    .unwrap()
+                    .is_none()
+            );
+            let saved = talks.get(&talk.id).unwrap();
+            assert_eq!(saved.status, TalkStatus::Closed);
+            assert!(saved.pending_messages.is_empty());
+            drop(file);
+            drop(answer);
+            assert!(
+                try_queue_consult(&talks, &talk.id, "consultation", None)
+                    .unwrap()
+                    .is_some()
+            );
+            let saved = talks.get(&talk.id).unwrap();
+            assert_eq!(saved.status, TalkStatus::Open);
+            assert_eq!(saved.pending, "consultation");
+            assert_eq!(saved.pending_messages.len(), 1);
+            assert_eq!(saved.pending_messages[0].sender, Some(Sender::Magi));
+        }
     }
 
     #[test]

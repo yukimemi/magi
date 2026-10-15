@@ -112,26 +112,34 @@ pub fn begin(questions: &Questions, talks: &Talks, q: &Question, talk: &Talk) ->
     if !fresh {
         return Ok(false);
     }
-    let mut talk = talk.clone();
-    // Serialize dispatch with answers. A hold can settle the question while
-    // its destination is being prepared; never deliver an obsolete consultation.
-    let dispatch = questions.update(&q.id, |r| {
-        if !r.status.open() || r.consult != q.consult {
-            return Ok(false);
+    // Serialize dispatch with answers, but never wait for conversation locks
+    // under the expiring question lock. Each retry reloads the latest question.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let dispatch = loop {
+        let mut busy = false;
+        let updated = questions.update(&q.id, |r| {
+            if !r.status.open() || r.consult != q.consult {
+                return Ok(false);
+            }
+            if talk::try_queue_consult(
+                talks,
+                &talk.id,
+                &crate::prompt::chat_consult(r),
+                Some(crate::prompt::chat_consult_display(r)),
+            )?
+            .is_none()
+            {
+                busy = true;
+                bail!("the conversation store is locked by another process");
+            }
+            Ok(true)
+        });
+        if busy && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
         }
-        // A closed origin chat is reopened before queueing. Keep this inside
-        // the same check so an already settled question cannot reopen a chat.
-        if !talk.status.open() {
-            talk::reopen(&mut talk, talks).context("reopen the chat")?;
-        }
-        talk::queue_magi_display(
-            &mut talk,
-            talks,
-            &crate::prompt::chat_consult(r),
-            Some(crate::prompt::chat_consult_display(r)),
-        )?;
-        Ok(true)
-    });
+        break updated;
+    };
     if let Err(e) = dispatch {
         let _ = questions.update(&q.id, |r| {
             if r.status.open() && r.consult == q.consult {
@@ -1491,7 +1499,13 @@ mod tests {
             Some(talk.id.as_str())
         );
 
-        let queued = store.get(&talk.id).unwrap().pending;
+        let destination = store.get(&talk.id).unwrap();
+        assert_eq!(destination.pending_messages.len(), 1);
+        assert_eq!(
+            destination.pending_messages[0].display,
+            Some(crate::prompt::chat_consult_display(&q))
+        );
+        let queued = destination.pending;
         assert_eq!(
             queued.matches(&q.id).count(),
             2 + 1,
