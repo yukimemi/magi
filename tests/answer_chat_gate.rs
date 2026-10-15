@@ -684,3 +684,80 @@ fn cli_waits_for_the_conversation_evidence_lock_before_reading_owner_intent() {
         );
     });
 }
+
+#[test]
+fn batch_holds_validate_surrounding_headings_and_paragraphs() {
+    for (template, accepted) in [
+        ("## チェックが失敗した場合のみ\n\n- {}: hold", false),
+        ("チェックが失敗した場合のみ\n\n- {}: hold", false),
+        ("- {}: hold\n\nただしチェック失敗時のみ", false),
+        (
+            "## Recommendations\n\nOnly if checks fail:\n\n- {}: hold",
+            false,
+        ),
+        (
+            "Only if checks fail\n===================\n\n- {}: hold",
+            false,
+        ),
+        (
+            "## Recommendations\n\n### チェックが失敗した場合のみ\n\n- {}: hold",
+            false,
+        ),
+        (
+            "Only if checks fail:\n\n| Question | Choice |\n| --- | --- |\n| {} | hold |",
+            false,
+        ),
+        (
+            "| Question | Choice |\n| --- | --- |\n| {} | hold |\n\nただしチェック失敗時のみ",
+            false,
+        ),
+        (
+            "## Recommendations\n\n- {}: hold\n\nThe decision stays on hold.",
+            true,
+        ),
+        ("> Only if checks fail\n\n- {}: hold", true),
+        ("```text\nOnly if checks fail\n```\n\n- {}: hold", true),
+    ] {
+        let f = fixture();
+        let words = "answer each as recommended";
+        let run = standing_owner(&f, words, Some(&template.replace("{}", &f.qid)));
+        let talks = Talks::at(f.tmp.path().join("talks"));
+        assert_eq!(
+            magi::consult::authorized_holds(&f.questions, &talks.get(&run).unwrap()),
+            accepted
+        );
+        let out = hold(&f, &run, words);
+        assert_eq!(
+            out.status.success(),
+            accepted,
+            "{template}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if !accepted {
+            assert_untouched(&f, &out);
+        }
+    }
+}
+
+#[test]
+fn a_direct_owner_hold_does_not_inherit_conditions_from_assistant_prose() {
+    let f = fixture();
+    let words = format!("{}: hold", f.qid);
+    let recommendations = format!("## チェックが失敗した場合のみ\n\n- {}: hold", f.qid);
+    let run = standing_owner(&f, &words, Some(&recommendations));
+    let out = hold(&f, &run, &words);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        f.questions
+            .get(&f.qid)
+            .unwrap()
+            .answer_authority
+            .unwrap()
+            .recommendation_turn
+            .is_none()
+    );
+}

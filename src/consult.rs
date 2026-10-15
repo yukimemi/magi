@@ -405,23 +405,31 @@ fn recommended_hold(body: &str, q: &Question, questions: &Questions) -> bool {
     let document = comrak::parse_document(&arena, body, &options);
     let lines: Vec<_> = body.lines().collect();
     let mut eligible = std::collections::BTreeSet::new();
-    let mut qualified = std::collections::BTreeSet::new();
     for node in document.descendants() {
         let data = node.data.borrow();
-        if matches!(
-            data.value,
-            NodeValue::Paragraph | NodeValue::TableRow(false)
-        ) && !node
+        if node
             .ancestors()
             .any(|n| matches!(n.data.borrow().value, NodeValue::BlockQuote))
         {
+            continue;
+        }
+        // A heading, introduction or trailing paragraph may qualify several
+        // rows without naming any question. Do not guess its scope: batch
+        // authority requires the whole unquoted recommendation to be clear.
+        if matches!(
+            data.value,
+            NodeValue::Heading(_) | NodeValue::Paragraph | NodeValue::TableRow(_)
+        ) && lines
+            .get(data.sourcepos.start.line - 1..data.sourcepos.end.line)
+            .is_some_and(|block| conditional_recommendation(&block.join(" ")))
+        {
+            return false;
+        }
+        if matches!(
+            data.value,
+            NodeValue::Paragraph | NodeValue::TableRow(false)
+        ) {
             eligible.extend(data.sourcepos.start.line..=data.sourcepos.end.line);
-            if lines
-                .get(data.sourcepos.start.line - 1..data.sourcepos.end.line)
-                .is_some_and(|block| conditional_recommendation(&block.join(" ")))
-            {
-                qualified.extend(data.sourcepos.start.line..=data.sourcepos.end.line);
-            }
         }
     }
     for (index, line) in body.lines().enumerate() {
@@ -433,10 +441,6 @@ fn recommended_hold(body: &str, q: &Question, questions: &Questions) -> bool {
             .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
             .collect();
         if !tokens.iter().any(|r| refers_to(r, q, questions)) {
-            continue;
-        }
-        if qualified.contains(&(index + 1)) || conditional_recommendation(line) {
-            rows.push(false);
             continue;
         }
         if line.starts_with('|') {
