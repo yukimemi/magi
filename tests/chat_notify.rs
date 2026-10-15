@@ -75,6 +75,13 @@ async fn a_finished_task_is_reported_once_however_often_it_is_swept() {
     let draft = drafts(&w);
     let saved = w.talks.get(&w.talk_id).expect("saved talk");
     assert_eq!(saved.pending_messages[0].sender, Some(talk::Sender::Magi));
+    let display = saved.pending_messages[0]
+        .display
+        .as_ref()
+        .expect("display snapshot");
+    assert_eq!(display.task.as_deref(), Some(t.id.as_str()));
+    assert!(display.facts.contains("done"));
+    assert!(!display.facts.contains("Tell the operator"));
     assert_eq!(saved.completion_notices.len(), 1);
     let reference = &saved.completion_notices[0];
     assert_eq!(reference.task, t.id);
@@ -363,6 +370,7 @@ async fn legacy_notices_resume_after_new_task_or_watch_notices_arrive() {
                 // records their boundaries. Preserve that wire shape directly
                 // instead of using the current metadata compaction in put.
                 legacy.pending_messages = vec![talk::Message {
+                    display: None,
                     sender: None,
                     body: legacy.pending.clone(),
                     attachments: Vec::new(),
@@ -497,6 +505,17 @@ async fn watch_reports_once_after_reload_and_preserves_cwd_arguments_and_environ
         w.talks.get(&w.talk_id).unwrap().pending_messages[0].sender,
         Some(talk::Sender::Magi)
     );
+    let saved = w.talks.get(&w.talk_id).expect("watch snapshot");
+    let display = saved
+        .pending_messages
+        .last()
+        .unwrap()
+        .display
+        .as_ref()
+        .expect("watch display");
+    assert!(display.facts.contains("status 7"));
+    assert!(!display.facts.contains("Tell the operator"));
+    assert!(display.output.as_ref().unwrap().contains("stderr-tail"));
     assert!(draft.contains("literal; $argument"));
     assert!(draft.contains("stderr-tail"));
     assert_eq!(

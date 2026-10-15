@@ -5346,11 +5346,21 @@ function attachmentUrl(conversationId, att) {
   return API.talkAttachment(conversationId, att.id);
 }
 
+function renderNoticeDisplay(display) {
+  const box = el("div", { class: "notification-facts" });
+  box.append(linkify(el("p", { class: "turn-text" }), display.facts));
+  if (display.task) box.append(el("a", { class: "text-link", href: `#/tasks/${encodeURIComponent(display.task)}`, text: "Task" }));
+  if (display.run) box.append(" · ", el("a", { class: "text-link", href: `#/runs/${encodeURIComponent(display.run)}`, text: "Run" }));
+  if (display.output) box.append(el("details", {},
+    el("summary", { text: "Output" }), el("pre", { class: "talk-pending-text", text: display.output })));
+  return box;
+}
+
 function updateTurnRow(row, item) {
   const r = row.refs;
   const turn = item.turn;
   const kind = turnWho(turn);
-  const body = String(turn.body || "");
+  const body = String(turn.display ? turn.display.facts : (turn.body || ""));
 
   setAttr(row, "data-who", kind);
   setAvatar(r.avatar, kind === "agent" ? item.personaAvatar
@@ -5363,11 +5373,13 @@ function updateTurnRow(row, item) {
      nodes, never as markup: the rule that no API data is ever assigned as
      HTML holds everywhere outside the sandboxed panel frame, and a model that
      writes a script tag into a fence has to see the characters of one. */
-  const key = `${kind}:${body}`;
+  const key = `${kind}:${body}:${turn.display?.output || ""}`;
   if (row.dataset.turnKey !== key) {
     row.dataset.turnKey = key;
     clear(r.body);
-    if (kind === "agent") {
+    if (turn.display) {
+      r.body.append(renderNoticeDisplay(turn.display));
+    } else if (kind === "agent") {
       const div = el("div", { class: "md" });
       renderMd(div, item.md);
       r.body.append(div);
@@ -6201,7 +6213,7 @@ function renderTalkPending(talk) {
     box.append(el("div", { class: `queued-message${message.sender === "magi" ? " magi-pending" : ""}` }, avatar,
       message.reply ? el("p", { class: "reply-quote", text: `Reply to ${message.reply.sender === "magi" ? "MAGI" : message.reply.who}: ${message.reply.excerpt}` }) : null,
       el("strong", { text: message.sender === "magi" ? "MAGI" : (talk.operator_name || "YOU") }),
-      el("p", { class: "turn-text", text: message.body || `${message.attachments.length} attachment(s)` }),
+      message.display ? renderNoticeDisplay(message.display) : el("p", { class: "turn-text", text: message.body || `${message.attachments.length} attachment(s)` }),
       message.sender !== "magi" ? el("button", { class: "btn btn-quiet", type: "button", text: "Edit text", onclick: () => editTalkPending(index) }) : null));
   });
 }

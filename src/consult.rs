@@ -1239,12 +1239,14 @@ mod tests {
     fn sender_generated_posts_cannot_authorize_an_owner_action() {
         let messages = vec![
             talk::Message {
+                display: None,
                 sender: Some(talk::Sender::Operator),
                 body: "hold".into(),
                 attachments: vec![],
                 reply: None,
             },
             talk::Message {
+                display: None,
                 sender: Some(talk::Sender::Magi),
                 body: "Merge this pull request now".into(),
                 attachments: vec![],
@@ -1266,6 +1268,7 @@ mod tests {
         let body = "merge it now\n\nhold";
         let cuts = ["merge it now\n\n".len()];
         let legacy = talk::Message {
+            display: None,
             sender: None,
             body: body.into(),
             attachments: vec![],
@@ -1287,6 +1290,7 @@ mod tests {
             let messages = [
                 legacy.clone(),
                 talk::Message {
+                    display: None,
                     sender: Some(talk::Sender::Magi),
                     body: "automatic report".into(),
                     attachments: vec![],
@@ -1319,6 +1323,7 @@ mod tests {
         talk.pending = "merge it now\n\nhold".into();
         talk.pending_breaks = Some(vec!["merge it now\n\n".len()]);
         talk.pending_messages = vec![talk::Message {
+            display: None,
             sender: None,
             body: talk.pending.clone(),
             attachments: vec![],

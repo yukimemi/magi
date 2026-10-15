@@ -2876,3 +2876,16 @@ Saved PR state is historical, and a failed forge lookup never proves an open PR.
 Reports distinguish execution, PR creation, approval and merge; post-merge release
 actions and incomplete verification stay visible. Automatic events authorize
 reporting and read-only investigation, never new tasks or repository edits.
+
+### Automatic chat notification display is separate from agent input
+
+`Message.body` remains the authoritative input for conversation resumption,
+including provenance explanations and agent directives. `Message.display` is an
+optional notification-time snapshot generated with the same scrubbing and bounds
+as that input, saved under the same lock as the draft, completion reference and
+deduplication key. Never rebuild it from current task or watch state.
+`TalkView` projects display facts for history, queued sends and saved reply quotes;
+new reply excerpts use those facts too. Legacy compatibility requires MAGI sender
+provenance or an exact `CompletionReference.notice` match and a complete known
+template; unknown bodies and operator prose remain literal. Watched output is
+untrusted text in an expandable element; links use the existing safe URL renderer.

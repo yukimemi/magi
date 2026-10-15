@@ -25,7 +25,7 @@ use anyhow::{Result, bail};
 use jiff::Timestamp;
 
 use crate::config::Config;
-use crate::prompt::{ChatTaskNotice, chat_task_notice};
+use crate::prompt::{ChatTaskNotice, NoticeDisplay, chat_task_report};
 use crate::queue::{ChatNotice, ChatNoticeOutcome, Queue, Task, TaskStatus};
 use crate::talk::{self, Talks};
 
@@ -516,6 +516,10 @@ pub fn run_facts(home: &Path, run: &str) -> RunFacts {
 
 /// The notice text for `task`, built from what magi recorded.
 pub fn notice_text(task: &Task, facts: &RunFacts) -> String {
+    notice_report(task, facts).0
+}
+
+fn notice_report(task: &Task, facts: &RunFacts) -> (String, NoticeDisplay) {
     let (status, reason) = match task.status {
         TaskStatus::Done => ("done", None),
         TaskStatus::Held => (
@@ -525,7 +529,7 @@ pub fn notice_text(task: &Task, facts: &RunFacts) -> String {
         TaskStatus::Blocked => ("blocked", task.block_reason.as_deref()),
         _ => ("not final", None),
     };
-    chat_task_notice(&ChatTaskNotice {
+    chat_task_report(&ChatTaskNotice {
         id: &task.id,
         title: &task.title,
         status,
@@ -560,7 +564,7 @@ fn deliver(
         .last()
         .map(|r| run_facts(home, r))
         .unwrap_or_default();
-    let text = notice_text(task, &facts);
+    let (text, display) = notice_report(task, &facts);
     let prefix = format!("{}:", task.id);
     let previous = |stored: &str| {
         stored.strip_prefix(&prefix).is_some_and(|old| {
@@ -573,7 +577,7 @@ fn deliver(
                     .is_some_and(|n| n.key == old && task.legacy_notice_matches(old))
         })
     };
-    match talk::queue_once_matching(
+    match talk::queue_notice(
         &mut talk,
         talks,
         &text,
@@ -584,6 +588,7 @@ fn deliver(
             run: task.runs.last().cloned(),
             notice: text.clone(),
         }),
+        display,
     ) {
         Ok(added) => Ok((ChatNoticeOutcome::Posted, added)),
         Err(e) => match talks.get(talk_id) {

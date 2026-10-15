@@ -173,6 +173,9 @@ pub struct Reply {
 /// One accepted send, retained even when the queue combines multiple sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
+    /// Notification-time facts for the UI; body remains the agent's authoritative input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<crate::prompt::NoticeDisplay>,
     /// Display provenance; absent in legacy records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<Sender>,
@@ -182,6 +185,25 @@ pub struct Message {
     pub attachments: Vec<Attachment>,
     /// Optional reply snapshot.
     pub reply: Option<Reply>,
+}
+
+/// UI facts may be recovered only from an explicit sender or an exact saved notice.
+pub(crate) fn notice_display(
+    talk: &Talk,
+    turn: &Turn,
+    message: Option<&Message>,
+) -> Option<crate::prompt::NoticeDisplay> {
+    if let Some(display) = message.and_then(|m| m.display.as_ref()) {
+        return Some(display.clone());
+    }
+    let body = message.map_or(turn.body.as_str(), |m| m.body.as_str());
+    if sender(turn, message) == Sender::Magi
+        || talk.completion_notices.iter().any(|r| r.notice == body)
+    {
+        crate::prompt::legacy_notice_display(body)
+    } else {
+        None
+    }
 }
 
 fn resolve_reply(talk: &Talk, target: Option<ReplyTarget>) -> Result<Option<Reply>> {
@@ -204,13 +226,19 @@ fn resolve_reply(talk: &Talk, target: Option<ReplyTarget>) -> Result<Option<Repl
             .context("invalid reply target")?;
         (&message.body, &message.attachments)
     };
+    let display = notice_display(talk, turn, turn.messages.get(target.message));
+    let body = display.as_ref().map_or(body.as_str(), |d| d.facts.as_str());
     let excerpt = if body.trim().is_empty() {
         format!("{} attachment(s)", attachments.len())
     } else {
         body.chars().take(240).collect()
     };
     Ok(Some(Reply {
-        sender: Some(sender(turn, turn.messages.get(target.message))),
+        sender: Some(if display.is_some() {
+            Sender::Magi
+        } else {
+            sender(turn, turn.messages.get(target.message))
+        }),
         target,
         who: turn.who,
         excerpt,
@@ -264,7 +292,10 @@ fn message_prompt(turn: &Turn, talk: &Talk, store: &Talks) -> String {
 /// Only legacy plain sends can omit metadata; explicit provenance is durable.
 fn messages_need_no_metadata(messages: &[Message]) -> bool {
     messages.iter().all(|message| {
-        message.sender.is_none() && message.reply.is_none() && message.attachments.is_empty()
+        message.sender.is_none()
+            && message.display.is_none()
+            && message.reply.is_none()
+            && message.attachments.is_empty()
     })
 }
 
@@ -1535,6 +1566,7 @@ pub fn record_reply(
         body: text.to_owned(),
         at: Timestamp::now(),
         messages: vec![Message {
+            display: None,
             sender: Some(Sender::Operator),
             body: text.to_owned(),
             attachments: attachments.clone(),
@@ -1574,7 +1606,7 @@ pub fn queue_reply(
         attachments,
         None,
         &|_| false,
-        (target, Sender::Operator),
+        (target, Sender::Operator, None),
     )
     .map(|_| ())
 }
@@ -1604,7 +1636,28 @@ pub(crate) fn queue_once_matching(
         Vec::new(),
         Some((key, reference)),
         previous,
-        (None, Sender::Magi),
+        (None, Sender::Magi, None),
+    )
+}
+
+/// Persist display facts with the notice, reference and deduplication key under one lock.
+pub(crate) fn queue_notice(
+    talk: &mut Talk,
+    store: &Talks,
+    text: &str,
+    key: &str,
+    previous: &dyn Fn(&str) -> bool,
+    reference: Option<&crate::chat_notify::CompletionReference>,
+    display: crate::prompt::NoticeDisplay,
+) -> Result<bool> {
+    queue_keyed(
+        talk,
+        store,
+        text,
+        Vec::new(),
+        Some((key, reference)),
+        previous,
+        (None, Sender::Magi, Some(display)),
     )
 }
 
@@ -1617,7 +1670,7 @@ pub fn queue_magi(talk: &mut Talk, store: &Talks, text: &str) -> Result<()> {
         Vec::new(),
         None,
         &|_| false,
-        (None, Sender::Magi),
+        (None, Sender::Magi, None),
     )
     .map(|_| ())
 }
@@ -1629,7 +1682,11 @@ fn queue_keyed(
     attachments: Vec<Attachment>,
     key: Option<(&str, Option<&crate::chat_notify::CompletionReference>)>,
     previous: &dyn Fn(&str) -> bool,
-    source: (Option<ReplyTarget>, Sender),
+    source: (
+        Option<ReplyTarget>,
+        Sender,
+        Option<crate::prompt::NoticeDisplay>,
+    ),
 ) -> Result<bool> {
     // Keep Markdown indentation in owner evidence; trim only to check emptiness.
     if text.trim().is_empty() && attachments.is_empty() {
@@ -1656,12 +1713,13 @@ fn queue_keyed(
             fresh.completion_notices.push(reference.clone());
         }
     }
-    let (target, provenance) = source;
+    let (target, provenance, display) = source;
     let reply = resolve_reply(&fresh, target)?;
     if fresh.pending_messages.is_empty()
         && (!fresh.pending.is_empty() || !fresh.pending_attachments.is_empty())
     {
         fresh.pending_messages.push(Message {
+            display: None,
             sender: None,
             body: fresh.pending.clone(),
             attachments: fresh.pending_attachments.clone(),
@@ -1669,6 +1727,7 @@ fn queue_keyed(
         });
     }
     fresh.pending_messages.push(Message {
+        display,
         sender: Some(provenance),
         body: text.to_owned(),
         attachments: attachments.clone(),
@@ -2092,6 +2151,7 @@ pub fn edit_pending_message(
         }
         let reply = fresh.pending_messages.first().and_then(|m| m.reply.clone());
         fresh.pending_messages = vec![Message {
+            display: None,
             sender: Some(Sender::Operator),
             body: text.to_owned(),
             attachments: fresh.pending_attachments.clone(),
@@ -2928,6 +2988,7 @@ fn plain_messages(body: &str, breaks: Option<&[usize]>) -> Vec<Message> {
             return Vec::new();
         };
         messages.push(Message {
+            display: None,
             sender: None,
             body: text.to_owned(),
             attachments: Vec::new(),
