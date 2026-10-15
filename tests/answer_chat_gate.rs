@@ -54,6 +54,7 @@ fn fixture() -> Fixture {
     // the owner's own reply follows it. `pending` ends up empty, so the gate
     // must read the stored turns.
     let owner = |body: &str| talk::Turn {
+        sender: None,
         breaks: Some(Vec::new()),
         messages: Vec::new(),
         posted_by: None,
@@ -68,6 +69,7 @@ fn fixture() -> Fixture {
     t.turns.push(owner(&queued));
     t.turns.push(owner("merge it now"));
     t.pending.clear();
+    t.pending_messages.clear();
     t.pending_breaks = None;
     talks.put(&mut t).expect("put talk");
 

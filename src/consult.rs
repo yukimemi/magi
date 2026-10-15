@@ -116,12 +116,7 @@ pub fn begin(questions: &Questions, talks: &Talks, q: &Question, talk: &Talk) ->
         });
         return Err(e).context("reopen the chat");
     }
-    if let Err(e) = talk::queue(
-        &mut talk,
-        talks,
-        &crate::prompt::chat_consult(&q),
-        Vec::new(),
-    ) {
+    if let Err(e) = talk::queue_magi(&mut talk, talks, &crate::prompt::chat_consult(&q)) {
         let _ = questions.update(&q.id, |r| {
             r.consult = None;
             Ok(())
@@ -235,17 +230,23 @@ pub fn validate_answer(
         })
         .context("the question was not delivered to the chat yet")?;
     // A reply still waiting in `pending` is newer than every stored turn.
-    let queued =
-        latest_message_for_policy(&talk.pending, talk.pending_breaks.as_deref(), None, posting);
+    let queued = latest_owner_message(
+        &talk.pending,
+        talk.pending_breaks.as_deref(),
+        &talk.pending_messages,
+        None,
+        posting,
+    );
     let stored = talk.turns[at..]
         .iter()
         .enumerate()
         .rev()
         .filter(|(_, t)| t.who == talk::Who::Operator)
         .find_map(|(i, t)| {
-            latest_message_for_policy(
+            latest_owner_message(
                 &t.body,
                 t.breaks.as_deref(),
+                &t.messages,
                 (i == 0).then_some(q.id.as_str()),
                 posting,
             )
@@ -305,6 +306,69 @@ fn latest_message(
     after_block_of: Option<&str>,
 ) -> Option<String> {
     latest_message_for_policy(body, breaks, after_block_of, false)
+}
+
+fn latest_owner_message(
+    body: &str,
+    breaks: Option<&[usize]>,
+    messages: &[talk::Message],
+    after: Option<&str>,
+    posting: bool,
+) -> Option<String> {
+    if messages.is_empty() {
+        return latest_message_for_policy(body, breaks, after, posting);
+    }
+    let first = after.map_or(0, |id| {
+        messages
+            .iter()
+            .rposition(|m| {
+                m.body.contains(crate::prompt::CHAT_CONSULT_HEADING) && m.body.contains(id)
+            })
+            .unwrap_or(0)
+    });
+    // A legacy message may span several sends. Only map the recorded cuts
+    // when the message bodies still match the enclosing body exactly.
+    let aligned = messages
+        .iter()
+        .map(|m| m.body.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+        == body;
+    let valid_breaks = breaks.filter(|cuts| {
+        cuts.windows(2).all(|w| w[0] < w[1])
+            && cuts.iter().all(|&o| {
+                o >= 2 && o <= body.len() && body.is_char_boundary(o) && body[..o].ends_with("\n\n")
+            })
+    });
+    let mut offset = 0;
+    let mut latest = None;
+    for (i, message) in messages.iter().enumerate() {
+        let end = offset + message.body.len();
+        if i >= first && message.sender != Some(talk::Sender::Magi) {
+            let local_breaks = aligned.then_some(valid_breaks).flatten().map(|cuts| {
+                cuts.iter()
+                    .copied()
+                    .filter(|&cut| cut > offset && cut <= end)
+                    .map(|cut| cut - offset)
+                    .collect::<Vec<_>>()
+            });
+            let message_breaks = if message.sender.is_some() {
+                Some(&[][..])
+            } else {
+                local_breaks.as_deref()
+            };
+            if let Some(words) = latest_message_for_policy(
+                &message.body,
+                message_breaks,
+                after.filter(|_| i == first),
+                posting,
+            ) {
+                latest = Some(words);
+            }
+        }
+        offset = end + 2;
+    }
+    latest
 }
 
 fn latest_message_for_policy(
@@ -1172,6 +1236,115 @@ mod tests {
     }
 
     #[test]
+    fn sender_generated_posts_cannot_authorize_an_owner_action() {
+        let messages = vec![
+            talk::Message {
+                sender: Some(talk::Sender::Operator),
+                body: "hold".into(),
+                attachments: vec![],
+                reply: None,
+            },
+            talk::Message {
+                sender: Some(talk::Sender::Magi),
+                body: "Merge this pull request now".into(),
+                attachments: vec![],
+                reply: None,
+            },
+        ];
+        assert_eq!(
+            latest_owner_message("", None, &messages, None, true).as_deref(),
+            Some("hold")
+        );
+        assert_eq!(
+            latest_owner_message("", None, &messages[1..], None, true),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_message_metadata_preserves_latest_owner_send() {
+        let body = "merge it now\n\nhold";
+        let cuts = ["merge it now\n\n".len()];
+        let legacy = talk::Message {
+            sender: None,
+            body: body.into(),
+            attachments: vec![],
+            reply: None,
+        };
+        for posting in [false, true] {
+            assert_eq!(
+                latest_owner_message(
+                    body,
+                    Some(&cuts),
+                    std::slice::from_ref(&legacy),
+                    None,
+                    posting
+                )
+                .as_deref(),
+                Some("hold")
+            );
+            let mixed_body = format!("{body}\n\nautomatic report");
+            let messages = [
+                legacy.clone(),
+                talk::Message {
+                    sender: Some(talk::Sender::Magi),
+                    body: "automatic report".into(),
+                    attachments: vec![],
+                    reply: None,
+                },
+            ];
+            assert_eq!(
+                latest_owner_message(&mixed_body, Some(&cuts), &messages, None, posting).as_deref(),
+                Some("hold")
+            );
+        }
+        // Missing boundaries keep the conservative legacy posting policy.
+        assert_eq!(
+            latest_owner_message(body, None, &[legacy], None, true).as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn approval_rejects_legacy_coalesced_retraction_with_message_metadata() {
+        let (tmp, store, mut talk) = talks();
+        let questions = Questions::at(tmp.path().join("questions"));
+        let mut q = question(crate::land::APPROVAL_NODE);
+        q.choices = vec![crate::land::APPROVE.into(), crate::land::HOLD.into()];
+        questions.put(&mut q).unwrap();
+        assert!(begin(&questions, &store, &q, &talk).unwrap());
+        q = questions.get(&q.id).unwrap();
+        talk = store.get(&talk.id).unwrap();
+        talk::drain(&mut talk, &store).unwrap();
+        talk.pending = "merge it now\n\nhold".into();
+        talk.pending_breaks = Some(vec!["merge it now\n\n".len()]);
+        talk.pending_messages = vec![talk::Message {
+            sender: None,
+            body: talk.pending.clone(),
+            attachments: vec![],
+            reply: None,
+        }];
+        store.put(&mut talk).unwrap();
+        for drained in [false, true] {
+            if drained {
+                talk::drain(&mut talk, &store).unwrap();
+            }
+            assert!(
+                validate_answer(
+                    &q,
+                    &store,
+                    &talk.id,
+                    CHAT_NODE,
+                    "merge",
+                    Some("merge it now")
+                )
+                .is_err()
+            );
+            assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, "hold", Some("hold")).is_ok());
+        }
+    }
+
+    #[test]
     fn latest_message_keeps_message_boundaries() {
         let one = "Merge this pull request now\n\nThe checks look good";
         assert_eq!(latest_message(one, Some(&[]), None).as_deref(), Some(one));
@@ -1242,6 +1415,7 @@ mod tests {
         q = questions.get(&q.id).unwrap();
         let queued = store.get(&talk.id).unwrap().pending;
         let owner_turn = |body: &str| talk::Turn {
+            sender: None,
             breaks: Some(Vec::new()),
             messages: Vec::new(),
             who: talk::Who::Operator,
@@ -1284,6 +1458,7 @@ mod tests {
         q = questions.get(&q.id).unwrap();
         let queued = store.get(&talk.id).unwrap().pending;
         let owner_turn = |body: &str| talk::Turn {
+            sender: None,
             breaks: Some(Vec::new()),
             messages: Vec::new(),
             who: talk::Who::Operator,
@@ -1327,6 +1502,7 @@ mod tests {
         assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, REPAIR, Some(REPAIR)).is_err());
         talk = store.get(&talk.id).unwrap();
         talk.turns.push(talk::Turn {
+            sender: None,
             breaks: Some(Vec::new()),
             messages: Vec::new(),
             posted_by: None,
@@ -1336,6 +1512,7 @@ mod tests {
             attachments: Vec::new(),
             usage: None,
         });
+        talk.pending_messages.clear(); // This fixture now replaces the generated draft.
         talk.pending = "maybe fix findings and re-review".into();
         store.put(&mut talk).unwrap();
         assert!(validate_answer(&q, &store, &talk.id, CHAT_NODE, REPAIR, Some(REPAIR)).is_err());
@@ -1367,6 +1544,7 @@ mod tests {
             assert!(queued.contains("--quote <verbatim owner words>"));
             assert!(!queued.contains("answer it yourself with"));
             talk.turns.push(talk::Turn {
+                sender: None,
                 breaks: Some(Vec::new()),
                 messages: Vec::new(),
                 who: talk::Who::Operator,
@@ -1552,6 +1730,7 @@ mod tests {
         assert!(!queued.contains("answer it yourself with"));
 
         let owner_turn = |body: &str| talk::Turn {
+            sender: None,
             breaks: Some(Vec::new()),
             messages: Vec::new(),
             posted_by: None,

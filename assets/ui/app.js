@@ -5291,6 +5291,10 @@ function focusFirstAsk() {
    drawn as a third kind of turn. */
 const MAGI_PREFIX = "magi: ";
 function turnWho(turn) {
+  if (turn.sender === "magi") return "system";
+  if (turn.sender === "operator") return "operator";
+  if (turn.sender === "persona") return "agent";
+  if (turn.posted_by) return "system";
   if (turn.who === "agent" && String(turn.body || "").startsWith(MAGI_PREFIX)) return "system";
   return turn.who === "operator" ? "operator" : "agent";
 }
@@ -5350,7 +5354,7 @@ function updateTurnRow(row, item) {
 
   setAttr(row, "data-who", kind);
   setAvatar(r.avatar, kind === "agent" ? item.personaAvatar
-    : kind === "operator" ? item.operatorAvatar : "");
+    : kind === "operator" ? item.operatorAvatar : (item.magiAvatar || magiIconState.avatar));
   setText(r.who, kind === "operator" ? (item.operatorName || "YOU")
     : kind === "system" ? "MAGI" : (item.personaName || "AGENT"));
 
@@ -5370,7 +5374,7 @@ function updateTurnRow(row, item) {
     } else {
       r.body.append(el("p", {
         class: "turn-text",
-        text: kind === "system" ? body.slice(MAGI_PREFIX.length) : body,
+        text: kind === "system" && body.startsWith(MAGI_PREFIX) ? body.slice(MAGI_PREFIX.length) : body,
       }));
     }
   }
@@ -5411,7 +5415,7 @@ function updateTurnRow(row, item) {
   if (turn.reply) {
     const reply = turn.reply;
     r.reply.append(el("button", { class: "reply-quote", type: "button",
-      text: `${reply.who === "operator" ? (item.operatorName || "YOU") : (item.personaName || "AGENT")}: ${reply.excerpt}`,
+      text: `${reply.sender === "magi" ? "MAGI" : reply.who === "operator" ? (item.operatorName || "YOU") : (item.personaName || "AGENT")}: ${reply.excerpt}`,
       onclick: () => {
         const target = document.getElementById(`talk-message-${reply.target.turn}-${reply.target.message}`);
         if (target) {
@@ -5942,7 +5946,7 @@ function renderTalk() {
       return messages.map((message, j) => ({ turn: { ...turn, ...message }, md: turnsMd[i], key: `${i}-${j}`, conversationId: talk.id,
         replyTarget: i < talkTurns(talk).length ? { turn: i, message: j } : null,
         operatorName: talk.operator_name, operatorAvatar: talk.operator_avatar,
-        personaName: talk.persona_name, personaAvatar: talk.persona_avatar }));
+        magiAvatar: talk.magi_avatar, personaName: talk.persona_name, personaAvatar: talk.persona_avatar }));
     }),
     (item) => item.key, createTurnRow, updateTurnRow,
   );
@@ -6192,10 +6196,13 @@ function renderTalkPending(talk) {
     !(talk.pending_messages && talk.pending_messages.length) ? el("button", { class: "btn btn-quiet", type: "button", text: "Edit text", onclick: editTalkPending }) : null,
   ]);
   (talk.pending_messages || []).forEach((message, index) => {
-    box.append(el("div", { class: "queued-message" },
-      message.reply ? el("p", { class: "reply-quote", text: `Reply to ${message.reply.who}: ${message.reply.excerpt}` }) : null,
+    const avatar = avatarImg("turn-avatar");
+    setAvatar(avatar, message.sender === "magi" ? (talk.magi_avatar || magiIconState.avatar) : talk.operator_avatar);
+    box.append(el("div", { class: `queued-message${message.sender === "magi" ? " magi-pending" : ""}` }, avatar,
+      message.reply ? el("p", { class: "reply-quote", text: `Reply to ${message.reply.sender === "magi" ? "MAGI" : message.reply.who}: ${message.reply.excerpt}` }) : null,
+      el("strong", { text: message.sender === "magi" ? "MAGI" : (talk.operator_name || "YOU") }),
       el("p", { class: "turn-text", text: message.body || `${message.attachments.length} attachment(s)` }),
-      el("button", { class: "btn btn-quiet", type: "button", text: "Edit text", onclick: () => editTalkPending(index) })));
+      message.sender !== "magi" ? el("button", { class: "btn btn-quiet", type: "button", text: "Edit text", onclick: () => editTalkPending(index) }) : null));
   });
 }
 
@@ -9663,6 +9670,7 @@ async function putJson(url, body) {
 const settingsUrl = (url) => settingsState.repo ? `${url}?repo=${encodeURIComponent(settingsState.repo)}` : url;
 
 async function loadSettings() {
+  getJson("/api/magi-icon").then((value) => { magiIconState.avatar = value.avatar; renderSettings(); }).catch(() => {});
   if (settingsState.busy) return;
   const sequence = ++settingsState.request;
   settingsState.loading = true;
@@ -9860,6 +9868,67 @@ function renderSettingsRole(d, role) {
     seats && el("p", { class: "set-meta", text: seats }));
 }
 
+// Kept separately so repository switches and failed saves retain the selection.
+const magiIconState = { avatar: "", draft: "", busy: false, message: "" };
+
+async function chooseMagiIcon(file) {
+  if (!file || magiIconState.busy) return;
+  magiIconState.busy = true;
+  magiIconState.message = "Preparing preview…";
+  renderSettings();
+  let url;
+  try {
+    if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(file.type)) throw new Error("Choose a PNG, JPEG, GIF or WebP image.");
+    url = URL.createObjectURL(file);
+    const image = new Image();
+    image.src = url;
+    await image.decode();
+    const canvas = document.createElement("canvas");
+    let icon;
+    for (let edge = 384; edge >= 48; edge = Math.floor(edge * 0.75)) {
+      const scale = Math.min(1, edge / Math.max(image.width, image.height));
+      canvas.width = Math.max(1, Math.round(image.width * scale));
+      canvas.height = Math.max(1, Math.round(image.height * scale));
+      canvas.getContext("2d").drawImage(image, 0, 0, canvas.width, canvas.height);
+      icon = canvas.toDataURL("image/png");
+      if (icon.length <= 256 * 1024) break;
+    }
+    if (icon.length > 256 * 1024) throw new Error("The resized image exceeds 256 KiB. Choose a simpler image.");
+    magiIconState.draft = icon;
+    magiIconState.message = "Preview ready. Save to apply.";
+  } catch (error) { magiIconState.message = error.message; }
+  finally { if (url) URL.revokeObjectURL(url); magiIconState.busy = false; renderSettings(); }
+}
+
+async function saveMagiIcon(reset = false) {
+  magiIconState.busy = true;
+  renderSettings();
+  try {
+    const result = reset
+      ? await request("/api/magi-icon", { method: "DELETE" }).then((r) => r.json())
+      : await putJson("/api/magi-icon", { icon: magiIconState.draft });
+    magiIconState.avatar = result.avatar;
+    magiIconState.draft = "";
+    magiIconState.message = reset ? "Built-in MAGI icon restored." : "MAGI icon saved.";
+    if (state.talkDetail.talk) { state.talkDetail.talk.magi_avatar = result.avatar; renderTalk(); }
+  } catch (error) { magiIconState.message = `Could not save: ${error.message}`; }
+  finally { magiIconState.busy = false; renderSettings(); }
+}
+
+function renderMagiIconSettings() {
+  const picker = el("input", { type: "file", accept: "image/png,image/jpeg,image/gif,image/webp", "aria-label": "Choose MAGI icon", disabled: magiIconState.busy });
+  picker.addEventListener("change", () => chooseMagiIcon(picker.files[0]));
+  return el("section", { class: "panel magi-icon-settings" },
+    el("h2", { text: "MAGI sender icon" }),
+    el("p", { text: "Used for automatic messages in every conversation. Choose an image, preview it, then save. Images are resized; maximum 256 KiB." }),
+    el("img", { class: "magi-icon-preview", src: magiIconState.draft || magiIconState.avatar || "/avatars/magi?v=default", alt: "MAGI icon preview" }),
+    picker,
+    el("div", { class: "set-actions" },
+      el("button", { class: "btn btn-gold", type: "button", text: "Save MAGI icon", disabled: !magiIconState.draft || magiIconState.busy, onclick: () => saveMagiIcon() }),
+      el("button", { class: "btn btn-quiet", type: "button", text: "Reset to built-in", disabled: magiIconState.busy, onclick: () => saveMagiIcon(true) })),
+    el("p", { role: "status", text: magiIconState.message }));
+}
+
 function renderSettings() {
   renderSettingsContext();
   const d = settingsState.data;
@@ -9868,6 +9937,7 @@ function renderSettings() {
   const banner = $("settings-error");
   const msg = settingsState.message;
   if (!d) {
+    body.append(renderMagiIconSettings());
     setText($("settings-sub"), settingsState.loading ? "Loading…" : `As seen from ${settingsState.repo || "the default repository"}`);
     setText($("settings-error-text"), msg ? msg.text : "Settings could not be loaded.");
     show(banner, !settingsState.loading);
@@ -9876,8 +9946,9 @@ function renderSettings() {
   setText($("settings-sub"), `As seen from ${d.repo}`);
   if (settingsState.loading) return;
   if (d.error) {
+    body.append(renderMagiIconSettings());
     setText($("settings-error-text"),
-      `The config does not load, so nothing is shown and nothing can be edited: ${d.error.message}${d.error.path ? ` (${d.error.path})` : ""}`);
+      `The repository config could not be loaded: ${d.error.message}${d.error.path ? ` (${d.error.path})` : ""}`);
     show(banner, true);
     return;
   }
@@ -9889,6 +9960,7 @@ function renderSettings() {
   }
   const dirty = settingsDirty();
   body.append(
+    renderMagiIconSettings(),
     el("p", { class: "set-note", text: "A change applies to runs started after it is saved. Runs already in flight keep the settings they started with." }),
     ...d.roles.map((r) => renderSettingsRole(d, r)),
     el("div", { class: "set-actions" },

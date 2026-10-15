@@ -74,6 +74,7 @@ async fn a_finished_task_is_reported_once_however_often_it_is_swept() {
     assert_eq!(first, vec![w.talk_id.clone()]);
     let draft = drafts(&w);
     let saved = w.talks.get(&w.talk_id).expect("saved talk");
+    assert_eq!(saved.pending_messages[0].sender, Some(talk::Sender::Magi));
     assert_eq!(saved.completion_notices.len(), 1);
     let reference = &saved.completion_notices[0];
     assert_eq!(reference.task, t.id);
@@ -335,6 +336,85 @@ async fn a_notice_appended_to_an_operators_draft_is_not_started() {
     assert!(chat_notify::talks_to_start(&w.talks).is_empty());
 }
 
+#[tokio::test]
+async fn legacy_notices_resume_after_new_task_or_watch_notices_arrive() {
+    let _home = common::home_lock().await;
+    for (watch, combined) in [(false, false), (true, false), (false, true), (true, true)] {
+        for owner_after_notice in [None, Some(false), Some(true)] {
+            let w = world();
+            finished_task(&w, &w.talk_id, "20260902-000000-aaaa");
+            chat_notify::sweep(&w.queue, &w.talks, w.tmp.path());
+            let mut legacy = w.talks.get(&w.talk_id).expect("legacy draft");
+            if let Some(after) = owner_after_notice {
+                let owner = "unfinished operator thought";
+                if after {
+                    let start = legacy.pending.len() + 2;
+                    legacy.pending.push_str("\n\n");
+                    legacy.pending.push_str(owner);
+                    legacy.pending_breaks = Some(vec![start]);
+                } else {
+                    let prefix = format!("{owner}\n\n");
+                    legacy.pending.insert_str(0, &prefix);
+                    legacy.pending_breaks = Some(vec![prefix.len()]);
+                }
+            }
+            if combined {
+                // Legacy metadata can combine sends even though breaks still
+                // records their boundaries. Preserve that wire shape directly
+                // instead of using the current metadata compaction in put.
+                legacy.pending_messages = vec![talk::Message {
+                    sender: None,
+                    body: legacy.pending.clone(),
+                    attachments: Vec::new(),
+                    reply: None,
+                }];
+                std::fs::write(
+                    w.talks.path_of(&legacy.id),
+                    serde_json::to_vec(&legacy).unwrap(),
+                )
+                .expect("save combined legacy format");
+            } else {
+                legacy.pending_messages.clear();
+                w.talks.put(&mut legacy).expect("save plain legacy format");
+            }
+            let talks = Talks::at(w.tmp.path().join("talks"));
+            assert!(
+                talks
+                    .get(&w.talk_id)
+                    .unwrap()
+                    .pending_messages
+                    .iter()
+                    .all(|m| m.sender.is_none())
+            );
+
+            if watch {
+                let mut talk = talks.get(&w.talk_id).unwrap();
+                let report = magi::prompt::chat_watch_notice("job", "finished", "output");
+                talk::queue_once(&mut talk, &talks, &report, "watch:job:finished").unwrap();
+            } else {
+                finished_task(&w, &w.talk_id, "20260902-000000-bbbb");
+                chat_notify::sweep(&w.queue, &talks, w.tmp.path());
+            }
+            let talks = Talks::at(w.tmp.path().join("talks"));
+            let mut mixed = talks.get(&w.talk_id).unwrap();
+            assert_eq!(mixed.pending_messages[0].sender, None);
+            assert_eq!(
+                mixed.pending_messages.last().unwrap().sender,
+                Some(talk::Sender::Magi)
+            );
+            assert_eq!(
+                chat_notify::talks_to_start(&talks).contains(&w.talk_id),
+                owner_after_notice.is_none()
+            );
+
+            // Explicit operator provenance wins even when the text is a notice.
+            let notice = mixed.pending_messages.last().unwrap().body.clone();
+            talk::queue(&mut mixed, &talks, &notice, Vec::new()).unwrap();
+            assert!(chat_notify::talks_to_start(&talks).is_empty());
+        }
+    }
+}
+
 #[cfg(unix)]
 fn watch(w: &World, timeout: u64, command: &[&str], node: &str) -> Output {
     Command::new(env!("CARGO_BIN_EXE_magi"))
@@ -413,6 +493,10 @@ async fn watch_reports_once_after_reload_and_preserves_cwd_arguments_and_environ
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let draft = drafts(&w);
+    assert_eq!(
+        w.talks.get(&w.talk_id).unwrap().pending_messages[0].sender,
+        Some(talk::Sender::Magi)
+    );
     assert!(draft.contains("literal; $argument"));
     assert!(draft.contains("stderr-tail"));
     assert_eq!(

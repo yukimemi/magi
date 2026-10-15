@@ -95,6 +95,36 @@ pub enum Who {
     Agent,
 }
 
+/// Display provenance, independent of the CLI conversation role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Sender {
+    /// A real operator send.
+    Operator,
+    /// A reply from the conversation persona.
+    Persona,
+    /// A post injected by magi.
+    Magi,
+}
+
+/// Resolve old records conservatively; operator prose is never classified by text.
+pub fn sender(turn: &Turn, message: Option<&Message>) -> Sender {
+    message
+        .and_then(|m| m.sender)
+        .or(turn.sender)
+        .unwrap_or_else(|| {
+            if turn.posted_by.is_some()
+                || (turn.who == Who::Agent && turn.body.starts_with(MAGI_NOTE))
+            {
+                Sender::Magi
+            } else if turn.who == Who::Operator {
+                Sender::Operator
+            } else {
+                Sender::Persona
+            }
+        })
+}
+
 /// One image the operator attached to a turn.
 ///
 /// Never carries the bytes themselves: the picture lives on disk under
@@ -129,6 +159,9 @@ pub struct ReplyTarget {
 /// Server-generated, bounded snapshot; never recursively quotes replies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reply {
+    /// Display provenance; absent in legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<Sender>,
     /// Original message location.
     pub target: ReplyTarget,
     /// Original speaker.
@@ -140,6 +173,9 @@ pub struct Reply {
 /// One accepted send, retained even when the queue combines multiple sends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Message {
+    /// Display provenance; absent in legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<Sender>,
     /// Unmodified message text.
     pub body: String,
     /// Images belonging to this send.
@@ -174,6 +210,7 @@ fn resolve_reply(talk: &Talk, target: Option<ReplyTarget>) -> Result<Option<Repl
         body.chars().take(240).collect()
     };
     Ok(Some(Reply {
+        sender: Some(sender(turn, turn.messages.get(target.message))),
         target,
         who: turn.who,
         excerpt,
@@ -190,8 +227,12 @@ fn message_prompt(turn: &Turn, talk: &Talk, store: &Talks) -> String {
         .map(|message| match &message.reply {
             Some(reply) => {
                 let mut quote = format!(
-                    "[Reply to {:?}: {}]",
-                    reply.who,
+                    "[Reply to {}: {}]",
+                    if reply.sender == Some(Sender::Magi) {
+                        "MAGI".to_owned()
+                    } else {
+                        format!("{:?}", reply.who)
+                    },
                     reply.excerpt.lines().collect::<Vec<_>>().join(" "),
                 );
                 if let Some(target) = talk.turns.get(reply.target.turn) {
@@ -220,18 +261,20 @@ fn message_prompt(turn: &Turn, talk: &Talk, store: &Talks) -> String {
         .join("\n\n")
 }
 
-/// Plain text sends already have lossless boundaries in `breaks`. Keep the
-/// old wire format unless per-send replies or attachment ownership need metadata.
+/// Only legacy plain sends can omit metadata; explicit provenance is durable.
 fn messages_need_no_metadata(messages: &[Message]) -> bool {
-    messages
-        .iter()
-        .all(|message| message.reply.is_none() && message.attachments.is_empty())
+    messages.iter().all(|message| {
+        message.sender.is_none() && message.reply.is_none() && message.attachments.is_empty()
+    })
 }
 
 /// One message in the conversation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Turn {
+    /// Display provenance; absent in legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<Sender>,
     /// Who wrote it.
     pub who: Who,
     /// What they said.
@@ -710,8 +753,8 @@ impl Talks {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
         t.updated_at = Timestamp::now();
-        // Keep ordinary text conversations readable by older strict readers.
-        // The API retains messages; disk can recover them losslessly from breaks.
+        // Legacy plain messages can still be recovered losslessly from breaks.
+        // Explicit provenance must remain on disk, even without attachments.
         let mut persisted = t.clone();
         for turn in &mut persisted.turns {
             if turn.attachments.is_empty() && messages_need_no_metadata(&turn.messages) {
@@ -1487,10 +1530,12 @@ pub fn record_reply(
         bail!("nothing to say");
     }
     talk.turns.push(Turn {
+        sender: Some(Sender::Operator),
         who: Who::Operator,
         body: text.to_owned(),
         at: Timestamp::now(),
         messages: vec![Message {
+            sender: Some(Sender::Operator),
             body: text.to_owned(),
             attachments: attachments.clone(),
             reply,
@@ -1522,7 +1567,16 @@ pub fn queue_reply(
     attachments: Vec<Attachment>,
     target: Option<ReplyTarget>,
 ) -> Result<()> {
-    queue_keyed(talk, store, text, attachments, None, &|_| false, target).map(|_| ())
+    queue_keyed(
+        talk,
+        store,
+        text,
+        attachments,
+        None,
+        &|_| false,
+        (target, Sender::Operator),
+    )
+    .map(|_| ())
 }
 
 /// [`queue`] for a message that must be accepted at most once: `key` is
@@ -1550,8 +1604,22 @@ pub(crate) fn queue_once_matching(
         Vec::new(),
         Some((key, reference)),
         previous,
-        None,
+        (None, Sender::Magi),
     )
+}
+
+/// Queue an injected message without changing its input role or lease handling.
+pub fn queue_magi(talk: &mut Talk, store: &Talks, text: &str) -> Result<()> {
+    queue_keyed(
+        talk,
+        store,
+        text,
+        Vec::new(),
+        None,
+        &|_| false,
+        (None, Sender::Magi),
+    )
+    .map(|_| ())
 }
 
 fn queue_keyed(
@@ -1561,7 +1629,7 @@ fn queue_keyed(
     attachments: Vec<Attachment>,
     key: Option<(&str, Option<&crate::chat_notify::CompletionReference>)>,
     previous: &dyn Fn(&str) -> bool,
-    target: Option<ReplyTarget>,
+    source: (Option<ReplyTarget>, Sender),
 ) -> Result<bool> {
     // Keep Markdown indentation in owner evidence; trim only to check emptiness.
     if text.trim().is_empty() && attachments.is_empty() {
@@ -1588,17 +1656,20 @@ fn queue_keyed(
             fresh.completion_notices.push(reference.clone());
         }
     }
+    let (target, provenance) = source;
     let reply = resolve_reply(&fresh, target)?;
     if fresh.pending_messages.is_empty()
         && (!fresh.pending.is_empty() || !fresh.pending_attachments.is_empty())
     {
         fresh.pending_messages.push(Message {
+            sender: None,
             body: fresh.pending.clone(),
             attachments: fresh.pending_attachments.clone(),
             reply: None,
         });
     }
     fresh.pending_messages.push(Message {
+        sender: Some(provenance),
         body: text.to_owned(),
         attachments: attachments.clone(),
         reply,
@@ -1641,6 +1712,7 @@ pub fn post(store: &Talks, talk_id: &str, body: &str, by: &str) -> Result<()> {
         );
     }
     fresh.turns.push(Turn {
+        sender: Some(Sender::Magi),
         who: Who::Agent,
         body: body.to_owned(),
         at: Timestamp::now(),
@@ -1700,6 +1772,7 @@ pub fn drain(talk: &mut Talk, store: &Talks) -> Result<Option<String>> {
     let breaks = fresh.pending_breaks.take();
     let messages = std::mem::take(&mut fresh.pending_messages);
     fresh.turns.push(Turn {
+        sender: Some(Sender::Operator),
         who: Who::Operator,
         body: text.clone(),
         at: Timestamp::now(),
@@ -1840,6 +1913,7 @@ pub fn switch_agent(talk: &mut Talk, store: &Talks, spec: &AgentSpec) -> Result<
     // A deliberate switch pins the conversation to the agent chosen.
     fresh.fallback = false;
     fresh.turns.push(Turn {
+        sender: Some(Sender::Magi),
         breaks: None,
         messages: Vec::new(),
         posted_by: None,
@@ -1885,6 +1959,7 @@ pub fn switch_persona(talk: &mut Talk, store: &Talks, id: &str) -> Result<bool> 
         }
     };
     fresh.turns.push(Turn {
+        sender: Some(Sender::Magi),
         breaks: None,
         messages: Vec::new(),
         posted_by: None,
@@ -1972,6 +2047,14 @@ pub fn edit_pending_message(
         *talk = fresh;
         return Ok(false);
     }
+    if fresh
+        .pending_messages
+        .iter()
+        .enumerate()
+        .any(|(i, m)| m.sender == Some(Sender::Magi) && message.is_none_or(|index| index == i))
+    {
+        bail!("MAGI messages cannot be edited");
+    }
     if let Some(index) = message {
         let edited = fresh
             .pending_messages
@@ -2009,6 +2092,7 @@ pub fn edit_pending_message(
         }
         let reply = fresh.pending_messages.first().and_then(|m| m.reply.clone());
         fresh.pending_messages = vec![Message {
+            sender: Some(Sender::Operator),
             body: text.to_owned(),
             attachments: fresh.pending_attachments.clone(),
             reply,
@@ -2295,6 +2379,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     }
     let outcome = outcome.expect("a chain holds at least one agent");
     let note = |why: String| Turn {
+        sender: Some(Sender::Magi),
         breaks: None,
         messages: Vec::new(),
         posted_by: None,
@@ -2341,6 +2426,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         }
         Ok(out) => (
             Turn {
+                sender: Some(Sender::Persona),
                 breaks: None,
                 messages: Vec::new(),
                 posted_by: None,
@@ -2648,6 +2734,7 @@ pub fn switch_implementers(talk: &mut Talk, store: &Talks, n: u8) -> Result<bool
     let from = std::mem::replace(&mut fresh.implementers, n);
     fresh.implementers_dirty = true;
     fresh.turns.push(Turn {
+        sender: Some(Sender::Magi),
         breaks: None,
         messages: Vec::new(),
         posted_by: None,
@@ -2841,6 +2928,7 @@ fn plain_messages(body: &str, breaks: Option<&[usize]>) -> Vec<Message> {
             return Vec::new();
         };
         messages.push(Message {
+            sender: None,
             body: text.to_owned(),
             attachments: Vec::new(),
             reply: None,
@@ -3055,6 +3143,7 @@ mod tests {
 
     fn reply(body: &str, usage: Option<(u64, &str, Option<&str>)>) -> Turn {
         Turn {
+            sender: None,
             breaks: None,
             messages: Vec::new(),
             posted_by: None,
@@ -3136,6 +3225,7 @@ mod tests {
         let mut t = ctx_talk("small", vec![reply("abcdefg", None)]);
         assert_eq!(estimate_context_tokens(&t, 0), Some(2)); // 7 chars -> 2
         let op = Turn {
+            sender: None,
             who: Who::Operator,
             ..reply("abcdefg", None)
         };
@@ -3683,7 +3773,7 @@ mod tests {
     }
 
     #[test]
-    fn reply_plain_text_sends_keep_the_old_wire_format() {
+    fn reply_plain_text_sends_keep_provenance_and_boundaries() {
         let (tmp, talks) = store();
         let cfg = config(mock_agent(tmp.path(), REPLY, env("reply")));
         let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
@@ -3693,8 +3783,8 @@ mod tests {
         let wire: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(talks.path_of(&talk.id)).unwrap())
                 .unwrap();
-        assert!(wire.get("pending_messages").is_none());
-        assert!(wire["turns"][0].get("messages").is_none());
+        assert_eq!(wire["pending_messages"][0]["sender"], "operator");
+        assert_eq!(wire["turns"][0]["messages"][0]["sender"], "operator");
         drain(&mut talk, &talks).expect("drain");
         let saved = talks.get(&talk.id).expect("reload");
         assert_eq!(saved.turns[1].body, "first\n\nsecond");
@@ -3702,7 +3792,7 @@ mod tests {
         let wire: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(talks.path_of(&saved.id)).unwrap())
                 .unwrap();
-        // This is the full field set accepted by origin/main's strict Turn reader.
+        // Explicit provenance and send boundaries survive disk storage.
         for turn in wire["turns"].as_array().expect("turns") {
             for field in turn.as_object().expect("turn").keys() {
                 assert!(
@@ -3713,10 +3803,12 @@ mod tests {
                         "attachments",
                         "usage",
                         "breaks",
-                        "posted_by"
+                        "posted_by",
+                        "sender",
+                        "messages"
                     ]
                     .contains(&field.as_str()),
-                    "unknown field for old readers: {field}"
+                    "unknown turn field: {field}"
                 );
             }
         }
@@ -5618,5 +5710,55 @@ mod tests {
         drain(&mut talk, &talks).expect("drain");
         assert!(!queue_once(&mut talk, &talks, "one", "k").expect("again"));
         assert!(talks.get(&talk.id).expect("get").pending.is_empty());
+    }
+    #[test]
+    fn sender_mixed_notifications_survive_reload_drain_and_reply() {
+        let (_tmp, talks) = store();
+        let mut talk = ctx_talk("mock", Vec::new());
+        talks.put(&mut talk).unwrap();
+        queue(&mut talk, &talks, "owner", Vec::new()).unwrap();
+        assert!(queue_once(&mut talk, &talks, "notice", "n").unwrap());
+        let mut talk = talks.get(&talk.id).unwrap();
+        assert_eq!(talk.pending_messages[0].sender, Some(Sender::Operator));
+        assert_eq!(talk.pending_messages[1].sender, Some(Sender::Magi));
+        assert!(
+            edit_pending_message(&mut talk, &talks, "forged", "owner\n\nnotice", &[], Some(1))
+                .is_err()
+        );
+        drain(&mut talk, &talks).unwrap();
+        let mut talk = talks.get(&talk.id).unwrap();
+        let turn = talk.turns.last().unwrap();
+        assert_eq!(turn.who, Who::Operator);
+        assert_eq!(sender(turn, turn.messages.first()), Sender::Operator);
+        assert_eq!(sender(turn, turn.messages.get(1)), Sender::Magi);
+        let reply = resolve_reply(
+            &talk,
+            Some(ReplyTarget {
+                turn: 0,
+                message: 1,
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(reply.sender, Some(Sender::Magi));
+        assert!(!queue_once(&mut talk, &talks, "notice", "n").unwrap());
+    }
+
+    #[test]
+    fn sender_legacy_operator_prose_is_never_migrated_by_heading() {
+        let mut turn = reply("# Task finished\n\nmagi: operator typed this", None);
+        turn.who = Who::Operator;
+        assert_eq!(sender(&turn, None), Sender::Operator);
+        turn.who = Who::Agent;
+        turn.body = "magi: failed".into();
+        assert_eq!(sender(&turn, None), Sender::Magi);
+        turn.body = "persona reply".into();
+        assert_eq!(sender(&turn, None), Sender::Persona);
+        turn.posted_by = Some("task".into());
+        assert_eq!(sender(&turn, None), Sender::Magi);
+        turn.posted_by = None;
+        turn.body = "magi: actual persona words".into();
+        turn.sender = Some(Sender::Persona);
+        assert_eq!(sender(&turn, None), Sender::Persona);
     }
 }

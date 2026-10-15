@@ -974,6 +974,13 @@ impl Ui {
             )
             .route("/api/talks/{id}/avatar", get(talk_avatar))
             .route("/avatars/operator.svg", get(operator_avatar))
+            .route("/avatars/magi", get(magi_avatar))
+            .route(
+                "/api/magi-icon",
+                get(magi_icon_get)
+                    .put(magi_icon_put)
+                    .delete(magi_icon_delete),
+            )
             .route("/api/events", get(events))
             .with_state(Arc::new(self))
     }
@@ -6997,19 +7004,56 @@ struct TalkView {
     persona_avatar: String,
     /// Fixed operator avatar; display only and independent of repository config.
     operator_avatar: String,
+    magi_avatar: String,
 }
 
 impl TalkView {
     /// Reads the talk's repository config itself; a config that cannot be
     /// read leaves the window unknown but never fails the conversation.
-    fn new(talk: Talk, thinking: bool) -> Self {
+    fn new(talk: Talk, thinking: bool, home: &FsPath) -> Self {
         let cfg = Config::discover(&talk.repo, None).ok().map(|(cfg, _)| cfg);
-        Self::with_config(talk, thinking, cfg.as_ref())
+        Self::with_config(talk, thinking, cfg.as_ref(), home)
     }
 
     /// As [`Self::new`], with the config already in hand (the list reads one
     /// per repository, not one per conversation).
-    fn with_config(talk: Talk, thinking: bool, cfg: Option<&Config>) -> Self {
+    fn with_config(mut talk: Talk, thinking: bool, cfg: Option<&Config>, home: &FsPath) -> Self {
+        for turn in &mut talk.turns {
+            let provenance = talk::sender(turn, None);
+            turn.sender = Some(provenance);
+            for message in &mut turn.messages {
+                message.sender = Some(message.sender.unwrap_or(provenance));
+            }
+        }
+        // Old reply snapshots have only a role; recover provenance from their target.
+        let senders: Vec<Vec<talk::Sender>> = talk
+            .turns
+            .iter()
+            .map(|turn| {
+                if turn.messages.is_empty() {
+                    vec![talk::sender(turn, None)]
+                } else {
+                    turn.messages
+                        .iter()
+                        .map(|m| talk::sender(turn, Some(m)))
+                        .collect()
+                }
+            })
+            .collect();
+        for reply in talk
+            .turns
+            .iter_mut()
+            .flat_map(|t| t.messages.iter_mut())
+            .chain(talk.pending_messages.iter_mut())
+            .filter_map(|m| m.reply.as_mut())
+        {
+            if reply.sender.is_none() {
+                reply.sender = senders
+                    .get(reply.target.turn)
+                    .and_then(|messages| messages.get(reply.target.message))
+                    .copied();
+            }
+        }
         let context = talk::context_usage(&talk, cfg);
         let turn_bodies_md = talk
             .turns
@@ -7033,6 +7077,7 @@ impl TalkView {
             operator_name,
             persona_name,
             persona_avatar,
+            magi_avatar: magi_icon_url(home),
             operator_avatar: format!(
                 "/avatars/operator.svg?v={}",
                 persona_icon::fingerprint(Some(persona_icon::operator_svg()))
@@ -7097,7 +7142,7 @@ async fn talks_list(
                     let cfg = configs
                         .entry(talk.repo.clone())
                         .or_insert_with(|| Config::discover(&talk.repo, None).ok().map(|(c, _)| c));
-                    TalkView::with_config(talk, thinking, cfg.as_ref())
+                    TalkView::with_config(talk, thinking, cfg.as_ref(), &ui.home)
                 })
                 .collect(),
         ))
@@ -7154,7 +7199,7 @@ async fn talk_post(
         };
         let talk = talk::begin_with(&ui.talks, &cfg, repo, body.agent.as_deref(), &preferred)?;
         let thinking = ui.is_thinking(&talk.id);
-        Ok(TalkView::new(talk, thinking))
+        Ok(TalkView::new(talk, thinking, &ui.home))
     })
     .await?;
     Ok((StatusCode::CREATED, Json(view)))
@@ -7200,7 +7245,7 @@ async fn talk_detail(
             })
             .collect();
         Ok(Json(TalkDetailView {
-            view: TalkView::with_config(talk, thinking, cfg.as_ref()),
+            view: TalkView::with_config(talk, thinking, cfg.as_ref(), &ui.home),
             tasks,
             roster,
             personas,
@@ -7410,7 +7455,7 @@ async fn talk_say(
                                 None => None,
                             };
                             let thinking = ui.is_thinking(&id);
-                            Ok((TalkView::new(talk, thinking), claim))
+                            Ok((TalkView::new(talk, thinking, &ui.home), claim))
                         }
                     })
                     .await;
@@ -7539,7 +7584,10 @@ async fn talk_say(
         .map_err(|_| ApiError::internal("the talk turn task ended without answering"))??;
 
     // 202: the operator's message is recorded and a turn is running.
-    Ok((StatusCode::ACCEPTED, Json(TalkView::new(queued, thinking))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(TalkView::new(queued, thinking, &ui.home)),
+    ))
 }
 
 /// `POST /api/talks/{id}/pending/resume` promotes a persisted draft without
@@ -7579,7 +7627,7 @@ async fn talk_pending_resume(
         })
         .await?
     };
-    let view = TalkView::new(talk.clone(), true);
+    let view = TalkView::new(talk.clone(), true, &ui.home);
     let talks = ui.talks.clone();
     tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
     Ok((StatusCode::ACCEPTED, Json(view)))
@@ -7786,7 +7834,7 @@ async fn talk_pending_clear(
             ));
         }
         let thinking = ui.is_thinking(&talk.id);
-        Ok(Json(TalkView::new(talk, thinking)))
+        Ok(Json(TalkView::new(talk, thinking, &ui.home)))
     })
     .await
 }
@@ -7832,7 +7880,7 @@ async fn talk_pending_edit(
                 None => None,
             };
             let thinking = ui.is_thinking(&id);
-            Ok((TalkView::new(talk, thinking), claim))
+            Ok((TalkView::new(talk, thinking, &ui.home), claim))
         }
     })
     .await?;
@@ -7935,7 +7983,7 @@ async fn talk_agent(
         Err(_) => false,
     };
     let talk = switched?;
-    Ok(Json(TalkView::new(talk, draining)))
+    Ok(Json(TalkView::new(talk, draining, &ui.home)))
 }
 
 /// The body of `POST /api/talks/{id}/persona`.
@@ -8019,7 +8067,7 @@ async fn talk_persona(
         Err(_) => false,
     };
     let talk = switched?;
-    Ok(Json(TalkView::new(talk, draining)))
+    Ok(Json(TalkView::new(talk, draining, &ui.home)))
 }
 
 /// The body of `POST /api/talks/{id}/implementers`.
@@ -8100,7 +8148,7 @@ async fn talk_implementers(
         Err(_) => false,
     };
     let talk = switched?;
-    Ok(Json(TalkView::new(talk, draining)))
+    Ok(Json(TalkView::new(talk, draining, &ui.home)))
 }
 
 /// `POST /api/talks/{id}/close`.
@@ -8113,7 +8161,7 @@ async fn talk_close(
         let mut talk = ui.talks.get(&id)?;
         talk::close(&mut talk, &ui.talks)?;
         let thinking = ui.is_thinking(&talk.id);
-        Ok(Json(TalkView::new(talk, thinking)))
+        Ok(Json(TalkView::new(talk, thinking, &ui.home)))
     })
     .await
 }
@@ -8128,7 +8176,7 @@ async fn talk_reopen(
         let mut talk = ui.talks.get(&id)?;
         talk::reopen(&mut talk, &ui.talks)?;
         let thinking = ui.is_thinking(&talk.id);
-        Ok(Json(TalkView::new(talk, thinking)))
+        Ok(Json(TalkView::new(talk, thinking, &ui.home)))
     })
     .await
 }
@@ -8239,6 +8287,123 @@ fn svg_avatar(svg: &'static str) -> Response {
         svg,
     )
         .into_response()
+}
+
+// The global MAGI icon is deliberately independent of repository configuration.
+fn magi_icon_path(home: &FsPath) -> PathBuf {
+    home.join("magi-icon.data")
+}
+
+fn read_magi_icon(home: &FsPath) -> Option<String> {
+    let path = magi_icon_path(home);
+    let metadata = std::fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > persona_icon::ICON_MAX_BYTES as u64 {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    use std::io::Read;
+    let mut text = String::new();
+    file.take(persona_icon::ICON_MAX_BYTES as u64 + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    if text.len() > persona_icon::ICON_MAX_BYTES {
+        return None;
+    }
+    text.starts_with("data:").then_some(text)
+}
+
+fn magi_icon_url(home: &FsPath) -> String {
+    format!(
+        "/avatars/magi?v={}",
+        persona_icon::fingerprint(read_magi_icon(home).as_deref())
+    )
+}
+
+async fn magi_icon_get(State(ui): State<Arc<Ui>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({"avatar": magi_icon_url(&ui.home)}))
+}
+
+#[derive(Deserialize)]
+struct MagiIconUpload {
+    icon: String,
+}
+
+fn save_magi_icon(home: &FsPath, icon: &str) -> Result<()> {
+    if !icon.starts_with("data:") {
+        anyhow::bail!("upload a raster image");
+    }
+    let (mime, bytes) = persona_icon::load(icon)?;
+    if sniffed_mime(&bytes) != Some(mime) {
+        anyhow::bail!("image content does not match its type");
+    }
+    std::fs::create_dir_all(home)?;
+    let token = crate::rng::SplitMix64::new(crate::rng::entropy()).uuid_v4();
+    let temp = home.join(format!(".magi-icon-{token}.tmp"));
+    let result = (|| -> Result<()> {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(icon.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temp, magi_icon_path(home))?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(temp);
+    result?;
+    Ok(())
+}
+
+async fn magi_icon_put(
+    State(ui): State<Arc<Ui>>,
+    Json(upload): Json<MagiIconUpload>,
+) -> ApiResult<Json<serde_json::Value>> {
+    blocking(move || {
+        if !upload.icon.starts_with("data:") {
+            return Err(ApiError::bad_request("upload a raster image"));
+        }
+        let (mime, bytes) = persona_icon::load(&upload.icon).map_err(ApiError::bad_request_from)?;
+        if sniffed_mime(&bytes) != Some(mime) {
+            return Err(ApiError::bad_request(
+                "image content does not match its type",
+            ));
+        }
+        save_magi_icon(&ui.home, &upload.icon)?;
+        Ok(Json(serde_json::json!({"avatar": magi_icon_url(&ui.home)})))
+    })
+    .await
+}
+
+async fn magi_icon_delete(State(ui): State<Arc<Ui>>) -> ApiResult<Json<serde_json::Value>> {
+    blocking(move || {
+        match std::fs::remove_file(magi_icon_path(&ui.home)) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(anyhow::Error::from(e).into()),
+        }
+        Ok(Json(serde_json::json!({"avatar": magi_icon_url(&ui.home)})))
+    })
+    .await
+}
+
+async fn magi_avatar(State(ui): State<Arc<Ui>>, Query(q): Query<AvatarQuery>) -> Response {
+    let icon = (q.builtin.is_none())
+        .then(|| read_magi_icon(&ui.home))
+        .flatten();
+    let mut response = match icon
+        .as_deref()
+        .and_then(|icon| persona_icon::load(icon).ok())
+    {
+        Some((mime, bytes)) if sniffed_mime(&bytes) == Some(mime) => {
+            attachment_response(mime, bytes)
+        }
+        _ => svg_avatar(persona_icon::magi_svg()),
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
 }
 
 /// `GET /api/talks/{id}/avatar?persona=<id>` - a persona's avatar: the
@@ -11001,6 +11166,147 @@ mod tests {
         let cfg = config_for(&repo).await.expect("discover config");
         let talk = talk::begin(&talks, &cfg, repo.clone(), Some("mock")).expect("begin talk");
         (tmp, home, ui, talk.id, repo)
+    }
+
+    #[tokio::test]
+    async fn magi_provenance_view_resolves_legacy_replies_and_mixed_messages() {
+        let (_tmp, _home, ui, id, _) = avatar_fixture("").await;
+        let mut conversation = ui.talks.get(&id).unwrap();
+        talk::record(
+            &mut conversation,
+            &ui.talks,
+            "# Update on a task you filed\noperator words",
+            vec![],
+        )
+        .unwrap();
+        // Simulate an old operator record; headings do not prove authorship.
+        conversation.turns[0].sender = None;
+        conversation.turns[0].messages.clear();
+        ui.talks.put(&mut conversation).unwrap();
+        talk::queue(&mut conversation, &ui.talks, "owner", vec![]).unwrap();
+        talk::queue_once(&mut conversation, &ui.talks, "automatic report", "notice").unwrap();
+        talk::drain(&mut conversation, &ui.talks).unwrap();
+        talk::record_reply(
+            &mut conversation,
+            &ui.talks,
+            "about that report",
+            vec![],
+            Some(talk::ReplyTarget {
+                turn: 1,
+                message: 1,
+            }),
+        )
+        .unwrap();
+        conversation.turns[2].messages[0]
+            .reply
+            .as_mut()
+            .unwrap()
+            .sender = None;
+        conversation.turns.push(talk::Turn {
+            sender: Some(talk::Sender::Persona),
+            who: talk::Who::Agent,
+            body: "magi: actual persona words".into(),
+            at: Timestamp::now(),
+            attachments: vec![],
+            usage: None,
+            breaks: None,
+            messages: vec![],
+            posted_by: None,
+        });
+        ui.talks.put(&mut conversation).unwrap();
+        let view = TalkView::with_config(ui.talks.get(&id).unwrap(), false, None, &ui.home);
+        assert_eq!(view.talk.turns[0].sender, Some(talk::Sender::Operator));
+        assert_eq!(
+            view.talk.turns[1].messages[0].sender,
+            Some(talk::Sender::Operator)
+        );
+        assert_eq!(
+            view.talk.turns[1].messages[1].sender,
+            Some(talk::Sender::Magi)
+        );
+        assert_eq!(
+            view.talk.turns[2].messages[0]
+                .reply
+                .as_ref()
+                .unwrap()
+                .sender,
+            Some(talk::Sender::Magi)
+        );
+        assert_eq!(view.talk.turns[3].sender, Some(talk::Sender::Persona));
+    }
+
+    #[tokio::test]
+    async fn magi_icon_saves_resets_revalidates_and_refreshes_cache() {
+        let (_tmp, home, ui, id, repo) = avatar_fixture("").await;
+        let original = magi_icon_get(State(ui.clone())).await.0["avatar"].clone();
+        let icon = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let _ = magi_icon_put(
+            State(ui.clone()),
+            Json(MagiIconUpload { icon: icon.into() }),
+        )
+        .await
+        .unwrap();
+        let changed = magi_icon_get(State(ui.clone())).await.0["avatar"].clone();
+        assert_ne!(original, changed);
+        assert_eq!(read_magi_icon(home.path()).as_deref(), Some(icon));
+        let response = magi_avatar(
+            State(ui.clone()),
+            Query(AvatarQuery {
+                persona: None,
+                builtin: None,
+            }),
+        )
+        .await;
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+        assert_eq!(
+            response.headers()[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        for bad in [
+            "data:image/png;base64,PGh0bWw+".to_owned(),
+            "data:image/svg+xml;base64,PHN2Zz4=".to_owned(),
+            "A".repeat(persona_icon::ICON_MAX_BYTES + 1),
+        ] {
+            assert!(save_magi_icon(home.path(), &bad).is_err());
+            assert_eq!(read_magi_icon(home.path()).as_deref(), Some(icon));
+        }
+        // Re-opened server state reads the same independent home file.
+        let restarted = Arc::new(Ui::new(
+            Queue::at(home.path().join("queue")),
+            Questions::at(home.path().join("questions")),
+            Talks::at(home.path().join("talks")),
+            home.path().join("runs"),
+            home.path().to_path_buf(),
+            repo,
+        ));
+        assert_eq!(
+            magi_icon_get(State(restarted.clone())).await.0["avatar"],
+            changed
+        );
+        let view = TalkView::with_config(
+            restarted.talks.get(&id).unwrap(),
+            false,
+            None,
+            &restarted.home,
+        );
+        assert_eq!(view.magi_avatar, changed.as_str().unwrap());
+        std::fs::write(magi_icon_path(home.path()), "invalid").unwrap();
+        let response = magi_avatar(
+            State(ui.clone()),
+            Query(AvatarQuery {
+                persona: None,
+                builtin: None,
+            }),
+        )
+        .await;
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), persona_icon::magi_svg().as_bytes());
+        let _ = magi_icon_delete(State(ui.clone())).await.unwrap();
+        assert_eq!(magi_icon_get(State(ui.clone())).await.0["avatar"], original);
+        let _ = magi_icon_delete(State(ui)).await.unwrap();
     }
 
     /// `(status, content-type, nosniff, csp, body)` of one avatar request.
@@ -16895,6 +17201,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(10));
         let mut on_disk = f.talks().get(&talk).expect("get seeded talk");
         on_disk.turns.push(crate::talk::Turn {
+            sender: None,
             breaks: Some(Vec::new()),
             messages: Vec::new(),
             posted_by: None,

@@ -654,6 +654,20 @@ pub fn talks_to_start(talks: &Talks) -> Vec<String> {
 /// Is the draft made of completion notices alone? A notice appended to an
 /// operator's unsent draft must not start that draft on the daemon's initiative.
 fn pending_is_only_notices(t: &talk::Talk) -> bool {
+    if t.pending_messages.iter().any(|m| m.sender.is_some()) {
+        if !t.pending_messages.iter().all(|m| {
+            matches!(m.sender, None | Some(talk::Sender::Magi))
+                && m.attachments.is_empty()
+                && crate::prompt::is_completion_notice(&m.body)
+        }) {
+            return false;
+        }
+        if t.pending_messages.iter().all(|m| m.sender.is_some()) {
+            return true;
+        }
+        // A legacy Message may combine several sends. Check every recorded
+        // boundary below, including operator text after a notice heading.
+    }
     let body = &t.pending;
     if body.is_empty() || !t.pending_attachments.is_empty() {
         return false;
@@ -732,6 +746,30 @@ pub fn authorize_post(tasks: &[Task], run: &str, node: &str, talk_id: &str) -> R
 mod tests {
     use super::*;
     use crate::queue::Source;
+
+    #[test]
+    fn sender_notifications_only_auto_start_without_operator_sends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let talks = Talks::at(tmp.path().join("talks"));
+        let mut talk: talk::Talk = serde_json::from_value(serde_json::json!({
+            "schema":1,"id":"talk-a","repo":tmp.path(),"agent":"worker","status":"open","turns":[],
+            "created_at":Timestamp::now(),"updated_at":Timestamp::now(),
+            "seat":crate::agent::SeatState::new("talk","worker",1)
+        }))
+        .unwrap();
+        talks.put(&mut talk).unwrap();
+        let text = notice_text(&outcome_task(), &RunFacts::default());
+        assert!(crate::prompt::is_completion_notice(&text));
+        talk::queue_once(&mut talk, &talks, &text, "n").unwrap();
+        assert_eq!(talks_to_start(&talks), vec![talk.id.clone()]);
+        talk::queue(&mut talk, &talks, &text, Vec::new()).unwrap();
+        assert!(
+            talks_to_start(&talks).is_empty(),
+            "even matching operator prose remains an operator send"
+        );
+        talk::drain(&mut talk, &talks).unwrap();
+        assert!(!talk::queue_once(&mut talk, &talks, &text, "n").unwrap());
+    }
 
     fn outcome_task() -> Task {
         let mut t = Task::new(

@@ -1061,3 +1061,21 @@ raw agent reply under `artifacts/`. `MAGI_HOME` moves it.
 ## License
 
 MIT
+
+### MAGI message appearance
+
+Automatic task updates, watched-job reports, consult handovers, task posts, and
+system notices use the **MAGI** sender name, a gold bubble in both themes, and
+a dedicated built-in avatar. Operator sends and conversation persona replies
+keep their own names and icons. Older operator records retain their original
+attribution; message text alone is not evidence that MAGI wrote them.
+
+In the web **Settings** page, use **MAGI sender icon** to choose an image from
+your phone's image picker. Review the preview and tap **Save MAGI icon**, or
+**Reset to built-in** to restore the supplied artwork. The choice applies to
+all conversations, independently of operator and persona icons, and survives
+reloads and server restarts. It is stored atomically as `magi-icon.data` in the
+magi home directory; it does not rewrite repository or machine configuration.
+The picker resizes images to at most 384 pixels per side. PNG, JPEG, GIF, and
+WebP inputs are accepted; uploaded icons are limited to 256 KiB (including the
+data URI). Invalid or unavailable saved images fall back to the built-in icon.
