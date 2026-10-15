@@ -887,8 +887,15 @@ fn apply_one(
         let decision = d
             .question_decision
             .as_ref()
-            .map(|q| q.identity(&task))
-            .transpose()?;
+            .and_then(|q| match q.identity(&task) {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    // Invalid optional metadata must not discard the question
+                    // or leave a runnable task without its decision barrier.
+                    tracing::warn!(task = %task.id, %error, "ignoring invalid question decision target");
+                    None
+                }
+            });
         let context_value =
             serde_json::json!([&task.instruction, held.chat_notice_key(), targets, decision]);
         let context = serde_json::to_string(&context_value)?;
@@ -905,7 +912,7 @@ fn apply_one(
                     }
                     // Missing metadata cannot manufacture a new target. This
                     // also baselines older contexts whose last item was labels.
-                    d.question_decision.is_none()
+                    decision.is_none()
                         && serde_json::from_str::<serde_json::Value>(stored)
                             .ok()
                             .and_then(|v| {
@@ -2878,6 +2885,53 @@ printf '%s\n' "$MOCK_REPLY"
             },
         };
         assert!(unrelated.identity(&t).is_err());
+    }
+
+    #[test]
+    fn invalid_question_targets_still_file_and_block_queued_tasks() {
+        let dir = tempdir().unwrap();
+        init_repo_with_branch(dir.path(), "source-a");
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        for target in [
+            QuestionTarget::Source {
+                reference: "missing-source".into(),
+            },
+            QuestionTarget::Run {
+                id: "unrelated-run".into(),
+            },
+        ] {
+            let mut t = task("decision with invalid metadata");
+            t.repo = dir.path().into();
+            queue.put(&mut t).unwrap();
+            let d = Decision {
+                id: t.id.clone(),
+                question: Some("Which recovery should proceed?".into()),
+                choices: vec!["inspect first".into(), "keep waiting".into()],
+                question_decision: Some(QuestionDecision {
+                    operation: QuestionOperation::Recover,
+                    target,
+                }),
+                ..Decision::default()
+            };
+            apply_one(&queue, &questions, &d, None).unwrap();
+            let q = questions
+                .list()
+                .into_iter()
+                .find(|q| q.run == t.id)
+                .unwrap();
+            assert_eq!(q.summary, d.question.as_deref().unwrap());
+            assert_eq!(q.choices, d.choices);
+            assert!(q.status.open());
+            let context: serde_json::Value =
+                serde_json::from_str(q.decision_context.as_ref().unwrap()).unwrap();
+            assert!(context[3].is_null(), "invalid metadata was discarded");
+            let after = queue.get(&t.id).unwrap();
+            assert_eq!(after.status, TaskStatus::Blocked);
+            assert_eq!(after.blocked_by, vec![q.id.clone()]);
+            apply_one(&queue, &questions, &d, None).unwrap();
+            assert_eq!(questions.list().iter().filter(|q| q.run == t.id).count(), 1);
+        }
     }
 
     #[test]

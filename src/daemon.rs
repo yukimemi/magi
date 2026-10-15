@@ -3092,8 +3092,9 @@ async fn attempt(
         Ok(a) => a,
         Err(e) => {
             task.attempts += 1;
-            task.fail_startup(
+            task.fail_startup_target(
                 "startup-attachments",
+                e.name.clone(),
                 format!("{start_failed}{e:#}"),
                 opts.max_attempts,
             );
@@ -4394,15 +4395,25 @@ fn resumed_instruction(old_instruction: &str, task: &Task) -> String {
     append_answers(strip_answers_block(old_instruction, task), task)
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("attachment `{name}` is recorded on the task but {path} is missing")]
+struct MissingAttachment {
+    name: String,
+    path: PathBuf,
+}
+
 /// The task's attachments as absolute paths, each checked to still exist.
-fn task_attachments(queue: &Queue, task: &Task) -> Result<Vec<PathBuf>> {
+fn task_attachments(
+    queue: &Queue,
+    task: &Task,
+) -> std::result::Result<Vec<PathBuf>, MissingAttachment> {
     let paths = queue.attachment_paths(task);
     for (name, path) in task.attachments.iter().zip(&paths) {
         if !path.is_file() {
-            bail!(
-                "attachment `{name}` is recorded on the task but {} is missing",
-                path.display()
-            );
+            return Err(MissingAttachment {
+                name: name.clone(),
+                path: path.clone(),
+            });
         }
     }
     Ok(paths)
@@ -9113,6 +9124,60 @@ mod tests {
         std::fs::remove_file(&paths[0]).unwrap();
         let err = task_attachments(&q, &t).unwrap_err().to_string();
         assert!(err.contains("shot.png"), "{err}");
+    }
+
+    #[test]
+    fn different_missing_attachments_have_distinct_persisted_notice_causes() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue_path = dir.path().join("queue");
+        let queue = Queue::at(queue_path.clone());
+        let mut t = task();
+        t.source = crate::queue::Source::Agent {
+            run: "originating-chat".into(),
+            node: crate::queue::CHAT_NODE.into(),
+        };
+        let a = dir.path().join("a.png");
+        let b = dir.path().join("b.png");
+        std::fs::write(&a, "a").unwrap();
+        std::fs::write(&b, "b").unwrap();
+        queue.attach(&mut t, &[a, b]).unwrap();
+        let paths = task_attachments(&queue, &t).unwrap();
+        for path in &paths {
+            std::fs::remove_file(path).unwrap();
+        }
+        let missing = task_attachments(&queue, &t).unwrap_err();
+        t.attempts += 1;
+        let reason = missing.to_string();
+        t.fail_startup_target("startup-attachments", missing.name, reason, 1);
+        let first = t.chat_notice_due().expect("first attachment notice");
+        t.chat_notices.push(first.clone());
+        queue.put(&mut t).unwrap();
+
+        let queue = Queue::at(queue_path.clone());
+        let mut t = queue.get(&t.id).unwrap();
+        assert!(t.chat_notice_due().is_none(), "restart does not replay");
+        t.release_operator("test", None);
+        t.attempts += 1;
+        let missing = task_attachments(&queue, &t).unwrap_err();
+        t.fail_startup_target(
+            "startup-attachments",
+            missing.name,
+            "same missing attachment with regenerated wording",
+            1,
+        );
+        assert!(t.chat_notice_due().is_none(), "same object stays quiet");
+
+        std::fs::write(&paths[0], "restored").unwrap();
+        t.release_operator("test", None);
+        t.attempts += 1;
+        let missing = task_attachments(&queue, &t).unwrap_err();
+        let reason = missing.to_string();
+        t.fail_startup_target("startup-attachments", missing.name, reason, 1);
+        let second = t
+            .chat_notice_due()
+            .expect("different attachment must notify");
+        assert_ne!(first, second);
+        assert!(t.hold_reason.as_ref().unwrap().contains("b.png"));
     }
 
     #[test]

@@ -557,6 +557,10 @@ pub struct Task {
 pub struct NoticeCause {
     /// Processing stage or verified external evidence.
     pub stage: String,
+    /// Producer-verified blocker object, independent of the displayed error.
+    /// Omitted when absent to preserve existing persisted notice keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     /// An actual run that reached settlement; absent for preflight failures.
     pub run: Option<String>,
     /// The settled pass, so a resumed run can report a new failure.
@@ -889,6 +893,7 @@ impl Task {
     fn unresolved_hold_cause(&self) -> NoticeCause {
         NoticeCause {
             stage: "hold".into(),
+            target: None,
             run: self.runs.last().cloned(),
             pass: None,
         }
@@ -958,6 +963,7 @@ impl Task {
         self.import_chat_notice();
         self.hold_notice_cause = Some(NoticeCause {
             stage: stage.to_owned(),
+            target: None,
             run: run.map(str::to_owned),
             pass,
         });
@@ -997,6 +1003,20 @@ impl Task {
         self.fail(why, max_attempts);
         self.hold_notice_cause = unresolved;
         self.startup_notice_cause(stage);
+    }
+
+    /// A startup failure tied to a concrete object, such as a missing attachment.
+    pub(crate) fn fail_startup_target(
+        &mut self,
+        stage: &str,
+        target: String,
+        why: impl Into<String>,
+        max_attempts: usize,
+    ) {
+        self.fail_startup(stage, why, max_attempts);
+        if let Some(cause) = self.hold_notice_cause.as_mut() {
+            cause.target = Some(target);
+        }
     }
 
     /// A chat-filed task owes each material final outcome at most one notice.

@@ -2136,6 +2136,7 @@ mod tests {
                 "choices",
                 "consult",
                 "cwd",
+                "decision_context",
                 "delivered_turns",
                 "deputy",
                 "detail",
