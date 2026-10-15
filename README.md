@@ -471,6 +471,17 @@ The CLI accepts the same choice with
 This command records the choice and prints its execution status. A running
 `magi serve` / `magi web` resumes the existing run; without a daemon, use the
 printed `magi run --resume <run-id>` command to start the repair.
+Legacy merge/hold-only cards are upgraded on read, with the same durable
+choices used by the Web API, CLI and standing chat. Repair resumes the latest
+owning task and run; it never files a competing task. A held owner is released
+with a pin to that run, and repeated delivery of the same question is harmless.
+Existing chat consultations receive the current choices on their next turn.
+Repair obeys normal concurrency and quota waits rather than using the
+merge-decision priority lane. Missing or unsupported owners produce recovery
+guidance; restore the existing owner instead of adding another task.
+If an installed server still shows only merge/hold, update and restart it from
+a release containing these changes, then reload the card. The version alone
+does not distinguish a release from later source builds at the same version.
 Repair cycles are capped by `land_rounds`, with each new review bounded by
 `review_rounds`. A changed PR head, dirty worktree, failed repair or interrupted
 fixer holds with recovery guidance in `magi show`; an interrupted fixer is
