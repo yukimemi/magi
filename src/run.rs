@@ -219,7 +219,10 @@ use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 /// `None` ("origin unknown") rather than guessed at — a run from before this
 /// existed must not read as an operator's when nobody knows. The bump exists
 /// so a run is never mistaken for one whose origin was known and empty.
-/// Schema 14 records authored task criteria separately from generated review context.
+///
+/// Schema 14 records [`RunState::task_instruction`], authored task criteria
+/// separately from generated review context. Older records retain `None`:
+/// `instruction` may contain generated context and cannot establish authorship.
 pub const SCHEMA: u32 = 14;
 
 /// Why a pass over a run stopped at a node boundary, recorded when it
@@ -3025,6 +3028,13 @@ pub(crate) fn migrate_schema(mut state: RunState) -> Result<RunState> {
     // says "unknown", which is the truth for a run nobody recorded. Only the
     // version number advances.
     if state.schema == 12 {
+        state.schema = 13;
+    }
+    // Schema 13 predates `task_instruction`. Its `instruction` may include
+    // generated review context, so it cannot supply authored criteria.
+    // `#[serde(default)]` leaves the missing field as `None`; only the
+    // version number advances, preserving origin and execution state.
+    if state.schema == 13 {
         state.schema = SCHEMA;
     }
     if state.schema != SCHEMA {
@@ -4776,6 +4786,35 @@ mod tests {
             origin_label(migrated.origin.as_ref()),
             "origin unknown (started before origins were recorded)"
         );
+    }
+
+    #[test]
+    fn schema_supported_versions_all_reach_current() {
+        for schema in 5..=SCHEMA {
+            let mut value = serde_json::to_value(state()).expect("serialize state");
+            value["schema"] = serde_json::json!(schema);
+            if schema < 14 {
+                value.as_object_mut().unwrap().remove("task_instruction");
+            }
+            if schema < 13 {
+                value.as_object_mut().unwrap().remove("origin");
+            }
+            let old: RunState = serde_json::from_value(value).expect("legacy shape parses");
+            let migrated = migrate_schema(old)
+                .unwrap_or_else(|error| panic!("schema {schema} must migrate: {error}"));
+            assert_eq!(migrated.schema, SCHEMA, "schema {schema}");
+            assert!(migrated.task_instruction.is_none(), "schema {schema}");
+            assert!(migrated.origin.is_none(), "schema {schema}");
+        }
+    }
+
+    #[test]
+    fn schema_unsupported_versions_remain_rejected() {
+        for schema in [1, 2, 3, 4, SCHEMA + 1] {
+            let mut old = state();
+            old.schema = schema;
+            assert!(migrate_schema(old).is_err(), "schema {schema}");
+        }
     }
 
     #[test]

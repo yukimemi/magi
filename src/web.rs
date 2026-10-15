@@ -15770,6 +15770,46 @@ mod tests {
         assert_eq!(warm["live"], "live", "{warm}");
     }
 
+    #[test]
+    fn schema_thirteen_loads_through_cli_and_web_without_rewriting() {
+        let home = tempfile::tempdir().expect("temp home");
+        let runs = home.path().join("runs");
+        for origin in [None, Some(crate::run::Origin::queue("legacy-task"))] {
+            let mut state = RunState::new(
+                PathBuf::from("/repo/magi"),
+                "main".to_owned(),
+                "0123456789abcdef".to_owned(),
+                "Generated review context, not authored task criteria".to_owned(),
+                Config::default(),
+            );
+            state.origin = origin;
+            state.status = RunStatus::Blocked;
+            // Earlier migrations must not infer these facts again.
+            state.driver_exited = false;
+            state.gate_ran = true;
+            let expected = serde_json::to_value(&state).expect("serialize current state");
+            let mut legacy = expected.clone();
+            legacy["schema"] = serde_json::json!(13);
+            legacy.as_object_mut().unwrap().remove("task_instruction");
+            let dir = runs.join(&state.id);
+            std::fs::create_dir_all(&dir).expect("run dir");
+            let path = dir.join("run.json");
+            let body = serde_json::to_vec_pretty(&legacy).expect("serialize legacy state");
+            std::fs::write(&path, &body).expect("write legacy run");
+
+            for loaded in [
+                RunState::load_under(&state.id, home.path()).expect("CLI migration"),
+                read_run(&runs, &state.id).expect("web migration"),
+            ] {
+                assert_eq!(loaded.schema, crate::run::SCHEMA);
+                assert!(loaded.task_instruction.is_none());
+                assert_eq!(serde_json::to_value(loaded).unwrap(), expected);
+            }
+            assert_eq!(runs_unreadable(&runs), 0);
+            assert_eq!(std::fs::read(&path).unwrap(), body);
+        }
+    }
+
     /// Where a run came from is shown, and a run written before origins were
     /// recorded (schema 12, no `origin` key) stays readable and says so.
     #[tokio::test]
