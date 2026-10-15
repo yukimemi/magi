@@ -2956,7 +2956,7 @@ async fn attempt(
     };
     if let Err(e) = Config::discover_fetched(&repo, explicit).await {
         let reason = format!("[config] {e:#}");
-        task.notice_cause("config-fetch", None, None);
+        record_config_failure(task, &e);
         task.last_error = Some(reason.clone());
         task.hold_machine(Some(reason.clone()));
         record(queue, task);
@@ -4393,6 +4393,15 @@ fn instruction_for(task: &Task) -> String {
 /// three times.
 fn resumed_instruction(old_instruction: &str, task: &Task) -> String {
     append_answers(strip_answers_block(old_instruction, task), task)
+}
+
+/// Preserve the producer's verified boundary and target, independent of prose.
+fn record_config_failure(task: &mut Task, error: &anyhow::Error) {
+    let failure = error.downcast_ref::<crate::config::ConfigFailure>();
+    task.notice_cause(failure.map_or("config-load", |f| f.stage), None, None);
+    if let Some(cause) = task.hold_notice_cause.as_mut() {
+        cause.target = failure.map(|f| f.target.clone());
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -9124,6 +9133,54 @@ mod tests {
         std::fs::remove_file(&paths[0]).unwrap();
         let err = task_attachments(&q, &t).unwrap_err().to_string();
         assert!(err.contains("shot.png"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn config_failure_notices_distinguish_boundaries_and_targets_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue_path = dir.path().join("queue");
+        let queue = Queue::at(queue_path.clone());
+        let mut t = task();
+        t.source = Source::Agent {
+            run: "originating-chat".into(),
+            node: crate::queue::CHAT_NODE.into(),
+        };
+        let fetch = anyhow::anyhow!("network unavailable").context(crate::config::ConfigFailure {
+            stage: "config-fetch",
+            target: "origin/main".into(),
+        });
+        record_config_failure(&mut t, &fetch);
+        t.hold_machine(Some(format!("{fetch:#}")));
+        let fetch_key = t.chat_notice_due().unwrap();
+        t.chat_notices.push(fetch_key.clone());
+        queue.put(&mut t).unwrap();
+
+        let queue = Queue::at(queue_path);
+        let mut t = queue.get(&t.id).unwrap();
+        let a = dir.path().join("a.toml");
+        let b = dir.path().join("b.toml");
+        for (path, text, new_cause) in [
+            (&a, "[graph", true),
+            (&a, "[verify", false),
+            (&a, "[graph]\nimplementers = 'invalid-type'", true),
+            (&b, "[graph]\nimplementers = 'invalid-type'", true),
+        ] {
+            t.release_operator("test", None);
+            std::fs::write(path, text).unwrap();
+            let error = Config::discover_fetched(dir.path(), Some(path))
+                .await
+                .unwrap_err();
+            record_config_failure(&mut t, &error);
+            t.hold_machine(Some(format!("{error:#}")));
+            let due = t.chat_notice_due();
+            assert_eq!(due.is_some(), new_cause, "{error:#}");
+            if let Some(key) = due {
+                assert_ne!(key, fetch_key);
+                t.chat_notices.push(key);
+            }
+        }
+        t.succeed();
+        assert_eq!(t.chat_notice_due().as_deref(), Some("done"));
     }
 
     #[test]

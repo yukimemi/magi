@@ -2826,7 +2826,9 @@ pub fn conduct(
          `repair`, `complete`, `inspect`, `configure`, and a structured `target`. \
          For a recovery source use `{\"kind\":\"source\",\"reference\":\"<existing branch or commit>\"}`; \
          for an owned run use `{\"kind\":\"run\",\"id\":\"<recorded run id>\"}`; \
-         for the task itself use `{\"kind\":\"task\"}`. Copy concrete identifiers \
+         for a configuration decision use `{\"kind\":\"setting\",\"path\":\"<repo-relative TOML file>\",\"keys\":[\"<table>\",\"<key>\"]}` \
+         naming the existing setting being decided (for example storage.backend versus deployment.region). \
+         For a task-wide decision use `{\"kind\":\"task\"}`. Copy concrete identifiers \
          from the recorded facts; never invent a prose identity or vary the operation \
          just to re-ask. Source references are verified and normalized to commits. \
          Question text and choice labels are display only, and rewording them must \

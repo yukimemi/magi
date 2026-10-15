@@ -937,3 +937,105 @@ async fn question_targets_control_automatic_turns_independently_of_labels() {
         );
     }
 }
+
+#[tokio::test]
+async fn different_settings_on_one_task_require_distinct_decisions_and_chat_turns() {
+    use magi::ask::{Answer, Questions};
+    use magi::conduct::{self, Decision, QuestionTarget, Verdict};
+    let _home = common::home_lock().await;
+    let w = world();
+    std::fs::write(
+        w.tmp.path().join("settings.toml"),
+        "[storage]\nbackend = 'SQLite'\n[deployment]\nregion = 'east'\n",
+    )
+    .unwrap();
+    let questions = Questions::at(w.tmp.path().join("questions"));
+    let mut t = Task::new(
+        "configure service".into(),
+        "choose service settings".into(),
+        w.tmp.path().into(),
+        Source::Agent {
+            run: w.talk_id.clone(),
+            node: CHAT_NODE.into(),
+        },
+    );
+    t.hold_machine(Some("configuration decisions needed".into()));
+    w.queue.put(&mut t).unwrap();
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    let mut held_talk = w.talks.get(&w.talk_id).unwrap();
+    talk::clear_pending(&mut held_talk, &w.talks).unwrap();
+    let mut d: Decision = serde_json::from_value(serde_json::json!({
+        "id": t.id,
+        "question": "Which storage backend?",
+        "choices": ["SQLite", "Redis"],
+        "question_decision": {
+            "operation": "configure",
+            "target": {"kind": "setting", "path": "settings.toml", "keys": ["storage", "backend"]}
+        }
+    }))
+    .unwrap();
+    let apply = |decision: &Decision| {
+        conduct::apply(
+            &w.queue,
+            &questions,
+            &Verdict {
+                decisions: vec![decision.clone()],
+            },
+        )
+        .unwrap();
+    };
+    apply(&d);
+    assert_eq!(questions.list().len(), 1);
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    let mut talk = w.talks.get(&w.talk_id).unwrap();
+    talk::clear_pending(&mut talk, &w.talks).unwrap();
+    let mut q = questions.list().pop().unwrap();
+    q.answer(Answer::Choice("SQLite".into())).unwrap();
+    questions.put(&mut q).unwrap();
+    w.queue
+        .modify(&t.id, |task| {
+            task.unblock(&q.id);
+            task.hold_machine(Some("configuration decisions needed".into()));
+            true
+        })
+        .unwrap();
+    let unchanged = w.queue.get(&t.id).unwrap();
+    d.question = Some("Please select the storage engine".into());
+    apply(&d);
+    assert_eq!(questions.list().len(), 1, "rewording is the same decision");
+    assert!(chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).is_empty());
+    assert!(chat_notify::talks_to_start(&w.talks).is_empty());
+
+    // The next decision changes neither the task instruction nor held cause.
+    d.question = Some("Which deployment region?".into());
+    d.choices = vec!["east".into(), "west".into()];
+    d.question_decision.as_mut().unwrap().target = QuestionTarget::Setting {
+        path: "settings.toml".into(),
+        keys: vec!["deployment".into(), "region".into()],
+    };
+    apply(&d);
+    assert_eq!(
+        questions.list().len(),
+        2,
+        "new field requires another decision"
+    );
+    let after = w.queue.get(&t.id).unwrap();
+    assert_eq!(after.instruction, unchanged.instruction);
+    assert_eq!(after.hold_notice_cause, unchanged.hold_notice_cause);
+    assert_eq!(after.status, magi::queue::TaskStatus::Blocked);
+    assert_ne!(after.blocked_by, vec![q.id]);
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()).len(),
+        1
+    );
+    assert_eq!(
+        chat_notify::talks_to_start(&w.talks),
+        vec![w.talk_id.clone()]
+    );
+}

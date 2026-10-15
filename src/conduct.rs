@@ -127,6 +127,14 @@ pub enum QuestionTarget {
         /// Full recorded run id.
         id: String,
     },
+    /// A concrete TOML setting. Different fields on the same task require
+    /// different decisions even when both operations are `configure`.
+    Setting {
+        /// Repository-relative TOML file containing the setting.
+        path: String,
+        /// Exact table/key components copied from that file.
+        keys: Vec<String>,
+    },
     /// A recovery source which the repository can resolve to a commit.
     Source {
         /// Existing branch name or commit reference, never a display label.
@@ -153,6 +161,32 @@ impl QuestionDecision {
                     "question target is not this task's run"
                 );
                 format!("run:{id}")
+            }
+            QuestionTarget::Setting { path, keys } => {
+                use std::path::Component;
+                anyhow::ensure!(
+                    !path.is_empty()
+                        && Path::new(path)
+                            .components()
+                            .all(|c| matches!(c, Component::Normal(_)))
+                        && !keys.is_empty()
+                        && keys.iter().all(|key| !key.is_empty()),
+                    "question setting must name a repository file and concrete keys"
+                );
+                let root = task.repo.canonicalize()?;
+                let file = root.join(path).canonicalize()?;
+                let relative = file
+                    .strip_prefix(&root)
+                    .context("question setting is outside the repository")?;
+                let content = std::fs::read_to_string(&file)?;
+                let value: toml::Value = toml::from_str(&content)?;
+                let mut setting = &value;
+                for key in keys {
+                    setting = setting
+                        .get(key)
+                        .context("question setting key does not exist")?;
+                }
+                format!("setting:{}", serde_json::to_string(&(relative, keys))?)
             }
             QuestionTarget::Source { reference } => {
                 use crate::proc::Quiet as _;
