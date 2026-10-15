@@ -379,6 +379,9 @@ pub struct Task {
     /// otherwise.
     #[serde(default)]
     pub blocked_from: Option<TaskStatus>,
+    /// Last change of blocking targets, independent of explanation or delivery writes.
+    #[serde(default)]
+    pub blocked_at: Option<Timestamp>,
     /// Questions `crate::conduct` asked about this task that the operator has
     /// since answered, oldest first — what was asked, and what they said.
     ///
@@ -799,6 +802,7 @@ impl Task {
             blocked_by: Vec::new(),
             block_reason: None,
             blocked_from: None,
+            blocked_at: None,
             answers: Vec::new(),
             triage_applied: Vec::new(),
             actions_applied: Vec::new(),
@@ -962,18 +966,37 @@ impl Task {
     /// Startup retries cannot replace an unresolved run outcome without doing
     /// work. Distinct startup stages can still explain a newly encountered blocker.
     pub(crate) fn startup_notice_cause(&mut self, stage: &str) {
+        let recovery_only = matches!(
+            stage,
+            "startup-source" | "startup-candidates" | "startup-public-head"
+        );
         match self.hold_notice_cause.as_ref() {
-            Some(cause) if !cause.stage.starts_with("startup-") => return,
-            None if self
-                .chat_notice
-                .as_ref()
-                .is_some_and(|n| !is_done_notice_key(&n.key)) =>
+            Some(cause) if recovery_only && !cause.stage.starts_with("startup-") => return,
+            None if recovery_only
+                && self
+                    .chat_notice
+                    .as_ref()
+                    .is_some_and(|n| !is_done_notice_key(&n.key)) =>
             {
                 return;
             }
             _ => {}
         }
         self.notice_cause(stage, None, None);
+    }
+
+    /// Apply a preflight failure without allowing Running's generic failure
+    /// identity to overwrite the producer's stage or its unresolved recovery anchor.
+    pub(crate) fn fail_startup(
+        &mut self,
+        stage: &str,
+        why: impl Into<String>,
+        max_attempts: usize,
+    ) {
+        let unresolved = self.hold_notice_cause.clone();
+        self.fail(why, max_attempts);
+        self.hold_notice_cause = unresolved;
+        self.startup_notice_cause(stage);
     }
 
     /// A chat-filed task owes each material final outcome at most one notice.
@@ -1346,6 +1369,11 @@ impl Task {
     /// status it should eventually return to with `Blocked` itself.
     pub fn block(&mut self, blocked_by: Vec<String>, reason: Option<String>) {
         self.stamp_schema();
+        let before: std::collections::BTreeSet<_> = self.blocked_by.iter().collect();
+        let after: std::collections::BTreeSet<_> = blocked_by.iter().collect();
+        if self.status != TaskStatus::Blocked || before != after {
+            self.blocked_at = Some(Timestamp::now());
+        }
         if self.status != TaskStatus::Blocked {
             self.blocked_from = Some(self.status);
         }
@@ -5161,6 +5189,53 @@ mod tests {
             Some("different decision".into()),
         );
         assert!(t.chat_notice_due().is_some());
+    }
+
+    #[test]
+    fn running_startup_failures_preserve_stage_and_report_distinct_blockers() {
+        let mut t = chat_task();
+        t.start("existing-run".into());
+        t.fail("implementation failed", 1);
+        let failed = t.chat_notice_key().unwrap();
+        t.chat_notices.push(failed.clone());
+        t.release_operator("test", None);
+        t.start("existing-run".into());
+        t.fail_startup("startup-source", "same unresolved recovery source", 1);
+        assert_eq!(
+            t.chat_notice_due(),
+            None,
+            "no-progress recovery stays quiet"
+        );
+        t.release_operator("test", None);
+        t.start("existing-run".into());
+        t.fail_startup("startup-attachments", "attachment missing", 1);
+        let attachments = t.chat_notice_due().expect("new attachment blocker");
+        assert_ne!(attachments, failed);
+        assert_eq!(
+            t.hold_notice_cause.as_ref().unwrap().stage,
+            "startup-attachments"
+        );
+        t.chat_notices.push(attachments);
+        t.release_operator("test", None);
+        t.start("existing-run".into());
+        t.fail_startup(
+            "startup-attachments",
+            "same missing attachment, reworded",
+            1,
+        );
+        assert_eq!(
+            t.chat_notice_due(),
+            None,
+            "same stage after attempt counter reset"
+        );
+        t.release_operator("test", None);
+        t.start("existing-run".into());
+        t.fail_startup("startup-config", "different preflight stage", 1);
+        assert!(t.chat_notice_due().is_some());
+        assert_eq!(
+            t.hold_notice_cause.as_ref().unwrap().stage,
+            "startup-config"
+        );
     }
 
     #[test]

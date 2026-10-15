@@ -244,7 +244,9 @@ fn new_blocking_evidence(
                             && (dep.created_at > r.at
                                 || dep.held_at.is_some_and(|at| at > r.at)
                                 || dep.operator_decided_at.is_some_and(|at| at > r.at)
-                                || dep.passes.iter().any(|p| p.settled_at > r.at))
+                                || dep.passes.iter().any(|p| p.settled_at > r.at)
+                                || (dep.status == TaskStatus::Blocked
+                                    && dep.blocked_at.is_some_and(|at| at > r.at)))
                     })
                     .map(|dep| {
                         format!(
@@ -791,7 +793,11 @@ fn apply_one(
                 }
             })
             .collect();
-        let context = serde_json::to_string(&(&task.instruction, held.chat_notice_key(), targets))?;
+        // Choices are the actual answer contract, not explanatory prose. A
+        // different source approval must remain a different operator decision.
+        let choices: BTreeSet<_> = d.choices.iter().collect();
+        let context =
+            serde_json::to_string(&(&task.instruction, held.chat_notice_key(), targets, choices))?;
         // An answer alone does not justify asking the same decision again.
         // New producer evidence, an instruction edit or a different dependency
         // target can open another question; rewording cannot.
@@ -1547,6 +1553,45 @@ mod tests {
         queue.put(&mut after).unwrap();
         apply(&queue, &questions, &Verdict { decisions: vec![d] }).unwrap();
         assert!(queue.get(&t.id).unwrap().operator_held());
+    }
+
+    #[test]
+    fn newly_blocked_dependency_is_material_evidence_after_approval() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut dep = task("old queued dependency");
+        queue.put(&mut dep).unwrap();
+        let mut t = task("approved task");
+        t.release_operator("test", None);
+        queue.put(&mut t).unwrap();
+        let mut q = Question::new(
+            dep.id.clone(),
+            "check".into(),
+            "check".into(),
+            "New dependency approval".into(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut q).unwrap();
+        dep.block(vec![q.id.clone()], Some("new decision needed".into()));
+        let changed = dep.blocked_at;
+        queue.put(&mut dep).unwrap();
+        dep.block(vec![q.id], Some("same decision paraphrased".into()));
+        assert_eq!(
+            dep.blocked_at, changed,
+            "prose is not new blocking evidence"
+        );
+        queue.put(&mut dep).unwrap();
+        let d = Decision {
+            id: t.id.clone(),
+            blocked_by: vec![dep.id.clone()],
+            evidence: vec![dep.id],
+            ..Decision::default()
+        };
+        assert_eq!(new_blocking_evidence(&queue, &questions, &t, &d).len(), 1);
+        apply_one(&queue, &questions, &d, None).unwrap();
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Blocked);
     }
 
     #[test]
@@ -2701,12 +2746,13 @@ printf '%s\n' "$MOCK_REPLY"
         queue.put(&mut t).unwrap();
         let mut d = Decision {
             id: t.id.clone(),
-            question: Some("Consider recovery?".into()),
+            question: Some("Recover from source A?".into()),
+            choices: vec!["approve source A".into(), "keep held".into()],
             ..Decision::default()
         };
         apply_one(&queue, &questions, &d, None).unwrap();
         let mut q = questions.list().pop().unwrap();
-        q.answer(crate::ask::Answer::Text("keep held".into()))
+        q.answer(crate::ask::Answer::Choice("keep held".into()))
             .unwrap();
         questions.put(&mut q).unwrap();
         queue
@@ -2719,14 +2765,18 @@ printf '%s\n' "$MOCK_REPLY"
         d.question = Some("Should we keep waiting on recovery?".into());
         apply_one(&queue, &questions, &d, None).unwrap();
         assert_eq!(questions.list().len(), 1, "no repeated operator turn");
-        queue
-            .modify(&t.id, |task| {
-                task.instruction = "recover a different approved source".into();
-                true
-            })
-            .unwrap();
+        d.question = Some("Recover from source B?".into());
+        d.choices = vec!["approve source B".into(), "keep held".into()];
         apply_one(&queue, &questions, &d, None).unwrap();
-        assert_eq!(questions.list().len(), 2, "new decision target");
+        assert_eq!(
+            questions.list().len(),
+            2,
+            "new decision with unchanged task facts"
+        );
+        let after = queue.get(&t.id).unwrap();
+        assert_eq!(after.instruction, t.instruction);
+        assert_eq!(after.runs, t.runs);
+        assert_eq!(after.status, TaskStatus::Blocked);
     }
 
     #[test]

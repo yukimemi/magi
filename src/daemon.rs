@@ -2970,8 +2970,11 @@ async fn attempt(
             // Without that, a task naming a repository that does not exist
             // would be retried at every poll for as long as the daemon lives.
             task.attempts += 1;
-            task.startup_notice_cause("startup-config");
-            task.fail(format!("config: {e:#}"), opts.max_attempts);
+            task.fail_startup(
+                "startup-config",
+                format!("config: {e:#}"),
+                opts.max_attempts,
+            );
             record(queue, task);
             return Vec::new();
         }
@@ -3089,8 +3092,11 @@ async fn attempt(
         Ok(a) => a,
         Err(e) => {
             task.attempts += 1;
-            task.startup_notice_cause("startup-attachments");
-            task.fail(format!("{start_failed}{e:#}"), opts.max_attempts);
+            task.fail_startup(
+                "startup-attachments",
+                format!("{start_failed}{e:#}"),
+                opts.max_attempts,
+            );
             record(queue, task);
             return Vec::new();
         }
@@ -3255,8 +3261,11 @@ async fn attempt(
                 Err(put) => {
                     tracing::warn!("could not file the divergence question: {put:#}");
                     task.attempts += 1;
-                    task.startup_notice_cause("startup-question-store");
-                    task.fail(format!("{start_failed}{e:#}"), opts.max_attempts);
+                    task.fail_startup(
+                        "startup-question-store",
+                        format!("{start_failed}{e:#}"),
+                        opts.max_attempts,
+                    );
                 }
             }
             record(queue, task);
