@@ -6402,13 +6402,13 @@ struct QuestionView {
     /// `question.run` is a task id (conductor / triage questions), not a run
     /// id, so the UI links it to the task page.
     run_is_task: bool,
-    /// The chat conversation this question's task came from, when the owner
-    /// may hand the question to it - see [`crate::consult::origin_talk`]. The
-    /// UI offers "Ask the chat agent" only when this is set; it is never one
-    /// of `question.choices`.
+    /// The existing chat this question's task came from, including settled
+    /// questions - see [`crate::consult::associated_talk`].
     origin_chat: Option<String>,
     /// `origin_chat` is closed; consulting reopens it first.
     origin_chat_closed: bool,
+    /// Consultation eligibility is separate from navigation to the chat.
+    can_consult_chat: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -6479,13 +6479,17 @@ impl QuestionView {
             run_is_task: question.run_names_task(),
             origin_chat: None,
             origin_chat_closed: false,
+            can_consult_chat: false,
             question,
         }
     }
 
     /// Fill `origin_chat` from the queue and the talks.
     fn with_origin(mut self, tasks: &[crate::queue::Task], talks: &[Talk]) -> Self {
-        let talk = crate::consult::origin_talk(tasks, talks, &self.question);
+        let consult = crate::consult::origin_talk(tasks, talks, &self.question);
+        self.can_consult_chat = consult.is_some();
+        let talk =
+            consult.or_else(|| crate::consult::associated_talk(tasks, talks, &self.question));
         self.origin_chat_closed = talk.as_ref().is_some_and(|t| !t.status.open());
         self.origin_chat = talk.map(|t| t.id);
         self
@@ -10206,7 +10210,16 @@ mod tests {
             .unwrap();
         let list = fx.get("/api/questions").await.json();
         assert_eq!(list[0]["origin_chat"], talk.id.as_str(), "{list}");
-        let _ = id;
+        assert_eq!(list[0]["can_consult_chat"], true);
+        fx.questions()
+            .update(&id, |q| {
+                q.node = crate::bump::NOTICE_NODE.into();
+                Ok(())
+            })
+            .unwrap();
+        let list = fx.get("/api/questions").await.json();
+        assert_eq!(list[0]["origin_chat"], talk.id.as_str());
+        assert_eq!(list[0]["can_consult_chat"], false);
     }
 
     #[tokio::test]
@@ -10264,6 +10277,35 @@ mod tests {
         assert!(q.status.open());
         assert!(q.answer.is_none());
         assert_eq!(res.json()["origin_chat"], talk.id.as_str());
+        assert_eq!(res.json()["can_consult_chat"], true);
+        let list = fx.get("/api/questions").await.json();
+        assert_eq!(list[0]["origin_chat"], talk.id.as_str());
+        assert_eq!(list[0]["consult"]["talk"], talk.id.as_str());
+
+        let res = fx
+            .post(
+                &format!("/api/questions/{id}/answer"),
+                Some(r#"{"choice":"hold"}"#),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        assert_eq!(res.json()["answer"]["choice"], "hold");
+        assert_eq!(res.json()["origin_chat"], talk.id.as_str());
+        assert_eq!(res.json()["can_consult_chat"], false);
+        assert_eq!(fx.post(&path, None).await.status, 409);
+
+        let mut talk = fx.talks().get(&talk.id).unwrap();
+        crate::talk::close(&mut talk, &fx.talks()).unwrap();
+        let list = fx.get("/api/questions").await.json();
+        assert_eq!(list[0]["origin_chat"], talk.id.as_str());
+        assert_eq!(list[0]["origin_chat_closed"], true);
+        assert_eq!(list[0]["can_consult_chat"], false);
+
+        fx.talks().remove(&talk.id).unwrap();
+        let list = fx.get("/api/questions").await.json();
+        assert_eq!(list[0]["origin_chat"], Value::Null);
+        assert_eq!(list[0]["origin_chat_closed"], false);
+        assert_eq!(list[0]["can_consult_chat"], false);
     }
 
     #[tokio::test]

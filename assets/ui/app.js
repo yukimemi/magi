@@ -4772,7 +4772,8 @@ function createAskCard() {
   /* Not one of the question's choices: a separate action, shown only when the
      server says the question's task came from a chat (`origin_chat`). */
   const consultBtn = el("button", { class: "btn ask-consult", type: "button", text: "Ask the chat agent" });
-  const consultBox = el("div", { class: "ask-consult-box" }, consultBtn);
+  const chatLink = el("a", { class: "btn btn-quiet ask-chat-link", text: "Open chat" });
+  const consultBox = el("div", { class: "ask-consult-box" }, consultBtn, chatLink);
 
   const identity = createQuestionIdentity();
   const row = el("li", { class: "ask" },
@@ -4785,7 +4786,7 @@ function createAskCard() {
   row.refs = { identity, chipSlot, whenSlot, summary, runLink, node, seat, where, detail,
                hint, choices, text, send, free, error, answerLabel, answerText, answer, note,
                band, panelBox, stakes, thread, waitingNote, sayText, saySend, sayBox,
-               consultBtn, consultBox };
+               consultBtn, consultBox, chatLink };
   return row;
 }
 
@@ -4979,8 +4980,13 @@ function updateAskCard(row, question, { compact = false } = {}) {
 
   r.saySend.onclick = () => sayToQuestion(question.id, r.sayText.value, row);
   show(r.sayBox, open);
-  const canConsult = open && typeof question.origin_chat === "string" && question.origin_chat !== "";
-  show(r.consultBox, canConsult);
+  const hasChat = typeof question.origin_chat === "string" && question.origin_chat !== "";
+  const canConsult = open && hasChat && question.can_consult_chat === true;
+  show(r.consultBox, hasChat);
+  show(r.consultBtn, canConsult);
+  show(r.chatLink, hasChat);
+  setAttr(r.chatLink, "href", hasChat ? `#/chat/${encodeURIComponent(question.origin_chat)}` : null);
+  setText(r.chatLink, question.origin_chat_closed ? "Open chat (closed)" : "Open chat");
   r.consultBtn.disabled = Boolean(question.consult);
   setText(r.consultBtn, question.consult
     ? "Asked the chat agent"
