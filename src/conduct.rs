@@ -104,7 +104,7 @@ pub struct Decision {
     pub id: String,
     /// Ids this task should be blocked on. Meaningful only for a runnable
     /// (`queued`) task, or a machine-held task whose missing-only decision
-    /// can be disproved against the queue. Ignored otherwise.
+    /// is unconfirmed against the queue. Ignored otherwise.
     #[serde(default)]
     pub blocked_by: Vec<String>,
     /// Dependencies claimed missing as the sole reason for this question or
@@ -128,7 +128,7 @@ pub struct Decision {
     /// one is already open for this task) and blocks the task on its id
     /// instead of acting on `blocked_by` or `recovery`. Only a missing-only
     /// decision explicitly marked by [`Self::missing_dependencies`] may be
-    /// replaced with dependency waiting after disproving its missing claims.
+    /// replaced with dependency waiting unless the queue confirms missing blockers.
     #[serde(default)]
     pub question: Option<String>,
     /// Fixed answers for `question`, if it has any. Empty means free text.
@@ -710,19 +710,22 @@ fn apply_one(
     // Only an explicit missing-only claim can justify replacing a question
     // or hold. Existing prerequisites alone say nothing about independent
     // consent, destructive-operation questions, or other reasons to stay held.
+    // Ambiguous or unreadable inventories cannot confirm absence either: keep
+    // the original reference waiting until it can be resolved authoritatively.
     if matches!(task.status, TaskStatus::Queued | TaskStatus::Held)
         && !d.missing_dependencies.is_empty()
         && d.missing_dependencies.iter().all(|id| {
             let claim = crate::queue::dependency(queue, questions, id);
-            matches!(
-                &claim,
-                crate::queue::Dependency::Task(_)
-                    | crate::queue::Dependency::Question(_)
-                    | crate::queue::Dependency::Deleted(_)
-            ) && d
-                .blocked_by
-                .iter()
-                .any(|blocker| crate::queue::dependency(queue, questions, blocker) == claim)
+            claim != crate::queue::Dependency::Missing
+                && d.blocked_by.iter().any(|blocker| {
+                    blocker == id
+                        || (matches!(
+                            &claim,
+                            crate::queue::Dependency::Task(_)
+                                | crate::queue::Dependency::Question(_)
+                                | crate::queue::Dependency::Deleted(_)
+                        ) && crate::queue::dependency(queue, questions, blocker) == claim)
+                })
         })
         && (d.question.is_some() || d.recovery == Some(Recovery::Hold))
         && crate::queue::missing_blockers(queue, questions, &d.blocked_by).is_empty()
@@ -1723,6 +1726,86 @@ mod tests {
                     assert!(!after.block_reason.unwrap().contains("missing"));
                     assert!(questions.list().is_empty());
                     assert_eq!(after.instruction, waiting.instruction);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dependency_resolution_inconclusive_missing_only_decisions_keep_waiting() {
+        for held in [false, true] {
+            for unknown in [false, true] {
+                for question in [false, true] {
+                    let dir = tempdir().unwrap();
+                    let queue = Queue::at(dir.path().join("queue"));
+                    let questions = Questions::at(dir.path().join("questions"));
+                    let mut dep = task("running prerequisite");
+                    dep.id = "20261013-193611-ca5b".into();
+                    dep.start("existing-run".into());
+                    queue.put(&mut dep).unwrap();
+                    let reference = if unknown {
+                        // Even an exact, existing task id is Unknown when
+                        // the question inventory cannot be scanned.
+                        std::fs::write(questions.root(), "not a directory").unwrap();
+                        dep.id.clone()
+                    } else {
+                        let mut other = task("another prerequisite");
+                        other.id = "20261014-193611-ca5b".into();
+                        queue.put(&mut other).unwrap();
+                        "ca5b".to_owned()
+                    };
+                    assert_eq!(
+                        crate::queue::dependency(&queue, &questions, &reference),
+                        if unknown {
+                            crate::queue::Dependency::Unknown
+                        } else {
+                            crate::queue::Dependency::Ambiguous
+                        }
+                    );
+                    let mut waiting = task("waiting");
+                    if held {
+                        waiting.hold_machine(Some("dependency could not be located".into()));
+                    }
+                    queue.put(&mut waiting).unwrap();
+                    let reply = serde_json::json!({"decisions": [{
+                        "id": waiting.id, "blocked_by": [reference],
+                        "missing_dependencies": [reference],
+                        "question": question.then_some("ca5b is missing"),
+                        "recovery": (!question).then_some("hold"),
+                        "reason": "ca5b is missing"
+                    }]})
+                    .to_string();
+                    let cfg = config(mock_agent(dir.path(), REPLY, env(&reply)));
+                    let (queued, finished) = if held {
+                        (vec![], vec![waiting.clone()])
+                    } else {
+                        (vec![waiting.clone()], vec![])
+                    };
+                    Conductor::new()
+                        .run_once(
+                            &cfg,
+                            dir.path(),
+                            &queue,
+                            &questions,
+                            dir.path(),
+                            &queued,
+                            &[],
+                            &finished,
+                            2,
+                        )
+                        .await
+                        .unwrap();
+                    let after = queue.get(&waiting.id).unwrap();
+                    assert_eq!(after.status, TaskStatus::Blocked);
+                    assert_eq!(after.blocked_by, [reference]);
+                    assert_eq!(after.blocked_from, Some(waiting.status));
+                    assert!(!after.block_reason.unwrap().contains("missing"));
+                    assert_eq!(after.instruction, waiting.instruction);
+                    if unknown {
+                        assert!(questions.root().is_file());
+                    } else {
+                        assert!(questions.list().is_empty());
+                    }
                 }
             }
         }
