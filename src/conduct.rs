@@ -707,6 +707,28 @@ fn apply_one(
         return Ok(());
     }
 
+    // A missing-only decision with unverifiable aliases is not evidence for
+    // a question or hold. Do not guess that two ambiguous/unknown references
+    // mean the same record, or treat failure to prove that as proof of absence.
+    if matches!(task.status, TaskStatus::Queued | TaskStatus::Held)
+        && !d.missing_dependencies.is_empty()
+        && (d.question.is_some() || d.recovery == Some(Recovery::Hold))
+        && d.missing_dependencies
+            .iter()
+            .any(|id| !d.blocked_by.contains(id))
+        && d.missing_dependencies
+            .iter()
+            .chain(&d.blocked_by)
+            .any(|id| {
+                matches!(
+                    crate::queue::dependency(queue, questions, id),
+                    crate::queue::Dependency::Ambiguous | crate::queue::Dependency::Unknown
+                )
+            })
+    {
+        return Ok(());
+    }
+
     // Only an explicit missing-only claim can justify replacing a question
     // or hold. Existing prerequisites alone say nothing about independent
     // consent, destructive-operation questions, or other reasons to stay held.
@@ -1805,6 +1827,80 @@ mod tests {
                         assert!(questions.root().is_file());
                     } else {
                         assert!(questions.list().is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dependency_resolution_unverifiable_alias_decisions_are_discarded() {
+        for held in [false, true] {
+            for unknown in [false, true] {
+                for question in [false, true] {
+                    for short_blocker in [false, true] {
+                        let dir = tempdir().unwrap();
+                        let queue = Queue::at(dir.path().join("queue"));
+                        let questions = Questions::at(dir.path().join("questions"));
+                        let mut dep = task("running prerequisite");
+                        dep.id = "20261013-193611-ca5b".into();
+                        dep.start("existing-run".into());
+                        queue.put(&mut dep).unwrap();
+                        if unknown {
+                            std::fs::write(questions.root(), "not a directory").unwrap();
+                        } else {
+                            let mut other = task("another prerequisite");
+                            other.id = "20261014-193611-ca5b".into();
+                            queue.put(&mut other).unwrap();
+                        }
+                        let (blocker, missing) = if short_blocker {
+                            ("ca5b", dep.id.as_str())
+                        } else {
+                            (dep.id.as_str(), "ca5b")
+                        };
+                        let mut waiting = task("waiting");
+                        if held {
+                            waiting.hold_machine(Some("dependency could not be located".into()));
+                        }
+                        queue.put(&mut waiting).unwrap();
+                        let reply = serde_json::json!({"decisions": [{
+                            "id": waiting.id, "blocked_by": [blocker],
+                            "missing_dependencies": [missing],
+                            "question": question.then_some("ca5b is missing"),
+                            "recovery": (!question).then_some("hold"),
+                            "reason": "ca5b is missing"
+                        }]})
+                        .to_string();
+                        let cfg = config(mock_agent(dir.path(), REPLY, env(&reply)));
+                        let (queued, finished) = if held {
+                            (vec![], vec![waiting.clone()])
+                        } else {
+                            (vec![waiting.clone()], vec![])
+                        };
+                        Conductor::new()
+                            .run_once(
+                                &cfg,
+                                dir.path(),
+                                &queue,
+                                &questions,
+                                dir.path(),
+                                &queued,
+                                &[],
+                                &finished,
+                                2,
+                            )
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            serde_json::to_value(queue.get(&waiting.id).unwrap()).unwrap(),
+                            serde_json::to_value(&waiting).unwrap(),
+                            "unverifiable aliases must leave the entire task unchanged"
+                        );
+                        if unknown {
+                            assert!(questions.root().is_file());
+                        } else {
+                            assert!(questions.list().is_empty());
+                        }
                     }
                 }
             }
