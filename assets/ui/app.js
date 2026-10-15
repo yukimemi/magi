@@ -5395,9 +5395,10 @@ function attachmentUrl(conversationId, att) {
   return API.talkAttachment(conversationId, att.id);
 }
 
-function renderNoticeDisplay(display) {
+function renderNoticeDisplay(display, md) {
   const box = el("div", { class: "notification-facts" });
-  box.append(linkify(el("p", { class: "turn-text" }), display.facts));
+  box.append(Array.isArray(md) ? mdBlock("notification-prose", md)
+    : linkify(el("p", { class: "turn-text" }), display.facts));
   if (display.task) box.append(el("a", { class: "text-link", href: `#/tasks/${encodeURIComponent(display.task)}`, text: "Task" }));
   if (display.run) box.append(" · ", el("a", { class: "text-link", href: `#/runs/${encodeURIComponent(display.run)}`, text: "Run" }));
   if (display.output) box.append(el("details", {},
@@ -5417,20 +5418,20 @@ function updateTurnRow(row, item) {
   setText(r.who, kind === "operator" ? (item.operatorName || "YOU")
     : kind === "system" ? "MAGI" : (item.personaName || "AGENT"));
 
-  /* A turn never changes once it is on disk, so its body is built once. The
-     agent's is markdown prose, already parsed server-side, and is rendered as
+  /* Build prose when its display representation changes. Agent replies and
+     MAGI notification facts are parsed server-side and rendered as
      nodes, never as markup: the rule that no API data is ever assigned as
      HTML holds everywhere outside the sandboxed panel frame, and a model that
      writes a script tag into a fence has to see the characters of one. */
-  const key = `${kind}:${body}:${turn.display?.output || ""}`;
+  const key = JSON.stringify([kind, body, turn.display, item.noticeMd, item.md]);
   if (row.dataset.turnKey !== key) {
     row.dataset.turnKey = key;
     clear(r.body);
     if (turn.display) {
-      r.body.append(renderNoticeDisplay(turn.display));
-    } else if (kind === "agent") {
+      r.body.append(renderNoticeDisplay(turn.display, item.noticeMd));
+    } else if (kind === "agent" || (turn.sender === "magi" && Array.isArray(item.noticeMd))) {
       const div = el("div", { class: "md" });
-      renderMd(div, item.md);
+      renderMd(div, kind === "agent" ? item.md : item.noticeMd);
       r.body.append(div);
     } else {
       r.body.append(el("p", {
@@ -6004,7 +6005,7 @@ function renderTalk() {
     $("talk-turns"),
     turns.flatMap((turn, i) => {
       const messages = turn.messages && turn.messages.length ? turn.messages : [turn];
-      return messages.map((message, j) => ({ turn: { ...turn, ...message }, md: turnsMd[i], key: `${i}-${j}`, conversationId: talk.id,
+      return messages.map((message, j) => ({ turn: { ...turn, ...message }, md: turnsMd[i], noticeMd: talk.turn_messages_md?.[i]?.[j], key: `${i}-${j}`, conversationId: talk.id,
         replyTarget: i < talkTurns(talk).length ? { turn: i, message: j } : null,
         operatorName: talk.operator_name, operatorAvatar: talk.operator_avatar,
         magiAvatar: talk.magi_avatar, personaName: talk.persona_name, personaAvatar: talk.persona_avatar }));
@@ -6262,7 +6263,9 @@ function renderTalkPending(talk) {
     box.append(el("div", { class: `queued-message${message.sender === "magi" ? " magi-pending" : ""}` }, avatar,
       message.reply ? el("p", { class: "reply-quote", text: `Reply to ${message.reply.sender === "magi" ? "MAGI" : message.reply.who}: ${message.reply.excerpt}` }) : null,
       el("strong", { text: message.sender === "magi" ? "MAGI" : (talk.operator_name || "YOU") }),
-      message.display ? renderNoticeDisplay(message.display) : el("p", { class: "turn-text", text: message.body || `${message.attachments.length} attachment(s)` }),
+      message.display ? renderNoticeDisplay(message.display, talk.pending_messages_md?.[index])
+        : message.sender === "magi" && Array.isArray(talk.pending_messages_md?.[index])
+          ? mdBlock("notification-prose", talk.pending_messages_md[index]) : el("p", { class: "turn-text", text: message.body || `${message.attachments.length} attachment(s)` }),
       message.sender !== "magi" ? el("button", { class: "btn btn-quiet", type: "button", text: "Edit text", onclick: () => editTalkPending(index) }) : null));
   });
 }

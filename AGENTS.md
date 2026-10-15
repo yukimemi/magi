@@ -2890,6 +2890,13 @@ provenance or an exact `CompletionReference.notice` match and a complete known
 template; unknown bodies and operator prose remain literal. Watched output is
 untrusted text in an expandable element; links use the existing safe URL renderer.
 
+`TalkView.turn_messages_md` (turn/message indices, including one slot for legacy
+turns) and `pending_messages_md` are transient Markdown ASTs for normalized MAGI
+sends. Parse `NoticeDisplay.facts`, never completion agent input or watched output.
+Other MAGI bodies may use Markdown unless they are an unrecognized completion
+template. Operator sends stay literal. Both notification surfaces use the shared
+Markdown DOM renderer, with literal fallback when an AST is absent.
+
 ### Approval decisions and replacement implementations
 
 Approval choice tokens are stable; `Question::merge_target` holds the displayed
