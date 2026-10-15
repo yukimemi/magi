@@ -73,6 +73,22 @@ fn restart_recovery_requires_dispatch_capacity_and_a_live_owner() {
         availability(&store, &q, Some(&cfg)).reason,
         "deputy_exhausted"
     );
+    let error = require(&store, &q, Some(&cfg)).unwrap_err();
+    let refusal = error
+        .downcast_ref::<magi::question_delivery::TextUnavailable>()
+        .unwrap();
+    assert_eq!(
+        refusal.reason,
+        magi::question_delivery::UnavailableReason::DeputyExhausted
+    );
+    assert!(refusal.message.contains("起動回数"));
+    cfg.graph.language = "en".into();
+    let english = require(&store, &q, Some(&cfg)).unwrap_err();
+    let english = english
+        .downcast_ref::<magi::question_delivery::TextUnavailable>()
+        .unwrap();
+    assert_eq!(refusal.reason, english.reason);
+    assert_ne!(refusal.message, english.message);
     store.beat(&q.id, WaiterKind::Deputy);
     assert_eq!(availability(&store, &q, None).state, "live");
 }

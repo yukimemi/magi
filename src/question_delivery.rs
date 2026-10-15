@@ -2,12 +2,84 @@
 //! Called under the question update lock as well as when rendering its card.
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use jiff::Timestamp;
 use serde::Serialize;
 
 use crate::ask::{Question, Questions};
 use crate::config::Config;
+
+/// Stable refusal reasons, independent of the display language.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnavailableReason {
+    /// The question is already closed.
+    Settled,
+    /// The deputy has used its start budget.
+    DeputyExhausted,
+    /// Deputy configuration or its agent is unavailable.
+    DeputyDisabled,
+    /// The recipient deadline has passed.
+    Deadline,
+    /// The original agent cannot resume.
+    RecipientUnavailable,
+    /// No live daemon can recover the recipient.
+    DaemonUnavailable,
+}
+
+impl UnavailableReason {
+    /// Existing language-independent API reason code.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Settled => "settled",
+            Self::DeputyExhausted => "deputy_exhausted",
+            Self::DeputyDisabled => "deputy_disabled",
+            Self::Deadline => "deadline",
+            Self::RecipientUnavailable => "recipient_unavailable",
+            Self::DaemonUnavailable => "daemon_unavailable",
+        }
+    }
+
+    fn message(self, ja: bool) -> &'static str {
+        let (en, jp) = match self {
+            Self::Settled => (
+                "This question is already settled.",
+                "この質問は終了しています。",
+            ),
+            Self::DeputyExhausted => (
+                "Free-text replies are unavailable: the deputy has used all its starts.",
+                "自由文を送信できません。代理エージェントの起動回数を使い切りました。",
+            ),
+            Self::DeputyDisabled => (
+                "Free-text replies are unavailable: deputies are disabled or their configuration or agent is unavailable.",
+                "自由文を送信できません。代理エージェントが無効か、設定またはエージェントを利用できません。",
+            ),
+            Self::Deadline => (
+                "Free-text replies are unavailable: the recipient's deadline has passed.",
+                "自由文を送信できません。受信先の応答期限を過ぎています。",
+            ),
+            Self::RecipientUnavailable => (
+                "Free-text replies are unavailable: the asking agent has no resumable session.",
+                "自由文を送信できません。質問したエージェントのセッションを再開できません。",
+            ),
+            Self::DaemonUnavailable => (
+                "Free-text replies are unavailable: no running daemon can recover the recipient.",
+                "自由文を送信できません。受信先を復旧するデーモンが稼働していません。",
+            ),
+        };
+        if ja { jp } else { en }
+    }
+}
+
+/// Typed refusal shared by web and command-line ingress.
+#[derive(Debug, thiserror::Error)]
+#[error("question_text_unavailable ({code}): {message}", code = .reason.code())]
+pub struct TextUnavailable {
+    /// Machine-readable refusal reason.
+    pub reason: UnavailableReason,
+    /// Localized explanation for the operator.
+    pub message: String,
+}
 
 /// Current delivery state projected to the question card.
 #[derive(Debug, Clone, Serialize)]
@@ -18,6 +90,8 @@ pub struct Availability {
     pub reason: &'static str,
     /// Explanation in the question or configured language.
     pub message: String,
+    #[serde(skip)]
+    unavailable_reason: Option<UnavailableReason>,
 }
 
 impl Availability {
@@ -50,15 +124,17 @@ pub fn availability(store: &Questions, q: &Question, cfg: Option<&Config>) -> Av
     let result = |state, reason, en: &str, jp: &str| Availability {
         state,
         reason,
+        unavailable_reason: None,
         message: if ja { jp } else { en }.to_owned(),
     };
+    let unavailable = |reason: UnavailableReason| Availability {
+        state: "unavailable",
+        reason: reason.code(),
+        message: reason.message(ja).to_owned(),
+        unavailable_reason: Some(reason),
+    };
     if !q.status.open() {
-        return result(
-            "unavailable",
-            "settled",
-            "This question is already settled.",
-            "この質問は終了しています。",
-        );
+        return unavailable(UnavailableReason::Settled);
     }
     if store.read_lease(&q.id).is_some_and(|l| l.fresh(now)) {
         return result(
@@ -85,46 +161,21 @@ pub fn availability(store: &Questions, q: &Question, cfg: Option<&Config>) -> Av
             .as_ref()
             .is_some_and(|d| d.starts >= crate::deputy::MAX_STARTS)
         {
-            return result(
-                "unavailable",
-                "deputy_exhausted",
-                "Free-text replies are unavailable: the deputy has used all its starts.",
-                "自由文を送信できません。代理エージェントの起動回数を使い切りました。",
-            );
+            return unavailable(UnavailableReason::DeputyExhausted);
         }
         if !crate::deputy::can_start(cfg, crate::deputy::agent_of(q)) {
-            return result(
-                "unavailable",
-                "deputy_disabled",
-                "Free-text replies are unavailable: deputies are disabled or their configuration or agent is unavailable.",
-                "自由文を送信できません。代理エージェントが無効か、設定またはエージェントを利用できません。",
-            );
+            return unavailable(UnavailableReason::DeputyDisabled);
         }
         if !crate::deputy::restart_in_time(q, timeout, now) {
-            return result(
-                "unavailable",
-                "deadline",
-                "Free-text replies are unavailable: the recipient's deadline has passed.",
-                "自由文を送信できません。受信先の応答期限を過ぎています。",
-            );
+            return unavailable(UnavailableReason::Deadline);
         }
     } else {
         let waiter = crate::waiter::Waiter::new(store.clone(), home.to_path_buf(), cfg.cloned());
         if q.cwd.is_none() || !waiter.can_resume(q) {
-            return result(
-                "unavailable",
-                "recipient_unavailable",
-                "Free-text replies are unavailable: the asking agent has no resumable session.",
-                "自由文を送信できません。質問したエージェントのセッションを再開できません。",
-            );
+            return unavailable(UnavailableReason::RecipientUnavailable);
         }
         if crate::waiter::decide(q, None, false, timeout, now) == crate::waiter::Action::Expire {
-            return result(
-                "unavailable",
-                "deadline",
-                "Free-text replies are unavailable: the recipient's deadline has passed.",
-                "自由文を送信できません。受信先の応答期限を過ぎています。",
-            );
+            return unavailable(UnavailableReason::Deadline);
         }
     }
     if recovering(home, now) {
@@ -135,12 +186,7 @@ pub fn availability(store: &Questions, q: &Question, cfg: Option<&Config>) -> Av
             "自動配送待ちです。受信先の起動・再起動、または実行枠の空きを待っています。",
         )
     } else {
-        result(
-            "unavailable",
-            "daemon_unavailable",
-            "Free-text replies are unavailable: no running daemon can recover the recipient.",
-            "自由文を送信できません。受信先を復旧するデーモンが稼働していません。",
-        )
+        unavailable(UnavailableReason::DaemonUnavailable)
     }
 }
 
@@ -148,12 +194,12 @@ pub fn availability(store: &Questions, q: &Question, cfg: Option<&Config>) -> Av
 /// returns before changing the thread, answer, or delivery cursor.
 pub fn require(store: &Questions, q: &Question, cfg: Option<&Config>) -> Result<()> {
     let delivery = availability(store, q, cfg);
-    if !delivery.accepts_text() {
-        bail!(
-            "question_text_unavailable ({}): {}",
-            delivery.reason,
-            delivery.message
-        );
+    if let Some(reason) = delivery.unavailable_reason {
+        return Err(TextUnavailable {
+            reason,
+            message: delivery.message,
+        }
+        .into());
     }
     Ok(())
 }

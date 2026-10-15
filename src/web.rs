@@ -1768,12 +1768,14 @@ type ApiResult<T> = std::result::Result<T, ApiError>;
 struct ApiError {
     status: StatusCode,
     message: String,
+    text_reason: Option<crate::question_delivery::UnavailableReason>,
 }
 
 impl ApiError {
     /// The client asked for something malformed.
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
+            text_reason: None,
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
         }
@@ -1782,6 +1784,7 @@ impl ApiError {
     /// No such run or task.
     fn not_found(message: impl Into<String>) -> Self {
         Self {
+            text_reason: None,
             status: StatusCode::NOT_FOUND,
             message: message.into(),
         }
@@ -1803,6 +1806,7 @@ impl ApiError {
 
     fn conflict(message: impl Into<String>) -> Self {
         Self {
+            text_reason: None,
             status: StatusCode::CONFLICT,
             message: message.into(),
         }
@@ -1811,6 +1815,7 @@ impl ApiError {
     /// Our fault, or the disk's.
     fn internal(message: impl Into<String>) -> Self {
         Self {
+            text_reason: None,
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
         }
@@ -1830,10 +1835,9 @@ impl From<anyhow::Error> for ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut body = serde_json::json!({ "error": self.message });
-        if self.status == StatusCode::UNPROCESSABLE_ENTITY
-            && self.message.starts_with("question_text_unavailable")
-        {
+        if let Some(reason) = self.text_reason {
             body["code"] = serde_json::json!("question_text_unavailable");
+            body["reason"] = serde_json::json!(reason);
         }
         (self.status, Json(body)).into_response()
     }
@@ -4069,6 +4073,7 @@ fn settings_context(ui: &Ui, q: SettingsQuery) -> ApiResult<(PathBuf, Vec<repos:
         .find(|r| matches(r))
         .map(|r| r.path.clone())
         .ok_or_else(|| ApiError {
+            text_reason: None,
             status: StatusCode::UNPROCESSABLE_ENTITY,
             message: "Choose a known repository from the Settings selector.".to_owned(),
         })?;
@@ -4134,6 +4139,7 @@ async fn settings_put_roles(
         .map_err(|e| match e {
             settings::SaveError::Conflict(m) => ApiError::conflict(m),
             settings::SaveError::Refused(m) => ApiError {
+                text_reason: None,
                 status: StatusCode::UNPROCESSABLE_ENTITY,
                 message: m,
             },
@@ -6692,10 +6698,15 @@ async fn question_answer(
 
 /// A dedicated status avoids the client's settled-question 409 handling.
 fn question_text_error(e: anyhow::Error) -> ApiError {
-    let unavailable = e.to_string().starts_with("question_text_unavailable");
+    let reason = e
+        .downcast_ref::<crate::question_delivery::TextUnavailable>()
+        .map(|e| e.reason);
     let error = ApiError::bad_request_from(e);
-    if unavailable {
-        error.with_status(StatusCode::UNPROCESSABLE_ENTITY)
+    if let Some(reason) = reason {
+        ApiError {
+            text_reason: Some(reason),
+            ..error.with_status(StatusCode::UNPROCESSABLE_ENTITY)
+        }
     } else {
         error
     }
@@ -10625,6 +10636,14 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(rejected.status, StatusCode::UNPROCESSABLE_ENTITY);
+        let response = rejected.into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "question_text_unavailable");
+        assert_eq!(body["reason"], "deputy_exhausted");
+        assert!(body["error"].as_str().unwrap().contains("deputy_exhausted"));
         assert!(ui.questions.get(&q.id).unwrap().thread.is_empty());
         ui.questions.beat(&q.id, ask::WaiterKind::Deputy);
         let Json(view) = question_say(State(ui.clone()), Path(q.id.clone()), say())
