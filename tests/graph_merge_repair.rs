@@ -880,3 +880,31 @@ async fn decision_review_cli_resume_after_hold_requests_a_fresh_decision() {
     resume_after_hold(false).await;
 }
 }
+
+common::e2e! {
+async fn decision_cli_hold_release_invalidates_prior_merge_consent_on_daemon_resume() {
+    let (fx, mut runner, old_question) = held_pr_choice(false, false, "merge").await;
+    let task = decision_owner(&mut runner, &fx).await;
+    // The daemon has not consumed the merge answer. Hold and release through
+    // the real CLI while it is stopped, without changing the reviewed head.
+    run_cli(&fx, &["task", "hold", &task.id]);
+    run_cli(&fx, &["task", "release", &task.id]);
+    serve_decision(&fx, &runner.state).await;
+
+    let resumed = RunState::load(&runner.state.id).unwrap();
+    let fresh = resumed.land_approval.as_ref().unwrap();
+    assert_ne!(fresh.question, old_question, "{:?}", resumed.events);
+    assert_eq!(fresh.head, runner.state.land_approval.as_ref().unwrap().head);
+    assert!(Questions::open().get(&fresh.question).unwrap().status.open());
+    assert_eq!(Questions::open().get(&old_question).unwrap().resolution().as_deref(), Some("merge"));
+    assert_eq!(resumed.status, RunStatus::Landing);
+    assert!(resumed.parked);
+    let owner = magi::queue::Queue::open().get(&task.id).unwrap();
+    assert_eq!(owner.runs, task.runs);
+    assert_eq!(owner.status, magi::queue::TaskStatus::Parked);
+    assert!(!fx.tmp.path().join("forge/fixes").exists());
+    assert!(!fx.tmp.path().join("forge/closed").exists());
+    let calls = std::fs::read_to_string(fx.tmp.path().join("forge/calls")).unwrap();
+    assert!(calls.lines().filter(|line| line.starts_with("pr merge")).all(|line| line.contains("--disable-auto")));
+}
+}

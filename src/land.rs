@@ -1537,6 +1537,28 @@ pub fn deputy_brief(q: &ask::Question, state: Option<&RunState>) -> String {
     s
 }
 
+// Releasing a task permits work to resume; it does not renew merge consent.
+// Check the persisted operator decision both when reusing a card and at the
+// final merge boundary, since a hold/release can arrive between those reads.
+fn merge_consent_superseded(state: &RunState, question: &ask::Question) -> Result<bool> {
+    if !question.status.open() && approval(question.resolution().as_deref()) != Approval::Merge {
+        return Ok(false);
+    }
+    let Some(task_id) = state
+        .origin
+        .as_ref()
+        .and_then(|origin| origin.task.as_ref())
+    else {
+        return Ok(false);
+    };
+    let task = crate::queue::Queue::open()
+        .get(task_id)
+        .context("cannot verify operator decisions for the merge approval")?;
+    Ok(task
+        .operator_decided_at
+        .is_some_and(|at| at > question.answered_at.unwrap_or(question.asked_at)))
+}
+
 /// Ask the owner before merging, with the whole case attached as a panel.
 ///
 /// The evidence is gathered from the winner's own worktree with the `git` CLI,
@@ -1580,13 +1602,18 @@ async fn approval_gate(
                         .is_some_and(crate::merge_decision::stops)
             })
     });
+    let reusable = match reusable {
+        Some(q) if merge_consent_superseded(state, &q)? => None,
+        other => other,
+    };
     if reusable.is_none() {
         for stale in store
             .list()
             .into_iter()
             .filter(|q| q.run == state.id && q.node == APPROVAL_NODE && q.status.open())
         {
-            let why = "the pull request moved to a different head commit; asked again about it";
+            let why =
+                "the pull request head or operator decision changed; asked again for approval";
             if let Err(e) = store.update(&stale.id, |q| {
                 q.abandon(why);
                 Ok(())
@@ -3965,7 +3992,8 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                     }
                     if let Some(binding) = &state.land_approval {
                         let current = ask::Questions::open().get(&binding.question)?;
-                        if current.run != state.id
+                        if merge_consent_superseded(state, &current)?
+                            || current.run != state.id
                             || !binding.head.eq_ignore_ascii_case(&observed_head)
                             || approval(current.resolution().as_deref()) != Approval::Merge
                             || current.merge_target.as_ref().is_some_and(|t| {
