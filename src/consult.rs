@@ -10,6 +10,8 @@
 //!
 //! - **One place decides.** [`origin_talk`] is the only judge of "does this
 //!   question have a chat to ask"; the web view and both entry points use it.
+//!   [`associated_talk`] resolves the same association for navigation even
+//!   when the question can no longer be consulted.
 //! - **Not a choice.** The hand-over never goes into `Question::choices` and
 //!   never touches `Question::answer`: the question stays `Open`, its
 //!   validation and the choice actions stay as they were.
@@ -34,6 +36,12 @@ pub fn origin_talk(tasks: &[Task], talks: &[Talk], q: &Question) -> Option<Talk>
     if !q.status.open() || q.node == crate::bump::NOTICE_NODE {
         return None;
     }
+    associated_talk(tasks, talks, q)
+}
+
+/// The existing conversation associated with a question, regardless of whether
+/// the question is still eligible for consultation.
+pub fn associated_talk(tasks: &[Task], talks: &[Talk], q: &Question) -> Option<Talk> {
     let task = crate::daemon::task_of_question(tasks, q)?;
     let run = chat_talk_of(tasks, task)?;
     talks.iter().find(|t| t.id == run).cloned()
@@ -875,6 +883,40 @@ mod tests {
             .answer(crate::ask::Answer::Choice("Redis".to_owned()))
             .unwrap();
         assert!(hit(&[chat], &[talk], &answered).is_none());
+    }
+
+    #[test]
+    fn associated_chat_remains_navigable_after_consultation_and_settlement() {
+        let (tmp, store, mut talk) = talks();
+        let chat = from_chat(&talk);
+        let tasks = std::slice::from_ref(&chat);
+        let mut q = question("implement");
+        let questions = Questions::at(tmp.path().join("questions"));
+        questions.put(&mut q).unwrap();
+        assert!(begin(&questions, &store, &q, &talk).unwrap());
+        q = questions.get(&q.id).unwrap();
+        let associated = |q: &Question, talk: &Talk| {
+            associated_talk(tasks, std::slice::from_ref(talk), q).map(|t| t.id)
+        };
+        assert_eq!(associated(&q, &talk), Some(talk.id.clone()));
+        assert!(q.status.open());
+        assert!(q.answer.is_none());
+        assert!(origin_talk(tasks, std::slice::from_ref(&talk), &q).is_some());
+        q.answer(crate::ask::Answer::Choice("Redis".into()))
+            .unwrap();
+        assert_eq!(associated(&q, &talk), Some(talk.id.clone()));
+        assert!(origin_talk(tasks, std::slice::from_ref(&talk), &q).is_none());
+        talk.status = TalkStatus::Closed;
+        assert_eq!(associated(&q, &talk), Some(talk.id.clone()));
+        let mut q = question("implement");
+        q.abandon("expired");
+        assert_eq!(associated(&q, &talk), Some(talk.id.clone()));
+        assert!(origin_talk(tasks, std::slice::from_ref(&talk), &q).is_none());
+        assert!(associated_talk(tasks, &[], &q).is_none());
+        assert!(associated_talk(&[], std::slice::from_ref(&talk), &q).is_none());
+        let notice = question(crate::bump::NOTICE_NODE);
+        assert_eq!(associated(&notice, &talk), Some(talk.id.clone()));
+        assert!(origin_talk(tasks, &[talk], &notice).is_none());
     }
 
     #[test]

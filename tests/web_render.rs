@@ -4120,3 +4120,105 @@ async fn chat_notification_display_hides_machine_context_on_phone_and_desktop() 
         browser.close_page(&page).await;
     }
 }
+
+/// Chat navigation remains independent of consultation and answer controls.
+#[tokio::test]
+async fn question_chat_link_survives_consultation_and_settlement() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "CI requires Chrome");
+        eprintln!("SKIP question chat link: no Chrome/Chromium found");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let talks = Talks::at(home.join("talks"));
+    let mut chat = talk::begin(
+        &talks,
+        &fx.config,
+        fx.repo.clone(),
+        Some(&fx.config.agents[0].id),
+    )
+    .unwrap();
+    talk::record(&mut chat, &talks, "Question origin chat", Vec::new()).unwrap();
+    let base = serve_with_client_probe(
+        &home,
+        Queue::at(home.join("queue")),
+        talks,
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Questions,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
+    for (width, height, mobile) in [(1280, 900, false), (390, 844, true), (320, 640, true)] {
+        let page = browser
+            .open_page(&format!("{base}#/questions"), width, height, mobile)
+            .await
+            .unwrap();
+        browser
+            .wait_for(
+                &page,
+                "!!window.deck && deck.state.questions !== null",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        browser
+            .eval(&page, &format!("window.originChat = {:?}", chat.id))
+            .await
+            .unwrap();
+        let out = browser.eval(&page, r##"(async () => {
+          await window.queueReady;
+          const check = (ok, why) => { if (!ok) throw new Error(why); };
+          const q = { id: 'question-chat-link', run: 'run', status: 'open',
+            summary: 'Choose a backend', detail: '', asked_at: '2026-10-12T23:05:24Z',
+            node: 'implement', choices: [], origin_chat: originChat, can_consult_chat: true };
+          const render = (patch = {}) => {
+            Object.assign(q, patch); deck.state.questions = [{ ...q }]; deck.renderQuestions();
+          };
+          render();
+          const row = document.querySelector('#questions-list .ask');
+          const { consultBtn, chatLink, text, sayText } = row.refs;
+          check(chatLink.tagName === 'A' && !chatLink.hidden, 'missing native chat link');
+          check(!consultBtn.hidden && !consultBtn.disabled, 'consultation unavailable');
+          text.value = 'Keep this answer'; sayText.value = 'Keep this reply'; text.focus();
+          render({ consult: { talk: originChat } });
+          check(consultBtn.disabled && consultBtn.textContent === 'Asked the chat agent', 'consultation state lost');
+          check(!chatLink.hidden && chatLink.getAttribute('href') === '#/chat/' + encodeURIComponent(originChat), 'consulted chat unavailable');
+          check(text.value === 'Keep this answer' && sayText.value === 'Keep this reply' && document.activeElement === text, 'draft or focus lost');
+          check(!row.refs.send.disabled, 'answering disabled by consultation');
+          const box = row.refs.consultBox.getBoundingClientRect();
+          for (const control of [consultBtn, chatLink]) {
+            const rect = control.getBoundingClientRect();
+            check(rect.height >= 44, 'small tap target');
+            check(rect.left >= box.left && rect.right <= box.right + 1 && rect.right <= innerWidth, 'action overflows');
+          }
+          const buttonRect = consultBtn.getBoundingClientRect(), linkRect = chatLink.getBoundingClientRect();
+          check(linkRect.left >= buttonRect.right || linkRect.top >= buttonRect.bottom, 'actions overlap');
+          render({ status: 'answered', can_consult_chat: false });
+          check(consultBtn.hidden && !chatLink.hidden, 'settled chat unavailable');
+          render({ origin_chat_closed: true });
+          check(chatLink.textContent === 'Open chat (closed)', 'closed chat not labelled');
+          render({ status: 'abandoned' });
+          check(!chatLink.hidden, 'abandoned chat unavailable');
+          render({ origin_chat: null });
+          check(row.refs.consultBox.hidden && chatLink.hidden && !chatLink.hasAttribute('href'), 'stale chat link retained');
+          render({ origin_chat: 'chat /?#日本語' });
+          check(decodeURIComponent(chatLink.hash.split('/')[2]) === q.origin_chat, 'chat ID encoding lost');
+          render({ origin_chat: originChat });
+          chatLink.click();
+          return true;
+        })()"##).await.unwrap();
+        assert_eq!(out, true, "question chat link @{width}px");
+        browser
+            .wait_for(
+                &page,
+                "!document.querySelector('#view-talk').hidden && document.querySelector('#talk-h').textContent === 'Question origin chat'",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        browser.close_page(&page).await;
+    }
+}
