@@ -1483,23 +1483,12 @@ impl Questions {
     /// Expand an id prefix to exactly one question id. The short id the phone
     /// and the reports show is a suffix, so that is accepted too.
     pub fn resolve_id(&self, prefix: &str) -> Result<String> {
-        if self.path_of(prefix).is_file() {
-            return Ok(prefix.to_owned());
-        }
-        let hits: Vec<String> = self
-            .list()
-            .into_iter()
-            .map(|q| q.id)
-            .filter(|id| id.starts_with(prefix) || id.ends_with(prefix))
-            .collect();
-        match hits.len() {
-            1 => Ok(hits.into_iter().next().expect("exactly one hit")),
-            0 => bail!("no question matches `{prefix}`"),
-            _ => bail!(
-                "`{prefix}` matches {} questions: {}",
-                hits.len(),
-                hits.join(", ")
-            ),
+        use crate::queue::{Reference, record_ids, resolve_reference};
+        let ids = record_ids(&self.root, "json")?;
+        match resolve_reference(prefix, ids.iter().map(String::as_str)) {
+            Reference::Found(id) => Ok(id),
+            Reference::Missing => bail!("no question matches `{prefix}`"),
+            Reference::Ambiguous => bail!("`{prefix}` matches multiple questions"),
         }
     }
 

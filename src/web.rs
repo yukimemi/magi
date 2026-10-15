@@ -4137,7 +4137,7 @@ async fn queue_list(
 ) -> ApiResult<Json<Vec<TaskView>>> {
     blocking(move || {
         let tasks = ui.queue.list();
-        let inv = crate::blockers::Inventory::new(tasks.clone(), &ui.questions.list());
+        let inv = crate::blockers::Inventory::load(&ui.queue, &ui.questions);
         Ok(Json(
             tasks
                 .into_iter()
@@ -5380,7 +5380,7 @@ async fn task_detail(
             .queue
             .get(&id)
             .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
-        let inv = crate::blockers::Inventory::new(ui.queue.list(), &ui.questions.list());
+        let inv = crate::blockers::Inventory::load(&ui.queue, &ui.questions);
         let mut history = task_history(&task, |id| read_run(&ui.runs, id).ok());
         mark_badges(&ui, &task, &mut history);
         let runs_unreadable = history.iter().filter(|h| !h.readable).count();

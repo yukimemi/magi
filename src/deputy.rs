@@ -677,11 +677,19 @@ impl Job {
         let read = &thread[..q.delivered_turns.min(thread.len())];
         let unread = q.unread_from_owner();
         let snapshot = q.thread.len();
+        let current_brief = format!(
+            "{}\n\n{}",
+            dep.brief,
+            crate::queue::dependency_facts(
+                &crate::queue::Queue::at(self.home.join("queue")),
+                &self.store
+            )
+        );
         let body = prompt::deputy(&prompt::DeputyPrompt {
             id: &q.id,
             summary: &q.summary,
             detail: &q.detail,
-            brief: &dep.brief,
+            brief: &current_brief,
             choices: &q.choices,
             thread: read,
             unread: unread.as_deref(),
@@ -763,7 +771,7 @@ impl Job {
                 id: &q.id,
                 summary: &q.summary,
                 detail: &q.detail,
-                brief: &dep.brief,
+                brief: &current_brief,
                 choices: &q.choices,
                 thread: read,
                 unread: None,

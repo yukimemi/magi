@@ -2089,7 +2089,6 @@ impl Queue {
     /// from, passed in rather than reopened here so a test queue at an
     /// explicit root never reads the operator's real questions directory.
     pub fn remove(&self, id: &str, in_flight: bool, questions: &Questions) -> Result<Removal> {
-        let _ = questions;
         let resolved = self.resolve_id(id)?;
         if in_flight {
             bail!("task {resolved} is being run by a live daemon right now");
@@ -2105,7 +2104,7 @@ impl Queue {
             }
             return Err(e);
         }
-        let (released, still_blocked) = self.release_dependents_of(&resolved);
+        let (released, still_blocked) = self.release_dependents_of(&resolved, questions);
         Ok(Removal {
             id: resolved,
             released,
@@ -2137,8 +2136,8 @@ impl Queue {
     /// Apply [`Task::dependency_deleted`] to `task` for every `blocked_by` id
     /// that [`Queue::remove`] deleted. Returns those ids. The caller holds
     /// the task's claim and saves it.
-    pub fn apply_deleted_blockers(&self, task: &mut Task) -> Vec<String> {
-        let deleted = deleted_blockers(self, &task.blocked_by);
+    pub fn apply_deleted_blockers(&self, task: &mut Task, questions: &Questions) -> Vec<String> {
+        let deleted = deleted_blockers(self, questions, &task.blocked_by);
         deleted
             .into_iter()
             .filter(|id| task.dependency_deleted(id))
@@ -2192,12 +2191,16 @@ impl Queue {
     /// [`Task::dependency_deleted`]. Returns the ids released to another
     /// status and those that remain `blocked` on something else. Each
     /// dependent is re-read inside its claim, never written from a stale copy.
-    fn release_dependents_of(&self, dependency: &str) -> (Vec<String>, Vec<String>) {
+    fn release_dependents_of(
+        &self,
+        dependency: &str,
+        questions: &Questions,
+    ) -> (Vec<String>, Vec<String>) {
         let (mut released, mut still_blocked) = (Vec::new(), Vec::new());
         for listed in self.list() {
-            if listed.status != TaskStatus::Blocked
-                || !listed.blocked_by.iter().any(|b| b == dependency)
-            {
+            if listed.status != TaskStatus::Blocked || !listed.blocked_by.iter().any(|b| {
+                matches!(crate::queue::dependency(self, questions, b), Dependency::Deleted(id) if id == dependency)
+            }) {
                 continue;
             }
             let Ok(_claim) = self.claim(&listed.id) else {
@@ -2206,8 +2209,14 @@ impl Queue {
             let Ok(mut task) = self.get(&listed.id) else {
                 continue;
             };
-            if !task.dependency_deleted(dependency) {
+            let references: Vec<String> = task.blocked_by.iter().filter(|id| {
+                matches!(crate::queue::dependency(self, questions, id), Dependency::Deleted(full) if full == dependency)
+            }).cloned().collect();
+            if references.is_empty() {
                 continue;
+            }
+            for reference in references {
+                task.dependency_deleted(&reference);
             }
             if self.put(&mut task).is_err() {
                 continue;
@@ -2313,7 +2322,11 @@ impl Queue {
                 continue;
             };
             if self.path_of(id).exists()
-                || tasks.iter().any(|t| t.blocked_by.iter().any(|b| b == id))
+                || tasks.iter().any(|t| {
+                    t.blocked_by
+                        .iter()
+                        .any(|b| id.starts_with(b) || id.ends_with(b))
+                })
             {
                 continue;
             }
@@ -2463,23 +2476,11 @@ impl Queue {
 
     /// Expand an id prefix to exactly one task id.
     pub fn resolve_id(&self, prefix: &str) -> Result<String> {
-        if self.path_of(prefix).is_file() {
-            return Ok(prefix.to_owned());
-        }
-        let hits: Vec<String> = self
-            .list()
-            .into_iter()
-            .map(|t| t.id)
-            .filter(|id| id.starts_with(prefix) || id.ends_with(prefix))
-            .collect();
-        match hits.len() {
-            1 => Ok(hits.into_iter().next().expect("exactly one hit")),
-            0 => bail!("no task matches `{prefix}`"),
-            _ => bail!(
-                "`{prefix}` matches {} tasks: {}",
-                hits.len(),
-                hits.join(", ")
-            ),
+        let ids = record_ids(&self.root, "json")?;
+        match resolve_reference(prefix, ids.iter().map(String::as_str)) {
+            Reference::Found(id) => Ok(id),
+            Reference::Missing => bail!("no task matches `{prefix}`"),
+            Reference::Ambiguous => bail!("`{prefix}` matches multiple tasks"),
         }
     }
 
@@ -2616,19 +2617,138 @@ fn read_path(path: &Path) -> Result<Task> {
     Ok(task)
 }
 
-/// Ids inside a `blocked_by` list that name neither an existing task file nor
-/// an existing question file - a dependency deleted (`magi task rm`, or by
-/// hand) while something was still waiting on it.
-///
-/// Existence is decided by [`Queue::path_of`]/[`Questions::path_of`]
-/// `is_file()` alone, never by [`Queue::get`]/[`Questions::get`] succeeding:
-/// those also fail on a merely unreadable file - mid-write, corrupt, or from
-/// a schema ahead of this build (see [`read_path`]) - and misreading "cannot
-/// read it right now" as "it was deleted" would quarantine a task over a
-/// transient failure. `blocked_by` always carries a full id, written by
-/// `crate::conduct` or `crate::triage` from a real task's or question's own
-/// `id`/`short`, never a prefix a caller typed - so the exact-path check is
-/// complete on its own, with no [`Queue::resolve_id`] fallback needed.
+/// Resolution shared by queue lookups and dependency inventories. Exact ids
+/// win; otherwise both the CLI prefix and displayed suffix are supported.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Reference {
+    Found(String),
+    Missing,
+    Ambiguous,
+}
+
+pub(crate) fn resolve_reference<'a>(id: &str, ids: impl Iterator<Item = &'a str>) -> Reference {
+    let mut hits = Vec::new();
+    for candidate in ids {
+        if candidate == id {
+            return Reference::Found(candidate.to_owned());
+        }
+        if candidate.starts_with(id) || candidate.ends_with(id) {
+            hits.push(candidate);
+        }
+    }
+    match hits.as_slice() {
+        [] => Reference::Missing,
+        [one] => Reference::Found((*one).to_owned()),
+        _ => Reference::Ambiguous,
+    }
+}
+
+/// Read names, not deserialized records: list() intentionally skips corrupt
+/// and future-schema records, which still exist and must keep their waiters.
+pub(crate) fn record_ids(root: &Path, extension: &str) -> Result<Vec<String>> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut ids = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_some_and(|e| e == extension)
+            && let Some(id) = path.file_stem().and_then(|s| s.to_str())
+        {
+            ids.push(id.to_owned());
+        }
+    }
+    Ok(ids)
+}
+
+/// Unknown and ambiguous dependencies stay waiting; neither is evidence that
+/// the operator deleted a prerequisite or needs to supply its replacement.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Dependency {
+    /// Existing task record, with its canonical id; its contents may be unreadable.
+    Task(String),
+    /// Existing question record, with its canonical id.
+    Question(String),
+    /// Explicitly removed task, identified by its tombstone.
+    Deleted(String),
+    /// No matching record or tombstone after a successful inventory read.
+    Missing,
+    /// More than one record matches the reference.
+    Ambiguous,
+    /// The inventory cannot currently be read, so existence is unknown.
+    Unknown,
+}
+
+/// Resolve against authoritative task, question and deletion record names.
+pub fn dependency(queue: &Queue, questions: &Questions, id: &str) -> Dependency {
+    let (Ok(tasks), Ok(qs), Ok(removed)) = (
+        record_ids(queue.root(), "json"),
+        record_ids(questions.root(), "json"),
+        record_ids(queue.root(), "removed"),
+    ) else {
+        return Dependency::Unknown;
+    };
+    // Include tombstones in ambiguity checks: a reused suffix must never
+    // release a waiter on a different, still-live task.
+    let mut ids = tasks
+        .iter()
+        .chain(qs.iter())
+        .chain(removed.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    match resolve_reference(id, ids.iter().map(String::as_str)) {
+        Reference::Found(id) if tasks.contains(&id) => Dependency::Task(id),
+        Reference::Found(id) if qs.contains(&id) => Dependency::Question(id),
+        Reference::Found(id) if queue.was_deleted(&id) => Dependency::Deleted(id),
+        Reference::Found(_) => Dependency::Unknown,
+        Reference::Missing => Dependency::Missing,
+        Reference::Ambiguous => Dependency::Ambiguous,
+    }
+}
+
+/// Canonicalize only proven dependencies, preserving unknown legacy references.
+pub fn normalize_blockers(queue: &Queue, questions: &Questions, ids: &mut [String]) {
+    for id in ids {
+        if let Dependency::Task(full) | Dependency::Question(full) | Dependency::Deleted(full) =
+            dependency(queue, questions, id)
+        {
+            *id = full;
+        }
+    }
+}
+
+/// Live queue facts for decision and deputy prompts. Historical hold reasons
+/// and question text are claims, never an inventory of existing prerequisites.
+pub fn dependency_facts(queue: &Queue, questions: &Questions) -> String {
+    let inventory = crate::blockers::Inventory::load(queue, questions);
+    let mut text = String::from(
+        "Current authoritative queue (historical missing-task claims may be stale; unreadable or ambiguous references must keep waiting):\n",
+    );
+    match record_ids(queue.root(), "json") {
+        Ok(ids) => {
+            for id in ids {
+                match queue.get(&id) {
+                    Ok(task) => text.push_str(&format!(
+                        "{}: {}; blocked_by={:?}; chain={:?}\n",
+                        task.id,
+                        task.status.as_str(),
+                        task.blocked_by,
+                        inventory.waits_on(&task)
+                    )),
+                    Err(_) => text.push_str(&format!("{id}: exists, state unreadable\n")),
+                }
+            }
+        }
+        Err(_) => text.push_str("Queue inventory unreadable: existence is unknown.\n"),
+    }
+    text
+}
+
+/// Only a successful directory scan with no matching record proves absence.
 pub fn missing_blockers(
     queue: &Queue,
     questions: &Questions,
@@ -2636,23 +2756,21 @@ pub fn missing_blockers(
 ) -> Vec<String> {
     blocked_by
         .iter()
-        .filter(|id| {
-            !queue.path_of(id).is_file()
-                && !questions.path_of(id).is_file()
-                && !queue.was_deleted(id)
-        })
+        .filter(|id| dependency(queue, questions, id) == Dependency::Missing)
         .cloned()
         .collect()
 }
 
-/// Ids in `blocked_by` that [`Queue::remove`] deleted on purpose: tombstoned
-/// and with no record. A live task is never included, tombstone or not. These
-/// are resolved with [`Task::dependency_deleted`], not held; an id that
-/// vanished without a tombstone stays [`missing_blockers`]' to report.
-pub fn deleted_blockers(queue: &Queue, blocked_by: &[String]) -> Vec<String> {
+/// Return the original references, so legacy short ids are removed by the
+/// same Task transition as full ids.
+pub fn deleted_blockers(
+    queue: &Queue,
+    questions: &Questions,
+    blocked_by: &[String],
+) -> Vec<String> {
     blocked_by
         .iter()
-        .filter(|id| queue.was_deleted(id))
+        .filter(|id| matches!(dependency(queue, questions, id), Dependency::Deleted(_)))
         .cloned()
         .collect()
 }
@@ -4235,8 +4353,68 @@ mod tests {
         let mut task = q.get(&blocked.id).unwrap();
         assert_eq!(task.status, TaskStatus::Blocked);
         assert!(missing_blockers(&q, &questions, &task.blocked_by).is_empty());
-        assert_eq!(q.apply_deleted_blockers(&mut task), [dep.id.clone()]);
+        assert_eq!(
+            q.apply_deleted_blockers(&mut task, &questions),
+            [dep.id.clone()]
+        );
         assert_eq!(task.status, TaskStatus::Queued);
+    }
+
+    #[test]
+    fn dependency_resolution_short_deleted_reference_releases_only_its_waiters() {
+        let (dir, q) = queue();
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut dep = task("dependency");
+        dep.id = "20261013-193611-ca5b".into();
+        q.put(&mut dep).unwrap();
+        let mut waiting = task("waiting");
+        waiting.block(vec!["ca5b".into()], None);
+        q.put(&mut waiting).unwrap();
+        q.remove(&dep.id, false, &questions).unwrap();
+        assert_eq!(q.get(&waiting.id).unwrap().status, TaskStatus::Queued);
+        assert_eq!(
+            dependency(&q, &questions, "ca5b"),
+            Dependency::Deleted(dep.id)
+        );
+    }
+
+    #[test]
+    fn dependency_resolution_preserves_cross_store_ambiguity_and_exact_ids() {
+        let (dir, queue) = queue();
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut dep = task("dependency");
+        dep.id = "20261013-193611-ca5b".into();
+        queue.put(&mut dep).unwrap();
+        std::fs::create_dir_all(questions.root()).unwrap();
+        let question_id = "20261014-193611-ca5b";
+        std::fs::write(questions.path_of(question_id), "unreadable question").unwrap();
+        assert_eq!(questions.resolve_id("ca5b").unwrap(), question_id);
+        assert_eq!(
+            dependency(&queue, &questions, "ca5b"),
+            Dependency::Ambiguous
+        );
+        assert_eq!(
+            dependency(&queue, &questions, &dep.id),
+            Dependency::Task(dep.id)
+        );
+        assert_eq!(
+            dependency(&queue, &questions, question_id),
+            Dependency::Question(question_id.into())
+        );
+        assert_eq!(
+            dependency(&queue, &questions, "missing"),
+            Dependency::Missing
+        );
+    }
+
+    #[test]
+    fn dependency_resolution_directory_errors_are_unknown_not_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("not-a-directory"));
+        std::fs::write(q.root(), "file").unwrap();
+        let questions = Questions::at(dir.path().join("questions"));
+        assert_eq!(dependency(&q, &questions, "ca5b"), Dependency::Unknown);
+        assert!(missing_blockers(&q, &questions, &["ca5b".into()]).is_empty());
     }
 
     #[test]
@@ -4250,7 +4428,7 @@ mod tests {
             missing_blockers(&q, &questions, std::slice::from_ref(&dep.id)),
             [dep.id.clone()]
         );
-        assert!(deleted_blockers(&q, std::slice::from_ref(&dep.id)).is_empty());
+        assert!(deleted_blockers(&q, &questions, std::slice::from_ref(&dep.id)).is_empty());
     }
 
     #[test]

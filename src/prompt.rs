@@ -2828,11 +2828,20 @@ never `agent:`.\n\n",
     );
 
     s.push_str(
+        "If a question or hold is solely because prerequisites are missing, \
+         list those same `blocked_by` references in `missing_dependencies`. \
+         Magi checks those claims against the current queue before asking. \
+         Leave `missing_dependencies` empty or omit it for any independent \
+         question, consent requirement, or hold reason, even when dependencies \
+         also exist. Never mark a mixed decision as missing-only.\n\n",
+    );
+
+    s.push_str(
         "# Output\n\n\
          Your reasoning first, then exactly one fenced json block, last:\n\n\
          ```json\n\
          {\"decisions\":[{\"id\":\"<task id>\",\"blocked_by\":[\"<task or \
-         question id>\"],\"reason\":\"<one line>\",\"recovery\":\
+         question id>\"],\"missing_dependencies\":[\"<id, only for a missing-only decision>\"],\"reason\":\"<one line>\",\"recovery\":\
          \"requeue|hold|review|done\",\"question\":\"<text, optional>\",\
          \"choices\":[\"<optional>\"]}]}\n\
          ```\n\n\
