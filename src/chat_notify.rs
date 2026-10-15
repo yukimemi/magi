@@ -647,15 +647,18 @@ pub fn talks_to_start(talks: &Talks) -> Vec<String> {
 /// operator's unsent draft must not start that draft on the daemon's initiative.
 fn pending_is_only_notices(t: &talk::Talk) -> bool {
     if t.pending_messages.iter().any(|m| m.sender.is_some()) {
-        return t.pending_messages.iter().all(|m| {
-            // Legacy sends retain their old notice-only scheduling rule when
-            // a new report joins the draft. This does not change authorship;
-            // an explicit operator sender always prevents automatic resume.
-            (m.sender == Some(talk::Sender::Magi)
-                || (m.sender.is_none() && t.pending_breaks.is_some()))
+        if !t.pending_messages.iter().all(|m| {
+            matches!(m.sender, None | Some(talk::Sender::Magi))
                 && m.attachments.is_empty()
                 && crate::prompt::is_completion_notice(&m.body)
-        });
+        }) {
+            return false;
+        }
+        if t.pending_messages.iter().all(|m| m.sender.is_some()) {
+            return true;
+        }
+        // A legacy Message may combine several sends. Check every recorded
+        // boundary below, including operator text after a notice heading.
     }
     let body = &t.pending;
     if body.is_empty() || !t.pending_attachments.is_empty() {

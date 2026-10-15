@@ -339,20 +339,44 @@ async fn a_notice_appended_to_an_operators_draft_is_not_started() {
 #[tokio::test]
 async fn legacy_notices_resume_after_new_task_or_watch_notices_arrive() {
     let _home = common::home_lock().await;
-    for watch in [false, true] {
-        for legacy_owner_draft in [false, true] {
+    for (watch, combined) in [(false, false), (true, false), (false, true), (true, true)] {
+        for owner_after_notice in [None, Some(false), Some(true)] {
             let w = world();
             finished_task(&w, &w.talk_id, "20260902-000000-aaaa");
             chat_notify::sweep(&w.queue, &w.talks, w.tmp.path());
             let mut legacy = w.talks.get(&w.talk_id).expect("legacy draft");
-            if legacy_owner_draft {
-                let owner = "unfinished operator thought\n\n";
-                legacy.pending.insert_str(0, owner);
-                legacy.pending_breaks = Some(vec![owner.len()]);
+            if let Some(after) = owner_after_notice {
+                let owner = "unfinished operator thought";
+                if after {
+                    let start = legacy.pending.len() + 2;
+                    legacy.pending.push_str("\n\n");
+                    legacy.pending.push_str(owner);
+                    legacy.pending_breaks = Some(vec![start]);
+                } else {
+                    let prefix = format!("{owner}\n\n");
+                    legacy.pending.insert_str(0, &prefix);
+                    legacy.pending_breaks = Some(vec![prefix.len()]);
+                }
             }
-            // Older versions stored plain sends using only body and breaks.
-            legacy.pending_messages.clear();
-            w.talks.put(&mut legacy).expect("save legacy format");
+            if combined {
+                // Legacy metadata can combine sends even though breaks still
+                // records their boundaries. Preserve that wire shape directly
+                // instead of using the current metadata compaction in put.
+                legacy.pending_messages = vec![talk::Message {
+                    sender: None,
+                    body: legacy.pending.clone(),
+                    attachments: Vec::new(),
+                    reply: None,
+                }];
+                std::fs::write(
+                    w.talks.path_of(&legacy.id),
+                    serde_json::to_vec(&legacy).unwrap(),
+                )
+                .expect("save combined legacy format");
+            } else {
+                legacy.pending_messages.clear();
+                w.talks.put(&mut legacy).expect("save plain legacy format");
+            }
             let talks = Talks::at(w.tmp.path().join("talks"));
             assert!(
                 talks
@@ -380,7 +404,7 @@ async fn legacy_notices_resume_after_new_task_or_watch_notices_arrive() {
             );
             assert_eq!(
                 chat_notify::talks_to_start(&talks).contains(&w.talk_id),
-                !legacy_owner_draft
+                owner_after_notice.is_none()
             );
 
             // Explicit operator provenance wins even when the text is a notice.
