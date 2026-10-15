@@ -2735,6 +2735,14 @@ async fn answer_cmd(
     drop(evidence_guard);
     println!("answered {} {}", q.short(), q.summary);
     if q.node == magi::land::APPROVAL_NODE
+        && q.resolution().as_deref() == Some(magi::merge_decision::DISMISS)
+    {
+        println!(
+            "Obsolete approval ended; its execution is retired, history retained and PR unchanged. No merge or replacement was authorized."
+        );
+    }
+    if q.node == magi::land::APPROVAL_NODE
+        && q.resolution().as_deref() != Some(magi::merge_decision::DISMISS)
         && q.resolution()
             .as_deref()
             .is_some_and(magi::merge_decision::stops)

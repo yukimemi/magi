@@ -4705,7 +4705,7 @@ function renderStakes(row, question) {
   } else {
     r.stakes.append(el("button", {
       class: "btn btn-gold stakes-arm", type: "button", text: label("Merge this pull request\u2026", "指摘を確認して、この head のマージを承認…"),
-      onclick: () => { row.dataset.withdrawArmed = ""; row.dataset.armed = "1"; renderStakes(row, question); },
+      onclick: () => { row.dataset.dismissArmed = ""; row.dataset.withdrawArmed = ""; row.dataset.armed = "1"; renderStakes(row, question); },
     }));
   }
 
@@ -4724,6 +4724,22 @@ function renderStakes(row, question) {
     const name = String(choice).toLowerCase();
     if (name === "merge" || name === "hold") continue;
     if (name.startsWith("reimplement:")) { replacements.push(choice); continue; }
+    if (name === "dismiss: end obsolete approval without changing pr") {
+      const block = el("div", { class: "stakes-action" });
+      r.stakes.append(block);
+      if (row.dataset.dismissArmed === "1") {
+        const cancel = el("button", { class: "btn btn-quiet", type: "button", text: label("Cancel dismissal", "終了をキャンセル"),
+          onclick: () => { row.dataset.dismissArmed = ""; renderStakes(row, question); } });
+        block.append(el("p", { class: "stakes-warn", text: label("This approval is obsolete or superseded. End its old execution and pending approval? The PR is unchanged, no merge is authorized, and history is retained. A later attempt is unaffected.", "この承認は不要、または別の実装で完了しています。古い実行と承認待ちを終了しますか？ マージせず、PR は変更せず、履歴は残します。後続の実行には影響しません。") }), cancel,
+          el("button", { class: "btn", type: "button", text: label("Confirm: end obsolete approval; PR unchanged", "確認：古い承認を終了（PR は変更しない）"),
+            onclick: () => answerQuestion(question.id, { choice }, row) }));
+        requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
+      } else {
+        block.append(el("button", { class: "btn", type: "button", text: label("End obsolete approval (no merge; PR unchanged)…", "古い承認を終了（マージしない・PR は変更しない）…"),
+          onclick: () => { row.dataset.armed = ""; row.dataset.withdrawArmed = ""; row.dataset.dismissArmed = "1"; renderStakes(row, question); } }));
+      }
+      continue;
+    }
     if (name === "withdraw: close pr and end task") {
       const withdrawBlock = el("div", { class: "stakes-action" });
       r.stakes.append(withdrawBlock);
@@ -4736,7 +4752,7 @@ function renderStakes(row, question) {
         requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
       } else {
         withdrawBlock.append(el("button", { class: "btn", type: "button", text: label("Withdraw: close PR and end task…", "取り下げ：PR を閉じてタスクを終了…"),
-          onclick: () => { row.dataset.armed = ""; row.dataset.withdrawArmed = "1"; renderStakes(row, question); } }));
+          onclick: () => { row.dataset.dismissArmed = ""; row.dataset.armed = ""; row.dataset.withdrawArmed = "1"; renderStakes(row, question); } }));
       }
       continue;
     }
@@ -5063,6 +5079,7 @@ function updateAskCard(row, question, { compact = false } = {}) {
     row.dataset.choiceKey = choiceKey;
     row.dataset.armed = "";
     row.dataset.withdrawArmed = "";
+    row.dataset.dismissArmed = "";
     row.dataset.replacementChoice = "";
     clear(r.choices);
     clear(r.stakes);

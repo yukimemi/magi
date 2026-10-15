@@ -10065,6 +10065,329 @@ mod tests {
         assert_eq!(fx.get("/api/health").await.json()["questions_open"], 1);
     }
 
+    fn obsolete_approval_state() -> RunState {
+        let mut state = crate::land::tests::repair_state(true, true);
+        state.pr = Some(crate::run::PrRecord {
+            url: "https://github.com/example/repo/pull/42".into(),
+            number: 42,
+            state: "open".into(),
+            checks: "green".into(),
+            round: 1,
+            rounds: 4,
+            red_at_merge: Vec::new(),
+        });
+        state
+    }
+
+    #[tokio::test]
+    async fn obsolete_approval_answer_handler_persists_retirement_for_each_owner_shape() {
+        for owner in ["missing", "current", "completed", "later"] {
+            let fx = Fixture {
+                home: TempDir::new().unwrap(),
+                addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            };
+            let mut state = obsolete_approval_state();
+            state.status = RunStatus::Landing;
+            state.parked = true;
+            state.driver_exited = true;
+            let mut q = Question::new(
+                state.id.clone(),
+                crate::land::APPROVAL_NODE.into(),
+                "land".into(),
+                "Old approval".into(),
+                "Original evidence".into(),
+                vec!["merge".into(), "hold".into()],
+            );
+            state.land_approval = Some(crate::run::LandApproval {
+                question: q.id.clone(),
+                head: "head".into(),
+            });
+            state.save_under(fx.home.path()).unwrap();
+            let stale = state.clone();
+            fx.questions().put(&mut q).unwrap();
+            let mut task = Task::new(
+                "Owner".into(),
+                "Original instruction".into(),
+                state.repo.clone(),
+                Source::Human,
+            );
+            task.runs.push(state.id.clone());
+            task.status = if owner == "completed" {
+                TaskStatus::Done
+            } else {
+                TaskStatus::Parked
+            };
+            if owner == "later" {
+                task.runs.push("later-run".into());
+            }
+            if owner != "missing" {
+                fx.queue().put(&mut task).unwrap();
+            }
+            let ui = Arc::new(Ui::new(
+                fx.queue(),
+                fx.questions(),
+                fx.talks(),
+                fx.runs(),
+                fx.home.path().into(),
+                state.repo.clone(),
+            ));
+            let response = question_answer(
+                State(ui),
+                Path(q.id.clone()),
+                Ok(Json(NewAnswer {
+                    choice: Some(crate::merge_decision::DISMISS.into()),
+                    text: None,
+                })),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                response.0.question.resolution().as_deref(),
+                Some(crate::merge_decision::DISMISS)
+            );
+            let disk = RunState::load_under(&state.id, fx.home.path()).unwrap();
+            assert_eq!(disk.status, RunStatus::Superseded);
+            assert!(crate::pr_head::ensure_owner_record(&stale, Some(&disk)).is_err());
+            assert!(!crate::merge_decision::resumable_hold(&disk));
+            assert_eq!(
+                serde_json::to_value(&disk.pr).unwrap(),
+                serde_json::to_value(&stale.pr).unwrap()
+            );
+            assert_eq!(fx.questions().count_open(), 0);
+            assert!(fx.questions().get(&q.id).unwrap().chosen_action().is_none());
+            crate::daemon::apply_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
+            if owner == "missing" {
+                assert!(fx.queue().list().is_empty());
+            } else {
+                let after = fx.queue().get(&task.id).unwrap();
+                assert_eq!(
+                    after.status,
+                    if owner == "current" {
+                        TaskStatus::Done
+                    } else {
+                        task.status
+                    }
+                );
+                assert_eq!(after.runs, task.runs);
+                assert_eq!(after.instruction, task.instruction);
+                assert_eq!(after.action_applied(&q.id), owner == "current");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn obsolete_legacy_approval_dismissal_survives_http_reconnect_without_an_owner() {
+        let fx = Fixture::start().await;
+        let mut state = obsolete_approval_state();
+        state.status = RunStatus::Landing;
+        state.parked = true;
+        state.driver_exited = true;
+        let mut q = Question::new(
+            state.id.clone(),
+            crate::land::APPROVAL_NODE.into(),
+            "land".into(),
+            "Superseded PR approval".into(),
+            "Original review evidence".into(),
+            vec!["merge".into(), "hold".into()],
+        );
+        state.land_approval = Some(crate::run::LandApproval {
+            question: q.id.clone(),
+            head: "old-reviewed-head".into(),
+        });
+        // The old persisted PR may still say open even when a separate change
+        // already landed. Dismissal must not use that snapshot to close it.
+        state.save_under(fx.home.path()).unwrap();
+        let stale_driver = state.clone();
+        fx.questions().put(&mut q).unwrap();
+        let path = fx
+            .home
+            .path()
+            .join("questions")
+            .join(format!("{}.json", q.id));
+        let mut legacy = serde_json::to_value(&q).unwrap();
+        legacy["schema"] = 9.into();
+        legacy.as_object_mut().unwrap().remove("merge_target");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        // POST without GET tests legacy upgrade and validation at the actual
+        // entry point, rather than constructing a modern card in the test.
+        let body = serde_json::json!({"choice": crate::merge_decision::DISMISS}).to_string();
+        let answer_path = format!("/api/questions/{}/answer", q.id);
+        let res = fx.post(&answer_path, Some(&body)).await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let disk = fx.questions().get(&q.id).unwrap();
+        assert_eq!(
+            disk.resolution().as_deref(),
+            Some(crate::merge_decision::DISMISS)
+        );
+        assert!(disk.detail.starts_with("Original review evidence"));
+        let retired = RunState::load_under(&state.id, fx.home.path()).unwrap();
+        assert_eq!(retired.status, RunStatus::Superseded);
+        assert_eq!(
+            serde_json::to_value(&retired.pr).unwrap(),
+            serde_json::to_value(&state.pr).unwrap()
+        );
+        assert!(!retired.merge_decision.as_ref().unwrap().closed);
+        assert!(!crate::merge_decision::resumable_hold(&retired));
+        assert!(fx.queue().list().is_empty());
+        crate::daemon::apply_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
+        // A restarted server re-reads the persisted pending list.
+        let addr = Fixture::serve(
+            fx.home.path(),
+            PathBuf::from("/repo/magi"),
+            launch_idle,
+            None,
+        )
+        .await;
+        let reconnected = Fixture {
+            home: fx.home,
+            addr,
+        };
+        let listed = reconnected.get("/api/questions").await.json();
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|q| q["status"] != "open")
+        );
+        assert_eq!(listed[0]["id"], q.id, "history remains available");
+        assert_eq!(
+            reconnected.get("/api/health").await.json()["questions_open"],
+            0
+        );
+        assert_eq!(
+            reconnected
+                .post(&answer_path, Some(r#"{"choice":"merge"}"#))
+                .await
+                .status,
+            409
+        );
+        // A late waiter cannot turn the old answer into a new decision.
+        assert!(
+            reconnected
+                .questions()
+                .update(&q.id, |q| q.answer(Answer::Choice("hold".into())))
+                .is_err()
+        );
+        // The same guard used by claims, repair and publication rejects a
+        // saved in-memory driver as well as the persisted terminal record.
+        assert!(crate::pr_head::ensure_owner_record(&stale_driver, Some(&retired)).is_err());
+    }
+
+    #[tokio::test]
+    async fn obsolete_approval_dismissal_respects_claims_and_later_attempts() {
+        let fx = Fixture::start().await;
+        let mut state = obsolete_approval_state();
+        state.status = RunStatus::Landing;
+        state.driver_exited = true;
+        let mut q = Question::new(
+            state.id.clone(),
+            crate::land::APPROVAL_NODE.into(),
+            "land".into(),
+            "Obsolete approval".into(),
+            String::new(),
+            vec!["merge".into(), "hold".into()],
+        );
+        state.land_approval = Some(crate::run::LandApproval {
+            question: q.id.clone(),
+            head: "head".into(),
+        });
+        state.save_under(fx.home.path()).unwrap();
+        fx.questions().put(&mut q).unwrap();
+        let mut task = Task::new(
+            "Owner".into(),
+            "Original instruction".into(),
+            state.repo.clone(),
+            Source::Human,
+        );
+        task.runs = vec![state.id.clone(), "later-run".into()];
+        fx.queue().put(&mut task).unwrap();
+        let before = std::fs::read(fx.queue().path_of(&task.id)).unwrap();
+        let claim = fx.queue().claim(&task.id).unwrap();
+        let body = serde_json::json!({"choice": crate::merge_decision::DISMISS}).to_string();
+        let path = format!("/api/questions/{}/answer", q.id);
+        assert_eq!(fx.post(&path, Some(&body)).await.status, 400);
+        assert!(fx.questions().get(&q.id).unwrap().status.open());
+        drop(claim);
+        let publication = crate::pr_head::owner_lock(fx.home.path(), &state.id).unwrap();
+        assert_eq!(fx.post(&path, Some(&body)).await.status, 400);
+        assert!(fx.questions().get(&q.id).unwrap().status.open());
+        drop(publication);
+        // Unknown liveness and armed auto-merge both fail without settling.
+        state.driver_exited = false;
+        state.driver_pid = None;
+        state.save_under(fx.home.path()).unwrap();
+        assert_eq!(fx.post(&path, Some(&body)).await.status, 400);
+        state.driver_exited = true;
+        state.land_armed_head = Some("head".into());
+        state.save_under(fx.home.path()).unwrap();
+        assert_eq!(fx.post(&path, Some(&body)).await.status, 400);
+        state.land_armed_head = None;
+        state.save_under(fx.home.path()).unwrap();
+        assert_eq!(fx.post(&path, Some(&body)).await.status, 200);
+        crate::daemon::apply_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
+        assert_eq!(std::fs::read(fx.queue().path_of(&task.id)).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn obsolete_approval_dismissal_retries_partial_writes_and_finishes_only_current_owner() {
+        let fx = Fixture::start().await;
+        let mut state = obsolete_approval_state();
+        state.status = RunStatus::Landing;
+        state.driver_exited = true;
+        let mut q = Question::new(
+            state.id.clone(),
+            crate::land::APPROVAL_NODE.into(),
+            "land".into(),
+            "Obsolete approval".into(),
+            String::new(),
+            vec!["merge".into(), "hold".into()],
+        );
+        state.land_approval = Some(crate::run::LandApproval {
+            question: q.id.clone(),
+            head: "head".into(),
+        });
+        state.save_under(fx.home.path()).unwrap();
+        fx.questions().put(&mut q).unwrap();
+        let mut task = Task::new(
+            "Owner".into(),
+            "Original instruction".into(),
+            state.repo.clone(),
+            Source::Human,
+        );
+        task.runs.push(state.id.clone());
+        task.status = TaskStatus::Parked;
+        fx.queue().put(&mut task).unwrap();
+        // Model a crash after the run stop was persisted but before the queue
+        // and answered question were flushed. Retrying must finish, not resume.
+        state.merge_decision = Some(crate::merge_decision::Decision {
+            question: q.id.clone(),
+            target: crate::merge_decision::Target {
+                pr: state.pr.as_ref().unwrap().url.clone(),
+                head: "head".into(),
+                language: "ja".into(),
+            },
+            choice: crate::merge_decision::DISMISS.into(),
+            closed: false,
+            replacement_run: None,
+            replacement_pr: None,
+        });
+        state.status = RunStatus::Superseded;
+        state.save_under(fx.home.path()).unwrap();
+        let body = serde_json::json!({"choice": crate::merge_decision::DISMISS}).to_string();
+        let path = format!("/api/questions/{}/answer", q.id);
+        assert_eq!(fx.post(&path, Some(&body)).await.status, 200);
+        let done = fx.queue().get(&task.id).unwrap();
+        assert_eq!(done.status, TaskStatus::Done);
+        assert_eq!(done.runs, task.runs);
+        assert_eq!(done.instruction, task.instruction);
+        assert!(done.action_applied(&q.id));
+        crate::daemon::apply_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
+        assert_eq!(fx.queue().get(&task.id).unwrap().status, TaskStatus::Done);
+        assert!(!fx.questions().get(&q.id).unwrap().status.open());
+    }
+
     #[tokio::test]
     async fn merge_decision_api_persists_exact_target_and_selected_action() {
         let fx = Fixture {
