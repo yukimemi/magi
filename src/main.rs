@@ -2686,35 +2686,52 @@ async fn answer_cmd(
     let tasks = magi::queue::Queue::open().list();
     let talks = magi::talk::Talks::open();
     let seat = agent_env();
-    let (q, evidence_guard) = store.update(&q.id, |r| {
-        let evidence_guard = seat
-            .as_ref()
-            .filter(|(_, node)| {
+    let evidence_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let (q, evidence_guard) = loop {
+        let mut evidence_busy = false;
+        let updated = store.update(&q.id, |r| {
+            let evidence_guard = if seat.as_ref().is_some_and(|(_, node)| {
                 node == magi::queue::CHAT_NODE
                     && magi::consult::QuestionKind::of(r) != magi::consult::QuestionKind::Ordinary
-            })
-            .map(|_| talks.answer_guard())
-            .transpose()?;
-        if let Some((run, node)) = &seat {
-            magi::consult::refuse_operator_held(r, node, &tasks)?;
-            let reply = match &answer {
-                ask::Answer::Choice(s) | ask::Answer::Text(s) => s,
+            }) {
+                match talks.try_answer_guard()? {
+                    Some(guard) => Some(guard),
+                    None => {
+                        evidence_busy = true;
+                        bail!("conversation evidence is locked by another process");
+                    }
+                }
+            } else {
+                None
             };
-            r.answer_authority = magi::consult::authorize_answer(
-                r,
-                &talks,
-                &store,
-                run,
-                node,
-                reply,
-                quote.as_deref(),
-            )?;
+            if let Some((run, node)) = &seat {
+                magi::consult::refuse_operator_held(r, node, &tasks)?;
+                let reply = match &answer {
+                    ask::Answer::Choice(s) | ask::Answer::Text(s) => s,
+                };
+                r.answer_authority = magi::consult::authorize_answer(
+                    r,
+                    &talks,
+                    &store,
+                    run,
+                    node,
+                    reply,
+                    quote.as_deref(),
+                )?;
+            }
+            r.answer(answer.clone())?;
+            // Returning the guard retains it through Questions::update's atomic
+            // write; dropping it in this closure would leave a retraction race.
+            Ok(evidence_guard)
+        });
+        if evidence_busy && std::time::Instant::now() < evidence_deadline {
+            // Never wait under the expiring question lock. update has released
+            // it; the next attempt will read the latest question under a new lock.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
         }
-        r.answer(answer)?;
-        // Returning the guard retains it through Questions::update's atomic
-        // write; dropping it in this closure would leave a retraction race.
-        Ok(evidence_guard)
-    })?;
+        break updated?;
+    };
     drop(evidence_guard);
     println!("answered {} {}", q.short(), q.summary);
     if q.node == magi::land::APPROVAL_NODE

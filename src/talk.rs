@@ -49,7 +49,7 @@
 //! own home.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -653,29 +653,41 @@ impl Talks {
         }
     }
 
-    /// Freeze owner evidence until an answer has been persisted. Acquire this
-    /// after the question lock, and retain it through `Questions::update`'s
-    /// write, using the same lock order as consultation dispatch.
+    /// Freeze owner evidence until an answer has been persisted. Callers under
+    /// a question lock must use [`Self::try_answer_guard`] instead: waiting here
+    /// can outlive the question lock's expiry. Retain the guard through
+    /// `Questions::update`'s write to prevent a retraction race.
     pub fn answer_guard(&self) -> Result<AnswerGuard<'_>> {
-        let mutex = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
-        // Keep temporary lock files separate from transcripts so answering
-        // seats can synchronize without permission to alter owner evidence.
-        let root = self.answer_lock_root();
-        std::fs::create_dir_all(&root).context("create conversation evidence lock directory")?;
-        let path = root.join("store.turn");
         let deadline = std::time::Instant::now() + TAKEOVER_LOCK_TTL * 2;
         loop {
-            if let Some(file) = TurnLock::take(&path)? {
-                return Ok(AnswerGuard {
-                    _file: file,
-                    _mutex: mutex,
-                });
+            if let Some(guard) = self.try_answer_guard()? {
+                return Ok(guard);
             }
             if std::time::Instant::now() >= deadline {
                 bail!("conversation evidence is locked by another process");
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Acquire owner evidence without waiting while a question lock is held.
+    /// On contention, release the question lock before retrying, then reload
+    /// the question so another answer cannot be overwritten by an old snapshot.
+    pub fn try_answer_guard(&self) -> Result<Option<AnswerGuard<'_>>> {
+        let mutex = match self.lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(err)) => err.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+        };
+        // Keep temporary lock files separate from transcripts so answering
+        // seats can synchronize without permission to alter owner evidence.
+        let root = self.answer_lock_root();
+        std::fs::create_dir_all(&root).context("create conversation evidence lock directory")?;
+        let path = root.join("store.turn");
+        Ok(TurnLock::take(&path)?.map(|file| AnswerGuard {
+            _file: file,
+            _mutex: mutex,
+        }))
     }
 
     /// Writable synchronization files, separate from conversation evidence.
@@ -5460,6 +5472,18 @@ mod tests {
     }
 
     #[test]
+    fn evidence_try_lock_does_not_wait_for_either_store_handle() {
+        let (tmp, talks) = store();
+        let guard = talks.answer_guard().unwrap();
+        // The same handle contends on the mutex, another on the file lock.
+        assert!(talks.try_answer_guard().unwrap().is_none());
+        let other = Talks::at(tmp.path().join("talks"));
+        assert!(other.try_answer_guard().unwrap().is_none());
+        drop(guard);
+        assert!(other.try_answer_guard().unwrap().is_some());
+    }
+
+    #[test]
     fn owner_retraction_waits_until_the_authorized_question_is_persisted() {
         use crate::ask::{Answer, Question, Questions};
         use std::sync::mpsc;
@@ -5485,7 +5509,7 @@ mod tests {
             let mut writer = None;
             let (saved, guard) = questions
                 .update(&q.id, |q| {
-                    let guard = talks.answer_guard()?;
+                    let guard = talks.try_answer_guard()?.context("evidence is busy")?;
                     q.answer_authority = crate::consult::authorize_answer(
                         q,
                         &talks,

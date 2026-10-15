@@ -661,15 +661,8 @@ fn cli_waits_for_the_conversation_evidence_lock_before_reading_owner_intent() {
     let guard = talks.answer_guard().unwrap();
     std::thread::scope(|scope| {
         let answer = scope.spawn(|| hold(&f, &run, &words));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let lock = f.questions.root().join(format!("{}.lock", f.qid));
-        while !lock.exists() && !answer.is_finished() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(
-            lock.exists(),
-            "the CLI must first acquire the question lock"
-        );
+        // Evidence contention must wait outside the short-lived question lock.
+        std::thread::sleep(std::time::Duration::from_millis(150));
         assert!(
             !answer.is_finished(),
             "the CLI must also wait for conversation updates"
@@ -681,6 +674,51 @@ fn cli_waits_for_the_conversation_evidence_lock_before_reading_owner_intent() {
             out.status.success(),
             "{}",
             String::from_utf8_lossy(&out.stderr)
+        );
+    });
+}
+
+#[test]
+fn cli_reloads_a_concurrently_settled_question_after_evidence_contention() {
+    let f = fixture();
+    let words = format!("{}: hold", f.qid);
+    let run = standing_owner(&f, &words, None);
+    let talks = Talks::at(f.tmp.path().join("talks"));
+    let guard = talks.answer_guard().unwrap();
+    std::thread::scope(|scope| {
+        let answer = scope.spawn(|| hold(&f, &run, &words));
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !answer.is_finished(),
+            "the CLI must be waiting for evidence"
+        );
+
+        // A manual hold needs no conversation evidence and must be able to
+        // settle immediately, without waiting for the question lock to expire.
+        let started = std::time::Instant::now();
+        let (settled, ()) = f
+            .questions
+            .update(&f.qid, |q| {
+                q.answer(magi::ask::Answer::Choice("hold".into()))
+            })
+            .unwrap();
+        let elapsed = started.elapsed();
+        drop(guard);
+        let out = answer.join().unwrap();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "evidence contention retained the question lock for {elapsed:?}"
+        );
+        assert!(
+            !out.status.success(),
+            "the competing answer already settled it: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let saved = f.questions.get(&f.qid).unwrap();
+        assert_eq!(
+            serde_json::to_value(saved).unwrap(),
+            serde_json::to_value(settled).unwrap(),
+            "the manual answer and its lack of conversation authority must survive"
         );
     });
 }
