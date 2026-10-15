@@ -636,21 +636,32 @@ pub fn approval_choices(state: &RunState) -> Vec<String> {
     choices
 }
 
-/// Upgrade an unanswered legacy two-choice question without changing its id,
-/// panel, head binding or any already recorded owner decision.
+/// Upgrade legacy choices and their resume action without changing the id,
+/// panel, head binding or any already recorded owner decision. An earlier
+/// repair answer also gains the action so interrupted handoffs can reconcile.
 pub fn upgrade_repair_choice(q: &mut ask::Question, state: &RunState) -> bool {
     if q.node == APPROVAL_NODE
-        && q.status.open()
+        && (q.status.open() || q.resolution().as_deref() == Some(REPAIR))
         && repair_available(state)
         && state
             .land_approval
             .as_ref()
             .is_some_and(|a| a.question == q.id)
-        && !q.choices.iter().any(|c| c == REPAIR)
     {
-        q.choices.push(REPAIR.to_owned());
-        q.detail.push_str("\n\n`fix findings and re-review` runs one repair and bounded review on this PR; it does not approve a merge. A fresh decision follows the updated review and gate.");
-        true
+        let mut changed = false;
+        if q.status.open() && !q.choices.iter().any(|c| c == REPAIR) {
+            q.choices.push(REPAIR.to_owned());
+            q.detail.push_str("\n\n`fix findings and re-review` runs one repair and bounded review on this PR; it does not approve a merge. A fresh decision follows the updated review and gate.");
+            changed = true;
+        }
+        let action = ask::ChoiceAction::Resume {
+            run: state.id.clone(),
+        };
+        if q.actions.get(REPAIR) != Some(&action) {
+            q.actions.insert(REPAIR.to_owned(), action);
+            changed = true;
+        }
+        changed
     } else {
         false
     }
@@ -1640,6 +1651,12 @@ async fn approval_gate(
                 approval_choices(state),
             );
             if fresh.choices.iter().any(|c| c == REPAIR) {
+                fresh.actions.insert(
+                    REPAIR.to_owned(),
+                    ask::ChoiceAction::Resume {
+                        run: state.id.clone(),
+                    },
+                );
                 fresh.detail.push_str("\n\n`fix findings and re-review` runs one repair and bounded review on this PR; it does not approve a merge. A fresh decision follows the updated review and gate.");
             }
             store
@@ -4832,7 +4849,7 @@ impl Default for GhUser {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::run::{Candidate, ReviewRecord, ReviewRound, Tally};
 
@@ -6128,7 +6145,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         );
     }
 
-    fn repair_state(major: bool, reject: bool) -> RunState {
+    pub(crate) fn repair_state(major: bool, reject: bool) -> RunState {
         let mut state = landing_state();
         let mut rec = review_record(1, "alpha", "precise rejection reason");
         rec.vote = Some(if reject {
@@ -6193,6 +6210,20 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         store
             .update(&id, |q| q.answer(ask::Answer::Choice(REPAIR.into())))
             .unwrap();
+        // An earlier build may have recorded the repair answer and stopped
+        // before any driver consumed it. Reconcile that durable decision too.
+        store
+            .update(&id, |q| {
+                q.actions.clear();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.get(&id).unwrap().chosen_action(),
+            Some(&ask::ChoiceAction::Resume {
+                run: state.id.clone()
+            })
+        );
         let binding = state.land_approval.clone();
         assert_eq!(
             approval_gate(&mut state, &pr, "feat: x", None, "abc")

@@ -9763,6 +9763,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_merge_repair_api_resumes_the_parked_owner_once() {
+        let fx = Fixture {
+            home: TempDir::new().unwrap(),
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        };
+        let mut state = crate::land::tests::repair_state(true, true);
+        state.status = RunStatus::Landing;
+        state.parked = true;
+        state.driver_exited = true;
+        let mut task = Task::new(
+            "Existing PR owner".into(),
+            state.instruction.clone(),
+            state.repo.clone(),
+            Source::Human,
+        );
+        task.runs.push(state.id.clone());
+        task.status = TaskStatus::Parked;
+        fx.queue().put(&mut task).unwrap();
+        let mut q = Question::new(
+            state.id.clone(),
+            crate::land::APPROVAL_NODE.into(),
+            "land".into(),
+            "Contested merge".into(),
+            "Original evidence".into(),
+            vec!["merge".into(), "hold".into()],
+        );
+        state.land_approval = Some(crate::run::LandApproval {
+            question: q.id.clone(),
+            head: "reviewed-head".into(),
+        });
+        state.save_under(fx.home.path()).unwrap();
+        fx.questions().put(&mut q).unwrap();
+        // POST directly, without a preceding GET: validation must see the
+        // same durable upgrade that the card, CLI and chat see.
+        let ui = Arc::new(Ui::new(
+            fx.queue(),
+            fx.questions(),
+            fx.talks(),
+            fx.runs(),
+            fx.home.path().to_path_buf(),
+            state.repo.clone(),
+        ));
+        let response = question_answer(
+            State(ui),
+            Path(q.id.clone()),
+            Ok(Json(NewAnswer {
+                choice: Some(crate::land::REPAIR.into()),
+                text: None,
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0.question.id, q.id);
+        let upgraded = fx.questions().get(&q.id).unwrap();
+        assert_eq!(
+            upgraded.choices,
+            [crate::land::APPROVE, crate::land::HOLD, crate::land::REPAIR]
+        );
+        assert!(upgraded.detail.starts_with("Original evidence"));
+        let claim = fx.queue().claim(&task.id).unwrap();
+        crate::daemon::apply_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
+        assert!(
+            fx.queue().get(&task.id).unwrap().resume_override.is_none(),
+            "an existing driver keeps its claim"
+        );
+        drop(claim);
+        crate::daemon::apply_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
+        let resumed = fx.queue().get(&task.id).unwrap();
+        assert_eq!(
+            resumed
+                .resume_override
+                .as_ref()
+                .unwrap()
+                .pinned_run
+                .as_deref(),
+            Some(state.id.as_str())
+        );
+        assert!(resumed.status.runnable());
+        assert_eq!(resumed.instruction, task.instruction);
+        assert_eq!(resumed.runs, task.runs);
+        assert!(resumed.action_applied(&q.id));
+        crate::daemon::apply_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
+        assert_eq!(fx.queue().list().len(), 1);
+        assert_eq!(
+            fx.queue().get(&task.id).unwrap().resume_override,
+            resumed.resume_override
+        );
+        let disk = RunState::load_under(&state.id, fx.home.path()).unwrap();
+        assert!(
+            disk.merge_repairs.is_empty(),
+            "only the claimed run driver may execute repair"
+        );
+        assert_eq!(disk.land_approval.unwrap().head, "reviewed-head");
+    }
+
+    #[tokio::test]
     async fn answering_records_the_choice_and_a_second_answer_conflicts() {
         let fx = Fixture::start().await;
         let id = ask(&fx, "Which backend?", &["SQLite", "Redis"]);

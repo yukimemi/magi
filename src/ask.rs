@@ -1351,9 +1351,11 @@ impl Questions {
     }
 
     fn with_repair_choice(&self, q: Question) -> Question {
-        if q.status.open()
+        if (q.status.open() || q.resolution().as_deref() == Some(crate::land::REPAIR))
             && q.node == crate::land::APPROVAL_NODE
-            && !q.choices.iter().any(|c| c == crate::land::REPAIR)
+            && (!q.choices.iter().any(|c| c == crate::land::REPAIR)
+                || q.actions.get(crate::land::REPAIR)
+                    != Some(&ChoiceAction::Resume { run: q.run.clone() }))
             && let Some(home) = self.root.parent()
             && let Ok(state) = crate::run::RunState::load_under(&q.run, home)
             && crate::land::repair_available(&state)

@@ -11950,6 +11950,13 @@ mod tests {
             "task".to_owned(),
             Config::default(),
         );
+        // These fixtures share one home and save concurrently. Short clock
+        // IDs can collide, making an ownership test read another test's run.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        state.id = format!(
+            "20000101-000000-{:04x}",
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         state.status = status;
         Runner {
             state,

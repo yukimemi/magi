@@ -106,6 +106,15 @@ async fn held_pr(noop: bool, keep_findings: bool) -> (common::Fixture, Runner, S
         .unwrap()
         .question
         .clone();
+    // Persist the exact legacy card shape, rather than manufacturing a
+    // third button in memory. The real answer binary must migrate it.
+    Questions::open()
+        .update(&id, |q| {
+            q.choices = vec!["merge".into(), "hold".into()];
+            q.actions.clear();
+            Ok(())
+        })
+        .unwrap();
     assert!(
         Questions::open()
             .get(&id)
@@ -213,6 +222,78 @@ async fn assert_fresh_decision(noop: bool) {
             .count(),
         1
     );
+}
+
+common::e2e! {
+async fn merge_repair_legacy_chat_refreshes_choices_on_the_next_turn() {
+    let (fx, runner, id) = held_pr(false, false).await;
+    let questions = Questions::open();
+    questions.update(&id, |q| {
+        q.status = magi::ask::QuestionStatus::Open;
+        q.answer = None;
+        q.choices = vec!["merge".into(), "hold".into()];
+        q.actions.clear();
+        Ok(())
+    }).unwrap();
+    let talks = magi::talk::Talks::open();
+    let mut cfg = fx.config.clone();
+    cfg.agents[0].command = vec!["sh".into(), "-c".into(), "cat".into()];
+    cfg.agents[0].env.clear();
+    cfg.talk.allow_write = false;
+    let mut talk = magi::talk::begin(&talks, &cfg, fx.repo.clone(), Some(&cfg.agents[0].id)).unwrap();
+    magi::talk::say(&talks.claim_turn(&talk.id).unwrap().unwrap(), &mut talk, &talks, &cfg, "Discuss the decision", Vec::new()).await.unwrap();
+    let legacy = questions.update(&id, |q| {
+        q.choices = vec!["merge".into(), "hold".into()];
+        q.actions.clear();
+        Ok(())
+    }).unwrap().0;
+    assert!(magi::consult::begin(&questions, &talks, &legacy, &talk).unwrap());
+    talk = talks.get(&talk.id).unwrap();
+    assert!(!talk.pending.contains("--reply 'fix findings and re-review'"));
+    magi::talk::say(&talks.claim_turn(&talk.id).unwrap().unwrap(), &mut talk, &talks, &cfg, "What actions are available?", Vec::new()).await.unwrap();
+    assert!(talk.turns.last().unwrap().body.contains("--reply 'fix findings and re-review'"));
+    assert!(questions.get(&id).unwrap().status.open());
+    assert!(RunState::load(&runner.state.id).unwrap().merge_repairs.is_empty());
+    assert!(!fx.tmp.path().join("forge/fixes").exists());
+}
+}
+
+common::e2e! {
+async fn merge_repair_legacy_cli_answer_dispatches_through_parked_task_owner() {
+    let (fx, mut runner, old_question) = held_pr(false, false).await;
+    let queue = magi::queue::Queue::open();
+    let mut task = magi::queue::Task::new("Existing PR".into(), runner.state.instruction.clone(), fx.repo.clone(), magi::queue::Source::Human);
+    task.status = magi::queue::TaskStatus::Parked;
+    task.runs.push(runner.state.id.clone());
+    runner.state.origin = Some(Origin::queue(&task.id));
+    runner.state.save().unwrap();
+    queue.put(&mut task).unwrap();
+    let config = fx.tmp.path().join("dispatch.toml");
+    let mut cfg = runner.state.config.clone();
+    cfg.disk.min_free_bytes = 0;
+    cfg.disk.auto_fold = false;
+    std::fs::write(&config, toml::to_string(&cfg).unwrap()).unwrap();
+    magi::daemon::serve_until(magi::daemon::Opts {
+        repo: fx.repo.clone(), config: Some(config), once: true,
+        worktrees_root: Some(fx.tmp.path().join("worktrees")),
+        ..Default::default()
+    }, magi::daemon::Stop::new()).await.unwrap();
+    let disk = RunState::load(&runner.state.id).unwrap();
+    assert_eq!(disk.merge_repairs.len(), 1);
+    assert_eq!(disk.merge_repairs[0].question, old_question);
+    assert_eq!(disk.merge_repairs[0].phase, MergeRepairPhase::Complete);
+    assert!(disk.instruction.starts_with(&runner.state.instruction));
+    assert!(disk.parked);
+    assert_ne!(disk.land_approval.as_ref().unwrap().question, old_question);
+    assert!(disk.gate_status().ok());
+    assert_eq!(queue.list().len(), 1);
+    let owner = queue.get(&task.id).unwrap();
+    assert!(owner.runs.iter().all(|id| id == &disk.id));
+    assert_eq!(owner.instruction, task.instruction);
+    assert!(owner.action_applied(&old_question));
+    let calls = std::fs::read_to_string(fx.tmp.path().join("forge/calls")).unwrap();
+    assert!(calls.lines().filter(|l| l.starts_with("pr merge")).all(|l| l.contains("--disable-auto")));
+}
 }
 
 common::e2e! {

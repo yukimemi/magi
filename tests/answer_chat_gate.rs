@@ -105,6 +105,74 @@ fn assert_untouched(f: &Fixture, out: &Output) {
 }
 
 #[test]
+fn legacy_consult_repair_requires_exact_owner_choice_and_keeps_original_handoff() {
+    let f = fixture();
+    let q = f.questions.get(&f.qid).unwrap();
+    let mut state = magi::run::RunState::new(
+        f.tmp.path().into(),
+        "main".into(),
+        "reviewed-head".into(),
+        "Original instruction".into(),
+        Config::default(),
+    );
+    state.id = q.run.clone();
+    state.status = magi::run::RunStatus::Landing;
+    state.parked = true;
+    state.land_approval = Some(magi::run::LandApproval {
+        question: q.id.clone(),
+        head: "reviewed-head".into(),
+    });
+    state.reviews.push(serde_json::from_value(serde_json::json!({
+        "round": 1, "head": "reviewed-head", "reviews": [{"reviewer": 1, "agent": "mock", "vote": "reject", "summary": "Unresolved review"}],
+        "blocking": 0, "answered": 1, "expected": 1
+    })).unwrap());
+    state.save_under(f.tmp.path()).unwrap();
+    let talks = Talks::at(f.tmp.path().join("talks"));
+    let mut t = talks.get(&f.talk_id).unwrap();
+    let old_handoff = t.turns[0].body.clone();
+    assert!(!old_handoff.contains(magi::land::REPAIR));
+    let submit = || {
+        Command::new(env!("CARGO_BIN_EXE_magi"))
+            .args([
+                "answer",
+                &f.qid,
+                "--reply",
+                magi::land::REPAIR,
+                "--quote",
+                magi::land::REPAIR,
+            ])
+            .env("MAGI_HOME", f.tmp.path())
+            .env("MAGI_CONFIG_DIR", f.tmp.path().join("config"))
+            .env("MAGI_RUN", &f.talk_id)
+            .env("MAGI_NODE", magi::queue::CHAT_NODE)
+            .output()
+            .unwrap()
+    };
+    t.pending = format!("maybe {}", magi::land::REPAIR);
+    t.pending_breaks = Some(Vec::new());
+    talks.put(&mut t).unwrap();
+    assert_untouched(&f, &submit());
+    t.pending = magi::land::REPAIR.into();
+    talks.put(&mut t).unwrap();
+    let out = submit();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let answered = f.questions.get(&f.qid).unwrap();
+    assert_eq!(answered.resolution().as_deref(), Some(magi::land::REPAIR));
+    assert_eq!(
+        answered.chosen_action(),
+        Some(&magi::ask::ChoiceAction::Resume { run: q.run })
+    );
+    assert_eq!(talks.get(&f.talk_id).unwrap().turns[0].body, old_handoff);
+    let disk = magi::run::RunState::load_under(&state.id, f.tmp.path()).unwrap();
+    assert!(disk.merge_repairs.is_empty());
+    assert_eq!(disk.instruction, "Original instruction");
+}
+
+#[test]
 fn a_chat_merge_without_a_quote_is_refused() {
     let f = fixture();
     let out = answer(&f, &f.talk_id, None);

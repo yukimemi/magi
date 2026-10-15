@@ -871,6 +871,35 @@ where
                 ));
             }
             match load(run) {
+                Ok(s)
+                    if q.node == land::APPROVAL_NODE
+                        && q.resolution().as_deref() == Some(land::REPAIR) =>
+                {
+                    if s.merge_repairs.iter().any(|r| r.question == q.id)
+                        || s.land_approval.as_ref().is_some_and(|a| a.question != q.id)
+                    {
+                        // A live/manual driver already consumed or superseded
+                        // this answer. Do not hold its fresh approval wait.
+                        ActionDecision::Stale
+                    } else if s.liveness(false) == Liveness::Live {
+                        ActionDecision::Skip
+                    } else if s.status != RunStatus::Landing
+                        || s.released()
+                        || !land::repair_available(&s)
+                        || !implementers_match(task, &s)
+                        || !s
+                            .land_approval
+                            .as_ref()
+                            .is_some_and(|a| a.question == q.id && !a.head.is_empty())
+                    {
+                        ActionDecision::Refuse(format!(
+                            "repair question {} no longer names a supported current approval on run {}; inspect `magi show {}` and restore the existing owner's approval before retrying; do not file another task",
+                            q.id, run, run
+                        ))
+                    } else {
+                        ActionDecision::Resume(run.clone())
+                    }
+                }
                 Ok(s) if s.status.resumable() && !s.released() && !exhausted_review_budget(&s) => {
                     ActionDecision::Resume(run.clone())
                 }
@@ -1043,13 +1072,25 @@ pub(crate) fn task_of_question<'a>(tasks: &'a [Task], q: &ask::Question) -> Opti
 /// records a pinned [`crate::queue::OperatorResume`], which `crate::conduct`
 /// honours (no re-hold, no requeue) until the task runs and [`attempt`]'s
 /// ordinary `unfinished_run` logic resumes that same run.
-fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
+pub(crate) fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
     let tasks = queue.list();
     for q in questions.list() {
         if q.chosen_action().is_none() {
             continue;
         }
         let Some(listed) = task_of_question(&tasks, &q) else {
+            if q.node == land::APPROVAL_NODE && q.resolution().as_deref() == Some(land::REPAIR) {
+                notices::raise_in(
+                    home,
+                    Notice::warn(
+                        &format!("repair-owner:{}", q.id),
+                        &format!(
+                            "Repair is waiting: no task owns run {}. Inspect `magi show {}` and restore its original queue owner; do not file a competing repair task.",
+                            q.run, q.run
+                        ),
+                    ),
+                );
+            }
             continue;
         };
         if listed.action_applied(&q.id) {
@@ -2036,6 +2077,15 @@ fn land_resume_state(task: &Task) -> LandResume {
         return LandResume::Ready;
     };
     if !q.status.open() {
+        // Repair spends agent resources and must obey concurrency and quota
+        // waits; only a merge/hold decision may use the decision-only lane.
+        if q.resolution().as_deref() == Some(land::REPAIR) {
+            return if state.liveness(false) == Liveness::Live {
+                LandResume::StillWaiting
+            } else {
+                LandResume::NotLanding
+            };
+        }
         return LandResume::Ready;
     }
     // `ask::ask_and_wait`'s own deadline is what used to retire a question
@@ -2937,6 +2987,22 @@ async fn attempt(
     } else {
         starter_with_implementers(task, previous.as_ref(), proposed)
     };
+    // A repair pin must never degrade into a new competition or takeover if
+    // the owner disappears between the answer and dispatch.
+    if let Some(pin) = &task.resume_override
+        && let Some(run) = &pin.pinned_run
+        && Questions::open().get(&pin.question_id).map_or(true, |q| {
+            q.node == land::APPROVAL_NODE && q.resolution().as_deref() == Some(land::REPAIR)
+        })
+        && starter != Starter::Resume(run.clone())
+    {
+        task.hold_machine(Some(format!(
+            "repair owner cannot resume; inspect `magi show {run}` and restore the existing run before `magi task release {}`; no replacement task was started",
+            task.id
+        )));
+        record(queue, task);
+        return Vec::new();
+    }
     // Absolute paths of the files the task was filed with, re-read from the
     // task now so a file attached while it was held reaches a resumed run
     // too. A stored name whose file has gone is an error before any agent is
@@ -9186,6 +9252,111 @@ mod tests {
             );
             assert_eq!(t.runs, vec!["B", "A"]);
         }
+    }
+
+    #[test]
+    fn merge_repair_dispatch_refuses_obsolete_bindings_and_unsupported_owners() {
+        let mut state = crate::land::tests::repair_state(true, true);
+        state.status = RunStatus::Landing;
+        state.parked = true;
+        state.driver_exited = true;
+        let mut q = ask::Question::new(
+            state.id.clone(),
+            land::APPROVAL_NODE.into(),
+            "land".into(),
+            "Merge?".into(),
+            String::new(),
+            vec![land::APPROVE.into(), land::HOLD.into()],
+        );
+        q.id = state.id.clone();
+        state.land_approval = Some(crate::run::LandApproval {
+            question: q.id.clone(),
+            head: "current-head".into(),
+        });
+        assert!(land::upgrade_repair_choice(&mut q, &state));
+        q.answer(ask::Answer::Choice(land::REPAIR.into())).unwrap();
+        let mut task = held_task_with(&state.id);
+        task.status = TaskStatus::Parked;
+        assert_eq!(
+            decide_action(&task, &q, &PHRASES_EN, |_| Ok(state.clone())),
+            ActionDecision::Resume(state.id.clone())
+        );
+        let mut superseded = state.clone();
+        superseded.land_approval.as_mut().unwrap().question = "fresh-decision".into();
+        assert_eq!(
+            decide_action(&task, &q, &PHRASES_EN, |_| Ok(superseded)),
+            ActionDecision::Stale
+        );
+        for case in 1..4 {
+            let mut changed = state.clone();
+            match case {
+                1 => changed.status = RunStatus::Blocked,
+                2 => changed.released_to = Some("new-owner".into()),
+                _ => changed.land_approval.as_mut().unwrap().head.clear(),
+            }
+            assert!(matches!(
+                decide_action(&task, &q, &PHRASES_EN, |_| Ok(changed)),
+                ActionDecision::Refuse(_)
+            ));
+        }
+        assert!(matches!(
+            decide_action(&task, &q, &PHRASES_EN, |_| anyhow::bail!("missing owner")),
+            ActionDecision::Refuse(_)
+        ));
+        task.runs.push("replacement".into());
+        assert_eq!(
+            decide_action(&task, &q, &PHRASES_EN, |_| panic!(
+                "old owner must not load"
+            )),
+            ActionDecision::Stale
+        );
+    }
+
+    #[test]
+    fn merge_repair_dispatch_obeys_capacity_and_quota_while_hold_stays_decision_only() {
+        let mut state = crate::land::tests::repair_state(true, true);
+        state.status = RunStatus::Landing;
+        state.parked = true;
+        state.driver_exited = true;
+        let mut q = ask::Question::new(
+            state.id.clone(),
+            land::APPROVAL_NODE.into(),
+            "land".into(),
+            "Merge?".into(),
+            String::new(),
+            vec![land::APPROVE.into(), land::HOLD.into()],
+        );
+        q.id = state.id.clone();
+        state.land_approval = Some(crate::run::LandApproval {
+            question: q.id.clone(),
+            head: "current-head".into(),
+        });
+        state.save().unwrap();
+        land::upgrade_repair_choice(&mut q, &state);
+        q.answer(ask::Answer::Choice(land::REPAIR.into())).unwrap();
+        Questions::open().put(&mut q).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = Queue::at(tmp.path().join("queue"));
+        let mut task = held_task_with(&state.id);
+        task.status = TaskStatus::Parked;
+        queue.put(&mut task).unwrap();
+        let empty = Arc::new(tokio::sync::Semaphore::new(0));
+        let free = Arc::new(tokio::sync::Semaphore::new(1));
+        assert!(claim_dispatch(&queue, &task, false, &empty, &free).is_none());
+        assert!(claim_dispatch(&queue, &task, true, &free, &free).is_none());
+        let claim = claim_dispatch(&queue, &task, false, &free, &free).unwrap();
+        assert!(claim.permit.is_some());
+        assert!(claim_dispatch(&queue, &task, false, &free, &free).is_none());
+        drop(claim);
+        Questions::open()
+            .update(&q.id, |q| {
+                q.answer = Some(ask::Answer::Choice(land::HOLD.into()));
+                Ok(())
+            })
+            .unwrap();
+        let claim = claim_dispatch(&queue, &task, true, &empty, &empty).unwrap();
+        assert!(claim.permit.is_none());
+        assert!(RunState::load(&state.id).unwrap().merge_repairs.is_empty());
     }
 
     #[test]

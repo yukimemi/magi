@@ -2205,6 +2205,29 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             }
             format!("{}\n\n{standing}{text}{last_note}", transcript(talk, store))
         };
+        // A resumed conversation may remember a legacy merge/hold-only card.
+        // Re-send current persisted choices, without altering the owner's words.
+        let current_approvals = questions
+            .as_ref()
+            .map(|store| {
+                store
+                    .list()
+                    .iter()
+                    .filter(|q| {
+                        q.status.open()
+                            && q.node == crate::land::APPROVAL_NODE
+                            && q.consult.as_ref().is_some_and(|c| c.talk == talk.id)
+                    })
+                    .map(crate::prompt::chat_consult)
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            })
+            .unwrap_or_default();
+        let body = if current_approvals.is_empty() {
+            body
+        } else {
+            format!("{current_approvals}\n\n# Current operator message\n\n{body}")
+        };
         let attempt_stem = if n == 0 {
             stem.clone()
         } else {
