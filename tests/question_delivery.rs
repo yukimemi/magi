@@ -329,3 +329,91 @@ fn terminal_text_answer_remains_a_decision_without_a_recipient() {
     assert_eq!(saved.resolution().as_deref(), Some("chosen name"));
     assert!(!saved.status.open());
 }
+
+#[test]
+fn release_watch_deputy_thread_with_empty_run_is_an_agent_reply() {
+    for live_lease in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let store = Questions::at(home.path().join("questions"));
+        let mut q = Question::new(
+            String::new(),
+            magi::bump::NOTICE_NODE.into(),
+            "release-watch".into(),
+            "Continue watching?".into(),
+            String::new(),
+            vec!["hold".into()],
+        );
+        q.answer_timeout = 60;
+        q.deputy = Some(Deputy::new("release context".into()));
+        q.deputy.as_mut().unwrap().starts = magi::deputy::MAX_STARTS;
+        q.say("Explain the release status").unwrap();
+        q.delivered_turns = q.thread.len(); // Already read by the replying deputy.
+        store.put(&mut q).unwrap();
+        if live_lease {
+            store.beat(&q.id, WaiterKind::Deputy);
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_magi"))
+            .args([
+                "ask",
+                "--thread",
+                &q.id,
+                "--summary",
+                "Release explanation",
+                "--choice",
+                "hold",
+            ])
+            .current_dir(home.path())
+            .env("MAGI_HOME", home.path())
+            .env(Config::CONFIG_DIR_ENV, "")
+            .env("MAGI_RUN", "")
+            .env("MAGI_NODE", magi::deputy::NODE)
+            .env("MAGI_SEAT", magi::ask::deputy_seat_key(&q.id))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut answered = false;
+        let mut timed_out = false;
+        loop {
+            if !answered
+                && let Ok(fresh) = store.get(&q.id)
+                && fresh
+                    .thread
+                    .last()
+                    .is_some_and(|t| t.who == magi::ask::Who::Agent)
+            {
+                answered = store
+                    .update(&q.id, |q| {
+                        q.answer(magi::ask::Answer::Choice("hold".into()))
+                    })
+                    .is_ok();
+            }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                child.kill().unwrap();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(!timed_out, "thread command did not finish");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let saved = store.get(&q.id).unwrap();
+        assert!(answered, "the command must wait for the owner's decision");
+        assert_eq!(saved.thread.len(), 2);
+        assert_eq!(saved.thread[0].body, "Explain the release status");
+        assert_eq!(saved.thread[1].who, magi::ask::Who::Agent);
+        assert_eq!(saved.thread[1].body, "Release explanation");
+        assert_eq!(saved.delivered_turns, 2);
+        assert_eq!(saved.resolution().as_deref(), Some("hold"));
+    }
+}

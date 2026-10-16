@@ -2252,8 +2252,14 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
     // is attributed to the seat that asked it rather than to whoever is at the
     // terminal. Outside a run those are empty and the question still works.
     let run = std::env::var("MAGI_RUN").unwrap_or_default();
-    let node = std::env::var("MAGI_NODE").unwrap_or_else(|_| "ask".to_owned());
-    let seat = std::env::var("MAGI_SEAT").unwrap_or_else(|_| "operator".to_owned());
+    let node_env = std::env::var("MAGI_NODE").ok();
+    let seat_env = std::env::var("MAGI_SEAT").ok();
+    // Release-watch deputies have no run id. Invocation identity comes from
+    // the node and seat, both exported by agent::invoke even for those seats.
+    let agent_thread = node_env.as_ref().is_some_and(|s| !s.trim().is_empty())
+        && seat_env.as_ref().is_some_and(|s| !s.trim().is_empty());
+    let node = node_env.unwrap_or_else(|| "ask".to_owned());
+    let seat = seat_env.unwrap_or_else(|| "operator".to_owned());
 
     if let Some(why) = asking_is_not_this_seat_s_job(&node) {
         bail!(why);
@@ -2267,7 +2273,7 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
     let mut q = match thread {
         Some(id) => {
             let resolved = store.resolve_id(&id)?;
-            if run.is_empty() || seat == "operator" {
+            if !agent_thread {
                 store.update(&resolved, |q| {
                     magi::question_delivery::require(&store, q, Some(&cfg))?;
                     q.say(thread_message(&summary, &detail))
