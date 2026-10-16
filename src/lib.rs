@@ -60,6 +60,7 @@ pub mod pr_outcome;
 pub mod pr_recovery;
 pub mod proc;
 pub mod prompt;
+pub mod question_delivery;
 pub mod queue;
 pub mod rebase;
 pub mod reconcile;

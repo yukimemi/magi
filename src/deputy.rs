@@ -295,6 +295,11 @@ pub fn deadline(q: &Question, default_timeout: u64) -> i64 {
     from.saturating_add(secs as i64)
 }
 
+/// Dispatch and text admission share the fixed-clock and unread-word rules.
+pub fn restart_in_time(q: &Question, default_timeout: u64, now: Timestamp) -> bool {
+    now.as_second() <= deadline(q, default_timeout) || q.unread_from_owner().is_some()
+}
+
 /// Can `magi serve` start a deputy at all under `cfg`? Not when deputies are
 /// switched off (`daemon.max_deputies = 0`) or the config could not be read.
 ///
@@ -477,9 +482,7 @@ impl Deputies {
             }
             // Past the deadline the waiter retires the question; a say that
             // arrived in time is still read first.
-            if now.as_second() > deadline(&q, self.default_timeout())
-                && q.unread_from_owner().is_none()
-            {
+            if !restart_in_time(&q, self.default_timeout(), now) {
                 continue;
             }
             if self.inflight.len() >= self.max || !can_start(self.cfg.as_ref(), dep.agent.as_str())
@@ -734,10 +737,7 @@ impl Job {
         // The question store is outside the repository, and `magi ask` writes it.
         // A merge approval's deputy also files follow-up tasks with `magi task
         // add`, which writes the queue; that is the one other place it writes.
-        let writable = [
-            self.store.root().to_path_buf(),
-            crate::queue::Queue::open().root().to_path_buf(),
-        ];
+        let writable = [self.store.root().to_path_buf(), self.home.join("queue")];
         macro_rules! invocation {
             ($prompt:expr, $stem:expr, $timeout:expr) => {
                 Invocation {
@@ -847,6 +847,8 @@ impl Job {
                 d.seat = Some(kept);
             }
             r.waiter = None;
+            // Retire ownership under the same lock used by text admission.
+            self.store.drop_lease(&q.id);
             // The owner's words were in the prompt. An agent that read them but
             // answered in prose instead of `magi ask --thread` still spoke;
             // keep it on the record so the owner reads it.
@@ -862,7 +864,6 @@ impl Job {
             }
             Ok(())
         })?;
-        self.store.drop_lease(&q.id);
         if let Some(why) = why {
             tracing::warn!("question {}: the deputy ended: {why}", q.short());
             notices::raise_in(

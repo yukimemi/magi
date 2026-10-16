@@ -152,6 +152,9 @@ pub struct Status {
     pub completed: usize,
     /// Queue polls since start, so a wedged loop shows up as a frozen count.
     pub polls: u64,
+    /// Effective startup capabilities of the question recovery loops.
+    #[serde(default)]
+    pub question_recovery: Option<crate::question_delivery::Recovery>,
 }
 
 impl Status {
@@ -168,6 +171,7 @@ impl Status {
             current: Vec::new(),
             completed: 0,
             polls: 0,
+            question_recovery: None,
         }
     }
 }
@@ -426,6 +430,9 @@ pub struct Reading {
     pub completed: u64,
     /// Queue polls this daemon process has made.
     pub polls: u64,
+    /// Effective startup capabilities of the question recovery loops.
+    #[serde(default)]
+    pub question_recovery: Option<crate::question_delivery::Recovery>,
 }
 
 /// Accept the old single-`Current`-or-absent shape as well as the current
@@ -1994,7 +2001,17 @@ async fn drive(
     // every heartbeat — or the heartbeat to keep its own shadow copy of them —
     // for no gain. The lock is only ever held across a field assignment, never
     // across an await.
-    let status = Arc::new(Mutex::new(Status::new()));
+    let recovery_cfg = prepare(&opts.repo, opts).ok();
+    let daemon_cfg = recovery_cfg
+        .as_ref()
+        .map(|c| c.daemon.clone())
+        .unwrap_or_default();
+    let mut initial_status = Status::new();
+    initial_status.question_recovery = Some(crate::question_delivery::Recovery::new(
+        recovery_cfg.as_ref(),
+        daemon_cfg.max_deputies,
+    ));
+    let status = Arc::new(Mutex::new(initial_status));
     write_status_to(status_file, &lock(&status)).context("publish the daemon status file")?;
     let beat = tokio::spawn(heartbeat(Arc::clone(&status), status_file.to_path_buf()));
 
@@ -2003,9 +2020,6 @@ async fn drive(
     // repository a given task happens to name - see
     // `Config::daemon.max_concurrent_runs`'s doc for why that is a machine
     // fact in the same sense the agent roster is.
-    let daemon_cfg = prepare(&opts.repo, opts)
-        .map(|c| c.daemon)
-        .unwrap_or_default();
     let concurrency = max_concurrent(daemon_cfg.max_concurrent_runs);
 
     // Something has to be waiting on every question for as long as it is open,
@@ -2016,7 +2030,7 @@ async fn drive(
         crate::waiter::Waiter::new(
             crate::ask::Questions::at(home.join("questions")),
             home.to_path_buf(),
-            prepare(&opts.repo, opts).ok(),
+            recovery_cfg.clone(),
         ),
         stop.clone(),
     ));
@@ -2028,7 +2042,7 @@ async fn drive(
         crate::deputy::Deputies::new(
             crate::ask::Questions::at(home.join("questions")),
             home.to_path_buf(),
-            prepare(&opts.repo, opts).ok(),
+            recovery_cfg.clone(),
             opts.repo.clone(),
             daemon_cfg.max_deputies,
             {
