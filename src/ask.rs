@@ -1327,7 +1327,12 @@ impl Questions {
         }
         let _guard = Unlock(lock);
         let mut q = read_path(&self.path_of(id))?;
+        let was_dismissed = q.resolution().as_deref() == Some(crate::merge_decision::DISMISS);
         let out = f(&mut q)?;
+        if !was_dismissed && q.resolution().as_deref() == Some(crate::merge_decision::DISMISS) {
+            let home = self.root.parent().context("question store has no home")?;
+            crate::merge_decision::dismiss(home, &q)?;
+        }
         self.put(&mut q)?;
         Ok((q, out))
     }

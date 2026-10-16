@@ -1129,6 +1129,10 @@ pub(crate) fn task_of_question<'a>(tasks: &'a [Task], q: &ask::Question) -> Opti
 pub(crate) fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
     let tasks = queue.list();
     for q in questions.list() {
+        // Dismissal is committed by the question writer, never a resume.
+        if q.resolution().as_deref() == Some(crate::merge_decision::DISMISS) {
+            continue;
+        }
         if q.chosen_action().is_none() {
             continue;
         }
@@ -1547,7 +1551,7 @@ fn settle_and_diagnose(
         if task.runs.last().is_some_and(|id| id != &state.id) {
             return;
         }
-        if d.choice == md::WITHDRAW && d.closed {
+        if (d.choice == md::WITHDRAW && d.closed) || d.choice == md::DISMISS {
             task.succeed();
         } else if let Some(agent) = md::selected_agent(&d.choice).filter(|_| d.closed) {
             if state.liveness(false) != Liveness::Dead {

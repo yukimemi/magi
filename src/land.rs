@@ -634,6 +634,7 @@ pub fn approval_choices(state: &RunState) -> Vec<String> {
         HOLD.to_owned(),
         REPAIR.to_owned(),
         crate::merge_decision::WITHDRAW.to_owned(),
+        crate::merge_decision::DISMISS.to_owned(),
     ];
     choices.extend(
         state
@@ -672,7 +673,9 @@ pub fn upgrade_repair_choice(q: &mut ask::Question, state: &RunState) -> bool {
         }
     }
     for choice in q.choices.clone() {
-        if (q.status.open() && crate::merge_decision::stops(&choice))
+        if (q.status.open()
+            && crate::merge_decision::stops(&choice)
+            && choice != crate::merge_decision::DISMISS)
             || (choice == REPAIR && (q.status.open() || q.resolution().as_deref() == Some(REPAIR)))
         {
             q.actions.insert(
@@ -1721,7 +1724,8 @@ async fn approval_gate(
                 fresh.detail.push_str("\n\n`fix findings and re-review` runs one repair and bounded review on this PR; it does not approve a merge. A fresh decision follows the updated review and gate.");
             }
             for choice in fresh.choices.clone() {
-                if crate::merge_decision::stops(&choice) {
+                if crate::merge_decision::stops(&choice) && choice != crate::merge_decision::DISMISS
+                {
                     fresh.actions.insert(
                         choice,
                         ask::ChoiceAction::Resume {

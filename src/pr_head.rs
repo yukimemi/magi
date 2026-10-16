@@ -61,17 +61,27 @@ fn try_lock_file(file: &std::fs::File) -> std::io::Result<()> {
 
 pub(crate) fn ensure_owner(state: &RunState) -> Result<()> {
     let disk = run::try_home().and_then(|home| RunState::load_under(&state.id, &home).ok());
-    if state.merge_decision.as_ref().is_some_and(|d| d.closed)
-        || disk
-            .as_ref()
-            .is_some_and(|s| s.merge_decision.as_ref().is_some_and(|d| d.closed))
+    ensure_owner_record(state, disk.as_ref())
+}
+
+/// The same ownership check with an explicitly loaded disk record.
+pub(crate) fn ensure_owner_record(state: &RunState, disk: Option<&RunState>) -> Result<()> {
+    if state
+        .merge_decision
+        .as_ref()
+        .is_some_and(|d| d.closed || d.choice == crate::merge_decision::DISMISS)
+        || disk.is_some_and(|s| {
+            s.merge_decision
+                .as_ref()
+                .is_some_and(|d| d.closed || d.choice == crate::merge_decision::DISMISS)
+        })
     {
         bail!("this execution was retired by an owner decision; resume the current task instead");
     }
     if let Some(next) = state
         .pr_taken_over_by
         .as_ref()
-        .or_else(|| disk.as_ref().and_then(|s| s.pr_taken_over_by.as_ref()))
+        .or_else(|| disk.and_then(|s| s.pr_taken_over_by.as_ref()))
     {
         bail!(
             "pull request ownership was superseded by run {}",

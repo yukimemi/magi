@@ -1101,7 +1101,7 @@ data URI). Invalid or unavailable saved images fall back to the built-in icon.
 
 ### Choosing the next action at the merge gate
 
-The approval card offers five actions (localized for `graph.language = "ja"`):
+The approval card offers these actions (localized for `graph.language = "ja"`):
 
 | Action | Result |
 | --- | --- |
@@ -1109,6 +1109,7 @@ The approval card offers five actions (localized for `graph.language = "ja"`):
 | Reimplement with selected agent / 選択した agent で再実装 | Select a configured implementer explicitly. The old execution retires and auto-merge is disabled; closure of the old PR must be confirmed before the **same task** starts a new attempt and PR. The original instruction, attachments and review context survive. |
 | Hold decision and stop work / 判断を保留して作業を停止 | Leaves the PR open, blocks the run and manually holds the queue task. Stops repair, rebasing and merge work, including when the PR head changed. It is not a request for repair. |
 | Withdraw: close PR and end task / 取り下げ | A second confirmation explicitly closes the PR and terminates the task. History remains. Failed or unconfirmed closure holds the task instead of declaring it done. |
+| End obsolete approval (no merge; PR unchanged) / 古い承認を終了 | A second confirmation retires a stopped execution and its pending approval, preserving history even when the original queue task is missing. It never contacts the forge, closes a PR, or starts replacement work. Later attempts and completed tasks are unaffected. A live or unknown driver, an existing auto-merge arm, or a conflicting decision refuses dismissal; stop the driver and disable auto-merge first. Use Withdraw when you explicitly intend to close an active PR. |
 | Merge this pull request / マージを承認 | A second confirmation approves only the displayed head, including the outstanding findings shown in the review panel. A changed head needs a fresh decision. |
 
 CLI answers use stable tokens, independently of translated button labels:
@@ -1118,6 +1119,7 @@ magi answer <question-id> --reply 'fix findings and re-review'
 magi answer <question-id> --reply 'reimplement:<configured-agent-id>'
 magi answer <question-id> --reply hold
 magi answer <question-id> --reply 'withdraw: close PR and end task'
+magi answer <question-id> --reply 'dismiss: end obsolete approval without changing PR'
 magi answer <question-id> --reply merge
 ```
 
@@ -1125,7 +1127,9 @@ magi answer <question-id> --reply merge
 legacy cards are extended in place, keeping their question ID and displayed
 head. Answered cards retain their choices and decision history.
 
-The daemon resumes the existing parked owner to apply the answer. Answering
+Dismissal is applied locally while saving the answer; no daemon or original
+queue task is required. It is permanent for that execution, unlike Hold.
+For the other actions, the daemon resumes the existing parked owner to apply the answer. Answering
 alone does not dispatch an agent. Without a running daemon, explicitly resume
 the existing owning task/run; do not file a second repair or replacement task.
 After an applied hold, explicitly run `magi task release <task-id>` with the

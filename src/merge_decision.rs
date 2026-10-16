@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 /// Explicit closure confirmation, also usable as a CLI choice.
 pub const WITHDRAW: &str = "withdraw: close PR and end task";
+/// Retire obsolete local work without changing the PR on the forge.
+pub const DISMISS: &str = "dismiss: end obsolete approval without changing PR";
 /// Prefix followed by the exact configured agent id.
 pub const REIMPLEMENT: &str = "reimplement:";
 
@@ -63,7 +65,97 @@ pub fn selected_agent(choice: &str) -> Option<&str> {
 pub fn stops(choice: &str) -> bool {
     choice.eq_ignore_ascii_case(crate::land::HOLD)
         || choice == WITHDRAW
+        || choice == DISMISS
         || selected_agent(choice).is_some()
+}
+
+/// Apply a dismissal while the question writer holds its lock. Unlike withdrawal,
+/// this needs no forge access or queue owner. Claims serialize with a restarting
+/// daemon; the publication lock serializes with standalone driver takeover.
+/// Persist the stop before settling the answer so a partial write fails closed
+/// and retrying the same question completes the operation.
+pub(crate) fn dismiss(home: &std::path::Path, q: &crate::ask::Question) -> anyhow::Result<()> {
+    use crate::run::{Liveness, RunState, RunStatus};
+    use anyhow::ensure;
+
+    ensure!(
+        q.node == crate::land::APPROVAL_NODE,
+        "only merge approvals can be dismissed"
+    );
+    let queue = crate::queue::Queue::at(home.join("queue"));
+    let owners: Vec<_> = queue
+        .list()
+        .into_iter()
+        .filter(|t| t.runs.contains(&q.run))
+        .collect();
+    let mut claims = Vec::new();
+    for task in &owners {
+        claims.push(queue.claim(&task.id)?);
+    }
+    let _lock = crate::pr_head::owner_lock(home, &q.run)?;
+    let mut state = RunState::load_under(&q.run, home)?;
+    ensure!(
+        state.liveness(false) == Liveness::Dead,
+        "stop the current driver before dismissing this obsolete approval"
+    );
+    ensure!(
+        state.land_armed_head.is_none(),
+        "disable existing PR auto-merge before dismissing this approval"
+    );
+    let binding = state
+        .land_approval
+        .as_ref()
+        .filter(|b| b.question == q.id)
+        .ok_or_else(|| anyhow::anyhow!("this is no longer the run's approval question"))?;
+    let pr = state
+        .pr
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("approval has no recorded PR"))?;
+    let target = q.merge_target.clone().unwrap_or_else(|| Target {
+        pr: pr.url.clone(),
+        head: binding.head.clone(),
+        language: state.config.graph.language.clone(),
+    });
+    ensure!(
+        target.pr == pr.url && target.head == binding.head,
+        "approval target does not match the recorded run"
+    );
+    ensure!(
+        state
+            .merge_decision
+            .as_ref()
+            .is_none_or(|d| d.question == q.id && d.choice == DISMISS),
+        "another owner decision already controls this run"
+    );
+    if state.merge_decision.is_none() {
+        state.merge_decision = Some(Decision {
+            question: q.id.clone(),
+            target,
+            choice: DISMISS.into(),
+            closed: false,
+            replacement_run: None,
+            replacement_pr: None,
+        });
+        if !state.status.done() {
+            state.status = RunStatus::Superseded;
+        }
+        state.parked = false;
+        state.event(
+            "land",
+            "Owner dismissed obsolete approval; execution retired, PR unchanged",
+        );
+        state.save_under(home)?;
+    }
+    for owner in owners {
+        let mut task = queue.get(&owner.id)?;
+        // A later attempt or an already completed task owns its own outcome.
+        if task.runs.last() == Some(&q.run) && task.status != crate::queue::TaskStatus::Done {
+            task.succeed();
+            task.mark_action_applied(&q.id);
+            queue.put(&mut task)?;
+        }
+    }
+    Ok(())
 }
 
 /// Only an applied hold can be reopened by an explicit run/task resume.
