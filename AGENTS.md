@@ -2922,6 +2922,11 @@ replacement implementation.
 the final allowed start can still be live without any ordinary waiter/cwd.
 Without a lease, deputy dispatch predicates and `waiter::Waiter::can_resume`
 plus a daemon heartbeat or live upgrade handover lease determine recovery.
+`daemon.json` publishes a credential-free `question_recovery` snapshot from the
+same startup config/capacity passed to the loops; current file edits do not
+change that running capability. Legacy heartbeats without a snapshot prove no
+recovery capacity. Answer decisions (including text answers) do not require a
+recipient; only conversational operator text uses admission.
 Operator text ingress must call `question_delivery::require` inside the
 question update lock before writing. `ask --thread` without an agent identity
 is an operator message, never an agent reply. Explicit chat consultations and

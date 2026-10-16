@@ -2732,11 +2732,6 @@ async fn answer_cmd(
                     quote.as_deref(),
                 )?;
             }
-            if seat.is_none() && matches!(&answer, ask::Answer::Text(_)) && r.free_text() {
-                let repo = std::env::current_dir()?;
-                let cfg = Config::discover(&repo, None).ok().map(|(cfg, _)| cfg);
-                magi::question_delivery::require(&store, r, cfg.as_ref())?;
-            }
             r.answer(answer.clone())?;
             // Returning the guard retains it through Questions::update's atomic
             // write; dropping it in this closure would leave a retraction race.

@@ -4,10 +4,44 @@ use std::path::Path;
 
 use anyhow::Result;
 use jiff::Timestamp;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::ask::{Question, Questions};
 use crate::config::Config;
+
+/// Recovery capabilities of the configuration actually held by the daemon.
+/// Contains no commands, environment values, or credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recovery {
+    max_deputies: usize,
+    deputy_agents: Vec<String>,
+    deputy_fallback: bool,
+    /// Default timeout used by the running recovery loops.
+    pub answer_timeout: u64,
+}
+
+impl Recovery {
+    /// Snapshot the same configuration and capacity passed to `Deputies`.
+    pub fn new(cfg: Option<&Config>, max_deputies: usize) -> Self {
+        Self {
+            max_deputies,
+            deputy_agents: cfg.map_or_else(Vec::new, |c| {
+                c.agents.iter().map(|a| a.id.clone()).collect()
+            }),
+            deputy_fallback: cfg.is_some_and(|c| c.resolve_roles().is_ok()),
+            answer_timeout: cfg.map_or_else(
+                || Config::default().graph.answer_timeout,
+                |c| c.graph.answer_timeout,
+            ),
+        }
+    }
+
+    fn can_start(&self, agent: &str) -> bool {
+        self.max_deputies > 0
+            && (self.deputy_fallback
+                || (!agent.is_empty() && self.deputy_agents.iter().any(|id| id == agent)))
+    }
+}
 
 /// Stable refusal reasons, independent of the display language.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -102,15 +136,27 @@ impl Availability {
 }
 
 /// The same heartbeat and upgrade lease readers used by the daemon UI.
-fn recovering(home: &Path, now: Timestamp) -> bool {
-    crate::daemon::read_status(home).is_some_and(|s| s.running(now))
-        || crate::updater::read_progress(home).is_some_and(|p| {
-            matches!(
-                p.stage,
-                crate::updater::Stage::Parking | crate::updater::Stage::Restarting
-            ) && crate::updater::live_lease(&p, crate::updater::read_lease(home).as_ref(), now)
-                .is_some()
-        })
+fn recovering(home: &Path, now: Timestamp, cfg: Option<&Config>) -> Option<Recovery> {
+    let daemon = crate::daemon::read_status(home)?;
+    let handover = crate::updater::read_progress(home).is_some_and(|p| {
+        matches!(
+            p.stage,
+            crate::updater::Stage::Parking | crate::updater::Stage::Restarting
+        ) && crate::updater::live_lease(&p, crate::updater::read_lease(home).as_ref(), now)
+            .is_some()
+    });
+    let running = daemon.running(now);
+    let recovery = daemon.question_recovery?;
+    if running {
+        return Some(recovery);
+    }
+    // During handover a successor has not published its capabilities yet.
+    // Do not promise recovery if prospective settings changed in the gap.
+    if handover && cfg.is_some_and(|c| recovery == Recovery::new(Some(c), c.daemon.max_deputies)) {
+        Some(recovery)
+    } else {
+        None
+    }
 }
 
 /// Inspect current leases and the existing deputy/waiter recovery prerequisites.
@@ -152,9 +198,10 @@ pub fn availability(store: &Questions, q: &Question, cfg: Option<&Config>) -> Av
             },
         );
     }
-    let timeout = cfg.map_or_else(
+    let recovery = recovering(home, now, cfg);
+    let timeout = recovery.as_ref().map_or_else(
         || Config::default().graph.answer_timeout,
-        |c| c.graph.answer_timeout,
+        |r| r.answer_timeout,
     );
     if crate::deputy::kind_of(q).is_some() {
         if q.deputy
@@ -163,7 +210,10 @@ pub fn availability(store: &Questions, q: &Question, cfg: Option<&Config>) -> Av
         {
             return unavailable(UnavailableReason::DeputyExhausted);
         }
-        if !crate::deputy::can_start(cfg, crate::deputy::agent_of(q)) {
+        let Some(recovery) = recovery.as_ref() else {
+            return unavailable(UnavailableReason::DaemonUnavailable);
+        };
+        if !recovery.can_start(crate::deputy::agent_of(q)) {
             return unavailable(UnavailableReason::DeputyDisabled);
         }
         if !crate::deputy::restart_in_time(q, timeout, now) {
@@ -178,7 +228,7 @@ pub fn availability(store: &Questions, q: &Question, cfg: Option<&Config>) -> Av
             return unavailable(UnavailableReason::Deadline);
         }
     }
-    if recovering(home, now) {
+    if recovery.is_some() {
         result(
             "waiting",
             "recovery",

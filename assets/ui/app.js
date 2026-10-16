@@ -5080,8 +5080,8 @@ function updateAskCard(row, question, { compact = false } = {}) {
   // the agent has not replied yet, deciding is not an option: the
   // controls stay visible - the owner can still see what was on offer - but
   // disabled, with `waitingNote` above saying why.
-  r.text.disabled = waitingOnAgent || textUnavailable;
-  r.send.disabled = waitingOnAgent || textUnavailable;
+  r.text.disabled = choicesLocked;
+  r.send.disabled = choicesLocked;
   for (const btn of r.choices.querySelectorAll("button")) btn.disabled = choicesLocked && !(merge && question.consult);
   for (const btn of r.stakes.querySelectorAll("button")) btn.disabled = choicesLocked && !(merge && question.consult);
 

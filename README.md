@@ -1151,11 +1151,14 @@ Question free-text replies require a live recipient or one the running daemon
 can automatically recover. The card distinguishes listening, waiting for startup
 or restart/capacity, and unavailable recipients. It disables only text submission
 when the deputy has exhausted its start budget, is disabled/unavailable, or the
-asking seat cannot resume. The server and terminal text commands check again
-before saving; a stale card cannot submit into a dead thread. Rejected drafts
+asking seat cannot resume. The running daemon publishes its effective recovery
+capacity; editing settings requires restarting it before new capacity becomes
+available. Conversational text commands check again before saving; a stale card
+cannot submit into a dead thread. Rejected drafts
 remain in the input, and earlier saved messages remain in the question history,
-marked undelivered when no recipient can read them. Offered decisions and the
-explicit originating-chat consultation route keep their existing authorization;
+marked undelivered when no recipient can read them. Offered decisions (including
+free-text answers) and the explicit originating-chat consultation route keep
+their existing authorization;
 delivery availability never authorizes merging or closing a PR.
 
 Standing chat and deputy consultation leave the card unanswered while discussing

@@ -7,13 +7,15 @@ import { test } from 'node:test';
 const source = readFileSync(new URL('../assets/ui/app.js', import.meta.url), 'utf8');
 const availability = source.slice(source.indexOf('  const delivery = question.text_delivery;'), source.indexOf('  setText(r.waitingNote, waitingText);'));
 const controls = source.slice(source.indexOf('  r.sayText.disabled = waitingOnAgent || textUnavailable;'), source.indexOf('  /* The detail is immutable'));
+const decisionControls = source.slice(source.indexOf('  r.text.disabled = choicesLocked;'), source.indexOf('  for (const btn of r.choices.querySelectorAll'));
 const update = runInNewContext(`(r, question) => {
   const waitingOnAgent = question.waiting_on_agent === true;
   ${availability}
   ${controls}
+  ${decisionControls}
   return { choicesLocked, waitingText };
 }`);
-const refs = () => ({ sayText: { value: 'close the PR' }, saySend: {} });
+const refs = () => ({ sayText: { value: 'close the PR' }, saySend: {}, text: {}, send: {} });
 
 test('unavailable text is disabled while offered decisions remain usable', () => {
   for (const reason of ['deputy_exhausted', 'deputy_disabled', 'daemon_unavailable', 'recipient_unavailable']) {
@@ -23,6 +25,8 @@ test('unavailable text is disabled while offered decisions remain usable', () =>
     assert.equal(r.saySend.disabled, true);
     assert.equal(r.sayText.value, 'close the PR');
     assert.equal(state.choicesLocked, false);
+    assert.equal(r.text.disabled, false);
+    assert.equal(r.send.disabled, false);
     assert.match(state.waitingText, /recorded and undelivered/);
   }
 });

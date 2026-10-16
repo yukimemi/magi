@@ -6681,13 +6681,8 @@ async fn question_answer(
         let cfg = deputy_config(&ui.repo);
         let (q, ()) = ui
             .questions
-            .update(&q.id, |r| {
-                if matches!(&answer, Answer::Text(_)) && r.free_text() {
-                    crate::question_delivery::require(&ui.questions, r, cfg.as_ref())?;
-                }
-                r.answer(answer)
-            })
-            .map_err(question_text_error)?;
+            .update(&q.id, |r| r.answer(answer))
+            .map_err(ApiError::bad_request_from)?;
         let (tasks, talks) = (ui.queue.list(), ui.talks.list());
         Ok(Json(
             QuestionView::of(q, &ui.questions, cfg.as_ref()).with_origin(&tasks, &talks),
@@ -10613,6 +10608,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn question_text_handler_uses_running_capabilities_and_preserves_text_answers() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let mut q = Question::new(
+            "task".into(),
+            crate::land::APPROVAL_NODE.into(),
+            "land".into(),
+            "Explain?".into(),
+            String::new(),
+            vec!["hold".into()],
+        );
+        q.deputy = Some(ask::Deputy::new("context".into()));
+        ui.questions.put(&mut q).unwrap();
+        let mut cfg = stub_config();
+        cfg.daemon.max_deputies = 0;
+        let mut status = crate::daemon::Status::new();
+        status.question_recovery = Some(crate::question_delivery::Recovery::new(Some(&cfg), 0));
+        crate::daemon::write_status_to(&home.path().join("daemon.json"), &status).unwrap();
+        let before = std::fs::read(ui.questions.path_of(&q.id)).unwrap();
+        let error = question_say(
+            State(ui.clone()),
+            Path(q.id.clone()),
+            Ok(Json(NewSay {
+                body: "Explain the findings".into(),
+            })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.text_reason,
+            Some(crate::question_delivery::UnavailableReason::DeputyDisabled)
+        );
+        assert_eq!(std::fs::read(ui.questions.path_of(&q.id)).unwrap(), before);
+
+        let mut text = Question::new(
+            "task".into(),
+            "ask".into(),
+            "operator".into(),
+            "Which name?".into(),
+            String::new(),
+            vec![],
+        );
+        ui.questions.put(&mut text).unwrap();
+        let Json(view) = question_answer(
+            State(ui.clone()),
+            Path(text.id.clone()),
+            Ok(Json(NewAnswer {
+                choice: None,
+                text: Some("chosen name".into()),
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(view.question.resolution().as_deref(), Some("chosen name"));
+        assert!(!ui.questions.get(&text.id).unwrap().status.open());
+    }
+
+    #[tokio::test]
     async fn question_text_handler_admission_without_transport() {
         let home = tempfile::tempdir().unwrap();
         let ui = delta_test_ui(home.path());
@@ -10726,21 +10779,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn question_text_delivery_refuses_absent_recipients_at_both_text_routes() {
+    async fn question_text_delivery_uses_daemon_configuration_after_file_edit() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut cfg = stub_config();
+        cfg.daemon.max_deputies = 0;
+        std::fs::write(
+            repo.path().join("magi.toml"),
+            toml::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
+        let fx = Fixture::with_repo(repo.path().to_path_buf()).await;
+        let mut status = crate::daemon::Status::new();
+        status.question_recovery = Some(crate::question_delivery::Recovery::new(Some(&cfg), 0));
+        crate::daemon::write_status_to(&fx.home.path().join("daemon.json"), &status).unwrap();
+        let id = ask(&fx, "Explain?", &["hold"]);
+        fx.questions()
+            .update(&id, |q| {
+                q.node = crate::land::APPROVAL_NODE.into();
+                q.deputy = Some(ask::Deputy::new("context".into()));
+                q.deputy.as_mut().unwrap().agent = "stub".into();
+                Ok(())
+            })
+            .unwrap();
+        cfg.daemon.max_deputies = 1;
+        std::fs::write(
+            repo.path().join("magi.toml"),
+            toml::to_string(&cfg).unwrap(),
+        )
+        .unwrap();
+        let view = fx.get("/api/questions").await.json();
+        assert_eq!(view[0]["deputies_enabled"], true);
+        assert_eq!(view[0]["text_delivery"]["reason"], "deputy_disabled");
+        let before = std::fs::read(fx.questions().path_of(&id)).unwrap();
+        let res = fx
+            .post(
+                &format!("/api/questions/{id}/say"),
+                Some(r#"{"body":"Please explain"}"#),
+            )
+            .await;
+        assert_eq!(res.status, 422, "{}", res.body);
+        assert_eq!(std::fs::read(fx.questions().path_of(&id)).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn question_text_delivery_preserves_text_decisions_without_a_recipient() {
         let fx = Fixture::start().await;
         let id = ask(&fx, "No seat", &[]);
         let store = fx.questions();
         let before = std::fs::read(store.path_of(&id)).unwrap();
-        for (suffix, body) in [
-            ("say", r#"{"body":"hello"}"#),
-            ("answer", r#"{"text":"hello"}"#),
-        ] {
-            let res = fx
-                .post(&format!("/api/questions/{id}/{suffix}"), Some(body))
-                .await;
-            assert_eq!(res.status, 422, "{}", res.body);
-            assert_eq!(std::fs::read(store.path_of(&id)).unwrap(), before);
-        }
+        let res = fx
+            .post(
+                &format!("/api/questions/{id}/say"),
+                Some(r#"{"body":"hello"}"#),
+            )
+            .await;
+        assert_eq!(res.status, 422, "{}", res.body);
+        assert_eq!(std::fs::read(store.path_of(&id)).unwrap(), before);
+        let res = fx
+            .post(
+                &format!("/api/questions/{id}/answer"),
+                Some(r#"{"text":"hello"}"#),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        assert_eq!(
+            store.get(&id).unwrap().resolution().as_deref(),
+            Some("hello")
+        );
     }
 
     #[tokio::test]

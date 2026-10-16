@@ -17,6 +17,15 @@ fn config() -> Config {
     .unwrap()
 }
 
+fn publish(home: &std::path::Path, cfg: &Config) {
+    let mut status = magi::daemon::Status::new();
+    status.question_recovery = Some(magi::question_delivery::Recovery::new(
+        Some(cfg),
+        cfg.daemon.max_deputies,
+    ));
+    magi::daemon::write_status_to(&home.join("daemon.json"), &status).unwrap();
+}
+
 fn question(store: &Questions) -> Question {
     let mut q = Question::new(
         "task".into(),
@@ -43,11 +52,7 @@ fn restart_recovery_requires_dispatch_capacity_and_a_live_owner() {
         availability(&store, &q, Some(&cfg)).reason,
         "daemon_unavailable"
     );
-    magi::daemon::write_status_to(
-        &home.path().join("daemon.json"),
-        &magi::daemon::Status::new(),
-    )
-    .unwrap();
+    publish(home.path(), &cfg);
     assert_eq!(availability(&store, &q, Some(&cfg)).state, "waiting");
     store
         .update(&q.id, |q| {
@@ -57,6 +62,12 @@ fn restart_recovery_requires_dispatch_capacity_and_a_live_owner() {
         .unwrap();
     assert_eq!(store.get(&q.id).unwrap().thread.len(), 1);
     cfg.daemon.max_deputies = 0;
+    assert_eq!(
+        availability(&store, &q, Some(&cfg)).state,
+        "waiting",
+        "editing config does not disable the running deputy loop"
+    );
+    publish(home.path(), &cfg);
     cfg.graph.language = "ja".into();
     assert!(
         availability(&store, &q, Some(&cfg))
@@ -99,16 +110,31 @@ fn deadline_and_handover_use_existing_recovery_rules() {
     let store = Questions::at(home.path().join("questions"));
     let mut q = question(&store);
     let cfg = config();
+    publish(home.path(), &cfg);
+    let mut status = magi::daemon::Status::new();
+    status.updated_at -= std::time::Duration::from_secs(3600);
+    status.question_recovery = Some(magi::question_delivery::Recovery::new(
+        Some(&cfg),
+        cfg.daemon.max_deputies,
+    ));
+    magi::daemon::write_status_to(&home.path().join("daemon.json"), &status).unwrap();
     let mut progress = magi::updater::Progress::new("old".into(), "new".into());
     progress.advance(magi::updater::Stage::Restarting);
     magi::updater::write_progress(home.path(), &progress).unwrap();
     let lease = magi::updater::LeaseGuard::enter(home.path(), None);
     assert_eq!(availability(&store, &q, Some(&cfg)).state, "waiting");
+    let mut edited = cfg.clone();
+    edited.daemon.max_deputies = 0;
+    assert_eq!(
+        availability(&store, &q, Some(&edited)).reason,
+        "daemon_unavailable"
+    );
     drop(lease);
     assert_eq!(
         availability(&store, &q, Some(&cfg)).reason,
         "daemon_unavailable"
     );
+    publish(home.path(), &cfg);
     q.asked_at -= std::time::Duration::from_secs(7200);
     assert_eq!(availability(&store, &q, Some(&cfg)).reason, "deadline");
 }
@@ -154,11 +180,7 @@ async fn an_accepted_recovery_message_is_consumed_by_the_deputy_dispatcher() {
     let mut cfg = config();
     cfg.graph.sessions = false;
     cfg.agents[0].command = vec!["echo".into(), "Here is the review explanation".into()];
-    magi::daemon::write_status_to(
-        &home.path().join("daemon.json"),
-        &magi::daemon::Status::new(),
-    )
-    .unwrap();
+    publish(home.path(), &cfg);
     store
         .update(&q.id, |q| {
             require(&store, q, Some(&cfg))?;
@@ -218,11 +240,7 @@ fn ordinary_waiter_admission_uses_the_actual_session_target() {
     q.cwd = Some(home.path().to_string_lossy().into_owned());
     q.answer_timeout = 3600;
     store.put(&mut q).unwrap();
-    magi::daemon::write_status_to(
-        &home.path().join("daemon.json"),
-        &magi::daemon::Status::new(),
-    )
-    .unwrap();
+    publish(home.path(), &cfg);
     assert_eq!(availability(&store, &q, Some(&cfg)).state, "waiting");
     run.seats.get_mut("impl-A").unwrap().turns = 0;
     run.save_under(home.path()).unwrap();
@@ -232,4 +250,82 @@ fn ordinary_waiter_admission_uses_the_actual_session_target() {
     );
     store.beat(&q.id, WaiterKind::Asker);
     assert_eq!(availability(&store, &q, Some(&cfg)).state, "live");
+}
+
+#[tokio::test]
+async fn recovery_uses_running_capacity_instead_of_edited_configuration() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Questions::at(home.path().join("questions"));
+    let q = question(&store);
+    let mut startup = config();
+    startup.daemon.max_deputies = 0;
+    publish(home.path(), &startup);
+    let mut edited = startup.clone();
+    edited.daemon.max_deputies = 1;
+    let before = std::fs::read(store.path_of(&q.id)).unwrap();
+    let error = store
+        .update(&q.id, |q| {
+            require(&store, q, Some(&edited))?;
+            q.say("Please explain")
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("deputy_disabled"));
+    assert_eq!(std::fs::read(store.path_of(&q.id)).unwrap(), before);
+    let mut deputies = magi::deputy::Deputies::new(
+        store.clone(),
+        home.path().to_path_buf(),
+        Some(startup),
+        home.path().to_path_buf(),
+        0,
+        std::sync::Arc::new(|| false),
+    );
+    deputies.tick(jiff::Timestamp::now());
+    deputies.drain().await;
+    assert_eq!(store.get(&q.id).unwrap().deputy.unwrap().starts, 0);
+
+    // A restarted daemon publishes the new capability before admitting text.
+    publish(home.path(), &edited);
+    assert_eq!(availability(&store, &q, None).state, "waiting");
+    // A legacy heartbeat without a capability snapshot cannot prove recovery.
+    magi::daemon::write_status_to(
+        &home.path().join("daemon.json"),
+        &magi::daemon::Status::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        availability(&store, &q, Some(&edited)).reason,
+        "daemon_unavailable"
+    );
+}
+
+#[test]
+fn terminal_text_answer_remains_a_decision_without_a_recipient() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Questions::at(home.path().join("questions"));
+    let mut q = Question::new(
+        "task".into(),
+        "ask".into(),
+        "operator".into(),
+        "Which name?".into(),
+        String::new(),
+        vec![],
+    );
+    store.put(&mut q).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_magi"))
+        .args(["answer", &q.id, "--reply", "chosen name"])
+        .env("MAGI_HOME", home.path())
+        .env_remove("MAGI_RUN")
+        .env_remove("MAGI_NODE")
+        .env_remove("MAGI_SEAT")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let saved = store.get(&q.id).unwrap();
+    assert_eq!(saved.resolution().as_deref(), Some("chosen name"));
+    assert!(!saved.status.open());
 }
