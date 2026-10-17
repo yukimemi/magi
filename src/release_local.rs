@@ -308,17 +308,43 @@ pub async fn run_job(env: &Env<'_>, job: &mut Job, save: Save<'_>) -> Result<()>
     result
 }
 
-/// Release checkouts are disposable only after completion or before any step
-/// has progressed. Surface refusal instead of leaving stale registrations or
-/// deleting the directory behind Git's back.
+/// Remove disposable release output, retaining registered trees if Git refuses.
+/// An unregistered leftover may be removed only after registration is checked
+/// successfully; a live foreign repository is never a leftover.
 async fn remove_release_worktree(repo: &Path, wt: &Path) -> Result<()> {
-    if wt.exists()
-        && !git::worktree_remove(repo, wt)
-            .await
-            .context("remove release checkout")?
-    {
-        bail!("release checkout removal refused: {}", wt.display());
+    if !wt.exists() {
+        return Ok(());
     }
+    if !std::fs::symlink_metadata(wt)?.is_dir() {
+        bail!("release checkout is not a directory: {}", wt.display());
+    }
+    if git::worktree_remove(repo, wt)
+        .await
+        .context("remove release checkout")?
+    {
+        return Ok(());
+    }
+    // Do not infer missing registration from the removal error: locked trees
+    // and permission errors must not become permission to delete by hand.
+    let listing = git::git(repo, &["worktree", "list", "--porcelain", "-z"])
+        .await
+        .context("check release checkout registration")?;
+    let target = std::fs::canonicalize(wt)?;
+    for entry in listing.split('\0') {
+        if let Some(path) = entry.strip_prefix("worktree ") {
+            let registered = Path::new(path);
+            if registered == wt || std::fs::canonicalize(registered)? == target {
+                bail!("release checkout removal refused: {}", wt.display());
+            }
+        }
+    }
+    if wt.join(".git").exists() && git::git_raw(wt, &["rev-parse", "--git-dir"]).await?.ok() {
+        bail!(
+            "release checkout contains an unregistered repository: {}",
+            wt.display()
+        );
+    }
+    std::fs::remove_dir_all(wt).context("remove unregistered release checkout")?;
     Ok(())
 }
 
@@ -781,6 +807,51 @@ mod tests {
         go(&f, &rel, &mut job).await.unwrap();
         assert!(job.finished);
         assert!(!wt.exists(), "a finished release removes its checkout");
+    }
+
+    #[tokio::test]
+    async fn release_preclean_recovers_an_unregistered_leftover() {
+        let f = fixture();
+        let wt = job_dir(&f.home, "o/r#1").join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("leftover"), "interrupted setup").unwrap();
+        let mut job = Job::new("1.0.0", "u", &f.commit);
+        go(&f, &release(&["test ! -e leftover"]), &mut job)
+            .await
+            .unwrap();
+        assert!(job.finished);
+        assert!(!wt.exists());
+    }
+
+    #[tokio::test]
+    async fn release_preclean_recovers_a_pruned_checkout_with_a_stale_git_link() {
+        let f = fixture();
+        let wt = job_dir(&f.home, "o/r#1").join("wt");
+        git::worktree_add_detached(&f.repo, &wt, &f.commit)
+            .await
+            .unwrap();
+        let moved = wt.with_file_name("moved");
+        std::fs::rename(&wt, &moved).unwrap();
+        g(&f.repo, &["worktree", "prune", "--expire", "now"]);
+        std::fs::rename(&moved, &wt).unwrap();
+        let mut job = Job::new("1.0.0", "u", &f.commit);
+        go(&f, &release(&["true"]), &mut job).await.unwrap();
+        assert!(job.finished);
+        assert!(!wt.exists());
+    }
+
+    #[tokio::test]
+    async fn release_preclean_retains_an_unregistered_live_repository() {
+        let f = fixture();
+        let wt = job_dir(&f.home, "o/r#1").join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        g(&wt, &["init", "-q"]);
+        std::fs::write(wt.join("owned"), "retain").unwrap();
+        let mut job = Job::new("1.0.0", "u", &f.commit);
+        let err = go(&f, &release(&["true"]), &mut job).await.unwrap_err();
+        assert!(err.to_string().contains("unregistered repository"), "{err}");
+        assert!(wt.join("owned").exists());
+        assert!(!job.tag_done);
     }
 
     #[tokio::test]
