@@ -303,9 +303,23 @@ pub async fn run_job(env: &Env<'_>, job: &mut Job, save: Save<'_>) -> Result<()>
     // fresh checkout would skip the build and attach nothing. Only a finished
     // release cleans up.
     if job.finished {
-        let _ = git::worktree_remove(env.repo, &wt).await;
+        remove_release_worktree(env.repo, &wt).await?;
     }
     result
+}
+
+/// Release checkouts are disposable only after completion or before any step
+/// has progressed. Surface refusal instead of leaving stale registrations or
+/// deleting the directory behind Git's back.
+async fn remove_release_worktree(repo: &Path, wt: &Path) -> Result<()> {
+    if wt.exists()
+        && !git::worktree_remove(repo, wt)
+            .await
+            .context("remove release checkout")?
+    {
+        bail!("release checkout removal refused: {}", wt.display());
+    }
+    Ok(())
 }
 
 async fn drive(env: &Env<'_>, dir: &Path, wt: &Path, job: &mut Job, save: Save<'_>) -> Result<()> {
@@ -321,8 +335,7 @@ async fn drive(env: &Env<'_>, dir: &Path, wt: &Path, job: &mut Job, save: Save<'
         && git::rev_parse(wt, "HEAD").await.ok().as_deref() == Some(job.commit.as_str());
     if !reusable {
         if wt.exists() {
-            let _ = git::worktree_remove(repo, wt).await;
-            let _ = std::fs::remove_dir_all(wt);
+            remove_release_worktree(repo, wt).await?;
         }
         // The merge commit exists on the remote; this checkout may not have it
         // yet. A failed fetch is only fatal if the commit is still missing.
@@ -768,6 +781,24 @@ mod tests {
         go(&f, &rel, &mut job).await.unwrap();
         assert!(job.finished);
         assert!(!wt.exists(), "a finished release removes its checkout");
+    }
+
+    #[tokio::test]
+    async fn finished_release_reports_cleanup_refusal_and_keeps_the_checkout() {
+        let f = fixture();
+        let mut job = Job::new("1.0.0", "u", &f.commit);
+        let rel = release(&["touch built.txt", "git worktree lock ."]);
+        let err = go(&f, &rel, &mut job).await.unwrap_err().to_string();
+        assert!(err.contains("release checkout removal refused"), "{err}");
+        assert!(job.finished);
+        let wt = job_dir(&f.home, "o/r#1").join("wt");
+        assert!(wt.join("built.txt").exists());
+        g(&f.repo, &["worktree", "unlock", wt.to_str().unwrap()]);
+        // Retrying cleanup does not repeat any completed release command.
+        go(&f, &rel, &mut job).await.unwrap();
+        assert_eq!(job.done, 2);
+        assert!(!wt.exists());
+        assert!(!g(&f.repo, &["worktree", "list", "--porcelain"]).contains(wt.to_str().unwrap()));
     }
 
     #[tokio::test]

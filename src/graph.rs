@@ -1011,14 +1011,14 @@ impl Runner {
             Err(e) => Err(e),
         };
         if let Err(e) = setup {
-            git::worktree_remove(repo, &worktree).await.ok();
+            git::worktree_remove_clean(repo, &worktree).await.ok();
             return Err(e);
         }
         let commits = git::commits_ahead(&worktree, &base_commit, "HEAD")
             .await
             .unwrap_or(0);
         if commits == 0 {
-            git::worktree_remove(repo, &worktree).await.ok();
+            git::worktree_remove_clean(repo, &worktree).await.ok();
             bail!("`{branch}` has no commits beyond {}", short(&base_commit));
         }
         let files = git::changed_files(&worktree, &base_commit, "HEAD")
@@ -1033,7 +1033,7 @@ impl Runner {
             && head_tree == base_tree
         {
             let head = git::rev_parse(&worktree, "HEAD").await.unwrap_or_default();
-            git::worktree_remove(repo, &worktree).await.ok();
+            git::worktree_remove_clean(repo, &worktree).await.ok();
             bail!(
                 "`{branch}` at {} has a tree identical to base {}; this usually means \
                  the branch ref is stale (check `git rev-parse refs/heads/{branch}` \
@@ -1621,7 +1621,7 @@ impl Runner {
             Err(e) => Err(e),
         };
         if let Err(e) = result {
-            git::worktree_remove(repo, wt).await.ok();
+            git::worktree_remove_clean(repo, wt).await.ok();
             if in_prep {
                 self.rollback_prep(repo).await;
             }
@@ -1640,7 +1640,10 @@ impl Runner {
     async fn rollback_prep(&mut self, repo: &Path) {
         let root = self.state.worktree_root();
         for c in std::mem::take(&mut self.state.candidates) {
-            if matches!(git::worktree_remove(repo, &c.worktree).await, Ok(true)) {
+            if matches!(
+                git::worktree_remove_clean(repo, &c.worktree).await,
+                Ok(true)
+            ) {
                 git::branch_delete(repo, &c.branch).await.ok();
             } else {
                 self.state.candidates.push(c);
@@ -1648,12 +1651,12 @@ impl Runner {
         }
         let seats = self.roles.judges.len().max(self.state.config.graph.judges);
         for j in 1..=seats {
-            git::worktree_remove(repo, &root.join(format!("judge-{j}")))
+            git::worktree_remove_clean(repo, &root.join(format!("judge-{j}")))
                 .await
                 .ok();
         }
         for k in 1..=self.state.config.graph.advisors {
-            git::worktree_remove(repo, &root.join(format!("advisor-{k}")))
+            git::worktree_remove_clean(repo, &root.join(format!("advisor-{k}")))
                 .await
                 .ok();
         }
@@ -1735,7 +1738,7 @@ impl Runner {
             if let Err(e) = worktree_setup::prepare(&self.state.config, &repo, &worktree).await {
                 // Nothing of this prep may survive: a resume must start over,
                 // not find half the candidates and skip the rest.
-                git::worktree_remove(&repo, &worktree).await.ok();
+                git::worktree_remove_clean(&repo, &worktree).await.ok();
                 git::branch_delete(&repo, &branch).await.ok();
                 self.rollback_prep(&repo).await;
                 self.state.status = RunStatus::Blocked;
@@ -13252,6 +13255,52 @@ mod tests {
             );
             runner.state = RunState::load(&runner.state.id).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn candidate_preservation_legacy_failed_seat_keeps_edits_before_judging() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        let wt = runner.state.candidates[0].worktree.clone();
+        runner.state.candidates[0].failed = Some("CLI failed before commit".into());
+        std::fs::write(wt.join("recovered"), "failed seat edits").unwrap();
+        let index_lock = PathBuf::from(
+            git::git(
+                &wt,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "index.lock",
+                ],
+            )
+            .await
+            .unwrap(),
+        );
+        std::fs::write(&index_lock, "fixture-owned lock").unwrap();
+        runner.state.schema = 14;
+        runner.state = crate::run::migrate_schema(runner.state.clone()).unwrap();
+        assert!(runner.state.candidate_preservation.contains_key(&'A'));
+        assert!(runner.implement().await.is_err());
+        assert!(runner.after_implement().is_err());
+        assert!(runner.fold_losers().await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(wt.join("recovered")).unwrap(),
+            "failed seat edits"
+        );
+        assert!(runner.state.candidate_preservation.contains_key(&'A'));
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        std::fs::remove_file(index_lock).unwrap();
+        // Recovery finds changes that the old uncontested result never judged.
+        assert!(runner.implement().await.is_err());
+        assert!(runner.state.candidate_preservation[&'A'].contains("supported recovery"));
+        assert!(runner.state.candidates[0].empty);
+        assert_eq!(runner.state.tally.as_ref().unwrap().winner, 'B');
+        assert!(
+            crate::run::read_artifact(&runner.state, "cand-A.patch")
+                .unwrap()
+                .contains("failed seat edits")
+        );
+        assert!(wt.exists());
     }
 
     #[tokio::test]

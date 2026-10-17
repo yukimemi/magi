@@ -3095,11 +3095,12 @@ pub(crate) fn migrate_schema(mut state: RunState) -> Result<RunState> {
         state.schema = 14;
     }
     // Only legacy, unfolded empty candidates lack a confirmed preservation
-    // result. Native schema-15 records and intentionally folded candidates
+    // result, even if their CLI failed: failure never proves edits were saved.
+    // Native schema-15 records and intentionally folded candidates
     // must not be re-flagged on every resume.
     if state.schema == 14 {
         for c in &state.candidates {
-            if !c.folded && c.empty && c.failed.is_none() && c.verified_noop.is_none() {
+            if !c.folded && c.empty && c.verified_noop.is_none() {
                 state
                     .candidate_preservation
                     .entry(c.label)

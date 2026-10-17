@@ -292,11 +292,12 @@ fn parse_worktree_holder(listing: &str, branch: &str) -> Option<PathBuf> {
     None
 }
 
-/// Remove a clean worktree. Dirty or unreadable trees are never forced away.
+/// Force removal of a disposable worktree, including build output or conflicts.
+/// Candidate work must use [`worktree_remove_clean`] instead.
 /// Returns `Ok(false)` on refusal; callers must retain their ownership record.
 pub async fn worktree_remove(repo: &Path, path: &Path) -> Result<bool> {
     let path_s = path.to_string_lossy().to_string();
-    let out = git_raw(repo, &["worktree", "remove", &path_s]).await?;
+    let out = git_raw(repo, &["worktree", "remove", "--force", &path_s]).await?;
     if out.ok() {
         return Ok(true);
     }
@@ -1719,6 +1720,28 @@ mod tests {
             stray_lockfiles(&s(&["a/Cargo.lock"]), &s(&["Cargo.toml"])).len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn clean_removal_preserves_edits_while_scratch_removal_discards_them() {
+        let (guard, repo) = scratch().await;
+        let wt = guard.path().join("scratch-wt");
+        worktree_add_detached(&repo, &wt, "HEAD").await.unwrap();
+        tokio::fs::write(wt.join("built.txt"), "build output")
+            .await
+            .unwrap();
+        assert!(!worktree_remove_clean(&repo, &wt).await.unwrap());
+        assert!(wt.join("built.txt").exists());
+        let listing = git(&repo, &["worktree", "list", "--porcelain"])
+            .await
+            .unwrap();
+        assert!(listing.contains(&wt.to_string_lossy().to_string()));
+        assert!(worktree_remove(&repo, &wt).await.unwrap());
+        assert!(!wt.exists());
+        let listing = git(&repo, &["worktree", "list", "--porcelain"])
+            .await
+            .unwrap();
+        assert!(!listing.contains(&wt.to_string_lossy().to_string()));
     }
 
     #[tokio::test]
