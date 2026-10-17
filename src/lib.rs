@@ -68,6 +68,7 @@ pub mod recovery;
 pub mod refs;
 pub mod release_local;
 pub mod release_watch;
+mod repo_lock;
 pub mod report;
 pub mod report_view;
 pub mod repos;

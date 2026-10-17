@@ -358,6 +358,18 @@ pub async fn invoke(
     seat: &mut SeatState,
     inv: &Invocation<'_>,
 ) -> Result<AgentOutput> {
+    // A registered repository requires coordination even from readers. Hold
+    // the real lock in the launcher, without widening their sandbox. The Arc
+    // stays alive until the invocation (including timeout cleanup) finishes.
+    let read_lock = if inv.allow_write {
+        None
+    } else {
+        crate::repo_lock::Lease::for_checkout(inv.cwd).await?
+    };
+    let prompt = read_lock.as_ref().map(|lease| format!(
+        "Repository coordination: the launcher holds the exclusive repository lock at {} on behalf of this read-only seat for this entire invocation. Do not acquire a second lock or release/delete that file. Your filesystem access remains read-only.\n\n{}",
+        lease.path.display(), inv.prompt
+    ));
     // Apply once for initial, resumed, fallback and waiter invocations alike.
     // Deputies/chat retain their explicit grants; read-only stays read-only.
     let home = repository_writer(inv).then(crate::run::home);
@@ -371,6 +383,7 @@ pub async fn invoke(
     }
     let inv = &Invocation {
         writable: &writable,
+        prompt: prompt.as_deref().unwrap_or(inv.prompt),
         ..inv.clone()
     };
     tokio::fs::create_dir_all(inv.artifacts)
@@ -479,8 +492,11 @@ pub async fn invoke(
         }
         Err(_) => {
             tracing::warn!(seat = %seat.key, secs = inv.timeout.as_secs(), "agent timed out");
-            // Kill the tree so the readers see EOF instead of hanging with it.
-            child.start_kill().ok();
+            // Wait for CLI termination before releasing its repository lease.
+            child
+                .kill()
+                .await
+                .context("stop timed-out seat before releasing repository coordination")?;
             (None, true)
         }
     };

@@ -312,6 +312,85 @@ fn release_lock(holder: &mut Running) {
     assert!(holder.0.wait().unwrap().success());
 }
 
+#[tokio::test]
+#[ignore = "requires PowerShell to verify the real repository lock protocol"]
+async fn readonly_invocation_holds_dotnet_compatible_lock_and_refuses_external_contention() {
+    use magi::agent::{Invocation, SeatState, invoke};
+    use magi::config::{AgentKind, AgentSpec};
+    use std::collections::BTreeMap;
+
+    let fx = Fixture::new();
+    std::fs::write(
+        fx.primary.join(".git/kanade-sync.contract"),
+        "shared-lock-v1\n",
+    )
+    .unwrap();
+    let script = r#"
+$ErrorActionPreference = 'Stop'
+try {
+  $other = [IO.File]::Open($env:CHECK_LOCK, [IO.FileMode]::OpenOrCreate,
+    [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+} catch { $denied = $true }
+if (-not $denied) { $other.Dispose(); exit 25 }
+[IO.File]::WriteAllText((Join-Path $PWD 'seat-started'), 'yes')
+Write-Output 'real-lock-contends'
+"#;
+    let spec = AgentSpec {
+        id: "fixture".into(),
+        kind: AgentKind::Command,
+        model: None,
+        command: vec![
+            "pwsh".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            script.into(),
+        ],
+        extra_args: vec![],
+        prompt_delivery: None,
+        env: BTreeMap::from([(
+            "CHECK_LOCK".into(),
+            fx.primary
+                .join(".git/kanade-sync.lock")
+                .to_str()
+                .unwrap()
+                .into(),
+        )]),
+    };
+    let artifacts = fx._tmp.path().join("reader-artifacts");
+    let inv = Invocation {
+        cwd: &fx.seat,
+        prompt: "fixture read-only work",
+        timeout: Duration::from_secs(10),
+        allow_write: false,
+        unsandboxed: false,
+        sessions: false,
+        artifacts: &artifacts,
+        stem: "reader",
+        run: "fixture-run",
+        node: "review",
+        cache_dir: None,
+        attachments: &[],
+        writable: &[],
+    };
+    let mut seat = SeatState::new("fixture-reader", "fixture", 1);
+    let mut holder = held_lock(&fx);
+    assert!(invoke(&spec, &mut seat, &inv).await.is_err());
+    assert!(!fx.seat.join("seat-started").exists());
+    assert!(
+        !artifacts.exists(),
+        "failed acquisition precedes even prompt creation"
+    );
+    release_lock(&mut holder);
+    let out = invoke(&spec, &mut seat, &inv).await.unwrap();
+    assert!(out.usable(), "{out:?}");
+    assert!(out.text.contains("real-lock-contends"), "{out:?}");
+    let prompt = std::fs::read_to_string(artifacts.join("reader.prompt.md")).unwrap();
+    assert!(prompt.contains("launcher holds the exclusive repository lock"));
+    assert!(prompt.contains("filesystem access remains read-only"));
+    checked(&mut fx.pwsh(&format!("{ACQUIRE}\n$lock.Dispose()")));
+}
+
 #[test]
 #[ignore = "requires PowerShell; run explicitly on the deployment host"]
 fn shared_lock_contention_prevents_work_and_release_allows_reacquisition() {

@@ -452,9 +452,13 @@ Outside every `kata:` marker, so this survives `kata apply`.
 directory plus the `questions` and `notifications` stores, through the backend's
 supported directory mechanism. Keep this policy centralized for initial turns,
 resumes, fallbacks and waiter delivery. Never replace it with a sandbox bypass
-or the entire state root. Deputies/chats retain explicit grants; read-only seats
-are unchanged. Directory grants permit a repository's lock contract but do not
-acquire or shorten that lock. Backend enforcement limits, host verification and
+or the entire state root. Deputies/chats retain explicit grants. For read-only
+seats in repositories registered with `shared-lock-v1`, the launcher holds the
+real exclusive lock through `repo_lock::Lease` for the entire invocation without
+widening their sandbox. Concurrent readers in one launcher share that lease;
+external contention prevents startup. Editing-seat directory grants permit the
+repository's lock contract but do not acquire or shorten that lock.
+Backend enforcement limits, host verification and
 the held-task recovery procedure are in `docs/seat-write-scope.md`.
 
 ### The package is `magi-cli`, everything else is `magi`

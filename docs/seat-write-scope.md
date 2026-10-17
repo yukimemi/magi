@@ -15,8 +15,9 @@ store. Resolution/preparation failure prevents agent startup. The central path
 also covers session resume, fallback agents and waiter continuation. Recovery
 repairs use the `fix` node. Read-only bump decisions do not receive grants.
 
-This permits the repository's lock protocol; it does not acquire a lock for the
-agent or change its lifetime. Acquisition failure still requires stopping work.
+The editing-seat grants permit the repository's lock protocol; editing agents
+still acquire their own lock and retain it for the required lifetime.
+Acquisition failure still requires stopping work.
 Do not delete lock files, forge ownership or use short-lived locks for a whole
 work session. Granting the common Git *directory* also permits other Git metadata
 writes, including refs and sibling worktree administration. Directory-level
@@ -39,12 +40,29 @@ grants and do not gain repository metadata access through this policy.
 | opencode / omp | No additional flag required | Existing auto modes provide no enforced read-only or checkout-only filesystem boundary. |
 | command | No sandbox imposed by magi | The configured executable is responsible for confinement and lock compliance. |
 
-Read-only seats retain their existing policy and receive none of these new
-grants. A backend with enforced read-only access cannot satisfy a repository
-rule requiring every reader to acquire a writable shared lock, or run
-`magi ask`. Review/judge/deliberate/vote also cannot ask by CLI policy. Such a
-repository needs a separately approved coordination design before the whole
-workflow can be called repaired; widening read-only access is outside this fix.
+Read-only seats retain their sandbox policy and receive none of these new
+grants. For a repository registered with `kanade-sync.contract` containing
+`shared-lock-v1`, `repo_lock::Lease` acquires the real exclusive
+`kanade-sync.lock` in the launcher before creating the seat's prompt or starting
+its CLI. The handle stays open for the entire invocation, including waiting
+for termination on timeout. The prompt identifies this actual launcher-owned
+lock and tells the reader not to try taking a second exclusive handle. This
+applies to every read-only invocation regardless of backend or node name,
+including advisors, judges, deliberation, voting, review, bump decisions and
+waiter resumes. Concurrent readers in the same launcher share the held handle;
+other processes still contend with it. Contention fails without waiting and
+starts no agent. The last reader releases by closing the handle, never by
+unlinking the lock file.
+
+The native implementation interoperates with .NET `FileShare.None`: Unix
+`flock(LOCK_EX | LOCK_NB)` and Windows zero share mode. Unsupported platforms,
+unreadable registrations and unknown contract versions fail closed. This does
+not register repositories or change writable seats' obligation to acquire and
+hold their lock. Unregistered repositories cannot be assumed coordinated.
+It also does not replace the launcher's obligation to coordinate worktree
+creation or unrelated repository operations before recovery is accepted.
+Review/judge/deliberate/vote remain unable to ask by CLI policy; granting readers
+question-store writes is outside this fix.
 
 macOS/Linux enforcement depends on the installed CLI and OS sandbox. Windows
 sandbox behavior and Antigravity terminal restrictions have not been validated
@@ -60,6 +78,8 @@ cache:
 RUSTUP_TOOLCHAIN=stable cargo test --locked --lib agent::tests::repository_write_scope
 RUSTUP_TOOLCHAIN=stable cargo test --locked --lib agent::tests::writable_directories
 RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope
+RUSTUP_TOOLCHAIN=stable cargo test --locked --lib repo_lock::tests
+RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope readonly_invocation -- --ignored --nocapture
 RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope shared_lock_contention -- --ignored --nocapture
 RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope host_seat -- --ignored --nocapture
 RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope sandbox_seat -- --ignored --nocapture
@@ -94,7 +114,7 @@ Recovery must follow these steps:
    through its supported operating procedure. Inspect a newly launched seat's
    actual arguments and run the sandbox fixture on that host. Verify the target
    repository's lock and the supported question route with the actual backend;
-   resolve the read-only coordination limitation above wherever applicable.
+   confirm the launcher-held read-only lease and coordination of worktree creation.
 3. Only after that evidence exists, run
    `magi task release 20261016-031545-f3b5`. This releases the original task with
    its original instructions/history; do not restart a failed no-change run,
@@ -104,26 +124,54 @@ Recovery must follow these steps:
    Mac verification remain with that task; its minipc verification exemption
    remains in force.
 
-At implementation time the outer seat refused shared Git writes (including
-`git fetch`'s `FETCH_HEAD`) and nested sandbox startup failed with
-`sandbox_apply: Operation not permitted`. Network resolution also prevented
-`git ls-remote` from checking upstream freshness. The available `origin/main`
-was `3393efac3837257589499a9d686cdedbb54cd844`. These are blockers to live
-repair/recovery claims, not evidence that the hold can be lifted.
+## Review round 1 verification
 
-Staging this candidate also failed creating the worktree administration
-directory's `index.lock` with `Operation not permitted`. The parent graph must
-capture the candidate and finish its normal review/PR workflow; no alternate
-Git directory or sandbox bypass was used to manufacture a commit.
+Initial attempts inside the outer seat failed writing shared Git metadata and
+launching a nested sandbox (`sandbox_apply: Operation not permitted`). An
+authorized host execution of the actual backend test subsequently succeeded:
 
-The real PowerShell lock fixture passed: a second process could not acquire
-the held lock, its work marker was absent, and acquisition/work succeeded after
-the holder disposed the handle. The separate host control-plane fixture also
-passed a real `magi ask` / `magi answer` round trip while holding the lock.
-These host successes establish the lock/CLI contracts, not sandbox usability.
-The explicit sandbox test failed at sandbox startup under this outer seat;
-unrelated-write denial and the question round trip inside the intended sandbox
-still require an un-nested host run. No production task was released or edited.
-The 60 `agent::tests` passed, as did both default `seat_write_scope` tests,
-including actual invocation argument capture for every editing node on first
-turn and resume, and preservation of read-only/deputy/chat scope.
+```sh
+RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope sandbox_seat -- --ignored --nocapture
+# sandbox_seat_can_lock_ask_and_receive_answer_but_cannot_write_unrelated_state ... ok
+# 1 passed; 0 failed
+```
+
+This used the installed CLI's actual sandbox, resolved write roots and real
+PowerShell `FileShare.None` lock. It first refused contention before question
+creation, then acquired the released lock, denied a write to the sibling queue
+directory, and completed a supported `magi ask` / `magi answer` round trip.
+The test's inner sandbox remained enabled; host authorization only allowed
+launching that sandbox outside the enclosing seat restriction.
+
+The read-only invocation fixture also passed:
+
+```sh
+RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope readonly_invocation -- --ignored --nocapture
+# readonly_invocation_holds_dotnet_compatible_lock_and_refuses_external_contention ... ok
+# 1 passed; 0 failed
+RUSTUP_TOOLCHAIN=stable cargo test --locked --lib repo_lock::tests -- --nocapture
+# 2 passed; 0 failed
+```
+
+An external .NET holder prevented the read-only invocation from creating even
+its prompt or starting its CLI. After release, the real invoked reader observed
+that its launcher's native handle excluded a second .NET handle. After the
+invocation returned, .NET acquisition succeeded again. Native tests additionally
+verify that concurrent launcher readers retain their shared exclusive handle
+until the last reader finishes, and never delete the lock file.
+
+These fixtures establish sandbox and protocol behavior; they do not deploy a
+binary or verify an existing daemon's environment. The original task remains
+held, with no replacement or production-record edits. Merge approval, binary
+deployment, daemon restart and verification of the actual target's full
+coordination path remain prerequisites to releasing it. Windows interoperation
+still needs validation on Windows; the tests above ran on macOS.
+
+The 60 focused `agent::tests` and both default `seat_write_scope` tests also
+passed after the read-only coordination change.
+
+An authorized `git fetch origin main` succeeded during round 1. Both
+`origin/main` and `FETCH_HEAD` resolved to
+`3393efac3837257589499a9d686cdedbb54cd844`. A fresh supported `magi task show`
+confirmed the original task still has its manual hold and both original runs;
+no release was attempted.
