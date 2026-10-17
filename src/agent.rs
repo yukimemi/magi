@@ -163,8 +163,12 @@ pub async fn worktree_writable_roots(cwd: &Path, home: &Path) -> Result<Vec<Path
     )
     .await
     .context("resolve seat shared Git directory")?;
-    let mut roots =
-        vec![std::fs::canonicalize(common).context("canonicalize seat shared Git directory")?];
+    let common = std::fs::canonicalize(common).context("canonicalize seat shared Git directory")?;
+    let cwd = std::fs::canonicalize(cwd).context("canonicalize seat working directory")?;
+    let mut roots = Vec::new();
+    if !common.starts_with(&cwd) {
+        roots.push(common);
+    }
     // Questions::put/update/beat/panels write questions. Its quiet_for hook
     // updates matching notifications. Neither needs queue, runs, talks, nor
     // the entire state directory.
@@ -1856,6 +1860,16 @@ mod tests {
                     let plan = build_command(&spec(kind, None), &seat, &i, Path::new("/art/p.md"))
                         .unwrap();
                     for root in &roots {
+                        if kind == AgentKind::Antigravity {
+                            assert_eq!(
+                                plan.argv.windows(2).any(|w| {
+                                    w[0] == "--add-dir" && w[1] == root.to_str().unwrap()
+                                }),
+                                allow_write,
+                                "resumed={resumed}: {:?}",
+                                plan.argv
+                            );
+                        }
                         assert_eq!(
                             plan.argv
                                 .iter()

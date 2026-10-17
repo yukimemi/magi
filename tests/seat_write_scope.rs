@@ -96,6 +96,66 @@ async fn isolated_seat_scope_resolves_common_git_and_only_question_stores() {
             .is_err()
     );
     assert!(!fx.home.join("bad").exists());
+    // A primary checkout already covers its Git directory through cwd.
+    // Canonicalization must also preserve this for a symlinked cwd.
+    let expected = &roots[1..];
+    assert_eq!(
+        worktree_writable_roots(&fx.primary, &fx.home)
+            .await
+            .unwrap(),
+        expected
+    );
+    #[cfg(unix)]
+    {
+        let alias = fx._tmp.path().join("primary-alias");
+        std::os::unix::fs::symlink(&fx.primary, &alias).unwrap();
+        assert_eq!(
+            worktree_writable_roots(&alias, &fx.home).await.unwrap(),
+            expected
+        );
+    }
+}
+
+/// Exercise OS enforcement without requiring an installed agent CLI or PowerShell.
+/// Run explicitly on macOS outside an enclosing sandbox that forbids sandbox_apply.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires a host that can launch Seatbelt"]
+async fn seatbelt_enforces_resolved_write_scope() {
+    let fx = Fixture::new();
+    let roots = worktree_writable_roots(&fx.seat, &fx.home).await.unwrap();
+    let mut profile = String::from("(version 1)(allow default)(deny file-write*)");
+    for root in std::iter::once(fx.seat.canonicalize().unwrap()).chain(roots) {
+        // JSON quoting escapes the temporary path for Seatbelt's string syntax.
+        profile.push_str(&format!(
+            "(allow file-write* (subpath {}))",
+            serde_json::to_string(root.to_str().unwrap()).unwrap()
+        ));
+    }
+    let lock = fx.primary.join(".git/kanade-sync.lock");
+    let question = fx.home.join("questions/probe.tmp");
+    let work = fx.seat.join("work-started");
+    let notification = fx.home.join("notifications/probe");
+    let denied = fx.home.join("queue-probe");
+    let run = |script: &str| {
+        Command::new("/usr/bin/sandbox-exec")
+            .args(["-p", &profile, "/bin/sh", "-c", script, "scope-probe"])
+            .args([&lock, &question, &work, &notification, &denied])
+            .current_dir(&fx.seat)
+            .output()
+            .expect("launch Seatbelt")
+    };
+    // Pass paths as positional arguments, never interpolate them as shell code.
+    let allowed = run(r#"echo lock > "$1" && echo question > "$2" &&
+        mv "$2" "$2.saved" && echo work > "$3" && echo notice > "$4""#);
+    assert!(allowed.status.success(), "{allowed:?}");
+    assert!(lock.is_file());
+    assert!(question.with_extension("tmp.saved").is_file());
+    assert!(work.is_file());
+    assert!(notification.is_file());
+    let refused = run(r#"echo forbidden > "$5""#);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(!denied.exists());
 }
 
 common::e2e! {
