@@ -12511,8 +12511,7 @@ mod tests {
         runner.state.prep_complete = Some(false);
         runner.state.config.graph.timeout_resource_wait = 30;
         runner.state.save().unwrap();
-        let external =
-            std::fs::File::create(runner.state.repo.join(".git/kanade-sync.lock")).unwrap();
+        let external = std::fs::File::create(runner.state.repo.join(".git/updater.lock")).unwrap();
         assert_eq!(
             unsafe { libc::flock(external.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
