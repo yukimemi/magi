@@ -569,7 +569,10 @@ impl Waiter {
                 let why = match other {
                     Ok(o) if o.timed_out => "the resumed turn timed out".to_owned(),
                     Ok(o) if o.quota_exhausted() => "the agent is out of quota".to_owned(),
-                    Ok(o) => format!("the resumed turn failed (exit {:?})", o.exit_code),
+                    Ok(o) => format!(
+                        "the resumed turn failed ({})",
+                        notices::exit_status(o.exit_code)
+                    ),
                     Err(e) => format!("the agent could not be started: {e:#}"),
                 };
                 self.refuse(&q, key, &why);

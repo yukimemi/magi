@@ -635,6 +635,45 @@ pub fn merged_red(run_id: &str, summary: &str) -> Notice {
     })
 }
 
+/// Human-readable process status for operator-facing failure details.
+pub fn exit_status(code: Option<i32>) -> String {
+    match code {
+        Some(code) => format!("exit code {code}"),
+        None => "exit code unavailable".to_owned(),
+    }
+}
+
+/// Trims text and drops empty values or meaningless placeholder phrases like `"(no reason given)"`.
+pub fn clean_text(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim)
+        .filter(|t| !t.is_empty() && *t != "(no reason given)" && *t != "(none)")
+}
+
+/// Formats a list of identifiers or items into human-readable comma-separated prose.
+/// Returns `None` if the list is empty or contains only blank entries.
+pub fn format_list<T: AsRef<str>>(items: &[T]) -> Option<String> {
+    let non_empty: Vec<&str> = items
+        .iter()
+        .map(|s| s.as_ref().trim())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if non_empty.is_empty() {
+        None
+    } else {
+        Some(non_empty.join(", "))
+    }
+}
+
+/// Ensures a sentence ends with a single period and has no trailing whitespace.
+pub fn ensure_sentence(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let trimmed_dot = trimmed.trim_end_matches('.');
+    format!("{trimmed_dot}.")
+}
+
 /// The notice for a task the machine or its attempt budget has held, if it is.
 ///
 /// Called from [`crate::queue::Queue::put`], which every task transition goes
@@ -657,11 +696,13 @@ pub fn task_held(task: &crate::queue::Task) -> Option<Notice> {
         .hold_reason
         .as_deref()
         .or(task.last_error.as_deref())
+        .and_then(|w| clean_text(Some(w)))
         .unwrap_or("no reason recorded");
+    let why_sentence = why.trim_end_matches('.');
     Some(
         Notice::warn(
             &format!("task:{}", task.id),
-            format!("Task {} is held: {why}.", task.short()),
+            format!("Task {} is held: {why_sentence}.", task.short()),
         )
         .link(Link::Task {
             id: task.id.clone(),
@@ -669,6 +710,54 @@ pub fn task_held(task: &crate::queue::Task) -> Option<Notice> {
         .about([task.id.clone()])
         .since(task.held_at),
     )
+}
+
+/// The notice for a conductor concern raised after explicit resumption without
+/// verified new blocking evidence.
+///
+/// Informational: preserves the task state without re-blocking on old evidence,
+/// explains that no state changed and no reply is required, and attaches a link
+/// to the task. Any proposed question text is omitted to avoid soliciting an
+/// answer to an unregistered question.
+pub fn conductor_resumption(
+    task_id: &str,
+    task_short: &str,
+    reason: Option<&str>,
+    blocked_by: &[String],
+    evidence: &[String],
+    has_question: bool,
+) -> Notice {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(format!(
+        "Conductor raised a concern for task {task_short} after explicit resumption, but its state was not changed because no verified new blocking evidence was found."
+    ));
+
+    if let Some(r) = clean_text(reason) {
+        parts.push(format!("Concern: {}.", r.trim_end_matches('.')));
+    }
+
+    if has_question {
+        parts.push("An unregistered question was proposed; no reply is required.".to_owned());
+    }
+
+    if let Some(deps) = format_list(blocked_by) {
+        parts.push(format!("Proposed dependencies: {deps}."));
+    }
+
+    if let Some(ev) = format_list(evidence) {
+        parts.push(format!("Cited evidence: {ev}."));
+    }
+
+    parts.push(
+        "No reply to this notice is needed. To hold this task, use manual hold via the queue."
+            .to_owned(),
+    );
+
+    Notice::warn(&format!("conductor-resumption:{task_id}"), parts.join(" "))
+        .link(Link::Task {
+            id: task_id.to_owned(),
+        })
+        .about([task_id.to_owned()])
 }
 
 /// The notice for a run whose graph returned an error before it settled.
@@ -874,6 +963,12 @@ mod tests {
         assert!(s.get(&id_of("deputy:old")).is_err());
         assert_eq!(s.all().len(), CAP);
         assert!(s.all().iter().all(|n| n.key.starts_with("current:")));
+    }
+
+    #[test]
+    fn process_exit_status_is_readable_even_without_a_code() {
+        assert_eq!(exit_status(Some(1)), "exit code 1");
+        assert_eq!(exit_status(None), "exit code unavailable");
     }
 
     fn store() -> (tempfile::TempDir, Notices) {
@@ -1461,5 +1556,84 @@ mod tests {
             },
             Some(notify),
         );
+    }
+
+    #[test]
+    fn formatting_helpers_clean_text_and_lists() {
+        assert_eq!(clean_text(None), None);
+        assert_eq!(clean_text(Some("")), None);
+        assert_eq!(clean_text(Some("   ")), None);
+        assert_eq!(clean_text(Some("(no reason given)")), None);
+        assert_eq!(clean_text(Some("(none)")), None);
+        assert_eq!(clean_text(Some("  real reason  ")), Some("real reason"));
+
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(format_list(&empty), None);
+        assert_eq!(format_list(&["", "  "]), None);
+        assert_eq!(format_list(&["task-1"]), Some("task-1".into()));
+        assert_eq!(format_list(&["a", "b", "c"]), Some("a, b, c".into()));
+
+        assert_eq!(ensure_sentence(""), "");
+        assert_eq!(ensure_sentence("hello"), "hello.");
+        assert_eq!(ensure_sentence("hello."), "hello.");
+        assert_eq!(ensure_sentence("hello.."), "hello.");
+    }
+
+    #[test]
+    fn conductor_resumption_notice_is_readable_and_non_soliciting() {
+        let task_id = "20261017-000000-abcd";
+        let task_short = "abcd";
+        let reason = "awaiting manual review";
+        let blocked_by = vec!["dep-1".to_owned(), "dep-2".to_owned()];
+        let evidence = vec!["check-failed".to_owned()];
+        let has_question = true;
+
+        let notice = conductor_resumption(
+            task_id,
+            task_short,
+            Some(reason),
+            &blocked_by,
+            &evidence,
+            has_question,
+        );
+
+        assert_eq!(notice.key, format!("conductor-resumption:{task_id}"));
+        assert_eq!(notice.severity, Severity::Warn);
+        assert_eq!(
+            notice.link,
+            Some(Link::Task {
+                id: task_id.to_owned()
+            })
+        );
+        assert_eq!(notice.subjects, vec![task_id.to_owned()]);
+
+        let msg = &notice.message;
+        // Contains concise understandable prose explaining what happened
+        assert!(msg.contains("Conductor raised a concern for task abcd after explicit resumption"));
+        assert!(msg.contains("Concern: awaiting manual review."));
+        assert!(msg.contains("Proposed dependencies: dep-1, dep-2."));
+        assert!(msg.contains("Cited evidence: check-failed."));
+        // Explicitly clarifies that no reply is required
+        assert!(msg.contains("No reply to this notice is needed."));
+        // No raw Debug formatting or dumped structures
+        assert!(!msg.contains("Some("));
+        assert!(!msg.contains("None"));
+        assert!(!msg.contains("[]"));
+        assert!(!msg.contains("{:?}"));
+    }
+
+    #[test]
+    fn conductor_resumption_notice_omits_empty_details() {
+        let task_id = "20261017-000000-abcd";
+        let notice = conductor_resumption(task_id, "abcd", None, &[], &[], false);
+
+        let msg = &notice.message;
+        assert!(!msg.contains("Concern:"));
+        assert!(!msg.contains("Proposed dependencies:"));
+        assert!(!msg.contains("Cited evidence:"));
+        assert!(!msg.contains("unregistered question"));
+        assert!(!msg.contains("None"));
+        assert!(!msg.contains("[]"));
+        assert!(msg.contains("No reply to this notice is needed."));
     }
 }

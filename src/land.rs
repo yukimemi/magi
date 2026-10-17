@@ -1103,7 +1103,7 @@ impl Words {
                 _ => (if ja { "場所未指定" } else { "no location" }).to_owned(),
             };
             let title: String = f.title.chars().take(TITLE_CHARS).collect();
-            let _ = writeln!(out, "- {} {:?} {at}: {title}", f.id, f.severity);
+            let _ = writeln!(out, "- {} {} {at}: {title}", f.id, f.severity);
         }
         if c.findings.len() > SHOWN {
             let more = c.findings.len() - SHOWN;
@@ -1534,7 +1534,7 @@ pub fn deputy_brief(q: &ask::Question, state: Option<&RunState>) -> String {
                     (Some(file), None) => format!(" ({file})"),
                     _ => String::new(),
                 };
-                s.push_str(&format!("\n- [{}] {:?}{at}: {}", f.id, f.severity, f.title));
+                s.push_str(&format!("\n- [{}] {}{at}: {}", f.id, f.severity, f.title));
             }
             let seats: Vec<String> = c.rejecters.iter().map(|(n, _)| format!("#{n}")).collect();
             s.push_str(&format!("\nReviewers who rejected: {}.", seats.join(", ")));
@@ -3042,15 +3042,12 @@ fn repo_label(repo: &Path, pr_url: &str) -> String {
 /// `failing`, which can be non-empty on a green observation.
 fn red_merge_summary(repo_name: &str, pr: &PrState) -> Option<String> {
     (pr.checks == Checks::Red).then(|| {
+        let details = crate::notices::format_list(&pr.failing)
+            .map(|names| format!(": {names}"))
+            .unwrap_or_default();
         format!(
-            "Merged {repo_name} PR #{} with red checks: {} ({})",
-            pr.number,
-            if pr.failing.is_empty() {
-                "(none named)".to_owned()
-            } else {
-                pr.failing.join(", ")
-            },
-            pr.url
+            "Merged {repo_name} PR #{} with red checks{details} ({})",
+            pr.number, pr.url
         )
     })
 }
@@ -4681,8 +4678,13 @@ pub async fn fix_round(
         }
         Ok(o) if !o.usable() => {
             return Ok(Fixed::Failed(format!(
-                "the fixer produced nothing usable (exit {:?}, timed out: {})",
-                o.exit_code, o.timed_out
+                "the fixer produced nothing usable ({}{})",
+                crate::notices::exit_status(o.exit_code),
+                if o.timed_out {
+                    "; the turn timed out"
+                } else {
+                    ""
+                }
             )));
         }
         Ok(_) => {}
@@ -5907,6 +5909,23 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     }
 
     #[test]
+    fn red_merge_notices_omit_empty_check_details() {
+        for checks in [vec![], vec!["", "  "]] {
+            let red = pr(Checks::Red, &checks, 0);
+            let summary = red_merge_summary("owner/repo", &red).unwrap();
+            let notice = crate::notices::merged_red("run-1", &summary);
+            assert_eq!(
+                notice.message,
+                format!("Merged owner/repo PR #16 with red checks ({})", red.url)
+            );
+            assert_eq!(notice.severity, crate::notices::Severity::Warn);
+        }
+        let red = pr(Checks::Red, &["", " test ", " "], 0);
+        let summary = red_merge_summary("owner/repo", &red).unwrap();
+        assert!(summary.contains("with red checks: test ("), "{summary}");
+    }
+
+    #[test]
     fn the_repo_label_comes_from_the_pull_request_url() {
         let p = Path::new("/tmp/checkout");
         assert_eq!(
@@ -6927,7 +6946,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         state.contested_handoff = Some(contested());
         let b = deputy_brief(&q, Some(&state));
         assert!(b.contains("https://example.test/pull/7"), "{b}");
-        assert!(b.contains("R3-1-1") && b.contains("src/a.rs:1"), "{b}");
+        assert!(b.contains("[R3-1-1] major (src/a.rs:1)"), "{b}");
         assert!(b.contains("#1"), "the rejecting seat: {b}");
         state.contested_handoff = None;
         assert!(deputy_brief(&q, Some(&state)).contains("not recorded as contested"));
@@ -6947,7 +6966,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             );
             assert!(text.contains("pull/42"), "{text}");
             assert!(
-                text.contains("R3-1-1 Major src/a.rs:1: problem R3-1-1"),
+                text.contains("R3-1-1 major src/a.rs:1: problem R3-1-1"),
                 "{text}"
             );
             assert!(text.contains("R3-1-5"), "{text}");

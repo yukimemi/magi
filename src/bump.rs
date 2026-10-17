@@ -112,7 +112,10 @@ async fn ask_decision(
             Ok(out) if out.timed_out => (run::FailClass::Timeout, "timed out".to_owned()),
             Ok(out) if out.exit_code != Some(0) => (
                 run::FailClass::Other("cli".into()),
-                format!("CLI exit {:?}", out.exit_code),
+                format!(
+                    "CLI failed ({})",
+                    crate::notices::exit_status(out.exit_code)
+                ),
             ),
             Ok(out) if out.text.trim().is_empty() => (
                 run::FailClass::Other("empty".into()),
@@ -2705,6 +2708,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_worktree_failure_reaches_release_notice_without_debug_exit_codes() {
+        let (dir, repo) = origin_with(&[("f", "x\n")]).await;
+        let worktree = dir.path().join("occupied");
+        tokio::fs::create_dir(&worktree).await.unwrap();
+        let existing = worktree.join("keep");
+        tokio::fs::write(&existing, "operator data").await.unwrap();
+        let err = release_attempt::<(), _, _, _, _>(
+            &repo,
+            "origin",
+            "main",
+            &worktree,
+            "release-test",
+            no_pr,
+            |_| async { panic!("worktree creation must fail before release edits") },
+        )
+        .await
+        .unwrap_err();
+        let (version, reason) = notice_for_failure(&Progress::default(), &err);
+        assert!(
+            reason.contains("create the release-bump worktree"),
+            "{reason}"
+        );
+        assert!(reason.contains("exit code 128"), "{reason}");
+        let store = Notices::at(dir.path().join("notifications"));
+        let mut state = winner_state(&repo, "main");
+        state.status = RunStatus::Merged;
+        report_problem_in(&mut state, &store, None, version.as_deref(), &reason, false).await;
+        let notices = store.list();
+        assert_eq!(notices.len(), 1);
+        let notice = &notices[0];
+        assert!(
+            notice.message.contains("exit code 128"),
+            "{}",
+            notice.message
+        );
+        assert!(!notice.message.contains("Some(") && !notice.message.contains("None"));
+        assert_eq!(notice.severity, Severity::Error);
+        assert_eq!(state.status, RunStatus::Merged);
+        assert!(state.needs_attention());
+        assert!(!git::branch_exists(&repo, "release-test").await.unwrap());
+        assert_eq!(
+            tokio::fs::read_to_string(existing).await.unwrap(),
+            "operator data"
+        );
+    }
+
+    #[tokio::test]
     async fn base_has_cargo_toml_tells_rust_from_non_rust() {
         let (_d, rust) = origin_with(&[("Cargo.toml", "[package]\nversion = \"0.1.0\"\n")]).await;
         assert!(base_has_cargo_toml(&rust, "origin", "main").await.unwrap());
@@ -2995,7 +3045,7 @@ mod tests {
                 "CLI invocation failed; inspect attempt artifacts",
             ),
             ("not JSON", "0", "invalid decision JSON or missing reason"),
-            (VALID_DECISION, "1", "CLI exit Some(1)"),
+            (VALID_DECISION, "1", "CLI failed (exit code 1)"),
             ("", "timeout", "timed out"),
         ] {
             let dir = tempfile::tempdir().unwrap();

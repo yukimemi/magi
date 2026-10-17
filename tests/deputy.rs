@@ -76,6 +76,35 @@ async fn turn(d: &mut Deputies) {
 }
 
 common::e2e! {
+#[cfg(unix)]
+async fn failed_deputy_notices_describe_exit_status_without_debug_values() {
+    for (command, status) in [
+        ("cat >/dev/null; exit 1", "exit code 1"),
+        ("cat >/dev/null; kill -TERM $$", "exit code unavailable"),
+    ] {
+        for sessions in [false, true] {
+            let mut s = scene(home_lock().await);
+            s.fx.config.graph.sessions = sessions;
+            for agent in &mut s.fx.config.agents {
+                agent.command = vec!["sh".into(), "-c".into(), command.into()];
+            }
+            let mut d = deputies(&s, 1);
+            turn(&mut d).await;
+            let notices = magi::notices::Notices::at(s.home.join("notifications"));
+            let id = magi::notices::id_of(&format!("deputy-turn:{}", s.q.id));
+            let notice = notices.get(&id).unwrap();
+            assert!(notice.message.contains(&format!("its turn failed ({status})")), "{}", notice.message);
+            assert!(!notice.message.contains("Some(") && !notice.message.contains("None"));
+            assert_eq!(notice.severity, magi::notices::Severity::Warn);
+            let question = s.store.get(&s.q.id).unwrap();
+            assert_eq!(question.status, QuestionStatus::Open);
+            assert_eq!(question.choices, s.q.choices);
+        }
+    }
+}
+}
+
+common::e2e! {
 async fn exhausted_deputies_do_not_create_or_increment_notifications() {
     let s = scene(home_lock().await);
     s.store.update(&s.q.id, |q| {
