@@ -657,7 +657,14 @@ mod tests {
     fn external_contention_refuses_a_seat_without_waiting() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("updater.lock");
-        let external = exclusive(&path).unwrap();
+        // Keep this owner outside READERS, but explicitly unlock on drop:
+        // another test's fork may inherit the descriptor before exec.
+        let external = Lease {
+            _file: exclusive(&path).unwrap(),
+        };
+        // Model that inherited open file description without a timing race.
+        #[cfg(unix)]
+        let _inherited = external._file.try_clone().unwrap();
         assert!(Lease::acquire(path.clone()).is_err());
         drop(external);
         assert!(Lease::acquire(path).is_ok());
