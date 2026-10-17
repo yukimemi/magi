@@ -12489,7 +12489,9 @@ mod tests {
         assert!(runner.state.prep_failure.is_none());
         assert!(runner.state.seats.is_empty());
         runner.pause.park();
-        tokio::time::timeout(Duration::from_secs(1), runner.execute())
+        // Include headroom for Git subprocesses under parallel test load;
+        // the repository contention deadline itself remains one second.
+        tokio::time::timeout(Duration::from_secs(10), runner.execute())
             .await
             .unwrap()
             .unwrap();
