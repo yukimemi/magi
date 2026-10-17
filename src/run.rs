@@ -465,9 +465,11 @@ pub enum RunStatus {
     /// A later attempt at the same task already finished the job — see
     /// `crate::queue::Task::superseded_attempts` — so this run's own
     /// `Blocked`/`Stalled` no longer means anyone has to look at it. Written
-    /// only over one of those two statuses, only once the task itself is
+    /// over one of those two statuses once the task itself is
     /// `crate::queue::TaskStatus::Done`, and only onto an attempt that comes
-    /// before the one that succeeded. Unlike them, not [`Self::resumable`]:
+    /// before the one that succeeded. Publication can also retire a stopped,
+    /// non-terminal predecessor after an explicit worktree handover to its
+    /// successor leaves it nothing to resume. Unlike them, not [`Self::resumable`]:
     /// there is nothing left to resume towards, the task already has its
     /// answer, and a fold is free to clean this run's worktree away without
     /// waiting on a human to confirm that first.
@@ -1852,11 +1854,13 @@ impl ActiveSeat {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Liveness {
-    /// Proven: a daemon's heartbeat claims the run, or `driver_pid` answers
+    /// Proven: a daemon's heartbeat or a matching held execution lease claims
+    /// the run, or (for legacy records) `driver_pid` answers
     /// alive under the same identity (`driver_started_at`) this run recorded
     /// for it.
     Live,
-    /// Proven: no daemon claim, and either `driver_pid` answers dead outright
+    /// Proven: no daemon claim, and an explicit exit or matching free execution
+    /// lease, or `driver_pid` answers dead outright
     /// or it answers alive under a *different* identity than recorded — a
     /// pid the OS has since handed to an unrelated process is exactly as
     /// good as proof the original driver is gone (see
@@ -2268,6 +2272,8 @@ pub struct RunState {
     /// from one a killed process abandoned, and printed the same "no live
     /// daemon claims this run" warning over a run that was, in fact, still
     /// answering. See [`Liveness`] for how this and the daemon claim combine.
+    /// Released ownership clears this field together with `driver_started_at`;
+    /// legacy records may retain the old pid with `driver_exited = true`.
     #[serde(default)]
     pub driver_pid: Option<u32>,
     /// The OS-reported moment [`Self::driver_pid`] started, recorded in the
@@ -2292,11 +2298,11 @@ pub struct RunState {
     /// its graph walk returned, whatever the outcome. Cleared at the start of
     /// every walk, set as the last write of one.
     ///
-    /// A long-lived `magi serve` records its own pid and keeps it after the
-    /// run ends, so that pid answers alive with a matching identity for as
-    /// long as the daemon lives, and every blocked, failed or parked run it
-    /// ever drove would read as being worked on right now. A crash or kill
-    /// never sets this, and needs nothing to: the pid is dead then.
+    /// A long-lived `magi serve` outlives its individual graph walks. The
+    /// execution guard sets this and clears the pid/start marker when a walk
+    /// returns, is cancelled or unwinds. A kill or failed save instead leaves
+    /// a free pass-bound execution lease or a lost process identity for
+    /// startup reconciliation. Older exited records may retain a historical pid.
     #[serde(default)]
     pub driver_exited: bool,
     /// Last observation of the winner's pull request, when a land loop ran.
@@ -2879,11 +2885,36 @@ impl RunState {
     /// identity queries.
     #[must_use]
     pub fn liveness(&self, daemon_claims: bool) -> Liveness {
-        self.liveness_with(
+        self.liveness_under(&home(), daemon_claims)
+    }
+
+    /// The same judge, rooted at the caller's run store.
+    #[must_use]
+    pub fn liveness_under(&self, home: &Path, daemon_claims: bool) -> Liveness {
+        self.liveness_under_with(
+            home,
             daemon_claims,
             crate::proc::pid_status,
             crate::proc::process_started_at,
         )
+    }
+
+    pub(crate) fn liveness_under_with<F, G>(
+        &self,
+        home: &Path,
+        daemon_claims: bool,
+        query: F,
+        identity: G,
+    ) -> Liveness
+    where
+        F: FnOnce(u32) -> Option<bool>,
+        G: FnOnce(u32) -> Option<String>,
+    {
+        if daemon_claims {
+            return Liveness::Live;
+        }
+        let process = self.liveness_with(false, query, identity);
+        crate::driver::judge(self, home, process)
     }
 
     /// Clear every seat this run still lists as active and fail it, unless it

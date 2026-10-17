@@ -48,7 +48,7 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, Invocation, SeatState};
-use crate::ask::{Deputy, Question, Questions};
+use crate::ask::{ChoiceAction, Deputy, Question, Questions};
 use crate::config::Config;
 use crate::prompt;
 use crate::queue::{Queue, Task, TaskStatus};
@@ -255,6 +255,9 @@ pub struct Decision {
     /// Fixed answers for `question`, if it has any. Empty means free text.
     #[serde(default)]
     pub choices: Vec<String>,
+    /// Explicit operations keyed by exact choice labels; never inferred from prose.
+    #[serde(default)]
+    pub actions: BTreeMap<String, ChoiceAction>,
     /// Stable operation and concrete target of a question. Missing on legacy
     /// decisions: those share the task's existing cause, regardless of prose.
     #[serde(default)]
@@ -976,6 +979,11 @@ fn apply_one(
                     text.clone(),
                     d.reason.clone().unwrap_or_default(),
                     d.choices.clone(),
+                );
+                q.actions = d.actions.clone();
+                anyhow::ensure!(
+                    q.actions.keys().all(|label| q.choices.contains(label)),
+                    "question action must name an offered choice"
                 );
                 q.decision_context = Some(context);
                 // The wait is handed to a deputy (`crate::deputy`), so a
@@ -2296,6 +2304,7 @@ printf '%s\n' "$MOCK_REPLY"
                 recovery: None,
                 question: None,
                 choices: Vec::new(),
+                actions: BTreeMap::new(),
                 question_decision: None,
                 evidence: Vec::new(),
                 missing_dependencies: Vec::new(),
@@ -2328,6 +2337,7 @@ printf '%s\n' "$MOCK_REPLY"
                 recovery: None,
                 question: Some("Which storage backend?".to_owned()),
                 choices: vec!["SQLite".to_owned(), "Redis".to_owned()],
+                actions: BTreeMap::new(),
                 question_decision: None,
                 evidence: Vec::new(),
                 missing_dependencies: Vec::new(),
@@ -2451,6 +2461,7 @@ printf '%s\n' "$MOCK_REPLY"
                     recovery: None,
                     question: Some("Which backend?".to_owned()),
                     choices: Vec::new(),
+                    actions: BTreeMap::new(),
                     question_decision: None,
                     evidence: Vec::new(),
                     missing_dependencies: Vec::new(),

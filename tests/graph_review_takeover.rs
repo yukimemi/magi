@@ -29,7 +29,7 @@ fn run_git(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
-/// An earlier run, mid-flight, whose candidate worktree holds `BRANCH` with one
+/// An earlier stopped run whose candidate worktree holds `BRANCH` with one
 /// commit on it. Returns the saved run and the worktree path.
 fn old_run(fx: &common::Fixture) -> (RunState, PathBuf) {
     old_run_at(fx, false)
@@ -67,6 +67,7 @@ fn old_run_at(fx: &common::Fixture, outside: bool) -> (RunState, PathBuf) {
     run_git(&wt, &["commit", "-q", "-m", "old run work"]);
 
     state.status = RunStatus::Gating;
+    state.driver_exited = true;
     state.candidates.push(Candidate {
         index: 0,
         label: 'A',
@@ -195,6 +196,7 @@ async fn a_running_run_is_refused_and_left_alone() {
     let pid = std::process::id();
     old.driver_pid = Some(pid);
     old.driver_started_at = magi::proc::process_started_at(pid);
+    old.driver_exited = false;
     old.save().unwrap();
 
     let err = Runner::review_taking_over(
@@ -275,6 +277,7 @@ fn other_task_run(fx: &common::Fixture) -> (RunState, PathBuf) {
     run_git(&wt, &["add", "-A"]);
     run_git(&wt, &["commit", "-q", "-m", "other run work"]);
     state.status = RunStatus::Blocked;
+    state.driver_exited = true;
     state.candidates.push(Candidate {
         index: 0,
         label: 'A',
@@ -349,6 +352,7 @@ async fn a_live_run_of_another_task_is_left_alone_and_named() {
     old.status = RunStatus::Reviewing;
     old.driver_pid = Some(pid);
     old.driver_started_at = magi::proc::process_started_at(pid);
+    old.driver_exited = false;
     old.save().unwrap();
 
     let err = Runner::review_taking_over(&fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[])), magi::run::Origin::operator())
@@ -378,5 +382,138 @@ async fn an_earlier_attempts_worktree_outside_the_worktree_root_is_left_alone() 
     assert!(format!("{err:#}").contains("worktree root"), "{err:#}");
     assert!(wt.exists());
     assert!(!RunState::load_under(&old.id, &magi::run::home()).unwrap().released());
+}
+}
+
+common::e2e! {
+async fn an_unknown_legacy_driver_is_refused_without_treating_missing_pid_as_proof() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (mut old, wt) = old_run(&fx);
+    old.driver_exited = false;
+    old.save().unwrap();
+    let error = Runner::review_taking_over(
+        &fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[&old])), magi::run::Origin::operator(),
+    ).await.err().expect("unknown ownership must not be released");
+    assert!(format!("{error:#}").contains("could not be shown"));
+    assert!(wt.exists());
+    assert!(!RunState::load(&old.id).unwrap().released());
+}
+}
+
+common::e2e! {
+async fn a_legacy_unclaimed_run_can_execute_park_and_then_hand_over() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (mut old, wt) = old_run(&fx);
+    old.driver_exited = false;
+    old.driver_pid = None;
+    old.driver_started_at = None;
+    // Like a review-only run before its first graph claim, the candidate
+    // checkout is already prepared. Resuming must not rebuild that checkout.
+    old.prep_complete = Some(true);
+    old.save().unwrap();
+    assert_eq!(old.liveness(false), magi::run::Liveness::Unknown);
+    let mut resumed = Runner::resume(&old.id).expect("legacy unclaimed runs can resume");
+    let pause = magi::graph::Pause::new();
+    pause.park();
+    resumed.on_pause(pause);
+    resumed.execute().await.unwrap();
+    let stopped = RunState::load(&old.id).unwrap();
+    assert!(stopped.parked && stopped.driver_exited);
+    assert_eq!(stopped.liveness(false), magi::run::Liveness::Dead);
+    let successor = Runner::review_taking_over(
+        &fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[&stopped])), magi::run::Origin::operator(),
+    ).await.expect("an actual execution exit establishes proof for handover");
+    assert!(!wt.exists());
+    assert_eq!(RunState::load(&old.id).unwrap().released_to.as_deref(), Some(successor.state.id.as_str()));
+}
+}
+
+common::e2e! {
+async fn a_failed_successor_can_restore_its_handover_under_the_owner_lock() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (old, wt) = old_run(&fx);
+    let released = magi::handover::release(&fx.repo, BRANCH, "successor", &takeover(&[&old]))
+        .await.unwrap().expect("the stopped worktree is released");
+    assert!(!wt.exists());
+    released.restore(&fx.repo, BRANCH).await;
+    assert!(wt.exists());
+    let restored = RunState::load(&old.id).unwrap();
+    assert!(!restored.released());
+    assert!(!restored.candidates[0].folded);
+    assert!(restored.driver_exited);
+    assert!(Runner::resume(&old.id).is_ok());
+}
+}
+
+common::e2e! {
+async fn checkpointed_predecessors_keep_their_worktree_and_remain_resumable() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (base, wt) = old_run(&fx);
+    let tip = run_git(&fx.repo, &["rev-parse", BRANCH]);
+    for checkpoint in ["publication", "blocked-publication", "approval", "landing", "armed", "decision", "repair", "question"] {
+        let mut old = base.clone();
+        match checkpoint {
+            "publication" => old.pr_publication_pending = true,
+            "blocked-publication" => {
+                old.status = RunStatus::Blocked;
+                old.pr_publication_pending = true;
+            }
+            "approval" => {
+                old.status = RunStatus::Landing;
+                old.land_approval = Some(magi::run::LandApproval { question: "approval".into(), head: tip.clone() });
+            }
+            "landing" => old.status = RunStatus::Landing,
+            "armed" => old.land_armed_head = Some(tip.clone()),
+            "decision" => old.merge_decision = Some(magi::merge_decision::Decision {
+                question: "decision".into(),
+                target: magi::merge_decision::Target { pr: "https://github.com/o/r/pull/1".into(), head: tip.clone(), language: "en".into() },
+                choice: "hold".into(), closed: false, replacement_run: None, replacement_pr: None,
+            }),
+            "repair" => old.merge_repairs.push(magi::run::MergeRepair {
+                question: "repair".into(), head: tip.clone(), pr: "https://github.com/o/r/pull/1".into(),
+                reviews: Vec::new(), gate: Vec::new(), gate_head: None, gate_fixes: Vec::new(), pre_gate: Vec::new(),
+                phase: magi::run::MergeRepairPhase::Requested, failure: None,
+            }),
+            "question" => {
+                let mut question = magi::ask::Question::new(old.id.clone(), "review".into(), "reviewer".into(),
+                    "Continue?".into(), String::new(), Vec::new());
+                magi::ask::Questions::open().put(&mut question).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        old.save().unwrap();
+        let before = std::fs::read(old.dir().join("run.json")).unwrap();
+        let error = Runner::review_taking_over(
+            &fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[&old])), magi::run::Origin::operator(),
+        ).await.err().expect("checkpointed work must stay with its original run");
+        assert!(matches!(error.downcast_ref::<magi::handover::Refused>(), Some(magi::handover::Refused::Unsafe { .. })), "{checkpoint}: {error:#}");
+        assert!(format!("{error:#}").contains("resume that run"), "{checkpoint}: {error:#}");
+        assert!(wt.exists(), "{checkpoint}");
+        assert_eq!(run_git(&fx.repo, &["rev-parse", BRANCH]), tip, "{checkpoint}");
+        assert_eq!(std::fs::read(old.dir().join("run.json")).unwrap(), before, "{checkpoint}");
+        let resumed = Runner::resume(&old.id).expect("refusal must preserve resumption");
+        assert!(!resumed.state.released(), "{checkpoint}");
+        assert!(!resumed.state.candidates[0].folded, "{checkpoint}");
+    }
+}
+}
+
+common::e2e! {
+async fn historical_approval_on_a_completed_run_does_not_block_handover() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (mut old, wt) = old_run(&fx);
+    old.status = RunStatus::Ready;
+    old.land_approval = Some(magi::run::LandApproval { question: "historical".into(), head: "head".into() });
+    old.save().unwrap();
+    let successor = Runner::review_taking_over(
+        &fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[&old])), magi::run::Origin::operator(),
+    ).await.expect("completed-run evidence is historical");
+    assert!(!wt.exists());
+    assert_eq!(RunState::load(&old.id).unwrap().released_to.as_deref(), Some(successor.state.id.as_str()));
 }
 }

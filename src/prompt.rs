@@ -2911,6 +2911,15 @@ pub fn conduct(
          one \
          already does and only needs the human's word — or a quick manual \
          action — before the task can move again.\n\n\
+         Driver liveness is a machine fact: use the run's shared execution-lease \
+         and process-identity judge, never ask the owner to certify that a run is dead. \
+         A proven-stopped predecessor needs no permission to retry takeover. \
+         Resumable predecessor work must continue in its existing run. Only unknown \
+         liveness warrants a driver question; offer executable choices: \
+         `daemon: recheck and retry` (release/requeue the task, rerunning all ownership checks) \
+         or `daemon: hold the task` (leave it held). Attach structured `actions`: \
+         {\"daemon: recheck and retry\":{\"do\":\"requeue\"},\"daemon: hold the task\":{\"do\":\"hold\"}}. \
+         The daemon applies the chosen queue operation; neither answer overrides the liveness judge.\n\n\
          You may also `ask` the operator instead of choosing a recovery — \
          see below.\n\n",
     );
@@ -3002,6 +3011,9 @@ pub fn conduct(
          `choices`, if it is multiple choice) on a decision — magi files it \
          without blocking and blocks that task on its id. If a task already \
          has an unanswered question of yours, do not ask it again. With every question, \
+         attach `actions` keyed by exact choice labels when selecting a daemon queue operation \
+         (`{\"do\":\"requeue\"}`, `{\"do\":\"hold\"}`, `{\"do\":\"done\"}`, or \
+         `{\"do\":\"resume\",\"run\":\"<recorded run id>\"}`). Then \
          supply `question_decision`: an `operation` from `recover`, `resume`, \
          `repair`, `complete`, `inspect`, `configure`, and a structured `target`. \
          For a recovery source use `{\"kind\":\"source\",\"reference\":\"<existing branch or commit>\"}`; \
@@ -3035,7 +3047,7 @@ never `agent:`.\n\n",
          {\"decisions\":[{\"id\":\"<task id>\",\"blocked_by\":[\"<task or \
          question id>\"],\"missing_dependencies\":[\"<id, only for a missing-only decision>\"],\"reason\":\"<one line>\",\"recovery\":\
          \"requeue|hold|review|done\",\"question\":\"<text, optional>\",\
-         \"choices\":[\"<optional>\"],\"question_decision\":{\"operation\":\"recover\",\"target\":{\"kind\":\"source\",\"reference\":\"<existing branch or commit>\"}}}]}\n\
+         \"choices\":[\"<optional>\"],\"actions\":{\"<exact choice label>\":{\"do\":\"hold\"}},\"question_decision\":{\"operation\":\"recover\",\"target\":{\"kind\":\"source\",\"reference\":\"<existing branch or commit>\"}}}]}\n\
          ```\n\n\
          Omit any field you have nothing to say for. `\"decisions\":[]` is a \
          valid answer when nothing here needs changing.",

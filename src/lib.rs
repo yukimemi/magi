@@ -39,6 +39,7 @@ pub mod daemon;
 pub mod deputy;
 pub mod direct;
 pub mod disk;
+mod driver;
 pub mod dupes;
 pub mod fixer;
 pub mod followup;
