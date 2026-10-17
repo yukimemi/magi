@@ -400,3 +400,50 @@ async fn an_unknown_legacy_driver_is_refused_without_treating_missing_pid_as_pro
     assert!(!RunState::load(&old.id).unwrap().released());
 }
 }
+
+common::e2e! {
+async fn a_legacy_unclaimed_run_can_execute_park_and_then_hand_over() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (mut old, wt) = old_run(&fx);
+    old.driver_exited = false;
+    old.driver_pid = None;
+    old.driver_started_at = None;
+    // Like a review-only run before its first graph claim, the candidate
+    // checkout is already prepared. Resuming must not rebuild that checkout.
+    old.prep_complete = Some(true);
+    old.save().unwrap();
+    assert_eq!(old.liveness(false), magi::run::Liveness::Unknown);
+    let mut resumed = Runner::resume(&old.id).expect("legacy unclaimed runs can resume");
+    let pause = magi::graph::Pause::new();
+    pause.park();
+    resumed.on_pause(pause);
+    resumed.execute().await.unwrap();
+    let stopped = RunState::load(&old.id).unwrap();
+    assert!(stopped.parked && stopped.driver_exited);
+    assert_eq!(stopped.liveness(false), magi::run::Liveness::Dead);
+    let successor = Runner::review_taking_over(
+        &fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[&stopped])), magi::run::Origin::operator(),
+    ).await.expect("an actual execution exit establishes proof for handover");
+    assert!(!wt.exists());
+    assert_eq!(RunState::load(&old.id).unwrap().released_to.as_deref(), Some(successor.state.id.as_str()));
+}
+}
+
+common::e2e! {
+async fn a_failed_successor_can_restore_its_handover_under_the_owner_lock() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (old, wt) = old_run(&fx);
+    let released = magi::handover::release(&fx.repo, BRANCH, "successor", &takeover(&[&old]))
+        .await.unwrap().expect("the stopped worktree is released");
+    assert!(!wt.exists());
+    released.restore(&fx.repo, BRANCH).await;
+    assert!(wt.exists());
+    let restored = RunState::load(&old.id).unwrap();
+    assert!(!restored.released());
+    assert!(!restored.candidates[0].folded);
+    assert!(restored.driver_exited);
+    assert!(Runner::resume(&old.id).is_ok());
+}
+}

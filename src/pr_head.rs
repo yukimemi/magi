@@ -165,7 +165,8 @@ async fn predecessors(
 }
 
 /// A released execution has no remaining graph to resume. Only an explicit
-/// handover to this successor licenses retiring a non-terminal predecessor;
+/// completed handover licenses retiring a non-terminal predecessor, even if
+/// its immediate successor handed the work on again;
 /// all other interrupted runs must resume their existing graph first.
 fn validate_predecessor(
     old: &mut RunState,
@@ -185,7 +186,10 @@ fn validate_predecessor(
         Liveness::Dead => {}
     }
     if !old.status.done() {
-        if old.released_to.as_deref() != Some(next.id.as_str())
+        if old.released_to.is_none()
+            || old.candidates.iter().any(|c| {
+                old.released_branches.contains(&c.branch) && c.worktree.try_exists().unwrap_or(true)
+            })
             || old.pr_publication_pending
             || old.land_approval.is_some()
             || old.merge_decision.is_some()
@@ -204,7 +208,11 @@ fn validate_predecessor(
         old.status = crate::run::RunStatus::Superseded;
         old.event(
             "publish",
-            format!("execution retired after worktree handover to {}", next.id),
+            format!(
+                "execution retired after completed worktree handover to {}; current publisher {}",
+                old.released_to.as_deref().expect("checked handover"),
+                next.id
+            ),
         );
         old.save_under(home)?;
     }
@@ -517,6 +525,53 @@ mod tests {
         let disk = RunState::load_under(&old.id, home.path()).unwrap();
         assert_eq!(disk.status, crate::run::RunStatus::Superseded);
         assert_eq!(disk.released_to, Some(next.id));
+    }
+
+    #[test]
+    fn successive_handovers_do_not_strand_a_stopped_gating_publisher() {
+        let home = tempfile::tempdir().unwrap();
+        let mut a = predecessor(home.path());
+        let mut b = predecessor(home.path());
+        let c = predecessor(home.path());
+        for state in [&mut a, &mut b] {
+            state.status = crate::run::RunStatus::Gating;
+            state.driver_exited = true;
+            state.pr_head = Some("task-head".into());
+        }
+        a.released_to = Some(b.id.clone());
+        b.released_to = Some(c.id.clone());
+        let worktree = home.path().join("released-worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        a.released_branches.push("branch".into());
+        a.candidates.push(Candidate {
+            index: 0,
+            label: 'A',
+            agent: "existing".into(),
+            branch: "branch".into(),
+            worktree: worktree.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: true,
+        });
+        a.pr_publication_pending = true;
+        assert!(validate_predecessor(&mut a, &c, home.path(), false).is_err());
+        a.pr_publication_pending = false;
+        // Saving the handover marker precedes removal. A crash in that gap
+        // must not be mistaken for a completed transfer.
+        assert!(validate_predecessor(&mut a, &c, home.path(), false).is_err());
+        std::fs::remove_dir(worktree).unwrap();
+        assert!(validate_predecessor(&mut a, &c, home.path(), false).is_ok());
+        assert_eq!(a.status, crate::run::RunStatus::Superseded);
+        assert_eq!(a.released_to.as_deref(), Some(b.id.as_str()));
+        assert!(validate_predecessor(&mut b, &c, home.path(), true).is_err());
+        assert!(validate_predecessor(&mut b, &c, home.path(), false).is_ok());
+        assert_eq!(b.status, crate::run::RunStatus::Superseded);
     }
 
     #[test]

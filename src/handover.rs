@@ -123,6 +123,7 @@ pub struct Released {
     index: usize,
     path: PathBuf,
     home: PathBuf,
+    successor: String,
     /// The branch tip when the worktree was released; the branch sync may
     /// have moved it since.
     tip: String,
@@ -135,6 +136,26 @@ impl Released {
     /// out again at the old path and unmark the old run. Best-effort - if the
     /// worktree cannot be re-added the old run stays marked, which is true.
     pub async fn restore(&self, repo: &Path, branch: &str) {
+        let Ok(_owner) = crate::pr_head::owner_lock(&self.home, &self.old_id) else {
+            tracing::warn!("could not lock run {} for handover rollback", self.old_id);
+            return;
+        };
+        let Ok(mut state) = RunState::load_under(&self.old_id, &self.home) else {
+            return;
+        };
+        let claimed =
+            crate::daemon::is_working_on(&self.home, &self.old_id, jiff::Timestamp::now());
+        if state.released_to.as_deref() != Some(self.successor.as_str())
+            || state.status == RunStatus::Superseded
+            || state.pr_taken_over_by.is_some()
+            || state.liveness_under(&self.home, claimed) != Liveness::Dead
+        {
+            tracing::warn!(
+                "run {} changed ownership; handover rollback refused",
+                self.old_id
+            );
+            return;
+        }
         let path = self.path.to_string_lossy().to_string();
         // Nothing holds the branch now, so it can be put back where the old
         // run left it before its worktree is recreated at that commit.
@@ -152,15 +173,13 @@ impl Released {
             );
             return;
         }
-        let put_back = RunState::load_under(&self.old_id, &self.home).and_then(|mut s| {
-            if let Some(c) = s.candidates.get_mut(self.index) {
-                c.folded = false;
-            }
-            s.released_to = None;
-            s.released_branches.retain(|b| b != branch);
-            s.events.pop();
-            s.save_under(&self.home)
-        });
+        if let Some(c) = state.candidates.get_mut(self.index) {
+            c.folded = false;
+        }
+        state.released_to = None;
+        state.released_branches.retain(|b| b != branch);
+        state.events.pop();
+        let put_back = state.save_under(&self.home);
         if let Err(e) = put_back {
             tracing::warn!("could not unmark run {}: {e:#}", self.old_id);
         }
@@ -351,6 +370,28 @@ fn find_magi_owner(
     }
 }
 
+/// The scan only finds a possible holder. Driver claims share this lock, so
+/// reload and validate the candidate while holding it through removal/rollback.
+fn locked_holder(home: &Path, id: &str, path: &Path) -> Result<(RunState, usize, std::fs::File)> {
+    let owner = crate::pr_head::owner_lock(home, id)?;
+    let state = RunState::load_under(id, home)?;
+    let index = state
+        .candidates
+        .iter()
+        .position(|c| !c.folded && same_path(&c.worktree, path))
+        .ok_or_else(|| anyhow::anyhow!("worktree holder changed; retry takeover"))?;
+    anyhow::ensure!(
+        state.released_to.is_none(),
+        "run already handed over its worktree; retry takeover"
+    );
+    anyhow::ensure!(
+        path.parent()
+            .is_some_and(|p| same_path(&state.worktree_root(), p)),
+        "worktree holder root changed; retry takeover"
+    );
+    Ok((state, index, owner))
+}
+
 /// Release the worktree holding `branch` to `new_run`, when an earlier attempt
 /// at the same task, or a run magi itself recorded, holds it and it is safe. Returns the run whose worktree
 /// was released (see [`Released`]), or `None` when nothing needed (or was allowed) to happen.
@@ -404,7 +445,7 @@ pub async fn release(
             Err(why) => return Err(foreign(branch, &path, &why)),
         };
     }
-    let Some((mut state, index, kind)) = owner else {
+    let Some((state, _, kind)) = owner else {
         return Err(foreign(
             branch,
             &path,
@@ -416,6 +457,7 @@ pub async fn release(
         ));
     };
 
+    let (mut state, index, _owner) = locked_holder(&takeover.home, &state.id, &path)?;
     let holder = inspect(repo, branch, &path, &state, &takeover.home).await?;
     if let Decision::Refuse(why) = decide(&kind, &holder) {
         return Err(Refused::Unsafe {
@@ -453,8 +495,8 @@ pub async fn release(
     // edit made after the first look is refused rather than thrown away.
     // Ignored files such as `target/` go with the worktree by design.
     // Against the record as it is on disk now, not the copy read earlier: a
-    // resume that started in between has saved its driver there. (The resume
-    // side refuses a released run too - see `Runner::execute_graph`.)
+    // driver cannot claim between this check and removal: _owner remains
+    // held through the save, removal and any rollback.
     let again = match RunState::load_under(&old_id, &takeover.home) {
         Ok(fresh) => inspect(repo, branch, &path, &fresh, &takeover.home).await,
         Err(e) => Err(e),
@@ -490,6 +532,7 @@ pub async fn release(
         index,
         path,
         home: takeover.home.clone(),
+        successor: new_run.to_owned(),
         tip: holder.tip,
         audit,
     }))
@@ -525,6 +568,100 @@ mod tests {
             head: "a".repeat(40),
             tip: "a".repeat(40),
         }
+    }
+
+    fn recorded_holder(home: &Path) -> (RunState, PathBuf) {
+        let mut state = RunState::new(
+            "repo".into(),
+            "main".into(),
+            "base".into(),
+            "task".into(),
+            crate::config::Config::default(),
+        );
+        state.config.graph.worktree_root = Some(home.join("worktrees"));
+        let path = state.worktree_root().join("cand-A");
+        std::fs::create_dir_all(&path).unwrap();
+        state.driver_exited = true;
+        state.candidates.push(crate::run::Candidate {
+            index: 0,
+            label: 'A',
+            agent: "existing".into(),
+            branch: "branch".into(),
+            worktree: path.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: false,
+        });
+        state.save_under(home).unwrap();
+        (state, path)
+    }
+
+    #[test]
+    fn handover_reloads_a_driver_claim_after_the_scan_and_excludes_new_claims() {
+        let home = tempfile::tempdir().unwrap();
+        let (mut state, path) = recorded_holder(home.path());
+        let scanned = state.clone();
+        // A resume won the race after the holder scan, before the owner lock.
+        state.driver_exited = false;
+        state.driver_pid = Some(std::process::id());
+        state.driver_started_at = crate::proc::process_started_at(std::process::id());
+        state.begin_pass();
+        state.save_under(home.path()).unwrap();
+        let mut driver = crate::driver::DriverGuard::acquire(home.path(), &state).unwrap();
+        driver.record(&state).unwrap();
+        let (fresh, _, owner) = locked_holder(home.path(), &scanned.id, &path).unwrap();
+        assert!(!fresh.driver_exited);
+        assert_eq!(fresh.passes, state.passes);
+        assert_ne!(fresh.liveness_under(home.path(), false), Liveness::Dead);
+        assert!(crate::pr_head::owner_lock(home.path(), &state.id).is_err());
+        assert!(path.exists());
+        assert!(
+            RunState::load_under(&state.id, home.path())
+                .unwrap()
+                .released_to
+                .is_none()
+        );
+        drop(owner);
+        assert!(crate::pr_head::owner_lock(home.path(), &state.id).is_ok());
+    }
+
+    #[test]
+    fn handover_revalidates_candidate_ownership_under_the_claim_lock() {
+        let home = tempfile::tempdir().unwrap();
+        let (mut state, path) = recorded_holder(home.path());
+        state.candidates[0].folded = true;
+        state.released_to = Some("next".into());
+        state.save_under(home.path()).unwrap();
+        assert!(locked_holder(home.path(), &state.id, &path).is_err());
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_stale_restore_does_not_undo_a_later_handover() {
+        let home = tempfile::tempdir().unwrap();
+        let (mut state, path) = recorded_holder(home.path());
+        state.candidates[0].folded = true;
+        state.released_to = Some("later".into());
+        state.save_under(home.path()).unwrap();
+        let released = Released {
+            old_id: state.id.clone(),
+            index: 0,
+            path,
+            home: home.path().to_owned(),
+            successor: "original".into(),
+            tip: "tip".into(),
+            audit: String::new(),
+        };
+        released.restore(Path::new("nonexistent"), "branch").await;
+        let disk = RunState::load_under(&state.id, home.path()).unwrap();
+        assert_eq!(disk.released_to.as_deref(), Some("later"));
+        assert!(disk.candidates[0].folded);
     }
 
     #[test]

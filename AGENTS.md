@@ -1145,12 +1145,22 @@ answer never substitutes for proof. Questions offer executable retry/recheck or
 hold actions, never ask the owner to certify death.
 
 A non-terminal predecessor with resumable work must resume its existing graph.
-Publication retires it as `Superseded` only after an explicit `released_to`
-handover to this successor, with no pending publication, approval, merge decision,
-armed merge or repair checkpoint. That handover already checked clean worktrees
+Publication retires it as `Superseded` only after a completed handover recorded
+in `released_to` (the released worktree is absent), with no pending publication,
+approval, merge decision, armed merge or repair checkpoint. That handover already checked clean worktrees
 and branch tips and prevents the old graph resuming. This is the narrow rule for
 an interrupted `gating` predecessor with no work left: it cannot block successors
-forever once its worktree has actually transferred.
+forever once its worktree has actually transferred. Retirement preserves the
+immediate `released_to` audit link: A→B→C does not require rewriting A→C, because
+A has no graph to resume after its completed A→B handover. Each publisher still
+passes its own liveness and pending-checkpoint checks. Handover holds the old
+run's owner lock from its fresh read through deletion or rollback, so publication
+cannot observe a half-completed transfer and driver claims cannot race it.
+
+PID absence alone is still unknown for a legacy record. Such a run can be resumed
+through the existing graph; an actual execution exit or park establishes stopped
+driver evidence for a later handover. Never certify a legacy driver dead merely
+because its old format did not record a pid.
 
 Auto-merge is disabled before replacing the head. Successful publication saves
 the new run's pushed SHA and PR record,
