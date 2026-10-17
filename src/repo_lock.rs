@@ -32,25 +32,46 @@ struct Lease {
     _file: File,
 }
 
+/// Distinguish a non-checkout without interpreting Git's localized stderr.
+/// Once a checkout marker is present, resolution errors remain fatal: a broken
+/// Git file or inaccessible shared directory must never bypass coordination.
+pub(crate) async fn common_dir(cwd: &Path) -> Result<Option<PathBuf>> {
+    let cwd = match std::fs::canonicalize(cwd) {
+        Ok(cwd) => cwd,
+        // Preserve normal spawn failure for a missing command working directory.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e).context("resolve seat working directory"),
+    };
+    let mut checkout = false;
+    for ancestor in cwd.ancestors() {
+        match std::fs::symlink_metadata(ancestor.join(".git")) {
+            Ok(_) => {
+                checkout = true;
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).context("inspect seat checkout marker"),
+        }
+    }
+    if !checkout {
+        return Ok(None);
+    }
+    let common = crate::git::git(
+        &cwd,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .await
+    .context("resolve seat shared Git directory")?;
+    Ok(Some(
+        std::fs::canonicalize(common).context("canonicalize seat shared Git directory")?,
+    ))
+}
+
 impl SeatLease {
     pub(crate) async fn for_checkout(cwd: &Path, allow_write: bool) -> Result<Option<Self>> {
-        let out = crate::git::git_raw(
-            cwd,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )
-        .await?;
-        if !out.ok() {
-            // Some non-repository conversations and command adapters have no
-            // checkout. Do not hide failures resolving a real repository.
-            if out.stderr.contains("not a git repository") {
-                return Ok(None);
-            }
-            bail!(
-                "resolve read-only seat shared Git directory: {}",
-                out.stderr
-            );
-        }
-        let common = std::fs::canonicalize(out.stdout)?;
+        let Some(common) = common_dir(cwd).await? else {
+            return Ok(None);
+        };
         match std::fs::read_to_string(common.join("kanade-sync.contract")) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).context("read repository coordination contract"),
@@ -171,6 +192,21 @@ fn exclusive(path: &Path) -> std::io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn non_checkout_needs_no_git_resolution_but_broken_checkout_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(common_dir(dir.path()).await.unwrap().is_none());
+        assert!(
+            common_dir(&dir.path().join("missing"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        std::fs::write(dir.path().join(".git"), "gitdir: missing-git-directory\n").unwrap();
+        assert!(common_dir(dir.path()).await.is_err());
+        assert!(SeatLease::for_checkout(dir.path(), false).await.is_err());
+    }
 
     #[test]
     fn readers_share_real_lock_until_the_last_seat_finishes() {

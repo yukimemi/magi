@@ -458,6 +458,12 @@ mod coordination {
                 let _lock = take_lock(&path).expect("editor must not contend with a local reader");
                 std::fs::write(marker, "edited").unwrap();
             }
+            "holding-editor" => {
+                let path = PathBuf::from(std::env::var_os("COORDINATION_LOCK").unwrap());
+                let _lock = take_lock(&path).expect("editor takes the real lock");
+                std::fs::write(marker, "ready").unwrap();
+                std::thread::sleep(Duration::from_secs(30));
+            }
             "quick" => {
                 std::fs::write(marker, "ready").unwrap();
             }
@@ -531,6 +537,79 @@ mod coordination {
     fn alive(pid: i32) -> bool {
         // SAFETY: signal zero only probes the recorded fixture process.
         unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[tokio::test]
+    async fn control_plane_progresses_while_editor_holds_reservation_and_real_lock() {
+        let fx = registered();
+        let editor_spec = spec(&fx, "holding-editor");
+        let art = fx._tmp.path().join("art");
+        let write_inv = invocation(&fx, &art, true);
+        let mut editor_seat = SeatState::new("editor", "fixture", 1);
+        let mut editor = Box::pin(invoke(&editor_spec, &mut editor_seat, &write_inv));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !fx.seat.join("holding-editor").exists() {
+            tokio::select! {
+                out = &mut editor => panic!("editor exited early: {out:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            assert!(Instant::now() < deadline);
+        }
+        let lock = fx.primary.join(".git/kanade-sync.lock");
+        assert!(take_lock(&lock).is_none());
+        // Empty writable roots are the ordinary chat path, including a chat
+        // configured to allow writes. No control role should queue on the repo.
+        for node in ["conduct", "dupes", "chat", "deputy"] {
+            for allow_write in [false, true] {
+                let marker = fx.home.join(format!("{node}-{allow_write}"));
+                std::fs::create_dir_all(&fx.home).unwrap();
+                let mut control_spec = spec(&fx, "quick");
+                control_spec.env.insert(
+                    "COORDINATION_MARKER".into(),
+                    marker.to_str().unwrap().into(),
+                );
+                let control_inv = Invocation {
+                    node,
+                    ..invocation(&fx, &art, allow_write)
+                };
+                let mut seat = SeatState::new(node, "fixture", 1);
+                let out = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    invoke(&control_spec, &mut seat, &control_inv),
+                )
+                .await
+                .expect("control plane must not wait for editor")
+                .unwrap();
+                assert!(out.usable(), "{node}: {out:?}");
+                assert!(marker.exists());
+                assert!(take_lock(&lock).is_none(), "editor still owns real lock");
+            }
+        }
+        // Repository readers must still respect the editor's lock, even with
+        // a short decision budget; control-plane exclusions do not widen them.
+        for node in ["judge", "advise", "review"] {
+            let reader_spec = spec(&fx, "quick");
+            let reader_inv = Invocation {
+                node,
+                ..invocation(&fx, &art, false)
+            };
+            let mut seat = SeatState::new(node, "fixture", 1);
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    invoke(&reader_spec, &mut seat, &reader_inv),
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(seat.turns, 0);
+            assert!(!fx.seat.join("quick").exists());
+        }
+        drop(editor);
+        while take_lock(&lock).is_none() {
+            assert!(Instant::now() < deadline, "editor cleanup must finish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test]

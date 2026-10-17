@@ -150,6 +150,13 @@ fn repository_writer(inv: &Invocation<'_>) -> bool {
         )
 }
 
+fn repository_seat(inv: &Invocation<'_>) -> bool {
+    // These roles consume supplied state, prompts and conversation history.
+    // In particular, they must be able to deliver an answer or make queue
+    // decisions while an editor holds its reservation waiting for that answer.
+    !matches!(inv.node, "deputy" | "chat" | "conduct" | "dupes")
+}
+
 /// Resolve the additional write scope for a repository editing seat.
 ///
 /// Resolve Git's common directory from the actual seat checkout, never by
@@ -157,17 +164,12 @@ fn repository_writer(inv: &Invocation<'_>) -> bool {
 /// them to a sandbox (notably `/tmp` aliases on macOS). Failure is a startup
 /// error: do not start work with an unusable lock/question route.
 pub async fn worktree_writable_roots(cwd: &Path, home: &Path) -> Result<Vec<PathBuf>> {
-    let common = crate::git::git(
-        cwd,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .await
-    .context("resolve seat shared Git directory")?;
-    let common = std::fs::canonicalize(common).context("canonicalize seat shared Git directory")?;
-    let cwd = std::fs::canonicalize(cwd).context("canonicalize seat working directory")?;
     let mut roots = Vec::new();
-    if !common.starts_with(&cwd) {
-        roots.push(common);
+    if let Some(common) = crate::repo_lock::common_dir(cwd).await? {
+        let cwd = std::fs::canonicalize(cwd).context("canonicalize seat working directory")?;
+        if !common.starts_with(&cwd) {
+            roots.push(common);
+        }
     }
     // Questions::put/update/beat/panels write questions. Its quiet_for hook
     // updates matching notifications. Neither needs queue, runs, talks, nor
@@ -361,16 +363,10 @@ pub async fn invoke(
     // Wait for repository scheduling before spawning or starting a seat's
     // budget. Readers hold the real lock; editors exclude local readers while
     // taking their own repository-prescribed lock inside the seat.
-    // A question deputy or consulted chat writes control-plane stores only.
-    // It must remain usable while the editing seat waits for that answer.
-    // These purpose-specific seats do no repository work and retain their
-    // existing explicit grants, without claiming a repository lease.
-    let control_plane = inv.allow_write
-        && (inv.node == "deputy" || (inv.node == "chat" && !inv.writable.is_empty()));
-    let lease = if control_plane {
-        None
-    } else {
+    let lease = if repository_seat(inv) {
         crate::repo_lock::SeatLease::for_checkout(inv.cwd, inv.allow_write).await?
+    } else {
+        None
     };
     let prompt = lease.as_ref().filter(|lease| lease.delegated).map(|lease| format!(
         "Repository coordination: the launcher holds the exclusive repository lock at {} on behalf of this read-only seat for this entire invocation. Do not acquire a second lock or release/delete that file. Your filesystem access remains read-only.\n\n{}",

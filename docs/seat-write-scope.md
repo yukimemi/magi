@@ -47,7 +47,7 @@ grants. For a repository registered with `kanade-sync.contract` containing
 its CLI. The handle stays open for the entire invocation, including waiting
 for termination on timeout. The prompt identifies this actual launcher-owned
 lock and tells the reader not to try taking a second exclusive handle. This
-applies to every read-only invocation regardless of backend or node name,
+applies to repository-reading invocations regardless of backend,
 including advisors, judges, deliberation, voting, review, bump decisions and
 waiter resumes. Concurrent readers in the same launcher share the held handle;
 other processes still contend with it. Nonblocking acquisition attempts retry
@@ -58,20 +58,27 @@ can cancel this wait without having started any work. The last reader releases
 by closing the handle, never by
 unlinking the lock file.
 
-Every registered invocation also takes a fair per-repository local reservation.
-Readers share a reservation; an editor takes an exclusive reservation before
+Every registered repository seat also takes a fair per-repository local
+reservation. Readers share a reservation; an editor takes an exclusive reservation before
 starting its CLI, then acquires the required .NET lock itself. A queued editor
 prevents subsequent readers from overtaking it. The last reader's OS handle
-closes before its reservation wakes an editor. Thus a long read-only chat or
+closes before its reservation wakes an editor. Thus a long read-only advisor or
 review cannot cause this launcher's editor to start into a lock held by its own
 readers. A reader waiting for an external lock releases its local reservation
 between nonblocking attempts, allowing an editor to proceed.
 
-Purpose-specific question deputies and consulted chats with explicit store
-grants stay outside repository scheduling and must perform no repository work.
-They do not claim to hold a repository lease. This preserves the supported
+Control-plane seats (`conduct`, `dupes`, `chat`, and `deputy`) stay outside
+repository scheduling and must perform no repository work. This is independent
+of write permission and explicit store grants, including ordinary chats with
+empty writable roots. They do not claim to hold a repository lease. This preserves the supported
 question/control-plane route while an editing seat waits for an answer; putting
 that route behind the editor's reservation would deadlock delivery.
+
+Repository readers (including judges, advisors and reviewers) still wait for
+the editor: allowing them through would violate the shared-lock contract.
+Non-checkout command seats need no Git resolution. Checkout detection uses the
+filesystem marker rather than localized Git errors; once a marker is found,
+resolution failures remain fatal before spawning.
 
 The native lock interoperates with .NET `FileShare.None` using Unix
 `flock(LOCK_EX | LOCK_NB)`. Unsupported platforms,
