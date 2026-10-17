@@ -2189,7 +2189,7 @@ pub fn chat_consult(q: &crate::ask::Question) -> String {
              An earlier message, silence, a question, or a conditional instruction does not authorize posting. \
              Ask for clarification when uncertain; leave the question open. \
              The safe `use fallback` choice can be saved once the owner has chosen it. \
-             `use my text`, when offered, uses the owner's latest title and must pass the posting gate. \
+             `use my text`, when offered, requires `<full-question-id>: use my text <question/content fingerprint>` followed by a newline and the literal title in the latest owner message, quoted whole; hold or an old title is insufficient. The title must pass the posting gate. \
              Do not edit the repository.\n",
             id = q.id,
         ));

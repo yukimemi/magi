@@ -152,14 +152,14 @@ pub fn begin(questions: &Questions, talks: &Talks, q: &Question, talk: &Talk) ->
     Ok(dispatch?.1)
 }
 
-/// Refuse a chat answer whose task the operator held, as
+/// Refuse a chat approval answer whose task the operator held, as
 /// `ask_settle_cmd` does for a deputy: such a hold is lifted by the operator's
 /// button. The task is the one `q.run` names, directly or as one of its runs;
 /// none found (an unreadable task is not listed) does not refuse. The caller
 /// reads the queue before taking the question lock, so a hold placed in between
 /// is missed for that one call.
 pub fn refuse_operator_held(q: &Question, node: &str, tasks: &[crate::queue::Task]) -> Result<()> {
-    if node != CHAT_NODE {
+    if node != CHAT_NODE || QuestionKind::of(q) != QuestionKind::Merge {
         return Ok(());
     }
     let release_run = if q.run.is_empty() && q.node == crate::bump::NOTICE_NODE {
@@ -244,6 +244,9 @@ pub fn question_fingerprint(q: &Question) -> String {
 /// Replacement title explicitly supplied with its question/content binding.
 /// The final posting gate still vets this literal text before publication.
 pub fn owner_title<'a>(q: &Question, instruction: &'a str) -> Option<&'a str> {
+    if instruction.starts_with("    ") || instruction.starts_with('\t') {
+        return None;
+    }
     let (command, title) = instruction.trim().split_once('\n')?;
     let expected = format!(
         "{}: {} {}",
@@ -466,7 +469,9 @@ pub fn destructive_effect(q: &Question, label: &str) -> bool {
     if q.node == crate::github_text::ASK_NODE {
         return matches!(
             label,
-            crate::github_text::POST_ORIGINAL | crate::github_text::USE_REWRITE
+            crate::github_text::POST_ORIGINAL
+                | crate::github_text::USE_REWRITE
+                | crate::github_text::USE_MY_TEXT
         );
     }
     match q.node.as_str() {
@@ -517,7 +522,8 @@ pub(crate) fn validate_batch_effect(
     Ok(())
 }
 
-fn validate_effect(
+/// Validate action-specific evidence independently of its delivery route.
+pub(crate) fn validate_effect(
     q: &Question,
     choice: &str,
     instruction: &str,

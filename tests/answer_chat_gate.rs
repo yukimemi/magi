@@ -1408,3 +1408,235 @@ fn same_chat_replacement_title_uses_bound_current_owner_text_and_retains_evidenc
     );
     assert_eq!(answered.answer_authority.unwrap().instruction, words);
 }
+
+fn title_deputy(f: &Fixture, words: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_magi"))
+        .args([
+            "ask",
+            "--settle",
+            &f.qid,
+            "--choice",
+            magi::github_text::USE_MY_TEXT,
+            "--quote",
+            words,
+        ])
+        .env("MAGI_HOME", f.tmp.path())
+        .env("MAGI_CONFIG_DIR", f.tmp.path().join("config"))
+        .env("MAGI_NODE", magi::deputy::NODE)
+        .env("MAGI_RUN", &f.questions.get(&f.qid).unwrap().run)
+        .env("MAGI_SEAT", "title-deputy")
+        .output()
+        .unwrap()
+}
+
+fn posting_deputy_question(f: &Fixture) -> magi::ask::Question {
+    f.questions
+        .update(&f.qid, |q| {
+            q.node = magi::github_text::ASK_NODE.into();
+            q.seat = magi::github_text::ASK_SEAT.into();
+            q.choices = vec![
+                magi::github_text::USE_FALLBACK.into(),
+                magi::github_text::USE_MY_TEXT.into(),
+            ];
+            let mut deputy = magi::ask::Deputy::new("Posting question".into());
+            deputy.seat = Some(magi::agent::SeatState::new("title-deputy", "mock", 1));
+            q.deputy = Some(deputy);
+            q.say("Earlier English title")?;
+            Ok(())
+        })
+        .unwrap()
+        .0
+}
+
+#[test]
+fn deputy_replacement_title_rejects_hold_retraction_and_quoted_or_missing_consent() {
+    for mode in [
+        "hold",
+        "never mind",
+        "do not post",
+        "use my text",
+        "おっけーそれぞれ回答してー",
+        "conditional",
+        "code",
+        "stale quote",
+    ] {
+        let f = fixture();
+        let q = posting_deputy_question(&f);
+        let instruction = format!(
+            "{}: use my text {}\nCurrent literal title",
+            q.id,
+            magi::consult::question_fingerprint(&q)
+        );
+        let latest = match mode {
+            "conditional" => format!("Maybe {instruction}"),
+            "code" => format!("    {instruction}"),
+            "stale quote" => "hold".into(),
+            text => text.into(),
+        };
+        f.questions
+            .update(&f.qid, |q| {
+                q.say(&instruction)?;
+                q.say(&latest)
+            })
+            .unwrap();
+        let before = std::fs::read(f.questions.path_of(&f.qid)).unwrap();
+        let quote = if mode == "stale quote" {
+            &instruction
+        } else {
+            &latest
+        };
+        let out = title_deputy(&f, quote);
+        assert_untouched(&f, &out);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("posting confirmation"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let q = f.questions.get(&f.qid).unwrap();
+        assert_eq!(
+            magi::github_text::read_reply(&q),
+            magi::github_text::Reply::Fallback
+        );
+        assert_eq!(std::fs::read(f.questions.path_of(&f.qid)).unwrap(), before);
+    }
+}
+
+#[test]
+fn deputy_replacement_title_requires_current_content_binding_and_publishes_only_literal_text() {
+    let f = fixture();
+    let q = posting_deputy_question(&f);
+    let instruction = format!(
+        "{}: use my text {}\nCurrent literal title",
+        q.id,
+        magi::consult::question_fingerprint(&q)
+    );
+    f.questions.update(&f.qid, |q| q.say(&instruction)).unwrap();
+    let out = title_deputy(&f, &instruction);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let answered = f.questions.get(&f.qid).unwrap();
+    assert_eq!(
+        magi::github_text::read_reply(&answered),
+        magi::github_text::Reply::Title("Current literal title".into())
+    );
+    assert!(
+        answered
+            .thread
+            .iter()
+            .any(|turn| turn.who == magi::ask::Who::Operator && turn.body == instruction)
+    );
+    let before = std::fs::read(f.questions.path_of(&f.qid)).unwrap();
+    assert!(!title_deputy(&f, &instruction).status.success());
+    assert_eq!(std::fs::read(f.questions.path_of(&f.qid)).unwrap(), before);
+    let mut changed = answered;
+    changed.detail.push_str("Changed saved content");
+    assert_eq!(
+        magi::github_text::read_reply(&changed),
+        magi::github_text::Reply::Fallback
+    );
+}
+
+#[test]
+fn operator_held_tasks_keep_ordinary_chat_decisions_available_without_lifting_the_hold() {
+    for node in [magi::triage::NODE, magi::triage::DEPS_NODE, "recovery"] {
+        for destination in ["same", "other", "none"] {
+            for batch in [false, true] {
+                for choice in ["hold", "retry"] {
+                    let f = fixture();
+                    let (q, ()) = f
+                        .questions
+                        .update(&f.qid, |q| {
+                            q.node = node.into();
+                            q.choices = vec![
+                                "retry".into(),
+                                "wait".into(),
+                                "discard".into(),
+                                "hold".into(),
+                            ];
+                            if destination == "none" {
+                                q.consult = None;
+                            }
+                            Ok(())
+                        })
+                        .unwrap();
+                    let queue = magi::queue::Queue::at(f.tmp.path().join("queue"));
+                    let mut task = magi::queue::Task::new(
+                        "Held task".into(),
+                        "Original task".into(),
+                        f.tmp.path().into(),
+                        magi::queue::Source::Human,
+                    );
+                    task.runs.push(q.run.clone());
+                    task.hold_manual(Some("Owner says wait".into()));
+                    queue.put(&mut task).unwrap();
+                    let before = std::fs::read(queue.path_of(&task.id)).unwrap();
+                    let words = if batch {
+                        "おっけーそれぞれ回答してー".into()
+                    } else {
+                        format!("{}: {choice}", q.id)
+                    };
+                    let run = standing_owner(
+                        &f,
+                        &words,
+                        batch.then(|| format!("{}: {choice}", q.id)).as_deref(),
+                    );
+                    if destination == "same" {
+                        f.questions
+                            .update(&f.qid, |q| {
+                                q.consult.as_mut().unwrap().talk = run.clone();
+                                Ok(())
+                            })
+                            .unwrap();
+                    }
+                    let out = choose(&f, &run, choice, &words);
+                    assert!(
+                        out.status.success(),
+                        "{node}/{destination}/{batch}/{choice}: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    assert_eq!(
+                        f.questions.get(&f.qid).unwrap().resolution().as_deref(),
+                        Some(choice)
+                    );
+                    assert!(queue.get(&task.id).unwrap().operator_held());
+                    assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn operator_held_chat_approvals_still_refuse_even_explicit_holds() {
+    for node in [magi::land::APPROVAL_NODE, magi::bump::NOTICE_NODE] {
+        let f = fixture();
+        let (q, ()) = f
+            .questions
+            .update(&f.qid, |q| {
+                q.node = node.into();
+                if node == magi::bump::NOTICE_NODE {
+                    q.seat = "release-watch".into();
+                }
+                Ok(())
+            })
+            .unwrap();
+        let queue = magi::queue::Queue::at(f.tmp.path().join("queue"));
+        let mut task = magi::queue::Task::new(
+            "Held approval".into(),
+            "Original task".into(),
+            f.tmp.path().into(),
+            magi::queue::Source::Human,
+        );
+        task.runs.push(q.run.clone());
+        task.hold_manual(Some("Owner says wait".into()));
+        queue.put(&mut task).unwrap();
+        let words = format!("{}: hold", q.id);
+        let run = standing_owner(&f, &words, None);
+        let out = choose(&f, &run, "hold", &words);
+        assert_untouched(&f, &out);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("held by the operator"));
+    }
+}

@@ -507,13 +507,18 @@ owner's terminal CLI and web question-card clicks remain direct owner decisions
 and use the same question lock, offered-choice validation and downstream
 execution transitions. A web chat send uses standing-conversation validation.
 Deputies settle only their own question seat, using the latest persisted owner
-thread and the same execution-effect inventory. A deputy's one-question thread
+thread and the same execution-effect inventory. A deputy's replacement-title
+instruction requires the same question/content fingerprint and literal title as
+a standing-chat instruction; hold and retractions cannot supply posting consent.
+A deputy's one-question thread
 has no cross-question recommendation manifest: generic batch words alone cannot
 select a choice there; the active standing conversation's manifested evidence
 uses the answer CLI for those questions. Triage/release/daemon/waiter
 consumers apply recorded answers, never infer authorization from recommendations.
 Missing head, content or consequence confirmation is reported as such, rather
-than a consultation-destination error. A manually held task stays held.
+than a consultation-destination error. For chat answers, operator-held refusal
+is specific to approval questions; ordinary triage, dependency and recovery questions remain
+answerable, and recording their answers does not itself lift the task's hold.
 
 When review hands off with unresolved Major findings or final rejecting votes,
 the decision also offers **fix findings and re-review**. Selecting it runs one

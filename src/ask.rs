@@ -836,7 +836,10 @@ impl Question {
         if let Some(message) = latest {
             crate::consult::validate_batch_effect(self, label, message, quote)?;
         }
-        if crate::deputy::merge_gated(self) {
+        if self.node == crate::github_text::ASK_NODE && label == crate::github_text::USE_MY_TEXT {
+            let message = latest.context("use my text requires a current owner instruction with the literal replacement title")?;
+            crate::consult::validate_effect(self, label, message, quote, true)?;
+        } else if crate::deputy::merge_gated(self) {
             // The merge is irreversible and a say is not a decision. `hold` must
             // be the latest message exactly. For `merge`, whether the words are
             // a clear, unhedged instruction is the deputy's judgement alone;
