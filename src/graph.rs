@@ -2471,6 +2471,19 @@ impl Runner {
                     self.state.candidate_preservation.insert(label, reason);
                 }
             }
+            if self.state.candidate_preservation.is_empty()
+                && self.state.status == RunStatus::Blocked
+                && self.state.candidates.iter().all(|c| c.failed.is_none())
+            {
+                // Persist the recovered phase with the cleared pending marker;
+                // a crash between saves must not turn this into a selected-seat
+                // failure hold on the next resume.
+                self.state.status = RunStatus::Implementing;
+                self.state.event(
+                    "preserve",
+                    "candidate persistence recovered; implementation can continue",
+                );
+            }
             self.state.save()?;
         }
         if !self.state.candidate_preservation.is_empty() {
@@ -13276,6 +13289,94 @@ mod tests {
         std::fs::remove_file(judge.join("uncommitted")).unwrap();
         runner.fold_losers().await.unwrap();
         assert!(!judge.exists());
+        runner.fold_losers().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn candidate_preservation_selected_implementer_resumes_through_execute_graph() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        runner.state.candidates.retain(|c| c.label == 'B');
+        runner.state.tally = None;
+        runner.state.judge_skipped = false;
+        runner.state.prep_complete = Some(true);
+        runner.state.config.graph.advise = false;
+        runner.state.config.graph.selected_implementer = Some("alpha".into());
+        let wt = runner.state.candidates[0].worktree.clone();
+        std::fs::write(wt.join("leftover"), "completed implementation").unwrap();
+        runner
+            .state
+            .candidate_preservation
+            .insert('B', "awaiting persistence".into());
+        let index_lock = git::git(
+            &wt,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "index.lock",
+            ],
+        )
+        .await
+        .unwrap();
+        std::fs::write(&index_lock, "fixture-owned lock").unwrap();
+        runner.state.save().unwrap();
+        assert!(runner.execute_graph().await.is_err());
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert!(runner.state.candidate_preservation.contains_key(&'B'));
+        std::fs::remove_file(index_lock).unwrap();
+        // Park at the next graph boundary: this tests the real selected-seat
+        // hold guard without dispatching reviewers or publishing anything.
+        for _ in 0..2 {
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            runner.pause.park();
+            runner.execute_graph().await.unwrap();
+            assert_eq!(runner.state.status, RunStatus::Implementing);
+            assert!(runner.state.candidate_preservation.is_empty());
+            assert_eq!(runner.state.candidates[0].commits, 2);
+            assert!(runner.state.tally.is_none());
+        }
+        runner.implement().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::Judging);
+        // A genuine selected-implementer hold must still require release.
+        runner.state.status = RunStatus::Blocked;
+        runner.state.candidates[0].failed = Some("implementation failed".into());
+        runner.state.save().unwrap();
+        let error = runner.execute_graph().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("selected implementation is held")
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_preservation_cleanup_unregisters_a_vanished_worktree() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        let repo = runner.state.repo.clone();
+        let candidate = runner.state.candidates[0].clone();
+        // Remove only the disposable fixture directory, leaving Git's linked
+        // worktree registration and branch intact, as in a vanished checkout.
+        std::fs::remove_dir_all(&candidate.worktree).unwrap();
+        assert!(
+            git::git(&repo, &["worktree", "list", "--porcelain"])
+                .await
+                .unwrap()
+                .contains(candidate.worktree.to_str().unwrap())
+        );
+        assert!(
+            !git::branch_delete(&repo, &candidate.branch).await.unwrap(),
+            "the stale registration initially keeps the branch checked out"
+        );
+        runner.fold_losers().await.unwrap();
+        assert!(runner.state.candidates[0].folded);
+        assert!(!git::branch_exists(&repo, &candidate.branch).await.unwrap());
+        assert!(
+            !git::git(&repo, &["worktree", "list", "--porcelain"])
+                .await
+                .unwrap()
+                .contains(candidate.worktree.to_str().unwrap())
+        );
+        runner.state = RunState::load(&runner.state.id).unwrap();
         runner.fold_losers().await.unwrap();
     }
 
