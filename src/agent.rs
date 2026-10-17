@@ -358,15 +358,21 @@ pub async fn invoke(
     seat: &mut SeatState,
     inv: &Invocation<'_>,
 ) -> Result<AgentOutput> {
-    // A registered repository requires coordination even from readers. Hold
-    // the real lock in the launcher, without widening their sandbox. The Arc
-    // stays alive until the invocation (including timeout cleanup) finishes.
-    let read_lock = if inv.allow_write {
+    // Wait for repository scheduling before spawning or starting a seat's
+    // budget. Readers hold the real lock; editors exclude local readers while
+    // taking their own repository-prescribed lock inside the seat.
+    // A question deputy or consulted chat writes control-plane stores only.
+    // It must remain usable while the editing seat waits for that answer.
+    // These purpose-specific seats do no repository work and retain their
+    // existing explicit grants, without claiming a repository lease.
+    let control_plane = inv.allow_write
+        && (inv.node == "deputy" || (inv.node == "chat" && !inv.writable.is_empty()));
+    let lease = if control_plane {
         None
     } else {
-        crate::repo_lock::Lease::for_checkout(inv.cwd).await?
+        crate::repo_lock::SeatLease::for_checkout(inv.cwd, inv.allow_write).await?
     };
-    let prompt = read_lock.as_ref().map(|lease| format!(
+    let prompt = lease.as_ref().filter(|lease| lease.delegated).map(|lease| format!(
         "Repository coordination: the launcher holds the exclusive repository lock at {} on behalf of this read-only seat for this entire invocation. Do not acquire a second lock or release/delete that file. Your filesystem access remains read-only.\n\n{}",
         lease.path.display(), inv.prompt
     ));
@@ -453,13 +459,19 @@ pub async fn invoke(
         cmd.env_remove("CARGO_TARGET_DIR");
     }
 
-    let mut child = cmd
+    #[cfg(unix)]
+    if lease.is_some() {
+        cmd.process_group(0);
+    }
+    let child = cmd
         .spawn()
         .with_context(|| format!("spawn `{}` for seat {}", plan.argv[0], seat.key))?;
+    // No await occurs between spawn and transfer to the cancellation owner.
+    let mut running = crate::seat_process::Running::new(child, lease);
     // Feed stdin from a task rather than inline: a `command` agent that never
     // reads its stdin, or a prompt larger than the pipe buffer, would
     // otherwise deadlock here before the process is ever waited on.
-    if let (Some(body), Some(mut sink)) = (plan.stdin.clone(), child.stdin.take()) {
+    if let (Some(body), Some(mut sink)) = (plan.stdin.clone(), running.child().stdin.take()) {
         tokio::spawn(async move {
             sink.write_all(body.as_bytes()).await.ok();
             sink.shutdown().await.ok();
@@ -482,10 +494,10 @@ pub async fn invoke(
     //
     // Now the readers own the bytes, so a timeout keeps whatever arrived, and
     // the wait ends at exit even if a stray handle stays open.
-    let (out_buf, out_reader) = drain(child.stdout.take());
-    let (err_buf, err_reader) = drain(child.stderr.take());
+    let (out_buf, out_reader) = drain(running.child().stdout.take());
+    let (err_buf, err_reader) = drain(running.child().stderr.take());
 
-    let (code, timed_out) = match tokio::time::timeout(inv.timeout, child.wait()).await {
+    let (code, timed_out) = match tokio::time::timeout(inv.timeout, running.child().wait()).await {
         Ok(res) => {
             let status = res.with_context(|| format!("wait for seat {}", seat.key))?;
             (status.code(), false)
@@ -493,13 +505,17 @@ pub async fn invoke(
         Err(_) => {
             tracing::warn!(seat = %seat.key, secs = inv.timeout.as_secs(), "agent timed out");
             // Wait for CLI termination before releasing its repository lease.
-            child
-                .kill()
-                .await
-                .context("stop timed-out seat before releasing repository coordination")?;
+            if !running.coordinated() {
+                running
+                    .child()
+                    .kill()
+                    .await
+                    .context("stop timed-out seat")?;
+            }
             (None, true)
         }
     };
+    running.finish().await;
 
     // The child is gone either way, so the readers are bounded now. A grace
     // window rather than an unbounded await: a surviving grandchild can still

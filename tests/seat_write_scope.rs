@@ -312,6 +312,7 @@ fn release_lock(holder: &mut Running) {
     assert!(holder.0.wait().unwrap().success());
 }
 
+#[cfg(unix)]
 #[tokio::test]
 #[ignore = "requires PowerShell to verify the real repository lock protocol"]
 async fn readonly_invocation_holds_dotnet_compatible_lock_and_refuses_external_contention() {
@@ -375,20 +376,319 @@ Write-Output 'real-lock-contends'
     };
     let mut seat = SeatState::new("fixture-reader", "fixture", 1);
     let mut holder = held_lock(&fx);
-    assert!(invoke(&spec, &mut seat, &inv).await.is_err());
-    assert!(!fx.seat.join("seat-started").exists());
-    assert!(
-        !artifacts.exists(),
-        "failed acquisition precedes even prompt creation"
-    );
-    release_lock(&mut holder);
-    let out = invoke(&spec, &mut seat, &inv).await.unwrap();
+    let out = {
+        let attempt = invoke(&spec, &mut seat, &inv);
+        tokio::pin!(attempt);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut attempt)
+                .await
+                .is_err()
+        );
+        assert!(!fx.seat.join("seat-started").exists());
+        assert!(
+            !artifacts.exists(),
+            "resource wait precedes prompt creation"
+        );
+        release_lock(&mut holder);
+        tokio::time::timeout(Duration::from_secs(10), &mut attempt)
+            .await
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(seat.turns, 1, "contention was not an agent attempt");
     assert!(out.usable(), "{out:?}");
     assert!(out.text.contains("real-lock-contends"), "{out:?}");
     let prompt = std::fs::read_to_string(artifacts.join("reader.prompt.md")).unwrap();
     assert!(prompt.contains("launcher holds the exclusive repository lock"));
     assert!(prompt.contains("filesystem access remains read-only"));
     checked(&mut fx.pwsh(&format!("{ACQUIRE}\n$lock.Dispose()")));
+}
+
+#[cfg(unix)]
+mod coordination {
+    use super::*;
+    use magi::agent::{Invocation, SeatState, invoke};
+    use magi::config::{AgentKind, AgentSpec};
+    use std::collections::BTreeMap;
+    use std::fs::{File, OpenOptions};
+    use std::os::fd::AsRawFd as _;
+
+    fn take_lock(path: &std::path::Path) -> Option<File> {
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .unwrap();
+        // SAFETY: this descriptor stays open for the entire returned File.
+        (unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0).then_some(f)
+    }
+
+    #[test]
+    fn seat_child() {
+        let Ok(mode) = std::env::var("COORDINATION_CHILD") else {
+            return;
+        };
+        let marker = PathBuf::from(std::env::var_os("COORDINATION_MARKER").unwrap());
+        match mode.as_str() {
+            "reader" => {
+                let mut tool = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "coordination::seat_child", "--nocapture"])
+                    .env("COORDINATION_CHILD", "tool")
+                    .spawn()
+                    .unwrap();
+                std::fs::write(
+                    marker.with_extension("pids"),
+                    format!("{} {}", std::process::id(), tool.id()),
+                )
+                .unwrap();
+                tool.wait().unwrap();
+            }
+            "tool" => {
+                // Terminal tools can live in a different process group from
+                // their CLI. Cancellation must terminate these as well.
+                // SAFETY: change only this fixture process's own group.
+                assert_eq!(unsafe { libc::setpgid(0, 0) }, 0);
+                std::fs::write(&marker, "ready").unwrap();
+                std::thread::sleep(Duration::from_secs(30));
+            }
+            "editor" => {
+                let path = PathBuf::from(std::env::var_os("COORDINATION_LOCK").unwrap());
+                let _lock = take_lock(&path).expect("editor must not contend with a local reader");
+                std::fs::write(marker, "edited").unwrap();
+            }
+            "quick" => {
+                std::fs::write(marker, "ready").unwrap();
+            }
+            _ => panic!("unknown coordination helper"),
+        }
+    }
+
+    fn spec(fx: &Fixture, mode: &str) -> AgentSpec {
+        AgentSpec {
+            id: "fixture".into(),
+            kind: AgentKind::Command,
+            model: None,
+            command: vec![
+                std::env::current_exe().unwrap().to_str().unwrap().into(),
+                "--exact".into(),
+                "coordination::seat_child".into(),
+                "--nocapture".into(),
+            ],
+            extra_args: vec![],
+            prompt_delivery: None,
+            env: BTreeMap::from([
+                ("COORDINATION_CHILD".into(), mode.into()),
+                (
+                    "COORDINATION_MARKER".into(),
+                    fx.seat.join(mode).to_str().unwrap().into(),
+                ),
+                (
+                    "COORDINATION_LOCK".into(),
+                    fx.primary
+                        .join(".git/kanade-sync.lock")
+                        .to_str()
+                        .unwrap()
+                        .into(),
+                ),
+            ]),
+        }
+    }
+
+    fn invocation<'a>(
+        fx: &'a Fixture,
+        art: &'a std::path::Path,
+        allow_write: bool,
+    ) -> Invocation<'a> {
+        Invocation {
+            cwd: &fx.seat,
+            prompt: "fixture",
+            timeout: Duration::from_secs(20),
+            allow_write,
+            unsandboxed: false,
+            sessions: false,
+            artifacts: art,
+            stem: "fixture",
+            run: "fixture",
+            node: "test",
+            cache_dir: None,
+            attachments: &[],
+            writable: &[],
+        }
+    }
+
+    fn registered() -> Fixture {
+        let fx = Fixture::new();
+        std::fs::write(
+            fx.primary.join(".git/kanade-sync.contract"),
+            "shared-lock-v1\n",
+        )
+        .unwrap();
+        fx
+    }
+
+    fn alive(pid: i32) -> bool {
+        // SAFETY: signal zero only probes the recorded fixture process.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[tokio::test]
+    async fn cancellation_keeps_lock_until_cli_and_tool_have_terminated() {
+        let fx = registered();
+        let spec = spec(&fx, "reader");
+        let art = fx._tmp.path().join("art");
+        let inv = invocation(&fx, &art, false);
+        let mut seat = SeatState::new("reader", "fixture", 1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        {
+            let future = invoke(&spec, &mut seat, &inv);
+            tokio::pin!(future);
+            while !fx.seat.join("reader").exists() {
+                tokio::select! {
+                    out = &mut future => panic!("reader exited early: {out:?}"),
+                    _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+                assert!(Instant::now() < deadline);
+            }
+        } // same future-drop path as waiter halt and chat lease loss
+        let pids: Vec<i32> = std::fs::read_to_string(fx.seat.join("reader.pids"))
+            .unwrap()
+            .split_whitespace()
+            .map(|p| p.parse().unwrap())
+            .collect();
+        loop {
+            if let Some(lock) = take_lock(&fx.primary.join(".git/kanade-sync.lock")) {
+                assert!(
+                    pids.iter().all(|pid| !alive(*pid)),
+                    "lock released while a seat process lives"
+                );
+                drop(lock);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "cancelled seat did not finish cleanup"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(seat.turns, 0);
+    }
+
+    #[tokio::test]
+    async fn editing_seat_waits_for_reader_cleanup_then_acquires_its_real_lock() {
+        let fx = registered();
+        let reader_spec = spec(&fx, "reader");
+        let editor_spec = spec(&fx, "editor");
+        let art = fx._tmp.path().join("art");
+        let read_inv = invocation(&fx, &art, false);
+        let write_inv = invocation(&fx, &art, true);
+        let mut reader_seat = SeatState::new("reader", "fixture", 1);
+        let mut editor_seat = SeatState::new("editor", "fixture", 1);
+        let reader = invoke(&reader_spec, &mut reader_seat, &read_inv);
+        let editor = invoke(&editor_spec, &mut editor_seat, &write_inv);
+        let mut reader = Box::pin(reader);
+        let mut editor = Box::pin(editor);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !fx.seat.join("reader").exists() {
+            tokio::select! {
+                out = &mut reader => panic!("reader exited early: {out:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            assert!(Instant::now() < deadline);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut editor)
+                .await
+                .is_err()
+        );
+        assert!(
+            !fx.seat.join("editor").exists(),
+            "editor must not start while reader owns the lock"
+        );
+        let later_spec = spec(&fx, "quick");
+        let mut later_seat = SeatState::new("later-reader", "fixture", 1);
+        let mut later_reader = Box::pin(invoke(&later_spec, &mut later_seat, &read_inv));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut later_reader)
+                .await
+                .is_err()
+        );
+        assert!(
+            !fx.seat.join("quick").exists(),
+            "new readers must not overtake a queued editor"
+        );
+        // Question/control-plane delivery must remain available while a repo
+        // seat is waiting for the owner's answer. It performs no repo work.
+        let questions = fx.home.join("questions");
+        std::fs::create_dir_all(&questions).unwrap();
+        let mut deputy_spec = spec(&fx, "quick");
+        deputy_spec.env.insert(
+            "COORDINATION_MARKER".into(),
+            questions.join("control-plane").to_str().unwrap().into(),
+        );
+        let roots = [questions.clone()];
+        let deputy_inv = Invocation {
+            allow_write: true,
+            node: "deputy",
+            writable: &roots,
+            ..invocation(&fx, &art, true)
+        };
+        let mut deputy_seat = SeatState::new("deputy", "fixture", 1);
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            invoke(&deputy_spec, &mut deputy_seat, &deputy_inv),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(out.usable(), "{out:?}");
+        assert!(questions.join("control-plane").exists());
+        drop(reader);
+        let out = tokio::time::timeout(Duration::from_secs(10), &mut editor)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(out.usable(), "{out:?}");
+        assert!(fx.seat.join("editor").exists());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), &mut later_reader)
+                .await
+                .unwrap()
+                .unwrap()
+                .usable()
+        );
+        drop(editor);
+        assert_eq!(editor_seat.turns, 1);
+    }
+
+    #[tokio::test]
+    async fn external_contention_waits_without_spawning_or_charging_an_attempt() {
+        let fx = registered();
+        let external = take_lock(&fx.primary.join(".git/kanade-sync.lock")).unwrap();
+        let spec = spec(&fx, "quick");
+        let art = fx._tmp.path().join("art");
+        let inv = invocation(&fx, &art, false);
+        let mut seat = SeatState::new("reader", "fixture", 1);
+        {
+            let future = invoke(&spec, &mut seat, &inv);
+            tokio::pin!(future);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), &mut future)
+                    .await
+                    .is_err()
+            );
+            assert!(!art.exists());
+            assert!(!fx.seat.join("quick").exists());
+            drop(external);
+            let out = tokio::time::timeout(Duration::from_secs(10), &mut future)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(out.usable(), "{out:?}");
+        }
+        assert_eq!(seat.turns, 1, "only the eventual invocation counts");
+    }
 }
 
 #[test]

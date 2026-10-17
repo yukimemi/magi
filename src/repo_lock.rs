@@ -13,14 +13,27 @@ use anyhow::{Context as _, Result, bail};
 
 static READERS: LazyLock<Mutex<BTreeMap<PathBuf, Weak<Lease>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
+static GATES: LazyLock<Mutex<BTreeMap<PathBuf, Weak<tokio::sync::RwLock<()>>>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
-pub(crate) struct Lease {
-    _file: File,
+/// A local reservation prevents a launcher-held reader from blocking this
+/// launcher's editing agents when they take their own .NET lock. The fair
+/// RwLock queues editors ahead of subsequent readers, before any CLI starts.
+pub(crate) struct SeatLease {
     pub(crate) path: PathBuf,
+    pub(crate) delegated: bool,
+    // Field drop order matters: close the OS lock before waking an editor.
+    _lock: Option<Arc<Lease>>,
+    _read: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+    _write: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
 }
 
-impl Lease {
-    pub(crate) async fn for_checkout(cwd: &Path) -> Result<Option<Arc<Self>>> {
+struct Lease {
+    _file: File,
+}
+
+impl SeatLease {
+    pub(crate) async fn for_checkout(cwd: &Path, allow_write: bool) -> Result<Option<Self>> {
         let out = crate::git::git_raw(
             cwd,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -44,9 +57,69 @@ impl Lease {
             Ok(contract) if contract.trim() == "shared-lock-v1" => {}
             Ok(_) => bail!("unsupported repository coordination contract"),
         }
-        Self::acquire(common.join("kanade-sync.lock")).map(Some)
+        // Group termination is required to safely release coordination after
+        // cancellation. Until Windows job containment is implemented here,
+        // registered seats fail closed before spawning on that platform.
+        if !cfg!(unix) {
+            bail!("supervised repository coordination currently requires Unix process groups");
+        }
+        let path = common.join("kanade-sync.lock");
+        let gate = {
+            let mut gates = GATES
+                .lock()
+                .map_err(|_| anyhow::anyhow!("repository gate registry poisoned"))?;
+            let gate = gates
+                .get(&path)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(())));
+            gates.retain(|_, gate| gate.strong_count() != 0);
+            gates.insert(path.clone(), Arc::downgrade(&gate));
+            gate
+        };
+        if allow_write {
+            let permit = gate.write_owned().await;
+            return Ok(Some(Self {
+                path,
+                delegated: false,
+                _read: None,
+                _write: Some(permit),
+                _lock: None,
+            }));
+        }
+        let mut announced = false;
+        loop {
+            let permit = Arc::clone(&gate).read_owned().await;
+            match Lease::acquire(path.clone()) {
+                Ok(lease) => {
+                    return Ok(Some(Self {
+                        path,
+                        delegated: true,
+                        _read: Some(permit),
+                        _write: None,
+                        _lock: Some(lease),
+                    }));
+                }
+                Err(e)
+                    if e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) =>
+                {
+                    // Infrastructure scheduling, not an agent attempt. Do not
+                    // start a CLI, its timeout, a fallback or a handover. Drop
+                    // the local read permit so a queued editor can proceed.
+                    drop(permit);
+                    if !announced {
+                        tracing::info!(path = %path.display(), "waiting for repository coordination before starting seat");
+                        announced = true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
+}
 
+impl Lease {
     fn acquire(path: PathBuf) -> Result<Arc<Self>> {
         let mut readers = READERS
             .lock()
@@ -60,10 +133,7 @@ impl Lease {
                 path.display()
             )
         })?;
-        let lease = Arc::new(Self {
-            _file: file,
-            path: path.clone(),
-        });
+        let lease = Arc::new(Self { _file: file });
         readers.retain(|_, lease| lease.strong_count() != 0);
         readers.insert(path, Arc::downgrade(&lease));
         Ok(lease)

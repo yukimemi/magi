@@ -454,9 +454,15 @@ supported directory mechanism. Keep this policy centralized for initial turns,
 resumes, fallbacks and waiter delivery. Never replace it with a sandbox bypass
 or the entire state root. Deputies/chats retain explicit grants. For read-only
 seats in repositories registered with `shared-lock-v1`, the launcher holds the
-real exclusive lock through `repo_lock::Lease` for the entire invocation without
-widening their sandbox. Concurrent readers in one launcher share that lease;
-external contention prevents startup. Editing-seat directory grants permit the
+real exclusive lock through `repo_lock::SeatLease` without widening their
+sandbox. A fair per-repository gate admits concurrent readers or one editor;
+editors take their own OS lock after readers have released theirs. External
+reader-lock contention waits before starting the CLI or its budget, never as
+an agent failure. `seat_process::Running` transfers cancelled processes and
+coordination to an independent cleanup thread and releases only after the CLI
+and discovered tool descendants terminate. Registered seats currently require
+Unix containment; other platforms fail closed before spawning.
+Editing-seat directory grants permit the
 repository's lock contract but do not acquire or shorten that lock.
 Backend enforcement limits, host verification and
 the held-task recovery procedure are in `docs/seat-write-scope.md`.
