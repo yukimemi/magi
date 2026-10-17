@@ -757,6 +757,15 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
                 && let Ok(q) = questions.get(&full)
                 && q.status == ask::QuestionStatus::Answered
             {
+                // The action sweep releases conductor blockers atomically
+                // with their selected operation. A fresh deputy lease must
+                // never leave an answered hold temporarily runnable.
+                if q.node == crate::conduct::NODE
+                    && q.chosen_action().is_some()
+                    && !task.action_applied(&q.id)
+                {
+                    continue;
+                }
                 let answer = match &q.answer {
                     Some(ask::Answer::Choice(c) | ask::Answer::Text(c)) => c.clone(),
                     None => String::new(),
@@ -1174,6 +1183,29 @@ pub(crate) fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &
         let Ok(mut task) = queue.get(&listed.id) else {
             continue;
         };
+        // Work only on this local copy until the action can be committed.
+        // In particular, a fresh lease below leaves the persisted task blocked.
+        if q.node == crate::conduct::NODE && task.status == TaskStatus::Blocked {
+            let blockers: Vec<_> = task
+                .blocked_by
+                .iter()
+                .filter(|id| {
+                    crate::queue::dependency(queue, questions, id)
+                        == crate::queue::Dependency::Question(q.id.clone())
+                })
+                .cloned()
+                .collect();
+            if !blockers.is_empty() {
+                for id in blockers {
+                    task.unblock(&id);
+                }
+                let answer = match &q.answer {
+                    Some(ask::Answer::Choice(c) | ask::Answer::Text(c)) => c.clone(),
+                    None => String::new(),
+                };
+                task.record_answer(q.summary.clone(), answer);
+            }
+        }
         let language = language_of(&task, Path::new("."));
         let decision = decide_action(&task, &q, phrases(&language), |id| {
             RunState::load_under(id, home)
@@ -10406,8 +10438,25 @@ mod tests {
                 q.answer(ask::Answer::Choice(choice.into())).unwrap();
                 questions.put(&mut q).unwrap();
 
-                // Match the daemon's deterministic sweep before scheduling.
+                // A Web answer does not remove the deputy's fresh lease.
+                questions.beat(&q.id, ask::WaiterKind::Deputy);
+                for _ in 0..2 {
+                    resolve_blockers(&queue, &questions);
+                    apply_choice_actions(&queue, &questions, &home);
+                    let waiting = queue.get(&t.id).unwrap();
+                    assert_eq!(waiting.status, TaskStatus::Blocked);
+                    assert_eq!(waiting.blocked_by, [q.id.clone()]);
+                    assert!(waiting.answers.is_empty());
+                    assert!(!waiting.action_applied(&q.id));
+                    assert!(runnable(&queue).is_empty());
+                    let free = Arc::new(tokio::sync::Semaphore::new(1));
+                    assert!(claim_dispatch(&queue, &t, false, &free, &free).is_none());
+                }
+                std::fs::remove_file(questions.root().join(format!("{}.lease", q.id))).unwrap();
+
+                // Releasing the blocker and applying the operation share one save.
                 resolve_blockers(&queue, &questions);
+                assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Blocked);
                 apply_choice_actions(&queue, &questions, &home);
                 let after = queue.get(&t.id).unwrap();
                 assert_eq!(
