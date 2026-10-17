@@ -666,8 +666,9 @@ fixer chain (graft: sonnet -> sol -> astra) over a wait that was not the agent's
   prints no countdown. A seat's `started_at` is re-stamped at spawn
   (`seats_spawning`, `seat_spawned`).
 - **Separate wall-clock budgets on purpose**: the node/run budgets, `verify.e2e` /
-  `gate` (`with_cache_lease` takes the lease inside the command budget; its expiry is
-  already `CommandOutcome::resource_blocked`), `dupes` / `github_text` `JUDGE_BUDGET`
+  `gate` (`with_cache_lease` bounds acquisition by `timeout_resource_wait`, then
+  gives commands their full verification budget; acquisition expiry is
+  `CommandOutcome::resource_blocked`), `dupes` / `github_text` `JUDGE_BUDGET`
   (an overall 15 s for a whole check), `retry_budget` (a nudge's quarter),
   `talk_wait_bound`, `land::WAIT_CEILING`. `land`, `rebase`, `bump`, talk, deputy,
   waiter and conduct invoke without waiting for anything before spawn.
