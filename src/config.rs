@@ -1109,6 +1109,7 @@ impl TryFrom<CoordinationFields> for Coordination {
             ("coordination.lock_file", &fields.lock_file),
         ] {
             if name.trim().is_empty()
+                || name != name.trim()
                 || name == "."
                 || name.contains("..")
                 || name.contains(['/', '\\', ':', '\0'])
@@ -2800,6 +2801,10 @@ lock_file = "{{ vars.bad }}"
             for bad in [
                 "",
                 " ",
+                " file",
+                "file ",
+                "\tfile",
+                "file\t",
                 ".",
                 "..",
                 "file..name",

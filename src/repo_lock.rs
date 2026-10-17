@@ -383,6 +383,31 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn default_off_takes_no_lock_even_if_contract_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::git::git(dir.path(), &["init"]).await.unwrap();
+        let common = common_dir(dir.path()).await.unwrap().unwrap();
+        let policy = crate::config::test_coordination().unwrap();
+        std::fs::write(common.join(&policy.contract_file), &policy.contract_token).unwrap();
+        let wait = WaitPolicy::new(Duration::ZERO, || false);
+        for allow_write in [false, true] {
+            assert!(
+                SeatLease::checkout_with(dir.path(), allow_write, None, &wait)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            SeatLease::operation_with(dir.path(), None, &wait)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!common.join(&policy.lock_file).exists());
+    }
+
+    #[tokio::test]
     async fn unconfigured_coordination_ignores_contracts_and_broken_checkouts() {
         let dir = tempfile::tempdir().unwrap();
         crate::git::git(dir.path(), &["init"]).await.unwrap();
