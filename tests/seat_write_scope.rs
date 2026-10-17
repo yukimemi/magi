@@ -1,6 +1,7 @@
 //! Real shared-directory and control-plane fixtures. No operator state is used.
 mod common;
 
+#[cfg(unix)]
 fn coordination() -> &'static magi::config::Coordination {
     static POLICY: std::sync::LazyLock<magi::config::Coordination> = std::sync::LazyLock::new(
         || {
