@@ -262,12 +262,7 @@ pub fn recommendation_manifest(body: &str, questions: &Questions) -> Recommendat
         questions: questions
             .list()
             .iter()
-            .filter(|q| {
-                q.status.open()
-                    && q.choices
-                        .iter()
-                        .any(|c| recommended_choice(body, q, questions, c))
-            })
+            .filter(|q| q.status.open() && recommended_choice(body, q, questions).is_some())
             .map(|q| (q.id.clone(), question_fingerprint(q)))
             .collect(),
     }
@@ -634,7 +629,7 @@ fn choice_authority(
             || talk::sender(recommendation, None) != talk::Sender::Persona
             || recommendation.posted_by.is_some()
             || recommendation.at < q.asked_at
-            || !recommended_choice(&recommendation.body, q, questions, reply)
+            || recommended_choice(&recommendation.body, q, questions) != Some(reply)
         {
             return None;
         }
@@ -670,24 +665,40 @@ fn batch_instruction(text: &str) -> bool {
     // Whole-message grammar: substrings in conditional, reported, quoted or
     // retracted instructions cannot match. Keep this deliberately bounded.
     let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    let compact = compact.trim_end_matches(['!', '！', '。', '.', 'ー']);
-    let compact = compact
-        .strip_prefix("ありがと！")
-        .or_else(|| compact.strip_prefix("ありがとう！"))
-        .unwrap_or(compact);
-    matches!(
-        compact,
-        "じゃあそれぞれ回答して"
-            | "それぞれ回答して"
-            | "それぞれ回答してください"
-            | "おっけーそれぞれ回答して"
-    ) || matches!(
-        text.trim()
-            .trim_end_matches(['.', '!'])
-            .to_ascii_lowercase()
-            .as_str(),
-        "answer each as recommended" | "answer all as recommended"
-    )
+    let mut compact = compact.trim_end_matches(['!', '！', '。', '.', 'ー', '〜', '～']);
+    let prefixes = [
+        "おっけー",
+        "オッケー〜",
+        "オッケー",
+        "おっけ〜",
+        "おけ",
+        "オケ",
+        "ok",
+        "OK",
+        "Ok",
+        "ありがとうございます",
+        "ありがとう",
+        "ありがと",
+        "了解です",
+        "了解",
+        "はい",
+        "じゃあ",
+        "では",
+    ];
+    while let Some(rest) = prefixes
+        .iter()
+        .find_map(|prefix| compact.strip_prefix(prefix))
+    {
+        compact = rest.trim_start_matches(['!', '！', '、', ',', '。', '.', 'ー', '〜', '～']);
+    }
+    matches!(compact, "それぞれ回答して" | "それぞれ回答してください")
+        || matches!(
+            text.trim()
+                .trim_end_matches(['.', '!'])
+                .to_ascii_lowercase()
+                .as_str(),
+            "answer each as recommended" | "answer all as recommended"
+        )
 }
 
 fn refers_to(reference: &str, q: &Question, questions: &Questions) -> bool {
@@ -708,7 +719,7 @@ fn direct_choice(text: &str, q: &Question, questions: &Questions, reply: &str) -
         && choice.trim() == reply
 }
 
-fn recommended_choice(body: &str, q: &Question, questions: &Questions, reply: &str) -> bool {
+fn recommended_choice<'a>(body: &str, q: &'a Question, questions: &Questions) -> Option<&'a str> {
     // A row must match the entire offered label, including prefixes such as
     // `dismiss:` or `reimplement:`. Prefix/substring matches confer no authority.
     // A row must select exactly one offered choice, rather than list options.
@@ -741,7 +752,7 @@ fn recommended_choice(body: &str, q: &Question, questions: &Questions, reply: &s
             .get(data.sourcepos.start.line - 1..data.sourcepos.end.line)
             .is_some_and(|block| conditional_recommendation(&block.join(" ")))
         {
-            return false;
+            return None;
         }
         if matches!(
             data.value,
@@ -775,7 +786,15 @@ fn recommended_choice(body: &str, q: &Question, questions: &Questions, reply: &s
                 .iter()
                 .filter(|c| q.choices.iter().any(|choice| choice == **c))
                 .collect();
-            rows.push(!other_question && references == 1 && choices == [&reply]);
+            if other_question || references != 1 || choices.len() != 1 {
+                return None;
+            }
+            rows.push(
+                q.choices
+                    .iter()
+                    .find(|choice| choice.as_str() == *choices[0])?
+                    .as_str(),
+            );
             continue;
         }
         let row = line.trim_start_matches(['-', '*', ' ']);
@@ -790,18 +809,24 @@ fn recommended_choice(body: &str, q: &Question, questions: &Questions, reply: &s
             .or_else(|| rest.strip_prefix('→'))
             .or_else(|| rest.strip_prefix('|'))
             .map(str::trim);
+        if !refers_to(reference, q, questions) {
+            return None;
+        }
+        let choice = choice?;
+        // Preserve the legacy safe-hold wording without granting PR closure.
+        let choice = if choice == "hold、その後PRを閉じる" {
+            crate::land::HOLD
+        } else {
+            choice.trim_matches('`')
+        };
         rows.push(
-            refers_to(reference, q, questions)
-                && choice.is_some_and(|choice| {
-                    // Consume the entire choice. A pipe is an alternative,
-                    // not an excuse to discard it. The one supported trailing
-                    // action is separate from the hold and grants no closure.
-                    choice.trim_matches('`') == reply
-                        || (reply == crate::land::HOLD && choice == "hold、その後PRを閉じる")
-                }),
+            q.choices
+                .iter()
+                .find(|offered| offered.as_str() == choice)?
+                .as_str(),
         );
     }
-    rows == [true]
+    (rows.len() == 1).then(|| rows[0])
 }
 
 fn conditional_recommendation(line: &str) -> bool {
@@ -1416,6 +1441,58 @@ mod tests {
             "SQLite is simpler.".to_owned(),
             vec!["SQLite".to_owned(), "Redis".to_owned()],
         )
+    }
+
+    #[test]
+    fn batch_instruction_normalizes_repeated_japanese_prefixes() {
+        for instruction in [
+            "おっけーそれぞれ回答してー",
+            "了解です、ありがとう！では、それぞれ回答してください。",
+            "ありがとうございます！はい、じゃあそれぞれ回答して〜",
+            "オッケー〜！おけ、それぞれ回答して",
+            "OK！それぞれ回答して",
+            "answer all as recommended!",
+        ] {
+            assert!(batch_instruction(instruction), "{instruction}");
+        }
+        for instruction in [
+            "了解です",
+            "ありがとう！それぞれ回答してもいい？",
+            "もし大丈夫ならそれぞれ回答して",
+            "それぞれ回答して、いや待って",
+            "「それぞれ回答して」",
+        ] {
+            assert!(!batch_instruction(instruction), "{instruction}");
+        }
+    }
+
+    #[test]
+    fn recommendation_returns_only_one_exact_offered_choice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let questions = Questions::at(tmp.path().join("questions"));
+        let mut q = question("implement");
+        questions.put(&mut q).unwrap();
+        let table = |rows: &str| format!("| Question | Choice |\n| --- | --- |\n{rows}");
+        let row = format!("| {} | SQLite |", q.id);
+        assert_eq!(
+            recommended_choice(&table(&row), &q, &questions),
+            Some("SQLite")
+        );
+        assert_eq!(
+            recommended_choice(&format!("{}: Redis", q.id), &q, &questions),
+            Some("Redis")
+        );
+        for body in [
+            table(&format!("{row}\n| {} | Redis |", q.id)),
+            table(&format!("{row}\n{row}")),
+            table(&format!("| {} | SQLite | Redis |", q.id)),
+            table(&format!("| {} | SQLite maybe |", q.id)),
+            format!("> {}: SQLite", q.id),
+            format!("If approved:\n\n{}: SQLite", q.id),
+            "No recommendation".into(),
+        ] {
+            assert_eq!(recommended_choice(&body, &q, &questions), None, "{body}");
+        }
     }
 
     #[test]
