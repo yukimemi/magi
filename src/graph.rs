@@ -1175,13 +1175,6 @@ impl Runner {
         result
     }
 
-    fn repository_blocked(&self) -> bool {
-        self.state
-            .resource_block
-            .as_ref()
-            .is_some_and(|block| block.kind == "repository coordination")
-    }
-
     fn repository_wait(&self) -> crate::repo_lock::WaitPolicy {
         repository_wait(&self.state, Some((&self.pause, &self.interrupt)))
     }
@@ -4086,15 +4079,20 @@ impl Runner {
             {
                 self.graft_restore(&winner.worktree, &rec.pre).await?;
             }
-            if let Some(g) = self.state.graft.as_mut() {
-                g.outcome = GraftOutcome::RolledBack(graft::INTERRUPTED.to_owned());
+            if rec.outcome == GraftOutcome::WaitingForRestore {
+                self.state.graft = None;
+                self.state.save()?;
+            } else {
+                if let Some(g) = self.state.graft.as_mut() {
+                    g.outcome = GraftOutcome::RolledBack(graft::INTERRUPTED.to_owned());
+                }
+                self.state.event(
+                    "graft",
+                    "rolled back: the previous round was interrupted; the winner is untouched",
+                );
+                self.state.save()?;
+                return Ok(());
             }
-            self.state.event(
-                "graft",
-                "rolled back: the previous round was interrupted; the winner is untouched",
-            );
-            self.state.save()?;
-            return Ok(());
         }
         let plan = match graft::plan(&self.state) {
             Ok(plan) => plan,
@@ -4178,13 +4176,10 @@ impl Runner {
             })
             .await;
         if matches!(out, AgentOutcome::ResourceBlocked(_)) {
-            // No seat started for a cache/slot block. Restore any earlier
-            // fallback's edits under coordination and make this step retryable.
-            // A repository block cannot confirm restoration yet.
-            if !self.repository_blocked() {
-                self.graft_restore(&wt, &pre).await?;
-                self.state.graft = None;
-            }
+            // Preserve the need to restore earlier fallback edits without
+            // confusing an unstarted seat with an interrupted invocation.
+            self.state.graft.as_mut().expect("graft record").outcome =
+                GraftOutcome::WaitingForRestore;
             return self.stop_for_resource();
         }
         let mut why: Option<String> = None;
@@ -5457,9 +5452,16 @@ impl Runner {
             return Ok(());
         }
         let wt = winner.worktree.clone();
-        let head = git::rev_parse(&wt, "HEAD").await?;
+        let mut head = git::rev_parse(&wt, "HEAD").await?;
         match rec.repair.clone() {
             Repair::Done { .. } => return Ok(()),
+            Repair::WaitingForRestore { before } => {
+                self.graft_restore(&wt, &before).await?;
+                head = before;
+                rec.repair = Repair::NotStarted;
+                self.state.recovery = Some(rec.clone());
+                self.state.save()?;
+            }
             Repair::Started { before } => {
                 // Interrupted: the unfinished edits are not trusted.
                 // An unconfirmed rollback blocks the run with `Started` kept,
@@ -5530,11 +5532,8 @@ impl Runner {
             })
             .await;
         if matches!(out, AgentOutcome::ResourceBlocked(_)) {
-            if !self.repository_blocked() {
-                self.graft_restore(&wt, &head).await?;
-                rec.repair = Repair::NotStarted;
-                self.state.recovery = Some(rec);
-            }
+            rec.repair = Repair::WaitingForRestore { before: head };
+            self.state.recovery = Some(rec);
             return self.stop_for_resource();
         }
         let failed = match &out {
@@ -12205,7 +12204,7 @@ mod tests {
         runner.recovery_repair(&winner).await.unwrap();
         assert!(matches!(
             runner.state.recovery.as_ref().unwrap().repair,
-            crate::recovery::Repair::NotStarted
+            crate::recovery::Repair::WaitingForRestore { .. }
         ));
         drop(held);
         runner.state.resource_block = None;
@@ -12216,6 +12215,148 @@ mod tests {
             crate::recovery::Repair::Done { .. }
         ));
         assert!(runner.state.seats.values().any(|seat| seat.turns > 0));
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn repository_blocked_graft_and_recovery_retry_after_deferred_restore() {
+        use std::os::fd::AsRawFd as _;
+        for graft in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut runner = registered_runner(tmp.path()).await;
+            runner.state.config.graph.timeout_resource_wait = 1;
+            let winner = runner.state.candidates[0].clone();
+            let marker = tmp.path().join("fixer-started");
+            let mut fixer = spec("fixer");
+            fixer.command = vec![
+                "sh".into(),
+                "-c".into(),
+                format!("echo started >> '{}'; echo done", marker.display()),
+            ];
+            runner.roles.fixer = Some(vec![fixer]);
+            if graft {
+                let mut loser = winner.clone();
+                loser.label = 'B';
+                loser.index = 1;
+                runner.state.candidates.push(loser);
+                runner.state.config.graph.graft_runner_up = true;
+                runner.state.tally = Some(Tally {
+                    first_choice: BTreeMap::new(),
+                    borda: BTreeMap::new(),
+                    winner: winner.label,
+                    rankings: 1,
+                    unanimous_initial: true,
+                    deliberated: false,
+                    changed_votes: 0,
+                    unanimous_final: true,
+                    tie_break: None,
+                    judges: 1,
+                    present: 1,
+                    quorum: 1,
+                    met_quorum: true,
+                    uncontested: None,
+                });
+                runner.state.judgements.push(crate::run::Judgement {
+                    judge: 1,
+                    seat: "judge-1".into(),
+                    agent: "judge".into(),
+                    ranking: vec![winner.label, 'B'],
+                    reasons: BTreeMap::new(),
+                    confidence: None,
+                    strengths: BTreeMap::from([("B".into(), vec!["handles empty input".into()])]),
+                    order: vec![0, 1],
+                    failed: None,
+                    duration_ms: 0,
+                });
+            } else {
+                runner.state.recovery = Some(crate::recovery::RecoveryRecord {
+                    from_run: "earlier".into(),
+                    generation: 1,
+                    mode: crate::recovery::Mode::VerifyRepair,
+                    reasons: Vec::new(),
+                    reviewed_head: None,
+                    rounds: Vec::new(),
+                    open_findings: Vec::new(),
+                    evidence: None,
+                    criteria_inherited: true,
+                    repair: crate::recovery::Repair::NotStarted,
+                });
+            }
+            let reader = crate::repo_lock::SeatLease::for_checkout(&winner.worktree, false)
+                .await
+                .unwrap();
+            let pause = runner.pause.clone();
+            let (result, ()) = tokio::join!(
+                async {
+                    if graft {
+                        runner.graft().await
+                    } else {
+                        runner.recovery_repair(&winner).await
+                    }
+                },
+                async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    pause.park();
+                }
+            );
+            result.unwrap();
+            assert!(!marker.exists(), "a blocked seat must not spawn");
+            // Exercise the persisted state, as a binary replacement/resume does.
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            if graft {
+                assert_eq!(
+                    runner.state.graft.as_ref().unwrap().outcome,
+                    GraftOutcome::WaitingForRestore
+                );
+            } else {
+                assert!(matches!(
+                    runner.state.recovery.as_ref().unwrap().repair,
+                    crate::recovery::Repair::WaitingForRestore { .. }
+                ));
+            }
+            drop(reader);
+            runner.pause = Pause::new();
+            runner.state.resource_block = None;
+            // Deferred restoration must still respect an external lock owner.
+            let external =
+                std::fs::File::create(runner.state.repo.join(".git/kanade-sync.lock")).unwrap();
+            assert_eq!(
+                unsafe { libc::flock(external.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            let leftover = winner.worktree.join("leftover");
+            std::fs::write(&leftover, "earlier fallback edits").unwrap();
+            let result = if graft {
+                runner.graft().await
+            } else {
+                runner.recovery_repair(&winner).await
+            };
+            assert!(
+                result
+                    .unwrap_err()
+                    .is::<crate::repo_lock::ResourceBlocked>()
+            );
+            assert!(leftover.exists());
+            assert!(!marker.exists());
+            drop(external);
+            runner.state.resource_block = None;
+            let result = if graft {
+                runner.graft().await
+            } else {
+                runner.recovery_repair(&winner).await
+            };
+            result.unwrap();
+            assert!(!leftover.exists(), "restore must precede retry");
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "started\n");
+            if graft {
+                assert!(runner.state.graft.as_ref().unwrap().outcome.settled());
+            } else {
+                assert!(matches!(
+                    runner.state.recovery.as_ref().unwrap().repair,
+                    crate::recovery::Repair::Done { .. }
+                ));
+            }
+        }
     }
 
     #[tokio::test]

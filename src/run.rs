@@ -919,6 +919,8 @@ pub enum GraftOutcome {
     /// Started but not finished: a record in this state on load means the
     /// process stopped mid-round and the winner is restored on resume.
     Running,
+    /// The seat could not start; restore `pre` under coordination, then retry.
+    WaitingForRestore,
     /// The winner's pre-graft commit was restored, with the reason.
     RolledBack(String),
 }
@@ -926,7 +928,10 @@ pub enum GraftOutcome {
 impl GraftOutcome {
     /// Is the record final, i.e. must a resume leave it alone?
     pub fn settled(&self) -> bool {
-        !matches!(self, GraftOutcome::Running)
+        !matches!(
+            self,
+            GraftOutcome::Running | GraftOutcome::WaitingForRestore
+        )
     }
 }
 

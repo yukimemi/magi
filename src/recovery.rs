@@ -112,6 +112,11 @@ pub enum Repair {
         /// HEAD before the call.
         before: String,
     },
+    /// The seat could not start. Restore under coordination before retrying.
+    WaitingForRestore {
+        /// HEAD before the blocked attempt (or its earlier fallback).
+        before: String,
+    },
     /// Settled.
     Done {
         /// HEAD before the call.
