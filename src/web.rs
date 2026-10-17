@@ -5048,6 +5048,10 @@ struct FlowNode {
     href: Option<String>,
     /// Overrides `status` as the badge word (`stale` / `superseded`).
     badge: Option<String>,
+    /// Start of this entry, never the run's latest update or pass settlement.
+    started_at: Option<Timestamp>,
+    /// Context links (chat / follow-up) do not represent execution entries.
+    time_expected: bool,
 }
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -5099,6 +5103,8 @@ fn task_flow(
         readable: true,
         href: None,
         badge: None,
+        started_at: None,
+        time_expected: matches!(kind, "start" | "run" | "end"),
     };
     let mut nodes = Vec::new();
     let mut edges: Vec<FlowEdge> = Vec::new();
@@ -5161,12 +5167,25 @@ fn task_flow(
             attempt: AttemptCost::None,
         });
     }
-    nodes.push(node("start", "start", "Task queued".to_owned()));
+    let mut start = node("start", "start", "Task queued".to_owned());
+    start.started_at = Some(task.created_at);
+    nodes.push(start);
     let mut prev = "start".to_owned();
     let mut prev_exit: Option<(RunExit, String, AttemptCost)> = None;
     for (i, h) in history.iter().enumerate() {
         let key = format!("run-{}", h.n);
         let mut n = node(&key, "run", format!("Run {}", h.short));
+        // Creation marks only the first pass of legacy runs. A resumed pass
+        // without a record must not inherit the original run's start time.
+        n.started_at = h
+            .readable
+            .then(|| {
+                h.pass
+                    .as_ref()
+                    .map(|p| p.started_at)
+                    .or_else(|| if h.pass_n == 1 { h.created_at } else { None })
+            })
+            .flatten();
         n.run_kind = Some(h.kind);
         n.readable = h.readable;
         n.href = Some(format!("#/runs/{}", h.id));
@@ -5218,6 +5237,11 @@ fn task_flow(
     let mut end = node("end", "end", task.status.as_str().to_owned());
     end.status = Some(task.status.as_str());
     end.status_of = "task";
+    // Other task states do not persist their transition start. In particular,
+    // blocked_at can change while the task remains blocked.
+    if task.status == TaskStatus::Held {
+        end.started_at = task.held_at;
+    }
     nodes.push(end);
     let (label, attempt) = match prev_exit {
         None => (
@@ -13654,6 +13678,83 @@ mod tests {
                 .and_then(|(_, s)| s.clone())
         });
         task_flow(task, &h, 5, None)
+    }
+
+    #[test]
+    fn flow_start_times_use_each_pass_not_run_updates_or_settlements() {
+        let queued = "2026-10-10T00:00:00Z".parse().unwrap();
+        let created = "2026-10-10T01:00:00Z".parse().unwrap();
+        let first = "2026-10-10T02:00:00Z".parse().unwrap();
+        let resumed = "2026-10-10T03:00:00Z".parse().unwrap();
+        let held = "2026-10-10T04:00:00Z".parse().unwrap();
+        let run = flow_run(RunStatus::Implementing, |s| {
+            s.created_at = created;
+            s.passes = vec![recorded_pass(0, None), recorded_pass(1, None)];
+            s.passes[0].started_at = first;
+            s.passes[1].started_at = resumed;
+        });
+        let mut task = flow_task(&[RUN_X, RUN_X]);
+        task.created_at = queued;
+        task.passes = vec![settled_pass(RUN_X, 0, crate::queue::PassCost::Refunded)];
+        task.status = TaskStatus::Held;
+        task.held_at = Some(held);
+        let flow = flow_for(&task, &[(RUN_X, Some(run))]);
+        assert_eq!(
+            flow.nodes.iter().map(|n| n.started_at).collect::<Vec<_>>(),
+            vec![Some(queued), Some(first), Some(resumed), Some(held)]
+        );
+        assert!(flow.nodes.iter().all(|n| n.time_expected));
+        let json = serde_json::to_value(&flow).unwrap();
+        assert_eq!(json["nodes"][2]["started_at"], resumed.to_string());
+        assert_eq!(json["nodes"][2]["time_expected"], true);
+    }
+
+    #[test]
+    fn flow_start_times_leave_legacy_resumes_unreadable_and_status_starts_unknown() {
+        let created = "2026-10-10T01:00:00Z".parse().unwrap();
+        let run = flow_run(RunStatus::Implementing, |s| s.created_at = created);
+        let mut task = flow_task(&[RUN_X, RUN_X, "missing"]);
+        // These timestamps are not the start of the current status.
+        task.held_at = Some(created);
+        task.blocked_at = Some(created);
+        for status in [
+            TaskStatus::Queued,
+            TaskStatus::Running,
+            TaskStatus::Blocked,
+            TaskStatus::Done,
+            TaskStatus::Failed,
+            TaskStatus::Parked,
+            TaskStatus::Held,
+        ] {
+            task.status = status;
+            if status == TaskStatus::Held {
+                task.held_at = None;
+            }
+            let flow = flow_for(&task, &[(RUN_X, Some(run.clone()))]);
+            assert_eq!(flow.nodes[1].started_at, Some(created));
+            assert_eq!(flow.nodes[2].started_at, None, "legacy resume");
+            assert_eq!(flow.nodes[3].started_at, None, "unreadable run");
+            assert_eq!(flow.nodes[4].started_at, None, "{status:?}");
+            let json = serde_json::to_value(&flow).unwrap();
+            assert!(json["nodes"][3]["started_at"].is_null());
+            assert_eq!(json["nodes"][3]["time_expected"], true);
+        }
+    }
+
+    #[test]
+    fn flow_context_links_do_not_expect_start_times() {
+        let mut task = flow_task(&[]);
+        task.source = Source::Agent {
+            run: "chat-id".to_owned(),
+            node: "chat".to_owned(),
+        };
+        let origin = followup_origin(&fu(None), |_| None, |_| None);
+        let flow = task_flow(&task, &[], 5, Some(&origin));
+        for node in &flow.nodes[..2] {
+            assert!(!node.time_expected);
+            assert_eq!(node.started_at, None);
+        }
+        assert!(flow.nodes[2].time_expected);
     }
 
     fn fu(origin_task: Option<&str>) -> crate::queue::FollowUp {
