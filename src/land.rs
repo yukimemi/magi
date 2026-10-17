@@ -2666,7 +2666,8 @@ fn names_same_pr(a: &RunState, url: &str, number: u64, repo: &Path) -> bool {
 ///
 /// Lifecycle writes through to other runs are deliberately narrow (task-head
 /// ownership is recorded separately): only a **terminal** run (never one a
-/// driver may still be writing), never one a live daemon claims, only a record
+/// driver may still be writing), only a proven-stopped driver with no daemon
+/// claim (the shared liveness judge), only a record
 /// whose `pr.state` is still `open`, and only `merged` / `closed` ever goes in.
 /// The record is read as folding reads it (no schema check: every bump so far
 /// only added fields, and the whole struct round-trips) and written through
@@ -2680,6 +2681,9 @@ fn rewrite_open_prs(
     let now = Timestamp::now();
     let mut changed = 0;
     for id in crate::run::list_ids_in(&home.join("runs")) {
+        let Ok(_owner) = crate::pr_head::owner_lock(home, &id) else {
+            continue;
+        };
         let path = home.join("runs").join(&id).join("run.json");
         let Ok(body) = std::fs::read_to_string(&path) else {
             continue;
@@ -2689,7 +2693,8 @@ fn rewrite_open_prs(
         };
         if !state.status.done()
             || state.pr.as_ref().is_none_or(|p| p.state != "open")
-            || crate::daemon::is_working_on(home, &id, now)
+            || state.liveness_under(home, crate::daemon::is_working_on(home, &id, now))
+                != crate::run::Liveness::Dead
         {
             continue;
         }
@@ -7247,6 +7252,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         );
         run.id = id.to_owned();
         run.status = status;
+        run.driver_exited = true;
         run.pr = Some(crate::run::PrRecord {
             number: url.rsplit('/').next().unwrap().parse().unwrap(),
             url: url.to_owned(),
@@ -7345,6 +7351,28 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         );
         let hit = RunState::load_under("20261004-100000-aaaa", h).unwrap();
         assert!(hit.events.iter().any(|e| e.message.contains("merged")));
+    }
+
+    #[test]
+    fn lifecycle_updates_preserve_live_and_unknown_terminal_drivers() {
+        let home = tempfile::tempdir().unwrap();
+        let live_id = "20261004-100000-aaaa";
+        let unknown_id = "20261004-100100-bbbb";
+        for id in [live_id, unknown_id] {
+            pr_run(home.path(), id, "repo", RunStatus::Ready, PR, "open");
+            let mut s = RunState::load_under(id, home.path()).unwrap();
+            s.driver_exited = false;
+            if id == live_id {
+                s.driver_pid = Some(std::process::id());
+                s.driver_started_at = crate::proc::process_started_at(std::process::id());
+            }
+            s.save_under(home.path()).unwrap();
+        }
+        let known = BTreeMap::from([(PR.to_owned(), PrLifecycle::Merged)]);
+        assert_eq!(apply_pr_states(home.path(), &known), 0);
+        for id in [live_id, unknown_id] {
+            assert_eq!(recorded(home.path(), id), "open");
+        }
     }
 
     #[test]

@@ -1865,6 +1865,11 @@ where
         if !crate::run::is_run_id(&id) {
             continue;
         }
+        // Serialize the proof and save with claims and takeover: a new
+        // execution must not be overwritten after the liveness observation.
+        let Ok(_owner) = crate::pr_head::owner_lock(home, &id) else {
+            continue;
+        };
         // Unreadable is `clean::fold_due`'s problem, not this one's — see
         // that module's docs for why a run this cannot parse is left alone
         // rather than guessed at. A different schema number is not that: this
@@ -1878,7 +1883,7 @@ where
         let Ok(mut state) = serde_json::from_str::<RunState>(&body) else {
             continue;
         };
-        if state.status.done() || !state.active_all_overrun(now) {
+        if state.driver_exited || state.status.done() || !state.active_all_overrun(now) {
             continue;
         }
         // Not `!is_working_on(..)` alone: that is only "no *daemon* claims
@@ -1893,7 +1898,9 @@ where
         // its strongest, provable answer licenses wiping this run's active
         // seats and failing it out from under whatever is still running it.
         let daemon_claims = is_working_on(home, &id, now);
-        if state.liveness_with(daemon_claims, &query, &identity) != crate::run::Liveness::Dead {
+        if state.liveness_under_with(home, daemon_claims, &query, &identity)
+            != crate::run::Liveness::Dead
+        {
             continue;
         }
         state.abandon("daemon");
@@ -2007,6 +2014,7 @@ async fn drive(
         .as_ref()
         .map(|c| c.daemon.clone())
         .unwrap_or_default();
+    crate::driver::reconcile(home);
     let mut initial_status = Status::new();
     initial_status.question_recovery = Some(crate::question_delivery::Recovery::new(
         recovery_cfg.as_ref(),

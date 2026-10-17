@@ -69,6 +69,7 @@ fn old_run(fx: &common::Fixture, shape: impl FnOnce(&mut ReviewRound, &mut RunSt
     run_git(&wt, &["commit", "-q", "-m", "old run work"]);
     let tip = run_git(&wt, &["rev-parse", "HEAD"]);
     state.status = RunStatus::Blocked;
+    state.driver_exited = true;
     state.candidates.push(Candidate {
         index: 0,
         label: 'B',

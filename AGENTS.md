@@ -1136,15 +1136,31 @@ machine-generated title; human title edits survive. Metadata errors stop with
 `pr_publication_pending`, so a resume retries publication using the saved
 lease and existing candidates.
 
-The old run must be terminal with a proven stopped driver and no daemon claim;
-unknown liveness refuses takeover. Auto-merge is disabled before replacing the
-head. Successful publication saves the new run's pushed SHA and PR record,
+Takeover uses `RunState::liveness_under`, the same driver judge as land and
+worktree release. No daemon claim may remain: a matching held execution lease
+protects a live driver; a matching released lease, explicit graph exit, or proven
+process identity loss establishes a stopped driver. A free lock without matching
+pass metadata is not evidence for a legacy run. Unknown stays unknown; an owner
+answer never substitutes for proof. Questions offer executable retry/recheck or
+hold actions, never ask the owner to certify death.
+
+A non-terminal predecessor with resumable work must resume its existing graph.
+Publication retires it as `Superseded` only after an explicit `released_to`
+handover to this successor, with no pending publication, approval, merge decision,
+armed merge or repair checkpoint. That handover already checked clean worktrees
+and branch tips and prevents the old graph resuming. This is the narrow rule for
+an interrupted `gating` predecessor with no work left: it cannot block successors
+forever once its worktree has actually transferred.
+
+Auto-merge is disabled before replacing the head. Successful publication saves
+the new run's pushed SHA and PR record,
 then marks *transferring* predecessors `pr_taken_over_by` (idempotently); their PR
 records remain history and lifecycle writes still propagate to them. Reports and the
 web show them as superseded, and they cannot re-enter the graph or land.
 
-**Two sets of predecessors.** Every terminal, stopped run sharing the task head
-and git-common-dir is scanned, locked and liveness-checked (an active or unknown
+**Two sets of predecessors.** Every stopped run sharing the task head and
+git-common-dir is scanned (non-terminal runs must satisfy the handover rule
+above), locked and liveness-checked (an active or unknown
 driver still refuses publication), and its `pr_pushed_head` is a candidate for
 the push lease. Only a predecessor whose recorded PR is the *same open PR* being
 published (`pr_head::transfers_ownership`: same url, state not merged/closed) is
@@ -1566,6 +1582,16 @@ the agent CLIs' quota, not local CPU.
   deliberate legibility: the operator can see what was in flight. Do not add a
   startup sweep that "cleans" those into `Queued` without also proving the run
   is dead.
+- Driver ownership lasts for one graph execution, including resource-block and
+  park postprocessing. A pass-bound OS execution lease and drop guard release it
+  on return, error, cancellation or unwind; normal completion saves final state
+  and cleared ownership together. Cleanup checks the pass identity so it cannot
+  clear a successor. Save failure or process kill leaves lease-based recovery.
+- Before publishing a new daemon generation, startup reconciles proven-stopped
+  driver records once under the ownership lock, retaining status and resume
+  checkpoints. Prior daemon claims with a proven-lost matching process identity
+  do not survive restart. Unknown identities and held leases stay protected;
+  recovered resumable runs are not failed by abandoned-seat cleanup.
 - Ctrl-C does not abandon a run in flight. Killing the graph mid-node leaves
   worktrees, branches and agent sessions behind, and throws away agent calls
   already paid for.

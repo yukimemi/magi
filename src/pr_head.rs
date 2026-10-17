@@ -26,7 +26,7 @@ pub(crate) fn owner_lock(home: &Path, id: &str) -> Result<std::fs::File> {
 
 // std::fs::File locking requires Rust 1.89; keep the declared 1.85 MSRV.
 #[cfg(unix)]
-fn try_lock_file(file: &std::fs::File) -> std::io::Result<()> {
+pub(crate) fn try_lock_file(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     // SAFETY: the descriptor belongs to a live File. flock does not retain
     // pointers; closing the File releases the lock, including on process exit.
@@ -38,7 +38,7 @@ fn try_lock_file(file: &std::fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn try_lock_file(file: &std::fs::File) -> std::io::Result<()> {
+pub(crate) fn try_lock_file(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -140,7 +140,7 @@ async fn predecessors(
         let _lock = owner_lock(home, &id)?;
         // The scan only selects possible owners; validate a fresh record under
         // the same lock the driver claim uses, and hold it through takeover.
-        let old = RunState::load_under(&id, home)?;
+        let mut old = RunState::load_under(&id, home)?;
         let other = git::git(
             &old.repo,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -157,16 +157,58 @@ async fn predecessors(
             continue;
         }
         let claimed = crate::daemon::is_working_on(home, &id, jiff::Timestamp::now());
-        if !old.status.done() || old.liveness(claimed) != Liveness::Dead {
-            bail!(
-                "previous public head owner {} is active or its driver is unknown",
-                old.short()
-            );
-        }
+        validate_predecessor(&mut old, state, home, claimed)?;
         previous.push((old, _lock));
     }
     previous.sort_by_key(|(s, _)| s.updated_at);
     Ok(previous)
+}
+
+/// A released execution has no remaining graph to resume. Only an explicit
+/// handover to this successor licenses retiring a non-terminal predecessor;
+/// all other interrupted runs must resume their existing graph first.
+fn validate_predecessor(
+    old: &mut RunState,
+    next: &RunState,
+    home: &Path,
+    claimed: bool,
+) -> Result<()> {
+    match old.liveness_under(home, claimed) {
+        Liveness::Live => bail!(
+            "previous public head owner {} still has a live driver",
+            old.short()
+        ),
+        Liveness::Unknown => bail!(
+            "previous public head owner {} driver state unknown; recheck and retry, or hold the task; an owner answer cannot prove driver death",
+            old.short()
+        ),
+        Liveness::Dead => {}
+    }
+    if !old.status.done() {
+        if old.released_to.as_deref() != Some(next.id.as_str())
+            || old.pr_publication_pending
+            || old.land_approval.is_some()
+            || old.merge_decision.is_some()
+            || old.land_armed_head.is_some()
+            || !old.merge_repairs.is_empty()
+            || crate::ask::Questions::at(home.join("questions"))
+                .list()
+                .iter()
+                .any(|q| q.run == old.id && q.status.open())
+        {
+            bail!(
+                "previous public head owner {} has resumable work; resume that run instead of publishing a successor",
+                old.short()
+            );
+        }
+        old.status = crate::run::RunStatus::Superseded;
+        old.event(
+            "publish",
+            format!("execution retired after worktree handover to {}", next.id),
+        );
+        old.save_under(home)?;
+    }
+    Ok(())
 }
 
 /// Refuse startup while a historical publisher is still active or ambiguous.
@@ -353,9 +395,7 @@ pub(crate) async fn publish(
         // Re-read before writing, using the same terminal/driver guard.
         let mut old = RunState::load_under(&old.id, &home)?;
         let claimed = crate::daemon::is_working_on(&home, &old.id, jiff::Timestamp::now());
-        if !old.status.done() || old.liveness(claimed) != Liveness::Dead {
-            bail!("previous owner became active during publication");
-        }
+        validate_predecessor(&mut old, state, &home, claimed)?;
         if old.pr_taken_over_by.as_deref() == Some(state.id.as_str()) {
             continue;
         }
@@ -429,6 +469,55 @@ async fn checked_gh(repo: &Path, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn predecessor(home: &Path) -> RunState {
+        let mut s = RunState::new(
+            "repo".into(),
+            "main".into(),
+            "base".into(),
+            "task".into(),
+            crate::config::Config::default(),
+        );
+        s.status = crate::run::RunStatus::Ready;
+        s.save_under(home).unwrap();
+        s
+    }
+
+    #[test]
+    fn takeover_needs_proof_and_preserves_live_or_unknown_drivers() {
+        let home = tempfile::tempdir().unwrap();
+        let mut old = predecessor(home.path());
+        let next = predecessor(home.path());
+        assert!(validate_predecessor(&mut old, &next, home.path(), false).is_err());
+        old.driver_exited = true;
+        assert!(validate_predecessor(&mut old, &next, home.path(), false).is_ok());
+        assert!(validate_predecessor(&mut old, &next, home.path(), true).is_err());
+        old.driver_exited = false;
+        old.driver_pid = Some(std::process::id());
+        old.driver_started_at = crate::proc::process_started_at(std::process::id());
+        assert!(validate_predecessor(&mut old, &next, home.path(), false).is_err());
+        old.driver_started_at = Some("1".into());
+        assert!(validate_predecessor(&mut old, &next, home.path(), false).is_ok());
+    }
+
+    #[test]
+    fn a_stopped_gating_predecessor_retires_only_after_explicit_handover() {
+        let home = tempfile::tempdir().unwrap();
+        let mut old = predecessor(home.path());
+        let next = predecessor(home.path());
+        old.status = crate::run::RunStatus::Gating;
+        old.driver_exited = true;
+        assert!(validate_predecessor(&mut old, &next, home.path(), false).is_err());
+        assert_eq!(old.status, crate::run::RunStatus::Gating);
+        old.released_to = Some(next.id.clone());
+        old.pr_publication_pending = true;
+        assert!(validate_predecessor(&mut old, &next, home.path(), false).is_err());
+        old.pr_publication_pending = false;
+        assert!(validate_predecessor(&mut old, &next, home.path(), false).is_ok());
+        let disk = RunState::load_under(&old.id, home.path()).unwrap();
+        assert_eq!(disk.status, crate::run::RunStatus::Superseded);
+        assert_eq!(disk.released_to, Some(next.id));
+    }
 
     #[test]
     fn selected_public_lease_refuses_moves_and_deletion_even_after_validation() {

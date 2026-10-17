@@ -95,7 +95,10 @@ pub(crate) fn dismiss(home: &std::path::Path, q: &crate::ask::Question) -> anyho
     let _lock = crate::pr_head::owner_lock(home, &q.run)?;
     let mut state = RunState::load_under(&q.run, home)?;
     ensure!(
-        state.liveness(false) == Liveness::Dead,
+        state.liveness_under(
+            home,
+            crate::daemon::is_working_on(home, &state.id, jiff::Timestamp::now())
+        ) == Liveness::Dead,
         "stop the current driver before dismissing this obsolete approval"
     );
     ensure!(

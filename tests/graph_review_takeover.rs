@@ -29,7 +29,7 @@ fn run_git(cwd: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
 }
 
-/// An earlier run, mid-flight, whose candidate worktree holds `BRANCH` with one
+/// An earlier stopped run whose candidate worktree holds `BRANCH` with one
 /// commit on it. Returns the saved run and the worktree path.
 fn old_run(fx: &common::Fixture) -> (RunState, PathBuf) {
     old_run_at(fx, false)
@@ -67,6 +67,7 @@ fn old_run_at(fx: &common::Fixture, outside: bool) -> (RunState, PathBuf) {
     run_git(&wt, &["commit", "-q", "-m", "old run work"]);
 
     state.status = RunStatus::Gating;
+    state.driver_exited = true;
     state.candidates.push(Candidate {
         index: 0,
         label: 'A',
@@ -195,6 +196,7 @@ async fn a_running_run_is_refused_and_left_alone() {
     let pid = std::process::id();
     old.driver_pid = Some(pid);
     old.driver_started_at = magi::proc::process_started_at(pid);
+    old.driver_exited = false;
     old.save().unwrap();
 
     let err = Runner::review_taking_over(
@@ -275,6 +277,7 @@ fn other_task_run(fx: &common::Fixture) -> (RunState, PathBuf) {
     run_git(&wt, &["add", "-A"]);
     run_git(&wt, &["commit", "-q", "-m", "other run work"]);
     state.status = RunStatus::Blocked;
+    state.driver_exited = true;
     state.candidates.push(Candidate {
         index: 0,
         label: 'A',
@@ -349,6 +352,7 @@ async fn a_live_run_of_another_task_is_left_alone_and_named() {
     old.status = RunStatus::Reviewing;
     old.driver_pid = Some(pid);
     old.driver_started_at = magi::proc::process_started_at(pid);
+    old.driver_exited = false;
     old.save().unwrap();
 
     let err = Runner::review_taking_over(&fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[])), magi::run::Origin::operator())
@@ -378,5 +382,21 @@ async fn an_earlier_attempts_worktree_outside_the_worktree_root_is_left_alone() 
     assert!(format!("{err:#}").contains("worktree root"), "{err:#}");
     assert!(wt.exists());
     assert!(!RunState::load_under(&old.id, &magi::run::home()).unwrap().released());
+}
+}
+
+common::e2e! {
+async fn an_unknown_legacy_driver_is_refused_without_treating_missing_pid_as_proof() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (mut old, wt) = old_run(&fx);
+    old.driver_exited = false;
+    old.save().unwrap();
+    let error = Runner::review_taking_over(
+        &fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[&old])), magi::run::Origin::operator(),
+    ).await.err().expect("unknown ownership must not be released");
+    assert!(format!("{error:#}").contains("could not be shown"));
+    assert!(wt.exists());
+    assert!(!RunState::load(&old.id).unwrap().released());
 }
 }

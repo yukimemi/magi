@@ -176,8 +176,8 @@ pub struct Holder {
     pub status: RunStatus,
     /// Whether anything is driving it.
     pub liveness: Liveness,
-    /// A driver pid is recorded but could not be shown dead: it may well be
-    /// running, so "unknown" must not read as "gone".
+    /// Driver ownership could not be shown dead, including legacy records
+    /// without a pid: "unknown" must not read as "gone".
     pub driver_unproven: bool,
     /// Any uncommitted change, untracked files included.
     pub dirty: bool,
@@ -218,10 +218,9 @@ fn short(sha: &str) -> String {
 
 /// Whether `holder`'s worktree may be released to a new run.
 ///
-/// [`Liveness::Unknown`] releases only when no driver pid was ever recorded
-/// (nothing that could still be running); a recorded pid that could not be
-/// shown dead is refused like a live one. A run of another task that is in
-/// `landing` (possibly waiting on the owner's approval) is refused as well.
+/// [`Liveness::Unknown`] is refused like a live driver: an owner's answer
+/// cannot substitute for execution-lease or process-identity evidence. A run
+/// of another task that is in `landing` (possibly waiting on the owner's approval) is refused as well.
 pub fn decide(owner: &Owner, holder: &Holder) -> Decision {
     if let Owner::Foreign(why) = owner {
         return Decision::Refuse(why.clone());
@@ -236,7 +235,7 @@ pub fn decide(owner: &Owner, holder: &Holder) -> Decision {
                 .map(|p| format!(" (driver pid {p})"))
                 .unwrap_or_default()
         ));
-    } else if holder.driver_unproven {
+    } else if holder.liveness == Liveness::Unknown || holder.driver_unproven {
         why.push("its driver process could not be shown to be gone".to_owned());
     }
     if *owner == Owner::MagiRun && holder.status == RunStatus::Landing {
@@ -277,7 +276,7 @@ async fn inspect(
     home: &Path,
 ) -> Result<Holder> {
     let claimed = crate::daemon::is_working_on(home, &state.id, jiff::Timestamp::now());
-    let liveness = state.liveness(claimed);
+    let liveness = state.liveness_under(home, claimed);
     // Spelled out: `status.showUntrackedFiles=no` in a user's config would
     // otherwise hide new files from `git status` and let them be deleted.
     let porcelain = git::git(path, &["status", "--porcelain", "--untracked-files=normal"]).await?;
@@ -285,7 +284,7 @@ async fn inspect(
         run: state.id.clone(),
         status: state.status,
         liveness,
-        driver_unproven: liveness == Liveness::Unknown && state.driver_pid.is_some(),
+        driver_unproven: liveness == Liveness::Unknown,
         dirty: !porcelain.trim().is_empty(),
         dirty_files: porcelain
             .lines()
@@ -518,7 +517,7 @@ mod tests {
         Holder {
             run: "20260901-000000-f82f".to_owned(),
             status: RunStatus::Gating,
-            liveness: Liveness::Unknown,
+            liveness: Liveness::Dead,
             driver_unproven: false,
             dirty: false,
             dirty_files: Vec::new(),
@@ -591,6 +590,18 @@ mod tests {
             why.contains("right now") && why.contains("f82f") && why.contains("4242"),
             "{why}"
         );
+    }
+
+    #[test]
+    fn unknown_without_a_recorded_pid_is_not_proof_of_a_stopped_driver() {
+        let holder = Holder {
+            liveness: Liveness::Unknown,
+            ..holder()
+        };
+        assert!(matches!(
+            decide(&Owner::EarlierAttempt, &holder),
+            Decision::Refuse(_)
+        ));
     }
 
     #[test]

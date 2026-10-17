@@ -2911,6 +2911,14 @@ pub fn conduct(
          one \
          already does and only needs the human's word — or a quick manual \
          action — before the task can move again.\n\n\
+         Driver liveness is a machine fact: use the run's shared execution-lease \
+         and process-identity judge, never ask the owner to certify that a run is dead. \
+         A proven-stopped predecessor needs no permission to retry takeover. \
+         Resumable predecessor work must continue in its existing run. Only unknown \
+         liveness warrants a driver question; offer executable choices: \
+         `daemon: recheck and retry` (release/requeue the task, rerunning all ownership checks) \
+         or `daemon: hold the task` (leave it held). The deputy must perform the \
+         selected queue operation; neither answer overrides the liveness judge.\n\n\
          You may also `ask` the operator instead of choosing a recovery — \
          see below.\n\n",
     );

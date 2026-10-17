@@ -578,6 +578,19 @@ impl Drop for FixClaim {
     }
 }
 
+/// Holds the mutable runner as well as its durable lease: cancellation must
+/// clear both copies of ownership, including state a caller may save later.
+struct DriverExecution<'a> {
+    runner: &'a mut Runner,
+    driver: crate::driver::DriverGuard,
+}
+
+impl Drop for DriverExecution<'_> {
+    fn drop(&mut self) {
+        self.driver.release_local(&mut self.runner.state);
+    }
+}
+
 impl Runner {
     /// Start a fresh run against `repo`.
     pub async fn start(
@@ -1161,21 +1174,23 @@ impl Runner {
         } else {
             None
         };
-        let wait = self.repository_wait();
-        let result = wait.scope(self.execute_graph()).await;
+        let mut execution = self.claim_driver()?;
+        let runner = &mut *execution.runner;
+        let wait = runner.repository_wait();
+        let result = wait.scope(runner.execute_graph()).await;
         let result = match result {
             Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => {
-                record_repository_block(&mut self.state, &e);
-                self.park_here()?;
+                record_repository_block(&mut runner.state, &e);
+                runner.park_here()?;
                 Ok(())
             }
             other => other,
         };
-        self.mark_driver_exited();
+        execution.driver.finish(&mut runner.state)?;
         let ended = if result.is_err() {
-            Some(crate::notices::run_stopped(&self.state.id, &self.state))
+            Some(crate::notices::run_stopped(&runner.state.id, &runner.state))
         } else {
-            crate::notices::run_ended(&self.state)
+            crate::notices::run_ended(&runner.state)
         };
         if let Some(notice) = ended {
             crate::notices::raise(notice);
@@ -1192,51 +1207,44 @@ impl Runner {
         coordinate_operation(&mut self.state, cwd, &wait).await
     }
 
-    /// Record that this process no longer drives the run, so its pid (a
-    /// daemon's outlives the run) is not read as a live driver.
-    ///
-    /// Written onto the record as it is on disk, never this copy: another
-    /// process may have resumed the run (recording its own pid and clearing
-    /// the flag) or released its worktree since this copy was read, and
-    /// saving over that would mark a running driver dead. Only a record still
-    /// naming this process as the driver is touched.
-    fn mark_driver_exited(&mut self) {
-        self.state.driver_exited = true;
-        let pid = std::process::id();
-        let Ok(_lock) = crate::pr_head::owner_lock(&crate::run::home(), &self.state.id) else {
-            return;
-        };
-        let Ok(mut disk) = RunState::load(&self.state.id) else {
-            return;
-        };
-        if disk.released_to.is_some() || disk.driver_pid != Some(pid) || disk.driver_exited {
-            return;
-        }
-        disk.driver_exited = true;
-        if let Err(e) = disk.save() {
-            tracing::warn!("could not record that run {} stopped: {e:#}", self.state.id);
-        }
-    }
-
     /// Validate ownership and persist the driver claim in one critical section.
-    fn claim_driver(&mut self) -> Result<()> {
-        let _lock = crate::pr_head::owner_lock(&crate::run::home(), &self.state.id)?;
+    fn claim_driver(&mut self) -> Result<DriverExecution<'_>> {
+        let owner = crate::pr_head::owner_lock(&crate::run::home(), &self.state.id)?;
         let disk = RunState::load(&self.state.id)?;
         crate::pr_head::ensure_owner(&disk)?;
+        if disk.liveness(false) == crate::run::Liveness::Live {
+            bail!("run already has a live driver; wait for its execution to end");
+        }
+        if let Some(to) = &disk.released_to {
+            bail!(
+                "run {} cannot continue: its worktree was released to run {}",
+                self.state.short(),
+                crate::run::short_of(to)
+            );
+        }
+        let driver = crate::driver::DriverGuard::acquire(&crate::run::home(), &disk)?;
+        let mut execution = DriverExecution {
+            runner: self,
+            driver,
+        };
+        // Declare after the execution guard: on any claim error this short
+        // lock must drop before that guard reloads and releases ownership.
+        let _owner = owner;
+        let state = &mut execution.runner.state;
         // Moving again, so it is no longer parked. Set before the walk rather
         // than in `resume`, so every way of re-entering the graph clears it
         // and a card cannot claim a run is waiting to be resumed while the
         // agents are already working.
-        self.state.parked = false;
-        self.state.resource_wait = None;
-        self.state.resource_block = None;
+        state.parked = false;
+        state.resource_wait = None;
+        state.resource_block = None;
         // Any seat this state still lists as answering belongs to whatever
         // process last drove this run — this one included, if it crashed
         // mid-wave. Cleared and flushed immediately, before anything else
         // runs, so a resume can never show a seat as live when nothing is
         // asking it anything yet; the node that actually dispatches the next
         // wave repopulates it.
-        self.state.clear_active();
+        state.clear_active();
         // Recorded in the same spot, and flushed together with the clear
         // above: this is the pid a reader checks (`RunState::liveness`) when
         // no daemon claim exists to answer "is a process still driving this
@@ -1251,27 +1259,18 @@ impl Runner {
         // pid, so `liveness` can tell a live pid that is genuinely still us
         // apart from one the OS has since handed to an unrelated process —
         // see that field's own doc for why the pid alone is not enough.
-        // A resume that raced a takeover: the record on disk says the worktree
-        // was handed to a later run after this copy was read. Saving over it
-        // would erase that and drive a run with nothing to run in.
-        if let Some(to) = &disk.released_to {
-            bail!(
-                "run {} cannot continue: its worktree was released to run {}",
-                self.state.short(),
-                crate::run::short_of(to)
-            );
-        }
         let pid = std::process::id();
-        self.state.driver_pid = Some(pid);
-        self.state.driver_started_at = crate::proc::process_started_at(pid);
-        self.state.driver_exited = false;
-        self.state.begin_pass();
-        self.state.save()?;
-        Ok(())
+        state.driver_pid = Some(pid);
+        state.driver_started_at = crate::proc::process_started_at(pid);
+        state.driver_exited = false;
+        state.begin_pass();
+        execution.driver.bind(state);
+        state.save()?;
+        execution.driver.record(state)?;
+        Ok(execution)
     }
 
     async fn execute_graph(&mut self) -> Result<()> {
-        self.claim_driver()?;
         if self
             .state
             .merge_decision
@@ -12477,6 +12476,9 @@ mod tests {
             0
         );
         runner.execute().await.unwrap();
+        let disk = RunState::load(&runner.state.id).unwrap();
+        assert!(disk.driver_exited);
+        assert_eq!(disk.driver_pid, None);
         assert_eq!(runner.state.status, RunStatus::Blocked);
         assert_eq!(
             runner.state.resource_block.as_ref().unwrap().kind,
@@ -12491,6 +12493,39 @@ mod tests {
             .unwrap();
         assert!(runner.state.parked);
         assert!(runner.state.prep_failure.is_none());
+        let disk = RunState::load(&runner.state.id).unwrap();
+        assert!(disk.driver_exited);
+        assert_eq!(disk.driver_pid, None);
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn dropping_execute_during_a_repository_wait_releases_the_driver() {
+        use std::os::fd::AsRawFd as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runner = registered_runner(tmp.path()).await;
+        runner.state.prep_complete = Some(false);
+        runner.state.config.graph.timeout_resource_wait = 30;
+        runner.state.save().unwrap();
+        let external =
+            std::fs::File::create(runner.state.repo.join(".git/kanade-sync.lock")).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(external.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), runner.execute())
+                .await
+                .is_err()
+        );
+        let disk = RunState::load(&runner.state.id).unwrap();
+        assert!(disk.driver_exited);
+        assert_eq!(disk.driver_pid, None);
+        assert!(disk.status.resumable());
+        assert!(runner.state.driver_exited);
+        assert_eq!(runner.state.driver_pid, None);
+        runner.state.save().unwrap();
+        assert_eq!(RunState::load(&runner.state.id).unwrap().driver_pid, None);
     }
 
     #[tokio::test]
@@ -13023,6 +13058,36 @@ mod tests {
             pause: Pause::new(),
             interrupt: Pause::new(),
         }
+    }
+
+    #[test]
+    fn a_failed_driver_lease_record_releases_the_claim_and_retained_state() {
+        crate::run::pin_test_home();
+        let mut runner = runner_at(RunStatus::Gating);
+        runner.state.save().unwrap();
+        // run.json can commit, but the subsequent lease metadata write fails.
+        // Cleanup must run after releasing the short ownership lock.
+        std::fs::create_dir(runner.state.dir().join("driver.json.tmp")).unwrap();
+        assert!(runner.claim_driver().is_err());
+        assert!(runner.state.driver_exited);
+        assert_eq!(runner.state.driver_pid, None);
+        let disk = RunState::load(&runner.state.id).unwrap();
+        assert!(disk.driver_exited);
+        assert_eq!(disk.driver_pid, None);
+        assert_eq!(disk.status, RunStatus::Gating);
+    }
+
+    #[tokio::test]
+    async fn an_early_graph_error_releases_its_driver() {
+        crate::run::pin_test_home();
+        let mut runner = runner_at(RunStatus::Blocked);
+        runner.state.config.graph.selected_implementer = Some("selected".into());
+        runner.state.save().unwrap();
+        assert!(runner.execute().await.is_err());
+        let disk = RunState::load(&runner.state.id).unwrap();
+        assert!(disk.driver_exited);
+        assert_eq!(disk.driver_pid, None);
+        assert_eq!(disk.status, RunStatus::Blocked);
     }
 
     fn merge_repair_request(phase: crate::run::MergeRepairPhase) -> crate::run::MergeRepair {
