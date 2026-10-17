@@ -167,8 +167,10 @@ impl Drop for DriverGuard {
 
 /// Startup recovery preserves status, candidates and checkpoints. Only the
 /// ownership evidence is repaired; an interrupted graph remains resumable.
-pub(crate) fn reconcile(home: &Path) {
+/// Returns the run IDs whose repaired ownership was successfully saved.
+pub(crate) fn reconcile(home: &Path) -> Vec<String> {
     let previous = crate::daemon::read_status(home);
+    let mut reconciled = Vec::new();
     for id in crate::run::list_ids_in(&home.join("runs")) {
         let Ok(_owner) = crate::pr_head::owner_lock(home, &id) else {
             continue;
@@ -192,9 +194,12 @@ pub(crate) fn reconcile(home: &Path) {
             state.clear_active();
             if let Err(e) = state.save_under(home) {
                 tracing::warn!("could not reconcile run {id} driver: {e:#}");
+            } else {
+                reconciled.push(id);
             }
         }
     }
+    reconciled
 }
 
 #[cfg(test)]
@@ -315,12 +320,13 @@ mod tests {
         assert_eq!(s.liveness_under(home.path(), true), Liveness::Live);
         s.status = RunStatus::Gating;
         s.save_under(home.path()).unwrap();
-        reconcile(home.path());
+        assert_eq!(reconcile(home.path()), vec![s.id.clone()]);
         let recovered = RunState::load_under(&s.id, home.path()).unwrap();
         assert!(recovered.driver_exited);
         assert_eq!(recovered.driver_pid, None);
         assert_eq!(recovered.status, RunStatus::Gating);
         assert!(recovered.status.resumable());
+        assert!(reconcile(home.path()).is_empty());
     }
 
     #[test]
@@ -340,7 +346,7 @@ mod tests {
         unknown.save_under(home.path()).unwrap();
         let live = state(home.path());
         let _guard = claim(home.path(), &live);
-        reconcile(home.path());
+        assert_eq!(reconcile(home.path()), vec![stale.id.clone()]);
         let stale = RunState::load_under(&stale.id, home.path()).unwrap();
         assert!(stale.driver_exited);
         assert!(stale.status.resumable());
@@ -384,7 +390,7 @@ mod tests {
         s.save_under(home.path()).unwrap();
         drop(lease(home.path(), &s.id).unwrap());
         assert_eq!(s.liveness_under(home.path(), false), Liveness::Unknown);
-        reconcile(home.path());
+        assert!(reconcile(home.path()).is_empty());
         assert!(
             !RunState::load_under(&s.id, home.path())
                 .unwrap()

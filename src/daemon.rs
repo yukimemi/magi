@@ -2014,7 +2014,10 @@ async fn drive(
         .as_ref()
         .map(|c| c.daemon.clone())
         .unwrap_or_default();
-    crate::driver::reconcile(home);
+    let reconciled = crate::driver::reconcile(home);
+    if !reconciled.is_empty() {
+        tracing::info!(runs = ?reconciled, "reconciled stopped run drivers at startup");
+    }
     let mut initial_status = Status::new();
     initial_status.question_recovery = Some(crate::question_delivery::Recovery::new(
         recovery_cfg.as_ref(),
