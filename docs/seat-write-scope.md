@@ -55,11 +55,14 @@ waiter resumes. Concurrent readers in the same launcher share the held handle;
 other processes still contend with it. Nonblocking acquisition attempts retry
 on external contention as an infrastructure wait, before creating artifacts,
 starting the CLI or starting its timeout. No error reaches fallback, seat
-history or review budgets merely because an updater owns the lock. Both local
-reservation waits and external lock waits are bounded by
-`graph.timeout_resource_wait` and check the run's pause/interrupt handles at
-least every five seconds. Expiry produces a repository-coordination resource
-block, not an agent failure or a permanent preparation failure; a pause remains
+history or review budgets merely because an updater owns the lock. External
+lock waits are bounded by `graph.timeout_resource_wait`. Local reservation
+waits have no resource deadline: editing seats in one registered repository
+serialize, and a predecessor may legitimately run longer than that limit.
+These waits check the run's pause/interrupt handles at least every five seconds.
+An immediately available reservation still permits a completed node to save
+its results before honoring a park at the next node boundary. External wait
+expiry produces a repository-coordination resource block, not an agent failure or a permanent preparation failure; a pause remains
 a park. Standalone invocations use the default graph limit, chats and public
 folding use their configured limit, and callers can also cancel by dropping
 the waiting future. No process or prompt artifact exists until acquisition.

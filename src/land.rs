@@ -4696,6 +4696,11 @@ pub async fn fix_round(
 
     // An agent that edited files but never committed would otherwise push
     // nothing and look like a refusal.
+    let wait = crate::repo_lock::WaitPolicy::new(
+        Duration::from_secs(state.config.graph.timeout_resource_wait),
+        || false,
+    );
+    let coordination = crate::repo_lock::SeatLease::operation_with(&winner.worktree, &wait).await?;
     match git::rescue_commit(
         &winner.worktree,
         &format!("magi: land round {round} fixes (uncommitted work)"),
@@ -4714,6 +4719,7 @@ pub async fn fix_round(
         Err(_) => {}
     }
     let after = git::rev_parse(&winner.worktree, "HEAD").await?;
+    drop(coordination);
     if after == before {
         return Ok(Fixed::Declined);
     }

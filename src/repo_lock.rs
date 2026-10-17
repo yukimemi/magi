@@ -73,22 +73,42 @@ impl WaitPolicy {
     }
 
     async fn wait<T>(&self, future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-        let future = tokio::time::timeout(self.limit, future);
+        self.wait_inner(future, true).await
+    }
+
+    async fn local<T>(&self, future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        self.wait_inner(future, false).await
+    }
+
+    async fn wait_inner<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T>>,
+        bounded: bool,
+    ) -> Result<T> {
         tokio::pin!(future);
-        loop {
-            if self.cancelled() {
-                return Err(ResourceBlocked(
-                    "repository coordination wait cancelled for parking".into(),
-                )
-                .into());
+        let deadline = async {
+            if bounded {
+                tokio::time::sleep(self.limit).await;
+            } else {
+                std::future::pending::<()>().await;
             }
-            tokio::select! {
-                result = &mut future => return result.unwrap_or_else(|_| Err(ResourceBlocked(
-                    format!("repository coordination remained busy for {}s", self.limit.as_secs())
-                ).into())),
-                // Also bounds cancellation while queued on the fair local gate.
-                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+        };
+        tokio::pin!(deadline);
+        let cancelled = async {
+            while !self.cancelled() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
+        };
+        tokio::pin!(cancelled);
+        tokio::select! {
+            biased;
+            result = &mut future => result,
+            () = &mut cancelled => Err(ResourceBlocked(
+                "repository coordination wait cancelled for parking".into(),
+            ).into()),
+            () = &mut deadline => Err(ResourceBlocked(
+                format!("repository coordination remained busy for {}s", self.limit.as_secs())
+            ).into()),
         }
     }
 }
@@ -164,35 +184,25 @@ impl SeatLease {
     /// updaters. Unlike an editing seat, it has no child agent to take the OS
     /// lock. Release this lease before invoking a seat (the gate is not reentrant).
     pub(crate) async fn operation_with(cwd: &Path, wait: &WaitPolicy) -> Result<Option<Self>> {
-        wait.wait(Self::operation(cwd)).await
-    }
-
-    async fn operation(cwd: &Path) -> Result<Option<Self>> {
-        let mut announced = false;
-        loop {
-            let Some(mut permit) = Self::checkout(cwd, true).await? else {
-                return Ok(None);
-            };
-            match Lease::acquire(permit.path.clone()) {
-                Ok(lock) => {
-                    permit._lock = Some(lock);
-                    permit.delegated = true;
-                    return Ok(Some(permit));
-                }
-                Err(e)
-                    if e.downcast_ref::<std::io::Error>()
-                        .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) =>
-                {
-                    if !announced {
-                        tracing::info!(path = %permit.path.display(), "waiting for repository coordination before preparation");
-                        announced = true;
+        let Some(mut permit) = Self::checkout(cwd, true, wait).await? else {
+            return Ok(None);
+        };
+        permit._lock = Some(
+            wait.wait(async {
+                loop {
+                    match Lease::acquire(permit.path.clone()) {
+                        Ok(lock) => return Ok(lock),
+                        Err(e) if contended(&e) => {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        Err(e) => return Err(e),
                     }
-                    drop(permit);
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
-                Err(e) => return Err(e),
-            }
-        }
+            })
+            .await?,
+        );
+        permit.delegated = true;
+        Ok(Some(permit))
     }
 
     pub(crate) async fn for_checkout(cwd: &Path, allow_write: bool) -> Result<Option<Self>> {
@@ -204,10 +214,10 @@ impl SeatLease {
         allow_write: bool,
         wait: &WaitPolicy,
     ) -> Result<Option<Self>> {
-        wait.wait(Self::checkout(cwd, allow_write)).await
+        Self::checkout(cwd, allow_write, wait).await
     }
 
-    async fn checkout(cwd: &Path, allow_write: bool) -> Result<Option<Self>> {
+    async fn checkout(cwd: &Path, allow_write: bool, wait: &WaitPolicy) -> Result<Option<Self>> {
         let Some(common) = common_dir(cwd).await? else {
             return Ok(None);
         };
@@ -237,7 +247,7 @@ impl SeatLease {
             gate
         };
         if allow_write {
-            let permit = gate.write_owned().await;
+            let permit = wait.local(async { Ok(gate.write_owned().await) }).await?;
             return Ok(Some(Self {
                 path,
                 delegated: false,
@@ -247,8 +257,12 @@ impl SeatLease {
             }));
         }
         let mut announced = false;
+        let mut remaining = wait.limit;
         loop {
-            let permit = Arc::clone(&gate).read_owned().await;
+            let permit = wait
+                .local(async { Ok(Arc::clone(&gate).read_owned().await) })
+                .await?;
+            let started = std::time::Instant::now();
             match Lease::acquire(path.clone()) {
                 Ok(lease) => {
                     return Ok(Some(Self {
@@ -259,10 +273,7 @@ impl SeatLease {
                         _lock: Some(lease),
                     }));
                 }
-                Err(e)
-                    if e.downcast_ref::<std::io::Error>()
-                        .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) =>
-                {
+                Err(e) if contended(&e) => {
                     // Infrastructure scheduling, not an agent attempt. Do not
                     // start a CLI, its timeout, a fallback or a handover. Drop
                     // the local read permit so a queued editor can proceed.
@@ -271,12 +282,34 @@ impl SeatLease {
                         tracing::info!(path = %path.display(), "waiting for repository coordination before starting seat");
                         announced = true;
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    let external_wait = WaitPolicy {
+                        limit: remaining,
+                        ..wait.clone()
+                    };
+                    external_wait
+                        .wait(async {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Ok(())
+                        })
+                        .await?;
+                    remaining = remaining.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        return Err(ResourceBlocked(
+                            "repository coordination remained busy".into(),
+                        )
+                        .into());
+                    }
                 }
                 Err(e) => return Err(e),
             }
         }
     }
+}
+
+fn contended(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock)
 }
 
 impl Lease {
@@ -334,7 +367,41 @@ mod tests {
 
     #[tokio::test]
     #[cfg(unix)]
-    async fn coordination_waits_are_bounded_and_cancel_local_and_external_contention() {
+    async fn queued_editors_outlive_the_external_wait_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::git::git(dir.path(), &["init"]).await.unwrap();
+        let common = common_dir(dir.path()).await.unwrap().unwrap();
+        std::fs::write(common.join("kanade-sync.contract"), "shared-lock-v1\n").unwrap();
+        let short = WaitPolicy::new(Duration::from_millis(20), || false);
+        let first = SeatLease::checkout_with(dir.path(), true, &short)
+            .await
+            .unwrap();
+        let (second, ()) =
+            tokio::join!(SeatLease::checkout_with(dir.path(), true, &short), async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                drop(first);
+            });
+        drop(second.unwrap());
+        // A parked node can save a completed seat when coordination is free.
+        let parked = WaitPolicy::new(Duration::from_millis(20), || true);
+        drop(
+            SeatLease::operation_with(dir.path(), &parked)
+                .await
+                .unwrap(),
+        );
+        // No contract means no resource wait, even after a park request.
+        std::fs::remove_file(common.join("kanade-sync.contract")).unwrap();
+        assert!(
+            SeatLease::operation_with(dir.path(), &parked)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn external_waits_are_bounded_and_local_contention_is_cancellable() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = tempfile::tempdir().unwrap();
         crate::git::git(dir.path(), &["init"]).await.unwrap();
@@ -361,20 +428,6 @@ mod tests {
         let editor = SeatLease::checkout_with(dir.path(), true, &short)
             .await
             .unwrap();
-        assert!(
-            SeatLease::checkout_with(dir.path(), false, &short)
-                .await
-                .err()
-                .expect("busy")
-                .is::<ResourceBlocked>()
-        );
-        assert!(
-            SeatLease::checkout_with(dir.path(), true, &short)
-                .await
-                .err()
-                .expect("busy")
-                .is::<ResourceBlocked>()
-        );
         for operation in [false, true] {
             let cancelled = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&cancelled);

@@ -1175,6 +1175,13 @@ impl Runner {
         result
     }
 
+    fn repository_blocked(&self) -> bool {
+        self.state
+            .resource_block
+            .as_ref()
+            .is_some_and(|block| block.kind == "repository coordination")
+    }
+
     fn repository_wait(&self) -> crate::repo_lock::WaitPolicy {
         repository_wait(&self.state, Some((&self.pause, &self.interrupt)))
     }
@@ -1440,9 +1447,9 @@ impl Runner {
     }
 
     /// A wave could not start its agents because a shared resource stayed busy
-    /// (see [`RunState::resource_block`]): end the node without recording any
-    /// result, leaving the run `Blocked` and resumable. No seat history,
-    /// handover, quota loss or candidate state was written for it.
+    /// (see [`RunState::resource_block`]): leave the run `Blocked` and
+    /// resumable. Unstarted seats have no result; completed peers retain
+    /// their saved candidate state.
     fn stop_for_resource(&mut self) -> Result<()> {
         // A wait abandoned because the run is parking stays a park.
         if self.state.resource_block.is_some() && !(self.pause.parked() || self.interrupt.parked())
@@ -2249,24 +2256,24 @@ impl Runner {
             round: None,
         };
         let mut results = wave(jobs, Arc::clone(&self.sem), &ctx, &mut self.state, 0).await;
-        if wave_blocked(&results) {
-            return self.stop_for_resource();
+        if !wave_blocked(&results) {
+            self.resume_undelivered(&mut results, &sent, &prompts, &run_id)
+                .await;
+            self.resume_seat_handovers(&mut results, &mut sent, &prompts, &run_id)
+                .await?;
+            self.resume_unconfirmed_commands(&mut results, &sent, &prompts, &run_id)
+                .await;
         }
-        self.resume_undelivered(&mut results, &sent, &prompts, &run_id)
-            .await;
-        self.resume_seat_handovers(&mut results, &mut sent, &prompts, &run_id)
-            .await?;
-        self.resume_unconfirmed_commands(&mut results, &sent, &prompts, &run_id)
-            .await;
-        if self.state.resource_block.is_some() {
-            return self.stop_for_resource();
-        }
+        let resource_blocked = self.state.resource_block.is_some() || wave_blocked(&results);
 
         let selected_failed = self.state.config.graph.selected_implementer.is_some()
             && results
                 .iter()
                 .any(|(_, _, out)| FailClass::of(out).is_some());
         for (&i, (_wi, seat, out)) in todo.iter().zip(results) {
+            if matches!(out, AgentOutcome::ResourceBlocked(_)) {
+                continue;
+            }
             let seat_key = seat.key.clone();
             // A quota fallback (`resume_seat_handovers`) may have handed this
             // seat to a different agent than the one `prep` recorded on the
@@ -2335,7 +2342,13 @@ impl Runner {
 
             // Rescue anything the agent edited but never committed: an
             // uncommitted candidate would silently be an empty one.
-            let _coordination = self.coordinate(&worktree).await?;
+            // Parking stops pending resource waits, but completed seats must
+            // persist their output before the node boundary observes it.
+            let wait = crate::repo_lock::WaitPolicy::new(
+                Duration::from_secs(self.state.config.graph.timeout_resource_wait),
+                || false,
+            );
+            let _coordination = coordinate_operation(&mut self.state, &worktree, &wait).await?;
             let rescued = match git::rescue_commit(
                 &worktree,
                 &format!("magi: candidate {label} (uncommitted work)"),
@@ -2403,6 +2416,9 @@ impl Runner {
             self.state.save()?;
         }
 
+        if resource_blocked {
+            return self.stop_for_resource();
+        }
         if selected_failed {
             self.state.status = RunStatus::Blocked;
             self.state.event("implement", "selected implementer failed or hit quota; holding without fallback, review or publication");
@@ -4161,10 +4177,14 @@ impl Runner {
                 }
             })
             .await;
-        // The chosen seat or the restoration before its successor could not
-        // start. Keep Running: a later resume must confirm the rollback under
-        // coordination before it can settle this graft.
         if matches!(out, AgentOutcome::ResourceBlocked(_)) {
+            // No seat started for a cache/slot block. Restore any earlier
+            // fallback's edits under coordination and make this step retryable.
+            // A repository block cannot confirm restoration yet.
+            if !self.repository_blocked() {
+                self.graft_restore(&wt, &pre).await?;
+                self.state.graft = None;
+            }
             return self.stop_for_resource();
         }
         let mut why: Option<String> = None;
@@ -5509,9 +5529,12 @@ impl Runner {
                 handover: None,
             })
             .await;
-        // Keep Started so reentry confirms the rollback under coordination;
-        // never try restoring again during the same exhausted resource wait.
         if matches!(out, AgentOutcome::ResourceBlocked(_)) {
+            if !self.repository_blocked() {
+                self.graft_restore(&wt, &head).await?;
+                rec.repair = Repair::NotStarted;
+                self.state.recovery = Some(rec);
+            }
             return self.stop_for_resource();
         }
         let failed = match &out {
@@ -12104,6 +12127,95 @@ mod tests {
         runner.roles.judges = vec![spec("judge")];
         runner.prep().await.unwrap();
         runner
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn parked_implementer_persists_completed_work() {
+        for registered in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut runner = registered_runner(tmp.path()).await;
+            if !registered {
+                std::fs::remove_file(runner.state.repo.join(".git/kanade-sync.contract")).unwrap();
+            }
+            let marker = tmp.path().join("started");
+            let release = tmp.path().join("release");
+            let mut implementer = spec("implement");
+            implementer.command = vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "touch '{}'; while [ ! -f '{}' ]; do sleep 0.01; done; echo completed > completed; echo saved-result",
+                    marker.display(),
+                    release.display()
+                ),
+            ];
+            runner.roles.implementers = vec![implementer.clone()];
+            runner.state.config.agents = vec![implementer];
+            let pause = runner.pause.clone();
+            let (result, ()) = tokio::join!(runner.implement(), async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while !marker.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                pause.park();
+                std::fs::write(&release, "go").unwrap();
+            });
+            result.unwrap();
+            let candidate = &runner.state.candidates[0];
+            assert!(candidate.commits > 0, "{candidate:?}");
+            assert!(candidate.summary.contains("saved-result"));
+            assert_eq!(candidate.files, 1);
+            let before = candidate.commits;
+            runner.implement().await.unwrap();
+            assert_eq!(runner.state.candidates[0].commits, before);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn resource_blocked_recovery_retries_the_unstarted_fixer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runner = registered_runner(tmp.path()).await;
+        let winner = runner.state.candidates[0].clone();
+        let cache = tmp.path().join("cache");
+        runner.state.config.verify.e2e = vec![format!("CARGO_TARGET_DIR={} true", cache.display())];
+        runner.state.config.graph.timeout_resource_wait = 0;
+        let owner = crate::cache::Owner::here("other", "e2e", "e2e", &cache, "abc");
+        let crate::cache::AcquireOutcome::Acquired(held) =
+            crate::cache::try_acquire(&crate::run::home(), &cache, &owner).unwrap()
+        else {
+            panic!("cache must be free")
+        };
+        runner.state.recovery = Some(crate::recovery::RecoveryRecord {
+            from_run: "earlier".into(),
+            generation: 1,
+            mode: crate::recovery::Mode::VerifyRepair,
+            reasons: Vec::new(),
+            reviewed_head: None,
+            rounds: Vec::new(),
+            open_findings: Vec::new(),
+            evidence: None,
+            criteria_inherited: true,
+            repair: crate::recovery::Repair::NotStarted,
+        });
+        runner.recovery_repair(&winner).await.unwrap();
+        assert!(matches!(
+            runner.state.recovery.as_ref().unwrap().repair,
+            crate::recovery::Repair::NotStarted
+        ));
+        drop(held);
+        runner.state.resource_block = None;
+        runner.state.config.graph.timeout_resource_wait = 1;
+        runner.recovery_repair(&winner).await.unwrap();
+        assert!(matches!(
+            runner.state.recovery.as_ref().unwrap().repair,
+            crate::recovery::Repair::Done { .. }
+        ));
+        assert!(runner.state.seats.values().any(|seat| seat.turns > 0));
     }
 
     #[tokio::test]
