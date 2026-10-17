@@ -99,8 +99,12 @@ untracked symlinks require manual recovery and are never followed. Snapshots
 are supplemental evidence and never authorize deleting a dirty worktree.
 Normal folding requires clean successful removal before marking a candidate
 folded. Orphan/unreadable cleanup retains unknown or dirty content and recovery
-artifacts. Legacy empty records with a reply are inspected on resume; a missing
-worktree blocks rather than silently accepting an old no-change classification.
+artifacts. Migration inspects only unfolded legacy empty records; already
+confirmed schema-15 results and intentionally folded candidates are not re-flagged.
+If recovered work changes a previously judged candidate set, the run stops with
+its existing decisions and recovery evidence retained for a supported recovery
+operation. Partial loser cleanup saves each completed candidate and safely
+retries missing worktrees or already removed branches.
 
 ## Commit boundary in this recovery seat
 

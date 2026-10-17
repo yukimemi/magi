@@ -1273,6 +1273,9 @@ impl Runner {
     }
 
     async fn execute_graph(&mut self) -> Result<()> {
+        // Preservation may invalidate an old empty classification. Resolve it
+        // before any resume shortcut can reuse a verdict or publish a branch.
+        self.persist_candidates().await?;
         if self
             .state
             .merge_decision
@@ -2181,19 +2184,6 @@ impl Runner {
     // ----------------------------------------------------------- implement
 
     async fn implement(&mut self) -> Result<()> {
-        // Legacy empty records did not distinguish a failed rescue from no work.
-        for c in &self.state.candidates {
-            if c.empty
-                && c.failed.is_none()
-                && c.verified_noop.is_none()
-                && (!c.summary.is_empty() || c.worktree.exists())
-            {
-                self.state
-                    .candidate_preservation
-                    .entry(c.label)
-                    .or_insert_with(|| "legacy empty candidate requires inspection".to_owned());
-            }
-        }
         self.persist_candidates().await?;
         // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
         // agent files with `magi task add` name the run that paid for it. The
@@ -2445,6 +2435,16 @@ impl Runner {
                 let stat = git::diff_stat(&c.worktree, base, "HEAD").await?;
                 let files = git::changed_files(&c.worktree, base, "HEAD").await?.len();
                 write_artifact(&self.state, &format!("cand-{label}.patch"), &patch)?;
+                if c.empty && commits > 0 && !patch.trim().is_empty()
+                    && (self.state.judge_skipped || !self.state.judgements.is_empty()
+                        || !self.state.deliberation.is_empty() || !self.state.votes.is_empty()
+                        || self.state.tally.is_some())
+                {
+                    // Keep the old classification and pending marker so every
+                    // retry stops too. Retain decisions as recovery evidence;
+                    // only a supported recovery operation may replace them.
+                    bail!("candidate {label} changes the judged candidate set; supported recovery and fresh judging are required before continuing");
+                }
                 let c = &mut self.state.candidates[i];
                 c.commits = commits;
                 c.stat = stat;
@@ -4383,10 +4383,13 @@ impl Runner {
             }
             let (wt, branch, label) = (c.worktree.clone(), c.branch.clone(), c.label);
             remove_preserved_worktree(&repo, &wt).await?;
-            if !git::branch_delete(&repo, &branch).await? {
+            if git::branch_exists(&repo, &branch).await?
+                && !git::branch_delete(&repo, &branch).await?
+            {
                 bail!("candidate branch removal refused");
             }
             self.state.candidates[i].folded = true;
+            self.state.save()?;
             folded.push(label.to_string());
         }
         // The judges are finished; their checkouts are pure cost from here.
@@ -11117,6 +11120,16 @@ pub(crate) async fn gh_pr_create(
 
 /// Never force deletion of uncommitted work, including unknown legacy trees.
 async fn remove_preserved_worktree(repo: &Path, path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A previous cleanup may have removed the tree before a branch
+            // deletion or state save failed. Unregister it if still present.
+            git::worktree_remove_clean(repo, path).await?;
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+        Ok(_) => {}
+    }
     if !git::is_clean(path).await? {
         bail!(
             "worktree has uncommitted work; refusing removal: {}",
@@ -13103,6 +13116,167 @@ mod tests {
             heads.push(git::rev_parse(&candidate.worktree, "HEAD").await.unwrap());
         }
         heads
+    }
+
+    async fn preservation_resume_fixture() -> (tempfile::TempDir, Runner) {
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let mut runner = runner_at(RunStatus::Reviewing);
+        runner.state.repo = repo.clone();
+        runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
+        runner.state.config.graph.worktree_root = Some(tmp.path().join("wt"));
+        for (index, label) in ['A', 'B'].into_iter().enumerate() {
+            let branch = format!("candidate-{label}");
+            let worktree = runner.state.worktree_root().join(format!("cand-{label}"));
+            git::worktree_add_branch(&repo, &worktree, &branch, "main")
+                .await
+                .unwrap();
+            if label == 'B' {
+                std::fs::write(worktree.join("change"), "winner").unwrap();
+                git::rescue_commit(&worktree, "candidate change")
+                    .await
+                    .unwrap();
+            }
+            runner.state.candidates.push(Candidate {
+                index,
+                label,
+                agent: "alpha".into(),
+                branch,
+                worktree,
+                summary: "completed reply".into(),
+                stat: String::new(),
+                files: usize::from(label == 'B'),
+                commits: usize::from(label == 'B'),
+                empty: label == 'A',
+                failed: None,
+                verified_noop: None,
+                duration_ms: 1,
+                folded: false,
+            });
+        }
+        runner.state.judge_skipped = true;
+        runner.state.tally = Some(Tally {
+            first_choice: BTreeMap::new(),
+            borda: BTreeMap::new(),
+            winner: 'B',
+            rankings: 0,
+            unanimous_initial: false,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: false,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+            uncontested: Some("only B produced a change".into()),
+        });
+        runner.state.save().unwrap();
+        (tmp, runner)
+    }
+
+    #[tokio::test]
+    async fn candidate_preservation_does_not_reflag_confirmed_or_folded_empty_candidates() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        // Schema 15 already confirmed the unfolded no-change result.
+        runner.implement().await.unwrap();
+        assert!(runner.state.candidate_preservation.is_empty());
+        assert!(
+            !runner
+                .state
+                .dir()
+                .join("artifacts/candidate-A-recovery")
+                .exists()
+        );
+        runner.fold_losers().await.unwrap();
+        assert!(!runner.state.candidates[0].worktree.exists());
+        for schema in [14, crate::run::SCHEMA] {
+            runner.state.schema = schema;
+            runner.state = crate::run::migrate_schema(runner.state.clone()).unwrap();
+            runner.state.save().unwrap();
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            runner.implement().await.unwrap();
+            assert!(runner.state.candidate_preservation.is_empty());
+            assert!(runner.state.candidates[0].folded);
+            assert_eq!(runner.state.tally.as_ref().unwrap().winner, 'B');
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_preservation_legacy_recovery_blocks_stale_verdict_on_every_resume() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        let wt = runner.state.candidates[0].worktree.clone();
+        std::fs::write(wt.join("recovered"), "owned edits").unwrap();
+        runner.state.schema = 14;
+        runner.state = crate::run::migrate_schema(runner.state.clone()).unwrap();
+        assert!(runner.state.candidate_preservation.contains_key(&'A'));
+        let tally = serde_json::to_value(&runner.state.tally).unwrap();
+        for _ in 0..2 {
+            assert!(runner.implement().await.is_err());
+            assert_eq!(runner.state.status, RunStatus::Blocked);
+            assert!(runner.state.candidate_preservation[&'A'].contains("supported recovery"));
+            assert!(
+                runner.state.candidates[0].empty,
+                "old verdict must remain unusable"
+            );
+            assert_eq!(serde_json::to_value(&runner.state.tally).unwrap(), tally);
+            assert!(runner.state.judge_skipped);
+            assert!(runner.state.judgements.is_empty() && runner.state.votes.is_empty());
+            assert!(
+                crate::run::read_artifact(&runner.state, "cand-A.patch")
+                    .unwrap()
+                    .contains("owned edits")
+            );
+            assert!(wt.exists());
+            assert_eq!(
+                git::commits_ahead(&wt, &runner.state.base_commit, "HEAD")
+                    .await
+                    .unwrap(),
+                1
+            );
+            runner.state = RunState::load(&runner.state.id).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_preservation_loser_cleanup_resumes_after_branch_and_judge_failures() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        let repo = runner.state.repo.clone();
+        let common = git::git(
+            &repo,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .await
+        .unwrap();
+        let branch_lock = PathBuf::from(common).join("refs/heads/candidate-A.lock");
+        std::fs::write(&branch_lock, "fixture-owned lock").unwrap();
+        assert!(runner.fold_losers().await.is_err());
+        assert!(!runner.state.candidates[0].worktree.exists());
+        assert!(!runner.state.candidates[0].folded);
+        assert!(git::branch_exists(&repo, "candidate-A").await.unwrap());
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        std::fs::remove_file(branch_lock).unwrap();
+        let judge = runner.state.worktree_root().join("judge-1");
+        git::worktree_add_detached(&repo, &judge, "main")
+            .await
+            .unwrap();
+        std::fs::write(judge.join("uncommitted"), "retain").unwrap();
+        runner.roles.judges = vec![spec("judge")];
+        assert!(runner.fold_losers().await.is_err());
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        assert!(
+            runner.state.candidates[0].folded,
+            "candidate progress saved before judge failure"
+        );
+        assert!(!git::branch_exists(&repo, "candidate-A").await.unwrap());
+        assert!(judge.join("uncommitted").exists());
+        std::fs::remove_file(judge.join("uncommitted")).unwrap();
+        runner.fold_losers().await.unwrap();
+        assert!(!judge.exists());
+        runner.fold_losers().await.unwrap();
     }
 
     #[tokio::test]

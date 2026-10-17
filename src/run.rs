@@ -3094,9 +3094,18 @@ pub(crate) fn migrate_schema(mut state: RunState) -> Result<RunState> {
     if state.schema == 13 {
         state.schema = 14;
     }
-    // Old empty candidates are inspected at implementation re-entry; never
-    // infer a completed rescue from their zero commit count.
+    // Only legacy, unfolded empty candidates lack a confirmed preservation
+    // result. Native schema-15 records and intentionally folded candidates
+    // must not be re-flagged on every resume.
     if state.schema == 14 {
+        for c in &state.candidates {
+            if !c.folded && c.empty && c.failed.is_none() && c.verified_noop.is_none() {
+                state
+                    .candidate_preservation
+                    .entry(c.label)
+                    .or_insert_with(|| "legacy empty candidate requires inspection".to_owned());
+            }
+        }
         state.schema = SCHEMA;
     }
     if state.schema != SCHEMA {
