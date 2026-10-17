@@ -799,7 +799,7 @@ fn apply_one(
     if blocking && task.resumption.is_some() && evidence.is_empty() {
         crate::notices::raise(crate::notices::conductor_resumption(
             &task.id,
-            &task.short(),
+            task.short(),
             d.reason.as_deref(),
             &d.blocked_by,
             &d.evidence,
