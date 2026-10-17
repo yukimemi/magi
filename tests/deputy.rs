@@ -555,7 +555,7 @@ async fn a_settle_note_naming_the_filed_task_lands_on_the_thread() {
     script(&s, &[
         FOLLOW_UP,
         "MAGI ask --settle \"$qid\" --choice merge --quote 'マージしていいよ' \
-         --note 'Filed Fix R1-1 (held until `magi task release <id>`).'",
+         --note 'Filed Fix R1-1 (held; released after the merge unless its hold reason says otherwise).'",
     ]);
 
     turn(&mut deputies(&s, 2)).await;
