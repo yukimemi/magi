@@ -3125,9 +3125,7 @@ async fn chat_remembers_selector_changes_after_navigation() {
     ] {
         browser
             .eval(&page, &format!(
-                "(async () => {{ const hash = '#/chat/{}'; if (location.hash !== hash) {{ \
-                 const changed = new Promise(resolve => window.addEventListener('hashchange', \
-                 () => setTimeout(resolve, 0), {{ once: true }})); location.hash = hash; await changed; }} return true; }})()",
+                "location.hash = '#/chat/{}'; true",
                 first.id
             ))
             .await
@@ -3137,10 +3135,11 @@ async fn chat_remembers_selector_changes_after_navigation() {
                 &page,
                 &format!(
                     "location.hash === '#/chat/{}' \
+                     && document.getElementById('talk-meta')?.title.startsWith('{}\\n') \
                      && document.getElementById('talk-agent')?.options.length > 1 \
                      && document.getElementById('talk-persona')?.options.length > 1 \
                      && document.getElementById('talk-{field}')?.disabled === false",
-                    first.id
+                    first.id, first.id
                 ),
                 w,
             )
@@ -3183,11 +3182,13 @@ async fn chat_remembers_selector_changes_after_navigation() {
             )
             .await
             .expect("server accepted change");
+        // A hash change and a matching agent can describe the loading shell:
+        // cached summaries already contain that agent. Wait for the rendered
+        // record's identity so the delayed response really lands on another
+        // loaded conversation, regardless of fetch/hashchange timing.
         browser
             .eval(&page, &format!(
-                "(async () => {{ const changed = new Promise(resolve => window.addEventListener('hashchange', \
-                 () => setTimeout(resolve, 0), {{ once: true }})); \
-                 location.hash = '#/chat/{}'; await changed; return true; }})()",
+                "location.hash = '#/chat/{}'; true",
                 second.id
             ))
             .await
@@ -3196,8 +3197,10 @@ async fn chat_remembers_selector_changes_after_navigation() {
             .wait_for(
                 &page,
                 &format!(
-                    "location.hash === '#/chat/{}' && document.getElementById('talk-agent')?.value === '{}'",
-                    second.id, agent
+                    "location.hash === '#/chat/{}' \
+                     && document.getElementById('talk-meta')?.title.startsWith('{}\\n') \
+                     && document.getElementById('talk-agent')?.value === '{}'",
+                    second.id, second.id, agent
                 ),
                 w,
             )
