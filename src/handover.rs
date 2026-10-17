@@ -389,7 +389,11 @@ pub(crate) fn has_resume_checkpoint(state: &RunState, home: &Path) -> bool {
 
 /// The scan only finds a possible holder. Driver claims share this lock, so
 /// reload and validate the candidate while holding it through removal/rollback.
-fn locked_holder(home: &Path, id: &str, path: &Path) -> Result<(RunState, usize, std::fs::File)> {
+fn locked_holder(
+    home: &Path,
+    id: &str,
+    path: &Path,
+) -> Result<(RunState, usize, crate::pr_head::OwnerLock)> {
     let owner = crate::pr_head::owner_lock(home, id)?;
     let state = RunState::load_under(id, home)?;
     let index = state

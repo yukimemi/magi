@@ -842,6 +842,8 @@ enum ActionDecision {
     Resume(String),
     /// Requeue as a fresh competition.
     Requeue,
+    /// Hold the task by explicit operator choice.
+    Hold,
     /// Close the task as done.
     Done,
     /// The question is about an earlier attempt than the task's latest; it
@@ -907,6 +909,7 @@ where
     }
     match action {
         ask::ChoiceAction::Requeue => ActionDecision::Requeue,
+        ask::ChoiceAction::Hold => ActionDecision::Hold,
         ask::ChoiceAction::Done => ActionDecision::Done,
         ask::ChoiceAction::Resume { run } => {
             if task.runs.last() != Some(run) {
@@ -1177,7 +1180,10 @@ pub(crate) fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &
         });
         let ran = matches!(
             decision,
-            ActionDecision::Resume(_) | ActionDecision::Requeue | ActionDecision::Done
+            ActionDecision::Resume(_)
+                | ActionDecision::Requeue
+                | ActionDecision::Hold
+                | ActionDecision::Done
         );
         if ran && asker_may_still_read(questions, &q, home) {
             // The asking process or its seat can still take the word; act
@@ -1208,6 +1214,7 @@ pub(crate) fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &
                 task.release_operator("choice-requeue", Some(&q.id));
                 task.requeue();
             }
+            ActionDecision::Hold => task.hold_manual(Some(q.summary.clone())),
             ActionDecision::Done => task.succeed(),
             ActionDecision::Refuse(why) => {
                 if task.operator_held() {
@@ -10359,6 +10366,74 @@ mod tests {
             assert!(still_held.review_branch.is_none());
             assert!(!still_held.fresh_start);
             assert!(queue.next_runnable().is_none());
+        }
+    }
+
+    #[test]
+    fn conductor_driver_choices_apply_from_both_queued_and_held_tasks() {
+        for held in [false, true] {
+            for retry in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let queue = Queue::at(dir.path().join("queue"));
+                let questions = Questions::at(dir.path().join("questions"));
+                let home = dir.path().join("home");
+                let mut t = task();
+                if held {
+                    t.hold_machine(Some("driver state unknown".into()));
+                }
+                queue.put(&mut t).unwrap();
+                let verdict = serde_json::from_value(serde_json::json!({
+                    "decisions": [{
+                        "id": t.id,
+                        "question": "Driver state unknown; retry the checks or hold?",
+                        "choices": ["daemon: recheck and retry", "daemon: hold the task"],
+                        "actions": {
+                            "daemon: recheck and retry": {"do": "requeue"},
+                            "daemon: hold the task": {"do": "hold"}
+                        }
+                    }]
+                }))
+                .unwrap();
+                crate::conduct::apply(&queue, &questions, &verdict).unwrap();
+                assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Blocked);
+                let mut q = questions.list().pop().unwrap();
+                let choice = if retry {
+                    "daemon: recheck and retry"
+                } else {
+                    "daemon: hold the task"
+                };
+                assert_eq!(q.actions.len(), 2);
+                q.answer(ask::Answer::Choice(choice.into())).unwrap();
+                questions.put(&mut q).unwrap();
+
+                // Match the daemon's deterministic sweep before scheduling.
+                resolve_blockers(&queue, &questions);
+                apply_choice_actions(&queue, &questions, &home);
+                let after = queue.get(&t.id).unwrap();
+                assert_eq!(
+                    after.status,
+                    if retry {
+                        TaskStatus::Queued
+                    } else {
+                        TaskStatus::Held
+                    }
+                );
+                assert!(after.action_applied(&q.id));
+                assert_eq!(after.operator_held(), !retry);
+                assert_eq!(after.answers.len(), 1);
+
+                // A later operator decision must not replay this answer.
+                let mut changed = after;
+                if retry {
+                    changed.hold_manual(Some("later hold".into()));
+                } else {
+                    changed.release_operator("test", None);
+                }
+                let expected = changed.status;
+                queue.put(&mut changed).unwrap();
+                apply_choice_actions(&queue, &questions, &home);
+                assert_eq!(queue.get(&t.id).unwrap().status, expected);
+            }
         }
     }
 

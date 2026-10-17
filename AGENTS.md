@@ -1142,7 +1142,10 @@ protects a live driver; a matching released lease, explicit graph exit, or prove
 process identity loss establishes a stopped driver. A free lock without matching
 pass metadata is not evidence for a legacy run. Unknown stays unknown; an owner
 answer never substitutes for proof. Questions offer executable retry/recheck or
-hold actions, never ask the owner to certify death.
+hold actions, never ask the owner to certify death. Conductor decisions attach
+`actions` by exact choice label: `{"do":"requeue"}` for retry/recheck and
+`{"do":"hold"}` for an explicit operator hold. The daemon applies the selected
+action once after resolving the question blocker; labels alone never act.
 
 A predecessor with resumable publication, landing, approval, merge-decision,
 armed-merge or repair work, or an open question, must keep its existing graph.

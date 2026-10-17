@@ -253,18 +253,20 @@ pub enum ChoiceAction {
     },
     /// Requeue the task as a fresh competition.
     Requeue,
+    /// Hold the task until the operator releases it.
+    Hold,
     /// Close the task as done.
     Done,
 }
 
 impl ChoiceAction {
     /// Parse a `--action` value: `<label>=<verb>`, where the verb is
-    /// `resume[:<run>]`, `requeue` or `done`. A `resume` without a run takes
+    /// `resume[:<run>]`, `requeue`, `hold` or `done`. A `resume` without a run takes
     /// `default_run` (the asker's own `MAGI_RUN`). Returns the label and its
     /// action; whether the label is one of the choices is the caller's check.
     pub fn parse(spec: &str, default_run: &str) -> Result<(String, Self)> {
         let Some((label, verb)) = spec.rsplit_once('=') else {
-            bail!("`--action {spec}` must look like `<choice>=<resume[:run]|requeue|done>`");
+            bail!("`--action {spec}` must look like `<choice>=<resume[:run]|requeue|hold|done>`");
         };
         let label = label.trim();
         if label.is_empty() {
@@ -284,10 +286,11 @@ impl ChoiceAction {
                 }
             }
             None if verb == "requeue" => Self::Requeue,
+            None if verb == "hold" => Self::Hold,
             None if verb == "done" => Self::Done,
             _ => bail!(
                 "unknown action `{verb}` in `--action {spec}`; \
-                 use resume[:<run>], requeue or done"
+                 use resume[:<run>], requeue, hold or done"
             ),
         };
         Ok((label.to_owned(), action))
@@ -298,6 +301,7 @@ impl ChoiceAction {
         match self {
             Self::Resume { run } => format!("resume run {}", short(run)),
             Self::Requeue => "requeue the task".to_owned(),
+            Self::Hold => "hold the task until the operator releases it".to_owned(),
             Self::Done => "mark the task done".to_owned(),
         }
     }
@@ -3759,6 +3763,11 @@ mod tests {
         assert_eq!(
             ChoiceAction::parse("x=requeue", "").unwrap().1,
             ChoiceAction::Requeue
+        );
+
+        assert_eq!(
+            ChoiceAction::parse("x=hold", "").unwrap().1,
+            ChoiceAction::Hold
         );
 
         for bad in [

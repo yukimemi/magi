@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 /// Serializes driver claims with publication takeover. The file stays in place:
 /// unlinking a locked inode would let a second caller lock a different one.
 /// Contention fails closed rather than blocking an async executor.
-pub(crate) fn owner_lock(home: &Path, id: &str) -> Result<std::fs::File> {
+pub(crate) fn owner_lock(home: &Path, id: &str) -> Result<OwnerLock> {
     let path = home.join("runs").join(id).join("pr-owner.lock");
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -21,7 +21,24 @@ pub(crate) fn owner_lock(home: &Path, id: &str) -> Result<std::fs::File> {
         .open(path)
         .context("open public head ownership lock")?;
     try_lock_file(&file).context("public head ownership is being updated; retry later")?;
-    Ok(file)
+    Ok(OwnerLock { _file: file })
+}
+
+/// Explicitly unlock on Unix: another test/thread can fork while this lock is
+/// held. Its inherited descriptor can survive our close until exec, so closing
+/// alone does not necessarily release the shared open-file-description lock.
+pub(crate) struct OwnerLock {
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor is owned by this live guard. LOCK_UN releases
+        // its flock even if a fork temporarily retains a duplicate descriptor.
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 // std::fs::File locking requires Rust 1.89; keep the declared 1.85 MSRV.
@@ -113,7 +130,7 @@ async fn predecessors(
     state: &RunState,
     home: &Path,
     head: &str,
-) -> Result<Vec<(RunState, std::fs::File)>> {
+) -> Result<Vec<(RunState, OwnerLock)>> {
     let common = git::git(
         &state.repo,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -474,6 +491,24 @@ async fn checked_gh(repo: &Path, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_lock_releases_even_while_a_duplicate_descriptor_is_open() {
+        let home = tempfile::tempdir().unwrap();
+        let state = predecessor(home.path());
+        let owner = owner_lock(home.path(), &state.id).unwrap();
+        // Models the shared file description inherited across a concurrent
+        // fork, before that child reaches exec and closes CLOEXEC descriptors.
+        let inherited = owner._file.try_clone().unwrap();
+        assert!(owner_lock(home.path(), &state.id).is_err());
+        drop(owner);
+        let next = owner_lock(home.path(), &state.id).unwrap();
+        drop(inherited);
+        assert!(owner_lock(home.path(), &state.id).is_err());
+        drop(next);
+        assert!(owner_lock(home.path(), &state.id).is_ok());
+    }
 
     fn predecessor(home: &Path) -> RunState {
         let mut s = RunState::new(

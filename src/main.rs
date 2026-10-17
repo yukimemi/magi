@@ -471,7 +471,7 @@ enum Command {
         #[arg(long = "choice", conflicts_with = "wait")]
         choices: Vec<String>,
         /// Have the daemon act when a choice is answered:
-        /// `<choice>=resume[:<run>]`, `<choice>=requeue` or `<choice>=done`.
+        /// `<choice>=resume[:<run>]`, `<choice>=requeue`, `<choice>=hold` or `<choice>=done`.
         /// The choice must be one of the `--choice` values, matched exactly;
         /// `resume` without a run means this run (`MAGI_RUN`). The daemon acts
         /// on the task that owns the run - resuming a run, requeuing the task
