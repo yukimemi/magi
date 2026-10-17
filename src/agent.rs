@@ -91,7 +91,7 @@ pub fn has_session(kind: AgentKind, seat: &SeatState, sessions_enabled: bool) ->
 }
 
 /// One agent invocation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Invocation<'a> {
     /// Working directory. Always a real checkout, so every CLI can read the
     /// repository without per-vendor "extra directory" flags.
@@ -136,10 +136,44 @@ pub struct Invocation<'a> {
     /// caller, not here.
     pub attachments: &'a [PathBuf],
     /// Directories outside `cwd` the seat may write, when it may write at all.
-    /// Only codex's `workspace-write` sandbox is confined to the workspace, so
-    /// only it needs this: a deputy's `magi ask` writes the question store,
-    /// which lives under magi's data directory, not in the repository.
+    /// Explicit, purpose-specific grants (for example a deputy's stores).
+    /// Repository editing seats also receive the shared Git directory and
+    /// question control-plane directories in [`invoke`].
     pub writable: &'a [PathBuf],
+}
+
+fn repository_writer(inv: &Invocation<'_>) -> bool {
+    inv.allow_write
+        && matches!(
+            inv.node,
+            "implement" | "fix" | "graft" | "gate-fix" | "land" | "rebase"
+        )
+}
+
+/// Resolve the additional write scope for a repository editing seat.
+///
+/// Resolve Git's common directory from the actual seat checkout, never by
+/// assuming `.git` is a directory. Canonicalize directories before handing
+/// them to a sandbox (notably `/tmp` aliases on macOS). Failure is a startup
+/// error: do not start work with an unusable lock/question route.
+pub async fn worktree_writable_roots(cwd: &Path, home: &Path) -> Result<Vec<PathBuf>> {
+    let common = crate::git::git(
+        cwd,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .await
+    .context("resolve seat shared Git directory")?;
+    let mut roots =
+        vec![std::fs::canonicalize(common).context("canonicalize seat shared Git directory")?];
+    // Questions::put/update/beat/panels write questions. Its quiet_for hook
+    // updates matching notifications. Neither needs queue, runs, talks, nor
+    // the entire state directory.
+    for name in ["questions", "notifications"] {
+        let dir = home.join(name);
+        std::fs::create_dir_all(&dir).with_context(|| format!("prepare seat {name} directory"))?;
+        roots.push(std::fs::canonicalize(dir)?);
+    }
+    Ok(roots)
 }
 
 /// Evidence that a CLI ran out of its rate limit / quota, distinct from an
@@ -320,6 +354,21 @@ pub async fn invoke(
     seat: &mut SeatState,
     inv: &Invocation<'_>,
 ) -> Result<AgentOutput> {
+    // Apply once for initial, resumed, fallback and waiter invocations alike.
+    // Deputies/chat retain their explicit grants; read-only stays read-only.
+    let home = repository_writer(inv).then(crate::run::home);
+    let mut writable = inv.writable.to_vec();
+    if let Some(home) = &home {
+        for root in worktree_writable_roots(inv.cwd, home).await? {
+            if !writable.contains(&root) {
+                writable.push(root);
+            }
+        }
+    }
+    let inv = &Invocation {
+        writable: &writable,
+        ..inv.clone()
+    };
     tokio::fs::create_dir_all(inv.artifacts)
         .await
         .with_context(|| format!("create {}", inv.artifacts.display()))?;
@@ -367,6 +416,11 @@ pub async fn invoke(
         // No console window. `magi web` has no console of its own, so Windows
         // would give each agent a fresh one - and draw it. See `crate::proc`.
         .quiet();
+    if let Some(home) = home {
+        // Match the control-plane store we granted, even with a relative
+        // MAGI_HOME or a per-agent environment override.
+        cmd.env("MAGI_HOME", std::fs::canonicalize(home)?);
+    }
     if let Some(cache) = inv.cache_dir {
         // Same directory the verify commands build into: one cache to prune,
         // and the compile the seat pays for is the compile the gate reuses.
@@ -660,6 +714,14 @@ fn build_command(
                 let dir = parent.to_string_lossy().into_owned();
                 if !add_dirs.contains(&dir) {
                     add_dirs.push(dir);
+                }
+            }
+            if inv.allow_write {
+                for path in inv.writable {
+                    let dir = path.to_string_lossy().into_owned();
+                    if !add_dirs.contains(&dir) {
+                        add_dirs.push(dir);
+                    }
                 }
             }
             for dir in add_dirs {
@@ -1757,6 +1819,59 @@ mod tests {
         let want = "sandbox_workspace_write.writable_roots=[\"/data/questions\"]";
         assert!(mk(true).argv.windows(2).any(|w| w == ["-c", want]));
         assert!(!mk(false).argv.iter().any(|a| a.contains("writable_roots")));
+    }
+
+    #[test]
+    fn repository_write_scope_covers_editing_nodes_without_changing_other_roles() {
+        let mut i = inv(Path::new("."), Path::new("/art"), true);
+        for node in ["implement", "fix", "graft", "gate-fix", "land", "rebase"] {
+            i.node = node;
+            assert!(repository_writer(&i), "{node}");
+            i.allow_write = false;
+            assert!(!repository_writer(&i), "{node}");
+            i.allow_write = true;
+        }
+        for node in ["deputy", "chat", "judge", "review", "bump", "conduct"] {
+            i.node = node;
+            assert!(!repository_writer(&i), "{node}");
+        }
+    }
+
+    #[test]
+    fn writable_directories_reach_initial_and_resumed_adapter_commands() {
+        let roots = [
+            PathBuf::from("/shared/git"),
+            PathBuf::from("/state/questions"),
+        ];
+        for kind in [AgentKind::Codex, AgentKind::Antigravity] {
+            for resumed in [false, true] {
+                let mut seat = SeatState::new("impl-A", "a", 7);
+                if resumed {
+                    seat.turns = 1;
+                    seat.captured_session = Some("session-id".into());
+                }
+                for allow_write in [false, true] {
+                    let mut i = inv(Path::new("."), Path::new("/art"), allow_write);
+                    i.writable = &roots;
+                    let plan = build_command(&spec(kind, None), &seat, &i, Path::new("/art/p.md"))
+                        .unwrap();
+                    for root in &roots {
+                        assert_eq!(
+                            plan.argv
+                                .iter()
+                                .any(|arg| arg.contains(root.to_str().unwrap())),
+                            allow_write,
+                            "{kind:?}, resumed={resumed}: {:?}",
+                            plan.argv
+                        );
+                    }
+                    if kind == AgentKind::Codex && resumed {
+                        let at = plan.argv.iter().position(|s| s == "resume").unwrap();
+                        assert!(!plan.argv[at..].iter().any(|s| s == "-c"));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

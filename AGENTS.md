@@ -446,6 +446,17 @@ Releases / crates.io.
 
 Outside every `kata:` marker, so this survives `kata apply`.
 
+### Editing-seat filesystem scope
+
+`agent::invoke` grants repository editing nodes their actual shared Git
+directory plus the `questions` and `notifications` stores, through the backend's
+supported directory mechanism. Keep this policy centralized for initial turns,
+resumes, fallbacks and waiter delivery. Never replace it with a sandbox bypass
+or the entire state root. Deputies/chats retain explicit grants; read-only seats
+are unchanged. Directory grants permit a repository's lock contract but do not
+acquire or shorten that lock. Backend enforcement limits, host verification and
+the held-task recovery procedure are in `docs/seat-write-scope.md`.
+
 ### The package is `magi-cli`, everything else is `magi`
 
 `magi` on crates.io is an 882-byte placeholder (`description = "Placeholder"`,
