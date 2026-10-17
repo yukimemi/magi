@@ -8,10 +8,12 @@ and panel assets live in `questions`. Filing a question covers matching notices
 in `notifications` through `Questions::put` / `notices::quiet_for`.
 
 `agent::invoke` prepares these additional directories before starting editing
-nodes (`implement`, `fix`, `graft`, `gate-fix`, `land`, `rebase`). It resolves
+nodes (`implement`, `fix`, `graft`, `gate-fix`, `land`, `rebase`) and ordinary
+write-enabled chat turns. For checkouts it resolves
 `git rev-parse --path-format=absolute --git-common-dir` from the actual seat,
 canonicalizes the directories, and pins the child's `MAGI_HOME` to the parent
-store. Resolution/preparation failure prevents agent startup. The central path
+store. Checkout resolution or store preparation failure prevents agent startup;
+non-checkout command seats receive just the control-plane directories. The central path
 also covers session resume, fallback agents and waiter continuation. Recovery
 repairs use the `fix` node. Read-only bump decisions do not receive grants.
 
@@ -67,16 +69,22 @@ review cannot cause this launcher's editor to start into a lock held by its own
 readers. A reader waiting for an external lock releases its local reservation
 between nonblocking attempts, allowing an editor to proceed.
 
-Control-plane seats (`conduct`, `dupes`, `chat`, and `deputy`) stay outside
-repository scheduling and must perform no repository work. This is independent
-of write permission and explicit store grants, including ordinary chats with
-empty writable roots. They do not claim to hold a repository lease. This preserves the supported
+Control-plane seats (`conduct`, `dupes`, and `deputy`) and consulted chat turns
+with explicit question/answer-store grants stay outside repository scheduling.
+The current consultation prompt overrides the standing briefing: it permits
+only supplied conversation/question context and supported control-plane commands,
+and forbids repository inspection, fetch, tests and edits for that turn.
+Ordinary chats with empty writable roots remain repository seats: read-only
+chats receive a launcher-held lock, and write-enabled chats reserve the editor
+gate and receive shared Git and question-store grants to take their own lock.
+Control-only turns do not claim to hold a repository lease. This preserves the supported
 question/control-plane route while an editing seat waits for an answer; putting
 that route behind the editor's reservation would deadlock delivery.
 
 Repository readers (including judges, advisors and reviewers) still wait for
 the editor: allowing them through would violate the shared-lock contract.
-Non-checkout command seats need no Git resolution. Checkout detection uses the
+Non-checkout command seats need no Git resolution and receive only question and
+notification store grants when writable. Checkout detection uses the
 filesystem marker rather than localized Git errors; once a marker is found,
 resolution failures remain fatal before spawning.
 

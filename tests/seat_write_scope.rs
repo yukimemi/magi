@@ -89,9 +89,23 @@ async fn isolated_seat_scope_resolves_common_git_and_only_question_stores() {
             roots
         );
     }
-    // Bad repository resolution is fatal before creating stores or starting work.
+    // Non-checkout command seats still get the narrow question route.
+    let plain_home = fx.home.join("plain");
+    assert_eq!(
+        worktree_writable_roots(fx._tmp.path(), &plain_home)
+            .await
+            .unwrap(),
+        [
+            plain_home.join("questions").canonicalize().unwrap(),
+            plain_home.join("notifications").canonicalize().unwrap()
+        ]
+    );
+    // A broken checkout is fatal before creating stores or starting work.
+    let broken = fx._tmp.path().join("broken");
+    std::fs::create_dir(&broken).unwrap();
+    std::fs::write(broken.join(".git"), "gitdir: nonexistent\n").unwrap();
     assert!(
-        worktree_writable_roots(fx._tmp.path(), &fx.home.join("bad"))
+        worktree_writable_roots(&broken, &fx.home.join("bad"))
             .await
             .is_err()
     );
@@ -203,7 +217,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
         ]),
     };
     let artifacts = fx._tmp.path().join("artifacts");
-    for node in ["implement", "fix", "graft", "gate-fix", "land", "rebase"] {
+    for node in ["implement", "fix", "graft", "gate-fix", "land", "rebase", "chat"] {
         let mut seat = SeatState::new("fixture-seat", "fixture", 1);
         for resumed in [false, true] {
             if resumed {
@@ -467,6 +481,17 @@ mod coordination {
             "quick" => {
                 std::fs::write(marker, "ready").unwrap();
             }
+            "chat-reader" => {
+                let path = PathBuf::from(std::env::var_os("COORDINATION_LOCK").unwrap());
+                assert!(
+                    take_lock(&path).is_none(),
+                    "launcher holds real lock for chat"
+                );
+                let prompt =
+                    std::fs::read_to_string(std::env::var_os("MAGI_PROMPT_FILE").unwrap()).unwrap();
+                assert!(prompt.contains("launcher holds the exclusive repository lock"));
+                std::fs::write(marker, "ready").unwrap();
+            }
             _ => panic!("unknown coordination helper"),
         }
     }
@@ -557,10 +582,14 @@ mod coordination {
         }
         let lock = fx.primary.join(".git/kanade-sync.lock");
         assert!(take_lock(&lock).is_none());
-        // Empty writable roots are the ordinary chat path, including a chat
-        // configured to allow writes. No control role should queue on the repo.
+        let consult_roots = [fx.home.join("questions")];
+        // Only consulted chat has a control-only scope. Ordinary chat may
+        // investigate code and must wait for repository coordination.
         for node in ["conduct", "dupes", "chat", "deputy"] {
             for allow_write in [false, true] {
+                if node == "chat" && !allow_write {
+                    continue;
+                }
                 let marker = fx.home.join(format!("{node}-{allow_write}"));
                 std::fs::create_dir_all(&fx.home).unwrap();
                 let mut control_spec = spec(&fx, "quick");
@@ -570,6 +599,7 @@ mod coordination {
                 );
                 let control_inv = Invocation {
                     node,
+                    writable: if node == "chat" { &consult_roots } else { &[] },
                     ..invocation(&fx, &art, allow_write)
                 };
                 let mut seat = SeatState::new(node, "fixture", 1);
@@ -582,16 +612,27 @@ mod coordination {
                 .unwrap();
                 assert!(out.usable(), "{node}: {out:?}");
                 assert!(marker.exists());
+                if node == "chat" {
+                    let prompt = std::fs::read_to_string(art.join("fixture.prompt.md")).unwrap();
+                    assert!(prompt.contains("No repository lease is held"));
+                    assert!(prompt.contains("do not read repository files or history"));
+                }
                 assert!(take_lock(&lock).is_none(), "editor still owns real lock");
             }
         }
         // Repository readers must still respect the editor's lock, even with
         // a short decision budget; control-plane exclusions do not widen them.
-        for node in ["judge", "advise", "review"] {
+        for (node, allow_write) in [
+            ("judge", false),
+            ("advise", false),
+            ("review", false),
+            ("chat", false),
+            ("chat", true),
+        ] {
             let reader_spec = spec(&fx, "quick");
             let reader_inv = Invocation {
                 node,
-                ..invocation(&fx, &art, false)
+                ..invocation(&fx, &art, allow_write)
             };
             let mut seat = SeatState::new(node, "fixture", 1);
             assert!(
@@ -745,9 +786,12 @@ mod coordination {
     async fn external_contention_waits_without_spawning_or_charging_an_attempt() {
         let fx = registered();
         let external = take_lock(&fx.primary.join(".git/kanade-sync.lock")).unwrap();
-        let spec = spec(&fx, "quick");
+        let spec = spec(&fx, "chat-reader");
         let art = fx._tmp.path().join("art");
-        let inv = invocation(&fx, &art, false);
+        let inv = Invocation {
+            node: "chat",
+            ..invocation(&fx, &art, false)
+        };
         let mut seat = SeatState::new("reader", "fixture", 1);
         {
             let future = invoke(&spec, &mut seat, &inv);
@@ -758,7 +802,7 @@ mod coordination {
                     .is_err()
             );
             assert!(!art.exists());
-            assert!(!fx.seat.join("quick").exists());
+            assert!(!fx.seat.join("chat-reader").exists());
             drop(external);
             let out = tokio::time::timeout(Duration::from_secs(10), &mut future)
                 .await

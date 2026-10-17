@@ -139,22 +139,30 @@ pub struct Invocation<'a> {
     /// Explicit, purpose-specific grants (for example a deputy's stores).
     /// Repository editing seats also receive the shared Git directory and
     /// question control-plane directories in [`invoke`].
+    /// For chat, nonempty explicit roots with write permission designate a
+    /// control-only consultation turn; repository investigation is suspended.
     pub writable: &'a [PathBuf],
 }
 
 fn repository_writer(inv: &Invocation<'_>) -> bool {
     inv.allow_write
-        && matches!(
+        && (matches!(
             inv.node,
             "implement" | "fix" | "graft" | "gate-fix" | "land" | "rebase"
-        )
+        ) || (inv.node == "chat" && repository_seat(inv)))
+}
+
+fn consulted_chat(inv: &Invocation<'_>) -> bool {
+    // talk::turn supplies explicit question/answer-store roots only while
+    // delivering a consultation or an authorized hold.
+    inv.node == "chat" && inv.allow_write && !inv.writable.is_empty()
 }
 
 fn repository_seat(inv: &Invocation<'_>) -> bool {
     // These roles consume supplied state, prompts and conversation history.
     // In particular, they must be able to deliver an answer or make queue
     // decisions while an editor holds its reservation waiting for that answer.
-    !matches!(inv.node, "deputy" | "chat" | "conduct" | "dupes")
+    !matches!(inv.node, "deputy" | "conduct" | "dupes") && !consulted_chat(inv)
 }
 
 /// Resolve the additional write scope for a repository editing seat.
@@ -368,10 +376,17 @@ pub async fn invoke(
     } else {
         None
     };
-    let prompt = lease.as_ref().filter(|lease| lease.delegated).map(|lease| format!(
+    let prompt = if consulted_chat(inv) {
+        Some(format!(
+            "{}\n\nCurrent turn scope: answer the supplied consultation or authorized hold using the conversation and supplied question context and supported magi control-plane commands only. This overrides repository investigation permissions in the standing briefing or earlier turns. No repository lease is held: do not read repository files or history, fetch, run tests, or edit repository files. If repository investigation is needed, report that it must wait for a normal repository-coordinated turn after the consultation is resolved.",
+            inv.prompt
+        ))
+    } else {
+        lease.as_ref().filter(|lease| lease.delegated).map(|lease| format!(
         "Repository coordination: the launcher holds the exclusive repository lock at {} on behalf of this read-only seat for this entire invocation. Do not acquire a second lock or release/delete that file. Your filesystem access remains read-only.\n\n{}",
         lease.path.display(), inv.prompt
-    ));
+        ))
+    };
     // Apply once for initial, resumed, fallback and waiter invocations alike.
     // Deputies/chat retain their explicit grants; read-only stays read-only.
     let home = repository_writer(inv).then(crate::run::home);
@@ -1856,17 +1871,29 @@ mod tests {
     #[test]
     fn repository_write_scope_covers_editing_nodes_without_changing_other_roles() {
         let mut i = inv(Path::new("."), Path::new("/art"), true);
-        for node in ["implement", "fix", "graft", "gate-fix", "land", "rebase"] {
+        for node in [
+            "implement",
+            "fix",
+            "graft",
+            "gate-fix",
+            "land",
+            "rebase",
+            "chat",
+        ] {
             i.node = node;
             assert!(repository_writer(&i), "{node}");
             i.allow_write = false;
             assert!(!repository_writer(&i), "{node}");
             i.allow_write = true;
         }
-        for node in ["deputy", "chat", "judge", "review", "bump", "conduct"] {
+        for node in ["deputy", "judge", "review", "bump", "conduct"] {
             i.node = node;
             assert!(!repository_writer(&i), "{node}");
         }
+        i.node = "chat";
+        let roots = [PathBuf::from("/questions")];
+        i.writable = &roots;
+        assert!(!repository_writer(&i), "consultation keeps explicit grants");
     }
 
     #[test]
