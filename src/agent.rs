@@ -93,6 +93,8 @@ pub fn has_session(kind: AgentKind, seat: &SeatState, sessions_enabled: bool) ->
 /// One agent invocation.
 #[derive(Debug, Clone)]
 pub struct Invocation<'a> {
+    /// Rendered repository coordination policy for this invocation.
+    pub coordination: Option<&'a crate::config::Coordination>,
     /// Working directory. Always a real checkout, so every CLI can read the
     /// repository without per-vendor "extra directory" flags.
     pub cwd: &'a Path,
@@ -372,7 +374,8 @@ pub async fn invoke(
     // budget. Readers hold the real lock; editors exclude local readers while
     // taking their own repository-prescribed lock inside the seat.
     let lease = if repository_seat(inv) {
-        crate::repo_lock::SeatLease::for_checkout(inv.cwd, inv.allow_write).await?
+        crate::repo_lock::SeatLease::for_checkout(inv.cwd, inv.allow_write, inv.coordination)
+            .await?
     } else {
         None
     };
@@ -1741,6 +1744,7 @@ mod tests {
 
     fn inv<'a>(cwd: &'a Path, art: &'a Path, allow_write: bool) -> Invocation<'a> {
         Invocation {
+            coordination: None,
             cwd,
             prompt: "do the thing",
             timeout: Duration::from_secs(900),
@@ -2298,6 +2302,7 @@ mod tests {
             &spec(AgentKind::Antigravity, None),
             &seat,
             &Invocation {
+                coordination: None,
                 cwd: Path::new("."),
                 prompt: "p",
                 timeout: Duration::from_secs(3600),
@@ -2765,6 +2770,7 @@ mod tests {
             &s,
             &mut seat,
             &Invocation {
+                coordination: None,
                 cwd: dir.path(),
                 prompt: "unused",
                 timeout: Duration::from_secs(30),
@@ -2802,6 +2808,7 @@ mod tests {
             &s,
             &mut seat,
             &Invocation {
+                coordination: None,
                 cwd: dir.path(),
                 prompt: "unused",
                 timeout: Duration::from_secs(30),
@@ -2850,6 +2857,7 @@ mod tests {
             &s,
             &mut seat,
             &Invocation {
+                coordination: None,
                 cwd: dir.path(),
                 prompt: "unused",
                 timeout: Duration::from_secs(30),
@@ -2897,6 +2905,7 @@ mod tests {
             &s,
             &mut seat,
             &Invocation {
+                coordination: None,
                 cwd: dir.path(),
                 prompt: &big,
                 timeout: Duration::from_secs(60),
@@ -2927,6 +2936,7 @@ mod tests {
             &s,
             &mut seat,
             &Invocation {
+                coordination: None,
                 cwd: dir.path(),
                 prompt: "unused",
                 timeout: Duration::from_millis(300),
@@ -2963,6 +2973,7 @@ mod tests {
             &s,
             &mut seat,
             &Invocation {
+                coordination: None,
                 cwd: dir.path(),
                 prompt: "unused",
                 // Wide enough to cover process-spawn latency inside a loaded

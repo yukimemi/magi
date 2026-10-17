@@ -179,6 +179,7 @@ pub async fn rebase_with_fixer(
                 &spec,
                 &mut seat,
                 &Invocation {
+                    coordination: state.config.coordination.as_ref(),
                     cwd: scratch,
                     prompt: &prompt_text,
                     timeout: Duration::from_secs(state.config.graph.timeout_fix),

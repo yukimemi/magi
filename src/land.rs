@@ -4641,6 +4641,7 @@ pub async fn fix_round(
             &spec,
             &mut seat,
             &Invocation {
+                coordination: state.config.coordination.as_ref(),
                 cwd: &winner.worktree,
                 prompt: &prompt,
                 timeout: Duration::from_secs(state.config.graph.timeout_fix),
@@ -4702,7 +4703,12 @@ pub async fn fix_round(
         Duration::from_secs(state.config.graph.timeout_resource_wait),
         || false,
     );
-    let coordination = crate::repo_lock::SeatLease::operation_with(&winner.worktree, &wait).await?;
+    let coordination = crate::repo_lock::SeatLease::operation_with(
+        &winner.worktree,
+        state.config.coordination.as_ref(),
+        &wait,
+    )
+    .await?;
     match git::rescue_commit(
         &winner.worktree,
         &format!("magi: land round {round} fixes (uncommitted work)"),

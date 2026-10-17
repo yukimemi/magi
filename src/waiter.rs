@@ -158,6 +158,7 @@ pub fn decide_owned(
 
 /// Everything needed to resume one seat.
 struct Target {
+    coordination: Option<crate::config::Coordination>,
     spec: AgentSpec,
     seat: SeatState,
     cwd: PathBuf,
@@ -358,6 +359,7 @@ impl Waiter {
             return Err("the seat has no session to resume".to_owned());
         }
         Ok(Target {
+            coordination: cfg.coordination.clone(),
             spec,
             seat,
             cwd,
@@ -517,6 +519,7 @@ impl Waiter {
         let stem = format!("deliver-{}", now.as_second());
         let cache_dir = None;
         let inv = Invocation {
+            coordination: target.coordination.as_ref(),
             cwd: &target.cwd,
             prompt: &body,
             timeout: DELIVERY_TIMEOUT,

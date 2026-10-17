@@ -183,8 +183,12 @@ impl SeatLease {
     /// Launcher-owned VCS/setup work must exclude both seats and external
     /// updaters. Unlike an editing seat, it has no child agent to take the OS
     /// lock. Release this lease before invoking a seat (the gate is not reentrant).
-    pub(crate) async fn operation_with(cwd: &Path, wait: &WaitPolicy) -> Result<Option<Self>> {
-        let Some(mut permit) = Self::checkout(cwd, true, wait).await? else {
+    pub(crate) async fn operation_with(
+        cwd: &Path,
+        coordination: Option<&crate::config::Coordination>,
+        wait: &WaitPolicy,
+    ) -> Result<Option<Self>> {
+        let Some(mut permit) = Self::checkout(cwd, true, coordination, wait).await? else {
             return Ok(None);
         };
         permit._lock = Some(
@@ -205,26 +209,39 @@ impl SeatLease {
         Ok(Some(permit))
     }
 
-    pub(crate) async fn for_checkout(cwd: &Path, allow_write: bool) -> Result<Option<Self>> {
-        Self::checkout_with(cwd, allow_write, &WaitPolicy::current()).await
+    pub(crate) async fn for_checkout(
+        cwd: &Path,
+        allow_write: bool,
+        coordination: Option<&crate::config::Coordination>,
+    ) -> Result<Option<Self>> {
+        Self::checkout_with(cwd, allow_write, coordination, &WaitPolicy::current()).await
     }
 
     pub(crate) async fn checkout_with(
         cwd: &Path,
         allow_write: bool,
+        coordination: Option<&crate::config::Coordination>,
         wait: &WaitPolicy,
     ) -> Result<Option<Self>> {
-        Self::checkout(cwd, allow_write, wait).await
+        Self::checkout(cwd, allow_write, coordination, wait).await
     }
 
-    async fn checkout(cwd: &Path, allow_write: bool, wait: &WaitPolicy) -> Result<Option<Self>> {
+    async fn checkout(
+        cwd: &Path,
+        allow_write: bool,
+        coordination: Option<&crate::config::Coordination>,
+        wait: &WaitPolicy,
+    ) -> Result<Option<Self>> {
+        let Some(coordination) = coordination else {
+            return Ok(None);
+        };
         let Some(common) = common_dir(cwd).await? else {
             return Ok(None);
         };
-        match std::fs::read_to_string(common.join("kanade-sync.contract")) {
+        match std::fs::read_to_string(common.join(&coordination.contract_file)) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).context("read repository coordination contract"),
-            Ok(contract) if contract.trim() == "shared-lock-v1" => {}
+            Ok(contract) if contract.trim() == coordination.contract_token => {}
             Ok(_) => bail!("unsupported repository coordination contract"),
         }
         // Group termination is required to safely release coordination after
@@ -233,7 +250,7 @@ impl SeatLease {
         if !cfg!(unix) {
             bail!("supervised repository coordination currently requires Unix process groups");
         }
-        let path = common.join("kanade-sync.lock");
+        let path = common.join(&coordination.lock_file);
         let gate = {
             let mut gates = GATES
                 .lock()
@@ -366,36 +383,123 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn default_off_takes_no_lock_even_if_contract_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::git::git(dir.path(), &["init"]).await.unwrap();
+        let common = common_dir(dir.path()).await.unwrap().unwrap();
+        let policy = crate::config::test_coordination().unwrap();
+        std::fs::write(common.join(&policy.contract_file), &policy.contract_token).unwrap();
+        let wait = WaitPolicy::new(Duration::ZERO, || false);
+        for allow_write in [false, true] {
+            assert!(
+                SeatLease::checkout_with(dir.path(), allow_write, None, &wait)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(
+            SeatLease::operation_with(dir.path(), None, &wait)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!common.join(&policy.lock_file).exists());
+    }
+
+    #[tokio::test]
+    async fn unconfigured_coordination_ignores_contracts_and_broken_checkouts() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::git::git(dir.path(), &["init"]).await.unwrap();
+        let common = common_dir(dir.path()).await.unwrap().unwrap();
+        std::fs::write(common.join("updater.contract"), "unsupported").unwrap();
+        let wait = WaitPolicy::new(Duration::ZERO, || true);
+        assert!(
+            SeatLease::checkout_with(dir.path(), false, None, &wait)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            SeatLease::operation_with(dir.path(), None, &wait)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!common.join("updater.lock").exists());
+        assert!(
+            SeatLease::for_checkout(
+                dir.path(),
+                false,
+                crate::config::test_coordination().as_ref()
+            )
+            .await
+            .is_err()
+        );
+        let broken = tempfile::tempdir().unwrap();
+        std::fs::write(broken.path().join(".git"), "gitdir: missing\n").unwrap();
+        assert!(
+            SeatLease::for_checkout(broken.path(), false, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     #[cfg(unix)]
     async fn queued_editors_outlive_the_external_wait_limit() {
         let dir = tempfile::tempdir().unwrap();
         crate::git::git(dir.path(), &["init"]).await.unwrap();
         let common = common_dir(dir.path()).await.unwrap().unwrap();
-        std::fs::write(common.join("kanade-sync.contract"), "shared-lock-v1\n").unwrap();
+        std::fs::write(common.join("updater.contract"), "test-protocol-v1\n").unwrap();
         let short = WaitPolicy::new(Duration::from_millis(20), || false);
-        let first = SeatLease::checkout_with(dir.path(), true, &short)
-            .await
-            .unwrap();
-        let (second, ()) =
-            tokio::join!(SeatLease::checkout_with(dir.path(), true, &short), async {
+        let first = SeatLease::checkout_with(
+            dir.path(),
+            true,
+            crate::config::test_coordination().as_ref(),
+            &short,
+        )
+        .await
+        .unwrap();
+        let (second, ()) = tokio::join!(
+            async {
+                SeatLease::checkout_with(
+                    dir.path(),
+                    true,
+                    crate::config::test_coordination().as_ref(),
+                    &short,
+                )
+                .await
+            },
+            async {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 drop(first);
-            });
+            }
+        );
         drop(second.unwrap());
         // A parked node can save a completed seat when coordination is free.
         let parked = WaitPolicy::new(Duration::from_millis(20), || true);
         drop(
-            SeatLease::operation_with(dir.path(), &parked)
-                .await
-                .unwrap(),
+            SeatLease::operation_with(
+                dir.path(),
+                crate::config::test_coordination().as_ref(),
+                &parked,
+            )
+            .await
+            .unwrap(),
         );
         // No contract means no resource wait, even after a park request.
-        std::fs::remove_file(common.join("kanade-sync.contract")).unwrap();
+        std::fs::remove_file(common.join("updater.contract")).unwrap();
         assert!(
-            SeatLease::operation_with(dir.path(), &parked)
-                .await
-                .unwrap()
-                .is_none()
+            SeatLease::operation_with(
+                dir.path(),
+                crate::config::test_coordination().as_ref(),
+                &parked
+            )
+            .await
+            .unwrap()
+            .is_none()
         );
     }
 
@@ -406,28 +510,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::git::git(dir.path(), &["init"]).await.unwrap();
         let common = common_dir(dir.path()).await.unwrap().unwrap();
-        std::fs::write(common.join("kanade-sync.contract"), "shared-lock-v1\n").unwrap();
-        let path = common.join("kanade-sync.lock");
+        std::fs::write(common.join("updater.contract"), "test-protocol-v1\n").unwrap();
+        let path = common.join("updater.lock");
         let short = WaitPolicy::new(Duration::from_millis(100), || false);
         let external = exclusive(&path).unwrap();
         assert!(
-            SeatLease::checkout_with(dir.path(), false, &short)
-                .await
-                .err()
-                .expect("busy")
-                .is::<ResourceBlocked>()
+            SeatLease::checkout_with(
+                dir.path(),
+                false,
+                crate::config::test_coordination().as_ref(),
+                &short
+            )
+            .await
+            .err()
+            .expect("busy")
+            .is::<ResourceBlocked>()
         );
         assert!(
-            SeatLease::operation_with(dir.path(), &short)
-                .await
-                .err()
-                .expect("busy")
-                .is::<ResourceBlocked>()
+            SeatLease::operation_with(
+                dir.path(),
+                crate::config::test_coordination().as_ref(),
+                &short
+            )
+            .await
+            .err()
+            .expect("busy")
+            .is::<ResourceBlocked>()
         );
         drop(external);
-        let editor = SeatLease::checkout_with(dir.path(), true, &short)
-            .await
-            .unwrap();
+        let editor = SeatLease::checkout_with(
+            dir.path(),
+            true,
+            crate::config::test_coordination().as_ref(),
+            &short,
+        )
+        .await
+        .unwrap();
         for operation in [false, true] {
             let cancelled = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&cancelled);
@@ -436,9 +554,20 @@ mod tests {
             let (result, ()) = tokio::join!(
                 async {
                     if operation {
-                        SeatLease::operation_with(dir.path(), &wait).await
+                        SeatLease::operation_with(
+                            dir.path(),
+                            crate::config::test_coordination().as_ref(),
+                            &wait,
+                        )
+                        .await
                     } else {
-                        SeatLease::checkout_with(dir.path(), false, &wait).await
+                        SeatLease::checkout_with(
+                            dir.path(),
+                            false,
+                            crate::config::test_coordination().as_ref(),
+                            &wait,
+                        )
+                        .await
                     }
                 },
                 async {
@@ -454,7 +583,15 @@ mod tests {
         }
         drop(editor);
         // Timed-out and cancelled waiters must not retain a reservation.
-        drop(SeatLease::operation_with(dir.path(), &short).await.unwrap());
+        drop(
+            SeatLease::operation_with(
+                dir.path(),
+                crate::config::test_coordination().as_ref(),
+                &short,
+            )
+            .await
+            .unwrap(),
+        );
         assert!(exclusive(&path).is_ok());
     }
 
@@ -470,13 +607,21 @@ mod tests {
         );
         std::fs::write(dir.path().join(".git"), "gitdir: missing-git-directory\n").unwrap();
         assert!(common_dir(dir.path()).await.is_err());
-        assert!(SeatLease::for_checkout(dir.path(), false).await.is_err());
+        assert!(
+            SeatLease::for_checkout(
+                dir.path(),
+                false,
+                crate::config::test_coordination().as_ref()
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[test]
     fn readers_share_real_lock_until_the_last_seat_finishes() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kanade-sync.lock");
+        let path = dir.path().join("updater.lock");
         let first = Lease::acquire(path.clone()).unwrap();
         let second = Lease::acquire(path.clone()).unwrap();
         assert!(Arc::ptr_eq(&first, &second));
@@ -492,7 +637,7 @@ mod tests {
     #[cfg(unix)]
     fn last_lease_unlocks_even_with_an_inherited_descriptor() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kanade-sync.lock");
+        let path = dir.path().join("updater.lock");
         let lease = Lease::acquire(path.clone()).unwrap();
         // dup shares the open file description, just like a descriptor
         // inherited across fork before CLOEXEC takes effect.
@@ -511,8 +656,15 @@ mod tests {
     #[test]
     fn external_contention_refuses_a_seat_without_waiting() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kanade-sync.lock");
-        let external = exclusive(&path).unwrap();
+        let path = dir.path().join("updater.lock");
+        // Keep this owner outside READERS, but explicitly unlock on drop:
+        // another test's fork may inherit the descriptor before exec.
+        let external = Lease {
+            _file: exclusive(&path).unwrap(),
+        };
+        // Model that inherited open file description without a timing race.
+        #[cfg(unix)]
+        let _inherited = external._file.try_clone().unwrap();
         assert!(Lease::acquire(path.clone()).is_err());
         drop(external);
         assert!(Lease::acquire(path).is_ok());

@@ -718,7 +718,10 @@ impl Runner {
             task_instruction: None,
         });
         let wait = repository_wait(&state, None);
-        let coordination = crate::repo_lock::SeatLease::operation_with(&repo, &wait).await?;
+        let coordination_config = state.config.coordination.clone();
+        let coordination =
+            crate::repo_lock::SeatLease::operation_with(&repo, coordination_config.as_ref(), &wait)
+                .await?;
         let released = crate::handover::release(&repo, branch, &state.id, &takeover).await?;
         if let Some(released) = &released {
             state.event(
@@ -771,7 +774,12 @@ impl Runner {
         if opened.is_err()
             && let Some(released) = &released
         {
-            let _coordination = crate::repo_lock::SeatLease::operation_with(&repo, &wait).await?;
+            let _coordination = crate::repo_lock::SeatLease::operation_with(
+                &repo,
+                coordination_config.as_ref(),
+                &wait,
+            )
+            .await?;
             released.restore(&repo, branch).await;
         }
         opened
@@ -2119,6 +2127,7 @@ impl Runner {
                     spec,
                     &mut seat,
                     &Invocation {
+                        coordination: self.state.config.coordination.as_ref(),
                         cwd,
                         prompt: &prompt,
                         timeout,
@@ -9033,7 +9042,9 @@ async fn coordinate_operation(
     cwd: &Path,
     wait: &crate::repo_lock::WaitPolicy,
 ) -> Result<Option<crate::repo_lock::SeatLease>> {
-    let result = crate::repo_lock::SeatLease::operation_with(cwd, wait).await;
+    let result =
+        crate::repo_lock::SeatLease::operation_with(cwd, state.config.coordination.as_ref(), wait)
+            .await;
     if let Err(e) = &result {
         record_repository_block(state, e);
     }
@@ -9211,6 +9222,7 @@ async fn wave(
             .map(Path::to_path_buf);
         let spawned_tx = spawned_tx.clone();
         let repository_wait = repository_wait.clone();
+        let coordination = state.config.coordination.clone();
         set.spawn(async move {
             // A wait for a parallelism slot is scheduling, not the agent: it
             // is bounded by its own limit and ends as a resource block, never
@@ -9235,6 +9247,7 @@ async fn wave(
                     &job.spec,
                     &mut seat,
                     &Invocation {
+                        coordination: coordination.as_ref(),
                         cwd: &job.cwd,
                         prompt: &job.prompt,
                         timeout: job.timeout,
@@ -12022,7 +12035,7 @@ mod tests {
             (failed.clone(), "first".into()),
             (successor.clone(), "second".into()),
         ];
-        let lock_path = runner.state.repo.join(".git/kanade-sync.lock");
+        let lock_path = runner.state.repo.join(".git/updater.lock");
         let external = std::fs::File::create(&lock_path).unwrap();
         assert_eq!(
             unsafe { libc::flock(external.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
@@ -12116,9 +12129,10 @@ mod tests {
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         init_repo(&repo);
-        std::fs::write(repo.join(".git/kanade-sync.contract"), "shared-lock-v1\n").unwrap();
+        std::fs::write(repo.join(".git/updater.contract"), "test-protocol-v1\n").unwrap();
         let mut runner = runner_at(RunStatus::Prep);
         runner.state.repo = repo.clone();
+        runner.state.config.coordination = crate::config::test_coordination();
         runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
         runner.state.config.graph.worktree_root = Some(root.join("wt"));
         runner.state.config.graph.advise = false;
@@ -12135,7 +12149,7 @@ mod tests {
             let tmp = tempfile::tempdir().unwrap();
             let mut runner = registered_runner(tmp.path()).await;
             if !registered {
-                std::fs::remove_file(runner.state.repo.join(".git/kanade-sync.contract")).unwrap();
+                std::fs::remove_file(runner.state.repo.join(".git/updater.contract")).unwrap();
             }
             let marker = tmp.path().join("started");
             let release = tmp.path().join("release");
@@ -12282,9 +12296,13 @@ mod tests {
                     repair: crate::recovery::Repair::NotStarted,
                 });
             }
-            let reader = crate::repo_lock::SeatLease::for_checkout(&winner.worktree, false)
-                .await
-                .unwrap();
+            let reader = crate::repo_lock::SeatLease::for_checkout(
+                &winner.worktree,
+                false,
+                crate::config::test_coordination().as_ref(),
+            )
+            .await
+            .unwrap();
             let pause = runner.pause.clone();
             let (result, ()) = tokio::join!(
                 async {
@@ -12319,7 +12337,7 @@ mod tests {
             runner.state.resource_block = None;
             // Deferred restoration must still respect an external lock owner.
             let external =
-                std::fs::File::create(runner.state.repo.join(".git/kanade-sync.lock")).unwrap();
+                std::fs::File::create(runner.state.repo.join(".git/updater.lock")).unwrap();
             assert_eq!(
                 unsafe { libc::flock(external.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
                 0
@@ -12402,7 +12420,7 @@ mod tests {
         let unfinished = git::rev_parse(&winner.worktree, "HEAD").await.unwrap();
         let leftover = winner.worktree.join("leftover");
         std::fs::write(&leftover, "untrusted edits").unwrap();
-        let path = runner.state.repo.join(".git/kanade-sync.lock");
+        let path = runner.state.repo.join(".git/updater.lock");
         let external = std::fs::File::create(&path).unwrap();
         assert_eq!(
             unsafe { libc::flock(external.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
@@ -12453,8 +12471,7 @@ mod tests {
         runner.state.prep_complete = Some(false);
         runner.state.config.graph.timeout_resource_wait = 1;
         runner.state.save().unwrap();
-        let external =
-            std::fs::File::create(runner.state.repo.join(".git/kanade-sync.lock")).unwrap();
+        let external = std::fs::File::create(runner.state.repo.join(".git/updater.lock")).unwrap();
         assert_eq!(
             unsafe { libc::flock(external.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
@@ -12505,9 +12522,14 @@ mod tests {
         // It must obtain the editor reservation and finish without waiting
         // for the gate that is queued behind its cache.
         let wait = crate::repo_lock::WaitPolicy::new(Duration::from_millis(200), || false);
-        let editor = crate::repo_lock::SeatLease::checkout_with(&winner.worktree, true, &wait)
-            .await
-            .unwrap();
+        let editor = crate::repo_lock::SeatLease::checkout_with(
+            &winner.worktree,
+            true,
+            crate::config::test_coordination().as_ref(),
+            &wait,
+        )
+        .await
+        .unwrap();
         drop(editor);
         guard.release();
         let outcomes = tokio::time::timeout(Duration::from_secs(10), &mut gate)
@@ -12530,9 +12552,10 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         init_repo(&repo);
         let common = repo.join(".git");
-        std::fs::write(common.join("kanade-sync.contract"), "shared-lock-v1\n").unwrap();
+        std::fs::write(common.join("updater.contract"), "test-protocol-v1\n").unwrap();
         let mut runner = runner_at(RunStatus::Prep);
         runner.state.repo = repo.clone();
+        runner.state.config.coordination = crate::config::test_coordination();
         runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
         runner.state.config.graph.worktree_root = Some(tmp.path().join("wt"));
         runner.state.config.graph.advise = false;
@@ -12549,7 +12572,7 @@ mod tests {
             "-c".into(),
             format!("touch '{}'; echo completed", completed.display()),
         ];
-        let outsider = std::fs::File::create(common.join("kanade-sync.lock")).unwrap();
+        let outsider = std::fs::File::create(common.join("updater.lock")).unwrap();
         assert_eq!(
             unsafe { libc::flock(outsider.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
@@ -12643,8 +12666,8 @@ mod tests {
             "gate completion must release coordination"
         );
         drop(outsider);
-        std::fs::remove_file(common.join("kanade-sync.lock")).unwrap();
-        std::fs::create_dir(common.join("kanade-sync.lock")).unwrap();
+        std::fs::remove_file(common.join("updater.lock")).unwrap();
+        std::fs::create_dir(common.join("updater.lock")).unwrap();
         std::fs::remove_file(&started).unwrap();
         std::fs::remove_file(&checked).unwrap();
         let head = git::rev_parse(&winner.worktree, "HEAD").await.unwrap();
@@ -12678,14 +12701,15 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         init_repo(&repo);
         let common = repo.join(".git");
-        std::fs::write(common.join("kanade-sync.contract"), "shared-lock-v1\n").unwrap();
-        let lock = std::fs::File::create(common.join("kanade-sync.lock")).unwrap();
+        std::fs::write(common.join("updater.contract"), "test-protocol-v1\n").unwrap();
+        let lock = std::fs::File::create(common.join("updater.lock")).unwrap();
         assert_eq!(
             unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
         let mut runner = runner_at(RunStatus::Prep);
         runner.state.repo = repo.clone();
+        runner.state.config.coordination = crate::config::test_coordination();
         runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
         runner.state.config.graph.worktree_root = Some(tmp.path().join("wt"));
         runner.state.config.graph.advise = true;
@@ -12737,7 +12761,7 @@ mod tests {
                 }
             }) => result.unwrap(),
         }
-        let outsider = std::fs::File::open(common.join("kanade-sync.lock")).unwrap();
+        let outsider = std::fs::File::open(common.join("updater.lock")).unwrap();
         assert_eq!(
             unsafe { libc::flock(outsider.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             -1
@@ -12745,7 +12769,11 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(100),
-                crate::repo_lock::SeatLease::for_checkout(&repo, true)
+                crate::repo_lock::SeatLease::for_checkout(
+                    &repo,
+                    true,
+                    crate::config::test_coordination().as_ref()
+                )
             )
             .await
             .is_err(),
@@ -12774,12 +12802,13 @@ mod tests {
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         init_repo(&repo);
-        std::fs::write(repo.join(".git/kanade-sync.contract"), "shared-lock-v1\n").unwrap();
+        std::fs::write(repo.join(".git/updater.contract"), "test-protocol-v1\n").unwrap();
         // A directory at the required lock path makes opening the real lock
         // fail, rather than merely exercising an invalid registration.
-        std::fs::create_dir(repo.join(".git/kanade-sync.lock")).unwrap();
+        std::fs::create_dir(repo.join(".git/updater.lock")).unwrap();
         let mut runner = runner_at(RunStatus::Prep);
         runner.state.repo = repo.clone();
+        runner.state.config.coordination = crate::config::test_coordination();
         runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
         runner.state.config.graph.worktree_root = Some(tmp.path().join("wt"));
         runner.roles.implementers = vec![spec("implement")];
@@ -13514,9 +13543,10 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         init_repo(&repo);
         let common = repo.join(".git");
-        std::fs::write(common.join("kanade-sync.contract"), "shared-lock-v1\n").unwrap();
+        std::fs::write(common.join("updater.contract"), "test-protocol-v1\n").unwrap();
         let home = tmp.path().join("home");
         let mut config = Config::default();
+        config.coordination = crate::config::test_coordination();
         config.graph.worktree_root = Some(tmp.path().join("wt"));
         config.graph.timeout_resource_wait = 1;
         let mut state = RunState::new(
@@ -13562,7 +13592,7 @@ mod tests {
             .unwrap();
         // A separate OS handle bypasses the launcher's local gate, exactly as
         // an external updater does, and must still prevent all folding work.
-        let external = std::fs::File::create(common.join("kanade-sync.lock")).unwrap();
+        let external = std::fs::File::create(common.join("updater.lock")).unwrap();
         assert_eq!(
             unsafe { libc::flock(external.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
@@ -17325,13 +17355,14 @@ mod resource_wait_tests {
         let tmp = tempfile::tempdir().unwrap();
         crate::git::git(tmp.path(), &["init"]).await.unwrap();
         let common = tmp.path().join(".git");
-        std::fs::write(common.join("kanade-sync.contract"), "shared-lock-v1\n").unwrap();
-        let external = std::fs::File::create(common.join("kanade-sync.lock")).unwrap();
+        std::fs::write(common.join("updater.contract"), "test-protocol-v1\n").unwrap();
+        let external = std::fs::File::create(common.join("updater.lock")).unwrap();
         assert_eq!(
             unsafe { libc::flock(external.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
         let mut st = state(1);
+        st.config.coordination = crate::config::test_coordination();
         let mut reader = job(
             sh("reader", "echo must-not-run"),
             tmp.path(),
@@ -17355,9 +17386,13 @@ mod resource_wait_tests {
         assert!(st.active.is_empty() && st.quota.is_empty() && st.handovers.is_empty());
         assert!(!tmp.path().join("art/impl-A.prompt.md").exists());
         drop(external);
-        let editor = crate::repo_lock::SeatLease::for_checkout(tmp.path(), true)
-            .await
-            .unwrap();
+        let editor = crate::repo_lock::SeatLease::for_checkout(
+            tmp.path(),
+            true,
+            crate::config::test_coordination().as_ref(),
+        )
+        .await
+        .unwrap();
         let pause = Pause::new();
         let interrupt = Pause::new();
         let prompts = Prompts::default();

@@ -43,10 +43,16 @@ grants and do not gain repository metadata access through this policy.
 | command | No sandbox imposed by magi | The configured executable is responsible for confinement and lock compliance. |
 
 Read-only seats retain their sandbox policy and receive none of these new
-grants. For a repository registered with `kanade-sync.contract` containing
-`shared-lock-v1`, `repo_lock::SeatLease` acquires the real exclusive
-`kanade-sync.lock` in the launcher before creating the seat's prompt or starting
-its CLI. The handle stays open for the entire invocation, including waiting
+grants. Repository coordination is opt-in through `[coordination]` in either
+the machine or repository config: `contract_file`, `contract_token`, and
+`lock_file` are all required after layer merging and template rendering. File
+names must be plain names inside the Git common directory (no separators or
+`..`). With no section, no contract is read and no lock is taken. A missing
+configured contract also leaves the repository unregistered; other read errors
+or a token mismatch fail closed. The contract's trimmed contents must match
+`contract_token`. For registered repositories, `repo_lock::SeatLease` acquires
+the real exclusive configured `lock_file` in the launcher before creating the
+seat's prompt or starting its CLI. The handle stays open for the entire invocation, including waiting
 for termination on timeout. The prompt identifies this actual launcher-owned
 lock and tells the reader not to try taking a second exclusive handle. This
 applies to repository-reading invocations regardless of backend,

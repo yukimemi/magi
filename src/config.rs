@@ -1080,10 +1080,74 @@ impl Release {
     }
 }
 
+/// Optional contract with an external repository updater.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(try_from = "CoordinationFields")]
+pub struct Coordination {
+    /// Contract file name inside the Git common directory.
+    pub contract_file: String,
+    /// Accepted trimmed contract contents.
+    pub contract_token: String,
+    /// Shared OS lock file name inside the Git common directory.
+    pub lock_file: String,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+struct CoordinationFields {
+    contract_file: String,
+    contract_token: String,
+    lock_file: String,
+}
+
+impl TryFrom<CoordinationFields> for Coordination {
+    type Error = anyhow::Error;
+
+    fn try_from(fields: CoordinationFields) -> Result<Self> {
+        for (key, name) in [
+            ("coordination.contract_file", &fields.contract_file),
+            ("coordination.lock_file", &fields.lock_file),
+        ] {
+            if name.trim().is_empty()
+                || name != name.trim()
+                || name == "."
+                || name.contains("..")
+                || name.contains(['/', '\\', ':', '\0'])
+            {
+                bail!(
+                    "{key} must be a plain file name inside the Git common directory (no separators or '..')"
+                );
+            }
+        }
+        let token = &fields.contract_token;
+        if token.is_empty() || token.trim() != token || token.chars().any(char::is_control) {
+            bail!(
+                "coordination.contract_token must be a nonempty single-line token without surrounding whitespace"
+            );
+        }
+        Ok(Self {
+            contract_file: fields.contract_file,
+            contract_token: fields.contract_token,
+            lock_file: fields.lock_file,
+        })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_coordination() -> Option<Coordination> {
+    Some(Coordination {
+        contract_file: "updater.contract".into(),
+        contract_token: "test-protocol-v1".into(),
+        lock_file: "updater.lock".into(),
+    })
+}
+
 /// Top-level configuration.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
+    /// External repository coordination; absent means disabled.
+    pub coordination: Option<Coordination>,
     /// Agent roster.
     pub agents: Vec<AgentSpec>,
     /// Role assignment.
@@ -2679,6 +2743,118 @@ fn remote_layers(repo: &Path) -> Result<Vec<PathBuf>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn coordination_defaults_off_and_validates_rendered_layer_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = dir.path().join("machine.toml");
+        let repo = dir.path().join("repo.toml");
+        std::fs::write(&machine, "").unwrap();
+        assert!(Config::default().coordination.is_none());
+        assert!(Config::load(&machine).unwrap().coordination.is_none());
+        std::fs::write(
+            &machine,
+            r#"
+[vars]
+contract = "updater.contract"
+[coordination]
+contract_file = "{{ vars.contract }}"
+contract_token = "protocol-v1"
+lock_file = "updater.lock"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&machine).unwrap();
+        let policy = cfg.coordination.unwrap();
+        assert_eq!(policy.contract_file, "updater.contract");
+        assert_eq!(policy.contract_token, "protocol-v1");
+        assert_eq!(policy.lock_file, "updater.lock");
+        std::fs::write(&repo, "[coordination]\nlock_file = 'repository.lock'\n").unwrap();
+        let cfg = Config::load_layers(&[machine.clone(), repo.clone()]).unwrap();
+        let policy = cfg.coordination.unwrap();
+        assert_eq!(policy.contract_file, "updater.contract");
+        assert_eq!(policy.lock_file, "repository.lock");
+        std::fs::write(
+            &repo,
+            r#"
+[vars]
+bad = "../escape"
+[coordination]
+lock_file = "{{ vars.bad }}"
+"#,
+        )
+        .unwrap();
+        let error = Config::load_layers(&[machine, repo]).unwrap_err();
+        assert!(format!("{error:#}").contains("coordination.lock_file"));
+    }
+
+    #[test]
+    fn coordination_rejects_invalid_names_tokens_and_incomplete_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let valid = toml::toml! {
+            [coordination]
+            contract_file = "updater.contract"
+            contract_token = "protocol-v1"
+            lock_file = "updater.lock"
+        };
+        for key in ["contract_file", "lock_file"] {
+            for bad in [
+                "",
+                " ",
+                " file",
+                "file ",
+                "\tfile",
+                "file\t",
+                ".",
+                "..",
+                "file..name",
+                "../escape",
+                "a/b",
+                "a\\b",
+                "/absolute",
+                "C:drive",
+                "C:\\absolute",
+                "nul\0name",
+            ] {
+                let mut table = valid.clone();
+                table["coordination"][key] = bad.into();
+                std::fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
+                let error = Config::load(&path).unwrap_err();
+                assert!(
+                    format!("{error:#}").contains(&format!("coordination.{key}")),
+                    "{bad:?}: {error:#}"
+                );
+            }
+        }
+        for bad in ["", " ", " token", "token ", "two\nlines", "two\rlines"] {
+            let mut table = valid.clone();
+            table["coordination"]["contract_token"] = bad.into();
+            std::fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
+            let error = Config::load(&path).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("coordination.contract_token"),
+                "{error:#}"
+            );
+        }
+        for key in ["contract_file", "contract_token", "lock_file"] {
+            let mut table = valid.clone();
+            table["coordination"].as_table_mut().unwrap().remove(key);
+            std::fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
+            let error = Config::load(&path).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(&format!("coordination.{key}")),
+                "{error:#}"
+            );
+        }
+        let mut table = valid;
+        table["coordination"]
+            .as_table_mut()
+            .unwrap()
+            .insert("typo".into(), "value".into());
+        std::fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
+        assert!(format!("{:#}", Config::load(&path).unwrap_err()).contains("typo"));
+    }
+
     #[test]
     fn context_window_prefers_exact_then_longest_prefix_and_user_over_builtin() {
         let mut cfg = Config::default();
