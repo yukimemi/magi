@@ -717,7 +717,8 @@ impl Runner {
             choice: None,
             task_instruction: None,
         });
-        let coordination = crate::repo_lock::SeatLease::for_operation(&repo).await?;
+        let wait = repository_wait(&state, None);
+        let coordination = crate::repo_lock::SeatLease::operation_with(&repo, &wait).await?;
         let released = crate::handover::release(&repo, branch, &state.id, &takeover).await?;
         if let Some(released) = &released {
             state.event(
@@ -770,7 +771,7 @@ impl Runner {
         if opened.is_err()
             && let Some(released) = &released
         {
-            let _coordination = crate::repo_lock::SeatLease::for_operation(&repo).await?;
+            let _coordination = crate::repo_lock::SeatLease::operation_with(&repo, &wait).await?;
             released.restore(&repo, branch).await;
         }
         opened
@@ -817,7 +818,8 @@ impl Runner {
     ) -> Result<Self> {
         let mut state = state;
         let branch = state.branch_for('A');
-        let coordination = crate::repo_lock::SeatLease::for_operation(repo).await?;
+        let wait = repository_wait(&state, None);
+        let coordination = coordinate_operation(&mut state, repo, &wait).await?;
         git::git(repo, &["branch", &branch, &selection.head]).await?;
         drop(coordination);
         state.event(
@@ -912,7 +914,8 @@ impl Runner {
         base_commit: String,
         takeover: &crate::handover::Takeover,
     ) -> Result<Self> {
-        let _coordination = crate::repo_lock::SeatLease::for_operation(repo).await?;
+        let wait = repository_wait(&state, None);
+        let _coordination = coordinate_operation(&mut state, repo, &wait).await?;
         if state.pr_recovery.is_none() {
             sync_review_branch(repo, branch, &state.config.merge.remote, &base_commit).await?;
         }
@@ -1150,7 +1153,16 @@ impl Runner {
         } else {
             None
         };
-        let result = self.execute_graph().await;
+        let wait = self.repository_wait();
+        let result = wait.scope(self.execute_graph()).await;
+        let result = match result {
+            Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => {
+                record_repository_block(&mut self.state, &e);
+                self.park_here()?;
+                Ok(())
+            }
+            other => other,
+        };
         self.mark_driver_exited();
         let ended = if result.is_err() {
             Some(crate::notices::run_stopped(&self.state.id, &self.state))
@@ -1161,6 +1173,15 @@ impl Runner {
             crate::notices::raise(notice);
         }
         result
+    }
+
+    fn repository_wait(&self) -> crate::repo_lock::WaitPolicy {
+        repository_wait(&self.state, Some((&self.pause, &self.interrupt)))
+    }
+
+    async fn coordinate(&mut self, cwd: &Path) -> Result<Option<crate::repo_lock::SeatLease>> {
+        let wait = self.repository_wait();
+        coordinate_operation(&mut self.state, cwd, &wait).await
     }
 
     /// Record that this process no longer drives the run, so its pid (a
@@ -1361,6 +1382,9 @@ impl Runner {
             return Ok(());
         }
         if let Err(e) = self.prep().await {
+            if e.is::<crate::repo_lock::ResourceBlocked>() {
+                return Err(e);
+            }
             self.state.status = RunStatus::Blocked;
             self.state
                 .prep_failure
@@ -1635,7 +1659,7 @@ impl Runner {
         let repo = self.state.repo.clone();
         // Includes rollback, config, refs, checkout creation and setup. No
         // repository mutation may precede the real shared lock acquisition.
-        let _coordination = crate::repo_lock::SeatLease::for_operation(&repo).await?;
+        let _coordination = self.coordinate(&repo).await?;
         self.rollback_prep(&repo).await;
         self.state.prep_complete = Some(false);
         self.state.status = RunStatus::Prep;
@@ -2017,6 +2041,9 @@ impl Runner {
                     );
                 }
                 Err(e) => {
+                    if e.is::<crate::repo_lock::ResourceBlocked>() {
+                        return Err(e);
+                    }
                     self.state.event(
                         "advise",
                         format!("could not synthesize a design brief: {e:#}"),
@@ -2086,30 +2113,32 @@ impl Runner {
                     .event("advise", format!("synthesis falling back to {}", spec.id));
             }
             let mut seat = self.seat("advise-synthesis", &spec.id);
-            let outcome = agent::invoke(
-                spec,
-                &mut seat,
-                &Invocation {
-                    cwd,
-                    prompt: &prompt,
-                    timeout,
-                    allow_write: false,
-                    unsandboxed: false,
-                    sessions: false,
-                    artifacts,
-                    stem: &if n == 0 {
-                        "advise-synthesis".to_owned()
-                    } else {
-                        format!("advise-synthesis-{}", spec.id)
+            let wait = self.repository_wait();
+            let outcome = wait
+                .scope(agent::invoke(
+                    spec,
+                    &mut seat,
+                    &Invocation {
+                        cwd,
+                        prompt: &prompt,
+                        timeout,
+                        allow_write: false,
+                        unsandboxed: false,
+                        sessions: false,
+                        artifacts,
+                        stem: &if n == 0 {
+                            "advise-synthesis".to_owned()
+                        } else {
+                            format!("advise-synthesis-{}", spec.id)
+                        },
+                        run: run_id,
+                        node: "advise",
+                        cache_dir: None,
+                        attachments: &[],
+                        writable: &[],
                     },
-                    run: run_id,
-                    node: "advise",
-                    cache_dir: None,
-                    attachments: &[],
-                    writable: &[],
-                },
-            )
-            .await;
+                ))
+                .await;
             if outcome.is_ok() {
                 self.state.seats.insert(seat.key.clone(), seat);
             }
@@ -2306,7 +2335,7 @@ impl Runner {
 
             // Rescue anything the agent edited but never committed: an
             // uncommitted candidate would silently be an empty one.
-            let _coordination = crate::repo_lock::SeatLease::for_operation(&worktree).await?;
+            let _coordination = self.coordinate(&worktree).await?;
             let rescued = match git::rescue_commit(
                 &worktree,
                 &format!("magi: candidate {label} (uncommitted work)"),
@@ -2606,7 +2635,7 @@ impl Runner {
                 tried.insert(next.id.clone());
                 fallback_attempt += 1;
 
-                let coordination = crate::repo_lock::SeatLease::for_operation(&job.cwd).await?;
+                let coordination = self.coordinate(&job.cwd).await?;
                 if let Ok(r) = git::rescue_commit(
                     &job.cwd,
                     &format!(
@@ -3967,6 +3996,9 @@ impl Runner {
         let Err(e) = self.graft_inner().await else {
             return Ok(());
         };
+        if e.is::<crate::repo_lock::ResourceBlocked>() {
+            return Err(e);
+        }
         if e.downcast_ref::<GraftRestoreFailed>().is_some() {
             self.state.status = RunStatus::Blocked;
             self.state.event("graft", format!("blocked: {e:#}"));
@@ -3981,7 +4013,10 @@ impl Runner {
             && !rec.outcome.settled()
         {
             if let Some(winner) = self.state.winner().cloned() {
-                if let Err(re) = Self::graft_restore(&winner.worktree, &rec.pre).await {
+                if let Err(re) = self.graft_restore(&winner.worktree, &rec.pre).await {
+                    if re.is::<crate::repo_lock::ResourceBlocked>() {
+                        return Err(re);
+                    }
                     self.state.status = RunStatus::Blocked;
                     self.state.event("graft", format!("blocked: {re:#}"));
                     self.state.save()?;
@@ -4001,7 +4036,8 @@ impl Runner {
 
     /// Put the winner back on `pre` and confirm it: a failed `reset` (a stale
     /// `index.lock`, say) or a tip that is not `pre` afterwards is an error.
-    async fn graft_restore(wt: &Path, pre: &str) -> Result<()> {
+    async fn graft_restore(&mut self, wt: &Path, pre: &str) -> Result<()> {
+        let _coordination = self.coordinate(wt).await?;
         crate::recovery::restore_repair(wt, pre)
             .await
             .map_err(|e| GraftRestoreFailed(format!("{e:#}")).into())
@@ -4032,7 +4068,7 @@ impl Runner {
             if self.state.reviews.is_empty()
                 && let Some(winner) = self.state.winner().cloned()
             {
-                Self::graft_restore(&winner.worktree, &rec.pre).await?;
+                self.graft_restore(&winner.worktree, &rec.pre).await?;
             }
             if let Some(g) = self.state.graft.as_mut() {
                 g.outcome = GraftOutcome::RolledBack(graft::INTERRUPTED.to_owned());
@@ -4125,14 +4161,10 @@ impl Runner {
                 }
             })
             .await;
-        // Never spawned: nothing changed (`HEAD == pre` is confirmed), so the
-        // record goes back to "not started" - not `RolledBack`, which would
-        // settle it - and the run stops resumably. The seat, the chain and
-        // the quota are untouched.
+        // The chosen seat or the restoration before its successor could not
+        // start. Keep Running: a later resume must confirm the rollback under
+        // coordination before it can settle this graft.
         if matches!(out, AgentOutcome::ResourceBlocked(_)) {
-            Self::graft_restore(&wt, &pre).await?;
-            self.state.graft = None;
-            self.state.save()?;
             return self.stop_for_resource();
         }
         let mut why: Option<String> = None;
@@ -4168,7 +4200,7 @@ impl Runner {
 
         let mut post = None;
         let mut lines = None;
-        let _coordination = crate::repo_lock::SeatLease::for_operation(&wt).await?;
+        let _coordination = self.coordinate(&wt).await?;
         if why.is_none() {
             let rescued = git::rescue_commit(&wt, "magi: graft (uncommitted work)").await;
             if let Ok(r) = &rescued {
@@ -4229,7 +4261,9 @@ impl Runner {
             Some(why) => {
                 // Not settled until the restore is confirmed: the record
                 // stays `Running`, so a resume retries it.
-                Self::graft_restore(&wt, &pre).await?;
+                crate::recovery::restore_repair(&wt, &pre)
+                    .await
+                    .map_err(|e| GraftRestoreFailed(format!("{e:#}")))?;
                 self.state.event(
                     "graft",
                     format!("rolled back: {why}; the winner is untouched"),
@@ -4259,7 +4293,7 @@ impl Runner {
             return Ok(());
         };
         let repo = self.state.repo.clone();
-        let _coordination = crate::repo_lock::SeatLease::for_operation(&repo).await?;
+        let _coordination = self.coordinate(&repo).await?;
         let mut folded = Vec::new();
         for i in 0..self.state.candidates.len() {
             let c = &self.state.candidates[i];
@@ -4930,7 +4964,8 @@ impl Runner {
         // `worktree_remove` is a `git worktree remove --force`, which would
         // otherwise discard uncommitted work left there by the operator or
         // another process before this had a chance to even look at it.
-        let coordination = crate::repo_lock::SeatLease::for_operation(&self.state.repo).await?;
+        let repo = self.state.repo.clone();
+        let coordination = self.coordinate(&repo).await?;
         if winner.worktree.exists() {
             // Lockfiles a rescue commit withheld stay untracked on purpose and
             // are already recorded; they are not the operator's work to protect.
@@ -5116,7 +5151,8 @@ impl Runner {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        let coordination = crate::repo_lock::SeatLease::for_operation(&self.state.repo).await?;
+        let repo = self.state.repo.clone();
+        let coordination = self.coordinate(&repo).await?;
         if let Ok(r) = git::rescue_commit(&fix_worktree, &rescue_message).await {
             self.state.note_withheld("fix", &r.withheld);
         }
@@ -5345,6 +5381,23 @@ impl Runner {
                     AgentOutcome::Ok(_) => "nothing usable".to_owned(),
                     other => fail_reason(other),
                 };
+                // A failed agent's edits must not reach the next one, and a
+                // restore that did not work ends the chain: the call fails
+                // and the caller's own (confirmed) restore decides.
+                if let Some((wt, rev)) = restore
+                    && let Err(e) = self.graft_restore(wt, rev).await
+                {
+                    let why =
+                        format!("could not restore the worktree before the next fixer: {e:#}");
+                    tracing::warn!("{why}");
+                    let out = if e.is::<crate::repo_lock::ResourceBlocked>() {
+                        AgentOutcome::ResourceBlocked(why)
+                    } else {
+                        AgentOutcome::Failed(why)
+                    };
+                    last = Some((job, seat, out));
+                    break;
+                }
                 record_handover(
                     &mut self.state,
                     node,
@@ -5354,18 +5407,6 @@ impl Runner {
                     &class,
                     &reason,
                 );
-                // A failed agent's edits must not reach the next one, and a
-                // restore that did not work ends the chain: the call fails
-                // and the caller's own (confirmed) restore decides.
-                if let Some((wt, rev)) = restore
-                    && let Err(e) = git::restore_to(wt, rev).await
-                {
-                    let why =
-                        format!("could not restore the worktree before the next fixer: {e:#}");
-                    tracing::warn!("{why}");
-                    last = Some((job, seat, AgentOutcome::Failed(why)));
-                    break;
-                }
                 continue;
             }
             last = Some((job, seat, out));
@@ -5403,7 +5444,10 @@ impl Runner {
                 // Interrupted: the unfinished edits are not trusted.
                 // An unconfirmed rollback blocks the run with `Started` kept,
                 // so a resume retries it; the tree is never reviewed as is.
-                if let Err(e) = Self::graft_restore(&wt, &before).await {
+                if let Err(e) = self.graft_restore(&wt, &before).await {
+                    if e.is::<crate::repo_lock::ResourceBlocked>() {
+                        return Err(e);
+                    }
                     return self
                         .stop_recovery(rec, &before, format!("interrupted; rollback failed: {e:#}"))
                         .await;
@@ -5465,17 +5509,9 @@ impl Runner {
                 handover: None,
             })
             .await;
-        // Never spawned: nothing changed, so the repair goes back to "not
-        // started" and the run stops resumably, as for a graft.
+        // Keep Started so reentry confirms the rollback under coordination;
+        // never try restoring again during the same exhausted resource wait.
         if matches!(out, AgentOutcome::ResourceBlocked(_)) {
-            if let Err(e) = Self::graft_restore(&wt, &head).await {
-                return self
-                    .stop_recovery(rec, &head, format!("resource wait; restore failed: {e:#}"))
-                    .await;
-            }
-            rec.repair = Repair::NotStarted;
-            self.state.recovery = Some(rec);
-            self.state.save()?;
             return self.stop_for_resource();
         }
         let failed = match &out {
@@ -5493,7 +5529,7 @@ impl Runner {
             AgentOutcome::Failed(e) => Some(e.clone()),
         };
         self.state.seats.insert(seat.key.clone(), seat);
-        let coordination = crate::repo_lock::SeatLease::for_operation(&wt).await?;
+        let coordination = self.coordinate(&wt).await?;
         let failed = match failed {
             // The agent's partial edits are not kept.
             Some(why) => {
@@ -5683,7 +5719,7 @@ impl Runner {
             // commit: nobody can perturb the winner's tree, and the fixer can
             // keep working without racing a reviewer.
             let mut jobs = Vec::new();
-            let coordination = crate::repo_lock::SeatLease::for_operation(&repo).await?;
+            let coordination = self.coordinate(&repo).await?;
             for (r, spec) in reviewers.iter().cloned().enumerate() {
                 let wt = root.join(format!("review-{}", r + 1));
                 // `clean -fdx` in a reset wipes setup's products, so every
@@ -6038,11 +6074,10 @@ impl Runner {
                 );
                 (Vec::new(), false, true, Some(reason))
             } else {
-                let _coordination =
-                    crate::repo_lock::SeatLease::for_operation(&winner.worktree).await?;
                 let e2e_commands = self.state.config.verify.e2e.clone();
                 let cache_dir = self.state.config.cache_dir();
                 let context = format!("round {round}");
+                let wait = self.repository_wait();
                 let (e2e, verify_retried) = with_cache_lease(
                     &mut self.state,
                     cache_dir.as_deref(),
@@ -6052,6 +6087,7 @@ impl Runner {
                     &head,
                     verify_timeout,
                     &context,
+                    &wait,
                     |state, budget| {
                         let shell = shell.clone();
                         let e2e_commands = e2e_commands.clone();
@@ -6070,7 +6106,7 @@ impl Runner {
                         }
                     },
                 )
-                .await;
+                .await?;
                 (e2e, verify_retried, false, None)
             };
 
@@ -6359,7 +6395,7 @@ impl Runner {
             }
             fix.continuation = Some(continuation);
             self.state.seats.insert(final_seat.key.clone(), final_seat);
-            let coordination = crate::repo_lock::SeatLease::for_operation(&winner.worktree).await?;
+            let coordination = self.coordinate(&winner.worktree).await?;
             if let Ok(r) = git::rescue_commit(
                 &winner.worktree,
                 &format!("magi: review round {round} fixes (uncommitted work)"),
@@ -6547,7 +6583,6 @@ impl Runner {
             E2eStatus::Deferred | E2eStatus::ResourceBlocked
         );
         if needs_catchup_run {
-            let _coordination = crate::repo_lock::SeatLease::for_operation(worktree).await?;
             let round = self.state.reviews[round_idx].round;
             let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
             let commands = self.state.config.verify.e2e.clone();
@@ -6556,6 +6591,7 @@ impl Runner {
             let context = format!(
                 "round {round}: verification unresolved, catching up before the final decision"
             );
+            let wait = self.repository_wait();
             let (outcomes, verify_retried) = with_cache_lease(
                 &mut self.state,
                 cache_dir.as_deref(),
@@ -6565,6 +6601,7 @@ impl Runner {
                 &attempted_head,
                 timeout,
                 &context,
+                &wait,
                 |state, budget| {
                     let shell = shell.to_vec();
                     let commands = commands.clone();
@@ -6575,7 +6612,7 @@ impl Runner {
                     }
                 },
             )
-            .await;
+            .await?;
             let last = &mut self.state.reviews[round_idx];
             last.e2e = outcomes;
             last.verify_retried = verify_retried;
@@ -6750,15 +6787,15 @@ impl Runner {
     /// configured means nothing happens - no event, no commit. `commit_all`
     /// commits any leftover change under the neutral identity and returns
     /// `false` when the tree is clean, so no empty commit is ever made.
-    async fn run_pre_gate(&mut self, winner: &Candidate) {
-        let commands = self.state.config.verify.pre_gate.clone();
+    async fn run_pre_gate(state: &mut RunState, winner: &Candidate) {
+        let commands = state.config.verify.pre_gate.clone();
         if commands.is_empty() {
             return;
         }
-        let shell = self.state.config.shell();
-        let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
+        let shell = state.config.shell();
+        let timeout = Duration::from_secs(state.config.graph.verify_timeout());
         let (outcomes, _) = run_commands(
-            &mut self.state,
+            state,
             "pre_gate",
             "pre_gate",
             0,
@@ -6776,7 +6813,7 @@ impl Runner {
                     o.code
                 );
             }
-            self.state.event(
+            state.event(
                 "pre_gate",
                 format!(
                     "`{}` -> {}",
@@ -6793,20 +6830,19 @@ impl Runner {
                 ),
             );
         }
-        self.state.pre_gate = outcomes;
+        state.pre_gate = outcomes;
         match git::commit_all(&winner.worktree, "magi: pre_gate (mechanical fixes)").await {
             Ok(true) => match git::rev_parse(&winner.worktree, "HEAD").await {
                 Ok(head) => {
-                    self.state
-                        .event("pre_gate", format!("committed mechanical fixes ({head})"));
-                    self.state.pre_gate_commit = Some(head);
+                    state.event("pre_gate", format!("committed mechanical fixes ({head})"));
+                    state.pre_gate_commit = Some(head);
                 }
                 Err(e) => tracing::warn!("pre_gate committed but HEAD unreadable: {e:#}"),
             },
             Ok(false) => {}
             Err(e) => tracing::warn!("pre_gate could not commit its changes: {e:#}"),
         }
-        if let Err(e) = self.state.save() {
+        if let Err(e) = state.save() {
             tracing::warn!("could not persist the pre_gate record: {e:#}");
         }
     }
@@ -6814,25 +6850,15 @@ impl Runner {
     /// Run `verify.gate` once against the winner's current tree, logging one
     /// event per command. Empty when nothing is configured.
     async fn run_gate(&mut self, winner: &Candidate) -> Result<Vec<CommandOutcome>> {
-        // The seat has finished and released its own lock. Mechanical edits,
-        // commits and verification still require repository coordination.
-        let _coordination = crate::repo_lock::SeatLease::for_operation(&winner.worktree).await?;
-        self.run_pre_gate(winner).await;
         let shell = self.state.config.shell();
         let gate_commands = self.state.config.verify.gate.clone();
-        // Zero commands has nothing to run and nothing that could touch the
-        // shared build cache, so it never needs a lease: `Config::cache_dir`
-        // is derived from `verify.e2e` too, so a repo with no `verify.gate`
-        // commands but a `CARGO_TARGET_DIR`-using `verify.e2e` would
-        // otherwise queue behind an unrelated run's lease and come back
-        // resource-blocked - `gate_ran` would stay false on nothing but
-        // cache contention, for a step that had nothing to check in the
-        // first place.
-        let outcomes = if gate_commands.is_empty() {
+        let has_pre_gate = !self.state.config.verify.pre_gate.is_empty();
+        let outcomes = if gate_commands.is_empty() && !has_pre_gate {
             Vec::new()
         } else {
             let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
             let cache_dir = self.state.config.cache_dir();
+            let wait = self.repository_wait();
             let head = git::rev_parse(&winner.worktree, "HEAD").await?;
             let (outcomes, _) = with_cache_lease(
                 &mut self.state,
@@ -6843,11 +6869,13 @@ impl Runner {
                 &head,
                 timeout,
                 "final gate",
+                &wait,
                 |state, budget| {
                     let shell = shell.clone();
                     let gate_commands = gate_commands.clone();
-                    let worktree = winner.worktree.clone();
+                    let winner = winner.clone();
                     async move {
+                        Self::run_pre_gate(state, &winner).await;
                         let (outcomes, timed_out_pids) = run_commands(
                             state,
                             "gate",
@@ -6855,7 +6883,7 @@ impl Runner {
                             0,
                             &shell,
                             &gate_commands,
-                            &worktree,
+                            &winner.worktree,
                             budget,
                         )
                         .await;
@@ -6863,7 +6891,7 @@ impl Runner {
                     }
                 },
             )
-            .await;
+            .await?;
             outcomes
         };
         if outcomes.is_empty() {
@@ -7027,7 +7055,7 @@ impl Runner {
             AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => record.error = Some(e),
         }
         self.state.seats.insert(seat.key.clone(), seat);
-        let _coordination = crate::repo_lock::SeatLease::for_operation(&winner.worktree).await?;
+        let coordination = self.coordinate(&winner.worktree).await?;
         if let Ok(r) = git::rescue_commit(
             &winner.worktree,
             &format!("magi: gate fix {attempt} (uncommitted work)"),
@@ -7057,12 +7085,14 @@ impl Runner {
             format!("gate-fix round {attempt}: tree changed vs base; re-running verify.e2e"),
         );
 
+        drop(coordination);
         let commands = self.state.config.verify.e2e.clone();
         if !commands.is_empty() {
             let shell = self.state.config.shell();
             let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
             let cache_dir = self.state.config.cache_dir();
             let context = format!("gate-fix round {attempt}");
+            let wait = self.repository_wait();
             let (e2e, _) = with_cache_lease(
                 &mut self.state,
                 cache_dir.as_deref(),
@@ -7072,6 +7102,7 @@ impl Runner {
                 &after,
                 timeout,
                 &context,
+                &wait,
                 |state, budget| {
                     let shell = shell.clone();
                     let commands = commands.clone();
@@ -7083,7 +7114,7 @@ impl Runner {
                     }
                 },
             )
-            .await;
+            .await?;
             if verify_inconclusive(&e2e) {
                 return Ok(GateFix::Defer);
             }
@@ -8245,6 +8276,9 @@ impl Runner {
                     self.state.save()?;
                 }
                 Err(e) => {
+                    if e.is::<crate::repo_lock::ResourceBlocked>() {
+                        return Err(e);
+                    }
                     self.state.status = RunStatus::Blocked;
                     self.state.event("land", format!("gave up: {e}"));
                     self.state.save()?;
@@ -8263,14 +8297,13 @@ impl Runner {
         let i = self.state.merge_repairs.len() - 1;
         let request = self.state.merge_repairs[i].clone();
         if request.phase == Phase::Fixing {
-            let restored = match self.state.winner() {
-                Some(winner) => {
-                    crate::recovery::restore_repair(&winner.worktree, &request.head).await
-                }
+            let restored = match self.state.winner().cloned() {
+                Some(winner) => self.graft_restore(&winner.worktree, &request.head).await,
                 None => Err(anyhow::anyhow!("repair has no winning branch")),
             };
             let why = match restored {
                 Ok(()) => "repair was interrupted during the fixer and rolled back; inspect its artifacts and the PR head, then run an explicit review".to_owned(),
+                Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => return Err(e),
                 Err(e) => format!("repair was interrupted; rollback failed: {e:#}; restore the reviewed branch before running an explicit review"),
             };
             self.hold_merge_repair(i, why)?;
@@ -8943,6 +8976,48 @@ struct WaveCtx<'a> {
     pauses: Option<(&'a Pause, &'a Pause)>,
 }
 
+/// Shared scheduling policy for operations and spawned seat invocations.
+fn repository_wait(
+    state: &RunState,
+    pauses: Option<(&Pause, &Pause)>,
+) -> crate::repo_lock::WaitPolicy {
+    let pauses = pauses.map(|(a, b)| (a.clone(), b.clone()));
+    let inherited = crate::repo_lock::WaitPolicy::current();
+    crate::repo_lock::WaitPolicy::new(
+        Duration::from_secs(state.config.graph.timeout_resource_wait),
+        move || {
+            inherited.cancelled()
+                || pauses
+                    .as_ref()
+                    .is_some_and(|(a, b)| a.parked() || b.parked())
+        },
+    )
+}
+
+fn record_repository_block(state: &mut RunState, error: &anyhow::Error) {
+    if error.is::<crate::repo_lock::ResourceBlocked>() {
+        state.resource_block = Some(crate::run::ResourceBlock {
+            node: "repository".into(),
+            kind: "repository coordination".into(),
+            detail: error.to_string(),
+            at: Timestamp::now(),
+        });
+        state.event("resource", error.to_string());
+    }
+}
+
+async fn coordinate_operation(
+    state: &mut RunState,
+    cwd: &Path,
+    wait: &crate::repo_lock::WaitPolicy,
+) -> Result<Option<crate::repo_lock::SeatLease>> {
+    let result = crate::repo_lock::SeatLease::operation_with(cwd, wait).await;
+    if let Err(e) = &result {
+        record_repository_block(state, e);
+    }
+    result
+}
+
 /// Run one job, honouring the parallelism budget.
 async fn run_one(
     job: SeatJob,
@@ -9081,6 +9156,7 @@ async fn wave(
     // permit, i.e. just before their CLI is spawned.
     let (spawned_tx, mut spawned_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let overlay = prompts.overlay(node);
+    let repository_wait = repository_wait(state, pauses);
     for (i, mut job) in jobs.into_iter().enumerate() {
         job.prompt = prompt::with_overlay(job.prompt, overlay.clone());
         if cache.is_some() {
@@ -9112,6 +9188,7 @@ async fn wave(
             .filter(|_| job.allow_write && cache_guard.is_some())
             .map(Path::to_path_buf);
         let spawned_tx = spawned_tx.clone();
+        let repository_wait = repository_wait.clone();
         set.spawn(async move {
             // A wait for a parallelism slot is scheduling, not the agent: it
             // is bounded by its own limit and ends as a resource block, never
@@ -9131,26 +9208,27 @@ async fn wave(
             };
             spawned_tx.send(job.seat.key.clone()).ok();
             let mut seat = job.seat;
-            let out = agent::invoke(
-                &job.spec,
-                &mut seat,
-                &Invocation {
-                    cwd: &job.cwd,
-                    prompt: &job.prompt,
-                    timeout: job.timeout,
-                    allow_write: job.allow_write,
-                    unsandboxed: false,
-                    sessions: job.sessions,
-                    artifacts: &job.artifacts,
-                    stem: &job.stem,
-                    run: &run,
-                    node: &node,
-                    cache_dir: cache.as_deref(),
-                    attachments: &attachments,
-                    writable: &[],
-                },
-            )
-            .await;
+            let out = repository_wait
+                .scope(agent::invoke(
+                    &job.spec,
+                    &mut seat,
+                    &Invocation {
+                        cwd: &job.cwd,
+                        prompt: &job.prompt,
+                        timeout: job.timeout,
+                        allow_write: job.allow_write,
+                        unsandboxed: false,
+                        sessions: job.sessions,
+                        artifacts: &job.artifacts,
+                        stem: &job.stem,
+                        run: &run,
+                        node: &node,
+                        cache_dir: cache.as_deref(),
+                        attachments: &attachments,
+                        writable: &[],
+                    },
+                ))
+                .await;
             let out = match out {
                 Ok(o) if o.usable() => AgentOutcome::Ok(o),
                 Ok(o) if o.quota_exhausted() => AgentOutcome::Quota(o),
@@ -9167,6 +9245,9 @@ async fn wave(
                     "exited with {:?} and no usable output",
                     o.exit_code
                 )),
+                Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => {
+                    AgentOutcome::ResourceBlocked(e.to_string())
+                }
                 Err(e) => AgentOutcome::Failed(e.to_string()),
             };
             (i, seat, out)
@@ -9205,7 +9286,12 @@ async fn wave(
         {
             state.resource_block = Some(crate::run::ResourceBlock {
                 node: node.to_owned(),
-                kind: "parallel slot".to_owned(),
+                kind: if why.contains("repository coordination") {
+                    "repository coordination"
+                } else {
+                    "parallel slot"
+                }
+                .to_owned(),
                 detail: why.clone(),
                 at: Timestamp::now(),
             });
@@ -9905,9 +9991,11 @@ impl std::error::Error for CacheCheckError {}
 /// cache directory is a staleness bug, not a lock contention one.
 ///
 /// Cache acquisition has its own bound, `timeout_resource_wait`, just as
-/// agent waves do. Contention must not consume the verification budget:
-/// `body` receives the full `budget` after the cache is acquired and fresh.
-/// Without a shared cache this is a pass-through with the same full budget.
+/// agent waves do. Repository scheduling also has its own bounded,
+/// cancellable resource-wait policy. Contention must not consume the
+/// verification budget: `body` receives the full `budget` after both leases
+/// are acquired and the cache is fresh. Without a shared cache, only
+/// repository coordination is acquired before handing over the full budget.
 ///
 /// A lease that cannot be acquired within the resource wait is reported as a single
 /// synthetic [`CommandOutcome`] (`code: None`) rather than silently skipping
@@ -9923,84 +10011,87 @@ async fn with_cache_lease<'s, F, Fut>(
     head: &str,
     budget: Duration,
     context: &str,
+    wait: &crate::repo_lock::WaitPolicy,
     body: F,
-) -> (Vec<CommandOutcome>, bool)
+) -> Result<(Vec<CommandOutcome>, bool)>
 where
     F: FnOnce(&'s mut RunState, Duration) -> Fut,
     Fut: std::future::Future<Output = (Vec<CommandOutcome>, bool, Vec<u32>)>,
 {
-    let Some(cache_dir) = cache_dir else {
-        let (outcomes, retried, _timed_out_pids) = body(state, budget).await;
-        return (outcomes, retried);
-    };
-    let home = crate::run::home();
-    let owner = crate::cache::Owner::here(&state.id, node, seat, worktree, head);
+    // Match editing waves: cache first, repository second. In particular,
+    // pre_gate must never hold the repository while waiting for a wave's cache.
     let started = Instant::now();
+    let home = crate::run::home();
     let resource_limit = Duration::from_secs(state.config.graph.timeout_resource_wait);
-    let guard =
-        match acquire_cache_lease(state, cache_dir, &owner, resource_limit, context, &|| false)
-            .await
-            .and_then(|g| {
-                g.ok_or_else(|| anyhow::anyhow!("the wait for the build cache was cancelled"))
-            }) {
-            Ok(g) => g,
+    let guard = if let Some(cache_dir) = cache_dir {
+        let owner = crate::cache::Owner::here(&state.id, node, seat, worktree, head);
+        match acquire_cache_lease(state, cache_dir, &owner, resource_limit, context, &|| {
+            wait.cancelled()
+        })
+        .await
+        .and_then(|g| {
+            g.ok_or_else(|| anyhow::anyhow!("the wait for the build cache was cancelled"))
+        }) {
+            Ok(g) => Some(g),
             Err(e) => {
-                return (
+                return Ok((
                     vec![CommandOutcome {
-                        command: "(waiting for the shared build cache)".to_owned(),
+                        command: "(waiting for the shared build cache)".into(),
                         code: None,
                         output_tail: e.to_string(),
                         duration_ms: started.elapsed().as_millis() as u64,
                         resource_blocked: true,
                     }],
                     false,
-                );
+                ));
             }
-        };
-    let identity = crate::cache::Identity::new(worktree, head);
-    if let Err(e) = crate::cache::ensure_fresh(
-        &home,
-        cache_dir,
-        &identity,
-        &state.config.verify.cargo_manifests(),
-    ) {
-        // A failed freshness check means this process cannot vouch for what
-        // is sitting in the cache right now - on Windows this is exactly the
-        // "a stale test executable is still locked, `cargo clean -p` cannot
-        // remove it" case the evidence log records. Running verify anyway
-        // and reporting whatever it says would let a result nobody can trust
-        // stand for the tree it claims to have checked; fail the step
-        // instead of the patch.
-        state.event(
-            "verify",
-            format!(
-                "{context}: could not confirm the shared build cache matches {} at {}: {e:#}",
-                worktree.display(),
-                short(head)
-            ),
-        );
-        guard.release();
-        return (
-            vec![CommandOutcome {
-                command: "(confirming the shared build cache is fresh)".to_owned(),
-                code: None,
-                output_tail: e.to_string(),
-                duration_ms: started.elapsed().as_millis() as u64,
-                resource_blocked: true,
-            }],
-            false,
-        );
+        }
+    } else {
+        None
+    };
+    let _coordination = coordinate_operation(state, worktree, wait).await?;
+    if let Some(cache_dir) = cache_dir {
+        let identity = crate::cache::Identity::new(worktree, head);
+        if let Err(e) = crate::cache::ensure_fresh(
+            &home,
+            cache_dir,
+            &identity,
+            &state.config.verify.cargo_manifests(),
+        ) {
+            state.event(
+                "verify",
+                format!(
+                    "{context}: could not confirm the shared build cache matches {} at {}: {e:#}",
+                    worktree.display(),
+                    short(head)
+                ),
+            );
+            if let Some(guard) = guard {
+                guard.release();
+            }
+            return Ok((
+                vec![CommandOutcome {
+                    command: "(confirming the shared build cache is fresh)".into(),
+                    code: None,
+                    output_tail: e.to_string(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    resource_blocked: true,
+                }],
+                false,
+            ));
+        }
     }
     let (outcomes, retried, timed_out_pids) = body(state, budget).await;
-    // A timed-out command's process was only *asked* to die (`kill_on_drop`,
-    // `start_kill`); confirm it actually has before handing the directory to
-    // the next acquirer. See `wait_for_timed_out_children_to_die`'s own doc
-    // for what this can and cannot see.
     if !timed_out_pids.is_empty() {
         wait_for_timed_out_children_to_die(&timed_out_pids).await;
     }
-    guard.release();
-    (outcomes, retried)
+    // Drop repository coordination before releasing the cache, reversing the
+    // acquisition order. A cancelled/error future also drops both guards.
+    drop(_coordination);
+    if let Some(guard) = guard {
+        guard.release();
+    }
+    Ok((outcomes, retried))
 }
 
 /// Poll `pids` — commands [`run_commands`] reports as still running when its
@@ -10930,7 +11021,14 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> R
     let repo = state.repo.clone();
     // CLI, Web and automatic cleanup all enter here, independently of
     // Runner::fold_losers. Protect deletion and shared config release too.
-    let _coordination = crate::repo_lock::SeatLease::for_operation(&repo).await?;
+    let wait = repository_wait(state, None);
+    let _coordination = match coordinate_operation(state, &repo, &wait).await {
+        Ok(lease) => lease,
+        Err(e) => {
+            state.save_under(home)?;
+            return Err(e);
+        }
+    };
     let root = state.worktree_root();
     let winner = state.tally.as_ref().map(|t| t.winner);
     let mut removed = Vec::new();
@@ -11875,6 +11973,297 @@ mod tests {
             git::rev_parse(&repo, "magi/task-selected").await.unwrap(),
             head
         );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn fallback_and_interrupted_restoration_require_coordination() {
+        use std::os::fd::AsRawFd as _;
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runner = registered_runner(tmp.path()).await;
+        runner.state.config.graph.timeout_resource_wait = 1;
+        let winner = runner.state.candidates[0].clone();
+        let head = git::rev_parse(&winner.worktree, "HEAD").await.unwrap();
+        let leftover = winner.worktree.join("leftover");
+        std::fs::write(&leftover, "untrusted edits").unwrap();
+        let next = tmp.path().join("next-fixer");
+        let mut failed = spec("first");
+        failed.command = vec!["sh".into(), "-c".into(), "exit 1".into()];
+        let mut successor = spec("second");
+        successor.command = vec![
+            "sh".into(),
+            "-c".into(),
+            format!("touch '{}'; echo done", next.display()),
+        ];
+        let attempts = vec![
+            (failed.clone(), "first".into()),
+            (successor.clone(), "second".into()),
+        ];
+        let lock_path = runner.state.repo.join(".git/kanade-sync.lock");
+        let external = std::fs::File::create(&lock_path).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(external.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let artifacts = tmp.path().join("artifacts");
+        let build = |spec, seat| SeatJob {
+            spec,
+            seat,
+            cwd: winner.worktree.clone(),
+            prompt: "fixture".into(),
+            timeout: Duration::from_secs(10),
+            allow_write: true,
+            sessions: false,
+            artifacts: artifacts.clone(),
+            stem: "fix".into(),
+            handover: None,
+        };
+        let (_, _, out) = runner
+            .ask_fixer_among(
+                attempts.clone(),
+                "graft",
+                None,
+                Some((&winner.worktree, &head)),
+                build,
+            )
+            .await;
+        assert!(matches!(out, AgentOutcome::ResourceBlocked(_)));
+        assert!(leftover.exists(), "contention must prevent clean");
+        assert!(!next.exists());
+        assert!(runner.state.handovers.is_empty());
+        // Early interrupted-repair rollback uses the same protected route.
+        runner.state.recovery = Some(crate::recovery::RecoveryRecord {
+            from_run: "earlier".into(),
+            generation: 1,
+            mode: crate::recovery::Mode::VerifyRepair,
+            reasons: Vec::new(),
+            reviewed_head: None,
+            rounds: Vec::new(),
+            open_findings: Vec::new(),
+            evidence: None,
+            criteria_inherited: true,
+            repair: crate::recovery::Repair::Started {
+                before: head.clone(),
+            },
+        });
+        assert!(
+            runner
+                .recovery_repair(&winner)
+                .await
+                .unwrap_err()
+                .is::<crate::repo_lock::ResourceBlocked>()
+        );
+        assert!(matches!(
+            runner.state.recovery.as_ref().unwrap().repair,
+            crate::recovery::Repair::Started { .. }
+        ));
+        assert!(leftover.exists());
+        drop(external);
+        runner.recovery_repair(&winner).await.unwrap();
+        assert!(!leftover.exists());
+        assert!(matches!(
+            runner.state.recovery.as_ref().unwrap().repair,
+            crate::recovery::Repair::Done { .. }
+        ));
+        // A hard lock-open failure also leaves HEAD and untracked work intact.
+        std::fs::remove_file(&lock_path).unwrap();
+        std::fs::create_dir(&lock_path).unwrap();
+        std::fs::write(&leftover, "untrusted edits").unwrap();
+        let (_, _, out) = runner
+            .ask_fixer_among(
+                attempts,
+                "graft",
+                None,
+                Some((&winner.worktree, &head)),
+                build,
+            )
+            .await;
+        assert!(matches!(out, AgentOutcome::Failed(_)));
+        assert!(leftover.exists());
+        assert!(!next.exists());
+        assert_eq!(
+            git::rev_parse(&winner.worktree, "HEAD").await.unwrap(),
+            head
+        );
+    }
+
+    #[cfg(unix)]
+    async fn registered_runner(root: &Path) -> Runner {
+        ask_test_home();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        std::fs::write(repo.join(".git/kanade-sync.contract"), "shared-lock-v1\n").unwrap();
+        let mut runner = runner_at(RunStatus::Prep);
+        runner.state.repo = repo.clone();
+        runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
+        runner.state.config.graph.worktree_root = Some(root.join("wt"));
+        runner.state.config.graph.advise = false;
+        runner.roles.implementers = vec![spec("implement")];
+        runner.roles.judges = vec![spec("judge")];
+        runner.prep().await.unwrap();
+        runner
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn interrupted_graft_restore_waits_and_preserves_its_record() {
+        use std::os::fd::AsRawFd as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runner = registered_runner(tmp.path()).await;
+        runner.state.config.graph.timeout_resource_wait = 1;
+        let winner = runner.state.candidates[0].clone();
+        let pre = git::rev_parse(&winner.worktree, "HEAD").await.unwrap();
+        runner.state.tally = Some(Tally {
+            first_choice: BTreeMap::new(),
+            borda: BTreeMap::new(),
+            winner: winner.label,
+            rankings: 0,
+            unanimous_initial: false,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: false,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+            uncontested: Some("fixture".into()),
+        });
+        runner.state.graft = Some(GraftRecord {
+            pre: pre.clone(),
+            post: None,
+            lines: None,
+            limit: None,
+            agent: None,
+            outcome: GraftOutcome::Running,
+            requested: Vec::new(),
+            adoption: None,
+            adoption_error: None,
+        });
+        std::fs::write(winner.worktree.join("README.md"), "unfinished graft\n").unwrap();
+        git::commit_all(&winner.worktree, "unfinished graft")
+            .await
+            .unwrap();
+        let unfinished = git::rev_parse(&winner.worktree, "HEAD").await.unwrap();
+        let leftover = winner.worktree.join("leftover");
+        std::fs::write(&leftover, "untrusted edits").unwrap();
+        let path = runner.state.repo.join(".git/kanade-sync.lock");
+        let external = std::fs::File::create(&path).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(external.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(
+            runner
+                .graft()
+                .await
+                .unwrap_err()
+                .is::<crate::repo_lock::ResourceBlocked>()
+        );
+        assert!(matches!(
+            runner.state.graft.as_ref().unwrap().outcome,
+            GraftOutcome::Running
+        ));
+        assert_eq!(
+            git::rev_parse(&winner.worktree, "HEAD").await.unwrap(),
+            unfinished
+        );
+        assert!(leftover.exists());
+        drop(external);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(runner.graft().await.is_err());
+        assert!(matches!(
+            runner.state.graft.as_ref().unwrap().outcome,
+            GraftOutcome::Running
+        ));
+        assert_eq!(
+            git::rev_parse(&winner.worktree, "HEAD").await.unwrap(),
+            unfinished
+        );
+        assert!(leftover.exists());
+        std::fs::remove_dir(&path).unwrap();
+        runner.graft().await.unwrap();
+        assert!(runner.state.graft.as_ref().unwrap().outcome.settled());
+        assert_eq!(git::rev_parse(&winner.worktree, "HEAD").await.unwrap(), pre);
+        assert!(!leftover.exists());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn repository_contention_blocks_and_parks_without_poisoning_preparation() {
+        use std::os::fd::AsRawFd as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runner = registered_runner(tmp.path()).await;
+        runner.state.prep_complete = Some(false);
+        runner.state.config.graph.timeout_resource_wait = 1;
+        runner.state.save().unwrap();
+        let external =
+            std::fs::File::create(runner.state.repo.join(".git/kanade-sync.lock")).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(external.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        runner.execute().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert_eq!(
+            runner.state.resource_block.as_ref().unwrap().kind,
+            "repository coordination"
+        );
+        assert!(runner.state.prep_failure.is_none());
+        assert!(runner.state.seats.is_empty());
+        runner.pause.park();
+        tokio::time::timeout(Duration::from_secs(1), runner.execute())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(runner.state.parked);
+        assert!(runner.state.prep_failure.is_none());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn gate_takes_cache_before_repository_so_an_editing_wave_can_finish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runner = registered_runner(tmp.path()).await;
+        let winner = runner.state.candidates[0].clone();
+        let cache = tmp.path().join("cache");
+        let started = tmp.path().join("pre-gate-started");
+        runner.state.config.verify.pre_gate = vec![format!("touch '{}'", started.display())];
+        runner.state.config.verify.gate =
+            vec![format!("CARGO_TARGET_DIR='{}' true", cache.display())];
+        let home = crate::run::home();
+        let owner =
+            crate::cache::Owner::here("editing-wave", "implement", "*", &winner.worktree, "HEAD");
+        let guard = match crate::cache::try_acquire(&home, &cache, &owner).unwrap() {
+            crate::cache::AcquireOutcome::Acquired(g) => g,
+            crate::cache::AcquireOutcome::Busy(busy) => panic!("cache must be free: {busy:?}"),
+        };
+        let mut gate = Box::pin(runner.run_gate(&winner));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut gate)
+                .await
+                .is_err()
+        );
+        assert!(!started.exists(), "pre-gate must wait for the cache too");
+        // Simulate the wave that already owns the cache entering invoke.
+        // It must obtain the editor reservation and finish without waiting
+        // for the gate that is queued behind its cache.
+        let wait = crate::repo_lock::WaitPolicy::new(Duration::from_millis(200), || false);
+        let editor = crate::repo_lock::SeatLease::checkout_with(&winner.worktree, true, &wait)
+            .await
+            .unwrap();
+        drop(editor);
+        guard.release();
+        let outcomes = tokio::time::timeout(Duration::from_secs(10), &mut gate)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(gate);
+        assert!(outcomes.iter().all(CommandOutcome::ok));
+        assert!(started.exists());
     }
 
     #[tokio::test]
@@ -12876,6 +13265,7 @@ mod tests {
         let home = tmp.path().join("home");
         let mut config = Config::default();
         config.graph.worktree_root = Some(tmp.path().join("wt"));
+        config.graph.timeout_resource_wait = 1;
         let mut state = RunState::new(
             repo.clone(),
             "main".into(),
@@ -12940,7 +13330,21 @@ mod tests {
                 .unwrap(),
             worktrees_before
         );
+        let error = tokio::time::timeout(Duration::from_secs(3), &mut fold)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(error.is::<crate::repo_lock::ResourceBlocked>());
+        drop(fold);
+        assert!(candidate.exists() && reviewer.exists());
+        assert!(!state.candidates[0].folded && state.enabled_worktree_config);
+        assert_eq!(
+            state.resource_block.as_ref().unwrap().kind,
+            "repository coordination"
+        );
+        assert_eq!(std::fs::read(common.join("config")).unwrap(), config_before);
         drop(external);
+        let mut fold = Box::pin(fold_run(&mut state, true, &home));
         let removed = tokio::time::timeout(Duration::from_secs(10), &mut fold)
             .await
             .unwrap()
@@ -16568,6 +16972,7 @@ mod resource_wait_tests {
         });
         let mut st = state(10);
         let budget = Duration::from_millis(50);
+        let wait = repository_wait(&st, None);
         let (outcomes, _) = with_cache_lease(
             &mut st,
             Some(&cache),
@@ -16577,6 +16982,7 @@ mod resource_wait_tests {
             "abc1234",
             budget,
             "test gate",
+            &wait,
             |_, available| async move {
                 assert_eq!(
                     available, budget,
@@ -16585,7 +16991,8 @@ mod resource_wait_tests {
                 (Vec::new(), false, Vec::new())
             },
         )
-        .await;
+        .await
+        .unwrap();
         release.await.unwrap();
         assert!(outcomes.is_empty(), "{outcomes:?}");
         assert!(
@@ -16605,6 +17012,7 @@ mod resource_wait_tests {
         let cache = tmp.path().join("target");
         let _held = hold(&cache);
         let mut st = state(0);
+        let wait = repository_wait(&st, None);
         let (outcomes, _) = with_cache_lease(
             &mut st,
             Some(&cache),
@@ -16614,9 +17022,11 @@ mod resource_wait_tests {
             "abc1234",
             Duration::from_secs(60),
             "test gate",
+            &wait,
             |_, _| async { panic!("commands must not start without the cache lease") },
         )
-        .await;
+        .await
+        .unwrap();
         assert_eq!(outcomes.len(), 1);
         assert!(outcomes[0].resource_blocked);
         assert!(st.resource_wait.is_none());
@@ -16652,6 +17062,75 @@ mod resource_wait_tests {
         assert!(st.resource_block.is_none());
         assert!(st.handovers.is_empty() && st.seat_history.is_empty() && st.quota.is_empty());
         assert!(st.resource_wait.is_none() && st.active.is_empty());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn repository_wait_in_a_wave_is_a_bounded_cancellable_resource_block() {
+        use std::os::fd::AsRawFd as _;
+        crate::run::pin_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        crate::git::git(tmp.path(), &["init"]).await.unwrap();
+        let common = tmp.path().join(".git");
+        std::fs::write(common.join("kanade-sync.contract"), "shared-lock-v1\n").unwrap();
+        let external = std::fs::File::create(common.join("kanade-sync.lock")).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(external.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let mut st = state(1);
+        let mut reader = job(
+            sh("reader", "echo must-not-run"),
+            tmp.path(),
+            Duration::from_secs(30),
+        );
+        reader.allow_write = false;
+        let results = run(
+            vec![reader.clone()],
+            Arc::new(Semaphore::new(1)),
+            None,
+            &mut st,
+        )
+        .await;
+        assert!(matches!(results[0].2, AgentOutcome::ResourceBlocked(_)));
+        assert_eq!(results[0].1.turns, 0);
+        assert!(FailClass::of(&results[0].2).is_none());
+        assert_eq!(
+            st.resource_block.as_ref().unwrap().kind,
+            "repository coordination"
+        );
+        assert!(st.active.is_empty() && st.quota.is_empty() && st.handovers.is_empty());
+        assert!(!tmp.path().join("art/impl-A.prompt.md").exists());
+        drop(external);
+        let editor = crate::repo_lock::SeatLease::for_checkout(tmp.path(), true)
+            .await
+            .unwrap();
+        let pause = Pause::new();
+        let interrupt = Pause::new();
+        let prompts = Prompts::default();
+        let ctx = WaveCtx {
+            run: "r",
+            node: "review",
+            prompts: &prompts,
+            cache: None,
+            round: None,
+            carry_seats: false,
+            pauses: Some((&pause, &interrupt)),
+        };
+        let (results, ()) = tokio::join!(
+            wave(vec![reader], Arc::new(Semaphore::new(1)), &ctx, &mut st, 0),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                pause.park();
+            }
+        );
+        assert!(
+            matches!(&results[0].2, AgentOutcome::ResourceBlocked(why) if why.contains("parking"))
+        );
+        assert_eq!(results[0].1.turns, 0);
+        assert!(st.active.is_empty() && st.quota.is_empty() && st.handovers.is_empty());
+        assert!(!tmp.path().join("art/impl-A.prompt.md").exists());
+        drop(editor);
     }
 
     #[tokio::test]

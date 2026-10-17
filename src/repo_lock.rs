@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 
@@ -15,6 +16,82 @@ static READERS: LazyLock<Mutex<BTreeMap<PathBuf, Weak<Lease>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 static GATES: LazyLock<Mutex<BTreeMap<PathBuf, Weak<tokio::sync::RwLock<()>>>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Repository scheduling is infrastructure work, never an agent failure.
+#[derive(Debug)]
+pub(crate) struct ResourceBlocked(pub(crate) String);
+
+impl std::fmt::Display for ResourceBlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ResourceBlocked {}
+
+#[derive(Clone)]
+pub(crate) struct WaitPolicy {
+    limit: Duration,
+    cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+tokio::task_local! {
+    static WAIT_POLICY: WaitPolicy;
+}
+
+impl Default for WaitPolicy {
+    fn default() -> Self {
+        Self::new(
+            Duration::from_secs(crate::config::Graph::default().timeout_resource_wait),
+            || false,
+        )
+    }
+}
+
+impl WaitPolicy {
+    pub(crate) fn current() -> Self {
+        WAIT_POLICY.try_with(Clone::clone).unwrap_or_default()
+    }
+
+    /// Spawned wave tasks must scope their own copy; task locals are not
+    /// implicitly inherited by spawned tasks.
+    pub(crate) async fn scope<T>(&self, future: impl std::future::Future<Output = T>) -> T {
+        WAIT_POLICY.scope(self.clone(), future).await
+    }
+    pub(crate) fn new(
+        limit: Duration,
+        cancelled: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            limit,
+            cancelled: Arc::new(cancelled),
+        }
+    }
+
+    pub(crate) fn cancelled(&self) -> bool {
+        (self.cancelled)()
+    }
+
+    async fn wait<T>(&self, future: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        let future = tokio::time::timeout(self.limit, future);
+        tokio::pin!(future);
+        loop {
+            if self.cancelled() {
+                return Err(ResourceBlocked(
+                    "repository coordination wait cancelled for parking".into(),
+                )
+                .into());
+            }
+            tokio::select! {
+                result = &mut future => return result.unwrap_or_else(|_| Err(ResourceBlocked(
+                    format!("repository coordination remained busy for {}s", self.limit.as_secs())
+                ).into())),
+                // Also bounds cancellation while queued on the fair local gate.
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
+}
 
 /// A local reservation prevents a launcher-held reader from blocking this
 /// launcher's editing agents when they take their own .NET lock. The fair
@@ -86,10 +163,14 @@ impl SeatLease {
     /// Launcher-owned VCS/setup work must exclude both seats and external
     /// updaters. Unlike an editing seat, it has no child agent to take the OS
     /// lock. Release this lease before invoking a seat (the gate is not reentrant).
-    pub(crate) async fn for_operation(cwd: &Path) -> Result<Option<Self>> {
+    pub(crate) async fn operation_with(cwd: &Path, wait: &WaitPolicy) -> Result<Option<Self>> {
+        wait.wait(Self::operation(cwd)).await
+    }
+
+    async fn operation(cwd: &Path) -> Result<Option<Self>> {
         let mut announced = false;
         loop {
-            let Some(mut permit) = Self::for_checkout(cwd, true).await? else {
+            let Some(mut permit) = Self::checkout(cwd, true).await? else {
                 return Ok(None);
             };
             match Lease::acquire(permit.path.clone()) {
@@ -115,6 +196,18 @@ impl SeatLease {
     }
 
     pub(crate) async fn for_checkout(cwd: &Path, allow_write: bool) -> Result<Option<Self>> {
+        Self::checkout_with(cwd, allow_write, &WaitPolicy::current()).await
+    }
+
+    pub(crate) async fn checkout_with(
+        cwd: &Path,
+        allow_write: bool,
+        wait: &WaitPolicy,
+    ) -> Result<Option<Self>> {
+        wait.wait(Self::checkout(cwd, allow_write)).await
+    }
+
+    async fn checkout(cwd: &Path, allow_write: bool) -> Result<Option<Self>> {
         let Some(common) = common_dir(cwd).await? else {
             return Ok(None);
         };
@@ -238,6 +331,79 @@ fn exclusive(path: &Path) -> std::io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn coordination_waits_are_bounded_and_cancel_local_and_external_contention() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        crate::git::git(dir.path(), &["init"]).await.unwrap();
+        let common = common_dir(dir.path()).await.unwrap().unwrap();
+        std::fs::write(common.join("kanade-sync.contract"), "shared-lock-v1\n").unwrap();
+        let path = common.join("kanade-sync.lock");
+        let short = WaitPolicy::new(Duration::from_millis(100), || false);
+        let external = exclusive(&path).unwrap();
+        assert!(
+            SeatLease::checkout_with(dir.path(), false, &short)
+                .await
+                .err()
+                .expect("busy")
+                .is::<ResourceBlocked>()
+        );
+        assert!(
+            SeatLease::operation_with(dir.path(), &short)
+                .await
+                .err()
+                .expect("busy")
+                .is::<ResourceBlocked>()
+        );
+        drop(external);
+        let editor = SeatLease::checkout_with(dir.path(), true, &short)
+            .await
+            .unwrap();
+        assert!(
+            SeatLease::checkout_with(dir.path(), false, &short)
+                .await
+                .err()
+                .expect("busy")
+                .is::<ResourceBlocked>()
+        );
+        assert!(
+            SeatLease::checkout_with(dir.path(), true, &short)
+                .await
+                .err()
+                .expect("busy")
+                .is::<ResourceBlocked>()
+        );
+        for operation in [false, true] {
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&cancelled);
+            let wait =
+                WaitPolicy::new(Duration::from_secs(60), move || flag.load(Ordering::SeqCst));
+            let (result, ()) = tokio::join!(
+                async {
+                    if operation {
+                        SeatLease::operation_with(dir.path(), &wait).await
+                    } else {
+                        SeatLease::checkout_with(dir.path(), false, &wait).await
+                    }
+                },
+                async {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    cancelled.store(true, Ordering::SeqCst);
+                }
+            );
+            let error = result
+                .err()
+                .expect("cancelled before obtaining the local gate");
+            assert!(error.is::<ResourceBlocked>());
+            assert!(error.to_string().contains("parking"));
+        }
+        drop(editor);
+        // Timed-out and cancelled waiters must not retain a reservation.
+        drop(SeatLease::operation_with(dir.path(), &short).await.unwrap());
+        assert!(exclusive(&path).is_ok());
+    }
 
     #[tokio::test]
     async fn non_checkout_needs_no_git_resolution_but_broken_checkout_fails_closed() {

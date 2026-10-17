@@ -4686,6 +4686,7 @@ pub async fn fix_round(
             )));
         }
         Ok(_) => {}
+        Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => return Err(e),
         Err(e) => return Ok(Fixed::Failed(format!("{e:#}"))),
     }
 

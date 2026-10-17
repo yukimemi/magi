@@ -1655,6 +1655,7 @@ pub fn pick_chain(
 /// answer such as a timeout or empty reply.
 pub fn chain_advances(outcome: &Result<AgentOutput>) -> bool {
     match outcome {
+        Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => false,
         Err(_) => true,
         Ok(out) => output_advances(out),
     }

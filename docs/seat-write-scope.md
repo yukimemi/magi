@@ -55,8 +55,15 @@ waiter resumes. Concurrent readers in the same launcher share the held handle;
 other processes still contend with it. Nonblocking acquisition attempts retry
 on external contention as an infrastructure wait, before creating artifacts,
 starting the CLI or starting its timeout. No error reaches fallback, seat
-history or review budgets merely because an updater owns the lock. A caller
-can cancel this wait without having started any work. The last reader explicitly
+history or review budgets merely because an updater owns the lock. Both local
+reservation waits and external lock waits are bounded by
+`graph.timeout_resource_wait` and check the run's pause/interrupt handles at
+least every five seconds. Expiry produces a repository-coordination resource
+block, not an agent failure or a permanent preparation failure; a pause remains
+a park. Standalone invocations use the default graph limit, chats and public
+folding use their configured limit, and callers can also cancel by dropping
+the waiting future. No process or prompt artifact exists until acquisition.
+The last reader explicitly
 unlocks before closing the handle, never unlinking the lock file. Explicit
 unlocking prevents an unrelated concurrent fork's inherited descriptor from
 delaying release until that process executes or exits.
@@ -73,10 +80,20 @@ between nonblocking attempts, allowing an editor to proceed.
 Launcher operations reacquire both the exclusive local reservation and the real
 OS lock after a seat finishes. Candidate and fixer rescue commits, recovery
 rollback, review verification (including catch-up), and the complete mechanical
-pre-gate and final gate sequence cannot
-start while an external updater owns the lock. Fallback preparation releases
+pre-gate and final gate sequence cannot start while an external updater owns
+the lock. Interrupted grafts, early recovery rollback and restoration between
+fixer fallbacks all use the same operation lease. If acquisition fails or
+expires, reset/clean do not run and an unsettled rollback record stays unsettled.
+Fallback preparation releases
 its operation lease before starting the next seat; the local gate is not
 reentrant.
+
+Whenever both resources are needed, acquisition order is shared build cache,
+then repository reservation/OS lock; release is in reverse order. Verification
+acquires repository coordination inside the cache lease, including mechanical
+pre-gate edits. Rescue commits release their repository lease before entering
+verification. This matches editing waves and avoids a cache holder waiting
+for a repository reserved by the very verification waiting for its cache.
 
 Control-plane seats (`conduct`, `dupes`, and `deputy`) and consulted chat turns
 with explicit question/answer-store grants stay outside repository scheduling.
