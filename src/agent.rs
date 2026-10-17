@@ -91,7 +91,7 @@ pub fn has_session(kind: AgentKind, seat: &SeatState, sessions_enabled: bool) ->
 }
 
 /// One agent invocation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Invocation<'a> {
     /// Working directory. Always a real checkout, so every CLI can read the
     /// repository without per-vendor "extra directory" flags.
@@ -136,10 +136,58 @@ pub struct Invocation<'a> {
     /// caller, not here.
     pub attachments: &'a [PathBuf],
     /// Directories outside `cwd` the seat may write, when it may write at all.
-    /// Only codex's `workspace-write` sandbox is confined to the workspace, so
-    /// only it needs this: a deputy's `magi ask` writes the question store,
-    /// which lives under magi's data directory, not in the repository.
+    /// Explicit, purpose-specific grants (for example a deputy's stores).
+    /// Repository editing seats also receive the shared Git directory and
+    /// question control-plane directories in [`invoke`].
+    /// For chat, nonempty explicit roots with write permission designate a
+    /// control-only consultation turn; repository investigation is suspended.
     pub writable: &'a [PathBuf],
+}
+
+fn repository_writer(inv: &Invocation<'_>) -> bool {
+    inv.allow_write
+        && (matches!(
+            inv.node,
+            "implement" | "fix" | "graft" | "gate-fix" | "land" | "rebase"
+        ) || (inv.node == "chat" && repository_seat(inv)))
+}
+
+fn consulted_chat(inv: &Invocation<'_>) -> bool {
+    // talk::turn supplies explicit question/answer-store roots only while
+    // delivering a consultation or an authorized hold.
+    inv.node == "chat" && inv.allow_write && !inv.writable.is_empty()
+}
+
+fn repository_seat(inv: &Invocation<'_>) -> bool {
+    // These roles consume supplied state, prompts and conversation history.
+    // In particular, they must be able to deliver an answer or make queue
+    // decisions while an editor holds its reservation waiting for that answer.
+    !matches!(inv.node, "deputy" | "conduct" | "dupes") && !consulted_chat(inv)
+}
+
+/// Resolve the additional write scope for a repository editing seat.
+///
+/// Resolve Git's common directory from the actual seat checkout, never by
+/// assuming `.git` is a directory. Canonicalize directories before handing
+/// them to a sandbox (notably `/tmp` aliases on macOS). Failure is a startup
+/// error: do not start work with an unusable lock/question route.
+pub async fn worktree_writable_roots(cwd: &Path, home: &Path) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    if let Some(common) = crate::repo_lock::common_dir(cwd).await? {
+        let cwd = std::fs::canonicalize(cwd).context("canonicalize seat working directory")?;
+        if !common.starts_with(&cwd) {
+            roots.push(common);
+        }
+    }
+    // Questions::put/update/beat/panels write questions. Its quiet_for hook
+    // updates matching notifications. Neither needs queue, runs, talks, nor
+    // the entire state directory.
+    for name in ["questions", "notifications"] {
+        let dir = home.join(name);
+        std::fs::create_dir_all(&dir).with_context(|| format!("prepare seat {name} directory"))?;
+        roots.push(std::fs::canonicalize(dir)?);
+    }
+    Ok(roots)
 }
 
 /// Evidence that a CLI ran out of its rate limit / quota, distinct from an
@@ -320,6 +368,41 @@ pub async fn invoke(
     seat: &mut SeatState,
     inv: &Invocation<'_>,
 ) -> Result<AgentOutput> {
+    // Wait for repository scheduling before spawning or starting a seat's
+    // budget. Readers hold the real lock; editors exclude local readers while
+    // taking their own repository-prescribed lock inside the seat.
+    let lease = if repository_seat(inv) {
+        crate::repo_lock::SeatLease::for_checkout(inv.cwd, inv.allow_write).await?
+    } else {
+        None
+    };
+    let prompt = if consulted_chat(inv) {
+        Some(format!(
+            "{}\n\nCurrent turn scope: answer the supplied consultation or authorized hold using the conversation and supplied question context and supported magi control-plane commands only. This overrides repository investigation permissions in the standing briefing or earlier turns. No repository lease is held: do not read repository files or history, fetch, run tests, or edit repository files. If repository investigation is needed, report that it must wait for a normal repository-coordinated turn after the consultation is resolved.",
+            inv.prompt
+        ))
+    } else {
+        lease.as_ref().filter(|lease| lease.delegated).map(|lease| format!(
+        "Repository coordination: the launcher holds the exclusive repository lock at {} on behalf of this read-only seat for this entire invocation. Do not acquire a second lock or release/delete that file. Your filesystem access remains read-only.\n\n{}",
+        lease.path.display(), inv.prompt
+        ))
+    };
+    // Apply once for initial, resumed, fallback and waiter invocations alike.
+    // Deputies/chat retain their explicit grants; read-only stays read-only.
+    let home = repository_writer(inv).then(crate::run::home);
+    let mut writable = inv.writable.to_vec();
+    if let Some(home) = &home {
+        for root in worktree_writable_roots(inv.cwd, home).await? {
+            if !writable.contains(&root) {
+                writable.push(root);
+            }
+        }
+    }
+    let inv = &Invocation {
+        writable: &writable,
+        prompt: prompt.as_deref().unwrap_or(inv.prompt),
+        ..inv.clone()
+    };
     tokio::fs::create_dir_all(inv.artifacts)
         .await
         .with_context(|| format!("create {}", inv.artifacts.display()))?;
@@ -367,6 +450,11 @@ pub async fn invoke(
         // No console window. `magi web` has no console of its own, so Windows
         // would give each agent a fresh one - and draw it. See `crate::proc`.
         .quiet();
+    if let Some(home) = home {
+        // Match the control-plane store we granted, even with a relative
+        // MAGI_HOME or a per-agent environment override.
+        cmd.env("MAGI_HOME", std::fs::canonicalize(home)?);
+    }
     if let Some(cache) = inv.cache_dir {
         // Same directory the verify commands build into: one cache to prune,
         // and the compile the seat pays for is the compile the gate reuses.
@@ -382,13 +470,19 @@ pub async fn invoke(
         cmd.env_remove("CARGO_TARGET_DIR");
     }
 
-    let mut child = cmd
+    #[cfg(unix)]
+    if lease.is_some() {
+        cmd.process_group(0);
+    }
+    let child = cmd
         .spawn()
         .with_context(|| format!("spawn `{}` for seat {}", plan.argv[0], seat.key))?;
+    // No await occurs between spawn and transfer to the cancellation owner.
+    let mut running = crate::seat_process::Running::new(child, lease);
     // Feed stdin from a task rather than inline: a `command` agent that never
     // reads its stdin, or a prompt larger than the pipe buffer, would
     // otherwise deadlock here before the process is ever waited on.
-    if let (Some(body), Some(mut sink)) = (plan.stdin.clone(), child.stdin.take()) {
+    if let (Some(body), Some(mut sink)) = (plan.stdin.clone(), running.child().stdin.take()) {
         tokio::spawn(async move {
             sink.write_all(body.as_bytes()).await.ok();
             sink.shutdown().await.ok();
@@ -411,21 +505,28 @@ pub async fn invoke(
     //
     // Now the readers own the bytes, so a timeout keeps whatever arrived, and
     // the wait ends at exit even if a stray handle stays open.
-    let (out_buf, out_reader) = drain(child.stdout.take());
-    let (err_buf, err_reader) = drain(child.stderr.take());
+    let (out_buf, out_reader) = drain(running.child().stdout.take());
+    let (err_buf, err_reader) = drain(running.child().stderr.take());
 
-    let (code, timed_out) = match tokio::time::timeout(inv.timeout, child.wait()).await {
+    let (code, timed_out) = match tokio::time::timeout(inv.timeout, running.child().wait()).await {
         Ok(res) => {
             let status = res.with_context(|| format!("wait for seat {}", seat.key))?;
             (status.code(), false)
         }
         Err(_) => {
             tracing::warn!(seat = %seat.key, secs = inv.timeout.as_secs(), "agent timed out");
-            // Kill the tree so the readers see EOF instead of hanging with it.
-            child.start_kill().ok();
+            // Wait for CLI termination before releasing its repository lease.
+            if !running.coordinated() {
+                running
+                    .child()
+                    .kill()
+                    .await
+                    .context("stop timed-out seat")?;
+            }
             (None, true)
         }
     };
+    running.finish().await;
 
     // The child is gone either way, so the readers are bounded now. A grace
     // window rather than an unbounded await: a surviving grandchild can still
@@ -660,6 +761,14 @@ fn build_command(
                 let dir = parent.to_string_lossy().into_owned();
                 if !add_dirs.contains(&dir) {
                     add_dirs.push(dir);
+                }
+            }
+            if inv.allow_write {
+                for path in inv.writable {
+                    let dir = path.to_string_lossy().into_owned();
+                    if !add_dirs.contains(&dir) {
+                        add_dirs.push(dir);
+                    }
                 }
             }
             for dir in add_dirs {
@@ -1546,6 +1655,7 @@ pub fn pick_chain(
 /// answer such as a timeout or empty reply.
 pub fn chain_advances(outcome: &Result<AgentOutput>) -> bool {
     match outcome {
+        Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => false,
         Err(_) => true,
         Ok(out) => output_advances(out),
     }
@@ -1757,6 +1867,81 @@ mod tests {
         let want = "sandbox_workspace_write.writable_roots=[\"/data/questions\"]";
         assert!(mk(true).argv.windows(2).any(|w| w == ["-c", want]));
         assert!(!mk(false).argv.iter().any(|a| a.contains("writable_roots")));
+    }
+
+    #[test]
+    fn repository_write_scope_covers_editing_nodes_without_changing_other_roles() {
+        let mut i = inv(Path::new("."), Path::new("/art"), true);
+        for node in [
+            "implement",
+            "fix",
+            "graft",
+            "gate-fix",
+            "land",
+            "rebase",
+            "chat",
+        ] {
+            i.node = node;
+            assert!(repository_writer(&i), "{node}");
+            i.allow_write = false;
+            assert!(!repository_writer(&i), "{node}");
+            i.allow_write = true;
+        }
+        for node in ["deputy", "judge", "review", "bump", "conduct"] {
+            i.node = node;
+            assert!(!repository_writer(&i), "{node}");
+        }
+        i.node = "chat";
+        let roots = [PathBuf::from("/questions")];
+        i.writable = &roots;
+        assert!(!repository_writer(&i), "consultation keeps explicit grants");
+    }
+
+    #[test]
+    fn writable_directories_reach_initial_and_resumed_adapter_commands() {
+        let roots = [
+            PathBuf::from("/shared/git"),
+            PathBuf::from("/state/questions"),
+        ];
+        for kind in [AgentKind::Codex, AgentKind::Antigravity] {
+            for resumed in [false, true] {
+                let mut seat = SeatState::new("impl-A", "a", 7);
+                if resumed {
+                    seat.turns = 1;
+                    seat.captured_session = Some("session-id".into());
+                }
+                for allow_write in [false, true] {
+                    let mut i = inv(Path::new("."), Path::new("/art"), allow_write);
+                    i.writable = &roots;
+                    let plan = build_command(&spec(kind, None), &seat, &i, Path::new("/art/p.md"))
+                        .unwrap();
+                    for root in &roots {
+                        if kind == AgentKind::Antigravity {
+                            assert_eq!(
+                                plan.argv.windows(2).any(|w| {
+                                    w[0] == "--add-dir" && w[1] == root.to_str().unwrap()
+                                }),
+                                allow_write,
+                                "resumed={resumed}: {:?}",
+                                plan.argv
+                            );
+                        }
+                        assert_eq!(
+                            plan.argv
+                                .iter()
+                                .any(|arg| arg.contains(root.to_str().unwrap())),
+                            allow_write,
+                            "{kind:?}, resumed={resumed}: {:?}",
+                            plan.argv
+                        );
+                    }
+                    if kind == AgentKind::Codex && resumed {
+                        let at = plan.argv.iter().position(|s| s == "resume").unwrap();
+                        assert!(!plan.argv[at..].iter().any(|s| s == "-c"));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

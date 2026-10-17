@@ -568,6 +568,9 @@ pub fn run(state: &RunState) -> String {
         }
         match &r.repair {
             crate::recovery::Repair::NotStarted => {}
+            crate::recovery::Repair::WaitingForRestore { .. } => {
+                let _ = writeln!(s, "  repair: waiting to restore and retry");
+            }
             crate::recovery::Repair::Started { .. } => {
                 let _ = writeln!(s, "  repair: {}", yellow("unfinished"));
             }
@@ -592,6 +595,9 @@ pub fn run(state: &RunState) -> String {
         };
         let _ = match &g.outcome {
             crate::run::GraftOutcome::Applied => writeln!(s, "  {}{size}", green("applied")),
+            crate::run::GraftOutcome::WaitingForRestore => {
+                writeln!(s, "  {}{size}", yellow("waiting to restore and retry"))
+            }
             crate::run::GraftOutcome::Running => writeln!(s, "  {}{size}", yellow("unfinished")),
             crate::run::GraftOutcome::RolledBack(why) => {
                 writeln!(s, "  {} {why}{size}", yellow("rolled back:"))

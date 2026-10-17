@@ -1594,6 +1594,7 @@ fn settle_and_diagnose(
     }
     if let Some(replacement) = &task.replacement
         && !state.parked
+        && state.resource_block.is_none()
         && (state.viable().is_empty()
             || (state.status == RunStatus::Blocked && state.tally.is_none()))
     {
@@ -3343,7 +3344,13 @@ async fn attempt(
             return Vec::new();
         }
     };
-    let started = match &starter {
+    let startup_pause = stop.pause();
+    let startup_interrupt = interrupt_pause.clone();
+    let wait = crate::repo_lock::WaitPolicy::new(
+        Duration::from_secs(config.graph.timeout_resource_wait),
+        move || startup_pause.parked() || startup_interrupt.parked(),
+    );
+    let started = wait.scope(async { match &starter {
         Starter::Review(_) if task.pr_recovery.is_some() => {
             let selected = task.pr_recovery.clone().expect("selected recovery");
             match selected.check_task(&task.id, &task.instruction) {
@@ -3445,9 +3452,22 @@ async fn attempt(
                 r
             })
         }
-    };
+    }}).await;
     let mut runner = match started {
         Ok(r) => r,
+        Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => {
+            task.last_error = Some(e.to_string());
+            if stop.parking() || interrupt_pause.parked() {
+                let attempts = task.attempts;
+                task.park(e.to_string());
+                // Startup has not spent an attempt to refund.
+                task.attempts = attempts;
+            } else {
+                task.hold_machine(Some(format!("{}{e}", crate::cache::RESOURCE_HOLD)));
+            }
+            record(queue, task);
+            return Vec::new();
+        }
         // A branch an earlier attempt still holds and magi will not release
         // by itself is the operator's call, not a failed attempt: hold the
         // task with the reason, spend nothing, and say so on the bell.
@@ -5323,6 +5343,30 @@ mod tests {
         assert!(
             !t.operator_held(),
             "a machine hold, released without a human"
+        );
+
+        let mut selected = task();
+        selected.start("20260902-000000-cccc".into());
+        selected.replacement = Some(crate::merge_decision::Replacement {
+            question: "fixture".into(),
+            run: "earlier".into(),
+            pr: "https://example.invalid/pr/1".into(),
+            agent: "selected".into(),
+            context: "fixture".into(),
+        });
+        state.resource_block.as_mut().unwrap().kind = "repository coordination".into();
+        settle_and_diagnose(&mut selected, verdict, "blocked", 2, &state);
+        assert_eq!(selected.attempts, 0);
+        assert!(
+            !selected.operator_held(),
+            "a selected agent also retains a machine resource hold"
+        );
+        assert!(
+            selected
+                .hold_reason
+                .as_deref()
+                .unwrap()
+                .starts_with("[resource] ")
         );
 
         // A park request outranks it: still the operator's doing.

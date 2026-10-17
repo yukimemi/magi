@@ -1048,6 +1048,7 @@ fn graft_view(
     sources.dedup();
     let (outcome, reason) = match &g.outcome {
         GraftOutcome::Applied => ("applied", None),
+        GraftOutcome::WaitingForRestore => ("waiting_for_restore", None),
         GraftOutcome::Running => ("unfinished", None),
         GraftOutcome::RolledBack(w) => ("rolled_back", Some(w.clone())),
     };

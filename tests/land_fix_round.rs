@@ -76,3 +76,54 @@ async fn a_fixer_that_commits_for_itself_counts_as_progress() {
     assert!(state.events.iter().any(|e| e.message.contains("pushed a fix")));
 }
 }
+
+common::e2e! {
+#[cfg(unix)]
+async fn land_rescue_waits_for_the_real_repository_lock() {
+    use std::os::fd::AsRawFd as _;
+    let home = common::home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    fx.config.graph.implementers = 1;
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
+        .await.expect("start");
+    runner.execute().await.expect("execute");
+    let mut state = runner.state;
+    let winner = state.winner().cloned().unwrap();
+    let before = git(&winner.worktree, &["rev-parse", "HEAD"]);
+    // Register after setup so this test isolates the gap after a land seat.
+    std::fs::write(fx.repo.join(".git/kanade-sync.contract"), "shared-lock-v1\n").unwrap();
+    let marker = fx.tmp.path().join("edited");
+    let release = fx.tmp.path().join("release");
+    let mut fixer = state.config.agents[0].clone();
+    fixer.id = "land-lock-test".into();
+    fixer.command = vec!["sh".into(), "-c".into(), format!(
+        "echo fix > land-edit; touch '{}'; while [ ! -f '{}' ]; do sleep 0.01; done; echo fixed",
+        marker.display(), release.display())];
+    state.config.roles.fixer = Some(fixer.id.as_str().into());
+    state.config.agents.push(fixer);
+    state.config.graph.timeout_resource_wait = 1;
+    let pr = PrState {
+        url: "https://example.invalid/pull/1".into(), number: 1,
+        state: PrLifecycle::Open, checks: Checks::Red,
+        failing: vec!["check".into()], review_comments: Vec::new(), blocking: Blocking::Yes,
+    };
+    let (out, external) = tokio::join!(
+        fix_round(&mut state, &pr, 1, 2, "check failed", ""),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !marker.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+            let lock = std::fs::File::create(fx.repo.join(".git/kanade-sync.lock")).unwrap();
+            assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+            std::fs::write(&release, "go").unwrap();
+            lock
+        }
+    );
+    assert!(out.unwrap_err().to_string().contains("repository coordination"));
+    assert_eq!(git(&winner.worktree, &["rev-parse", "HEAD"]), before);
+    assert!(git(&winner.worktree, &["status", "--porcelain"]).contains("land-edit"));
+    drop(external);
+}
+}
