@@ -5180,10 +5180,11 @@ fn task_flow(
         n.started_at = h
             .readable
             .then(|| {
-                h.pass
-                    .as_ref()
-                    .map(|p| p.started_at)
-                    .or_else(|| if h.pass_n == 1 { h.created_at } else { None })
+                h.pass.as_ref().map(|p| p.started_at).or(if h.pass_n == 1 {
+                    h.created_at
+                } else {
+                    None
+                })
             })
             .flatten();
         n.run_kind = Some(h.kind);
