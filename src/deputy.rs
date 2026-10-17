@@ -825,7 +825,10 @@ impl Job {
             Ok(o) if o.quota_exhausted() => (None, Some("the agent is out of quota".to_owned())),
             Ok(o) => (
                 None,
-                Some(format!("its turn failed (exit {:?})", o.exit_code)),
+                Some(format!(
+                    "its turn failed ({})",
+                    notices::exit_status(o.exit_code)
+                )),
             ),
             Err(e) => (None, Some(format!("the agent could not be started: {e:#}"))),
         };

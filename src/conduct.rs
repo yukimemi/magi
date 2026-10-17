@@ -2778,14 +2778,24 @@ printf '%s\n' "$MOCK_REPLY"
         // A notice was filed with human-readable text and task link
         let notices = crate::notices::Notices::open();
         let notice = notices
-            .get(&crate::notices::id_of(&format!("conductor-resumption:{}", t.id)))
+            .get(&crate::notices::id_of(&format!(
+                "conductor-resumption:{}",
+                t.id
+            )))
             .expect("conductor-resumption notice filed");
 
-        assert_eq!(notice.link, Some(crate::notices::Link::Task { id: t.id.clone() }));
+        assert_eq!(
+            notice.link,
+            Some(crate::notices::Link::Task { id: t.id.clone() })
+        );
         // Message does NOT contain the question prose to avoid asking for non-existent answers
         assert!(!notice.message.contains("How should we proceed"));
         // Message explicitly notes that no reply is required
-        assert!(notice.message.contains("No reply to this notice is needed."));
+        assert!(
+            notice
+                .message
+                .contains("No reply to this notice is needed.")
+        );
         // No raw Rust debug representations
         assert!(!notice.message.contains("Some("));
         assert!(!notice.message.contains("None"));

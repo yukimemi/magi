@@ -635,9 +635,18 @@ pub fn merged_red(run_id: &str, summary: &str) -> Notice {
     })
 }
 
+/// Human-readable process status for operator-facing failure details.
+pub fn exit_status(code: Option<i32>) -> String {
+    match code {
+        Some(code) => format!("exit code {code}"),
+        None => "exit code unavailable".to_owned(),
+    }
+}
+
 /// Trims text and drops empty values or meaningless placeholder phrases like `"(no reason given)"`.
 pub fn clean_text(s: Option<&str>) -> Option<&str> {
-    s.map(str::trim).filter(|t| !t.is_empty() && *t != "(no reason given)" && *t != "(none)")
+    s.map(str::trim)
+        .filter(|t| !t.is_empty() && *t != "(no reason given)" && *t != "(none)")
 }
 
 /// Formats a list of identifiers or items into human-readable comma-separated prose.
@@ -739,16 +748,16 @@ pub fn conductor_resumption(
         parts.push(format!("Cited evidence: {ev}."));
     }
 
-    parts.push("No reply to this notice is needed. To hold this task, use manual hold via the queue.".to_owned());
+    parts.push(
+        "No reply to this notice is needed. To hold this task, use manual hold via the queue."
+            .to_owned(),
+    );
 
-    Notice::warn(
-        &format!("conductor-resumption:{task_id}"),
-        parts.join(" "),
-    )
-    .link(Link::Task {
-        id: task_id.to_owned(),
-    })
-    .about([task_id.to_owned()])
+    Notice::warn(&format!("conductor-resumption:{task_id}"), parts.join(" "))
+        .link(Link::Task {
+            id: task_id.to_owned(),
+        })
+        .about([task_id.to_owned()])
 }
 
 /// The notice for a run whose graph returned an error before it settled.
@@ -954,6 +963,12 @@ mod tests {
         assert!(s.get(&id_of("deputy:old")).is_err());
         assert_eq!(s.all().len(), CAP);
         assert!(s.all().iter().all(|n| n.key.starts_with("current:")));
+    }
+
+    #[test]
+    fn process_exit_status_is_readable_even_without_a_code() {
+        assert_eq!(exit_status(Some(1)), "exit code 1");
+        assert_eq!(exit_status(None), "exit code unavailable");
     }
 
     fn store() -> (tempfile::TempDir, Notices) {
@@ -1584,7 +1599,12 @@ mod tests {
 
         assert_eq!(notice.key, format!("conductor-resumption:{task_id}"));
         assert_eq!(notice.severity, Severity::Warn);
-        assert_eq!(notice.link, Some(Link::Task { id: task_id.to_owned() }));
+        assert_eq!(
+            notice.link,
+            Some(Link::Task {
+                id: task_id.to_owned()
+            })
+        );
         assert_eq!(notice.subjects, vec![task_id.to_owned()]);
 
         let msg = &notice.message;
@@ -1605,14 +1625,7 @@ mod tests {
     #[test]
     fn conductor_resumption_notice_omits_empty_details() {
         let task_id = "20261017-000000-abcd";
-        let notice = conductor_resumption(
-            task_id,
-            "abcd",
-            None,
-            &[],
-            &[],
-            false,
-        );
+        let notice = conductor_resumption(task_id, "abcd", None, &[], &[], false);
 
         let msg = &notice.message;
         assert!(!msg.contains("Concern:"));

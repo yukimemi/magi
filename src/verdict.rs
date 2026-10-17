@@ -141,6 +141,17 @@ impl Severity {
     }
 }
 
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Nit => "nit",
+            Self::Minor => "minor",
+            Self::Major => "major",
+            Self::Blocker => "blocker",
+        })
+    }
+}
+
 /// One review finding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
@@ -422,6 +433,18 @@ pub fn verified_noop(summary: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn severity_has_explicit_operator_labels() {
+        for (severity, label) in [
+            (Severity::Nit, "nit"),
+            (Severity::Minor, "minor"),
+            (Severity::Major, "major"),
+            (Severity::Blocker, "blocker"),
+        ] {
+            assert_eq!(severity.to_string(), label);
+        }
+    }
 
     #[test]
     fn malformed_strengths_never_cost_the_ranking() {

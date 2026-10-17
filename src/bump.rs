@@ -112,7 +112,10 @@ async fn ask_decision(
             Ok(out) if out.timed_out => (run::FailClass::Timeout, "timed out".to_owned()),
             Ok(out) if out.exit_code != Some(0) => (
                 run::FailClass::Other("cli".into()),
-                format!("CLI exit {:?}", out.exit_code),
+                format!(
+                    "CLI failed ({})",
+                    crate::notices::exit_status(out.exit_code)
+                ),
             ),
             Ok(out) if out.text.trim().is_empty() => (
                 run::FailClass::Other("empty".into()),
@@ -2995,7 +2998,7 @@ mod tests {
                 "CLI invocation failed; inspect attempt artifacts",
             ),
             ("not JSON", "0", "invalid decision JSON or missing reason"),
-            (VALID_DECISION, "1", "CLI exit Some(1)"),
+            (VALID_DECISION, "1", "CLI failed (exit code 1)"),
             ("", "timeout", "timed out"),
         ] {
             let dir = tempfile::tempdir().unwrap();
