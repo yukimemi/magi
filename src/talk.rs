@@ -2559,11 +2559,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             attachments: &attachment_paths,
             writable: &consult_roots,
         };
-        let wait = crate::repo_lock::WaitPolicy::new(
-            Duration::from_secs(cfg.graph.timeout_resource_wait),
-            || false,
-        );
-        let result = wait.scope(agent::invoke(spec, &mut talk.seat, &inv)).await;
+        let result = agent::invoke(spec, &mut talk.seat, &inv).await;
         let advance = agent::chain_advances(&result);
         if n == 0 || !advance {
             outcome = Some(result);
