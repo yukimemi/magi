@@ -79,6 +79,7 @@ async fn ask_decision(
             spec,
             &mut seat,
             &Invocation {
+                coordination: state.config.coordination.as_ref(),
                 cwd: repo,
                 prompt,
                 timeout: attempt_timeout,
@@ -191,6 +192,7 @@ async fn guard_reason(
             spec,
             seat,
             &Invocation {
+                coordination: state.config.coordination.as_ref(),
                 cwd: repo,
                 prompt: &rewrite,
                 timeout: crate::graph::retry_budget(DECISION_TIMEOUT, true),

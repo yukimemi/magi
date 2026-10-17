@@ -982,6 +982,35 @@ command = ["sh", "./mock-agent.sh"]   # {prompt_file} {cwd} {label} {session}
 `command` agents also receive `MAGI_SEAT`, `MAGI_TURN`, `MAGI_PROMPT_FILE` and
 `MAGI_ALLOW_WRITE` in the environment.
 
+### External repository coordination
+
+Coordination is disabled unless `[coordination]` is configured in the machine
+config or a repository config layer. All three keys are required after normal
+layer merging and template rendering; unknown keys are rejected. For example,
+replace these placeholder values with the external updater's protocol:
+
+```toml
+[coordination]
+contract_file = "example-updater.contract"
+contract_token = "example-protocol-v1"
+lock_file = "example-updater.lock"
+```
+
+`contract_file` and `lock_file` are plain file names inside the Git common
+directory: empty or whitespace-only names, `.`, any `..`, separators (`/` or
+`\`), NUL, absolute paths and drive prefixes are rejected. `contract_token`
+must be nonempty, single-line, and have no surrounding whitespace. The trimmed
+contract file contents must equal that token. A missing contract leaves the
+repository unregistered; an unreadable or mismatched contract fails closed.
+Without this section no contract is inspected and no coordination lock is taken.
+
+The launcher shares one exclusive OS handle among its readers, serializes
+editors fairly, and holds reader locks until their processes terminate.
+External contention uses `[graph] timeout_resource_wait` and remains an
+infrastructure resource wait. See [seat write scope](docs/seat-write-scope.md).
+Operators relying on the former built-in file names must set all three keys in
+their machine config to keep coordinating with their external updater.
+
 ### Worktree setup
 
 magi creates its worktrees with plain `git worktree add` and does not read

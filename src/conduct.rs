@@ -1377,6 +1377,7 @@ impl Conductor {
                 format!("turn-{}-{}", seat.turns + 1, spec.id)
             };
             let inv = Invocation {
+                coordination: cfg.coordination.as_ref(),
                 cwd: repo,
                 prompt: &body,
                 timeout: TURN_TIMEOUT,

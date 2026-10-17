@@ -729,6 +729,7 @@ impl Job {
         macro_rules! invocation {
             ($prompt:expr, $stem:expr, $timeout:expr) => {
                 Invocation {
+                    coordination: cfg.coordination.as_ref(),
                     cwd: &cwd,
                     prompt: $prompt,
                     timeout: $timeout,

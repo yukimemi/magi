@@ -2538,6 +2538,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             format!("{stem}-{}", spec.id)
         };
         let inv = Invocation {
+            coordination: cfg.coordination.as_ref(),
             cwd: &talk.repo,
             prompt: &body,
             timeout: turn_timeout(cfg),

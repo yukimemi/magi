@@ -1,6 +1,15 @@
 //! Real shared-directory and control-plane fixtures. No operator state is used.
 mod common;
 
+fn coordination() -> &'static magi::config::Coordination {
+    static POLICY: std::sync::LazyLock<magi::config::Coordination> = std::sync::LazyLock::new(
+        || {
+            toml::from_str("contract_file = 'updater.contract'\ncontract_token = 'test-protocol-v1'\nlock_file = 'updater.lock'").unwrap()
+        },
+    );
+    &POLICY
+}
+
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
@@ -146,7 +155,7 @@ async fn seatbelt_enforces_resolved_write_scope() {
             serde_json::to_string(root.to_str().unwrap()).unwrap()
         ));
     }
-    let lock = fx.primary.join(".git/kanade-sync.lock");
+    let lock = fx.primary.join(".git/updater.lock");
     let question = fx.home.join("questions/probe.tmp");
     let work = fx.seat.join("work-started");
     let notification = fx.home.join("notifications/probe");
@@ -227,6 +236,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
                 &spec,
                 &mut seat,
                 &Invocation {
+                    coordination: Some(coordination()),
                     cwd: &fx.seat,
                     prompt: "fixture",
                     timeout: Duration::from_secs(10),
@@ -269,6 +279,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
     for (node, allow_write) in [("review", false), ("implement", false), ("deputy", true), ("chat", true)] {
         let mut seat = SeatState::new("fixture-seat", "fixture", 1);
         invoke(&spec, &mut seat, &Invocation {
+            coordination: Some(coordination()),
             cwd: &fx.seat, prompt: "fixture", timeout: Duration::from_secs(10),
             allow_write, unsandboxed: false, sessions: false,
             artifacts: &artifacts, stem: node, run: "fixture-run", node,
@@ -289,7 +300,7 @@ $ErrorActionPreference = 'Stop'
 $common = git rev-parse --path-format=absolute --git-common-dir
 if ($LASTEXITCODE -ne 0) { exit 24 }
 try {
-  $lock = [IO.File]::Open((Join-Path $common 'kanade-sync.lock'),
+  $lock = [IO.File]::Open((Join-Path $common 'updater.lock'),
     [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
 } catch { Write-Output 'lock-refused'; exit 23 }
 "#;
@@ -336,8 +347,8 @@ async fn readonly_invocation_holds_dotnet_compatible_lock_and_refuses_external_c
 
     let fx = Fixture::new();
     std::fs::write(
-        fx.primary.join(".git/kanade-sync.contract"),
-        "shared-lock-v1\n",
+        fx.primary.join(".git/updater.contract"),
+        "test-protocol-v1\n",
     )
     .unwrap();
     let script = r#"
@@ -366,7 +377,7 @@ Write-Output 'real-lock-contends'
         env: BTreeMap::from([(
             "CHECK_LOCK".into(),
             fx.primary
-                .join(".git/kanade-sync.lock")
+                .join(".git/updater.lock")
                 .to_str()
                 .unwrap()
                 .into(),
@@ -374,6 +385,7 @@ Write-Output 'real-lock-contends'
     };
     let artifacts = fx._tmp.path().join("reader-artifacts");
     let inv = Invocation {
+        coordination: Some(coordination()),
         cwd: &fx.seat,
         prompt: "fixture read-only work",
         timeout: Duration::from_secs(10),
@@ -518,7 +530,7 @@ mod coordination {
                 (
                     "COORDINATION_LOCK".into(),
                     fx.primary
-                        .join(".git/kanade-sync.lock")
+                        .join(".git/updater.lock")
                         .to_str()
                         .unwrap()
                         .into(),
@@ -533,6 +545,7 @@ mod coordination {
         allow_write: bool,
     ) -> Invocation<'a> {
         Invocation {
+            coordination: Some(coordination()),
             cwd: &fx.seat,
             prompt: "fixture",
             timeout: Duration::from_secs(20),
@@ -552,8 +565,8 @@ mod coordination {
     fn registered() -> Fixture {
         let fx = Fixture::new();
         std::fs::write(
-            fx.primary.join(".git/kanade-sync.contract"),
-            "shared-lock-v1\n",
+            fx.primary.join(".git/updater.contract"),
+            "test-protocol-v1\n",
         )
         .unwrap();
         fx
@@ -562,6 +575,58 @@ mod coordination {
     fn alive(pid: i32) -> bool {
         // SAFETY: signal zero only probes the recorded fixture process.
         unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[tokio::test]
+    async fn machine_config_preserves_existing_external_lock_protocol() {
+        let fx = Fixture::new();
+        // Literal migration fixture: these are existing external files, never defaults.
+        let machine = fx._tmp.path().join("machine.toml");
+        std::fs::write(
+            &machine,
+            r#"
+[coordination]
+contract_file = "kanade-sync.contract"
+contract_token = "shared-lock-v1"
+lock_file = "kanade-sync.lock"
+"#,
+        )
+        .unwrap();
+        let cfg = magi::config::Config::load(&machine).unwrap();
+        let policy = cfg.coordination.as_ref().unwrap();
+        let common = fx.primary.join(".git");
+        std::fs::write(
+            common.join(&policy.contract_file),
+            format!("{}\n", policy.contract_token),
+        )
+        .unwrap();
+        let external = take_lock(&common.join(&policy.lock_file)).unwrap();
+        let mut spec = spec(&fx, "chat-reader");
+        spec.env.insert(
+            "COORDINATION_LOCK".into(),
+            common.join(&policy.lock_file).to_str().unwrap().into(),
+        );
+        let art = fx._tmp.path().join("art");
+        let inv = Invocation {
+            coordination: cfg.coordination.as_ref(),
+            ..invocation(&fx, &art, false)
+        };
+        let mut seat = SeatState::new("reader", "fixture", 1);
+        let future = invoke(&spec, &mut seat, &inv);
+        tokio::pin!(future);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut future)
+                .await
+                .is_err()
+        );
+        assert!(!art.exists());
+        drop(external);
+        let out = tokio::time::timeout(Duration::from_secs(10), &mut future)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(out.usable(), "{out:?}");
+        assert!(take_lock(&common.join(&policy.lock_file)).is_some());
     }
 
     #[tokio::test]
@@ -580,7 +645,7 @@ mod coordination {
             }
             assert!(Instant::now() < deadline);
         }
-        let lock = fx.primary.join(".git/kanade-sync.lock");
+        let lock = fx.primary.join(".git/updater.lock");
         assert!(take_lock(&lock).is_none());
         let consult_roots = [fx.home.join("questions")];
         // Only consulted chat has a control-only scope. Ordinary chat may
@@ -678,7 +743,7 @@ mod coordination {
             .map(|p| p.parse().unwrap())
             .collect();
         loop {
-            if let Some(lock) = take_lock(&fx.primary.join(".git/kanade-sync.lock")) {
+            if let Some(lock) = take_lock(&fx.primary.join(".git/updater.lock")) {
                 assert!(
                     pids.iter().all(|pid| !alive(*pid)),
                     "lock released while a seat process lives"
@@ -785,7 +850,7 @@ mod coordination {
     #[tokio::test]
     async fn external_contention_waits_without_spawning_or_charging_an_attempt() {
         let fx = registered();
-        let external = take_lock(&fx.primary.join(".git/kanade-sync.lock")).unwrap();
+        let external = take_lock(&fx.primary.join(".git/updater.lock")).unwrap();
         let spec = spec(&fx, "chat-reader");
         let art = fx._tmp.path().join("art");
         let inv = Invocation {
@@ -828,7 +893,7 @@ fn shared_lock_contention_prevents_work_and_release_allows_reacquisition() {
     release_lock(&mut holder);
     checked(&mut fx.pwsh(&work));
     assert!(fx.seat.join("work-started").is_file());
-    assert!(fx.primary.join(".git/kanade-sync.lock").is_file());
+    assert!(fx.primary.join(".git/updater.lock").is_file());
 }
 
 #[tokio::test]
@@ -939,5 +1004,5 @@ try {{
         assert!(stdout.contains("unrelated-denied"), "{stdout}");
     }
     assert!(!unrelated.join("denied").exists());
-    assert!(fx.primary.join(".git/kanade-sync.lock").is_file());
+    assert!(fx.primary.join(".git/updater.lock").is_file());
 }

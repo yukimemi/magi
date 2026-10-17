@@ -453,7 +453,7 @@ directory plus the `questions` and `notifications` stores, through the backend's
 supported directory mechanism. Keep this policy centralized for initial turns,
 resumes, fallbacks and waiter delivery. Never replace it with a sandbox bypass
 or the entire state root. Deputies/chats retain explicit grants. For read-only
-seats in repositories registered with `shared-lock-v1`, the launcher holds the
+seats in repositories registered through `[coordination]`, the launcher holds the
 real exclusive lock through `repo_lock::SeatLease` without widening their
 sandbox. A fair per-repository gate admits concurrent readers or one editor;
 editors take their own OS lock after readers have released theirs. External
@@ -462,6 +462,15 @@ an agent failure. `seat_process::Running` transfers cancelled processes and
 coordination to an independent cleanup thread and releases only after the CLI
 and discovered tool descendants terminate. Registered seats currently require
 Unix containment; other platforms fail closed before spawning.
+Coordination is disabled without `[coordination]`. Machine and repository layers
+may set `contract_file`, `contract_token`, and `lock_file`; all three are required
+after normal layer merging and teravars rendering. Names are plain files inside
+the Git common directory, never paths or names containing `..`; the trimmed
+contract contents must match the configured token. A missing configured contract
+leaves the repository unregistered. Pass this policy explicitly through
+`Invocation` and `SeatLease`, including resumes and launcher operations; never
+infer it from discovered files or a task-local wait policy. Existing external
+protocols require those three keys in the operator's machine config.
 Editing-seat directory grants permit the
 repository's lock contract but do not acquire or shorten that lock.
 Backend enforcement limits, host verification and

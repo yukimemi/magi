@@ -90,8 +90,11 @@ async fn land_rescue_waits_for_the_real_repository_lock() {
     let mut state = runner.state;
     let winner = state.winner().cloned().unwrap();
     let before = git(&winner.worktree, &["rev-parse", "HEAD"]);
+    state.config.coordination = Some(toml::from_str(
+        "contract_file = 'updater.contract'\ncontract_token = 'test-protocol-v1'\nlock_file = 'updater.lock'"
+    ).unwrap());
     // Register after setup so this test isolates the gap after a land seat.
-    std::fs::write(fx.repo.join(".git/kanade-sync.contract"), "shared-lock-v1\n").unwrap();
+    std::fs::write(fx.repo.join(".git/updater.contract"), "test-protocol-v1\n").unwrap();
     let marker = fx.tmp.path().join("edited");
     let release = fx.tmp.path().join("release");
     let mut fixer = state.config.agents[0].clone();
@@ -115,7 +118,7 @@ async fn land_rescue_waits_for_the_real_repository_lock() {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
             }).await.unwrap();
-            let lock = std::fs::File::create(fx.repo.join(".git/kanade-sync.lock")).unwrap();
+            let lock = std::fs::File::create(fx.repo.join(".git/updater.lock")).unwrap();
             assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
             std::fs::write(&release, "go").unwrap();
             lock
