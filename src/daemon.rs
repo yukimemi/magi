@@ -2719,6 +2719,11 @@ async fn poll(
     // must not sit out a quota cooldown it did not cause.
     let quota_cooldown_until: Arc<Mutex<Option<Timestamp>>> = Arc::new(Mutex::new(None));
     let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+    // A panicked task loses its return value, so remember which queue task
+    // each spawned attempt belongs to. Chat turns share `inflight` but are
+    // not registered here.
+    let mut attempt_tasks: std::collections::HashMap<tokio::task::Id, String> =
+        std::collections::HashMap::new();
     let mut conductor = Conductor::new();
     // See `maybe_prune_cache_between_runs`'s own doc: this is the cache check
     // a congested queue would otherwise starve of the fully-idle branch below.
@@ -2740,14 +2745,8 @@ async fn poll(
         // anything still running. `InFlightGuard` already released the slot
         // even if the spawned attempt panicked; this only surfaces that it
         // happened, since a panic swallowed here otherwise leaves no trace.
-        while let Some(result) = inflight.try_join_next() {
-            if let Err(e) = result {
-                tracing::error!("a spawned attempt did not finish cleanly: {e}");
-                notices::raise(Notice::error(
-                    "loop:attempt",
-                    "A queued attempt ended abnormally; check the task it was running.",
-                ));
-            }
+        while let Some(result) = inflight.try_join_next_with_id() {
+            reap_attempt(result, &mut attempt_tasks);
         }
 
         let swept = sweep_stale_claims(queue, STALE_CLAIM);
@@ -2942,7 +2941,8 @@ async fn poll(
             let status = Arc::clone(status);
             let stop = stop.clone();
             let quota_cooldown_until = Arc::clone(&quota_cooldown_until);
-            inflight.spawn(async move {
+            let spawned_task = task_id.clone();
+            let handle = inflight.spawn(async move {
                 // Held for the whole attempt: dropping either at the end of
                 // this task is what releases the claim and, for an ordinary
                 // candidate, frees its concurrency slot back to the loop.
@@ -2981,6 +2981,7 @@ async fn poll(
                     }
                 }
             });
+            attempt_tasks.insert(handle.id(), spawned_task);
         }
 
         if started_any {
@@ -3025,16 +3026,39 @@ async fn poll(
     // above exited: a stop only sets a flag - see `serve_until` - and
     // returning here while `inflight` still holds spawned work would abandon
     // it exactly as a mid-node kill would.
-    while let Some(result) = inflight.join_next().await {
-        if let Err(e) = result {
-            tracing::error!("a spawned attempt did not finish cleanly: {e}");
-            notices::raise(Notice::error(
-                "loop:attempt",
-                "A queued attempt ended abnormally; check the task it was running.",
-            ));
-        }
+    while let Some(result) = inflight.join_next_with_id().await {
+        reap_attempt(result, &mut attempt_tasks);
     }
     Ok(())
+}
+
+/// Forget a finished spawn and, if it ended abnormally, raise the notice.
+fn reap_attempt(
+    result: Result<(tokio::task::Id, ()), tokio::task::JoinError>,
+    attempt_tasks: &mut std::collections::HashMap<tokio::task::Id, String>,
+) {
+    match result {
+        Ok((id, ())) => {
+            attempt_tasks.remove(&id);
+        }
+        Err(e) => {
+            tracing::error!("a spawned attempt did not finish cleanly: {e}");
+            let task = attempt_tasks.remove(&e.id());
+            notices::raise(abnormal_attempt_notice(task.as_deref()));
+        }
+    }
+}
+
+/// The notice for an attempt that panicked or was cancelled. With a known
+/// task the key is per task and the notice links to it; the wording stays
+/// fixed so a retry never relights it.
+fn abnormal_attempt_notice(task: Option<&str>) -> Notice {
+    const MESSAGE: &str = "A queued attempt ended abnormally; check the task it was running.";
+    match task {
+        Some(id) => Notice::error(&format!("loop:attempt:{id}"), MESSAGE)
+            .link(Link::Task { id: id.to_string() }),
+        None => Notice::error("loop:attempt", MESSAGE),
+    }
 }
 
 /// Run one claimed task to a terminal status and record the outcome.
@@ -10503,5 +10527,24 @@ mod tests {
         queue.put(&mut again).unwrap();
         apply_choice_actions(&queue, &questions, &home);
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
+    }
+}
+
+#[cfg(test)]
+mod abnormal_attempt_notice_tests {
+    use super::*;
+
+    #[test]
+    fn a_known_task_gets_its_own_key_and_a_link() {
+        let n = abnormal_attempt_notice(Some("t1"));
+        assert_eq!(n.key, "loop:attempt:t1");
+        assert!(matches!(n.link, Some(Link::Task { ref id }) if id == "t1"));
+    }
+
+    #[test]
+    fn an_unknown_task_keeps_the_plain_key() {
+        let n = abnormal_attempt_notice(None);
+        assert_eq!(n.key, "loop:attempt");
+        assert!(n.link.is_none());
     }
 }
