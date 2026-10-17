@@ -122,13 +122,19 @@ async fn a_resumed_run_drops_a_stale_active_marker_left_by_a_killed_process() {
 }
 
 common::e2e! {
-/// `driver_pid` is what `RunState::liveness` checks when no daemon claims a
-/// run — a plain `magi run` / `magi review` claims nothing there. `execute`
-/// must write this process's own pid every time it runs, including on a
-/// resume, so a stale pid from whatever process drove an earlier attempt
-/// (possibly dead by the time this one starts) never survives into a fresh
-/// process's own report.
-async fn execute_records_its_own_pid_as_the_driver_on_every_entry() {
+/// Driver ownership lasts only while `execute` is driving the graph. Both
+/// parking and completing a resumed run must release it in memory and on disk,
+/// even when the resume started with a dead process's stale driver record.
+async fn execute_releases_its_driver_after_parking_and_resuming() {
+    fn assert_driver_released(state: &magi::run::RunState) {
+        let saved = magi::run::RunState::load(&state.id).expect("load saved state");
+        for state in [state, &saved] {
+            assert_eq!(state.driver_pid, None);
+            assert_eq!(state.driver_started_at, None);
+            assert!(state.driver_exited);
+        }
+    }
+
     let _home = home_lock().await;
     let fx = fixture(_home, Judges::Unanimous, false);
     let pause = Pause::new();
@@ -138,22 +144,19 @@ async fn execute_records_its_own_pid_as_the_driver_on_every_entry() {
     runner.on_pause(pause.clone());
     pause.park();
     runner.execute().await.expect("execute parks cleanly");
-    assert_eq!(runner.state.driver_pid, Some(std::process::id()));
+    assert_driver_released(&runner.state);
 
     // Pretend an earlier, now-dead process drove this run — exactly what a
     // resume after a kill finds on disk.
     runner.state.driver_pid = Some(999_999_999);
+    runner.state.driver_exited = false;
     runner.state.save().expect("save");
     let id = runner.state.id.clone();
     drop(runner);
 
     let mut resumed = Runner::resume(&id).expect("resume");
     resumed.execute().await.expect("execute to a verdict");
-    assert_eq!(
-        resumed.state.driver_pid,
-        Some(std::process::id()),
-        "the resuming process's own pid replaces whatever a dead one left behind"
-    );
+    assert_driver_released(&resumed.state);
 }
 }
 
