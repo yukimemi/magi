@@ -1416,9 +1416,12 @@ impl Conductor {
             result = match out {
                 Err(e) => Err(e.context("invoking the conductor")),
                 Ok(out) if advance => Err(anyhow::anyhow!(
-                    "no usable reply (exit {:?}, timed out {})",
-                    out.exit_code,
-                    out.timed_out
+                    "no usable reply ({})",
+                    crate::notices::turn_status(
+                        out.exit_code,
+                        out.timed_out,
+                        out.quota_exhausted()
+                    )
                 )),
                 Ok(out) => verdict::extract_json(&out.text)
                     .context("the conductor's reply could not be parsed"),
@@ -1655,6 +1658,7 @@ mod tests {
         ] {
             let repeated = Decision {
                 reason: Some(reason.into()),
+                question: Some("How should we proceed?".into()),
                 ..d.clone()
             };
             apply(
@@ -1667,6 +1671,19 @@ mod tests {
             .unwrap();
             assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
         }
+        assert!(
+            questions.list().is_empty(),
+            "a rejected proposal registers no question"
+        );
+        let notice = crate::notices::Notices::open()
+            .get(&crate::notices::id_of(&format!(
+                "conductor-resumption:{}",
+                t.id
+            )))
+            .unwrap();
+        assert!(!notice.message.contains("How should we proceed?"));
+        assert!(!notice.message.contains("Some("));
+        assert!(notice.message.contains("No reply to this notice is needed"));
         let reloaded = Queue::at(dir.path().join("queue")).get(&t.id).unwrap();
         assert_eq!(reloaded.resumption, approval);
         assert_eq!(reloaded.answers, t.answers);

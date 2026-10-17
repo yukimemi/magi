@@ -601,6 +601,47 @@ fn read_path(path: &Path) -> Result<Notice> {
     Ok(n)
 }
 
+/// A non-empty optional detail, trimmed for display. Never rewrites saved prose.
+pub(crate) fn detail(value: Option<&str>) -> Option<&str> {
+    clean_text(value)
+}
+
+/// Short explanation of a CLI turn that produced no usable response.
+pub(crate) fn turn_status(code: Option<i32>, timed_out: bool, quota_exhausted: bool) -> String {
+    let mut parts = vec![exit_status(code)];
+    if timed_out {
+        parts.push("time limit reached".to_owned());
+    }
+    if quota_exhausted {
+        parts.push("quota exhausted".to_owned());
+    }
+    parts.join("; ")
+}
+
+/// A currently open registered question associated with this notice, if any.
+/// `covered_by` records historical deduplication, not current answerability.
+pub(crate) fn answerable_question(n: &Notice, questions: &crate::ask::Questions) -> Option<String> {
+    let direct = n.covered_by.as_deref().or_else(|| {
+        ["question:", "deputy-turn:", "repair-owner:", "action:"]
+            .iter()
+            .find_map(|prefix| n.key.strip_prefix(prefix))
+    });
+    let release = if direct.is_none() && n.key.starts_with("release-pr:") {
+        questions
+            .root()
+            .parent()
+            .and_then(|home| crate::release_watch::question_for_notice(home, &n.key))
+    } else {
+        None
+    };
+    let id = direct.or(release.as_deref())?;
+    questions
+        .get(id)
+        .ok()
+        .filter(|q| q.status.open())
+        .map(|q| q.id)
+}
+
 /// The notice for a run that ended Blocked, Stalled or Failed, if it did.
 ///
 /// A parked run was only asked to stop, so it is not news. A run that left a
@@ -692,11 +733,8 @@ pub fn task_held(task: &crate::queue::Task) -> Option<Notice> {
     if task.status != TaskStatus::Held || task.hold_source != Some(HoldSource::Machine) {
         return None;
     }
-    let why = task
-        .hold_reason
-        .as_deref()
-        .or(task.last_error.as_deref())
-        .and_then(|w| clean_text(Some(w)))
+    let why = clean_text(task.hold_reason.as_deref())
+        .or_else(|| clean_text(task.last_error.as_deref()))
         .unwrap_or("no reason recorded");
     let why_sentence = why.trim_end_matches('.');
     Some(
@@ -748,6 +786,7 @@ pub fn conductor_resumption(
         parts.push(format!("Cited evidence: {ev}."));
     }
 
+    parts.push("Existing holds and questions still apply.".to_owned());
     parts.push(
         "No reply to this notice is needed. To hold this task, use manual hold via the queue."
             .to_owned(),
@@ -928,6 +967,104 @@ pub fn raise_in_with(home: &Path, mut notice: Notice, send: &dyn Fn(Page)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_details_omit_blanks_and_explain_process_results() {
+        assert_eq!(detail(None), None);
+        assert_eq!(detail(Some(" \n\t")), None);
+        assert_eq!(detail(Some(" concern ")), Some("concern"));
+        assert_eq!(exit_status(Some(7)), "exit code 7");
+        assert_eq!(exit_status(None), "exit code unavailable");
+        assert_eq!(
+            turn_status(None, true, true),
+            "exit code unavailable; time limit reached; quota exhausted"
+        );
+        let mut task = held_task();
+        task.hold_reason = Some("   ".into());
+        task.last_error = Some(" failure recorded ".into());
+        assert!(
+            task_held(&task)
+                .unwrap()
+                .message
+                .ends_with("failure recorded.")
+        );
+    }
+
+    #[test]
+    fn resumption_notice_and_external_page_are_informational() {
+        let dir = tempfile::tempdir().unwrap();
+        let n = conductor_resumption(
+            "t1",
+            "t1",
+            Some("Inspection remains a concern."),
+            &["dep1".into(), " ".into()],
+            &[],
+            false,
+        );
+        assert!(n.message.contains("Concern: Inspection remains a concern."));
+        assert!(n.message.contains("Proposed dependencies: dep1."));
+        assert!(n.message.contains("its state was not changed"));
+        assert!(
+            n.message
+                .contains("Existing holds and questions still apply")
+        );
+        assert!(n.message.contains("No reply to this notice is needed"));
+        assert_eq!(n.link, Some(Link::Task { id: "t1".into() }));
+        let sent = pages(dir.path(), n.clone());
+        assert_eq!(sent[0].summary, n.message);
+        assert!(pages(dir.path(), n).is_empty(), "repeat remains silent");
+        let empty = conductor_resumption("t2", "t2", Some(" "), &[], &[], false);
+        for absent in [
+            "Concern:",
+            "Proposed dependencies:",
+            "Some(",
+            "None",
+            "[]",
+            "question:",
+            "evidence:",
+            "?",
+        ] {
+            assert!(!empty.message.contains(absent), "{absent}");
+        }
+    }
+
+    #[test]
+    fn only_currently_open_registered_questions_have_response_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = ask(dir.path(), "t1", "conduct");
+        let questions = crate::ask::Questions::at(dir.path().join("questions"));
+        let mut n = Notice::warn("task:t1", "held");
+        n.covered_by = Some(q.id.clone());
+        assert_eq!(answerable_question(&n, &questions), Some(q.id.clone()));
+        questions
+            .update(&q.id, |q| {
+                q.answer(crate::ask::Answer::Text("continue".into()))
+            })
+            .unwrap();
+        assert_eq!(answerable_question(&n, &questions), None);
+        let abandoned = ask(dir.path(), "t2", "conduct");
+        let failure = Notice::warn(&format!("question:{}", abandoned.id), "delivery failed");
+        assert_eq!(
+            answerable_question(&failure, &questions),
+            Some(abandoned.id.clone())
+        );
+        questions
+            .update(&abandoned.id, |q| {
+                q.abandon("run gone");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(answerable_question(&failure, &questions), None);
+        n.covered_by = Some("missing".into());
+        assert_eq!(answerable_question(&n, &questions), None);
+        assert_eq!(
+            answerable_question(
+                &conductor_resumption("t1", "t1", None, &[], &[], false),
+                &questions
+            ),
+            None
+        );
+    }
 
     #[test]
     fn legacy_deputy_warnings_are_hidden_without_hiding_other_namespaces() {

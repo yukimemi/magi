@@ -141,7 +141,10 @@ pub fn failure_of(out: &anyhow::Result<AgentOutput>) -> (FailClass, String) {
         Ok(o) if o.timed_out => (FailClass::Timeout, "timed out".to_owned()),
         Ok(o) => (
             FailClass::Other("unusable".to_owned()),
-            format!("nothing usable (exit {:?})", o.exit_code),
+            format!(
+                "nothing usable ({})",
+                crate::notices::exit_status(o.exit_code)
+            ),
         ),
     }
 }

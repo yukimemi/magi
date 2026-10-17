@@ -265,11 +265,9 @@ pub async fn chain_judge(
             last = match out {
                 Err(e) => e.context(format!("judge `{}` failed", spec.id)),
                 Ok(o) => anyhow::anyhow!(
-                    "judge `{}` gave no usable reply (exit {:?}, timed out {}, quota {})",
+                    "judge `{}` gave no usable reply ({})",
                     spec.id,
-                    o.exit_code,
-                    o.timed_out,
-                    o.quota_exhausted()
+                    crate::notices::turn_status(o.exit_code, o.timed_out, o.quota_exhausted())
                 ),
             };
             continue;

@@ -633,7 +633,11 @@ command = ["ntfy", "publish", "magi", "{summary} — {url}"]
 `{summary}`, `{run}` and `{url}` are substituted into the argv, never into a
 shell string, so a question containing `; rm -rf` stays one argument. `{url}`
 comes from `MAGI_WEB_URL`, which `magi web` prints at startup — a run cannot
-discover the address another process bound. A notification that fails is logged
+discover the address another process bound. Unless the configured URL already
+has a fragment, questions link to Questions and notices link to Notifications.
+Question notifications identify the question and how to answer it; a notice
+has no reply of its own. Related open questions have a separate response link
+in the notification centre. A notification that fails is logged
 and ignored: a broken webhook is not a reason to throw away an implementation.
 
 The same command also fires for the web UI's notices (the header bell): a run

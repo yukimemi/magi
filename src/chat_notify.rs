@@ -202,7 +202,7 @@ async fn current_pr(repo: &Path, url: &str) -> Result<serde_json::Value> {
         serde_json::json!({"url":v["url"],"state":v["state"],"head":rollup.head,
         "merged_at":v["mergedAt"],"checks_total":rollup.checks.len(),
         "checks":rollup.checks.iter().take(20).map(|c| serde_json::json!({
-            "name":c.name,"verdict":format!("{:?}", c.verdict),"url":c.url
+            "name":c.name,"verdict":c.verdict.label(),"url":c.url
         })).collect::<Vec<_>>() }),
     )
 }

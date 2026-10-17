@@ -227,8 +227,8 @@ pub async fn rebase_with_fixer(
             }
             Ok(o) if !o.usable() => {
                 error = Some(format!(
-                    "the fixer produced nothing usable (exit {:?}, timed out: {})",
-                    o.exit_code, o.timed_out
+                    "the fixer produced nothing usable ({})",
+                    crate::notices::turn_status(o.exit_code, o.timed_out, o.quota_exhausted())
                 ));
             }
             Ok(_) => {}

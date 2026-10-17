@@ -385,6 +385,15 @@ pub(crate) fn state_for_question(home: &Path, question_id: &str) -> Option<Watch
         .find(|s| s.question.as_deref() == Some(question_id))
 }
 
+/// Resolve a release notification through its saved watch record, never its prose.
+pub(crate) fn question_for_notice(home: &Path, key: &str) -> Option<String> {
+    let pr = key.strip_prefix("release-pr:")?;
+    let state = Watcher::new(Box::new(GhForge), home.to_path_buf()).load(pr);
+    (pr_key(&state.url).as_deref() == Some(pr))
+        .then_some(state.question)
+        .flatten()
+}
+
 /// The task a release-watch question's answer could touch: the one that
 /// finished the run which opened the release pull request (`WatchState::run`).
 /// `None` when the record or the run is not known - then there is nothing to
@@ -1427,6 +1436,41 @@ mod tests {
             progress_at: progress,
             ..WatchState::default()
         }
+    }
+
+    #[test]
+    fn release_notice_uses_saved_question_and_checks_its_current_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let watcher = Watcher::new(Box::new(GhForge), dir.path().to_path_buf());
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut q = Question::new(
+            String::new(),
+            crate::bump::NOTICE_NODE.into(),
+            "release-watch".into(),
+            "Release?".into(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut q).unwrap();
+        let st = WatchState {
+            url: "https://example.invalid/o/r/pull/7".into(),
+            question: Some(q.id.clone()),
+            ..WatchState::default()
+        };
+        assert!(watcher.save("o/r#7", &st));
+        let n = Notice::warn("release-pr:o/r#7", "Release PR is waiting for approval.");
+        assert_eq!(
+            notices::answerable_question(&n, &questions),
+            Some(q.id.clone())
+        );
+        questions
+            .update(&q.id, |q| {
+                q.abandon("obsolete approval");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(notices::answerable_question(&n, &questions), None);
+        assert_eq!(question_for_notice(dir.path(), "release-pr:o/r#8"), None);
     }
 
     #[test]

@@ -4953,9 +4953,9 @@ fn diagnostic(state: &RunState) -> Option<String> {
     // Gate failure: which check(s), and the tail of what each printed.
     for o in state.gate.iter().filter(|o| !o.ok()) {
         parts.push(format!(
-            "gate `{}` failed ({:?}):\n{}",
+            "gate `{}` failed ({}):\n{}",
             o.command,
-            o.code,
+            notices::exit_status(o.code),
             crate::run::tail(&o.output_tail, DIAGNOSTIC_OUTPUT_TAIL)
         ));
     }

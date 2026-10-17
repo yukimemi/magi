@@ -223,7 +223,11 @@ use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 /// Schema 14 records [`RunState::task_instruction`], authored task criteria
 /// separately from generated review context. Older records retain `None`:
 /// `instruction` may contain generated context and cannot establish authorship.
-pub const SCHEMA: u32 = 14;
+///
+/// Schema 15 records pending candidate preservation independently of an empty
+/// implementation. Older drivers must refuse to resume these records rather
+/// than judge without honoring the preservation barrier.
+pub const SCHEMA: u32 = 15;
 
 /// Why a pass over a run stopped at a node boundary, recorded when it
 /// happened. Never inferred afterwards: `upgrade.json` is overwritten by the
@@ -2237,6 +2241,10 @@ pub struct RunState {
     /// fold must leave them alone.
     #[serde(default)]
     pub released_branches: Vec<String>,
+    /// Completed implementation turns whose Git/artifact preservation is not confirmed.
+    /// A resume retries persistence, never dispatches these turns again.
+    #[serde(default)]
+    pub candidate_preservation: BTreeMap<char, String>,
     /// Existing branches and commits the task text names, and what the
     /// repository says about each (`crate::refs`). Unmerged ones seed the
     /// candidates; `base_commit` stays the comparison point.
@@ -2480,6 +2488,7 @@ impl RunState {
             resource_block: None,
             released_to: None,
             released_branches: Vec::new(),
+            candidate_preservation: BTreeMap::new(),
             seeds: Vec::new(),
             prep_failure: None,
             prep_complete: Some(false),
@@ -3083,6 +3092,11 @@ pub(crate) fn migrate_schema(mut state: RunState) -> Result<RunState> {
     // `#[serde(default)]` leaves the missing field as `None`; only the
     // version number advances, preserving origin and execution state.
     if state.schema == 13 {
+        state.schema = 14;
+    }
+    // Old empty candidates are inspected at implementation re-entry; never
+    // infer a completed rescue from their zero commit count.
+    if state.schema == 14 {
         state.schema = SCHEMA;
     }
     if state.schema != SCHEMA {
