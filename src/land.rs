@@ -675,6 +675,7 @@ pub fn upgrade_repair_choice(q: &mut ask::Question, state: &RunState) -> bool {
     for choice in q.choices.clone() {
         if (q.status.open()
             && crate::merge_decision::stops(&choice)
+            && choice != HOLD
             && choice != crate::merge_decision::DISMISS)
             || (choice == REPAIR && (q.status.open() || q.resolution().as_deref() == Some(REPAIR)))
         {
@@ -1724,7 +1725,9 @@ async fn approval_gate(
                 fresh.detail.push_str("\n\n`fix findings and re-review` runs one repair and bounded review on this PR; it does not approve a merge. A fresh decision follows the updated review and gate.");
             }
             for choice in fresh.choices.clone() {
-                if crate::merge_decision::stops(&choice) && choice != crate::merge_decision::DISMISS
+                if crate::merge_decision::stops(&choice)
+                    && choice != HOLD
+                    && choice != crate::merge_decision::DISMISS
                 {
                     fresh.actions.insert(
                         choice,
@@ -6538,6 +6541,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             .unwrap();
         let upgraded = store.get(&id).unwrap();
         assert_eq!(upgraded.choices, approval_choices(&state));
+        assert!(!upgraded.actions.contains_key(HOLD));
         assert_eq!(store.get(&id).unwrap().choices, upgraded.choices);
         assert!(
             store
