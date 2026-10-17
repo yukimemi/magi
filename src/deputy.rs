@@ -242,19 +242,7 @@ pub fn generic_brief(
 /// merge (`land::unhedged`)? Discarding a task deletes it; a divergence answer
 /// drops commits.
 pub fn destructive(q: &Question, label: &str) -> bool {
-    let at = q.choices.iter().position(|c| c == label);
-    // By label, not position: the retry question orders its choices differently.
-    if q.node == crate::github_text::ASK_NODE {
-        return matches!(
-            label,
-            crate::github_text::POST_ORIGINAL | crate::github_text::USE_REWRITE
-        );
-    }
-    match q.node.as_str() {
-        crate::triage::NODE => at == Some(2),
-        crate::triage::DEPS_NODE => at == Some(1),
-        n => n == crate::reconcile::NODE && q.seat == crate::reconcile::SEAT,
-    }
+    crate::consult::destructive_effect(q, label)
 }
 
 /// Does `--settle` hold `q` to the merge-approval rules (the verbatim quote of

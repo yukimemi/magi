@@ -152,19 +152,27 @@ pub fn begin(questions: &Questions, talks: &Talks, q: &Question, talk: &Talk) ->
     Ok(dispatch?.1)
 }
 
-/// Refuse a chat's answer to a merge approval whose task the operator held, as
+/// Refuse a chat approval answer whose task the operator held, as
 /// `ask_settle_cmd` does for a deputy: such a hold is lifted by the operator's
 /// button. The task is the one `q.run` names, directly or as one of its runs;
 /// none found (an unreadable task is not listed) does not refuse. The caller
 /// reads the queue before taking the question lock, so a hold placed in between
 /// is missed for that one call.
 pub fn refuse_operator_held(q: &Question, node: &str, tasks: &[crate::queue::Task]) -> Result<()> {
-    if q.node != crate::land::APPROVAL_NODE || node != CHAT_NODE {
+    if node != CHAT_NODE || QuestionKind::of(q) != QuestionKind::Merge {
         return Ok(());
     }
+    let release_run = if q.run.is_empty() && q.node == crate::bump::NOTICE_NODE {
+        crate::run::try_home()
+            .and_then(|home| crate::release_watch::state_for_question(&home, &q.id))
+            .and_then(|state| state.run)
+    } else {
+        None
+    };
+    let run = release_run.as_deref().unwrap_or(&q.run);
     if let Some(task) = tasks
         .iter()
-        .find(|t| t.id == q.run || t.runs.contains(&q.run))
+        .find(|t| t.id == run || t.runs.iter().any(|id| id == run))
         && task.operator_held()
     {
         bail!(
@@ -205,14 +213,68 @@ pub struct AnswerAuthority {
     pub recommendation_fingerprint: Option<String>,
     /// Exact decision covered by this evidence.
     pub question: String,
-    /// Exact offered choice; this evidence path only authorizes hold.
+    /// Exact offered choice covered by the instruction.
     pub choice: String,
+    /// Execution facts validated when this answer was authorized.
+    #[serde(default)]
+    pub question_fingerprint: String,
+}
+
+/// Immutable recommendation-time binding to question choices and targets.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecommendationManifest {
+    /// Fingerprint of the full persona reply.
+    pub body: String,
+    /// Full question IDs and fingerprints of their execution-relevant facts.
+    pub questions: std::collections::BTreeMap<String, String>,
+}
+
+/// Fingerprint of execution-relevant question facts, independent of answer state.
+pub fn question_fingerprint(q: &Question) -> String {
+    let facts = serde_json::json!({
+        "id": q.id, "run": q.run, "node": q.node, "seat": q.seat,
+        "summary": q.summary, "detail": q.detail, "choices": q.choices,
+        "actions": q.actions, "merge_target": q.merge_target,
+        "posting_comparison": q.posting_comparison,
+        "decision_context": q.decision_context, "triage_generation": q.triage_generation,
+    });
+    crate::github_text::fingerprint("", &facts.to_string())
+}
+
+/// Replacement title explicitly supplied with its question/content binding.
+/// The final posting gate still vets this literal text before publication.
+pub fn owner_title<'a>(q: &Question, instruction: &'a str) -> Option<&'a str> {
+    if instruction.starts_with("    ") || instruction.starts_with('\t') {
+        return None;
+    }
+    let (command, title) = instruction.trim().split_once('\n')?;
+    let expected = format!(
+        "{}: {} {}",
+        q.id,
+        crate::github_text::USE_MY_TEXT,
+        question_fingerprint(q)
+    );
+    (command == expected && !title.trim().is_empty() && !title.contains('\n'))
+        .then_some(title.trim())
+}
+
+/// Capture at publication, never reconstruct new authority from old history.
+pub fn recommendation_manifest(body: &str, questions: &Questions) -> RecommendationManifest {
+    RecommendationManifest {
+        body: crate::github_text::fingerprint("", body),
+        questions: questions
+            .list()
+            .iter()
+            .filter(|q| q.status.open() && recommended_choice(body, q, questions).is_some())
+            .map(|q| (q.id.clone(), question_fingerprint(q)))
+            .collect(),
+    }
 }
 
 /// Validate an answer under the question lock. The caller must also retain
 /// [`Talks::answer_guard`] from before this read until the answer is persisted.
 /// Consultation is a delivery route, not the source of authority for an
-/// explicit, independently bound owner hold.
+/// explicit, independently bound owner decision.
 pub fn authorize_answer(
     q: &Question,
     talks: &Talks,
@@ -222,37 +284,298 @@ pub fn authorize_answer(
     reply: &str,
     quote: Option<&str>,
 ) -> Result<Option<AnswerAuthority>> {
-    if node == CHAT_NODE && QuestionKind::of(q) == QuestionKind::Merge && reply == crate::land::HOLD
-    {
-        if q.actions.contains_key(crate::land::HOLD) {
-            bail!("hold cannot execute a question action");
-        }
-        let talk = talks.get(run)?;
-        if let Some(evidence) = hold_authority(q, questions, &talk, quote) {
-            return Ok(Some(evidence));
-        }
-        if q.consult.as_ref().is_none_or(|c| c.talk != run) {
-            bail!(
-                "hold requires --quote of the entire latest owner send, either `<question-id>: hold` \
-                 or an explicit instruction to answer each immediately preceding question-by-question \
-                 recommendation; the persisted send and exact question/hold binding must be current"
-            );
-        }
-        // Keep legacy same-chat single-word holds, as well as its merge and
-        // repair policies. A batch instruction never expands those policies.
+    if node != CHAT_NODE {
+        return Ok(None);
     }
-    validate_answer(q, talks, run, node, reply, quote)?;
-    Ok(None)
+    if reply == crate::land::HOLD && q.actions.contains_key(reply) {
+        bail!("hold cannot execute a question action");
+    }
+    let talk = talks.get(run)?;
+    if reply != crate::land::HOLD
+        && current_instruction(&talk).is_some_and(|(_, _, words)| {
+            words.starts_with("    ")
+                || words.starts_with('\t')
+                || words.trim_start().starts_with("```")
+                || words.trim_start().starts_with('>')
+        })
+    {
+        bail!("quoted or code-block owner text is not an explicit instruction for this action");
+    }
+    if let Some(evidence) = choice_authority(q, questions, &talk, reply, quote) {
+        validate_effect(
+            q,
+            reply,
+            &evidence.instruction,
+            quote.unwrap_or_default(),
+            true,
+        )?;
+        // A running original consultation can still be preparing a decision.
+        // Holds are safe to interrupt; other choices wait for that turn to stop.
+        if reply != crate::land::HOLD
+            && let Some(consult) = &q.consult
+            && consult.talk != run
+            && talks.turn_held(&consult.talk)
+        {
+            bail!("original consultation is active; wait for its turn to finish before answering");
+        }
+        return Ok(Some(evidence));
+    }
+    if current_instruction(&talk).is_some_and(|(_, _, words)| batch_instruction(words)) {
+        validate_effect(
+            q,
+            reply,
+            current_instruction(&talk).unwrap().2,
+            quote.unwrap_or_default(),
+            true,
+        )?;
+        bail!(
+            "batch authorization requires a current, unambiguous recommendation for this exact offered choice and unchanged question target/content"
+        );
+    }
+    // Preserve already supported consulted-chat answers. Independent evidence
+    // is required when consultation delivery cannot bind this conversation.
+    if q.consult.as_ref().is_some_and(|c| c.talk == run) {
+        validate_answer(q, talks, run, node, reply, quote)?;
+        if QuestionKind::of(q) == QuestionKind::Ordinary && consent(q, reply) != Consent::Delegable
+        {
+            let (_, _, instruction) = current_instruction(&talk)
+                .context("this action requires a current explicit owner instruction")?;
+            validate_effect(q, reply, instruction, quote.unwrap_or_default(), false)?;
+        }
+        return Ok(None);
+    }
+    if let Some((_, _, instruction)) = current_instruction(&talk) {
+        validate_effect(q, reply, instruction, quote.unwrap_or_default(), true)?;
+    }
+    bail!(
+        "answer requires --quote of the entire latest owner send bound to this question ID and exact offered choice, or explicit authorization of the immediately preceding question-by-question recommendations; persisted evidence must be current"
+    )
 }
 
-/// Whether this turn needs the limited question-store write grant. This uses
-/// the same evidence check as the CLI; the CLI rechecks against fresh records.
-pub fn authorized_holds(questions: &Questions, talk: &Talk) -> bool {
+/// Whether this turn needs the question-store write grant. Uses the same
+/// persisted evidence and effect policy as the CLI; the CLI rechecks on write.
+pub fn authorized_answers(questions: &Questions, talk: &Talk) -> bool {
     let quote = current_instruction(talk).map(|(_, _, body)| body);
     questions.list().iter().any(|q| {
-        QuestionKind::of(q) == QuestionKind::Merge
-            && hold_authority(q, questions, talk, quote).is_some()
+        if q.free_text() {
+            return quote
+                .and_then(|s| s.split_once(':'))
+                .is_some_and(|(_, reply)| {
+                    choice_authority(q, questions, talk, reply.trim(), quote).is_some()
+                });
+        }
+        q.choices.iter().any(|choice| {
+            choice_authority(q, questions, talk, choice, quote).is_some_and(|e| {
+                validate_effect(q, choice, &e.instruction, quote.unwrap_or_default(), true).is_ok()
+            })
+        })
     })
+}
+
+/// The complete standing-turn write grant, also used by sandbox regressions.
+/// Consultations and bound owner decisions need question/evidence locks;
+/// authorized dismissals additionally need queue claims and the exact run's
+/// ownership/state writes. Never grant the whole home or lift the sandbox.
+pub fn answer_write_roots(
+    questions: &Questions,
+    talks: &Talks,
+    talk: &Talk,
+) -> Vec<std::path::PathBuf> {
+    if !pending_consults(questions, &talk.id) && !authorized_answers(questions, talk) {
+        return Vec::new();
+    }
+    let Some(home) = questions.root().parent() else {
+        return Vec::new();
+    };
+    let quote = current_instruction(talk).map(|(_, _, words)| words);
+    let mut roots = std::collections::BTreeSet::from([
+        questions.root().to_path_buf(),
+        talks.answer_lock_root(),
+    ]);
+    for q in questions.list() {
+        if q.status.open()
+            && q.node == crate::land::APPROVAL_NODE
+            && q.choices
+                .iter()
+                .any(|choice| choice == crate::merge_decision::DISMISS)
+            && crate::run::is_run_id(&q.run)
+            && authorize_answer(
+                &q,
+                talks,
+                questions,
+                &talk.id,
+                CHAT_NODE,
+                crate::merge_decision::DISMISS,
+                quote,
+            )
+            .is_ok()
+        {
+            roots.insert(home.join("queue"));
+            roots.insert(home.join("runs").join(&q.run));
+        }
+    }
+    roots.into_iter().collect()
+}
+
+/// Compatibility name for callers of the earlier hold-only grant.
+pub fn authorized_holds(questions: &Questions, talk: &Talk) -> bool {
+    authorized_answers(questions, talk)
+}
+
+/// Action consent is separate from consultation routing. This inventory uses
+/// execution effects (including structured actions), not only question nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Consent {
+    /// Explicit single or batch instruction is sufficient.
+    Delegable,
+    /// Exact PR/head approval is required.
+    Merge,
+    /// Exact offered consequence must be confirmed individually.
+    Consequence,
+    /// Chosen public text needs explicit confirmation.
+    Posting,
+}
+
+/// Execution effects shared with question deputies. The issuer and seat are
+/// part of the policy: identical labels can have different consumers.
+pub fn destructive_effect(q: &Question, label: &str) -> bool {
+    if label == crate::land::HOLD && !q.actions.contains_key(label) {
+        return false;
+    }
+    // Conductor metadata describes the requested operation independently of
+    // generated choice wording. Completing a task or changing settings needs
+    // individual consent even when no structured ChoiceAction was attached.
+    if q.node == crate::conduct::NODE
+        && q.decision_context
+            .as_deref()
+            .and_then(|context| serde_json::from_str::<serde_json::Value>(context).ok())
+            .is_some_and(|context| {
+                matches!(
+                    context
+                        .get(3)
+                        .and_then(|v| v.get(0))
+                        .and_then(|v| v.as_str()),
+                    Some("complete" | "configure")
+                )
+            })
+    {
+        return true;
+    }
+    if matches!(q.actions.get(label), Some(crate::ask::ChoiceAction::Done)) {
+        return true;
+    }
+    let at = q.choices.iter().position(|c| c == label);
+    // By label, not position: the retry question orders its choices differently.
+    if q.node == crate::github_text::ASK_NODE {
+        return matches!(
+            label,
+            crate::github_text::POST_ORIGINAL
+                | crate::github_text::USE_REWRITE
+                | crate::github_text::USE_MY_TEXT
+        );
+    }
+    match q.node.as_str() {
+        crate::triage::NODE => at == Some(2),
+        crate::triage::DEPS_NODE => matches!(at, Some(1 | 2)),
+        n => n == crate::reconcile::NODE && q.seat == crate::reconcile::SEAT,
+    }
+}
+
+/// Classify every offered decision, including generic structured actions.
+pub fn consent(q: &Question, choice: &str) -> Consent {
+    if choice == crate::land::APPROVE {
+        Consent::Merge
+    } else if q.node == crate::github_text::ASK_NODE
+        && matches!(
+            choice,
+            crate::github_text::POST_ORIGINAL
+                | crate::github_text::USE_REWRITE
+                | crate::github_text::USE_MY_TEXT
+        )
+    {
+        Consent::Posting
+    } else if choice == crate::merge_decision::WITHDRAW
+        || crate::merge_decision::selected_agent(choice).is_some()
+        || destructive_effect(q, choice)
+        || matches!(q.actions.get(choice), Some(crate::ask::ChoiceAction::Done))
+    {
+        Consent::Consequence
+    } else {
+        Consent::Delegable
+    }
+}
+
+/// Deputies use their authenticated question thread rather than a talk.
+/// A generic batch instruction cannot replace action-specific confirmation.
+pub(crate) fn validate_batch_effect(
+    q: &Question,
+    choice: &str,
+    message: &str,
+    quote: &str,
+) -> Result<()> {
+    if batch_instruction(message) {
+        validate_effect(q, choice, message, quote, false)?;
+        bail!(
+            "a deputy's one-question thread has no persisted question-by-question recommendation manifest; use the active standing conversation's bound owner evidence rather than inferring a choice from generic batch words"
+        );
+    }
+    Ok(())
+}
+
+/// Validate action-specific evidence independently of its delivery route.
+pub(crate) fn validate_effect(
+    q: &Question,
+    choice: &str,
+    instruction: &str,
+    quote: &str,
+    bound: bool,
+) -> Result<()> {
+    let direct = format!("{}: {}", q.id, choice);
+    match consent(q, choice) {
+        Consent::Delegable => {}
+        Consent::Merge => {
+            let target = q.merge_target.as_ref().context("merge requires the specific reviewed PR and head binding; this legacy card has no recorded target")?;
+            let token = format!("merge {}", target.head);
+            if quote.trim() != instruction.trim()
+                || !(instruction.trim() == token
+                    || instruction.trim() == format!("{}: {token}", q.id))
+            {
+                bail!(
+                    "merge requires separate explicit confirmation of this specific reviewed PR and head: `{}: {token}`; a batch recommendation is insufficient",
+                    q.id
+                );
+            }
+        }
+        Consent::Consequence => {
+            if quote.trim() != instruction.trim()
+                || !(instruction.trim() == direct || (!bound && instruction.trim() == choice))
+            {
+                bail!(
+                    "`{choice}` requires an individual owner confirmation of the exact offered consequence: `{direct}`; batch authorization is insufficient"
+                );
+            }
+        }
+        Consent::Posting => {
+            if bound {
+                let token = format!("{}: {} {}", q.id, choice, question_fingerprint(q));
+                let content_matches = if choice == crate::github_text::USE_MY_TEXT {
+                    owner_title(q, instruction).is_some()
+                } else {
+                    instruction.trim() == token
+                };
+                if !content_matches || quote.trim() != instruction.trim() {
+                    bail!(
+                        "posting confirmation requires owner confirmation bound to the exact question and saved content: `{token}`; `use my text` additionally requires a newline and the literal replacement title; batch authorization is insufficient"
+                    );
+                }
+            } else if !crate::github_text::posting_authorized(instruction, quote, choice) {
+                bail!(
+                    "posting confirmation requires an explicit, unconditional instruction for the chosen text; batch authorization is insufficient"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn current_instruction(talk: &Talk) -> Option<(usize, usize, &str)> {
@@ -313,27 +636,42 @@ fn current_instruction(talk: &Talk) -> Option<(usize, usize, &str)> {
     None
 }
 
-fn hold_authority(
+fn choice_authority(
     q: &Question,
     questions: &Questions,
     talk: &Talk,
+    reply: &str,
     quote: Option<&str>,
 ) -> Option<AnswerAuthority> {
     if !q.status.open()
-        || !q.choices.iter().any(|c| c == crate::land::HOLD)
-        || q.actions.contains_key(crate::land::HOLD)
+        || !(q.free_text() || q.choices.iter().any(|c| c == reply))
+        || (reply == crate::land::HOLD && q.actions.contains_key(reply))
     {
         return None;
     }
     let (turn, message, instruction) = current_instruction(talk)?;
+    if reply != crate::land::HOLD
+        && (instruction.starts_with("    ") || instruction.starts_with('\t'))
+    {
+        return None;
+    }
     if quote.map(str::trim) != Some(instruction.trim()) || talk.turns[turn].at < q.asked_at {
         return None;
     }
-    let direct = direct_hold(instruction, q, questions);
+    let direct = direct_choice(instruction, q, questions, reply)
+        || (reply == crate::github_text::USE_MY_TEXT
+            && q.node == crate::github_text::ASK_NODE
+            && owner_title(q, instruction).is_some())
+        || (consent(q, reply) == Consent::Posting
+            && instruction.trim() == format!("{}: {} {}", q.id, reply, question_fingerprint(q)))
+        || (consent(q, reply) == Consent::Merge
+            && q.merge_target
+                .as_ref()
+                .is_some_and(|t| instruction.trim() == format!("{}: merge {}", q.id, t.head)));
     let recommendation_turn = if direct {
         None
     } else {
-        if !batch_instruction(instruction) {
+        if message != 0 || q.free_text() || !batch_instruction(instruction) {
             return None;
         }
         let index = turn.checked_sub(1)?;
@@ -342,8 +680,19 @@ fn hold_authority(
             || talk::sender(recommendation, None) != talk::Sender::Persona
             || recommendation.posted_by.is_some()
             || recommendation.at < q.asked_at
-            || !recommended_hold(&recommendation.body, q, questions)
+            || recommended_choice(&recommendation.body, q, questions) != Some(reply)
         {
+            return None;
+        }
+        if let Some(manifest) = talk.recommendations.get(&index) {
+            if manifest.body != crate::github_text::fingerprint("", &recommendation.body)
+                || manifest.questions.get(&q.id) != Some(&question_fingerprint(q))
+            {
+                return None;
+            }
+        } else if reply != crate::land::HOLD {
+            // Old transcripts can prove a safe hold, but cannot establish what
+            // mutable action/target was shown before manifests were persisted.
             return None;
         }
         Some(index)
@@ -358,7 +707,8 @@ fn hold_authority(
         recommendation_fingerprint: recommendation_turn
             .map(|i| crate::github_text::fingerprint("", &talk.turns[i].body)),
         question: q.id.clone(),
-        choice: crate::land::HOLD.into(),
+        choice: reply.into(),
+        question_fingerprint: question_fingerprint(q),
     })
 }
 
@@ -366,21 +716,40 @@ fn batch_instruction(text: &str) -> bool {
     // Whole-message grammar: substrings in conditional, reported, quoted or
     // retracted instructions cannot match. Keep this deliberately bounded.
     let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
-    let compact = compact.trim_end_matches(['!', '！', '。', '.', 'ー']);
-    let compact = compact
-        .strip_prefix("ありがと！")
-        .or_else(|| compact.strip_prefix("ありがとう！"))
-        .unwrap_or(compact);
-    matches!(
-        compact,
-        "じゃあそれぞれ回答して" | "それぞれ回答して" | "それぞれ回答してください"
-    ) || matches!(
-        text.trim()
-            .trim_end_matches(['.', '!'])
-            .to_ascii_lowercase()
-            .as_str(),
-        "answer each as recommended" | "answer all as recommended"
-    )
+    let mut compact = compact.trim_end_matches(['!', '！', '。', '.', 'ー', '〜', '～']);
+    let prefixes = [
+        "おっけー",
+        "オッケー〜",
+        "オッケー",
+        "おっけ〜",
+        "おけ",
+        "オケ",
+        "ok",
+        "OK",
+        "Ok",
+        "ありがとうございます",
+        "ありがとう",
+        "ありがと",
+        "了解です",
+        "了解",
+        "はい",
+        "じゃあ",
+        "では",
+    ];
+    while let Some(rest) = prefixes
+        .iter()
+        .find_map(|prefix| compact.strip_prefix(prefix))
+    {
+        compact = rest.trim_start_matches(['!', '！', '、', ',', '。', '.', 'ー', '〜', '～']);
+    }
+    matches!(compact, "それぞれ回答して" | "それぞれ回答してください")
+        || matches!(
+            text.trim()
+                .trim_end_matches(['.', '!'])
+                .to_ascii_lowercase()
+                .as_str(),
+            "answer each as recommended" | "answer all as recommended"
+        )
 }
 
 fn refers_to(reference: &str, q: &Question, questions: &Questions) -> bool {
@@ -390,17 +759,20 @@ fn refers_to(reference: &str, q: &Question, questions: &Questions) -> bool {
             && questions.resolve_id(reference).is_ok_and(|id| id == q.id))
 }
 
-fn direct_hold(text: &str, q: &Question, questions: &Questions) -> bool {
+fn direct_choice(text: &str, q: &Question, questions: &Questions, reply: &str) -> bool {
     // One complete instruction, binding both the question and the offered
     // choice. Other actions (including closing the PR) are never inferred.
     let Some((reference, choice)) = text.trim().split_once(':') else {
         return false;
     };
-    refers_to(reference.trim().trim_matches('`'), q, questions) && choice.trim() == "hold"
+    let reference = reference.trim().trim_matches('`');
+    (reference == q.id || (reply == crate::land::HOLD && refers_to(reference, q, questions)))
+        && choice.trim() == reply
 }
 
-fn recommended_hold(body: &str, q: &Question, questions: &Questions) -> bool {
-    // Supported list/table rows: `<id>: hold`, `<id> → hold`, or `| <id> | hold |`.
+fn recommended_choice<'a>(body: &str, q: &'a Question, questions: &Questions) -> Option<&'a str> {
+    // A row must match the entire offered label, including prefixes such as
+    // `dismiss:` or `reimplement:`. Prefix/substring matches confer no authority.
     // A row must select exactly one offered choice, rather than list options.
     // Repeated or conflicting rows are ambiguous even if one recommends hold.
     let mut rows = Vec::new();
@@ -431,7 +803,7 @@ fn recommended_hold(body: &str, q: &Question, questions: &Questions) -> bool {
             .get(data.sourcepos.start.line - 1..data.sourcepos.end.line)
             .is_some_and(|block| conditional_recommendation(&block.join(" ")))
         {
-            return false;
+            return None;
         }
         if matches!(
             data.value,
@@ -465,7 +837,15 @@ fn recommended_hold(body: &str, q: &Question, questions: &Questions) -> bool {
                 .iter()
                 .filter(|c| q.choices.iter().any(|choice| choice == **c))
                 .collect();
-            rows.push(!other_question && references == 1 && choices == [&crate::land::HOLD]);
+            if other_question || references != 1 || choices.len() != 1 {
+                return None;
+            }
+            rows.push(
+                q.choices
+                    .iter()
+                    .find(|choice| choice.as_str() == *choices[0])?
+                    .as_str(),
+            );
             continue;
         }
         let row = line.trim_start_matches(['-', '*', ' ']);
@@ -480,17 +860,24 @@ fn recommended_hold(body: &str, q: &Question, questions: &Questions) -> bool {
             .or_else(|| rest.strip_prefix('→'))
             .or_else(|| rest.strip_prefix('|'))
             .map(str::trim);
+        if !refers_to(reference, q, questions) {
+            return None;
+        }
+        let choice = choice?;
+        // Preserve the legacy safe-hold wording without granting PR closure.
+        let choice = if choice == "hold、その後PRを閉じる" {
+            crate::land::HOLD
+        } else {
+            choice.trim_matches('`')
+        };
         rows.push(
-            refers_to(reference, q, questions)
-                && choice.is_some_and(|choice| {
-                    // Consume the entire choice. A pipe is an alternative,
-                    // not an excuse to discard it. The one supported trailing
-                    // action is separate from the hold and grants no closure.
-                    matches!(choice.trim_matches('`'), "hold" | "hold、その後PRを閉じる")
-                }),
+            q.choices
+                .iter()
+                .find(|offered| offered.as_str() == choice)?
+                .as_str(),
         );
     }
-    rows == [true]
+    (rows.len() == 1).then(|| rows[0])
 }
 
 fn conditional_recommendation(line: &str) -> bool {
@@ -537,8 +924,10 @@ fn conditional_recommendation(line: &str) -> bool {
 impl QuestionKind {
     /// Select the policy from the stored question node.
     pub fn of(q: &Question) -> Self {
+        if crate::deputy::merge_gated(q) {
+            return Self::Merge;
+        }
         match q.node.as_str() {
-            crate::land::APPROVAL_NODE => Self::Merge,
             crate::github_text::ASK_NODE => Self::Posting,
             _ => Self::Ordinary,
         }
@@ -563,6 +952,11 @@ pub fn validate_answer(
     let posting = kind == QuestionKind::Posting;
     if posting && !q.choices.iter().any(|c| c == reply) {
         bail!("posting confirmation requires one of the offered choices");
+    }
+    if posting && reply == crate::github_text::USE_MY_TEXT {
+        bail!(
+            "use my text requires current question-bound owner evidence with the content fingerprint, a newline and the literal replacement title; an old question-thread title or hold is insufficient"
+        );
     }
     if posting
         && !matches!(
@@ -647,7 +1041,7 @@ pub fn validate_answer(
     }
     if reply == crate::land::APPROVE && batch_instruction(&latest) {
         bail!(
-            "a batch answer instruction authorizes hold only; merging requires a separate explicit \
+            "a batch answer instruction is insufficient for merge; merging requires a separate explicit \
              confirmation of this specific reviewed PR and head through the existing approval driver"
         );
     }
@@ -663,8 +1057,17 @@ pub fn validate_answer(
             && crate::merge_decision::exact_owner_choice(reply, &latest, quote)
     };
     if !valid {
+        if reply == crate::land::APPROVE {
+            if let Some(target) = &q.merge_target {
+                bail!(
+                    "merge requires the latest whole owner message and --quote to be exactly `merge {}` for the displayed PR/head",
+                    target.head
+                );
+            }
+            bail!("merge requires a verbatim quote of the latest explicit owner merge instruction");
+        }
         bail!(
-            "merge requires a verbatim quote of the latest owner message; hold requires the whole message to be hold"
+            "`{reply}` requires the latest whole owner message and --quote to equal this exact offered choice, or current question-bound owner evidence under the action-specific consent policy"
         );
     }
     Ok(())
@@ -1094,6 +1497,58 @@ mod tests {
             "SQLite is simpler.".to_owned(),
             vec!["SQLite".to_owned(), "Redis".to_owned()],
         )
+    }
+
+    #[test]
+    fn batch_instruction_normalizes_repeated_japanese_prefixes() {
+        for instruction in [
+            "おっけーそれぞれ回答してー",
+            "了解です、ありがとう！では、それぞれ回答してください。",
+            "ありがとうございます！はい、じゃあそれぞれ回答して〜",
+            "オッケー〜！おけ、それぞれ回答して",
+            "OK！それぞれ回答して",
+            "answer all as recommended!",
+        ] {
+            assert!(batch_instruction(instruction), "{instruction}");
+        }
+        for instruction in [
+            "了解です",
+            "ありがとう！それぞれ回答してもいい？",
+            "もし大丈夫ならそれぞれ回答して",
+            "それぞれ回答して、いや待って",
+            "「それぞれ回答して」",
+        ] {
+            assert!(!batch_instruction(instruction), "{instruction}");
+        }
+    }
+
+    #[test]
+    fn recommendation_returns_only_one_exact_offered_choice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let questions = Questions::at(tmp.path().join("questions"));
+        let mut q = question("implement");
+        questions.put(&mut q).unwrap();
+        let table = |rows: &str| format!("| Question | Choice |\n| --- | --- |\n{rows}");
+        let row = format!("| {} | SQLite |", q.id);
+        assert_eq!(
+            recommended_choice(&table(&row), &q, &questions),
+            Some("SQLite")
+        );
+        assert_eq!(
+            recommended_choice(&format!("{}: Redis", q.id), &q, &questions),
+            Some("Redis")
+        );
+        for body in [
+            table(&format!("{row}\n| {} | Redis |", q.id)),
+            table(&format!("{row}\n{row}")),
+            table(&format!("| {} | SQLite | Redis |", q.id)),
+            table(&format!("| {} | SQLite maybe |", q.id)),
+            format!("> {}: SQLite", q.id),
+            format!("If approved:\n\n{}: SQLite", q.id),
+            "No recommendation".into(),
+        ] {
+            assert_eq!(recommended_choice(&body, &q, &questions), None, "{body}");
+        }
     }
 
     #[test]

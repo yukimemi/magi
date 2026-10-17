@@ -9872,14 +9872,12 @@ impl std::error::Error for CacheCheckError {}
 /// *different* worktrees building the same package name/version into one
 /// cache directory is a staleness bug, not a lock contention one.
 ///
-/// The wait for the lease is carved out of `budget`, never on top of it —
-/// `body` is handed whatever is left, so a caller's own node timeout is the
-/// only clock involved, exactly what AGENTS.md's build-cache section asks
-/// for ("never an unbounded wait"). When `cache_dir` is `None` — no shared
-/// cache configured at all — this is a pass-through: `body` runs with the
-/// full budget and nothing is leased.
+/// Cache acquisition has its own bound, `timeout_resource_wait`, just as
+/// agent waves do. Contention must not consume the verification budget:
+/// `body` receives the full `budget` after the cache is acquired and fresh.
+/// Without a shared cache this is a pass-through with the same full budget.
 ///
-/// A lease that cannot be acquired within `budget` is reported as a single
+/// A lease that cannot be acquired within the resource wait is reported as a single
 /// synthetic [`CommandOutcome`] (`code: None`) rather than silently skipping
 /// verification — the same shape a spawn failure already takes in
 /// [`run_commands`], so a caller need not special-case it.
@@ -9906,25 +9904,27 @@ where
     let home = crate::run::home();
     let owner = crate::cache::Owner::here(&state.id, node, seat, worktree, head);
     let started = Instant::now();
-    let guard = match acquire_cache_lease(state, cache_dir, &owner, budget, context, &|| false)
-        .await
-        .and_then(|g| {
-            g.ok_or_else(|| anyhow::anyhow!("the wait for the build cache was cancelled"))
-        }) {
-        Ok(g) => g,
-        Err(e) => {
-            return (
-                vec![CommandOutcome {
-                    command: "(waiting for the shared build cache)".to_owned(),
-                    code: None,
-                    output_tail: e.to_string(),
-                    duration_ms: started.elapsed().as_millis() as u64,
-                    resource_blocked: true,
-                }],
-                false,
-            );
-        }
-    };
+    let resource_limit = Duration::from_secs(state.config.graph.timeout_resource_wait);
+    let guard =
+        match acquire_cache_lease(state, cache_dir, &owner, resource_limit, context, &|| false)
+            .await
+            .and_then(|g| {
+                g.ok_or_else(|| anyhow::anyhow!("the wait for the build cache was cancelled"))
+            }) {
+            Ok(g) => g,
+            Err(e) => {
+                return (
+                    vec![CommandOutcome {
+                        command: "(waiting for the shared build cache)".to_owned(),
+                        code: None,
+                        output_tail: e.to_string(),
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        resource_blocked: true,
+                    }],
+                    false,
+                );
+            }
+        };
     let identity = crate::cache::Identity::new(worktree, head);
     if let Err(e) = crate::cache::ensure_fresh(
         &home,
@@ -9959,8 +9959,7 @@ where
             false,
         );
     }
-    let remaining = budget.saturating_sub(started.elapsed());
-    let (outcomes, retried, timed_out_pids) = body(state, remaining).await;
+    let (outcomes, retried, timed_out_pids) = body(state, budget).await;
     // A timed-out command's process was only *asked* to die (`kill_on_drop`,
     // `start_kill`); confirm it actually has before handing the directory to
     // the next acquirer. See `wait_for_timed_out_children_to_die`'s own doc
@@ -13046,6 +13045,7 @@ mod tests {
         // `verify.gate` stays empty (the default). Bounded so a regression
         // that does start waiting fails the test in seconds, not hangs it.
         config.graph.timeout_verify = Some(2);
+        config.graph.timeout_resource_wait = 2;
 
         let other = crate::cache::Owner::here("other-run", "e2e", "e2e", &repo, "deadbeef");
         let _held = match crate::cache::try_acquire(&home, &cache_dir, &other)
@@ -13412,6 +13412,7 @@ mod tests {
         // Bounded so a regression that does start waiting fails the test in
         // seconds, not hangs it.
         config.graph.timeout_verify = Some(2);
+        config.graph.timeout_resource_wait = 2;
 
         let other = crate::cache::Owner::here("other-run", "e2e", "e2e", &repo, "deadbeef");
         let held = match crate::cache::try_acquire(&home, &cache_dir, &other)
@@ -13599,6 +13600,7 @@ mod tests {
         )];
         config.graph.review_rounds = 1;
         config.graph.timeout_verify = Some(2);
+        config.graph.timeout_resource_wait = 2;
 
         let other = crate::cache::Owner::here("other-run", "e2e", "e2e", &repo, "deadbeef");
         let held = match crate::cache::try_acquire(&home, &cache_dir, &other)
@@ -16138,6 +16140,72 @@ mod resource_wait_tests {
             pauses: None,
         };
         wave(jobs, sem, &ctx, st, 0).await
+    }
+
+    #[tokio::test]
+    async fn verification_cache_wait_preserves_the_command_budget() {
+        crate::run::pin_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("target");
+        let guard = hold(&cache);
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            guard.release();
+        });
+        let mut st = state(10);
+        let budget = Duration::from_millis(50);
+        let (outcomes, _) = with_cache_lease(
+            &mut st,
+            Some(&cache),
+            "gate",
+            "gate",
+            tmp.path(),
+            "abc1234",
+            budget,
+            "test gate",
+            |_, available| async move {
+                assert_eq!(
+                    available, budget,
+                    "contention must not shorten verification"
+                );
+                (Vec::new(), false, Vec::new())
+            },
+        )
+        .await;
+        release.await.unwrap();
+        assert!(outcomes.is_empty(), "{outcomes:?}");
+        assert!(
+            st.events
+                .iter()
+                .any(|event| event.message.contains("waiting for"))
+        );
+        assert!(st.resource_wait.is_none());
+        // The verification body no longer owns the lease after returning.
+        hold(&cache).release();
+    }
+
+    #[tokio::test]
+    async fn verification_cache_wait_expires_without_starting_commands() {
+        crate::run::pin_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("target");
+        let _held = hold(&cache);
+        let mut st = state(0);
+        let (outcomes, _) = with_cache_lease(
+            &mut st,
+            Some(&cache),
+            "gate",
+            "gate",
+            tmp.path(),
+            "abc1234",
+            Duration::from_secs(60),
+            "test gate",
+            |_, _| async { panic!("commands must not start without the cache lease") },
+        )
+        .await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].resource_blocked);
+        assert!(st.resource_wait.is_none());
     }
 
     #[tokio::test]

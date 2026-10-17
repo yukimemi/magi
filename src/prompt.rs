@@ -2152,13 +2152,14 @@ pub fn chat_consult(q: &crate::ask::Question) -> String {
         }
         s.push('\n');
     }
+    s.push_str("Consultation delivery is independent of owner authority. An authentic current standing-conversation instruction may bind `<full-question-id>: <exact offered choice>`, with the entire persisted owner send as --quote. Explicit batch authorization (including おっけーそれぞれ回答してー) binds immediately preceding persisted question-by-question recommendations for hold, dismissal, repair and non-destructive recovery choices. Merge still requires the exact displayed head; withdrawal, PR closure, replacement and discard require individual explicit consequence confirmation; posting requires exact saved-content confirmation. Report the missing action-specific evidence, never ask the owner to change chats merely for consultation ownership. Existing execution state and owner claims still apply.\n\n");
     if crate::consult::QuestionKind::of(q) == crate::consult::QuestionKind::Merge {
         if let Some(target) = &q.merge_target {
-            s.push_str(&format!("This card names PR {} at head `{}`. To approve through chat, the owner's whole latest message and your --quote must be exactly `merge {}`; a consultation or a general instruction to merge is insufficient. Stop, repair and replacement require the exact offered choice token as the whole latest message and quote. `withdraw: close PR and end task` confirms BOTH PR closure and task termination. `reimplement:<agent-id>` retires the old execution and closes its PR before a new attempt with that configured implementer; no fallback implementer is allowed. The driver applies these decisions; never queue another task yourself.\n\n", target.pr, target.head, target.head));
+            s.push_str(&format!("This card names PR {} at head `{}`. To approve through chat, the owner's whole latest message and your --quote must be exactly `merge {}`; a consultation or a general instruction to merge is insufficient. Individual stop and replacement decisions require the exact offered consequence token; independently bound owner instructions use `<full-question-id>: <exact choice>`. Repair and dismissal can also follow explicitly authorized persisted question-by-question recommendations. `withdraw: close PR and end task` confirms BOTH PR closure and task termination. `reimplement:<agent-id>` retires the old execution and closes its PR before a new attempt with that configured implementer; no fallback implementer is allowed. The driver applies these decisions; never queue another task yourself.\n\n", target.pr, target.head, target.head));
         }
         if q.choices.iter().any(|c| c == crate::land::REPAIR) {
             s.push_str(&format!(
-                "The third choice `fix findings and re-review` requests one repair and bounded re-review of this same PR, without merging or queuing another task. Only when the owner's entire latest message is exactly that label, run `magi answer {} --reply 'fix findings and re-review' --quote 'fix findings and re-review'`. Otherwise discuss the choice and ask for clarification. The driver performs it and presents new review/gate results for a fresh merge decision.\n\n",
+                "The third choice `fix findings and re-review` requests one repair and bounded re-review of this same PR, without merging or queuing another task. For a legacy individual consulted-chat answer when the owner's entire latest message is exactly that label, run `magi answer {} --reply 'fix findings and re-review' --quote 'fix findings and re-review'`. An independently bound individual or persisted batch owner instruction can also authorize repair through the standing-conversation policy. The driver performs it and presents new review/gate results for a fresh merge decision.\n\n",
                 q.id,
             ));
         }
@@ -2188,7 +2189,7 @@ pub fn chat_consult(q: &crate::ask::Question) -> String {
              An earlier message, silence, a question, or a conditional instruction does not authorize posting. \
              Ask for clarification when uncertain; leave the question open. \
              The safe `use fallback` choice can be saved once the owner has chosen it. \
-             `use my text`, when offered, uses the owner's latest title and must pass the posting gate. \
+             `use my text`, when offered, requires `<full-question-id>: use my text <question/content fingerprint>` followed by a newline and the literal title in the latest owner message, quoted whole; hold or an old title is insufficient. The title must pass the posting gate. \
              Do not edit the repository.\n",
             id = q.id,
         ));

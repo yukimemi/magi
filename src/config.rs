@@ -460,12 +460,12 @@ pub struct Graph {
     /// commands, checking their output - actually needs rather than what a
     /// person waiting on a phone can tolerate.
     pub timeout_talk: u64,
-    /// Longest an agent seat may wait, before it is spawned, for something
-    /// that is not the agent itself (today: the shared build cache's lease),
-    /// seconds.
+    /// Longest an agent seat or verification batch may wait for the shared
+    /// build cache's lease before starting, seconds.
     ///
     /// A separate clock from every `timeout_*` above: those start when the CLI
-    /// is spawned and never include this wait. Expiry is a resource block (a
+    /// or verification command is spawned and never include this wait.
+    /// Expiry is a resource block (a
     /// resumable hold that spends no attempt and rotates no agent), not an
     /// agent timeout.
     pub timeout_resource_wait: u64,

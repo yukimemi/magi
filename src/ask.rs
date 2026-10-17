@@ -724,6 +724,9 @@ impl Question {
             ),
             _ => {}
         }
+        if body.eq_ignore_ascii_case(crate::land::HOLD) && self.actions.contains_key(body) {
+            bail!("hold cannot execute a question action");
+        }
         self.answered_at = Some(Timestamp::now());
         self.answer = Some(answer);
         self.status = QuestionStatus::Answered;
@@ -830,7 +833,13 @@ impl Question {
                     t.body.trim()
                 }
             });
-        if crate::deputy::merge_gated(self) {
+        if let Some(message) = latest {
+            crate::consult::validate_batch_effect(self, label, message, quote)?;
+        }
+        if self.node == crate::github_text::ASK_NODE && label == crate::github_text::USE_MY_TEXT {
+            let message = latest.context("use my text requires a current owner instruction with the literal replacement title")?;
+            crate::consult::validate_effect(self, label, message, quote, true)?;
+        } else if crate::deputy::merge_gated(self) {
             // The merge is irreversible and a say is not a decision. `hold` must
             // be the latest message exactly. For `merge`, whether the words are
             // a clear, unhedged instruction is the deputy's judgement alone;
@@ -1368,7 +1377,22 @@ impl Questions {
         Ok(self.with_repair_choice(q))
     }
 
-    fn with_repair_choice(&self, q: Question) -> Question {
+    fn with_repair_choice(&self, mut q: Question) -> Question {
+        // Older local release approvals already persisted their displayed head
+        // in the watch record. Recover that binding, never today's forge head.
+        if q.status.open()
+            && q.merge_target.is_none()
+            && let Some(home) = self.root.parent()
+            && let Some(target) = crate::release_watch::approval_target(home, &q)
+            && let Ok((current, ())) = self.update(&q.id, |current| {
+                if current.status.open() && current.merge_target.is_none() {
+                    current.merge_target = Some(target.clone());
+                }
+                Ok(())
+            })
+        {
+            q = current;
+        }
         if (q.status.open() || q.resolution().as_deref() == Some(crate::land::REPAIR))
             && q.node == crate::land::APPROVAL_NODE
             && let Some(home) = self.root.parent()
@@ -2989,6 +3013,40 @@ mod tests {
         dep.seat = Some(crate::agent::SeatState::new("deputy-x", "alpha", 1));
         q.deputy = Some(dep);
         q
+    }
+
+    #[test]
+    fn deputy_batch_words_never_replace_specific_consent_or_a_recommendation_manifest() {
+        for choice in [
+            crate::merge_decision::WITHDRAW,
+            "reimplement:primary",
+            "retry",
+            "discard",
+        ] {
+            let mut q = approval_question();
+            q.choices.push(choice.into());
+            if matches!(choice, "retry" | "discard") {
+                q.node = "recovery".into();
+            }
+            if choice == "discard" {
+                q.actions.insert(choice.into(), ChoiceAction::Done);
+            }
+            let words = "おっけーそれぞれ回答してー";
+            q.say(words).unwrap();
+            let error = q
+                .settle_by_deputy("deputy-x", choice, words, None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(if choice == "retry" {
+                    "manifest"
+                } else {
+                    "individual owner confirmation"
+                }),
+                "{choice}: {error}"
+            );
+            assert!(q.status.open());
+        }
     }
 
     #[test]

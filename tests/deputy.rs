@@ -900,3 +900,25 @@ fn generic_brief_offers_read_only_investigation_only_for_a_run_id() {
         assert!(without.contains("You know only what the question itself says"));
     }
 }
+
+common::e2e! {
+async fn deputy_non_hold_owner_choices_remain_independent_of_consultation_destination() {
+    let s = scene(home_lock().await);
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    for choice in [magi::land::REPAIR, magi::merge_decision::WITHDRAW, "reimplement:primary"] {
+        let mut q = file_land(&s.store, "Owner decision");
+        q.choices.push(choice.into());
+        q.consult = Some(magi::ask::ChatConsult { talk: "different-standing-conversation".into(), at: Timestamp::now() });
+        q.say(choice).unwrap();
+        s.store.put(&mut q).unwrap();
+        let command = format!("MAGI ask --settle \"$qid\" --choice '{choice}' --quote '{choice}'");
+        script(&s, &[&command]);
+        turn(&mut deputies(&s, 2)).await;
+        assert_actions_succeeded(&s, 1);
+        let answered = s.store.get(&q.id).unwrap();
+        assert_eq!(answered.resolution().as_deref(), Some(choice));
+        assert_eq!(answered.consult, q.consult);
+        assert_eq!(answered.thread.iter().filter(|t| t.who == Who::Agent && t.body.starts_with("Settled as")).count(), 1);
+    }
+}
+}

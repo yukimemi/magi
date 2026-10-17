@@ -539,7 +539,7 @@ enum Command {
         /// The answer: one of the offered choices, or free text.
         #[arg(long, conflicts_with_all = ["list", "say", "ask_chat"])]
         reply: Option<String>,
-        /// Verbatim latest owner words for a consulted merge approval or guarded posting choice from chat.
+        /// Entire latest persisted owner send for a chat decision. Direct: `<full-id>: <choice>`; explicit batch instructions bind the preceding recommendations. Merge, public content and destructive effects retain specific consent requirements.
         #[arg(long, requires = "reply")]
         quote: Option<String>,
         /// Speak back without deciding: a clarifying question, a request for
@@ -2709,10 +2709,10 @@ async fn answer_cmd(
     let (q, evidence_guard) = loop {
         let mut evidence_busy = false;
         let updated = store.update(&q.id, |r| {
-            let evidence_guard = if seat.as_ref().is_some_and(|(_, node)| {
-                node == magi::queue::CHAT_NODE
-                    && magi::consult::QuestionKind::of(r) != magi::consult::QuestionKind::Ordinary
-            }) {
+            let evidence_guard = if seat
+                .as_ref()
+                .is_some_and(|(_, node)| node == magi::queue::CHAT_NODE)
+            {
                 match talks.try_answer_guard()? {
                     Some(guard) => Some(guard),
                     None => {

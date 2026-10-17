@@ -666,8 +666,9 @@ fixer chain (graft: sonnet -> sol -> astra) over a wait that was not the agent's
   prints no countdown. A seat's `started_at` is re-stamped at spawn
   (`seats_spawning`, `seat_spawned`).
 - **Separate wall-clock budgets on purpose**: the node/run budgets, `verify.e2e` /
-  `gate` (`with_cache_lease` takes the lease inside the command budget; its expiry is
-  already `CommandOutcome::resource_blocked`), `dupes` / `github_text` `JUDGE_BUDGET`
+  `gate` (`with_cache_lease` bounds acquisition by `timeout_resource_wait`, then
+  gives commands their full verification budget; acquisition expiry is
+  `CommandOutcome::resource_blocked`), `dupes` / `github_text` `JUDGE_BUDGET`
   (an overall 15 s for a whole check), `retry_budget` (a nudge's quarter),
   `talk_wait_bound`, `land::WAIT_CEILING`. `land`, `rebase`, `bump`, talk, deputy,
   waiter and conduct invoke without waiting for anything before spawn.
@@ -2543,8 +2544,11 @@ with `magi answer` or puts the decision points to the owner in the chat.
   question has a chat to ask (open question, task from a chat, talk still
   open, and never `bump::NOTICE_NODE`). Merge approvals can be consulted,
   but the chat must wait for explicit owner confirmation. `magi answer` from
-  a chat requires its run id to match the consultation and `--quote` to cite
-  the latest owner message; hold requires the whole message to be `hold`.
+  a chat supports independent current owner evidence through
+  `consult::authorize_answer`; consultation delivery is not authority.
+  `--quote` must bind the latest persisted owner send and exact question/choice.
+  The README decision matrix documents individual and batch consent, manifests,
+  retained legacy same-chat answers and downstream execution restrictions.
   `QuestionView::origin_chat` is its result; `app.js` shows "Ask the chat agent" only when it is set.
 - **Never a choice.** Nothing is added to `Question::choices` and
   `Question::answer` is untouched. The question stays `Open`; `Question::consult`
@@ -2935,3 +2939,21 @@ Explicit chat consultations and
 agent replies retain their own authorization. A delivery rejection uses HTTP
 422 / `question_text_unavailable`, preserving drafts and all previously saved
 text; decision choices are independent of delivery availability.
+
+### Owner answer evidence and execution effects
+
+`consult::consent` classifies decisions by issuer, offered choice, structured
+action and execution effect. `deputy::destructive` delegates the destructive
+effect inventory to `consult::destructive_effect`. Never add a choice exception
+to just one ingress. `Talk::recommendations` captures question/content snapshots
+when a persona reply is first persisted; do not reconstruct non-hold manifests
+from mutable current questions for older turns. `AnswerAuthority` retains the
+originating conversation/send and recommendation fingerprints; `Question::consult`
+is delivery history and stays intact after settlement. The full action/route
+matrix is in README.md. The CLI holds the talk evidence guard through the
+question write for ordinary decisions too, preventing queued retraction races.
+
+Local release-watch approval cards also persist `merge_target`. Older cards may
+recover it only from their matching watch record's `asked_head`, never from a
+new forge snapshot or question prose. The same-chat deputy still requires
+`merge <head>` for those cards.

@@ -1451,7 +1451,7 @@ pub fn deputy_brief() -> String {
          undone, so settle it only when the owner's latest message clearly and unconditionally \
          asks for the original to be posted, quoting it verbatim; otherwise ask back with \
          `--thread` (doubt and silence fall back to the FALLBACK text). `{USE_MY_TEXT}` posts \
-         the title the owner wrote in their latest message and must pass the gate. \
+         a literal title from an explicit current instruction: `<full-question-id>: use my text <question/content fingerprint>` followed by a newline and the replacement title. Quote that entire latest owner message. Magi reports the required fingerprint when consent is missing; hold, retraction and old thread text never supply a title. The title must still pass the gate. \
          When offered, `{USE_REWRITE}` posts both saved REWRITE fields unmodified despite \
          the listed failed rules. It requires the same verbatim quote of the owner's latest \
          clear, unconditional instruction as `{POST_ORIGINAL}`; otherwise ask back."
@@ -1500,7 +1500,8 @@ pub enum Reply {
 }
 
 /// Read the answer. `use my text` takes the latest operator message that is
-/// not newer than the answer; none means fallback.
+/// not newer than the answer; none means fallback. Bound instructions yield
+/// only their literal title, and a changed content binding falls back safely.
 pub fn read_reply(q: &crate::ask::Question) -> Reply {
     use crate::ask::{Answer, Who};
     let chose = match (&q.answer, q.status) {
@@ -1516,11 +1517,34 @@ pub fn read_reply(q: &crate::ask::Question) -> Reply {
     if chose != USE_MY_TEXT {
         return Reply::Fallback;
     }
-    q.thread
+    if let Some(authority) = &q.answer_authority {
+        return if authority.question == q.id && authority.choice == USE_MY_TEXT {
+            crate::consult::owner_title(q, &authority.instruction)
+                .map_or(Reply::Fallback, |title| Reply::Title(title.to_owned()))
+        } else {
+            Reply::Fallback
+        };
+    }
+    let Some(owner) = q
+        .thread
         .iter()
         .rev()
         .find(|t| t.who == Who::Operator && !t.body.trim().is_empty())
-        .map_or(Reply::Fallback, |t| Reply::Title(t.body.clone()))
+    else {
+        return Reply::Fallback;
+    };
+    // A deputy's validated instruction binds its literal title to the saved
+    // question content. Never publish the command itself if that binding moved.
+    if owner
+        .body
+        .trim_start()
+        .starts_with(&format!("{}: {USE_MY_TEXT}", q.id))
+    {
+        return crate::consult::owner_title(q, &owner.body)
+            .map_or(Reply::Fallback, |title| Reply::Title(title.to_owned()));
+    }
+    // Direct owner card/terminal decisions retain their existing title input.
+    Reply::Title(owner.body.clone())
 }
 
 /// Has the fixed `asked_at + timeout` deadline passed?

@@ -659,6 +659,9 @@ pub fn upgrade_repair_choice(q: &mut ask::Question, state: &RunState) -> bool {
     }
     let before = (q.choices.clone(), q.actions.clone(), q.merge_target.clone());
     if q.status.open() {
+        // Older cards attached Resume to hold; a hold must remain answerable
+        // without dispatching a question action.
+        q.actions.remove(HOLD);
         for choice in approval_choices(state) {
             if !q.choices.contains(&choice) {
                 q.choices.push(choice);
@@ -675,6 +678,7 @@ pub fn upgrade_repair_choice(q: &mut ask::Question, state: &RunState) -> bool {
     for choice in q.choices.clone() {
         if (q.status.open()
             && crate::merge_decision::stops(&choice)
+            && choice != HOLD
             && choice != crate::merge_decision::DISMISS)
             || (choice == REPAIR && (q.status.open() || q.resolution().as_deref() == Some(REPAIR)))
         {
@@ -1724,7 +1728,9 @@ async fn approval_gate(
                 fresh.detail.push_str("\n\n`fix findings and re-review` runs one repair and bounded review on this PR; it does not approve a merge. A fresh decision follows the updated review and gate.");
             }
             for choice in fresh.choices.clone() {
-                if crate::merge_decision::stops(&choice) && choice != crate::merge_decision::DISMISS
+                if crate::merge_decision::stops(&choice)
+                    && choice != HOLD
+                    && choice != crate::merge_decision::DISMISS
                 {
                     fresh.actions.insert(
                         choice,
@@ -6538,6 +6544,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             .unwrap();
         let upgraded = store.get(&id).unwrap();
         assert_eq!(upgraded.choices, approval_choices(&state));
+        assert!(!upgraded.actions.contains_key(HOLD));
         assert_eq!(store.get(&id).unwrap().choices, upgraded.choices);
         assert!(
             store
@@ -6764,6 +6771,52 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 .unwrap(),
             ApprovalGate::Approved
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_hold_actions_are_removed_on_get_and_list_before_answering() {
+        crate::run::pin_test_home();
+        let store = ask::Questions::open();
+        for via_list in [false, true] {
+            let mut state = repair_state(false, true);
+            let pr = green_pr();
+            approval_gate(&mut state, &pr, "feat: x", None, "abc")
+                .await
+                .unwrap();
+            let id = state.land_approval.as_ref().unwrap().question.clone();
+            store
+                .update(&id, |q| {
+                    q.actions.insert(
+                        HOLD.to_owned(),
+                        ask::ChoiceAction::Resume {
+                            run: state.id.clone(),
+                        },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            let q = if via_list {
+                store.list().into_iter().find(|q| q.id == id).unwrap()
+            } else {
+                store.get(&id).unwrap()
+            };
+            assert!(!q.actions.contains_key(HOLD));
+            store
+                .update(&id, |q| {
+                    // Check the persisted migration, without another read upgrade.
+                    assert!(!q.actions.contains_key(HOLD));
+                    assert!(!upgrade_repair_choice(q, &state));
+                    q.answer(ask::Answer::Choice(HOLD.to_owned()))
+                })
+                .unwrap();
+            assert!(store.get(&id).unwrap().chosen_action().is_none());
+            assert_eq!(
+                approval_gate(&mut state, &pr, "feat: x", None, "abc")
+                    .await
+                    .unwrap(),
+                ApprovalGate::Held
+            );
+        }
     }
 
     #[tokio::test]

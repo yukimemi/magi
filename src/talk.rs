@@ -521,6 +521,9 @@ pub struct Talk {
     pub status: TalkStatus,
     /// Everything said, oldest first.
     pub turns: Vec<Turn>,
+    /// Recommendation-time question snapshots keyed by persona turn position.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub recommendations: std::collections::BTreeMap<usize, crate::consult::RecommendationManifest>,
     /// Exclusive transcript boundary included in the last successful CLI prompt.
     /// Posts at or beyond it still need replay, even if a reply follows them.
     /// Missing on older records, which infer it from the last non-post reply.
@@ -840,6 +843,29 @@ impl Talks {
     pub fn put(&self, t: &mut Talk) -> Result<()> {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
+        let previous = self.get(&t.id).ok();
+        let start = previous.as_ref().map_or(0, |old| old.turns.len());
+        // Existing manifests are immutable even when a stale handle saves.
+        if let Some(old) = previous {
+            t.recommendations = old.recommendations;
+        }
+        let questions = crate::ask::Questions::at(
+            self.root
+                .parent()
+                .context("talk store has no home")?
+                .join("questions"),
+        );
+        for (index, turn) in t.turns.iter().enumerate().skip(start) {
+            if turn.who == Who::Agent
+                && sender(turn, None) == Sender::Persona
+                && turn.posted_by.is_none()
+            {
+                t.recommendations.insert(
+                    index,
+                    crate::consult::recommendation_manifest(&turn.body, &questions),
+                );
+            }
+        }
         t.updated_at = Timestamp::now();
         // Legacy plain messages can still be recovered losslessly from breaks.
         // Explicit provenance must remain on disk, even without attachments.
@@ -1538,6 +1564,7 @@ pub fn begin_with(
 
     let now = Timestamp::now();
     let mut talk = Talk {
+        recommendations: Default::default(),
         posts_read_through: Some(0),
         pending_breaks: None,
         pending_messages: Vec::new(),
@@ -2352,20 +2379,18 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // which writes the question store; a read-only sandbox refuses that. So
     // while such a question is still open - the hand-over turn and the turns
     // in which the owner decides - the turn may write, with the question store
-    // as a writable root. It goes back to read-only once the question is
+    // as a writable root, plus execution roots for an authorized dismissal.
+    // It goes back to read-only once the question is
     // answered or abandoned. As for the deputy, what the seat may touch beyond
     // that rests on the prompt, not the sandbox.
     // `try_home`, not `Questions::open`: a unit test that never pinned a home
     // has no store to consult, and must not abort the turn on `run::home()`.
     let questions =
         crate::run::try_home().map(|home| crate::ask::Questions::at(home.join("questions")));
-    let consulted = questions.as_ref().is_some_and(|q| {
-        crate::consult::pending_consults(q, &talk.id) || crate::consult::authorized_holds(q, talk)
+    let consult_roots = questions.as_ref().map_or_else(Vec::new, |questions| {
+        crate::consult::answer_write_roots(questions, store, talk)
     });
-    let consult_roots: Vec<PathBuf> = match &questions {
-        Some(q) if consulted => vec![q.root().to_path_buf(), store.answer_lock_root()],
-        _ => Vec::new(),
-    };
+    let consulted = !consult_roots.is_empty();
 
     let (allow_write, unsandboxed) = turn_access(cfg.talk.allow_write, consulted);
 
@@ -2984,18 +3009,24 @@ pub fn briefing_for(
          list`, `magi show <id>`, `magi task list`, or the like, the same way \
          you would answer any other question in this conversation.\n\n\
          # Answering existing questions\n\n\
-         A consultation destination does not restrict an explicit owner hold. \
-         For a guarded hold, the latest owner message may be `<question-id>: hold`, \
-         or explicitly instruct you to answer each immediately preceding recommendation \
-         (for example, `それぞれ回答して` or `answer each as recommended`). \
-         Present recommendations as one row per question: `<question-id>: hold` \
-         or `| <question-id> | hold | reason |`. Use full IDs or unique short IDs. \
-         Then run `magi answer <question-id> --reply hold --quote <entire latest owner message>`. \
-         This limited question-store write is available even for a question consulted \
-         elsewhere or never consulted. It never authorizes merge, public posting, PR closure, \
-         repair or another driver. For those actions retain the specific confirmation and \
-         supported execution requirements; report exactly what confirmation is missing. \
-         Recommendations, thanks alone and generated messages are not owner instructions.\n\n\
+         Consultation delivery does not restrict an explicit owner decision. \
+         Use `magi answer <full-question-id> --reply <exact offered choice> --quote <entire latest owner message>`. \
+         Direct instructions bind `<full-question-id>: <exact offered choice>`. \
+         An explicit batch instruction (including `おっけーそれぞれ回答してー`) authorizes \
+         the immediately preceding persisted recommendations, one row per question: \
+         `<full-question-id>: <exact offered choice>` or a table with separate ID and choice cells. \
+         Hold, obsolete-approval dismissal, repair/re-review and non-destructive recovery choices \
+         may be delegated this way, including cross-chat and never-consulted questions. \
+         Merge requires `<full-question-id>: merge <displayed head>`. Withdrawal, PR closure, \
+         replacement that closes the old PR, discard and task completion require an individual \
+         exact consequence instruction; a batch instruction is insufficient. Public posting requires \
+         the exact question/content fingerprint reported by the answer command. `use my text` \
+         requires the question/content fingerprint followed by a newline and the literal replacement title. Report the exact missing evidence. \
+         Never create another driver or task to apply an answer: existing execution transitions \
+         retain their state, ownership and confirmation checks. A busy original consultation must \
+         finish before a non-hold answer. A hold grants no closure or withdrawal. \
+         Thanks, silence, recommendations alone, conditional/retracted instructions and generated \
+         messages are not owner authorization.\n\n\
          # When the operator wants something done\n\n\
          Run:\n\n\
          magi task add {flag} --repo {repo} <instruction>\n\n\
@@ -3308,6 +3339,7 @@ mod tests {
 
     fn ctx_talk(agent: &str, turns: Vec<Turn>) -> Talk {
         Talk {
+            recommendations: Default::default(),
             posts_read_through: None,
             pending_breaks: None,
             pending_messages: Vec::new(),
@@ -3563,6 +3595,7 @@ mod tests {
     fn the_frozen_json_field_names_round_trip_through_disk() {
         let (tmp, talks) = store();
         let mut talk = Talk {
+            recommendations: Default::default(),
             posts_read_through: None,
             pending_breaks: None,
             pending_messages: Vec::new(),
@@ -5851,6 +5884,7 @@ mod tests {
         let (tmp, talks) = store();
         let make = |id: &str, status: TalkStatus| {
             let mut t = Talk {
+                recommendations: Default::default(),
                 posts_read_through: None,
                 pending_breaks: None,
                 pending_messages: Vec::new(),
