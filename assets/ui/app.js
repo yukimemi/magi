@@ -10184,6 +10184,24 @@ function renderTaskFollowup(o) {
   row("Generation", el("span", { text: String(o.generation) }));
 }
 
+const FLOW_START = new Intl.DateTimeFormat(undefined, {
+  year: "numeric", month: "short", day: "numeric",
+  hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  timeZoneName: "short",
+});
+
+function flowStartTime(node) {
+  if (!node.time_expected) return null;
+  const at = typeof node.started_at === "string" ? Date.parse(node.started_at) : NaN;
+  if (!Number.isFinite(at)) {
+    return el("span", { class: "flow-time", text: "Start time not recorded" });
+  }
+  return el("time", {
+    class: "flow-time", datetime: node.started_at,
+    text: `Started ${FLOW_START.format(at)}`,
+  });
+}
+
 const FLOW_COST = { spent: "\u22121 attempt", refunded: "\u21ba refunded", unknown: "attempt unknown" };
 
 function renderTaskFlow(flow) {
@@ -10213,6 +10231,8 @@ function renderTaskFlow(flow) {
     if (n.kind === "run" && !n.decided && n.readable) attrs["data-undecided"] = "";
     if (!n.readable) attrs["data-unreadable"] = "";
     const box = el(n.href ? "a" : "div", n.href ? { ...attrs, href: n.href } : attrs, top);
+    const time = flowStartTime(n);
+    if (time) box.append(time);
     if (n.detail) box.append(el("div", { class: "flow-detail", text: n.detail }));
     list.append(el("li", {}, box));
   }

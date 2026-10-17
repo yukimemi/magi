@@ -656,6 +656,7 @@ async fn followup_task_links_back_to_its_parent() {
         findings: vec!["R3-1-1".to_owned(), "R3-1-2".to_owned()],
         generation: 1,
     });
+    child.start("missing-flow-run".to_owned());
     queue.put(&mut child).expect("seed child");
 
     let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
@@ -685,6 +686,11 @@ async fn followup_task_links_back_to_its_parent() {
                      label: s.textContent, visible: r.width > 0 && r.height > 0, \
                      panelHidden: document.getElementById('task-followup-panel').hidden, \
                      block: b.textContent, \
+                     flowTimes: [...document.querySelectorAll('#task-flow .flow-time')].map(t => ({ \
+                       tag: t.tagName, text: t.textContent, datetime: t.getAttribute('datetime'), \
+                       fits: t.getBoundingClientRect().right <= innerWidth })), \
+                     runHref: document.querySelector('#task-flow [data-kind=run]').getAttribute('href'), \
+                     contextTime: !!n.querySelector('.flow-time'), \
                      spill: document.documentElement.scrollWidth > document.documentElement.clientWidth }; })()",
             )
             .await
@@ -710,6 +716,21 @@ async fn followup_task_links_back_to_its_parent() {
             block.contains("R3-1-1, R3-1-2") && block.contains("pull/7"),
             "{tag}"
         );
+        assert_eq!(out["contextTime"], false, "{tag}");
+        assert_eq!(out["runHref"], "#/runs/missing-flow-run", "{tag}");
+        let times = out["flowTimes"].as_array().expect("flow timestamps");
+        assert_eq!(times.len(), 3, "{tag}");
+        assert_eq!(times[0]["tag"], "TIME", "{tag}");
+        assert_eq!(times[0]["datetime"], child.created_at.to_string(), "{tag}");
+        assert!(
+            times[0]["text"].as_str().unwrap().starts_with("Started "),
+            "{tag}"
+        );
+        for time in &times[1..] {
+            assert_eq!(time["text"], "Start time not recorded", "{tag}");
+            assert!(time["datetime"].is_null(), "{tag}");
+        }
+        assert!(times.iter().all(|t| t["fits"] == true), "{tag}");
         assert_eq!(out["spill"], false, "{tag}");
         browser.close_page(&page).await;
 
