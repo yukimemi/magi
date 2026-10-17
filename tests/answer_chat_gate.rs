@@ -895,3 +895,456 @@ fn chat_merge_preserves_the_recorded_head_confirmation_requirement() {
         Some("merge")
     );
 }
+
+fn choose(f: &Fixture, run: &str, choice: &str, words: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_magi"))
+        .args(["answer", &f.qid, "--reply", choice, "--quote", words])
+        .env("MAGI_HOME", f.tmp.path())
+        .env("MAGI_CONFIG_DIR", f.tmp.path().join("config"))
+        .env("MAGI_RUN", run)
+        .env("MAGI_NODE", magi::queue::CHAT_NODE)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn non_hold_batch_decisions_use_current_manifests_across_consultation_destinations() {
+    for destination in ["same", "other", "none"] {
+        for choice in [magi::land::REPAIR, "retry", "requeue", "use fallback"] {
+            let f = fixture();
+            f.questions
+                .update(&f.qid, |q| {
+                    q.choices.push(choice.into());
+                    if choice != magi::land::REPAIR {
+                        q.node = "recovery".into();
+                    }
+                    if choice == "requeue" {
+                        q.actions
+                            .insert(choice.into(), magi::ask::ChoiceAction::Requeue);
+                    }
+                    if destination == "none" {
+                        q.consult = None;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let words = "おっけーそれぞれ回答してー";
+            let run = standing_owner(&f, words, Some(&format!("{}: {choice}", f.qid)));
+            if destination == "same" {
+                f.questions
+                    .update(&f.qid, |q| {
+                        q.consult.as_mut().unwrap().talk = run.clone();
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let out = choose(&f, &run, choice, words);
+            assert!(
+                out.status.success(),
+                "{destination}/{choice}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let q = f.questions.get(&f.qid).unwrap();
+            assert_eq!(q.resolution().as_deref(), Some(choice));
+            assert_eq!(q.answer_authority.unwrap().choice, choice);
+            assert!(!choose(&f, &run, choice, words).status.success());
+        }
+    }
+}
+
+#[test]
+fn non_hold_manifests_reject_changed_questions_recommendations_and_busy_consultations() {
+    for mode in ["choice", "target", "content", "recommendation", "active"] {
+        let f = fixture();
+        f.questions
+            .update(&f.qid, |q| {
+                q.choices.push(magi::land::REPAIR.into());
+                Ok(())
+            })
+            .unwrap();
+        let words = "おっけーそれぞれ回答してー";
+        let run = standing_owner(
+            &f,
+            words,
+            Some(&format!("{}: {}", f.qid, magi::land::REPAIR)),
+        );
+        let talks = Talks::at(f.tmp.path().join("talks"));
+        let _lease = if mode == "active" {
+            talks.claim_turn(&f.talk_id).unwrap()
+        } else {
+            None
+        };
+        if mode == "recommendation" {
+            let mut t = talks.get(&run).unwrap();
+            t.turns[0].body.push_str("\nChanged recommendation");
+            talks.put(&mut t).unwrap();
+        }
+        f.questions
+            .update(&f.qid, |q| {
+                match mode {
+                    "choice" => q.choices.push("different choice".into()),
+                    "content" => q.detail.push_str("Changed content"),
+                    "target" => {
+                        q.merge_target = Some(magi::merge_decision::Target {
+                            pr: "https://example.test/pull/1".into(),
+                            head: "changed".into(),
+                            language: "en".into(),
+                        })
+                    }
+                    _ => {}
+                }
+                Ok(())
+            })
+            .unwrap();
+        let out = choose(&f, &run, magi::land::REPAIR, words);
+        assert_untouched(&f, &out);
+        let error = String::from_utf8_lossy(&out.stderr);
+        assert!(!error.contains("different chat"), "{error}");
+        assert!(
+            error.contains(if mode == "active" {
+                "original consultation is active"
+            } else {
+                "unchanged question target/content"
+            }),
+            "{mode}: {error}"
+        );
+    }
+}
+
+#[test]
+fn batch_reports_action_specific_missing_consent_in_every_conversation() {
+    for choice in [
+        "merge",
+        magi::merge_decision::WITHDRAW,
+        "reimplement:primary",
+        "post original",
+        "discard",
+        "complete task",
+    ] {
+        let f = fixture();
+        f.questions
+            .update(&f.qid, |q| {
+                q.choices.push(choice.into());
+                q.merge_target = Some(magi::merge_decision::Target {
+                    pr: "https://example.test/pull/1".into(),
+                    head: "reviewed-head".into(),
+                    language: "en".into(),
+                });
+                if choice == "post original" {
+                    q.node = magi::github_text::ASK_NODE.into();
+                }
+                if choice == "complete task" {
+                    q.node = magi::conduct::NODE.into();
+                    q.decision_context =
+                        Some(r#"[null,null,null,["complete","task:owner"]]"#.into());
+                }
+                if choice == "discard" {
+                    q.actions
+                        .insert(choice.into(), magi::ask::ChoiceAction::Done);
+                }
+                Ok(())
+            })
+            .unwrap();
+        let words = "おっけーそれぞれ回答してー";
+        let run = standing_owner(&f, words, Some(&format!("{}: {choice}", f.qid)));
+        let out = choose(&f, &run, choice, words);
+        assert_untouched(&f, &out);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("batch"), "{choice}: {err}");
+        assert!(!err.contains("different chat"), "{err}");
+    }
+}
+
+#[test]
+fn cross_chat_merge_and_closure_require_individual_bound_tokens() {
+    for choice in [
+        "merge",
+        magi::merge_decision::WITHDRAW,
+        "reimplement:primary",
+    ] {
+        let f = fixture();
+        f.questions
+            .update(&f.qid, |q| {
+                q.choices.push(choice.into());
+                q.merge_target = Some(magi::merge_decision::Target {
+                    pr: "https://example.test/pull/1".into(),
+                    head: "reviewed-head".into(),
+                    language: "en".into(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        let words = format!(
+            "{}: {}",
+            f.qid,
+            if choice == "merge" {
+                "merge reviewed-head"
+            } else {
+                choice
+            }
+        );
+        let run = standing_owner(&f, &words, None);
+        let out = choose(&f, &run, choice, &words);
+        assert!(
+            out.status.success(),
+            "{choice}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            f.questions
+                .get(&f.qid)
+                .unwrap()
+                .answer_authority
+                .unwrap()
+                .instruction,
+            words
+        );
+    }
+}
+
+#[test]
+fn japanese_batch_dismisses_obsolete_execution_without_touching_its_pr() {
+    for unconsulted in [false, true] {
+        let f = fixture();
+        let (q, ()) = f
+            .questions
+            .update(&f.qid, |q| {
+                q.choices.push(magi::merge_decision::DISMISS.into());
+                q.merge_target = Some(magi::merge_decision::Target {
+                    pr: "https://example.test/pull/1".into(),
+                    head: "reviewed-head".into(),
+                    language: "en".into(),
+                });
+                if unconsulted {
+                    q.consult = None;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let mut state = magi::run::RunState::new(
+            f.tmp.path().into(),
+            "main".into(),
+            "base".into(),
+            "Original task".into(),
+            Config::default(),
+        );
+        state.id = q.run.clone();
+        state.status = magi::run::RunStatus::Blocked;
+        state.driver_exited = true;
+        state.land_approval = Some(magi::run::LandApproval {
+            question: q.id.clone(),
+            head: "reviewed-head".into(),
+        });
+        state.pr = Some(magi::run::PrRecord {
+            url: "https://example.test/pull/1".into(),
+            number: 1,
+            state: "open".into(),
+            checks: "green".into(),
+            round: 1,
+            rounds: 2,
+            red_at_merge: vec![],
+        });
+        state.save_under(f.tmp.path()).unwrap();
+        let words = "おっけーそれぞれ回答してー";
+        let run = standing_owner(
+            &f,
+            words,
+            Some(&format!("{}: {}", q.id, magi::merge_decision::DISMISS)),
+        );
+        let out = choose(&f, &run, magi::merge_decision::DISMISS, words);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stopped = magi::run::RunState::load_under(&q.run, f.tmp.path()).unwrap();
+        // A terminal blocked status is retained as history; the persisted
+        // dismissal, rather than a fabricated new run, retires its execution.
+        assert_eq!(stopped.status, magi::run::RunStatus::Blocked);
+        assert_eq!(stopped.pr.unwrap().state, "open");
+        let decision = stopped.merge_decision.unwrap();
+        assert_eq!(decision.choice, magi::merge_decision::DISMISS);
+        assert!(!decision.closed);
+        assert_eq!(
+            f.questions
+                .get(&q.id)
+                .unwrap()
+                .answer_authority
+                .unwrap()
+                .instruction,
+            words
+        );
+        assert!(
+            !choose(&f, &run, magi::merge_decision::DISMISS, words)
+                .status
+                .success()
+        );
+    }
+}
+
+#[test]
+fn explicit_public_content_and_literal_owner_title_are_bound_to_the_question() {
+    for choice in [
+        magi::github_text::POST_ORIGINAL,
+        magi::github_text::USE_REWRITE,
+        magi::github_text::USE_MY_TEXT,
+    ] {
+        let f = fixture();
+        let (q, ()) = f
+            .questions
+            .update(&f.qid, |q| {
+                q.node = magi::github_text::ASK_NODE.into();
+                q.choices = vec![choice.into(), magi::github_text::USE_FALLBACK.into()];
+                q.consult = None;
+                Ok(())
+            })
+            .unwrap();
+        let token = magi::consult::question_fingerprint(&q);
+        let words = format!(
+            "{}: {choice} {token}{}",
+            q.id,
+            if choice == magi::github_text::USE_MY_TEXT {
+                "\nOwner's explicit replacement title"
+            } else {
+                ""
+            }
+        );
+        let run = standing_owner(&f, &words, None);
+        let out = choose(&f, &run, choice, &words);
+        assert!(
+            out.status.success(),
+            "{choice}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let answered = f.questions.get(&q.id).unwrap();
+        if choice == magi::github_text::USE_MY_TEXT {
+            assert_eq!(
+                magi::github_text::read_reply(&answered),
+                magi::github_text::Reply::Title("Owner's explicit replacement title".into())
+            );
+        }
+        assert!(answered.answer_authority.is_some());
+        if choice == magi::github_text::USE_MY_TEXT {
+            let mut changed = answered.clone();
+            changed.detail.push_str("Changed content");
+            changed.thread.push(magi::ask::Turn {
+                who: magi::ask::Who::Operator,
+                body: "Stale thread title".into(),
+                at: Timestamp::now(),
+                note: None,
+            });
+            assert_eq!(
+                magi::github_text::read_reply(&changed),
+                magi::github_text::Reply::Fallback
+            );
+        }
+    }
+}
+
+#[test]
+fn competing_non_hold_instructions_have_one_winner_and_no_second_execution() {
+    let f = fixture();
+    f.questions
+        .update(&f.qid, |q| {
+            q.choices
+                .extend([magi::land::REPAIR.into(), "retry".into()]);
+            Ok(())
+        })
+        .unwrap();
+    let words = format!("{}: {}", f.qid, magi::land::REPAIR);
+    let first = standing_owner(&f, &words, None);
+    let talks = Talks::at(f.tmp.path().join("talks"));
+    let mut t = talks.get(&first).unwrap();
+    t.id = "20260907-000000-c0de".into();
+    t.turns.clear();
+    talks.put(&mut t).unwrap();
+    let second_words = format!("{}: retry", f.qid);
+    talk::record(&mut t, &talks, &second_words, vec![]).unwrap();
+    let (a, b) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| choose(&f, &first, magi::land::REPAIR, &words));
+        let b = scope.spawn(|| choose(&f, &t.id, "retry", &second_words));
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert_ne!(a.status.success(), b.status.success());
+    let q = f.questions.get(&f.qid).unwrap();
+    assert_eq!(
+        q.answer_authority.unwrap().choice,
+        if a.status.success() {
+            magi::land::REPAIR
+        } else {
+            "retry"
+        }
+    );
+}
+
+#[test]
+fn unconsulted_free_text_uses_the_complete_bound_owner_answer() {
+    let f = fixture();
+    f.questions
+        .update(&f.qid, |q| {
+            q.choices.clear();
+            q.node = "implement".into();
+            q.consult = None;
+            Ok(())
+        })
+        .unwrap();
+    let text = "Use the existing local cache.";
+    let words = format!("{}: {text}", f.qid);
+    let run = standing_owner(&f, &words, None);
+    let talks = Talks::at(f.tmp.path().join("talks"));
+    assert!(magi::consult::authorized_answers(
+        &f.questions,
+        &talks.get(&run).unwrap()
+    ));
+    let out = choose(&f, &run, text, &words);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        f.questions.get(&f.qid).unwrap().resolution().as_deref(),
+        Some(text)
+    );
+}
+
+#[test]
+fn use_my_text_never_reuses_old_thread_content_without_a_new_literal_title() {
+    let f = fixture();
+    let (q, ()) = f
+        .questions
+        .update(&f.qid, |q| {
+            q.node = magi::github_text::ASK_NODE.into();
+            q.choices = vec![magi::github_text::USE_MY_TEXT.into()];
+            q.say("Stale title from an earlier discussion")?;
+            Ok(())
+        })
+        .unwrap();
+    let words = format!(
+        "{}: use my text {}",
+        q.id,
+        magi::consult::question_fingerprint(&q)
+    );
+    let run = standing_owner(&f, &words, None);
+    let out = choose(&f, &run, magi::github_text::USE_MY_TEXT, &words);
+    assert_untouched(&f, &out);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("literal replacement title"));
+}
+
+#[test]
+fn owner_code_examples_do_not_authorize_non_hold_actions() {
+    for prefix in ["    ", "\t", "> ", "```\n"] {
+        let f = fixture();
+        f.questions
+            .update(&f.qid, |q| {
+                q.choices.push(magi::land::REPAIR.into());
+                Ok(())
+            })
+            .unwrap();
+        let words = format!("{prefix}{}: {}", f.qid, magi::land::REPAIR);
+        let run = standing_owner(&f, &words, None);
+        let out = choose(&f, &run, magi::land::REPAIR, &words);
+        assert_untouched(&f, &out);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("quoted or code-block"));
+    }
+}

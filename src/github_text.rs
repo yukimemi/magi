@@ -1516,6 +1516,14 @@ pub fn read_reply(q: &crate::ask::Question) -> Reply {
     if chose != USE_MY_TEXT {
         return Reply::Fallback;
     }
+    if let Some(authority) = &q.answer_authority {
+        return if authority.question == q.id && authority.choice == USE_MY_TEXT {
+            crate::consult::owner_title(q, &authority.instruction)
+                .map_or(Reply::Fallback, |title| Reply::Title(title.to_owned()))
+        } else {
+            Reply::Fallback
+        };
+    }
     q.thread
         .iter()
         .rev()

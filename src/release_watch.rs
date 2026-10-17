@@ -398,10 +398,24 @@ pub fn task_of_question(
     queue.list().into_iter().find(|t| t.runs.contains(&run))
 }
 
-/// What a deputy is told about a release-watch question: which pull request,
-/// and what each offered choice really does - matched to [`Watcher::apply_answer`]
-/// and [`Watcher::settle_job_question`]. A missing watch record is said to be
-/// missing, never reconstructed.
+/// Recover only a matching watch record's displayed local approval target.
+/// Never parse the question's prose or use the PR's current head as consent.
+pub(crate) fn approval_target(home: &Path, q: &Question) -> Option<crate::merge_decision::Target> {
+    if q.node != crate::bump::NOTICE_NODE
+        || q.seat != "release-watch"
+        || !q.choices.iter().any(|c| c == land::APPROVE)
+    {
+        return None;
+    }
+    let state = state_for_question(home, &q.id)?;
+    Some(crate::merge_decision::Target {
+        pr: state.url,
+        head: state.asked_head?,
+        language: "en".into(),
+    })
+}
+
+/// Explain the watcher-owned effects and immutable approval target to a deputy.
 pub(crate) fn deputy_brief(q: &Question, home: &Path) -> String {
     let mut s = String::from(
         "This question was filed by magi's release watcher about a release pull \
@@ -421,6 +435,9 @@ pub(crate) fn deputy_brief(q: &Question, home: &Path) -> String {
              pull request is known to you only through the question's own text. \
              Say so to the owner rather than guessing.",
         ),
+    }
+    if let Some(target) = &q.merge_target {
+        s.push_str(&format!("\n\nThis approval is bound to PR {} at head `{}`. A deputy merge requires the owner's whole latest message and quote to be exactly `merge {}`. A standing conversation can bind it as `{}: merge {}`. A generic batch instruction never authorizes merge.", target.pr, target.head, target.head, q.id, target.head));
     }
     s.push_str("\n\nWhat each option does:");
     for c in &q.choices {
@@ -945,6 +962,11 @@ impl Watcher {
                             ),
                             vec![land::APPROVE.to_owned(), land::HOLD.to_owned()],
                         );
+                        q.merge_target = Some(crate::merge_decision::Target {
+                            pr: snap.url.clone(),
+                            head: snap.head.clone(),
+                            language: "en".into(),
+                        });
                         match self.questions().put(&mut q) {
                             Ok(()) => st.question = Some(q.id.clone()),
                             Err(e) => tracing::warn!("could not file the question for {pr}: {e:#}"),
@@ -2094,7 +2116,26 @@ mod tests {
         let repo = PathBuf::from("/nowhere");
         let no = || false;
         w.lap(std::slice::from_ref(&repo), 60, 1, &no).await;
-        let id = w.questions().list()[0].id.clone();
+        let original = &w.questions().list()[0];
+        assert_eq!(original.merge_target.as_ref().unwrap().head, "h1");
+        let id = original.id.clone();
+        w.questions()
+            .update(&id, |q| {
+                q.merge_target = None;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            w.questions()
+                .get(&id)
+                .unwrap()
+                .merge_target
+                .as_ref()
+                .unwrap()
+                .head,
+            "h1",
+            "legacy binding comes from the matching persisted watch record"
+        );
         // The head moves before the owner answers.
         *fake.snap.lock().unwrap() = Some(snap(PrLifecycle::Open, "h2", vec![]));
         answer(&w, &id, land::APPROVE);

@@ -10431,6 +10431,8 @@ mod tests {
         };
         for choice in [
             crate::land::HOLD,
+            crate::land::REPAIR,
+            crate::land::APPROVE,
             crate::merge_decision::WITHDRAW,
             "reimplement:beta",
         ] {
@@ -10443,6 +10445,7 @@ mod tests {
                 vec![
                     "merge".into(),
                     "hold".into(),
+                    crate::land::REPAIR.into(),
                     crate::merge_decision::WITHDRAW.into(),
                     "reimplement:beta".into(),
                 ],
@@ -10451,6 +10454,10 @@ mod tests {
                 pr: "https://github.com/example/repo/pull/42".into(),
                 head: "exact-reviewed-head".into(),
                 language: "ja".into(),
+            });
+            q.consult = Some(ask::ChatConsult {
+                talk: "another-conversation".into(),
+                at: jiff::Timestamp::now(),
             });
             fx.questions().put(&mut q).unwrap();
             let ui = Arc::new(Ui::new(
@@ -10474,6 +10481,11 @@ mod tests {
             assert_eq!(response.0.question.resolution().as_deref(), Some(choice));
             let disk = fx.questions().get(&q.id).unwrap();
             assert_eq!(disk.merge_target, q.merge_target);
+            assert_eq!(disk.consult, q.consult);
+            assert!(
+                disk.answer_authority.is_none(),
+                "a direct owner card is its own decision"
+            );
             assert_eq!(disk.resolution().as_deref(), Some(choice));
             assert!(
                 question_answer(

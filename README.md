@@ -458,24 +458,58 @@ in an irreversible decision.
 **Silence is a hold.** An unanswered approval never merges, and neither does
 anything other than the word `merge`.
 
-A standing conversation can record an explicitly requested **hold** even when
-the question was consulted elsewhere or never handed to a chat. The latest
-owner send can name the question directly (`<question-id>: hold`), or explicitly
-authorize the immediately preceding question-by-question recommendations
-(`それぞれ回答して`, including `ありがと！じゃあそれぞれ回答してー！`, or
-`answer each as recommended`). Recommendations use list rows such as
-`` `<question-id>`: hold `` or table rows such as
-`` | `<question-id>` | `hold` | reason | ``. Unique short question IDs work too.
-The assistant runs `magi answer <question-id> --reply hold --quote <whole owner message>`;
-the CLI checks the persisted sender, message boundaries, timing and exact binding
-again under the question lock. The answer retains its authorizing conversation,
-instruction and recommendation references, while keeping the original consultation
-as history. A newer queued message prevents using the older instruction.
-Thanks alone, recommendations alone, generated notices, conditional instructions
-and repeated or conflicting recommendation rows do not authorize an answer.
-This batch path covers hold only: it cannot approve merge, public posting, repair
-or PR closure. Those actions still require their existing specific confirmation
-and supported execution state. A manually held task stays held.
+A standing conversation can answer an exact owner decision even when the
+question was consulted elsewhere or never consulted. Use
+`magi answer <full-question-id> --reply '<exact offered choice>' --quote '<whole latest owner send>'`.
+Direct instructions use `<full-question-id>: <exact offered choice>`. Explicit
+batch authorization, including `おっけーそれぞれ回答してー`,
+`ありがと！じゃあそれぞれ回答してー！` and `answer each as recommended`,
+binds the immediately preceding persona reply. Recommendations use one list row
+`<question-id>: <exact choice>` per question, or separate ID and choice table
+cells. Duplicate/conflicting rows, conditions, quoted examples and generated
+messages confer no authority. Unique short IDs remain supported in recommendations;
+full IDs are preferred and required for individual non-hold instructions.
+
+Recommendation manifests persist the reply fingerprint and each question's
+choices, actions, PR/head and content fingerprint at publication. Changed facts,
+newer queued owner sends and already answered/abandoned questions are rejected.
+Old history without a manifest can still establish a safe hold; new non-hold
+batch authority requires a persisted manifest rather than guessing old targets.
+The question retains its original consultation and the originating owner send,
+turn/message positions and recommendation fingerprint. Closed questions cease
+being pending consultations. Concurrent writers settle once under the question
+lock and retain the winning evidence; non-hold cross-chat answers wait for an
+active original consultation to finish. The existing owner/daemon applies the
+answer; no additional task or driver is created.
+
+| Decision / execution effect | Individual standing instruction | Explicit batch | Existing execution requirements |
+| --- | --- | --- | --- |
+| Hold | `<id>: hold`; same consulted chat also accepts `hold` | Yes | No structured action on hold; no closure implied |
+| Dismiss obsolete approval | `<id>: dismiss: end obsolete approval without changing PR` | Yes | Dead original driver, no armed auto-merge, matching run approval; PR unchanged |
+| Fix findings and re-review | `<id>: fix findings and re-review` | Yes | Offered/recoverable repair, same run and PR, bounded review and fresh approval |
+| Ordinary queue/conductor/agent questions; retry, rerun, requeue, resume, release recovery | `<id>: <exact choice>` | Yes, except destructive effects | Existing claims, operator holds, task generation and recovery state |
+| Free-text questions | `<id>: <complete answer>` | No: no offered choice to bind | Existing asker/waiter dispatch |
+| Withdrawal / PR closure / `reimplement:<agent>` | `<id>: <exact consequence token>` | No | Existing closure confirmation, owner claim and replacement transitions |
+| Triage discard, dependency discard/detach, divergence overwrite, structured `done`, conductor complete/configure | `<id>: <exact consequence token>` | No | Individual explicit consequence; existing consumer checks |
+| Merge (land and release-watch approvals) | `<id>: merge <displayed head>` | No | Recorded PR/head (legacy release cards recover only their matching watch record); final head, review, gate and owner checks still apply |
+| Guarded `post original` / `use rewrite` | `<id>: <choice> <question/content fingerprint>` (reported by CLI) | No | Explicit saved content binding; final posting gate |
+| Guarded `use fallback` | `<id>: use fallback` | Yes | Existing safe fallback and posting gate |
+| Guarded `use my text` | `<id>: use my text <question/content fingerprint>` followed by a newline and the literal replacement title | No | Persisted owner title and final posting gate; a choice token alone supplies no title |
+
+All three consultation destinations (same chat, other chat, never consulted)
+use this matrix. The CLI and standing turn write grant share evidence validation;
+consulted-chat legacy single decisions keep their existing quote policy. The
+owner's terminal CLI and web question-card clicks remain direct owner decisions
+and use the same question lock, offered-choice validation and downstream
+execution transitions. A web chat send uses standing-conversation validation.
+Deputies settle only their own question seat, using the latest persisted owner
+thread and the same execution-effect inventory. A deputy's one-question thread
+has no cross-question recommendation manifest: generic batch words alone cannot
+select a choice there; the active standing conversation's manifested evidence
+uses the answer CLI for those questions. Triage/release/daemon/waiter
+consumers apply recorded answers, never infer authorization from recommendations.
+Missing head, content or consequence confirmation is reported as such, rather
+than a consultation-destination error. A manually held task stays held.
 
 When review hands off with unresolved Major findings or final rejecting votes,
 the decision also offers **fix findings and re-review**. Selecting it runs one
