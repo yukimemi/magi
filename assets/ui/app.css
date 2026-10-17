@@ -2196,6 +2196,7 @@ details.panel > summary + * { margin-top: var(--s2); }
 .task-flow .flow-node[data-unreadable] { border-style: dashed; border-color: var(--line-2); color: var(--ink-3); }
 .task-flow .flow-top { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
 .task-flow .flow-time { font-size: var(--t2); color: var(--ink-2); white-space: normal; overflow-wrap: anywhere; }
+.task-flow span.flow-time { color: var(--ink-3); }
 .task-flow .flow-detail { font-size: var(--t2); color: var(--ink-2); }
 .task-flow .flow-edge { position: relative; margin: 0; padding: var(--s2) 0 var(--s2) var(--s5); border-left: 2px solid var(--line-2); margin-left: var(--s4); font-size: var(--t2); color: var(--ink-2); overflow-wrap: anywhere; }
 .task-flow .flow-edge::after { content: ""; position: absolute; left: -6px; bottom: -1px; border: 5px solid transparent; border-top: 7px solid var(--line-2); border-bottom: 0; }

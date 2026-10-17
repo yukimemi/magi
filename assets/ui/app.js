@@ -10186,7 +10186,7 @@ function renderTaskFollowup(o) {
 
 const FLOW_START = new Intl.DateTimeFormat(undefined, {
   year: "numeric", month: "short", day: "numeric",
-  hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23",
+  hour: "2-digit", minute: "2-digit", hourCycle: "h23",
   timeZoneName: "short",
 });
 
@@ -10194,7 +10194,7 @@ function flowStartTime(node) {
   if (!node.time_expected) return null;
   const at = typeof node.started_at === "string" ? Date.parse(node.started_at) : NaN;
   if (!Number.isFinite(at)) {
-    return el("div", { class: "flow-time", text: "Start time not recorded" });
+    return el("span", { class: "flow-time", text: "Start time not recorded" });
   }
   return el("time", {
     class: "flow-time", datetime: node.started_at,
