@@ -757,6 +757,15 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
                 && let Ok(q) = questions.get(&full)
                 && q.status == ask::QuestionStatus::Answered
             {
+                // The action sweep releases conductor blockers atomically
+                // with their selected operation. A fresh deputy lease must
+                // never leave an answered hold temporarily runnable.
+                if q.node == crate::conduct::NODE
+                    && q.chosen_action().is_some()
+                    && !task.action_applied(&q.id)
+                {
+                    continue;
+                }
                 let answer = match &q.answer {
                     Some(ask::Answer::Choice(c) | ask::Answer::Text(c)) => c.clone(),
                     None => String::new(),
@@ -842,6 +851,8 @@ enum ActionDecision {
     Resume(String),
     /// Requeue as a fresh competition.
     Requeue,
+    /// Hold the task by explicit operator choice.
+    Hold,
     /// Close the task as done.
     Done,
     /// The question is about an earlier attempt than the task's latest; it
@@ -907,6 +918,7 @@ where
     }
     match action {
         ask::ChoiceAction::Requeue => ActionDecision::Requeue,
+        ask::ChoiceAction::Hold => ActionDecision::Hold,
         ask::ChoiceAction::Done => ActionDecision::Done,
         ask::ChoiceAction::Resume { run } => {
             if task.runs.last() != Some(run) {
@@ -1171,13 +1183,39 @@ pub(crate) fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &
         let Ok(mut task) = queue.get(&listed.id) else {
             continue;
         };
+        // Work only on this local copy until the action can be committed.
+        // In particular, a fresh lease below leaves the persisted task blocked.
+        if q.node == crate::conduct::NODE && task.status == TaskStatus::Blocked {
+            let blockers: Vec<_> = task
+                .blocked_by
+                .iter()
+                .filter(|id| {
+                    crate::queue::dependency(queue, questions, id)
+                        == crate::queue::Dependency::Question(q.id.clone())
+                })
+                .cloned()
+                .collect();
+            if !blockers.is_empty() {
+                for id in blockers {
+                    task.unblock(&id);
+                }
+                let answer = match &q.answer {
+                    Some(ask::Answer::Choice(c) | ask::Answer::Text(c)) => c.clone(),
+                    None => String::new(),
+                };
+                task.record_answer(q.summary.clone(), answer);
+            }
+        }
         let language = language_of(&task, Path::new("."));
         let decision = decide_action(&task, &q, phrases(&language), |id| {
             RunState::load_under(id, home)
         });
         let ran = matches!(
             decision,
-            ActionDecision::Resume(_) | ActionDecision::Requeue | ActionDecision::Done
+            ActionDecision::Resume(_)
+                | ActionDecision::Requeue
+                | ActionDecision::Hold
+                | ActionDecision::Done
         );
         if ran && asker_may_still_read(questions, &q, home) {
             // The asking process or its seat can still take the word; act
@@ -1208,6 +1246,7 @@ pub(crate) fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &
                 task.release_operator("choice-requeue", Some(&q.id));
                 task.requeue();
             }
+            ActionDecision::Hold => task.hold_manual(Some(q.summary.clone())),
             ActionDecision::Done => task.succeed(),
             ActionDecision::Refuse(why) => {
                 if task.operator_held() {
@@ -1865,6 +1904,11 @@ where
         if !crate::run::is_run_id(&id) {
             continue;
         }
+        // Serialize the proof and save with claims and takeover: a new
+        // execution must not be overwritten after the liveness observation.
+        let Ok(_owner) = crate::pr_head::owner_lock(home, &id) else {
+            continue;
+        };
         // Unreadable is `clean::fold_due`'s problem, not this one's — see
         // that module's docs for why a run this cannot parse is left alone
         // rather than guessed at. A different schema number is not that: this
@@ -1878,7 +1922,7 @@ where
         let Ok(mut state) = serde_json::from_str::<RunState>(&body) else {
             continue;
         };
-        if state.status.done() || !state.active_all_overrun(now) {
+        if state.driver_exited || state.status.done() || !state.active_all_overrun(now) {
             continue;
         }
         // Not `!is_working_on(..)` alone: that is only "no *daemon* claims
@@ -1893,7 +1937,9 @@ where
         // its strongest, provable answer licenses wiping this run's active
         // seats and failing it out from under whatever is still running it.
         let daemon_claims = is_working_on(home, &id, now);
-        if state.liveness_with(daemon_claims, &query, &identity) != crate::run::Liveness::Dead {
+        if state.liveness_under_with(home, daemon_claims, &query, &identity)
+            != crate::run::Liveness::Dead
+        {
             continue;
         }
         state.abandon("daemon");
@@ -2007,6 +2053,10 @@ async fn drive(
         .as_ref()
         .map(|c| c.daemon.clone())
         .unwrap_or_default();
+    let reconciled = crate::driver::reconcile(home);
+    if !reconciled.is_empty() {
+        tracing::info!(runs = ?reconciled, "reconciled stopped run drivers at startup");
+    }
     let mut initial_status = Status::new();
     initial_status.question_recovery = Some(crate::question_delivery::Recovery::new(
         recovery_cfg.as_ref(),
@@ -10348,6 +10398,91 @@ mod tests {
             assert!(still_held.review_branch.is_none());
             assert!(!still_held.fresh_start);
             assert!(queue.next_runnable().is_none());
+        }
+    }
+
+    #[test]
+    fn conductor_driver_choices_apply_from_both_queued_and_held_tasks() {
+        for held in [false, true] {
+            for retry in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let queue = Queue::at(dir.path().join("queue"));
+                let questions = Questions::at(dir.path().join("questions"));
+                let home = dir.path().join("home");
+                let mut t = task();
+                if held {
+                    t.hold_machine(Some("driver state unknown".into()));
+                }
+                queue.put(&mut t).unwrap();
+                let verdict = serde_json::from_value(serde_json::json!({
+                    "decisions": [{
+                        "id": t.id,
+                        "question": "Driver state unknown; retry the checks or hold?",
+                        "choices": ["daemon: recheck and retry", "daemon: hold the task"],
+                        "actions": {
+                            "daemon: recheck and retry": {"do": "requeue"},
+                            "daemon: hold the task": {"do": "hold"}
+                        }
+                    }]
+                }))
+                .unwrap();
+                crate::conduct::apply(&queue, &questions, &verdict).unwrap();
+                assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Blocked);
+                let mut q = questions.list().pop().unwrap();
+                let choice = if retry {
+                    "daemon: recheck and retry"
+                } else {
+                    "daemon: hold the task"
+                };
+                assert_eq!(q.actions.len(), 2);
+                q.answer(ask::Answer::Choice(choice.into())).unwrap();
+                questions.put(&mut q).unwrap();
+
+                // A Web answer does not remove the deputy's fresh lease.
+                questions.beat(&q.id, ask::WaiterKind::Deputy);
+                for _ in 0..2 {
+                    resolve_blockers(&queue, &questions);
+                    apply_choice_actions(&queue, &questions, &home);
+                    let waiting = queue.get(&t.id).unwrap();
+                    assert_eq!(waiting.status, TaskStatus::Blocked);
+                    assert_eq!(waiting.blocked_by, [q.id.clone()]);
+                    assert!(waiting.answers.is_empty());
+                    assert!(!waiting.action_applied(&q.id));
+                    assert!(runnable(&queue).is_empty());
+                    let free = Arc::new(tokio::sync::Semaphore::new(1));
+                    assert!(claim_dispatch(&queue, &t, false, &free, &free).is_none());
+                }
+                std::fs::remove_file(questions.root().join(format!("{}.lease", q.id))).unwrap();
+
+                // Releasing the blocker and applying the operation share one save.
+                resolve_blockers(&queue, &questions);
+                assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Blocked);
+                apply_choice_actions(&queue, &questions, &home);
+                let after = queue.get(&t.id).unwrap();
+                assert_eq!(
+                    after.status,
+                    if retry {
+                        TaskStatus::Queued
+                    } else {
+                        TaskStatus::Held
+                    }
+                );
+                assert!(after.action_applied(&q.id));
+                assert_eq!(after.operator_held(), !retry);
+                assert_eq!(after.answers.len(), 1);
+
+                // A later operator decision must not replay this answer.
+                let mut changed = after;
+                if retry {
+                    changed.hold_manual(Some("later hold".into()));
+                } else {
+                    changed.release_operator("test", None);
+                }
+                let expected = changed.status;
+                queue.put(&mut changed).unwrap();
+                apply_choice_actions(&queue, &questions, &home);
+                assert_eq!(queue.get(&t.id).unwrap().status, expected);
+            }
         }
     }
 

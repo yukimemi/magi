@@ -1136,15 +1136,52 @@ machine-generated title; human title edits survive. Metadata errors stop with
 `pr_publication_pending`, so a resume retries publication using the saved
 lease and existing candidates.
 
-The old run must be terminal with a proven stopped driver and no daemon claim;
-unknown liveness refuses takeover. Auto-merge is disabled before replacing the
-head. Successful publication saves the new run's pushed SHA and PR record,
+Takeover uses `RunState::liveness_under`, the same driver judge as land and
+worktree release. No daemon claim may remain: a matching held execution lease
+protects a live driver; a matching released lease, explicit graph exit, or proven
+process identity loss establishes a stopped driver. A free lock without matching
+pass metadata is not evidence for a legacy run. Unknown stays unknown; an owner
+answer never substitutes for proof. Questions offer executable retry/recheck or
+hold actions, never ask the owner to certify death. Conductor decisions attach
+`actions` by exact choice label: `{"do":"requeue"}` for retry/recheck and
+`{"do":"hold"}` for an explicit operator hold. The daemon applies the selected
+action once after resolving the question blocker; labels alone never act.
+
+A predecessor with resumable publication, landing, approval, merge-decision,
+armed-merge or repair work, or an open question, must keep its existing graph.
+`handover::has_resume_checkpoint` is checked under the owner lock both before
+worktree release and before publication retirement, including for earlier attempts
+of the same task. Refusal leaves `released_to` and candidate ownership unchanged,
+so `Runner::resume` remains available. Completed runs may retain historical
+checkpoint fields without blocking handover.
+
+A non-terminal predecessor with resumable work must resume its existing graph.
+Publication retires it as `Superseded` only after a completed handover recorded
+in `released_to` (the released worktree is absent), with no pending publication,
+approval, merge decision, armed merge or repair checkpoint. That handover already checked clean worktrees
+and branch tips and prevents the old graph resuming. This is the narrow rule for
+an interrupted `gating` predecessor with no work left: it cannot block successors
+forever once its worktree has actually transferred. Retirement preserves the
+immediate `released_to` audit link: A→B→C does not require rewriting A→C, because
+A has no graph to resume after its completed A→B handover. Each publisher still
+passes its own liveness and pending-checkpoint checks. Handover holds the old
+run's owner lock from its fresh read through deletion or rollback, so publication
+cannot observe a half-completed transfer and driver claims cannot race it.
+
+PID absence alone is still unknown for a legacy record. Such a run can be resumed
+through the existing graph; an actual execution exit or park establishes stopped
+driver evidence for a later handover. Never certify a legacy driver dead merely
+because its old format did not record a pid.
+
+Auto-merge is disabled before replacing the head. Successful publication saves
+the new run's pushed SHA and PR record,
 then marks *transferring* predecessors `pr_taken_over_by` (idempotently); their PR
 records remain history and lifecycle writes still propagate to them. Reports and the
 web show them as superseded, and they cannot re-enter the graph or land.
 
-**Two sets of predecessors.** Every terminal, stopped run sharing the task head
-and git-common-dir is scanned, locked and liveness-checked (an active or unknown
+**Two sets of predecessors.** Every stopped run sharing the task head and
+git-common-dir is scanned (non-terminal runs must satisfy the handover rule
+above), locked and liveness-checked (an active or unknown
 driver still refuses publication), and its `pr_pushed_head` is a candidate for
 the push lease. Only a predecessor whose recorded PR is the *same open PR* being
 published (`pr_head::transfers_ownership`: same url, state not merged/closed) is
@@ -1566,6 +1603,16 @@ the agent CLIs' quota, not local CPU.
   deliberate legibility: the operator can see what was in flight. Do not add a
   startup sweep that "cleans" those into `Queued` without also proving the run
   is dead.
+- Driver ownership lasts for one graph execution, including resource-block and
+  park postprocessing. A pass-bound OS execution lease and drop guard release it
+  on return, error, cancellation or unwind; normal completion saves final state
+  and cleared ownership together. Cleanup checks the pass identity so it cannot
+  clear a successor. Save failure or process kill leaves lease-based recovery.
+- Before publishing a new daemon generation, startup reconciles proven-stopped
+  driver records once under the ownership lock, retaining status and resume
+  checkpoints. Prior daemon claims with a proven-lost matching process identity
+  do not survive restart. Unknown identities and held leases stay protected;
+  recovered resumable runs are not failed by abandoned-seat cleanup.
 - Ctrl-C does not abandon a run in flight. Killing the graph mid-node leaves
   worktrees, branches and agent sessions behind, and throws away agent calls
   already paid for.

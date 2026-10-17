@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 /// Serializes driver claims with publication takeover. The file stays in place:
 /// unlinking a locked inode would let a second caller lock a different one.
 /// Contention fails closed rather than blocking an async executor.
-pub(crate) fn owner_lock(home: &Path, id: &str) -> Result<std::fs::File> {
+pub(crate) fn owner_lock(home: &Path, id: &str) -> Result<OwnerLock> {
     let path = home.join("runs").join(id).join("pr-owner.lock");
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -21,12 +21,29 @@ pub(crate) fn owner_lock(home: &Path, id: &str) -> Result<std::fs::File> {
         .open(path)
         .context("open public head ownership lock")?;
     try_lock_file(&file).context("public head ownership is being updated; retry later")?;
-    Ok(file)
+    Ok(OwnerLock { _file: file })
+}
+
+/// Explicitly unlock on Unix: another test/thread can fork while this lock is
+/// held. Its inherited descriptor can survive our close until exec, so closing
+/// alone does not necessarily release the shared open-file-description lock.
+pub(crate) struct OwnerLock {
+    _file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor is owned by this live guard. LOCK_UN releases
+        // its flock even if a fork temporarily retains a duplicate descriptor.
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 // std::fs::File locking requires Rust 1.89; keep the declared 1.85 MSRV.
 #[cfg(unix)]
-fn try_lock_file(file: &std::fs::File) -> std::io::Result<()> {
+pub(crate) fn try_lock_file(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     // SAFETY: the descriptor belongs to a live File. flock does not retain
     // pointers; closing the File releases the lock, including on process exit.
@@ -38,7 +55,7 @@ fn try_lock_file(file: &std::fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn try_lock_file(file: &std::fs::File) -> std::io::Result<()> {
+pub(crate) fn try_lock_file(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     #[link(name = "kernel32")]
     unsafe extern "system" {
@@ -113,7 +130,7 @@ async fn predecessors(
     state: &RunState,
     home: &Path,
     head: &str,
-) -> Result<Vec<(RunState, std::fs::File)>> {
+) -> Result<Vec<(RunState, OwnerLock)>> {
     let common = git::git(
         &state.repo,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -140,7 +157,7 @@ async fn predecessors(
         let _lock = owner_lock(home, &id)?;
         // The scan only selects possible owners; validate a fresh record under
         // the same lock the driver claim uses, and hold it through takeover.
-        let old = RunState::load_under(&id, home)?;
+        let mut old = RunState::load_under(&id, home)?;
         let other = git::git(
             &old.repo,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -157,16 +174,63 @@ async fn predecessors(
             continue;
         }
         let claimed = crate::daemon::is_working_on(home, &id, jiff::Timestamp::now());
-        if !old.status.done() || old.liveness(claimed) != Liveness::Dead {
-            bail!(
-                "previous public head owner {} is active or its driver is unknown",
-                old.short()
-            );
-        }
+        validate_predecessor(&mut old, state, home, claimed)?;
         previous.push((old, _lock));
     }
     previous.sort_by_key(|(s, _)| s.updated_at);
     Ok(previous)
+}
+
+/// A released execution has no remaining graph to resume. Only an explicit
+/// completed handover licenses retiring a non-terminal predecessor, even if
+/// its immediate successor handed the work on again;
+/// all other interrupted runs must resume their existing graph first.
+fn validate_predecessor(
+    old: &mut RunState,
+    next: &RunState,
+    home: &Path,
+    claimed: bool,
+) -> Result<()> {
+    match old.liveness_under(home, claimed) {
+        Liveness::Live => bail!(
+            "previous public head owner {} still has a live driver",
+            old.short()
+        ),
+        Liveness::Unknown => bail!(
+            "previous public head owner {} driver state unknown; recheck and retry, or hold the task; an owner answer cannot prove driver death",
+            old.short()
+        ),
+        Liveness::Dead => {}
+    }
+    if crate::handover::has_resume_checkpoint(old, home) {
+        bail!(
+            "previous public head owner {} has resumable work; resume that run instead of publishing a successor",
+            old.short()
+        );
+    }
+    if !old.status.done() {
+        if old.released_to.is_none()
+            || old.candidates.iter().any(|c| {
+                old.released_branches.contains(&c.branch) && c.worktree.try_exists().unwrap_or(true)
+            })
+        {
+            bail!(
+                "previous public head owner {} has resumable work; resume that run instead of publishing a successor",
+                old.short()
+            );
+        }
+        old.status = crate::run::RunStatus::Superseded;
+        old.event(
+            "publish",
+            format!(
+                "execution retired after completed worktree handover to {}; current publisher {}",
+                old.released_to.as_deref().expect("checked handover"),
+                next.id
+            ),
+        );
+        old.save_under(home)?;
+    }
+    Ok(())
 }
 
 /// Refuse startup while a historical publisher is still active or ambiguous.
@@ -353,9 +417,7 @@ pub(crate) async fn publish(
         // Re-read before writing, using the same terminal/driver guard.
         let mut old = RunState::load_under(&old.id, &home)?;
         let claimed = crate::daemon::is_working_on(&home, &old.id, jiff::Timestamp::now());
-        if !old.status.done() || old.liveness(claimed) != Liveness::Dead {
-            bail!("previous owner became active during publication");
-        }
+        validate_predecessor(&mut old, state, &home, claimed)?;
         if old.pr_taken_over_by.as_deref() == Some(state.id.as_str()) {
             continue;
         }
@@ -429,6 +491,120 @@ async fn checked_gh(repo: &Path, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_lock_releases_even_while_a_duplicate_descriptor_is_open() {
+        let home = tempfile::tempdir().unwrap();
+        let state = predecessor(home.path());
+        let owner = owner_lock(home.path(), &state.id).unwrap();
+        // Models the shared file description inherited across a concurrent
+        // fork, before that child reaches exec and closes CLOEXEC descriptors.
+        let inherited = owner._file.try_clone().unwrap();
+        assert!(owner_lock(home.path(), &state.id).is_err());
+        drop(owner);
+        let next = owner_lock(home.path(), &state.id).unwrap();
+        drop(inherited);
+        assert!(owner_lock(home.path(), &state.id).is_err());
+        drop(next);
+        assert!(owner_lock(home.path(), &state.id).is_ok());
+    }
+
+    fn predecessor(home: &Path) -> RunState {
+        let mut s = RunState::new(
+            "repo".into(),
+            "main".into(),
+            "base".into(),
+            "task".into(),
+            crate::config::Config::default(),
+        );
+        s.status = crate::run::RunStatus::Ready;
+        s.save_under(home).unwrap();
+        s
+    }
+
+    #[test]
+    fn takeover_needs_proof_and_preserves_live_or_unknown_drivers() {
+        let home = tempfile::tempdir().unwrap();
+        let mut old = predecessor(home.path());
+        let next = predecessor(home.path());
+        assert!(validate_predecessor(&mut old, &next, home.path(), false).is_err());
+        old.driver_exited = true;
+        assert!(validate_predecessor(&mut old, &next, home.path(), false).is_ok());
+        assert!(validate_predecessor(&mut old, &next, home.path(), true).is_err());
+        old.driver_exited = false;
+        old.driver_pid = Some(std::process::id());
+        old.driver_started_at = crate::proc::process_started_at(std::process::id());
+        assert!(validate_predecessor(&mut old, &next, home.path(), false).is_err());
+        old.driver_started_at = Some("1".into());
+        assert!(validate_predecessor(&mut old, &next, home.path(), false).is_ok());
+    }
+
+    #[test]
+    fn a_stopped_gating_predecessor_retires_only_after_explicit_handover() {
+        let home = tempfile::tempdir().unwrap();
+        let mut old = predecessor(home.path());
+        let next = predecessor(home.path());
+        old.status = crate::run::RunStatus::Gating;
+        old.driver_exited = true;
+        assert!(validate_predecessor(&mut old, &next, home.path(), false).is_err());
+        assert_eq!(old.status, crate::run::RunStatus::Gating);
+        old.released_to = Some(next.id.clone());
+        old.pr_publication_pending = true;
+        assert!(validate_predecessor(&mut old, &next, home.path(), false).is_err());
+        old.pr_publication_pending = false;
+        assert!(validate_predecessor(&mut old, &next, home.path(), false).is_ok());
+        let disk = RunState::load_under(&old.id, home.path()).unwrap();
+        assert_eq!(disk.status, crate::run::RunStatus::Superseded);
+        assert_eq!(disk.released_to, Some(next.id));
+    }
+
+    #[test]
+    fn successive_handovers_do_not_strand_a_stopped_gating_publisher() {
+        let home = tempfile::tempdir().unwrap();
+        let mut a = predecessor(home.path());
+        let mut b = predecessor(home.path());
+        let c = predecessor(home.path());
+        for state in [&mut a, &mut b] {
+            state.status = crate::run::RunStatus::Gating;
+            state.driver_exited = true;
+            state.pr_head = Some("task-head".into());
+        }
+        a.released_to = Some(b.id.clone());
+        b.released_to = Some(c.id.clone());
+        let worktree = home.path().join("released-worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        a.released_branches.push("branch".into());
+        a.candidates.push(Candidate {
+            index: 0,
+            label: 'A',
+            agent: "existing".into(),
+            branch: "branch".into(),
+            worktree: worktree.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: true,
+        });
+        a.pr_publication_pending = true;
+        assert!(validate_predecessor(&mut a, &c, home.path(), false).is_err());
+        a.pr_publication_pending = false;
+        // Saving the handover marker precedes removal. A crash in that gap
+        // must not be mistaken for a completed transfer.
+        assert!(validate_predecessor(&mut a, &c, home.path(), false).is_err());
+        std::fs::remove_dir(worktree).unwrap();
+        assert!(validate_predecessor(&mut a, &c, home.path(), false).is_ok());
+        assert_eq!(a.status, crate::run::RunStatus::Superseded);
+        assert_eq!(a.released_to.as_deref(), Some(b.id.as_str()));
+        assert!(validate_predecessor(&mut b, &c, home.path(), true).is_err());
+        assert!(validate_predecessor(&mut b, &c, home.path(), false).is_ok());
+        assert_eq!(b.status, crate::run::RunStatus::Superseded);
+    }
 
     #[test]
     fn selected_public_lease_refuses_moves_and_deletion_even_after_validation() {
