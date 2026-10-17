@@ -185,20 +185,17 @@ fn validate_predecessor(
         ),
         Liveness::Dead => {}
     }
+    if crate::handover::has_resume_checkpoint(old, home) {
+        bail!(
+            "previous public head owner {} has resumable work; resume that run instead of publishing a successor",
+            old.short()
+        );
+    }
     if !old.status.done() {
         if old.released_to.is_none()
             || old.candidates.iter().any(|c| {
                 old.released_branches.contains(&c.branch) && c.worktree.try_exists().unwrap_or(true)
             })
-            || old.pr_publication_pending
-            || old.land_approval.is_some()
-            || old.merge_decision.is_some()
-            || old.land_armed_head.is_some()
-            || !old.merge_repairs.is_empty()
-            || crate::ask::Questions::at(home.join("questions"))
-                .list()
-                .iter()
-                .any(|q| q.run == old.id && q.status.open())
         {
             bail!(
                 "previous public head owner {} has resumable work; resume that run instead of publishing a successor",

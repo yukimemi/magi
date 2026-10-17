@@ -447,3 +447,73 @@ async fn a_failed_successor_can_restore_its_handover_under_the_owner_lock() {
     assert!(Runner::resume(&old.id).is_ok());
 }
 }
+
+common::e2e! {
+async fn checkpointed_predecessors_keep_their_worktree_and_remain_resumable() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (base, wt) = old_run(&fx);
+    let tip = run_git(&fx.repo, &["rev-parse", BRANCH]);
+    for checkpoint in ["publication", "blocked-publication", "approval", "landing", "armed", "decision", "repair", "question"] {
+        let mut old = base.clone();
+        match checkpoint {
+            "publication" => old.pr_publication_pending = true,
+            "blocked-publication" => {
+                old.status = RunStatus::Blocked;
+                old.pr_publication_pending = true;
+            }
+            "approval" => {
+                old.status = RunStatus::Landing;
+                old.land_approval = Some(magi::run::LandApproval { question: "approval".into(), head: tip.clone() });
+            }
+            "landing" => old.status = RunStatus::Landing,
+            "armed" => old.land_armed_head = Some(tip.clone()),
+            "decision" => old.merge_decision = Some(magi::merge_decision::Decision {
+                question: "decision".into(),
+                target: magi::merge_decision::Target { pr: "https://github.com/o/r/pull/1".into(), head: tip.clone(), language: "en".into() },
+                choice: "hold".into(), closed: false, replacement_run: None, replacement_pr: None,
+            }),
+            "repair" => old.merge_repairs.push(magi::run::MergeRepair {
+                question: "repair".into(), head: tip.clone(), pr: "https://github.com/o/r/pull/1".into(),
+                reviews: Vec::new(), gate: Vec::new(), gate_head: None, gate_fixes: Vec::new(), pre_gate: Vec::new(),
+                phase: magi::run::MergeRepairPhase::Requested, failure: None,
+            }),
+            "question" => {
+                let mut question = magi::ask::Question::new(old.id.clone(), "review".into(), "reviewer".into(),
+                    "Continue?".into(), String::new(), Vec::new());
+                magi::ask::Questions::open().put(&mut question).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        old.save().unwrap();
+        let before = std::fs::read(old.dir().join("run.json")).unwrap();
+        let error = Runner::review_taking_over(
+            &fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[&old])), magi::run::Origin::operator(),
+        ).await.err().expect("checkpointed work must stay with its original run");
+        assert!(matches!(error.downcast_ref::<magi::handover::Refused>(), Some(magi::handover::Refused::Unsafe { .. })), "{checkpoint}: {error:#}");
+        assert!(format!("{error:#}").contains("resume that run"), "{checkpoint}: {error:#}");
+        assert!(wt.exists(), "{checkpoint}");
+        assert_eq!(run_git(&fx.repo, &["rev-parse", BRANCH]), tip, "{checkpoint}");
+        assert_eq!(std::fs::read(old.dir().join("run.json")).unwrap(), before, "{checkpoint}");
+        let resumed = Runner::resume(&old.id).expect("refusal must preserve resumption");
+        assert!(!resumed.state.released(), "{checkpoint}");
+        assert!(!resumed.state.candidates[0].folded, "{checkpoint}");
+    }
+}
+}
+
+common::e2e! {
+async fn historical_approval_on_a_completed_run_does_not_block_handover() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (mut old, wt) = old_run(&fx);
+    old.status = RunStatus::Ready;
+    old.land_approval = Some(magi::run::LandApproval { question: "historical".into(), head: "head".into() });
+    old.save().unwrap();
+    let successor = Runner::review_taking_over(
+        &fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[&old])), magi::run::Origin::operator(),
+    ).await.expect("completed-run evidence is historical");
+    assert!(!wt.exists());
+    assert_eq!(RunState::load(&old.id).unwrap().released_to.as_deref(), Some(successor.state.id.as_str()));
+}
+}

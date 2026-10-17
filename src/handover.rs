@@ -239,7 +239,7 @@ fn short(sha: &str) -> String {
 ///
 /// [`Liveness::Unknown`] is refused like a live driver: an owner's answer
 /// cannot substitute for execution-lease or process-identity evidence. A run
-/// of another task that is in `landing` (possibly waiting on the owner's approval) is refused as well.
+/// in `landing` (possibly waiting on the owner's approval) is refused as well.
 pub fn decide(owner: &Owner, holder: &Holder) -> Decision {
     if let Owner::Foreign(why) = owner {
         return Decision::Refuse(why.clone());
@@ -257,7 +257,7 @@ pub fn decide(owner: &Owner, holder: &Holder) -> Decision {
     } else if holder.liveness == Liveness::Unknown || holder.driver_unproven {
         why.push("its driver process could not be shown to be gone".to_owned());
     }
-    if *owner == Owner::MagiRun && holder.status == RunStatus::Landing {
+    if holder.status == RunStatus::Landing {
         why.push("that run is in `landing`, possibly waiting on an approval".to_owned());
     }
     if holder.dirty {
@@ -370,6 +370,23 @@ fn find_magi_owner(
     }
 }
 
+/// A resumable publication, landing or owner decision must keep its existing
+/// graph and worktree. Call under the owner lock before releasing or retiring
+/// a predecessor; completed runs may retain these fields as historical evidence.
+pub(crate) fn has_resume_checkpoint(state: &RunState, home: &Path) -> bool {
+    state.status.resumable()
+        && (state.status == RunStatus::Landing
+            || state.pr_publication_pending
+            || state.land_approval.is_some()
+            || state.merge_decision.is_some()
+            || state.land_armed_head.is_some()
+            || !state.merge_repairs.is_empty()
+            || crate::ask::Questions::at(home.join("questions"))
+                .list()
+                .iter()
+                .any(|q| q.run == state.id && q.status.open()))
+}
+
 /// The scan only finds a possible holder. Driver claims share this lock, so
 /// reload and validate the candidate while holding it through removal/rollback.
 fn locked_holder(home: &Path, id: &str, path: &Path) -> Result<(RunState, usize, std::fs::File)> {
@@ -458,6 +475,13 @@ pub async fn release(
     };
 
     let (mut state, index, _owner) = locked_holder(&takeover.home, &state.id, &path)?;
+    if has_resume_checkpoint(&state, &takeover.home) {
+        return Err(Refused::Unsafe {
+            branch: branch.to_owned(),
+            path: path.display().to_string(),
+            why: format!("run {} has a resumable publication, landing or decision checkpoint; resume that run instead of releasing its worktree", state.short()),
+        }.into());
+    }
     let holder = inspect(repo, branch, &path, &state, &takeover.home).await?;
     if let Decision::Refuse(why) = decide(&kind, &holder) {
         return Err(Refused::Unsafe {
@@ -684,7 +708,7 @@ mod tests {
     }
 
     #[test]
-    fn a_landing_run_of_another_task_is_refused_but_an_earlier_attempt_is_not() {
+    fn landing_is_protected_even_for_an_earlier_attempt() {
         let landing = Holder {
             status: RunStatus::Landing,
             ..holder()
@@ -693,7 +717,10 @@ mod tests {
             decide(&Owner::MagiRun, &landing),
             Decision::Refuse(_)
         ));
-        assert_eq!(decide(&Owner::EarlierAttempt, &landing), Decision::Release);
+        assert!(matches!(
+            decide(&Owner::EarlierAttempt, &landing),
+            Decision::Refuse(_)
+        ));
     }
 
     #[test]

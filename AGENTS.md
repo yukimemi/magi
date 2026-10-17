@@ -1144,6 +1144,14 @@ pass metadata is not evidence for a legacy run. Unknown stays unknown; an owner
 answer never substitutes for proof. Questions offer executable retry/recheck or
 hold actions, never ask the owner to certify death.
 
+A predecessor with resumable publication, landing, approval, merge-decision,
+armed-merge or repair work, or an open question, must keep its existing graph.
+`handover::has_resume_checkpoint` is checked under the owner lock both before
+worktree release and before publication retirement, including for earlier attempts
+of the same task. Refusal leaves `released_to` and candidate ownership unchanged,
+so `Runner::resume` remains available. Completed runs may retain historical
+checkpoint fields without blocking handover.
+
 A non-terminal predecessor with resumable work must resume its existing graph.
 Publication retires it as `Superseded` only after a completed handover recorded
 in `released_to` (the released worktree is absent), with no pending publication,
