@@ -10912,6 +10912,9 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> R
         return Ok(Vec::new());
     }
     let repo = state.repo.clone();
+    // CLI, Web and automatic cleanup all enter here, independently of
+    // Runner::fold_losers. Protect deletion and shared config release too.
+    let _coordination = crate::repo_lock::SeatLease::for_operation(&repo).await?;
     let root = state.worktree_root();
     let winner = state.tally.as_ref().map(|t| t.winner);
     let mut removed = Vec::new();
@@ -12693,6 +12696,106 @@ mod tests {
             "the loser's branch is removed"
         );
         assert!(state.candidates[1].folded, "the loser is marked folded");
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn fold_run_waits_for_shared_lock_before_removing_worktrees_branches_or_config() {
+        use std::os::fd::AsRawFd as _;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let common = repo.join(".git");
+        std::fs::write(common.join("kanade-sync.contract"), "shared-lock-v1\n").unwrap();
+        let home = tmp.path().join("home");
+        let mut config = Config::default();
+        config.graph.worktree_root = Some(tmp.path().join("wt"));
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".into(),
+            "deadbeef".into(),
+            "task".into(),
+            config,
+        );
+        let root = state.worktree_root();
+        let candidate = root.join("cand-A");
+        let reviewer = root.join("review-1");
+        let branch = state.branch_for('A');
+        git::worktree_add_branch(&repo, &candidate, &branch, "main")
+            .await
+            .unwrap();
+        git::worktree_add_detached(&repo, &reviewer, "main")
+            .await
+            .unwrap();
+        git::acquire_worktree_config(&repo).await.unwrap();
+        state.enabled_worktree_config = true;
+        state.status = RunStatus::Ready;
+        state.candidates.push(Candidate {
+            index: 0,
+            label: 'A',
+            agent: "implement".into(),
+            branch: branch.clone(),
+            worktree: candidate.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: false,
+        });
+        state.save_under(&home).unwrap();
+        let config_before = std::fs::read(common.join("config")).unwrap();
+        let worktrees_before = git::git(&repo, &["worktree", "list", "--porcelain"])
+            .await
+            .unwrap();
+        // A separate OS handle bypasses the launcher's local gate, exactly as
+        // an external updater does, and must still prevent all folding work.
+        let external = std::fs::File::create(common.join("kanade-sync.lock")).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(external.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let mut fold = Box::pin(fold_run(&mut state, true, &home));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut fold)
+                .await
+                .is_err()
+        );
+        assert!(candidate.exists());
+        assert!(reviewer.exists());
+        assert!(git::branch_exists(&repo, &branch).await.unwrap());
+        assert_eq!(std::fs::read(common.join("config")).unwrap(), config_before);
+        assert_eq!(
+            git::git(&repo, &["worktree", "list", "--porcelain"])
+                .await
+                .unwrap(),
+            worktrees_before
+        );
+        drop(external);
+        let removed = tokio::time::timeout(Duration::from_secs(10), &mut fold)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(fold);
+        assert!(removed.contains(&branch));
+        assert!(!root.exists());
+        assert!(!git::branch_exists(&repo, &branch).await.unwrap());
+        assert!(state.candidates[0].folded);
+        assert!(!state.enabled_worktree_config);
+        assert_ne!(std::fs::read(common.join("config")).unwrap(), config_before);
+        let enabled = git::git_raw(
+            &repo,
+            &["config", "--local", "--get", "extensions.worktreeConfig"],
+        )
+        .await
+        .unwrap();
+        assert!(!enabled.ok(), "the last config reference was released");
     }
 
     /// A branch handed to a later run is that run's (and its pull request's):

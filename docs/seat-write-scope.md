@@ -99,8 +99,10 @@ local exclusive reservation and the real shared OS lock through preparation,
 then releases them before invoking any seat (the gate is not reentrant).
 This covers candidate/judge/advisor preparation, the attached under-review
 checkout and takeover, reviewer creation/reset/setup on every round, and
-operator-fix creation/setup and removal. Folding the prepared worktrees uses
-the same protection. External contention waits before these mutations begin;
+operator-fix creation/setup and removal. Both `Runner::fold_losers` and the
+public `fold_run` used by CLI, Web and automatic cleanup take the same lease
+before removing worktrees/branches or releasing shared worktree config.
+External contention waits before these mutations begin;
 an unreadable lock or unsupported registration fails preparation closed.
 These bounded preparation leases do not replace editing agents' session-long
 locks or establish coordination of unrelated repository operations.
@@ -143,6 +145,7 @@ RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope
 RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope coordination:: -- --nocapture
 RUSTUP_TOOLCHAIN=stable cargo test --locked --lib repo_lock::tests
 RUSTUP_TOOLCHAIN=stable cargo test --locked --lib graph::tests::preparation_
+RUSTUP_TOOLCHAIN=stable cargo test --locked --lib graph::tests::fold_run_
 RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope readonly_invocation -- --ignored --nocapture
 RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope shared_lock_contention -- --ignored --nocapture
 RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope host_seat -- --ignored --nocapture
