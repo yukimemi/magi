@@ -1177,7 +1177,9 @@ impl Runner {
         let mut execution = self.claim_driver()?;
         let runner = &mut *execution.runner;
         let wait = runner.repository_wait();
-        let result = wait.scope(runner.execute_graph()).await;
+        // Keep the graph's large future off the callers' stack, including
+        // standalone task attempts running on a default-sized test thread.
+        let result = wait.scope(Box::pin(runner.execute_graph())).await;
         let result = match result {
             Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => {
                 record_repository_block(&mut runner.state, &e);
