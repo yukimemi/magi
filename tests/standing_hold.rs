@@ -15,6 +15,23 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
     std::fs::create_dir_all(&repo).unwrap();
     let talks = Talks::at(tmp.path().join("talks"));
     let questions = Questions::at(tmp.path().join("questions"));
+    // Nested sandbox application can be forbidden even on macOS. Keep the
+    // real CLI coverage there; exercise the write boundary when available.
+    let sandbox_available = if cfg!(target_os = "macos") {
+        let probe = std::process::Command::new("sandbox-exec")
+            .args(["-p", "(version 1) (allow default)", "/usr/bin/true"])
+            .output()
+            .unwrap();
+        if !probe.status.success() {
+            eprintln!(
+                "sandbox boundary checks unavailable: {}",
+                String::from_utf8_lossy(&probe.stderr)
+            );
+        }
+        probe.status.success()
+    } else {
+        false
+    };
     let script = tmp.path().join("answer.sh");
     std::fs::write(
         &script,
@@ -180,16 +197,16 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
                 );
                 let env = &mut cfg.agents[0].env;
                 env.insert("PROFILE".into(), String::new());
-                if cfg!(target_os = "macos")
-                    && choice == magi::merge_decision::DISMISS
-                    && authorized
-                {
+                if sandbox_available && choice == magi::merge_decision::DISMISS && authorized {
                     let home = tmp.path().canonicalize().unwrap();
                     let base = [questions.root().to_path_buf(), talks.answer_lock_root()];
                     let profile = |extra: &[std::path::PathBuf]| {
                         let allowed = extra
                             .iter()
                             .map(|path| {
+                                // Seatbelt matches resolved paths, including
+                                // macOS's /var -> /private/var temp alias.
+                                let path = home.join(path.strip_prefix(tmp.path()).unwrap());
                                 format!(
                                     "(subpath {})",
                                     serde_json::to_string(&path.to_string_lossy()).unwrap()
@@ -239,7 +256,12 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
                 let lease = talks.claim_turn(&t.id).unwrap().unwrap();
                 talk::respond(&lease, &mut t, &talks, &cfg, &words)
                     .await
-                    .unwrap();
+                    .unwrap_or_else(|error| {
+                        let stderr =
+                            std::fs::read_to_string(talks.artifacts_of(&t.id).join("turn-1.err"))
+                                .unwrap_or_default();
+                        panic!("{choice} ({destination}): {error}; stderr: {stderr}");
+                    });
                 let saved = questions.get(&q.id).unwrap();
                 assert_eq!(
                     saved.resolution().as_deref(),
