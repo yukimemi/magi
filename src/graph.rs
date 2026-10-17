@@ -717,6 +717,7 @@ impl Runner {
             choice: None,
             task_instruction: None,
         });
+        let coordination = crate::repo_lock::SeatLease::for_operation(&repo).await?;
         let released = crate::handover::release(&repo, branch, &state.id, &takeover).await?;
         if let Some(released) = &released {
             state.event(
@@ -755,6 +756,7 @@ impl Runner {
                 break;
             }
         }
+        drop(coordination);
         let opened = Self::open_review(
             &repo,
             branch,
@@ -768,6 +770,7 @@ impl Runner {
         if opened.is_err()
             && let Some(released) = &released
         {
+            let _coordination = crate::repo_lock::SeatLease::for_operation(&repo).await?;
             released.restore(&repo, branch).await;
         }
         opened
@@ -814,7 +817,9 @@ impl Runner {
     ) -> Result<Self> {
         let mut state = state;
         let branch = state.branch_for('A');
+        let coordination = crate::repo_lock::SeatLease::for_operation(repo).await?;
         git::git(repo, &["branch", &branch, &selection.head]).await?;
+        drop(coordination);
         state.event(
             "recovery",
             format!(
@@ -907,6 +912,7 @@ impl Runner {
         base_commit: String,
         takeover: &crate::handover::Takeover,
     ) -> Result<Self> {
+        let _coordination = crate::repo_lock::SeatLease::for_operation(repo).await?;
         if state.pr_recovery.is_none() {
             sync_review_branch(repo, branch, &state.config.merge.remote, &base_commit).await?;
         }
@@ -1627,6 +1633,9 @@ impl Runner {
             return Ok(());
         }
         let repo = self.state.repo.clone();
+        // Includes rollback, config, refs, checkout creation and setup. No
+        // repository mutation may precede the real shared lock acquisition.
+        let _coordination = crate::repo_lock::SeatLease::for_operation(&repo).await?;
         self.rollback_prep(&repo).await;
         self.state.prep_complete = Some(false);
         self.state.status = RunStatus::Prep;
@@ -4245,6 +4254,7 @@ impl Runner {
             return Ok(());
         };
         let repo = self.state.repo.clone();
+        let _coordination = crate::repo_lock::SeatLease::for_operation(&repo).await?;
         let mut folded = Vec::new();
         for i in 0..self.state.candidates.len() {
             let c = &self.state.candidates[i];
@@ -4915,6 +4925,7 @@ impl Runner {
         // `worktree_remove` is a `git worktree remove --force`, which would
         // otherwise discard uncommitted work left there by the operator or
         // another process before this had a chance to even look at it.
+        let coordination = crate::repo_lock::SeatLease::for_operation(&self.state.repo).await?;
         if winner.worktree.exists() {
             // Lockfiles a rescue commit withheld stay untracked on purpose and
             // are already recorded; they are not the operator's work to protect.
@@ -4996,6 +5007,7 @@ impl Runner {
             &self.state.config.graph.github_language,
         );
         let timeout = Duration::from_secs(self.state.config.graph.timeout_fix);
+        drop(coordination);
         let (job, seat, out) = self
             .ask_fixer(&winner, "fix", None, |spec, seat| SeatJob {
                 prompt: fix_prompt.clone(),
@@ -5099,6 +5111,7 @@ impl Runner {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        let coordination = crate::repo_lock::SeatLease::for_operation(&self.state.repo).await?;
         if let Ok(r) = git::rescue_commit(&fix_worktree, &rescue_message).await {
             self.state.note_withheld("fix", &r.withheld);
         }
@@ -5107,6 +5120,7 @@ impl Runner {
         git::worktree_remove(&self.state.repo, &fix_worktree)
             .await
             .ok();
+        drop(coordination);
 
         self.state.event(
             "fix",
@@ -5662,6 +5676,7 @@ impl Runner {
             // commit: nobody can perturb the winner's tree, and the fixer can
             // keep working without racing a reviewer.
             let mut jobs = Vec::new();
+            let coordination = crate::repo_lock::SeatLease::for_operation(&repo).await?;
             for (r, spec) in reviewers.iter().cloned().enumerate() {
                 let wt = root.join(format!("review-{}", r + 1));
                 // `clean -fdx` in a reset wipes setup's products, so every
@@ -5712,6 +5727,7 @@ impl Runner {
                 });
             }
 
+            drop(coordination);
             self.state.event(
                 "review",
                 format!(
@@ -11839,6 +11855,138 @@ mod tests {
         assert_eq!(
             git::rev_parse(&repo, "magi/task-selected").await.unwrap(),
             head
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn preparation_waits_for_shared_lock_before_checkout_and_holds_it_through_setup() {
+        use std::os::fd::AsRawFd as _;
+        use std::time::Duration;
+
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let common = repo.join(".git");
+        std::fs::write(common.join("kanade-sync.contract"), "shared-lock-v1\n").unwrap();
+        let lock = std::fs::File::create(common.join("kanade-sync.lock")).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let mut runner = runner_at(RunStatus::Prep);
+        runner.state.repo = repo.clone();
+        runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
+        runner.state.config.graph.worktree_root = Some(tmp.path().join("wt"));
+        runner.state.config.graph.advise = true;
+        runner.state.config.graph.advisors = 1;
+        runner.roles.implementers = vec![spec("implement")];
+        runner.roles.judges = vec![spec("judge")];
+        let root = runner.state.worktree_root();
+        let started = tmp.path().join("setup-started");
+        let proceed = tmp.path().join("setup-proceed");
+        runner.state.config.worktree.setup = vec![crate::config::SetupStep {
+            run: Some(format!(
+                "touch '{}'; while ! test -f '{}'; do sleep 0.02; done",
+                started.display(),
+                proceed.display()
+            )),
+            ..Default::default()
+        }];
+        let branches = git::git(&repo, &["branch", "--list"]).await.unwrap();
+        let config = git::git(&repo, &["config", "--local", "--list"])
+            .await
+            .unwrap();
+        let mut prep = Box::pin(runner.prep());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut prep)
+                .await
+                .is_err()
+        );
+        assert!(
+            !root.exists(),
+            "contention must prevent even checkout creation"
+        );
+        assert!(!started.exists(), "contention must prevent setup");
+        assert_eq!(
+            git::git(&repo, &["branch", "--list"]).await.unwrap(),
+            branches
+        );
+        assert_eq!(
+            git::git(&repo, &["config", "--local", "--list"])
+                .await
+                .unwrap(),
+            config
+        );
+        drop(lock);
+        tokio::select! {
+            result = &mut prep => panic!("setup must wait for its signal: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(10), async {
+                while !started.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }) => result.unwrap(),
+        }
+        let outsider = std::fs::File::open(common.join("kanade-sync.lock")).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(outsider.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                crate::repo_lock::SeatLease::for_checkout(&repo, true)
+            )
+            .await
+            .is_err(),
+            "preparation must also exclude local editors"
+        );
+        std::fs::write(proceed, "ready").unwrap();
+        tokio::time::timeout(Duration::from_secs(10), &mut prep)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(prep);
+        assert_eq!(runner.state.prep_complete, Some(true));
+        assert!(root.join("judge-1").exists());
+        assert!(root.join("advisor-1").exists());
+        assert_eq!(
+            unsafe { libc::flock(outsider.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn preparation_lock_failure_prevents_repository_changes() {
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        std::fs::write(repo.join(".git/kanade-sync.contract"), "shared-lock-v1\n").unwrap();
+        // A directory at the required lock path makes opening the real lock
+        // fail, rather than merely exercising an invalid registration.
+        std::fs::create_dir(repo.join(".git/kanade-sync.lock")).unwrap();
+        let mut runner = runner_at(RunStatus::Prep);
+        runner.state.repo = repo.clone();
+        runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
+        runner.state.config.graph.worktree_root = Some(tmp.path().join("wt"));
+        runner.roles.implementers = vec![spec("implement")];
+        let error = runner.prep().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("acquire mandatory repository lock")
+        );
+        assert!(!runner.state.worktree_root().exists());
+        assert!(runner.state.candidates.is_empty());
+        assert!(!repo.join(".git/config.worktree").exists());
+        assert_eq!(
+            git::git(&repo, &["branch", "--list"]).await.unwrap().trim(),
+            "* main"
         );
     }
 

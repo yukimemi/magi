@@ -93,8 +93,17 @@ The native lock interoperates with .NET `FileShare.None` using Unix
 unreadable registrations and unknown contract versions fail closed. This does
 not register repositories or change writable seats' obligation to acquire and
 hold their lock. Unregistered repositories cannot be assumed coordinated.
-It also does not replace the launcher's obligation to coordinate worktree
-creation or unrelated repository operations before recovery is accepted.
+Launcher worktree preparation takes `SeatLease::for_operation` before any
+rollback, config/ref mutation, checkout creation or setup. It holds both the
+local exclusive reservation and the real shared OS lock through preparation,
+then releases them before invoking any seat (the gate is not reentrant).
+This covers candidate/judge/advisor preparation, the attached under-review
+checkout and takeover, reviewer creation/reset/setup on every round, and
+operator-fix creation/setup and removal. Folding the prepared worktrees uses
+the same protection. External contention waits before these mutations begin;
+an unreadable lock or unsupported registration fails preparation closed.
+These bounded preparation leases do not replace editing agents' session-long
+locks or establish coordination of unrelated repository operations.
 Review/judge/deliberate/vote remain unable to ask by CLI policy; granting readers
 question-store writes is outside this fix.
 
@@ -133,6 +142,7 @@ RUSTUP_TOOLCHAIN=stable cargo test --locked --lib agent::tests::writable_directo
 RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope
 RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope coordination:: -- --nocapture
 RUSTUP_TOOLCHAIN=stable cargo test --locked --lib repo_lock::tests
+RUSTUP_TOOLCHAIN=stable cargo test --locked --lib graph::tests::preparation_
 RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope readonly_invocation -- --ignored --nocapture
 RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope shared_lock_contention -- --ignored --nocapture
 RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope host_seat -- --ignored --nocapture

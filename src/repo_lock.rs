@@ -68,6 +68,37 @@ pub(crate) async fn common_dir(cwd: &Path) -> Result<Option<PathBuf>> {
 }
 
 impl SeatLease {
+    /// Launcher-owned VCS/setup work must exclude both seats and external
+    /// updaters. Unlike an editing seat, it has no child agent to take the OS
+    /// lock. Release this lease before invoking a seat (the gate is not reentrant).
+    pub(crate) async fn for_operation(cwd: &Path) -> Result<Option<Self>> {
+        let mut announced = false;
+        loop {
+            let Some(mut permit) = Self::for_checkout(cwd, true).await? else {
+                return Ok(None);
+            };
+            match Lease::acquire(permit.path.clone()) {
+                Ok(lock) => {
+                    permit._lock = Some(lock);
+                    permit.delegated = true;
+                    return Ok(Some(permit));
+                }
+                Err(e)
+                    if e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) =>
+                {
+                    if !announced {
+                        tracing::info!(path = %permit.path.display(), "waiting for repository coordination before preparation");
+                        announced = true;
+                    }
+                    drop(permit);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     pub(crate) async fn for_checkout(cwd: &Path, allow_write: bool) -> Result<Option<Self>> {
         let Some(common) = common_dir(cwd).await? else {
             return Ok(None);
