@@ -90,8 +90,8 @@ pub async fn fetch_origin(cwd: &Path, timeout: std::time::Duration) -> Result<()
         .context("spawn git fetch")?;
     if !out.status.success() {
         bail!(
-            "git fetch failed (exit {:?}): {}",
-            out.status.code(),
+            "git fetch failed ({}): {}",
+            crate::notices::exit_status(out.status.code()),
             String::from_utf8_lossy(&out.stderr).trim_end()
         );
     }
@@ -103,10 +103,10 @@ pub async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
     let out = git_raw(cwd, args).await?;
     if !out.ok() {
         bail!(
-            "git {} failed in {} (exit {:?}): {}",
+            "git {} failed in {} ({}): {}",
             args.join(" "),
             cwd.display(),
-            out.code,
+            crate::notices::exit_status(out.code),
             if out.stderr.is_empty() {
                 out.stdout.as_str()
             } else {
@@ -374,7 +374,8 @@ pub async fn remote_has_branch(repo: &Path, remote: &str, branch: &str) -> Resul
         Some(0) => Ok(true),
         Some(2) => Ok(false),
         code => bail!(
-            "git ls-remote {remote} failed (exit {code:?}): {}",
+            "git ls-remote {remote} failed ({}): {}",
+            crate::notices::exit_status(code),
             out.stderr
         ),
     }
@@ -1186,8 +1187,8 @@ pub async fn ancestry(repo: &Path, ancestor: &str, of: &str) -> Result<bool> {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
         _ => bail!(
-            "git merge-base --is-ancestor {ancestor} {of} failed (exit {:?}): {}",
-            out.code,
+            "git merge-base --is-ancestor {ancestor} {of} failed ({}): {}",
+            crate::notices::exit_status(out.code),
             out.stderr
         ),
     }
