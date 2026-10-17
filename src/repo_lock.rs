@@ -32,6 +32,21 @@ struct Lease {
     _file: File,
 }
 
+impl Drop for Lease {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            // A concurrent fork can briefly inherit this open file description
+            // before exec closes it. Closing our descriptor alone would leave
+            // the lock held until that unrelated child closes its copy too.
+            // The last lease owns the lock lifetime, not inherited descriptors.
+            // SAFETY: the file remains open throughout this drop method.
+            unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
 /// Distinguish a non-checkout without interpreting Git's localized stderr.
 /// Once a checkout marker is present, resolution errors remain fatal: a broken
 /// Git file or inaccessible shared directory must never bypass coordination.
@@ -252,6 +267,26 @@ mod tests {
         drop(second);
         drop(exclusive(&path).unwrap());
         assert!(path.exists(), "never unlink the shared lock");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn last_lease_unlocks_even_with_an_inherited_descriptor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kanade-sync.lock");
+        let lease = Lease::acquire(path.clone()).unwrap();
+        // dup shares the open file description, just like a descriptor
+        // inherited across fork before CLOEXEC takes effect.
+        let inherited = lease._file.try_clone().unwrap();
+        assert!(exclusive(&path).is_err());
+        drop(lease);
+        let outsider = exclusive(&path).expect("last lease must release the real lock");
+        drop(inherited);
+        assert!(
+            exclusive(&path).is_err(),
+            "old copies cannot unlock a new owner"
+        );
+        drop(outsider);
     }
 
     #[test]

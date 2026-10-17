@@ -56,9 +56,10 @@ other processes still contend with it. Nonblocking acquisition attempts retry
 on external contention as an infrastructure wait, before creating artifacts,
 starting the CLI or starting its timeout. No error reaches fallback, seat
 history or review budgets merely because an updater owns the lock. A caller
-can cancel this wait without having started any work. The last reader releases
-by closing the handle, never by
-unlinking the lock file.
+can cancel this wait without having started any work. The last reader explicitly
+unlocks before closing the handle, never unlinking the lock file. Explicit
+unlocking prevents an unrelated concurrent fork's inherited descriptor from
+delaying release until that process executes or exits.
 
 Every registered repository seat also takes a fair per-repository local
 reservation. Readers share a reservation; an editor takes an exclusive reservation before
@@ -68,6 +69,14 @@ closes before its reservation wakes an editor. Thus a long read-only advisor or
 review cannot cause this launcher's editor to start into a lock held by its own
 readers. A reader waiting for an external lock releases its local reservation
 between nonblocking attempts, allowing an editor to proceed.
+
+Launcher operations reacquire both the exclusive local reservation and the real
+OS lock after a seat finishes. Candidate and fixer rescue commits, recovery
+rollback, review verification (including catch-up), and the complete mechanical
+pre-gate and final gate sequence cannot
+start while an external updater owns the lock. Fallback preparation releases
+its operation lease before starting the next seat; the local gate is not
+reentrant.
 
 Control-plane seats (`conduct`, `dupes`, and `deputy`) and consulted chat turns
 with explicit question/answer-store grants stay outside repository scheduling.

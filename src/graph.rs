@@ -2226,7 +2226,7 @@ impl Runner {
         self.resume_undelivered(&mut results, &sent, &prompts, &run_id)
             .await;
         self.resume_seat_handovers(&mut results, &mut sent, &prompts, &run_id)
-            .await;
+            .await?;
         self.resume_unconfirmed_commands(&mut results, &sent, &prompts, &run_id)
             .await;
         if self.state.resource_block.is_some() {
@@ -2306,6 +2306,7 @@ impl Runner {
 
             // Rescue anything the agent edited but never committed: an
             // uncommitted candidate would silently be an empty one.
+            let _coordination = crate::repo_lock::SeatLease::for_operation(&worktree).await?;
             let rescued = match git::rescue_commit(
                 &worktree,
                 &format!("magi: candidate {label} (uncommitted work)"),
@@ -2556,7 +2557,7 @@ impl Runner {
         sent: &mut [SeatJob],
         prompts: &Prompts,
         run_id: &str,
-    ) {
+    ) -> Result<()> {
         let instruction = seeded_instruction(&self.state);
         let language = self.state.config.graph.language.clone();
         let github_language = self.state.config.graph.github_language.clone();
@@ -2605,6 +2606,7 @@ impl Runner {
                 tried.insert(next.id.clone());
                 fallback_attempt += 1;
 
+                let coordination = crate::repo_lock::SeatLease::for_operation(&job.cwd).await?;
                 if let Ok(r) = git::rescue_commit(
                     &job.cwd,
                     &format!(
@@ -2621,6 +2623,7 @@ impl Runner {
                 {
                     self.state.note_withheld("implement", &r.withheld);
                 }
+                drop(coordination);
 
                 record_handover(
                     &mut self.state,
@@ -2676,6 +2679,7 @@ impl Runner {
                 *out = fallback_out;
             }
         }
+        Ok(())
     }
 
     /// Ask an implement seat's own CLI to confirm what it started, once, when
@@ -4164,6 +4168,7 @@ impl Runner {
 
         let mut post = None;
         let mut lines = None;
+        let _coordination = crate::repo_lock::SeatLease::for_operation(&wt).await?;
         if why.is_none() {
             let rescued = git::rescue_commit(&wt, "magi: graft (uncommitted work)").await;
             if let Ok(r) = &rescued {
@@ -5488,6 +5493,7 @@ impl Runner {
             AgentOutcome::Failed(e) => Some(e.clone()),
         };
         self.state.seats.insert(seat.key.clone(), seat);
+        let coordination = crate::repo_lock::SeatLease::for_operation(&wt).await?;
         let failed = match failed {
             // The agent's partial edits are not kept.
             Some(why) => {
@@ -5511,6 +5517,7 @@ impl Runner {
             }
         };
         let after = git::rev_parse(&wt, "HEAD").await?;
+        drop(coordination);
         self.state.event(
             "recovery",
             match &failed {
@@ -6031,6 +6038,8 @@ impl Runner {
                 );
                 (Vec::new(), false, true, Some(reason))
             } else {
+                let _coordination =
+                    crate::repo_lock::SeatLease::for_operation(&winner.worktree).await?;
                 let e2e_commands = self.state.config.verify.e2e.clone();
                 let cache_dir = self.state.config.cache_dir();
                 let context = format!("round {round}");
@@ -6350,6 +6359,7 @@ impl Runner {
             }
             fix.continuation = Some(continuation);
             self.state.seats.insert(final_seat.key.clone(), final_seat);
+            let coordination = crate::repo_lock::SeatLease::for_operation(&winner.worktree).await?;
             if let Ok(r) = git::rescue_commit(
                 &winner.worktree,
                 &format!("magi: review round {round} fixes (uncommitted work)"),
@@ -6368,6 +6378,7 @@ impl Runner {
             // non-empty `patch` and reads as "progressed" — exactly backwards
             // for a `git` failure the stagnation check cannot see through.
             let diff_after = git::diff(&winner.worktree, &base, "HEAD").await?;
+            drop(coordination);
             let progressed = diff_after != patch;
             let commit_note = if fix.committed {
                 "committed"
@@ -6536,6 +6547,7 @@ impl Runner {
             E2eStatus::Deferred | E2eStatus::ResourceBlocked
         );
         if needs_catchup_run {
+            let _coordination = crate::repo_lock::SeatLease::for_operation(worktree).await?;
             let round = self.state.reviews[round_idx].round;
             let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
             let commands = self.state.config.verify.e2e.clone();
@@ -6802,6 +6814,9 @@ impl Runner {
     /// Run `verify.gate` once against the winner's current tree, logging one
     /// event per command. Empty when nothing is configured.
     async fn run_gate(&mut self, winner: &Candidate) -> Result<Vec<CommandOutcome>> {
+        // The seat has finished and released its own lock. Mechanical edits,
+        // commits and verification still require repository coordination.
+        let _coordination = crate::repo_lock::SeatLease::for_operation(&winner.worktree).await?;
         self.run_pre_gate(winner).await;
         let shell = self.state.config.shell();
         let gate_commands = self.state.config.verify.gate.clone();
@@ -7012,6 +7027,7 @@ impl Runner {
             AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => record.error = Some(e),
         }
         self.state.seats.insert(seat.key.clone(), seat);
+        let _coordination = crate::repo_lock::SeatLease::for_operation(&winner.worktree).await?;
         if let Ok(r) = git::rescue_commit(
             &winner.worktree,
             &format!("magi: gate fix {attempt} (uncommitted work)"),
@@ -11857,6 +11873,153 @@ mod tests {
         assert_eq!(git::rev_parse(&repo, "historical").await.unwrap(), obsolete);
         assert_eq!(
             git::rev_parse(&repo, "magi/task-selected").await.unwrap(),
+            head
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn post_seat_rescue_and_gate_wait_for_shared_lock() {
+        use std::os::fd::AsRawFd as _;
+
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let common = repo.join(".git");
+        std::fs::write(common.join("kanade-sync.contract"), "shared-lock-v1\n").unwrap();
+        let mut runner = runner_at(RunStatus::Prep);
+        runner.state.repo = repo.clone();
+        runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
+        runner.state.config.graph.worktree_root = Some(tmp.path().join("wt"));
+        runner.state.config.graph.advise = false;
+        runner.roles.implementers = vec![spec("implement")];
+        runner.roles.judges = vec![spec("judge")];
+        runner.prep().await.unwrap();
+        let winner = runner.state.candidates[0].clone();
+        // Emulate edits already left by a completed seat. The fixture CLI
+        // only reports completion; it performs no repository operations.
+        std::fs::write(winner.worktree.join("leftover"), "seat work\n").unwrap();
+        let completed = tmp.path().join("seat-completed");
+        runner.roles.implementers[0].command = vec![
+            "sh".into(),
+            "-c".into(),
+            format!("touch '{}'; echo completed", completed.display()),
+        ];
+        let outsider = std::fs::File::create(common.join("kanade-sync.lock")).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(outsider.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let before = git::rev_parse(&winner.worktree, "HEAD").await.unwrap();
+        let mut implement = Box::pin(runner.implement());
+        tokio::select! {
+            result = &mut implement => panic!("rescue must wait: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(10), async {
+                while !completed.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }) => result.unwrap(),
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut implement)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            git::rev_parse(&winner.worktree, "HEAD").await.unwrap(),
+            before
+        );
+        assert_eq!(
+            unsafe { libc::flock(outsider.as_raw_fd(), libc::LOCK_UN) },
+            0
+        );
+        tokio::time::timeout(Duration::from_secs(10), &mut implement)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(implement);
+        assert_ne!(
+            git::rev_parse(&winner.worktree, "HEAD").await.unwrap(),
+            before
+        );
+        assert!(git::is_clean(&winner.worktree).await.unwrap());
+
+        let started = tmp.path().join("pre-gate-started");
+        let proceed = tmp.path().join("pre-gate-proceed");
+        let checked = tmp.path().join("gate-ran");
+        runner.state.config.verify.pre_gate = vec![format!(
+            "echo mechanical >> README.md; touch '{}'; while ! test -f '{}'; do sleep 0.02; done",
+            started.display(),
+            proceed.display()
+        )];
+        runner.state.config.verify.gate = vec![format!("touch '{}'", checked.display())];
+        assert_eq!(
+            unsafe { libc::flock(outsider.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let mut gate = Box::pin(runner.run_gate(&winner));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut gate)
+                .await
+                .is_err()
+        );
+        assert!(!started.exists());
+        assert!(!checked.exists());
+        assert!(git::is_clean(&winner.worktree).await.unwrap());
+        assert_eq!(
+            unsafe { libc::flock(outsider.as_raw_fd(), libc::LOCK_UN) },
+            0
+        );
+        tokio::select! {
+            result = &mut gate => panic!("pre-gate must wait for signal: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(10), async {
+                while !started.exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }) => result.unwrap(),
+        }
+        assert_eq!(
+            unsafe { libc::flock(outsider.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1,
+            "mechanical edits must hold the real lock"
+        );
+        std::fs::write(proceed, "ready").unwrap();
+        let outcomes = tokio::time::timeout(Duration::from_secs(10), &mut gate)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(gate);
+        assert!(outcomes.iter().all(CommandOutcome::ok));
+        assert!(checked.exists());
+        assert!(runner.state.pre_gate_commit.is_some());
+        assert!(git::is_clean(&winner.worktree).await.unwrap());
+        assert_eq!(
+            unsafe { libc::flock(outsider.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0,
+            "gate completion must release coordination"
+        );
+        drop(outsider);
+        std::fs::remove_file(common.join("kanade-sync.lock")).unwrap();
+        std::fs::create_dir(common.join("kanade-sync.lock")).unwrap();
+        std::fs::remove_file(&started).unwrap();
+        std::fs::remove_file(&checked).unwrap();
+        let head = git::rev_parse(&winner.worktree, "HEAD").await.unwrap();
+        let error = runner.run_gate(&winner).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("acquire mandatory repository lock")
+        );
+        assert!(
+            !started.exists(),
+            "failed acquisition must prevent pre-gate"
+        );
+        assert!(!checked.exists(), "failed acquisition must prevent gate");
+        assert!(git::is_clean(&winner.worktree).await.unwrap());
+        assert_eq!(
+            git::rev_parse(&winner.worktree, "HEAD").await.unwrap(),
             head
         );
     }
