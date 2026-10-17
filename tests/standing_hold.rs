@@ -11,6 +11,8 @@ use magi::talk::{self, Talks};
 async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_cli() {
     let tmp = tempfile::tempdir().unwrap();
     magi::run::set_home(tmp.path().to_path_buf());
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
     let talks = Talks::at(tmp.path().join("talks"));
     let questions = Questions::at(tmp.path().join("questions"));
     let script = tmp.path().join("answer.sh");
@@ -19,7 +21,15 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
         "cat >/dev/null\n\
          test \"$MAGI_ALLOW_WRITE\" = \"$EXPECTED_WRITE\" || exit 31\n\
          if test \"$DO_ANSWER\" = 1; then\n\
-           \"$ANSWER_BIN\" answer \"$QUESTION\" --reply \"$CHOICE\" --quote \"$OWNER_WORDS\" || exit 32\n\
+           if test -n \"$PROFILE\"; then\n\
+             if sandbox-exec -f \"$BASE_PROFILE\" \"$ANSWER_BIN\" answer \"$QUESTION\" --reply \"$CHOICE\" --quote \"$OWNER_WORDS\" >\"$REJECT_LOG\" 2>&1; then exit 33; fi\n\
+             cmp \"$QUESTION_BEFORE\" \"$QUESTION_PATH\" || exit 34\n\
+             cmp \"$RUN_BEFORE\" \"$RUN_PATH\" || exit 35\n\
+             if sandbox-exec -f \"$PROFILE\" sh -c 'echo forbidden > \"$1\"' sh \"$OUTSIDE\" 2>/dev/null; then exit 36; fi\n\
+             sandbox-exec -f \"$PROFILE\" \"$ANSWER_BIN\" answer \"$QUESTION\" --reply \"$CHOICE\" --quote \"$OWNER_WORDS\" || exit 37\n\
+           else\n\
+             \"$ANSWER_BIN\" answer \"$QUESTION\" --reply \"$CHOICE\" --quote \"$OWNER_WORDS\" || exit 32\n\
+           fi\n\
          fi\n\
          echo 'Turn finished.'\n",
     )
@@ -47,7 +57,12 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
         ..Config::default()
     };
     assert!(!cfg.talk.allow_write);
-    for choice in ["hold", magi::land::REPAIR, "retry"] {
+    for choice in [
+        "hold",
+        magi::land::REPAIR,
+        "retry",
+        magi::merge_decision::DISMISS,
+    ] {
         for destination in ["elsewhere", "none", "same"] {
             for authorized in [false, true] {
                 // The same-chat unapproved turn already has its existing write
@@ -64,16 +79,61 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
                         "hold".into(),
                         magi::land::REPAIR.into(),
                         "retry".into(),
+                        magi::merge_decision::DISMISS.into(),
                     ],
                 );
+                let mut owner_task = None;
+                if choice == magi::merge_decision::DISMISS {
+                    q.run = q.id.clone();
+                    let mut state = magi::run::RunState::new(
+                        repo.clone(),
+                        "main".into(),
+                        "head".into(),
+                        "Original task".into(),
+                        Config::default(),
+                    );
+                    state.id = q.run.clone();
+                    state.status = magi::run::RunStatus::Landing;
+                    state.parked = true;
+                    state.driver_exited = true;
+                    state.land_approval = Some(magi::run::LandApproval {
+                        question: q.id.clone(),
+                        head: "head".into(),
+                    });
+                    state.pr = Some(magi::run::PrRecord {
+                        url: "https://example.test/pull/1".into(),
+                        number: 1,
+                        state: "open".into(),
+                        checks: "green".into(),
+                        round: 1,
+                        rounds: 2,
+                        red_at_merge: vec![],
+                    });
+                    state.save_under(tmp.path()).unwrap();
+                    q.merge_target = Some(magi::merge_decision::Target {
+                        pr: "https://example.test/pull/1".into(),
+                        head: "head".into(),
+                        language: "en".into(),
+                    });
+                    let queue = magi::queue::Queue::at(tmp.path().join("queue"));
+                    let mut task = magi::queue::Task::new(
+                        "Original task".into(),
+                        "Original instruction".into(),
+                        repo.clone(),
+                        magi::queue::Source::Human,
+                    );
+                    task.runs.push(q.run.clone());
+                    task.status = magi::queue::TaskStatus::Parked;
+                    queue.put(&mut task).unwrap();
+                    owner_task = Some(task.id);
+                }
                 questions.put(&mut q).unwrap();
-                let mut t =
-                    talk::begin(&talks, &cfg, tmp.path().to_path_buf(), Some("mock")).unwrap();
+                let mut t = talk::begin(&talks, &cfg, repo.clone(), Some("mock")).unwrap();
                 if destination != "none" {
                     let origin = if destination == "same" {
                         t.clone()
                     } else {
-                        talk::begin(&talks, &cfg, tmp.path().to_path_buf(), Some("mock")).unwrap()
+                        talk::begin(&talks, &cfg, repo.clone(), Some("mock")).unwrap()
                     };
                     magi::consult::begin(&questions, &talks, &q, &origin).unwrap();
                     if destination == "same" {
@@ -98,7 +158,73 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
                 } else {
                     "thanks".into()
                 };
+                talk::record(&mut t, &talks, &words, vec![]).unwrap();
+                // Use the complete grant passed by the standing turn to its
+                // invocation, rather than independently granting retirement access.
+                let roots = magi::consult::answer_write_roots(&questions, &talks, &t);
+                let mut expected_roots = if expected_write {
+                    vec![questions.root().to_path_buf(), talks.answer_lock_root()]
+                } else {
+                    vec![]
+                };
+                if choice == magi::merge_decision::DISMISS && authorized {
+                    expected_roots.extend([
+                        tmp.path().join("queue"),
+                        tmp.path().join("runs").join(&q.run),
+                    ]);
+                }
+                expected_roots.sort();
+                assert_eq!(
+                    roots, expected_roots,
+                    "only an authorized dismissal widens execution access"
+                );
                 let env = &mut cfg.agents[0].env;
+                env.insert("PROFILE".into(), String::new());
+                if cfg!(target_os = "macos")
+                    && choice == magi::merge_decision::DISMISS
+                    && authorized
+                {
+                    let home = tmp.path().canonicalize().unwrap();
+                    let base = [questions.root().to_path_buf(), talks.answer_lock_root()];
+                    let profile = |extra: &[std::path::PathBuf]| {
+                        let allowed = extra
+                            .iter()
+                            .map(|path| {
+                                format!(
+                                    "(subpath {})",
+                                    serde_json::to_string(&path.to_string_lossy()).unwrap()
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        format!(
+                            "(version 1) (allow default) (deny file-write* (subpath {})) (allow file-write* {allowed})",
+                            serde_json::to_string(&home.to_string_lossy()).unwrap()
+                        )
+                    };
+                    let base_profile = tmp.path().join("base.sb");
+                    let full_profile = tmp.path().join("answer.sb");
+                    std::fs::write(&base_profile, profile(&base)).unwrap();
+                    std::fs::write(&full_profile, profile(&roots)).unwrap();
+                    let question_before = tmp.path().join("question-before");
+                    let run_path = tmp.path().join("runs").join(&q.run).join("run.json");
+                    let run_before = tmp.path().join("run-before");
+                    std::fs::copy(questions.path_of(&q.id), &question_before).unwrap();
+                    std::fs::copy(&run_path, &run_before).unwrap();
+                    for (key, path) in [
+                        ("PROFILE", full_profile),
+                        ("BASE_PROFILE", base_profile),
+                        ("QUESTION_BEFORE", question_before),
+                        ("QUESTION_PATH", questions.path_of(&q.id)),
+                        ("RUN_BEFORE", run_before),
+                        ("RUN_PATH", run_path),
+                        ("OUTSIDE", tmp.path().join("unrelated-data")),
+                        ("REJECT_LOG", tmp.path().join("rejected.log")),
+                    ] {
+                        env.insert(key.into(), path.to_string_lossy().into_owned());
+                    }
+                }
+
                 env.insert(
                     "EXPECTED_WRITE".into(),
                     if expected_write { "1" } else { "0" }.into(),
@@ -111,13 +237,36 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
                 env.insert("QUESTION".into(), q.id.clone());
                 env.insert("OWNER_WORDS".into(), words.clone());
                 let lease = talks.claim_turn(&t.id).unwrap().unwrap();
-                talk::say(&lease, &mut t, &talks, &cfg, &words, vec![])
+                talk::respond(&lease, &mut t, &talks, &cfg, &words)
                     .await
                     .unwrap();
                 let saved = questions.get(&q.id).unwrap();
-                assert_eq!(saved.resolution().as_deref(), authorized.then_some(choice));
+                assert_eq!(
+                    saved.resolution().as_deref(),
+                    authorized.then_some(choice),
+                    "{:?}",
+                    t.turns.last()
+                );
                 if authorized {
                     assert_eq!(saved.answer_authority.unwrap().talk, t.id);
+                }
+                if let Some(task_id) = owner_task {
+                    let state = magi::run::RunState::load_under(&q.run, tmp.path()).unwrap();
+                    let task = magi::queue::Queue::at(tmp.path().join("queue"))
+                        .get(&task_id)
+                        .unwrap();
+                    if authorized {
+                        assert_eq!(
+                            state.merge_decision.unwrap().choice,
+                            magi::merge_decision::DISMISS
+                        );
+                        assert_eq!(state.status, magi::run::RunStatus::Superseded);
+                        assert_eq!(task.status, magi::queue::TaskStatus::Done);
+                    } else {
+                        assert!(state.merge_decision.is_none());
+                        assert_eq!(task.status, magi::queue::TaskStatus::Parked);
+                    }
+                    assert_eq!(state.pr.unwrap().state, "open");
                 }
             }
         }

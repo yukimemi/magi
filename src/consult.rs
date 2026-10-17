@@ -369,6 +369,51 @@ pub fn authorized_answers(questions: &Questions, talk: &Talk) -> bool {
     })
 }
 
+/// The complete standing-turn write grant, also used by sandbox regressions.
+/// Consultations and bound owner decisions need question/evidence locks;
+/// authorized dismissals additionally need queue claims and the exact run's
+/// ownership/state writes. Never grant the whole home or lift the sandbox.
+pub fn answer_write_roots(
+    questions: &Questions,
+    talks: &Talks,
+    talk: &Talk,
+) -> Vec<std::path::PathBuf> {
+    if !pending_consults(questions, &talk.id) && !authorized_answers(questions, talk) {
+        return Vec::new();
+    }
+    let Some(home) = questions.root().parent() else {
+        return Vec::new();
+    };
+    let quote = current_instruction(talk).map(|(_, _, words)| words);
+    let mut roots = std::collections::BTreeSet::from([
+        questions.root().to_path_buf(),
+        talks.answer_lock_root(),
+    ]);
+    for q in questions.list() {
+        if q.status.open()
+            && q.node == crate::land::APPROVAL_NODE
+            && q.choices
+                .iter()
+                .any(|choice| choice == crate::merge_decision::DISMISS)
+            && crate::run::is_run_id(&q.run)
+            && authorize_answer(
+                &q,
+                talks,
+                questions,
+                &talk.id,
+                CHAT_NODE,
+                crate::merge_decision::DISMISS,
+                quote,
+            )
+            .is_ok()
+        {
+            roots.insert(home.join("queue"));
+            roots.insert(home.join("runs").join(&q.run));
+        }
+    }
+    roots.into_iter().collect()
+}
+
 /// Compatibility name for callers of the earlier hold-only grant.
 pub fn authorized_holds(questions: &Questions, talk: &Talk) -> bool {
     authorized_answers(questions, talk)
@@ -901,6 +946,11 @@ pub fn validate_answer(
     let posting = kind == QuestionKind::Posting;
     if posting && !q.choices.iter().any(|c| c == reply) {
         bail!("posting confirmation requires one of the offered choices");
+    }
+    if posting && reply == crate::github_text::USE_MY_TEXT {
+        bail!(
+            "use my text requires current question-bound owner evidence with the content fingerprint, a newline and the literal replacement title; an old question-thread title or hold is insufficient"
+        );
     }
     if posting
         && !matches!(

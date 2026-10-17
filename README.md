@@ -480,7 +480,11 @@ turn/message positions and recommendation fingerprint. Closed questions cease
 being pending consultations. Concurrent writers settle once under the question
 lock and retain the winning evidence; non-hold cross-chat answers wait for an
 active original consultation to finish. The existing owner/daemon applies the
-answer; no additional task or driver is created.
+answer; no additional task or driver is created. An authorized standing-chat
+dismissal additionally grants the queue and exact run directories required for
+claims, the ownership lock and retirement writes, while keeping the sandbox
+enabled. `use my text` in the same consulted chat requires current bound owner
+evidence with the literal replacement title; it cannot reuse old thread text.
 
 | Decision / execution effect | Individual standing instruction | Explicit batch | Existing execution requirements |
 | --- | --- | --- | --- |

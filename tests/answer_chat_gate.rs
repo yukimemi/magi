@@ -1348,3 +1348,63 @@ fn owner_code_examples_do_not_authorize_non_hold_actions() {
         assert!(String::from_utf8_lossy(&out.stderr).contains("quoted or code-block"));
     }
 }
+
+#[test]
+fn same_chat_replacement_title_cannot_be_authorized_by_hold_or_old_thread_text() {
+    for words in ["hold", "thanks", "use my text"] {
+        let f = fixture();
+        f.questions
+            .update(&f.qid, |q| {
+                q.node = magi::github_text::ASK_NODE.into();
+                q.choices = vec![
+                    magi::github_text::USE_MY_TEXT.into(),
+                    magi::github_text::USE_FALLBACK.into(),
+                ];
+                q.say("Earlier English title")?;
+                Ok(())
+            })
+            .unwrap();
+        let talks = Talks::at(f.tmp.path().join("talks"));
+        let mut t = talks.get(&f.talk_id).unwrap();
+        talk::record(&mut t, &talks, words, vec![]).unwrap();
+        let before = std::fs::read(f.questions.path_of(&f.qid)).unwrap();
+        let out = choose(&f, &t.id, magi::github_text::USE_MY_TEXT, words);
+        assert_untouched(&f, &out);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("literal replacement title"));
+        assert_eq!(std::fs::read(f.questions.path_of(&f.qid)).unwrap(), before);
+    }
+}
+
+#[test]
+fn same_chat_replacement_title_uses_bound_current_owner_text_and_retains_evidence() {
+    let f = fixture();
+    let (q, ()) = f
+        .questions
+        .update(&f.qid, |q| {
+            q.node = magi::github_text::ASK_NODE.into();
+            q.choices = vec![magi::github_text::USE_MY_TEXT.into()];
+            q.say("Earlier English title")?;
+            Ok(())
+        })
+        .unwrap();
+    let talks = Talks::at(f.tmp.path().join("talks"));
+    let mut t = talks.get(&f.talk_id).unwrap();
+    let words = format!(
+        "{}: use my text {}\nCurrent explicitly supplied title",
+        q.id,
+        magi::consult::question_fingerprint(&q)
+    );
+    talk::record(&mut t, &talks, &words, vec![]).unwrap();
+    let out = choose(&f, &t.id, magi::github_text::USE_MY_TEXT, &words);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let answered = f.questions.get(&f.qid).unwrap();
+    assert_eq!(
+        magi::github_text::read_reply(&answered),
+        magi::github_text::Reply::Title("Current explicitly supplied title".into())
+    );
+    assert_eq!(answered.answer_authority.unwrap().instruction, words);
+}
