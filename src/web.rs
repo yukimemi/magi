@@ -17920,6 +17920,24 @@ mod tests {
         assert!(APP_JS.contains("jumpToTask(id)"));
     }
 
+    #[test]
+    fn notifications_distinguish_actionable_questions_from_informational_notices() {
+        let start = APP_JS
+            .find("function noticeCoveredBy(")
+            .expect("noticeCoveredBy exists");
+        let body = &APP_JS[start..];
+        let body = &body[..body.find("\n}\n").expect("noticeCoveredBy ends")];
+
+        // An open question provides an actionable link to the questions route
+        assert!(body.contains("q.status === \"open\""));
+        assert!(body.contains("href: \"#/questions\""));
+        assert!(body.contains("Answer in question"));
+
+        // A resolved question displays status rather than an actionable link
+        assert!(body.contains("(resolved)"));
+        assert!(body.contains("(closed)"));
+    }
+
     /// Chat rows are two lines at every width: the title alone, then the
     /// shrinkable secondary info.
     #[test]

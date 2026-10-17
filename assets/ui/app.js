@@ -9098,6 +9098,22 @@ function renderBell() {
   setAttr($("bell"), "aria-label", n > 0 ? `Notifications, ${n} unread` : "Notifications");
 }
 
+function noticeCoveredBy(qid) {
+  if (!qid) return null;
+  const short = shortId(qid);
+  if (!state.questions) {
+    return el("span", { text: `in question ${short}` });
+  }
+  const q = state.questions.find((item) => item.id === qid);
+  if (q && q.status === "open") {
+    return el("a", { href: "#/questions", text: `Answer in question ${short}` });
+  }
+  if (q) {
+    return el("span", { text: `Question ${short} (resolved)` });
+  }
+  return el("span", { text: `Question ${short} (closed)` });
+}
+
 function noticeLink(link) {
   if (!link) return null;
   if (link.kind === "run") return el("a", { href: `#/runs/${encodeURIComponent(link.id)}`, text: `Run ${shortId(link.id)}` });
@@ -9145,7 +9161,7 @@ function renderNotifications() {
         el("span", { text: n.severity }),
         el("time", { datetime: n.last_at, title: at.title, text: at.text }),
         n.count > 1 ? el("span", { text: `\u00d7${n.count}` }) : null,
-        n.covered_by ? el("span", { text: `in question ${n.covered_by.slice(0, 8)}` }) : null,
+        noticeCoveredBy(n.covered_by),
         link),
       el("div", { class: "notice-actions" },
         unread ? el("button", { class: "btn btn-quiet", type: "button", text: "Mark read",

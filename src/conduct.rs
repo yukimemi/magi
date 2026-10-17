@@ -797,16 +797,14 @@ fn apply_one(
         d.question.is_some() || !d.blocked_by.is_empty() || d.recovery == Some(Recovery::Hold);
     let evidence = new_blocking_evidence(queue, questions, &task, d);
     if blocking && task.resumption.is_some() && evidence.is_empty() {
-        crate::notices::raise(
-            crate::notices::Notice::warn(
-                &format!("conductor-resumption:{}", task.id),
-                format!(
-                    "Conductor concern after explicit resumption (no verified new evidence): {}; question: {:?}; dependencies: {:?}; evidence: {:?}",
-                    hold_note(d), d.question, d.blocked_by, d.evidence
-                ),
-            )
-            .about([task.id.clone()]),
-        );
+        crate::notices::raise(crate::notices::conductor_resumption(
+            &task.id,
+            &task.short(),
+            d.reason.as_deref(),
+            &d.blocked_by,
+            &d.evidence,
+            d.question.is_some(),
+        ));
         return Ok(());
     }
 
@@ -2729,6 +2727,72 @@ printf '%s\n' "$MOCK_REPLY"
         )
         .unwrap();
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
+    }
+
+    #[test]
+    fn conductor_resumption_notice_does_not_solicit_unregistered_questions() {
+        crate::run::pin_test_home();
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+
+        let mut t = task("task with explicit resumption");
+        t.status = TaskStatus::Queued;
+        t.resumption = Some(crate::queue::Resumption {
+            generation: 1,
+            source: "test".into(),
+            question_id: Some("q1".into()),
+            at: jiff::Timestamp::now(),
+            instruction: "resume".into(),
+            answers_through: 0,
+            runs_through: 0,
+            cleared_reason: None,
+            blocking_evidence: Vec::new(),
+        });
+        queue.put(&mut t).unwrap();
+
+        // Conductor suggests a question and dependencies without new evidence
+        let decision = Decision {
+            id: t.id.clone(),
+            question: Some("How should we proceed with this task?".into()),
+            blocked_by: vec!["dep-x".into()],
+            reason: Some("needs clarification".into()),
+            recovery: Some(Recovery::Hold),
+            ..Decision::default()
+        };
+
+        apply(
+            &queue,
+            &questions,
+            &Verdict {
+                decisions: vec![decision],
+            },
+        )
+        .unwrap();
+
+        // Task stays Queued (not re-blocked on old evidence)
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
+        // No question was filed in the questions store
+        assert!(questions.list().is_empty());
+
+        // A notice was filed with human-readable text and task link
+        let notices = crate::notices::Notices::open();
+        let notice = notices
+            .get(&crate::notices::id_of(&format!("conductor-resumption:{}", t.id)))
+            .expect("conductor-resumption notice filed");
+
+        assert_eq!(notice.link, Some(crate::notices::Link::Task { id: t.id.clone() }));
+        // Message does NOT contain the question prose to avoid asking for non-existent answers
+        assert!(!notice.message.contains("How should we proceed"));
+        // Message explicitly notes that no reply is required
+        assert!(notice.message.contains("No reply to this notice is needed."));
+        // No raw Rust debug representations
+        assert!(!notice.message.contains("Some("));
+        assert!(!notice.message.contains("None"));
+        assert!(!notice.message.contains("[]"));
+        assert!(!notice.message.contains("{:?}"));
+        // Mention proposed dependencies cleanly
+        assert!(notice.message.contains("Proposed dependencies: dep-x."));
     }
 
     #[test]
