@@ -151,20 +151,25 @@ fn repository_writer(inv: &Invocation<'_>) -> bool {
         && (matches!(
             inv.node,
             "implement" | "fix" | "graft" | "gate-fix" | "land" | "rebase"
-        ) || (inv.node == "chat" && repository_seat(inv)))
+        ) || (inv.node == crate::queue::CHAT_NODE && !consulted_chat(inv)))
 }
 
 fn consulted_chat(inv: &Invocation<'_>) -> bool {
     // talk::turn supplies explicit question/answer-store roots only while
     // delivering a consultation or an authorized hold.
-    inv.node == "chat" && inv.allow_write && !inv.writable.is_empty()
+    inv.node == crate::queue::CHAT_NODE && inv.allow_write && !inv.writable.is_empty()
 }
 
 fn repository_seat(inv: &Invocation<'_>) -> bool {
     // These roles consume supplied state, prompts and conversation history.
     // In particular, they must be able to deliver an answer or make queue
     // decisions while an editor holds its reservation waiting for that answer.
-    !matches!(inv.node, "deputy" | "conduct" | "dupes") && !consulted_chat(inv)
+    // Chat turns are conversation, not repository work sessions. Coordination
+    // must not serialize them, independently of their filesystem grants.
+    !matches!(
+        inv.node,
+        crate::queue::CHAT_NODE | "deputy" | "conduct" | "dupes"
+    )
 }
 
 /// Resolve the additional write scope for a repository editing seat.
@@ -381,7 +386,7 @@ pub async fn invoke(
     };
     let prompt = if consulted_chat(inv) {
         Some(format!(
-            "{}\n\nCurrent turn scope: answer the supplied consultation or authorized hold using the conversation and supplied question context and supported magi control-plane commands only. This overrides repository investigation permissions in the standing briefing or earlier turns. No repository lease is held: do not read repository files or history, fetch, run tests, or edit repository files. If repository investigation is needed, report that it must wait for a normal repository-coordinated turn after the consultation is resolved.",
+            "{}\n\nCurrent turn scope: answer the supplied consultation or authorized hold using the conversation and supplied question context and supported magi control-plane commands only. This overrides repository investigation permissions in the standing briefing or earlier turns. No repository lease is held: do not read repository files or history, fetch, run tests, or edit repository files. If repository investigation is needed, report that it must wait for a normal chat turn after the consultation is resolved.",
             inv.prompt
         ))
     } else {
@@ -1899,6 +1904,46 @@ mod tests {
         let roots = [PathBuf::from("/questions")];
         i.writable = &roots;
         assert!(!repository_writer(&i), "consultation keeps explicit grants");
+    }
+
+    #[test]
+    fn coordination_classification_is_independent_of_write_grants() {
+        let roots = [PathBuf::from("/questions")];
+        for node in [
+            crate::queue::CHAT_NODE,
+            "implement",
+            "fix",
+            "graft",
+            "gate-fix",
+            "land",
+            "rebase",
+            "review",
+            "judge",
+            "advise",
+            "deputy",
+            "waiter",
+            "conduct",
+            "dupes",
+        ] {
+            for allow_write in [false, true] {
+                for writable in [&[][..], &roots[..]] {
+                    let mut i = inv(Path::new("."), Path::new("/art"), allow_write);
+                    i.node = node;
+                    i.writable = writable;
+                    assert_eq!(
+                        repository_seat(&i),
+                        !matches!(
+                            node,
+                            crate::queue::CHAT_NODE | "deputy" | "conduct" | "dupes"
+                        ),
+                        "{node}, allow_write={allow_write}, writable={writable:?}"
+                    );
+                    if node == crate::queue::CHAT_NODE {
+                        assert_eq!(repository_writer(&i), allow_write && writable.is_empty());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

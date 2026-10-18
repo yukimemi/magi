@@ -455,7 +455,11 @@ resumes, fallbacks and waiter delivery. Never replace it with a sandbox bypass
 or the entire state root. Deputies/chats retain explicit grants. For read-only
 seats in repositories registered through `[coordination]`, the launcher holds the
 real exclusive lock through `repo_lock::SeatLease` without widening their
-sandbox. A fair per-repository gate admits concurrent readers or one editor;
+sandbox. All chat turns (`queue::CHAT_NODE`), including consultation delivery
+and waiter-style continuations through `talk::turn`, bypass `SeatLease` and the
+per-repository gate: conversation must not wait behind repository work sessions.
+Their filesystem grants and sandbox policy stay unchanged. A fair per-repository
+gate admits concurrent readers or one editor;
 editors take their own OS lock after readers have released theirs. External
 reader-lock contention waits before starting the CLI or its budget, never as
 an agent failure. `seat_process::Running` transfers cancelled processes and

@@ -491,14 +491,25 @@ mod coordination {
                 std::fs::write(marker, "ready").unwrap();
                 std::thread::sleep(Duration::from_secs(30));
             }
+            "holding-chat" => {
+                let prompt =
+                    std::fs::read_to_string(std::env::var_os("MAGI_PROMPT_FILE").unwrap()).unwrap();
+                assert!(!prompt.contains("launcher holds the exclusive repository lock"));
+                std::fs::write(&marker, "ready").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !marker.with_extension("release").exists() {
+                    assert!(Instant::now() < deadline, "chat was not released");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
             "quick" => {
                 std::fs::write(marker, "ready").unwrap();
             }
-            "chat-reader" => {
+            "locked-reader" => {
                 let path = PathBuf::from(std::env::var_os("COORDINATION_LOCK").unwrap());
                 assert!(
                     take_lock(&path).is_none(),
-                    "launcher holds real lock for chat"
+                    "launcher holds real lock for reader"
                 );
                 let prompt =
                     std::fs::read_to_string(std::env::var_os("MAGI_PROMPT_FILE").unwrap()).unwrap();
@@ -578,6 +589,108 @@ mod coordination {
         unsafe { libc::kill(pid, 0) == 0 }
     }
 
+    // Each child reports startup and waits for an explicit release. Observing
+    // both markers before release proves overlapping invocations, not merely
+    // two quick successful turns. Separate artifact directories avoid races.
+    async fn concurrent_chats(fx: &Fixture, policy: Option<&magi::config::Coordination>) {
+        for allow_write in [false, true] {
+            let first_marker = fx.seat.join(format!("first-chat-{allow_write}"));
+            let second_marker = fx.seat.join(format!("second-chat-{allow_write}"));
+            let mut first_spec = spec(fx, "holding-chat");
+            first_spec.env.insert(
+                "COORDINATION_MARKER".into(),
+                first_marker.to_str().unwrap().into(),
+            );
+            let mut second_spec = first_spec.clone();
+            second_spec.env.insert(
+                "COORDINATION_MARKER".into(),
+                second_marker.to_str().unwrap().into(),
+            );
+            let first_art = fx._tmp.path().join(format!("first-art-{allow_write}"));
+            let second_art = fx._tmp.path().join(format!("second-art-{allow_write}"));
+            let first_inv = Invocation {
+                node: magi::queue::CHAT_NODE,
+                coordination: policy,
+                ..invocation(fx, &first_art, allow_write)
+            };
+            let second_inv = Invocation {
+                artifacts: &second_art,
+                ..first_inv.clone()
+            };
+            let mut first_seat = SeatState::new("first-chat", "fixture", 1);
+            let mut second_seat = SeatState::new("second-chat", "fixture", 1);
+            let mut first = Box::pin(invoke(&first_spec, &mut first_seat, &first_inv));
+            let mut second = Box::pin(invoke(&second_spec, &mut second_seat, &second_inv));
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !first_marker.exists() || !second_marker.exists() {
+                    tokio::select! {
+                        out = &mut first => panic!("first chat exited before release: {out:?}"),
+                        out = &mut second => panic!("second chat exited before release: {out:?}"),
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+                    }
+                }
+            })
+            .await
+            .expect("both chats must spawn without waiting for repository coordination");
+            for marker in [&first_marker, &second_marker] {
+                std::fs::write(marker.with_extension("release"), "go").unwrap();
+            }
+            let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(first, second)
+            })
+            .await
+            .unwrap();
+            assert!(first.unwrap().usable());
+            assert!(second.unwrap().usable());
+            assert_eq!(first_seat.turns, 1);
+            assert_eq!(second_seat.turns, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn chats_spawn_concurrently_despite_external_shared_lock() {
+        let fx = Fixture::new();
+        let mut policy = coordination().clone();
+        policy.contract_token = "shared-lock-v1".into();
+        std::fs::write(
+            fx.primary.join(".git").join(&policy.contract_file),
+            &policy.contract_token,
+        )
+        .unwrap();
+        let external = take_lock(&fx.primary.join(".git").join(&policy.lock_file)).unwrap();
+        let run_spec = spec(&fx, "locked-reader");
+        let run_art = fx._tmp.path().join("run-art");
+        let run_inv = Invocation {
+            node: "implement",
+            coordination: Some(&policy),
+            ..invocation(&fx, &run_art, false)
+        };
+        let mut run_seat = SeatState::new("implement", "fixture", 1);
+        let mut run = Box::pin(invoke(&run_spec, &mut run_seat, &run_inv));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut run)
+                .await
+                .is_err()
+        );
+        assert!(!run_art.exists(), "implement must still wait before spawn");
+        concurrent_chats(&fx, Some(&policy)).await;
+        assert!(!run_art.exists());
+        drop(external);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), run)
+                .await
+                .unwrap()
+                .unwrap()
+                .usable()
+        );
+        assert_eq!(run_seat.turns, 1);
+    }
+
+    #[tokio::test]
+    async fn chats_spawn_concurrently_without_coordination() {
+        concurrent_chats(&Fixture::new(), None).await;
+    }
+
     #[tokio::test]
     async fn machine_config_preserves_existing_external_lock_protocol() {
         let fx = Fixture::new();
@@ -602,7 +715,7 @@ lock_file = "kanade-sync.lock"
         )
         .unwrap();
         let external = take_lock(&common.join(&policy.lock_file)).unwrap();
-        let mut spec = spec(&fx, "chat-reader");
+        let mut spec = spec(&fx, "locked-reader");
         spec.env.insert(
             "COORDINATION_LOCK".into(),
             common.join(&policy.lock_file).to_str().unwrap().into(),
@@ -635,7 +748,10 @@ lock_file = "kanade-sync.lock"
         let fx = registered();
         let editor_spec = spec(&fx, "holding-editor");
         let art = fx._tmp.path().join("art");
-        let write_inv = invocation(&fx, &art, true);
+        let write_inv = Invocation {
+            node: "implement",
+            ..invocation(&fx, &art, true)
+        };
         let mut editor_seat = SeatState::new("editor", "fixture", 1);
         let mut editor = Box::pin(invoke(&editor_spec, &mut editor_seat, &write_inv));
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -649,8 +765,10 @@ lock_file = "kanade-sync.lock"
         let lock = fx.primary.join(".git/updater.lock");
         assert!(take_lock(&lock).is_none());
         let consult_roots = [fx.home.join("questions")];
-        // Only consulted chat has a control-only scope. Ordinary chat may
-        // investigate code and must wait for repository coordination.
+        // Both ordinary chats can start while the implement seat owns the
+        // local editor reservation and real OS lock.
+        concurrent_chats(&fx, Some(coordination())).await;
+        // Consulted chats retain their control-only prompt and grants.
         for node in ["conduct", "dupes", "chat", "deputy"] {
             for allow_write in [false, true] {
                 if node == "chat" && !allow_write {
@@ -692,8 +810,8 @@ lock_file = "kanade-sync.lock"
             ("judge", false),
             ("advise", false),
             ("review", false),
-            ("chat", false),
-            ("chat", true),
+            ("implement", false),
+            ("implement", true),
         ] {
             let reader_spec = spec(&fx, "quick");
             let reader_inv = Invocation {
@@ -768,7 +886,10 @@ lock_file = "kanade-sync.lock"
         let editor_spec = spec(&fx, "editor");
         let art = fx._tmp.path().join("art");
         let read_inv = invocation(&fx, &art, false);
-        let write_inv = invocation(&fx, &art, true);
+        let write_inv = Invocation {
+            node: "implement",
+            ..invocation(&fx, &art, true)
+        };
         let mut reader_seat = SeatState::new("reader", "fixture", 1);
         let mut editor_seat = SeatState::new("editor", "fixture", 1);
         let reader = invoke(&reader_spec, &mut reader_seat, &read_inv);
@@ -852,10 +973,10 @@ lock_file = "kanade-sync.lock"
     async fn external_contention_waits_without_spawning_or_charging_an_attempt() {
         let fx = registered();
         let external = take_lock(&fx.primary.join(".git/updater.lock")).unwrap();
-        let spec = spec(&fx, "chat-reader");
+        let spec = spec(&fx, "locked-reader");
         let art = fx._tmp.path().join("art");
         let inv = Invocation {
-            node: "chat",
+            node: "review",
             ..invocation(&fx, &art, false)
         };
         let mut seat = SeatState::new("reader", "fixture", 1);
@@ -868,7 +989,7 @@ lock_file = "kanade-sync.lock"
                     .is_err()
             );
             assert!(!art.exists());
-            assert!(!fx.seat.join("chat-reader").exists());
+            assert!(!fx.seat.join("locked-reader").exists());
             drop(external);
             let out = tokio::time::timeout(Duration::from_secs(10), &mut future)
                 .await

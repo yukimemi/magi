@@ -69,8 +69,8 @@ These waits check the run's pause/interrupt handles at least every five seconds.
 An immediately available reservation still permits a completed node to save
 its results before honoring a park at the next node boundary. External wait
 expiry produces a repository-coordination resource block, not an agent failure or a permanent preparation failure; a pause remains
-a park. Standalone invocations use the default graph limit, chats and public
-folding use their configured limit, and callers can also cancel by dropping
+a park. Standalone invocations use the default graph limit and public
+folding uses its configured limit, and callers can also cancel by dropping
 the waiting future. No process or prompt artifact exists until acquisition.
 The last reader explicitly
 unlocks before closing the handle, never unlinking the lock file. Explicit
@@ -104,14 +104,18 @@ pre-gate edits. Rescue commits release their repository lease before entering
 verification. This matches editing waves and avoids a cache holder waiting
 for a repository reserved by the very verification waiting for its cache.
 
-Control-plane seats (`conduct`, `dupes`, and `deputy`) and consulted chat turns
-with explicit question/answer-store grants stay outside repository scheduling.
+Control-plane seats (`conduct`, `dupes`, and `deputy`) and all chat turns
+(`queue::CHAT_NODE`) stay outside repository scheduling. Chat is conversation,
+not a long repository editing session: it never acquires or waits on a
+`SeatLease` or participates in the per-repository gate, regardless of write
+permission or coordination registration. This includes consult drains, completion
+notices and waiter-style continuations delivered through `talk::turn`.
+Existing filesystem grants and sandbox policy remain unchanged.
 The current consultation prompt overrides the standing briefing: it permits
 only supplied conversation/question context and supported control-plane commands,
 and forbids repository inspection, fetch, tests and edits for that turn.
-Ordinary chats with empty writable roots remain repository seats: read-only
-chats receive a launcher-held lock, and write-enabled chats reserve the editor
-gate and receive shared Git and question-store grants to take their own lock.
+Ordinary write-enabled chats with empty writable roots retain their shared Git
+and question-store grants; read-only chats remain read-only.
 Control-only turns do not claim to hold a repository lease. This preserves the supported
 question/control-plane route while an editing seat waits for an answer; putting
 that route behind the editor's reservation would deadlock delivery.
