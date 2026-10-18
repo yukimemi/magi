@@ -589,38 +589,64 @@ fn read_state(runs: &Path, id: &str) -> Result<RunState> {
     Ok(state)
 }
 
+/// Remove only verified clean Git worktrees and empty directory scaffolding.
+/// Unknown files or unreadable Git state require recovery, never recursive deletion.
+async fn remove_clean_bay(root: &Path) -> Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut directories = Vec::new();
+    let mut worktrees = Vec::new();
+    while let Some(path) = pending.pop() {
+        if path.join(".git").exists() {
+            if !crate::git::is_clean(&path).await? {
+                anyhow::bail!("uncommitted work in {}; recovery required", path.display());
+            }
+            worktrees.push(path);
+        } else {
+            for entry in std::fs::read_dir(&path)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    anyhow::bail!(
+                        "unknown worktree content in {}; recovery required",
+                        path.display()
+                    );
+                }
+                pending.push(entry.path());
+            }
+            directories.push(path);
+        }
+    }
+    for path in worktrees {
+        if !crate::git::worktree_remove_clean(&path, &path).await? {
+            anyhow::bail!("clean worktree removal refused: {}", path.display());
+        }
+    }
+    for path in directories.into_iter().rev() {
+        std::fs::remove_dir(path)?;
+    }
+    Ok(())
+}
+
 /// Remove a run that cannot be read: its state directory under `runs` and its
 /// worktree directory under `worktrees_root`.
 ///
-/// The state file is the only record of a run's repository and branches, so a
-/// run this unreadable is discarded at the filesystem level - there is no
-/// candidate list to fold first. The worktrees live under
-/// [`crate::run::default_worktree_root`] unless the run's config relocated
-/// them, which an unreadable run cannot tell us; the default location is
-/// removed, and anything the run placed elsewhere is a leftover for whoever
-/// knows where it went.
-///
-/// Deleting a worktree directory by hand leaves its registration in git, and a
-/// registered path cannot be re-`worktree add`-ed until it is pruned - so every
-/// worktree is unregistered from its repository first, best-effort, via the
-/// `gitdir:` link git keeps inside the directory.
+/// Inspect worktrees before deleting any state or artifacts. Only clean registered
+/// worktrees and empty directory scaffolding can be reclaimed; unknown or dirty
+/// content remains available for recovery. Nonstandard worktree roots remain the
+/// operator's responsibility when the state file cannot identify them.
 pub async fn fold_unreadable(runs: &Path, worktrees_root: &Path, id: &str) -> Result<Vec<String>> {
     let resolved = resolve_id_path(runs, id)?;
     let mut removed = Vec::new();
     let run_dir = runs.join(&resolved);
+    let wt = worktrees_root.join(short_of(&resolved));
+    if wt.exists() {
+        remove_clean_bay(&wt).await?;
+        removed.push(wt.to_string_lossy().into_owned());
+    }
+    // Keep the recovery artifacts if any worktree could not be removed safely.
     if run_dir.exists() {
         std::fs::remove_dir_all(&run_dir)
             .with_context(|| format!("remove {}", run_dir.display()))?;
         removed.push(format!("runs/{resolved}"));
-    }
-    let wt = worktrees_root.join(short_of(&resolved));
-    if wt.exists() {
-        crate::git::remove_worktree_from_linked(&wt).await;
-        for e in std::fs::read_dir(&wt).into_iter().flatten().flatten() {
-            crate::git::remove_worktree_from_linked(&e.path()).await;
-        }
-        std::fs::remove_dir_all(&wt).with_context(|| format!("remove {}", wt.display()))?;
-        removed.push(wt.to_string_lossy().into_owned());
     }
     Ok(removed)
 }
@@ -699,11 +725,7 @@ pub async fn fold_orphaned_worktrees(
         if !stale_enough(&wt, grace_secs, now) {
             continue;
         }
-        crate::git::remove_worktree_from_linked(&wt).await;
-        for e in std::fs::read_dir(&wt).into_iter().flatten().flatten() {
-            crate::git::remove_worktree_from_linked(&e.path()).await;
-        }
-        match std::fs::remove_dir_all(&wt) {
+        match remove_clean_bay(&wt).await {
             Ok(()) => folded += 1,
             Err(e) => tracing::warn!(
                 "housekeep: remove orphaned worktree {}: {e:#}",
@@ -1407,6 +1429,24 @@ mod tests {
     }
 
     #[test]
+    fn fold_unreadable_preserves_unknown_content_and_recovery_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let runs = dir.path().join("runs");
+        let wt = dir.path().join("wt");
+        let id = "20260905-000000-abcd";
+        std::fs::create_dir_all(runs.join(id).join("artifacts")).unwrap();
+        std::fs::write(runs.join(id).join("run.json"), "garbage").unwrap();
+        std::fs::create_dir_all(wt.join("abcd")).unwrap();
+        std::fs::write(wt.join("abcd/leftover"), "owned edits").unwrap();
+        assert!(block_on(fold_unreadable(&runs, &wt, id)).is_err());
+        assert!(runs.join(id).join("artifacts").exists());
+        assert_eq!(
+            std::fs::read_to_string(wt.join("abcd/leftover")).unwrap(),
+            "owned edits"
+        );
+    }
+
+    #[test]
     fn fold_unreadable_releases_run_dir_and_worktrees() {
         let dir = tempfile::tempdir().unwrap();
         let runs = dir.path().join("runs");
@@ -1415,7 +1455,6 @@ mod tests {
         std::fs::create_dir_all(runs.join(id)).unwrap();
         std::fs::write(runs.join(id).join("run.json"), "garbage").unwrap();
         std::fs::create_dir_all(wt.join("abcd")).unwrap();
-        std::fs::write(wt.join("abcd").join("leftover"), b"x").unwrap();
 
         let removed = block_on(fold_unreadable(&runs, &wt, id)).expect("fold");
         assert_eq!(removed.len(), 2);
@@ -1426,7 +1465,6 @@ mod tests {
         std::fs::create_dir_all(runs.join(id)).unwrap();
         std::fs::write(runs.join(id).join("run.json"), "garbage").unwrap();
         std::fs::create_dir_all(wt.join("abcd")).unwrap();
-        std::fs::write(wt.join("abcd").join("leftover"), b"x").unwrap();
         let removed = block_on(fold_unreadable(&runs, &wt, "20260905")).expect("by prefix");
         assert_eq!(removed.len(), 2);
         // Once gone, `id` cannot be resolved at all - same as `run::resolve_id`

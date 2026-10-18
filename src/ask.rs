@@ -1863,17 +1863,32 @@ async fn wait_loop(
 /// An error here is reported, not swallowed, so `magi notify --test` can show
 /// the operator why nothing arrives. The waiting path logs it and carries on.
 pub async fn notify(cmd: &config::Notify, q: &Question) -> Result<()> {
-    notify_text(cmd, &q.run, &q.summary).await
+    let mut summary = format!("Question {}: {}", q.short(), q.summary.trim());
+    if q.status.open() {
+        summary.push_str(&format!(
+            " Respond in Questions or with `magi answer {}`.",
+            q.id
+        ));
+    }
+    let url = question_url(&std::env::var(WEB_URL_ENV).unwrap_or_default());
+    notify_at(cmd, &q.run, &summary, &url).await
 }
 
 /// [`notify`] for an event that is not a question: the same command, the same
 /// placeholders, with `summary` and `run` supplied directly.
 pub async fn notify_text(cmd: &config::Notify, run: &str, summary: &str) -> Result<()> {
+    let url = view_url(
+        &std::env::var(WEB_URL_ENV).unwrap_or_default(),
+        "notifications",
+    );
+    notify_at(cmd, run, summary, &url).await
+}
+
+async fn notify_at(cmd: &config::Notify, run: &str, summary: &str, url: &str) -> Result<()> {
     let Some((program, args)) = cmd.command.split_first() else {
         // No command configured: the web UI is the only surface, by choice.
         return Ok(());
     };
-    let url = web_url();
     if url.is_empty() && cmd.command.iter().any(|a| a.contains("{url}")) {
         tracing::warn!(
             "the notification command uses {{url}} but {WEB_URL_ENV} is unset, \
@@ -1881,7 +1896,7 @@ pub async fn notify_text(cmd: &config::Notify, run: &str, summary: &str) -> Resu
              the address `magi web --open` printed"
         );
     }
-    let argv: Vec<String> = args.iter().map(|a| expand(a, run, summary, &url)).collect();
+    let argv: Vec<String> = args.iter().map(|a| expand(a, run, summary, url)).collect();
     tracing::debug!(program = %program, args = ?argv, "notifying");
 
     let mut child = tokio::process::Command::new(program);
@@ -1943,11 +1958,6 @@ fn expand(template: &str, run: &str, summary: &str, url: &str) -> String {
     out
 }
 
-/// The URL `{url}` expands to, from [`WEB_URL_ENV`].
-fn web_url() -> String {
-    question_url(&std::env::var(WEB_URL_ENV).unwrap_or_default())
-}
-
 /// Point a configured base URL at the view that can answer the question.
 ///
 /// A notification the operator has to navigate from is a question that stays
@@ -1955,11 +1965,15 @@ fn web_url() -> String {
 /// operator already wrote a fragment, in which case they have said where they
 /// want to land and magi does not know better.
 fn question_url(base: &str) -> String {
+    view_url(base, "questions")
+}
+
+fn view_url(base: &str, view: &str) -> String {
     let base = base.trim().trim_end_matches('/');
     if base.is_empty() || base.contains('#') {
         return base.to_owned();
     }
-    format!("{base}/#/questions")
+    format!("{base}/#/{view}")
 }
 
 /// Assemble a panel's contents in an already-empty directory.
@@ -2620,6 +2634,52 @@ mod tests {
         // No command at all is the default, and is silence rather than failure.
         assert!(notify(&quiet(), &q).await.is_ok());
         assert!(notify_text(&quiet(), "run", "text").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn external_question_notification_names_the_supported_response_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page");
+        let cmd = config::Notify {
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "printf '%s' \"$1\" > \"$2\"".into(),
+                "notify".into(),
+                "{summary}".into(),
+                path.to_string_lossy().into_owned(),
+            ],
+        };
+        let q = choice_question();
+        notify(&cmd, &q).await.unwrap();
+        let sent = std::fs::read_to_string(&path).unwrap();
+        assert!(sent.starts_with("Question "));
+        assert!(sent.contains(&q.summary));
+        assert!(sent.contains(&format!("magi answer {}", q.id)));
+        notify_text(&cmd, "", "Informational report. No reply needed.")
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "Informational report. No reply needed."
+        );
+    }
+
+    #[test]
+    fn external_notifications_and_questions_have_distinct_destinations() {
+        assert_eq!(
+            question_url("https://example.invalid/"),
+            "https://example.invalid/#/questions"
+        );
+        assert_eq!(
+            view_url("https://example.invalid/", "notifications"),
+            "https://example.invalid/#/notifications"
+        );
+        assert_eq!(view_url("", "notifications"), "");
+        assert_eq!(
+            view_url("https://example.invalid/#/queue", "notifications"),
+            "https://example.invalid/#/queue"
+        );
     }
 
     #[test]

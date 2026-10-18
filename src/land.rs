@@ -4684,13 +4684,8 @@ pub async fn fix_round(
         }
         Ok(o) if !o.usable() => {
             return Ok(Fixed::Failed(format!(
-                "the fixer produced nothing usable ({}{})",
-                crate::notices::exit_status(o.exit_code),
-                if o.timed_out {
-                    "; the turn timed out"
-                } else {
-                    ""
-                }
+                "the fixer produced nothing usable ({})",
+                crate::notices::turn_status(o.exit_code, o.timed_out, o.quota_exhausted())
             )));
         }
         Ok(_) => {}
@@ -5050,6 +5045,18 @@ pub(crate) enum Verdict {
     Fail,
     Pending,
     Unknown,
+}
+
+impl Verdict {
+    /// Short operator-facing check result.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "passed",
+            Self::Fail => "failed",
+            Self::Pending => "pending",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

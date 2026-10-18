@@ -1662,11 +1662,9 @@ async fn ask_judge(cfg: &Config, cwd: &Path, title: &str, body: &str) -> Result<
             last = match out {
                 Err(e) => e.context(format!("language judge `{}` failed", spec.id)),
                 Ok(o) => anyhow::anyhow!(
-                    "language judge `{}` gave no usable reply (exit {:?}, timed out {}, quota {})",
+                    "language judge `{}` gave no usable reply ({})",
                     spec.id,
-                    o.exit_code,
-                    o.timed_out,
-                    o.quota_exhausted()
+                    crate::notices::turn_status(o.exit_code, o.timed_out, o.quota_exhausted())
                 ),
             };
             continue;

@@ -1011,14 +1011,14 @@ impl Runner {
             Err(e) => Err(e),
         };
         if let Err(e) = setup {
-            git::worktree_remove(repo, &worktree).await.ok();
+            git::worktree_remove_clean(repo, &worktree).await.ok();
             return Err(e);
         }
         let commits = git::commits_ahead(&worktree, &base_commit, "HEAD")
             .await
             .unwrap_or(0);
         if commits == 0 {
-            git::worktree_remove(repo, &worktree).await.ok();
+            git::worktree_remove_clean(repo, &worktree).await.ok();
             bail!("`{branch}` has no commits beyond {}", short(&base_commit));
         }
         let files = git::changed_files(&worktree, &base_commit, "HEAD")
@@ -1033,7 +1033,7 @@ impl Runner {
             && head_tree == base_tree
         {
             let head = git::rev_parse(&worktree, "HEAD").await.unwrap_or_default();
-            git::worktree_remove(repo, &worktree).await.ok();
+            git::worktree_remove_clean(repo, &worktree).await.ok();
             bail!(
                 "`{branch}` at {} has a tree identical to base {}; this usually means \
                  the branch ref is stale (check `git rev-parse refs/heads/{branch}` \
@@ -1273,6 +1273,9 @@ impl Runner {
     }
 
     async fn execute_graph(&mut self) -> Result<()> {
+        // Preservation may invalidate an old empty classification. Resolve it
+        // before any resume shortcut can reuse a verdict or publish a branch.
+        self.persist_candidates().await?;
         if self
             .state
             .merge_decision
@@ -1305,6 +1308,7 @@ impl Runner {
         if self.state.config.graph.selected_implementer.is_some()
             && self.state.status == RunStatus::Blocked
             && self.state.tally.is_none()
+            && self.state.candidate_preservation.is_empty()
         {
             bail!(
                 "selected implementation is held; explicitly release the owning task to retry it"
@@ -1617,7 +1621,7 @@ impl Runner {
             Err(e) => Err(e),
         };
         if let Err(e) = result {
-            git::worktree_remove(repo, wt).await.ok();
+            git::worktree_remove_clean(repo, wt).await.ok();
             if in_prep {
                 self.rollback_prep(repo).await;
             }
@@ -1636,17 +1640,23 @@ impl Runner {
     async fn rollback_prep(&mut self, repo: &Path) {
         let root = self.state.worktree_root();
         for c in std::mem::take(&mut self.state.candidates) {
-            git::worktree_remove(repo, &c.worktree).await.ok();
-            git::branch_delete(repo, &c.branch).await.ok();
+            if matches!(
+                git::worktree_remove_clean(repo, &c.worktree).await,
+                Ok(true)
+            ) {
+                git::branch_delete(repo, &c.branch).await.ok();
+            } else {
+                self.state.candidates.push(c);
+            }
         }
         let seats = self.roles.judges.len().max(self.state.config.graph.judges);
         for j in 1..=seats {
-            git::worktree_remove(repo, &root.join(format!("judge-{j}")))
+            git::worktree_remove_clean(repo, &root.join(format!("judge-{j}")))
                 .await
                 .ok();
         }
         for k in 1..=self.state.config.graph.advisors {
-            git::worktree_remove(repo, &root.join(format!("advisor-{k}")))
+            git::worktree_remove_clean(repo, &root.join(format!("advisor-{k}")))
                 .await
                 .ok();
         }
@@ -1670,6 +1680,11 @@ impl Runner {
         // repository mutation may precede the real shared lock acquisition.
         let _coordination = self.coordinate(&repo).await?;
         self.rollback_prep(&repo).await;
+        if !self.state.candidates.is_empty() {
+            bail!(
+                "preparation rollback retained worktrees; recover their uncommitted work before retrying"
+            );
+        }
         self.state.prep_complete = Some(false);
         self.state.status = RunStatus::Prep;
         self.state.save()?;
@@ -1723,7 +1738,7 @@ impl Runner {
             if let Err(e) = worktree_setup::prepare(&self.state.config, &repo, &worktree).await {
                 // Nothing of this prep may survive: a resume must start over,
                 // not find half the candidates and skip the rest.
-                git::worktree_remove(&repo, &worktree).await.ok();
+                git::worktree_remove_clean(&repo, &worktree).await.ok();
                 git::branch_delete(&repo, &branch).await.ok();
                 self.rollback_prep(&repo).await;
                 self.state.status = RunStatus::Blocked;
@@ -2172,6 +2187,7 @@ impl Runner {
     // ----------------------------------------------------------- implement
 
     async fn implement(&mut self) -> Result<()> {
+        self.persist_candidates().await?;
         // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
         // agent files with `magi task add` name the run that paid for it. The
         // prompt overlay is cloned alongside it because the waves borrow it
@@ -2290,8 +2306,6 @@ impl Runner {
             let exhausted_the_fallback_chain = FailClass::of(&out).is_some();
             self.state.seats.insert(seat.key.clone(), seat);
             let label = self.state.candidates[i].label;
-            let worktree = self.state.candidates[i].worktree.clone();
-            let base = self.state.base_commit.clone();
 
             let (summary, duration, failed, verified_claim) = match out {
                 AgentOutcome::Ok(o) => {
@@ -2300,7 +2314,10 @@ impl Runner {
                         if o.timed_out {
                             "agent timed out".to_owned()
                         } else {
-                            format!("agent exited with {:?}", o.exit_code)
+                            format!(
+                                "agent exited with {}",
+                                crate::notices::exit_status(o.exit_code)
+                            )
                         }
                     });
                     let verified_claim = verified_noop_claim(failed.is_none(), &o.commands, &text);
@@ -2343,81 +2360,22 @@ impl Runner {
                 }
             };
 
-            // Rescue anything the agent edited but never committed: an
-            // uncommitted candidate would silently be an empty one.
-            // Parking stops pending resource waits, but completed seats must
-            // persist their output before the node boundary observes it.
-            let wait = crate::repo_lock::WaitPolicy::new(
-                Duration::from_secs(self.state.config.graph.timeout_resource_wait),
-                || false,
-            );
-            let _coordination = coordinate_operation(&mut self.state, &worktree, &wait).await?;
-            let rescued = match git::rescue_commit(
-                &worktree,
-                &format!("magi: candidate {label} (uncommitted work)"),
-            )
-            .await
-            {
-                Ok(r) => {
-                    self.state.note_withheld("implement", &r.withheld);
-                    r.committed
-                }
-                Err(_) => false,
-            };
-            let commits = git::commits_ahead(&worktree, &base, "HEAD")
-                .await
-                .unwrap_or(0);
-            let patch = git::diff(&worktree, &base, "HEAD")
-                .await
-                .unwrap_or_default();
-            let stat = git::diff_stat(&worktree, &base, "HEAD")
-                .await
-                .unwrap_or_default();
-            let files = git::changed_files(&worktree, &base, "HEAD")
-                .await
-                .map(|f| f.len())
-                .unwrap_or(0);
-            write_artifact(&self.state, &format!("cand-{label}.patch"), &patch)?;
-
+            // Save every completed turn before any fallible Git operation. A failed
+            // rescue must not erase the reply or prevent collection of other seats.
             let c = &mut self.state.candidates[i];
             if !exhausted_the_fallback_chain {
                 c.agent = agent;
             }
             c.summary = blind::sanitize_prose(&summary, &self.state.config.blind);
-            c.stat = stat;
-            c.files = files;
-            c.commits = commits;
             c.duration_ms = duration;
-            c.empty = commits == 0 || patch.trim().is_empty();
-            // An agent that failed but still produced a committed change stays
-            // in the running: the patch is what gets judged, not the exit code.
-            c.failed = match failed {
-                Some(_) if c.empty => failed,
-                _ => None,
-            };
-            // Only an empty candidate can be a verified no-op: a claim next
-            // to a real patch is not what the marker is for, and `c.failed`
-            // being `Some` here already implies `verified_claim` was never
-            // set (see the guard above the match that produced it).
-            c.verified_noop = if c.empty { verified_claim } else { None };
-            let note = match (&c.failed, c.empty, &c.verified_noop, rescued) {
-                (Some(e), _, _, _) => format!("candidate {label}: {e}"),
-                (None, true, Some(_), _) => {
-                    format!("candidate {label}: no change produced (agent-verified no-op)")
-                }
-                (None, true, None, _) => format!("candidate {label}: no change produced"),
-                (None, false, _, true) => {
-                    format!(
-                        "candidate {label}: {files} files, {commits} commits (rescued an uncommitted tree)"
-                    )
-                }
-                (None, false, _, false) => {
-                    format!("candidate {label}: {files} files, {commits} commits")
-                }
-            };
-            self.state.event("implement", note);
-            self.state.save()?;
+            c.failed = failed;
+            c.verified_noop = verified_claim;
+            self.state
+                .candidate_preservation
+                .insert(label, "awaiting persistence".to_owned());
         }
+        self.state.save()?;
+        self.persist_candidates().await?;
 
         if resource_blocked {
             return self.stop_for_resource();
@@ -2431,6 +2389,114 @@ impl Runner {
             );
         }
         self.after_implement()
+    }
+
+    /// Retry only persistence after a completed implementation turn.
+    async fn persist_candidates(&mut self) -> Result<()> {
+        let labels: Vec<_> = self.state.candidate_preservation.keys().copied().collect();
+        for label in labels {
+            let i = self
+                .state
+                .candidates
+                .iter()
+                .position(|c| c.label == label)
+                .context("pending candidate is missing")?;
+            let c = self.state.candidates[i].clone();
+            let result = async {
+                let wait = crate::repo_lock::WaitPolicy::new(
+                    Duration::from_secs(self.state.config.graph.timeout_resource_wait),
+                    || false,
+                );
+                let _coordination =
+                    coordinate_operation(&mut self.state, &c.worktree, &wait).await?;
+                // Best effort evidence requires no index writes. A successful snapshot
+                // never authorizes removal of a tree whose rescue failed.
+                if let Err(e) = git::snapshot_uncommitted(
+                    &c.worktree,
+                    &self
+                        .state
+                        .dir()
+                        .join("artifacts")
+                        .join(format!("candidate-{label}-recovery")),
+                )
+                .await
+                {
+                    self.state.event(
+                        "preserve",
+                        format!("candidate {label} snapshot incomplete: {e:#}"),
+                    );
+                }
+                let rescued = git::rescue_commit(
+                    &c.worktree,
+                    &format!("magi: candidate {label} (uncommitted work)"),
+                )
+                .await?;
+                self.state.note_withheld("implement", &rescued.withheld);
+                let base = &self.state.base_commit;
+                let commits = git::commits_ahead(&c.worktree, base, "HEAD").await?;
+                let patch = git::diff(&c.worktree, base, "HEAD").await?;
+                let stat = git::diff_stat(&c.worktree, base, "HEAD").await?;
+                let files = git::changed_files(&c.worktree, base, "HEAD").await?.len();
+                write_artifact(&self.state, &format!("cand-{label}.patch"), &patch)?;
+                if c.empty && commits > 0 && !patch.trim().is_empty()
+                    && (self.state.judge_skipped || !self.state.judgements.is_empty()
+                        || !self.state.deliberation.is_empty() || !self.state.votes.is_empty()
+                        || self.state.tally.is_some())
+                {
+                    // Keep the old classification and pending marker so every
+                    // retry stops too. Retain decisions as recovery evidence;
+                    // only a supported recovery operation may replace them.
+                    bail!("candidate {label} changes the judged candidate set; supported recovery and fresh judging are required before continuing");
+                }
+                let c = &mut self.state.candidates[i];
+                c.commits = commits;
+                c.stat = stat;
+                c.files = files;
+                c.empty = commits == 0 || patch.trim().is_empty();
+                if !c.empty {
+                    c.failed = None;
+                    c.verified_noop = None;
+                }
+                self.state.event(
+                    "preserve",
+                    format!("candidate {label}: {files} files, {commits} commits"),
+                );
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            match result {
+                Ok(()) => {
+                    self.state.candidate_preservation.remove(&label);
+                }
+                Err(e) => {
+                    let reason = format!("candidate {label} preservation failed: {e:#}");
+                    self.state.event("preserve", &reason);
+                    self.state.candidate_preservation.insert(label, reason);
+                }
+            }
+            if self.state.candidate_preservation.is_empty()
+                && self.state.status == RunStatus::Blocked
+                && self.state.candidates.iter().all(|c| c.failed.is_none())
+            {
+                // Persist the recovered phase with the cleared pending marker;
+                // a crash between saves must not turn this into a selected-seat
+                // failure hold on the next resume.
+                self.state.status = RunStatus::Implementing;
+                self.state.event(
+                    "preserve",
+                    "candidate persistence recovered; implementation can continue",
+                );
+            }
+            self.state.save()?;
+        }
+        if !self.state.candidate_preservation.is_empty() {
+            self.state.status = RunStatus::Blocked;
+            self.state.save()?;
+            bail!(
+                "candidate preservation incomplete; retain worktrees and artifacts, repair persistence and resume this run"
+            );
+        }
+        Ok(())
     }
 
     /// Ask again, once, for work a CLI did and then failed to hand over.
@@ -3018,6 +3084,9 @@ impl Runner {
     }
 
     fn after_implement(&mut self) -> Result<()> {
+        if !self.state.candidate_preservation.is_empty() {
+            bail!("candidate preservation incomplete; judging is unsafe");
+        }
         // Scan every candidate patch once the set is complete.
         if self.state.leaks.is_empty() {
             let cfg = self.state.config.blind.clone();
@@ -4317,6 +4386,9 @@ impl Runner {
         let Some(winner) = self.state.tally.as_ref().map(|t| t.winner) else {
             return Ok(());
         };
+        if !self.state.candidate_preservation.is_empty() {
+            bail!("candidate preservation incomplete; refusing cleanup");
+        }
         let repo = self.state.repo.clone();
         let _coordination = self.coordinate(&repo).await?;
         let mut folded = Vec::new();
@@ -4326,9 +4398,14 @@ impl Runner {
                 continue;
             }
             let (wt, branch, label) = (c.worktree.clone(), c.branch.clone(), c.label);
-            git::worktree_remove(&repo, &wt).await.ok();
-            git::branch_delete(&repo, &branch).await.ok();
+            remove_preserved_worktree(&repo, &wt).await?;
+            if git::branch_exists(&repo, &branch).await?
+                && !git::branch_delete(&repo, &branch).await?
+            {
+                bail!("candidate branch removal refused");
+            }
             self.state.candidates[i].folded = true;
+            self.state.save()?;
             folded.push(label.to_string());
         }
         // The judges are finished; their checkouts are pure cost from here.
@@ -4336,7 +4413,7 @@ impl Runner {
         for j in 1..=self.roles.judges.len() {
             let wt = root.join(format!("judge-{j}"));
             if wt.exists() {
-                git::worktree_remove(&repo, &wt).await.ok();
+                remove_preserved_worktree(&repo, &wt).await?;
             }
         }
         // The design-deliberation stage is finished by the time a tally
@@ -4345,7 +4422,7 @@ impl Runner {
             for k in 1..=self.state.config.graph.advisors {
                 let wt = root.join(format!("advisor-{k}"));
                 if wt.exists() {
-                    git::worktree_remove(&repo, &wt).await.ok();
+                    remove_preserved_worktree(&repo, &wt).await?;
                 }
             }
         }
@@ -8837,10 +8914,25 @@ impl FailClass {
 }
 
 /// The message's first line with its variable parts removed — digit runs and
-/// path-like tokens — so "exited with Some(2)" and "exited with Some(7)" read
+/// path-like tokens — so "exit code 2" and "exit code 7" read
 /// as one kind of failure.
 fn failure_signature(msg: &str) -> String {
-    let line = msg.lines().next().unwrap_or("").trim().to_lowercase();
+    let mut line = msg.lines().next().unwrap_or("").trim().to_lowercase();
+    // `SeatHistory::last_fail` persists these signatures across resumes. Keep
+    // the historical machine key while the process diagnosis uses readable prose.
+    if let Some(code) = line
+        .strip_prefix("process exited with no usable output (exit code ")
+        .and_then(|s| s.strip_suffix(')'))
+        .and_then(|s| s.parse::<i32>().ok())
+    {
+        line = format!("exited with some({code}) and no usable output");
+    } else if matches!(
+        line.as_str(),
+        "process exited with no usable output (no exit code reported)"
+            | "process exited with no usable output (exit code unavailable)"
+    ) {
+        line = "exited with none and no usable output".to_owned();
+    }
     let mut out = Vec::new();
     for word in line.split_whitespace() {
         if word.contains('/') || word.contains('\\') {
@@ -9278,8 +9370,8 @@ async fn wave(
                 Ok(o) if o.work_undelivered() => AgentOutcome::Dropped(o),
                 Ok(o) if o.timed_out => AgentOutcome::Failed(TIMED_OUT.to_owned()),
                 Ok(o) => AgentOutcome::Failed(format!(
-                    "exited with {:?} and no usable output",
-                    o.exit_code
+                    "process exited with no usable output ({})",
+                    crate::notices::exit_status(o.exit_code)
                 )),
                 Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => {
                     AgentOutcome::ResourceBlocked(e.to_string())
@@ -11042,6 +11134,30 @@ pub(crate) async fn gh_pr_create(
     }
 }
 
+/// Never force deletion of uncommitted work, including unknown legacy trees.
+async fn remove_preserved_worktree(repo: &Path, path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // A previous cleanup may have removed the tree before a branch
+            // deletion or state save failed. Unregister it if still present.
+            git::worktree_remove_clean(repo, path).await?;
+            return Ok(());
+        }
+        Err(e) => return Err(e.into()),
+        Ok(_) => {}
+    }
+    if !git::is_clean(path).await? {
+        bail!(
+            "worktree has uncommitted work; refusing removal: {}",
+            path.display()
+        );
+    }
+    if !git::worktree_remove_clean(repo, path).await? {
+        bail!("worktree removal refused: {}", path.display());
+    }
+    Ok(())
+}
+
 /// Tear a run's worktrees and branches down.
 ///
 /// `home` is where the updated `run.json` is saved (via
@@ -11053,6 +11169,9 @@ pub(crate) async fn gh_pr_create(
 pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> Result<Vec<String>> {
     if crate::pr_recovery::sources_retained(home, &state.id) {
         return Ok(Vec::new());
+    }
+    if !state.candidate_preservation.is_empty() {
+        bail!("candidate preservation incomplete; refusing cleanup");
     }
     let repo = state.repo.clone();
     // CLI, Web and automatic cleanup all enter here, independently of
@@ -11075,15 +11194,20 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> R
         if is_winner && !drop_winner {
             continue;
         }
-        if c.worktree.exists() {
-            git::worktree_remove(&repo, &c.worktree).await.ok();
+        let existed = c.worktree.exists();
+        // A vanished directory can still have a Git registration that keeps
+        // its branch checked out. Remove that registration before the branch.
+        remove_preserved_worktree(&repo, &c.worktree).await?;
+        if existed {
             removed.push(c.worktree.to_string_lossy().into_owned());
         }
         // A branch handed to a later run (and its pull request) is not this
         // run's to delete.
         let handed_over = state.released_branches.contains(&c.branch);
-        if !handed_over && git::branch_exists(&repo, &c.branch).await.unwrap_or(false) {
-            git::branch_delete(&repo, &c.branch).await.ok();
+        if !handed_over && git::branch_exists(&repo, &c.branch).await? {
+            if !git::branch_delete(&repo, &c.branch).await? {
+                bail!("candidate branch removal refused");
+            }
             removed.push(c.branch.clone());
         }
         state.candidates[i].folded = true;
@@ -11099,7 +11223,7 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> R
         if keep {
             continue;
         }
-        git::worktree_remove(&repo, &path).await.ok();
+        remove_preserved_worktree(&repo, &path).await?;
         removed.push(path.to_string_lossy().into_owned());
     }
 
@@ -11385,6 +11509,25 @@ mod tests {
             failure_signature("exited with Some(2) and no usable output"),
             failure_signature("exited with Some(137) and no usable output")
         );
+        assert_eq!(
+            failure_signature("process exited with no usable output (exit code 2)"),
+            failure_signature("process exited with no usable output (exit code 137)")
+        );
+        for (old, new) in [
+            (
+                "exited with Some(2) and no usable output",
+                "process exited with no usable output (exit code 2)",
+            ),
+            (
+                "exited with None and no usable output",
+                "process exited with no usable output (exit code unavailable)",
+            ),
+        ] {
+            let previous = FailClass::Other(failure_signature(old));
+            let current = FailClass::Other(failure_signature(new));
+            assert_eq!(previous, current, "resumption retains the failure class");
+            assert!(!should_hand_over(Some(&previous), &current));
+        }
         assert_eq!(
             failure_signature("cannot open /tmp/a/b.txt: denied\nsecond line"),
             failure_signature("cannot open /var/x.txt: denied")
@@ -12992,6 +13135,534 @@ mod tests {
             heads.push(git::rev_parse(&candidate.worktree, "HEAD").await.unwrap());
         }
         heads
+    }
+
+    async fn preservation_resume_fixture() -> (tempfile::TempDir, Runner) {
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let mut runner = runner_at(RunStatus::Reviewing);
+        runner.state.repo = repo.clone();
+        runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
+        runner.state.config.graph.worktree_root = Some(tmp.path().join("wt"));
+        for (index, label) in ['A', 'B'].into_iter().enumerate() {
+            let branch = format!("candidate-{label}");
+            let worktree = runner.state.worktree_root().join(format!("cand-{label}"));
+            git::worktree_add_branch(&repo, &worktree, &branch, "main")
+                .await
+                .unwrap();
+            if label == 'B' {
+                std::fs::write(worktree.join("change"), "winner").unwrap();
+                git::rescue_commit(&worktree, "candidate change")
+                    .await
+                    .unwrap();
+            }
+            runner.state.candidates.push(Candidate {
+                index,
+                label,
+                agent: "alpha".into(),
+                branch,
+                worktree,
+                summary: "completed reply".into(),
+                stat: String::new(),
+                files: usize::from(label == 'B'),
+                commits: usize::from(label == 'B'),
+                empty: label == 'A',
+                failed: None,
+                verified_noop: None,
+                duration_ms: 1,
+                folded: false,
+            });
+        }
+        runner.state.judge_skipped = true;
+        runner.state.tally = Some(Tally {
+            first_choice: BTreeMap::new(),
+            borda: BTreeMap::new(),
+            winner: 'B',
+            rankings: 0,
+            unanimous_initial: false,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: false,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+            uncontested: Some("only B produced a change".into()),
+        });
+        runner.state.save().unwrap();
+        (tmp, runner)
+    }
+
+    #[tokio::test]
+    async fn candidate_preservation_does_not_reflag_confirmed_or_folded_empty_candidates() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        // Schema 15 already confirmed the unfolded no-change result.
+        runner.implement().await.unwrap();
+        assert!(runner.state.candidate_preservation.is_empty());
+        assert!(
+            !runner
+                .state
+                .dir()
+                .join("artifacts/candidate-A-recovery")
+                .exists()
+        );
+        runner.fold_losers().await.unwrap();
+        assert!(!runner.state.candidates[0].worktree.exists());
+        for schema in [14, crate::run::SCHEMA] {
+            runner.state.schema = schema;
+            runner.state = crate::run::migrate_schema(runner.state.clone()).unwrap();
+            runner.state.save().unwrap();
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            runner.implement().await.unwrap();
+            assert!(runner.state.candidate_preservation.is_empty());
+            assert!(runner.state.candidates[0].folded);
+            assert_eq!(runner.state.tally.as_ref().unwrap().winner, 'B');
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_preservation_legacy_recovery_blocks_stale_verdict_on_every_resume() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        let wt = runner.state.candidates[0].worktree.clone();
+        std::fs::write(wt.join("recovered"), "owned edits").unwrap();
+        runner.state.schema = 14;
+        runner.state = crate::run::migrate_schema(runner.state.clone()).unwrap();
+        assert!(runner.state.candidate_preservation.contains_key(&'A'));
+        let tally = serde_json::to_value(&runner.state.tally).unwrap();
+        for _ in 0..2 {
+            assert!(runner.implement().await.is_err());
+            assert_eq!(runner.state.status, RunStatus::Blocked);
+            assert!(runner.state.candidate_preservation[&'A'].contains("supported recovery"));
+            assert!(
+                runner.state.candidates[0].empty,
+                "old verdict must remain unusable"
+            );
+            assert_eq!(serde_json::to_value(&runner.state.tally).unwrap(), tally);
+            assert!(runner.state.judge_skipped);
+            assert!(runner.state.judgements.is_empty() && runner.state.votes.is_empty());
+            assert!(
+                crate::run::read_artifact(&runner.state, "cand-A.patch")
+                    .unwrap()
+                    .contains("owned edits")
+            );
+            assert!(wt.exists());
+            assert_eq!(
+                git::commits_ahead(&wt, &runner.state.base_commit, "HEAD")
+                    .await
+                    .unwrap(),
+                1
+            );
+            runner.state = RunState::load(&runner.state.id).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_preservation_legacy_failed_seat_keeps_edits_before_judging() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        let wt = runner.state.candidates[0].worktree.clone();
+        runner.state.candidates[0].failed = Some("CLI failed before commit".into());
+        std::fs::write(wt.join("recovered"), "failed seat edits").unwrap();
+        let index_lock = PathBuf::from(
+            git::git(
+                &wt,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "index.lock",
+                ],
+            )
+            .await
+            .unwrap(),
+        );
+        std::fs::write(&index_lock, "fixture-owned lock").unwrap();
+        runner.state.schema = 14;
+        runner.state = crate::run::migrate_schema(runner.state.clone()).unwrap();
+        assert!(runner.state.candidate_preservation.contains_key(&'A'));
+        assert!(runner.implement().await.is_err());
+        assert!(runner.after_implement().is_err());
+        assert!(runner.fold_losers().await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(wt.join("recovered")).unwrap(),
+            "failed seat edits"
+        );
+        assert!(runner.state.candidate_preservation.contains_key(&'A'));
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        std::fs::remove_file(index_lock).unwrap();
+        // Recovery finds changes that the old uncontested result never judged.
+        assert!(runner.implement().await.is_err());
+        assert!(runner.state.candidate_preservation[&'A'].contains("supported recovery"));
+        assert!(runner.state.candidates[0].empty);
+        assert_eq!(runner.state.tally.as_ref().unwrap().winner, 'B');
+        assert!(
+            crate::run::read_artifact(&runner.state, "cand-A.patch")
+                .unwrap()
+                .contains("failed seat edits")
+        );
+        assert!(wt.exists());
+    }
+
+    #[tokio::test]
+    async fn candidate_preservation_loser_cleanup_resumes_after_branch_and_judge_failures() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        let repo = runner.state.repo.clone();
+        let common = git::git(
+            &repo,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        )
+        .await
+        .unwrap();
+        let branch_lock = PathBuf::from(common).join("refs/heads/candidate-A.lock");
+        std::fs::write(&branch_lock, "fixture-owned lock").unwrap();
+        assert!(runner.fold_losers().await.is_err());
+        assert!(!runner.state.candidates[0].worktree.exists());
+        assert!(!runner.state.candidates[0].folded);
+        assert!(git::branch_exists(&repo, "candidate-A").await.unwrap());
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        std::fs::remove_file(branch_lock).unwrap();
+        let judge = runner.state.worktree_root().join("judge-1");
+        git::worktree_add_detached(&repo, &judge, "main")
+            .await
+            .unwrap();
+        std::fs::write(judge.join("uncommitted"), "retain").unwrap();
+        runner.roles.judges = vec![spec("judge")];
+        assert!(runner.fold_losers().await.is_err());
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        assert!(
+            runner.state.candidates[0].folded,
+            "candidate progress saved before judge failure"
+        );
+        assert!(!git::branch_exists(&repo, "candidate-A").await.unwrap());
+        assert!(judge.join("uncommitted").exists());
+        std::fs::remove_file(judge.join("uncommitted")).unwrap();
+        runner.fold_losers().await.unwrap();
+        assert!(!judge.exists());
+        runner.fold_losers().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn candidate_preservation_selected_implementer_resumes_through_execute_graph() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        runner.state.candidates.retain(|c| c.label == 'B');
+        runner.state.tally = None;
+        runner.state.judge_skipped = false;
+        runner.state.prep_complete = Some(true);
+        runner.state.config.graph.advise = false;
+        runner.state.config.graph.selected_implementer = Some("alpha".into());
+        let wt = runner.state.candidates[0].worktree.clone();
+        std::fs::write(wt.join("leftover"), "completed implementation").unwrap();
+        runner
+            .state
+            .candidate_preservation
+            .insert('B', "awaiting persistence".into());
+        let index_lock = git::git(
+            &wt,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "index.lock",
+            ],
+        )
+        .await
+        .unwrap();
+        std::fs::write(&index_lock, "fixture-owned lock").unwrap();
+        runner.state.save().unwrap();
+        assert!(runner.execute_graph().await.is_err());
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert!(runner.state.candidate_preservation.contains_key(&'B'));
+        std::fs::remove_file(index_lock).unwrap();
+        // Park at the next graph boundary: this tests the real selected-seat
+        // hold guard without dispatching reviewers or publishing anything.
+        for _ in 0..2 {
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            runner.pause.park();
+            runner.execute_graph().await.unwrap();
+            assert_eq!(runner.state.status, RunStatus::Implementing);
+            assert!(runner.state.candidate_preservation.is_empty());
+            assert_eq!(runner.state.candidates[0].commits, 2);
+            assert!(runner.state.tally.is_none());
+        }
+        runner.implement().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::Judging);
+        // A genuine selected-implementer hold must still require release.
+        runner.state.status = RunStatus::Blocked;
+        runner.state.candidates[0].failed = Some("implementation failed".into());
+        runner.state.save().unwrap();
+        let error = runner.execute_graph().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("selected implementation is held")
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_preservation_cleanup_unregisters_a_vanished_worktree() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        let repo = runner.state.repo.clone();
+        let candidate = runner.state.candidates[0].clone();
+        // Remove only the disposable fixture directory, leaving Git's linked
+        // worktree registration and branch intact, as in a vanished checkout.
+        let registered = git::worktree_holding(&repo, &candidate.branch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registered.canonicalize().unwrap(),
+            candidate.worktree.canonicalize().unwrap()
+        );
+        std::fs::remove_dir_all(&candidate.worktree).unwrap();
+        assert_eq!(
+            git::worktree_holding(&repo, &candidate.branch)
+                .await
+                .unwrap(),
+            Some(registered)
+        );
+        assert!(
+            !git::branch_delete(&repo, &candidate.branch).await.unwrap(),
+            "the stale registration initially keeps the branch checked out"
+        );
+        runner.fold_losers().await.unwrap();
+        assert!(runner.state.candidates[0].folded);
+        assert!(!git::branch_exists(&repo, &candidate.branch).await.unwrap());
+        assert_eq!(
+            git::worktree_holding(&repo, &candidate.branch)
+                .await
+                .unwrap(),
+            None
+        );
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        runner.fold_losers().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fold_run_unregisters_a_vanished_worktree_and_can_retry() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        let repo = runner.state.repo.clone();
+        let candidate = runner.state.candidates[0].clone();
+        let winner = runner.state.candidates[1].clone();
+        let registered = git::worktree_holding(&repo, &candidate.branch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registered.canonicalize().unwrap(),
+            candidate.worktree.canonicalize().unwrap()
+        );
+        std::fs::remove_dir_all(&candidate.worktree).unwrap();
+        assert_eq!(
+            git::worktree_holding(&repo, &candidate.branch)
+                .await
+                .unwrap(),
+            Some(registered)
+        );
+        assert!(!git::branch_delete(&repo, &candidate.branch).await.unwrap());
+
+        for _ in 0..2 {
+            fold_run(&mut runner.state, false, &crate::run::home())
+                .await
+                .unwrap();
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            assert!(runner.state.candidates[0].folded);
+            assert!(!git::branch_exists(&repo, &candidate.branch).await.unwrap());
+            assert_eq!(
+                git::worktree_holding(&repo, &candidate.branch)
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert!(!runner.state.candidates[1].folded);
+            assert!(winner.worktree.exists());
+            assert!(git::branch_exists(&repo, &winner.branch).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn candidate_preservation_retries_after_upgrade_without_rerunning_seats() {
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let mut runner = runner_at(RunStatus::Implementing);
+        runner.state.repo = repo.clone();
+        runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
+        runner.state.config.graph.worktree_root = Some(tmp.path().join("wt"));
+        for (index, label) in ['A', 'B'].into_iter().enumerate() {
+            let branch = format!("candidate-{label}");
+            let wt = runner.state.worktree_root().join(format!("cand-{label}"));
+            git::worktree_add_branch(&repo, &wt, &branch, "main")
+                .await
+                .unwrap();
+            std::fs::write(wt.join("README.md"), "tracked edits\n").unwrap();
+            git::git(&wt, &["add", "README.md"]).await.unwrap();
+            std::fs::write(wt.join("README.md"), "later tracked edits\n").unwrap();
+            std::fs::write(wt.join("new-file"), "untracked edits\n").unwrap();
+            runner.state.candidates.push(Candidate {
+                index,
+                label,
+                agent: "alpha".to_owned(),
+                branch,
+                worktree: wt,
+                summary: "completed implementation".to_owned(),
+                stat: String::new(),
+                files: 0,
+                commits: 0,
+                empty: false,
+                failed: None,
+                verified_noop: None,
+                duration_ms: 42,
+                folded: false,
+            });
+            runner
+                .state
+                .candidate_preservation
+                .insert(label, "awaiting persistence".to_owned());
+        }
+        let wt = runner.state.candidates[0].worktree.clone();
+        let index_lock = git::git(
+            &wt,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "index.lock",
+            ],
+        )
+        .await
+        .unwrap();
+        std::fs::write(&index_lock, "fixture-owned lock").unwrap();
+        runner.state.save().unwrap();
+        assert!(runner.persist_candidates().await.is_err());
+        assert!(runner.state.candidate_preservation.contains_key(&'A'));
+        assert!(!runner.state.candidate_preservation.contains_key(&'B'));
+        assert_eq!(
+            runner.state.candidates[1].commits, 1,
+            "other results are still collected"
+        );
+        assert!(
+            !runner.state.candidates[0].empty,
+            "failed rescue is not no change"
+        );
+        assert_eq!(
+            runner.state.candidates[0].summary,
+            "completed implementation"
+        );
+        assert!(runner.after_implement().is_err());
+        let home = tmp.path().join("fold-home");
+        assert!(fold_run(&mut runner.state, true, &home).await.is_err());
+        assert!(wt.join("new-file").exists());
+        let recovery = runner.state.dir().join("artifacts/candidate-A-recovery");
+        assert!(recovery.join("staged.patch").exists());
+        assert!(recovery.join("unstaged.patch").exists());
+        assert_eq!(
+            std::fs::read_to_string(recovery.join("untracked/new-file")).unwrap(),
+            "untracked edits\n"
+        );
+        runner.state.begin_pass();
+        runner.state.end_pass_parked(ParkCause::Upgrade {
+            from: "1.0".into(),
+            to: Some("1.1".into()),
+        });
+        runner.state.save().unwrap();
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        assert!(matches!(
+            runner.state.passes.last().unwrap().end,
+            Some(crate::run::PassEnd::Parked {
+                cause: ParkCause::Upgrade { .. }
+            })
+        ));
+        std::fs::remove_file(index_lock).unwrap();
+        // No implementer is configured: a persistence retry cannot dispatch a seat.
+        runner.implement().await.unwrap();
+        assert!(runner.state.candidate_preservation.is_empty());
+        assert!(
+            runner
+                .state
+                .candidates
+                .iter()
+                .all(|c| c.commits == 1 && !c.empty)
+        );
+        assert!(git::is_clean(&wt).await.unwrap());
+        assert!(
+            crate::run::read_artifact(&runner.state, "cand-A.patch")
+                .unwrap()
+                .contains("later tracked edits")
+        );
+    }
+
+    #[tokio::test]
+    async fn candidate_preservation_git_read_and_cleanup_fail_closed() {
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let wt = tmp.path().join("candidate");
+        git::worktree_add_branch(&repo, &wt, "candidate", "main")
+            .await
+            .unwrap();
+        std::fs::write(wt.join("uncommitted"), "keep").unwrap();
+        assert!(remove_preserved_worktree(&repo, &wt).await.is_err());
+        assert!(wt.join("uncommitted").exists());
+        assert!(git::branch_exists(&repo, "candidate").await.unwrap());
+        std::fs::remove_file(wt.join("uncommitted")).unwrap();
+        let mut runner = runner_at(RunStatus::Implementing);
+        runner.state.repo = repo.clone();
+        runner.state.base_commit = "missing-base".to_owned();
+        runner.state.candidates.push(Candidate {
+            index: 0,
+            label: 'A',
+            agent: "alpha".into(),
+            branch: "candidate".into(),
+            worktree: wt.clone(),
+            summary: "completed".into(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 1,
+            folded: false,
+        });
+        std::fs::write(wt.join("uncommitted"), "keep").unwrap();
+        assert!(
+            fold_run(&mut runner.state, true, &tmp.path().join("home"))
+                .await
+                .is_err()
+        );
+        assert!(!runner.state.candidates[0].folded);
+        assert!(git::branch_exists(&repo, "candidate").await.unwrap());
+        std::fs::remove_file(wt.join("uncommitted")).unwrap();
+        runner
+            .state
+            .candidate_preservation
+            .insert('A', "pending".into());
+        assert!(runner.persist_candidates().await.is_err());
+        assert!(!runner.state.candidates[0].empty);
+        assert!(!runner.state.candidates[0].folded);
+        assert!(wt.exists());
+        runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
+        let patch_path = runner.state.dir().join("artifacts/cand-A.patch");
+        std::fs::create_dir_all(&patch_path).unwrap();
+        assert!(
+            runner.persist_candidates().await.is_err(),
+            "artifact failure stays pending"
+        );
+        assert!(runner.state.candidate_preservation.contains_key(&'A'));
+        assert!(!runner.state.candidates[0].empty);
+        std::fs::remove_dir(patch_path).unwrap();
+        runner.persist_candidates().await.unwrap();
+        assert!(
+            runner.state.candidates[0].empty,
+            "only successful inspection confirms no change"
+        );
     }
 
     fn init_repo(dir: &Path) {

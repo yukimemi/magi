@@ -2787,9 +2787,13 @@ async fn answer_cmd(
 /// thread, a deputy's note indented under the turn it belongs to.
 fn print_question_record(q: &ask::Question) {
     println!("{}  {}", q.short(), q.summary);
-    println!("      status: {:?}", q.status);
+    println!("      status: {}", q.status.as_str());
     if let Some(answer) = &q.answer {
-        println!("      answer: {answer:?}");
+        let (kind, text) = match answer {
+            ask::Answer::Choice(text) => ("chosen", text),
+            ask::Answer::Text(text) => ("answer", text),
+        };
+        println!("      {kind}: {}", text.trim().replace('\n', "\n        "));
     }
     if let Some(authority) = &q.answer_authority {
         println!(

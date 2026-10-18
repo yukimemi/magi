@@ -4967,6 +4967,7 @@ function renderPostingComparison(parent, view) {
 function updateAskCard(row, question, { compact = false } = {}) {
   const r = row.refs;
   updateQuestionIdentity(r.identity, question.id);
+  row.dataset.questionId = question.id;
   const status = String(question.status || "open");
   const open = status === "open";
   const choices = Array.isArray(question.choices) ? question.choices : [];
@@ -5357,7 +5358,9 @@ function renderQuestions() {
          settled ? `${settled} on record` : null].filter(Boolean).join(" \u00b7 "));
 
   show($("questions-empty"), questions.length === 0);
+  const targetWasLoaded = [...list.querySelectorAll(".ask")].some((row) => row.dataset.questionId === state.route.id);
   syncList(list, questions, (q) => q.id, createAskCard, (row, q) => updateAskCard(row, q));
+  if (state.route.name === "questions" && state.route.id && !targetWasLoaded) focusFirstAsk();
 }
 
 /* The operator followed the band here to answer one specific thing; leaving
@@ -5367,8 +5370,17 @@ function focusFirstAsk() {
   requestAnimationFrame(() => {
     // Do not take focus back after the operator has started answering.
     if (document.activeElement !== active) return;
-    const first = $("questions-list").querySelector('.ask[data-state="open"] .ask-summary');
-    if (first) first.focus({ preventScroll: true });
+    const list = $("questions-list");
+    const target = state.route.name === "questions" && state.route.id
+      ? [...list.querySelectorAll(".ask")].find((row) => row.dataset.questionId === state.route.id)
+      : null;
+    const specific = state.route.name === "questions" && state.route.id;
+    const first = specific ? target?.querySelector(".ask-summary")
+      : list.querySelector('.ask[data-state="open"] .ask-summary');
+    if (first) {
+      first.focus({ preventScroll: true });
+      if (target) target.scrollIntoView({ block: "center" });
+    }
   });
 }
 
@@ -9192,17 +9204,16 @@ function renderBell() {
 function noticeCoveredBy(qid) {
   if (!qid) return null;
   const short = shortId(qid);
-  if (!state.questions) {
-    return el("span", { text: `in question ${short}` });
-  }
-  const q = state.questions.find((item) => item.id === qid);
-  if (q && q.status === "open") {
-    return el("a", { href: "#/questions", text: `Answer in question ${short}` });
-  }
-  if (q) {
+  const q = state.questions?.find((item) => item.id === qid);
+  if (q && q.status !== "open") {
     return el("span", { text: `Question ${short} (resolved)` });
   }
-  return el("span", { text: `Question ${short} (closed)` });
+  if (state.questions && !q) {
+    return el("span", { text: `Question ${short} (closed)` });
+  }
+  // Only the server's answerable_question supplies a response action. A
+  // historical association must not solicit an answer during a refresh race.
+  return el("span", { text: `Associated question ${short}` });
 }
 
 function noticeLink(link) {
@@ -9236,7 +9247,12 @@ function renderNotifications() {
   clear(list);
   for (const n of items) {
     const at = when(n.last_at);
-    const link = noticeLink(n.link);
+    const questionLink = n.answerable_question ? el("a", {
+      href: `#/questions/${encodeURIComponent(n.answerable_question)}`,
+      text: "Open question to respond",
+    }) : null;
+    const subjectLink = noticeLink(n.link);
+    const link = questionLink || subjectLink;
     const unread = !n.read_at;
     /* The link itself is the one reliable tap target on a phone, but it is a
        small piece of text at the end of the meta row - a tap on the message,
@@ -9249,11 +9265,12 @@ function renderNotifications() {
       onclick: link ? (event) => { if (!event.target.closest("a, button")) link.click(); } : null },
       linkify(el("div", { class: "notice-msg" }), n.message),
       el("div", { class: "notice-meta" },
-        el("span", { text: n.severity }),
+        el("span", { text: { info: "Information", warn: "Warning", error: "Error" }[n.severity] || "Notification" }),
         el("time", { datetime: n.last_at, title: at.title, text: at.text }),
         n.count > 1 ? el("span", { text: `\u00d7${n.count}` }) : null,
-        noticeCoveredBy(n.covered_by),
-        link),
+        el("span", { text: questionLink ? "Related open question" : "Notification · no reply here" }),
+        link,
+        questionLink ? subjectLink : noticeCoveredBy(n.covered_by)),
       el("div", { class: "notice-actions" },
         unread ? el("button", { class: "btn btn-quiet", type: "button", text: "Mark read",
           onclick: () => noticeAction(API.notificationRead(n.id), "Could not mark read") }) : null,
@@ -9429,7 +9446,7 @@ async function applyRevisions_(source) {
   const taskStale = queueRev !== state.rev.queue || runsRev !== state.rev.runs;
   const talkStale = queueRev !== state.rev.queue || talksRev !== state.rev.talks;
 
-  if (notificationsRev !== state.rev.notifications) {
+  if (notificationsRev !== state.rev.notifications || questionsRev !== state.rev.questions) {
     state.rev.notifications = notificationsRev;
     jobs.push(loadNotifications());
   }
@@ -9534,7 +9551,7 @@ function parseRoute() {
   if (parts[0] === "queue") return { name: "queue", id: null };
   if (parts[0] === "stats") return { name: "stats", id: null };
   if (parts[0] === "settings") return { name: "settings", id: null };
-  if (parts[0] === "questions") return { name: "questions", id: null };
+  if (parts[0] === "questions") return { name: "questions", id: parts[1] ? decodeURIComponent(parts[1]) : null };
   if (parts[0] === "notifications") return { name: "notifications", id: null };
   if (parts[0] === "chat" && parts[1]) return { name: "talk", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "chat") return { name: "talks", id: null };

@@ -1945,10 +1945,10 @@ fn task_report_with(
     if let Some(r) = n.reason.filter(|r| !r.trim().is_empty()) {
         s.push_str(&format!("- Reason: {}\n", clean(r, 600)));
     }
-    if let Some(r) = n.run {
+    if let Some(r) = crate::notices::detail(n.run) {
         s.push_str(&format!("- Run: `{}`\n", clean(r, 120)));
     }
-    if let Some(p) = n.pr {
+    if let Some(p) = crate::notices::detail(n.pr) {
         s.push_str(&format!("- Pull request: {}\n", clean(p, 2048)));
     }
     if let Some(m) = n.summary.filter(|m| !m.trim().is_empty()) {
@@ -1958,7 +1958,7 @@ fn task_report_with(
         facts: s.clone(),
         output: None,
         task: Some(clean(n.id, 120)),
-        run: n.run.map(|r| clean(r, 120)),
+        run: crate::notices::detail(n.run).map(|r| clean(r, 120)),
     };
     s = format!(
         "# {CHAT_TASK_NOTICE_HEADING}\n\nThis is an automatic report from magi, not a message from the operator. A task filed from this conversation reached a final state.\n\n{s}"
@@ -4183,6 +4183,24 @@ mod tests {
 #[cfg(test)]
 mod notification_display_tests {
     use super::*;
+
+    #[test]
+    fn notification_display_omits_empty_optional_chat_facts() {
+        let (body, display) = chat_task_report(&ChatTaskNotice {
+            id: "t1",
+            title: "Change",
+            status: "held",
+            reason: Some(" "),
+            run: Some("\t"),
+            pr: Some("\n"),
+            summary: Some(""),
+        });
+        for label in ["- Reason:", "- Run:", "- Pull request:", "- Result:"] {
+            assert!(!body.contains(label));
+            assert!(!display.facts.contains(label));
+        }
+        assert_eq!(display.run, None);
+    }
 
     #[test]
     fn notification_display_scrubs_new_and_legacy_task_facts() {

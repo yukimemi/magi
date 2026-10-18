@@ -6723,6 +6723,15 @@ async fn notifications_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<serde_j
     blocking(move || {
         let items = ui.notices.list();
         let unread = items.iter().filter(|n| n.unread()).count();
+        let items: Vec<_> = items
+            .into_iter()
+            .map(|n| {
+                let question = crate::notices::answerable_question(&n, &ui.questions);
+                let mut item = serde_json::to_value(n)?;
+                item["answerable_question"] = serde_json::json!(question);
+                Ok(item)
+            })
+            .collect::<anyhow::Result<_>>()?;
         Ok(Json(
             serde_json::json!({ "unread": unread, "items": items }),
         ))
@@ -11351,6 +11360,41 @@ mod tests {
             .await;
         assert_eq!(res.status, 404, "{}", res.body);
         assert!(res.json()["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn notifications_resolve_live_questions_without_changing_saved_notices() {
+        let fx = Fixture::start().await;
+        let questions = Questions::at(fx.home.path().join("questions"));
+        let store = Notices::at(fx.home.path().join("notifications"));
+        let mut q = ask::Question::new(
+            "t1".into(),
+            "conduct".into(),
+            "conductor".into(),
+            "Continue?".into(),
+            String::new(),
+            Vec::new(),
+        );
+        questions.put(&mut q).unwrap();
+        let mut n = Notice::warn("task:t1", "Task t1 is held.");
+        n.covered_by = Some(q.id.clone());
+        let n = store.raise(n).unwrap();
+        let listed = fx.get("/api/notifications").await.json();
+        assert_eq!(listed["items"][0]["answerable_question"], q.id);
+        questions
+            .update(&q.id, |q| {
+                q.abandon("run gone");
+                Ok(())
+            })
+            .unwrap();
+        let listed = fx.get("/api/notifications").await.json();
+        assert!(listed["items"][0]["answerable_question"].is_null());
+        assert_eq!(store.get(&n.id).unwrap().covered_by, Some(q.id));
+        assert!(
+            !std::fs::read_to_string(store.root().join(format!("{}.json", n.id)))
+                .unwrap()
+                .contains("answerable_question")
+        );
     }
 
     #[tokio::test]
@@ -18272,14 +18316,25 @@ mod tests {
         let body = &APP_JS[start..];
         let body = &body[..body.find("\n}\n").expect("noticeCoveredBy ends")];
 
-        // An open question provides an actionable link to the questions route
-        assert!(body.contains("q.status === \"open\""));
-        assert!(body.contains("href: \"#/questions\""));
-        assert!(body.contains("Answer in question"));
+        // Historical associations are informational, even for open questions.
+        assert!(body.contains("Associated question ${short}"));
+        assert!(!body.contains("el(\"a\""));
 
         // A resolved question displays status rather than an actionable link
         assert!(body.contains("(resolved)"));
         assert!(body.contains("(closed)"));
+
+        let start = APP_JS
+            .find("function renderNotifications()")
+            .expect("renderNotifications exists");
+        let body = &APP_JS[start..];
+        let body = &body[..body.find("\n}\n").expect("renderNotifications ends")];
+
+        // Only a server-resolved answerable question supplies a response link.
+        assert!(body.contains("const questionLink = n.answerable_question ? el(\"a\", {"));
+        assert!(body.contains("href: `#/questions/${encodeURIComponent(n.answerable_question)}`"));
+        assert!(body.contains("text: \"Open question to respond\",\n    }) : null;"));
+        assert!(body.contains("questionLink ? subjectLink : noticeCoveredBy(n.covered_by)"));
     }
 
     /// Chat rows are two lines at every width: the title alone, then the

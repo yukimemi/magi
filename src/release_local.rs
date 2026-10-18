@@ -303,9 +303,49 @@ pub async fn run_job(env: &Env<'_>, job: &mut Job, save: Save<'_>) -> Result<()>
     // fresh checkout would skip the build and attach nothing. Only a finished
     // release cleans up.
     if job.finished {
-        let _ = git::worktree_remove(env.repo, &wt).await;
+        remove_release_worktree(env.repo, &wt).await?;
     }
     result
+}
+
+/// Remove disposable release output, retaining registered trees if Git refuses.
+/// An unregistered leftover may be removed only after registration is checked
+/// successfully; a live foreign repository is never a leftover.
+async fn remove_release_worktree(repo: &Path, wt: &Path) -> Result<()> {
+    if !wt.exists() {
+        return Ok(());
+    }
+    if !std::fs::symlink_metadata(wt)?.is_dir() {
+        bail!("release checkout is not a directory: {}", wt.display());
+    }
+    if git::worktree_remove(repo, wt)
+        .await
+        .context("remove release checkout")?
+    {
+        return Ok(());
+    }
+    // Do not infer missing registration from the removal error: locked trees
+    // and permission errors must not become permission to delete by hand.
+    let listing = git::git(repo, &["worktree", "list", "--porcelain", "-z"])
+        .await
+        .context("check release checkout registration")?;
+    let target = std::fs::canonicalize(wt)?;
+    for entry in listing.split('\0') {
+        if let Some(path) = entry.strip_prefix("worktree ") {
+            let registered = Path::new(path);
+            if registered == wt || std::fs::canonicalize(registered)? == target {
+                bail!("release checkout removal refused: {}", wt.display());
+            }
+        }
+    }
+    if wt.join(".git").exists() && git::git_raw(wt, &["rev-parse", "--git-dir"]).await?.ok() {
+        bail!(
+            "release checkout contains an unregistered repository: {}",
+            wt.display()
+        );
+    }
+    std::fs::remove_dir_all(wt).context("remove unregistered release checkout")?;
+    Ok(())
 }
 
 async fn drive(env: &Env<'_>, dir: &Path, wt: &Path, job: &mut Job, save: Save<'_>) -> Result<()> {
@@ -321,8 +361,7 @@ async fn drive(env: &Env<'_>, dir: &Path, wt: &Path, job: &mut Job, save: Save<'
         && git::rev_parse(wt, "HEAD").await.ok().as_deref() == Some(job.commit.as_str());
     if !reusable {
         if wt.exists() {
-            let _ = git::worktree_remove(repo, wt).await;
-            let _ = std::fs::remove_dir_all(wt);
+            remove_release_worktree(repo, wt).await?;
         }
         // The merge commit exists on the remote; this checkout may not have it
         // yet. A failed fetch is only fatal if the commit is still missing.
@@ -768,6 +807,69 @@ mod tests {
         go(&f, &rel, &mut job).await.unwrap();
         assert!(job.finished);
         assert!(!wt.exists(), "a finished release removes its checkout");
+    }
+
+    #[tokio::test]
+    async fn release_preclean_recovers_an_unregistered_leftover() {
+        let f = fixture();
+        let wt = job_dir(&f.home, "o/r#1").join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("leftover"), "interrupted setup").unwrap();
+        let mut job = Job::new("1.0.0", "u", &f.commit);
+        go(&f, &release(&["test ! -e leftover"]), &mut job)
+            .await
+            .unwrap();
+        assert!(job.finished);
+        assert!(!wt.exists());
+    }
+
+    #[tokio::test]
+    async fn release_preclean_recovers_a_pruned_checkout_with_a_stale_git_link() {
+        let f = fixture();
+        let wt = job_dir(&f.home, "o/r#1").join("wt");
+        git::worktree_add_detached(&f.repo, &wt, &f.commit)
+            .await
+            .unwrap();
+        let moved = wt.with_file_name("moved");
+        std::fs::rename(&wt, &moved).unwrap();
+        g(&f.repo, &["worktree", "prune", "--expire", "now"]);
+        std::fs::rename(&moved, &wt).unwrap();
+        let mut job = Job::new("1.0.0", "u", &f.commit);
+        go(&f, &release(&["true"]), &mut job).await.unwrap();
+        assert!(job.finished);
+        assert!(!wt.exists());
+    }
+
+    #[tokio::test]
+    async fn release_preclean_retains_an_unregistered_live_repository() {
+        let f = fixture();
+        let wt = job_dir(&f.home, "o/r#1").join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        g(&wt, &["init", "-q"]);
+        std::fs::write(wt.join("owned"), "retain").unwrap();
+        let mut job = Job::new("1.0.0", "u", &f.commit);
+        let err = go(&f, &release(&["true"]), &mut job).await.unwrap_err();
+        assert!(err.to_string().contains("unregistered repository"), "{err}");
+        assert!(wt.join("owned").exists());
+        assert!(!job.tag_done);
+    }
+
+    #[tokio::test]
+    async fn finished_release_reports_cleanup_refusal_and_keeps_the_checkout() {
+        let f = fixture();
+        let mut job = Job::new("1.0.0", "u", &f.commit);
+        let rel = release(&["touch built.txt", "git worktree lock ."]);
+        let err = go(&f, &rel, &mut job).await.unwrap_err().to_string();
+        assert!(err.contains("release checkout removal refused"), "{err}");
+        assert!(job.finished);
+        let wt = job_dir(&f.home, "o/r#1").join("wt");
+        assert!(wt.join("built.txt").exists());
+        g(&f.repo, &["worktree", "unlock", wt.to_str().unwrap()]);
+        // Retrying cleanup does not repeat any completed release command.
+        go(&f, &rel, &mut job).await.unwrap();
+        assert_eq!(job.done, 2);
+        assert!(!wt.exists());
+        assert!(!g(&f.repo, &["worktree", "list", "--porcelain"]).contains(wt.to_str().unwrap()));
     }
 
     #[tokio::test]

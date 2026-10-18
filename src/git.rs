@@ -292,16 +292,19 @@ fn parse_worktree_holder(listing: &str, branch: &str) -> Option<PathBuf> {
     None
 }
 
-/// Remove a worktree. Returns `Ok(false)` when git refused (e.g. the path is
-/// already gone), so callers can keep folding the rest of a run.
+/// Force removal of a disposable worktree, including build output or conflicts.
+/// Candidate work must use [`worktree_remove_clean`] instead.
+/// Returns `Ok(false)` on refusal; callers must retain their ownership record.
 pub async fn worktree_remove(repo: &Path, path: &Path) -> Result<bool> {
     let path_s = path.to_string_lossy().to_string();
     let out = git_raw(repo, &["worktree", "remove", "--force", &path_s]).await?;
     if out.ok() {
         return Ok(true);
     }
-    // A worktree whose directory was deleted by hand only needs pruning.
-    git_raw(repo, &["worktree", "prune"]).await?;
+    // Do not prune metadata for an existing tree after any refusal.
+    if !path.exists() {
+        git_raw(repo, &["worktree", "prune"]).await?;
+    }
     Ok(false)
 }
 
@@ -655,6 +658,65 @@ async fn nul_list(worktree: &Path, args: &[&str]) -> Result<Vec<String>> {
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
         .collect())
+}
+
+/// Index-independent recovery evidence. Never treats a snapshot as a commit.
+/// Preserve staged and working tree changes separately, plus untracked bytes.
+/// Failure leaves the original tree untouched and is reported by the caller.
+pub async fn snapshot_uncommitted(worktree: &Path, destination: &Path) -> Result<()> {
+    if destination.exists() {
+        if destination.join("complete").exists() {
+            return Ok(());
+        }
+        bail!("earlier recovery snapshot is incomplete; retain original worktree");
+    }
+    std::fs::create_dir_all(destination)?;
+    for (name, args) in [
+        ("status.txt", vec!["status", "--porcelain=v1"]),
+        ("staged.patch", vec!["diff", "--binary", "--cached"]),
+        ("unstaged.patch", vec!["diff", "--binary"]),
+    ] {
+        // GitOut trims stdout for display. Recovery patches need exact bytes,
+        // including trailing whitespace and no-final-newline markers.
+        let out = Command::new("git")
+            .args(&args)
+            .current_dir(worktree)
+            .quiet()
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        if !out.status.success() {
+            bail!(
+                "recovery snapshot failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::fs::write(destination.join(name), out.stdout)?;
+    }
+    let paths = nul_list(
+        worktree,
+        &["ls-files", "-z", "--others", "--exclude-standard"],
+    )
+    .await?;
+    for name in paths {
+        let relative = Path::new(&name);
+        if relative
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            bail!("unsafe recovery path");
+        }
+        let source = worktree.join(relative);
+        let target = destination.join("untracked").join(relative);
+        std::fs::create_dir_all(target.parent().context("untracked recovery parent")?)?;
+        if std::fs::symlink_metadata(&source)?.file_type().is_symlink() {
+            // Do not follow a link outside the checkout or silently flatten it.
+            bail!("untracked symlink requires manual recovery: {name}");
+        }
+        std::fs::copy(source, target)?;
+    }
+    std::fs::write(destination.join("complete"), "snapshot captured\n")?;
+    Ok(())
 }
 
 /// [`commit_all`] for an agent's leftover work, minus stray foreign lockfiles.
@@ -1658,6 +1720,36 @@ mod tests {
             stray_lockfiles(&s(&["a/Cargo.lock"]), &s(&["Cargo.toml"])).len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn clean_removal_preserves_edits_while_scratch_removal_discards_them() {
+        let (guard, repo) = scratch().await;
+        let wt = guard.path().join("scratch-wt");
+        worktree_add_detached(&repo, &wt, "HEAD").await.unwrap();
+        tokio::fs::write(wt.join("built.txt"), "build output")
+            .await
+            .unwrap();
+        assert!(!worktree_remove_clean(&repo, &wt).await.unwrap());
+        assert!(wt.join("built.txt").exists());
+        let listing = git(&repo, &["worktree", "list", "--porcelain"])
+            .await
+            .unwrap();
+        let registered = listing
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .map(PathBuf::from)
+            .find(|path| path.canonicalize().unwrap() == wt.canonicalize().unwrap())
+            .expect("the refused removal must retain the worktree registration");
+        assert!(worktree_remove(&repo, &wt).await.unwrap());
+        assert!(!wt.exists());
+        let listing = git(&repo, &["worktree", "list", "--porcelain"])
+            .await
+            .unwrap();
+        assert!(!listing.lines().any(|line| {
+            line.strip_prefix("worktree ")
+                .is_some_and(|path| Path::new(path) == registered)
+        }));
     }
 
     #[tokio::test]
