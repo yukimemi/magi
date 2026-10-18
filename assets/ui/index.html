@@ -581,6 +581,12 @@
       <p class="view-sub" id="talk-meta"></p>
     </div>
 
+    <div class="talk-task-progress" id="talk-task-progress" role="status">
+      <span id="talk-task-progress-text">Tasks filed from this chat: not loaded yet.</span>
+      <button type="button" class="btn btn-quiet" id="talk-task-progress-open" aria-controls="talk-tasks-panel" hidden></button>
+      <p class="panel-note" id="talk-task-progress-note" hidden>Other unresolved matters in this conversation still need your review before closing it.</p>
+    </div>
+
     <ol class="turns" id="talk-turns"></ol>
 
     <!-- A turn can run for `talk::TURN_TIMEOUT` while the agent investigates,

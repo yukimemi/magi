@@ -5860,13 +5860,32 @@ function talkShell(id, summary) {
   };
 }
 
+const talkDetailRequests = new Map();
+function nextTalkRequest(id) {
+  const request = (talkDetailRequests.get(id) || 0) + 1;
+  talkDetailRequests.set(id, request);
+  return request;
+}
+
+/* Operation responses omit detail-only fields. Keep the last known task
+   snapshot until a fresh detail arrives, and supersede older reads. */
+function acceptTalkUpdate(talk) {
+  if (state.talkDetail.id !== talk.id) return;
+  state.talkDetail.talk = { ...state.talkDetail.talk, ...talk };
+  loadTalk(talk.id, { background: true });
+}
+
 async function loadTalk(id, { background = false } = {}) {
+  const detail = state.talkDetail;
+  const request = nextTalkRequest(id);
   const wait = state.talkWaits.get(id);
   const observed = wait && { generation: wait.generation, startedAt: Date.now() };
   try {
     const talk = await getJson(API.talk(id));
+    if (request !== talkDetailRequests.get(id)) return;
     trackTalkThinking(talk, observed);
     if (state.talkDetail.id !== id) return;
+    if (state.talkDetail !== detail) return;
     state.talkDetail.talk = talk;
     state.talkDetail.roster = Array.isArray(talk.roster) ? talk.roster : [];
     state.talkDetail.personas = Array.isArray(talk.personas) ? talk.personas : [];
@@ -5874,6 +5893,8 @@ async function loadTalk(id, { background = false } = {}) {
     renderTalk();
     ok();
   } catch (error) {
+    if (request !== talkDetailRequests.get(id)) return;
+    if (state.talkDetail.id === id && state.talkDetail !== detail) return;
     /* 404 means the conversation is gone: nothing will ever end its wait by
        growing the transcript, so settle it here. Other errors keep the wait
        and are retried. */
@@ -5895,34 +5916,49 @@ async function loadTalk(id, { background = false } = {}) {
   }
 }
 
-/* A standing Chat can outlive dozens of tasks filed from it, so the panel
-   defaults folded and this is what stays visible either way: not a count,
-   but the breakdown an operator actually reads it for - whether what they
-   filed is moving, stuck, or still waiting its turn. Order puts the states
-   that want a human (running, held, failed) ahead of the quiet ones, and a
-   zero count is left out rather than printed as "0 done". */
-function talkTasksSummary(tasks) {
-  const counts = { running: 0, held: 0, failed: 0, parked: 0, queued: 0, done: 0 };
-  for (const task of tasks) {
-    const status = String(task.status_str || task.status || "");
-    if (status in counts) counts[status] += 1;
-  }
-  const parts = [`${tasks.length} filed`];
-  for (const key of ["running", "held", "failed", "parked", "queued", "done"]) {
-    if (counts[key]) parts.push(`${counts[key]} ${key}`);
-  }
-  return parts.join(" · ");
+/* The server uses Done alone as completion, for the same tasks as the list. */
+function talkTasksSummary(progress) {
+  return ["running", "held", "blocked", "failed", "parked", "queued", "done"]
+    .filter((status) => progress.counts[status] > 0)
+    .map((status) => `${progress.counts[status]} ${status}`).join(" · ");
 }
 
 const TALK_TASKS_STORAGE_KEY = "magi.talkTasksOpen";
 
 function renderTalkTasks(talk) {
   const panel = $("talk-tasks-panel");
+  const progress = talk && talk.task_progress;
   const tasks = Array.isArray(talk && talk.tasks) ? talk.tasks : [];
-  show(panel, tasks.length > 0);
-  if (tasks.length === 0) return;
-  setText($("talk-tasks-count"), talkTasksSummary(tasks));
-  syncList($("talk-tasks"), tasks, (t) => t.id, createTalkTaskRow, updateTalkTaskRow);
+  const status = $("talk-task-progress");
+  const text = $("talk-task-progress-text");
+  const link = $("talk-task-progress-open");
+  show(status, true);
+  show(link, Boolean(progress && progress.state === "incomplete"));
+  show($("talk-task-progress-note"), Boolean(progress && progress.state === "complete"));
+  if (!progress) {
+    setText(text, "Tasks filed from this chat: not loaded yet.");
+  } else if (progress.state === "none") {
+    setText(text, "No tasks filed from this chat.");
+  } else if (progress.state === "complete") {
+    setText(text, `Tasks filed from this chat: all ${progress.total} complete.`);
+  } else {
+    setText(text, "Tasks filed from this chat: ");
+    setText(link, `${progress.total - progress.done} of ${progress.total} unfinished`);
+    link.onclick = () => {
+      panel.open = true;
+      const first = $("talk-tasks").querySelector("a");
+      if (first) {
+        first.scrollIntoView({ block: "center" });
+        first.focus({ preventScroll: true });
+      }
+    };
+  }
+  show(panel, Boolean(progress && tasks.length));
+  if (!progress || tasks.length === 0) return;
+  setText($("talk-tasks-count"), talkTasksSummary(progress));
+  const unfinished = new Set(progress.unfinished_ids);
+  const ordered = [...tasks].sort((a, b) => Number(unfinished.has(b.id)) - Number(unfinished.has(a.id)));
+  syncList($("talk-tasks"), ordered, (t) => t.id, createTalkTaskRow, updateTalkTaskRow);
 
   /* Folded is the default for any conversation the operator hasn't touched
      this panel on before; once they open or close it here, that sticks by
@@ -5985,6 +6021,10 @@ function renderTalk() {
     clear($("talk-status"));
     clear($("talk-turns"));
     show($("talk-tasks-panel"), false);
+    show($("talk-task-progress"), !gone);
+    setText($("talk-task-progress-text"), "Tasks filed from this chat: not loaded yet.");
+    show($("talk-task-progress-open"), false);
+    show($("talk-task-progress-note"), false);
     show($("talk-say"), false);
     show($("talk-composer"), !gone);
     show($("talk-closed"), false);
@@ -6165,7 +6205,7 @@ async function switchTalkAgent() {
     /* Only the conversation still on screen takes the answer: the operator
        may have navigated away while this was in flight. */
     if (state.talkDetail.id === id) {
-      state.talkDetail.talk = talk;
+      acceptTalkUpdate(talk);
       announce(`Agent changed to ${agent}.`);
     }
     loadTalks().catch(() => {});
@@ -6232,7 +6272,7 @@ async function switchTalkImplementers() {
     const talk = await postJson(API.talkImplementers(id), { implementers });
     rememberTalkDefault("implementers", talk.implementers || 1);
     if (state.talkDetail.id === id) {
-      state.talkDetail.talk = talk;
+      acceptTalkUpdate(talk);
       announce(`Implementers set to ${implementers === 1 ? "Solo" : implementers}.`);
     }
     loadTalks().catch(() => {});
@@ -6261,7 +6301,7 @@ async function switchTalkPersona() {
     const talk = await postJson(API.talkPersona(id), { persona });
     rememberTalkDefault("persona", talk.persona || "default");
     if (state.talkDetail.id === id) {
-      state.talkDetail.talk = talk;
+      acceptTalkUpdate(talk);
       announce(`Persona changed to ${persona}.`);
     }
     loadTalks().catch(() => {});
@@ -6316,7 +6356,7 @@ async function resumeTalkPending() {
   try {
     const next = await postJson(API.talkPendingResume(id), {});
     if (state.talkDetail.id === id) {
-      state.talkDetail.talk = next;
+      acceptTalkUpdate(next);
       trackTalkThinking(next);
       renderTalk();
     }
@@ -6343,7 +6383,7 @@ async function editTalkPending(messageIndex) {
   try {
     const next = await postJson(API.talkPendingEdit(id), { text, message: messageIndex, expected_text: expectedText, expected_attachments: expectedAttachments });
     if (state.talkDetail.id === id) {
-      state.talkDetail.talk = next;
+      acceptTalkUpdate(next);
       trackTalkThinking(next);
       renderTalk();
     }
@@ -6366,7 +6406,7 @@ async function clearTalkPending() {
   try {
     const next = await postJson(API.talkPendingClear(id), { expected_text: expectedText, expected_attachments: expectedAttachments });
     if (state.talkDetail.id === id) {
-      state.talkDetail.talk = next;
+      acceptTalkUpdate(next);
       renderTalk();
     }
     announce("Queued message cleared.");
@@ -6601,6 +6641,7 @@ async function startTalk() {
     renderTalks();
     announce("Conversation opened.");
     location.hash = `#/chat/${talk.id}`;
+    loadTalk(talk.id, { background: true });
     ok();
   } catch (failure) {
     fail(`Could not open a conversation: ${failure.message}`);
@@ -6654,7 +6695,7 @@ async function sendTalkTurn(event) {
     trackTalkThinking(queued, wait && { generation: wait.generation, startedAt: Date.now() });
     releaseTalkAttachments(submissionAttachments);
     if (state.talkDetail.id === id) {
-      state.talkDetail.talk = queued;
+      acceptTalkUpdate(queued);
       renderTalk();
       announce("Sent. The agent is answering.");
     }
@@ -6676,7 +6717,7 @@ async function closeTalk() {
   button.disabled = true;
   try {
     const talk = await postJson(API.talkClose(id), {});
-    state.talkDetail.talk = talk;
+    acceptTalkUpdate(talk);
     renderTalk();
     await loadTalks();
     announce("Conversation closed.");
@@ -6695,7 +6736,7 @@ async function reopenTalk() {
   button.disabled = true;
   try {
     const talk = await postJson(API.talkReopen(id), {});
-    state.talkDetail.talk = talk;
+    acceptTalkUpdate(talk);
     renderTalk();
     await loadTalks();
     announce("Conversation reopened.");
@@ -9386,6 +9427,7 @@ async function applyRevisions_(source) {
 
   /* Same reason, read before the revisions are overwritten. */
   const taskStale = queueRev !== state.rev.queue || runsRev !== state.rev.runs;
+  const talkStale = queueRev !== state.rev.queue || talksRev !== state.rev.talks;
 
   if (notificationsRev !== state.rev.notifications) {
     state.rev.notifications = notificationsRev;
@@ -9417,7 +9459,9 @@ async function applyRevisions_(source) {
      reaches a phone whose own POST is still outstanding. */
   if (talksRev !== state.rev.talks) {
     jobs.push(loadTalks({ rev: talksRev, delta: source.talks_delta }));
-    if (state.route.name === "talk" && state.talkDetail.id && !state.talkDetail.gone) jobs.push(loadTalk(state.talkDetail.id, { background: true }));
+  }
+  if (talkStale && state.route.name === "talk" && state.talkDetail.id && !state.talkDetail.gone) {
+    jobs.push(loadTalk(state.talkDetail.id, { background: true }));
   }
   /* Bumped by this process whenever the loop it owns starts, stops, claims or
      finishes, so a phone learns about a tap it did not make. Guarded on the

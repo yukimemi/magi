@@ -32,7 +32,23 @@ impl Identity {
     }
 }
 
-fn lease(home: &Path, id: &str) -> Result<File> {
+/// Release ownership when the guard ends, even if a concurrent fork still
+/// holds a copy of the file description before exec closes it.
+struct ExecutionLease {
+    _file: File,
+}
+
+#[cfg(unix)]
+impl Drop for ExecutionLease {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the live file owns this descriptor. Explicit unlock releases
+        // the flock even while an inherited descriptor remains open.
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
+fn lease(home: &Path, id: &str) -> Result<ExecutionLease> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -40,7 +56,7 @@ fn lease(home: &Path, id: &str) -> Result<File> {
         .truncate(false)
         .open(home.join("runs").join(id).join("driver.lock"))?;
     crate::pr_head::try_lock_file(&file).context("run execution lease unavailable")?;
-    Ok(file)
+    Ok(ExecutionLease { _file: file })
 }
 
 /// A held lease is evidence of an execution, including within a long-lived
@@ -81,7 +97,7 @@ pub(crate) struct DriverGuard {
     home: PathBuf,
     id: String,
     identity: Identity,
-    _lease: File,
+    _lease: ExecutionLease,
     finished: bool,
 }
 
@@ -367,12 +383,17 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut s = state(home.path());
         let old = claim(home.path(), &s);
+        // Model descriptors inherited by concurrent process launches before exec.
+        #[cfg(unix)]
+        let _old_inherited = old._lease._file.try_clone().unwrap();
         let path = home.path().join("runs").join(&s.id).join("run.json");
         let saved = std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         drop(old);
         std::fs::write(&path, saved).unwrap();
         let mut new = DriverGuard::acquire(home.path(), &s).unwrap();
+        #[cfg(unix)]
+        let _new_inherited = new._lease._file.try_clone().unwrap();
         s.begin_pass();
         new.bind(&s);
         // A failed run.json write leaves the old disk generation untouched.
@@ -380,6 +401,31 @@ mod tests {
         let disk = RunState::load_under(&s.id, home.path()).unwrap();
         assert!(!disk.driver_exited);
         assert_eq!(disk.liveness_under(home.path(), false), Liveness::Dead);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn execution_lease_releases_even_with_an_inherited_descriptor() {
+        for finished in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let mut s = state(home.path());
+            let mut guard = claim(home.path(), &s);
+            let inherited = guard._lease._file.try_clone().unwrap();
+            assert!(DriverGuard::acquire(home.path(), &s).is_err());
+            if finished {
+                guard.finish(&mut s).unwrap();
+            }
+            drop(guard);
+            let next = DriverGuard::acquire(home.path(), &s)
+                .expect("ending execution must release its lease before inherited copies close");
+            drop(inherited);
+            assert!(
+                DriverGuard::acquire(home.path(), &s).is_err(),
+                "closing an old copy must not unlock the next execution"
+            );
+            drop(next);
+            assert!(DriverGuard::acquire(home.path(), &s).is_ok());
+        }
     }
 
     #[test]
