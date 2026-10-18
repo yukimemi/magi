@@ -43,8 +43,9 @@ struct ExecutionLease {
 impl Drop for ExecutionLease {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd as _;
-        // SAFETY: the live file owns this descriptor. Explicit unlock releases
-        // the flock even while an inherited descriptor remains open.
+        // SAFETY: this live guard owns the descriptor. Explicit unlock releases
+        // the shared open-file-description lock even if a concurrent fork has
+        // inherited a duplicate that has not yet been closed by exec.
         unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
@@ -177,8 +178,8 @@ impl Drop for DriverGuard {
         if let Err(e) = result {
             tracing::warn!("could not release run {} driver: {e:#}", self.id);
         }
-        // On save failure the OS still releases the lease; the next judge or
-        // startup reconciliation can prove this pass has stopped.
+        // On save failure the lease field still unlocks on drop; the next
+        // judge or startup reconciliation can prove this pass has stopped.
     }
 }
 

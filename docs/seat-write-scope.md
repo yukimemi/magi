@@ -32,6 +32,30 @@ change. Notification webhooks remain best effort; network access is not added.
 Deputies and consulted chats keep their existing explicit, purpose-specific
 grants and do not gain repository metadata access through this policy.
 
+## Parent-owned review and verification
+
+Child seats in an existing run implement and commit their assigned changes and
+run necessary focused checks. The parent graph owns the review loop, full
+verification and final gate, including reruns after repairs. Child seats must
+not launch `magi review`, `magi run` or another nested run to review their own
+candidate. Advisor proposals and synthesized briefs must omit separate-review
+instructions, including conditional `--merge none` advice, and must not assign
+parent-owned full verification to implementers. Fixed ownership guidance follows
+the brief in the implementation prompt and applies without a configured cache.
+Review, judging, fix, graft, landing, rebase and implementation continuation
+prompts carry the same ownership rule; question delivery retains the seat's
+existing conversation and supported `magi ask` wait/thread flow.
+
+This is prompt-only guidance. It does not filter generated brief text, intercept
+shell commands, reject nested CLI invocations or guarantee agent compliance.
+Filesystem grants and repository coordination remain separate mechanisms; they
+are not a duplicate-review guard. Supported question/control-plane commands
+remain available as explicitly instructed, and parent review/verification/gate
+execution is unchanged. For genuinely hand-written changes outside a parent
+run, the repository's existing `AGENTS.md` requirement still applies:
+`magi review <branch> --merge none` before opening a PR. Kata-managed conventions
+are unchanged.
+
 ## Adapter and platform limits
 
 | Adapter | Additional scope | Enforcement limits |

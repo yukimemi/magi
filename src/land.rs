@@ -4852,7 +4852,9 @@ fn fix_prompt(
     } else {
         let _ = write!(s, "\n# Failing checks\n\n- {}\n", pr.failing.join("\n- "));
         if logs.trim().is_empty() {
-            s.push_str("\nNo log could be read; reproduce the failure locally.\n");
+            s.push_str(
+                "\nNo log could be read; investigate the failure with necessary focused checks.\n",
+            );
         } else {
             let _ = write!(s, "\n## Failing log tails\n\n{logs}\n");
         }
@@ -4903,6 +4905,8 @@ fn fix_prompt(
     if let Some(overlay) = state.config.prompts.overlay("fix") {
         let _ = write!(s, "\n\n{overlay}");
     }
+    s.push('\n');
+    s.push_str(crate::prompt::child_run_ownership());
     s
 }
 
@@ -6160,6 +6164,14 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 body: "this branch never checks the exit code".to_owned(),
             }],
         }
+    }
+
+    #[test]
+    fn land_fixer_defers_review_and_verification_without_a_cache() {
+        let state = run_state();
+        let p = fix_prompt(&state, &green_pr(), 1, 2, "red", "");
+        assert!(p.contains(crate::prompt::child_run_ownership()), "{p}");
+        assert!(p.contains("Commit in this worktree"), "{p}");
     }
 
     #[test]
