@@ -2146,3 +2146,89 @@ fn recovery_cli_generated_sends_in_the_owner_turn_do_not_replace_real_evidence()
     assert_eq!(authority.instruction, words);
     assert_eq!(authority.message, 1);
 }
+
+#[test]
+fn guarded_quote_whitespace_keeps_legacy_comparison_and_complete_owner_evidence() {
+    for choice in ["merge", magi::github_text::POST_ORIGINAL, "complete task"] {
+        for padded_owner in [false, true] {
+            let f = fixture();
+            let (q, ()) = f
+                .questions
+                .update(&f.qid, |q| {
+                    q.consult = None;
+                    q.choices = vec![choice.into()];
+                    if choice == "merge" {
+                        q.merge_target = Some(magi::merge_decision::Target {
+                            pr: "https://example.test/pull/1".into(),
+                            head: "reviewed-head".into(),
+                            language: "en".into(),
+                        });
+                    } else if choice == magi::github_text::POST_ORIGINAL {
+                        q.node = magi::github_text::ASK_NODE.into();
+                    } else {
+                        q.node = "implement".into();
+                        q.actions
+                            .insert(choice.into(), magi::ask::ChoiceAction::Done);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let command = if choice == "merge" {
+                format!("{}: merge reviewed-head", q.id)
+            } else if choice == magi::github_text::POST_ORIGINAL {
+                format!(
+                    "{}: {choice} {}",
+                    q.id,
+                    magi::consult::question_fingerprint(&q)
+                )
+            } else {
+                format!("{}: {choice}", q.id)
+            };
+            let padded = format!(" {command} \n");
+            let (words, quote) = if padded_owner {
+                (&padded, &command)
+            } else {
+                (&command, &padded)
+            };
+            let run = standing_owner(&f, words, None);
+            let out = choose(&f, &run, choice, quote);
+            assert!(
+                out.status.success(),
+                "{choice}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                f.questions
+                    .get(&f.qid)
+                    .unwrap()
+                    .answer_authority
+                    .unwrap()
+                    .instruction,
+                *words
+            );
+        }
+    }
+}
+
+#[test]
+fn recovery_quote_whitespace_still_requires_the_exact_complete_owner_send() {
+    for interpreted in [false, true] {
+        let f = recovery_fixture();
+        let words = if interpreted {
+            "はい、それで進めてください".into()
+        } else {
+            format!("{}: resume-run", f.qid)
+        };
+        let run = standing_owner(&f, &words, Some(&format!("{}: resume-run", f.qid)));
+        let out = recovery_answer(
+            &f,
+            &run,
+            &f.qid,
+            "resume-run",
+            Some(&format!("{words}\n")),
+            interpreted,
+        );
+        assert_untouched(&f, &out);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("stale persisted evidence"));
+    }
+}

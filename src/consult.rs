@@ -876,7 +876,11 @@ fn choice_authority(
             && q.merge_target
                 .as_ref()
                 .is_some_and(|t| instruction.trim() == format!("{}: merge {}", q.id, t.head)));
-    let quote_matches = quote == Some(instruction);
+    let quote_matches = if contextual_recovery(q, reply) {
+        quote == Some(instruction)
+    } else {
+        quote.map(str::trim) == Some(instruction.trim())
+    };
     let persisted_recovery = quote.is_none() && direct && contextual_recovery(q, reply);
     if !quote_matches && !persisted_recovery {
         return None;
