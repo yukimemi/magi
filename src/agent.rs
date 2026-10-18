@@ -95,6 +95,8 @@ pub fn has_session(kind: AgentKind, seat: &SeatState, sessions_enabled: bool) ->
 pub struct Invocation<'a> {
     /// Rendered repository coordination policy for this invocation.
     pub coordination: Option<&'a crate::config::Coordination>,
+    /// Launcher fetch evidence, unchanged on session resume.
+    pub fetched_base: Option<&'a crate::run::FetchedBase>,
     /// Working directory. Always a real checkout, so every CLI can read the
     /// repository without per-vendor "extra directory" flags.
     pub cwd: &'a Path,
@@ -195,6 +197,31 @@ pub async fn worktree_writable_roots(cwd: &Path, home: &Path) -> Result<Vec<Path
         roots.push(std::fs::canonicalize(dir)?);
     }
     Ok(roots)
+}
+
+/// Current-turn instructions override stale fetch/commit requirements in history.
+fn editing_access_note(
+    kind: AgentKind,
+    unsandboxed: bool,
+    base: Option<&crate::run::FetchedBase>,
+) -> String {
+    let mut note = String::from(
+        "Launcher repository access contract (applies to this turn and overrides earlier fetch/commit instructions):\n",
+    );
+    if let Some(base) = base {
+        note.push_str(&format!(
+            "The launcher successfully fetched `{}/{}` at {} and pinned the run base to `{}`. Use this exact local commit as the verified fetched base; this is a snapshot, not a claim that the remote has not moved since. Do not fetch again as a prerequisite, move the base, or refresh it on resume. Base updates belong to the launcher's existing base-sync path.\n",
+            base.remote, base.branch, base.fetched_at, base.commit,
+        ));
+    } else {
+        note.push_str("No successful launcher fetch evidence is supplied for this invocation. Do not describe local tracking refs as freshly fetched. If fresh remote evidence is essential, report an infrastructure blocker requiring a launcher fetch and a new prepared turn.\n");
+    }
+    // Only the sandboxed backend has this verified access restriction.
+    if kind != AgentKind::Codex || unsandboxed {
+        return note;
+    }
+    note.push_str("Network access is restricted by the seat sandbox. A shared Git directory grant does not guarantee access to protected Git administration paths. Use local status, diff and log to inspect the checkout. If add/commit is denied, leave the implementation files in this assigned worktree: the launcher saves eligible edits after the seat exits. Do not repeatedly retry denied fetches or ask the owner to approve unavailable sandbox permissions. If an essential operation (including rebase continuation or dependency download) is still impossible, stop with an actionable infrastructure report naming the operation, target and error; the operator must repair/deploy the launcher environment before a single new attempt. Do not use bypass flags, change permissions, edit another checkout, or claim a network failure proves host DNS is broken. Specification questions remain valid.\n");
+    note
 }
 
 /// Evidence that a CLI ran out of its rate limit / quota, distinct from an
@@ -406,9 +433,18 @@ pub async fn invoke(
             }
         }
     }
+    let mut prompt = prompt.unwrap_or_else(|| inv.prompt.to_owned());
+    if repository_writer(inv) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&editing_access_note(
+            spec.kind,
+            inv.unsandboxed,
+            inv.fetched_base,
+        ));
+    }
     let inv = &Invocation {
         writable: &writable,
-        prompt: prompt.as_deref().unwrap_or(inv.prompt),
+        prompt: &prompt,
         ..inv.clone()
     };
     tokio::fs::create_dir_all(inv.artifacts)
@@ -421,6 +457,23 @@ pub async fn invoke(
 
     let plan = build_command(spec, seat, inv, &prompt_path)?;
     tracing::debug!(seat = %seat.key, agent = %spec.id, argv = ?plan.argv, "spawning agent");
+    // Store scope evidence without environment values or arbitrary extra args.
+    tokio::fs::write(
+        inv.artifacts.join(format!("{}.access.json", inv.stem)),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "launcher_version": env!("CARGO_PKG_VERSION"),
+            "kind": spec.kind,
+            "allow_write": inv.allow_write,
+            "unsandboxed": inv.unsandboxed,
+            "requested_network_access": if spec.kind == AgentKind::Codex && repository_writer(inv) && !inv.unsandboxed {
+                Some(false)
+            } else { None },
+            "writable_roots": inv.writable,
+            "fetched_base": inv.fetched_base,
+        }))?,
+    )
+    .await
+    .context("write seat access evidence")?;
 
     let started = Instant::now();
     // Resolve against the PATH the child will actually see: `spec.env` may
@@ -822,6 +875,10 @@ fn build_command(
                 // that asks blocks until its timeout kills it.
                 argv.push("-c".to_owned());
                 argv.push("approval_policy=\"never\"".to_owned());
+                if repository_writer(inv) {
+                    argv.push("-c".to_owned());
+                    argv.push("sandbox_workspace_write.network_access=false".to_owned());
+                }
                 if inv.allow_write && !inv.writable.is_empty() {
                     let roots: Vec<String> = inv
                         .writable
@@ -1750,6 +1807,7 @@ mod tests {
     fn inv<'a>(cwd: &'a Path, art: &'a Path, allow_write: bool) -> Invocation<'a> {
         Invocation {
             coordination: None,
+            fetched_base: None,
             cwd,
             prompt: "do the thing",
             timeout: Duration::from_secs(900),
@@ -1774,6 +1832,107 @@ mod tests {
             Path::new("/art/p.md"),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn editing_access_requires_fetch_evidence_and_keeps_snapshot() {
+        let missing = editing_access_note(AgentKind::Codex, false, None);
+        assert!(missing.contains("No successful launcher fetch evidence"));
+        let base = crate::run::FetchedBase {
+            remote: "origin".into(),
+            branch: "main".into(),
+            commit: "0123456789abcdef".into(),
+            fetched_at: "2026-10-18T00:00:00Z".parse().unwrap(),
+        };
+        let note = editing_access_note(AgentKind::Codex, false, Some(&base));
+        for expected in [
+            "origin/main",
+            "0123456789abcdef",
+            "2026-10-18T00:00:00Z",
+            "Do not fetch again",
+            "launcher saves eligible edits",
+            "Specification questions remain valid",
+        ] {
+            assert!(note.contains(expected), "missing {expected}");
+        }
+        for kind in [
+            AgentKind::Codex,
+            AgentKind::Claude,
+            AgentKind::Opencode,
+            AgentKind::Antigravity,
+            AgentKind::Omp,
+            AgentKind::Command,
+        ] {
+            for unsandboxed in [false, true] {
+                let scoped = editing_access_note(kind, unsandboxed, Some(&base));
+                assert!(scoped.contains(&base.commit));
+                assert!(scoped.contains("Do not fetch again"));
+                let restricted = kind == AgentKind::Codex && !unsandboxed;
+                for claim in [
+                    "Network access is restricted",
+                    "protected Git administration paths",
+                    "launcher saves eligible edits",
+                    "unavailable sandbox permissions",
+                ] {
+                    assert_eq!(scoped.contains(claim), restricted, "{kind:?}/{unsandboxed}");
+                    assert_eq!(
+                        editing_access_note(kind, unsandboxed, None).contains(claim),
+                        restricted,
+                        "{kind:?}/{unsandboxed} without fetch evidence",
+                    );
+                }
+            }
+        }
+        let roundtrip: crate::run::FetchedBase =
+            serde_json::from_str(&serde_json::to_string(&base).unwrap()).unwrap();
+        assert_eq!(
+            editing_access_note(AgentKind::Codex, false, Some(&roundtrip)),
+            note
+        );
+    }
+
+    #[test]
+    fn editing_network_policy_is_explicit_on_initial_and_resume() {
+        for resumed in [false, true] {
+            let mut seat = SeatState::new("impl-A", "a", 7);
+            if resumed {
+                seat.turns = 1;
+                seat.captured_session = Some("fixture-thread".into());
+            }
+            let mut invocation = inv(Path::new("."), Path::new("/art"), true);
+            invocation.node = "implement";
+            let plan = build_command(
+                &spec(AgentKind::Codex, None),
+                &seat,
+                &invocation,
+                Path::new("/art/p.md"),
+            )
+            .unwrap();
+            let policy = plan
+                .argv
+                .iter()
+                .position(|s| s == "sandbox_workspace_write.network_access=false")
+                .unwrap();
+            if resumed {
+                assert!(policy < plan.argv.iter().position(|s| s == "resume").unwrap());
+            }
+            assert!(!plan.argv.iter().any(|s| s.contains("bypass")));
+            invocation.node = "deputy";
+            let deputy = build_command(
+                &spec(AgentKind::Codex, None),
+                &seat,
+                &invocation,
+                Path::new("/art/p.md"),
+            )
+            .unwrap();
+            assert!(!deputy.argv.iter().any(|s| s.contains("network_access")));
+            assert!(
+                !plan_for(AgentKind::Codex, &seat, false)
+                    .argv
+                    .iter()
+                    .any(|s| s.contains("writable_roots"))
+            );
+        }
     }
 
     #[test]
@@ -2348,6 +2507,7 @@ mod tests {
             &seat,
             &Invocation {
                 coordination: None,
+                fetched_base: None,
                 cwd: Path::new("."),
                 prompt: "p",
                 timeout: Duration::from_secs(3600),
@@ -2816,6 +2976,7 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
+                fetched_base: None,
                 cwd: dir.path(),
                 prompt: "unused",
                 timeout: Duration::from_secs(30),
@@ -2854,6 +3015,7 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
+                fetched_base: None,
                 cwd: dir.path(),
                 prompt: "unused",
                 timeout: Duration::from_secs(30),
@@ -2903,6 +3065,7 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
+                fetched_base: None,
                 cwd: dir.path(),
                 prompt: "unused",
                 timeout: Duration::from_secs(30),
@@ -2951,6 +3114,7 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
+                fetched_base: None,
                 cwd: dir.path(),
                 prompt: &big,
                 timeout: Duration::from_secs(60),
@@ -2982,6 +3146,7 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
+                fetched_base: None,
                 cwd: dir.path(),
                 prompt: "unused",
                 timeout: Duration::from_millis(300),
@@ -3019,6 +3184,7 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
+                fetched_base: None,
                 cwd: dir.path(),
                 prompt: "unused",
                 // Wide enough to cover process-spawn latency inside a loaded

@@ -25,6 +25,122 @@ fn checked(cmd: &mut Command) -> Output {
     out
 }
 
+/// Run outside an enclosing seat sandbox. This records administration-path
+/// behavior rather than assuming that a common-directory grant overrides it.
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires the installed sandbox and permission to launch sandbox-exec"]
+async fn sandbox_git_operations_and_network_policy() {
+    let fx = Fixture::new();
+    let roots = worktree_writable_roots(&fx.seat, &fx.home).await.unwrap();
+    let unrelated = fx.home.join("queue");
+    std::fs::create_dir(&unrelated).unwrap();
+    checked(Command::new("git").current_dir(&fx.seat).args([
+        "remote",
+        "add",
+        "origin",
+        fx.primary.to_str().unwrap(),
+    ]));
+    let baseline = checked(Command::new("/usr/bin/python3").args([
+        "-c",
+        "import socket; print(socket.getaddrinfo('github.com', 443))",
+    ]));
+    println!(
+        "host DNS succeeded: {}",
+        String::from_utf8_lossy(&baseline.stdout)
+    );
+    let script = r#"
+import json, os, pathlib, socket, subprocess
+pathlib.Path('probe').write_text('sandbox edit\n')
+for args in [['status', '--short'], ['diff'], ['log', '-1', '--oneline'],
+             ['add', 'probe'], ['-c', 'user.name=Fixture', '-c',
+              'user.email=fixture@example.invalid', 'commit', '-m', 'probe'],
+             ['fetch', 'origin', 'main']]:
+    p = subprocess.run(['git'] + args, capture_output=True, text=True)
+    print(json.dumps({'operation': args, 'exit': p.returncode, 'error': p.stderr}), flush=True)
+    if args[0] in ['status', 'diff', 'log']:
+        assert p.returncode == 0
+try:
+    pathlib.Path(os.environ['UNRELATED']).write_text('denied')
+except PermissionError:
+    print('unrelated-denied', flush=True)
+else:
+    raise AssertionError('unrelated write succeeded')
+s = socket.socket()
+s.settimeout(2)
+result = s.connect_ex(('127.0.0.1', int(os.environ['PROBE_PORT'])))
+print(json.dumps({'network_enabled': os.environ['PROBE_NETWORK'], 'connect_exit': result}), flush=True)
+assert (result == 0) == (os.environ['PROBE_NETWORK'] == 'true')
+try:
+    print(json.dumps({'dns': socket.getaddrinfo('github.com', 443)}), flush=True)
+except OSError as e:
+    print(json.dumps({'dns_error': str(e)}), flush=True)
+    assert os.environ['PROBE_NETWORK'] == 'false', 'DNS must work with network enabled'
+"#;
+    // Loopback comparison isolates network policy from external DNS outages.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect(
+        "host sandbox probe needs loopback bind permission; run outside the enclosing seat sandbox",
+    );
+    for network in ["false", "true"] {
+        let out = Command::new("codex")
+            .current_dir(&fx.seat)
+            .args(["sandbox", "-c", "sandbox_mode=\"workspace-write\"", "-c"])
+            .arg(format!(
+                "sandbox_workspace_write.writable_roots={}",
+                serde_json::to_string(&roots).unwrap()
+            ))
+            .args([
+                "-c",
+                "sandbox_workspace_write.exclude_slash_tmp=true",
+                "-c",
+                "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+                "-c",
+            ])
+            .arg(format!("sandbox_workspace_write.network_access={network}"))
+            .args(["/usr/bin/python3", "-c", script])
+            .env("UNRELATED", unrelated.join("denied"))
+            .env("PROBE_NETWORK", network)
+            .env(
+                "PROBE_PORT",
+                listener.local_addr().unwrap().port().to_string(),
+            )
+            .output()
+            .unwrap();
+        println!(
+            "network={network}: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "sandbox probe failed: {out:?}");
+        assert!(!unrelated.join("denied").exists());
+    }
+    // Exercise the launcher's real preservation route, including the saved tree.
+    checked(
+        Command::new("git")
+            .current_dir(&fx.seat)
+            .args(["config", "user.name", "Fixture"]),
+    );
+    checked(Command::new("git").current_dir(&fx.seat).args([
+        "config",
+        "user.email",
+        "fixture@example.invalid",
+    ]));
+    let saved = magi::git::rescue_commit(&fx.seat, "fixture: launcher save")
+        .await
+        .unwrap();
+    let tree = checked(
+        Command::new("git")
+            .current_dir(&fx.seat)
+            .args(["show", "HEAD:probe"]),
+    );
+    assert_eq!(String::from_utf8_lossy(&tree.stdout), "sandbox edit\n");
+    assert!(saved.withheld.is_empty());
+    println!(
+        "launcher rescue committed={}, saved HEAD:probe verified",
+        saved.committed
+    );
+}
+
 struct Fixture {
     _tmp: tempfile::TempDir,
     primary: PathBuf,
@@ -226,6 +342,11 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
             ("MAGI_HOME".into(), "incorrect-store".into()),
         ]),
     };
+    let fetched_base = magi::run::FetchedBase {
+        remote: "origin".into(), branch: "main".into(),
+        commit: "fixture-pinned-base".into(),
+        fetched_at: "2026-10-18T00:00:00Z".parse().unwrap(),
+    };
     let artifacts = fx._tmp.path().join("artifacts");
     for node in ["implement", "fix", "graft", "gate-fix", "land", "rebase", "chat"] {
         let mut seat = SeatState::new("fixture-seat", "fixture", 1);
@@ -238,6 +359,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
                 &mut seat,
                 &Invocation {
                     coordination: Some(coordination()),
+                    fetched_base: Some(&fetched_base),
                     cwd: &fx.seat,
                     prompt: "fixture",
                     timeout: Duration::from_secs(10),
@@ -256,6 +378,14 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
             .await
             .unwrap();
             assert!(out.usable(), "{out:?}");
+            let prompt = std::fs::read_to_string(artifacts.join(format!("{node}.prompt.md"))).unwrap();
+            assert!(prompt.contains("fixture-pinned-base"), "{node}, resumed={resumed}");
+            assert!(prompt.contains("Do not fetch again"));
+            let access: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(artifacts.join(format!("{node}.access.json"))).unwrap(),
+            ).unwrap();
+            assert_eq!(access["fetched_base"]["commit"], "fixture-pinned-base");
+
             let args = std::fs::read_to_string(&args_path).unwrap();
             let roots = worktree_writable_roots(&fx.seat, &fx.home).await.unwrap();
             assert!(
@@ -281,6 +411,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
         let mut seat = SeatState::new("fixture-seat", "fixture", 1);
         invoke(&spec, &mut seat, &Invocation {
             coordination: Some(coordination()),
+            fetched_base: None,
             cwd: &fx.seat, prompt: "fixture", timeout: Duration::from_secs(10),
             allow_write, unsandboxed: false, sessions: false,
             artifacts: &artifacts, stem: node, run: "fixture-run", node,
@@ -387,6 +518,7 @@ Write-Output 'real-lock-contends'
     let artifacts = fx._tmp.path().join("reader-artifacts");
     let inv = Invocation {
         coordination: Some(coordination()),
+        fetched_base: None,
         cwd: &fx.seat,
         prompt: "fixture read-only work",
         timeout: Duration::from_secs(10),
@@ -558,6 +690,7 @@ mod coordination {
     ) -> Invocation<'a> {
         Invocation {
             coordination: Some(coordination()),
+            fetched_base: None,
             cwd: &fx.seat,
             prompt: "fixture",
             timeout: Duration::from_secs(20),
@@ -723,6 +856,7 @@ lock_file = "kanade-sync.lock"
         let art = fx._tmp.path().join("art");
         let inv = Invocation {
             coordination: cfg.coordination.as_ref(),
+            fetched_base: None,
             ..invocation(&fx, &art, false)
         };
         let mut seat = SeatState::new("reader", "fixture", 1);

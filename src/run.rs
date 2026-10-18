@@ -1999,6 +1999,19 @@ pub struct LandReruns {
     pub runs: BTreeMap<String, i64>,
 }
 
+/// Successful launcher fetch, persisted independently of moving tracking refs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FetchedBase {
+    /// Remote fetched by the launcher.
+    pub remote: String,
+    /// Remote branch selected as the run base.
+    pub branch: String,
+    /// Resolved commit immediately after the successful fetch.
+    pub commit: String,
+    /// Time the launcher observed the successful fetch.
+    pub fetched_at: Timestamp,
+}
+
 /// The whole run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunState {
@@ -2012,6 +2025,9 @@ pub struct RunState {
     pub base_branch: String,
     /// Commit the run started from.
     pub base_commit: String,
+    /// Absent in older runs; never infer fetch evidence from a tracking ref.
+    #[serde(default)]
+    pub fetched_base: Option<FetchedBase>,
     /// The task, verbatim.
     pub instruction: String,
     /// Authored task criteria before review scaffolding was generated.
@@ -2435,6 +2451,7 @@ impl RunState {
             repo,
             base_branch,
             base_commit,
+            fetched_base: None,
             instruction,
             task_instruction: None,
             created_at: now,

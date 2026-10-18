@@ -180,6 +180,7 @@ pub async fn rebase_with_fixer(
                 &mut seat,
                 &Invocation {
                     coordination: state.config.coordination.as_ref(),
+                    fetched_base: state.fetched_base.as_ref(),
                     cwd: scratch,
                     prompt: &prompt_text,
                     timeout: Duration::from_secs(state.config.graph.timeout_fix),

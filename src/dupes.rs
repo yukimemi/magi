@@ -246,6 +246,7 @@ pub async fn chain_judge(
         let mut seat = agent::SeatState::new("dupes", &spec.id, crate::rng::entropy());
         let inv = agent::Invocation {
             coordination: cfg.coordination.as_ref(),
+            fetched_base: None,
             cwd: repo,
             prompt: &body,
             timeout: left.min(JUDGE_TURN),

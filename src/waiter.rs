@@ -159,6 +159,7 @@ pub fn decide_owned(
 /// Everything needed to resume one seat.
 struct Target {
     coordination: Option<crate::config::Coordination>,
+    fetched_base: Option<crate::run::FetchedBase>,
     spec: AgentSpec,
     seat: SeatState,
     cwd: PathBuf,
@@ -326,14 +327,14 @@ impl Waiter {
             .map(PathBuf::from)
             .filter(|p| p.is_dir())
             .ok_or("the directory the agent was working in is gone")?;
-        let (cfg, seat, allow_write) = if q.run == crate::conduct::NODE {
+        let (cfg, seat, allow_write, fetched_base) = if q.run == crate::conduct::NODE {
             let cfg = self
                 .conduct_cfg
                 .clone()
                 .ok_or("the conductor's configuration is not available")?;
             let seat = crate::conduct::load_seat(&self.home)
                 .ok_or("the conductor has no recorded session")?;
-            (cfg, seat, false)
+            (cfg, seat, false, None)
         } else {
             let state = RunState::load_under(&q.run, &self.home)
                 .map_err(|_| "the run that asked is gone".to_owned())?;
@@ -349,7 +350,7 @@ impl Waiter {
                 .cloned()
                 .ok_or("the run has no record of the asking seat")?;
             let write = matches!(q.node.as_str(), "implement" | "fix");
-            (state.config, seat, write)
+            (state.config, seat, write, state.fetched_base)
         };
         let spec = cfg
             .agent(&seat.agent)
@@ -360,6 +361,7 @@ impl Waiter {
         }
         Ok(Target {
             coordination: cfg.coordination.clone(),
+            fetched_base,
             spec,
             seat,
             cwd,
@@ -520,6 +522,7 @@ impl Waiter {
         let cache_dir = None;
         let inv = Invocation {
             coordination: target.coordination.as_ref(),
+            fetched_base: target.fetched_base.as_ref(),
             cwd: &target.cwd,
             prompt: &body,
             timeout: DELIVERY_TIMEOUT,

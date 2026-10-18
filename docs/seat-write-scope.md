@@ -338,3 +338,145 @@ An authorized `git fetch origin main` succeeded during round 1. Both
 `3393efac3837257589499a9d686cdedbb54cd844`. A fresh supported `magi task show`
 confirmed the original task still has its manual hold and both original runs;
 no release was attempted.
+
+
+## 2026-10-18–19: editing-seat Git/network investigation
+
+### 元席の実効設定と配備経路（R1-1-2）
+
+保存済み run `20261018-084955-964b` の `impl-A.out` と、対応セッション
+`01a14c4b-2cb9-7341-bef5-88fe101e2eb0` の `session_meta` / `turn_context` を確認した。
+CLI は 0.160.0、実効設定は `workspace-write`、`approval_policy=never`、
+`network_access=false` だった。追加 roots は対象リポジトリの common Git
+directory、questions、notifications の三つで、二つの temporary-directory
+除外設定はいずれも false だった。したがって、元席での失敗は common Git
+directory の指定欠落ではない。通常 fetch は linked worktree の
+`FETCH_HEAD` を開く段階で EPERM、`--no-write-fetch-head` は名前解決失敗だった。
+run の `base_commit` は依頼文の SHA と一致する。これは別リポジトリの基底であり、
+この修正へ cherry-pick するコミットではない。
+
+元プロセス終了後に最新版のソースや現在のインストール版を見ても、当時の
+実行ファイルは特定できない。そこで保存された Web handover ログを確認した。
+
+| UTC 時刻 | 保存ログが示す事実 |
+| --- | --- |
+| 2026-10-17 23:40:36.960 | v0.159.0 の release archive を通常のインストール先へ配備完了 |
+| 23:40:36.979–36.980 | その実行ファイルの `web` コマンドで後継 PID 1604 を起動 |
+| 23:40:38.034 | 後継自身が `web process started (version 0.159.0)` と記録 |
+| 23:49:55.408 | 問題の run を作成 |
+
+元の kernel exec argv 全文を記録したログは残っていないため、履歴の復元と
+推測を混同しない。取得不能な部分は、ログで特定した**配備版そのもの**を使う
+管理された再現で補った。v0.159.0 の release asset を一時領域だけに取得し、
+`magi --version` が 0.159.0 を返すことを確認した。
+
+- tag の commit: `7738d9ad524726e33e482174207d6dd62bcae89c`
+- release asset ID: `651740632`（元 handover ログの download URL と一致し、API の digest も下記 hash と一致）
+- archive SHA-256: `84fc30f9c45880c92a521b09747a260c24daa6fd9ef0cb5d48f4829e592fd9b9`
+- 実行ファイル SHA-256: `45d993d8a191a8fdff4c7c44c859beeeafff51d6c448010ae0bd2483ac78cae5`
+
+再現では local bare remote、隔離した `MAGI_HOME` / `MAGI_CONFIG_DIR` と
+`graph.worktree_root` を使用した。元 run の roster に保存されていたモデルと
+extra args をそのまま設定し、単一編集席・advice 無効・retry 無効・merge none・
+land 無効に限定した。`magi run` が通る通常の graph / `agent::invoke` 経路を使い、
+PATH 上の記録用 CLI が**実際に受け取った**引数を JSON に保存して直ちに終了する。
+この CLI は実装もモデル呼出しも行わない。意図した exit 1 の後、launcher は
+`no candidate produced a change; nothing to judge` で終了した。本番 daemon、
+元タスクの owner、元実装 worktree は操作していない。
+
+取得した argv の正規化表記（パスと保存モデル値のみ置換）:
+
+```text
+exec --json --skip-git-repo-check -C <fixture-worktree>
+--sandbox workspace-write
+-c approval_policy="never"
+-c sandbox_workspace_write.writable_roots=["<common>","<questions>","<notifications>"]
+-m <saved-model> -c model_reasoning_effort="medium" -
+```
+
+`node=implement` / `seat=impl-A`、roots の実際の canonical paths、保存モデルと
+extra args の一致、stdin delivery、bypass と network override の不在を機械的に
+照合して成功した。raw 記録 `fixture/verified-invocation.json` の SHA-256 は
+`d76be226fb1dade49c561cc46de0a494fc61cf213affe3f85bdb6bf9afebe41f`。
+この再現は現在のソースから組み立てた想定 argv ではなく、当時の release
+実行ファイルが通常の編集席起動で渡した argv である。ただし、元席そのものの
+失われた raw trace を取得したとの主張ではない。network flag の不在だけで
+実効値を推定せず、元セッションの `network_access=false` と合わせて判断する。
+
+### ホスト上の実 sandbox 検証（R1-1-1）
+
+最初の候補席では enclosing sandbox が loopback bind と入れ子の sandbox 起動を
+拒否した。この失敗を検証成功とは数えていなかった。今回、許可されたホスト実行
+経路から、**内側の sandbox は有効なまま**既存の ignored fixture を実行した。
+実行環境は macOS 27.0.1 / arm64、インストール済み CLI は 0.163.0。
+以下の直接検証はこの版に限り、元席の 0.160.0 を再実行したとの主張ではない。
+
+```sh
+RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope sandbox_git_operations_and_network_policy -- --ignored --nocapture
+# 1 passed; 0 failed
+RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope sandbox_seat -- --ignored --nocapture
+# 1 passed; 0 failed
+RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope readonly_invocation -- --ignored --nocapture
+# 1 passed; 0 failed
+```
+
+最初の fixture は使い捨て linked worktree と local remote を使い、実 CLI の
+`sandbox` コマンドで workspace-write と同じ common Git / 制御ストア roots を
+設定する。temporary-directory の既定許可を除外し、許可外書込みの検査を厳密にする。
+ネットワーク以外の設定を固定して false / true を比較した。
+
+| 操作 | network=false | network=true |
+| --- | --- | --- |
+| worktree のファイル編集 | 成功 | 成功 |
+| `git status` / `git diff` / `git log` | すべて exit 0 | すべて exit 0 |
+| `git add` / `git commit` | `index.lock` 作成が EPERM、exit 128 | 同じ拒否 |
+| local remote の `git fetch` | `FETCH_HEAD` open が EPERM、exit 255 | 同じ拒否 |
+| 許可 roots 外への書込み | 拒否、ファイルなし | 拒否、ファイルなし |
+| ホスト listener への接続 | errno 1 | 成功 |
+| DNS | 名前解決失敗 | 成功 |
+
+直前の sandbox 外ホスト DNS も成功した。したがって、この比較では DNS の
+失敗はホスト DNS 障害ではなくネットワーク sandbox policy によるものと確認できた。
+ネットワークを有効にしても Git 管理領域の拒否は変わらず、両制限を切り分けられた。
+比較用 true はこの fixture のみであり、production の編集席設定は変更していない。
+
+検査後は Git を手動実行するだけでなく、実際の `git::rescue_commit` をホストで
+呼び出した。`committed=true`、withheld なしで成功し、`git show HEAD:probe` の
+内容が sandbox 内で書いた内容と完全一致することを assert した。これで
+管理領域を席へ開放せずに編集を launcher が保存する経路を直接検証した。
+
+二番目の fixture は実 sandbox 内の .NET `FileShare.None` ロックで、競合中は
+質問作成前に拒否、解放後は取得成功、許可外 queue 書込み拒否、実際の
+`magi ask` / `magi answer` の往復成功を確認した。三番目は読取り専用席の
+launcher 保持ロックについて、外部競合時には prompt / CLI を開始せず、
+実行中には外部取得を拒否し、終了後に再取得できることを確認した。
+
+### 修正、限界と配備・復旧
+
+launcher の base fetch は `SeatLease::operation_with` で調停し、成功時だけ
+remote / branch / SHA / 取得時刻を保存する。初回・resume・fallback・waiter は
+この保存値を渡し、resume のために基底を更新しない。旧 run の証跡は欠落のままとし、
+tracking ref から取得成功を捏造しない。既存の base-sync 処理を使う。
+
+共通 invoke 経路は、取得済み固定基底、Git 更新拒否時の launcher 保存、必須操作が
+拒否されたときの操作・対象・エラーを含む報告を説明する。質問文字列の判定で
+正当な仕様質問を禁止しない。scope artifact はあくまで要求設定であり、実効設定の
+証明とは区別する。sandbox bypass、chmod、広い state / home 許可は追加しない。
+依存取得や rebase 続行など、席内で必須の操作が拒否されるケースは引き続き
+インフラ blocker であり、これらすべての対応を今回実証したわけではない。
+
+配備は次の順序で行う。
+
+1. 親グラフの全体検証・`cargo make check`・必須レビューを完了し、通常の承認で
+   merge / 配備する。候補内で本番 graph を再帰起動しない。
+2. README の既存「Update & restart」手順で安全に更新し、二重 daemon を作らない。
+   実行イメージと版、起動時刻を確認する。ディスク上の更新だけでは既存席は変わらない。
+3. 配備先の実 CLI で上の三 fixture を再実行し、新席の debug `spawning agent`
+   argv、access artifact、保存セッションの実効 policy を照合する。固定 SHA の
+   読取り、launcher 保存、coordination、質問経路と許可外書込み拒否を確認する。
+4. 元タスクの現在の owner / run / hold を `magi task show` で確認し、既存 owner の
+   復旧経路を一つだけ使う。稼働中 graph の並行 resume、代替タスクの新設、元実装の
+   肩代わりは行わない。旧 run に取得証跡がなければ検証済み fetch と準備経路を経る。
+
+今回のホスト検証は成功したが、production バイナリの配備・daemon 再起動と
+新しい production 席の確認は実施していない。全体 gate とレビューは親グラフの担当。

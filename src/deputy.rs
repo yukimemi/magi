@@ -730,6 +730,7 @@ impl Job {
             ($prompt:expr, $stem:expr, $timeout:expr) => {
                 Invocation {
                     coordination: cfg.coordination.as_ref(),
+                    fetched_base: None,
                     cwd: &cwd,
                     prompt: $prompt,
                     timeout: $timeout,
