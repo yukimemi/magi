@@ -2684,6 +2684,14 @@ impl Queue {
 
     /// Expand an id prefix to exactly one task id.
     pub fn resolve_id(&self, prefix: &str) -> Result<String> {
+        if !prefix.is_empty()
+            && prefix != "."
+            && prefix != ".."
+            && !prefix.contains(['/', '\\'])
+            && self.path_of(prefix).is_file()
+        {
+            return Ok(prefix.to_owned());
+        }
         let ids = record_ids(&self.root, "json")?;
         match resolve_reference(prefix, ids.iter().map(String::as_str)) {
             Reference::Found(id) => Ok(id),

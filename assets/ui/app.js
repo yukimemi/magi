@@ -2925,6 +2925,7 @@ function renderTaskDeleteBox(host, task, box) {
 
 /* A change to one task: the Queue, and the detail page when it is that task. */
 async function refreshTask(id) {
+  cancelDetailSections(`task:${id}:`);
   const jobs = [loadQueue()];
   if (state.taskDetail.id === id) jobs.push(loadTask(id));
   await Promise.all(jobs);
@@ -6014,6 +6015,52 @@ function talkShell(id, summary) {
   };
 }
 
+// A section owns its request until navigation or completion. Repeated refresh
+// signals join pending work instead of continually superseding slow responses.
+const detailSections = new Map();
+function cancelDetailSections(prefix = "") {
+  for (const [key, job] of detailSections) {
+    if (!key.startsWith(prefix)) continue;
+    job.controller.abort();
+    detailSections.delete(key);
+  }
+}
+function sectionRequest(key, url, accept, reject, text = false, refresh = false) {
+  if (detailSections.has(key)) {
+    const pending = detailSections.get(key);
+    if (refresh) pending.refresh = () => sectionRequest(key, url, accept, reject, text);
+    return pending.promise;
+  }
+  const controller = new AbortController();
+  const job = { controller };
+  detailSections.set(key, job);
+  job.promise = (text ? getText : getJson)(url, { signal: controller.signal })
+    .then(value => { if (detailSections.get(key) === job) return accept(value); })
+    .catch(error => { if (detailSections.get(key) === job && error.name !== "AbortError") return reject(error); })
+    .finally(() => {
+      if (detailSections.get(key) !== job) return;
+      detailSections.delete(key);
+      if (job.refresh) return job.refresh();
+    });
+  return job.promise;
+}
+function sectionNotice(anchorId, key, message, retry) {
+  const anchor = $(anchorId);
+  if (!anchor) return;
+  let box = $(key);
+  if (!box) {
+    box = el("div", { id: key, role: "status", class: "view-sub" });
+    anchor.after(box);
+  }
+  const signature = `${message}:${Boolean(retry)}`;
+  if (box.dataset.signature === signature) return;
+  box.dataset.signature = signature;
+  clear(box);
+  if (message) box.append(el("span", { text: message }));
+  if (retry) box.append(el("button", { type: "button", class: "btn btn-quiet", text: "Retry", onclick: retry }));
+  show(box, Boolean(message));
+}
+
 const talkDetailRequests = new Map();
 function nextTalkRequest(id) {
   const request = (talkDetailRequests.get(id) || 0) + 1;
@@ -6025,8 +6072,16 @@ function nextTalkRequest(id) {
    snapshot until a fresh detail arrives, and supersede older reads. */
 function acceptTalkUpdate(talk) {
   if (state.talkDetail.id !== talk.id) return;
+  cancelDetailSections();
   state.talkDetail.talk = { ...state.talkDetail.talk, ...talk };
   loadTalk(talk.id, { background: true });
+}
+
+function applyTalkSections(detail) {
+  if (!detail.talk || !detail.sections) return;
+  const { context, context_for, ...metadata } = detail.sections;
+  Object.assign(detail.talk, metadata);
+  if (context_for === detail.talk.updated_at) detail.talk.context = context;
 }
 
 async function loadTalk(id, { background = false } = {}) {
@@ -6034,40 +6089,47 @@ async function loadTalk(id, { background = false } = {}) {
   const request = nextTalkRequest(id);
   const wait = state.talkWaits.get(id);
   const observed = wait && { generation: wait.generation, startedAt: Date.now() };
-  try {
-    const talk = await getJson(API.talk(id));
-    if (request !== talkDetailRequests.get(id)) return;
+  const current = () => state.talkDetail === detail && state.talkDetail.id === id;
+  const retry = () => loadTalk(id, { background: true });
+  sectionNotice("talk-meta", "talk-core-state", detail.talk ? "" : "Loading conversation…");
+  const core = sectionRequest(`talk:${id}:core`, `${API.talk(id)}/core`, talk => {
+    if (!current()) return;
     trackTalkThinking(talk, observed);
-    if (state.talkDetail.id !== id) return;
-    if (state.talkDetail !== detail) return;
-    state.talkDetail.talk = talk;
-    state.talkDetail.roster = Array.isArray(talk.roster) ? talk.roster : [];
-    state.talkDetail.personas = Array.isArray(talk.personas) ? talk.personas : [];
-    rememberTalkChoices(talk.repo, state.talkDetail.roster, state.talkDetail.personas);
+    detail.talk = { ...detail.talk, ...talk };
+    applyTalkSections(detail);
+    sectionNotice("talk-meta", "talk-core-state", "");
     renderTalk();
-    ok();
-  } catch (error) {
-    if (request !== talkDetailRequests.get(id)) return;
-    if (state.talkDetail.id === id && state.talkDetail !== detail) return;
-    /* 404 means the conversation is gone: nothing will ever end its wait by
-       growing the transcript, so settle it here. Other errors keep the wait
-       and are retried. */
+  }, error => {
+    if (!current()) return;
     if (error.status === 404) {
       endTalkTurn(id);
-      if (state.talkDetail.id === id) {
-        state.talkDetail.talk = null;
-        state.talkDetail.roster = [];
-        state.talkDetail.personas = [];
-        state.talkDetail.gone = true;
-        ok();
-        renderTalk();
-      }
-      return;
+      detail.talk = null;
+      detail.gone = true;
+      renderTalk();
     }
-    if (state.talkDetail.id === id) {
-      failFor(background, `Could not load conversation ${shortId(id)}: ${error.message}`, error);
+    sectionNotice("talk-meta", "talk-core-state", `Conversation: ${error.message}`, retry);
+  }, false, background);
+  sectionNotice("talk-task-progress", "talk-sections-state", detail.sections ? "" : "Loading related tasks and choices…");
+  const sections = sectionRequest(`talk:${id}:sections`, `${API.talk(id)}/sections`, data => {
+    if (!current()) return;
+    detail.sections = data;
+    detail.sectionsError = false;
+    detail.roster = data.roster;
+    detail.personas = data.personas;
+    if (detail.talk) {
+      applyTalkSections(detail);
+      rememberTalkChoices(detail.talk.repo, data.roster, data.personas);
     }
-  }
+    sectionNotice("talk-task-progress", "talk-sections-state", "");
+    renderTalk();
+  }, error => {
+    if (current()) {
+      detail.sectionsError = true;
+      sectionNotice("talk-task-progress", "talk-sections-state", `Related information: ${error.message}`, retry);
+      renderTalk();
+    }
+  }, false, background);
+  await Promise.allSettled([core, sections]);
 }
 
 /* The server uses Done alone as completion, for the same tasks as the list. */
@@ -6241,6 +6303,14 @@ function renderTalk() {
   setAttr($("talk-meta"), "title", `${talk.id}\nstarted ${started.title}`);
 
   const turnsMd = talkTurnsMd(talk);
+  const previousTail = $("talk-turns").lastElementChild;
+  const viewportBottom = $("main").dataset.split === "1"
+    ? $("view-talk").getBoundingClientRect().bottom : window.innerHeight;
+  const followingTail = !previousTail || previousTail.getBoundingClientRect().bottom <= viewportBottom + 80;
+  const shownDetail = state.talkDetail;
+  const scrollCurrentTalk = () => {
+    if (state.talkDetail === shownDetail && state.route.name === "talk") scrollToLastTurn("talk-turns");
+  };
   syncList(
     $("talk-turns"),
     turns.flatMap((turn, i) => {
@@ -6262,9 +6332,9 @@ function renderTalk() {
     && turns[turns.length - 1].body === wait.pending.body;
   if (state.openingTalk) {
     state.openingTalk = false;
-    if (turnCount > 0) requestAnimationFrame(() => scrollToLastTurn("talk-turns"));
-  } else if (turnCount > state.prevTalkTurnCount && !lastIsPending) {
-    requestAnimationFrame(() => scrollToLastTurn("talk-turns"));
+    if (turnCount > 0) requestAnimationFrame(scrollCurrentTalk);
+  } else if (followingTail && turnCount > state.prevTalkTurnCount && !lastIsPending) {
+    requestAnimationFrame(scrollCurrentTalk);
   }
   state.prevTalkTurnCount = turnCount;
 
@@ -6298,6 +6368,7 @@ let talkAgentSwitching = false;
 function renderTalkAgent(talk, busy, loading = false) {
   const box = $("talk-agent-box");
   const select = $("talk-agent");
+  loading = loading || !state.talkDetail.sections || state.talkDetail.sectionsError;
   const roster = state.talkDetail.roster || [];
   show(box, loading || roster.length > 0);
   if (document.activeElement !== select) {
@@ -6313,7 +6384,7 @@ function renderTalkAgent(talk, busy, loading = false) {
     }
     select.value = talk.agent;
   }
-  select.disabled = busy || talkAgentSwitching || talkPersonaSwitching || talkImplementersSwitching
+  select.disabled = loading || busy || talkAgentSwitching || talkPersonaSwitching || talkImplementersSwitching
     || String(talk.status || "open") !== "open" || roster.length < 2;
 }
 
@@ -6393,6 +6464,7 @@ $("talk-persona-box").querySelector(".talk-agent-label").prepend(talkPersonaAvat
 function renderTalkPersona(talk, busy, loading = false) {
   const box = $("talk-persona-box");
   const select = $("talk-persona");
+  loading = loading || !state.talkDetail.sections || state.talkDetail.sectionsError;
   const personas = state.talkDetail.personas || [];
   show(box, loading || personas.length > 0);
   const current = talk.persona || "default";
@@ -6405,7 +6477,7 @@ function renderTalkPersona(talk, busy, loading = false) {
     for (const p of entries) select.append(el("option", { value: p.id, text: p.name }));
     select.value = current;
   }
-  select.disabled = busy || talkPersonaSwitching || talkAgentSwitching || talkImplementersSwitching
+  select.disabled = loading || busy || talkPersonaSwitching || talkAgentSwitching || talkImplementersSwitching
     || String(talk.status || "open") !== "open";
 }
 
@@ -7446,7 +7518,10 @@ function renderReportCards() {
   show(box, cards);
   show(raw, !cards);
   show($("wrap-toggle"), !cards);
-  if (!cards) return;
+  if (!cards) {
+    setText(raw, state.detail.report || "Loading text report…");
+    return;
+  }
   /* Rebuild only when the data moved, so a refresh does not disturb a card
      the operator is reading. */
   const sig = `${runId}\n${JSON.stringify(view)}`;
@@ -7493,11 +7568,17 @@ function renderRunDetail() {
     show($("run-ask-panel"), false);
     show($("run-land-panel"), false);
     show($("run-active-panel"), false);
+    for (const panel of ["run-advise-panel", "run-verdict", "run-cands-panel", "run-reviews-panel", "run-passes-panel", "run-handovers-panel", "run-quota-panel"]) show($(panel), false);
+    clear($("run-instruction"));
+    delete $("run-instruction").dataset.forRun;
     clear($("run-task-box"));
     clear($("run-actions-box"));
     clear($("run-fold-merged-box"));
     clear($("run-delete-box"));
-    setText($("run-report"), report === null ? "Loading\u2026" : report);
+    renderReportCards();
+    clear($("run-events"));
+    delete $("run-events").dataset.signature;
+    show($("run-alert"), false);
     return;
   }
 
@@ -7592,9 +7673,15 @@ function renderRunDetail() {
   renderPasses(run);
   renderTimeline(run);
   renderRunTaskEntry(run);
-  renderRunActions(run);
-  renderRunFoldMerged(run);
-  renderRunDelete(run);
+  if (state.detail.evidenceError) {
+    clear($("run-actions-box"));
+    clear($("run-fold-merged-box"));
+    clear($("run-delete-box"));
+  } else {
+    renderRunActions(run);
+    renderRunFoldMerged(run);
+    renderRunDelete(run);
+  }
 
   setText($("run-report"), report === null ? "Loading\u2026" : report);
 }
@@ -7730,7 +7817,8 @@ async function foldRun(id) {
       ? `Folded ${shortId(id)}: ${n} worktree${n === 1 ? "" : "s"} and branches removed.`
       : `Run ${shortId(id)} had nothing left to fold.`);
     closeRunActions();
-    await loadRun(id);
+    cancelDetailSections(`run:${id}:`);
+    if (state.detail.id === id) await loadRun(id);
   } catch (error) {
     /* The alert banner sits in normal flow, under the sheet's own top-layer
        backdrop, so it must close first or the failure is unreadable. */
@@ -7748,7 +7836,8 @@ async function resumeRun(id) {
     ok();
     announce(`Run ${shortId(id)} is being resumed. The card will follow it.`);
     closeRunActions();
-    await loadRun(id);
+    cancelDetailSections(`run:${id}:`);
+    if (state.detail.id === id) await loadRun(id);
   } catch (error) {
     closeRunActions();
     fail(`Could not resume run ${shortId(id)}: ${error.message}`);
@@ -7828,7 +7917,8 @@ async function foldMergedRun(id, prUrl) {
     announce(`Recorded ${shortId(id)} as merged via ${url}: ${out.before} → ${out.after}.`);
     armedFoldMerged = null;
     closeRunActions();
-    await loadRun(id);
+    cancelDetailSections(`run:${id}:`);
+    if (state.detail.id === id) await loadRun(id);
   } catch (error) {
     closeRunActions();
     fail(`Could not record ${shortId(id)} as merged: ${error.message}`);
@@ -9122,6 +9212,9 @@ function renderTimeline(run) {
   show($("run-events-note"), events.length > 0);
 
   const list = $("run-events");
+  const signature = JSON.stringify([run.id, events]);
+  if (list.dataset.signature === signature) return;
+  list.dataset.signature = signature;
   clear(list);
   for (const group of groupEvents(events)) {
     list.append(el("li", { class: "tl-group" },
@@ -9245,10 +9338,11 @@ function loadStore(name, url, change, apply) {
           // may already be queued; its base will be checked on the next read.
           if (target) state.rev[name] = target.rev;
           cancelStoreRetry(name);
+          sectionNotice(`${name === "queue" ? "queue" : name}-h`, `${name}-load-state`, "");
           ok();
         } catch (error) {
           state.rev[name] = null;
-          failBackground(`Could not load ${name}: ${error.message}`, error);
+          sectionNotice(`${name}-h`, `${name}-load-state`, `Could not load ${name}: ${error.message}`, () => loadStore(name, url, null, apply));
           // Even the final change must recover while SSE stays connected:
           // health otherwise polls without applying revisions in that state.
           cancelStoreRetry(name);
@@ -9280,18 +9374,23 @@ function loadQueue(change) {
 }
 
 async function loadStats({ background = false } = {}) {
-  try {
-    const params = new URLSearchParams();
-    if (state.statsRepo) params.set("repo", state.statsRepo);
-    if (state.statsAll) params.set("all", "true");
-    const query = params.toString();
-    const url = query ? `${API.stats}?${query}` : API.stats;
-    state.stats = await getJson(url);
-    renderStats();
-    ok();
-  } catch (error) {
-    failFor(background, `Could not load stats: ${error.message}`, error);
+  const params = new URLSearchParams();
+  if (state.statsRepo) params.set("repo", state.statsRepo);
+  if (state.statsAll) params.set("all", "true");
+  const query = params.toString();
+  const key = `stats:${query}`;
+  for (const [name, job] of detailSections) {
+    if (name.startsWith("stats:") && name !== key) {
+      job.controller.abort();
+      detailSections.delete(name);
+    }
   }
+  sectionNotice("stats-h", "stats-load-state", state.stats ? "Updating statistics…" : "Loading statistics…");
+  return sectionRequest(key, query ? `${API.stats}?${query}` : API.stats, stats => {
+    state.stats = stats;
+    sectionNotice("stats-h", "stats-load-state", "");
+    renderStats();
+  }, error => sectionNotice("stats-h", "stats-load-state", `Statistics: ${error.message}`, () => loadStats()));
 }
 
 /* The repository selector's change handler - switches state.statsRepo and
@@ -9310,9 +9409,8 @@ function selectStatsRepo(value) {
    a backlog of them would mean the loop had been stalled for days — and one
    fetch keeps the runs list, the ask bar and the open run in agreement about
    which runs are parked. */
-async function loadQuestions() {
-  try {
-    const list = await getJson(API.questions);
+function loadQuestions() {
+  return loadStore("questions", API.questions, null, list => {
     state.questions = sortQuestions(Array.isArray(list) ? list : []);
     renderQuestions();
     renderAskBar();
@@ -9325,10 +9423,7 @@ async function loadQuestions() {
     renderRuns();
     renderQueue();
     if (state.route.name === "run" && state.detail.run) renderRunDetail();
-    ok();
-  } catch (error) {
-    failBackground(`Could not load questions: ${error.message}`, error);
-  }
+  });
 }
 
 /* ---- notification centre ------------------------------------------------
@@ -9572,64 +9667,61 @@ function runShell(id, summary) {
   };
 }
 
-function loadRawReport(id, requestId) {
-  if (state.detail.id !== id || requestId !== runDetailRequests.get(id)) return;
-  if (state.detail.report && state.detail.report !== "Loading…") return;
-  getText(API.report(id))
-    .then((text) => {
-      if (state.detail.id !== id || requestId !== runDetailRequests.get(id)) return;
-      state.detail.report = text;
-      renderReportCards();
-    })
-    .catch((err) => {
-      if (state.detail.id !== id || requestId !== runDetailRequests.get(id)) return;
-      state.detail.report = `The report could not be rendered: ${err.message}`;
-      renderReportCards();
-    });
+function loadRawReport(id) {
+  const detail = state.detail;
+  return sectionRequest(`run:${id}:raw`, API.report(id), text => {
+    if (state.detail !== detail) return;
+    detail.report = text;
+    sectionNotice("run-report-note", "run-raw-state", "");
+    renderReportCards();
+  }, error => {
+    if (state.detail !== detail) return;
+    sectionNotice("run-report-note", "run-raw-state", `Text report: ${error.message}`, () => loadRawReport(id));
+  }, true);
 }
 
 async function loadRun(id, { background = false } = {}) {
-  const fresh = state.detail.id !== id;
   const requestId = nextRunRequest(id);
-
-  if (fresh) {
-    const summary = (state.runs || []).find((r) => r.id === id);
-    state.detail = runShell(id, summary);
+  if (state.detail.id !== id) {
+    state.detail = runShell(id, (state.runs || []).find(r => r.id === id));
+    sectionNotice("run-report-note", "run-report-state", "");
+    sectionNotice("run-report-note", "run-raw-state", "");
     renderRunDetail();
   }
-
-  // 1. Run core details
-  getJson(API.run(id))
-    .then((run) => {
-      if (state.detail.id !== id || requestId !== runDetailRequests.get(id)) return;
-      state.detail.run = run;
-      ok();
+  const detail = state.detail;
+  const retry = () => loadRun(id, { background: true });
+  sectionNotice("run-meta", "run-core-state", detail.run && !detail.run.isShell ? "" : "Loading run…");
+  const core = sectionRequest(`run:${id}:core`, API.run(id), run => {
+    if (state.detail !== detail) return;
+    detail.run = run;
+    detail.evidenceError = false;
+    sectionNotice("run-meta", "run-core-state", "");
+    renderRunDetail();
+  }, error => {
+    if (state.detail === detail) {
+      detail.evidenceError = true;
+      sectionNotice("run-meta", "run-core-state", `Run: ${error.message}`, retry);
       renderRunDetail();
-    })
-    .catch((err) => {
-      if (state.detail.id !== id || requestId !== runDetailRequests.get(id)) return;
-      failFor(background, `Could not load run ${shortId(id)}: ${err.message}`, err);
-      renderRunDetail();
-    });
-
-  // 2. Structured report (independent fetch)
-  getJson(API.reportJson(id))
-    .then((view) => {
-      if (state.detail.id !== id || requestId !== runDetailRequests.get(id)) return;
-      state.detail.reportView = view;
-      state.detail.reportLoading = false;
+    }
+  }, false, background);
+  const report = sectionRequest(`run:${id}:report`, API.reportJson(id), view => {
+    if (state.detail !== detail) return;
+    detail.reportView = view;
+    state.detail.reportLoading = false;
+    sectionNotice("run-report-note", "run-report-state", "");
+    renderReportCards();
+    if (state.rawReport || view.schema !== REPORT_VIEW_SCHEMA || !Array.isArray(view.sections)) return loadRawReport(id);
+  }, error => {
+    if (state.detail !== detail) return;
+    state.detail.reportLoading = false;
+    sectionNotice("run-report-note", "run-report-state", `Report: ${error.message}`, retry);
+    if (!detail.reportView) {
+      detail.reportView = { error: error.message };
       renderReportCards();
-      if (state.rawReport) {
-        loadRawReport(id, requestId);
-      }
-    })
-    .catch((err) => {
-      if (state.detail.id !== id || requestId !== runDetailRequests.get(id)) return;
-      state.detail.reportView = { error: err.message || "request failed" };
-      state.detail.reportLoading = false;
-      renderReportCards();
-      loadRawReport(id, requestId);
-    });
+      return loadRawReport(id);
+    }
+  }, false, background);
+  await Promise.allSettled([core, report]);
 }
 
 /* Named with a trailing underscore because `applyRevisions` is also the option
@@ -9929,6 +10021,7 @@ function markSelected() {
 function applyRoute() {
   const route = parseRoute();
   const changed = route.name !== state.route.name || route.id !== state.route.id;
+  if (changed) cancelDetailSections();
   state.route = route;
 
   const split = splitPanes(route, Boolean(splitMedia && splitMedia.matches));
@@ -10475,22 +10568,35 @@ function taskShell(id, summary) {
 async function loadTask(id, { background = false } = {}) {
   const req = nextTaskRequest(id);
   if (state.taskDetail.id !== id) {
-    const summary = (state.queue || []).find((t) => t.id === id);
-    state.taskDetail = taskShell(id, summary);
+    state.taskDetail = taskShell(id, (state.queue || []).find(t => t.id === id));
   }
+  const detail = state.taskDetail;
+  const retry = () => loadTask(id, { background: true });
   renderTask();
-  try {
-    const task = await getJson(API.task(id));
-    if (req !== taskDetailRequests.get(id) || state.taskDetail.id !== id) return;
-    state.taskDetail.task = task;
-    state.taskDetail.error = null;
-    ok();
-  } catch (e) {
-    if (req !== taskDetailRequests.get(id) || state.taskDetail.id !== id) return;
-    state.taskDetail.error = e.message;
-    failFor(background, `Could not load task ${shortId(id)}: ${e.message}`, e);
-  }
-  renderTask();
+  sectionNotice("task-meta", "task-core-state", detail.task && !detail.task.isShell ? "" : "Loading task…");
+  const core = sectionRequest(`task:${id}:core`, `${API.task(id)}/core`, task => {
+    if (state.taskDetail !== detail) return;
+    if (!detail.task || detail.task.isShell || detail.task.coreOnly) detail.task = { ...task, coreOnly: true };
+    sectionNotice("task-meta", "task-core-state", "");
+    renderTask();
+  }, error => {
+    if (state.taskDetail === detail) sectionNotice("task-meta", "task-core-state", `Task: ${error.message}`, retry);
+  }, false, background);
+  sectionNotice("task-attempts-count", "task-history-state", detail.task && !detail.task.coreOnly && !detail.task.isShell ? "" : "Loading history and dependencies…");
+  const history = sectionRequest(`task:${id}:history`, API.task(id), task => {
+    if (state.taskDetail !== detail) return;
+    detail.task = task;
+    detail.error = null;
+    sectionNotice("task-attempts-count", "task-history-state", "");
+    renderTask();
+  }, error => {
+    if (state.taskDetail === detail) {
+      detail.error = error.message;
+      renderTaskActions(null);
+      sectionNotice("task-attempts-count", "task-history-state", `History and dependencies: ${error.message}`, retry);
+    }
+  }, false, background);
+  await Promise.allSettled([core, history]);
 }
 
 function renderTask() {
@@ -10518,7 +10624,11 @@ function renderTask() {
       setText($("task-meta"), error || "");
     }
     show($("task-why-panel"), false);
+    renderTaskFollowup(null);
+    clear($("task-instruction"));
+    delete $("task-instruction").dataset.forTask;
     clear($("task-runs"));
+    delete $("task-runs").dataset.signature;
     clear($("task-flow"));
     setText($("task-flow-summary"), "");
     setText($("task-attempts-count"), "");
@@ -10537,7 +10647,7 @@ function renderTask() {
     task.source_label,
     repoName,
     task.solo ? "solo" : "",
-    `${spent} of ${task.max_attempts} attempts used`,
+    task.coreOnly ? `${spent} attempts used` : `${spent} of ${task.max_attempts} attempts used`,
   ].filter(Boolean);
   const metaKids = [];
   metaBits.forEach((bit, i) => {
@@ -10562,7 +10672,15 @@ function renderTask() {
     box.dataset.forTask = stamp;
     renderMd(box, task.instruction_md);
   }
-  renderTaskActions(task);
+  renderTaskActions(task.coreOnly || error ? null : task);
+  if (task.coreOnly) {
+    clear($("task-runs"));
+    delete $("task-runs").dataset.signature;
+    clear($("task-flow"));
+    setText($("task-flow-summary"), "");
+    setText($("task-attempts-count"), "");
+    return;
+  }
 
   const history = Array.isArray(task.history) ? task.history : [];
   const passesTotal = Number(task.passes_total) || history.length;
@@ -10578,6 +10696,9 @@ function renderTask() {
     : "");
   show($("task-unreadable"), unreadable > 0);
 
+  const historySignature = JSON.stringify([task.id, task.history, task.flow, task.followup_origin]);
+  if ($("task-runs").dataset.signature === historySignature) return;
+  $("task-runs").dataset.signature = historySignature;
   renderTaskFlow(task.flow);
   renderTaskFollowup(task.followup_origin);
 
@@ -11048,6 +11169,7 @@ function wire() {
 
   $("report-raw-toggle").addEventListener("click", () => {
     state.rawReport = !state.rawReport;
+    if (state.rawReport) loadRawReport(state.detail.id);
     renderReportCards();
   });
 
@@ -11149,6 +11271,7 @@ async function boot() {
      falls back to health's own count until /api/questions has answered. So
      all five now share one round trip, and renderRuns runs once more after
      to pick up whichever of health/runs landed second. */
+  subscribe();
   await Promise.allSettled([
     loadHealth(), loadRuns(), loadQueue(), loadQuestions(), loadTalks(), loadNotifications(),
   ]);
@@ -11162,7 +11285,6 @@ async function boot() {
   }
   renderRuns();
 
-  subscribe();
   setInterval(() => {
     if (document.hidden) return;
     loadHealth({ applyRevisions: !state.streamOpen });

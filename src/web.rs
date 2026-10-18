@@ -293,34 +293,55 @@ mod id_links;
 type Stamps = HashMap<String, (u128, u64)>;
 
 /// Metadata only: no task instructions or conversation bodies are read here.
+#[cfg(test)]
 fn store_stamps(root: &FsPath, runs: bool) -> Stamps {
-    std::fs::read_dir(root)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let path = if runs {
-                entry.path().join("run.json")
-            } else {
-                entry.path()
-            };
-            if !runs && path.extension().is_none_or(|ext| ext != "json") {
-                return None;
-            }
-            let metadata = path.metadata().ok()?;
-            let modified = metadata
-                .modified()
-                .ok()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?;
-            let id = if runs {
-                entry.file_name().to_string_lossy().into_owned()
-            } else {
-                path.file_stem()?.to_string_lossy().into_owned()
-            };
-            Some((id, (modified.as_nanos(), metadata.len())))
-        })
-        .collect()
+    try_store_stamps(root, runs).unwrap_or_default()
+}
+
+fn try_store_stamps(root: &FsPath, runs: bool) -> std::io::Result<Stamps> {
+    try_stamps(root, runs, false)
+}
+
+fn try_stamps(root: &FsPath, runs: bool, all_entries: bool) -> std::io::Result<Stamps> {
+    use std::hash::{Hash as _, Hasher as _};
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(e),
+    };
+    let mut stamps = HashMap::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = if runs {
+            entry.path().join("run.json")
+        } else {
+            entry.path()
+        };
+        if !runs && !all_entries && path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let identity = match file_identity(&path) {
+            Ok(identity) => identity,
+            Err(e) if runs && e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let modified = identity
+            .modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let mut hasher = std::hash::DefaultHasher::new();
+        identity.hash(&mut hasher);
+        let id = if runs || all_entries {
+            entry.file_name().to_string_lossy().into_owned()
+        } else {
+            path.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        };
+        stamps.insert(id, (modified.as_nanos(), hasher.finish()));
+    }
+    Ok(stamps)
 }
 
 #[derive(Debug, Serialize)]
@@ -351,6 +372,7 @@ fn diff_stamps(previous: &Stamps, next: &Stamps, base: u64) -> Delta {
 }
 
 /// Change detection token for recorded runs under `runs`.
+#[cfg(test)]
 fn runs_revision(runs: &FsPath) -> u64 {
     stamps_revision(&store_stamps(runs, true))
 }
@@ -375,26 +397,63 @@ pub(crate) struct ChangeNotification {
     pub payload: serde_json::Value,
 }
 
-#[derive(Default, Clone, Debug)]
+#[derive(Default, Debug)]
 pub(crate) struct QueueIndex {
-    pub rev: u64,
-    pub run_to_task: HashMap<String, String>,
-    pub talk_to_tasks: HashMap<String, Vec<String>>,
+    // Retain parsed records only while their file identity is unchanged.
+    records: HashMap<String, (FileIdentity, Arc<TaskRelation>)>,
+    #[cfg(test)]
+    reparsed: usize,
 }
 
-#[derive(Default, Clone, Debug)]
-pub(crate) struct QuestionsIndex {
-    pub rev: u64,
-    pub open_by_run: HashMap<String, Vec<Question>>,
+#[derive(Debug)]
+struct TaskRelation {
+    id: String,
+    priority: i32,
+    runs: Vec<String>,
+    source: Source,
 }
+
+impl From<Task> for TaskRelation {
+    fn from(task: Task) -> Self {
+        Self {
+            id: task.id,
+            priority: task.priority,
+            runs: task.runs,
+            source: task.source,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct FileIdentity {
+    modified: std::time::SystemTime,
+    len: u64,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+fn file_identity(path: &FsPath) -> std::io::Result<FileIdentity> {
+    let meta = path.metadata()?;
+    Ok(FileIdentity {
+        modified: meta.modified()?,
+        len: meta.len(),
+        #[cfg(unix)]
+        identity: {
+            use std::os::unix::fs::MetadataExt as _;
+            (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+        },
+    })
+}
+
+type Revisions = (u64, u64, u64, u64, u64, u64);
+type MonitorSnapshot = Option<(Revisions, [Stamps; 3])>;
 
 #[derive(Debug)]
 pub(crate) struct SharedMonitor {
     pub broadcaster: tokio::sync::broadcast::Sender<ChangeNotification>,
-    pub latest: Arc<Mutex<Option<((u64, u64, u64, u64, u64, u64), [Stamps; 3])>>>,
+    pub latest: Arc<Mutex<MonitorSnapshot>>,
     pub worker_started: std::sync::atomic::AtomicBool,
     pub queue_index: Arc<Mutex<QueueIndex>>,
-    pub questions_index: Arc<Mutex<QuestionsIndex>>,
 }
 
 impl SharedMonitor {
@@ -405,7 +464,25 @@ impl SharedMonitor {
             latest: Arc::default(),
             worker_started: std::sync::atomic::AtomicBool::new(false),
             queue_index: Arc::default(),
-            questions_index: Arc::default(),
+        }
+    }
+
+    async fn revisions(&self, ui: &Arc<Ui>) -> ApiResult<Revisions> {
+        let mut receiver = self.broadcaster.subscribe();
+        self.ensure_worker(ui);
+        loop {
+            if let Some((revisions, _)) = self
+                .latest
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+            {
+                return Ok(*revisions);
+            }
+            tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .map_err(|_| ApiError::internal("Store monitoring is unavailable; retry"))?
+                .map_err(|_| ApiError::internal("Store monitoring restarted; retry"))?;
         }
     }
 
@@ -435,24 +512,26 @@ impl SharedMonitor {
                 let state = Arc::clone(&ui);
                 let scan = tokio::task::spawn_blocking(move || {
                     let stamps = [
-                        store_stamps(state.queue.root(), false),
-                        store_stamps(&state.runs, true),
-                        store_stamps(state.talks.root(), false),
+                        try_store_stamps(state.queue.root(), false)?,
+                        try_store_stamps(&state.runs, true)?,
+                        try_store_stamps(state.talks.root(), false)?,
                     ];
                     let revisions = (
                         stamps_revision(&stamps[0]),
                         stamps_revision(&stamps[1]),
-                        state.questions.revision(),
+                        stamps_revision(&try_stamps(state.questions.root(), false, true)?),
                         stamps_revision(&stamps[2]),
-                        state.notices.revision(),
+                        stamps_revision(&try_stamps(state.notices.root(), false, true)?),
                         state.lock_loop().rev,
                     );
-                    (revisions, stamps)
+                    Ok::<_, std::io::Error>((revisions, stamps))
                 })
                 .await;
 
-                let Ok((revisions, next_stamps)) = scan else {
-                    break;
+                // A slow filesystem must not turn missed ticks into a busy loop.
+                ticker.reset();
+                let Ok(Ok((revisions, next_stamps))) = scan else {
+                    continue;
                 };
 
                 let mut latest_guard = match ui.monitor.latest.lock() {
@@ -490,7 +569,9 @@ impl SharedMonitor {
                     .enumerate()
                     {
                         let delta = diff_stamps(&prev[index], &next_stamps[index], rev);
-                        if delta.changed.len() + delta.removed.len() > 0 && delta.changed.len() <= 50 {
+                        if delta.changed.len() + delta.removed.len() > 0
+                            && delta.changed.len() <= 50
+                        {
                             payload[key] = serde_json::to_value(delta).expect("serializable delta");
                         }
                     }
@@ -499,9 +580,7 @@ impl SharedMonitor {
                 *latest_guard = Some((revisions, next_stamps));
                 drop(latest_guard);
 
-                let _ = ui.monitor.broadcaster.send(ChangeNotification {
-                    payload,
-                });
+                let _ = ui.monitor.broadcaster.send(ChangeNotification { payload });
             }
         });
     }
@@ -658,128 +737,86 @@ impl Ui {
         }
     }
 
-    /// Look up the matching task for a run using the queue index when fresh.
-    pub(crate) fn find_task_for_run(&self, run_id: &str) -> Option<Task> {
-        let queue_rev = {
-            let guard = match self.monitor.latest.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            guard.as_ref().map(|(r, _)| r.0).unwrap_or(0)
+    /// Refresh metadata on every lookup, including external-process writes. Only
+    /// changed records are parsed. Never publish a partial scan as an empty set.
+    fn indexed_tasks(&self) -> ApiResult<Vec<Arc<TaskRelation>>> {
+        let mut index = self
+            .monitor
+            .queue_index
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let entries = match std::fs::read_dir(self.queue.root()) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                index.records.clear();
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(anyhow::Error::from(e).into()),
         };
-        if queue_rev != 0 {
-            if let Ok(guard) = self.monitor.queue_index.lock() {
-                if guard.rev == queue_rev {
-                    if let Some(task_id) = guard.run_to_task.get(run_id) {
-                        return self.queue.get(task_id).ok();
-                    } else {
-                        return None;
-                    }
-                }
+        let mut seen = HashSet::new();
+        for entry in entries {
+            let path = entry.map_err(anyhow::Error::from)?.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
             }
-        }
-        let tasks = self.queue.list();
-        let mut run_to_task = HashMap::new();
-        let mut talk_to_tasks: HashMap<String, Vec<String>> = HashMap::new();
-        let mut found = None;
-
-        for t in &tasks {
-            for r in &t.runs {
-                run_to_task.insert(r.clone(), t.id.clone());
-            }
-            if let Source::Agent { run, .. } = &t.source {
-                talk_to_tasks.entry(run.clone()).or_default().push(t.id.clone());
-            }
-            if t.runs.contains(&run_id.to_string()) && found.is_none() {
-                found = Some(t.clone());
-            }
-        }
-
-        if let Ok(mut guard) = self.monitor.queue_index.lock() {
-            guard.rev = queue_rev;
-            guard.run_to_task = run_to_task;
-            guard.talk_to_tasks = talk_to_tasks;
-        }
-
-        found
-    }
-
-    /// Look up the tasks filed by a talk using the queue index when fresh.
-    pub(crate) fn find_tasks_for_talk(&self, talk_id: &str) -> Vec<Task> {
-        let queue_rev = {
-            let guard = match self.monitor.latest.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
             };
-            guard.as_ref().map(|(r, _)| r.0).unwrap_or(0)
-        };
-        if queue_rev != 0 {
-            if let Ok(guard) = self.monitor.queue_index.lock() {
-                if guard.rev == queue_rev {
-                    if let Some(task_ids) = guard.talk_to_tasks.get(talk_id) {
-                        return task_ids.iter().filter_map(|tid| self.queue.get(tid).ok()).collect();
-                    } else {
-                        return Vec::new();
-                    }
+            let stamp = file_identity(&path).map_err(anyhow::Error::from)?;
+            seen.insert(id.to_owned());
+            // On platforms without inode/ctime, re-read rather than trust a
+            // same-size replacement with a preserved modification timestamp.
+            if !cfg!(unix) || index.records.get(id).is_none_or(|(old, _)| *old != stamp) {
+                let task = self.queue.get(id)?;
+                #[cfg(test)]
+                {
+                    index.reparsed += 1;
                 }
+                if file_identity(&path).map_err(anyhow::Error::from)? != stamp {
+                    return Err(ApiError::conflict("Queue changed during read; retry"));
+                }
+                index
+                    .records
+                    .insert(id.to_owned(), (stamp, Arc::new(TaskRelation::from(task))));
             }
         }
-        let tasks = self.queue.list();
-        let mut run_to_task = HashMap::new();
-        let mut talk_to_tasks: HashMap<String, Vec<String>> = HashMap::new();
-
-        for t in &tasks {
-            for r in &t.runs {
-                run_to_task.insert(r.clone(), t.id.clone());
-            }
-            if let Source::Agent { run, .. } = &t.source {
-                talk_to_tasks.entry(run.clone()).or_default().push(t.id.clone());
-            }
-        }
-
-        let result = talk_to_tasks
-            .get(talk_id)
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|tid| self.queue.get(tid).ok())
+        index.records.retain(|id, _| seen.contains(id));
+        let mut tasks: Vec<_> = index
+            .records
+            .values()
+            .map(|(_, task)| task.clone())
             .collect();
-
-        if let Ok(mut guard) = self.monitor.queue_index.lock() {
-            guard.rev = queue_rev;
-            guard.run_to_task = run_to_task;
-            guard.talk_to_tasks = talk_to_tasks;
-        }
-
-        result
+        tasks.sort_unstable_by(|a, b| b.priority.cmp(&a.priority).then_with(|| b.id.cmp(&a.id)));
+        Ok(tasks)
     }
 
-    /// Open questions belonging to a run, using index when fresh.
-    pub(crate) fn open_questions_for_run(&self, run_id: &str) -> Vec<Question> {
-        let q_rev = self.questions.revision();
-        if q_rev != 0 {
-            if let Ok(guard) = self.monitor.questions_index.lock() {
-                if guard.rev == q_rev {
-                    return guard.open_by_run.get(run_id).cloned().unwrap_or_default();
-                }
-            }
-        }
-        let open_qs = self
-            .questions
-            .list()
+    fn find_task_for_run(&self, run_id: &str) -> ApiResult<Option<Task>> {
+        let Some(record) = self
+            .indexed_tasks()?
             .into_iter()
-            .filter(|q| q.status.open())
-            .collect::<Vec<_>>();
-        let mut open_by_run: HashMap<String, Vec<Question>> = HashMap::new();
-        for q in open_qs {
-            open_by_run.entry(q.run.clone()).or_default().push(q);
+            .find(|task| task.runs.iter().any(|id| id == run_id))
+        else {
+            return Ok(None);
+        };
+        let task = self.queue.get(&record.id)?;
+        if !task.runs.iter().any(|id| id == run_id) {
+            return Err(ApiError::conflict("Task relationship changed; retry"));
         }
-        let res = open_by_run.get(run_id).cloned().unwrap_or_default();
-        if let Ok(mut guard) = self.monitor.questions_index.lock() {
-            guard.rev = q_rev;
-            guard.open_by_run = open_by_run;
-        }
-        res
+        Ok(Some(task))
+    }
+
+    fn find_tasks_for_talk(&self, talk_id: &str) -> ApiResult<Vec<Task>> {
+        self.indexed_tasks()?
+            .into_iter()
+            .filter(|task| matches!(&task.source, Source::Agent { run, .. } if run == talk_id))
+            .map(|record| {
+                let task = self.queue.get(&record.id)?;
+                if !matches!(&task.source, Source::Agent { run, .. } if run == talk_id) {
+                    return Err(ApiError::conflict("Task relationship changed; retry"));
+                }
+                Ok(task)
+            })
+            .collect()
     }
 
     /// The operator's own state: `<home>/queue`, `<home>/questions`,
@@ -1265,6 +1302,7 @@ impl Ui {
             .route("/api/queue", get(queue_list))
             .route("/api/search", get(search_get))
             .route("/api/queue/{id}", get(task_detail).delete(queue_delete))
+            .route("/api/queue/{id}/core", get(task_core))
             .route("/api/stats", get(stats_get))
             .route("/api/repos", get(repos_list))
             .route("/api/settings", get(settings_get))
@@ -1301,6 +1339,8 @@ impl Ui {
             )
             .route("/api/talks", get(talks_list).post(talk_post))
             .route("/api/talks/{id}", get(talk_detail).delete(talk_delete))
+            .route("/api/talks/{id}/core", get(talk_core))
+            .route("/api/talks/{id}/sections", get(talk_sections))
             .route("/api/talks/{id}/say", post(talk_say))
             .route("/api/talks/{id}/pending/resume", post(talk_pending_resume))
             .route("/api/talks/{id}/pending/clear", post(talk_pending_clear))
@@ -2672,6 +2712,7 @@ impl DaemonView {
 }
 
 async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
+    let revisions = ui.monitor.revisions(&ui).await?;
     blocking(move || {
         // One read of the status file for the two fields that describe it, so
         // `daemon` and `loop` in the same answer cannot disagree about who is
@@ -2686,19 +2727,25 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
         let cfg = deputy_config(&ui.repo);
         let update = cached_update_view(cfg.as_ref());
         let upgrade = updater::read_progress(&ui.home).map(|p| upgrade_progress_view(&ui, p));
+        let questions = ui.questions.list();
         Ok(Json(HealthView {
             version: env!("CARGO_PKG_VERSION"),
             home: ui.home.display().to_string(),
-            queue_rev: stamps_revision(&store_stamps(ui.queue.root(), false)),
-            runs_rev: runs_revision(&ui.runs),
-            questions_rev: ui.questions.revision(),
-            talks_rev: stamps_revision(&store_stamps(ui.talks.root(), false)),
-            notifications_rev: ui.notices.revision(),
+            queue_rev: revisions.0,
+            runs_rev: revisions.1,
+            questions_rev: revisions.2,
+            talks_rev: revisions.3,
+            notifications_rev: revisions.4,
             notifications_unread: ui.notices.count_unread(),
             loop_rev,
             runs_unreadable: runs_unreadable(&ui.runs),
-            questions_open: ui.questions.count_open(),
-            questions_needs_owner: ui.questions.count_needs_owner(),
+            questions_open: questions.iter().filter(|q| q.status.open()).count(),
+            questions_needs_owner: questions
+                .iter()
+                .filter(|q| {
+                    q.status.open() && (!q.waiting_on_agent() || ui.questions.deputy_exhausted(q))
+                })
+                .count(),
             daemon: DaemonView::of(reading.clone()),
             looping: ui.loop_view(reading),
             disk: DiskView::of(&ui, cfg.as_ref()),
@@ -3937,15 +3984,23 @@ async fn run_detail(
         let state = read_run(&ui.runs, &id)?;
         let daemon_claims = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
         let live = state.liveness(daemon_claims);
-        let waiting = !ui.open_questions_for_run(&id).is_empty();
+        let waiting = ui
+            .questions
+            .list()
+            .iter()
+            .any(|q| q.run == id && q.status.open());
         let max_attempts = daemon::Opts::default().max_attempts;
 
-        let matching_task = ui.find_task_for_run(&id);
+        let matching_task = ui.find_task_for_run(&id)?;
 
         let superseded_by = state
             .pr_taken_over_by
             .clone()
-            .or_else(|| matching_task.as_ref().and_then(|t| t.successor_of(&id).cloned()))
+            .or_else(|| {
+                matching_task
+                    .as_ref()
+                    .and_then(|t| t.successor_of(&id).cloned())
+            })
             .as_deref()
             .map(crate::run::short_of)
             .map(str::to_owned);
@@ -3966,9 +4021,8 @@ async fn run_detail(
                 })
             });
 
-        let task = matching_task.map(|t| {
-            task_outcome(&t, &id, max_attempts, |r| read_run(&ui.runs, r).ok())
-        });
+        let task = matching_task
+            .map(|t| task_outcome(&t, &id, max_attempts, |r| read_run(&ui.runs, r).ok()));
 
         Ok(Json(RunDetailView::of(
             state,
@@ -5843,6 +5897,14 @@ fn mark_badges(ui: &Ui, task: &Task, history: &mut [TaskRunView]) {
     }
 }
 
+async fn task_core(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResult<Json<TaskView>> {
+    blocking(move || {
+        let id = resolve_task(&ui.queue, &id)?;
+        Ok(Json(TaskView::from(ui.queue.get(&id)?)))
+    })
+    .await
+}
+
 async fn task_detail(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
@@ -6603,10 +6665,7 @@ async fn mutate(
 /// The change stream: one revision number per store, on connect and whenever
 /// any of them moves.
 ///
-/// The poll runs in one spawned task per client, which is affordable because
-/// the work is a directory scan and a `stat` per file. It stops as soon as the
-/// receiver is gone, so a phone that walks out of range costs nothing after
-/// its next tick - there is no session and no cleanup to forget.
+/// One shared worker scans stores; clients only forward its notifications.
 async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
     ui.monitor.ensure_worker(&ui);
     let mut broadcast_rx = ui.monitor.broadcaster.subscribe();
@@ -6621,60 +6680,31 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
             };
             guard.as_ref().map(|(r, _)| *r)
         };
-        let revisions = match initial_revisions {
-            Some(r) => r,
-            None => {
-                let st = Arc::clone(&state);
-                let scan = tokio::task::spawn_blocking(move || {
-                    let stamps = [
-                        store_stamps(st.queue.root(), false),
-                        store_stamps(&st.runs, true),
-                        store_stamps(st.talks.root(), false),
-                    ];
-                    let revisions = (
-                        stamps_revision(&stamps[0]),
-                        stamps_revision(&stamps[1]),
-                        st.questions.revision(),
-                        stamps_revision(&stamps[2]),
-                        st.notices.revision(),
-                        st.lock_loop().rev,
-                    );
-                    let mut guard = match st.monitor.latest.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
-                    if guard.is_none() {
-                        *guard = Some((revisions, stamps));
-                    }
-                    revisions
-                })
-                .await;
-                match scan {
-                    Ok(r) => r,
-                    Err(_) => return,
+        if let Some(revisions) = initial_revisions {
+            let initial_payload = serde_json::json!({
+                "queue_rev": revisions.0,
+                "runs_rev": revisions.1,
+                "questions_rev": revisions.2,
+                "talks_rev": revisions.3,
+                "notifications_rev": revisions.4,
+                "loop_rev": revisions.5,
+            });
+
+            if let Ok(event) = Event::default().event("change").json_data(initial_payload) {
+                if tx.send(event).await.is_err() {
+                    return;
                 }
-            }
-        };
-
-        let initial_payload = serde_json::json!({
-            "queue_rev": revisions.0,
-            "runs_rev": revisions.1,
-            "questions_rev": revisions.2,
-            "talks_rev": revisions.3,
-            "notifications_rev": revisions.4,
-            "loop_rev": revisions.5,
-        });
-
-        if let Ok(event) = Event::default().event("change").json_data(initial_payload) {
-            if tx.send(event).await.is_err() {
-                return;
             }
         }
 
         loop {
-            match broadcast_rx.recv().await {
+            match tokio::select! {
+                _ = tx.closed() => return,
+                value = broadcast_rx.recv() => value,
+            } {
                 Ok(notif) => {
-                    let Ok(event) = Event::default().event("change").json_data(notif.payload) else {
+                    let Ok(event) = Event::default().event("change").json_data(notif.payload)
+                    else {
                         break;
                     };
                     if tx.send(event).await.is_err() {
@@ -6763,9 +6793,13 @@ pub fn runs_unreadable(runs: &FsPath) -> usize {
         .count()
 }
 
+fn plain_record_id(id: &str) -> bool {
+    !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\'])
+}
+
 /// Expand an id or short id to exactly one run id.
 fn resolve_run(runs: &FsPath, id: &str) -> ApiResult<String> {
-    if runs.join(id).join("run.json").is_file() {
+    if plain_record_id(id) && runs.join(id).join("run.json").is_file() {
         return Ok(id.to_owned());
     }
     pick(run_ids(runs), id, "run")
@@ -6773,7 +6807,7 @@ fn resolve_run(runs: &FsPath, id: &str) -> ApiResult<String> {
 
 /// Expand an id or short id to exactly one task id.
 fn resolve_task(queue: &Queue, id: &str) -> ApiResult<String> {
-    if queue.path_of(id).is_file() {
+    if plain_record_id(id) && queue.path_of(id).is_file() {
         return Ok(id.to_owned());
     }
     let ids = crate::queue::record_ids(queue.root(), "json").unwrap_or_default();
@@ -7270,7 +7304,7 @@ async fn question_consult(
 
 /// Expand an id or short id to exactly one question id.
 fn resolve_question(store: &Questions, id: &str) -> ApiResult<String> {
-    if store.path_of(id).is_file() {
+    if plain_record_id(id) && store.path_of(id).is_file() {
         return Ok(id.to_owned());
     }
     pick(
@@ -7891,6 +7925,77 @@ async fn talk_post(
     Ok((StatusCode::CREATED, Json(view)))
 }
 
+/// Transcript first: unrelated queue history and repository probes are deferred.
+async fn talk_core(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResult<Json<TalkView>> {
+    blocking(move || {
+        let id = resolve_talk(&ui.talks, &id)?;
+        let talk = ui.talks.get(&id)?;
+        let thinking = ui.is_thinking(&id);
+        Ok(Json(TalkView::with_config(talk, thinking, None, &ui.home)))
+    })
+    .await
+}
+
+async fn talk_sections(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    blocking(move || {
+        let id = resolve_talk(&ui.talks, &id)?;
+        let talk = ui.talks.get(&id)?;
+        let tasks = ui.find_tasks_for_talk(&talk.id)?;
+        let task_progress = talk_task_progress(&tasks);
+        let tasks: Vec<_> = tasks
+            .into_iter()
+            .map(|task| {
+                serde_json::json!({
+                    "id": task.id, "title": task.title, "status_str": task.status.as_str(),
+                })
+            })
+            .collect();
+        let cfg = Config::discover(&talk.repo, None).ok().map(|(cfg, _)| cfg);
+        let roster: Vec<_> = cfg
+            .as_ref()
+            .map(|cfg| {
+                cfg.agents
+                    .iter()
+                    .map(|a| RosterEntry {
+                        id: a.id.clone(),
+                        kind: a.kind,
+                        runnable: agent::installed(a),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let specs = cfg
+            .as_ref()
+            .map(|cfg| cfg.talk.personas.clone())
+            .unwrap_or_default();
+        let personas: Vec<_> = persona::catalog(&specs)
+            .into_iter()
+            .map(|p| PersonaEntry {
+                avatar: avatar_url(&ui.home, &talk.id, &p),
+                id: p.id,
+                name: p.name,
+            })
+            .collect();
+        let active_persona = persona::find(&specs, &talk.persona)
+            .unwrap_or_else(|| persona::find(&specs, persona::DEFAULT_ID).expect("default"));
+        let persona_name = (!active_persona.is_default()).then(|| active_persona.name.clone());
+        let persona_avatar = avatar_url(&ui.home, &talk.id, &active_persona);
+        Ok(Json(serde_json::json!({
+            "tasks": tasks, "task_progress": task_progress,
+            "roster": roster, "personas": personas,
+            "context": talk::context_usage(&talk, cfg.as_ref()),
+            "context_for": talk.updated_at,
+            "operator_name": cfg.as_ref().and_then(|cfg| cfg.talk.operator_name()),
+            "persona_name": persona_name,
+            "persona_avatar": persona_avatar,
+        })))
+    })
+    .await
+}
+
 /// `GET /api/talks/{id}`.
 async fn talk_detail(
     State(ui): State<Arc<Ui>>,
@@ -7900,7 +8005,7 @@ async fn talk_detail(
         let id = resolve_talk(&ui.talks, &id)?;
         let talk = ui.talks.get(&id)?;
         let thinking = ui.is_thinking(&talk.id);
-        let tasks = ui.find_tasks_for_talk(&talk.id);
+        let tasks = ui.find_tasks_for_talk(&talk.id)?;
         let task_progress = talk_task_progress(&tasks);
         let tasks = tasks.into_iter().map(TaskView::from).collect();
         let cfg = Config::discover(&talk.repo, None).ok().map(|(cfg, _)| cfg);
@@ -8903,7 +9008,7 @@ fn talk_ids(root: &FsPath) -> Vec<String> {
 
 /// Expand an id or short id to exactly one talk id.
 fn resolve_talk(store: &Talks, id: &str) -> ApiResult<String> {
-    if store.path_of(id).is_file() {
+    if plain_record_id(id) && store.path_of(id).is_file() {
         return Ok(id.to_owned());
     }
     pick(talk_ids(store.root()), id, "talk")
@@ -19578,9 +19683,19 @@ mod tests {
         });
         f.talks().put(&mut on_disk).expect("record a turn");
 
-        let after = f.get("/api/health").await.json()["talks_rev"]
-            .as_u64()
-            .expect("talks_rev");
+        let after = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let revision = f.get("/api/health").await.json()["talks_rev"]
+                    .as_u64()
+                    .unwrap();
+                if revision != before {
+                    break revision;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("shared monitor observes external turn");
         assert_ne!(
             before, after,
             "a phone must be able to notice a talk's reply without polling every store"
@@ -22831,10 +22946,19 @@ mod tests {
         std::fs::write(talks.root().join("corrupt-talk.json"), "invalid json").unwrap();
 
         // Valid task and talk
-        let mut task = Task::new("title".into(), "inst".into(), PathBuf::from("/repo"), Source::Human);
+        let mut task = Task::new(
+            "title".into(),
+            "inst".into(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
         task.id = "20261019-123456-abcd".into();
         // Write manually so it's a valid file
-        std::fs::write(queue.path_of(&task.id), serde_json::to_string(&task).unwrap()).unwrap();
+        std::fs::write(
+            queue.path_of(&task.id),
+            serde_json::to_string(&task).unwrap(),
+        )
+        .unwrap();
 
         let talk_id = "20261019-234567-cdef";
         seed_talk_at(&talks, talk_id, "open");
@@ -22848,57 +22972,200 @@ mod tests {
         assert_eq!(resolve_talk(&talks, "cdef").unwrap(), talk_id);
     }
 
-    #[tokio::test]
-    async fn queue_index_and_talk_index_avoid_repeated_scans() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    #[test]
+    fn queue_index_observes_external_replacement_deletion_and_corruption() {
+        let dir = tempfile::tempdir().unwrap();
         let ui = delta_test_ui(dir.path());
+        let mut task = Task::new(
+            "task".into(),
+            "body".into(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        task.runs = vec!["run-a".into()];
+        ui.queue.put(&mut task).unwrap();
+        assert!(ui.find_task_for_run("run-a").unwrap().is_some());
+        task.runs = vec!["run-b".into()];
+        let path = ui.queue.path_of(&task.id);
+        let modified = path.metadata().unwrap().modified().unwrap();
+        let replacement = path.with_extension("replacement");
+        let bytes = serde_json::to_vec_pretty(&task).unwrap();
+        assert_eq!(bytes.len() as u64, path.metadata().unwrap().len());
+        std::fs::write(&replacement, &bytes).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(ui.find_task_for_run("run-a").unwrap().is_none());
+        assert!(ui.find_task_for_run("run-b").unwrap().is_some());
+        std::fs::write(&path, "broken").unwrap();
+        assert!(ui.find_task_for_run("run-b").is_err());
+        std::fs::write(&path, bytes).unwrap();
+        assert!(ui.find_task_for_run("run-b").unwrap().is_some());
+        std::fs::remove_file(ui.queue.path_of(&task.id)).unwrap();
+        assert!(ui.find_task_for_run("run-b").unwrap().is_none());
+    }
 
-        // Create 20 tasks, some filed from a talk, some having runs
-        let talk_id = "20261019-100000-talk";
-        let run_id = "20261019-110000-runa";
+    #[tokio::test]
+    async fn conversation_core_is_independent_of_unreadable_related_history() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let id = seed_talk_at(&ui.talks, "20261019-000000-core", "open");
+        std::fs::create_dir_all(ui.queue.root()).unwrap();
+        std::fs::write(ui.queue.root().join("unreadable.json"), "broken").unwrap();
+        let Json(core) = talk_core(State(ui.clone()), Path(id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(core.talk.id, id);
+        assert!(talk_sections(State(ui), Path(id)).await.is_err());
+    }
 
-        for i in 0..20 {
+    #[tokio::test]
+    async fn conversation_sections_omit_large_task_instructions() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let id = seed_talk_at(&ui.talks, "20261019-000000-core", "open");
+        let mut task = Task::new(
+            "filed task".into(),
+            "large instruction ".repeat(65536),
+            PathBuf::from("/repo"),
+            Source::Agent {
+                run: id.clone(),
+                node: "chat".into(),
+            },
+        );
+        ui.queue.put(&mut task).unwrap();
+        let Json(sections) = talk_sections(State(ui), Path(id)).await.unwrap();
+        assert_eq!(sections["tasks"][0]["id"], task.id);
+        assert_eq!(sections["tasks"][0]["status_str"], task.status.as_str());
+        assert!(sections["tasks"][0].get("instruction").is_none());
+        assert!(serde_json::to_vec(&sections).unwrap().len() < 8192);
+    }
+
+    #[test]
+    fn exact_record_lookup_rejects_paths_and_preserves_short_id_ambiguity() {
+        let home = tempfile::tempdir().unwrap();
+        let talks = Talks::at(home.path().join("talks"));
+        seed_talk_at(&talks, "20261019-000001-abcd", "open");
+        seed_talk_at(&talks, "20261019-000002-abcd", "open");
+        std::fs::write(home.path().join("outside.json"), "{}").unwrap();
+        assert!(resolve_talk(&talks, "../outside").is_err());
+        assert!(resolve_talk(&talks, "abcd").is_err());
+        assert_eq!(
+            resolve_talk(&talks, "20261019-000001-abcd").unwrap(),
+            "20261019-000001-abcd"
+        );
+    }
+
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/web_latency/baseline.rs"
+    ));
+
+    #[tokio::test]
+    #[ignore = "local performance measurement; see docs/web-responsiveness.md"]
+    async fn web_history_latency_measurement() {
+        use std::time::Instant;
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let id = seed_talk_at(&ui.talks, "20261019-000000-core", "open");
+        let mut template = ui.talks.get(&id).unwrap();
+        template.turns = serde_json::from_value(serde_json::json!([{
+            "who": "operator", "body": "Show the accumulated work and its current status.",
+            "at": Timestamp::now().to_string(),
+        }]))
+        .unwrap();
+        std::fs::write(
+            ui.talks.path_of(&id),
+            serde_json::to_vec(&template).unwrap(),
+        )
+        .unwrap();
+        let count = std::env::var("MAGI_BENCH_RECORDS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1000);
+        for i in 0..count {
+            template.id = format!("20261019-{i:06}-history");
+            template.pending = "history ".repeat(2048);
+            std::fs::write(
+                ui.talks.path_of(&template.id),
+                serde_json::to_vec(&template).unwrap(),
+            )
+            .unwrap();
             let mut task = Task::new(
-                format!("task {i}"),
-                "inst".into(),
+                "old task".into(),
+                "instruction ".repeat(2048),
                 PathBuf::from("/repo"),
-                if i % 2 == 0 {
-                    Source::Agent {
-                        run: talk_id.into(),
-                        node: "chat".into(),
-                    }
-                } else {
-                    Source::Human
-                },
+                Source::Human,
             );
-            if i == 5 {
-                task.runs = vec![run_id.into()];
-            }
+            task.id = format!("20261019-{i:06}-task");
             ui.queue.put(&mut task).unwrap();
         }
-
-        // First lookup populates index
-        let found_task = ui.find_task_for_run(run_id).expect("task found");
-        assert!(found_task.runs.contains(&run_id.to_string()));
-
-        let talk_tasks = ui.find_tasks_for_talk(talk_id);
-        assert_eq!(talk_tasks.len(), 10);
-
-        // Corrupt all tasks on disk to prove subsequent lookups use the index
-        // without deserializing the whole queue again while revisions match
-        let queue_rev = {
-            let guard = ui.monitor.latest.lock().unwrap();
-            guard.as_ref().map(|(r, _)| r.0).unwrap_or(0)
-        };
-        // Ensure index rev matches
-        {
-            let mut guard = ui.monitor.queue_index.lock().unwrap();
-            guard.rev = queue_rev;
+        for baseline in [true, false] {
+            for clients in [1, 4] {
+                let parsed_before = ui.monitor.queue_index.lock().unwrap().reparsed;
+                let mut samples = Vec::new();
+                for _ in 0..12 {
+                    let mut jobs = Vec::new();
+                    for _ in 0..clients {
+                        let ui = ui.clone();
+                        let id = id.clone();
+                        jobs.push(tokio::spawn(async move {
+                            let start = Instant::now();
+                            if baseline {
+                                let response =
+                                    baseline_talk_detail(State(ui), Path(id)).await.unwrap().0;
+                                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                                return (
+                                    elapsed,
+                                    elapsed,
+                                    serde_json::to_vec(&response).unwrap().len(),
+                                );
+                            }
+                            let core = talk_core(State(ui.clone()), Path(id.clone()));
+                            let secondary = talk_sections(State(ui), Path(id));
+                            let (first, total) = tokio::join!(
+                                async {
+                                    let value = core.await.unwrap().0;
+                                    (
+                                        start.elapsed().as_secs_f64() * 1000.0,
+                                        serde_json::to_vec(&value).unwrap().len(),
+                                    )
+                                },
+                                async {
+                                    let value = secondary.await.unwrap().0;
+                                    (
+                                        start.elapsed().as_secs_f64() * 1000.0,
+                                        serde_json::to_vec(&value).unwrap().len(),
+                                    )
+                                }
+                            );
+                            (first.0, first.0.max(total.0), first.1 + total.1)
+                        }));
+                    }
+                    for job in jobs {
+                        samples.push(job.await.unwrap());
+                    }
+                }
+                let mut first: Vec<_> = samples.iter().map(|s| s.0).collect();
+                let mut total: Vec<_> = samples.iter().map(|s| s.1).collect();
+                first.sort_by(f64::total_cmp);
+                total.sort_by(f64::total_cmp);
+                let n = first.len();
+                let parsed = ui.monitor.queue_index.lock().unwrap().reparsed - parsed_before;
+                println!(
+                    "baseline={baseline} records={count} clients={clients} first_ms p50={:.2} p95={:.2}; complete_ms p50={:.2} p95={:.2}; bytes={}; indexed_task_parses={parsed}",
+                    first[n / 2],
+                    first[(n * 95 / 100).min(n - 1)],
+                    total[n / 2],
+                    total[(n * 95 / 100).min(n - 1)],
+                    samples[0].2
+                );
+            }
         }
-
-        // Secondary lookup for the run should directly get the task by id
-        let found_again = ui.find_task_for_run(run_id).expect("task found from index");
-        assert_eq!(found_again.id, found_task.id);
     }
 
     #[test]
@@ -22912,4 +23179,3 @@ mod tests {
         assert!(APP_JS.contains("state.detail.reportLoading = false;"));
     }
 }
-
