@@ -288,6 +288,8 @@ impl Default for Opts {
     }
 }
 
+mod id_links;
+
 /// Everything the handlers touch.
 ///
 /// The queue, the runs directory and the magi home are fields rather than
@@ -904,6 +906,7 @@ impl Ui {
             .route("/app.css", get(app_css))
             .route("/app.js", get(app_js))
             .route("/api/health", get(health))
+            .route("/api/references", post(id_links::resolve_text))
             .route("/api/loop", get(loop_get).post(loop_post))
             .route("/api/upgrade", post(upgrade_post))
             .route("/api/runs", get(runs_list))
@@ -3298,7 +3301,7 @@ fn source_link(source: &Source) -> Option<SourceLink> {
     Some(SourceLink {
         kind,
         id: run.clone(),
-        href: format!("#/{route}/{}", encode_segment(run)),
+        href: id_links::page_href(route, run),
     })
 }
 
@@ -7208,7 +7211,26 @@ impl TalkView {
 
     /// As [`Self::new`], with the config already in hand (the list reads one
     /// per repository, not one per conversation).
-    fn with_config(mut talk: Talk, thinking: bool, cfg: Option<&Config>, home: &FsPath) -> Self {
+    fn with_config(talk: Talk, thinking: bool, cfg: Option<&Config>, home: &FsPath) -> Self {
+        let mut references = id_links::IdIndex::load(
+            &home.join("runs"),
+            &Queue::at(home.join("queue")),
+            &Questions::at(home.join("questions")),
+            &Talks::at(home.join("talks")),
+        );
+        if id_links::has_findings(&talk) {
+            references.findings(&home.join("runs"));
+        }
+        Self::with_references(talk, thinking, cfg, home, &references)
+    }
+
+    fn with_references(
+        mut talk: Talk,
+        thinking: bool,
+        cfg: Option<&Config>,
+        home: &FsPath,
+        references: &id_links::IdIndex,
+    ) -> Self {
         // This owned value is the display DTO; never write it back to the talk store.
         let snapshot = talk.clone();
         for (index, turn) in talk.turns.iter_mut().enumerate() {
@@ -7320,12 +7342,12 @@ impl TalkView {
             }
         }
         let context = talk::context_usage(&talk, cfg);
-        let turn_bodies_md = talk
+        let mut turn_bodies_md: Vec<Vec<md::Node>> = talk
             .turns
             .iter()
             .map(|turn| md::to_nodes(&turn.body, &md::ImageBase::None))
             .collect();
-        let turn_messages_md = talk
+        let mut turn_messages_md: Vec<Vec<Option<Vec<md::Node>>>> = talk
             .turns
             .iter()
             .map(|turn| {
@@ -7345,7 +7367,7 @@ impl TalkView {
                 }
             })
             .collect();
-        let pending_messages_md = talk
+        let mut pending_messages_md: Vec<Option<Vec<md::Node>>> = talk
             .pending_messages
             .iter()
             .map(|message| {
@@ -7356,6 +7378,17 @@ impl TalkView {
                 )
             })
             .collect();
+        for nodes in &mut turn_bodies_md {
+            references.markdown(nodes);
+        }
+        for nodes in turn_messages_md
+            .iter_mut()
+            .flatten()
+            .chain(pending_messages_md.iter_mut())
+            .flatten()
+        {
+            references.markdown(nodes);
+        }
         let specs = cfg.map_or(&[][..], |c| &c.talk.personas[..]);
         let persona_name = persona::find(specs, &talk.persona)
             .filter(|p| !p.is_default())
@@ -7499,9 +7532,13 @@ async fn talks_list(
 ) -> ApiResult<Json<Vec<TalkView>>> {
     blocking(move || {
         let mut configs: HashMap<PathBuf, Option<Config>> = HashMap::new();
+        let talks = ui.talks.list();
+        let mut references = id_links::IdIndex::load(&ui.runs, &ui.queue, &ui.questions, &ui.talks);
+        if talks.iter().any(id_links::has_findings) {
+            references.findings(&ui.runs);
+        }
         Ok(Json(
-            ui.talks
-                .list()
+            talks
                 .into_iter()
                 .filter(|talk| q.contains(&talk.id))
                 .map(|talk| {
@@ -7509,7 +7546,7 @@ async fn talks_list(
                     let cfg = configs
                         .entry(talk.repo.clone())
                         .or_insert_with(|| Config::discover(&talk.repo, None).ok().map(|(c, _)| c));
-                    TalkView::with_config(talk, thinking, cfg.as_ref(), &ui.home)
+                    TalkView::with_references(talk, thinking, cfg.as_ref(), &ui.home, &references)
                 })
                 .collect(),
         ))

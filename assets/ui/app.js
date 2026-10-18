@@ -308,9 +308,9 @@ function setText(node, value) {
   if (node.textContent !== next) node.textContent = next;
 }
 
-/* Puts `value` into `node` as text nodes and, for each http(s) URL in it, an
-   anchor. Nodes only, never innerHTML, so the text cannot inject markup. Other
-   schemes stay text. Trailing . , ; : and an unmatched ) are not part of the
+/* Puts `value` into `node` as text nodes, URL anchors, and store-verified
+   application references. Nodes only, never innerHTML, so the text cannot
+   inject markup. Other schemes stay text. Trailing . , ; : and an unmatched ) are not part of the
    URL; backticks and quotes end it. `{ replace: true }` swaps the node's
    children and does nothing when the text is unchanged (keeps an SSE refresh
    from dropping a selection); the default appends. Do not mix with setText on
@@ -333,14 +333,114 @@ function linkify(node, value, opts) {
     let ok = false;
     try { ok = /^https?:$/.test(new URL(url).protocol); } catch (_) { ok = false; }
     if (!ok) continue;
-    if (m.index > last) parts.push(document.createTextNode(text.slice(last, m.index)));
+    if (m.index > last) parts.push(referenceText(text.slice(last, m.index)));
     parts.push(el("a", { class: "text-link", href: url, target: "_blank", rel: "noopener noreferrer", text: url }));
     last = m.index + url.length;
   }
-  if (last < text.length) parts.push(document.createTextNode(text.slice(last)));
+  if (last < text.length) parts.push(referenceText(text.slice(last)));
   if (replace) node.replaceChildren(...parts);
   else node.append(...parts);
   return node;
+}
+
+/* The server owns token boundaries and existence checks. Retain weak handles
+   to decorated ranges so store revisions can recheck both missing and linked
+   references. A generation and contiguous-node check reject late responses;
+   unchanged results preserve selection. Nothing here changes the route. */
+const referenceRanges = new Set();
+let referencePending = [];
+let referenceTimer = null;
+function referenceNodes(parts, styled) {
+  return parts.map((part) => {
+    const label = styled ? el("code", { text: part.text }) : document.createTextNode(part.text);
+    return part.href ? el("a", { class: "text-link", href: part.href }, label) : label;
+  });
+}
+function referenceText(text, code = false, href = null, styled = false) {
+  text = String(text ?? "");
+  if (text.length > 16000) {
+    // Bound transport batches without cutting an ASCII token in half. A single
+    // overlong token cannot itself be a stored id and remains literal.
+    const fragment = document.createDocumentFragment();
+    const tokenChar = (ch) => /[a-z0-9_@./-]/i.test(ch);
+    let start = 0;
+    while (start < text.length) {
+      let end = Math.min(start + 16000, text.length);
+      if (end < text.length) {
+        while (end > start && tokenChar(text[end - 1])) end--;
+        if (end === start) {
+          end = start + 16000;
+          while (end < text.length && tokenChar(text[end])) end++;
+          fragment.append(document.createTextNode(text.slice(start, end)));
+          start = end;
+          continue;
+        }
+        if (end > start && /[\uDC00-\uDFFF]/.test(text[end])) end--;
+      }
+      fragment.append(referenceText(text.slice(start, end), code, null, styled));
+      start = end;
+    }
+    return fragment;
+  }
+  const parts = [{ text, href }];
+  const nodes = referenceNodes(parts, styled);
+  if (text && text.length <= 16000) {
+    const item = { nodes, text, code, styled, generation: 0, signature: JSON.stringify(parts) };
+    nodes[0].referenceRange = item; // The DOM retains its range; the registry does not.
+    referenceRanges.add(new WeakRef(item));
+    queueReference(item);
+  }
+  return nodes[0];
+}
+function currentReference(item) {
+  const parent = item.nodes[0].parentNode;
+  return parent && item.nodes[0].isConnected
+    && item.nodes.every((node, i) => node.parentNode === parent && (!i || item.nodes[i - 1].nextSibling === node))
+    && item.nodes.map((node) => node.textContent).join("") === item.text;
+}
+function queueReference(item) {
+  referencePending.push({ item, generation: ++item.generation });
+  if (referenceTimer === null) referenceTimer = setTimeout(flushReferences, 0);
+}
+function refreshReferences() {
+  for (const handle of referenceRanges) {
+    const item = handle.deref();
+    if (!item || !currentReference(item)) referenceRanges.delete(handle);
+    else queueReference(item);
+  }
+}
+async function flushReferences() {
+  referenceTimer = null;
+  const pending = referencePending;
+  referencePending = [];
+  for (const handle of referenceRanges) {
+    const item = handle.deref();
+    if (!item || !currentReference(item)) referenceRanges.delete(handle);
+  }
+  while (pending.length) {
+    const batch = [];
+    let size = 0;
+    while (pending.length && batch.length < 64 && size + pending[0].item.text.length * 3 <= 65536) {
+      const entry = pending.shift();
+      size += entry.item.text.length * 3;
+      if (entry.generation === entry.item.generation && currentReference(entry.item)) batch.push(entry);
+    }
+    if (!batch.length) continue;
+    try {
+      const results = await postJson("/api/references", batch.map(({ item }) => ({ text: item.text, code: item.code })));
+      batch.forEach(({ item, generation }, i) => {
+        if (item.generation !== generation || !currentReference(item) || !results[i]) return;
+        const signature = JSON.stringify(results[i]);
+        if (item.signature === signature) return;
+        const nodes = referenceNodes(results[i], item.styled);
+        item.nodes[0].before(...nodes);
+        for (const old of item.nodes) old.remove();
+        item.nodes = nodes;
+        item.signature = signature;
+        nodes[0].referenceRange = item;
+      });
+    } catch (_) { /* Reference decoration is optional; keep the original text. */ }
+  }
 }
 
 function setAttr(node, name, value) {
@@ -4368,6 +4468,7 @@ function isWaiting(run) {
 }
 
 /* ---- markdown ----------------------------------------------------------- *
+ * Store-backed internal links are distinct from external Markdown links.
  * Parsing markdown happens once, server-side (`magi::md`), which hands back a
  * tree of typed nodes rather than a string of HTML. What follows is the one
  * and only place this client turns that tree into DOM, with createElement and
@@ -4408,16 +4509,21 @@ function buildMd(node) {
     case "code_block":
       return el("pre", { "data-lang": node.lang || null }, el("code", { text: node.code || "" }));
     case "code":
-      return el("code", { text: node.code || "" });
+      return el("code", {}, referenceText(node.code || "", true));
     case "emphasis":
       return el("em", {}, (node.children || []).map(buildMd));
     case "strong":
       return el("strong", {}, (node.children || []).map(buildMd));
     case "strikethrough":
       return el("s", {}, (node.children || []).map(buildMd));
+    case "internal_link": {
+      const child = (node.children || [])[0] || {};
+      const code = child.type === "code";
+      return referenceText(code ? child.code : child.value, code, node.href, code);
+    }
     case "link":
       return el("a", { href: node.href, target: "_blank", rel: "noopener noreferrer" },
-        (node.children || []).map(buildMd));
+        (node.children || []).map(buildMdLiteral));
     case "image":
       return el("img", { src: node.src, alt: node.alt || "", loading: "lazy" });
     case "table":
@@ -4427,10 +4533,21 @@ function buildMd(node) {
     case "line_break":
       return el("br");
     case "text":
-      return document.createTextNode(node.value ?? "");
+      return referenceText(node.value ?? "");
     default:
       return document.createTextNode("");
   }
+}
+
+/* Existing anchors are opaque, including inline code in their label. */
+function buildMdLiteral(node) {
+  if (node.type === "text") return document.createTextNode(node.value ?? "");
+  if (node.type === "code") return el("code", { text: node.code || "" });
+  if (node.children) {
+    const tags = { emphasis: "em", strong: "strong", strikethrough: "s" };
+    return el(tags[node.type] || "span", {}, node.children.map(buildMdLiteral));
+  }
+  return buildMd(node);
 }
 
 function buildMdTable(node) {
@@ -5358,9 +5475,17 @@ function renderQuestions() {
          settled ? `${settled} on record` : null].filter(Boolean).join(" \u00b7 "));
 
   show($("questions-empty"), questions.length === 0);
-  const targetWasLoaded = [...list.querySelectorAll(".ask")].some((row) => row.dataset.questionId === state.route.id);
   syncList(list, questions, (q) => q.id, createAskCard, (row, q) => updateAskCard(row, q));
-  if (state.route.name === "questions" && state.route.id && !targetWasLoaded) focusFirstAsk();
+  consumeQuestionFocus();
+}
+
+let questionFocus = null;
+function consumeQuestionFocus() {
+  if (!questionFocus || state.route.name !== "questions" || state.route.id !== questionFocus) return;
+  const row = [...$("questions-list").querySelectorAll(".ask")].find((node) => node.dataset.questionId === questionFocus);
+  if (!row) return;
+  questionFocus = null; // Only explicit navigation may focus; refresh never does.
+  focusFirstAsk();
 }
 
 /* The operator followed the band here to answer one specific thing; leaving
@@ -9433,6 +9558,9 @@ async function applyRevisions_(source) {
   const talksRev = source.talks_rev;
   const notificationsRev = source.notifications_rev;
   const jobs = [];
+  if (queueRev !== state.rev.queue || runsRev !== state.rev.runs
+    || questionsRev !== state.rev.questions || talksRev !== state.rev.talks) refreshReferences();
+
 
   /* Read before either revision below is overwritten: /api/stats aggregates
      both the run history and the live queue, so either moving makes it
@@ -9799,7 +9927,11 @@ function applyRoute() {
   markSelected();
   /* The operator arrived to answer one specific thing, so the caret goes on
      it rather than on the top of the document. */
-  if (changed && route.name === "questions") focusFirstAsk();
+  if (changed) {
+    questionFocus = route.name === "questions" ? route.id : null;
+    if (questionFocus) consumeQuestionFocus();
+    else if (route.name === "questions") focusFirstAsk();
+  }
   /* A `#/queue/<id>` hash (a card permalink or an old bookmark) names the
      card it is about; land on it the same way a single-hit search does, rather than leaving
      the operator to scroll the whole Backlog by hand. Queued rather than
@@ -10292,7 +10424,7 @@ function renderTask() {
   metaBits.forEach((bit, i) => {
     if (i > 0) metaKids.push(" \u00b7 ");
     const link = bit === task.source_label ? sourceLinkOf(task) : null;
-    metaKids.push(link ? el("a", { href: link.href, text: bit }) : bit);
+    metaKids.push(link ? el("a", { href: link.href, text: bit }) : referenceText(bit));
   });
   $("task-meta").replaceChildren(...metaKids);
   setAttr($("task-meta"), "title", task.id);
