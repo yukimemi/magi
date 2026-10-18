@@ -411,7 +411,12 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
     for (node, allow_write) in [("review", false), ("implement", false), ("deputy", true), ("chat", true)] {
         let mut seat = SeatState::new("fixture-seat", "fixture", 1);
         invoke(&spec, &mut seat, &Invocation {
-            scope: magi::agent::InvocationScope::Repository,
+            // A chat turn holding explicit store roots is a consultation turn.
+            scope: if node == "chat" {
+                magi::agent::InvocationScope::ConsultationControl
+            } else {
+                magi::agent::InvocationScope::Repository
+            },
             coordination: Some(coordination()),
             fetched_base: None,
             cwd: &fx.seat, prompt: "fixture", timeout: Duration::from_secs(10),

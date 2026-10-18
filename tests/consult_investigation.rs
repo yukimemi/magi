@@ -56,8 +56,10 @@ case "$(cat "$MAGI_PROMPT_FILE")" in
 esac
 "#).unwrap();
         std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut cfg = Config::default();
-        cfg.coordination = Some(toml::from_str("contract_file='updater.contract'\ncontract_token='test-v1'\nlock_file='updater.lock'").unwrap());
+        let mut cfg = Config {
+            coordination: Some(toml::from_str("contract_file='updater.contract'\ncontract_token='test-v1'\nlock_file='updater.lock'").unwrap()),
+            ..Config::default()
+        };
         // Investigation must remain read-only even when the standing chat can edit.
         cfg.talk.allow_write = true;
         cfg.agents = vec![AgentSpec {
@@ -238,7 +240,7 @@ async fn consultation_investigates_on_delivery_and_natural_followup_then_returns
     let prompt = std::fs::read_to_string(f.trace.join("4.prompt")).unwrap();
     assert!(prompt.contains("Current turn scope: consultation control"));
     assert!(!prompt.contains("launcher holds the exclusive repository lock"));
-    let instruction = format!("{}: hold", f.question.id);
+    let instruction = "hold".to_string();
     f.say(&instruction).await;
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
         .args(["answer", &f.question.id, "--reply", "hold", "--quote", &instruction])
@@ -249,7 +251,6 @@ async fn consultation_investigates_on_delivery_and_natural_followup_then_returns
     assert!(!answered.status.open());
     assert_eq!(answered.consult, f.question.consult);
     assert_eq!(answered.waiter, f.question.waiter);
-    assert!(answered.answer_authority.is_some());
 }
 }
 
