@@ -31,7 +31,9 @@ Unchanged task histories and run timelines retain their DOM nodes.
   metadata; only changed records are reparsed. Unix fingerprints include device,
   inode and ctime as well as mtime/size, so atomic replacement with preserved
   mtime is detected. Other platforms reparse rather than assume this guarantee.
-  Failed scans/decodes return an error, never an empty dependency result.
+  ディレクトリ全体の走査失敗はエラーとして扱う。読み取れない個別レコードは
+  無関係な照会から隔離する。既知の関連レコードが破損した場合は、直前の関連を
+  保持して対象の再読み取りを失敗させ、不正な「関連なし」へ変換しない。
 - Run detail obtains the matching task once for successor, latest attempt and
   task outcome. This eliminates three independent queue parses.
 - A single worker scans revision metadata for all SSE clients and health reads.
@@ -42,6 +44,58 @@ Unchanged task histories and run timelines retain their DOM nodes.
   Question stores include lease and panel entries, not just JSON records.
 - No config or process-liveness cache was introduced. Mutation handlers retain
   their existing authoritative validation.
+
+## 実際の HTTP・ブラウザー比較（レビュー後に追加）
+
+旧ハンドラーを新しい supporting code 上で実行した下表の数値は、ルート本体の
+診断値に限定される。実際の origin/main と変更版の UI 比較、描画時間、SSE の
+負荷改善を証明する数値としては使用しない。
+
+コミット後、HTTP 待受と Chrome 起動が許可されたホストで実行する。
+`origin/main` は手動で更新した追跡参照を指定する。スクリプトは両参照を最初に
+SHA に固定し、一時ソースアーカイブから実際の router と埋め込み UI をそれぞれ
+ビルドする。同一の計測ドライバーと CDP クライアントだけをコピーし、アプリ本体や
+supporting code は各コミットのものを使う。作業ツリーやブランチは作成・変更しない。
+共有 `CARGO_TARGET_DIR` をそのまま使用する。
+
+```sh
+python3 tests/web_latency/compare.py --baseline origin/main --candidate HEAD \
+  --records 1000 --rounds 5 --output /tmp/magi-browser-comparison
+```
+
+`tests/web_browser_latency.rs` は独立した履歴を作成する。各ストアに 1,000 件の
+タスク、会話、Run、質問を置き、タスク指示は約 24 KiB、会話履歴は約 16 KiB。
+本物の HTTP サーバーと未改変の UI を起動し、会話・タスク・Run 詳細・レポート・
+三種類の一覧・質問・ダッシュボードを新規ナビゲーションで測定する。
+クライアント数は 1 と 4。非表示タブの描画抑制を避けるため、各クライアントは
+独立した Chrome プロファイルとブラウザープロセスを使用する。
+
+`first_ms` は navigation start から、画面固有の有用な DOM が可視となり、
+次の animation frame を迎えるまでの時間。見出しだけのスケルトンや Loading 表示は
+数えない。Run 詳細では指示パネルを開き、本文が可視となった時点を測る。
+画素の提示を直接測る指標ではない。
+`complete_ms` は有用な表示と初期 fetch 本文の読み込みがすべて完了した後の
+animation frame の時刻。同期的な描画処理が終わるまでを含める。
+200 ms の静穏期間は完了判定にだけ使い、数値には加算しない。SSE 接続確立も確認する。
+各試行の失敗応答は記録して失敗させ、成功した計測として扱わない。
+
+一覧が揃った後、接続を保った 10 秒間の CPU 時間と HTTP リクエスト数も記録する。
+CPU はサーバーと CDP ドライバーを含むテストプロセスの user + system 時間で、
+Chrome 子プロセスは含まない。この区間はブラウザーの評価を行わない。
+静止した蓄積履歴に対する比較であり、連続書き込み中の負荷を表すものではない。
+各版のログ、各試行の JSONL、固定 SHA を保存し、p50/p95 を出力する。
+最初の試行にはコールドなインデックスを含み、後続試行は同一サーバーを再利用する。
+
+このレビュー修正環境ではループバック bind が `Operation not permitted` で拒否され、
+インストール済み Chrome の headless 起動も終了コード -6 で終了した。
+実際の両版の UI 時間および SSE CPU 数値は未取得であり、R1-1-2 の計測結果の要件は
+未完了。上記コマンドは許可されたホストで実行する必要がある。画面キャプチャの
+エージェント待機タイマーをページ読み込み時間として扱っていない。
+
+バックグラウンド Run 更新では直前の完成した表示を保持し、回答入力はそのまま
+編集できる。クリックと submit の capture guard、および aria-disabled によって、
+新しい core と関係情報が一致するまで操作を保留する。失敗時にも入力 DOM を維持し、
+局所的な再試行を表示する。同一内容の取得成功ではアクション DOM を再構築しない。
 
 ## Reproduction and measurement boundaries
 
@@ -132,3 +186,14 @@ enabling actions from a partial task response.
 - `RUSTUP_TOOLCHAIN=stable cargo clippy --locked --lib -- -D warnings` passed.
 - The ignored before/after latency comparison passed for one and four clients.
   Full gate and browser/production profiling are not claimed by these checks.
+
+## レビュー修正時の確認
+
+- `node --test tests/web_progressive.mjs`: 16 件成功。
+- 破損タスクの隔離、既知の関連タスクの破損と修復、会話 core/sections の隔離を
+  対象とする Rust テスト 3 件成功。
+- `RUSTUP_TOOLCHAIN=stable cargo check --locked --test web_browser_latency --test web_render` 成功。
+- 同じ二つの integration target を対象とする Clippy（`-D warnings`）成功。
+- 実ブラウザーのフォーカス確認はコード追加・コンパイルまで。計測スクリプトは
+  ループバック待受の権限チェックで停止した。実行成功や比較数値は主張しない。
+- 全体テストと最終ゲートは親の検証で実施する。

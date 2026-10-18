@@ -786,7 +786,13 @@ impl Ui {
             // On platforms without inode/ctime, re-read rather than trust a
             // same-size replacement with a preserved modification timestamp.
             if !cfg!(unix) || index.records.get(id).is_none_or(|(old, _)| *old != stamp) {
-                let task = self.queue.get(id)?;
+                let Ok(task) = self.queue.get(id) else {
+                    // Isolate an unreadable record, as Queue::list does. Keep
+                    // its last known relationship so a lookup of THAT task
+                    // still fails on the authoritative read below. Never let
+                    // unrelated corruption disable every run and conversation.
+                    continue;
+                };
                 #[cfg(test)]
                 {
                     index.reparsed += 1;
@@ -23115,7 +23121,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(core.talk.id, id);
-        assert!(talk_sections(State(ui), Path(id)).await.is_err());
+        assert!(talk_sections(State(ui), Path(id)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn unrelated_corrupt_task_does_not_break_run_or_talk_relationships() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let talk_id = seed_talk_at(&ui.talks, "20261019-000000-core", "open");
+        let mut run = RunState::new(
+            PathBuf::from("/repo"),
+            "main".into(),
+            "01234567".into(),
+            "Useful run".into(),
+            Config::default(),
+        );
+        run.save_under(home.path()).unwrap();
+        let mut task = Task::new(
+            "Related".into(),
+            "body".into(),
+            PathBuf::from("/repo"),
+            Source::Agent {
+                run: talk_id.clone(),
+                node: "chat".into(),
+            },
+        );
+        task.runs = vec![run.id.clone()];
+        ui.queue.put(&mut task).unwrap();
+        std::fs::write(ui.queue.root().join("unrelated.json"), "broken").unwrap();
+        assert_eq!(ui.find_task_for_run(&run.id).unwrap().unwrap().id, task.id);
+        assert_eq!(ui.find_tasks_for_talk(&talk_id).unwrap()[0].id, task.id);
+        assert!(
+            run_detail(State(ui.clone()), Path(run.id.clone()))
+                .await
+                .is_ok()
+        );
+        assert!(
+            talk_sections(State(ui.clone()), Path(talk_id.clone()))
+                .await
+                .is_ok()
+        );
+        // Previously indexed corruption must not masquerade as no relationship.
+        std::fs::write(ui.queue.path_of(&task.id), "broken").unwrap();
+        assert!(ui.find_task_for_run(&run.id).is_err());
+        assert!(ui.find_tasks_for_talk(&talk_id).is_err());
+        ui.queue.put(&mut task).unwrap();
+        assert!(ui.find_task_for_run(&run.id).unwrap().is_some());
     }
 
     #[tokio::test]

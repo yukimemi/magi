@@ -17,7 +17,7 @@ function harness() {
   const state = { detail: { id: null }, runs: [], talkDetail: { id: 'a' }, talkWaits: new Map(), stats: null, queue: [], taskDetail: { id: null } };
   const get = (url, options) => new Promise((resolve, reject) => requests.push({ url, options, resolve, reject }));
   const api = runInNewContext(`${sections}\n${runs}\n${talks}\n${tasks}\n${stats}\n({loadRun, loadTalk, loadTask, loadStats, cancelDetailSections, sectionRequest})`, {
-    state, AbortController, URLSearchParams, API: { run: id => `run/${id}`, report: id => `raw/${id}`, reportJson: id => `report/${id}`, talk: id => `talk/${id}`, stats: 'stats', task: id => `task/${id}` },
+    state, $: () => null, AbortController, URLSearchParams, API: { run: id => `run/${id}`, report: id => `raw/${id}`, reportJson: id => `report/${id}`, talk: id => `talk/${id}`, stats: 'stats', task: id => `task/${id}` },
     REPORT_VIEW_SCHEMA: 1, getJson: get, getText: get,
     renderRunDetail: () => renders.push(state.detail.run), renderReportCards: () => renders.push(state.detail.reportView),
     renderTask: () => renders.push(state.taskDetail.task), renderTaskActions() {},
@@ -175,3 +175,47 @@ for (const evidenceFirst of [false, true]) {
     });
   }
 }
+
+for (const failure of [false, true]) {
+  test(`background run refresh retains snapshot until evidence completes (failure=${failure})`, async () => {
+    const h = harness();
+    const initial = h.api.loadRun('a');
+    const saved = { id: 'a', updated_at: 'before', live: 'dead', instruction: 'Kept' };
+    h.requests[0].resolve(saved);
+    h.requests[1].resolve(saved);
+    h.requests[2].resolve({ schema: 1, sections: [] });
+    await initial;
+    const rendered = h.renders.length;
+    const refresh = h.api.loadRun('a', { background: true });
+    assert.equal(h.state.detail.run, saved);
+    assert.equal(h.state.detail.evidenceError, false);
+    assert.equal(h.state.detail.evidencePending, true);
+    assert.equal(h.renders.length, rendered);
+    h.requests[3].resolve({ ...saved, updated_at: 'after' });
+    await flush();
+    assert.equal(h.state.detail.run, saved);
+    assert.equal(h.renders.length, rendered);
+    if (failure) h.requests[4].reject(new Error('temporary failure'));
+    else h.requests[4].resolve({ ...saved, updated_at: 'after' });
+    h.requests[5].resolve({ schema: 1, sections: [] });
+    await refresh;
+    assert.equal(h.state.detail.evidencePending, false);
+    assert.equal(h.state.detail.evidenceError, failure);
+    assert.equal(h.state.detail.run.updated_at, failure ? 'before' : 'after');
+  });
+}
+
+test('unchanged background evidence does not rebuild focused action controls', async () => {
+  const h = harness();
+  const saved = { id: 'a', updated_at: 'before', live: 'dead' };
+  const initial = h.api.loadRun('a');
+  h.requests[0].resolve(saved); h.requests[1].resolve(saved);
+  h.requests[2].resolve({ schema: 1, sections: [] });
+  await initial;
+  const rendered = h.renders.filter(r => r === saved).length;
+  const refresh = h.api.loadRun('a', { background: true });
+  h.requests[3].resolve({ ...saved }); h.requests[4].resolve({ ...saved });
+  h.requests[5].resolve({ schema: 1, sections: [] });
+  await refresh;
+  assert.equal(h.renders.filter(r => r && r.id === 'a').length, rendered);
+});

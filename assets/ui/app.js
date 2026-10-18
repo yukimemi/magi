@@ -7662,8 +7662,7 @@ function renderRunDetail() {
 
   syncRunPanels(run);
   if (state.detail.evidenceError) {
-    show($("run-ask-panel"), false);
-    show($("run-land-panel"), false);
+    setRunEvidencePending(Boolean(state.detail.evidencePending));
   } else {
     renderAsks(run);
     renderLand(run);
@@ -7678,10 +7677,8 @@ function renderRunDetail() {
   renderPasses(run);
   renderTimeline(run);
   renderRunTaskEntry(run);
-  if (state.detail.evidenceError) {
-    clear($("run-actions-box"));
-    clear($("run-fold-merged-box"));
-    clear($("run-delete-box"));
+  if (state.detail.evidenceError || state.detail.evidencePending) {
+    setRunEvidencePending(Boolean(state.detail.evidencePending));
   } else {
     renderRunActions(run);
     renderRunFoldMerged(run);
@@ -9685,6 +9682,41 @@ function loadRawReport(id) {
   }, true);
 }
 
+/* Retain editable fields and focus while related evidence is being checked.
+   aria-disabled plus capture guards also leaves a focused button in place. */
+function setRunEvidencePending(pending) {
+  state.detail.evidencePending = pending;
+  for (const id of ["run-ask-panel", "run-land-panel", "run-actions-box", "run-fold-merged-box", "run-delete-box"]) {
+    const box = $(id);
+    if (!box) continue;
+    if (!box.dataset.evidenceGuard) {
+      box.dataset.evidenceGuard = "true";
+      for (const event of ["click", "submit"]) box.addEventListener(event, e => {
+        if (e.target.closest(".ask-panel, .question-identity")) return;
+        if ((state.detail.evidencePending || state.detail.evidenceError)
+            && (e.type === "submit" || e.target.closest("button, input[type=submit]"))) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+        }
+      }, true);
+    }
+    for (const button of box.querySelectorAll("button, input[type=submit]")) {
+      if (button.closest(".ask-panel, .question-identity")) continue;
+      if (pending || state.detail.evidenceError) {
+        if (!button.hasAttribute("data-evidence-disabled")) {
+          button.dataset.evidenceDisabled = button.getAttribute("aria-disabled") || "";
+        }
+        button.setAttribute("aria-disabled", "true");
+      } else if (button.hasAttribute("data-evidence-disabled")) {
+        const previous = button.dataset.evidenceDisabled;
+        if (previous) button.setAttribute("aria-disabled", previous);
+        else button.removeAttribute("aria-disabled");
+        delete button.dataset.evidenceDisabled;
+      }
+    }
+  }
+}
+
 async function loadRun(id, { background = false } = {}) {
   const requestId = nextRunRequest(id);
   if (state.detail.id !== id) {
@@ -9696,10 +9728,16 @@ async function loadRun(id, { background = false } = {}) {
   const detail = state.detail;
   const retry = () => loadRun(id, { background: true });
   sectionNotice("run-meta", "run-core-state", detail.run && !detail.run.isShell ? "" : "Loading run…");
+  // Stage the two new responses without discarding the displayed snapshot.
+  // Shared staging also supports sectionRequest's coalesced trailing refresh.
   detail.core = null;
   detail.evidence = null;
-  detail.evidenceError = true;
-  renderRunDetail();
+  const retain = background && detail.run && !detail.run.isShell;
+  if (!retain) {
+    detail.evidenceError = true;
+    renderRunDetail();
+  }
+  setRunEvidencePending(true);
   sectionNotice("run-meta", "run-evidence-state", "Loading related status…");
   const applyEvidence = () => {
     if (!detail.core || !detail.evidence) return;
@@ -9707,25 +9745,32 @@ async function loadRun(id, { background = false } = {}) {
       sectionNotice("run-meta", "run-evidence-state", "Run changed while loading related status. Retry.", retry);
       return;
     }
+    const unchanged = JSON.stringify(detail.run) === JSON.stringify(detail.evidence);
     detail.run = detail.evidence;
     detail.evidenceError = false;
+    detail.evidencePending = false;
     sectionNotice("run-meta", "run-evidence-state", "");
-    renderRunDetail();
+    if (!unchanged) renderRunDetail();
+    setRunEvidencePending(false);
   };
   const core = sectionRequest(`run:${id}:core`, `${API.run(id)}/core`, run => {
     if (state.detail !== detail) return;
     detail.core = run;
-    detail.run = run;
-    detail.evidenceError = true;
     sectionNotice("run-meta", "run-core-state", "");
-    renderRunDetail();
+    if (!retain) {
+      detail.run = run;
+      detail.evidenceError = true;
+      renderRunDetail();
+      setRunEvidencePending(true);
+    }
     applyEvidence();
   }, error => {
     if (state.detail === detail) {
       detail.core = null;
       detail.evidenceError = true;
       sectionNotice("run-meta", "run-core-state", `Run: ${error.message}`, retry);
-      renderRunDetail();
+      if (!retain) renderRunDetail();
+      setRunEvidencePending(false);
     }
   }, false, background);
   const evidence = sectionRequest(`run:${id}:evidence`, API.run(id), run => {
@@ -9737,7 +9782,8 @@ async function loadRun(id, { background = false } = {}) {
     detail.evidence = null;
     detail.evidenceError = true;
     sectionNotice("run-meta", "run-evidence-state", `Related status: ${error.message}`, retry);
-    renderRunDetail();
+    if (!retain) renderRunDetail();
+    setRunEvidencePending(false);
   }, false, background);
   const report = sectionRequest(`run:${id}:report`, API.reportJson(id), view => {
     if (state.detail !== detail) return;
