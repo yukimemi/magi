@@ -405,19 +405,11 @@ already meant to do is the same noise.",
 /// targets get *built* — so a seat asked for a narrow check knows to reach
 /// for `--lib`/`--test` instead of assuming a filter alone bounds the build.
 ///
-/// `node` is the graph node this is spliced into (`"review"`, `"fix"`, ...).
-/// A reviewer or fixer gets an extra paragraph saying full verification is
-/// magi's own job, not theirs to repeat — the same duplicated-full-suite cost
-/// neither note's own advice does anything to prevent on its own, since a
-/// seat that dutifully stays inside its own worktree can still spend the
-/// round re-running the whole suite there. Phrased as a request, not a
-/// guarantee: magi has no way to stop a seat from running `cargo test
-/// --all-targets` anyway, so the note asks rather than claims it enforces
-/// anything.
-pub fn build_cache_note(node: &str, allow_write: bool) -> String {
-    let defer_to_parent = node == "review" || node == "fix";
+/// Ownership guidance lives in [`child_run_ownership`], independently of cache
+/// configuration. `node` is retained for callers naming the graph node.
+pub fn build_cache_note(_node: &str, allow_write: bool) -> String {
     if !allow_write {
-        let mut s = String::from(
+        return String::from(
             "\
 # The build cache\n\n\
 This seat is read-only, so it is not handed the shared `CARGO_TARGET_DIR` \
@@ -432,19 +424,8 @@ one. Narrow reproduction here means reading the code and its existing \
 output, not building or running Cargo — a compiled check belongs to the \
 full verification magi itself runs.",
         );
-        if defer_to_parent {
-            s.push_str(
-                "\n\n\
-Full verification — the complete test suite and the final gate — is magi's \
-own job: it runs once a round has no blocking findings left, and again on \
-the tree that would actually land. magi has no way to enforce which \
-commands a seat runs, so this is a request for judgment, not a rule it \
-polices.",
-            );
-        }
-        return s;
     }
-    let mut s = String::from(
+    String::from(
         "\
 # The build cache\n\n\
 This environment sets `CARGO_TARGET_DIR` to a shared build cache. Build and \
@@ -459,19 +440,38 @@ A test name filter narrows which tests *run*, not which Cargo targets get \
 the workspace before it runs a single one. For a focused unit check, use \
 `cargo test --lib <filter>`; for a focused integration check, use `cargo \
 test --test <target> [filter]`.",
-    );
-    if defer_to_parent {
-        s.push_str(
-            "\n\n\
-Full verification — the complete test suite and the final gate — is magi's \
-own job: it runs once a round has no blocking findings left, and again on \
-the tree that would actually land. Build and run focused, targeted checks \
-for what you touched rather than the full suite; magi has no way to enforce \
-which commands a seat runs, so this is a request for judgment, not a rule it \
-polices.",
-        );
-    }
-    s
+    )
+}
+
+/// Fixed guidance for child seats, including paths that bypass the wave launcher.
+/// This is prompt guidance, not command enforcement; keep control-plane use valid.
+pub fn child_run_ownership() -> &'static str {
+    "# Parent run ownership\n\n\
+You are a child seat inside an existing magi run. The parent graph owns the \
+review loop, full verification (the complete test suite), and final gate, \
+including rerunning them after fixes. Do not start `magi review`, `magi run`, \
+or another nested run to review or verify your own candidate. This applies \
+even to conditional advice to run a separate manual review with `--merge none`.\n\n\
+If assigned implementation or fixes, implement and commit your changes and \
+run necessary focused checks for what you touched; leave parent-owned full \
+verification and the final gate to the parent. Read-only seats should inspect \
+code and existing evidence without building or modifying the repository.\n\n\
+This ownership guidance takes precedence over conflicting review or full \
+verification instructions in the design brief or repository conventions for \
+this run. Repository requirements for genuinely hand-written changes outside \
+a parent magi run still apply, including `magi review <branch> --merge none`. \
+Supported question and control-plane commands, such as `magi ask` and its \
+foreground wait/thread replies, remain allowed as explicitly instructed.\n\n"
+}
+
+/// Constraints on advice that will be carried into an implementer's brief.
+fn brief_ownership() -> &'static str {
+    "Do not tell implementers to launch a separate review or repeat parent-owned \
+full verification or the final gate. Omit even conditional manual-review \
+advice, including advice to use `magi review` with `--merge none`, from proposals \
+and the synthesized brief. If describing validation, assign implementers only \
+necessary focused checks; explicitly leave the review loop, full verification \
+and final gate to the parent graph.\n\n"
 }
 
 /// Heading of the section that tells a seat not to build a second checkout.
@@ -492,9 +492,12 @@ branches or workspaces. This only concerns where you edit: reading other \
 branches or checkouts with git stays fine, and the rest of those instructions \
 (commit style, tests, and so on) still applies.";
 
-/// [`WORK_IN_PLACE_RULE`] as a prompt section, trailing blank line included.
+/// Shared worktree-seat guidance, with ownership independent of cache settings.
 fn work_in_place() -> String {
-    format!("{WORK_IN_PLACE_HEADING}\n\n{WORK_IN_PLACE_RULE}\n\n")
+    format!(
+        "{WORK_IN_PLACE_HEADING}\n\n{WORK_IN_PLACE_RULE}\n\n{}",
+        child_run_ownership()
+    )
 }
 
 /// Prompt for an implementer.
@@ -1199,7 +1202,7 @@ pub fn fix_in(
         if let Some(tail) = &v.tail {
             let _ = write!(
                 s,
-                "\nMust end green before this is done.\n\n```\n{}\n```\n",
+                "\nFix the cause below with focused checks; the parent reruns full verification.\n\n```\n{}\n```\n",
                 tail.trim()
             );
         }
@@ -1339,7 +1342,8 @@ pub fn recovery_fix(
     }
     sec.push_str(
         "The reviewers found nothing blocking on that commit, so the work is otherwise \
-         accepted. Make the check pass with the smallest change, and commit it.\n",
+         accepted. Repair the cause with the smallest change, run necessary focused \
+         checks, and commit it. The parent reruns the failed verification.\n",
     );
     recovery_rounds(&mut sec, rec);
     recovery_findings(&mut sec, rec);
@@ -1400,8 +1404,9 @@ pub fn gate_fix_in(
     }
     s.push_str(
         "\n# Rules\n\n\
-         1. Make the failing command(s) above pass, and commit the change in this \
-            worktree. Change only what the output points at.\n\
+         1. Repair the cause of the failing command(s) above, run necessary focused \
+            checks, and commit the change in this worktree. The parent reruns \
+            the gate. Change only what the output points at.\n\
          2. Do not weaken the gate: no disabling or skipping checks, no lint \
             suppressions added to silence a warning, no edits to the gate's own \
             configuration.\n\
@@ -1483,6 +1488,8 @@ pub fn graft(
          actually ported; `rejected` lists the ids you skipped, each with why. \
          Never list an id you did not port."
     );
+    s.push('\n');
+    s.push_str(child_run_ownership());
     s.push('\n');
     s.push_str(&lang(language));
     s
@@ -1763,6 +1770,7 @@ pub fn change_summary_in(
     } else {
         language_name(github_language)
     };
+    let ownership = child_run_ownership();
     let mut commits = String::new();
     for s in subjects {
         let _ = writeln!(commits, "- {}", s.trim());
@@ -1787,7 +1795,7 @@ pub fn change_summary_in(
          separately from magi's own records. You may list limitations or follow-ups the code \
          itself reveals. Do not name any model, vendor or person, and include no local paths, \
          hostnames or secrets; refer to files by repository-relative path.\n\n\
-         Reply with exactly this shape and nothing else:\n\
+         {ownership}Reply with exactly this shape and nothing else:\n\
          TITLE: <conventional-commit style title, under 72 characters>\n\
          <the Markdown description>"
     )
@@ -2441,7 +2449,7 @@ pub fn nudge(err: &str) -> String {
 /// and, if it started something in the background, still holds whatever
 /// means it has to check on that itself.
 pub fn resume_incomplete(why: &str) -> String {
-    format!(
+    let mut s = format!(
         "Your last reply ended the turn without the report this step requires \
          ({why}).\n\n\
          If you started something in the background — a test run, a build, \
@@ -2454,7 +2462,10 @@ pub fn resume_incomplete(why: &str) -> String {
          Then reply with your real, final report in the exact shape already \
          asked for — not another progress update. Ending your turn on \"I'll \
          wait\" or \"continuing once it finishes\" is not a final answer."
-    )
+    );
+    s.push('\n');
+    s.push_str(child_run_ownership());
+    s
 }
 
 /// Follow-up when the CLI hung up before delivering an answer.
@@ -2467,7 +2478,7 @@ pub fn resume_incomplete(why: &str) -> String {
 ///
 /// Says nothing about what the task was. The seat still has it.
 pub fn resume_after_drop(why: &str) -> String {
-    format!(
+    let mut s = format!(
         "Your last reply never reached me — the CLI ended the stream before it \
          finished ({why}). Nothing you wrote was recorded, and the working \
          tree is unchanged.\n\n\
@@ -2476,7 +2487,10 @@ pub fn resume_after_drop(why: &str) -> String {
          over and do not re-plan — you already did the thinking, and it is \
          still in this conversation. Keep the reply short; the files are what \
          matter, not the message."
-    )
+    );
+    s.push('\n');
+    s.push_str(child_run_ownership());
+    s
 }
 
 /// Prompt for one advisor seat in the design-deliberation stage
@@ -2513,6 +2527,8 @@ pub fn advisor(instruction: &str, seat: usize, seats: usize, language: &str) -> 
          ```",
         work_in_place()
     );
+    s.push_str("\n\n");
+    s.push_str(brief_ownership());
     s.push_str(&lang(language));
     s
 }
@@ -2566,6 +2582,8 @@ pub fn synthesize_brief(
             p.why_not_naive,
         );
     }
+    s.push('\n');
+    s.push_str(child_run_ownership());
     let example = proposals.first().map_or("advisor-1", |(seat, _)| seat);
     let _ = write!(
         s,
@@ -2582,6 +2600,8 @@ pub fn synthesize_brief(
          carried into the implementer's prompt, so nothing outside it should \
          be information the implementer needs.",
     );
+    s.push_str("\n\n");
+    s.push_str(brief_ownership());
     s.push_str(&lang(language));
     s
 }
@@ -3703,20 +3723,49 @@ mod tests {
     }
 
     #[test]
-    fn the_build_cache_note_tells_review_and_fix_seats_full_verification_is_not_theirs() {
-        // Production only ever pairs "review" with `allow_write = false` and
-        // "fix" with `allow_write = true` (see `graph::wave`'s per-job
-        // callers), but the deferral paragraph belongs to the node either way.
-        for (node, allow_write) in [("review", false), ("fix", true)] {
-            let note = build_cache_note(node, allow_write);
+    fn implementer_ownership_follows_even_a_conflicting_brief() {
+        let conflicting = "Run magi review with --merge none and cargo make check.";
+        for brief in [None, Some(""), Some("   "), Some(conflicting)] {
+            let p = implement("t", "/w", "en", brief, &[]);
+            assert!(p.contains(child_run_ownership()), "{p}");
+            assert!(p.contains("implement and commit your changes"));
+            assert!(p.contains("run necessary focused checks"));
+            assert!(p.contains("takes precedence over conflicting review"));
+            assert!(p.contains("`magi review <branch> --merge none`"));
+            assert!(p.contains("`magi ask`"));
+            assert!(p.contains("--thread"));
+            if brief == Some(conflicting) {
+                assert!(p.find(conflicting).unwrap() < p.find(child_run_ownership()).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn advice_cannot_delegate_parent_review_or_full_verification() {
+        let misleading = proposal("Ask the implementer to launch a separate manual review.");
+        for p in [
+            advisor("t", 1, 2, "en"),
+            synthesize_brief("t", &[], "en"),
+            synthesize_brief("t", &[("advisor-1", &misleading)], "en"),
+        ] {
+            assert!(p.contains(child_run_ownership()), "{p}");
+            assert!(p.contains(brief_ownership()), "{p}");
             assert!(
-                note.contains("magi's own job"),
-                "{node} must be told full verification is parent-owned: {note}"
+                p.contains("Omit even conditional manual-review advice"),
+                "{p}"
             );
-            assert!(
-                note.contains("has no way to enforce"),
-                "{node} must not be told magi polices this: {note}"
-            );
+        }
+    }
+
+    #[test]
+    fn non_worktree_and_resume_prompts_preserve_parent_ownership() {
+        for p in [
+            graft("t", 'A', &[], 10, "en"),
+            change_summary("a", "b", &[], ""),
+            resume_incomplete("missing report"),
+            resume_after_drop("lost stream"),
+        ] {
+            assert!(p.contains(child_run_ownership()), "{p}");
         }
     }
 
@@ -3739,15 +3788,6 @@ mod tests {
             !note.contains("own default `target/`")
                 && !note.contains("target/`, which is disposable"),
             "must not suggest an unmanaged per-worktree build directory: {note}"
-        );
-    }
-
-    #[test]
-    fn a_write_allowed_advise_seat_gets_no_full_verification_paragraph() {
-        let note = build_cache_note("advise", false);
-        assert!(
-            !note.contains("magi's own job"),
-            "only review/fix defer to the parent's full verification: {note}"
         );
     }
 
@@ -4096,6 +4136,10 @@ mod tests {
         ];
         for (name, p) in &seats {
             assert!(p.contains(WORK_IN_PLACE_RULE), "{name} lacks the rule");
+            assert!(
+                p.contains(child_run_ownership()),
+                "{name} lacks ownership guidance"
+            );
             assert_eq!(
                 p.matches(WORK_IN_PLACE_HEADING).count(),
                 1,
@@ -4106,7 +4150,7 @@ mod tests {
 
     #[test]
     fn work_in_place_rule_stays_tool_agnostic_and_clear_of_dispatch_words() {
-        let r = WORK_IN_PLACE_RULE.to_lowercase();
+        let r = format!("{WORK_IN_PLACE_RULE}{}", child_run_ownership()).to_lowercase();
         assert!(!r.contains("renri"));
         for word in [
             "final vote",
