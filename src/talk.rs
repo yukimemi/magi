@@ -2677,8 +2677,23 @@ async fn turn(
                     // Keep the successful control reply's session and report
                     // a hold, rather than falling back into another seat.
                     let mut out = result.expect("successful control response");
+                    let holder_hint = if error.is::<crate::repo_lock::ResourceBlocked>() {
+                        questions
+                            .as_ref()
+                            .and_then(|questions| questions.get(&id).ok())
+                            .zip(crate::run::try_home())
+                            .map(|(q, home)| {
+                                crate::consult::investigation_holder_hint(
+                                    &q,
+                                    &crate::queue::Queue::at(home.join("queue")).list(),
+                                )
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                     out.text = format!(
-                        "Investigation pending for question {id}: {error}. This investigation request made no answer or execution transition. Ask to investigate again in this conversation when repository coordination is available. The task awaiting this question may hold the lock; do not release another seat's lock. Supported read-only control-plane diagnostics remain available to decide the next step."
+                        "Investigation pending for question {id}: {error}. {holder_hint}This investigation request made no answer or execution transition. Ask to investigate again in this conversation when repository coordination is available. The task awaiting this question may hold the lock; do not release another seat's lock. Supported read-only control-plane diagnostics remain available to decide the next step."
                     );
                     Ok(out)
                 }

@@ -158,6 +158,8 @@ and unsupported platforms fail closed.
 A busy editor, queued writer or external lock produces an investigation-pending
 reply immediately. The lock owner is unknown; the task awaiting this question may
 be holding it. Never release another seat's lock or answer merely to investigate.
+When queue state identifies a related running task, the reply includes its ID and
+`magi task show` command as a diagnostic lead, without claiming lock ownership.
 Use read-only control-plane diagnostics and ask to investigate again in the same
 conversation when coordination is available. No question or execution state is
 changed by this transition. Genuine decisions still go through `magi answer`

@@ -422,6 +422,22 @@ pub fn authorized_holds(questions: &Questions, talk: &Talk) -> bool {
     authorized_answers(questions, talk)
 }
 
+/// Queue state is only a diagnostic lead, never proof of lock ownership.
+pub(crate) fn investigation_holder_hint(q: &Question, tasks: &[Task]) -> String {
+    let task = tasks.iter().find(|task| {
+        !q.run.is_empty()
+            && (task.id == q.run || task.runs.contains(&q.run))
+            && task.status == crate::queue::TaskStatus::Running
+    });
+    match task {
+        Some(task) => format!(
+            "Lock owner unknown. Related task {} is running and may hold the repository lock; inspect it with `magi task show {}`. ",
+            task.id, task.id
+        ),
+        None => "Lock owner unknown. ".into(),
+    }
+}
+
 /// Action consent is separate from consultation routing. This inventory uses
 /// execution effects (including structured actions), not only question nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1486,6 +1502,27 @@ mod tests {
             run: talk.id.clone(),
             node: CHAT_NODE.to_owned(),
         })
+    }
+
+    #[test]
+    fn investigation_holder_hint_is_advisory_and_requires_a_related_running_task() {
+        let mut q = question("implement");
+        let mut related = task(Source::Human);
+        let check = |q: &Question, tasks: &[Task]| investigation_holder_hint(q, tasks);
+        let hint = check(&q, std::slice::from_ref(&related));
+        assert!(hint.contains("Lock owner unknown"));
+        assert!(hint.contains("may hold"));
+        assert!(hint.contains(&format!("magi task show {}", related.id)));
+        assert_eq!(check(&q, &[]), "Lock owner unknown. ");
+        q.run = "unrelated".into();
+        assert_eq!(check(&q, std::slice::from_ref(&related)), check(&q, &[]));
+        q.run = related.id.clone();
+        assert!(check(&q, std::slice::from_ref(&related)).contains("may hold"));
+        related.hold_manual(None);
+        assert_eq!(check(&q, std::slice::from_ref(&related)), check(&q, &[]));
+        related.status = crate::queue::TaskStatus::Running;
+        q.run.clear();
+        assert_eq!(check(&q, &[related]), check(&q, &[]));
     }
 
     fn question(node: &str) -> Question {
