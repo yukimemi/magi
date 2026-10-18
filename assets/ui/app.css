@@ -1075,6 +1075,8 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
   content: "\25c7"; margin-right: var(--s2); flex: none;
   color: var(--gold-line); font-size: var(--t5);
 }
+.choice-item { display: flex; flex-direction: column; gap: var(--s1); min-width: 0; max-width: 100%; }
+.choice-effect { font-size: var(--t2); color: var(--ink-3); margin-left: var(--s3); line-height: 1.3; }
 .ask-consult-box { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); }
 .ask-free { display: flex; flex-direction: column; gap: var(--s2); }
 .ask-free .btn { align-self: flex-start; }

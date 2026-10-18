@@ -5234,10 +5234,15 @@ function updateAskCard(row, question, { compact = false } = {}) {
       }
     } else {
       for (const choice of choices) {
-        r.choices.append(el("button", {
-          class: "btn", type: "button", text: question.choice_effects?.[choice] ? `${choice} — ${question.choice_effects[choice]}` : choice,
+        const btn = el("button", {
+          class: "btn", type: "button", text: choice,
           onclick: () => answerQuestion(question.id, { choice }, row),
-        }));
+        });
+        const effect = question.choice_effects?.[choice];
+        r.choices.append(el("div", { class: "choice-item" },
+          btn,
+          effect ? el("span", { class: "choice-effect", text: effect }) : null,
+        ));
       }
     }
   }
