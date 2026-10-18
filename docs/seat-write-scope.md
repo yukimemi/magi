@@ -377,6 +377,26 @@ EPERM で拒否された。status / diff / log は実行できた。
 これはこの席の実際の sandbox での観測であり、入れ子 fixture の成功ではない。
 変更は割り当て worktree に残しており、親 launcher による保存が必要である。
 
+### 候補 A が記録した 0.163.0 の実機プローブ
+
+以下は候補 A の記録から移植した観測表であり、この席での再実行結果ではない。
+macOS 上の使い捨てリポジトリと linked worktree で、codex-cli 0.163.0 の
+`exec --sandbox workspace-write`、`approval_policy="never"`、
+`sandbox_workspace_write.writable_roots=[<common Git directory>]` を使用した。
+
+| 操作 | 候補 A が記録した結果 |
+| --- | --- |
+| `git log` / `git status` / `git diff` | 成功 |
+| `git fetch` | `<common>/worktrees/<name>/FETCH_HEAD` を開けず `Operation not permitted` |
+| `git add` / `git commit` | `<common>/worktrees/<name>/index.lock` を作れず `Operation not permitted` |
+| DNS / HTTPS (`curl https://github.com`) | `Could not resolve host`。ホスト側は名前解決に成功したとの記録 |
+| worktree と許可済み roots 外への書込み | `Operation not permitted` |
+
+この表は上記バージョンと構成の記録に限る。候補 A はネットワーク拒否を
+sandbox policy と説明しているが、この席での比較実験は前述の通り未完了である。
+他の版や OS、すべての Git 管理操作へ一般化せず、配備先では下記 fixture と
+実効設定を確認する。common Git directory の grant はロック用に維持する。
+
 ### 修正と検証
 
 launcher の既存 base fetch を `SeatLease::operation_with` で調停し、

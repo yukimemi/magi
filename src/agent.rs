@@ -200,7 +200,11 @@ pub async fn worktree_writable_roots(cwd: &Path, home: &Path) -> Result<Vec<Path
 }
 
 /// Current-turn instructions override stale fetch/commit requirements in history.
-fn editing_access_note(base: Option<&crate::run::FetchedBase>) -> String {
+fn editing_access_note(
+    kind: AgentKind,
+    unsandboxed: bool,
+    base: Option<&crate::run::FetchedBase>,
+) -> String {
     let mut note = String::from(
         "Launcher repository access contract (applies to this turn and overrides earlier fetch/commit instructions):\n",
     );
@@ -211,6 +215,10 @@ fn editing_access_note(base: Option<&crate::run::FetchedBase>) -> String {
         ));
     } else {
         note.push_str("No successful launcher fetch evidence is supplied for this invocation. Do not describe local tracking refs as freshly fetched. If fresh remote evidence is essential, report an infrastructure blocker requiring a launcher fetch and a new prepared turn.\n");
+    }
+    // Only the sandboxed backend has this verified access restriction.
+    if kind != AgentKind::Codex || unsandboxed {
+        return note;
     }
     note.push_str("Network access is restricted by the seat sandbox. A shared Git directory grant does not guarantee access to protected Git administration paths. Use local status, diff and log to inspect the checkout. If add/commit is denied, leave the implementation files in this assigned worktree: the launcher saves eligible edits after the seat exits. Do not repeatedly retry denied fetches or ask the owner to approve unavailable sandbox permissions. If an essential operation (including rebase continuation or dependency download) is still impossible, stop with an actionable infrastructure report naming the operation, target and error; the operator must repair/deploy the launcher environment before a single new attempt. Do not use bypass flags, change permissions, edit another checkout, or claim a network failure proves host DNS is broken. Specification questions remain valid.\n");
     note
@@ -426,9 +434,13 @@ pub async fn invoke(
         }
     }
     let mut prompt = prompt.unwrap_or_else(|| inv.prompt.to_owned());
-    if repository_writer(inv) && !inv.unsandboxed && spec.kind == AgentKind::Codex {
+    if repository_writer(inv) {
         prompt.push_str("\n\n");
-        prompt.push_str(&editing_access_note(inv.fetched_base));
+        prompt.push_str(&editing_access_note(
+            spec.kind,
+            inv.unsandboxed,
+            inv.fetched_base,
+        ));
     }
     let inv = &Invocation {
         writable: &writable,
@@ -1824,7 +1836,7 @@ mod tests {
 
     #[test]
     fn editing_access_requires_fetch_evidence_and_keeps_snapshot() {
-        let missing = editing_access_note(None);
+        let missing = editing_access_note(AgentKind::Codex, false, None);
         assert!(missing.contains("No successful launcher fetch evidence"));
         let base = crate::run::FetchedBase {
             remote: "origin".into(),
@@ -1832,7 +1844,7 @@ mod tests {
             commit: "0123456789abcdef".into(),
             fetched_at: "2026-10-18T00:00:00Z".parse().unwrap(),
         };
-        let note = editing_access_note(Some(&base));
+        let note = editing_access_note(AgentKind::Codex, false, Some(&base));
         for expected in [
             "origin/main",
             "0123456789abcdef",
@@ -1843,9 +1855,40 @@ mod tests {
         ] {
             assert!(note.contains(expected), "missing {expected}");
         }
+        for kind in [
+            AgentKind::Codex,
+            AgentKind::Claude,
+            AgentKind::Opencode,
+            AgentKind::Antigravity,
+            AgentKind::Omp,
+            AgentKind::Command,
+        ] {
+            for unsandboxed in [false, true] {
+                let scoped = editing_access_note(kind, unsandboxed, Some(&base));
+                assert!(scoped.contains(&base.commit));
+                assert!(scoped.contains("Do not fetch again"));
+                let restricted = kind == AgentKind::Codex && !unsandboxed;
+                for claim in [
+                    "Network access is restricted",
+                    "protected Git administration paths",
+                    "launcher saves eligible edits",
+                    "unavailable sandbox permissions",
+                ] {
+                    assert_eq!(scoped.contains(claim), restricted, "{kind:?}/{unsandboxed}");
+                    assert_eq!(
+                        editing_access_note(kind, unsandboxed, None).contains(claim),
+                        restricted,
+                        "{kind:?}/{unsandboxed} without fetch evidence",
+                    );
+                }
+            }
+        }
         let roundtrip: crate::run::FetchedBase =
             serde_json::from_str(&serde_json::to_string(&base).unwrap()).unwrap();
-        assert_eq!(editing_access_note(Some(&roundtrip)), note);
+        assert_eq!(
+            editing_access_note(AgentKind::Codex, false, Some(&roundtrip)),
+            note
+        );
     }
 
     #[test]
