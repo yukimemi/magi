@@ -137,6 +137,14 @@ of question-store write grants, selects consultation control or investigation.
 Control turns may use supplied context and supported read-only magi diagnostics
 while the task seat waits for an answer. They cannot inspect repository evidence.
 
+Investigation reuses the standing repository's coordination policy only when
+persisted task or run metadata identifies the same canonical repository path.
+A different repository, conflicting metadata, or an unresolved target produces
+an investigation-pending reply before lease acquisition or repository access.
+The question's agent working directory alone is not a policy source. Cross-repository
+consultation remains available for control-plane diagnostics and owner decisions;
+investigation does not switch checkouts or borrow another repository's policy.
+
 When evidence is needed, the conversation returns a single structured final
 response (`{"investigate_question":"<full question id>"}`). Only an entire
 successful response is interpreted, never a quoted/fenced example or failed

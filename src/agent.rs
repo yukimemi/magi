@@ -472,7 +472,6 @@ pub(crate) async fn invoke_leased(
             }
         }
     }
-    let mut prompt = prompt.unwrap_or_else(|| inv.prompt.to_owned());
     if repository_writer(inv) {
         prompt.push_str("\n\n");
         prompt.push_str(&editing_access_note(

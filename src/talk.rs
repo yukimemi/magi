@@ -2350,6 +2350,44 @@ fn validate_investigation(
     Ok(q.consult.expect("validated consultation"))
 }
 
+/// A continuation may only reuse the standing checkout and its coordination
+/// policy when persisted task/run metadata identifies that same repository.
+/// Question.cwd names an agent worktree, not the repository's policy source.
+fn validate_investigation_repository(
+    questions: &crate::ask::Questions,
+    question: &str,
+    repo: &Path,
+) -> Result<()> {
+    let q = questions.get(question)?;
+    let home = crate::run::try_home()
+        .context("cannot resolve consultation repository: state store unavailable")?;
+    let tasks = crate::queue::Queue::at(home.join("queue")).list();
+    let task = crate::daemon::task_of_question(&tasks, &q);
+    let run = crate::run::RunState::load_under(&q.run, &home).ok();
+    let standing =
+        std::fs::canonicalize(repo).context("resolve standing conversation repository")?;
+    let mut resolved = false;
+    for target in task
+        .map(|t| &t.repo)
+        .into_iter()
+        .chain(run.as_ref().map(|r| &r.repo))
+    {
+        let target = std::fs::canonicalize(target).context("resolve consulted task repository")?;
+        if target != standing {
+            bail!(
+                "consulted task repository differs from the standing conversation; investigation is held because its coordination policy cannot safely be reused across repositories. Use magi task show to inspect the task's repository and coordination before retrying"
+            );
+        }
+        resolved = true;
+    }
+    if !resolved {
+        bail!(
+            "cannot resolve consulted task repository from task or run metadata; restore that metadata before retrying investigation. Read-only magi diagnostics remain available"
+        );
+    }
+    Ok(())
+}
+
 /// Invoke the conversation's agent once and append what it said.
 ///
 /// The first turn ever taken carries the full [`briefing`], because nothing
@@ -2625,6 +2663,7 @@ async fn turn(
                     bail!("conversation turn ownership lost; investigation cancelled");
                 }
                 let consultation = validate_investigation(questions, store, &talk.id, &id)?;
+                validate_investigation_repository(questions, &id, &talk.repo)?;
                 let repository_lease =
                     crate::repo_lock::SeatLease::try_reader(&talk.repo, cfg.coordination.as_ref())
                         .await?;
@@ -2636,6 +2675,7 @@ async fn turn(
                 if validate_investigation(questions, store, &talk.id, &id)? != consultation {
                     bail!("consultation changed; request investigation again");
                 }
+                validate_investigation_repository(questions, &id, &talk.repo)?;
                 let body = format!(
                     "Investigate evidence needed for open question {id}. The operator message being answered is unchanged:\n\n{body}"
                 );
@@ -2662,6 +2702,7 @@ async fn turn(
                         {
                             bail!("consultation changed; request investigation again");
                         }
+                        validate_investigation_repository(questions, &id, &talk.repo)?;
                         Ok(())
                     },
                 )

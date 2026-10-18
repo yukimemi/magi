@@ -25,6 +25,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_task_repository(false).await
+    }
+
+    async fn with_task_repository(other: bool) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         magi::run::set_home(tmp.path().to_owned());
         let repo = tmp.path().join("repo");
@@ -85,6 +89,15 @@ esac
         let talks = Talks::at(tmp.path().join("talks"));
         let questions = Questions::at(tmp.path().join("questions"));
         let talk = talk::begin(&talks, &cfg, repo, Some("fixture")).unwrap();
+        let task_repo = if other {
+            let repo = tmp.path().join("other-repo");
+            std::fs::create_dir(&repo).unwrap();
+            magi::git::git(&repo, &["init"]).await.unwrap();
+            std::fs::write(repo.join(".git/updater.contract"), "test-v1").unwrap();
+            repo
+        } else {
+            talk.repo.clone()
+        };
         let mut question = Question::new(
             "task-run".into(),
             magi::land::APPROVAL_NODE.into(),
@@ -93,7 +106,7 @@ esac
             "Inspect before deciding.".into(),
             vec![magi::land::APPROVE.into(), magi::land::HOLD.into()],
         );
-        question.cwd = Some(talk.repo.to_string_lossy().into());
+        question.cwd = Some(task_repo.to_string_lossy().into());
         question.answer_timeout = 3600;
         question.merge_target = Some(magi::merge_decision::Target {
             pr: "https://example.invalid/pull/1".into(),
@@ -105,7 +118,7 @@ esac
             since: jiff::Timestamp::now(),
         });
         let mut run = magi::run::RunState::new(
-            talk.repo.clone(),
+            task_repo.clone(),
             "main".into(),
             "base-head".into(),
             "Task awaiting evidence".into(),
@@ -118,7 +131,7 @@ esac
         let mut task = magi::queue::Task::new(
             "Original task".into(),
             "Original instruction".into(),
-            talk.repo.clone(),
+            task_repo,
             magi::queue::Source::Agent {
                 run: talk.id.clone(),
                 node: "chat".into(),
@@ -304,5 +317,59 @@ async fn closing_during_control_response_cancels_investigation_before_repository
     assert!(!f.trace.join("1.prompt").exists());
     assert_eq!(f.talks.get(&f.talk.id).unwrap().status, talk::TalkStatus::Closed);
     assert!(f.talk.turns.last().unwrap().body.contains("investigation cancelled"));
+}
+}
+
+common::e2e! {
+async fn foreign_repository_consultation_stays_pending_even_when_standing_repository_is_free() {
+    use std::os::fd::AsRawFd as _;
+    let mut f = Fixture::with_task_repository(true).await;
+    let target = PathBuf::from(f.question.cwd.as_ref().unwrap());
+    let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+        .open(target.join(".git/updater.lock")).unwrap();
+    // SAFETY: this test owns the descriptor through both consultation turns.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+    tokio::time::timeout(std::time::Duration::from_secs(10), f.delivery()).await.unwrap();
+    assert_eq!(f.seat().turns, 1);
+    assert!(!f.trace.join("1.prompt").exists());
+    let reply = &f.talk.turns.last().unwrap().body;
+    assert!(reply.contains("Investigation pending"));
+    assert!(reply.contains("repository differs"));
+    assert!(reply.contains("magi task show"));
+    // SAFETY: release only this test's descriptor, never another seat's lock.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    // An idle foreign repository still cannot borrow the standing policy.
+    // Missing cwd must not make the persisted task/run association disappear.
+    f.question.cwd = None;
+    f.questions.put(&mut f.question).unwrap();
+    f.say("Investigate again without changing or answering the question.").await;
+    assert_eq!(f.seat().turns, 2);
+    assert!(!f.trace.join("2.prompt").exists());
+    assert!(f.talk.turns.last().unwrap().body.contains("repository differs"));
+}
+}
+
+common::e2e! {
+async fn unresolved_consultation_repository_does_not_fall_back_to_question_cwd() {
+    let mut f = Fixture::new().await;
+    let queue = magi::queue::Queue::at(f._tmp.path().join("queue"));
+    let task = queue.list().into_iter().find(|t| t.runs.contains(&f.question.run)).unwrap();
+    let paths = [
+        queue.path_of(&task.id),
+        f._tmp.path().join("runs").join(&f.question.run).join("run.json"),
+    ];
+    for path in &paths {
+        std::fs::remove_file(path).unwrap();
+    }
+    f.execution_files.retain(|(path, _)| !paths.contains(path));
+    // cwd still exists, but does not establish the task's repository policy.
+    assert!(f.question.cwd.is_some());
+    f.delivery().await;
+    assert_eq!(f.seat().turns, 1);
+    assert!(!f.trace.join("1.prompt").exists());
+    let reply = &f.talk.turns.last().unwrap().body;
+    assert!(reply.contains("Investigation pending"));
+    assert!(reply.contains("cannot resolve consulted task repository"));
+    assert!(reply.contains("restore that metadata"));
 }
 }
