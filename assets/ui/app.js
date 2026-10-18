@@ -1298,17 +1298,20 @@ async function upgrade() {
   if (!confirmed(btn, "Replace the binary and restart?")) return;
   upgradeSending = true;
   const target = state.health && state.health.update && state.health.update.to;
+  // Snapshot failure identities before the POST: health may report this
+  // attempt failing before its acknowledgement reaches the browser.
+  const priorFailures = [];
+  const health = state.health || {};
+  if (health.upgrade_request_error) priorFailures.push(JSON.stringify(health.upgrade_request_error));
+  if (health.upgrade && health.upgrade.stage === "failed") {
+    priorFailures.push(JSON.stringify({ error: health.upgrade.detail || "The upgrade did not complete.", to: health.upgrade.to, started_at: health.upgrade.started_at }));
+  }
   btn.disabled = true;
   setText(btn, "Upgrading\u2026");
   try {
     const out = await postJson(API.upgrade);
     upgradeError = null;
-    // Suppress both sources of stale failure until a later attempt changes them.
-    const health = state.health || {};
-    if (health.upgrade_request_error) dismissedUpgradeErrors.add(JSON.stringify(health.upgrade_request_error));
-    if (health.upgrade && health.upgrade.stage === "failed") {
-      dismissedUpgradeErrors.add(JSON.stringify({ error: health.upgrade.detail || "The upgrade did not complete.", to: health.upgrade.to, started_at: health.upgrade.started_at }));
-    }
+    for (const failure of priorFailures) dismissedUpgradeErrors.add(failure);
     renderUpgradeError();
     ok();
     const detail = out.detail || "The deck is replacing itself and will come back.";

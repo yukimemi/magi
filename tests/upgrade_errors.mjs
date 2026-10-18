@@ -113,3 +113,34 @@ test('active progress received before a lost response prevents a spurious failur
   await pending;
   assert.equal(h.$('upgrade-error').hidden, true);
 });
+
+test('accepted response only dismisses failures known before the request began', async () => {
+  for (const source of ['progress', 'request']) {
+    const h = harness(source === 'request' ? {error: 'Old request failure', occurred_at: 'old'} : null);
+    if (source === 'progress') {
+      h.health.upgrade = {stage: 'failed', to: 'v0.2.0', detail: 'Old download failure', started_at: 'old'};
+    }
+    let release;
+    h.context.fetch = async () => new Promise(resolve => { release = resolve; });
+    await h.upgrade();
+    const pending = h.upgrade();
+    h.context.state.health = {
+      ...h.health,
+      upgrade_request_error: source === 'request' ? {error: 'New request failure', occurred_at: 'new'} : null,
+      upgrade: source === 'progress'
+        ? {stage: 'failed', to: 'v0.2.0', detail: 'New download failure', started_at: 'new'}
+        : h.health.upgrade,
+    };
+    h.renderLoop();
+    assert.equal(h.$('upgrade-error').hidden, false, `${source}: failure arrives before acknowledgement`);
+    assert.match(h.$('upgrade-error-text').textContent, /New .* failure/);
+    release(new Response(JSON.stringify({to: 'v0.2.0'}), {status: 202}));
+    await pending;
+    for (let poll = 0; poll < 2; poll++) {
+      h.context.state.health = JSON.parse(JSON.stringify(h.context.state.health));
+      h.context.ok(); h.renderLoop();
+      assert.equal(h.$('upgrade-error').hidden, false, `${source}: acknowledgement must retain the new failure`);
+      assert.match(h.$('upgrade-error-text').textContent, /New .* failure/);
+    }
+  }
+});
