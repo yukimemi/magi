@@ -296,6 +296,40 @@ impl ChoiceAction {
         Ok((label.to_owned(), action))
     }
 
+    /// Stable aliases for internal recovery, independent of display labels.
+    /// Other effects still require their offered labels and existing consent.
+    pub fn matches_alias(&self, input: &str) -> bool {
+        let input = input.trim();
+        match self {
+            Self::Resume { run } => {
+                [
+                    "resume",
+                    "resume run",
+                    "resume-run",
+                    "再開",
+                    "実行再開",
+                    "実行を再開",
+                    "実行を再開する",
+                ]
+                .iter()
+                .any(|alias| input.eq_ignore_ascii_case(alias))
+                    || [
+                        format!("resume {run}"),
+                        format!("resume:{run}"),
+                        format!("resume run {run}"),
+                        format!("resume {}", short(run)),
+                        format!("resume run {}", short(run)),
+                    ]
+                    .iter()
+                    .any(|alias| input.eq_ignore_ascii_case(alias))
+            }
+            Self::Hold => ["hold", "keep-held", "keep held", "保留"]
+                .iter()
+                .any(|alias| input.eq_ignore_ascii_case(alias)),
+            _ => false,
+        }
+    }
+
     /// Short human wording, for `magi show` and the card.
     pub fn describe(&self) -> String {
         match self {
@@ -684,7 +718,7 @@ impl Question {
         if self.free_text() || self.choices.iter().any(|c| c == reply) {
             return Ok(reply);
         }
-        if matches!(reply, "keep-held" | "keep held")
+        if ChoiceAction::Hold.matches_alias(reply)
             && let Some(label) = self
                 .choices
                 .iter()
@@ -695,18 +729,7 @@ impl Question {
         let matches: Vec<_> = self
             .actions
             .iter()
-            .filter(|(label, action)| {
-                self.choices.contains(label)
-                    && match action {
-                        ChoiceAction::Resume { run } => {
-                            matches!(reply, "resume" | "resume run" | "resume-run")
-                                || reply == format!("resume run {}", short(run))
-                                || reply == format!("resume run {run}")
-                        }
-                        ChoiceAction::Hold => matches!(reply, "keep-held" | "keep held"),
-                        _ => false,
-                    }
-            })
+            .filter(|(label, action)| self.choices.contains(label) && action.matches_alias(reply))
             .collect();
         match matches.as_slice() {
             [(label, _)] => Ok(label.as_str()),
@@ -3837,6 +3860,29 @@ mod tests {
         q.answer(Answer::Choice("SQLite".to_owned())).unwrap();
         let shown = answer_for_agent(&q, "SQLite");
         assert!(shown.contains("new") && !shown.contains("old"), "{shown}");
+    }
+
+    #[test]
+    fn recovery_aliases_require_a_unique_offered_structured_effect() {
+        let mut q = choice_question();
+        q.choices = vec!["daemon: 再開A".into(), "daemon: 再開B".into()];
+        for (label, run) in [("daemon: 再開A", "run-a"), ("daemon: 再開B", "run-b")] {
+            q.actions
+                .insert(label.into(), ChoiceAction::Resume { run: run.into() });
+        }
+        assert!(
+            q.resolve_reply("再開")
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
+        assert_eq!(q.resolve_reply("resume:run-a").unwrap(), "daemon: 再開A");
+        q.choices.remove(1);
+        assert_eq!(q.resolve_reply("実行再開").unwrap(), "daemon: 再開A");
+        assert!(q.resolve_reply("resume run-b").is_err());
+        assert!(q.resolve_reply("保留").is_err());
+        assert!(!ChoiceAction::Requeue.matches_alias("再キュー"));
+        assert!(!ChoiceAction::Done.matches_alias("完了"));
     }
 
     #[test]

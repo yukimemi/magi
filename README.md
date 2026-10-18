@@ -474,8 +474,8 @@ messages confer no authority. Unique short IDs remain supported in recommendatio
 full IDs remain required for guarded individual non-hold instructions.
 
 For low-risk internal recovery, structured resume and keep-held actions support
-`resume-run` / `resume run` and `keep-held` aliases independently of localized
-labels. Unique short question IDs work for explicit `<id>: <action>` replies
+`resume-run` / `resume run` / `再開` / `実行を再開する` and
+`keep-held` / `hold` / `保留` aliases independently of localized labels. Unique short question IDs work for explicit `<id>: <action>` replies
 (and `<id> resume run` without a colon).
 The assistant normalizes the alias before both authorization and answer storage;
 an explicit recovery reply can use persisted owner evidence without `--quote`.

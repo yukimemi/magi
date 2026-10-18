@@ -1698,6 +1698,9 @@ fn recovery_cli_accepts_short_and_full_ids_with_stable_aliases_and_localized_lab
         for alias in [
             "resume run",
             "resume-run",
+            "再開",
+            "実行を再開する",
+            "Resume Run",
             "resume run beef",
             "resume",
             RECOVERY_LABEL,
@@ -1727,6 +1730,51 @@ fn recovery_cli_accepts_short_and_full_ids_with_stable_aliases_and_localized_lab
                 let twice = recovery_answer(&f, &run, id, alias, Some(&words), false);
                 assert!(!twice.status.success());
             }
+        }
+    }
+}
+
+#[test]
+fn recovery_cli_accepts_japanese_hold_and_diagnoses_refused_bindings() {
+    for mode in ["保留", "missing", "queued", "quote", "consent"] {
+        let f = recovery_fixture();
+        let words = if mode == "consent" {
+            "考え中".into()
+        } else {
+            format!("{}: 保留", f.qid)
+        };
+        let run = standing_owner(&f, &words, None);
+        let talks = Talks::at(f.tmp.path().join("talks"));
+        let mut t = talks.get(&run).unwrap();
+        if mode == "missing" {
+            t.turns.clear();
+        } else if mode == "queued" {
+            t.pending = "待って".into();
+        }
+        talks.put(&mut t).unwrap();
+        let quote = if mode == "quote" { "保留" } else { &words };
+        let out = recovery_answer(&f, &run, &f.qid, "保留", Some(quote), false);
+        if mode == "保留" {
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let q = f.questions.get(&f.qid).unwrap();
+            assert_eq!(q.resolution().as_deref(), Some(RECOVERY_HOLD));
+            assert_eq!(q.answer_authority.unwrap().instruction, words);
+        } else {
+            assert_untouched(&f, &out);
+            let expected = match mode {
+                "missing" => "missing context",
+                "consent" => "insufficient consent",
+                _ => "stale persisted evidence",
+            };
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains(expected),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         }
     }
 }

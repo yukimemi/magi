@@ -382,22 +382,41 @@ pub fn authorize_answer(
     if let Some((_, _, instruction)) = current_instruction(&talk) {
         validate_effect(q, reply, instruction, quote.unwrap_or_default(), true)?;
     }
-    if contextual_recovery(q, reply) {
-        let (_, _, instruction) = current_instruction(&talk).context(
-            "missing context: no current persisted owner send; read the conversation again",
-        )?;
-        if quote.is_some_and(|quote| quote != instruction) {
-            bail!(
-                "stale persisted evidence: --quote must preserve the entire latest owner send; read it again"
-            );
-        }
-        bail!(
-            "insufficient consent: bind an explicit question/action reply, or interpret approval of a single saved recommendation with --recovery-consent <entire latest owner send>; clarify only if the owner's intent is ambiguous"
-        );
+    bail!("{}", diagnose_authorization_failure(q, &talk, reply, quote))
+}
+
+/// Explain a refused binding without changing the authorization policy.
+fn diagnose_authorization_failure(
+    q: &Question,
+    talk: &Talk,
+    reply: &str,
+    quote: Option<&str>,
+) -> &'static str {
+    if !q.free_text() && !q.choices.iter().any(|choice| choice == reply) {
+        return "alias mismatch: resolve an offered label or supported action alias with `magi answer --list`";
     }
-    bail!(
-        "answer requires --quote of the entire latest owner send bound to this question ID and exact offered choice, or explicit authorization of the immediately preceding question-by-question recommendations; persisted evidence must be current"
-    )
+    let queued_owner = (!talk.pending.is_empty() || !talk.pending_messages.is_empty())
+        && (talk.pending_messages.is_empty()
+            || talk
+                .pending_messages
+                .iter()
+                .any(|send| send.sender != Some(talk::Sender::Magi)));
+    if queued_owner {
+        return "stale persisted evidence: a queued owner send may retract consent; wait for it to be drained and read it again";
+    }
+    let Some((turn, _, instruction)) = current_instruction(talk) else {
+        return "missing context: no current persisted owner send; read the conversation again";
+    };
+    if quote.is_some_and(|quote| quote != instruction) {
+        return "stale persisted evidence: --quote must preserve the entire latest owner send; read it again";
+    }
+    if talk.turns[turn].at < q.asked_at {
+        return "stale persisted evidence: the latest owner send predates this question; obtain a current decision";
+    }
+    if contextual_recovery(q, reply) {
+        return "insufficient consent: bind an explicit question/action reply, or interpret approval of a single saved recommendation with --recovery-consent <entire latest owner send>; clarify only if the owner's intent is ambiguous";
+    }
+    "insufficient consent: answer requires --quote of the entire latest owner send bound to this question ID and exact offered choice, or explicit authorization of the immediately preceding question-by-question recommendations; persisted evidence must be current"
 }
 
 /// Only structured internal recovery effects qualify. Approval and publication
