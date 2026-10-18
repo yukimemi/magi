@@ -10152,14 +10152,25 @@ async function saveAvatar(mode) {
   } catch (error) { editor.message = `Could not save: ${error.message}`; }
   finally { editor.busy = false; renderSettings(); }
 }
+function avatarStatusLabel(persona) {
+  const label = persona.override_state === "custom" ? "custom"
+    : persona.override_state === "builtin" ? "built-in locked"
+    : persona.has_config_icon ? "repo icon" : "built-in (inherit)";
+  return `[${label}]${persona.is_orphan ? " [orphan]" : ""}`;
+}
 function renderAvatarSettings() {
   const editor = avatarEditor();
-  const choices = [{ id: "operator", name: "Your avatar" }, ...avatarCatalog.personas.map((p) => ({ id: `persona:${p.id}`, name: `Persona: ${p.name}` }))];
+  const choices = [{ id: "operator", name: "Your avatar" }, ...avatarCatalog.personas.map((p) => ({ id: `persona:${p.id}`, name: `Persona: ${p.name} (${p.id}) ${avatarStatusLabel(p)}` }))];
   if (!choices.some((p) => p.id === avatarTarget)) choices.push({ id: avatarTarget, name: avatarTarget });
   const select = el("select", { id: "avatar-target", onchange: (event) => { avatarTarget = event.target.value; renderSettings(); } },
     choices.map((p) => el("option", { value: p.id, text: p.name })));
   select.value = avatarTarget;
-  const current = avatarTarget === "operator" ? avatarCatalog.operator : avatarCatalog.personas.find((p) => `persona:${p.id}` === avatarTarget)?.avatar;
+  const persona = avatarCatalog.personas.find((p) => `persona:${p.id}` === avatarTarget);
+  const current = avatarTarget === "operator" ? avatarCatalog.operator : persona?.avatar;
+  const status = !persona ? "" : persona.override_state === "custom" ? "Custom image override saved."
+    : persona.override_state === "builtin" ? "Locked to built-in avatar; configuration image ignored."
+    : persona.has_config_icon ? "Inherits repository configuration image; built-in avatar if unavailable."
+    : "Inherits built-in avatar.";
   const picker = el("input", { type: "file", accept: "image/png,image/jpeg,image/gif,image/webp", "aria-label": "Choose avatar image", disabled: editor.busy });
   picker.addEventListener("change", () => chooseMagiIcon(picker.files[0], editor));
   const preview = avatarImg("magi-icon-preview");
@@ -10170,7 +10181,9 @@ function renderAvatarSettings() {
   return el("section", { class: "panel magi-icon-settings avatar-settings" },
     el("h2", { text: "Your avatar and persona avatars" }),
     el("p", { text: "Display only. A persona change applies to the same ID in every repository and existing conversation. Saved images override configuration images. Reset uses the built-in avatar; Use configuration removes the override. Images are resized; maximum 256 KiB." }),
-    el("label", { for: "avatar-target", text: "Avatar to edit" }), select, preview, picker,
+    el("label", { for: "avatar-target", text: "Avatar to edit" }), select,
+    el("p", { role: "status", text: status + (persona?.is_orphan ? " Persona no longer in this repository; saved override retained." : "") }),
+    preview, picker,
     el("div", { class: "set-actions" },
       el("button", { class: "btn btn-gold", type: "button", text: "Save avatar", disabled: editor.busy || !editor.draft, onclick: () => saveAvatar("save") }),
       el("button", { class: "btn btn-quiet", type: "button", text: "Reset to built-in", disabled: editor.busy, onclick: () => saveAvatar("reset") }),

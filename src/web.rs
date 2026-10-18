@@ -8765,6 +8765,7 @@ async fn avatar_settings_get(
     blocking(move || {
         let (repo, specs) = avatar_settings_specs(&ui, q.repo)?;
         let mut catalog = persona::catalog(&specs);
+        let known_ids: Vec<_> = catalog.iter().map(|p| p.id.clone()).collect();
         let mut saved = Vec::new();
         saved_persona_ids(&ui.home.join("avatars/personas"), "", &mut saved);
         for id in saved {
@@ -8773,8 +8774,16 @@ async fn avatar_settings_get(
             }
         }
         let personas: Vec<_> = catalog.iter().map(|p| {
+            let saved = read_icon_file(&avatar_setting_path(&ui.home, Some(&p.id)));
+            let override_state = match saved.as_deref() {
+                Some("builtin") => "builtin",
+                Some(_) => "custom",
+                None => "inherit",
+            };
             let icon = effective_persona_icon(&ui.home, &p.id, p.icon.as_deref());
-            serde_json::json!({"id":p.id,"name":p.name,"avatar":format!("/avatars/persona?persona={}&repo={}&v={}",
+            serde_json::json!({"id":p.id,"name":p.name,
+                "override_state":override_state,"has_config_icon":p.icon.is_some(),
+                "is_orphan":!known_ids.contains(&p.id),"avatar":format!("/avatars/persona?persona={}&repo={}&v={}",
                 avatar_encode(&p.id), avatar_encode(&repo.to_string_lossy()), persona_icon::fingerprint(icon.as_deref()))})
         }).collect();
         Ok(Json(serde_json::json!({"operator":operator_icon_url(&ui.home), "personas":personas})))
@@ -8870,7 +8879,11 @@ fn read_icon_file(path: &FsPath) -> Option<String> {
     if text.len() > persona_icon::ICON_MAX_BYTES {
         return None;
     }
-    (text.starts_with("data:") || text == "builtin").then_some(text)
+    if text == "builtin" {
+        return Some(text);
+    }
+    validate_uploaded_icon(&text).ok()?;
+    Some(text)
 }
 
 fn magi_icon_url(home: &FsPath) -> String {
@@ -8893,7 +8906,7 @@ fn save_magi_icon(home: &FsPath, icon: &str) -> Result<()> {
     save_icon_file(&magi_icon_path(home), icon)
 }
 
-fn save_icon_file(path: &FsPath, icon: &str) -> Result<()> {
+fn validate_uploaded_icon(icon: &str) -> Result<()> {
     if !icon.starts_with("data:") {
         anyhow::bail!("upload a raster image");
     }
@@ -8901,6 +8914,11 @@ fn save_icon_file(path: &FsPath, icon: &str) -> Result<()> {
     if sniffed_mime(&bytes) != Some(mime) {
         anyhow::bail!("image content does not match its type");
     }
+    Ok(())
+}
+
+fn save_icon_file(path: &FsPath, icon: &str) -> Result<()> {
+    validate_uploaded_icon(icon)?;
     atomic_icon_write(path, icon)
 }
 
@@ -12764,6 +12782,48 @@ mod tests {
         let view = TalkView::with_config(conversation, false, None, &ui.home);
         assert!(view.talk.turns[0].messages.is_empty());
         assert!(view.talk.pending_messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn avatar_settings_report_states_and_inherit_after_corruption() {
+        let icon = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let (_tmp, home, ui, _, _) = avatar_fixture(&format!(
+            "[[talk.personas]]\nid = \"rei\"\nicon = \"{icon}\"\n"
+        ))
+        .await;
+        let path = avatar_setting_path(home.path(), Some("rei"));
+        let orphan = avatar_setting_path(home.path(), Some("removed"));
+        save_icon_file(&orphan, icon).unwrap();
+        for (saved, expected) in [
+            (icon, "custom"),
+            ("builtin", "builtin"),
+            ("data:image/png;base64,!!!!", "inherit"),
+            ("data:image/png;base64,PGh0bWw+", "inherit"),
+            ("/tmp/avatar.png", "inherit"),
+        ] {
+            atomic_icon_write(&path, saved).unwrap();
+            let catalog =
+                avatar_settings_get(State(ui.clone()), Query(AvatarSettingsQuery::default()))
+                    .await
+                    .unwrap()
+                    .0;
+            let personas = catalog["personas"].as_array().unwrap();
+            let rei = personas.iter().find(|p| p["id"] == "rei").unwrap();
+            assert_eq!(rei["override_state"], expected);
+            assert_eq!(rei["has_config_icon"], true);
+            assert_eq!(rei["is_orphan"], false);
+            let removed = personas.iter().find(|p| p["id"] == "removed").unwrap();
+            assert_eq!(removed["override_state"], "custom");
+            assert_eq!(removed["is_orphan"], true);
+            let default = personas.iter().find(|p| p["id"] == "default").unwrap();
+            assert_eq!(default["override_state"], "inherit");
+            assert_eq!(default["has_config_icon"], false);
+            let effective = effective_persona_icon(home.path(), "rei", Some(icon));
+            assert_eq!(
+                effective.as_deref(),
+                Some(if expected == "builtin" { "" } else { icon })
+            );
+        }
     }
 
     #[tokio::test]
