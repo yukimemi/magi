@@ -3034,3 +3034,19 @@ Local release-watch approval cards also persist `merge_target`. Older cards may
 recover it only from their matching watch record's `asked_head`, never from a
 new forge snapshot or question prose. The same-chat deputy still requires
 `merge <head>` for those cards.
+
+### Web avatar overrides
+
+The web settings avatar editor stores display-only machine-wide overrides under
+`ui.home/avatars`: `operator.data` and `personas/<hex ID chunks>/icon.data`.
+Persona IDs are UTF-8 encoded as reversible hex directory components, never
+sanitized filenames; overrides apply to that ID across repositories and existing
+conversations. The MAGI sender remains separate at `ui.home/magi-icon.data`, even
+when a persona has ID `magi`. Do not copy overrides into persona prompts or talk
+records. Precedence: uploaded override, explicit built-in reset, then the existing
+`[[talk.personas]].icon` resolution and built-in fallback. “Use configuration”
+removes the override, while “Reset to built-in” deliberately bypasses configured
+images. Settings uploads accept raster data URIs only; configured absolute and
+`~/` image paths keep their established behavior. Avatar URLs include override
+fingerprints and responses use `no-cache`; refresh conversation views and cached
+persona choices after edits. Orphaned saved persona IDs remain editable.
