@@ -18316,14 +18316,25 @@ mod tests {
         let body = &APP_JS[start..];
         let body = &body[..body.find("\n}\n").expect("noticeCoveredBy ends")];
 
-        // An open question provides an actionable link to the questions route
-        assert!(body.contains("q.status === \"open\""));
-        assert!(body.contains("href: \"#/questions\""));
-        assert!(body.contains("Answer in question"));
+        // Historical associations are informational, even for open questions.
+        assert!(body.contains("Associated question ${short}"));
+        assert!(!body.contains("el(\"a\""));
 
         // A resolved question displays status rather than an actionable link
         assert!(body.contains("(resolved)"));
         assert!(body.contains("(closed)"));
+
+        let start = APP_JS
+            .find("function renderNotifications()")
+            .expect("renderNotifications exists");
+        let body = &APP_JS[start..];
+        let body = &body[..body.find("\n}\n").expect("renderNotifications ends")];
+
+        // Only a server-resolved answerable question supplies a response link.
+        assert!(body.contains("const questionLink = n.answerable_question ? el(\"a\", {"));
+        assert!(body.contains("href: `#/questions/${encodeURIComponent(n.answerable_question)}`"));
+        assert!(body.contains("text: \"Open question to respond\",\n    }) : null;"));
+        assert!(body.contains("questionLink ? subjectLink : noticeCoveredBy(n.covered_by)"));
     }
 
     /// Chat rows are two lines at every width: the title alone, then the
