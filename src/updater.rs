@@ -77,6 +77,45 @@ pub fn repo_name() -> &'static str {
     REPO
 }
 
+/// This binary's path, safe to spawn after the file was replaced on disk.
+///
+/// Linux resolves `current_exe` through `/proc/self/exe`, and once the upgrade
+/// has swapped the binary the kernel reports the old, unlinked inode as
+/// `/path/magi (deleted)`. Spawning that string fails with ENOENT, which is how
+/// `Update & restart` killed `magi web` without a successor. The suffix is
+/// kernel decoration, not part of the name, so it is stripped when the
+/// decorated path does not exist and the plain one does - the new binary is
+/// what the successor has to be.
+pub fn current_exe() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    Ok(without_deleted_suffix(exe))
+}
+
+fn without_deleted_suffix(exe: PathBuf) -> PathBuf {
+    if exe.exists() {
+        return exe;
+    }
+    match plain_of_deleted(&exe) {
+        Some(p) if p.exists() => p,
+        _ => exe,
+    }
+}
+
+/// `exe` without the kernel's ` (deleted)` suffix. Bytes, not `str`: an
+/// install path that is not UTF-8 must still be repaired.
+#[cfg(unix)]
+fn plain_of_deleted(exe: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+    let bytes = exe.as_os_str().as_bytes().strip_suffix(b" (deleted)")?;
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+}
+
+/// Only Linux decorates the path; nothing to strip elsewhere.
+#[cfg(not(unix))]
+fn plain_of_deleted(_exe: &Path) -> Option<PathBuf> {
+    None
+}
+
 /// kaishin options.
 ///
 /// All four names are spelled out because three of them differ from
@@ -1002,6 +1041,37 @@ pub async fn finalize(pending: Option<Pending>, budget: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// After the binary is replaced, Linux names the running one
+    /// `<path> (deleted)`; spawning that fails, so the plain path must win
+    /// when it exists - and a real path must never be rewritten.
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_binarys_deleted_suffix_is_stripped_only_when_the_plain_path_exists() {
+        use std::os::unix::ffi::OsStringExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("magi");
+        let decorated = dir.path().join("magi (deleted)");
+
+        assert_eq!(without_deleted_suffix(decorated.clone()), decorated);
+        std::fs::write(&plain, b"new").unwrap();
+        assert_eq!(without_deleted_suffix(decorated.clone()), plain);
+        assert_eq!(without_deleted_suffix(plain.clone()), plain);
+        std::fs::write(&decorated, b"odd").unwrap();
+        assert_eq!(without_deleted_suffix(decorated.clone()), decorated);
+
+        // A directory that is not UTF-8 must be repaired too.
+        let raw = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"m\xffgi".to_vec()));
+        let raw_decorated = {
+            let mut s = raw.clone().into_os_string();
+            s.push(" (deleted)");
+            PathBuf::from(s)
+        };
+        std::fs::write(&raw, b"new").unwrap();
+        assert_eq!(without_deleted_suffix(raw_decorated), raw);
+    }
 
     /// An interval configured below GitHub's unauthenticated 60 req/hour/IP
     /// limit must be floored, or `web`'s background recheck loop - which,
