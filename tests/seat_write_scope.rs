@@ -41,6 +41,14 @@ async fn sandbox_git_operations_and_network_policy() {
         "origin",
         fx.primary.to_str().unwrap(),
     ]));
+    let baseline = checked(Command::new("/usr/bin/python3").args([
+        "-c",
+        "import socket; print(socket.getaddrinfo('github.com', 443))",
+    ]));
+    println!(
+        "host DNS succeeded: {}",
+        String::from_utf8_lossy(&baseline.stdout)
+    );
     let script = r#"
 import json, os, pathlib, socket, subprocess
 pathlib.Path('probe').write_text('sandbox edit\n')
@@ -67,6 +75,7 @@ try:
     print(json.dumps({'dns': socket.getaddrinfo('github.com', 443)}), flush=True)
 except OSError as e:
     print(json.dumps({'dns_error': str(e)}), flush=True)
+    assert os.environ['PROBE_NETWORK'] == 'false', 'DNS must work with network enabled'
 "#;
     // Loopback comparison isolates network policy from external DNS outages.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect(
@@ -105,22 +114,31 @@ except OSError as e:
         assert!(out.status.success(), "sandbox probe failed: {out:?}");
         assert!(!unrelated.join("denied").exists());
     }
-    // Saving outside the seat remains supported even if seat Git writes failed.
+    // Exercise the launcher's real preservation route, including the saved tree.
     checked(
         Command::new("git")
             .current_dir(&fx.seat)
-            .args(["add", "probe"]),
+            .args(["config", "user.name", "Fixture"]),
     );
     checked(Command::new("git").current_dir(&fx.seat).args([
-        "-c",
-        "user.name=Fixture",
-        "-c",
-        "user.email=fixture@example.invalid",
-        "commit",
-        "--allow-empty",
-        "-m",
-        "launcher save",
+        "config",
+        "user.email",
+        "fixture@example.invalid",
     ]));
+    let saved = magi::git::rescue_commit(&fx.seat, "fixture: launcher save")
+        .await
+        .unwrap();
+    let tree = checked(
+        Command::new("git")
+            .current_dir(&fx.seat)
+            .args(["show", "HEAD:probe"]),
+    );
+    assert_eq!(String::from_utf8_lossy(&tree.stdout), "sandbox edit\n");
+    assert!(saved.withheld.is_empty());
+    println!(
+        "launcher rescue committed={}, saved HEAD:probe verified",
+        saved.committed
+    );
 }
 
 struct Fixture {
