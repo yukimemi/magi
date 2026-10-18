@@ -83,6 +83,17 @@ pub fn retain_sources(task: &crate::queue::Task, home: &Path) -> Result<()> {
 }
 
 pub(crate) fn sources_retained(home: &Path, id: &str) -> bool {
+    explicit_sources_retained(home, id)
+        || crate::queue::Queue::at(home.join("queue"))
+            .list()
+            .iter()
+            .any(|task| {
+                task.status != crate::queue::TaskStatus::Done
+                    && task.runs.iter().any(|run| run == id)
+            })
+}
+
+pub(crate) fn explicit_sources_retained(home: &Path, id: &str) -> bool {
     home.join("runs")
         .join(id)
         .join(RETAIN_SOURCES)

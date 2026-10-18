@@ -85,6 +85,7 @@ pub async fn housekeep(
     now: Timestamp,
 ) -> Housekeeping {
     let mut out = Housekeeping::default();
+    crate::retention::sweep(home, &cfg.disk, now).await;
     if cfg.disk.auto_fold {
         let runs = home.join("runs");
         match fold_due(&runs, home, worktrees_root, &cfg.disk, now).await {
@@ -883,7 +884,17 @@ pub fn prune_cache_if_over_limit(
     let Some(cache) = cfg.cache_dir() else {
         return Ok(None);
     };
-    prune_cache(home, &cache, cfg.disk.cache_limit_bytes)
+    let limit = crate::disk::free_bytes(&cache)
+        .ok()
+        .map_or(cfg.disk.cache_limit_bytes, |free| {
+            crate::disk::pressure_limit(
+                dir_size(&cache),
+                cfg.disk.cache_limit_bytes,
+                cfg.disk.min_free_bytes,
+                free,
+            )
+        });
+    prune_cache(home, &cache, limit)
 }
 
 /// The cache's path, size and cap, for `magi cache show` and the health view.

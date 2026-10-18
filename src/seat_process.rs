@@ -7,6 +7,7 @@ pub(crate) struct Running {
     child: Option<Child>,
     lease: Option<SeatLease>,
     group: Option<u32>,
+    outputs: Vec<crate::retention::OutputLease>,
 }
 
 impl Running {
@@ -16,7 +17,21 @@ impl Running {
             child: Some(child),
             lease,
             group,
+            outputs: Vec::new(),
         }
+    }
+
+    pub(crate) fn with_outputs(
+        child: Child,
+        lease: Option<SeatLease>,
+        outputs: Vec<crate::retention::OutputLease>,
+    ) -> Self {
+        let mut running = Self::new(child, lease);
+        if !outputs.is_empty() {
+            running.group = running.child.as_ref().and_then(Child::id);
+        }
+        running.outputs = outputs;
+        running
     }
 
     pub(crate) fn child(&mut self) -> &mut Child {
@@ -24,13 +39,15 @@ impl Running {
     }
 
     pub(crate) fn coordinated(&self) -> bool {
-        self.lease.is_some()
+        self.lease.is_some() || !self.outputs.is_empty()
     }
 
     pub(crate) async fn finish(&mut self) {
-        if let Some(lease) = self.lease.take() {
+        if self.coordinated() {
+            let lease = self.lease.take();
+            let outputs = std::mem::take(&mut self.outputs);
             let child = self.child.take().expect("running seat has a child");
-            if cleanup(child, lease, self.group).await.is_err() {
+            if cleanup(child, lease, outputs, self.group).await.is_err() {
                 // Cleanup could not start. Its fallback owner retains the
                 // reservation; expose a resource hold rather than completion.
                 std::future::pending::<()>().await;
@@ -41,37 +58,42 @@ impl Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
-        let Some(lease) = self.lease.take() else {
+        if !self.coordinated() {
             return;
-        };
+        }
+        let lease = self.lease.take();
+        let outputs = std::mem::take(&mut self.outputs);
         let Some(child) = self.child.take() else {
             return;
         };
         let group = self.group;
         // The receiver may be dropped; the cleanup owner is independent of the
         // caller's future and even its async runtime. It is never abortable.
-        drop(cleanup(child, lease, group));
+        drop(cleanup(child, lease, outputs, group));
     }
 }
 
 fn cleanup(
     child: Child,
-    lease: SeatLease,
+    lease: Option<SeatLease>,
+    outputs: Vec<crate::retention::OutputLease>,
     group: Option<u32>,
 ) -> tokio::sync::oneshot::Receiver<()> {
     let (done, receiver) = tokio::sync::oneshot::channel();
     // Retain a fallback owner if the OS cannot start a cleanup thread. Losing
     // cleanup capacity must hold coordination, never unlock a running process.
-    let state = Arc::new(Mutex::new(Some((child, lease))));
+    let state = Arc::new(Mutex::new(Some((child, lease, outputs))));
     let owned = Arc::clone(&state);
     let started = std::thread::Builder::new()
         .name("repository-seat-cleanup".into())
         .spawn(move || {
-            let Some((mut child, lease)) = owned.lock().ok().and_then(|mut s| s.take()) else {
+            let Some((mut child, lease, outputs)) = owned.lock().ok().and_then(|mut s| s.take())
+            else {
                 return;
             };
             stop(&mut child, group);
             drop(lease);
+            drop(outputs);
             let _ = done.send(());
         });
     if let Err(e) = started {

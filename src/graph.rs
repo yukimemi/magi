@@ -1268,7 +1268,22 @@ impl Runner {
 
     /// Validate ownership and persist the driver claim in one critical section.
     fn claim_driver(&mut self) -> Result<DriverExecution<'_>> {
-        let owner = crate::pr_head::owner_lock(&crate::run::home(), &self.state.id)?;
+        let owner = match crate::pr_head::owner_lock(&crate::run::home(), &self.state.id) {
+            Ok(owner) => owner,
+            Err(error) => {
+                let detail = format!("worktree maintenance or ownership update: {error:#}");
+                // Admission did not own run.json: retain this resource outcome
+                // in memory for queue settlement without overwriting a concurrent
+                // retirement or publication transaction.
+                self.state.resource_block = Some(crate::run::ResourceBlock {
+                    node: "start".into(),
+                    kind: "worktree maintenance".into(),
+                    detail: detail.clone(),
+                    at: Timestamp::now(),
+                });
+                return Err(crate::repo_lock::ResourceBlocked(detail).into());
+            }
+        };
         let disk = RunState::load(&self.state.id)?;
         crate::pr_head::ensure_owner(&disk)?;
         if disk.liveness(false) == crate::run::Liveness::Live {
@@ -9165,7 +9180,12 @@ fn record_repository_block(state: &mut RunState, error: &anyhow::Error) {
     if error.is::<crate::repo_lock::ResourceBlocked>() {
         state.resource_block = Some(crate::run::ResourceBlock {
             node: "repository".into(),
-            kind: "repository coordination".into(),
+            kind: if error.to_string().contains("disk pressure") {
+                "disk pressure"
+            } else {
+                "repository coordination"
+            }
+            .into(),
             detail: error.to_string(),
             at: Timestamp::now(),
         });
@@ -9460,7 +9480,9 @@ async fn wave(
         {
             state.resource_block = Some(crate::run::ResourceBlock {
                 node: node.to_owned(),
-                kind: if why.contains("repository coordination") {
+                kind: if why.contains("disk pressure") {
+                    "disk pressure"
+                } else if why.contains("repository coordination") {
                     "repository coordination"
                 } else {
                     "parallel slot"
@@ -10459,7 +10481,7 @@ async fn run_commands(
         return (Vec::new(), Vec::new());
     }
     let mut out = Vec::new();
-    let mut timed_out_pids = Vec::new();
+    let timed_out_pids = Vec::new();
     let total = commands.len();
     for (idx, command) in commands.iter().enumerate() {
         state.task_command(task, node, attempt, command, idx + 1, total, timeout);
@@ -10476,28 +10498,76 @@ async fn run_commands(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        let mut outputs = Vec::new();
+        let protected = (|| -> Result<()> {
+            if let Some(guard) = crate::retention::OutputLease::borrow(cwd)? {
+                outputs.push(guard);
+            }
+            if let Some(cache) = state.config.cache_dir() {
+                outputs.push(crate::retention::OutputLease::cache(
+                    &crate::run::home(),
+                    &cache,
+                    false,
+                )?);
+            }
+            Ok(())
+        })();
+        if let Err(e) = protected {
+            out.push(CommandOutcome {
+                command: command.clone(),
+                code: None,
+                output_tail: format!("output ownership unavailable: {e:#}"),
+                duration_ms: 0,
+                resource_blocked: true,
+            });
+            continue;
+        }
+        #[cfg(unix)]
+        cmd.process_group(0);
         let spawned = cmd.spawn();
         let (code, body) = match spawned {
             Ok(child) => {
-                // Captured before the child is consumed below: `kill_on_drop`
-                // only *asks* the process to die when the timeout branch
-                // drops it, and the pid is the only way anyone downstream can
-                // later check whether that request actually took.
-                let pid = child.id();
-                match tokio::time::timeout(timeout, child.wait_with_output()).await {
-                    Ok(Ok(o)) => {
-                        let mut body = String::from_utf8_lossy(&o.stdout).into_owned();
-                        body.push_str(&String::from_utf8_lossy(&o.stderr));
-                        (o.status.code(), body)
-                    }
-                    Ok(Err(e)) => (None, format!("failed to run: {e}")),
-                    Err(_) => {
-                        if let Some(pid) = pid {
-                            timed_out_pids.push(pid);
-                        }
-                        (None, format!("timed out after {}s", timeout.as_secs()))
-                    }
+                let mut running = crate::seat_process::Running::with_outputs(child, None, outputs);
+                let (stdout, out_reader) = agent::drain(running.child().stdout.take());
+                let (stderr, err_reader) = agent::drain(running.child().stderr.take());
+                let mut paths = vec![cwd.to_owned()];
+                if let Some(cache) = state.config.cache_dir() {
+                    paths.push(cache);
                 }
+                let mut pressure = None;
+                let status = tokio::select! {
+                    status = tokio::time::timeout(timeout, running.child().wait()) => Some(status),
+                    reason = crate::retention::emergency(paths, state.config.disk.min_free_bytes) => {
+                        pressure = Some(reason); None
+                    }
+                };
+                let code = match status {
+                    Some(Ok(Ok(status))) => status.code(),
+                    _ => None,
+                };
+                running.finish().await;
+                if let Some(reason) = pressure {
+                    state.resource_block = Some(crate::run::ResourceBlock {
+                        node: node.to_owned(),
+                        kind: "disk pressure".to_owned(),
+                        detail: reason.clone(),
+                        at: Timestamp::now(),
+                    });
+                    out.push(CommandOutcome {
+                        command: command.clone(),
+                        code: None,
+                        output_tail: reason,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        resource_blocked: true,
+                    });
+                    break;
+                }
+                let mut body = agent::collect(&stdout, out_reader, Duration::from_secs(2)).await;
+                body.push_str(&agent::collect(&stderr, err_reader, Duration::from_secs(2)).await);
+                if code.is_none() {
+                    body.push_str("\ncommand failed or timed out; process tree stopped");
+                }
+                (code, body)
             }
             Err(e) => (None, format!("failed to spawn `{}`: {e}", shell[0])),
         };
@@ -11218,6 +11288,22 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> R
     }
     if !state.candidate_preservation.is_empty() {
         bail!("candidate preservation incomplete; refusing cleanup");
+    }
+    // Serialize ordinary folding with the same starts/resumes as target-only
+    // eviction. Otherwise a second janitor could remove the whole worktree
+    // around a live output borrower even though target eviction was fenced.
+    std::fs::create_dir_all(home.join("runs").join(&state.id))?;
+    let _owner = crate::pr_head::owner_lock(home, &state.id)?;
+    let _driver = crate::driver::maintenance(home, &state.id)?;
+    let mut output_guards = Vec::new();
+    for entry in std::fs::read_dir(state.worktree_root())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if entry.path().join(".git").is_file() {
+            output_guards.push(crate::retention::OutputLease::take(&entry.path(), true)?);
+        }
     }
     let repo = state.repo.clone();
     // CLI, Web and automatic cleanup all enter here, independently of

@@ -34,15 +34,10 @@
 //! new one — a bare lock file was never trusted alone there either; it is
 //! always paired with a liveness check.
 //!
-//! ## What this module does not do
-//!
-//! It does not reap a build's orphaned grandchildren once magi kills the
-//! seat that started them at a timeout — that is process-tree ownership, a
-//! different problem with its own owner elsewhere. A lease held by a process
-//! whose pid has exited is `Stale` and reclaimable *as a lease*, whether or
-//! not a grandchild is still writing files under the cache; this module only
-//! ever answers "who owns the cache directory", not "is every process that
-//! might still be touching it definitely gone".
+//! Process cleanup additionally holds an OS output lease through termination of
+//! managed tool descendants. Admission and destructive maintenance check that
+//! lease too: reclaiming a dead JSON owner alone does not permit deleting or
+//! reusing outputs still owned by cleanup.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -123,6 +118,8 @@ pub enum Busy {
     Unknown,
     /// Lost a race with another acquirer; the caller should just try again.
     Contended,
+    /// A process cleanup owner still protects the cache outputs.
+    Outputs,
 }
 
 impl Busy {
@@ -137,6 +134,9 @@ impl Busy {
             Busy::Unknown => {
                 "an unreadable lease is present; refusing to guess who holds it".to_owned()
             }
+            Busy::Outputs => {
+                "cache outputs are still owned by running tools or process cleanup".to_owned()
+            }
             Busy::Contended => "lost a race for the lease; retrying".to_owned(),
         }
     }
@@ -149,6 +149,7 @@ impl Busy {
 pub struct Guard {
     path: PathBuf,
     released: bool,
+    outputs: Option<crate::retention::OutputLease>,
 }
 
 impl Guard {
@@ -156,6 +157,7 @@ impl Guard {
         Guard {
             path,
             released: false,
+            outputs: None,
         }
     }
 
@@ -362,7 +364,29 @@ pub enum AcquireOutcome {
 /// stale one first. One attempt — a caller that wants to wait uses
 /// [`wait_for`], which is this in a loop bounded by a budget.
 pub fn try_acquire(home: &Path, cache_dir: &Path, owner: &Owner) -> Result<AcquireOutcome> {
+    let Ok(_outputs) = crate::retention::OutputLease::cache(home, cache_dir, true) else {
+        return Ok(AcquireOutcome::Busy(Busy::Outputs));
+    };
     try_acquire_with(home, cache_dir, owner, proc::pid_alive)
+}
+
+/// Take both cache ownership and exclusive output ownership for a destructive
+/// maintenance operation. Refuses while process cleanup still owns descendants.
+pub fn try_acquire_maintenance(
+    home: &Path,
+    cache_dir: &Path,
+    owner: &Owner,
+) -> Result<AcquireOutcome> {
+    let Ok(outputs) = crate::retention::OutputLease::cache(home, cache_dir, true) else {
+        return Ok(AcquireOutcome::Busy(Busy::Outputs));
+    };
+    match try_acquire_with(home, cache_dir, owner, proc::pid_alive)? {
+        AcquireOutcome::Acquired(mut guard) => {
+            guard.outputs = Some(outputs);
+            Ok(AcquireOutcome::Acquired(guard))
+        }
+        busy => Ok(busy),
+    }
 }
 
 /// [`try_acquire`] with its process-liveness query supplied by the caller —
@@ -411,6 +435,7 @@ fn try_acquire_with<F: Fn(u32) -> bool + Copy>(
 pub fn in_use(home: &Path, cache_dir: &Path) -> bool {
     let path = lease_path(home, cache_dir);
     matches!(classify(&path), Status::Active(_) | Status::Unknown)
+        || crate::retention::OutputLease::cache(home, cache_dir, true).is_err()
 }
 
 /// Prefix of the machine hold a task gets when its run stopped because this
@@ -502,6 +527,9 @@ pub enum EntryStatus {
     /// from the lease file's mere absence, which is indistinguishable from a
     /// path magi never touched (see [`CatalogRecord`]'s doc).
     Idle(Owner),
+    /// Tools or their independent cleanup owner retain an OS output lease.
+    /// The attached owner is the last recorded cache borrower.
+    Outputs(Owner),
 }
 
 /// Every cache directory magi knows about under `home`, whether or not
@@ -513,7 +541,16 @@ pub enum EntryStatus {
 /// answers "what has magi registered", not "what looks like a build cache".
 #[must_use]
 pub fn inventory(home: &Path) -> Vec<Entry> {
-    inventory_with(home, proc::pid_alive)
+    let mut entries = inventory_with(home, proc::pid_alive);
+    for entry in &mut entries {
+        if let EntryStatus::Idle(owner) | EntryStatus::Stale(owner) = &entry.status
+            && crate::retention::OutputLease::cache(home, Path::new(&entry.cache_dir), true)
+                .is_err()
+        {
+            entry.status = EntryStatus::Outputs(owner.clone());
+        }
+    }
+    entries
 }
 
 /// [`inventory`] with its process-liveness query supplied by the caller —
@@ -602,9 +639,10 @@ pub fn maintenance_prune(
         worktree: String::new(),
         head: String::new(),
     };
-    match try_acquire(home, cache_dir, &owner)? {
+    match try_acquire_maintenance(home, cache_dir, &owner)? {
         AcquireOutcome::Busy(_) => Ok(None),
         AcquireOutcome::Acquired(guard) => {
+            let _cargo = crate::retention::cargo_locks(cache_dir)?;
             let result = crate::disk::prune_dir(cache_dir, limit)?;
             guard.release();
             Ok(Some(result))
