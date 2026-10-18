@@ -1319,9 +1319,7 @@ impl Runner {
     }
 
     async fn execute_graph(&mut self) -> Result<()> {
-        if let Some(selection) = self.state.pr_recovery.clone() {
-            selection.configure(&mut self.state.config)?;
-        }
+        self.state.configure_recovery_resume()?;
         // Preservation may invalidate an old empty classification. Resolve it
         // before any resume shortcut can reuse a verdict or publish a branch.
         self.persist_candidates().await?;

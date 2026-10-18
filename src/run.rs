@@ -2675,6 +2675,26 @@ impl RunState {
         }
     }
 
+    /// Resolve legacy delivery intent only from an already published PR and approval binding.
+    fn recovery_disposition(&self) -> Option<crate::pr_recovery::Disposition> {
+        let selected = self.pr_recovery.as_ref()?;
+        selected.disposition.or_else(|| {
+            (self.config.merge.mode == MergeMode::Pr
+                && self.land_approval.is_some()
+                && self.pr.as_ref().is_some_and(|pr| pr.url == selected.url))
+            .then_some(crate::pr_recovery::Disposition::Land)
+        })
+    }
+
+    /// Validate a resumed recovery against its own durable configuration and landing records.
+    pub fn configure_recovery_resume(&mut self) -> anyhow::Result<()> {
+        if let Some(mut selected) = self.pr_recovery.clone() {
+            selected.disposition = self.recovery_disposition();
+            selected.configure(&mut self.config)?;
+        }
+        Ok(())
+    }
+
     /// Only a confirmed merge of the selected public PR completes a delivery task.
     pub fn public_delivery_complete(&self) -> bool {
         self.status == RunStatus::Merged
@@ -2687,7 +2707,8 @@ impl RunState {
                 p.state.eq_ignore_ascii_case("merged")
                     && self.pr_recovery.as_ref().is_some_and(|s| {
                         s.url == p.url
-                            && s.disposition == Some(crate::pr_recovery::Disposition::Land)
+                            && self.recovery_disposition()
+                                == Some(crate::pr_recovery::Disposition::Land)
                     })
             })
             && self.pr_pushed_head.as_deref().is_some_and(|head| {
@@ -2713,11 +2734,7 @@ impl RunState {
 
     /// Validate evidence for exactly the head about to be published or merged.
     pub fn check_delivery_evidence(&self, head: &str) -> anyhow::Result<()> {
-        if !self
-            .pr_recovery
-            .as_ref()
-            .is_some_and(|s| s.disposition == Some(crate::pr_recovery::Disposition::Land))
-        {
+        if self.recovery_disposition() != Some(crate::pr_recovery::Disposition::Land) {
             return Ok(());
         }
         let commands_match = |outcomes: &[CommandOutcome], commands: &[String]| {

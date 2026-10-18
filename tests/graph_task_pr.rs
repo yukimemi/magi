@@ -575,3 +575,146 @@ async fn selected_delivery_without_verification_or_disposition_stops_before_a_ru
     }
 }
 }
+
+async fn assert_recovery_resume_uses_saved_config(legacy: bool) {
+    let (fx, mut task, selected, bin) = Box::pin(selected_fixture()).await;
+    let queue = magi::queue::Queue::open();
+    let path = fx.tmp.path().join("mutable-recovery.toml");
+    std::fs::write(&path, toml::to_string(&fx.config).unwrap()).unwrap();
+    task.release_operator("test", None);
+    task.pr_recovery = Some(selected);
+    task.overrides.as_mut().unwrap().config = Some(path.clone());
+    queue.put(&mut task).unwrap();
+    let opts = magi::daemon::Opts {
+        repo: fx.repo.clone(),
+        ..Default::default()
+    };
+    Box::pin(magi::daemon::run_claimed(&opts, &queue, &mut task)).await;
+    assert_eq!(
+        task.status,
+        magi::queue::TaskStatus::Held,
+        "{:?} {:?}",
+        task.hold_reason,
+        task.last_error
+    );
+    let id = task.runs.last().unwrap().clone();
+    let mut state = RunState::load(&id).unwrap();
+    assert!(state.parked, "{:?}", state.events);
+    let approval = state.land_approval.clone().unwrap();
+    let head = state.pr_pushed_head.clone().unwrap();
+    let history = task.runs.clone();
+    let provenance = serde_json::to_value(&state.recovery_config).unwrap();
+    let gate = state.config.verify.gate.clone();
+    let e2e = state.config.verify.e2e.clone();
+    if legacy {
+        let old = state.pr_recovery.as_mut().unwrap();
+        old.disposition = None;
+        old.source_head = None;
+        task.pr_recovery = state.pr_recovery.clone();
+        let mut unbound = state.clone();
+        unbound.land_approval = None;
+        assert!(unbound.configure_recovery_resume().is_err());
+        let mut mismatched = state.clone();
+        mismatched.pr.as_mut().unwrap().url.push_str("/different");
+        assert!(mismatched.configure_recovery_resume().is_err());
+        state.save().unwrap();
+        queue.put(&mut task).unwrap();
+        let mut resumed = Runner::resume(&id).unwrap();
+        Box::pin(resumed.execute()).await.unwrap();
+        assert!(resumed.state.parked);
+        assert_eq!(
+            resumed.state.land_approval.as_ref().unwrap().question,
+            approval.question
+        );
+    }
+    let mut invalid_saved = state.clone();
+    invalid_saved.config.verify.gate.clear();
+    assert!(
+        invalid_saved.configure_recovery_resume().is_err(),
+        "legacy records cannot waive validation"
+    );
+    let mut incomplete = fx.config.clone();
+    incomplete.verify.gate.clear();
+    incomplete.verify.e2e.clear();
+    std::fs::write(&path, toml::to_string(&incomplete).unwrap()).unwrap();
+    for removed in [false, true] {
+        if removed {
+            std::fs::remove_file(&path).unwrap();
+        }
+        Box::pin(magi::daemon::run_claimed(&opts, &queue, &mut task)).await;
+        assert_eq!(
+            task.status,
+            magi::queue::TaskStatus::Held,
+            "{:?}",
+            task.hold_reason
+        );
+        assert_eq!(task.runs, history);
+        let saved = RunState::load(&id).unwrap();
+        assert!(saved.parked, "{:?}", saved.events);
+        assert_eq!(saved.config.verify.gate, gate);
+        assert_eq!(saved.config.verify.e2e, e2e);
+        assert_eq!(
+            saved.land_approval.as_ref().unwrap().question,
+            approval.question
+        );
+        assert_eq!(saved.gate_head.as_deref(), Some(head.as_str()));
+        assert_eq!(
+            serde_json::to_value(&saved.recovery_config).unwrap(),
+            provenance
+        );
+        assert_eq!(
+            std::fs::read_to_string(saved.winner().unwrap().worktree.join("reviewed-fix.txt"))
+                .unwrap(),
+            "preserved fix"
+        );
+    }
+    magi::ask::Questions::open()
+        .update(&approval.question, |q| {
+            q.answer(magi::ask::Answer::Choice("merge".into()))
+        })
+        .unwrap();
+    std::fs::write(bin.join("allow-merge"), "").unwrap();
+    Box::pin(magi::daemon::run_claimed(&opts, &queue, &mut task)).await;
+    assert_eq!(
+        task.status,
+        magi::queue::TaskStatus::Done,
+        "{:?}",
+        task.hold_reason
+    );
+    assert_eq!(task.runs, history);
+    let landed = RunState::load(&id).unwrap();
+    assert!(landed.public_delivery_complete());
+    assert_eq!(landed.pr_merged_head.as_deref(), Some(head.as_str()));
+    assert_eq!(
+        landed.pr_recovery.as_ref().unwrap().disposition.is_none(),
+        legacy
+    );
+}
+
+// Several complete graph resumes share one debug-build future in these scenes.
+fn recovery_resume_scene(name: &'static str, legacy: bool) {
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || {
+            common::isolated(name, || assert_recovery_resume_uses_saved_config(legacy));
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn selected_recovery_resumes_saved_validation_after_current_config_is_emptied_or_deleted() {
+    recovery_resume_scene(
+        "selected_recovery_resumes_saved_validation_after_current_config_is_emptied_or_deleted",
+        false,
+    );
+}
+
+#[test]
+fn legacy_recovery_with_public_pr_and_approval_resumes_saved_delivery() {
+    recovery_resume_scene(
+        "legacy_recovery_with_public_pr_and_approval_resumes_saved_delivery",
+        true,
+    );
+}

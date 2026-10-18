@@ -11,7 +11,10 @@ magi task recover-pr <task> --pr <url> --head <full-public-SHA> --disposition re
 requires fresh owner approval. `review` replaces the mode with `none` and
 finishes after local review. Other task overrides are preserved. The command
 prints the replaced merge override. Old selections without a disposition are
-held before starting agents or spending attempts; select again explicitly.
+held before starting new work; select again explicitly. An existing published
+recovery with a matching PR and an approval binding can resume its saved
+delivery workflow without a new selection. Its saved validation and all
+final-head and owner-approval checks still apply.
 Completed tasks can also be selected again through this command.
 
 `--head` is the public update lease. Optional `--source-head <full-SHA>` is the
@@ -36,9 +39,10 @@ ordered inputs. New recovery runs save `recovery_config` beside `config`:
 input paths (remote cache paths include the immutable source commit), task
 options, and any inherited daemon merge override. The final resolved commands
 are in `config.verify`; reporting provenance does not re-render the files.
-A resumed run retains its original configuration and source selection. To change
-validation after a completed review, select a new recovery with the same source
-and corrected settings instead of editing saved task/run JSON.
+A resumed run retains its original configuration and source selection, even
+when the current settings have changed or their input files are unavailable. To
+change validation after a completed review, select a new recovery with the same
+source and corrected settings instead of editing saved task/run JSON.
 
 An empty gate is **not configured / not tested**, including historical records
 with `gate_ran=true`. It is not a successful verification result. Intentional
