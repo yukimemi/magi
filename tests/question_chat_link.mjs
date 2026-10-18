@@ -5,7 +5,7 @@ import { runInNewContext } from 'node:vm';
 import { test } from 'node:test';
 
 const source = readFileSync(new URL('../assets/ui/app.js', import.meta.url), 'utf8');
-const controls = source.slice(source.indexOf('  const hasChat ='), source.indexOf('  r.sayText.disabled ='));
+const controls = source.slice(source.indexOf('function updateQuestionOrigin('), source.indexOf('function updateAskCard('));
 const router = source.slice(source.indexOf('function parseRoute()'), source.indexOf('/* ---- two-pane layout'));
 const consults = [];
 const context = {
@@ -15,10 +15,7 @@ const context = {
   consultChat: (id, row) => consults.push({ id, row }),
   location: { hash: '' },
 };
-const update = runInNewContext(`(r, question) => {
-  const row = { refs: r }, open = question.status === 'open';
-  ${controls}
-}`, context);
+const update = runInNewContext(`${controls}\n(r, question) => updateQuestionOrigin({ refs: r }, question)`, context);
 const parseRoute = runInNewContext(`${router}\nparseRoute`, context);
 const refs = () => ({ consultBox: {}, consultBtn: {}, chatLink: {} });
 const question = { id: 'q', status: 'open', origin_chat: 'chat /?#日本語', can_consult_chat: true };
@@ -66,4 +63,13 @@ test('updates remove a stale navigation target when the association disappears',
     assert.equal(r.chatLink.hidden, true);
     assert.equal(r.chatLink.href, undefined);
   }
+});
+
+
+test('origin enrichment leaves pending answer controls and draft untouched', () => {
+  const r = { ...refs(), consultPending: true, send: { disabled: true }, text: { value: 'Unsent answer' } };
+  update(r, question);
+  assert.equal(r.consultBtn.disabled, true);
+  assert.equal(r.send.disabled, true);
+  assert.equal(r.text.value, 'Unsent answer');
 });

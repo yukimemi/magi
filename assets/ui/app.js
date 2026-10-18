@@ -5088,6 +5088,31 @@ function renderPostingComparison(parent, view) {
   parent.append(after);
 }
 
+function updateQuestionOrigin(row, question) {
+  const r = row.refs;
+  const open = question.status === "open";
+  const hasChat = typeof question.origin_chat === "string" && question.origin_chat !== "";
+  const canConsult = open && hasChat && question.can_consult_chat === true;
+  show(r.consultBox, hasChat);
+  show(r.consultBtn, canConsult);
+  show(r.chatLink, hasChat);
+  setAttr(r.chatLink, "href", hasChat ? `#/chat/${encodeURIComponent(question.origin_chat)}` : null);
+  setText(r.chatLink, question.origin_chat_closed ? "Open chat (closed)" : "Open chat");
+  r.consultBtn.disabled = Boolean(question.consult) || r.consultPending === true;
+  setText(r.consultBtn, question.consult
+    ? "Asked the chat agent"
+    : question.origin_chat_closed ? "Reopen chat and ask" : "Ask the chat agent");
+  r.consultBtn.onclick = () => consultChat(question.id, row);
+}
+
+function renderQuestionOrigins() {
+  const questions = new Map((state.questions || []).map(question => [question.id, question]));
+  for (const row of document.querySelectorAll(".ask")) {
+    const question = questions.get(row.dataset.questionId);
+    if (question) updateQuestionOrigin(row, question);
+  }
+}
+
 function updateAskCard(row, question, { compact = false } = {}) {
   const r = row.refs;
   updateQuestionIdentity(r.identity, question.id);
@@ -5180,18 +5205,7 @@ function updateAskCard(row, question, { compact = false } = {}) {
 
   r.saySend.onclick = () => sayToQuestion(question.id, r.sayText.value, row);
   show(r.sayBox, open);
-  const hasChat = typeof question.origin_chat === "string" && question.origin_chat !== "";
-  const canConsult = open && hasChat && question.can_consult_chat === true;
-  show(r.consultBox, hasChat);
-  show(r.consultBtn, canConsult);
-  show(r.chatLink, hasChat);
-  setAttr(r.chatLink, "href", hasChat ? `#/chat/${encodeURIComponent(question.origin_chat)}` : null);
-  setText(r.chatLink, question.origin_chat_closed ? "Open chat (closed)" : "Open chat");
-  r.consultBtn.disabled = Boolean(question.consult);
-  setText(r.consultBtn, question.consult
-    ? "Asked the chat agent"
-    : question.origin_chat_closed ? "Reopen chat and ask" : "Ask the chat agent");
-  r.consultBtn.onclick = () => consultChat(question.id, row);
+  updateQuestionOrigin(row, question);
   r.sayText.disabled = waitingOnAgent || textUnavailable;
   r.saySend.disabled = waitingOnAgent || textUnavailable;
 
@@ -5378,6 +5392,8 @@ async function sayToQuestion(id, text, row) {
    The question stays open; the chat agent answers it or asks the owner there. */
 async function consultChat(id, row) {
   const r = row.refs;
+  if (r.consultPending) return;
+  r.consultPending = true;
   r.consultBtn.disabled = true;
   try {
     const said = await postJson(API.questionConsult(id), {});
@@ -5392,7 +5408,10 @@ async function consultChat(id, row) {
     }
     setText(r.error, error.message);
     show(r.error, true);
-    r.consultBtn.disabled = false;
+  } finally {
+    r.consultPending = false;
+    const current = (state.questions || []).find(question => question.id === id);
+    if (current) updateQuestionOrigin(row, current);
   }
 }
 
@@ -9303,8 +9322,22 @@ function loadStore(name, url, change, apply) {
   let flight = storeReads.get(name);
   if (flight) {
     // An explicit refresh needs a whole read even if followed by a delta.
+    const previous = flight.pending && flight.pending.change;
+    if (change && previous && change.rev === previous.rev) {
+      // The question and queue refresh paths can enqueue the same event.
+      // Keep a delta chain already merged through that revision.
+      change = previous;
+    } else if (change && change.delta && previous && previous.delta && change.delta.base === previous.rev) {
+      const changed = new Set(previous.delta.changed);
+      const removed = new Set(previous.delta.removed);
+      for (const id of change.delta.removed) { changed.delete(id); removed.add(id); }
+      for (const id of change.delta.changed) { removed.delete(id); changed.add(id); }
+      change = { rev: change.rev, delta: {
+        base: previous.delta.base, changed: [...changed], removed: [...removed],
+      } };
+    }
     flight.pending = {
-      change: change || (flight.pending && flight.pending.change),
+      change: change || previous,
       whole: !change || Boolean(flight.pending && flight.pending.whole),
     };
     return flight.promise;
@@ -9343,11 +9376,9 @@ function loadStore(name, url, change, apply) {
               apply(mergeStore(name, [...visible.values()], { changed: [], removed: [] }), true, observed, page.rows);
               cursor = page.next;
               sectionNotice(`${name}-h`, `${name}-load-state`, cursor ? "Loading older entries…" : "");
-              // A newer notification supersedes this enumeration. Never
-              // acknowledge a revision from an unfinished walk.
-              if (flight.pending) break;
+              // Finish the frozen membership walk even under continuous
+              // writes. Queued deltas reconcile it after every page is shown.
             } while (cursor);
-            if (flight.pending) continue;
             rows = mergeStore(name, [...collected.values()], {
               changed: (state[name] || []).map(row => row.id), removed: [],
             });
@@ -9444,8 +9475,41 @@ function selectStatsRepo(value) {
    a backlog of them would mean the loop had been stalled for days — and one
    fetch keeps the runs list, the ask bar and the open run in agreement about
    which runs are parked. */
+let questionOriginGeneration = 0;
+let questionOriginController = null;
+
+function loadQuestionOrigins() {
+  const generation = ++questionOriginGeneration;
+  if (questionOriginController) questionOriginController.abort();
+  const controller = new AbortController();
+  questionOriginController = controller;
+  sectionNotice("questions-h", "questions-origin-state", "Loading question origins…");
+  return getJson(`${API.questions}/origins`, { signal: controller.signal }).then(origins => {
+    if (generation !== questionOriginGeneration) return;
+    const byId = new Map(origins.map(origin => [origin.id, origin]));
+    let incomplete = false;
+    state.questions = state.questions.map(question => {
+      const origin = byId.get(question.id);
+      if (!origin || origin.record_revision !== question.record_revision) {
+        incomplete = true;
+        return { ...question, can_consult_chat: false };
+      }
+      return { ...question, origin_chat: origin.origin_chat,
+        origin_chat_closed: origin.origin_chat_closed, can_consult_chat: origin.can_consult_chat };
+    });
+    renderQuestionOrigins();
+    sectionNotice("questions-h", "questions-origin-state", incomplete ? "Questions changed while loading origins. Retry." : "", incomplete ? () => loadQuestions() : null);
+  }).catch(error => {
+    if (generation !== questionOriginGeneration || error.name === "AbortError") return;
+    sectionNotice("questions-h", "questions-origin-state", `Question origins: ${error.message}`, () => loadQuestions());
+  });
+}
+
 function loadQuestions() {
-  return loadStore("questions", API.questions, null, list => {
+  ++questionOriginGeneration;
+  if (questionOriginController) questionOriginController.abort();
+  sectionNotice("questions-h", "questions-origin-state", "");
+  return loadStore("questions", `${API.questions}/core`, null, list => {
     state.questions = sortQuestions(Array.isArray(list) ? list : []);
     renderQuestions();
     renderAskBar();
@@ -9458,6 +9522,8 @@ function loadQuestions() {
     renderRuns();
     renderQueue();
     if (state.route.name === "run" && state.detail.run) renderRunDetail();
+    if (state.questions.length) loadQuestionOrigins();
+    else sectionNotice("questions-h", "questions-origin-state", "");
   });
 }
 
