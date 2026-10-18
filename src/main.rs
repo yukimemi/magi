@@ -472,6 +472,7 @@ enum Command {
         choices: Vec<String>,
         /// Have the daemon act when a choice is answered:
         /// `<choice>=resume[:<run>]`, `<choice>=requeue`, `<choice>=hold` or `<choice>=done`.
+        /// Named maintenance actions also accept `<choice>=<typed action JSON>`.
         /// The choice must be one of the `--choice` values, matched exactly;
         /// `resume` without a run means this run (`MAGI_RUN`). The daemon acts
         /// on the task that owns the run - resuming a run, requeuing the task
@@ -2312,6 +2313,12 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
                 question_belongs_to_this_run(q, &run, "reply to")?;
                 q.reply(thread_message(&summary, &detail), choices)?;
                 q.actions = actions;
+                if q.node == magi::conduct::NODE {
+                    anyhow::ensure!(
+                        q.choices.iter().all(|c| q.actions.contains_key(c)),
+                        "every conductor choice needs an executable typed action"
+                    );
+                }
                 // Re-attached the same way a fresh ask's panel is: before the
                 // question is filed, so the owner never sees the reply a moment
                 // before the evidence for it.
@@ -2444,6 +2451,13 @@ fn ask_settle_cmd(
                 "task {} is held by the operator; an answer cannot settle it",
                 task.short()
             );
+        }
+        if let Some(action) = q.actions.get(label) {
+            for target in queue.list() {
+                if action.targets(&target) && target.operator_held() {
+                    bail!("target task {} is held by the operator", target.short());
+                }
+            }
         }
         q.settle_by_deputy(&seat, label, quote, note)
     })?;

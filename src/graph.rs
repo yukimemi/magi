@@ -7955,7 +7955,7 @@ impl Runner {
                 );
                 self.state.save()?;
                 store
-                    .put(&mut q)
+                    .put_executable(&mut q)
                     .context("file the posting-gate question")?;
                 if let Err(e) = ask::notify(&self.state.config.notify, &q).await {
                     tracing::warn!(

@@ -220,6 +220,29 @@ pub(crate) fn reconcile(home: &Path) -> Vec<String> {
     reconciled
 }
 
+/// Explicit owner action, separate from startup reconciliation. Never turn
+/// Unknown into permission to retire a record. Claims share this owner lock.
+pub(crate) fn abandon_proven_dead(home: &Path, id: &str) -> Result<()> {
+    anyhow::ensure!(crate::run::is_run_id(id), "invalid run id");
+    let _owner = crate::pr_head::owner_lock(home, id)?;
+    let mut state = RunState::load_under(id, home)?;
+    let claims = crate::daemon::is_working_on(home, id, jiff::Timestamp::now());
+    anyhow::ensure!(
+        state.liveness_under(home, claims) == Liveness::Dead,
+        "run liveness is not proven gone"
+    );
+    anyhow::ensure!(state.status.resumable(), "run is already terminal");
+    state.clear_active();
+    state.status = crate::run::RunStatus::Failed;
+    state.event(
+        "owner-choice",
+        "abandoned by an explicit choice after driver liveness was proven gone",
+    );
+    state.save_under(home)?;
+    crate::ask::Questions::at(home.join("questions")).settle_run(id, state.status)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

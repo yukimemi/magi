@@ -89,3 +89,6 @@ pub mod verdict;
 pub mod waiter;
 pub mod web;
 pub mod worktree_setup;
+
+pub mod choice_effect;
+mod resume;

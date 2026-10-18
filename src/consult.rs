@@ -669,7 +669,10 @@ pub fn destructive_effect(q: &Question, label: &str) -> bool {
     {
         return true;
     }
-    if matches!(q.actions.get(label), Some(crate::ask::ChoiceAction::Done)) {
+    if matches!(
+        q.actions.get(label),
+        Some(crate::ask::ChoiceAction::Done | crate::ask::ChoiceAction::AbandonRun { .. })
+    ) {
         return true;
     }
     let at = q.choices.iter().position(|c| c == label);

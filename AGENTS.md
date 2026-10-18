@@ -3054,3 +3054,30 @@ images. Settings uploads accept raster data URIs only; configured absolute and
 `~/` image paths keep their established behavior. Avatar URLs include override
 fingerprints and responses use `no-cache`; refresh conversation views and cached
 persona choices after edits. Orphaned saved persona IDs remain editable.
+
+### Executable question choices and maintenance deputies
+
+- Conductor choices must carry a closed `ask::ChoiceAction`; manual-only labels
+  are replaced by a safe hold. Never offer an owner run-record edit or an
+  arbitrary shell command as a choice. New question protocols belong in
+  `choice_effect::describe` and `tests/deputy.rs::unasked_questions`. The
+  conductor, triage, landing and release-watch builders validate their offers
+  with `Questions::put_executable`; the Web card hides unsupported legacy labels.
+- `ResumeRun`, `RerunChecks`, `ReleaseTask`, and `AbandonRun` are daemon-only
+  maintenance effects. Deputies only record `ask --settle`; they never resume,
+  rerun, release, or edit a run record themselves. Typed actions can be supplied
+  as JSON after the exact label's `--action <label>=` prefix.
+- Release binds the task ID, hold timestamp and exact reason. Rerun binds repo,
+  PR, head and failed workflow run IDs (at most 20). `choice-actions` receipts
+  record the target before external invocation; an uncertain result is never
+  automatically retried. Check the receipt and notification before retrying.
+  A fresh explicit question can authorize another bounded attempt; replaying
+  the same answered question never does. New release-watch rerun offers carry
+  the PR head and workflow IDs, and are omitted when no failed workflow is known.
+- Resume shares the Web entry point and the graph's execution lease. Abandon
+  calls the driver module's shared liveness judge under the owner lock; Unknown
+  is refused. Startup ownership repair does not abandon runs.
+- Cards and each deputy turn list effects from `choice_effect`. Resume and rerun
+  accept a clear owner instruction through the existing latest-message quote
+  gate. Abandon is a terminal consequence requiring individual confirmation;
+  merge, discard and posting retain their stricter confirmation rules.

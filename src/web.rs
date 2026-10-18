@@ -3874,24 +3874,7 @@ async fn run_resume(
         })
         .await?
     };
-    if let Some(to) = state
-        .pr_taken_over_by
-        .as_ref()
-        .or(state.released_to.as_ref())
-    {
-        return Err(ApiError::conflict(format!(
-            "run {} can no longer be resumed: its pull request or worktree ownership moved to run {}.",
-            state.short(),
-            crate::run::short_of(to)
-        )));
-    }
-    if !state.status.resumable() {
-        return Err(ApiError::conflict(format!(
-            "run {} is `{}`, and only a stalled or blocked run can be resumed",
-            state.short(),
-            status_word(state.status)
-        )));
-    }
+    crate::resume::validate(&ui.home, &id).map_err(|e| ApiError::conflict(e.to_string()))?;
     // Refused whenever the loop is running anything at all, not merely when
     // it is on this run: a manual resume racing a loop-driven run over the
     // same agent quota is the thing this guard exists to prevent, whether
@@ -3918,16 +3901,7 @@ async fn run_resume(
     let run = id.clone();
     tokio::spawn(async move {
         let _resume = _resume;
-        match crate::graph::Runner::resume(&run) {
-            Ok(mut runner) => {
-                if let Err(e) = runner.execute().await {
-                    tracing::warn!("resume of run {run} stopped: {e:#}");
-                }
-            }
-            // The run's own record is what the phone reads; this line is for
-            // the operator's terminal.
-            Err(e) => tracing::warn!("run {run} could not be resumed: {e:#}"),
-        }
+        crate::resume::execute(&run).await;
     });
     Ok((StatusCode::ACCEPTED, Json(queued)))
 }
@@ -6525,6 +6499,7 @@ fn resolve_task(queue: &Queue, id: &str) -> ApiResult<String> {
 /// files magi itself already serves for this question.
 #[derive(Debug, Serialize)]
 struct QuestionView {
+    choice_effects: std::collections::BTreeMap<String, String>,
     #[serde(flatten)]
     question: Question,
     detail_md: Vec<md::Node>,
@@ -6617,6 +6592,13 @@ impl QuestionView {
         };
         let holder = holder_of(&question, store.read_lease(&question.id).as_ref());
         Self {
+            choice_effects: question
+                .choices
+                .iter()
+                .filter_map(|c| {
+                    crate::choice_effect::describe(&question, c).map(|effect| (c.clone(), effect))
+                })
+                .collect(),
             detail_md: md::to_nodes(&question.detail, &base),
             posting_view: posting_view(&question, &base),
             thread_bodies_md: question
@@ -10666,7 +10648,7 @@ mod tests {
             );
             assert_eq!(fx.questions().count_open(), 0);
             assert!(fx.questions().get(&q.id).unwrap().chosen_action().is_none());
-            crate::daemon::apply_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
+            crate::daemon::apply_task_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
             if owner == "missing" {
                 assert!(fx.queue().list().is_empty());
             } else {
@@ -10741,7 +10723,7 @@ mod tests {
         assert!(!retired.merge_decision.as_ref().unwrap().closed);
         assert!(!crate::merge_decision::resumable_hold(&retired));
         assert!(fx.queue().list().is_empty());
-        crate::daemon::apply_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
+        crate::daemon::apply_task_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
         // A restarted server re-reads the persisted pending list.
         let addr = Fixture::serve(
             fx.home.path(),
@@ -10837,7 +10819,7 @@ mod tests {
         state.land_armed_head = None;
         state.save_under(fx.home.path()).unwrap();
         assert_eq!(fx.post(&path, Some(&body)).await.status, 200);
-        crate::daemon::apply_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
+        crate::daemon::apply_task_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
         assert_eq!(std::fs::read(fx.queue().path_of(&task.id)).unwrap(), before);
     }
 
@@ -10894,7 +10876,7 @@ mod tests {
         assert_eq!(done.runs, task.runs);
         assert_eq!(done.instruction, task.instruction);
         assert!(done.action_applied(&q.id));
-        crate::daemon::apply_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
+        crate::daemon::apply_task_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
         assert_eq!(fx.queue().get(&task.id).unwrap().status, TaskStatus::Done);
         assert!(!fx.questions().get(&q.id).unwrap().status.open());
     }
@@ -11040,13 +11022,13 @@ mod tests {
         assert_eq!(upgraded.choices, crate::land::approval_choices(&state));
         assert!(upgraded.detail.starts_with("Original evidence"));
         let claim = fx.queue().claim(&task.id).unwrap();
-        crate::daemon::apply_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
+        crate::daemon::apply_task_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
         assert!(
             fx.queue().get(&task.id).unwrap().resume_override.is_none(),
             "an existing driver keeps its claim"
         );
         drop(claim);
-        crate::daemon::apply_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
+        crate::daemon::apply_task_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
         let resumed = fx.queue().get(&task.id).unwrap();
         assert_eq!(
             resumed
@@ -11061,7 +11043,7 @@ mod tests {
         assert_eq!(resumed.instruction, task.instruction);
         assert_eq!(resumed.runs, task.runs);
         assert!(resumed.action_applied(&q.id));
-        crate::daemon::apply_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
+        crate::daemon::apply_task_choice_actions(&fx.queue(), &fx.questions(), fx.home.path());
         assert_eq!(fx.queue().list().len(), 1);
         assert_eq!(
             fx.queue().get(&task.id).unwrap().resume_override,

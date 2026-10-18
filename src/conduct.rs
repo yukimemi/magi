@@ -300,6 +300,7 @@ fn view(t: &Task, max_attempts: usize) -> prompt::ConductTask {
         max_attempts: t.effective_attempt_limit(max_attempts),
         last_error: t.last_error.clone(),
         hold_reason: t.hold_reason.clone(),
+        held_at: t.held_at.map(|at| at.to_string()),
         hold_source: t.hold_source.map(|source| source.label().to_owned()),
         blocked_by: t.blocked_by.clone(),
         answers: t
@@ -981,10 +982,7 @@ fn apply_one(
                     d.choices.clone(),
                 );
                 q.actions = d.actions.clone();
-                anyhow::ensure!(
-                    q.actions.keys().all(|label| q.choices.contains(label)),
-                    "question action must name an offered choice"
-                );
+                crate::choice_effect::executable_conductor(&mut q);
                 q.decision_context = Some(context);
                 // The wait is handed to a deputy (`crate::deputy`), so a
                 // free-text reply reaches an agent that knows why this was
@@ -999,7 +997,7 @@ fn apply_one(
                 if task.repo.is_dir() && task.repo != Path::new(".") {
                     q.cwd = Some(task.repo.to_string_lossy().into_owned());
                 }
-                questions.put(&mut q)?;
+                questions.put_executable(&mut q)?;
                 q.id
             }
         };
@@ -3060,7 +3058,10 @@ printf '%s\n' "$MOCK_REPLY"
                 .find(|q| q.run == t.id)
                 .unwrap();
             assert_eq!(q.summary, d.question.as_deref().unwrap());
-            assert_eq!(q.choices, d.choices);
+            assert!(
+                q.choices.iter().all(|c| q.actions.contains_key(c)),
+                "manual-only choices must become an executable hold"
+            );
             assert!(q.status.open());
             let context: serde_json::Value =
                 serde_json::from_str(q.decision_context.as_ref().unwrap()).unwrap();
@@ -3096,7 +3097,7 @@ printf '%s\n' "$MOCK_REPLY"
         };
         apply_one(&queue, &questions, &d, None).unwrap();
         let mut q = questions.list().pop().unwrap();
-        q.answer(crate::ask::Answer::Choice("keep held".into()))
+        q.answer(crate::ask::Answer::Choice(q.choices[0].clone()))
             .unwrap();
         questions.put(&mut q).unwrap();
         queue

@@ -1744,7 +1744,7 @@ async fn approval_gate(
                 .put_panel(&mut fresh, &html, &[])
                 .context("write the merge approval panel")?;
             store
-                .put(&mut fresh)
+                .put_executable(&mut fresh)
                 .context("file the merge approval question")?;
             state.land_approval = Some(LandApproval {
                 question: fresh.id.clone(),

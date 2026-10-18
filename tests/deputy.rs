@@ -741,7 +741,16 @@ fn unasked_questions() -> Vec<Question> {
         )
     };
     vec![
-        q(magi::conduct::NODE, "conduct", &["a", "b"]),
+        {
+            let mut conduct = q(magi::conduct::NODE, "conduct", &["a", "b"]);
+            conduct
+                .actions
+                .insert("a".into(), magi::ask::ChoiceAction::Requeue);
+            conduct
+                .actions
+                .insert("b".into(), magi::ask::ChoiceAction::Hold);
+            conduct
+        },
         q(magi::land::APPROVAL_NODE, "land", &["merge", "hold"]),
         q(
             magi::bump::NOTICE_NODE,
@@ -950,4 +959,256 @@ async fn deputy_non_hold_owner_choices_remain_independent_of_consultation_destin
         assert_eq!(answered.thread.iter().filter(|t| t.who == Who::Agent && t.body.starts_with("Settled as")).count(), 1);
     }
 }
+}
+
+#[test]
+fn every_question_choice_has_a_mapped_execution_effect() {
+    let mut all = unasked_questions();
+    let mut release = all[2].clone();
+    release.choices.extend(
+        [
+            magi::release_watch::RERUN_AGAIN,
+            magi::release_watch::RETRY,
+            magi::land::APPROVE,
+        ]
+        .map(str::to_owned),
+    );
+    all.push(release);
+    let mut posting = all[5].clone();
+    posting.choices.extend(
+        [
+            magi::github_text::POST_ORIGINAL,
+            magi::github_text::USE_REWRITE,
+        ]
+        .map(str::to_owned),
+    );
+    all.push(posting);
+    for q in all {
+        for label in &q.choices {
+            assert!(
+                magi::choice_effect::describe(&q, label).is_some(),
+                "{} / {} offers an unmapped choice: {label}",
+                q.node,
+                q.seat
+            );
+        }
+    }
+    let mut q = unasked_questions().remove(0);
+    q.choices.push("operator: edit the run record".into());
+    assert!(magi::choice_effect::describe(&q, q.choices.last().unwrap()).is_none());
+}
+
+fn maintenance_question(s: &Scene, action: magi::ask::ChoiceAction) -> Question {
+    let mut q = Question::new(
+        TASK.into(),
+        magi::conduct::NODE.into(),
+        "conduct".into(),
+        "Maintenance".into(),
+        String::new(),
+        vec!["daemon: execute".into()],
+    );
+    q.actions.insert(q.choices[0].clone(), action);
+    s.store.put_executable(&mut q).unwrap();
+    q
+}
+
+common::e2e! {
+async fn maintenance_release_is_bound_to_the_hold_and_applies_once_after_settle() {
+    use magi::queue::{Queue, Source, Task, TaskStatus};
+    use magi::ask::{Answer, ChoiceAction};
+    let s = scene(home_lock().await);
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    let queue = Queue::at(s.home.join("queue"));
+    let mut task = Task::new("held".into(), "work".into(), s.fx.repo.clone(), Source::Human);
+    task.hold_machine(Some("waiting for a repair".into()));
+    queue.put(&mut task).unwrap();
+    let action = ChoiceAction::ReleaseTask { task: task.id.clone(),
+        held_at: task.held_at.unwrap(), reason: task.hold_reason.clone() };
+    let mut q = maintenance_question(&s, action.clone());
+    q.say("daemon: execute").unwrap();
+    s.store.put(&mut q).unwrap();
+    script(&s, &["MAGI ask --settle \"$qid\" --choice 'daemon: execute' --quote 'daemon: execute'"]);
+    turn(&mut deputies(&s, 2)).await;
+    assert_actions_succeeded(&s, 1);
+    assert_eq!(s.store.get(&q.id).unwrap().status, QuestionStatus::Answered);
+    assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Held,
+        "a deputy records the answer and applies nothing");
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    let released = queue.get(&task.id).unwrap();
+    assert_eq!(released.status, TaskStatus::Queued);
+    assert!(released.action_applied(&q.id));
+    // Reopening the stores simulates a daemon restart. A fresh manual hold
+    // cannot be released by an old settled question.
+    task = released;
+    task.hold_machine(Some("another hold".into()));
+    queue.put(&mut task).unwrap();
+    magi::daemon::apply_choice_actions(&Queue::at(s.home.join("queue")),
+        &Questions::at(s.home.join("questions")), &s.home).await;
+    assert_eq!(queue.get(&task.id).unwrap().hold_reason.as_deref(), Some("another hold"));
+    // A different question bound to the original hold must refuse as well.
+    let mut stale = maintenance_question(&s, action);
+    stale.answer(Answer::Choice(stale.choices[0].clone())).unwrap();
+    s.store.put(&mut stale).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Held);
+    assert!(!queue.get(&task.id).unwrap().action_applied(&stale.id));
+    // Already released by hand is a refusal, never a second resumption.
+    let action = ChoiceAction::ReleaseTask { task: task.id.clone(),
+        held_at: task.held_at.unwrap(), reason: task.hold_reason.clone() };
+    let mut late = maintenance_question(&s, action);
+    late.answer(Answer::Choice(late.choices[0].clone())).unwrap();
+    s.store.put(&mut late).unwrap();
+    task.release_operator("manual", None);
+    queue.put(&mut task).unwrap();
+    let generation = task.resumption.as_ref().unwrap().generation;
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    assert_eq!(queue.get(&task.id).unwrap().resumption.unwrap().generation, generation);
+    task.hold_manual(Some("operator parked".into()));
+    queue.put(&mut task).unwrap();
+    let mut manual = maintenance_question(&s, ChoiceAction::ReleaseTask { task: task.id.clone(),
+        held_at: task.held_at.unwrap(), reason: task.hold_reason.clone() });
+    manual.say("daemon: execute").unwrap();
+    s.store.put(&mut manual).unwrap();
+    turn(&mut deputies(&s, 2)).await;
+    assert_eq!(s.store.get(&manual.id).unwrap().status, QuestionStatus::Open,
+        "a deputy cannot settle a typed release of an operator-held target");
+    assert!(queue.get(&task.id).unwrap().operator_held());
+}
+}
+
+common::e2e! {
+async fn maintenance_resume_refuses_a_live_driver_and_abandon_refuses_unknown() {
+    use magi::{ask::{Answer, ChoiceAction}, run::{RunState, RunStatus}};
+    let s = scene(home_lock().await);
+    let queue = magi::queue::Queue::at(s.home.join("queue"));
+    let mut run = RunState::new(s.fx.repo.clone(), "main".into(), "base".into(),
+        "work".into(), s.fx.config.clone());
+    run.status = RunStatus::Stalled;
+    run.driver_pid = Some(std::process::id());
+    run.driver_started_at = magi::proc::process_started_at(std::process::id());
+    assert!(run.driver_started_at.is_some(), "the test requires process identity");
+    run.driver_exited = false;
+    run.save_under(&s.home).unwrap();
+    let mut q = maintenance_question(&s, ChoiceAction::ResumeRun { run: run.id.clone() });
+    q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+    s.store.put(&mut q).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    let receipt = std::fs::read_to_string(s.home.join("choice-actions").join(format!("{}.json", q.id))).unwrap();
+    assert!(receipt.contains("live driver"), "{receipt}");
+    assert_eq!(RunState::load_under(&run.id, &s.home).unwrap().status, RunStatus::Stalled);
+    run.driver_pid = None;
+    run.driver_started_at = None;
+    run.save_under(&s.home).unwrap();
+    let mut q = maintenance_question(&s, ChoiceAction::AbandonRun { run: run.id.clone() });
+    q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+    s.store.put(&mut q).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    assert_eq!(RunState::load_under(&run.id, &s.home).unwrap().status, RunStatus::Stalled);
+    // Explicit stopped-driver evidence is accepted by the shared judge.
+    run.driver_exited = true;
+    run.save_under(&s.home).unwrap();
+    let mut q = maintenance_question(&s, ChoiceAction::AbandonRun { run: run.id.clone() });
+    q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+    s.store.put(&mut q).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    assert_eq!(RunState::load_under(&run.id, &s.home).unwrap().status, RunStatus::Failed);
+}
+}
+
+common::e2e! {
+#[cfg(unix)]
+async fn maintenance_reruns_are_recorded_before_forge_calls_and_survive_restart() {
+    use magi::ask::{Answer, ChoiceAction};
+    use std::os::unix::fs::PermissionsExt;
+    let s = scene(home_lock().await);
+    let bin = s.fx.tmp.path().join("choice-forge");
+    std::fs::create_dir_all(&bin).unwrap();
+    let snapshot = s.fx.tmp.path().join("choice-pr.json");
+    let log = s.fx.tmp.path().join("choice-reruns.log");
+    let gh = bin.join("gh");
+    std::fs::write(&gh, r#"#!/bin/sh
+case "$1 $2" in
+  'pr view') cat "$CHOICE_PR" ;;
+  'run rerun')
+    test -s "$CHOICE_HOME/choice-actions/reruns.json" || exit 19
+    grep -q "$3" "$CHOICE_HOME/choice-actions/reruns.json" || exit 20
+    printf '%s\n' "$3" >> "$CHOICE_LOG" ;;
+  *) exit 17 ;;
+esac
+"#).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    // SAFETY: e2e! isolates this test in a child; no other test shares PATH.
+    unsafe {
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        std::env::set_var("CHOICE_PR", &snapshot);
+        std::env::set_var("CHOICE_HOME", &s.home);
+        std::env::set_var("CHOICE_LOG", &log);
+    }
+    let write_snapshot = |head: &str| {
+        std::fs::write(&snapshot, serde_json::to_vec(&serde_json::json!({
+            "url": "https://github.com/o/r/pull/7", "number": 7, "state": "OPEN",
+            "headRefOid": head, "statusCheckRollup": [{
+                "__typename": "CheckRun", "name": "CI", "status": "COMPLETED",
+                "conclusion": "FAILURE", "detailsUrl": "https://github.com/o/r/actions/runs/42/job/1"
+            }]
+        })).unwrap()).unwrap();
+    };
+    write_snapshot("head");
+    let action = ChoiceAction::RerunChecks { repo: s.fx.repo.clone(),
+        pr: "https://github.com/o/r/pull/7".into(), head: "head".into(), runs: vec!["42".into()] };
+    let queue = magi::queue::Queue::at(s.home.join("queue"));
+    let mut q = maintenance_question(&s, action.clone());
+    q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+    s.store.put(&mut q).unwrap();
+    assert!(!log.exists(), "recording an answer applies nothing");
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "42\n");
+    let restarted = Questions::at(s.home.join("questions"));
+    magi::daemon::apply_choice_actions(&queue, &restarted, &s.home).await;
+    // A fresh explicit owner choice can authorize one more bounded rerun.
+    let mut duplicate = maintenance_question(&s, action.clone());
+    duplicate.answer(Answer::Choice(duplicate.choices[0].clone())).unwrap();
+    s.store.put(&mut duplicate).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &restarted, &s.home).await;
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "42\n42\n");
+    write_snapshot("different-head");
+    let mut stale = maintenance_question(&s, action.clone());
+    stale.answer(Answer::Choice(stale.choices[0].clone())).unwrap();
+    s.store.put(&mut stale).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &restarted, &s.home).await;
+    let receipt = std::fs::read_to_string(s.home.join("choice-actions").join(format!("{}.json", stale.id))).unwrap();
+    assert!(receipt.contains("head or lifecycle changed"), "{receipt}");
+    // A failed durable write prevents an external call.
+    write_snapshot("head");
+    let snapshot_body = std::fs::read_to_string(&snapshot).unwrap().replace("/runs/42/", "/runs/43/");
+    std::fs::write(&snapshot, snapshot_body).unwrap();
+    let mut unsaved_action = action;
+    if let ChoiceAction::RerunChecks { runs, .. } = &mut unsaved_action { runs[0] = "43".into(); }
+    let mut unsaved = maintenance_question(&s, unsaved_action);
+    unsaved.answer(Answer::Choice(unsaved.choices[0].clone())).unwrap();
+    s.store.put(&mut unsaved).unwrap();
+    std::fs::create_dir(s.home.join("choice-actions").join(format!("{}.tmp", unsaved.id))).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &restarted, &s.home).await;
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "42\n42\n");
+}
+}
+
+#[test]
+fn maintenance_choice_without_a_queue_owner_is_never_delivered_to_an_asker() {
+    let mut q = unasked_questions().remove(0);
+    q.cwd = Some("repo".into());
+    q.actions.insert(
+        q.choices[0].clone(),
+        magi::ask::ChoiceAction::ResumeRun {
+            run: "named".into(),
+        },
+    );
+    q.answer(magi::ask::Answer::Choice(q.choices[0].clone()))
+        .unwrap();
+    assert_eq!(
+        magi::waiter::decide_owned(&q, None, false, 3600, Timestamp::now(), false),
+        magi::waiter::Action::Idle
+    );
 }
