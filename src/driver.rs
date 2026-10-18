@@ -33,7 +33,8 @@ impl Identity {
 }
 
 /// Release ownership when the guard ends, even if a concurrent fork still
-/// holds a copy of the file description before exec closes it.
+/// holds a copy of the file description before exec closes it. Explicitly
+/// unlock before close so a completed execution can resume immediately.
 struct ExecutionLease {
     _file: File,
 }
@@ -41,7 +42,7 @@ struct ExecutionLease {
 #[cfg(unix)]
 impl Drop for ExecutionLease {
     fn drop(&mut self) {
-        use std::os::fd::AsRawFd;
+        use std::os::fd::AsRawFd as _;
         // SAFETY: the live file owns this descriptor. Explicit unlock releases
         // the flock even while an inherited descriptor remains open.
         unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
@@ -300,6 +301,39 @@ mod tests {
                 .unwrap()
                 .driver_exited
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn driver_drop_unlocks_even_with_an_inherited_descriptor() {
+        for finished in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let mut s = state(home.path());
+            let mut guard = claim(home.path(), &s);
+            // dup retains the same open file description as a concurrent fork.
+            let inherited = guard._lease._file.try_clone().unwrap();
+            assert!(DriverGuard::acquire(home.path(), &s).is_err());
+            if finished {
+                guard.finish(&mut s).unwrap();
+            }
+            assert!(DriverGuard::acquire(home.path(), &s).is_err());
+            drop(guard);
+            let next = claim(home.path(), &s);
+            assert!(
+                RunState::load_under(&s.id, home.path())
+                    .unwrap()
+                    .driver_exited
+            );
+            drop(next);
+            assert!(
+                home.path()
+                    .join("runs")
+                    .join(&s.id)
+                    .join("driver.lock")
+                    .exists()
+            );
+            drop(inherited);
+        }
     }
 
     #[tokio::test]
