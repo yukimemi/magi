@@ -246,7 +246,7 @@ async fn serve_with_client_probe(
             Some("state, upgrade, renderLoop, renderUpgradeError, loadHealth, ok")
         }
         ClientProbe::Connection => Some(
-            "state, loadHealth, loadLoop, loadTalk, tickTalkWaits, loadStats, resumeConnection, onPageShow, unreachable, loadQueue",
+            "state, loadHealth, loadLoop, loadTalk, tickTalkWaits, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, applyRevisions_, acceptTalkUpdate, renderTalkTasks",
         ),
     };
     let router = ui.router().layer(axum::middleware::from_fn(
@@ -4334,4 +4334,214 @@ async fn upgrade_failures_remain_readable_and_retryable_on_phone() {
     })()"##).await.expect("upgrade UI behavior");
     assert_eq!(result, true);
     browser.close_page(&page).await;
+}
+
+/// Task progress uses the detail snapshot, refreshes on queue changes, and
+/// remains actionable without expanding the transcript or task panel first.
+#[tokio::test]
+async fn chat_task_progress_refreshes_and_survives_operation_races() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP chat task progress: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let mut chat = talk::begin(&talks, &fx.config, fx.repo.clone(), None).expect("chat");
+    let mut tasks: Vec<_> = (0..7)
+        .map(|i| {
+            let mut task = Task::new(
+                format!("Task {i}"),
+                "instruction".into(),
+                fx.repo.clone(),
+                Source::Agent {
+                    run: chat.id.clone(),
+                    node: "chat".into(),
+                },
+            );
+            queue.put(&mut task).expect("task");
+            task
+        })
+        .collect();
+    let base = serve_with_client_probe(
+        &home,
+        queue.clone(),
+        talks.clone(),
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Connection,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    for (width, height, mobile) in [(1280, 900, false), (390, 844, true)] {
+        for (task, status) in tasks.iter_mut().zip([
+            TaskStatus::Done,
+            TaskStatus::Queued,
+            TaskStatus::Running,
+            TaskStatus::Held,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Parked,
+        ]) {
+            task.status = status;
+            queue.put(task).expect("status");
+        }
+        let page = browser
+            .open_page(&format!("{base}#/chat/{}", chat.id), width, height, mobile)
+            .await
+            .expect("page");
+        browser
+            .wait_for(&page, "!!window.deck", Duration::from_secs(30))
+            .await
+            .expect("client");
+        browser
+            .eval(
+                &page,
+                &format!(
+                    r#"(async () => {{
+            deck.state.route = {{ name: 'talk', id: {id:?} }};
+            deck.state.talkDetail = {{ id: {id:?}, talk: null }};
+            document.getElementById('view-talk').hidden = false;
+            await deck.loadTalk({id:?});
+            await deck.loadHealth({{ applyRevisions: true }});
+        }})()"#,
+                    id = chat.id
+                ),
+            )
+            .await
+            .expect("load chat");
+        let got = browser.eval(&page, r#"(() => {
+            const panel = document.getElementById('talk-tasks-panel');
+            const status = document.getElementById('talk-task-progress');
+            const button = document.getElementById('talk-task-progress-open');
+            const out = { text: status.textContent, folded: !panel.open };
+            const r = status.getBoundingClientRect();
+            out.fits = r.width > 0 && r.left >= 0 && r.right <= innerWidth
+                && status.scrollWidth <= status.clientWidth;
+            button.click();
+            out.open = panel.open;
+            out.focused = document.activeElement === document.querySelector('#talk-tasks a');
+            const first = document.querySelector('#talk-tasks a').getBoundingClientRect();
+            out.reachable = first.top >= 0 && first.bottom <= innerHeight;
+            out.links = [...document.querySelectorAll('#talk-tasks a')].map(a => a.getAttribute('href'));
+            out.first = document.querySelector('#talk-tasks a').textContent;
+            out.summary = document.getElementById('talk-tasks-count').textContent;
+            return out;
+        })()"#).await.expect("measure progress");
+        assert!(
+            got["text"].as_str().unwrap().contains("6 of 7 unfinished"),
+            "{got}"
+        );
+        for key in ["folded", "fits", "open", "focused", "reachable"] {
+            assert_eq!(got[key], true, "@{width} {key}: {got}");
+        }
+        assert!(
+            got["summary"].as_str().unwrap().contains("1 blocked"),
+            "{got}"
+        );
+        assert!(
+            !got["first"].as_str().unwrap().contains("Task 0"),
+            "unfinished first: {got}"
+        );
+        let links = got["links"].as_array().unwrap();
+        assert_eq!(links.len(), tasks.len());
+        for task in &tasks {
+            assert!(links.contains(&serde_json::json!(format!("#/tasks/{}", task.id))));
+        }
+        for task in &mut tasks {
+            task.status = TaskStatus::Done;
+            queue.put(task).expect("done");
+        }
+        // Queue changes alone must update the visible chat.
+        browser
+            .eval(&page, "deck.loadHealth({ applyRevisions: true })")
+            .await
+            .expect("queue refresh");
+        let got = browser
+            .eval(
+                &page,
+                "document.getElementById('talk-task-progress').textContent",
+            )
+            .await
+            .expect("completed text");
+        assert!(
+            got.as_str()
+                .unwrap()
+                .contains("Tasks filed from this chat: all 7 complete"),
+            "{got}"
+        );
+        assert!(
+            got.as_str().unwrap().contains("Other unresolved matters"),
+            "{got}"
+        );
+        // Both revisions in one event still fetch the detail only once.
+        tasks[0].status = TaskStatus::Queued;
+        queue.put(&mut tasks[0]).expect("requeue");
+        talk::record(&mut chat, &talks, "Another topic", Vec::new()).expect("chat revision");
+        let got = browser
+            .eval(
+                &page,
+                r#"(async () => {
+            const native = window.fetch;
+            let details = 0;
+            window.fetch = (...args) => {
+                if (String(args[0]).endsWith('/api/talks/' + deck.state.talkDetail.id)) details++;
+                return native(...args);
+            };
+            try { await deck.loadHealth({ applyRevisions: true }); } finally { window.fetch = native; }
+            return { details, text: document.getElementById('talk-task-progress').textContent };
+        })()"#,
+            )
+            .await
+            .expect("requeue refresh");
+        assert_eq!(got["details"], 1, "{got}");
+        assert!(
+            got["text"].as_str().unwrap().contains("1 of 7 unfinished"),
+            "{got}"
+        );
+        let got = browser.eval(&page, r#"(async () => {
+            const native = window.fetch, id = deck.state.talkDetail.id;
+            const snapshot = structuredClone(deck.state.talkDetail.talk);
+            const pending = [];
+            const response = body => ({ ok: true, status: 200, headers: new Headers(), json: async () => body });
+            const out = {};
+            window.fetch = () => new Promise(resolve => pending.push(resolve));
+            try {
+                const old = deck.loadTalk(id), fresh = deck.loadTalk(id);
+                pending.shift()(response({ ...snapshot, tasks: [], task_progress: { state: 'none', total: 0, done: 0, counts: {}, unfinished_ids: [] } }));
+                await old;
+                out.oldIgnored = deck.state.talkDetail.talk.tasks.length === 7;
+                pending.shift()(response(snapshot)); await fresh;
+                deck.acceptTalkUpdate({ id, status: 'closed' });
+                out.preserved = deck.state.talkDetail.talk.task_progress.total === 7
+                    && deck.state.talkDetail.talk.tasks.length === 7;
+                // Supersede the operation's refresh with a newer read.
+                const latest = deck.loadTalk(id);
+                const operationRead = pending.shift();
+                pending.shift()(response(snapshot)); await latest;
+                operationRead({ ok: false, status: 404, headers: new Headers(), text: async () => '{}' });
+                await new Promise(resolve => setTimeout(resolve, 0));
+                out.stale404Ignored = !deck.state.talkDetail.gone && !!deck.state.talkDetail.talk;
+                deck.renderTalkTasks({ id });
+                out.unknown = document.getElementById('talk-task-progress-text').textContent.includes('not loaded yet');
+                deck.renderTalkTasks({ id, tasks: [], task_progress: { state: 'none', total: 0, done: 0, counts: {}, unfinished_ids: [] } });
+                out.empty = document.getElementById('talk-task-progress-text').textContent === 'No tasks filed from this chat.'
+                    && document.getElementById('talk-tasks-panel').hidden;
+            } finally { window.fetch = native; }
+            return out;
+        })()"#).await.expect("operation and read races");
+        for key in [
+            "oldIgnored",
+            "preserved",
+            "stale404Ignored",
+            "unknown",
+            "empty",
+        ] {
+            assert_eq!(got[key], true, "@{width} {key}: {got}");
+        }
+        browser.close_page(&page).await;
+    }
 }

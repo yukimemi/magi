@@ -7402,12 +7402,55 @@ struct TalkDetailView {
     #[serde(flatten)]
     view: TalkView,
     tasks: Vec<TaskView>,
+    task_progress: TalkTaskProgress,
     /// The agents this talk's repository can switch to; empty when its
     /// configuration cannot be read, which must not fail the whole detail.
     roster: Vec<RosterEntry>,
     /// The personas the conversation can pick from. The built-ins are always
     /// listed, even when the repository's configuration cannot be read.
     personas: Vec<PersonaEntry>,
+}
+
+/// Progress covers only the tasks returned alongside it, not unresolved chat topics.
+#[derive(Debug, Serialize)]
+struct TalkTaskProgress {
+    state: &'static str,
+    total: usize,
+    done: usize,
+    counts: std::collections::BTreeMap<&'static str, usize>,
+    unfinished_ids: Vec<String>,
+}
+
+fn talk_task_progress(tasks: &[Task]) -> TalkTaskProgress {
+    let mut counts = std::collections::BTreeMap::from([
+        ("queued", 0),
+        ("running", 0),
+        ("done", 0),
+        ("failed", 0),
+        ("held", 0),
+        ("blocked", 0),
+        ("parked", 0),
+    ]);
+    let mut unfinished_ids = Vec::new();
+    for task in tasks {
+        *counts.entry(task.status.as_str()).or_default() += 1;
+        if task.status != TaskStatus::Done {
+            unfinished_ids.push(task.id.clone());
+        }
+    }
+    TalkTaskProgress {
+        state: if tasks.is_empty() {
+            "none"
+        } else if unfinished_ids.is_empty() {
+            "complete"
+        } else {
+            "incomplete"
+        },
+        total: tasks.len(),
+        done: tasks.len() - unfinished_ids.len(),
+        counts,
+        unfinished_ids,
+    }
 }
 
 /// One persona as the talk's persona selector shows it.
@@ -7520,10 +7563,9 @@ async fn talk_detail(
         let id = resolve_talk(&ui.talks, &id)?;
         let talk = ui.talks.get(&id)?;
         let thinking = ui.is_thinking(&talk.id);
-        let tasks = talk::tasks_of(&ui.queue, &talk.id)
-            .into_iter()
-            .map(TaskView::from)
-            .collect();
+        let tasks = talk::tasks_of(&ui.queue, &talk.id);
+        let task_progress = talk_task_progress(&tasks);
+        let tasks = tasks.into_iter().map(TaskView::from).collect();
         let cfg = Config::discover(&talk.repo, None).ok().map(|(cfg, _)| cfg);
         let roster = cfg
             .as_ref()
@@ -7553,6 +7595,7 @@ async fn talk_detail(
         Ok(Json(TalkDetailView {
             view: TalkView::with_config(talk, thinking, cfg.as_ref(), &ui.home),
             tasks,
+            task_progress,
             roster,
             personas,
         }))
@@ -12864,6 +12907,9 @@ mod tests {
                 node: "chat".to_owned(),
             },
         );
+        let empty = f.get(&format!("/api/talks/{talk_id}")).await.json();
+        assert_eq!(empty["task_progress"]["state"], "none");
+        assert_eq!(empty["task_progress"]["total"], 0);
         queue.put(&mut mine).expect("file the task");
         let mut theirs = Task::new(
             "unrelated".to_owned(),
@@ -12871,6 +12917,8 @@ mod tests {
             PathBuf::from("/repo/magi"),
             Source::Human,
         );
+        // A later task linked through origin_chat alone is outside this list.
+        theirs.origin_chat = Some(talk_id.clone());
         queue.put(&mut theirs).expect("file the task");
 
         let res = f.get(&format!("/api/talks/{talk_id}")).await;
@@ -12883,6 +12931,92 @@ mod tests {
         let tasks = body["tasks"].as_array().expect("tasks array");
         assert_eq!(tasks.len(), 1, "only this talk's own task is listed");
         assert_eq!(tasks[0]["id"], mine.id);
+        for status in [
+            TaskStatus::Queued,
+            TaskStatus::Running,
+            TaskStatus::Held,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Parked,
+            TaskStatus::Done,
+            TaskStatus::Queued,
+        ] {
+            mine.status = status;
+            queue.put(&mut mine).expect("update status");
+            let detail = f.get(&format!("/api/talks/{talk_id}")).await.json();
+            let progress = &detail["task_progress"];
+            assert_eq!(progress["total"], 1);
+            assert_eq!(progress["counts"][status.as_str()], 1);
+            assert_eq!(detail["tasks"][0]["status"], status.as_str());
+            assert_eq!(detail["status"], "open", "completion never closes the chat");
+            if status == TaskStatus::Done {
+                assert_eq!(progress["state"], "complete");
+                assert_eq!(progress["done"], 1);
+                assert_eq!(progress["unfinished_ids"], serde_json::json!([]));
+            } else {
+                assert_eq!(progress["state"], "incomplete");
+                assert_eq!(progress["done"], 0);
+                assert_eq!(progress["unfinished_ids"], serde_json::json!([mine.id]));
+            }
+        }
+    }
+
+    #[test]
+    fn talk_task_progress_counts_mixed_statuses() {
+        let mut tasks: Vec<_> = [
+            TaskStatus::Queued,
+            TaskStatus::Running,
+            TaskStatus::Held,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Parked,
+            TaskStatus::Done,
+        ]
+        .into_iter()
+        .map(|status| {
+            let mut task = Task::new(
+                "task".into(),
+                "task".into(),
+                PathBuf::from("/repo"),
+                Source::Human,
+            );
+            task.status = status;
+            task
+        })
+        .collect();
+        let progress = talk_task_progress(&tasks);
+        assert_eq!(progress.state, "incomplete");
+        assert_eq!(progress.total, 7);
+        assert_eq!(progress.done, 1);
+        assert_eq!(progress.unfinished_ids.len(), 6);
+        assert!(progress.counts.values().all(|count| *count == 1));
+        assert_eq!(
+            progress.unfinished_ids,
+            tasks[..6]
+                .iter()
+                .map(|task| task.id.clone())
+                .collect::<Vec<_>>()
+        );
+
+        for task in &mut tasks {
+            task.status = TaskStatus::Done;
+        }
+        let complete = talk_task_progress(&tasks);
+        assert_eq!(complete.state, "complete");
+        assert_eq!(complete.done, 7);
+        assert!(complete.unfinished_ids.is_empty());
+        tasks[0].status = TaskStatus::Queued;
+        let requeued = talk_task_progress(&tasks);
+        assert_eq!(requeued.state, "incomplete");
+        assert_eq!(requeued.done, 6);
+        assert_eq!(requeued.unfinished_ids, vec![tasks[0].id.clone()]);
+
+        let empty = talk_task_progress(&[]);
+        assert_eq!(empty.state, "none");
+        assert_eq!(empty.total, 0);
+        assert_eq!(empty.done, 0);
+        assert!(empty.unfinished_ids.is_empty());
+        assert!(empty.counts.values().all(|count| *count == 0));
     }
 
     #[tokio::test]

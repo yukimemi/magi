@@ -2928,3 +2928,7 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
   white-space: normal;
 }
 .upgrade-error p { margin: 0 0 .75rem; }
+
+/* The completion statement must remain fully readable at phone widths. */
+.talk-task-progress { margin-block: var(--s3); overflow-wrap: anywhere; }
+#talk-task-progress-open { max-width: 100%; white-space: normal; text-align: left; }
