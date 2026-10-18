@@ -29,23 +29,25 @@ function harness() {
 test('run core renders before slow report; successful cards do not fetch text', async () => {
   const h = harness();
   const done = h.api.loadRun('a');
-  h.requests.find(r => r.url === 'run/a').resolve({ id: 'a', useful: true });
+  h.requests.find(r => r.url === 'run/a/core').resolve({ id: 'a', useful: true });
   await flush();
   assert.equal(h.state.detail.run.useful, true);
   assert.equal(h.state.detail.reportLoading, true);
+  h.requests.find(r => r.url === 'run/a').resolve({ id: 'a', useful: true });
   h.requests.find(r => r.url === 'report/a').resolve({ schema: 1, sections: [] });
   await done;
   assert.equal(h.state.detail.reportLoading, false);
-  assert.equal(h.requests.length, 2);
+  assert.equal(h.requests.length, 3);
 });
 test('unknown schema triggers real text fallback independently', async () => {
   const h = harness();
   const done = h.api.loadRun('a');
   h.requests[0].resolve({ id: 'a' });
-  h.requests[1].resolve({ schema: 999 });
+  h.requests[1].resolve({ id: 'a' });
+  h.requests[2].resolve({ schema: 999 });
   await flush();
-  assert.equal(h.requests[2].url, 'raw/a');
-  h.requests[2].resolve('Readable report');
+  assert.equal(h.requests[3].url, 'raw/a');
+  h.requests[3].resolve('Readable report');
   await done;
   assert.equal(h.state.detail.report, 'Readable report');
 });
@@ -56,11 +58,13 @@ test('navigation aborts reads and rejects late responses even on return to same 
   h.state.detail = { id: null };
   const next = h.api.loadRun('a');
   assert.equal(h.requests[0].options.signal.aborted, true);
-  h.requests[2].resolve({ id: 'a', version: 2 });
-  h.requests[3].resolve({ schema: 1, sections: [] });
+  h.requests[3].resolve({ id: 'a', version: 2 });
+  h.requests[4].resolve({ id: 'a', version: 2 });
+  h.requests[5].resolve({ schema: 1, sections: [] });
   await next;
   h.requests[0].resolve({ id: 'a', version: 1 });
   h.requests[1].reject(new Error('late failure'));
+  h.requests[2].resolve({ schema: 1, sections: [] });
   await old;
   assert.equal(h.state.detail.run.version, 2);
   assert.ok(!h.notices.some(n => n[2].includes('late failure')));
@@ -69,13 +73,15 @@ test('pending refresh joins work, and failure retains useful report and run', as
   const h = harness();
   const first = h.api.loadRun('a');
   const second = h.api.loadRun('a');
-  assert.equal(h.requests.length, 2);
+  assert.equal(h.requests.length, 3);
   h.requests[0].resolve({ id: 'a', useful: true });
-  h.requests[1].resolve({ schema: 1, sections: ['kept'] });
+  h.requests[1].resolve({ id: 'a', useful: true });
+  h.requests[2].resolve({ schema: 1, sections: ['kept'] });
   await Promise.all([first, second]);
   const refresh = h.api.loadRun('a', { background: true });
-  h.requests[2].reject(new Error('core unavailable'));
-  h.requests[3].reject(new Error('report unavailable'));
+  h.requests[3].reject(new Error('core unavailable'));
+  h.requests[4].reject(new Error('evidence unavailable'));
+  h.requests[5].reject(new Error('report unavailable'));
   await refresh;
   assert.equal(h.state.detail.run.useful, true);
   assert.equal(h.state.detail.reportView.sections[0], 'kept');
@@ -111,16 +117,18 @@ test('a change during a slow read schedules one trailing refresh without paralle
   const first = h.api.loadRun('a');
   h.api.loadRun('a', { background: true });
   h.api.loadRun('a', { background: true });
-  assert.equal(h.requests.length, 2);
+  assert.equal(h.requests.length, 3);
   h.requests[0].resolve({ id: 'a', version: 1 });
-  h.requests[1].resolve({ schema: 1, sections: [] });
+  h.requests[1].resolve({ id: 'a', version: 1 });
+  h.requests[2].resolve({ schema: 1, sections: [] });
   await flush();
-  assert.equal(h.requests.length, 4);
-  h.requests[2].resolve({ id: 'a', version: 2 });
-  h.requests[3].resolve({ schema: 1, sections: [] });
+  assert.equal(h.requests.length, 6);
+  h.requests[3].resolve({ id: 'a', version: 2 });
+  h.requests[4].resolve({ id: 'a', version: 2 });
+  h.requests[5].resolve({ schema: 1, sections: [] });
   await first;
   assert.equal(h.state.detail.run.version, 2);
-  assert.equal(h.requests.length, 4);
+  assert.equal(h.requests.length, 6);
 });
 
 test('task instructions are useful while history fails, without complete action evidence', async () => {
@@ -146,3 +154,24 @@ test('late task core cannot downgrade an already complete detail', async () => {
   assert.equal(h.state.taskDetail.task.instruction, 'Full');
   assert.equal(h.state.taskDetail.task.coreOnly, undefined);
 });
+
+for (const evidenceFirst of [false, true]) {
+  for (const matches of [false, true]) {
+    test(`run actions require matching saved evidence (evidenceFirst=${evidenceFirst}, matches=${matches})`, async () => {
+      const h = harness();
+      const done = h.api.loadRun('a');
+      const core = { id: 'a', updated_at: 'now', useful: true };
+      const evidence = { id: 'a', updated_at: matches ? 'now' : 'earlier', live: 'dead' };
+      const first = evidenceFirst ? 1 : 0;
+      h.requests[first].resolve(evidenceFirst ? evidence : core);
+      await flush();
+      assert.equal(h.state.detail.evidenceError, true);
+      if (!evidenceFirst) assert.equal(h.state.detail.run.useful, true);
+      h.requests[1 - first].resolve(evidenceFirst ? core : evidence);
+      h.requests[2].resolve({ schema: 1, sections: [] });
+      await done;
+      assert.equal(h.state.detail.evidenceError, !matches);
+      if (!matches) assert.equal(h.state.detail.run.useful, true);
+    });
+  }
+}

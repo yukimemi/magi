@@ -89,6 +89,65 @@ impl Inventory {
         inventory
     }
 
+    /// Read only the dependency closure for a detail view. Names across both
+    /// stores (including tombstones and corrupt records) still establish
+    /// ambiguity, and unreadable records remain unknown rather than resolved.
+    pub fn load_for(
+        queue: &crate::queue::Queue,
+        questions: &crate::ask::Questions,
+        task: &Task,
+    ) -> Self {
+        let mut inventory = Self::new(vec![task.clone()], &[]);
+        if task.blocked_by.is_empty() {
+            return inventory;
+        }
+        let ids = (|| -> anyhow::Result<Vec<String>> {
+            let mut ids = crate::queue::record_ids(queue.root(), "json")?;
+            ids.extend(crate::queue::record_ids(questions.root(), "json")?);
+            ids.extend(crate::queue::record_ids(queue.root(), "removed")?);
+            ids.sort();
+            ids.dedup();
+            Ok(ids)
+        })();
+        match ids {
+            Ok(ids) => inventory.ids = ids,
+            Err(_) => inventory.complete = false,
+        }
+        let mut pending = task.blocked_by.clone();
+        let mut seen = BTreeSet::new();
+        while let Some(reference) = pending.pop() {
+            let full =
+                if queue.path_of(&reference).is_file() || questions.path_of(&reference).is_file() {
+                    reference
+                } else if inventory.complete {
+                    match crate::queue::resolve_reference(
+                        &reference,
+                        inventory.ids.iter().map(String::as_str),
+                    ) {
+                        crate::queue::Reference::Found(full) => full,
+                        _ => continue,
+                    }
+                } else {
+                    continue;
+                };
+            if !seen.insert(full.clone()) {
+                continue;
+            }
+            if queue.path_of(&full).is_file()
+                && let Ok(t) = queue.get(&full)
+            {
+                pending.extend(t.blocked_by.iter().cloned());
+                inventory.tasks.insert(full.clone(), t);
+            }
+            if questions.path_of(&full).is_file()
+                && let Ok(q) = questions.get(&full)
+            {
+                inventory.questions.insert(full, q.status);
+            }
+        }
+        inventory
+    }
+
     fn dep(&self, id: &str) -> Dep<'_> {
         // A partial scan does not invalidate readable exact records. It does
         // prevent proving that a prefix/suffix is unique across both stores.
@@ -280,6 +339,44 @@ mod tests {
 
     fn inv(tasks: Vec<Task>) -> Inventory {
         Inventory::new(tasks, &[])
+    }
+
+    #[test]
+    fn responsiveness_dependency_closure_matches_the_full_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = crate::queue::Queue::at(dir.path().join("queue"));
+        let questions = crate::ask::Questions::at(dir.path().join("questions"));
+        let mut held = t("held", TaskStatus::Held, &[]);
+        let mut middle = t("middle", TaskStatus::Blocked, &["held"]);
+        let mut waiting = t("waiting", TaskStatus::Blocked, &["middle"]);
+        for task in [&mut held, &mut middle, &mut waiting] {
+            queue.put(task).unwrap();
+        }
+        for n in 0..150 {
+            let mut unrelated = t(&format!("noise{n}"), TaskStatus::Done, &[]);
+            unrelated.instruction = "history ".repeat(4096);
+            queue.put(&mut unrelated).unwrap();
+        }
+        for reference in ["2026-middle", "middle", "missing", "collision"] {
+            waiting.blocked_by = vec![reference.into()];
+            queue.put(&mut waiting).unwrap();
+            std::fs::write(queue.root().join("a-collision.json"), "corrupt").unwrap();
+            std::fs::write(queue.root().join("b-collision.removed"), "removed").unwrap();
+            let full = Inventory::load(&queue, &questions);
+            let small = Inventory::load_for(&queue, &questions, &waiting);
+            assert_eq!(small.waits_on(&waiting), full.waits_on(&waiting));
+            assert_eq!(small.stuck_roots(&waiting), full.stuck_roots(&waiting));
+            assert!(small.tasks.len() <= 3);
+        }
+        // A cycle uses the same recursion and root rules as the full inventory.
+        held.status = TaskStatus::Blocked;
+        held.blocked_by = vec![middle.id.clone()];
+        queue.put(&mut held).unwrap();
+        waiting.blocked_by = vec![middle.id.clone()];
+        queue.put(&mut waiting).unwrap();
+        let full = Inventory::load(&queue, &questions);
+        let small = Inventory::load_for(&queue, &questions, &waiting);
+        assert_eq!(small.stuck_roots(&waiting), full.stuck_roots(&waiting));
     }
 
     #[test]

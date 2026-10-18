@@ -7661,8 +7661,13 @@ function renderRunDetail() {
   }
 
   syncRunPanels(run);
-  renderAsks(run);
-  renderLand(run);
+  if (state.detail.evidenceError) {
+    show($("run-ask-panel"), false);
+    show($("run-land-panel"), false);
+  } else {
+    renderAsks(run);
+    renderLand(run);
+  }
   renderActive(run);
   renderAdvise(run);
   renderVerdict(run);
@@ -9691,18 +9696,48 @@ async function loadRun(id, { background = false } = {}) {
   const detail = state.detail;
   const retry = () => loadRun(id, { background: true });
   sectionNotice("run-meta", "run-core-state", detail.run && !detail.run.isShell ? "" : "Loading run…");
-  const core = sectionRequest(`run:${id}:core`, API.run(id), run => {
-    if (state.detail !== detail) return;
-    detail.run = run;
+  detail.core = null;
+  detail.evidence = null;
+  detail.evidenceError = true;
+  renderRunDetail();
+  sectionNotice("run-meta", "run-evidence-state", "Loading related status…");
+  const applyEvidence = () => {
+    if (!detail.core || !detail.evidence) return;
+    if (!detail.core.updated_at || detail.core.updated_at !== detail.evidence.updated_at) {
+      sectionNotice("run-meta", "run-evidence-state", "Run changed while loading related status. Retry.", retry);
+      return;
+    }
+    detail.run = detail.evidence;
     detail.evidenceError = false;
+    sectionNotice("run-meta", "run-evidence-state", "");
+    renderRunDetail();
+  };
+  const core = sectionRequest(`run:${id}:core`, `${API.run(id)}/core`, run => {
+    if (state.detail !== detail) return;
+    detail.core = run;
+    detail.run = run;
+    detail.evidenceError = true;
     sectionNotice("run-meta", "run-core-state", "");
     renderRunDetail();
+    applyEvidence();
   }, error => {
     if (state.detail === detail) {
+      detail.core = null;
       detail.evidenceError = true;
       sectionNotice("run-meta", "run-core-state", `Run: ${error.message}`, retry);
       renderRunDetail();
     }
+  }, false, background);
+  const evidence = sectionRequest(`run:${id}:evidence`, API.run(id), run => {
+    if (state.detail !== detail) return;
+    detail.evidence = run;
+    applyEvidence();
+  }, error => {
+    if (state.detail !== detail) return;
+    detail.evidence = null;
+    detail.evidenceError = true;
+    sectionNotice("run-meta", "run-evidence-state", `Related status: ${error.message}`, retry);
+    renderRunDetail();
   }, false, background);
   const report = sectionRequest(`run:${id}:report`, API.reportJson(id), view => {
     if (state.detail !== detail) return;
@@ -9721,7 +9756,7 @@ async function loadRun(id, { background = false } = {}) {
       return loadRawReport(id);
     }
   }, false, background);
-  await Promise.allSettled([core, report]);
+  await Promise.allSettled([core, evidence, report]);
 }
 
 /* Named with a trailing underscore because `applyRevisions` is also the option

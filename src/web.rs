@@ -456,6 +456,34 @@ pub(crate) struct SharedMonitor {
     pub queue_index: Arc<Mutex<QueueIndex>>,
 }
 
+/// Keep a failed store's last observation without suppressing healthy stores.
+fn monitor_scan(ui: &Ui, previous: MonitorSnapshot) -> (Revisions, [Stamps; 3]) {
+    let (mut rev, mut stamps) = previous.unwrap_or_default();
+    for (index, root, runs) in [
+        (0, ui.queue.root(), false),
+        (1, ui.runs.as_path(), true),
+        (2, ui.talks.root(), false),
+    ] {
+        if let Ok(next) = try_store_stamps(root, runs) {
+            let value = stamps_revision(&next);
+            match index {
+                0 => rev.0 = value,
+                1 => rev.1 = value,
+                _ => rev.3 = value,
+            }
+            stamps[index] = next;
+        }
+    }
+    if let Ok(next) = try_stamps(ui.questions.root(), false, true) {
+        rev.2 = stamps_revision(&next);
+    }
+    if let Ok(next) = try_stamps(ui.notices.root(), false, true) {
+        rev.4 = stamps_revision(&next);
+    }
+    rev.5 = ui.lock_loop().rev;
+    (rev, stamps)
+}
+
 impl SharedMonitor {
     pub fn new() -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(64);
@@ -509,28 +537,19 @@ impl SharedMonitor {
                     break;
                 };
 
+                let previous = ui
+                    .monitor
+                    .latest
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
                 let state = Arc::clone(&ui);
-                let scan = tokio::task::spawn_blocking(move || {
-                    let stamps = [
-                        try_store_stamps(state.queue.root(), false)?,
-                        try_store_stamps(&state.runs, true)?,
-                        try_store_stamps(state.talks.root(), false)?,
-                    ];
-                    let revisions = (
-                        stamps_revision(&stamps[0]),
-                        stamps_revision(&stamps[1]),
-                        stamps_revision(&try_stamps(state.questions.root(), false, true)?),
-                        stamps_revision(&stamps[2]),
-                        stamps_revision(&try_stamps(state.notices.root(), false, true)?),
-                        state.lock_loop().rev,
-                    );
-                    Ok::<_, std::io::Error>((revisions, stamps))
-                })
-                .await;
+                let scan =
+                    tokio::task::spawn_blocking(move || monitor_scan(&state, previous)).await;
 
                 // A slow filesystem must not turn missed ticks into a busy loop.
                 ticker.reset();
-                let Ok(Ok((revisions, next_stamps))) = scan else {
+                let Ok((revisions, next_stamps)) = scan else {
                     continue;
                 };
 
@@ -1293,6 +1312,7 @@ impl Ui {
             .route("/api/upgrade", post(upgrade_post))
             .route("/api/runs", get(runs_list))
             .route("/api/runs/{id}", get(run_detail).delete(run_delete))
+            .route("/api/runs/{id}/core", get(run_core))
             .route("/api/runs/{id}/report", get(run_report))
             .route("/api/runs/{id}/report.json", get(run_report_json))
             .route("/api/runs/{id}/graft.diff", get(run_graft_diff))
@@ -3975,6 +3995,26 @@ impl RunDetailView {
     }
 }
 
+/// Core content needs neither the queue nor question/liveness evidence.
+async fn run_core(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<RunDetailView>> {
+    blocking(move || {
+        let id = resolve_run(&ui.runs, &id)?;
+        let state = read_run(&ui.runs, &id)?;
+        Ok(Json(RunDetailView::of(
+            state,
+            false,
+            crate::run::Liveness::Unknown,
+            None,
+            None,
+            None,
+        )))
+    })
+    .await
+}
+
 async fn run_detail(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
@@ -3984,6 +4024,7 @@ async fn run_detail(
         let state = read_run(&ui.runs, &id)?;
         let daemon_claims = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
         let live = state.liveness(daemon_claims);
+        crate::queue::record_ids(ui.questions.root(), "json")?;
         let waiting = ui
             .questions
             .list()
@@ -5916,7 +5957,11 @@ async fn task_detail(
             .get(&id)
             .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
         let inv = if task.status == TaskStatus::Blocked {
-            Some(crate::blockers::Inventory::load(&ui.queue, &ui.questions))
+            Some(crate::blockers::Inventory::load_for(
+                &ui.queue,
+                &ui.questions,
+                &task,
+            ))
         } else {
             None
         };
@@ -17943,6 +17988,32 @@ mod tests {
     /// driving this run right now — otherwise a seat from a killed process's
     /// last wave would read as live forever.
     #[tokio::test]
+    async fn run_core_survives_unavailable_related_stores() {
+        let home = TempDir::new().unwrap();
+        let ui = delta_test_ui(home.path());
+        let state = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".into(),
+            "0123456789abcdef".into(),
+            "Useful core instructions".into(),
+            Config::default(),
+        );
+        let dir = ui.runs.join(&state.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("run.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+        std::fs::write(ui.questions.root(), "unavailable").unwrap();
+        std::fs::write(ui.queue.root(), "unavailable").unwrap();
+        let core = run_core(State(ui.clone()), Path(state.id.clone()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(core.state.instruction, state.instruction);
+        assert_eq!(core.state.updated_at, state.updated_at);
+        assert!(core.task.is_none());
+        assert!(run_detail(State(ui), Path(state.id)).await.is_err());
+    }
+
+    #[tokio::test]
     async fn run_detail_reports_active_seats_and_whether_a_daemon_confirms_them() {
         let f = Fixture::start().await;
         // Matches `write_daemon`'s hard-coded `current.run`, so the second
@@ -19844,6 +19915,30 @@ mod tests {
             home.to_owned(),
             PathBuf::from("/repo/magi"),
         ))
+    }
+
+    #[test]
+    fn monitor_scan_isolates_store_failures_and_recovers() {
+        let home = TempDir::new().unwrap();
+        let ui = delta_test_ui(home.path());
+        std::fs::create_dir_all(ui.questions.root()).unwrap();
+        std::fs::write(ui.questions.root().join("q.json"), "{}").unwrap();
+        let before = monitor_scan(&ui, None);
+        std::fs::rename(ui.questions.root(), home.path().join("saved-questions")).unwrap();
+        std::fs::write(ui.questions.root(), "not a directory").unwrap();
+        std::fs::create_dir_all(ui.talks.root()).unwrap();
+        std::fs::write(ui.talks.root().join("new.json"), "{}").unwrap();
+        let during = monitor_scan(&ui, Some(before.clone()));
+        assert_eq!(during.0.2, before.0.2);
+        assert_ne!(during.0.3, before.0.3);
+        assert!(during.1[2].contains_key("new"));
+        std::fs::remove_file(ui.questions.root()).unwrap();
+        let after = monitor_scan(&ui, Some(during));
+        assert_eq!(after.0.2, 0);
+        assert_eq!(after.0.3, stamps_revision(&after.1[2]));
+        // A failed first scan also permits healthy stores to publish.
+        std::fs::write(ui.questions.root(), "not a directory").unwrap();
+        assert_eq!(monitor_scan(&ui, None).0.3, after.0.3);
     }
 
     #[tokio::test]
