@@ -11194,8 +11194,11 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> R
         if is_winner && !drop_winner {
             continue;
         }
-        if c.worktree.exists() {
-            remove_preserved_worktree(&repo, &c.worktree).await?;
+        let existed = c.worktree.exists();
+        // A vanished directory can still have a Git registration that keeps
+        // its branch checked out. Remove that registration before the branch.
+        remove_preserved_worktree(&repo, &c.worktree).await?;
+        if existed {
             removed.push(c.worktree.to_string_lossy().into_owned());
         }
         // A branch handed to a later run (and its pull request) is not this
@@ -13427,6 +13430,40 @@ mod tests {
         );
         runner.state = RunState::load(&runner.state.id).unwrap();
         runner.fold_losers().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fold_run_unregisters_a_vanished_worktree_and_can_retry() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        let repo = runner.state.repo.clone();
+        let candidate = runner.state.candidates[0].clone();
+        let winner = runner.state.candidates[1].clone();
+        std::fs::remove_dir_all(&candidate.worktree).unwrap();
+        assert!(
+            git::git(&repo, &["worktree", "list", "--porcelain"])
+                .await
+                .unwrap()
+                .contains(candidate.worktree.to_str().unwrap())
+        );
+        assert!(!git::branch_delete(&repo, &candidate.branch).await.unwrap());
+
+        for _ in 0..2 {
+            fold_run(&mut runner.state, false, &crate::run::home())
+                .await
+                .unwrap();
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            assert!(runner.state.candidates[0].folded);
+            assert!(!git::branch_exists(&repo, &candidate.branch).await.unwrap());
+            assert!(
+                !git::git(&repo, &["worktree", "list", "--porcelain"])
+                    .await
+                    .unwrap()
+                    .contains(candidate.worktree.to_str().unwrap())
+            );
+            assert!(!runner.state.candidates[1].folded);
+            assert!(winner.worktree.exists());
+            assert!(git::branch_exists(&repo, &winner.branch).await.unwrap());
+        }
     }
 
     #[tokio::test]
