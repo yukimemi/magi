@@ -452,10 +452,6 @@ review loop, full verification (the complete test suite), and final gate, \
 including rerunning them after fixes. Do not start `magi review`, `magi run`, \
 or another nested run to review or verify your own candidate. This applies \
 even to conditional advice to run a separate manual review with `--merge none`.\n\n\
-If assigned implementation or fixes, implement and commit your changes and \
-run necessary focused checks for what you touched; leave parent-owned full \
-verification and the final gate to the parent. Read-only seats should inspect \
-code and existing evidence without building or modifying the repository.\n\n\
 This ownership guidance takes precedence over conflicting review or full \
 verification instructions in the design brief or repository conventions for \
 this run. Repository requirements for genuinely hand-written changes outside \
@@ -493,9 +489,14 @@ branches or checkouts with git stays fine, and the rest of those instructions \
 (commit style, tests, and so on) still applies.";
 
 /// Shared worktree-seat guidance, with ownership independent of cache settings.
-fn work_in_place() -> String {
+fn work_in_place(allow_write: bool) -> String {
+    let role = if allow_write {
+        "Implement and commit your changes and run necessary focused checks for what you touched."
+    } else {
+        "Inspect code and existing evidence without building or modifying the repository."
+    };
     format!(
-        "{WORK_IN_PLACE_HEADING}\n\n{WORK_IN_PLACE_RULE}\n\n{}",
+        "{WORK_IN_PLACE_HEADING}\n\n{WORK_IN_PLACE_RULE}\n\n{}{role}\n\n",
         child_run_ownership()
     )
 }
@@ -559,12 +560,12 @@ pub fn implement_in(
             )
         })
         .unwrap_or_default();
-    let wip = work_in_place();
+    let wip = work_in_place(true);
     format!(
         "You are implementing a change in an isolated git worktree.\n\n\
          # Working directory\n\n{cwd}\n\n\
          # Task\n\n{instruction}\n\n\
-         {attachments_section}{brief_section}# Rules\n\n\
+         {attachments_section}{brief_section}{wip}# Rules\n\n\
          1. Work only inside this worktree. Nothing outside it is yours.\n\
          2. Commit your work. Anything left uncommitted is committed for you \
             under a neutral identity, so commit deliberately if the history \
@@ -583,7 +584,7 @@ pub fn implement_in(
             finished and report on its actual result. \"I'll wait\" or \
             \"continuing once it completes\" is never the final line of this \
             reply.\n\n\
-         {wip}# Reply format\n\n\
+         # Reply format\n\n\
          End your reply with, exactly:\n\n\
          ## SUMMARY\n\
          TITLE: type(scope): one-line description of the change you made\n\
@@ -619,7 +620,7 @@ pub fn judge(
     base_short: &str,
     language: &str,
 ) -> String {
-    let wip = work_in_place();
+    let wip = work_in_place(false);
     let mut s = format!(
         "You are one of {judges} independent judges in a blind evaluation. \
          {} candidate implementations of the same task were produced \
@@ -710,7 +711,7 @@ pub fn deliberate(
          knows which model sits in which seat, including you, and no one is \
          permitted to guess.\n\n\
          # The task the candidates were given\n\n{instruction}\n\n{}",
-        work_in_place()
+        work_in_place(false)
     );
     if let Some(ctx) = context {
         s.push_str("# Candidates (re-sent in full)\n\n");
@@ -762,7 +763,7 @@ pub fn final_vote(labels: &[char], language: &str) -> String {
          ```json\n\
          {{\"vote\":\"<label>\",\"reason\":\"<why, one or two sentences>\"}}\n\
          ```{}",
-        work_in_place(),
+        work_in_place(false),
         lang(language)
     )
 }
@@ -954,7 +955,7 @@ pub fn review(ctx: &ReviewCtx<'_>) -> String {
         s.push_str(prior);
     }
     s.push('\n');
-    s.push_str(&work_in_place());
+    s.push_str(&work_in_place(false));
     s.push_str(
         "# What to report\n\n\
          Real defects only, in priority order: incorrect behaviour, unhandled \
@@ -1114,7 +1115,7 @@ pub fn review_reconsider(ctx: &ReviewReconsiderCtx<'_>) -> String {
         }
     }
     s.push('\n');
-    s.push_str(&work_in_place());
+    s.push_str(&work_in_place(false));
     s.push_str(
         "# Your revote\n\n\
          Test the disagreement instead of restating your own findings: does another \
@@ -1221,7 +1222,7 @@ pub fn fix_in(
             \"continuing once it completes\" is never the final line of this \
             reply.\n\n",
     );
-    s.push_str(&work_in_place());
+    s.push_str(&work_in_place(true));
     s.push_str(
         "# Output\n\n\
          Your reasoning first, then exactly one fenced json block, last:\n\n\
@@ -1417,7 +1418,7 @@ pub fn gate_fix_in(
             do not end your reply while it is still pending. Confirm it \
             finished and report on its actual result.\n\n",
     );
-    s.push_str(&work_in_place());
+    s.push_str(&work_in_place(true));
     s.push_str(
         "# Output\n\n\
          Your reasoning first, then exactly one fenced json block, last:\n\n\
@@ -1588,7 +1589,7 @@ pub fn rebase_conflict(c: &RebaseConflict<'_>) -> String {
          6. If you start something in the background (a test run, a build), do \
             not end your reply while it is still pending.\n\n",
     );
-    s.push_str(&work_in_place());
+    s.push_str(&work_in_place(true));
     s.push_str(
         "# Output\n\n\
          Your reasoning first, then exactly one fenced json block, last:\n\n\
@@ -1742,6 +1743,7 @@ pub fn question_resumed(
             answer.trim()
         )),
     }
+    let _ = write!(s, "\n\n{}", child_run_ownership());
     s.push_str(&lang(language));
     s
 }
@@ -2525,7 +2527,7 @@ pub fn advisor(instruction: &str, seat: usize, seats: usize, language: &str) -> 
          \"why_not_naive\":\"why this earns its complexity over the obvious \
          first draft\"}}\n\
          ```",
-        work_in_place()
+        work_in_place(false)
     );
     s.push_str("\n\n");
     s.push_str(brief_ownership());
@@ -3728,12 +3730,13 @@ mod tests {
         for brief in [None, Some(""), Some("   "), Some(conflicting)] {
             let p = implement("t", "/w", "en", brief, &[]);
             assert!(p.contains(child_run_ownership()), "{p}");
-            assert!(p.contains("implement and commit your changes"));
+            assert!(p.contains("Implement and commit your changes"));
             assert!(p.contains("run necessary focused checks"));
             assert!(p.contains("takes precedence over conflicting review"));
             assert!(p.contains("`magi review <branch> --merge none`"));
             assert!(p.contains("`magi ask`"));
             assert!(p.contains("--thread"));
+            assert!(p.find(child_run_ownership()).unwrap() < p.find("# Rules").unwrap());
             if brief == Some(conflicting) {
                 assert!(p.find(conflicting).unwrap() < p.find(child_run_ownership()).unwrap());
             }
@@ -3764,6 +3767,8 @@ mod tests {
             change_summary("a", "b", &[], ""),
             resume_incomplete("missing report"),
             resume_after_drop("lost stream"),
+            question_resumed("q", "s", "", &[], &OwnerWord::Answered("yes"), "en"),
+            question_resumed("q", "s", "", &[], &OwnerWord::Said("why?"), "en"),
         ] {
             assert!(p.contains(child_run_ownership()), "{p}");
         }
@@ -4134,6 +4139,8 @@ mod tests {
             ("rebase_conflict", rebase),
             ("advisor", advisor("t", 1, 2, "en")),
         ];
+        assert!(seats[0].1.contains("Implement and commit your changes"));
+        assert!(seats[1].1.contains("Inspect code and existing evidence"));
         for (name, p) in &seats {
             assert!(p.contains(WORK_IN_PLACE_RULE), "{name} lacks the rule");
             assert!(
@@ -4150,13 +4157,18 @@ mod tests {
 
     #[test]
     fn work_in_place_rule_stays_tool_agnostic_and_clear_of_dispatch_words() {
-        let r = format!("{WORK_IN_PLACE_RULE}{}", child_run_ownership()).to_lowercase();
+        let r = format!("{}{}", work_in_place(true), work_in_place(false)).to_lowercase();
         assert!(!r.contains("renri"));
         for word in [
             "final vote",
             "deliberation round",
             "independent judges",
-            "reviewers of a patch",
+            "reviewers of",
+            "failed the verification gate",
+            "graft the runner-up strengths",
+            "opening a task for magi",
+            "you are advisor",
+            "describe a change for its pull request",
             "your patch was reviewed",
             "your revote",
             "claude",
