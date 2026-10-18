@@ -227,7 +227,11 @@ use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 /// Schema 15 records pending candidate preservation independently of an empty
 /// implementation. Older drivers must refuse to resume these records rather
 /// than judge without honoring the preservation barrier.
-pub const SCHEMA: u32 = 15;
+///
+/// Schema 16 records empty-attempt retirement. Older executors must reject
+/// retired runs rather than ignoring the new execution fence.
+
+pub const SCHEMA: u32 = 16;
 
 /// Why a pass over a run stopped at a node boundary, recorded when it
 /// happened. Never inferred afterwards: `upgrade.json` is overwritten by the
@@ -2073,6 +2077,10 @@ pub struct RunState {
     /// Successor that owns this run's pull request; this record is historical.
     #[serde(default)]
     pub pr_taken_over_by: Option<String>,
+    /// Empty attempt retired to a recovery authority; reports and refs remain.
+    /// Separate from Superseded: this never settles questions or closes PRs.
+    #[serde(default)]
+    pub retired_to: Option<String>,
     /// Candidates.
     #[serde(default)]
     pub candidates: Vec<Candidate>,
@@ -2474,6 +2482,7 @@ impl RunState {
             pr_posted_title: None,
             pr_publication_pending: false,
             pr_taken_over_by: None,
+            retired_to: None,
             candidates: Vec::new(),
             judgements: Vec::new(),
             judge_skipped: false,
@@ -3230,6 +3239,11 @@ pub(crate) fn migrate_schema(mut state: RunState) -> Result<RunState> {
                     .or_insert_with(|| "legacy empty candidate requires inspection".to_owned());
             }
         }
+        state.schema = 15;
+    }
+    // Native schema-15 preservation outcomes remain unchanged. Retirement
+    // adds an execution fence without inferring any new preservation result.
+    if state.schema == 15 {
         state.schema = SCHEMA;
     }
     if state.schema != SCHEMA {

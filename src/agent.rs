@@ -351,7 +351,7 @@ impl AgentOutput {
 const PIPE_GRACE: Duration = Duration::from_secs(3);
 
 /// Bytes a pipe reader has accumulated so far, shared with whoever spawned it.
-type Captured = Arc<Mutex<Vec<u8>>>;
+pub(crate) type Captured = Arc<Mutex<Vec<u8>>>;
 
 /// Read `pipe` to end in its own task, appending into a buffer the caller can
 /// inspect at any time.
@@ -362,7 +362,7 @@ type Captured = Arc<Mutex<Vec<u8>>>;
 /// arrive are the only evidence of what it was doing. An earlier version
 /// returned the buffer from the task and dropped it on timeout, which is how
 /// `<stem>.out` came to be empty on every timeout.
-fn drain<R>(pipe: Option<R>) -> (Captured, Option<tokio::task::JoinHandle<()>>)
+pub(crate) fn drain<R>(pipe: Option<R>) -> (Captured, Option<tokio::task::JoinHandle<()>>)
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -391,7 +391,7 @@ where
 ///
 /// A reader still blocked after that is abandoned, not awaited — but its bytes
 /// come back either way, which is the whole point.
-async fn collect(
+pub(crate) async fn collect(
     buf: &Captured,
     handle: Option<tokio::task::JoinHandle<()>>,
     grace: Duration,
@@ -441,6 +441,22 @@ pub(crate) async fn invoke_leased(
         writable: if readonly { &[] } else { inv.writable },
         ..inv.clone()
     };
+    let mut outputs = Vec::new();
+    if repository_seat(inv) {
+        if let Some(guard) = crate::retention::OutputLease::borrow(inv.cwd).map_err(|e| {
+            crate::repo_lock::ResourceBlocked(format!("worktree output ownership: {e:#}"))
+        })? {
+            outputs.push(guard);
+        }
+        if let Some(cache) = inv.cache_dir {
+            outputs.push(crate::retention::OutputLease::cache(
+                &crate::run::home(),
+                cache,
+                false,
+            )?);
+        }
+    }
+
     let scope = match inv.scope {
         InvocationScope::ConsultationControl => Some(
             "Current turn scope: consultation control. This replaces all earlier per-turn scope restrictions, including investigation's prohibition on answering. Repository access is suspended. Use supplied context and supported read-only magi control-plane diagnostics; do not inspect repository files/history, fetch, test or edit. If evidence is needed (including an operator request to investigate), return ONLY a JSON object {\"investigate_question\":\"<full open question id>\"}. The launcher will attempt a coordinated read-only continuation in this same conversation. Do not answer or resolve the question to obtain access. Owner decisions still require magi answer with exact required evidence.",
@@ -570,7 +586,7 @@ pub(crate) async fn invoke_leased(
     }
 
     #[cfg(unix)]
-    if lease.is_some() {
+    if lease.is_some() || !outputs.is_empty() {
         cmd.process_group(0);
     }
     // The final consultation/turn check is synchronous: no await separates
@@ -580,7 +596,7 @@ pub(crate) async fn invoke_leased(
         .spawn()
         .with_context(|| format!("spawn `{}` for seat {}", plan.argv[0], seat.key))?;
     // No await occurs between spawn and transfer to the cancellation owner.
-    let mut running = crate::seat_process::Running::new(child, lease);
+    let mut running = crate::seat_process::Running::with_outputs(child, lease, outputs);
     // Feed stdin from a task rather than inline: a `command` agent that never
     // reads its stdin, or a prompt larger than the pipe buffer, would
     // otherwise deadlock here before the process is ever waited on.
@@ -610,12 +626,27 @@ pub(crate) async fn invoke_leased(
     let (out_buf, out_reader) = drain(running.child().stdout.take());
     let (err_buf, err_reader) = drain(running.child().stderr.take());
 
-    let (code, timed_out) = match tokio::time::timeout(inv.timeout, running.child().wait()).await {
-        Ok(res) => {
+    let min_free = crate::run::RunState::load_under(inv.run, &crate::run::home())
+        .ok()
+        .map_or(0, |state| state.config.disk.min_free_bytes);
+    let mut paths = vec![inv.cwd.to_owned()];
+    if let Some(cache) = inv.cache_dir {
+        paths.push(cache.to_owned());
+    }
+    let mut pressure = None;
+    let waited = tokio::select! {
+        waited = tokio::time::timeout(inv.timeout, running.child().wait()) => Some(waited),
+        reason = crate::retention::emergency(paths, min_free) => {
+            pressure = Some(reason);
+            None
+        }
+    };
+    let (code, timed_out) = match waited {
+        Some(Ok(res)) => {
             let status = res.with_context(|| format!("wait for seat {}", seat.key))?;
             (status.code(), false)
         }
-        Err(_) => {
+        Some(Err(_)) | None => {
             tracing::warn!(seat = %seat.key, secs = inv.timeout.as_secs(), "agent timed out");
             // Wait for CLI termination before releasing its repository lease.
             if !running.coordinated() {
@@ -641,6 +672,9 @@ pub(crate) async fn invoke_leased(
     let err_path = inv.artifacts.join(format!("{}.err", inv.stem));
     tokio::fs::write(&out_path, &stdout).await.ok();
     tokio::fs::write(&err_path, &stderr).await.ok();
+    if let Some(reason) = pressure {
+        return Err(crate::repo_lock::ResourceBlocked(reason).into());
+    }
 
     let mut extracted = extract(spec.kind, &stdout);
     if spec.kind == AgentKind::Antigravity && extracted.quota.is_none() {
@@ -3088,6 +3122,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_invocation_cache_dir_reaches_the_seat_as_cargo_target_dir() {
+        crate::run::pin_test_home();
         // The whole point of threading the cache path through `Invocation`:
         // the compile the agent pays for lands in the directory `verify` reads
         // back out of its rendered commands, so one cache has one prune.

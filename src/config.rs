@@ -893,6 +893,10 @@ pub struct Disk {
     /// pruning only costs the rebuild of the dropped files, not of the world)
     /// without letting one addled cache swallow the machine.
     pub cache_limit_bytes: u64,
+    /// Aggregate retained worktree Cargo output cap; 0 disables reclamation.
+    pub worktree_limit_bytes: u64,
+    /// Maximum whole-target bytes reclaimed per pass (never partial targets).
+    pub worktree_reclaim_bytes: u64,
 }
 
 impl Default for Disk {
@@ -902,6 +906,8 @@ impl Default for Disk {
             auto_fold: true,
             fold_grace_secs: 6 * 60 * 60,
             cache_limit_bytes: 10 * 1024 * 1024 * 1024,
+            worktree_limit_bytes: 10 * 1024 * 1024 * 1024,
+            worktree_reclaim_bytes: 16 * 1024 * 1024 * 1024,
         }
     }
 }

@@ -554,10 +554,83 @@ pub struct Task {
     /// which pass cost what. Kept across a release.
     #[serde(default)]
     pub passes: Vec<TaskPass>,
+    /// Durable failed-input budget, unaffected by automatic release/requeue.
+    #[serde(default)]
+    pub recovery_budget: Option<RecoveryBudget>,
+    /// Inputs resolved before starting the current automatic attempt. The
+    /// settlement uses this same identity even for review-only runs.
+    #[serde(default)]
+    pub recovery_admission: Option<RecoveryAdmission>,
+    /// Previously seen input generations. Switching inputs away and back does
+    /// not refund an exhausted generation without explicit operator authority.
+    #[serde(default)]
+    pub recovery_generations: Vec<RecoveryBudget>,
     /// When the task was filed.
     pub created_at: Timestamp,
     /// Last change to this file.
     pub updated_at: Timestamp,
+}
+
+/// Admission identity shared by start and settlement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryAdmission {
+    /// Fetched upstream commit before any run-local rebase.
+    pub base: String,
+    /// Resolved instruction references and explicit review source.
+    pub inputs: String,
+}
+
+/// Failures against one recovery input generation. An owner release explicitly
+/// starts a new generation; a machine requeue never replenishes it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryBudget {
+    /// Authored instructions, not generated review scaffolding.
+    pub instruction: String,
+    /// Upstream commit used to prepare this generation.
+    pub base: String,
+    /// Referenced input commits, including their resolved identities.
+    pub inputs: String,
+    /// Stable processing stage of the last failure.
+    pub stage: String,
+    /// Failed passes, independent of the resettable claim counter.
+    pub failures: usize,
+    /// Fingerprint of actual candidate patches; equivalent rebased commits do
+    /// not count as progress. Unknown inputs never replenish the budget.
+    #[serde(default)]
+    pub progress: Option<String>,
+}
+
+fn recovery_progress(state: &crate::run::RunState) -> Option<String> {
+    use crate::proc::Quiet as _;
+    use std::hash::{Hash, Hasher};
+    let mut patches = Vec::new();
+    for candidate in state.candidates.iter().filter(|c| c.commits > 0) {
+        let output = std::process::Command::new("git")
+            .current_dir(&state.repo)
+            .args(["diff", "--binary", &state.base_commit, &candidate.branch])
+            .quiet()
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        patches.push(output.stdout);
+    }
+    patches.sort();
+    patches.dedup();
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    patches.hash(&mut hash);
+    Some(format!("{:x}", hash.finish()))
+}
+
+pub(crate) fn recovery_inputs(seeds: &[crate::refs::Seed]) -> String {
+    serde_json::to_string(
+        &seeds
+            .iter()
+            .map(|s| (&s.token, &s.sha, s.kind))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_default()
 }
 
 /// Facts a producer can independently attest about a held outcome.
@@ -840,6 +913,9 @@ impl Task {
             chat_notices: Vec::new(),
             hold_notice_cause: None,
             passes: Vec::new(),
+            recovery_budget: None,
+            recovery_admission: None,
+            recovery_generations: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -1719,6 +1795,9 @@ impl Task {
 
     /// Release on explicit operator authority, rather than automatic recovery.
     pub fn release_operator(&mut self, source: &str, question_id: Option<&str>) {
+        self.recovery_budget = None;
+        self.recovery_generations.clear();
+        self.recovery_admission = None;
         if self
             .resumption
             .as_ref()
@@ -1747,6 +1826,70 @@ impl Task {
         if let Some(previous) = self.resumption.replace(approval) {
             self.resumption_history.push(previous);
         }
+    }
+
+    /// Record a failed graph pass without allowing automatic requeues to refund it.
+    pub(crate) fn recovery_failed(&mut self, state: &crate::run::RunState) {
+        let (base, inputs) = self.recovery_admission.as_ref().map_or_else(
+            || (state.base_commit.clone(), recovery_inputs(&state.seeds)),
+            |a| (a.base.clone(), a.inputs.clone()),
+        );
+        let progress = recovery_progress(state);
+        let stage = if state.prep_failure.is_some() {
+            "preparation"
+        } else {
+            "execution"
+        };
+        let matches = |b: &RecoveryBudget| {
+            b.instruction == self.instruction
+                && b.base == base
+                && b.inputs == inputs
+                && (progress.is_none() || b.progress == progress)
+        };
+        if !self.recovery_budget.as_ref().is_some_and(matches) {
+            let previous = self
+                .recovery_generations
+                .iter()
+                .position(matches)
+                .map(|index| self.recovery_generations.remove(index));
+            if let Some(old) = self.recovery_budget.take() {
+                self.recovery_generations.push(old);
+            }
+            self.recovery_budget = previous;
+        }
+        if let Some(budget) = &mut self.recovery_budget {
+            budget.failures = budget.failures.saturating_add(1);
+            budget.stage = stage.to_owned();
+        } else {
+            self.recovery_budget = Some(RecoveryBudget {
+                instruction: self.instruction.clone(),
+                base,
+                inputs,
+                stage: stage.to_owned(),
+                failures: 1,
+                progress,
+            });
+        }
+    }
+
+    pub(crate) fn recovery_exhausted(
+        &self,
+        base: &str,
+        inputs: &str,
+        limit: usize,
+    ) -> Option<String> {
+        let same_input = |b: &&RecoveryBudget| {
+            b.instruction == self.instruction && b.base == base && b.inputs == inputs
+        };
+        let budget = self
+            .recovery_budget
+            .as_ref()
+            .filter(same_input)
+            .or_else(|| self.recovery_generations.iter().rev().find(same_input))?;
+        (budget.instruction == self.instruction && budget.base == base && budget.inputs == inputs
+            && budget.failures >= limit.max(1)).then(|| format!(
+                "[recovery-budget] {} failed passes against unchanged inputs ({}). Inspect the retained recovery sources and correct the cause, change the inputs, or explicitly release the task to approve another generation. Automatic requeue does not reset this budget.",
+                budget.failures, budget.stage))
     }
 
     /// Put a held or finished task back in line, with its attempt count reset
@@ -1846,7 +1989,7 @@ const TASK_LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Guard for [`Queue::lock_task`]; removes the lock file on drop, but only
 /// while the file still carries this guard's owner token.
-struct TaskLock {
+pub(crate) struct TaskLock {
     path: PathBuf,
     token: String,
 }
@@ -2212,7 +2355,7 @@ impl Queue {
     /// [`TASK_LOCK_STALE`] belongs to a writer that died mid-update and is
     /// broken. Not the claim lock (`<id>.lock`), which a daemon holds for a
     /// whole run.
-    fn lock_task(&self, id: &str) -> Result<TaskLock> {
+    pub(crate) fn lock_task(&self, id: &str) -> Result<TaskLock> {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
         let path = self.root.join(format!("{id}.write-lock"));

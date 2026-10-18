@@ -1800,6 +1800,13 @@ fn cache_status_line(status: &magi::cache::EntryStatus) -> (&'static str, String
                 o.run, o.node, o.seat
             ),
         ),
+        EntryStatus::Outputs(o) => (
+            "active",
+            format!(
+                "tools or process cleanup still own outputs; last borrower run {} node {} seat {}",
+                o.run, o.node, o.seat
+            ),
+        ),
         EntryStatus::Unknown => (
             "unknown",
             "an unreadable lease is present; refusing to guess who holds it".to_owned(),
@@ -1904,7 +1911,7 @@ fn cache(command: CacheCmd) -> Result<()> {
             }
         } else {
             let owner = magi::cache::Owner::here("(operator)", "cache-prune", "prune", &dir, "");
-            match magi::cache::try_acquire(&home, &dir, &owner)
+            match magi::cache::try_acquire_maintenance(&home, &dir, &owner)
                 .with_context(|| format!("check whether {} is in use", dir.display()))?
             {
                 magi::cache::AcquireOutcome::Busy(busy) => {
@@ -1963,6 +1970,20 @@ fn cache(command: CacheCmd) -> Result<()> {
         CacheCmd::List | CacheCmd::Prune { .. } => unreachable!("handled above"),
     };
     let (cfg, _from) = Config::discover(repo, config)?;
+    if matches!(command, CacheCmd::Show { .. }) {
+        if let Ok(body) = std::fs::read(magi::run::home().join("retention.json")) {
+            println!(
+                "retained worktree cleanup\n{}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        println!(
+            "worktree cap {} / per-pass reclamation {}",
+            bytes(cfg.disk.worktree_limit_bytes),
+            bytes(cfg.disk.worktree_reclaim_bytes)
+        );
+    }
+
     let Some(dir) = cfg.cache_dir() else {
         println!("no shared build cache configured (no CARGO_TARGET_DIR in `[verify]`)");
         return Ok(());
@@ -2010,7 +2031,7 @@ fn clear_cache_dir(home: &Path, dir: &Path) -> Result<()> {
     // still lose its compile. An unreadable lease refuses the clear too,
     // exactly as conservatively as it refuses the automatic janitor.
     let owner = magi::cache::Owner::here("(operator)", "cache-clear", "clear", dir, "");
-    match magi::cache::try_acquire(home, dir, &owner)
+    match magi::cache::try_acquire_maintenance(home, dir, &owner)
         .with_context(|| format!("check whether {} is in use", dir.display()))?
     {
         magi::cache::AcquireOutcome::Busy(busy) => {

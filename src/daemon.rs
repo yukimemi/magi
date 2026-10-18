@@ -943,7 +943,10 @@ where
                         ActionDecision::Stale
                     } else if s.liveness(false) == Liveness::Live {
                         ActionDecision::Skip
-                    } else if s.status == RunStatus::Landing && !s.released() {
+                    } else if s.status == RunStatus::Landing
+                        && !s.released()
+                        && s.retired_to.is_none()
+                    {
                         ActionDecision::Resume(run.clone())
                     } else {
                         ActionDecision::Refuse("Owner stop decision cannot resume its original landing execution; inspect the existing run. No replacement or merge was started.".into())
@@ -981,7 +984,12 @@ where
                 Ok(s) if s.liveness(false) == Liveness::Live => {
                     ActionDecision::Refuse("run already has a live driver".into())
                 }
-                Ok(s) if s.status.resumable() && !s.released() && !exhausted_review_budget(&s) => {
+                Ok(s)
+                    if s.status.resumable()
+                        && !s.released()
+                        && s.retired_to.is_none()
+                        && !exhausted_review_budget(&s) =>
+                {
                     ActionDecision::Resume(run.clone())
                 }
                 Ok(_) => ActionDecision::Refuse((p.resume_cannot_progress)(
@@ -1947,13 +1955,21 @@ fn settle_and_diagnose(
         task.last_error = Some(detail.to_owned());
         task.diagnostic = None;
         task.attempts = task.attempts.saturating_sub(1);
-        task.hold_machine(Some(format!(
-            "{}{} stayed busy past the resource-wait limit before `{}` could start; \
+        if block.kind == "disk pressure" {
+            task.hold_machine(Some(format!(
+                "{}{}",
+                crate::disk::RUNNING_PRESSURE,
+                block.detail
+            )));
+        } else {
+            task.hold_machine(Some(format!(
+                "{}{} stayed busy past the resource-wait limit before `{}` could start; \
              no agent was asked and no attempt was spent",
-            crate::cache::RESOURCE_HOLD,
-            block.kind,
-            block.node
-        )));
+                crate::cache::RESOURCE_HOLD,
+                block.kind,
+                block.node
+            )));
+        }
         if let Some(pass) = state.passes.last() {
             task.record_pass(&state.id, pass.index, attempts_before, None);
         }
@@ -1986,6 +2002,15 @@ fn settle_and_diagnose(
         task.hold_unrequested_retry(Some(format!("Selected recovery stopped: {detail}. Inspect the retained source and run; correct the cause before explicitly releasing or selecting again. No automatic replacement will start.")));
     } else {
         settle_in(task, verdict, detail, max_attempts, p);
+    }
+    if !verdict.parked
+        && !verdict.quota_hit
+        && matches!(
+            verdict.status,
+            RunStatus::Blocked | RunStatus::Failed | RunStatus::Stalled
+        )
+    {
+        task.recovery_failed(state);
     }
     if state.prep_failure.is_some() {
         // Minting a run whose candidates could not be prepared is not work
@@ -3091,6 +3116,7 @@ async fn poll(
     // See `maybe_prune_cache_between_runs`'s own doc: this is the cache check
     // a congested queue would otherwise starve of the fully-idle branch below.
     let mut cache_last_checked: Option<Timestamp> = None;
+    let mut disk_last_checked: Option<Timestamp> = None;
     // See `Interrupt`'s own doc: in-memory only, advanced once per tick.
     let mut interrupt = Interrupt::Idle;
     // The `Pause` handed to each dispatched candidate's own `Runner` - see
@@ -3146,6 +3172,34 @@ async fn poll(
                 now,
             )
             .await;
+        }
+
+        if cache_check_due(disk_last_checked, now, 30) {
+            disk_last_checked = Some(now);
+            if let Ok(cfg) = prepare(&opts.repo, opts) {
+                crate::retention::sweep(home, &cfg.disk, now).await;
+                // Shared-cache ownership makes this safe even with other runs
+                // active. Reclaim idle outputs before asking writers to park.
+                if let Err(e) = clean::prune_cache_if_over_limit(&cfg, home) {
+                    tracing::warn!("disk pressure cache cleanup failed: {e:#}");
+                }
+                for current in lock(status).current.clone() {
+                    if let Ok(state) = RunState::load_under(&current.run, home)
+                        && let Some(reason) = disk_gate(&state.repo, &state.config)
+                    {
+                        if let Some(pause) = interrupt_pauses.get(&current.task) {
+                            pause.park_because(reason);
+                        }
+                        notices::raise_in(
+                            home,
+                            Notice::warn(
+                                "disk:pressure",
+                                "Disk pressure persists after cleanup; active runs were asked to checkpoint and park. New starts and resumes wait for free space.",
+                            ),
+                        );
+                    }
+                }
+            }
         }
 
         let stalled = stalled_tasks(queue, home, now);
@@ -3596,6 +3650,41 @@ async fn attempt(
     }
     let p = phrases(&config.graph.language);
     let start_failed = p.could_not_start;
+    // Resolve once for both admission and settlement. Review-only runs do not
+    // have seed records, and may rebase later; neither fact can refund a failed
+    // automatic generation. Include an explicit review source's current head.
+    if let Ok(base) =
+        crate::git::merge_base_branch(&repo, &config.merge.remote, config.merge.base.as_deref())
+            .await
+        && let Ok(head) =
+            crate::git::rev_parse(&repo, &format!("{}/{}", config.merge.remote, base)).await
+    {
+        let seeds = crate::refs::resolve(
+            &repo,
+            &head,
+            &config.merge.remote,
+            &format!("{}\n{}", task.title, instruction_for(task)),
+        )
+        .await;
+        let mut inputs = crate::queue::recovery_inputs(&seeds);
+        if let Some(branch) = task.review_of.as_ref().or(task.review_branch.as_ref()) {
+            let source = crate::git::rev_parse(&repo, branch)
+                .await
+                .unwrap_or_default();
+            inputs.push_str(&format!(";review:{branch}:{source}"));
+        }
+        if let Some(reason) = task.recovery_exhausted(
+            &head,
+            &inputs,
+            task.attempt_limit
+                .map_or(opts.max_attempts, std::num::NonZeroUsize::get),
+        ) {
+            task.hold_unrequested_retry(Some(reason));
+            record(queue, task);
+            return Vec::new();
+        }
+        task.recovery_admission = Some(crate::queue::RecoveryAdmission { base: head, inputs });
+    }
 
     // The free-space gate, checked *before* anything is minted: a task that
     // waits out a full disk costs nothing yet, and must not spend an attempt
@@ -4568,7 +4657,7 @@ async fn triage_held(queue: &Queue, home: &Path, opts: &Opts) {
 /// A zero [`Config::disk::min_free_bytes`] opens the gate unconditionally -
 /// the operator opted out. A measurement failure is a gate, not a pass: both
 /// sides of "cannot tell" are served by not starting.
-fn disk_gate(repo: &Path, config: &Config) -> Option<String> {
+pub(crate) fn disk_gate(repo: &Path, config: &Config) -> Option<String> {
     disk_gate_with(repo, config, crate::disk::free_bytes)
 }
 
@@ -4584,10 +4673,32 @@ fn disk_gate_with<F: Fn(&Path) -> Result<u64>>(
     if min == 0 {
         return None;
     }
-    match free_bytes(repo) {
-        Ok(free) => crate::disk::gate_in(free, min, &config.graph.language),
-        Err(e) => Some(crate::disk::unmeasured_in(repo, &e, &config.graph.language)),
+    let mut paths = vec![repo.to_owned()];
+    if let Some(cache) = config.cache_dir() {
+        paths.push(cache);
     }
+    if let Some(root) = &config.graph.worktree_root {
+        paths.push(root.clone());
+    }
+    for path in paths {
+        let probe = if path == repo {
+            path.as_path()
+        } else {
+            path.ancestors().find(|p| p.exists()).unwrap_or(&path)
+        };
+        let reason = match free_bytes(probe) {
+            Ok(free) => crate::disk::gate_in(free, min, &config.graph.language),
+            Err(e) => Some(crate::disk::unmeasured_in(
+                probe,
+                &e,
+                &config.graph.language,
+            )),
+        };
+        if reason.is_some() {
+            return reason;
+        }
+    }
+    None
 }
 
 /// How long to wait before offering another task when a run lost a seat to a
@@ -4865,6 +4976,7 @@ where
         Ok(s)
             if s.status.resumable()
                 && !s.released()
+                && s.retired_to.is_none()
                 && !exhausted_review_budget(&s)
                 && s.liveness(false) != crate::run::Liveness::Live =>
         {
@@ -4900,7 +5012,11 @@ where
         return false;
     };
     load(id).is_ok_and(|s| {
-        s.parked && s.status.resumable() && !s.released() && !exhausted_review_budget(&s)
+        s.parked
+            && s.status.resumable()
+            && !s.released()
+            && s.retired_to.is_none()
+            && !exhausted_review_budget(&s)
     })
 }
 
@@ -7328,6 +7444,48 @@ mod tests {
             "diagnostic grew to {} bytes, unbounded",
             d.len()
         );
+    }
+
+    #[test]
+    fn selected_delivery_guards_survive_recovery_failure_accounting() {
+        for status in [RunStatus::Ready, RunStatus::Blocked, RunStatus::Failed] {
+            let mut t = task();
+            let mut state = run_state(status);
+            t.pr_recovery = Some(crate::pr_recovery::Selection {
+                url: "url".into(),
+                branch: format!("magi/task-{}", t.id),
+                head: "a".repeat(40),
+                source_head: None,
+                disposition: Some(crate::pr_recovery::Disposition::Land),
+                instruction: t.instruction.clone(),
+                approved_at: Timestamp::now(),
+            });
+            state.pr_recovery = t.pr_recovery.clone();
+            t.start(state.id.clone());
+            settle_and_diagnose(
+                &mut t,
+                Verdict {
+                    status,
+                    left_pr: false,
+                    quota_hit: false,
+                    parked: false,
+                    no_viable_candidates: false,
+                },
+                "delivery stopped",
+                5,
+                &state,
+            );
+            assert_eq!(t.status, TaskStatus::Held);
+            let reason = t.hold_reason.as_deref().unwrap();
+            if status == RunStatus::Ready {
+                assert!(reason.contains("Selected PR delivery is incomplete"));
+                assert!(t.recovery_budget.is_none());
+            } else {
+                assert!(reason.contains("Selected recovery stopped"));
+                assert_eq!(t.recovery_budget.as_ref().unwrap().failures, 1);
+            }
+            assert!(t.pr_recovery.is_some());
+        }
     }
 
     #[test]
