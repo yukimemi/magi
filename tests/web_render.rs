@@ -4063,6 +4063,111 @@ async fn magi_icon_settings_preview_save_reload_and_reset_on_phone() {
 }
 
 #[tokio::test]
+async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP avatar settings: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let base = serve(
+        &home,
+        Queue::at(home.join("queue")),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
+    let page = browser
+        .open_page(&format!("{base}#/settings"), 390, 844, true)
+        .await
+        .unwrap();
+    let timeout = Duration::from_secs(30);
+    browser
+        .wait_for(
+            &page,
+            "!!document.querySelector('.avatar-settings input')",
+            timeout,
+        )
+        .await
+        .unwrap();
+    let result = browser.eval(&page, r#"(async () => {
+      const panel = () => document.querySelector('.avatar-settings');
+      const original = (await (await fetch('/api/avatar-settings')).json()).operator;
+      const canvas = document.createElement('canvas'); canvas.width = 24; canvas.height = 24;
+      canvas.getContext('2d').fillRect(0, 0, 24, 24);
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+      const input = panel().querySelector('input');
+      const transfer = new DataTransfer(); transfer.items.add(new File([blob], 'phone.png', {type:'image/png'}));
+      input.files = transfer.files; input.dispatchEvent(new Event('change'));
+      const until = async f => { for(let i=0;i<200;i++) { if(f()) return; await new Promise(r=>setTimeout(r,25)); } throw new Error('UI timeout'); };
+      await until(() => panel().querySelector('img').src.startsWith('data:'));
+      if ((await (await fetch('/api/avatar-settings')).json()).operator !== original) throw new Error('preview saved before Save');
+      panel().querySelector('button').click();
+      await until(() => panel().textContent.includes('Avatar saved.'));
+      const saved = (await (await fetch('/api/avatar-settings')).json()).operator;
+      if (saved === original || !panel().querySelector('img').getAttribute('src').includes(saved)) throw new Error('saved preview did not refresh');
+      const rect = panel().getBoundingClientRect();
+      if (rect.right > document.documentElement.clientWidth + 1 || panel().scrollWidth > panel().clientWidth + 1) throw new Error('phone overflow');
+      const select = panel().querySelector('select');
+      select.value = 'persona:rei'; select.dispatchEvent(new Event('change'));
+      if (!panel().querySelector('button').disabled) throw new Error('operator draft leaked');
+      const personaInput = panel().querySelector('input');
+      personaInput.files = transfer.files; personaInput.dispatchEvent(new Event('change'));
+      await until(() => panel().querySelector('img').src.startsWith('data:'));
+      panel().querySelector('button').click();
+      await until(() => panel().textContent.includes('Avatar saved.'));
+      const catalog = await (await fetch('/api/avatar-settings')).json();
+      if (catalog.operator !== saved) throw new Error('persona save changed operator');
+      const rei = catalog.personas.find(p => p.id === 'rei');
+      const asuka = catalog.personas.find(p => p.id === 'asuka');
+      if (!rei || !asuka || rei.avatar === asuka.avatar) throw new Error('persona isolation');
+      panel().querySelectorAll('button')[1].click();
+      await until(() => panel().textContent.includes('Built-in avatar restored.'));
+      const reset = await (await fetch('/api/avatar-settings')).json();
+      if (reset.personas.find(p => p.id === 'rei').avatar === rei.avatar) throw new Error('reset URL unchanged');
+      const sel = panel().querySelector('select');
+      sel.value = 'operator'; sel.dispatchEvent(new Event('change'));
+      const invalid = new DataTransfer(); invalid.items.add(new File(['bad'], 'bad.png', {type:'image/png'}));
+      const invalidInput = panel().querySelector('input'); invalidInput.files = invalid.files; invalidInput.dispatchEvent(new Event('change'));
+      await until(() => !panel().querySelector('input').disabled);
+      if (!panel().querySelector('button').disabled) throw new Error('invalid image accepted');
+      if ((await (await fetch('/api/avatar-settings')).json()).operator !== saved) throw new Error('invalid image corrupted save');
+      for (const button of panel().querySelectorAll('button')) if (button.getBoundingClientRect().height < 44) throw new Error('small touch target');
+      return saved;
+    })()"#).await.unwrap();
+    browser.close_page(&page).await;
+    let page = browser
+        .open_page(&format!("{base}#/settings"), 390, 844, true)
+        .await
+        .unwrap();
+    browser
+        .wait_for(
+            &page,
+            &format!(
+                "document.querySelector('.avatar-settings .magi-icon-preview')?.getAttribute('src') === {}",
+                result
+            ),
+            timeout,
+        )
+        .await
+        .unwrap();
+    browser
+        .eval(
+            &page,
+            "document.querySelectorAll('.avatar-settings button')[1].click(); true",
+        )
+        .await
+        .unwrap();
+    browser.wait_for(&page, "document.querySelector('.avatar-settings').textContent.includes('Built-in avatar restored.')", timeout).await.unwrap();
+    assert!(!home.join("avatars/operator.data").exists());
+    browser.close_page(&page).await;
+}
+
+#[tokio::test]
 async fn chat_notification_display_hides_machine_context_on_phone_and_desktop() {
     let Some(chrome) = cdp::find_chrome() else {
         assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");

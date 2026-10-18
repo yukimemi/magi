@@ -2932,3 +2932,5 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
 /* The completion statement must remain fully readable at phone widths. */
 .talk-task-progress { margin-block: var(--s3); overflow-wrap: anywhere; }
 #talk-task-progress-open { max-width: 100%; white-space: normal; text-align: left; }
+.avatar-settings select { display: block; width: 100%; max-width: 100%; min-height: 44px; margin-block: var(--s3); }
+.avatar-settings .set-actions { flex-wrap: wrap; }

@@ -977,6 +977,13 @@ impl Ui {
             )
             .route("/api/talks/{id}/avatar", get(talk_avatar))
             .route("/avatars/operator.svg", get(operator_avatar))
+            .route(
+                "/api/avatar-settings",
+                get(avatar_settings_get)
+                    .put(avatar_settings_put)
+                    .delete(avatar_settings_delete),
+            )
+            .route("/avatars/persona", get(settings_persona_avatar))
             .route("/avatars/magi", get(magi_avatar))
             .route(
                 "/api/magi-icon",
@@ -7186,7 +7193,7 @@ struct TalkView {
     /// URL of the avatar for the conversation's persona (the default voice
     /// included). Server-built; a configured `icon` never reaches the client.
     persona_avatar: String,
-    /// Fixed operator avatar; display only and independent of repository config.
+    /// Operator avatar; display only and independent of repository config.
     operator_avatar: String,
     magi_avatar: String,
 }
@@ -7353,11 +7360,16 @@ impl TalkView {
         let persona_name = persona::find(specs, &talk.persona)
             .filter(|p| !p.is_default())
             .map(|p| p.name);
-        let persona_avatar = avatar_url(
-            &talk.id,
-            &persona::find(specs, &talk.persona)
-                .unwrap_or_else(|| persona::find(specs, persona::DEFAULT_ID).expect("default")),
-        );
+        let mut avatar_persona = persona::find(specs, &talk.persona)
+            .unwrap_or_else(|| persona::find(specs, persona::DEFAULT_ID).expect("default"));
+        // A removed configured persona may still have an override and old talks.
+        if avatar_persona.id != talk.persona
+            && read_icon_file(&avatar_setting_path(home, Some(&talk.persona))).is_some()
+        {
+            avatar_persona.id.clone_from(&talk.persona);
+            avatar_persona.icon = None;
+        }
+        let persona_avatar = avatar_url(home, &talk.id, &avatar_persona);
         let operator_name = cfg.and_then(|c| c.talk.operator_name()).map(str::to_owned);
         Self {
             turn_bodies_md,
@@ -7369,10 +7381,7 @@ impl TalkView {
             persona_name,
             persona_avatar,
             magi_avatar: magi_icon_url(home),
-            operator_avatar: format!(
-                "/avatars/operator.svg?v={}",
-                persona_icon::fingerprint(Some(persona_icon::operator_svg()))
-            ),
+            operator_avatar: operator_icon_url(home),
             talk,
         }
     }
@@ -7596,7 +7605,7 @@ async fn talk_detail(
         let personas = persona::catalog(&specs)
             .into_iter()
             .map(|p| PersonaEntry {
-                avatar: avatar_url(&talk.id, &p),
+                avatar: avatar_url(&ui.home, &talk.id, &p),
                 id: p.id,
                 name: p.name,
             })
@@ -8601,18 +8610,13 @@ async fn talk_attachment_get(
 
 /// The avatar URL for one persona of one conversation. `v` is a fingerprint of
 /// the icon setting, so changing it changes the URL.
-fn avatar_url(talk_id: &str, p: &persona::Persona) -> String {
-    let mut id = String::new();
-    for b in p.id.bytes() {
-        if b.is_ascii_alphanumeric() || b"-_.".contains(&b) {
-            id.push(char::from(b));
-        } else {
-            id.push_str(&format!("%{b:02X}"));
-        }
-    }
+fn avatar_url(home: &FsPath, talk_id: &str, p: &persona::Persona) -> String {
+    let id = avatar_encode(&p.id);
     format!(
         "/api/talks/{talk_id}/avatar?persona={id}&v={}",
-        persona_icon::fingerprint(p.icon.as_deref())
+        persona_icon::fingerprint(
+            effective_persona_icon(home, &p.id, p.icon.as_deref()).as_deref()
+        )
     )
 }
 
@@ -8630,8 +8634,13 @@ fn builtin_avatar(id: &str) -> Response {
     svg_avatar(persona_icon::builtin_svg(id))
 }
 
-async fn operator_avatar() -> Response {
-    svg_avatar(persona_icon::operator_svg())
+async fn operator_avatar(State(ui): State<Arc<Ui>>, Query(q): Query<AvatarQuery>) -> Response {
+    raster_or_builtin(
+        read_icon_file(&avatar_setting_path(&ui.home, None))
+            .filter(|_| q.builtin.is_none())
+            .as_deref(),
+        persona_icon::operator_svg(),
+    )
 }
 
 fn svg_avatar(svg: &'static str) -> Response {
@@ -8647,14 +8656,217 @@ fn svg_avatar(svg: &'static str) -> Response {
         .into_response()
 }
 
+fn avatar_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-_.".contains(&b) {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+// Display-only overrides live outside configuration and conversation records.
+fn avatar_setting_path(home: &FsPath, persona: Option<&str>) -> PathBuf {
+    let Some(id) = persona else {
+        return home.join("avatars/operator.data");
+    };
+    let encoded: String = id.bytes().map(|b| format!("{b:02x}")).collect();
+    let mut path = home.join("avatars/personas");
+    for chunk in encoded.as_bytes().chunks(100) {
+        path.push(std::str::from_utf8(chunk).expect("hex"));
+    }
+    path.join("icon.data")
+}
+
+fn effective_persona_icon(home: &FsPath, id: &str, configured: Option<&str>) -> Option<String> {
+    match read_icon_file(&avatar_setting_path(home, Some(id))) {
+        Some(value) if value == "builtin" => Some(String::new()),
+        Some(value) => Some(value),
+        None => configured.map(str::to_owned),
+    }
+}
+
+fn operator_icon_url(home: &FsPath) -> String {
+    format!(
+        "/avatars/operator.svg?v={}",
+        persona_icon::fingerprint(
+            read_icon_file(&avatar_setting_path(home, None))
+                .as_deref()
+                .or(Some(persona_icon::operator_svg()))
+        )
+    )
+}
+
+fn raster_or_builtin(icon: Option<&str>, builtin: &'static str) -> Response {
+    let mut response = match icon.and_then(|i| persona_icon::load(i).ok()) {
+        Some((mime, bytes)) if sniffed_mime(&bytes) == Some(mime) => {
+            attachment_response(mime, bytes)
+        }
+        _ => svg_avatar(builtin),
+    };
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+}
+
+#[derive(Default, Deserialize)]
+struct AvatarSettingsQuery {
+    repo: Option<PathBuf>,
+    persona: Option<String>,
+    builtin: Option<String>,
+    inherit: Option<String>,
+}
+
+fn avatar_settings_specs(
+    ui: &Ui,
+    repo: Option<PathBuf>,
+) -> ApiResult<(PathBuf, Vec<crate::config::PersonaSpec>)> {
+    let (repo, _) = settings_context(ui, SettingsQuery { repo })?;
+    let specs = settings::repository_config(&repo, ui.machine_config.as_deref())
+        .map(|cfg| cfg.talk.personas)
+        .unwrap_or_default();
+    Ok((repo, specs))
+}
+
+fn saved_persona_ids(path: &FsPath, prefix: &str, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "icon.data" {
+            let bytes: Option<Vec<u8>> = prefix
+                .as_bytes()
+                .chunks(2)
+                .map(|c| u8::from_str_radix(std::str::from_utf8(c).ok()?, 16).ok())
+                .collect();
+            if let Some(id) = bytes.and_then(|b| String::from_utf8(b).ok()) {
+                out.push(id);
+            }
+        } else if name.len() <= 100
+            && !name.is_empty()
+            && name.bytes().all(|b| b.is_ascii_hexdigit())
+            && entry.file_type().is_ok_and(|t| t.is_dir())
+        {
+            saved_persona_ids(&entry.path(), &format!("{prefix}{name}"), out);
+        }
+    }
+}
+
+async fn avatar_settings_get(
+    State(ui): State<Arc<Ui>>,
+    Query(q): Query<AvatarSettingsQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    blocking(move || {
+        let (repo, specs) = avatar_settings_specs(&ui, q.repo)?;
+        let mut catalog = persona::catalog(&specs);
+        let known_ids: Vec<_> = catalog.iter().map(|p| p.id.clone()).collect();
+        let mut saved = Vec::new();
+        saved_persona_ids(&ui.home.join("avatars/personas"), "", &mut saved);
+        for id in saved {
+            if !catalog.iter().any(|p| p.id == id) {
+                catalog.push(persona::Persona { name: format!("{id} (saved override)"), id, prompt: String::new(), icon: None });
+            }
+        }
+        let personas: Vec<_> = catalog.iter().map(|p| {
+            let saved = read_icon_file(&avatar_setting_path(&ui.home, Some(&p.id)));
+            let override_state = match saved.as_deref() {
+                Some("builtin") => "builtin",
+                Some(_) => "custom",
+                None => "inherit",
+            };
+            let icon = effective_persona_icon(&ui.home, &p.id, p.icon.as_deref());
+            serde_json::json!({"id":p.id,"name":p.name,
+                "override_state":override_state,"has_config_icon":p.icon.is_some(),
+                "is_orphan":!known_ids.contains(&p.id),"avatar":format!("/avatars/persona?persona={}&repo={}&v={}",
+                avatar_encode(&p.id), avatar_encode(&repo.to_string_lossy()), persona_icon::fingerprint(icon.as_deref()))})
+        }).collect();
+        Ok(Json(serde_json::json!({"operator":operator_icon_url(&ui.home), "personas":personas})))
+    }).await
+}
+
+async fn settings_persona_avatar(
+    State(ui): State<Arc<Ui>>,
+    Query(q): Query<AvatarSettingsQuery>,
+) -> ApiResult<Response> {
+    blocking(move || {
+        let (_, specs) = avatar_settings_specs(&ui, q.repo)?;
+        let id = q.persona.as_deref().unwrap_or(persona::DEFAULT_ID);
+        let found = persona::find(&specs, id);
+        let icon =
+            effective_persona_icon(&ui.home, id, found.as_ref().and_then(|p| p.icon.as_deref()));
+        Ok(raster_or_builtin(
+            icon.as_deref().filter(|_| q.builtin.is_none()),
+            persona_icon::builtin_svg(id),
+        ))
+    })
+    .await
+}
+
+fn validate_avatar_target(q: &AvatarSettingsQuery) -> ApiResult<()> {
+    if q.persona
+        .as_ref()
+        .is_some_and(|p| p.is_empty() || p.len() > 4096)
+    {
+        return Err(ApiError::bad_request("invalid persona id"));
+    }
+    Ok(())
+}
+
+async fn avatar_settings_put(
+    State(ui): State<Arc<Ui>>,
+    Query(q): Query<AvatarSettingsQuery>,
+    Json(upload): Json<MagiIconUpload>,
+) -> ApiResult<Json<serde_json::Value>> {
+    blocking(move || {
+        validate_avatar_target(&q)?;
+        save_icon_file(
+            &avatar_setting_path(&ui.home, q.persona.as_deref()),
+            &upload.icon,
+        )
+        .map_err(ApiError::bad_request_from)?;
+        Ok(Json(serde_json::json!({"saved":true})))
+    })
+    .await
+}
+
+async fn avatar_settings_delete(
+    State(ui): State<Arc<Ui>>,
+    Query(q): Query<AvatarSettingsQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    blocking(move || {
+        validate_avatar_target(&q)?;
+        let path = avatar_setting_path(&ui.home, q.persona.as_deref());
+        if q.persona.is_some() && q.inherit.is_none() {
+            atomic_icon_write(&path, "builtin")?;
+        } else {
+            match std::fs::remove_file(path) {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(anyhow::Error::from(e).into()),
+            }
+        }
+        Ok(Json(serde_json::json!({"saved":true})))
+    })
+    .await
+}
+
 // The global MAGI icon is deliberately independent of repository configuration.
 fn magi_icon_path(home: &FsPath) -> PathBuf {
     home.join("magi-icon.data")
 }
 
 fn read_magi_icon(home: &FsPath) -> Option<String> {
-    let path = magi_icon_path(home);
-    let metadata = std::fs::metadata(&path).ok()?;
+    read_icon_file(&magi_icon_path(home))
+}
+
+fn read_icon_file(path: &FsPath) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() > persona_icon::ICON_MAX_BYTES as u64 {
         return None;
     }
@@ -8667,7 +8879,11 @@ fn read_magi_icon(home: &FsPath) -> Option<String> {
     if text.len() > persona_icon::ICON_MAX_BYTES {
         return None;
     }
-    text.starts_with("data:").then_some(text)
+    if text == "builtin" {
+        return Some(text);
+    }
+    validate_uploaded_icon(&text).ok()?;
+    Some(text)
 }
 
 fn magi_icon_url(home: &FsPath) -> String {
@@ -8687,6 +8903,10 @@ struct MagiIconUpload {
 }
 
 fn save_magi_icon(home: &FsPath, icon: &str) -> Result<()> {
+    save_icon_file(&magi_icon_path(home), icon)
+}
+
+fn validate_uploaded_icon(icon: &str) -> Result<()> {
     if !icon.starts_with("data:") {
         anyhow::bail!("upload a raster image");
     }
@@ -8694,6 +8914,16 @@ fn save_magi_icon(home: &FsPath, icon: &str) -> Result<()> {
     if sniffed_mime(&bytes) != Some(mime) {
         anyhow::bail!("image content does not match its type");
     }
+    Ok(())
+}
+
+fn save_icon_file(path: &FsPath, icon: &str) -> Result<()> {
+    validate_uploaded_icon(icon)?;
+    atomic_icon_write(path, icon)
+}
+
+fn atomic_icon_write(path: &FsPath, icon: &str) -> Result<()> {
+    let home = path.parent().expect("icon parent");
     std::fs::create_dir_all(home)?;
     let token = crate::rng::SplitMix64::new(crate::rng::entropy()).uuid_v4();
     let temp = home.join(format!(".magi-icon-{token}.tmp"));
@@ -8705,7 +8935,7 @@ fn save_magi_icon(home: &FsPath, icon: &str) -> Result<()> {
             .open(&temp)?;
         file.write_all(icon.as_bytes())?;
         file.sync_all()?;
-        std::fs::rename(&temp, magi_icon_path(home))?;
+        std::fs::rename(&temp, path)?;
         Ok(())
     })();
     let _ = std::fs::remove_file(temp);
@@ -8790,11 +9020,28 @@ async fn talk_avatar(
                 Vec::new()
             }
         };
-        let Some(found) = persona::find(&specs, &wanted) else {
+        let found = persona::find(&specs, &wanted);
+        // Stored blank IDs are the plain voice, whose canonical ID is `default`.
+        let wanted = found.as_ref().map_or(wanted, |p| p.id.clone());
+        let icon = effective_persona_icon(
+            &ui.home,
+            &wanted,
+            found.as_ref().and_then(|p| p.icon.as_deref()),
+        );
+        if found.is_none() && icon.is_none() {
             return Ok(builtin_avatar(persona::DEFAULT_ID));
+        }
+        let Some(icon) = icon
+            .as_deref()
+            .filter(|icon| !icon.is_empty() && q.builtin.is_none())
+        else {
+            return Ok(builtin_avatar(&wanted));
         };
-        let Some(icon) = found.icon.as_deref().filter(|_| q.builtin.is_none()) else {
-            return Ok(builtin_avatar(&found.id));
+        let Some(found) = found else {
+            return Ok(raster_or_builtin(
+                Some(icon),
+                persona_icon::builtin_svg(&wanted),
+            ));
         };
         match persona_icon::load(icon) {
             Ok((mime, bytes)) if sniffed_mime(&bytes) == Some(mime) => {
@@ -12538,6 +12785,218 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn avatar_settings_report_states_and_inherit_after_corruption() {
+        let icon = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let (_tmp, home, ui, _, _) = avatar_fixture(&format!(
+            "[[talk.personas]]\nid = \"rei\"\nicon = \"{icon}\"\n"
+        ))
+        .await;
+        let path = avatar_setting_path(home.path(), Some("rei"));
+        let orphan = avatar_setting_path(home.path(), Some("removed"));
+        save_icon_file(&orphan, icon).unwrap();
+        for (saved, expected) in [
+            (icon, "custom"),
+            ("builtin", "builtin"),
+            ("data:image/png;base64,!!!!", "inherit"),
+            ("data:image/png;base64,PGh0bWw+", "inherit"),
+            ("/tmp/avatar.png", "inherit"),
+        ] {
+            atomic_icon_write(&path, saved).unwrap();
+            let catalog =
+                avatar_settings_get(State(ui.clone()), Query(AvatarSettingsQuery::default()))
+                    .await
+                    .unwrap()
+                    .0;
+            let personas = catalog["personas"].as_array().unwrap();
+            let rei = personas.iter().find(|p| p["id"] == "rei").unwrap();
+            assert_eq!(rei["override_state"], expected);
+            assert_eq!(rei["has_config_icon"], true);
+            assert_eq!(rei["is_orphan"], false);
+            let removed = personas.iter().find(|p| p["id"] == "removed").unwrap();
+            assert_eq!(removed["override_state"], "custom");
+            assert_eq!(removed["is_orphan"], true);
+            let default = personas.iter().find(|p| p["id"] == "default").unwrap();
+            assert_eq!(default["override_state"], "inherit");
+            assert_eq!(default["has_config_icon"], false);
+            let effective = effective_persona_icon(home.path(), "rei", Some(icon));
+            assert_eq!(
+                effective.as_deref(),
+                Some(if expected == "builtin" { "" } else { icon })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn avatar_settings_persist_reset_isolate_and_reject_invalid_images() {
+        let icon = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let (_tmp, home, ui, id, repo) = avatar_fixture(&format!(
+            "[[talk.personas]]\nid = \"rei\"\nicon = \"{icon}\"\n\n[[talk.personas]]\nid = \"custom\"\nname = \"Custom\"\nprompt = \"Stay concise\"\n"
+        ))
+        .await;
+        let target = |id: Option<&str>| AvatarSettingsQuery {
+            persona: id.map(str::to_owned),
+            ..Default::default()
+        };
+        let original_config = config_for(&repo).await.unwrap();
+        let original_persona = persona::find(&original_config.talk.personas, "rei").unwrap();
+        let original_prompt = persona::section_for(&original_persona, None);
+        let before = talk_detail(State(ui.clone()), Path(id.clone()))
+            .await
+            .unwrap()
+            .0;
+        for persona in [None, Some("rei"), Some("magi"), Some("../custom/日本語")] {
+            let _ = avatar_settings_put(
+                State(ui.clone()),
+                Query(target(persona)),
+                Json(MagiIconUpload { icon: icon.into() }),
+            )
+            .await
+            .unwrap();
+            let path = avatar_setting_path(home.path(), persona);
+            assert!(path.starts_with(home.path().join("avatars")));
+            assert_eq!(read_icon_file(&path).as_deref(), Some(icon));
+            for bad in [
+                "/tmp/image.png".to_owned(),
+                "data:image/png;base64,!!!!".to_owned(),
+                "data:image/png;base64,PGh0bWw+".to_owned(),
+                "data:image/svg+xml;base64,PHN2Zz4=".to_owned(),
+                format!(
+                    "data:image/png;base64,{}",
+                    "A".repeat(persona_icon::ICON_MAX_BYTES)
+                ),
+            ] {
+                assert!(
+                    avatar_settings_put(
+                        State(ui.clone()),
+                        Query(target(persona)),
+                        Json(MagiIconUpload { icon: bad })
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(read_icon_file(&path).as_deref(), Some(icon));
+            }
+        }
+        assert!(read_magi_icon(home.path()).is_none());
+        assert!(effective_persona_icon(home.path(), "asuka", None).is_none());
+        let after = talk_detail(State(ui.clone()), Path(id.clone()))
+            .await
+            .unwrap()
+            .0;
+        assert_ne!(before.view.operator_avatar, after.view.operator_avatar);
+        assert_ne!(
+            before
+                .personas
+                .iter()
+                .find(|p| p.id == "magi")
+                .unwrap()
+                .avatar,
+            after
+                .personas
+                .iter()
+                .find(|p| p.id == "magi")
+                .unwrap()
+                .avatar
+        );
+        let restarted = Arc::new(Ui::new(
+            Queue::at(home.path().join("queue")),
+            Questions::at(home.path().join("questions")),
+            Talks::at(home.path().join("talks")),
+            home.path().join("runs"),
+            home.path().to_owned(),
+            repo,
+        ));
+        let catalog = avatar_settings_get(State(restarted.clone()), Query(target(None)))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            catalog["personas"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["id"] == "../custom/日本語")
+        );
+        for expected in ["custom", "default", "rei"] {
+            assert!(
+                catalog["personas"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|p| p["id"] == expected)
+            );
+        }
+        let response =
+            operator_avatar(State(restarted.clone()), Query(AvatarQuery::default())).await;
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        let _ = avatar_settings_delete(State(restarted.clone()), Query(target(Some("rei"))))
+            .await
+            .unwrap();
+        assert_eq!(
+            effective_persona_icon(home.path(), "rei", Some(icon)),
+            Some(String::new())
+        );
+        let response = talk_avatar(
+            State(restarted.clone()),
+            Path(id.clone()),
+            Query(AvatarQuery {
+                persona: Some("rei".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/svg+xml");
+        let reset = talk_detail(State(restarted.clone()), Path(id.clone()))
+            .await
+            .unwrap()
+            .0;
+        assert_ne!(
+            after
+                .personas
+                .iter()
+                .find(|p| p.id == "rei")
+                .unwrap()
+                .avatar,
+            reset
+                .personas
+                .iter()
+                .find(|p| p.id == "rei")
+                .unwrap()
+                .avatar
+        );
+        let mut inherit = target(Some("rei"));
+        inherit.inherit = Some("1".into());
+        let _ = avatar_settings_delete(State(restarted.clone()), Query(inherit))
+            .await
+            .unwrap();
+        assert_eq!(
+            effective_persona_icon(home.path(), "rei", Some(icon)).as_deref(),
+            Some(icon)
+        );
+        let _ = avatar_settings_delete(State(restarted.clone()), Query(target(None)))
+            .await
+            .unwrap();
+        assert_eq!(operator_icon_url(home.path()), before.view.operator_avatar);
+        assert_eq!(
+            read_icon_file(&avatar_setting_path(home.path(), Some("magi"))).as_deref(),
+            Some(icon)
+        );
+        // Display changes never rewrite the conversation or its prompt-bearing config.
+        let cfg = config_for(&ui.repo).await.unwrap();
+        let resolved = persona::find(&cfg.talk.personas, "rei").unwrap();
+        assert_eq!(persona::section_for(&resolved, None), original_prompt);
+        assert!(!original_prompt.contains("data:image"));
+        assert_eq!(ui.talks.get(&id).unwrap().persona, before.view.talk.persona);
+        let stored = serde_json::to_string(&ui.talks.get(&id).unwrap()).unwrap();
+        assert!(!stored.contains("data:image"));
+        let mut orphan = ui.talks.get(&id).unwrap();
+        orphan.persona = "../custom/日本語".into();
+        let view = TalkView::with_config(orphan, false, Some(&cfg), home.path());
+        assert!(view.persona_avatar.contains("persona=..%2Fcustom%2F"));
+    }
+
+    #[tokio::test]
     async fn magi_icon_saves_resets_revalidates_and_refreshes_cache() {
         let (_tmp, home, ui, id, repo) = avatar_fixture("").await;
         let original = magi_icon_get(State(ui.clone())).await.0["avatar"].clone();
@@ -12650,7 +13109,8 @@ mod tests {
 
     #[tokio::test]
     async fn operator_avatar_is_distinct_svg_with_a_locked_down_policy() {
-        let res = operator_avatar().await;
+        let (_tmp, _home, ui, _id, _repo) = avatar_fixture("").await;
+        let res = operator_avatar(State(ui), Query(AvatarQuery::default())).await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.headers()[header::CONTENT_TYPE], "image/svg+xml");
         assert_eq!(res.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");

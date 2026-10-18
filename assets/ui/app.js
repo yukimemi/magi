@@ -9850,6 +9850,7 @@ async function putJson(url, body) {
 const settingsUrl = (url) => settingsState.repo ? `${url}?repo=${encodeURIComponent(settingsState.repo)}` : url;
 
 async function loadSettings() {
+  loadAvatarSettings();
   getJson("/api/magi-icon").then((value) => { magiIconState.avatar = value.avatar; renderSettings(); }).catch(() => {});
   if (settingsState.busy) return;
   const sequence = ++settingsState.request;
@@ -10051,10 +10052,10 @@ function renderSettingsRole(d, role) {
 // Kept separately so repository switches and failed saves retain the selection.
 const magiIconState = { avatar: "", draft: "", busy: false, message: "" };
 
-async function chooseMagiIcon(file) {
-  if (!file || magiIconState.busy) return;
-  magiIconState.busy = true;
-  magiIconState.message = "Preparing preview…";
+async function chooseMagiIcon(file, editor = magiIconState) {
+  if (!file || editor.busy) return;
+  editor.busy = true;
+  editor.message = "Preparing preview…";
   renderSettings();
   let url;
   try {
@@ -10074,10 +10075,10 @@ async function chooseMagiIcon(file) {
       if (icon.length <= 256 * 1024) break;
     }
     if (icon.length > 256 * 1024) throw new Error("The resized image exceeds 256 KiB. Choose a simpler image.");
-    magiIconState.draft = icon;
-    magiIconState.message = "Preview ready. Save to apply.";
-  } catch (error) { magiIconState.message = error.message; }
-  finally { if (url) URL.revokeObjectURL(url); magiIconState.busy = false; renderSettings(); }
+    editor.draft = icon;
+    editor.message = "Preview ready. Save to apply.";
+  } catch (error) { editor.message = error.message; }
+  finally { if (url) URL.revokeObjectURL(url); editor.busy = false; renderSettings(); }
 }
 
 async function saveMagiIcon(reset = false) {
@@ -10109,6 +10110,87 @@ function renderMagiIconSettings() {
     el("p", { role: "status", text: magiIconState.message }));
 }
 
+// Each target owns its draft; asynchronous preview/save always captures that target.
+const avatarEditors = new Map();
+let avatarCatalog = { operator: "/avatars/operator.svg?v=default", personas: [] };
+let avatarTarget = "operator";
+let avatarRequest = 0;
+function avatarEditor() {
+  if (!avatarEditors.has(avatarTarget)) avatarEditors.set(avatarTarget, { draft: "", busy: false, message: "" });
+  return avatarEditors.get(avatarTarget);
+}
+async function loadAvatarSettings() {
+  const sequence = ++avatarRequest;
+  try {
+    const catalog = await getJson(settingsUrl("/api/avatar-settings"));
+    if (sequence !== avatarRequest) return;
+    avatarCatalog = catalog;
+    renderSettings();
+  } catch (error) {
+    if (sequence === avatarRequest) { avatarEditor().message = `Could not load avatars: ${error.message}`; renderSettings(); }
+  }
+}
+async function saveAvatar(mode) {
+  const target = avatarTarget;
+  const editor = avatarEditor();
+  editor.busy = true;
+  renderSettings();
+  const params = new URLSearchParams();
+  if (target !== "operator") params.set("persona", target.slice(8));
+  if (mode === "inherit") params.set("inherit", "1");
+  const url = `/api/avatar-settings?${params}`;
+  try {
+    if (mode === "save") await putJson(url, { icon: editor.draft });
+    else await request(url, { method: "DELETE" });
+    editor.draft = "";
+    talkChoices.clear();
+    lastPersonas = [];
+    await loadAvatarSettings();
+    await loadTalks();
+    if (state.talkDetail.id) await loadTalk(state.talkDetail.id, { background: true });
+    editor.message = mode === "save" ? "Avatar saved." : mode === "inherit" ? "Configuration image restored." : "Built-in avatar restored.";
+  } catch (error) { editor.message = `Could not save: ${error.message}`; }
+  finally { editor.busy = false; renderSettings(); }
+}
+function avatarStatusLabel(persona) {
+  const label = persona.override_state === "custom" ? "custom"
+    : persona.override_state === "builtin" ? "built-in locked"
+    : persona.has_config_icon ? "repo icon" : "built-in (inherit)";
+  return `[${label}]${persona.is_orphan ? " [orphan]" : ""}`;
+}
+function renderAvatarSettings() {
+  const editor = avatarEditor();
+  const choices = [{ id: "operator", name: "Your avatar" }, ...avatarCatalog.personas.map((p) => ({ id: `persona:${p.id}`, name: `Persona: ${p.name} (${p.id}) ${avatarStatusLabel(p)}` }))];
+  if (!choices.some((p) => p.id === avatarTarget)) choices.push({ id: avatarTarget, name: avatarTarget });
+  const select = el("select", { id: "avatar-target", onchange: (event) => { avatarTarget = event.target.value; renderSettings(); } },
+    choices.map((p) => el("option", { value: p.id, text: p.name })));
+  select.value = avatarTarget;
+  const persona = avatarCatalog.personas.find((p) => `persona:${p.id}` === avatarTarget);
+  const current = avatarTarget === "operator" ? avatarCatalog.operator : persona?.avatar;
+  const status = !persona ? "" : persona.override_state === "custom" ? "Custom image override saved."
+    : persona.override_state === "builtin" ? "Locked to built-in avatar; configuration image ignored."
+    : persona.has_config_icon ? "Inherits repository configuration image; built-in avatar if unavailable."
+    : "Inherits built-in avatar.";
+  const picker = el("input", { type: "file", accept: "image/png,image/jpeg,image/gif,image/webp", "aria-label": "Choose avatar image", disabled: editor.busy });
+  picker.addEventListener("change", () => chooseMagiIcon(picker.files[0], editor));
+  const preview = avatarImg("magi-icon-preview");
+  preview.alt = "Avatar preview";
+  const fallback = avatarTarget === "operator" ? "/avatars/operator.svg?v=default"
+    : `/avatars/persona?persona=${encodeURIComponent(avatarTarget.slice(8))}${settingsState.repo ? `&repo=${encodeURIComponent(settingsState.repo)}` : ""}`;
+  setAvatar(preview, editor.draft || current || fallback);
+  return el("section", { class: "panel magi-icon-settings avatar-settings" },
+    el("h2", { text: "Your avatar and persona avatars" }),
+    el("p", { text: "Display only. A persona change applies to the same ID in every repository and existing conversation. Saved images override configuration images. Reset uses the built-in avatar; Use configuration removes the override. Images are resized; maximum 256 KiB." }),
+    el("label", { for: "avatar-target", text: "Avatar to edit" }), select,
+    el("p", { role: "status", text: status + (persona?.is_orphan ? " Persona no longer in this repository; saved override retained." : "") }),
+    preview, picker,
+    el("div", { class: "set-actions" },
+      el("button", { class: "btn btn-gold", type: "button", text: "Save avatar", disabled: editor.busy || !editor.draft, onclick: () => saveAvatar("save") }),
+      el("button", { class: "btn btn-quiet", type: "button", text: "Reset to built-in", disabled: editor.busy, onclick: () => saveAvatar("reset") }),
+      avatarTarget !== "operator" && el("button", { class: "btn btn-quiet", type: "button", text: "Use configuration", disabled: editor.busy, onclick: () => saveAvatar("inherit") })),
+    el("p", { role: "status", text: editor.message }));
+}
+
 function renderSettings() {
   renderSettingsContext();
   const d = settingsState.data;
@@ -10117,7 +10199,7 @@ function renderSettings() {
   const banner = $("settings-error");
   const msg = settingsState.message;
   if (!d) {
-    body.append(renderMagiIconSettings());
+    body.append(renderMagiIconSettings(), renderAvatarSettings());
     setText($("settings-sub"), settingsState.loading ? "Loading…" : `As seen from ${settingsState.repo || "the default repository"}`);
     setText($("settings-error-text"), msg ? msg.text : "Settings could not be loaded.");
     show(banner, !settingsState.loading);
@@ -10126,7 +10208,7 @@ function renderSettings() {
   setText($("settings-sub"), `As seen from ${d.repo}`);
   if (settingsState.loading) return;
   if (d.error) {
-    body.append(renderMagiIconSettings());
+    body.append(renderMagiIconSettings(), renderAvatarSettings());
     setText($("settings-error-text"),
       `The repository config could not be loaded: ${d.error.message}${d.error.path ? ` (${d.error.path})` : ""}`);
     show(banner, true);
@@ -10140,7 +10222,7 @@ function renderSettings() {
   }
   const dirty = settingsDirty();
   body.append(
-    renderMagiIconSettings(),
+    renderMagiIconSettings(), renderAvatarSettings(),
     el("p", { class: "set-note", text: "A change applies to runs started after it is saved. Runs already in flight keep the settings they started with." }),
     ...d.roles.map((r) => renderSettingsRole(d, r)),
     el("div", { class: "set-actions" },
