@@ -30,6 +30,16 @@ impl Fixture {
 
     async fn with_task_repository(other: bool) -> Self {
         let tmp = tempfile::tempdir().unwrap();
+        let cli_path = format!(
+            "{}:{}",
+            tmp.path().display(),
+            std::env::var("PATH").unwrap()
+        );
+        // Agent selection checks the parent's PATH before invocation uses the
+        // per-agent environment. Both must find the fixture CLI on CI too.
+        // SAFETY: e2e runs in a dedicated process on a current-thread runtime;
+        // no other turns or blocking work have started before this first await.
+        unsafe { std::env::set_var("PATH", &cli_path) };
         magi::run::set_home(tmp.path().to_owned());
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -74,14 +84,7 @@ esac
             extra_args: Vec::new(),
             prompt_delivery: None,
             env: BTreeMap::from([
-                (
-                    "PATH".into(),
-                    format!(
-                        "{}:{}",
-                        tmp.path().display(),
-                        std::env::var("PATH").unwrap()
-                    ),
-                ),
+                ("PATH".into(), cli_path),
                 ("TRACE".into(), trace.to_str().unwrap().into()),
                 ("MODE".into(), mode.to_str().unwrap().into()),
             ]),
