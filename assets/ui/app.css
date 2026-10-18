@@ -2915,3 +2915,16 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
 .magi-icon-settings input { display: block; max-width: 100%; margin-block: var(--s3); min-height: 44px; }
 .magi-icon-settings button { min-height: 44px; }
 .magi-icon-preview { display: block; width: 80px; height: 80px; object-fit: cover; border-radius: 16px; }
+
+/* Update failures stay readable at phone widths, outside the collapsed strip. */
+.upgrade-error {
+  margin: .75rem;
+  padding: .75rem;
+  border: 2px solid var(--on-rust);
+  background: var(--tint-rust);
+  color: var(--on-rust);
+  border-radius: .5rem;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.upgrade-error p { margin: 0 0 .75rem; }

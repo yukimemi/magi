@@ -326,6 +326,8 @@ pub struct Ui {
     /// Set once an upgrade task is spawned, cleared when it fails. Keeps the
     /// exclusion in memory for when `upgrade.json` could not be written.
     upgrade_spawned: Arc<std::sync::atomic::AtomicBool>,
+    /// Request failures before progress exists; never overwrite upgrade.json.
+    upgrade_request_error: Arc<Mutex<Option<UpgradeRequestFailure>>>,
     /// Runs this process is resuming right now.
     ///
     /// Separate from `talk_turns` because a run and a talk are different
@@ -421,6 +423,7 @@ impl Ui {
             talk_turns: Arc::default(),
             upgrade_gate: Arc::default(),
             upgrade_spawned: Arc::default(),
+            upgrade_request_error: Arc::default(),
             resuming: Arc::default(),
             repos_cache: repos::Cache::new(),
             machine_config: Config::machine_layer(),
@@ -2028,6 +2031,7 @@ struct HealthView {
     /// first one. Read off disk, so the successor can report what its
     /// predecessor started.
     upgrade: Option<UpgradeProgressView>,
+    upgrade_request_error: Option<UpgradeRequestFailure>,
 }
 
 /// What `/api/health` knows about a release newer than this build.
@@ -2345,6 +2349,11 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
             disk: DiskView::of(&ui, cfg.as_ref()),
             update,
             upgrade,
+            upgrade_request_error: ui
+                .upgrade_request_error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone(),
         }))
     })
     .await
@@ -2579,6 +2588,67 @@ fn upgrade_in_motion(progress: Option<&updater::Progress>) -> Option<&updater::P
     progress.filter(|p| !p.stage.terminal())
 }
 
+/// Retry timing extracted only from kaishin's known rate-limit diagnostics.
+/// Unknown diagnostics retain their complete message without guessing a delay.
+fn upgrade_retry_after(message: &str) -> Option<u64> {
+    if !message.contains("GitHub") || !message.contains("rate limit") {
+        return None;
+    }
+    if message.contains("retry now") {
+        return Some(0);
+    }
+    let duration = message
+        .split_once("resets in ")
+        .or_else(|| message.split_once("retry after "))?
+        .1
+        .split_once(')')?
+        .0;
+    let mut rest = duration.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let mut total = 0u64;
+    while !rest.is_empty() {
+        let n = rest.find(|c: char| !c.is_ascii_digit())?;
+        let amount: u64 = rest[..n].parse().ok()?;
+        let scale = match rest[n..].chars().next()? {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86400,
+            _ => return None,
+        };
+        total = total.checked_add(amount.checked_mul(scale)?)?;
+        rest = rest[n + 1..].trim_start();
+    }
+    Some(total)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct UpgradeRequestFailure {
+    occurred_at: String,
+    error: String,
+    retry_after_secs: Option<u64>,
+    /// Unix seconds; independent of the phone's polling cadence.
+    retry_at: Option<u64>,
+}
+
+impl UpgradeRequestFailure {
+    fn new(error: String) -> Self {
+        let retry_after_secs = upgrade_retry_after(&error);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Self {
+            occurred_at: jiff::Timestamp::now().to_string(),
+            error,
+            retry_after_secs,
+            retry_at: retry_after_secs.and_then(|s| now.checked_add(s)),
+        }
+    }
+}
+
 /// `POST /api/upgrade` - replace this binary with the newest release and come
 /// back on it.
 ///
@@ -2602,15 +2672,16 @@ fn upgrade_in_motion(progress: Option<&updater::Progress>) -> Option<&updater::P
 ///
 /// Answers **202**: the reply has to reach the phone while this process can
 /// still send one, and the phone learns the deck is back by reconnecting.
-async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<UpgradeView>)> {
+async fn upgrade_post(State(ui): State<Arc<Ui>>) -> Response {
     let reading = daemon::read_status(&ui.home);
     if let Some(other) = Foreign::of(reading.as_ref()) {
-        return Err(ApiError::conflict(format!(
+        return ApiError::conflict(format!(
             "the loop belongs to {}, so replacing this binary would leave \
              that process running an old one against the same queue. Upgrade \
              where it was started.",
             other.who()
-        )));
+        ))
+        .into_response();
     }
 
     // A second upgrade while one is moving would replace the binary and
@@ -2618,10 +2689,41 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
     // signal, leaving the process in `replaced` forever. Try-lock rather than
     // wait: a phone connection must not hang behind a GitHub round trip.
     let Ok(_gate) = Arc::clone(&ui.upgrade_gate).try_lock_owned() else {
-        return Err(ApiError::conflict(
-            "another request is already preparing an upgrade",
-        ));
+        return ApiError::conflict("another request is already preparing an upgrade")
+            .into_response();
     };
+    // Hold the same gate through recording/clearing the request outcome, so
+    // an older response cannot overwrite a retry's result.
+    finish_upgrade_request(&ui, upgrade_prepare(&ui).await)
+}
+
+fn finish_upgrade_request(ui: &Ui, result: ApiResult<(StatusCode, Json<UpgradeView>)>) -> Response {
+    match result {
+        Ok(out) => {
+            *ui.upgrade_request_error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+            out.into_response()
+        }
+        Err(error) if error.status != StatusCode::CONFLICT => {
+            let failure = UpgradeRequestFailure::new(error.message);
+            *ui.upgrade_request_error
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(failure.clone());
+            let mut response = (error.status, Json(&failure)).into_response();
+            if let Some(value) = failure
+                .retry_after_secs
+                .and_then(|secs| secs.to_string().parse().ok())
+            {
+                response.headers_mut().insert("retry-after", value);
+            }
+            response
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn upgrade_prepare(ui: &Arc<Ui>) -> ApiResult<(StatusCode, Json<UpgradeView>)> {
     if ui.upgrade_spawned.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(ApiError::conflict(
             "an upgrade is already in progress (this process started one and it \
@@ -2667,12 +2769,18 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> ApiResult<(StatusCode, Json<
     let (cfg, _) = Config::discover(&ui.repo, None).unwrap_or_default();
     let from = env!("CARGO_PKG_VERSION").to_owned();
     let latest = match crate::updater::Checker::new(&cfg.update) {
-        Some(checker) => checker
-            .newer_release()
-            .await
-            .map_err(|e| ApiError::internal(format!("check for a release: {e:#}")))?,
-        None => None,
+        Some(checker) => checker.newer_release().await,
+        None => Ok(None),
     };
+    upgrade_checked(ui, from, latest)
+}
+
+fn upgrade_checked(
+    ui: &Arc<Ui>,
+    from: String,
+    latest: anyhow::Result<Option<kaishin::LatestRelease>>,
+) -> ApiResult<(StatusCode, Json<UpgradeView>)> {
+    let latest = latest.map_err(|e| ApiError::internal(format!("check for a release: {e:#}")))?;
     let Some(latest) = latest else {
         return Ok((
             StatusCode::OK,
@@ -20032,6 +20140,91 @@ mod tests {
         }
     }
 
+    #[test]
+    fn upgrade_retry_timing_only_parses_known_diagnostics() {
+        assert_eq!(
+            upgrade_retry_after("GitHub API rate limit exceeded (resets in 1h 2m 3s). Use a token"),
+            Some(3723)
+        );
+        assert_eq!(
+            upgrade_retry_after("GitHub secondary rate limit hit (retry after 1m). Slow down"),
+            Some(60)
+        );
+        assert_eq!(
+            upgrade_retry_after("GitHub API rate limit exceeded (retry now)"),
+            Some(0)
+        );
+        for message in [
+            "permission denied",
+            "GitHub API rate limit exceeded",
+            "GitHub rate limit (resets in unknown)",
+            "GitHub rate limit (resets in 18446744073709551615d)",
+        ] {
+            assert_eq!(upgrade_retry_after(message), None, "{message}");
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_request_failure_survives_health_without_changing_successful_progress() {
+        let home = TempDir::new().unwrap();
+        let ui = Arc::new(idle_ui(&home).with_worktrees_root(home.path().join("wt")));
+        ui.start_loop(None).unwrap();
+        updater::write_progress(home.path(), &seeded_progress(updater::Stage::Done)).unwrap();
+        let before = std::fs::read(updater::progress_path(home.path())).unwrap();
+        let reason = "GitHub API rate limit exceeded (resets in 2m). Authenticate the request";
+        let result = upgrade_checked(&ui, "0.1.0".into(), Err(anyhow::anyhow!(reason)));
+        let response = finish_upgrade_request(&ui, result);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(response.headers()["retry-after"], "120");
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["error"].as_str().unwrap().contains(reason));
+        assert_eq!(body["retry_after_secs"], 120);
+        assert!(body["retry_at"].as_u64().is_some());
+        for _ in 0..2 {
+            let view = health(State(ui.clone())).await.unwrap().0;
+            let failure = serde_json::to_value(view.upgrade_request_error).unwrap();
+            assert_eq!(failure, body);
+        }
+        assert_eq!(
+            std::fs::read(updater::progress_path(home.path())).unwrap(),
+            before
+        );
+        assert!(!ui.lock_loop().resume_after_handover);
+        assert!(!ui.lock_loop().live.as_ref().unwrap().stop.stopped());
+        assert!(!ui.upgrade_spawned.load(std::sync::atomic::Ordering::SeqCst));
+        // A conflicting request must not erase the actionable earlier failure.
+        let gate = ui.upgrade_gate.lock().await;
+        assert_eq!(
+            upgrade_post(State(ui.clone())).await.status(),
+            StatusCode::CONFLICT
+        );
+        drop(gate);
+        assert!(
+            health(State(ui.clone()))
+                .await
+                .unwrap()
+                .0
+                .upgrade_request_error
+                .is_some()
+        );
+        let out = upgrade_checked(&ui, "0.1.0".into(), Ok(None));
+        assert_eq!(finish_upgrade_request(&ui, out).status(), StatusCode::OK);
+        assert!(
+            health(State(ui.clone()))
+                .await
+                .unwrap()
+                .0
+                .upgrade_request_error
+                .is_none()
+        );
+        let live = ui.lock_loop().live.take().unwrap();
+        live.stop.stop();
+        live.handle.await.unwrap();
+    }
+
     #[tokio::test]
     async fn an_upgrade_after_a_finished_or_failed_one_is_allowed() {
         use crate::updater::Stage;
@@ -20728,7 +20921,7 @@ mod tests {
         // and hidden with nothing to install, matching the 200 "already
         // current" branch: an operator on the newest build must not be
         // offered a restart that would only park a run for nothing.
-        assert!(APP_JS.contains("show(upgradeBtn, !foreign && update.available)"));
+        assert!(APP_JS.contains("show(upgradeBtn, canUpgrade)"));
         // A park waits for the node in flight, up to an hour for an implement
         // wave. Leaving the button reading "Upgrading…" for that long is the
         // same mistake as an error rendered off screen: it looks wedged.
@@ -20791,35 +20984,13 @@ mod tests {
 
     #[test]
     fn a_failed_upgrade_does_not_lock_the_loop_controls() {
-        // `Stage::Failed` is terminal on the server and nothing clears it on
-        // its own - not a fresh start, not time passing - so a full-strip
-        // takeover for it (the way the busy stages take the strip over,
-        // correctly, because those are transient) would have hidden
-        // start/stop/park behind an upgrade notice with no way back short of
-        // a person editing `upgrade.json` by hand or a later release
-        // happening to succeed. The failure must instead ride along as a note
-        // next to whatever control the loop's own state already offers.
         let body = &APP_JS[APP_JS.find("function renderLoop(").expect("renderLoop")
             ..APP_JS.find("function upgrade(").expect("upgrade")];
-        assert!(
-            !body.contains(
-                "upgradeStage === \"failed\") {\n    setAttr(box, \"data-state\", \"failed\")"
-            ),
-            "a failed upgrade must not take the whole strip over the way it used to"
-        );
-        assert!(
-            body.contains("upgradeFailNote"),
-            "the failure has to reach the loop's own note instead"
-        );
-        // `quiet` and `control` are the only two places `loop-why` is set from
-        // this function's own state; both must carry the note through, or a
-        // future edit to either one would silently drop it again.
-        assert_eq!(
-            body.matches("upgradeFailNote].filter(Boolean).join")
-                .count(),
-            2,
-            "both loop-why writers (quiet and control) must fold the note in"
-        );
+        assert!(!body.contains(
+            "upgradeStage === \"failed\") {\n    setAttr(box, \"data-state\", \"failed\")"
+        ));
+        assert!(body.contains("renderUpgradeError();"));
+        assert!(INDEX_HTML.contains("id=\"upgrade-error\""));
     }
 
     #[test]
