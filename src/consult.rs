@@ -218,6 +218,10 @@ pub struct AnswerAuthority {
     /// Execution facts validated when this answer was authorized.
     #[serde(default)]
     pub question_fingerprint: String,
+    /// The conversation agent interpreted this complete owner send as consent
+    /// to the single persisted internal recovery recommendation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_interpretation: Option<String>,
 }
 
 /// Immutable recommendation-time binding to question choices and targets.
@@ -227,6 +231,21 @@ pub struct RecommendationManifest {
     pub body: String,
     /// Full question IDs and fingerprints of their execution-relevant facts.
     pub questions: std::collections::BTreeMap<String, String>,
+    /// Canonical choice and structured effect captured with the persona reply.
+    /// Old transcripts cannot acquire this binding retrospectively.
+    #[serde(default)]
+    pub recovery: std::collections::BTreeMap<String, RecoveryRecommendation>,
+}
+
+/// Execution binding published with a single internal recovery recommendation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecoveryRecommendation {
+    /// Canonical stored label, independent of any alias used in the reply.
+    pub choice: String,
+    /// Structured effect; absent only for issuer-defined legacy keep-held.
+    pub action: Option<crate::ask::ChoiceAction>,
+    /// Run owning the question at recommendation time.
+    pub run: String,
 }
 
 /// Fingerprint of execution-relevant question facts, independent of answer state.
@@ -260,10 +279,26 @@ pub fn owner_title<'a>(q: &Question, instruction: &'a str) -> Option<&'a str> {
 
 /// Capture at publication, never reconstruct new authority from old history.
 pub fn recommendation_manifest(body: &str, questions: &Questions) -> RecommendationManifest {
+    let snapshot = questions.list();
     RecommendationManifest {
         body: crate::github_text::fingerprint("", body),
-        questions: questions
-            .list()
+        recovery: snapshot
+            .iter()
+            .filter_map(|q| {
+                let choice = recommended_choice(body, q, questions)?;
+                (q.status.open() && contextual_recovery(q, choice)).then(|| {
+                    (
+                        q.id.clone(),
+                        RecoveryRecommendation {
+                            choice: choice.into(),
+                            action: q.actions.get(choice).cloned(),
+                            run: q.run.clone(),
+                        },
+                    )
+                })
+            })
+            .collect(),
+        questions: snapshot
             .iter()
             .filter(|q| q.status.open() && recommended_choice(body, q, questions).is_some())
             .map(|q| (q.id.clone(), question_fingerprint(q)))
@@ -347,9 +382,140 @@ pub fn authorize_answer(
     if let Some((_, _, instruction)) = current_instruction(&talk) {
         validate_effect(q, reply, instruction, quote.unwrap_or_default(), true)?;
     }
+    if contextual_recovery(q, reply) {
+        let (_, _, instruction) = current_instruction(&talk).context(
+            "missing context: no current persisted owner send; read the conversation again",
+        )?;
+        if quote.is_some_and(|quote| quote != instruction) {
+            bail!(
+                "stale persisted evidence: --quote must preserve the entire latest owner send; read it again"
+            );
+        }
+        bail!(
+            "insufficient consent: bind an explicit question/action reply, or interpret approval of a single saved recommendation with --recovery-consent <entire latest owner send>; clarify only if the owner's intent is ambiguous"
+        );
+    }
     bail!(
         "answer requires --quote of the entire latest owner send bound to this question ID and exact offered choice, or explicit authorization of the immediately preceding question-by-question recommendations; persisted evidence must be current"
     )
+}
+
+/// Only structured internal recovery effects qualify. Approval and publication
+/// questions never acquire contextual consent, even if actions were attached.
+fn contextual_recovery(q: &Question, reply: &str) -> bool {
+    QuestionKind::of(q) == QuestionKind::Ordinary
+        && consent(q, reply) == Consent::Delegable
+        && (matches!(q.actions.get(reply), Some(crate::ask::ChoiceAction::Resume { run }) if !run.is_empty())
+            || matches!(q.actions.get(reply), Some(crate::ask::ChoiceAction::Hold))
+            || crate::triage::contextual_keep_held(q, reply))
+}
+
+/// Agent-mediated interpretation, bound to a full real owner send and the
+/// immutable recommendation. Call under the same locks as `authorize_answer`.
+/// This does not execute recovery; the daemon retains all ownership and merge gates.
+pub fn authorize_recovery(
+    q: &Question,
+    talks: &Talks,
+    questions: &Questions,
+    seat: (&str, &str),
+    reply: &str,
+    instruction: &str,
+) -> Result<Option<AnswerAuthority>> {
+    let (run, node) = seat;
+    if node != CHAT_NODE || !contextual_recovery(q, reply) {
+        bail!(
+            "insufficient consent: contextual interpretation is limited to structured internal resume/keep-held actions; use this decision's explicit consent workflow"
+        );
+    }
+    let talk = talks.get(run)?;
+    let evidence = recovery_authority(q, questions, &talk, reply, instruction)?;
+    if q.consult
+        .as_ref()
+        .is_some_and(|c| c.talk != run && talks.turn_held(&c.talk))
+    {
+        bail!("original consultation is active; wait for its turn to finish before answering");
+    }
+    Ok(Some(evidence))
+}
+
+fn recovery_authority(
+    q: &Question,
+    questions: &Questions,
+    talk: &Talk,
+    reply: &str,
+    instruction: &str,
+) -> Result<AnswerAuthority> {
+    let (turn, message, latest) = current_instruction(talk)
+        .context("missing context: wait for the current owner send to be persisted and drained")?;
+    if instruction != latest {
+        bail!(
+            "stale persisted evidence: the complete latest owner send differs; read the conversation again, including any retraction"
+        );
+    }
+    let owner_sends = talk.turns[turn]
+        .messages
+        .iter()
+        .filter(|send| talk::sender(&talk.turns[turn], Some(send)) != talk::Sender::Magi)
+        .count();
+    if owner_sends != 1
+        || latest.trim().is_empty()
+        || latest.starts_with("    ")
+        || latest.starts_with('\t')
+        || latest.trim_start().starts_with(['>', '`'])
+    {
+        bail!("insufficient consent: quoted text or multiple owner sends require clarification");
+    }
+    let index = talk.turns[..turn]
+        .iter()
+        .rposition(|t| talk::sender(t, None) != talk::Sender::Magi)
+        .context("missing context: present one explicit recovery recommendation first")?;
+    let recommendation = &talk.turns[index];
+    let manifest = talk.recommendations.get(&index).context(
+        "missing context: no persisted recommendation binding; present the recommendation now",
+    )?;
+    if recommendation.who != talk::Who::Agent
+        || talk::sender(recommendation, None) != talk::Sender::Persona
+        || recommendation.posted_by.is_some()
+        || manifest.body != crate::github_text::fingerprint("", &recommendation.body)
+        || manifest.questions.get(&q.id) != Some(&question_fingerprint(q))
+        || recommendation.at < q.asked_at
+        || talk.turns[turn].at < recommendation.at
+        || !q.status.open()
+    {
+        bail!(
+            "stale persisted evidence: recommendation or question target changed; present the current recommendation again"
+        );
+    }
+    if manifest.questions.len() != 1 {
+        bail!(
+            "ambiguous recovery context: multiple recommended decisions; clarify which question and action the owner intends"
+        );
+    }
+    let binding = manifest.recovery.get(&q.id)
+        .context("missing context: no structured recovery binding was saved; present a current recommendation")?;
+    if binding.run != q.run || binding.action.as_ref() != q.actions.get(&binding.choice) {
+        bail!("stale persisted evidence: the recommended recovery target changed");
+    }
+    if binding.choice != reply
+        || recommended_choice(&recommendation.body, q, questions) != Some(reply)
+    {
+        bail!("alias mismatch: the selected action differs from the persisted recommendation");
+    }
+    Ok(AnswerAuthority {
+        talk: talk.id.clone(),
+        turn,
+        message,
+        instruction: latest.into(),
+        instruction_fingerprint: crate::github_text::fingerprint("", latest),
+        recommendation_turn: Some(index),
+        recommendation_fingerprint: Some(manifest.body.clone()),
+        question: q.id.clone(),
+        choice: reply.into(),
+        question_fingerprint: question_fingerprint(q),
+        recovery_interpretation: Some(
+            "owner approved the single current recovery recommendation".into(),
+        ),
+    })
 }
 
 /// Whether this turn needs the question-store write grant. Uses the same
@@ -365,6 +531,13 @@ pub fn authorized_answers(questions: &Questions, talk: &Talk) -> bool {
                 });
         }
         q.choices.iter().any(|choice| {
+            if contextual_recovery(q, choice)
+                && quote.is_some_and(|words| {
+                    recovery_authority(q, questions, talk, choice, words).is_ok()
+                })
+            {
+                return true;
+            }
             choice_authority(q, questions, talk, choice, quote).is_some_and(|e| {
                 validate_effect(q, choice, &e.instruction, quote.unwrap_or_default(), true).is_ok()
             })
@@ -671,7 +844,7 @@ fn choice_authority(
     {
         return None;
     }
-    if quote.map(str::trim) != Some(instruction.trim()) || talk.turns[turn].at < q.asked_at {
+    if talk.turns[turn].at < q.asked_at {
         return None;
     }
     let direct = direct_choice(instruction, q, questions, reply)
@@ -684,6 +857,11 @@ fn choice_authority(
             && q.merge_target
                 .as_ref()
                 .is_some_and(|t| instruction.trim() == format!("{}: merge {}", q.id, t.head)));
+    let quote_matches = quote == Some(instruction);
+    let persisted_recovery = quote.is_none() && direct && contextual_recovery(q, reply);
+    if !quote_matches && !persisted_recovery {
+        return None;
+    }
     let recommendation_turn = if direct {
         None
     } else {
@@ -725,6 +903,7 @@ fn choice_authority(
         question: q.id.clone(),
         choice: reply.into(),
         question_fingerprint: question_fingerprint(q),
+        recovery_interpretation: None,
     })
 }
 
@@ -770,20 +949,31 @@ fn batch_instruction(text: &str) -> bool {
 
 fn refers_to(reference: &str, q: &Question, questions: &Questions) -> bool {
     reference == q.id
-        || (reference.len() >= 4
-            && reference == q.short()
-            && questions.resolve_id(reference).is_ok_and(|id| id == q.id))
+        || (reference.len() >= 4 && questions.resolve_id(reference).is_ok_and(|id| id == q.id))
 }
 
 fn direct_choice(text: &str, q: &Question, questions: &Questions, reply: &str) -> bool {
     // One complete instruction, binding both the question and the offered
     // choice. Other actions (including closing the PR) are never inferred.
-    let Some((reference, choice)) = text.trim().split_once(':') else {
+    let text = text.trim();
+    let binding = text.split_once(':').or_else(|| {
+        if contextual_recovery(q, reply) {
+            text.split_once(char::is_whitespace)
+        } else {
+            None
+        }
+    });
+    let Some((reference, choice)) = binding else {
         return false;
     };
     let reference = reference.trim().trim_matches('`');
-    (reference == q.id || (reply == crate::land::HOLD && refers_to(reference, q, questions)))
-        && choice.trim() == reply
+    (reference == q.id
+        || ((reply == crate::land::HOLD || contextual_recovery(q, reply))
+            && refers_to(reference, q, questions)))
+        && (choice.trim() == reply
+            || (contextual_recovery(q, reply)
+                && q.resolve_reply(choice.trim())
+                    .is_ok_and(|resolved| resolved == reply)))
 }
 
 fn recommended_choice<'a>(body: &str, q: &'a Question, questions: &Questions) -> Option<&'a str> {
@@ -851,7 +1041,7 @@ fn recommended_choice<'a>(body: &str, q: &'a Question, questions: &Questions) ->
                 .any(|c| c.len() >= 4 && questions.resolve_id(c).is_ok_and(|id| id != q.id));
             let choices: Vec<_> = cells
                 .iter()
-                .filter(|c| q.choices.iter().any(|choice| choice == **c))
+                .filter_map(|c| q.resolve_reply(c).ok())
                 .collect();
             if other_question || references != 1 || choices.len() != 1 {
                 return None;
@@ -859,7 +1049,7 @@ fn recommended_choice<'a>(body: &str, q: &'a Question, questions: &Questions) ->
             rows.push(
                 q.choices
                     .iter()
-                    .find(|choice| choice.as_str() == *choices[0])?
+                    .find(|choice| choice.as_str() == choices[0])?
                     .as_str(),
             );
             continue;
@@ -889,7 +1079,10 @@ fn recommended_choice<'a>(body: &str, q: &'a Question, questions: &Questions) ->
         rows.push(
             q.choices
                 .iter()
-                .find(|offered| offered.as_str() == choice)?
+                .find(|offered| {
+                    q.resolve_reply(choice)
+                        .is_ok_and(|resolved| offered.as_str() == resolved)
+                })?
                 .as_str(),
         );
     }

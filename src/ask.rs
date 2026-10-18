@@ -678,6 +678,47 @@ impl Question {
         self.choices.is_empty()
     }
 
+    /// Resolve terminal aliases to the exact stored label before authorization.
+    /// Aliases describe structured effects, never translated display text.
+    pub fn resolve_reply<'a>(&'a self, reply: &'a str) -> Result<&'a str> {
+        if self.free_text() || self.choices.iter().any(|c| c == reply) {
+            return Ok(reply);
+        }
+        if matches!(reply, "keep-held" | "keep held")
+            && let Some(label) = self
+                .choices
+                .iter()
+                .find(|label| crate::triage::contextual_keep_held(self, label))
+        {
+            return Ok(label);
+        }
+        let matches: Vec<_> = self
+            .actions
+            .iter()
+            .filter(|(label, action)| {
+                self.choices.contains(label)
+                    && match action {
+                        ChoiceAction::Resume { run } => {
+                            matches!(reply, "resume" | "resume run" | "resume-run")
+                                || reply == format!("resume run {}", short(run))
+                                || reply == format!("resume run {run}")
+                        }
+                        ChoiceAction::Hold => matches!(reply, "keep-held" | "keep held"),
+                        _ => false,
+                    }
+            })
+            .collect();
+        match matches.as_slice() {
+            [(label, _)] => Ok(label.as_str()),
+            [] => bail!(
+                "alias mismatch: `{reply}` is not an offered label or supported action alias; inspect `magi answer --list`"
+            ),
+            _ => bail!(
+                "ambiguous action alias: `{reply}` matches multiple choices; select the intended offered label"
+            ),
+        }
+    }
+
     /// Record an answer. Rejects a choice the question does not offer, free
     /// text on a multiple-choice question, an empty answer, and a second
     /// answer.

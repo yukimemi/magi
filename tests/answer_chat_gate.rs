@@ -1640,3 +1640,461 @@ fn operator_held_chat_approvals_still_refuse_even_explicit_holds() {
         assert!(String::from_utf8_lossy(&out.stderr).contains("held by the operator"));
     }
 }
+
+const RECOVERY_LABEL: &str = "daemon: 既存の実行を再開する";
+const RECOVERY_HOLD: &str = "daemon: 保留を続ける";
+
+fn recovery_fixture() -> Fixture {
+    let f = fixture();
+    f.questions
+        .update(&f.qid, |q| {
+            q.node = "internal-recovery".into();
+            q.seat = "conductor".into();
+            q.consult = None;
+            q.choices = vec![RECOVERY_LABEL.into(), RECOVERY_HOLD.into()];
+            q.actions = BTreeMap::from([
+                (
+                    RECOVERY_LABEL.into(),
+                    magi::ask::ChoiceAction::Resume { run: q.run.clone() },
+                ),
+                (RECOVERY_HOLD.into(), magi::ask::ChoiceAction::Hold),
+            ]);
+            Ok(())
+        })
+        .unwrap();
+    f
+}
+
+fn recovery_answer(
+    f: &Fixture,
+    run: &str,
+    id: &str,
+    reply: &str,
+    words: Option<&str>,
+    interpreted: bool,
+) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_magi"));
+    cmd.args(["answer", id, "--reply", reply])
+        .env("MAGI_HOME", f.tmp.path())
+        .env("MAGI_CONFIG_DIR", f.tmp.path().join("config"))
+        .env("MAGI_RUN", run)
+        .env("MAGI_NODE", magi::queue::CHAT_NODE);
+    if let Some(words) = words {
+        cmd.args([
+            if interpreted {
+                "--recovery-consent"
+            } else {
+                "--quote"
+            },
+            words,
+        ]);
+    }
+    cmd.output().unwrap()
+}
+
+#[test]
+fn recovery_cli_accepts_short_and_full_ids_with_stable_aliases_and_localized_labels() {
+    for short in [true, false] {
+        for alias in [
+            "resume run",
+            "resume-run",
+            "resume run beef",
+            "resume",
+            RECOVERY_LABEL,
+        ] {
+            for quoted in [true, false] {
+                let f = recovery_fixture();
+                let q = f.questions.get(&f.qid).unwrap();
+                let id = if short { q.short() } else { &f.qid };
+                let words = if alias == "resume run" && !quoted {
+                    format!("{id} {alias}")
+                } else {
+                    format!("{id}: {alias}")
+                };
+                let run = standing_owner(&f, &words, None);
+                let out =
+                    recovery_answer(&f, &run, id, alias, quoted.then_some(words.as_str()), false);
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let q = f.questions.get(&f.qid).unwrap();
+                assert_eq!(q.resolution().as_deref(), Some(RECOVERY_LABEL));
+                assert_eq!(q.answer_authority.unwrap().instruction, words);
+                // Recording a decision does not start a fresh competition or release ownership.
+                assert!(!f.tmp.path().join("runs").exists());
+                let twice = recovery_answer(&f, &run, id, alias, Some(&words), false);
+                assert!(!twice.status.success());
+            }
+        }
+    }
+}
+
+#[test]
+fn recovery_cli_interprets_natural_japanese_with_current_persisted_recommendation() {
+    for generated in [false, true] {
+        for (alias, label) in [("resume-run", RECOVERY_LABEL), ("keep-held", RECOVERY_HOLD)] {
+            let f = recovery_fixture();
+            let words = "はい、それで進めてください。";
+            let recommendation = if alias == "keep-held" {
+                format!(
+                    "| Question | Recommendation |\n| --- | --- |\n| {} | keep-held |",
+                    f.qid
+                )
+            } else {
+                format!("{}: {label}", f.qid)
+            };
+            let run = standing_owner(&f, words, Some(&recommendation));
+            if generated {
+                let talks = Talks::at(f.tmp.path().join("talks"));
+                let mut t = talks.get(&run).unwrap();
+                let mut notice = t.turns[0].clone();
+                notice.sender = Some(talk::Sender::Magi);
+                notice.body = "generated: resume something else".into();
+                t.turns.insert(1, notice.clone());
+                // Save a new transcript so its publication-time manifest indices stay correct.
+                t.id = "20260903-000000-d00d".into();
+                t.recommendations.clear();
+                t.turns.push(notice);
+                talks.put(&mut t).unwrap();
+                let out = recovery_answer(&f, &t.id, &f.qid, alias, Some(words), true);
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            } else {
+                let out = recovery_answer(&f, &run, &f.qid, alias, Some(words), true);
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            let evidence = f.questions.get(&f.qid).unwrap().answer_authority.unwrap();
+            assert_eq!(evidence.instruction, words);
+            assert!(evidence.recovery_interpretation.is_some());
+            assert_eq!(evidence.recommendation_turn, Some(0));
+        }
+    }
+}
+
+#[test]
+fn recovery_cli_rejects_stale_ambiguous_missing_and_mismatched_evidence() {
+    for mode in [
+        "no recommendation",
+        "changed target",
+        "changed actions",
+        "retraction",
+        "queued retraction",
+        "multiple recommendations",
+        "wrong action",
+        "quoted send",
+        "generated send",
+    ] {
+        let f = recovery_fixture();
+        let words = if mode == "quoted send" {
+            "> はい、それで進めて"
+        } else {
+            "はい、それで進めて"
+        };
+        let mut recommendation = format!("{}: {RECOVERY_LABEL}", f.qid);
+        if mode == "multiple recommendations" {
+            let mut other = f.questions.get(&f.qid).unwrap();
+            other.id = "20260903-000000-aaaa".into();
+            f.questions.put(&mut other).unwrap();
+            recommendation.push_str(&format!("\n\n{}: {RECOVERY_LABEL}", other.id));
+        }
+        let run = standing_owner(
+            &f,
+            words,
+            (mode != "no recommendation").then_some(recommendation.as_str()),
+        );
+        let talks = Talks::at(f.tmp.path().join("talks"));
+        if matches!(mode, "changed target" | "changed actions") {
+            f.questions
+                .update(&f.qid, |q| {
+                    if mode == "changed target" {
+                        q.run = "20260903-000000-dead".into();
+                    } else {
+                        q.actions
+                            .insert(RECOVERY_LABEL.into(), magi::ask::ChoiceAction::Requeue);
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        } else if matches!(mode, "retraction" | "queued retraction" | "generated send") {
+            let mut t = talks.get(&run).unwrap();
+            if mode == "queued retraction" {
+                t.pending = "待って、再開しないで".into();
+                t.pending_messages.clear();
+            } else if mode == "generated send" {
+                t.turns.last_mut().unwrap().sender = Some(talk::Sender::Magi);
+            } else {
+                talk::record(&mut t, &talks, "待って、再開しないで", vec![]).unwrap();
+            }
+            talks.put(&mut t).unwrap();
+        }
+        let alias = if mode == "wrong action" {
+            "keep-held"
+        } else {
+            "resume-run"
+        };
+        let out = recovery_answer(&f, &run, &f.qid, alias, Some(words), true);
+        assert_untouched(&f, &out);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("context")
+                || err.contains("evidence")
+                || err.contains("consent")
+                || err.contains("alias mismatch"),
+            "{mode}: {err}"
+        );
+    }
+}
+
+#[test]
+fn recovery_cli_does_not_extend_merge_posting_or_destructive_consent() {
+    for node in [
+        magi::land::APPROVAL_NODE,
+        magi::github_text::ASK_NODE,
+        "internal-recovery",
+    ] {
+        for action in [
+            magi::ask::ChoiceAction::Requeue,
+            magi::ask::ChoiceAction::Done,
+            magi::ask::ChoiceAction::Resume {
+                run: "20260902-000000-beef".into(),
+            },
+        ] {
+            if node == "internal-recovery"
+                && matches!(action, magi::ask::ChoiceAction::Resume { .. })
+            {
+                continue;
+            }
+            let f = recovery_fixture();
+            f.questions
+                .update(&f.qid, |q| {
+                    q.node = node.into();
+                    q.actions.insert(RECOVERY_LABEL.into(), action.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let words = "はい、それで進めて";
+            let run = standing_owner(&f, words, Some(&format!("{}: {RECOVERY_LABEL}", f.qid)));
+            let out = recovery_answer(&f, &run, &f.qid, RECOVERY_LABEL, Some(words), true);
+            assert_untouched(&f, &out);
+            assert!(String::from_utf8_lossy(&out.stderr).contains("insufficient consent"));
+        }
+    }
+}
+
+#[test]
+fn recovery_cli_does_not_reconstruct_old_bindings_or_accept_alias_collisions() {
+    for mode in [
+        "old manifest",
+        "alias collision",
+        "prefix",
+        "bad alias",
+        "partial quote",
+    ] {
+        let f = recovery_fixture();
+        let words = "はい、それで進めてください";
+        let run = standing_owner(&f, words, Some(&format!("{}: resume-run", f.qid)));
+        let talks = Talks::at(f.tmp.path().join("talks"));
+        let mut t = talks.get(&run).unwrap();
+        if mode == "old manifest" {
+            // put deliberately preserves existing manifests, so model an old
+            // on-disk transcript before recovery bindings existed.
+            t.recommendations.get_mut(&0).unwrap().recovery.clear();
+            std::fs::write(
+                f.tmp.path().join("talks").join(format!("{run}.json")),
+                serde_json::to_vec(&t).unwrap(),
+            )
+            .unwrap();
+        } else if mode == "alias collision" {
+            f.questions
+                .update(&f.qid, |q| {
+                    q.actions.insert(
+                        RECOVERY_HOLD.into(),
+                        magi::ask::ChoiceAction::Resume { run: q.run.clone() },
+                    );
+                    Ok(())
+                })
+                .unwrap();
+        }
+        if mode == "prefix" {
+            let q = f.questions.get(&f.qid).unwrap();
+            let prefix = &q.id[..q.id.len() - 2];
+            let words = format!("{prefix}: resume run");
+            let run = standing_owner(&f, &words, None);
+            let out = recovery_answer(&f, &run, prefix, "resume-run", Some(&words), false);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            continue;
+        }
+        let out = recovery_answer(
+            &f,
+            &run,
+            &f.qid,
+            if mode == "bad alias" {
+                "requeue-run"
+            } else {
+                "resume-run"
+            },
+            Some(if mode == "partial quote" {
+                "はい"
+            } else {
+                words
+            }),
+            true,
+        );
+        assert_untouched(&f, &out);
+    }
+}
+
+#[test]
+fn recovery_recommendation_uses_existing_question_grants_and_excludes_legacy_requeue() {
+    let f = recovery_fixture();
+    let words = "はい、それで進めてください";
+    let run = standing_owner(&f, words, Some(&format!("{}: resume-run", f.qid)));
+    let talks = Talks::at(f.tmp.path().join("talks"));
+    let t = talks.get(&run).unwrap();
+    assert!(magi::consult::authorized_answers(&f.questions, &t));
+    let roots = magi::consult::answer_write_roots(&f.questions, &talks, &t);
+    assert_eq!(roots.len(), 2);
+    assert!(roots.contains(&f.tmp.path().join("questions")));
+    assert!(!roots.contains(&f.tmp.path().to_path_buf()));
+
+    for choice in [0, 1] {
+        let f = recovery_fixture();
+        f.questions
+            .update(&f.qid, |q| {
+                q.node = "triage".into();
+                q.seat = "triage".into();
+                q.triage_generation = Some(0);
+                q.actions.clear();
+                Ok(())
+            })
+            .unwrap();
+        let label = if choice == 0 {
+            RECOVERY_LABEL
+        } else {
+            RECOVERY_HOLD
+        };
+        let run = standing_owner(&f, words, Some(&format!("{}: {label}", f.qid)));
+        let out = recovery_answer(&f, &run, &f.qid, label, Some(words), true);
+        assert_eq!(
+            out.status.success(),
+            choice == 1,
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn recovery_cli_preserves_pending_merge_approval_and_existing_run_ownership() {
+    let f = recovery_fixture();
+    let mut state = magi::run::RunState::new(
+        f.tmp.path().into(),
+        "main".into(),
+        "abc1234".into(),
+        "update docs".into(),
+        Config::default(),
+    );
+    state.status = magi::run::RunStatus::Blocked;
+    let mut approval = magi::ask::Question::new(
+        state.id.clone(),
+        magi::land::APPROVAL_NODE.into(),
+        "land".into(),
+        "Merge?".into(),
+        String::new(),
+        vec!["merge".into(), "hold".into()],
+    );
+    f.questions.put(&mut approval).unwrap();
+    state.land_approval = Some(magi::run::LandApproval {
+        question: approval.id.clone(),
+        head: "reviewed-head".into(),
+    });
+    state.save_under(f.tmp.path()).unwrap();
+    let before = serde_json::to_value(&state).unwrap();
+    f.questions
+        .update(&f.qid, |q| {
+            q.run = state.id.clone();
+            q.actions.insert(
+                RECOVERY_LABEL.into(),
+                magi::ask::ChoiceAction::Resume {
+                    run: state.id.clone(),
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+    let queue = magi::queue::Queue::at(f.tmp.path().join("queue"));
+    let mut task = magi::queue::Task::new(
+        "docs".into(),
+        "update docs".into(),
+        f.tmp.path().into(),
+        magi::queue::Source::Human,
+    );
+    task.runs.push(state.id.clone());
+    task.hold_machine(Some("mise github-cli has been repaired".into()));
+    queue.put(&mut task).unwrap();
+    let task_before = serde_json::to_value(&task).unwrap();
+    let words = "はい、それで進めてください";
+    let run = standing_owner(&f, words, Some(&format!("{}: resume-run", f.qid)));
+    let out = recovery_answer(&f, &run, &f.qid, "resume-run", Some(words), true);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(f.questions.get(&approval.id).unwrap().answer.is_none());
+    let after = magi::run::RunState::load_under(&state.id, f.tmp.path()).unwrap();
+    assert_eq!(serde_json::to_value(&after).unwrap(), before);
+    assert!(!after.released());
+    assert_eq!(queue.list().len(), 1);
+    assert_eq!(
+        serde_json::to_value(queue.get(&task.id).unwrap()).unwrap(),
+        task_before
+    );
+    let out = recovery_answer(&f, &run, &f.qid, "resume-run", Some(words), true);
+    assert!(!out.status.success());
+    assert!(f.questions.get(&approval.id).unwrap().answer.is_none());
+}
+
+#[test]
+fn recovery_cli_generated_sends_in_the_owner_turn_do_not_replace_real_evidence() {
+    let f = recovery_fixture();
+    let words = "はい、それで進めてください";
+    let run = standing_owner(&f, words, Some(&format!("{}: resume-run", f.qid)));
+    let talks = Talks::at(f.tmp.path().join("talks"));
+    let mut t = talks.get(&run).unwrap();
+    let turn = t.turns.last_mut().unwrap();
+    let mut notice = turn.messages[0].clone();
+    notice.sender = Some(talk::Sender::Magi);
+    notice.body = "generated notice: no owner authorization".into();
+    turn.messages.insert(0, notice.clone());
+    turn.messages.push(notice);
+    turn.body = turn
+        .messages
+        .iter()
+        .map(|m| m.body.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    talks.put(&mut t).unwrap();
+    let out = recovery_answer(&f, &run, &f.qid, "resume-run", Some(words), true);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let authority = f.questions.get(&f.qid).unwrap().answer_authority.unwrap();
+    assert_eq!(authority.instruction, words);
+    assert_eq!(authority.message, 1);
+}
