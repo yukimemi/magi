@@ -22,7 +22,8 @@ function harness() {
     renderRunDetail: () => renders.push(state.detail.run), renderReportCards: () => renders.push(state.detail.reportView),
     renderTask: () => renders.push(state.taskDetail.task), renderTaskActions() {},
     renderTalk: () => renders.push(state.talkDetail.talk), renderStats: () => renders.push(state.stats),
-    sectionNotice: (...args) => notices.push(args), trackTalkThinking() {}, rememberTalkChoices() {}, endTalkTurn() {},
+    renderStatsQueue: counts => renders.push({ queue: counts }),
+    show() {}, sectionNotice: (...args) => notices.push(args), trackTalkThinking() {}, rememberTalkChoices() {}, endTalkTurn() {},
   });
   return { api, requests, renders, notices, state };
 }
@@ -104,12 +105,16 @@ test('dashboard filter changes discard reversed responses', async () => {
   const first = h.api.loadStats();
   h.state.statsRepo = 'second';
   const second = h.api.loadStats();
-  h.requests[1].resolve({ repo: 'second' });
+  h.requests.find(r => r.url.includes('repo=second')).resolve({ repo: 'second' });
+  h.requests.find(r => r.url === 'stats/queue').resolve({ queued: 3 });
+  await flush();
+  // Coalesced background queue refresh also completes.
+  h.requests.filter(r => r.url === 'stats/queue').at(-1).resolve({ queued: 3 });
   await second;
-  h.requests[0].resolve({ repo: 'first' });
+  h.requests.find(r => r.url.includes('repo=first')).resolve({ repo: 'first' });
   await first;
   assert.equal(h.state.stats.repo, 'second');
-  assert.equal(h.requests[0].options.signal.aborted, true);
+  assert.equal(h.requests.find(r => r.url.includes('repo=first')).options.signal.aborted, true);
 });
 
 test('a change during a slow read schedules one trailing refresh without parallel duplicates', async () => {
@@ -218,4 +223,31 @@ test('unchanged background evidence does not rebuild focused action controls', a
   h.requests[5].resolve({ schema: 1, sections: [] });
   await refresh;
   assert.equal(h.renders.filter(r => r && r.id === 'a').length, rendered);
+});
+
+
+test('dashboard queue is useful while history is pending and survives its failure', async () => {
+  const h = harness();
+  const done = h.api.loadStats();
+  h.requests.find(r => r.url === 'stats/queue').resolve({ queued: 17 });
+  await flush();
+  assert.equal(h.renders[0].queue.queued, 17);
+  assert.equal(h.state.stats, null);
+  h.requests.find(r => r.url !== 'stats/queue').reject(new Error('history offline'));
+  await done;
+  assert.equal(h.renders[0].queue.queued, 17);
+  assert.ok(h.notices.some(n => n[2].includes('history offline') && typeof n[3] === 'function'));
+});
+
+
+test('queue-only dashboard refresh preserves run history without requesting it again', async () => {
+  const h = harness();
+  h.state.stats = { useful: 'history' };
+  const done = h.api.loadStats({ background: true, queueOnly: true });
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.requests[0].url, 'stats/queue');
+  h.requests[0].resolve({ queued: 9 });
+  await done;
+  assert.equal(h.state.stats.useful, 'history');
+  assert.equal(h.renders[0].queue.queued, 9);
 });

@@ -193,7 +193,10 @@ async fn browser_history_latency() {
         ("#/runs".into(), "#view-runs a.card .card-title"),
         ("#/chat".into(), "#talks-list a.card .card-title"),
         ("#/questions".into(), "#questions-list .ask-summary"),
-        ("#/stats".into(), "#stats-kpis"),
+        (
+            "#/stats".into(),
+            "#stats-kpis, #stats-queue-tiles .stats-tile",
+        ),
     ];
     for clients in [1, 4] {
         // One browser per client avoids hidden-tab rAF throttling.

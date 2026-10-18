@@ -73,7 +73,17 @@ impl Inventory {
     /// Include unreadable records and tombstones in id resolution; list()
     /// alone cannot prove uniqueness or absence.
     pub fn load(queue: &crate::queue::Queue, questions: &crate::ask::Questions) -> Self {
-        let mut inventory = Self::new(queue.list(), &questions.list());
+        Self::load_with_tasks(queue, questions, queue.list())
+    }
+
+    /// Reuse a listing already read by the caller. Still include tombstones
+    /// and unreadable ids when resolving dependency ambiguity.
+    pub fn load_with_tasks(
+        queue: &crate::queue::Queue,
+        questions: &crate::ask::Questions,
+        tasks: Vec<Task>,
+    ) -> Self {
+        let mut inventory = Self::new(tasks, &questions.list());
         let ids = (|| -> anyhow::Result<Vec<String>> {
             let mut ids = crate::queue::record_ids(queue.root(), "json")?;
             ids.extend(crate::queue::record_ids(questions.root(), "json")?);
@@ -97,8 +107,17 @@ impl Inventory {
         questions: &crate::ask::Questions,
         task: &Task,
     ) -> Self {
-        let mut inventory = Self::new(vec![task.clone()], &[]);
-        if task.blocked_by.is_empty() {
+        Self::load_for_tasks(queue, questions, std::slice::from_ref(task))
+    }
+
+    /// Share id enumeration and dependency reads across one list page.
+    pub fn load_for_tasks(
+        queue: &crate::queue::Queue,
+        questions: &crate::ask::Questions,
+        tasks: &[Task],
+    ) -> Self {
+        let mut inventory = Self::new(tasks.to_vec(), &[]);
+        if tasks.iter().all(|task| task.blocked_by.is_empty()) {
             return inventory;
         }
         let ids = (|| -> anyhow::Result<Vec<String>> {
@@ -113,7 +132,10 @@ impl Inventory {
             Ok(ids) => inventory.ids = ids,
             Err(_) => inventory.complete = false,
         }
-        let mut pending = task.blocked_by.clone();
+        let mut pending: Vec<_> = tasks
+            .iter()
+            .flat_map(|task| task.blocked_by.iter().cloned())
+            .collect();
         let mut seen = BTreeSet::new();
         while let Some(reference) = pending.pop() {
             let full =

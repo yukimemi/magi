@@ -405,9 +405,10 @@ pub(crate) struct QueueIndex {
     reparsed: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct TaskRelation {
     id: String,
+    status: Option<crate::queue::TaskStatus>,
     priority: i32,
     runs: Vec<String>,
     source: Source,
@@ -417,6 +418,7 @@ impl From<Task> for TaskRelation {
     fn from(task: Task) -> Self {
         Self {
             id: task.id,
+            status: Some(task.status),
             priority: task.priority,
             runs: task.runs,
             source: task.source,
@@ -454,6 +456,7 @@ pub(crate) struct SharedMonitor {
     pub latest: Arc<Mutex<MonitorSnapshot>>,
     pub worker_started: std::sync::atomic::AtomicBool,
     pub queue_index: Arc<Mutex<QueueIndex>>,
+    list_walks: Mutex<Vec<ListWalk>>,
 }
 
 /// Keep a failed store's last observation without suppressing healthy stores.
@@ -492,6 +495,7 @@ impl SharedMonitor {
             latest: Arc::default(),
             worker_started: std::sync::atomic::AtomicBool::new(false),
             queue_index: Arc::default(),
+            list_walks: Mutex::default(),
         }
     }
 
@@ -791,6 +795,10 @@ impl Ui {
                     // its last known relationship so a lookup of THAT task
                     // still fails on the authoritative read below. Never let
                     // unrelated corruption disable every run and conversation.
+                    // Counts must not present its previous status as current.
+                    if let Some((_, record)) = index.records.get_mut(id) {
+                        Arc::make_mut(record).status = None;
+                    }
                     continue;
                 };
                 #[cfg(test)]
@@ -1326,10 +1334,12 @@ impl Ui {
             .route("/api/runs/{id}/fold-merged", post(run_fold_merged))
             .route("/api/runs/{id}/resume", post(run_resume))
             .route("/api/queue", get(queue_list))
+            .route("/api/queue/page", get(queue_page))
             .route("/api/search", get(search_get))
             .route("/api/queue/{id}", get(task_detail).delete(queue_delete))
             .route("/api/queue/{id}/core", get(task_core))
             .route("/api/stats", get(stats_get))
+            .route("/api/stats/queue", get(stats_queue))
             .route("/api/repos", get(repos_list))
             .route("/api/settings", get(settings_get))
             .route("/api/settings/roles", put(settings_put_roles))
@@ -1364,6 +1374,7 @@ impl Ui {
                 post(notification_dismiss),
             )
             .route("/api/talks", get(talks_list).post(talk_post))
+            .route("/api/talks/page", get(talks_page))
             .route("/api/talks/{id}", get(talk_detail).delete(talk_delete))
             .route("/api/talks/{id}/core", get(talk_core))
             .route("/api/talks/{id}/sections", get(talk_sections))
@@ -2761,7 +2772,9 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
             runs_rev: revisions.1,
             questions_rev: revisions.2,
             talks_rev: revisions.3,
-            notifications_rev: revisions.4,
+            notifications_rev: stamps_revision(
+                &try_stamps(ui.notices.root(), false, true).map_err(anyhow::Error::from)?,
+            ),
             notifications_unread: ui.notices.count_unread(),
             loop_rev,
             runs_unreadable: runs_unreadable(&ui.runs),
@@ -4686,7 +4699,8 @@ async fn queue_list(
 ) -> ApiResult<Json<Vec<TaskView>>> {
     blocking(move || {
         let tasks = ui.queue.list();
-        let inv = crate::blockers::Inventory::load(&ui.queue, &ui.questions);
+        let inv =
+            crate::blockers::Inventory::load_with_tasks(&ui.queue, &ui.questions, tasks.clone());
         Ok(Json(
             tasks
                 .into_iter()
@@ -4694,6 +4708,184 @@ async fn queue_list(
                 .map(|t| TaskView::with_inventory(t, &inv))
                 .collect(),
         ))
+    })
+    .await
+}
+
+/// Cursor pages read a bounded number of records, never the older transcripts
+/// or instructions. Cursors advance through a frozen file-name snapshot,
+/// including corrupt rows, so skipped/deleted records cannot repeat a page.
+/// Concurrent inserts are reconciled by a trailing store refresh.
+#[derive(Debug, Default, Deserialize)]
+struct PageQuery {
+    before: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StorePage<T> {
+    rows: Vec<T>,
+    next: Option<String>,
+}
+
+const STORE_PAGE_SIZE: usize = 16;
+
+/// Freeze only membership for one bounded cursor walk. Statuses and bodies are
+/// always read from disk; writes/deletions during the walk are reconciled by
+/// the next store revision. Never rescan the entire directory for every page.
+#[derive(Debug)]
+struct ListWalk {
+    token: u64,
+    talks: bool,
+    opened: std::time::Instant,
+    ids: Arc<Vec<String>>,
+}
+
+fn page_ids(ui: &Ui, talks: bool, q: PageQuery) -> ApiResult<(Vec<String>, Option<String>)> {
+    let mut walks = ui
+        .monitor
+        .list_walks
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    walks.retain(|walk| walk.opened.elapsed() < Duration::from_secs(120));
+    let (token, ids, offset) = if let Some(cursor) = q.before {
+        let (token, offset) = cursor
+            .split_once(':')
+            .ok_or_else(|| ApiError::bad_request("Invalid list cursor"))?;
+        let token = token
+            .parse::<u64>()
+            .map_err(|_| ApiError::bad_request("Invalid list cursor"))?;
+        let offset = offset
+            .parse::<usize>()
+            .map_err(|_| ApiError::bad_request("Invalid list cursor"))?;
+        let walk = walks
+            .iter()
+            .find(|walk| walk.token == token && walk.talks == talks)
+            .ok_or_else(|| ApiError::conflict("List cursor expired; retry the list"))?;
+        (token, walk.ids.clone(), offset)
+    } else {
+        let root = if talks {
+            ui.talks.root()
+        } else {
+            ui.queue.root()
+        };
+        let mut ids = crate::queue::record_ids(root, "json")?;
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        let ids = Arc::new(ids);
+        let mut token = crate::rng::entropy();
+        while walks.iter().any(|walk| walk.token == token) {
+            token = crate::rng::entropy();
+        }
+        // Four clients can enumerate both stores and overlap a refresh. Bound
+        // retained membership snapshots; an evicted cursor explicitly retries.
+        if walks.len() >= 16 {
+            walks.remove(0);
+        }
+        walks.push(ListWalk {
+            token,
+            talks,
+            opened: std::time::Instant::now(),
+            ids: ids.clone(),
+        });
+        (token, ids, 0)
+    };
+    if offset > ids.len() {
+        return Err(ApiError::bad_request("Invalid list cursor"));
+    }
+    let end = offset.saturating_add(STORE_PAGE_SIZE).min(ids.len());
+    let next = (end < ids.len()).then(|| format!("{token}:{end}"));
+    Ok((ids[offset..end].to_vec(), next))
+}
+
+async fn queue_page(
+    State(ui): State<Arc<Ui>>,
+    Query(q): Query<PageQuery>,
+) -> ApiResult<Json<StorePage<TaskView>>> {
+    blocking(move || {
+        let (ids, next) = page_ids(&ui, false, q)?;
+        let tasks: Vec<_> = ids
+            .into_iter()
+            .filter_map(|id| ui.queue.get(&id).ok())
+            .collect();
+        let inv = crate::blockers::Inventory::load_for_tasks(&ui.queue, &ui.questions, &tasks);
+        let rows = tasks
+            .into_iter()
+            .map(|task| TaskView::with_inventory(task, &inv))
+            .collect();
+        Ok(Json(StorePage { rows, next }))
+    })
+    .await
+}
+
+/// List-only projection: retain every turn timestamp for exact unread counts,
+/// but do not ship transcripts, parse Markdown or discover repository config.
+/// Opening a conversation obtains its full context window and controls.
+#[derive(Serialize)]
+struct TalkListView {
+    id: String,
+    repo: PathBuf,
+    agent: String,
+    status: talk::TalkStatus,
+    turns: Vec<TalkListTurn>,
+    thinking: bool,
+    context: talk::ContextUsage,
+    created_at: Timestamp,
+    updated_at: Timestamp,
+}
+
+#[derive(Serialize)]
+struct TalkListTurn {
+    who: talk::Who,
+    at: Timestamp,
+    body: String,
+}
+
+async fn talks_page(
+    State(ui): State<Arc<Ui>>,
+    Query(q): Query<PageQuery>,
+) -> ApiResult<Json<StorePage<TalkListView>>> {
+    blocking(move || {
+        let (ids, next) = page_ids(&ui, true, q)?;
+        let rows = ids
+            .into_iter()
+            .filter_map(|id| ui.talks.get(&id).ok())
+            .map(|talk| TalkListView {
+                thinking: ui.is_thinking(&talk.id),
+                context: talk::context_usage(&talk, None),
+                turns: talk
+                    .turns
+                    .iter()
+                    .map(|turn| TalkListTurn {
+                        who: turn.who,
+                        at: turn.at,
+                        body: turn
+                            .body
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .chars()
+                            .take(240)
+                            .collect(),
+                    })
+                    .collect(),
+                id: talk.id,
+                repo: talk.repo,
+                agent: talk.agent,
+                status: talk.status,
+                created_at: talk.created_at,
+                updated_at: talk.updated_at,
+            })
+            .collect();
+        Ok(Json(StorePage { rows, next }))
+    })
+    .await
+}
+
+async fn stats_queue(State(ui): State<Arc<Ui>>) -> ApiResult<Json<TaskCountsView>> {
+    blocking(move || {
+        let tasks = ui.indexed_tasks()?;
+        Ok(Json(TaskCountsView::from(
+            crate::queue::TaskCounts::of_statuses(tasks.iter().filter_map(|task| task.status)),
+        )))
     })
     .await
 }
@@ -6299,7 +6491,7 @@ struct StatsView {
     advisors: Vec<AdvisorStatsView>,
     e2e: E2eStatsView,
     release_bumps: ReleaseBumpStatsView,
-    queue: TaskCountsView,
+    queue: Option<TaskCountsView>,
     /// Same count and same meaning as [`HealthView::runs_unreadable`] - see
     /// that field's doc. Asserted to match it in
     /// `stats_runs_unreadable_matches_health`.
@@ -6372,6 +6564,8 @@ struct StatsQuery {
     repo: Option<String>,
     /// `?all=true` keeps agents that are no longer in the roster.
     all: bool,
+    /// The dashboard fetches queue counts independently of run history.
+    runs_only: bool,
 }
 
 /// `GET /api/stats` - task and run statistics for the dashboard, aggregated
@@ -6420,7 +6614,8 @@ async fn stats_get(
             &jiff::tz::TimeZone::system(),
             STATS_DAILY_DAYS,
         );
-        let queue_counts = crate::queue::TaskCounts::of(&ui.queue.list());
+        let queue_counts = (!q.runs_only)
+            .then(|| TaskCountsView::from(crate::queue::TaskCounts::of(&ui.queue.list())));
         Ok(Json(StatsView {
             totals: StatsTotalsView::from(&collected.totals),
             agents: collected.agents.iter().map(AgentStatsView::from).collect(),
@@ -6436,7 +6631,7 @@ async fn stats_get(
                 .collect(),
             e2e: E2eStatsView::from(&collected.e2e),
             release_bumps: ReleaseBumpStatsView::from(&collected.release_bumps),
-            queue: TaskCountsView::from(queue_counts),
+            queue: queue_counts,
             runs_unreadable: runs_unreadable(&ui.runs),
             repos,
             daily: daily.iter().map(DailyStatsView::from).collect(),
@@ -7892,7 +8087,15 @@ async fn talks_list(
 ) -> ApiResult<Json<Vec<TalkView>>> {
     blocking(move || {
         let mut configs: HashMap<PathBuf, Option<Config>> = HashMap::new();
-        let talks = ui.talks.list();
+        let talks = q.ids.as_ref().map_or_else(
+            || ui.talks.list(),
+            |ids| {
+                ids.split(',')
+                    .filter(|id| plain_record_id(id))
+                    .filter_map(|id| ui.talks.get(id).ok())
+                    .collect()
+            },
+        );
         let references = if talks.iter().any(id_links::has_references) {
             ui.references.get(
                 &ui.runs,
@@ -7982,7 +8185,7 @@ async fn talk_core(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResu
         let id = resolve_talk(&ui.talks, &id)?;
         let talk = ui.talks.get(&id)?;
         let thinking = ui.is_thinking(&id);
-        Ok(Json(TalkView::with_config(talk, thinking, None, &ui.home)))
+        Ok(Json(TalkView::with_config(talk, thinking, None, &ui.home, &ui.references)))
     })
     .await
 }
@@ -19411,8 +19614,8 @@ mod tests {
         // A refresh must never navigate: the loaders still check that their
         // subject is the one on screen, and crossing the breakpoint only
         // re-reads the hash.
-        assert!(APP_JS.contains("if (state.detail.id !== id) return;"));
-        assert!(APP_JS.contains("if (state.taskDetail.id !== id) return;"));
+        assert!(APP_JS.contains("if (state.detail !== detail) return;"));
+        assert!(APP_JS.contains("if (state.taskDetail !== detail) return;"));
         assert!(APP_JS.contains("if (state.talkDetail.id !== id) return;"));
         assert!(APP_JS.contains("const relayout = () => applyRoute();"));
 
@@ -22733,7 +22936,7 @@ mod tests {
         assert!(APP_JS.contains("show($(\"task-actions-fab\"), route.name === \"task\")"));
         assert!(APP_JS.contains("if (route.name !== \"task\") closeTaskActions();"));
         // Refreshed whenever the detail redraws, including the loading state.
-        assert!(APP_JS.contains("renderTaskActions(task);"));
+        assert!(APP_JS.contains("renderTaskActions(task.coreOnly || error ? null : task);"));
         assert!(APP_JS.contains("renderTaskActions(null);"));
         // Same renderers and routes as the Queue card, no new endpoint.
         let sheet = APP_JS
@@ -23074,6 +23277,167 @@ mod tests {
     }
 
     #[test]
+    fn list_cursors_freeze_membership_and_expire_explicitly() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        std::fs::create_dir_all(ui.queue.root()).unwrap();
+        for i in 0..40 {
+            std::fs::write(ui.queue.path_of(&format!("record-{i:04}")), "broken").unwrap();
+        }
+        let (first, cursor) = page_ids(&ui, false, PageQuery::default()).unwrap();
+        assert_eq!(first.len(), STORE_PAGE_SIZE);
+        let cursor = cursor.unwrap();
+        std::fs::write(ui.queue.path_of("record-9999"), "broken").unwrap();
+        std::fs::remove_file(ui.queue.path_of(&first[0])).unwrap();
+        let (second, _) = page_ids(
+            &ui,
+            false,
+            PageQuery {
+                before: Some(cursor.clone()),
+            },
+        )
+        .unwrap();
+        assert_eq!(second[0], "record-0023");
+        assert!(second.iter().all(|id| !first.contains(id)));
+        assert!(
+            page_ids(
+                &ui,
+                true,
+                PageQuery {
+                    before: Some(cursor.clone())
+                }
+            )
+            .is_err()
+        );
+        let (fresh, _) = page_ids(&ui, false, PageQuery::default()).unwrap();
+        assert_eq!(fresh[0], "record-9999");
+        ui.monitor.list_walks.lock().unwrap().clear();
+        assert!(
+            page_ids(
+                &ui,
+                false,
+                PageQuery {
+                    before: Some(cursor)
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_queue_index_counts_only_fresh_readable_statuses() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let mut task = Task::new(
+            "task".into(),
+            "body".into(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        ui.queue.put(&mut task).unwrap();
+        assert_eq!(stats_queue(State(ui.clone())).await.unwrap().0.queued, 1);
+        let parsed = ui.monitor.queue_index.lock().unwrap().reparsed;
+        assert_eq!(stats_queue(State(ui.clone())).await.unwrap().0.queued, 1);
+        assert_eq!(ui.monitor.queue_index.lock().unwrap().reparsed, parsed);
+        task.status = crate::queue::TaskStatus::Held;
+        ui.queue.put(&mut task).unwrap();
+        assert_eq!(stats_queue(State(ui.clone())).await.unwrap().0.held, 1);
+        std::fs::write(ui.queue.path_of(&task.id), "broken").unwrap();
+        assert_eq!(stats_queue(State(ui.clone())).await.unwrap().0.held, 0);
+        ui.queue.put(&mut task).unwrap();
+        assert_eq!(stats_queue(State(ui.clone())).await.unwrap().0.held, 1);
+        std::fs::remove_file(ui.queue.path_of(&task.id)).unwrap();
+        assert_eq!(stats_queue(State(ui)).await.unwrap().0.held, 0);
+    }
+
+    #[tokio::test]
+    async fn health_notifications_revision_is_fresh_between_monitor_ticks() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        *ui.monitor.latest.lock().unwrap() = Some(((0, 0, 0, 0, 0, 0), Default::default()));
+        let before = health(State(ui.clone())).await.unwrap().0;
+        ui.notices.raise(Notice::warn("task:1", "held")).unwrap();
+        let after = health(State(ui)).await.unwrap().0;
+        assert_ne!(before.notifications_rev, after.notifications_rev);
+        assert_eq!(after.notifications_unread, 1);
+    }
+
+    #[tokio::test]
+    async fn list_pages_bound_history_and_keep_dependency_evidence() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let queue = &ui.queue;
+        let talks = &ui.talks;
+        for i in 0..1000 {
+            let id = format!("20261019-{i:06}-page");
+            let mut task = Task::new(
+                "task".into(),
+                "instruction".repeat(100),
+                PathBuf::from("/repo/magi"),
+                Source::Human,
+            );
+            task.id = id.clone();
+            if i == 0 {
+                task.status = crate::queue::TaskStatus::Held;
+            } else if i == 999 {
+                task.status = crate::queue::TaskStatus::Blocked;
+                task.blocked_by = vec!["20261019-000000-page".into()];
+            }
+            queue.put(&mut task).unwrap();
+            seed_talk_at(talks, &id, "open");
+        }
+        let page = serde_json::to_value(
+            queue_page(State(ui.clone()), Query(PageQuery::default()))
+                .await
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        assert_eq!(page["rows"].as_array().unwrap().len(), STORE_PAGE_SIZE);
+        assert_eq!(page["rows"][0]["id"], "20261019-000999-page");
+        assert!(
+            !page["rows"][0]["stuck_roots"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let cursor = page["next"].as_str().unwrap();
+        let last_id = page["rows"].as_array().unwrap().last().unwrap()["id"]
+            .as_str()
+            .unwrap();
+        // Deleting an already enumerated file cannot shift or repeat a page.
+        std::fs::remove_file(queue.path_of(last_id)).unwrap();
+        let next = serde_json::to_value(
+            queue_page(
+                State(ui.clone()),
+                Query(PageQuery {
+                    before: Some(cursor.into()),
+                }),
+            )
+            .await
+            .unwrap()
+            .0,
+        )
+        .unwrap();
+        assert_eq!(next["rows"].as_array().unwrap().len(), STORE_PAGE_SIZE);
+        assert!(next["rows"][0]["id"].as_str().unwrap() < last_id);
+        let chats = serde_json::to_value(
+            talks_page(State(ui.clone()), Query(PageQuery::default()))
+                .await
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        assert_eq!(chats["rows"].as_array().unwrap().len(), STORE_PAGE_SIZE);
+        assert!(chats["rows"][0].get("pending").is_none());
+        assert!(chats["rows"][0].get("turn_bodies_md").is_none());
+        let counts = serde_json::to_value(stats_queue(State(ui)).await.unwrap().0).unwrap();
+        assert_eq!(counts["held"], 1);
+        assert_eq!(counts["blocked"], 1);
+        assert_eq!(counts["queued"], 997);
+    }
+
+    #[test]
     fn queue_index_observes_external_replacement_deletion_and_corruption() {
         let dir = tempfile::tempdir().unwrap();
         let ui = delta_test_ui(dir.path());
@@ -23209,6 +23573,11 @@ mod tests {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/web_latency/baseline.rs"
+    ));
+
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/web_latency/lists.rs"
     ));
 
     #[tokio::test]

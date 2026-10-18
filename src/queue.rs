@@ -257,9 +257,14 @@ impl TaskCounts {
     /// already read, so it needs no root of its own and stays trivially
     /// testable against a hand-built slice.
     pub fn of(tasks: &[Task]) -> Self {
+        Self::of_statuses(tasks.iter().map(|task| task.status))
+    }
+
+    /// Count current statuses from a reconciled display projection.
+    pub(crate) fn of_statuses(statuses: impl IntoIterator<Item = TaskStatus>) -> Self {
         let mut counts = Self::default();
-        for t in tasks {
-            match t.status {
+        for status in statuses {
+            match status {
                 TaskStatus::Queued => counts.queued += 1,
                 TaskStatus::Running => counts.running += 1,
                 TaskStatus::Done => counts.done += 1,

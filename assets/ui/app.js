@@ -3351,12 +3351,8 @@ function renderStats() {
     );
   }
 
-  /* stats-body stays visible whenever there is anything to show at all -
-     which, unlike the run-only panels below, includes the queue: a home
-     that has never run a competition can still have tasks queued, and the
-     queue counts this dashboard promises are not derived from run history.
-     Only stats-runs-section (KPIs, verdicts, agents, reviewers) is gated on
-     noRuns; the queue panel is rendered unconditionally, right below. */
+  /* Run history reveals its own panels. The independent queue panel is
+     already visible even when this slower response has not arrived. */
   show($("stats-body"), true);
   show($("stats-empty"), noRuns);
   show($("stats-runs-section"), !noRuns);
@@ -3958,7 +3954,11 @@ function renderStatsBumps(b) {
    Queued and Failed both land on "upnext" - the same section queueSection()
    itself puts them in, since a card's own chip already tells them apart. */
 function renderStatsQueue(q) {
+  if (!q) return; // Run-only refreshes retain independently loaded queue counts.
   const root = $("stats-queue-tiles");
+  const signature = JSON.stringify(q);
+  if (root.dataset.counts === signature) return;
+  root.dataset.counts = signature;
   clear(root);
   const sectionTile = (label, value, tone, sectionKey) => statsTile(label, value, tone, {
     onClick: () => openQueueSectionFocus(sectionKey),
@@ -9287,7 +9287,7 @@ function renderStoreList(partial, render) {
 }
 
 function mergeStore(name, rows, delta) {
-  const merged = new Map(state[name].map((row) => [row.id, row]));
+  const merged = new Map((state[name] || []).map((row) => [row.id, row]));
   for (const id of delta.removed) merged.delete(id);
   // A changed file that could not be decoded is absent from the API too.
   for (const id of delta.changed) merged.delete(id);
@@ -9328,13 +9328,38 @@ function loadStore(name, url, change, apply) {
         try {
           const endpoint = partial
             ? `${url}${url.includes("?") ? "&" : "?"}ids=${encodeURIComponent(delta.changed.join(","))}` : url;
-          let rows = await getJson(endpoint);
+          let rows;
+          const paged = !partial && (name === "queue" || name === "talks");
+          if (paged) {
+            let cursor = null;
+            const collected = new Map();
+            do {
+              const page = await getJson(`${url}/page${cursor ? `?before=${encodeURIComponent(cursor)}` : ""}`);
+              for (const row of page.rows) collected.set(row.id, row);
+              // Keep the old snapshot while refreshing; remove deleted rows
+              // only after a complete enumeration. New pages retain DOM nodes.
+              const visible = new Map((state[name] || []).map(row => [row.id, row]));
+              for (const row of collected.values()) visible.set(row.id, row);
+              apply(mergeStore(name, [...visible.values()], { changed: [], removed: [] }), true, observed, page.rows);
+              cursor = page.next;
+              sectionNotice(`${name}-h`, `${name}-load-state`, cursor ? "Loading older entries…" : "");
+              // A newer notification supersedes this enumeration. Never
+              // acknowledge a revision from an unfinished walk.
+              if (flight.pending) break;
+            } while (cursor);
+            if (flight.pending) continue;
+            rows = mergeStore(name, [...collected.values()], {
+              changed: (state[name] || []).map(row => row.id), removed: [],
+            });
+          } else {
+            rows = await getJson(endpoint);
+          }
           if (partial && name === "runs" && delta.changed.some((id) =>
             state.runs.some((run) => run.id === id) && !rows.some((row) => row.id === id))) {
             rows = await getJson(url);
             apply(rows, false, observed, rows);
           } else {
-            apply(partial ? mergeStore(name, rows, delta) : rows, partial, observed, rows);
+            apply(partial ? mergeStore(name, rows, delta) : rows, partial || paged, observed, rows);
           }
           // Only successful reads acknowledge the target. A later notification
           // may already be queued; its base will be checked on the next read.
@@ -9375,24 +9400,32 @@ function loadQueue(change) {
   });
 }
 
-async function loadStats({ background = false } = {}) {
-  const params = new URLSearchParams();
+async function loadStats({ background = false, queueOnly = false } = {}) {
+  const params = new URLSearchParams({ runs_only: "true" });
   if (state.statsRepo) params.set("repo", state.statsRepo);
   if (state.statsAll) params.set("all", "true");
   const query = params.toString();
   const key = `stats:${query}`;
   for (const [name, job] of detailSections) {
-    if (name.startsWith("stats:") && name !== key) {
+    if (!queueOnly && name.startsWith("stats:") && name !== "stats:queue" && name !== key) {
       job.controller.abort();
       detailSections.delete(name);
     }
   }
-  sectionNotice("stats-h", "stats-load-state", state.stats ? "Updating statistics…" : "Loading statistics…");
-  return sectionRequest(key, query ? `${API.stats}?${query}` : API.stats, stats => {
+  if (!queueOnly) sectionNotice("stats-h", "stats-load-state", state.stats ? "Updating statistics…" : "Loading statistics…");
+  show($("stats-queue-scope-note"), !!state.statsRepo);
+  sectionNotice("stats-queue-tiles", "stats-queue-state", state.stats ? "Updating queue…" : "Loading queue…");
+  const queue = sectionRequest("stats:queue", `${API.stats}/queue`, counts => {
+    renderStatsQueue(counts);
+    sectionNotice("stats-queue-tiles", "stats-queue-state", "");
+  }, error => sectionNotice("stats-queue-tiles", "stats-queue-state", `Queue: ${error.message}`, () => loadStats()));
+  if (queueOnly) return queue;
+  const history = sectionRequest(key, query ? `${API.stats}?${query}` : API.stats, stats => {
     state.stats = stats;
     sectionNotice("stats-h", "stats-load-state", "");
     renderStats();
   }, error => sectionNotice("stats-h", "stats-load-state", `Statistics: ${error.message}`, () => loadStats()));
+  await Promise.allSettled([queue, history]);
 }
 
 /* The repository selector's change handler - switches state.statsRepo and
@@ -9846,7 +9879,9 @@ async function applyRevisions_(source) {
   if (taskStale && state.taskDetail.id) {
     jobs.push(loadTask(state.taskDetail.id, { background: true }));
   }
-  if (statsStale && state.route.name === "stats") jobs.push(loadStats({ background: true }));
+  if (statsStale && state.route.name === "stats") {
+    jobs.push(loadStats({ background: true, queueOnly: runsRev === state.rev.runs }));
+  }
   if (questionsRev !== state.rev.questions) {
     state.rev.questions = questionsRev;
     jobs.push(loadQuestions());
