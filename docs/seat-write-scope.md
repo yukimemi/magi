@@ -128,21 +128,45 @@ pre-gate edits. Rescue commits release their repository lease before entering
 verification. This matches editing waves and avoids a cache holder waiting
 for a repository reserved by the very verification waiting for its cache.
 
-Control-plane seats (`conduct`, `dupes`, and `deputy`) and all chat turns
-(`queue::CHAT_NODE`) stay outside repository scheduling. Chat is conversation,
-not a long repository editing session: it never acquires or waits on a
-`SeatLease` or participates in the per-repository gate, regardless of write
-permission or coordination registration. This includes consult drains, completion
-notices and waiter-style continuations delivered through `talk::turn`.
-Existing filesystem grants and sandbox policy remain unchanged.
-The current consultation prompt overrides the standing briefing: it permits
-only supplied conversation/question context and supported control-plane commands,
-and forbids repository inspection, fetch, tests and edits for that turn.
-Ordinary write-enabled chats with empty writable roots retain their shared Git
-and question-store grants; read-only chats remain read-only.
-Control-only turns do not claim to hold a repository lease. This preserves the supported
-question/control-plane route while an editing seat waits for an answer; putting
-that route behind the editor's reservation would deadlock delivery.
+Control-plane seats (`conduct`, `dupes`, and `deputy`) and ordinary chat turns
+(`queue::CHAT_NODE`), including consult drains, completion notices and waiter-style
+continuations delivered through `talk::turn`, stay outside repository scheduling.
+They never acquire or wait on a `SeatLease` or the per-repository gate.
+Consultation investigation is the explicit exception described below. Explicit invocation scope, independently
+of question-store write grants, selects consultation control or investigation.
+Control turns may use supplied context and supported read-only magi diagnostics
+while the task seat waits for an answer. They cannot inspect repository evidence.
+
+When evidence is needed, the conversation returns a single structured final
+response (`{"investigate_question":"<full question id>"}`). Only an entire
+successful response is interpreted, never a quoted/fenced example or failed
+output. The launcher checks that the question is still open and consulted to
+this conversation, tries the fair local reader gate and external OS lock without
+waiting, then rechecks the question and conversation before continuing the same
+seat/session. This is an internal continuation, not another operator message;
+exact-answer authorization keeps its original persisted send boundaries.
+
+Investigation has read-only filesystem access, no extra writable roots and no
+sandbox bypass, including in write-enabled standing conversations. It may inspect
+existing files/history within the standing permissions, but cannot fetch, edit,
+answer, close, withdraw, discard or resume. Its lease follows the ordinary process
+cleanup lifetime, including cancellation and descendants. The next operator turn
+returns to consultation control while the question remains open. Unregistered
+repositories follow the existing no-coordination policy; invalid registrations
+and unsupported platforms fail closed.
+
+A busy editor, queued writer or external lock produces an investigation-pending
+reply immediately. The lock owner is unknown; the task awaiting this question may
+be holding it. Never release another seat's lock or answer merely to investigate.
+Use read-only control-plane diagnostics and ask to investigate again in the same
+conversation when coordination is available. No question or execution state is
+changed by this transition. Genuine decisions still go through `magi answer`
+with its exact action-specific evidence and owner checks.
+
+Ordinary chats retain their existing filesystem grants and sandbox policy without
+repository scheduling. Read-only chats remain read-only; write-enabled chats
+retain their shared Git and question-store grants. Consultation delivery grants
+no repository edit permission.
 
 Repository readers (including judges, advisors and reviewers) still wait for
 the editor: allowing them through would violate the shared-lock contract.

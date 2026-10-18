@@ -1642,6 +1642,7 @@ async fn ask_judge(cfg: &Config, cwd: &Path, title: &str, body: &str) -> Result<
         }
         let mut seat = agent::SeatState::new("github-text", &spec.id, crate::rng::entropy());
         let inv = agent::Invocation {
+            scope: crate::agent::InvocationScope::Repository,
             coordination: cfg.coordination.as_ref(),
             fetched_base: None,
             cwd,

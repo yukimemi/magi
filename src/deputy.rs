@@ -729,6 +729,7 @@ impl Job {
         macro_rules! invocation {
             ($prompt:expr, $stem:expr, $timeout:expr) => {
                 Invocation {
+                    scope: crate::agent::InvocationScope::Repository,
                     coordination: cfg.coordination.as_ref(),
                     fetched_base: None,
                     cwd: &cwd,

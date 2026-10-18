@@ -2019,7 +2019,7 @@ pub async fn respond(
 ) -> Result<()> {
     check_lease(lease, talk)?;
     lease
-        .beating(turn(talk, store, cfg, text))
+        .beating(turn(lease, talk, store, cfg, text))
         .await
         .and_then(|done| done)
 }
@@ -2318,13 +2318,51 @@ fn pending_matches(talk: &Talk, expected_text: &str, expected_attachments: &[Str
             .eq(expected_attachments.iter())
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvestigationRequest {
+    investigate_question: String,
+}
+
+fn investigation_request(out: &agent::AgentOutput) -> Option<String> {
+    if !out.usable() || out.quota_exhausted() || out.dropped.is_some() {
+        return None;
+    }
+    // Parse only an entire successful final response, never quoted snippets,
+    // tool output, fenced examples or a failed attempt's stdout.
+    let request: InvestigationRequest = serde_json::from_str(out.text.trim()).ok()?;
+    (!request.investigate_question.is_empty()).then_some(request.investigate_question)
+}
+
+fn validate_investigation(
+    questions: &crate::ask::Questions,
+    talks: &Talks,
+    talk: &str,
+    question: &str,
+) -> Result<crate::ask::ChatConsult> {
+    if !talks.get(talk)?.status.open() {
+        bail!("conversation closed; investigation cancelled");
+    }
+    let q = questions.get(question)?;
+    if q.id != question || !q.status.open() || !q.consult.as_ref().is_some_and(|c| c.talk == talk) {
+        bail!("question is no longer open for consultation in this conversation");
+    }
+    Ok(q.consult.expect("validated consultation"))
+}
+
 /// Invoke the conversation's agent once and append what it said.
 ///
 /// The first turn ever taken carries the full [`briefing`], because nothing
 /// else has told the agent what this conversation is or what it may do.
 /// Every turn after that resends nothing when the CLI can resume its own
 /// session, and falls back to [`transcript`] only when it cannot.
-async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Result<()> {
+async fn turn(
+    lease: &TurnLease,
+    talk: &mut Talk,
+    store: &Talks,
+    cfg: &Config,
+    text: &str,
+) -> Result<()> {
     // Freeze both boundaries before invoking the CLI. Failure notes must not
     // hide unread posts in old records, and posts arriving during any attempt
     // (including fallback) were absent from this snapshot's prompt.
@@ -2390,7 +2428,10 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     let consult_roots = questions.as_ref().map_or_else(Vec::new, |questions| {
         crate::consult::answer_write_roots(questions, store, talk)
     });
-    let consulted = !consult_roots.is_empty();
+    let consulted = questions.as_ref().is_some_and(|questions| {
+        crate::consult::pending_consults(questions, &talk.id)
+            || crate::consult::authorized_answers(questions, talk)
+    });
 
     let (allow_write, unsandboxed) = turn_access(cfg.talk.allow_write, consulted);
 
@@ -2440,6 +2481,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     };
 
     let mut outcome = None;
+    let mut continuation_requested = false;
     let mut fell_back_from: Option<String> = None;
     // What the conversation looked like after the first agent's failed try,
     // so an exhausted chain leaves exactly what a single failed seat would.
@@ -2538,6 +2580,11 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             format!("{stem}-{}", spec.id)
         };
         let inv = Invocation {
+            scope: if consulted {
+                agent::InvocationScope::ConsultationControl
+            } else {
+                agent::InvocationScope::Repository
+            },
             coordination: cfg.coordination.as_ref(),
             fetched_base: None,
             cwd: &talk.repo,
@@ -2560,8 +2607,84 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             attachments: &attachment_paths,
             writable: &consult_roots,
         };
-        let result = agent::invoke(spec, &mut talk.seat, &inv).await;
-        let advance = agent::chain_advances(&result);
+        let wait = crate::repo_lock::WaitPolicy::new(
+            Duration::from_secs(cfg.graph.timeout_resource_wait),
+            || false,
+        );
+        let mut result = wait.scope(agent::invoke(spec, &mut talk.seat, &inv)).await;
+        if consulted
+            && let Ok(out) = &result
+            && let Some(id) = investigation_request(out)
+        {
+            continuation_requested = true;
+            // An internal continuation is not an operator send: do not append
+            // a turn or move exact-answer authorization's evidence boundary.
+            let continuation = async {
+                let questions = questions.as_ref().context("question store unavailable")?;
+                if !lease.holds() {
+                    bail!("conversation turn ownership lost; investigation cancelled");
+                }
+                let consultation = validate_investigation(questions, store, &talk.id, &id)?;
+                let repository_lease =
+                    crate::repo_lock::SeatLease::try_reader(&talk.repo, cfg.coordination.as_ref())
+                        .await?;
+                // Acquisition resolves Git asynchronously. Recheck close,
+                // deletion, answer and consultation withdrawal before spawn.
+                if !lease.holds() {
+                    bail!("conversation turn ownership lost; investigation cancelled");
+                }
+                if validate_investigation(questions, store, &talk.id, &id)? != consultation {
+                    bail!("consultation changed; request investigation again");
+                }
+                let body = format!(
+                    "Investigate evidence needed for open question {id}. The operator message being answered is unchanged:\n\n{body}"
+                );
+                let investigation_stem = format!("{attempt_stem}-investigation");
+                let investigation = Invocation {
+                    scope: agent::InvocationScope::ConsultationInvestigation,
+                    prompt: &body,
+                    allow_write: false,
+                    unsandboxed: false,
+                    writable: &[],
+                    stem: &investigation_stem,
+                    ..inv.clone()
+                };
+                agent::invoke_leased(
+                    spec,
+                    &mut talk.seat,
+                    &investigation,
+                    repository_lease,
+                    || {
+                        if !lease.holds() {
+                            bail!("conversation turn ownership lost; investigation cancelled");
+                        }
+                        if validate_investigation(questions, store, &talk.id, &id)? != consultation
+                        {
+                            bail!("consultation changed; request investigation again");
+                        }
+                        Ok(())
+                    },
+                )
+                .await
+            };
+            let investigation_result = wait.scope(continuation).await;
+            if !lease.holds() {
+                bail!("conversation turn ownership lost; investigation cancelled");
+            }
+            result = match investigation_result {
+                Ok(out) => Ok(out),
+                Err(error) => {
+                    // Keep the successful control reply's session and report
+                    // a hold, rather than falling back into another seat.
+                    let mut out = result.expect("successful control response");
+                    out.text = format!(
+                        "Investigation pending for question {id}: {error}. This investigation request made no answer or execution transition. Ask to investigate again in this conversation when repository coordination is available. The task awaiting this question may hold the lock; do not release another seat's lock. Supported read-only control-plane diagnostics remain available to decide the next step."
+                    );
+                    Ok(out)
+                }
+            };
+        }
+        let advance = !continuation_requested && agent::chain_advances(&result);
         if n == 0 || !advance {
             outcome = Some(result);
         } else {
@@ -2572,7 +2695,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             break;
         }
     }
-    if outcome.as_ref().is_some_and(agent::chain_advances) {
+    if !continuation_requested && outcome.as_ref().is_some_and(agent::chain_advances) {
         // Exhausted: back to the agent the conversation had, so the note
         // below names it and the next turn starts from it again.
         if let Some((id, seat)) = first_try {
@@ -5563,6 +5686,45 @@ mod tests {
             on_disk.turns
         );
         let _ = &cfg; // config kept only to build the agent above
+    }
+
+    #[test]
+    fn investigation_revalidates_question_identity_ownership_and_open_state() {
+        let (tmp, talks) = store();
+        let cfg = config(mock_agent(tmp.path(), REPLY, env("hi")));
+        let mut talk = begin(&talks, &cfg, tmp.path().to_owned(), None).unwrap();
+        let questions = crate::ask::Questions::at(tmp.path().join("questions"));
+        let mut q = crate::ask::Question::new(
+            "run".into(),
+            "implement".into(),
+            "impl-A".into(),
+            "Investigate?".into(),
+            String::new(),
+            vec![],
+        );
+        q.consult = Some(crate::ask::ChatConsult {
+            talk: talk.id.clone(),
+            at: Timestamp::now(),
+        });
+        questions.put(&mut q).unwrap();
+        let validate = || validate_investigation(&questions, &talks, &talk.id, &q.id);
+        assert_eq!(validate().unwrap(), q.consult.clone().unwrap());
+        assert!(validate_investigation(&questions, &talks, &talk.id, q.short()).is_err());
+        for change in [0, 1, 2] {
+            let mut changed = q.clone();
+            match change {
+                0 => changed.consult = None,
+                1 => changed.consult.as_mut().unwrap().talk = "other-talk".into(),
+                _ => changed.status = crate::ask::QuestionStatus::Answered,
+            }
+            questions.put(&mut changed).unwrap();
+            assert!(validate().is_err());
+            assert_eq!(questions.get(&q.id).unwrap(), changed);
+        }
+        questions.put(&mut q).unwrap();
+        close(&mut talk, &talks).unwrap();
+        assert!(validate_investigation(&questions, &talks, &talk.id, &q.id).is_err());
+        assert_eq!(questions.get(&q.id).unwrap(), q);
     }
 
     #[test]

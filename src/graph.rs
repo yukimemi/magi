@@ -2185,6 +2185,7 @@ impl Runner {
                     spec,
                     &mut seat,
                     &Invocation {
+                        scope: crate::agent::InvocationScope::Repository,
                         coordination: self.state.config.coordination.as_ref(),
                         fetched_base: None,
                         cwd,
@@ -9384,6 +9385,7 @@ async fn wave(
                     &job.spec,
                     &mut seat,
                     &Invocation {
+                        scope: crate::agent::InvocationScope::Repository,
                         coordination: coordination.as_ref(),
                         fetched_base: fetched_base.as_ref(),
                         cwd: &job.cwd,
