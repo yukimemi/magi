@@ -1735,13 +1735,21 @@ mod tests {
         let listing = git(&repo, &["worktree", "list", "--porcelain"])
             .await
             .unwrap();
-        assert!(listing.contains(&wt.to_string_lossy().to_string()));
+        let registered = listing
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .map(PathBuf::from)
+            .find(|path| path.canonicalize().unwrap() == wt.canonicalize().unwrap())
+            .expect("the refused removal must retain the worktree registration");
         assert!(worktree_remove(&repo, &wt).await.unwrap());
         assert!(!wt.exists());
         let listing = git(&repo, &["worktree", "list", "--porcelain"])
             .await
             .unwrap();
-        assert!(!listing.contains(&wt.to_string_lossy().to_string()));
+        assert!(!listing.lines().any(|line| {
+            line.strip_prefix("worktree ")
+                .is_some_and(|path| Path::new(path) == registered)
+        }));
     }
 
     #[tokio::test]

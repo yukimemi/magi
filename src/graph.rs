@@ -13408,12 +13408,20 @@ mod tests {
         let candidate = runner.state.candidates[0].clone();
         // Remove only the disposable fixture directory, leaving Git's linked
         // worktree registration and branch intact, as in a vanished checkout.
+        let registered = git::worktree_holding(&repo, &candidate.branch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registered.canonicalize().unwrap(),
+            candidate.worktree.canonicalize().unwrap()
+        );
         std::fs::remove_dir_all(&candidate.worktree).unwrap();
-        assert!(
-            git::git(&repo, &["worktree", "list", "--porcelain"])
+        assert_eq!(
+            git::worktree_holding(&repo, &candidate.branch)
                 .await
-                .unwrap()
-                .contains(candidate.worktree.to_str().unwrap())
+                .unwrap(),
+            Some(registered)
         );
         assert!(
             !git::branch_delete(&repo, &candidate.branch).await.unwrap(),
@@ -13422,11 +13430,11 @@ mod tests {
         runner.fold_losers().await.unwrap();
         assert!(runner.state.candidates[0].folded);
         assert!(!git::branch_exists(&repo, &candidate.branch).await.unwrap());
-        assert!(
-            !git::git(&repo, &["worktree", "list", "--porcelain"])
+        assert_eq!(
+            git::worktree_holding(&repo, &candidate.branch)
                 .await
-                .unwrap()
-                .contains(candidate.worktree.to_str().unwrap())
+                .unwrap(),
+            None
         );
         runner.state = RunState::load(&runner.state.id).unwrap();
         runner.fold_losers().await.unwrap();
@@ -13438,12 +13446,20 @@ mod tests {
         let repo = runner.state.repo.clone();
         let candidate = runner.state.candidates[0].clone();
         let winner = runner.state.candidates[1].clone();
+        let registered = git::worktree_holding(&repo, &candidate.branch)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registered.canonicalize().unwrap(),
+            candidate.worktree.canonicalize().unwrap()
+        );
         std::fs::remove_dir_all(&candidate.worktree).unwrap();
-        assert!(
-            git::git(&repo, &["worktree", "list", "--porcelain"])
+        assert_eq!(
+            git::worktree_holding(&repo, &candidate.branch)
                 .await
-                .unwrap()
-                .contains(candidate.worktree.to_str().unwrap())
+                .unwrap(),
+            Some(registered)
         );
         assert!(!git::branch_delete(&repo, &candidate.branch).await.unwrap());
 
@@ -13454,11 +13470,11 @@ mod tests {
             runner.state = RunState::load(&runner.state.id).unwrap();
             assert!(runner.state.candidates[0].folded);
             assert!(!git::branch_exists(&repo, &candidate.branch).await.unwrap());
-            assert!(
-                !git::git(&repo, &["worktree", "list", "--porcelain"])
+            assert_eq!(
+                git::worktree_holding(&repo, &candidate.branch)
                     .await
-                    .unwrap()
-                    .contains(candidate.worktree.to_str().unwrap())
+                    .unwrap(),
+                None
             );
             assert!(!runner.state.candidates[1].folded);
             assert!(winner.worktree.exists());
