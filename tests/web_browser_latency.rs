@@ -119,7 +119,7 @@ async fn browser_history_latency() {
         "Useful run instructions".into(),
         fx.config.clone(),
     );
-    run.status = RunStatus::Blocked;
+    run.status = RunStatus::Reviewing;
     run.save_under(&home).unwrap();
     let mut task = Task::new(
         "Useful task".into(),
@@ -164,7 +164,8 @@ async fn browser_history_latency() {
         home.join("runs"),
         home.clone(),
         fx.repo.clone(),
-    );
+    )
+    .with_worktrees_root(home.join("worktrees"));
     let requests = Arc::new(AtomicUsize::new(0));
     let counter = requests.clone();
     let router = ui.router().layer(axum::middleware::from_fn(
@@ -223,10 +224,13 @@ async fn browser_history_latency() {
                         .unwrap();
                 }
                 for (browser, page) in browsers.iter_mut().zip(&pages) {
-                    browser
+                    if let Err(error) = browser
                         .wait_for(page, "!!window.latency?.done", Duration::from_secs(120))
                         .await
-                        .unwrap();
+                    {
+                        let diagnostic = browser.eval(page, "({latency: window.latency, text: document.body.innerText.slice(0, 4000)})").await;
+                        panic!("{route}: {error}; {diagnostic:?}");
+                    }
                     let result = browser.eval(page, "window.latency.done").await.unwrap();
                     assert_eq!(result["errors"], json!([]), "failed requests: {result}");
                     let events = browser.take_events(&page.session);
