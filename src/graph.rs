@@ -484,17 +484,33 @@ async fn sync_review_branch(repo: &Path, branch: &str, remote: &str, base: &str)
     Ok(())
 }
 
-async fn resolve_base(repo: &Path, base_branch: &str, remote: &str) -> Result<String> {
+async fn resolve_base(
+    repo: &Path,
+    base_branch: &str,
+    remote: &str,
+    coordination: Option<&crate::config::Coordination>,
+) -> Result<crate::run::FetchedBase> {
+    let _lease = crate::repo_lock::SeatLease::operation_with(
+        repo,
+        coordination,
+        &crate::repo_lock::WaitPolicy::current(),
+    )
+    .await?;
     let tracking = format!("{remote}/{base_branch}");
     let fetched = git::fetch(repo, remote, base_branch).await;
     if let Ok(out) = &fetched
         && out.ok()
         && git::rev_exists(repo, &tracking).await
     {
-        return git::rev_parse(repo, &tracking).await;
+        return Ok(crate::run::FetchedBase {
+            remote: remote.to_owned(),
+            branch: base_branch.to_owned(),
+            commit: git::rev_parse(repo, &tracking).await?,
+            fetched_at: jiff::Timestamp::now(),
+        });
     }
     let why = match &fetched {
-        Ok(out) if !out.ok() => out.stderr.lines().next().unwrap_or("").to_owned(),
+        Ok(out) if !out.ok() => out.stderr.trim().to_owned(),
         Ok(_) => format!("{remote} has no {base_branch}"),
         Err(e) => e.to_string(),
     };
@@ -503,7 +519,9 @@ async fn resolve_base(repo: &Path, base_branch: &str, remote: &str) -> Result<St
     bail!(
         "cannot read {tracking} ({why}); refusing to branch off the local \
          `{base_branch}`, which may be behind. Fix the remote, or set [merge] \
-         base / remote in magi.toml"
+         base / remote in magi.toml. This is launcher preparation: check the \
+         launcher's Git administration access, network and repository coordination \
+         before retrying; an unattended seat cannot approve those permissions"
     )
 }
 
@@ -624,7 +642,14 @@ impl Runner {
         let base_branch =
             git::merge_base_branch(&repo, &config.merge.remote, config.merge.base.as_deref())
                 .await?;
-        let base_commit = resolve_base(&repo, &base_branch, &config.merge.remote).await?;
+        let fetched_base = resolve_base(
+            &repo,
+            &base_branch,
+            &config.merge.remote,
+            config.coordination.as_ref(),
+        )
+        .await?;
+        let base_commit = fetched_base.commit.clone();
         let roles = config.resolve_roles()?;
         let max_parallel = config.graph.max_parallel.max(1);
         // A task that points at work already in the repository starts from
@@ -641,6 +666,7 @@ impl Runner {
         // Recorded before the first save, so a crash right after minting
         // cannot leave a run with no origin. Legibility only: nothing reads it
         // to decide anything.
+        state.fetched_base = Some(fetched_base);
         state.origin = Some(origin);
         for seed in &seeds {
             state.event(
@@ -705,7 +731,14 @@ impl Runner {
         if base_branch == branch {
             bail!("`{branch}` is the base branch; there is nothing to review against");
         }
-        let base_commit = resolve_base(&repo, &base_branch, &config.merge.remote).await?;
+        let fetched_base = resolve_base(
+            &repo,
+            &base_branch,
+            &config.merge.remote,
+            config.coordination.as_ref(),
+        )
+        .await?;
+        let base_commit = fetched_base.commit.clone();
 
         let roles = config.resolve_roles()?;
         let max_parallel = config.graph.max_parallel.max(1);
@@ -716,6 +749,7 @@ impl Runner {
             String::new(),
             config,
         );
+        state.fetched_base = Some(fetched_base);
         state.origin = Some(origin);
 
         // Released before anything else touches the branch: a stale local
@@ -809,7 +843,14 @@ impl Runner {
         let base_branch =
             git::merge_base_branch(repo, &config.merge.remote, config.merge.base.as_deref())
                 .await?;
-        let base_commit = resolve_base(repo, &base_branch, &config.merge.remote).await?;
+        let fetched_base = resolve_base(
+            repo,
+            &base_branch,
+            &config.merge.remote,
+            config.coordination.as_ref(),
+        )
+        .await?;
+        let base_commit = fetched_base.commit.clone();
         selection
             .verify(repo, &config.merge.remote, &base_branch, &selection.head)
             .await?;
@@ -822,6 +863,7 @@ impl Runner {
             selection.instruction.clone(),
             config,
         );
+        state.fetched_base = Some(fetched_base);
         state.origin = Some(crate::run::Origin::queue(task));
         state.pr_head = Some(selection.branch.clone());
         state.pr_recovery = Some(selection.clone());
@@ -2144,6 +2186,7 @@ impl Runner {
                     &mut seat,
                     &Invocation {
                         coordination: self.state.config.coordination.as_ref(),
+                        fetched_base: None,
                         cwd,
                         prompt: &prompt,
                         timeout,
@@ -9316,6 +9359,7 @@ async fn wave(
         let spawned_tx = spawned_tx.clone();
         let repository_wait = repository_wait.clone();
         let coordination = state.config.coordination.clone();
+        let fetched_base = state.fetched_base.clone();
         set.spawn(async move {
             // A wait for a parallelism slot is scheduling, not the agent: it
             // is bounded by its own limit and ends as a resource block, never
@@ -9341,6 +9385,7 @@ async fn wave(
                     &mut seat,
                     &Invocation {
                         coordination: coordination.as_ref(),
+                        fetched_base: fetched_base.as_ref(),
                         cwd: &job.cwd,
                         prompt: &job.prompt,
                         timeout: job.timeout,
@@ -11289,6 +11334,99 @@ async fn ensure_setup_config(state: &mut RunState, repo: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn launcher_base_fetch_requires_remote_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let remote = tmp.path().join("remote");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::create_dir(&remote).unwrap();
+        git::git(&remote, &["init", "--bare", "-b", "main"])
+            .await
+            .unwrap();
+        git::git(&repo, &["init", "-b", "main"]).await.unwrap();
+        git::git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+        )
+        .await
+        .unwrap();
+        git::git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        git::git(&repo, &["push", "origin", "main"]).await.unwrap();
+        let head = git::rev_parse(&repo, "HEAD").await.unwrap();
+        assert_eq!(
+            resolve_base(&repo, "main", "origin", None)
+                .await
+                .unwrap()
+                .commit,
+            head
+        );
+        #[cfg(unix)]
+        {
+            let policy: crate::config::Coordination = toml::from_str(
+                "contract_file='fixture.contract'\ncontract_token='fixture-v1'\nlock_file='fixture.lock'",
+            ).unwrap();
+            std::fs::write(repo.join(".git/fixture.contract"), "fixture-v1").unwrap();
+            std::fs::remove_file(repo.join(".git/FETCH_HEAD")).unwrap();
+            let held = crate::repo_lock::SeatLease::operation_with(
+                &repo,
+                Some(&policy),
+                &crate::repo_lock::WaitPolicy::default(),
+            )
+            .await
+            .unwrap();
+            assert!(held.is_some());
+            let fetch = resolve_base(&repo, "main", "origin", Some(&policy));
+            tokio::pin!(fetch);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), &mut fetch)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !repo.join(".git/FETCH_HEAD").exists(),
+                "no fetch before admission"
+            );
+            drop(held);
+            let fetched = fetch.await.unwrap();
+            assert_eq!(fetched.commit, head);
+            assert_eq!(fetched.remote, "origin");
+            assert_eq!(fetched.branch, "main");
+        }
+        // A surviving tracking ref is not successful fetch evidence.
+        git::git(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                tmp.path().join("missing").to_str().unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+        let error = resolve_base(&repo, "main", "origin", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("cannot read origin/main"));
+        assert!(error.contains("refusing to branch off"));
+    }
+
     #[test]
     fn should_retitle_only_replaces_magi_shaped_or_leaked_titles() {
         let leaked = vec!["chore(deps): update a crate".to_owned()];

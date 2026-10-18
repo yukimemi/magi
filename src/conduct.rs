@@ -1386,6 +1386,7 @@ impl Conductor {
             };
             let inv = Invocation {
                 coordination: cfg.coordination.as_ref(),
+                fetched_base: None,
                 cwd: repo,
                 prompt: &body,
                 timeout: TURN_TIMEOUT,

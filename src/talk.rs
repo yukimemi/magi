@@ -2539,6 +2539,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         };
         let inv = Invocation {
             coordination: cfg.coordination.as_ref(),
+            fetched_base: None,
             cwd: &talk.repo,
             prompt: &body,
             timeout: turn_timeout(cfg),

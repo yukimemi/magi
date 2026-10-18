@@ -4647,6 +4647,7 @@ pub async fn fix_round(
             &mut seat,
             &Invocation {
                 coordination: state.config.coordination.as_ref(),
+                fetched_base: state.fetched_base.as_ref(),
                 cwd: &winner.worktree,
                 prompt: &prompt,
                 timeout: Duration::from_secs(state.config.graph.timeout_fix),

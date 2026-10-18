@@ -338,3 +338,118 @@ An authorized `git fetch origin main` succeeded during round 1. Both
 `3393efac3837257589499a9d686cdedbb54cd844`. A fresh supported `magi task show`
 confirmed the original task still has its manual hold and both original runs;
 no release was attempted.
+
+
+## 2026-10-18: editing-seat Git/network investigation
+
+保存済み run `20261018-084955-964b` の `impl-A.out` と、対応する
+セッション `01a14c4b-2cb9-7341-bef5-88fe101e2eb0` を読み取りで確認した。
+CLI は 0.160.0、実効設定は `workspace-write`、`approval_policy=never`、
+`network_access=false` だった。`writable_roots` には対象リポジトリの
+common Git directory と questions / notifications がすべて含まれていた。
+つまり、この失敗を「common directory の指定がなかった」と説明することはできない。
+通常の fetch は linked worktree の `FETCH_HEAD` を開く段階で EPERM、
+`--no-write-fetch-head` では GitHub の名前解決失敗が記録されていた。
+run の `base_commit` は依頼文にある SHA と一致する。この SHA は別リポジトリの
+基底であり、このインフラ修正へ cherry-pick するコミットではない。
+
+依頼時の情報はインストール版 0.159.0、daemon 起動 08:40 JST だった。
+本調査時のインストール版は 0.159.1、daemon heartbeat は別 PID と
+10:37 JST 起動を示した。プロセス一覧はこの席の sandbox に拒否されたため、
+元 daemon の実行ファイルと元席 argv 全文は証明できていない。
+現在の daemon は `lsof` の実行イメージの inode / size とインストール先が一致し、
+Web handover ログも 0.159.1 起動を記録していた。保存セッションの実効設定と
+現在のソースを区別すること。今後の `*.access.json` は launcher の版、
+要求範囲、取得証跡を保存するが、これも CLI が実際に採用した設定の証明ではない。
+argv は debug の `spawning agent` 記録、実効設定は対応セッションの
+`turn_context.sandbox_policy` と照合する。
+
+ホストからの fetch / ls-remote 成功は依頼者の観測である。一方、この席からの
+ls-remote は名前解決に失敗し、入れ子 sandbox は
+`sandbox_apply: Operation not permitted` で起動できなかった。
+実効ネットワーク拒否とホスト成功の組合せは sandbox 側制限と整合するが、
+この席ではネットワーク設定の比較実験は完了していない。
+Git 管理領域の保護範囲も、指定済み grant と実際の EPERM は確認できたものの、
+他の Git 操作すべてが拒否されると一般化してはならない。
+本修正席でも common Git directory が許可対象に含まれている状態で
+`git add` / `git commit` を実行したが、linked worktree の `index.lock` 作成が
+EPERM で拒否された。status / diff / log は実行できた。
+これはこの席の実際の sandbox での観測であり、入れ子 fixture の成功ではない。
+変更は割り当て worktree に残しており、親 launcher による保存が必要である。
+
+### 修正と検証
+
+launcher の既存 base fetch を `SeatLease::operation_with` で調停し、
+成功時のみ remote / branch / SHA / 取得時刻を run に保存する。
+席への入力はこの保存値を使い、resume / fallback / waiter 配送時には再取得しない。
+旧 run の証跡は欠落のままとし、tracking ref から取得成功を捏造しない。
+既存の base-sync 処理は変更しない。
+
+共通 invoke 経路で、編集席に「launcher が取得した固定基底」を説明する。
+管理領域への add / commit が拒否された場合は worktree の編集を残し、既存の
+launcher 保存処理に委ねる。fetch の反復や実現不能な権限承認質問ではなく、
+操作・対象・エラーと必要な復旧を報告する。これはプロンプトによる制御であり、
+質問文の文字列判定で正当な仕様質問を禁止する仕組みではない。
+ネットワーク拒否を明示し、bypass、広いディレクトリ許可、chmod は追加しない。
+依存取得や rebase 続行など、席内で必須の操作が拒否されるケースは引き続き
+インフラ blocker として扱う。読取り専用席、相談専用ターン、ロック寿命と
+子孫プロセスの終了待ちは変更しない。
+
+ホストで次を実行すると、実際の CLI sandbox で編集、status / diff / log、
+add / commit、ローカル remote からの fetch、無関係な書込み拒否を検査できる。
+Git 更新操作の可否とエラーは出力に記録する。ネットワーク設定の比較は
+loopback 接続で外部 DNS 障害と切り分け、GitHub DNS の結果も記録する。
+テスト内のネットワーク有効化は比較用であり、席への許可ではない。
+
+```sh
+RUSTUP_TOOLCHAIN=stable cargo test --locked --lib agent::tests::editing_
+RUSTUP_TOOLCHAIN=stable cargo test --locked --lib graph::tests::launcher_base_fetch
+RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope invoked_editing_seats_receive_scope_on_first_turn_and_resume -- --nocapture
+RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope sandbox_git_operations_and_network_policy -- --ignored --nocapture
+```
+
+入れ子 sandbox で失敗する場合は、その出力を実機検証成功と数えない。
+既存の `sandbox_seat` / `readonly_invocation` ホスト検証も合わせて実行し、
+lock / 質問 / 通知経路の境界を確認する。全 suite、`cargo make check`、
+必須レビューは候補内で再帰起動せず、親グラフが担当する。
+
+### 配備と元タスクの復旧
+
+1. 親グラフのレビューと gate を完了させ、通常の承認手順で配備する。
+   Web の既存「Update & restart」手順は README の同名項目に従う。
+   ローカルビルドを配備する場合も、元のサービス起動方式を確認してから
+   安全な終了・再起動を行い、稼働中 graph と二重の daemon を作らない。
+2. ホストで `command -v magi` / `magi --version`、プロセスの起動時刻と
+   実行ファイルを確認する。インストール先の更新だけで既存席は変わらない。
+   上記 sandbox fixture を enclosing sandbox 外で実行し、結果を保存する。
+3. 新しい席の access artifact と保存セッションの実効設定を照合し、固定 SHA が
+   ローカルで読めること、launcher の保存が成功すること、無関係な書込み拒否、
+   coordination と質問経路を確認する。失敗なら元タスクを起動せず、操作と
+   対象を添えて launcher 環境を修復する。
+4. 元タスクの現在の owner / run / hold 状態を `magi task show` で確認し、
+   既存 owner の復旧経路を一つだけ使う。稼働中 graph の並行 resume、
+   代替タスクの新設、実装の肩代わりは行わない。旧 run に取得証跡がない場合は、
+   ホストの検証済み fetch と準備経路を経る必要がある。
+
+本修正席は production のタスク状態、daemon、元実装の worktree を変更していない。
+
+本候補での対象検証: `agent::tests::editing_` は 2 件成功、
+`graph::tests::launcher_base_fetch_requires_remote_success` は 1 件成功した。
+後者は調停待ちの間 fetch が始まらないこと、成功した取得の SHA、
+remote が失敗した際に残存 tracking ref を採用しないことを検査した。
+`git diff --check` も成功した。実際の sandbox の入れ子起動は上記の通り
+拒否されており、ホスト fixture と配備後の確認は未完了である。
+
+`invoked_editing_seats_receive_scope_on_first_turn_and_resume` も 1 件成功し、
+各編集ロールの初回 / resume に固定基底と access artifact が伝わることを確認した。
+新しい ignored 実機プローブも実行したが、この席では loopback listener の bind が
+EPERM で拒否され、比較用 sandbox の起動前に終了した。別途、最小の
+`codex sandbox -c 'sandbox_mode="workspace-write"' /usr/bin/true` も
+`sandbox_apply: Operation not permitted` で終了した。
+したがって、ネットワーク比較・無関係な書込み拒否・sandbox 内 Git 操作について、
+今回追加したホスト fixture の成功はまだ証明できていない。
+
+編集席以外のネットワーク設定を保持する最終変更後も、
+`agent::tests::editing_` の 2 件と base-fetch 回帰テストを再実行して成功した。
+変更した Rust ファイルの `rustfmt --check` と `git diff --check` も成功した。
+全体 gate / レビューと、sandbox 外のホスト fixture は親・配備側の確認事項として残る。
