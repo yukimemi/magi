@@ -358,6 +358,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
                 &spec,
                 &mut seat,
                 &Invocation {
+                    scope: magi::agent::InvocationScope::Repository,
                     coordination: Some(coordination()),
                     fetched_base: Some(&fetched_base),
                     cwd: &fx.seat,
@@ -410,6 +411,12 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
     for (node, allow_write) in [("review", false), ("implement", false), ("deputy", true), ("chat", true)] {
         let mut seat = SeatState::new("fixture-seat", "fixture", 1);
         invoke(&spec, &mut seat, &Invocation {
+            // A chat turn holding explicit store roots is a consultation turn.
+            scope: if node == "chat" {
+                magi::agent::InvocationScope::ConsultationControl
+            } else {
+                magi::agent::InvocationScope::Repository
+            },
             coordination: Some(coordination()),
             fetched_base: None,
             cwd: &fx.seat, prompt: "fixture", timeout: Duration::from_secs(10),
@@ -517,6 +524,7 @@ Write-Output 'real-lock-contends'
     };
     let artifacts = fx._tmp.path().join("reader-artifacts");
     let inv = Invocation {
+        scope: magi::agent::InvocationScope::Repository,
         coordination: Some(coordination()),
         fetched_base: None,
         cwd: &fx.seat,
@@ -689,6 +697,7 @@ mod coordination {
         allow_write: bool,
     ) -> Invocation<'a> {
         Invocation {
+            scope: magi::agent::InvocationScope::Repository,
             coordination: Some(coordination()),
             fetched_base: None,
             cwd: &fx.seat,
@@ -855,6 +864,7 @@ lock_file = "kanade-sync.lock"
         );
         let art = fx._tmp.path().join("art");
         let inv = Invocation {
+            scope: magi::agent::InvocationScope::Repository,
             coordination: cfg.coordination.as_ref(),
             fetched_base: None,
             ..invocation(&fx, &art, false)
@@ -917,6 +927,7 @@ lock_file = "kanade-sync.lock"
                 );
                 let control_inv = Invocation {
                     node,
+                    scope: magi::agent::InvocationScope::ConsultationControl,
                     writable: if node == "chat" { &consult_roots } else { &[] },
                     ..invocation(&fx, &art, allow_write)
                 };
@@ -932,12 +943,36 @@ lock_file = "kanade-sync.lock"
                 assert!(marker.exists());
                 if node == "chat" {
                     let prompt = std::fs::read_to_string(art.join("fixture.prompt.md")).unwrap();
-                    assert!(prompt.contains("No repository lease is held"));
-                    assert!(prompt.contains("do not read repository files or history"));
+                    assert!(prompt.contains("Current turn scope: consultation control"));
+                    assert!(prompt.contains("do not inspect repository files/history"));
                 }
                 assert!(take_lock(&lock).is_none(), "editor still owns real lock");
             }
         }
+        let investigation_spec = spec(&fx, "quick");
+        let investigation_inv = Invocation {
+            scope: magi::agent::InvocationScope::ConsultationInvestigation,
+            node: "chat",
+            ..invocation(&fx, &art, false)
+        };
+        let mut investigation_seat = SeatState::new("chat", "fixture", 1);
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            invoke(
+                &investigation_spec,
+                &mut investigation_seat,
+                &investigation_inv,
+            ),
+        )
+        .await
+        .expect("investigation must not wait behind the asking editor")
+        .unwrap_err();
+        assert!(error.to_string().contains("reserved"));
+        assert_eq!(investigation_seat.turns, 0);
+        assert!(
+            take_lock(&lock).is_none(),
+            "original editor still owns its lock"
+        );
         // Repository readers must still respect the editor's lock, even with
         // a short decision budget; control-plane exclusions do not widen them.
         for (node, allow_write) in [
@@ -976,7 +1011,10 @@ lock_file = "kanade-sync.lock"
         let fx = registered();
         let spec = spec(&fx, "reader");
         let art = fx._tmp.path().join("art");
-        let inv = invocation(&fx, &art, false);
+        let inv = Invocation {
+            scope: magi::agent::InvocationScope::ConsultationInvestigation,
+            ..invocation(&fx, &art, false)
+        };
         let mut seat = SeatState::new("reader", "fixture", 1);
         let deadline = Instant::now() + Duration::from_secs(10);
         {

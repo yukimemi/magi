@@ -4646,6 +4646,7 @@ pub async fn fix_round(
             &spec,
             &mut seat,
             &Invocation {
+                scope: crate::agent::InvocationScope::Repository,
                 coordination: state.config.coordination.as_ref(),
                 fetched_base: state.fetched_base.as_ref(),
                 cwd: &winner.worktree,

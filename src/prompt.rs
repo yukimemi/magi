@@ -2162,6 +2162,7 @@ pub fn chat_consult(q: &crate::ask::Question) -> String {
         }
         s.push('\n');
     }
+    s.push_str("If repository evidence is needed to answer, request a coordinated investigation in this same conversation using the current turn's structured continuation protocol. Keep this question unanswered; never choose an answer just to unlock investigation. A busy repository leaves investigation pending and can be retried here. Supported read-only control-plane diagnostics remain available.\n\n");
     s.push_str("Consultation delivery is independent of owner authority. An authentic current standing-conversation instruction may bind `<full-question-id>: <exact offered choice>`, with the entire persisted owner send as --quote. Explicit batch authorization (including おっけーそれぞれ回答してー) binds immediately preceding persisted question-by-question recommendations for hold, dismissal, repair and non-destructive recovery choices. Merge still requires the exact displayed head; withdrawal, PR closure, replacement and discard require individual explicit consequence confirmation; posting requires exact saved-content confirmation. Report the missing action-specific evidence, never ask the owner to change chats merely for consultation ownership. Existing execution state and owner claims still apply.\n\n");
     if crate::consult::QuestionKind::of(q) == crate::consult::QuestionKind::Merge {
         if let Some(target) = &q.merge_target {

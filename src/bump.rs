@@ -79,6 +79,7 @@ async fn ask_decision(
             spec,
             &mut seat,
             &Invocation {
+                scope: crate::agent::InvocationScope::Repository,
                 coordination: state.config.coordination.as_ref(),
                 fetched_base: None,
                 cwd: repo,
@@ -193,6 +194,7 @@ async fn guard_reason(
             spec,
             seat,
             &Invocation {
+                scope: crate::agent::InvocationScope::Repository,
                 coordination: state.config.coordination.as_ref(),
                 fetched_base: None,
                 cwd: repo,
