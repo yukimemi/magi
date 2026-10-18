@@ -1252,6 +1252,11 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                                     ),
                                 "run queue owner changed"
                             );
+                            anyhow::ensure!(
+                                !task.operator_held()
+                                    && task.operator_decided_at.is_none_or(|at| at <= q.asked_at),
+                                "resume was superseded by an operator hold or newer operator decision"
+                            );
                             task.release_operator("choice", Some(&q.id));
                             task.resume_override = Some(crate::queue::OperatorResume {
                                 question_id: q.id.clone(),
@@ -1279,6 +1284,18 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                         let mut task = queue.get(task)?;
                         if task.action_applied(&q.id) {
                             return Ok(());
+                        }
+                        // Filing this conductor question temporarily wraps the
+                        // original hold in a Blocked state. Restore only that
+                        // exact blocker on the local copy before checking the
+                        // hold binding; unrelated waits never authorize release.
+                        if q.node == crate::conduct::NODE
+                            && q.run == task.id
+                            && task.status == TaskStatus::Blocked
+                            && task.blocked_from == Some(TaskStatus::Held)
+                            && task.blocked_by.as_slice() == [q.id.as_str()]
+                        {
+                            task.unblock(&q.id);
                         }
                         anyhow::ensure!(
                             task.status == TaskStatus::Held
@@ -1375,6 +1392,7 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
             && let Ok(mut origin) = queue.get(&listed.id)
         {
             if !origin.operator_held()
+                && origin.operator_decided_at.is_none_or(|at| at <= q.asked_at)
                 && !matches!(origin.status, TaskStatus::Running | TaskStatus::Done)
             {
                 if result.is_err() || matches!(action, ask::ChoiceAction::ResumeRun { .. }) {
