@@ -1014,9 +1014,9 @@ pub fn run(state: &RunState) -> String {
     // this reads the accessor rather than the raw list.
     match state.gate_status() {
         GateStatus::NotRun => {}
-        GateStatus::PassedWithNoCommands => {
+        GateStatus::NotConfigured => {
             let _ = writeln!(s, "\n{}", bold("gate"));
-            let _ = writeln!(s, "  {}  no gate commands configured", green("pass"));
+            let _ = writeln!(s, "  {}  no gate commands configured", dim("not tested"));
         }
         GateStatus::Passed | GateStatus::Failed => {
             let _ = writeln!(s, "\n{}", bold("gate"));
@@ -1074,10 +1074,12 @@ pub fn run(state: &RunState) -> String {
                 s,
                 "  mode {:?}  {}\n  {}",
                 m.mode,
-                if m.ok {
-                    green("ok")
-                } else if m.empty {
+                if m.empty {
                     yellow("empty candidate — nothing to land")
+                } else if m.ok && state.status == RunStatus::Merged {
+                    green("merged")
+                } else if m.ok && m.mode == MergeMode::Pr {
+                    yellow("published; not merged")
                 } else {
                     yellow("not merged")
                 },
@@ -2407,7 +2409,7 @@ mod tests {
     }
 
     #[test]
-    fn a_gate_with_no_commands_configured_shows_a_pass_not_silence() {
+    fn a_gate_with_no_commands_is_reported_as_not_tested() {
         let _guard = plain();
         let mut s = state();
         s.status = RunStatus::Ready;
@@ -2416,8 +2418,10 @@ mod tests {
 
         let text = run(&s);
         assert!(
-            text.contains("gate") && text.contains("no gate commands configured"),
-            "a run gated on nothing must say so, not read as if the gate never ran: {text}"
+            text.contains("gate")
+                && text.contains("no gate commands configured")
+                && text.contains("not tested"),
+            "an unconfigured gate must be explicit: {text}"
         );
     }
 

@@ -65,10 +65,17 @@ case "$1 $2" in
     else echo '[]'; fi ;;
   'pr view')
     sha=$(git ls-remote --refs origin refs/heads/magi/task-abcd-1234 2>/dev/null | cut -f1)
-    printf '{"headRefName":"magi/task-abcd-1234","baseRefName":"main","isCrossRepository":false,"headRefOid":"%s","state":"OPEN"}\n' "$sha" ;;
+    lifecycle=OPEN
+    if test -f "$TASK_PR_FORGE/merged"; then lifecycle=MERGED; fi
+    printf '{"url":"https://github.com/example/repo/pull/1","number":1,"title":"feat: existing work","reviews":[],"comments":[],"mergeStateStatus":"CLEAN","autoMergeRequest":null,"headRefName":"magi/task-abcd-1234","baseRefName":"main","isCrossRepository":false,"headRefOid":"%s","state":"%s"}\n' "$sha" "$lifecycle" ;;
   'pr create') touch "$TASK_PR_FORGE/open"; echo 'https://github.com/example/repo/pull/1' ;;
   'pr edit') test ! -f "$TASK_PR_FORGE/fail-edit" || exit 1; printf '%s\n' "$@" >> "$TASK_PR_FORGE/edits" ;;
-  'pr merge'|'pr comment') : ;;
+  'api graphql')
+    sha=$(git ls-remote --refs origin refs/heads/magi/task-abcd-1234 2>/dev/null | cut -f1)
+    printf '{"data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{"oid":"%s","statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false},"nodes":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}}}}]}}}}}\n' "$sha" ;;
+  'api repos/{owner}/{repo}/pulls/1/comments') echo '[]' ;;
+  'pr merge') printf '%s\n' "$*" >> "$TASK_PR_FORGE/merges"; case "$*" in *--disable-auto*) : ;; *) test -f "$TASK_PR_FORGE/allow-merge" || exit 99; touch "$TASK_PR_FORGE/merged" ;; esac ;;
+  'pr comment') : ;;
   *) exit 1 ;;
 esac
 "#).unwrap();
@@ -99,6 +106,7 @@ async fn attempt(repo: &Path, config: &magi::config::Config) -> RunState {
         "{:?}",
         runner.state.events
     );
+    assert_eq!(runner.state.status, magi::run::RunStatus::Ready);
     runner.state
 }
 
@@ -334,5 +342,236 @@ async fn lease_survives_a_merged_run_when_a_later_run_takes_over_the_open_pull_r
     assert_eq!(RunState::load(&second.id).unwrap().pr_taken_over_by.as_deref(), Some(third.id.as_str()));
     assert_eq!(comments(&forge), 1);
     assert_eq!(git::remote_head(&fx.repo, "origin", third.pr_branch().unwrap()).await.unwrap(), third.pr_pushed_head);
+}
+}
+
+// The local bare remote transports real Git objects; the wrapper supplies its
+// forge identity without substituting any ownership, ancestor or lease checks.
+fn recovery_transport(bin: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let real = std::process::Command::new("which")
+        .arg("git")
+        .output()
+        .unwrap();
+    assert!(real.status.success());
+    let script = bin.join("git");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+if test "$1 $2" = 'remote get-url'; then
+  echo 'https://github.com/example/repo.git'
+else exec "$RECOVERY_REAL_GIT" "$@"; fi
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // SAFETY: isolated test process before recovery dispatch.
+    unsafe {
+        std::env::set_var(
+            "RECOVERY_REAL_GIT",
+            String::from_utf8(real.stdout).unwrap().trim(),
+        );
+    }
+}
+
+async fn selected_fixture() -> (
+    common::Fixture,
+    magi::queue::Task,
+    magi::pr_recovery::Selection,
+    std::path::PathBuf,
+) {
+    let home = home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    let bin = forge(fx.tmp.path());
+    pr_config(&mut fx);
+    let first = attempt(&fx.repo, &fx.config).await;
+    let public = first.pr_pushed_head.clone().unwrap();
+    let wt = &first.winner().unwrap().worktree;
+    std::fs::write(wt.join("reviewed-fix.txt"), "preserved fix").unwrap();
+    git::git(wt, &["add", "reviewed-fix.txt"]).await.unwrap();
+    git::git(
+        wt,
+        &["commit", "-m", "fix: preserve reviewed implementation"],
+    )
+    .await
+    .unwrap();
+    let source = git::rev_parse(wt, "HEAD").await.unwrap();
+    recovery_transport(&bin);
+    let mut task = magi::queue::Task::new(
+        "existing delivery".into(),
+        "create note.txt".into(),
+        fx.repo.clone(),
+        magi::queue::Source::Human,
+    );
+    task.id = "abcd-1234".into();
+    task.runs.push(first.id);
+    task.succeed();
+    task.overrides = Some(magi::queue::RunOverrides {
+        merge: Some("none".into()),
+        reviewers: Some(1),
+        ..Default::default()
+    });
+    let selected = magi::pr_recovery::Selection {
+        url: "https://github.com/example/repo/pull/1".into(),
+        branch: "magi/task-abcd-1234".into(),
+        head: public,
+        source_head: Some(source),
+        disposition: Some(magi::pr_recovery::Disposition::Land),
+        instruction: task.instruction.clone(),
+        approved_at: jiff::Timestamp::now(),
+    };
+    (fx, task, selected, bin)
+}
+
+common::e2e! {
+async fn selected_delivery_reconciles_review_override_preserves_fix_and_waits_for_fresh_approval() {
+    let (fx, mut task, selected, bin) = selected_fixture().await;
+    let queue = magi::queue::Queue::open();
+    queue.put(&mut task).unwrap();
+    let config_path = fx.tmp.path().join("recovery.toml");
+    std::fs::write(&config_path, toml::to_string(&fx.config).unwrap()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
+        .args(["task", "recover-pr", &task.id, "--pr", &selected.url, "--head", &selected.head,
+            "--source-head", selected.source(), "--disposition", "land", "--config"])
+        .arg(&config_path).env("MAGI_HOME", magi::run::home()).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("replaced explicitly"));
+    let mut task = queue.get(&task.id).unwrap();
+    assert_eq!(task.overrides.as_ref().unwrap().merge.as_deref(), Some("pr"));
+    assert_eq!(task.overrides.as_ref().unwrap().reviewers, Some(1));
+    let expected_source = selected.source_head.clone();
+    let selected = task.pr_recovery.clone().unwrap();
+    assert_eq!(selected.source_head, expected_source);
+    let (mut config, layers) = magi::config::Config::discover_fetched(&fx.repo, Some(&config_path)).await.unwrap();
+    task.overrides.as_ref().unwrap().apply(&mut config);
+    assert_eq!(layers, vec![config_path.clone()]);
+    let opts = magi::daemon::Opts { repo: fx.repo.clone(), config: Some(fx.tmp.path().join("ignored-daemon.toml")), merge: Some("none".into()), ..Default::default() };
+    Box::pin(magi::daemon::run_claimed(&opts, &queue, &mut task)).await;
+    let runner = Runner::resume(task.runs.last().unwrap()).unwrap();
+    assert!(runner.state.config.graph.land);
+    assert!(runner.state.config.graph.land_approval);
+    let provenance = runner.state.recovery_config.as_ref().unwrap();
+    assert_eq!(provenance.layers, vec![config_path]);
+    assert!(provenance.daemon_merge.is_none());
+    assert_eq!(runner.state.config.verify.gate, config.verify.gate);
+    assert_eq!(runner.state.config.verify.e2e, config.verify.e2e);
+    assert_eq!(git::rev_parse(&runner.state.winner().unwrap().worktree, "HEAD").await.unwrap(), selected.source());
+    let result = Ok(());
+    assert!(runner.state.parked, "{:?}", runner.state.events);
+    assert!(!runner.state.public_delivery_complete());
+    for status in [magi::run::RunStatus::Ready, magi::run::RunStatus::Merged] {
+        let mut snapshot = runner.state.clone();
+        snapshot.parked = false;
+        snapshot.status = status;
+        let mut unfinished = task.clone();
+        magi::daemon::finish_attempt(3, &queue, &mut unfinished, &snapshot, &[], Ok(()));
+        assert_eq!(unfinished.status, magi::queue::TaskStatus::Held);
+    }
+    let approval = runner.state.land_approval.clone().expect("fresh approval");
+    let head = runner.state.pr_pushed_head.clone().unwrap();
+    assert_eq!(approval.head, head);
+    assert_ne!(head, selected.head);
+    runner.state.check_delivery_evidence(&head).unwrap();
+    for stale in ["gate", "e2e", "review", "missing-commands", "missing-reviewer"] {
+        let mut snapshot = runner.state.clone();
+        match stale {
+            "gate" => snapshot.gate_head = Some("old".into()),
+            "e2e" => snapshot.reviews.last_mut().unwrap().verified_head = Some("old".into()),
+            "review" => snapshot.reviews.last_mut().unwrap().head = "old".into(),
+            "missing-commands" => snapshot.gate.clear(),
+            _ => snapshot.reviews.last_mut().unwrap().answered = 0,
+        }
+        assert!(snapshot.check_delivery_evidence(&head).is_err(), "{stale}");
+    }
+    let mut unapproved = runner.state.clone();
+    unapproved.status = magi::run::RunStatus::Merged;
+    unapproved.pr.as_mut().unwrap().state = "merged".into();
+    unapproved.pr_merged_head = Some(head.clone());
+    assert!(!unapproved.public_delivery_complete(), "an unanswered question is not consent");
+    assert_eq!(git::remote_head(&fx.repo, "origin", &selected.branch).await.unwrap(), Some(head.clone()));
+    magi::daemon::finish_attempt(3, &queue, &mut task, &runner.state, &[], result);
+    assert_ne!(task.status, magi::queue::TaskStatus::Done);
+    let mut resumed = Runner::resume(&runner.state.id).unwrap();
+    resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.pr_recovery, Some(selected.clone()));
+    assert_eq!(resumed.state.land_approval.as_ref().unwrap().question, approval.question);
+    assert!(resumed.state.parked);
+    assert_eq!(std::fs::read_to_string(resumed.state.winner().unwrap().worktree.join("reviewed-fix.txt")).unwrap(), "preserved fix");
+    let merges = std::fs::read_to_string(bin.join("merges")).unwrap_or_default();
+    assert!(merges.lines().all(|l| l.contains("--disable-auto")), "{merges}");
+    magi::ask::Questions::open().update(&approval.question, |q|
+        q.answer(magi::ask::Answer::Choice("merge".into()))).unwrap();
+    std::fs::write(bin.join("allow-merge"), "").unwrap();
+    let result = resumed.execute().await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(resumed.state.public_delivery_complete(), "{:?}", resumed.state.events);
+    let mut incomplete = resumed.state.clone();
+    incomplete.pr_merged_head = Some("another-head".into());
+    assert!(!incomplete.public_delivery_complete());
+    incomplete.pr_merged_head = Some(head.clone());
+    incomplete.merge.as_mut().unwrap().empty = true;
+    assert!(!incomplete.public_delivery_complete(), "no-op success is not delivery");
+    magi::daemon::finish_attempt(3, &queue, &mut task, &resumed.state, &[], result);
+    assert_eq!(task.status, magi::queue::TaskStatus::Done);
+    let merges = std::fs::read_to_string(bin.join("merges")).unwrap();
+    assert!(merges.lines().filter(|l| !l.contains("--disable-auto"))
+        .all(|l| l.contains("--match-head-commit") && l.contains(&head)), "{merges}");
+}
+}
+
+common::e2e! {
+async fn selected_review_with_no_verification_finishes_locally_without_public_delivery() {
+    let (fx, mut task, mut selected, _bin) = selected_fixture().await;
+    selected.disposition = Some(magi::pr_recovery::Disposition::Review);
+    task.pr_recovery = Some(selected.clone());
+    let mut config = fx.config.clone();
+    config.verify.gate.clear();
+    config.verify.e2e.clear();
+    let mut runner = Runner::recover_pr(&fx.repo, &task.id, selected.clone(), config).await.unwrap();
+    task.start(runner.state.id.clone());
+    let queue = magi::queue::Queue::open();
+    queue.put(&mut task).unwrap();
+    let result = runner.execute().await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(runner.state.status, magi::run::RunStatus::Ready);
+    assert_eq!(runner.state.gate_status(), magi::run::GateStatus::NotConfigured);
+    assert!(!runner.state.gate_status().ok());
+    assert!(runner.state.events.iter().any(|e| e.message.contains("not tested")));
+    assert_eq!(git::remote_head(&fx.repo, "origin", &selected.branch).await.unwrap().as_deref(), Some(selected.head.as_str()));
+    magi::daemon::finish_attempt(3, &queue, &mut task, &runner.state, &[], result);
+    assert_eq!(task.status, magi::queue::TaskStatus::Done);
+}
+}
+
+common::e2e! {
+async fn selected_delivery_without_verification_or_disposition_stops_before_a_run_is_minted() {
+    let (fx, task, mut selected, _bin) = selected_fixture().await;
+    let mut config = fx.config.clone();
+    config.verify.gate.clear();
+    let runs = || std::fs::read_dir(magi::run::home().join("runs")).unwrap().count();
+    let before = runs();
+    for missing in ["gate", "e2e", "disposition"] {
+        if missing == "e2e" { config.verify.gate = fx.config.verify.gate.clone(); config.verify.e2e.clear(); }
+        if missing == "disposition" { selected.disposition = None; }
+        let error = Runner::recover_pr(&fx.repo, &task.id, selected.clone(), config.clone()).await.err().unwrap();
+        assert!(error.to_string().contains(missing), "{error:#}");
+        assert_eq!(runs(), before);
+        let path = fx.tmp.path().join("incomplete.toml");
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        let queue = magi::queue::Queue::open();
+        let mut queued = task.clone();
+        queued.release_operator("test", None);
+        queued.pr_recovery = Some(selected.clone());
+        queued.overrides.as_mut().unwrap().config = Some(path);
+        queue.put(&mut queued).unwrap();
+        let opts = magi::daemon::Opts { repo: fx.repo.clone(), ..Default::default() };
+        Box::pin(magi::daemon::run_claimed(&opts, &queue, &mut queued)).await;
+        assert_eq!(queued.status, magi::queue::TaskStatus::Held);
+        assert_eq!(queued.attempts, 0);
+        assert_eq!(queued.runs, task.runs);
+        assert!(queued.operator_held());
+        assert!(queued.hold_reason.as_deref().unwrap().contains(missing));
+        assert_eq!(runs(), before);
+    }
 }
 }

@@ -272,6 +272,9 @@ fn operator_action(
     {
         return "E2E verification failed, was deferred or could not run: report its commands and target commit; do not claim no action remains just because the PR merged.".into();
     }
+    if v["gate_ran"] == true && v["gate"].as_array().is_some_and(Vec::is_empty) {
+        return "Final gate is not configured: no commands ran. Report not tested; local review or a public merge does not prove verification.".into();
+    }
     if v["gate_ran"] != true
         || !v["gate"].is_array()
         || v["gate"].as_array().is_some_and(|cs| {

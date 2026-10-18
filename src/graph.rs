@@ -837,8 +837,9 @@ impl Runner {
         repo: &Path,
         task: &str,
         selection: crate::pr_recovery::Selection,
-        config: Config,
+        mut config: Config,
     ) -> Result<Self> {
+        selection.configure(&mut config)?;
         selection.check_task(task, &selection.instruction)?;
         let base_branch =
             git::merge_base_branch(repo, &config.merge.remote, config.merge.base.as_deref())
@@ -854,6 +855,7 @@ impl Runner {
         selection
             .verify(repo, &config.merge.remote, &base_branch, &selection.head)
             .await?;
+        selection.verify_source(repo).await?;
         let roles = config.resolve_roles()?;
         let max_parallel = config.graph.max_parallel.max(1);
         let mut state = RunState::new(
@@ -883,13 +885,15 @@ impl Runner {
         let branch = state.branch_for('A');
         let wait = repository_wait(&state, None);
         let coordination = coordinate_operation(&mut state, repo, &wait).await?;
-        git::git(repo, &["branch", &branch, &selection.head]).await?;
+        git::git(repo, &["branch", &branch, selection.source()]).await?;
         drop(coordination);
         state.event(
             "recovery",
             format!(
-                "selected public implementation {} from {}",
-                selection.head, selection.url
+                "selected implementation {} for {} (public lease {})",
+                selection.source(),
+                selection.url,
+                selection.head
             ),
         );
         let takeover = crate::handover::Takeover {
@@ -1315,6 +1319,9 @@ impl Runner {
     }
 
     async fn execute_graph(&mut self) -> Result<()> {
+        if let Some(selection) = self.state.pr_recovery.clone() {
+            selection.configure(&mut self.state.config)?;
+        }
         // Preservation may invalidate an old empty classification. Resolve it
         // before any resume shortcut can reuse a verdict or publish a branch.
         self.persist_candidates().await?;
@@ -7052,10 +7059,8 @@ impl Runner {
             // silence in this run's event log, since an empty `gate` alone
             // no longer says whether the gate ran at all (see
             // `RunState::gate_ran`'s own doc).
-            self.state.event(
-                "gate",
-                "no gate commands configured; nothing to check, passing",
-            );
+            self.state
+                .event("gate", "no gate commands configured; not tested");
         }
         for o in &outcomes {
             self.state.event(
@@ -8086,11 +8091,10 @@ impl Runner {
             // both before it has ever run and when its last attempt was
             // resource-blocked (see `Runner::gate`'s own doc), and neither is
             // permission to merge on nothing but the review record. Only a
-            // gate that actually ran - zero commands configured and
-            // vacuously passed, or one or more that all exited 0 - may
-            // proceed; `RunState::gate_status` is the single place that
-            // reading is computed.
-            || !self.state.gate_status().ok()
+            // gate that actually ran may proceed; an intentional local
+            // review can also finish with verification explicitly not configured.
+            // `RunState::gate_status` computes that distinction.
+            || !self.state.gate_allows_progress()
         {
             return Ok(());
         }
@@ -8319,6 +8323,8 @@ impl Runner {
 
         self.state.status = match (mode, outcome.ok) {
             (MergeMode::None, _) => RunStatus::Ready,
+            (_, true) if outcome.empty => RunStatus::Ready,
+            (MergeMode::Pr, true) => RunStatus::Ready,
             (_, true) => RunStatus::Merged,
             (_, false) => RunStatus::Blocked,
         };
@@ -8340,7 +8346,7 @@ impl Runner {
         // can do to a repository.
         if self.state.config.graph.land
             && mode == MergeMode::Pr
-            && self.state.status == RunStatus::Merged
+            && self.state.merge.as_ref().is_some_and(|m| m.ok && !m.empty)
         {
             self.run_land().await?;
         }
@@ -8526,7 +8532,7 @@ impl Runner {
         }
         if review_conclusion(&self.state.reviews, self.state.config.graph.review_rounds)
             != Some(RunStatus::Gating)
-            || !self.state.gate_status().ok()
+            || !self.state.gate_allows_progress()
         {
             self.hold_merge_repair(i, "updated review or gate did not pass; inspect the new results and resume review explicitly".to_owned())?;
             return Ok(false);
@@ -12181,6 +12187,8 @@ mod tests {
             url: "https://example.test/project/pull/1".into(),
             branch: "magi/task-selected".into(),
             head: head.clone(),
+            source_head: None,
+            disposition: Some(crate::pr_recovery::Disposition::Review),
             instruction: "preserve measured behavior".into(),
             approved_at: jiff::Timestamp::now(),
         };
@@ -14982,7 +14990,7 @@ mod tests {
             "zero configured commands is still a real attempt, not an unrun gate"
         );
         assert!(runner.state.gate.is_empty());
-        assert_eq!(runner.state.gate_status(), GateStatus::PassedWithNoCommands);
+        assert_eq!(runner.state.gate_status(), GateStatus::NotConfigured);
         assert_ne!(
             runner.state.status,
             RunStatus::Blocked,

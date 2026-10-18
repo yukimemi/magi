@@ -299,6 +299,7 @@ pub(crate) async fn publish(
     let remote = state.config.merge.remote.clone();
     let remote_head = git::remote_head(&winner.worktree, &remote, &head).await?;
     let local_tip = git::rev_parse(&winner.worktree, &winner.branch).await?;
+    state.check_delivery_evidence(&local_tip)?;
     let expected = if let Some(selected) = &state.pr_recovery {
         selected_lease(
             remote_head.as_deref(),

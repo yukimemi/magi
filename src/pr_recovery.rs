@@ -5,7 +5,31 @@ use std::path::Path;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::{git, land};
+use crate::{
+    config::{Config, MergeMode},
+    git, land,
+};
+
+/// Explicit purpose of an existing-PR recovery; never inferred from task prose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Disposition {
+    /// Validate, publish to the selected PR and request fresh owner-approved landing.
+    Land,
+    /// Finish after local review, without public delivery.
+    Review,
+}
+
+/// Inputs of the single configuration load used to start a recovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigEvidence {
+    /// Ordered configuration inputs; remote cache paths include the immutable source commit.
+    pub layers: Vec<std::path::PathBuf>,
+    /// Task options applied after loading the layers.
+    pub overrides: Option<crate::queue::RunOverrides>,
+    /// Daemon merge override, only when this task inherits daemon options.
+    pub daemon_merge: Option<String>,
+}
 
 /// Durable operator selection. Only the recovery command creates this record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,8 +38,14 @@ pub struct Selection {
     pub url: String,
     /// Task-scoped public branch.
     pub branch: String,
-    /// Complete implementation and initial publication lease.
+    /// Initial public publication lease, independent of the implementation source.
     pub head: String,
+    /// Full immutable source commit; older selections used the public lease.
+    #[serde(default)]
+    pub source_head: Option<String>,
+    /// Missing on old records: requires an explicit new selection before work.
+    #[serde(default)]
+    pub disposition: Option<Disposition>,
     /// Criteria the operator approved, retained without rewriting them.
     pub instruction: String,
     /// Approval generation: a later selection does not resume an earlier run.
@@ -70,6 +100,58 @@ impl std::fmt::Display for StartupFailed {
 impl std::error::Error for StartupFailed {}
 
 impl Selection {
+    /// Immutable implementation commit, distinct from the public update lease.
+    pub fn source(&self) -> &str {
+        self.source_head.as_deref().unwrap_or(&self.head)
+    }
+
+    /// Reconcile only the delivery controls; preserve all other resolved settings.
+    pub fn configure(&self, config: &mut Config) -> Result<()> {
+        match self.disposition {
+            Some(Disposition::Land) => {
+                ensure!(
+                    config.graph.reviewers > 0 && config.graph.review_rounds > 0,
+                    "delivery requires at least one reviewer and review round"
+                );
+                ensure!(
+                    !config.verify.gate.is_empty()
+                        && config.verify.gate.iter().all(|s| !s.trim().is_empty()),
+                    "delivery requires nonempty verify.gate commands; configure the repository's documented gate in a machine/repository layer or recover-pr --config <complete-config>"
+                );
+                ensure!(
+                    !config.verify.e2e.is_empty()
+                        && config.verify.e2e.iter().all(|s| !s.trim().is_empty()),
+                    "delivery requires nonempty verify.e2e commands; configure the repository's required real-machine checks before recover-pr --disposition land"
+                );
+                config.merge.mode = MergeMode::Pr;
+                config.graph.land = true;
+                config.graph.land_approval = true;
+            }
+            Some(Disposition::Review) => {
+                config.merge.mode = MergeMode::None;
+                config.graph.land = false;
+            }
+            None => anyhow::bail!(
+                "recovery disposition is missing; select the public head again with recover-pr --disposition land or --disposition review (and --source-head <full-SHA> to preserve a reviewed fix)"
+            ),
+        }
+        Ok(())
+    }
+
+    /// Prove the adopted fix contains the selected public implementation.
+    pub async fn verify_source(&self, repo: &Path) -> Result<()> {
+        let source = git::rev_parse(repo, &format!("{}^{{commit}}", self.source())).await?;
+        ensure!(
+            source == self.source(),
+            "source-head must resolve to its full commit SHA"
+        );
+        ensure!(
+            git::is_ancestor(repo, &self.head, &source).await,
+            "source-head does not preserve the selected public implementation; select a descendant commit"
+        );
+        Ok(())
+    }
+
     /// Confirm task identity and immutable criteria before starting work.
     pub fn check_task(&self, task: &str, instruction: &str) -> Result<()> {
         ensure!(
@@ -81,7 +163,9 @@ impl Selection {
             "recovery criteria changed; select the public head again"
         );
         ensure!(
-            self.head.len() == 40 && self.head.bytes().all(|b| b.is_ascii_hexdigit()),
+            [self.head.as_str(), self.source()]
+                .iter()
+                .all(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit())),
             "recovery requires a full commit SHA"
         );
         Ok(())
@@ -204,6 +288,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recovery_uses_resolved_layers_and_preserves_unrelated_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = dir.path().join("machine.toml");
+        let repo = dir.path().join("repository.toml");
+        std::fs::write(&machine, "[verify]\ngate = ['documented gate']\ne2e = ['real checks']\n[graph]\nland = false\nland_approval = false\n").unwrap();
+        std::fs::write(&repo, "[merge]\nmode = 'none'\nbase = 'trunk'\n").unwrap();
+        let mut config = Config::load_layers(&[machine, repo]).unwrap();
+        let overrides = crate::queue::RunOverrides {
+            merge: Some("none".into()),
+            reviewers: Some(2),
+            ..Default::default()
+        };
+        overrides.apply(&mut config);
+        let mut selection = Selection {
+            url: "url".into(),
+            branch: "magi/task-t".into(),
+            head: "a".repeat(40),
+            source_head: None,
+            disposition: Some(Disposition::Land),
+            instruction: "criteria".into(),
+            approved_at: jiff::Timestamp::now(),
+        };
+        selection.configure(&mut config).unwrap();
+        assert_eq!(config.merge.mode, MergeMode::Pr);
+        assert_eq!(config.graph.reviewers, 2);
+        assert_eq!(config.merge.base.as_deref(), Some("trunk"));
+        assert_eq!(config.verify.gate, ["documented gate"]);
+        assert_eq!(config.verify.e2e, ["real checks"]);
+        assert!(config.graph.land && config.graph.land_approval);
+        let explicit = dir.path().join("explicit.toml");
+        std::fs::write(&explicit, "[merge]\nbase = 'other'\n").unwrap();
+        let (mut replacement, paths) = Config::discover(dir.path(), Some(&explicit)).unwrap();
+        assert_eq!(paths, [explicit]);
+        assert!(
+            selection
+                .configure(&mut replacement)
+                .unwrap_err()
+                .to_string()
+                .contains("verify.gate")
+        );
+        replacement.verify.gate = vec![" ".into()];
+        assert!(selection.configure(&mut replacement).is_err());
+        selection.disposition = Some(Disposition::Review);
+        selection.configure(&mut replacement).unwrap();
+        assert_eq!(replacement.merge.mode, MergeMode::None);
+        assert!(!replacement.graph.land);
+    }
+
+    #[test]
     fn selected_source_requires_the_same_fetch_and_push_repository() {
         for remote in [
             "https://example.test/team/project.git",
@@ -253,6 +386,8 @@ mod tests {
             url: "url".into(),
             branch: "magi/task-t".into(),
             head: "a".repeat(40),
+            source_head: None,
+            disposition: Some(Disposition::Review),
             instruction: "approved".into(),
             approved_at: jiff::Timestamp::now(),
         };

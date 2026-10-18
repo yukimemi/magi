@@ -209,7 +209,10 @@ starts meanwhile cannot take it. `--merge`, `-c`, `-j`, `--review-rounds`,
 fails standalone leaves its task `held` (`magi task release` retries it).
 
 To recover an existing task PR from an implementation the operator has chosen,
-use `magi task recover-pr <task-id> --pr <PR-URL> --head <full-public-SHA>`.
+use `magi task recover-pr <task-id> --pr <PR-URL> --head <full-public-SHA> --disposition land`
+(or `--disposition review` for local review only). Optional `--source-head <full-SHA>`
+preserves a reviewed fix independently of the public-head lease. See
+[the recovery contract and validation setup](docs/existing-pr-recovery.md).
 This queues a single review candidate from the fetched public commit with its
 complete ancestry, preserving the task's instructions. The selection overrides
 historical review branches, resume pins and references extracted from prose.

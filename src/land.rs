@@ -3829,6 +3829,9 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 forge.poll().await;
             }
             Step::Done { merged } => {
+                if merged {
+                    state.pr_merged_head = (!seen.head.is_empty()).then(|| seen.head.clone());
+                }
                 // Auto-merge is pinned to the approved head, but the forge's
                 // own handling of a later push is not something magi can
                 // see: if the pull request merged on another commit, say so
@@ -3879,6 +3882,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 return Ok(pr);
             }
             Step::Merge => {
+                state.check_delivery_evidence(&seen.head)?;
                 let subject = merge_subject(
                     crate::graph::landing_title(state, &seen.title),
                     &crate::graph::landing_subject_source(state),
@@ -4025,10 +4029,14 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                     // and succeeds while it is still open. Ask the forge; an
                     // unreadable answer is not a confirmation either, so it
                     // is looked at again rather than recorded as merged.
-                    let confirmed = forge
-                        .view(&repo, pr_url)
-                        .await
-                        .is_ok_and(|c| c.pr.state == PrLifecycle::Merged);
+                    let confirmed = forge.view(&repo, pr_url).await.is_ok_and(|c| {
+                        if c.pr.state == PrLifecycle::Merged {
+                            state.pr_merged_head = (!c.head.is_empty()).then_some(c.head);
+                            true
+                        } else {
+                            false
+                        }
+                    });
                     if !confirmed {
                         if waited >= WAIT_CEILING {
                             let why = "the merge request succeeded but the pull request \
@@ -4069,6 +4077,10 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 let after_seen = forge.view(&repo, pr_url).await.ok();
                 let after = after_seen.as_ref().map(|s| s.pr.state);
                 if let Some(outcome) = merged_after_all(&argv, &out.1, after) {
+                    state.pr_merged_head = after_seen
+                        .as_ref()
+                        .map(|s| s.head.clone())
+                        .filter(|h| !h.is_empty());
                     pr.state = PrLifecycle::Merged;
                     state.status = RunStatus::Merged;
                     state.merge = Some(outcome);

@@ -189,7 +189,7 @@ async fn an_answer_after_a_restart_opens_the_pull_request_once() {
     assert_eq!(made.len(), 1, "calls: {:?}", gh_calls(&log));
     assert!(!arg_after(&made[0], "--body").contains("abcdef0123456789"));
     assert!(runner.state.github_text.as_ref().unwrap().resolved);
-    assert_eq!(runner.state.status, RunStatus::Merged);
+    assert_eq!(runner.state.status, RunStatus::Ready);
     assert!(runner.state.merge.as_ref().unwrap().ok);
     assert!(!runner.state.parked);
     assert_eq!(withheld_questions(&run_id).len(), 1, "asked once");
@@ -228,7 +228,7 @@ async fn silence_past_answer_timeout_opens_the_pull_request_with_redacted_text()
     let made = creates(&log);
     assert_eq!(made.len(), 1, "calls: {:?}", gh_calls(&log));
     assert!(!arg_after(&made[0], "--body").contains("abcdef0123456789"));
-    assert_eq!(runner.state.status, RunStatus::Merged);
+    assert_eq!(runner.state.status, RunStatus::Ready);
     assert!(runner.state.github_text.as_ref().unwrap().resolved);
     assert_eq!(withheld_questions(&run_id).len(), 1, "asked once");
 }
@@ -265,7 +265,7 @@ async fn use_rewrite_posts_both_saved_fields_after_restart_without_the_gate() {
     let at = made[0].iter().position(|a| a == "--body").unwrap();
     assert_eq!(made[0][at + 1..].join("\n"), rewrite.body);
     assert_eq!(runner.state.github_text.as_ref().unwrap().choice, Some(magi::run::GithubTextChoice::Rewrite));
-    assert_eq!(runner.state.status, RunStatus::Merged);
+    assert_eq!(runner.state.status, RunStatus::Ready);
     assert!(!runner.state.events.iter().any(|e| e.message.contains(&rewrite.title) || e.message.contains("リライト本文")));
 }
 }
@@ -312,7 +312,7 @@ async fn use_rewrite_updates_adopted_pr_and_blocks_on_edit_failure() {
         assert_eq!(arg_after(&edits[0], "--title"), rewrite.title);
         let at = edits[0].iter().position(|a| a == "--body").unwrap();
         assert_eq!(edits[0][at + 1..].join("\n"), rewrite.body);
-        assert_eq!(runner.state.status, if fail { RunStatus::Blocked } else { RunStatus::Merged });
+        assert_eq!(runner.state.status, if fail { RunStatus::Blocked } else { RunStatus::Ready });
         assert_eq!(runner.state.merge.as_ref().unwrap().ok, !fail);
         // The failed command echoes all arguments. Neither events nor the
         // merge outcome may retain that text.
@@ -352,7 +352,7 @@ async fn post_original_opens_the_pull_request_with_the_unmodified_text() {
     let g = runner.state.github_text.as_ref().unwrap();
     assert!(g.resolved);
     assert_eq!(g.choice, Some(magi::run::GithubTextChoice::Original));
-    assert_eq!(runner.state.status, RunStatus::Merged);
+    assert_eq!(runner.state.status, RunStatus::Ready);
     // The event log names fields, never the text.
     let events = runner
         .state
