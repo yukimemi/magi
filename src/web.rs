@@ -290,6 +290,223 @@ impl Default for Opts {
 
 mod id_links;
 
+type Stamps = HashMap<String, (u128, u64)>;
+
+/// Metadata only: no task instructions or conversation bodies are read here.
+fn store_stamps(root: &FsPath, runs: bool) -> Stamps {
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let path = if runs {
+                entry.path().join("run.json")
+            } else {
+                entry.path()
+            };
+            if !runs && path.extension().is_none_or(|ext| ext != "json") {
+                return None;
+            }
+            let metadata = path.metadata().ok()?;
+            let modified = metadata
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?;
+            let id = if runs {
+                entry.file_name().to_string_lossy().into_owned()
+            } else {
+                path.file_stem()?.to_string_lossy().into_owned()
+            };
+            Some((id, (modified.as_nanos(), metadata.len())))
+        })
+        .collect()
+}
+
+#[derive(Debug, Serialize)]
+struct Delta {
+    base: u64,
+    changed: Vec<String>,
+    removed: Vec<String>,
+}
+
+fn diff_stamps(previous: &Stamps, next: &Stamps, base: u64) -> Delta {
+    let mut changed: Vec<_> = next
+        .iter()
+        .filter(|(id, stamp)| previous.get(*id) != Some(*stamp))
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut removed: Vec<_> = previous
+        .keys()
+        .filter(|id| !next.contains_key(*id))
+        .cloned()
+        .collect();
+    changed.sort_unstable();
+    removed.sort_unstable();
+    Delta {
+        base,
+        changed,
+        removed,
+    }
+}
+
+/// Change detection token for recorded runs under `runs`.
+fn runs_revision(runs: &FsPath) -> u64 {
+    stamps_revision(&store_stamps(runs, true))
+}
+
+/// Opaque tokens use the exact metadata snapshot behind the delta, in both
+/// health and SSE. Nanoseconds and length also detect same-millisecond writes
+/// and deleting an older conversation (a newest-mtime token cannot do that).
+fn stamps_revision(stamps: &Stamps) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    if stamps.is_empty() {
+        return 0;
+    }
+    let mut entries: Vec<_> = stamps.iter().collect();
+    entries.sort_unstable();
+    let mut hasher = std::hash::DefaultHasher::new();
+    entries.hash(&mut hasher);
+    hasher.finish().max(1)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChangeNotification {
+    pub payload: serde_json::Value,
+}
+
+#[derive(Default, Clone, Debug)]
+pub(crate) struct QueueIndex {
+    pub rev: u64,
+    pub run_to_task: HashMap<String, String>,
+    pub talk_to_tasks: HashMap<String, Vec<String>>,
+}
+
+#[derive(Default, Clone, Debug)]
+pub(crate) struct QuestionsIndex {
+    pub rev: u64,
+    pub open_by_run: HashMap<String, Vec<Question>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct SharedMonitor {
+    pub broadcaster: tokio::sync::broadcast::Sender<ChangeNotification>,
+    pub latest: Arc<Mutex<Option<((u64, u64, u64, u64, u64, u64), [Stamps; 3])>>>,
+    pub worker_started: std::sync::atomic::AtomicBool,
+    pub queue_index: Arc<Mutex<QueueIndex>>,
+    pub questions_index: Arc<Mutex<QuestionsIndex>>,
+}
+
+impl SharedMonitor {
+    pub fn new() -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(64);
+        Self {
+            broadcaster: tx,
+            latest: Arc::default(),
+            worker_started: std::sync::atomic::AtomicBool::new(false),
+            queue_index: Arc::default(),
+            questions_index: Arc::default(),
+        }
+    }
+
+    pub fn ensure_worker(&self, ui: &Arc<Ui>) {
+        if self
+            .worker_started
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        let weak_ui = Arc::downgrade(ui);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(POLL);
+            loop {
+                ticker.tick().await;
+                let Some(ui) = weak_ui.upgrade() else {
+                    break;
+                };
+
+                let state = Arc::clone(&ui);
+                let scan = tokio::task::spawn_blocking(move || {
+                    let stamps = [
+                        store_stamps(state.queue.root(), false),
+                        store_stamps(&state.runs, true),
+                        store_stamps(state.talks.root(), false),
+                    ];
+                    let revisions = (
+                        stamps_revision(&stamps[0]),
+                        stamps_revision(&stamps[1]),
+                        state.questions.revision(),
+                        stamps_revision(&stamps[2]),
+                        state.notices.revision(),
+                        state.lock_loop().rev,
+                    );
+                    (revisions, stamps)
+                })
+                .await;
+
+                let Ok((revisions, next_stamps)) = scan else {
+                    break;
+                };
+
+                let mut latest_guard = match ui.monitor.latest.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+
+                let previous = latest_guard.take();
+                let (last_rev, prev_stamps) = match previous {
+                    Some((r, s)) => (Some(r), Some(s)),
+                    None => (None, None),
+                };
+
+                if last_rev == Some(revisions) {
+                    *latest_guard = Some((revisions, prev_stamps.unwrap_or(next_stamps)));
+                    continue;
+                }
+
+                let mut payload = serde_json::json!({
+                    "queue_rev": revisions.0,
+                    "runs_rev": revisions.1,
+                    "questions_rev": revisions.2,
+                    "talks_rev": revisions.3,
+                    "notifications_rev": revisions.4,
+                    "loop_rev": revisions.5,
+                });
+
+                if let (Some(base), Some(prev)) = (last_rev, prev_stamps.as_ref()) {
+                    for (index, (key, rev)) in [
+                        ("queue_delta", base.0),
+                        ("runs_delta", base.1),
+                        ("talks_delta", base.3),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let delta = diff_stamps(&prev[index], &next_stamps[index], rev);
+                        if delta.changed.len() + delta.removed.len() > 0 && delta.changed.len() <= 50 {
+                            payload[key] = serde_json::to_value(delta).expect("serializable delta");
+                        }
+                    }
+                }
+
+                *latest_guard = Some((revisions, next_stamps));
+                drop(latest_guard);
+
+                let _ = ui.monitor.broadcaster.send(ChangeNotification {
+                    payload,
+                });
+            }
+        });
+    }
+}
+
 /// Everything the handlers touch.
 ///
 /// The queue, the runs directory and the magi home are fields rather than
@@ -367,6 +584,7 @@ pub struct Ui {
     /// [`BusyQueueGate`].
     #[cfg(test)]
     busy_queue_gate: Arc<Mutex<Option<BusyQueueGate>>>,
+    pub(crate) monitor: Arc<SharedMonitor>,
 }
 
 /// A one-shot stop point the busy branch's queued-draft write can be made to
@@ -436,7 +654,132 @@ impl Ui {
             launch: launch_daemon,
             #[cfg(test)]
             busy_queue_gate: Arc::default(),
+            monitor: Arc::new(SharedMonitor::new()),
         }
+    }
+
+    /// Look up the matching task for a run using the queue index when fresh.
+    pub(crate) fn find_task_for_run(&self, run_id: &str) -> Option<Task> {
+        let queue_rev = {
+            let guard = match self.monitor.latest.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.as_ref().map(|(r, _)| r.0).unwrap_or(0)
+        };
+        if queue_rev != 0 {
+            if let Ok(guard) = self.monitor.queue_index.lock() {
+                if guard.rev == queue_rev {
+                    if let Some(task_id) = guard.run_to_task.get(run_id) {
+                        return self.queue.get(task_id).ok();
+                    } else {
+                        return None;
+                    }
+                }
+            }
+        }
+        let tasks = self.queue.list();
+        let mut run_to_task = HashMap::new();
+        let mut talk_to_tasks: HashMap<String, Vec<String>> = HashMap::new();
+        let mut found = None;
+
+        for t in &tasks {
+            for r in &t.runs {
+                run_to_task.insert(r.clone(), t.id.clone());
+            }
+            if let Source::Agent { run, .. } = &t.source {
+                talk_to_tasks.entry(run.clone()).or_default().push(t.id.clone());
+            }
+            if t.runs.contains(&run_id.to_string()) && found.is_none() {
+                found = Some(t.clone());
+            }
+        }
+
+        if let Ok(mut guard) = self.monitor.queue_index.lock() {
+            guard.rev = queue_rev;
+            guard.run_to_task = run_to_task;
+            guard.talk_to_tasks = talk_to_tasks;
+        }
+
+        found
+    }
+
+    /// Look up the tasks filed by a talk using the queue index when fresh.
+    pub(crate) fn find_tasks_for_talk(&self, talk_id: &str) -> Vec<Task> {
+        let queue_rev = {
+            let guard = match self.monitor.latest.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            guard.as_ref().map(|(r, _)| r.0).unwrap_or(0)
+        };
+        if queue_rev != 0 {
+            if let Ok(guard) = self.monitor.queue_index.lock() {
+                if guard.rev == queue_rev {
+                    if let Some(task_ids) = guard.talk_to_tasks.get(talk_id) {
+                        return task_ids.iter().filter_map(|tid| self.queue.get(tid).ok()).collect();
+                    } else {
+                        return Vec::new();
+                    }
+                }
+            }
+        }
+        let tasks = self.queue.list();
+        let mut run_to_task = HashMap::new();
+        let mut talk_to_tasks: HashMap<String, Vec<String>> = HashMap::new();
+
+        for t in &tasks {
+            for r in &t.runs {
+                run_to_task.insert(r.clone(), t.id.clone());
+            }
+            if let Source::Agent { run, .. } = &t.source {
+                talk_to_tasks.entry(run.clone()).or_default().push(t.id.clone());
+            }
+        }
+
+        let result = talk_to_tasks
+            .get(talk_id)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|tid| self.queue.get(tid).ok())
+            .collect();
+
+        if let Ok(mut guard) = self.monitor.queue_index.lock() {
+            guard.rev = queue_rev;
+            guard.run_to_task = run_to_task;
+            guard.talk_to_tasks = talk_to_tasks;
+        }
+
+        result
+    }
+
+    /// Open questions belonging to a run, using index when fresh.
+    pub(crate) fn open_questions_for_run(&self, run_id: &str) -> Vec<Question> {
+        let q_rev = self.questions.revision();
+        if q_rev != 0 {
+            if let Ok(guard) = self.monitor.questions_index.lock() {
+                if guard.rev == q_rev {
+                    return guard.open_by_run.get(run_id).cloned().unwrap_or_default();
+                }
+            }
+        }
+        let open_qs = self
+            .questions
+            .list()
+            .into_iter()
+            .filter(|q| q.status.open())
+            .collect::<Vec<_>>();
+        let mut open_by_run: HashMap<String, Vec<Question>> = HashMap::new();
+        for q in open_qs {
+            open_by_run.entry(q.run.clone()).or_default().push(q);
+        }
+        let res = open_by_run.get(run_id).cloned().unwrap_or_default();
+        if let Ok(mut guard) = self.monitor.questions_index.lock() {
+            guard.rev = q_rev;
+            guard.open_by_run = open_by_run;
+        }
+        res
     }
 
     /// The operator's own state: `<home>/queue`, `<home>/questions`,
@@ -3594,33 +3937,39 @@ async fn run_detail(
         let state = read_run(&ui.runs, &id)?;
         let daemon_claims = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
         let live = state.liveness(daemon_claims);
-        let waiting = !ui.questions.open_for(&id).is_empty();
+        let waiting = !ui.open_questions_for_run(&id).is_empty();
+        let max_attempts = daemon::Opts::default().max_attempts;
+
+        let matching_task = ui.find_task_for_run(&id);
+
         let superseded_by = state
             .pr_taken_over_by
             .clone()
-            .or_else(|| ui.queue.superseded_by(&id))
+            .or_else(|| matching_task.as_ref().and_then(|t| t.successor_of(&id).cloned()))
             .as_deref()
             .map(crate::run::short_of)
             .map(str::to_owned);
+
         // Best-effort: an unreadable head (mid-write, or deleted) just means
         // this run's own status stands on its own, same as no later attempt
         // existing at all.
-        let latest_attempt = ui.queue.latest_attempt(&id).and_then(|head_id| {
-            read_run(&ui.runs, &head_id).ok().map(|head| LatestAttempt {
-                short: head.short().to_owned(),
-                resolved: matches!(head.status, RunStatus::Merged | RunStatus::Ready),
-                status: head.status,
-                done: head.status.done(),
-                id: head.id,
-            })
+        let latest_attempt = matching_task
+            .as_ref()
+            .and_then(|t| t.runs.last().filter(|last| **last != id).cloned())
+            .and_then(|head_id| {
+                read_run(&ui.runs, &head_id).ok().map(|head| LatestAttempt {
+                    short: head.short().to_owned(),
+                    resolved: matches!(head.status, RunStatus::Merged | RunStatus::Ready),
+                    status: head.status,
+                    done: head.status.done(),
+                    id: head.id,
+                })
+            });
+
+        let task = matching_task.map(|t| {
+            task_outcome(&t, &id, max_attempts, |r| read_run(&ui.runs, r).ok())
         });
-        let max_attempts = daemon::Opts::default().max_attempts;
-        let task = ui
-            .queue
-            .list()
-            .into_iter()
-            .find(|t| t.runs.contains(&id))
-            .map(|t| task_outcome(&t, &id, max_attempts, |r| read_run(&ui.runs, r).ok()));
+
         Ok(Json(RunDetailView::of(
             state,
             waiting,
@@ -5504,7 +5853,11 @@ async fn task_detail(
             .queue
             .get(&id)
             .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
-        let inv = crate::blockers::Inventory::load(&ui.queue, &ui.questions);
+        let inv = if task.status == TaskStatus::Blocked {
+            Some(crate::blockers::Inventory::load(&ui.queue, &ui.questions))
+        } else {
+            None
+        };
         let mut history = task_history(&task, |id| read_run(&ui.runs, id).ok());
         mark_badges(&ui, &task, &mut history);
         let runs_unreadable = history.iter().filter(|h| !h.readable).count();
@@ -5517,16 +5870,20 @@ async fn task_detail(
             )
         });
         let flow = task_flow(&task, &history, max_attempts, origin.as_ref());
+        let task_view = match inv.as_ref() {
+            Some(inv) => TaskView::with_inventory(task, inv),
+            None => TaskView::from(task),
+        };
         Ok(Json(TaskDetailView {
             max_attempts,
             flow,
             followup_origin: origin,
             passes_total: history.len(),
-            runs_distinct: distinct_runs(&task.runs),
+            runs_distinct: distinct_runs(&task_view.task.runs),
             history,
             runs_unreadable,
             attempts_note: ATTEMPTS_NOTE,
-            task: TaskView::with_inventory(task, &inv),
+            task: task_view,
         }))
     })
     .await
@@ -6251,164 +6608,112 @@ async fn mutate(
 /// receiver is gone, so a phone that walks out of range costs nothing after
 /// its next tick - there is no session and no cleanup to forget.
 async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
+    ui.monitor.ensure_worker(&ui);
+    let mut broadcast_rx = ui.monitor.broadcaster.subscribe();
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(4);
+
+    let state = Arc::clone(&ui);
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(POLL);
-        let mut last: Option<(u64, u64, u64, u64, u64, u64)> = None;
-        let mut stamps: Option<[Stamps; 3]> = None;
-        loop {
-            // The first tick completes immediately, which is what makes the
-            // stream announce the current revisions on connect.
-            ticker.tick().await;
-            let state = Arc::clone(&ui);
-            let revisions = tokio::task::spawn_blocking(move || {
-                let stamps = [
-                    store_stamps(state.queue.root(), false),
-                    store_stamps(&state.runs, true),
-                    store_stamps(state.talks.root(), false),
-                ];
-                let revisions = (
-                    stamps_revision(&stamps[0]),
-                    stamps_revision(&stamps[1]),
-                    state.questions.revision(),
-                    stamps_revision(&stamps[2]),
-                    state.notices.revision(),
-                    // The loop's counter is in-process state rather than a
-                    // file, so nothing the three stats above look at would
-                    // tell this phone that another one started the loop.
-                    state.lock_loop().rev,
-                );
-                (revisions, stamps)
-            })
-            .await;
-            let Ok((revisions, next_stamps)) = revisions else {
-                break;
+        let initial_revisions = {
+            let guard = match state.monitor.latest.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
             };
-            if last == Some(revisions) {
-                continue;
-            }
-            let mut payload = serde_json::json!({
-                "queue_rev": revisions.0,
-                "runs_rev": revisions.1,
-                "questions_rev": revisions.2,
-                "talks_rev": revisions.3,
-                "notifications_rev": revisions.4,
-                "loop_rev": revisions.5,
-            });
-            if let (Some(base), Some(previous)) = (last, stamps.as_ref()) {
-                for (index, (key, rev)) in [
-                    ("queue_delta", base.0),
-                    ("runs_delta", base.1),
-                    ("talks_delta", base.3),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    let delta = diff_stamps(&previous[index], &next_stamps[index], rev);
-                    // Empty diffs may mean a non-file dependency moved. Read whole.
-                    if delta.changed.len() + delta.removed.len() > 0 && delta.changed.len() <= 50 {
-                        payload[key] = serde_json::to_value(delta).expect("serializable delta");
+            guard.as_ref().map(|(r, _)| *r)
+        };
+        let revisions = match initial_revisions {
+            Some(r) => r,
+            None => {
+                let st = Arc::clone(&state);
+                let scan = tokio::task::spawn_blocking(move || {
+                    let stamps = [
+                        store_stamps(st.queue.root(), false),
+                        store_stamps(&st.runs, true),
+                        store_stamps(st.talks.root(), false),
+                    ];
+                    let revisions = (
+                        stamps_revision(&stamps[0]),
+                        stamps_revision(&stamps[1]),
+                        st.questions.revision(),
+                        stamps_revision(&stamps[2]),
+                        st.notices.revision(),
+                        st.lock_loop().rev,
+                    );
+                    let mut guard = match st.monitor.latest.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    if guard.is_none() {
+                        *guard = Some((revisions, stamps));
                     }
+                    revisions
+                })
+                .await;
+                match scan {
+                    Ok(r) => r,
+                    Err(_) => return,
                 }
             }
-            last = Some(revisions);
-            stamps = Some(next_stamps);
-            // Giving up beats looping if the receiver is gone.
-            let Ok(event) = Event::default().event("change").json_data(payload) else {
-                break;
-            };
+        };
+
+        let initial_payload = serde_json::json!({
+            "queue_rev": revisions.0,
+            "runs_rev": revisions.1,
+            "questions_rev": revisions.2,
+            "talks_rev": revisions.3,
+            "notifications_rev": revisions.4,
+            "loop_rev": revisions.5,
+        });
+
+        if let Ok(event) = Event::default().event("change").json_data(initial_payload) {
             if tx.send(event).await.is_err() {
-                break;
+                return;
+            }
+        }
+
+        loop {
+            match broadcast_rx.recv().await {
+                Ok(notif) => {
+                    let Ok(event) = Event::default().event("change").json_data(notif.payload) else {
+                        break;
+                    };
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let revs = {
+                        let guard = match state.monitor.latest.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        guard.as_ref().map(|(r, _)| *r)
+                    };
+                    if let Some(revs) = revs {
+                        let payload = serde_json::json!({
+                            "queue_rev": revs.0,
+                            "runs_rev": revs.1,
+                            "questions_rev": revs.2,
+                            "talks_rev": revs.3,
+                            "notifications_rev": revs.4,
+                            "loop_rev": revs.5,
+                        });
+                        if let Ok(event) = Event::default().event("change").json_data(payload) {
+                            if tx.send(event).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
+                }
             }
         }
     });
+
     Sse::new(ReceiverStream::new(rx).map(Ok::<Event, Infallible>))
         .keep_alive(KeepAlive::new().interval(KEEPALIVE))
-}
-
-type Stamps = HashMap<String, (u128, u64)>;
-
-/// Metadata only: no task instructions or conversation bodies are read here.
-fn store_stamps(root: &FsPath, runs: bool) -> Stamps {
-    std::fs::read_dir(root)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let path = if runs {
-                entry.path().join("run.json")
-            } else {
-                entry.path()
-            };
-            if !runs && path.extension().is_none_or(|ext| ext != "json") {
-                return None;
-            }
-            let metadata = path.metadata().ok()?;
-            let modified = metadata
-                .modified()
-                .ok()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?;
-            let id = if runs {
-                entry.file_name().to_string_lossy().into_owned()
-            } else {
-                path.file_stem()?.to_string_lossy().into_owned()
-            };
-            Some((id, (modified.as_nanos(), metadata.len())))
-        })
-        .collect()
-}
-
-#[derive(Debug, Serialize)]
-struct Delta {
-    base: u64,
-    changed: Vec<String>,
-    removed: Vec<String>,
-}
-
-fn diff_stamps(previous: &Stamps, next: &Stamps, base: u64) -> Delta {
-    let mut changed: Vec<_> = next
-        .iter()
-        .filter(|(id, stamp)| previous.get(*id) != Some(*stamp))
-        .map(|(id, _)| id.clone())
-        .collect();
-    let mut removed: Vec<_> = previous
-        .keys()
-        .filter(|id| !next.contains_key(*id))
-        .cloned()
-        .collect();
-    changed.sort_unstable();
-    removed.sort_unstable();
-    Delta {
-        base,
-        changed,
-        removed,
-    }
-}
-
-/// Change detection token for recorded runs under `runs`.
-///
-/// Combines the id and `run.json` modification time of each run, so adding,
-/// updating, or deleting any run — even an older one — moves the revision and
-/// notifies connected clients via the change stream. Returns 0 when no runs
-/// exist.
-fn runs_revision(runs: &FsPath) -> u64 {
-    stamps_revision(&store_stamps(runs, true))
-}
-
-/// Opaque tokens use the exact metadata snapshot behind the delta, in both
-/// health and SSE. Nanoseconds and length also detect same-millisecond writes
-/// and deleting an older conversation (a newest-mtime token cannot do that).
-fn stamps_revision(stamps: &Stamps) -> u64 {
-    use std::hash::{Hash as _, Hasher as _};
-    if stamps.is_empty() {
-        return 0;
-    }
-    let mut entries: Vec<_> = stamps.iter().collect();
-    entries.sort_unstable();
-    let mut hasher = std::hash::DefaultHasher::new();
-    entries.hash(&mut hasher);
-    hasher.finish().max(1)
 }
 
 /// Run ids under `runs`, newest first.
@@ -6471,7 +6776,8 @@ fn resolve_task(queue: &Queue, id: &str) -> ApiResult<String> {
     if queue.path_of(id).is_file() {
         return Ok(id.to_owned());
     }
-    pick(queue.list().into_iter().map(|t| t.id).collect(), id, "task")
+    let ids = crate::queue::record_ids(queue.root(), "json").unwrap_or_default();
+    pick(ids, id, "task")
 }
 
 /// A question as the phone reads it.
@@ -7594,7 +7900,7 @@ async fn talk_detail(
         let id = resolve_talk(&ui.talks, &id)?;
         let talk = ui.talks.get(&id)?;
         let thinking = ui.is_thinking(&talk.id);
-        let tasks = talk::tasks_of(&ui.queue, &talk.id);
+        let tasks = ui.find_tasks_for_talk(&talk.id);
         let task_progress = talk_task_progress(&tasks);
         let tasks = tasks.into_iter().map(TaskView::from).collect();
         let cfg = Config::discover(&talk.repo, None).ok().map(|(cfg, _)| cfg);
@@ -8579,9 +8885,28 @@ async fn talk_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiRe
     .await
 }
 
+fn talk_ids(root: &FsPath) -> Vec<String> {
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                path.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Expand an id or short id to exactly one talk id.
 fn resolve_talk(store: &Talks, id: &str) -> ApiResult<String> {
-    pick(store.list().into_iter().map(|t| t.id).collect(), id, "talk")
+    if store.path_of(id).is_file() {
+        return Ok(id.to_owned());
+    }
+    pick(talk_ids(store.root()), id, "talk")
 }
 
 /// `POST /api/talks/{id}/attachments` - upload one image to attach to a
@@ -22492,4 +22817,99 @@ mod tests {
             );
         }
     }
+
+    #[tokio::test]
+    async fn resolve_talk_and_task_avoid_deserializing_corrupt_or_unrelated_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue = Queue::at(dir.path().join("queue"));
+        let talks = Talks::at(dir.path().join("talks"));
+        std::fs::create_dir_all(queue.root()).unwrap();
+        std::fs::create_dir_all(talks.root()).unwrap();
+
+        // Put a corrupt json file in both stores
+        std::fs::write(queue.root().join("corrupt-task.json"), "invalid json").unwrap();
+        std::fs::write(talks.root().join("corrupt-talk.json"), "invalid json").unwrap();
+
+        // Valid task and talk
+        let mut task = Task::new("title".into(), "inst".into(), PathBuf::from("/repo"), Source::Human);
+        task.id = "20261019-123456-abcd".into();
+        // Write manually so it's a valid file
+        std::fs::write(queue.path_of(&task.id), serde_json::to_string(&task).unwrap()).unwrap();
+
+        let talk_id = "20261019-234567-cdef";
+        seed_talk_at(&talks, talk_id, "open");
+
+        // Exact match should succeed without failing on the corrupt json file
+        assert_eq!(resolve_task(&queue, &task.id).unwrap(), task.id);
+        assert_eq!(resolve_talk(&talks, talk_id).unwrap(), talk_id);
+
+        // Prefix match should also succeed by scanning file names without deserializing corrupt file
+        assert_eq!(resolve_task(&queue, "abcd").unwrap(), task.id);
+        assert_eq!(resolve_talk(&talks, "cdef").unwrap(), talk_id);
+    }
+
+    #[tokio::test]
+    async fn queue_index_and_talk_index_avoid_repeated_scans() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ui = delta_test_ui(dir.path());
+
+        // Create 20 tasks, some filed from a talk, some having runs
+        let talk_id = "20261019-100000-talk";
+        let run_id = "20261019-110000-runa";
+
+        for i in 0..20 {
+            let mut task = Task::new(
+                format!("task {i}"),
+                "inst".into(),
+                PathBuf::from("/repo"),
+                if i % 2 == 0 {
+                    Source::Agent {
+                        run: talk_id.into(),
+                        node: "chat".into(),
+                    }
+                } else {
+                    Source::Human
+                },
+            );
+            if i == 5 {
+                task.runs = vec![run_id.into()];
+            }
+            ui.queue.put(&mut task).unwrap();
+        }
+
+        // First lookup populates index
+        let found_task = ui.find_task_for_run(run_id).expect("task found");
+        assert!(found_task.runs.contains(&run_id.to_string()));
+
+        let talk_tasks = ui.find_tasks_for_talk(talk_id);
+        assert_eq!(talk_tasks.len(), 10);
+
+        // Corrupt all tasks on disk to prove subsequent lookups use the index
+        // without deserializing the whole queue again while revisions match
+        let queue_rev = {
+            let guard = ui.monitor.latest.lock().unwrap();
+            guard.as_ref().map(|(r, _)| r.0).unwrap_or(0)
+        };
+        // Ensure index rev matches
+        {
+            let mut guard = ui.monitor.queue_index.lock().unwrap();
+            guard.rev = queue_rev;
+        }
+
+        // Secondary lookup for the run should directly get the task by id
+        let found_again = ui.find_task_for_run(run_id).expect("task found from index");
+        assert_eq!(found_again.id, found_task.id);
+    }
+
+    #[test]
+    fn app_js_contains_progressive_rendering_and_decoupled_reports() {
+        // Assert that app.js decouples loadRun and does not block on Promise.allSettled for reports
+        assert!(!APP_JS.contains("Promise.allSettled([\n    getJson(API.run(id)), getText(API.report(id)), getJson(API.reportJson(id))"));
+        assert!(APP_JS.contains("function nextRunRequest(id)"));
+        assert!(APP_JS.contains("function runShell(id, summary)"));
+        assert!(APP_JS.contains("function nextTaskRequest(id)"));
+        assert!(APP_JS.contains("function taskShell(id, summary)"));
+        assert!(APP_JS.contains("state.detail.reportLoading = false;"));
+    }
 }
+

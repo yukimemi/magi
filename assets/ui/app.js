@@ -860,8 +860,8 @@ async function request(url, init) {
   return res;
 }
 
-const getJson = (url) => request(url).then((r) => r.json());
-const getText = (url) => request(url).then((r) => r.text());
+const getJson = (url, options) => request(url, options).then((r) => r.json());
+const getText = (url, options) => request(url, options).then((r) => r.text());
 
 const postJson = (url, body) =>
   request(url, {
@@ -6167,12 +6167,19 @@ function renderTalk() {
   if (!talk) {
     const gone = Boolean(state.talkDetail.gone);
     const summary = gone ? null : state.talkDetail.summary;
-    setText($("talk-h"), gone ? "This conversation no longer exists." : "Loading conversation…");
+    const title = summary && summary.title ? summary.title : "Loading conversation…";
+    setText($("talk-h"), gone ? "This conversation no longer exists." : title);
+    const repoName = summary && typeof summary.repo === "string" ? summary.repo.split(/[\\/]/).filter(Boolean).pop() : "";
+    const meta = summary ? `${shortId(state.talkDetail.id)}${repoName ? ` · ${repoName}` : ""}` : "";
     setText(
       $("talk-meta"),
-      gone ? `${shortId(state.talkDetail.id)} · It was deleted. Pick another conversation from the list.` : "",
+      gone ? `${shortId(state.talkDetail.id)} · It was deleted. Pick another conversation from the list.` : meta,
     );
-    clear($("talk-status"));
+    const head = $("talk-status");
+    clear(head);
+    if (summary && summary.status) {
+      head.append(chip(summary.status, TALK_STATUS));
+    }
     clear($("talk-turns"));
     show($("talk-tasks-panel"), false);
     show($("talk-task-progress"), !gone);
@@ -7414,9 +7421,19 @@ function renderReportCards() {
   const note = $("run-report-note");
   const toggle = $("report-raw-toggle");
   let reason = null;
-  if (!view) reason = null;
-  else if (view.error) reason = `Structured report unavailable (${view.error}); showing the raw text.`;
-  else if (view.schema !== REPORT_VIEW_SCHEMA || !Array.isArray(view.sections)) {
+  if (!view) {
+    if (state.detail.reportLoading) {
+      setText(raw, "Loading report…");
+      show(box, false);
+      show(raw, true);
+      show(toggle, false);
+      show(note, false);
+      return;
+    }
+    reason = null;
+  } else if (view.error) {
+    reason = `Structured report unavailable (${view.error}); showing the raw text.`;
+  } else if (view.schema !== REPORT_VIEW_SCHEMA || !Array.isArray(view.sections)) {
     reason = `Structured report schema ${view.schema} is not understood; showing the raw text.`;
   }
   const runId = state.detail.id;
@@ -7458,22 +7475,24 @@ function renderRunDetail() {
   applyRunTab();
   renderReportCards();
 
-  if (!run) {
-    setText($("run-h"), "Loading run\u2026");
-    setText($("run-meta"), "");
-    clear($("run-status"));
-    /* Both of these are about a specific run, and a question belonging to a
-       different one is not merely stale, it is wrong. */
+  if (!run || run.isShell) {
+    const summary = (state.runs || []).find((r) => r.id === state.detail.id);
+    if (summary) {
+      const parkedNow = isWaiting(summary) || openFor(summary.id).length > 0;
+      const status = parkedNow && summary.badge_status !== "superseded" && summary.badge_status !== "stale" ? "waiting" : displayedRunStatus(summary);
+      const head = $("run-status");
+      clear(head);
+      head.append(chip(status, RUN_STATUS));
+      setText($("run-h"), summary.task_title || summary.id);
+      setText($("run-meta"), `${shortId(summary.id)} · ${summary.repo || ""}`);
+    } else {
+      setText($("run-h"), "Loading run\u2026");
+      setText($("run-meta"), "");
+      clear($("run-status"));
+    }
     show($("run-ask-panel"), false);
     show($("run-land-panel"), false);
     show($("run-active-panel"), false);
-    /* The fab and its sheet stay reachable across this route (see
-       applyRoute), so a switch to a different run id \u2014 the daemon strip's
-       currentRunLink, or back/forward between two run pages \u2014 must not leave
-       the previous run's Resume/Fold/Delete buttons sitting in the sheet:
-       their onclick closures still carry the old id, and Delete says itself
-       "cannot be undone". Clearing here, before the new run's data arrives,
-       is what used to happen for free when the whole panel was hidden. */
     clear($("run-task-box"));
     clear($("run-actions-box"));
     clear($("run-fold-merged-box"));
@@ -9536,33 +9555,81 @@ async function loadHealth({ applyRevisions = false, explicit = false } = {}) {
   }
 }
 
+const runDetailRequests = new Map();
+function nextRunRequest(id) {
+  const request = (runDetailRequests.get(id) || 0) + 1;
+  runDetailRequests.set(id, request);
+  return request;
+}
+
+function runShell(id, summary) {
+  return {
+    id,
+    run: summary ? { ...summary, isShell: true } : null,
+    report: null,
+    reportView: null,
+    reportLoading: true,
+  };
+}
+
+function loadRawReport(id, requestId) {
+  if (state.detail.id !== id || requestId !== runDetailRequests.get(id)) return;
+  if (state.detail.report && state.detail.report !== "Loading…") return;
+  getText(API.report(id))
+    .then((text) => {
+      if (state.detail.id !== id || requestId !== runDetailRequests.get(id)) return;
+      state.detail.report = text;
+      renderReportCards();
+    })
+    .catch((err) => {
+      if (state.detail.id !== id || requestId !== runDetailRequests.get(id)) return;
+      state.detail.report = `The report could not be rendered: ${err.message}`;
+      renderReportCards();
+    });
+}
+
 async function loadRun(id, { background = false } = {}) {
   const fresh = state.detail.id !== id;
-  if (fresh) state.detail = { id, run: null, report: null, reportView: null };
-  renderRunDetail();
+  const requestId = nextRunRequest(id);
 
-  const [run, report, view] = await Promise.allSettled([
-    getJson(API.run(id)), getText(API.report(id)), getJson(API.reportJson(id)),
-  ]);
-
-  if (state.detail.id !== id) return;   /* the operator navigated away */
-
-  if (run.status === "fulfilled") {
-    state.detail.run = run.value;
-    ok();
-  } else {
-    failFor(background, `Could not load run ${shortId(id)}: ${run.reason.message}`, run.reason);
+  if (fresh) {
+    const summary = (state.runs || []).find((r) => r.id === id);
+    state.detail = runShell(id, summary);
+    renderRunDetail();
   }
-  state.detail.report = report.status === "fulfilled"
-    ? report.value
-    : `The report could not be rendered: ${report.reason.message}`;
-  /* A failed or unknown-schema structured view is kept as a reason, never as
-     an empty report: renderReportCards falls back to the raw text with it. */
-  state.detail.reportView = view.status === "fulfilled"
-    ? view.value
-    : { error: view.reason && view.reason.message ? view.reason.message : "request failed" };
 
-  renderRunDetail();
+  // 1. Run core details
+  getJson(API.run(id))
+    .then((run) => {
+      if (state.detail.id !== id || requestId !== runDetailRequests.get(id)) return;
+      state.detail.run = run;
+      ok();
+      renderRunDetail();
+    })
+    .catch((err) => {
+      if (state.detail.id !== id || requestId !== runDetailRequests.get(id)) return;
+      failFor(background, `Could not load run ${shortId(id)}: ${err.message}`, err);
+      renderRunDetail();
+    });
+
+  // 2. Structured report (independent fetch)
+  getJson(API.reportJson(id))
+    .then((view) => {
+      if (state.detail.id !== id || requestId !== runDetailRequests.get(id)) return;
+      state.detail.reportView = view;
+      state.detail.reportLoading = false;
+      renderReportCards();
+      if (state.rawReport) {
+        loadRawReport(id, requestId);
+      }
+    })
+    .catch((err) => {
+      if (state.detail.id !== id || requestId !== runDetailRequests.get(id)) return;
+      state.detail.reportView = { error: err.message || "request failed" };
+      state.detail.reportLoading = false;
+      renderReportCards();
+      loadRawReport(id, requestId);
+    });
 }
 
 /* Named with a trailing underscore because `applyRevisions` is also the option
@@ -10390,17 +10457,36 @@ function renderSettings() {
  * Everything here comes from GET /api/queue/{id}: the server reads every run
  * in Task.runs and says what kind of attempt each was and how it ended, so
  * this only lays it out. */
+const taskDetailRequests = new Map();
+function nextTaskRequest(id) {
+  const request = (taskDetailRequests.get(id) || 0) + 1;
+  taskDetailRequests.set(id, request);
+  return request;
+}
+
+function taskShell(id, summary) {
+  return {
+    id,
+    task: summary ? { ...summary, isShell: true } : null,
+    error: null,
+  };
+}
+
 async function loadTask(id, { background = false } = {}) {
-  if (state.taskDetail.id !== id) state.taskDetail = { id, task: null, error: null };
+  const req = nextTaskRequest(id);
+  if (state.taskDetail.id !== id) {
+    const summary = (state.queue || []).find((t) => t.id === id);
+    state.taskDetail = taskShell(id, summary);
+  }
   renderTask();
   try {
     const task = await getJson(API.task(id));
-    if (state.taskDetail.id !== id) return;   /* navigated away */
+    if (req !== taskDetailRequests.get(id) || state.taskDetail.id !== id) return;
     state.taskDetail.task = task;
     state.taskDetail.error = null;
     ok();
   } catch (e) {
-    if (state.taskDetail.id !== id) return;
+    if (req !== taskDetailRequests.get(id) || state.taskDetail.id !== id) return;
     state.taskDetail.error = e.message;
     failFor(background, `Could not load task ${shortId(id)}: ${e.message}`, e);
   }
@@ -10412,16 +10498,33 @@ function renderTask() {
   setAttr($("view-task"), "data-task-id", task ? task.id : null);
   const head = $("task-status");
   clear(head);
-  if (!task) {
-    setText($("task-h"), error ? `Task ${shortId(id || "")} could not be loaded` : "Loading task\u2026");
-    setText($("task-meta"), error || "");
+  if (!task || task.isShell) {
+    const summary = (state.queue || []).find((t) => t.id === id);
+    if (summary) {
+      const status = String(summary.status_str || summary.status || "");
+      head.append(chip(status, TASK_STATUS));
+      if (summary.urgent === true) head.append(urgentTag());
+      setText($("task-h"), summary.title || shortId(summary.id));
+      const repoName = typeof summary.repo === "string" ? summary.repo.split(/[\\/]/).filter(Boolean).pop() : "";
+      const metaBits = [
+        shortId(summary.id),
+        summary.source_label,
+        repoName,
+        summary.solo ? "solo" : "",
+      ].filter(Boolean);
+      setText($("task-meta"), metaBits.join(" · "));
+    } else {
+      setText($("task-h"), error ? `Task ${shortId(id || "")} could not be loaded` : "Loading task\u2026");
+      setText($("task-meta"), error || "");
+    }
     show($("task-why-panel"), false);
     clear($("task-runs"));
     clear($("task-flow"));
     setText($("task-flow-summary"), "");
     setText($("task-attempts-count"), "");
     renderTaskActions(null);
-    return;
+    if (!task) return;
+    if (task.isShell) return;
   }
   const status = String(task.status_str || task.status || "");
   head.append(chip(status, TASK_STATUS));
