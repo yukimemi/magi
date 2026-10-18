@@ -204,6 +204,7 @@ enum ClientProbe {
     Settings,
     Questions,
     Connection,
+    Upgrade,
 }
 
 // Expose the live module's functions without installing a second client that
@@ -231,7 +232,7 @@ async fn serve_with_client_probe(
         .await
         .expect("bind loopback");
     let base = format!("http://{}/", listener.local_addr().unwrap());
-    let boot = !matches!(probe, ClientProbe::Connection);
+    let boot = !matches!(probe, ClientProbe::Connection | ClientProbe::Upgrade);
     let exports = match probe {
         ClientProbe::None => None,
         ClientProbe::Queue => Some(
@@ -241,6 +242,9 @@ async fn serve_with_client_probe(
         ClientProbe::Questions => Some(
             "state, shortId, renderQuestions, renderAsks, openPanel, closePanel, focusFirstAsk",
         ),
+        ClientProbe::Upgrade => {
+            Some("state, upgrade, renderLoop, renderUpgradeError, loadHealth, ok")
+        }
         ClientProbe::Connection => Some(
             "state, loadHealth, loadLoop, loadTalk, tickTalkWaits, loadStats, resumeConnection, onPageShow, unreachable, loadQueue",
         ),
@@ -2349,15 +2353,17 @@ async fn unreachable_banner_waits_out_transient_failures() {
           out.loopPreservesActionError = shown()
             && document.getElementById('alert').textContent === actionError;
           await deck.loadHealth();
-          /* Keep JSON parsing in the promise chain drained by tick. A native
-             Response body stream can finish after its setTimeout callback. */
-          window.fetch = async () => ({ ok: false, status: 500,
-            json: async () => ({ error: 'server failed' }) });
+          /* Keep body reads in the promise chain drained by tick. A native
+             Response body stream can finish after its setTimeout callback.
+             Match the text and header interfaces used by the transport. */
+          window.fetch = async () => ({ ok: false, status: 500, headers: new Headers(),
+            text: async () => JSON.stringify({ error: 'server failed' }) });
           clock += 10000;
           await tick();
           out.talkHttpImmediate = shown()
             && document.getElementById('alert').textContent.includes('server failed');
-          window.fetch = async () => ({ ok: false, status: 404, json: async () => ({}) });
+          window.fetch = async () => ({ ok: false, status: 404, headers: new Headers(),
+            text: async () => '{}' });
           clock += 10000;
           await tick();
           out.talkGone = deck.state.talkDetail.gone === true
@@ -4245,4 +4251,87 @@ async fn question_chat_link_survives_consultation_and_settlement() {
             .unwrap();
         browser.close_page(&page).await;
     }
+}
+
+#[tokio::test]
+async fn upgrade_failures_remain_readable_and_retryable_on_phone() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP upgrade UI: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let base = serve_with_client_probe(
+        &home,
+        Queue::at(home.join("queue")),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Upgrade,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
+    let page = browser.open_page(&base, 390, 844, true).await.unwrap();
+    let result = browser.eval(&page, r##"(async () => {
+      while (!window.deck) await new Promise(r => setTimeout(r, 20));
+      const assert = (ok, why) => { if (!ok) throw new Error(why); };
+      const health = {version:'0.1.0', loop:{}, daemon:{}, update:{available:true, to:'v0.2.0'}, upgrade:{stage:'done', to:'v0.1.0'}};
+      deck.state.health = health;
+      deck.renderLoop();
+      const button = document.getElementById('loop-upgrade');
+      const box = document.getElementById('upgrade-error');
+      const text = document.getElementById('upgrade-error-text');
+      const attempt = async () => { await deck.upgrade(); await deck.upgrade(); };
+      const reason = '<img src=x onerror=alert(1)> ' + 'GitHub API rate limit exceeded '.repeat(20);
+      let calls = 0, release;
+      window.fetch = async () => { calls++; return await new Promise(r => { release = r; }); };
+      await deck.upgrade();
+      const pending = deck.upgrade();
+      await Promise.resolve();
+      deck.renderLoop();
+      assert(button.disabled, 'redraw preserves sending state');
+      await deck.upgrade();
+      assert(calls === 1, 'no duplicate POST while sending');
+      release(new Response(JSON.stringify({error:reason,retry_after_secs:120,retry_at:2000000000}), {status:500}));
+      await pending;
+      assert(!box.hidden && text.textContent.includes(reason), 'full JSON reason visible');
+      assert(!box.querySelector('img') && text.textContent.includes('Retry after'), 'safe text and retry timing');
+      window.fetch = async () => new Response(JSON.stringify(health));
+      await deck.loadHealth();
+      deck.ok(); deck.renderLoop();
+      assert(!box.hidden, 'normal health polling retains failure over previous done');
+      const rect = box.getBoundingClientRect();
+      assert(rect.width <= 390 && box.scrollWidth <= box.clientWidth && text.clientHeight > 100, 'phone wraps full message');
+      document.getElementById('upgrade-error-dismiss').click();
+      deck.renderLoop();
+      assert(box.hidden, 'explicit dismissal survives redraw');
+      for (const [reply, expected] of [
+        [() => new Response('Proxy unavailable', {status:502, headers:{'Retry-After':'60'}}), '502'],
+        [() => { throw new Error('Network disconnected'); }, 'Network disconnected']
+      ]) {
+        window.fetch = async () => reply();
+        await attempt();
+        deck.ok(); deck.renderLoop();
+        assert(!box.hidden && text.textContent.includes(expected), 'HTTP/network failure retained');
+        assert(!button.disabled, 'retry enabled after failure');
+      }
+      deck.state.health = health;
+      // Health carries the pre-progress failure independently of old done.
+      health.upgrade_request_error = {error:'Retained release check failure', occurred_at:'now'};
+      // A successfully accepted retry clears local and stale server failures.
+      window.fetch = async () => new Response(JSON.stringify({to:'v0.2.0', detail:'Accepted'}), {status:202});
+      await attempt(); deck.renderLoop();
+      assert(box.hidden, 'accepted retry clears stale errors');
+      health.upgrade_request_error = {error:'New request failure', occurred_at:'later'};
+      deck.renderLoop();
+      assert(!box.hidden && text.textContent.includes('New request failure'), 'health restores request failure');
+      health.upgrade = {stage:'downloading', to:'v0.2.0'};
+      deck.renderLoop();
+      assert(box.hidden, 'active progress wins over response loss or stale failure');
+      return true;
+    })()"##).await.expect("upgrade UI behavior");
+    assert_eq!(result, true);
+    browser.close_page(&page).await;
 }

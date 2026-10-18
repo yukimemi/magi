@@ -726,15 +726,29 @@ let nextTalkWaitGeneration = 1;
 async function request(url, init) {
   const res = await fetch(url, init);
   if (!res.ok) {
+    let details = {};
     let message = `${res.status} ${res.statusText || "request failed"}`;
     try {
-      const body = await res.json();
-      if (body && typeof body.error === "string") message = body.error;
+      const raw = await res.text();
+      try {
+        const body = JSON.parse(raw);
+        details = body || {};
+        if (body && typeof body.error === "string") message = body.error;
+      } catch {
+        if (raw.trim()) message += `: ${raw.trim()}`;
+      }
     } catch {
-      /* an error body is not guaranteed to be JSON; the status stands in */
+      /* A response body may itself be interrupted; retain the HTTP status. */
     }
     const error = new Error(message);
     error.status = res.status;
+    error.retry_at = details.retry_at;
+    error.retry_after_secs = details.retry_after_secs;
+    if (error.retry_at == null) {
+      const retry = res.headers.get("retry-after");
+      if (retry && /^\d+$/.test(retry)) error.retry_at = Date.now() / 1000 + Number(retry);
+      else if (retry && Number.isFinite(Date.parse(retry))) error.retry_at = Date.parse(retry) / 1000;
+    }
     throw error;
   }
   return res;
@@ -915,26 +929,47 @@ function initLoopDetail() {
 }
 initLoopDetail();
 
+// Separate from the transient transport alert: normal polling must not erase
+// an update failure before someone can read it or after the page reloads.
+let upgradeSending = false;
+let upgradeError = null;
+const dismissedUpgradeErrors = new Set();
+function renderUpgradeError() {
+  const progress = state.health && state.health.upgrade;
+  const busy = progress && UPGRADE_BUSY_STAGES.has(progress.stage);
+  const saved = state.health && state.health.upgrade_request_error;
+  const failure = upgradeError || saved || (progress && progress.stage === "failed"
+    ? { error: progress.detail || "The upgrade did not complete.", to: progress.to, started_at: progress.started_at } : null);
+  const key = failure ? JSON.stringify(failure) : null;
+  const box = $("upgrade-error");
+  if (busy) {
+    upgradeError = null;
+    dismissedUpgradeErrors.add(key);
+  }
+  const visible = !busy && failure && !dismissedUpgradeErrors.has(key);
+  show(box, Boolean(visible));
+  if (!visible) return;
+  const target = failure.to || (state.health && state.health.update && state.health.update.to);
+  const retry = Number.isFinite(failure.retry_at)
+    ? ` Retry after ${new Date(failure.retry_at * 1000).toLocaleString()}.`
+    : Number.isFinite(failure.retry_after_secs) ? ` Retry after ${failure.retry_after_secs} seconds.` : "";
+  setText($("upgrade-error-text"), `Could not update${target ? ` to ${target}` : ""}: ${failure.error}${retry} You can retry using the update button (confirm twice).`);
+  $("upgrade-error-dismiss").onclick = () => {
+    dismissedUpgradeErrors.add(key);
+    show(box, false);
+  };
+}
+
 function renderLoop() {
+  renderUpgradeError();
   const box = $("daemon");
   const text = box.querySelector(".daemon-text");
   const why = $("loop-why");
   const button = $("loop-toggle");
   const controls = $("loop-controls");
-  /* A past upgrade failure, folded into whatever note the loop's own state
-     below already shows, rather than replacing it. `Stage::Failed` is
-     terminal on the server and nothing clears it automatically, so taking
-     the whole strip over for it - as the busy stages do, which is fine
-     because those are transient - would leave start/stop/park unreachable
-     from the phone until a fresh upgrade attempt happened to overwrite the
-     record. Declared here, before `quiet`/`control` close over it, and
-     assigned once the upgrade stage is known below. */
-  let upgradeFailNote = "";
-
   const quiet = (note) => {
-    const full = [note, upgradeFailNote].filter(Boolean).join(" ");
-    setText(why, full);
-    show(why, Boolean(full));
+    setText(why, note);
+    show(why, Boolean(note));
     show(button, false);
     button.dataset.armed = "";
     button.onclick = null;
@@ -973,7 +1008,7 @@ function renderLoop() {
      redraw while that tap is pending keeps showing the question, so the
      label never reads "Stop the loop" while the next tap already commits. */
   const control = (kind, label, note, question = null) => {
-    setText(why, [note, upgradeFailNote].filter(Boolean).join(" "));
+    setText(why, note);
     show(why, true);
     setAttr(button, "data-kind", kind);
     if (question && button.dataset.armed === "yes") {
@@ -1051,13 +1086,7 @@ function renderLoop() {
     return;
   }
 
-  /* The transition into "done" or "failed" is what is worth announcing -
-     being on either already (a fresh page load after the fact) is not news.
-     `failed` does not take the strip over the way the busy stages above do:
-     it is terminal on the server and nothing clears it on its own, so a
-     takeover here would have permanently hidden start/stop/park behind an
-     upgrade notice the operator has no way to dismiss. `upgradeFailNote`
-     carries it into the loop's own note instead, below. */
+  /* Announce transitions; the dedicated error panel retains failed attempts. */
   if (upgradeStage === "done" && UPGRADE_BUSY_STAGES.has(state.lastUpgradeStage)) {
     announce(`Updated to ${upgradeInfo.to || "the new build"} \u2014 back and running.`);
   }
@@ -1066,9 +1095,6 @@ function renderLoop() {
   }
   state.lastUpgradeStage = upgradeStage;
   setAttr(box, "data-upgrade-failed", upgradeStage === "failed" ? "yes" : null);
-  if (upgradeStage === "failed") {
-    upgradeFailNote = `The last upgrade to ${upgradeInfo.to || "a new release"} did not complete${upgradeInfo.detail ? ` (${upgradeInfo.detail})` : ""} \u2014 check on it by hand.`;
-  }
 
   const loop = state.health.loop || state.loop || {};
   const daemon = loop.daemon || state.health.daemon || {};
@@ -1096,16 +1122,18 @@ function renderLoop() {
      either way, and an operator with fixes waiting should not have to start
      the loop to install them. Hidden when the loop belongs to somebody else,
      because replacing this binary would leave that process running an old
-     one against the same queue - and hidden with nothing to install, because
-     restarting for an upgrade that would not happen used to park the run in
+     one against the same queue. With nothing to install or retry it stays
+     hidden, because restarting for an upgrade that would not happen used to park the run in
      flight and drop every connection for nothing. The version this deck is
      actually running is shown unconditionally, next to the strip, whether or
      not there is anything newer. */
   const update = state.health.update || { available: false, to: null };
-  show(upgradeBtn, !foreign && update.available);
-  if (!foreign && update.available && upgradeBtn.dataset.armed !== "yes") {
+  const canUpgrade = !foreign && (update.available || !$("upgrade-error").hidden);
+  show(upgradeBtn, canUpgrade);
+  if (canUpgrade && upgradeBtn.dataset.armed !== "yes") {
     setText(upgradeBtn, update.to ? `Update to ${update.to}` : "Update & restart");
-    upgradeBtn.disabled = false;
+    upgradeBtn.disabled = upgradeSending;
+    if (upgradeSending) setText(upgradeBtn, "Upgrading\u2026");
     upgradeBtn.onclick = upgrade;
   }
 
@@ -1265,12 +1293,26 @@ function quietNote(text) {
 }
 
 async function upgrade() {
+  if (upgradeSending) return;
   const btn = $("loop-upgrade");
   if (!confirmed(btn, "Replace the binary and restart?")) return;
+  upgradeSending = true;
+  const target = state.health && state.health.update && state.health.update.to;
+  // Snapshot failure identities before the POST: health may report this
+  // attempt failing before its acknowledgement reaches the browser.
+  const priorFailures = [];
+  const health = state.health || {};
+  if (health.upgrade_request_error) priorFailures.push(JSON.stringify(health.upgrade_request_error));
+  if (health.upgrade && health.upgrade.stage === "failed") {
+    priorFailures.push(JSON.stringify({ error: health.upgrade.detail || "The upgrade did not complete.", to: health.upgrade.to, started_at: health.upgrade.started_at }));
+  }
   btn.disabled = true;
   setText(btn, "Upgrading\u2026");
   try {
     const out = await postJson(API.upgrade);
+    upgradeError = null;
+    for (const failure of priorFailures) dismissedUpgradeErrors.add(failure);
+    renderUpgradeError();
     ok();
     const detail = out.detail || "The deck is replacing itself and will come back.";
     announce(detail);
@@ -1291,7 +1333,15 @@ async function upgrade() {
   } catch (error) {
     setText(btn, "Update & restart");
     btn.disabled = false;
-    fail(`Could not upgrade: ${error.message}`);
+    const progress = state.health && state.health.upgrade;
+    if (!progress || !UPGRADE_BUSY_STAGES.has(progress.stage)) {
+      upgradeError = { error: error.message, to: target, retry_at: error.retry_at, retry_after_secs: error.retry_after_secs };
+      dismissedUpgradeErrors.clear();
+      renderUpgradeError();
+    }
+  } finally {
+    upgradeSending = false;
+    btn.disabled = false;
   }
 }
 
