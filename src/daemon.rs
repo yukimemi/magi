@@ -3700,19 +3700,16 @@ async fn attempt(
     } else {
         starter_with_implementers(task, previous.as_ref(), proposed)
     };
-    // A repair pin must never degrade into a new competition or takeover if
-    // the owner disappears between the answer and dispatch.
+    // An explicit resume pin must never degrade into a new competition or
+    // takeover, including when its run stops being eligible after the answer.
     if let Some(pin) = &task.resume_override
         && let Some(run) = &pin.pinned_run
-        && Questions::open().get(&pin.question_id).map_or(true, |q| {
-            q.node == land::APPROVAL_NODE && q.resolution().as_deref() == Some(land::REPAIR)
-        })
         && starter != Starter::Resume(run.clone())
     {
         let run = run.clone();
-        task.notice_cause("repair-owner", Some(&run), None);
+        task.notice_cause("resume-owner", Some(&run), None);
         task.hold_machine(Some(format!(
-            "repair owner cannot resume; inspect `magi show {run}` and restore the existing run before `magi task release {}`; no replacement task was started",
+            "pinned run cannot resume; inspect `magi show {run}` and restore the existing run before `magi task release {}`; no replacement task was started",
             task.id
         )));
         record(queue, task);

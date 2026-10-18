@@ -1323,3 +1323,71 @@ async fn maintenance_resume_preserves_operator_decisions_after_deputy_settle() {
     }
 }
 }
+
+common::e2e! {
+async fn maintenance_named_resume_never_replaces_an_exhausted_run() {
+    use magi::{ask::{Answer, ChoiceAction}, queue::{Queue, Source, Task, TaskStatus},
+        run::{ReviewRound, RunState, RunStatus}};
+    let s = scene(home_lock().await);
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    let queue = Queue::at(s.home.join("queue"));
+    let mut config = s.fx.config.clone();
+    config.disk.min_free_bytes = 0;
+    config.disk.auto_fold = false;
+    config.disk.cache_limit_bytes = 0;
+    config.graph.review_rounds = 1;
+    let config_path = s.fx.tmp.path().join("resume.toml");
+    std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+    let opts = magi::daemon::Opts { repo: s.fx.repo.clone(), config: Some(config_path),
+        worktrees_root: Some(s.fx.tmp.path().join("worktrees")), ..Default::default() };
+    for exhausted_before_answer in [true, false] {
+        let mut task = Task::new("resume existing work".into(), "work".into(), s.fx.repo.clone(), Source::Human);
+        let mut run = RunState::new(s.fx.repo.clone(), "main".into(), "base".into(),
+            task.instruction.clone(), config.clone());
+        run.status = RunStatus::Blocked;
+        run.driver_exited = true;
+        run.pr_publication_pending = false;
+        let round = ReviewRound { round: 1, head: "base".into(), verified_head: None,
+            verified_at: None, reviews: Vec::new(), e2e: Vec::new(), verify_retried: false,
+            e2e_deferred: false, e2e_defer_reason: None, fix: None, blocking: 0,
+            answered: 1, expected: 1, clean: false, progressed: true, vote_split: false,
+            reconsideration: Vec::new(), verdict: None };
+        if exhausted_before_answer { run.reviews.push(round.clone()); }
+        run.save_under(&s.home).unwrap();
+        task.runs.push(run.id.clone());
+        task.hold_machine(Some("waiting for resume".into()));
+        queue.put(&mut task).unwrap();
+        assert!(task.review_of.is_none() && task.replacement.is_none() && task.pr_recovery.is_none());
+        let mut q = conductor_maintenance_question(&s, &queue, &task,
+            ChoiceAction::ResumeRun { run: run.id.clone() });
+        q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+        s.store.put(&mut q).unwrap();
+        magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+        task = queue.get(&task.id).unwrap();
+        assert_eq!(task.status, TaskStatus::Queued);
+        assert_eq!(task.resume_override.as_ref().unwrap().pinned_run.as_deref(), Some(run.id.as_str()));
+        // Also protect a pin that was accepted while budget remained but is
+        // no longer resumable by the time the daemon dispatches the attempt.
+        if !exhausted_before_answer {
+            run.reviews.push(round);
+            run.save_under(&s.home).unwrap();
+        }
+        let path = s.home.join("runs").join(&run.id).join("run.json");
+        let before = std::fs::read(&path).unwrap();
+        let runs_before = std::fs::read_dir(s.home.join("runs")).unwrap()
+            .map(|entry| entry.unwrap().file_name()).collect::<std::collections::BTreeSet<_>>();
+        let claim = queue.claim(&task.id).unwrap();
+        magi::daemon::run_claimed(&opts, &queue, &mut task).await;
+        drop(claim);
+        let stored = queue.get(&task.id).unwrap();
+        assert_eq!(stored.status, TaskStatus::Held);
+        assert!(stored.hold_reason.as_deref().unwrap().contains("pinned run cannot resume"), "{:?}", stored.hold_reason);
+        assert_eq!(stored.runs, vec![run.id.clone()]);
+        assert_eq!(stored.attempts, 0, "no new competition or graph execution");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let runs_after = std::fs::read_dir(s.home.join("runs")).unwrap()
+            .map(|entry| entry.unwrap().file_name()).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(runs_after, runs_before, "no replacement run was minted");
+    }
+}
+}
