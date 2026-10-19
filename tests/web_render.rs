@@ -4137,8 +4137,12 @@ async fn queue_compact_controls_and_edit_save_fit_and_preserve_drafts() {
           }}
           const originalFetch = window.fetch;
           const calls = [];
+          // Reference decoration also POSTs while refreshed cards render.
+          // Observe and refuse only this task's writes, preserving those reads.
+          const isTaskWrite = (url, options) => options?.method === 'POST'
+            && url.startsWith(`/api/queue/${{id}}/`);
           window.fetch = async (url, options) => {{
-            if (options?.method === 'POST') {{
+            if (isTaskWrite(url, options)) {{
               calls.push(url);
               return new Response(JSON.stringify({{error: 'Refused'}}), {{status: 409}});
             }}
@@ -4155,7 +4159,7 @@ async fn queue_compact_controls_and_edit_save_fit_and_preserve_drafts() {
           assert(dialog.open && document.querySelector('#task-edit-error').textContent.includes('Title and instruction saved'), 'partial save explained');
           calls.length = 0;
           window.fetch = async (url, options) => {{
-            if (options?.method === 'POST') calls.push(url);
+            if (isTaskWrite(url, options)) calls.push(url);
             return originalFetch(url, options);
           }};
           await deck.saveTaskEdit();
