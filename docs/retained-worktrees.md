@@ -31,6 +31,9 @@ caches and dep-info metadata remain. Unsupported or missing dep-info retains the
 outputs for inspection. Custom locations and cross-compilation layouts are not
 adopted automatically. The exact deletion list is recorded before removal in the
 run's `build-outputs.json`; a Cargo tag alone never owns all ignored contents.
+When the only remaining files are the cache identities, empty profile locks and
+dep-info corresponding to the reclaimed artifacts, cleanup also archives their
+exact contents per worktree in `build-residue/` under the run's reports.
 
 Deletion requires confirmed driver death, no daemon claim, the public-owner lock,
 the execution lease, an exclusive worktree-output lease and the Cargo profile
@@ -89,13 +92,18 @@ retirement. This inventory preserves other candidate changes as recovery sources
 it does not merge or discard them or transfer PR ownership.
 
 At most five obsolete empty attempts are retired per pass. Each removed worktree
-must still be clean, contain no untracked or ignored files, have HEAD exactly at
+must still be clean, contain no untracked or ignored files except archived Cargo
+residue, have HEAD exactly at
 its original base, and have no unfinished Git operation. Recorded and unrecorded
 candidate branches must also be at that base. Changed worktrees, unique commits,
 PR owners, review/recovery checkpoints, explicit retention markers, operator pins,
 selected replacement sources, pending candidate-preservation barriers and
 unanswered run decisions are kept. A task's hold
 is not released or completed. No PR is closed and no question is answered.
+Cargo residue qualifies only after artifact reclamation recorded a complete
+inventory, and only if every remaining file still matches that inventory under
+the output and Cargo locks. Added files, changed metadata, symlinks and missing
+proof retain the worktree. The archived metadata survives worktree removal.
 
 `retired_to` prevents execution independently of run status, before any worktree
 is removed. Reports, branch refs and the retirement event remain. Interrupted
