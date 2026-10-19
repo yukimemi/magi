@@ -387,12 +387,10 @@ async fn dropped_commits(repo: &Path, onto_sha: &str, orig: &str, head: &str) ->
     for c in missing_commits(&expected, &have) {
         // Git also drops a commit on its own when its change is already on
         // the base under a different patch (e.g. folded into one upstream
-        // commit). Verify the whole change against the base as well: later
-        // branch commits may supersede its lines in the result, making an
-        // isolated replay there conflict. Only a successful replay leaving
-        // the base's entire tree (including modes) unchanged proves absorption;
-        // a later edit to the same file alone cannot excuse a skipped change.
-        if replay_is_noop(repo, &c.sha, onto_sha).await {
+        // commit). Absorption alone is insufficient: the fixer may remove it
+        // again. Verify its paths in the final result, allowing only changes
+        // explained by the base and the original branch's later commits.
+        if absorbed_in_result(repo, &c.sha, onto_sha, orig, head).await {
             continue;
         }
         if !already_in_result(repo, &c.sha, orig, head).await {
@@ -537,6 +535,55 @@ async fn replay_is_noop(repo: &Path, sha: &str, head: &str) -> bool {
         Ok(t) => !merged.is_empty() && merged == t,
         Err(_) => false,
     }
+}
+
+/// An absorbed change may be superseded by later branch commits, so replaying
+/// it alone onto the result can conflict. Starting at `sha`, merge only those
+/// later changes with the base and require every path `sha` touched to match
+/// the result (including modes). A clean merge is evidence; a conflict or a
+/// failed lookup is not. Unrelated later edits cannot explain erasing its lines.
+async fn absorbed_in_result(repo: &Path, sha: &str, onto: &str, orig: &str, head: &str) -> bool {
+    if !replay_is_noop(repo, sha, onto).await {
+        return false;
+    }
+    let paths = commit_paths(repo, sha).await;
+    if paths.is_empty() {
+        return false;
+    }
+    let Ok(out) = git::git_raw(
+        repo,
+        &[
+            "merge-tree",
+            "--write-tree",
+            &format!("--merge-base={sha}"),
+            onto,
+            orig,
+        ],
+    )
+    .await
+    else {
+        return false;
+    };
+    if !out.ok() {
+        return false;
+    }
+    let merged = out.stdout.lines().next().unwrap_or("").trim();
+    if merged.is_empty() {
+        return false;
+    }
+    let mut args = vec![
+        "--literal-pathspecs",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=none",
+        "--quiet",
+        merged,
+        head,
+        "--",
+    ];
+    args.extend(paths.iter().map(String::as_str));
+    git::git_raw(repo, &args).await.is_ok_and(|out| out.ok())
 }
 
 /// The pure half of [`dropped_commits`]: the `expected` commits that may be
@@ -966,6 +1013,99 @@ mod tests {
         };
         assert!(why.contains("the rebase dropped some of the branch's commits (skipped?)"));
         assert!(why.contains("c1"));
+    }
+
+    #[tokio::test]
+    async fn an_absorbed_commit_erased_by_the_fixer_is_dropped() {
+        crate::run::pin_test_home();
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        sh(d, &["init", "-q", "-b", "main"]);
+        sh(d, &["config", "user.name", "t"]);
+        sh(d, &["config", "user.email", "t@example.com"]);
+        let body =
+            "old\n1\n2\n3\n4\n5\n6\n7\n8\n9\nlater\n10\n11\n12\n13\n14\n15\n16\n17\n18\nend\n";
+        std::fs::write(d.join("f.txt"), body).unwrap();
+        std::fs::write(d.join("conflict.txt"), "old\n").unwrap();
+        let base = commit(d, "base").await;
+        sh(d, &["checkout", "-q", "-b", "topic"]);
+        std::fs::write(d.join("conflict.txt"), "branch\n").unwrap();
+        commit(d, "c0").await;
+        std::fs::write(d.join("f.txt"), body.replacen("old", "new", 1)).unwrap();
+        let c1 = commit(d, "c1").await;
+        std::fs::write(
+            d.join("f.txt"),
+            body.replacen("old", "new", 1)
+                .replace("later", "branch tail"),
+        )
+        .unwrap();
+        let orig = commit(d, "c2").await;
+        sh(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("conflict.txt"), "upstream\n").unwrap();
+        let upstream = body
+            .replacen("old", "new", 1)
+            .replace("end", "upstream tail");
+        std::fs::write(d.join("f.txt"), &upstream).unwrap();
+        let onto = commit(d, "upstream composite").await;
+        let scratch = d.join("scratch");
+        assert!(matches!(
+            git::rebase_start(d, &scratch, "topic", &onto)
+                .await
+                .unwrap(),
+            git::RebaseStart::Conflicted(_)
+        ));
+        // While resolving C0, the fixer erases C1's absorbed first-line edit.
+        std::fs::write(scratch.join("conflict.txt"), "resolved\n").unwrap();
+        std::fs::write(scratch.join("f.txt"), upstream.replacen("new", "theirs", 1)).unwrap();
+        sh(&scratch, &["add", "conflict.txt", "f.txt"]);
+        let continued = git::git_raw(&scratch, &["rebase", "--continue"])
+            .await
+            .unwrap();
+        assert!(!continued.ok());
+        assert_eq!(git::rev_parse(&scratch, "REBASE_HEAD").await.unwrap(), c1);
+        let skipped = git::git_raw(&scratch, &["rebase", "--skip"]).await.unwrap();
+        assert!(skipped.ok(), "{}", skipped.stderr);
+        let head = git::rev_parse(&scratch, "HEAD").await.unwrap();
+        assert!(replay_is_noop(d, &c1, &onto).await);
+        // The later branch commit edits a different hunk, so the clean merge
+        // still requires "new" on line one. The final result has "theirs".
+        let expected = git::git_raw(
+            d,
+            &[
+                "merge-tree",
+                "--write-tree",
+                &format!("--merge-base={c1}"),
+                &onto,
+                &orig,
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(expected.ok(), "{}", expected.stderr);
+        assert!(!absorbed_in_result(d, &c1, &onto, &orig, &head).await);
+        assert_eq!(dropped_commits(d, &onto, &orig, &head).await, vec!["c1"]);
+        let mut state = RunState::new(
+            d.to_path_buf(),
+            "main".into(),
+            base,
+            "rebase".into(),
+            crate::config::Config::default(),
+        );
+        let outcome = finish(
+            &mut state,
+            &scratch,
+            "topic",
+            &orig,
+            &onto,
+            &["conflict.txt".into()],
+            "",
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, Rebased::Stopped(why) if why.contains("the rebase dropped some of the branch's commits (skipped?)") && why.contains("c1"))
+        );
+        std::fs::remove_dir_all(state.dir()).ok();
     }
 
     #[tokio::test]
