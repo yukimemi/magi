@@ -1,10 +1,11 @@
 //! Store-backed references shared by Markdown and plain-text UI surfaces.
 use super::*;
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub(super) struct IdIndex {
     entries: Vec<Entry>,
 }
+#[derive(Debug, Clone)]
 struct Entry {
     kind: &'static str,
     id: String,
@@ -28,21 +29,20 @@ pub(super) fn page_href(route: &str, id: &str) -> String {
 }
 
 impl IdIndex {
-    pub(super) fn load(runs: &FsPath, queue: &Queue, questions: &Questions, talks: &Talks) -> Self {
+    fn from_stamps(stores: &[Stamps; 4]) -> Self {
         let mut index = Self::default();
-        for id in run_ids(runs) {
-            if read_run(runs, &id).is_ok() {
-                index.add("run", &id, page_href("runs", &id));
+        for ((kind, route), ids) in [
+            ("run", "runs"),
+            ("task", "tasks"),
+            ("question", "questions"),
+            ("chat", "chat"),
+        ]
+        .into_iter()
+        .zip(stores)
+        {
+            for id in ids.keys() {
+                index.add(kind, id, page_href(route, id));
             }
-        }
-        for task in queue.list() {
-            index.add("task", &task.id, page_href("tasks", &task.id));
-        }
-        for q in questions.list() {
-            index.add("question", &q.id, page_href("questions", &q.id));
-        }
-        for t in talks.list() {
-            index.add("chat", &t.id, page_href("chat", &t.id));
         }
         index
     }
@@ -75,7 +75,7 @@ impl IdIndex {
         });
     }
 
-    fn resolve(&self, token: &str, code: bool) -> Option<String> {
+    fn resolve(&self, token: &str, _code: bool) -> Option<String> {
         let (kind, id) = match token.split_once('@') {
             Some(("run", id)) => (Some("run"), id),
             Some(("task", id)) => (Some("task"), id),
@@ -85,9 +85,6 @@ impl IdIndex {
             None => (None, token),
         };
         let short = id.len() == 4 && id.bytes().all(|b| b.is_ascii_hexdigit());
-        if short && !code && kind.is_none() && !id.bytes().any(|b| b.is_ascii_digit()) {
-            return None;
-        }
         let eligible = |e: &&Entry| kind.is_none_or(|kind| e.kind == kind);
         let exact: Vec<_> = self
             .entries
@@ -227,10 +224,17 @@ pub(super) async fn resolve_text(
         return Err(ApiError::bad_request("reference batch too large"));
     }
     blocking(move || {
-        let mut index = IdIndex::load(&ui.runs, &ui.queue, &ui.questions, &ui.talks);
-        if texts.iter().any(|t| t.text.contains('R')) {
-            index.findings(&ui.runs);
-        }
+        let index = if texts.iter().any(|t| needs_index(&t.text)) {
+            ui.references.get(
+                &ui.runs,
+                &ui.queue,
+                &ui.questions,
+                &ui.talks,
+                texts.iter().any(|t| has_finding_reference(&t.text)),
+            )
+        } else {
+            Arc::new(IdIndex::default())
+        };
         Ok(Json(
             texts.iter().map(|t| index.parts(&t.text, t.code)).collect(),
         ))
@@ -238,12 +242,166 @@ pub(super) async fn resolve_text(
     .await
 }
 
-/// Check all visible message bodies, including legacy turns and queued notices.
+/// Only a complete finding token demands review history, never a stray `R`.
+fn is_finding_reference(token: &str) -> bool {
+    let Some(rest) = token.strip_prefix('R') else {
+        return false;
+    };
+    let parts: Vec<_> = rest.split('-').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn tokens(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !c.is_ascii_alphanumeric() && !matches!(c, '-' | '_' | '@' | '/' | '.'))
+        .map(|token| token.trim_end_matches('.'))
+}
+
+fn has_finding_reference(text: &str) -> bool {
+    tokens(text).any(is_finding_reference)
+}
+
+fn needs_index(text: &str) -> bool {
+    tokens(text).any(|token| {
+        let id = token.rsplit('@').next().unwrap_or(token);
+        is_finding_reference(id)
+            || (id.len() == 4 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+            || {
+                let parts: Vec<_> = id.split('-').collect();
+                parts.len() == 3
+                    && parts[0].len() == 8
+                    && parts[1].len() == 6
+                    && parts[2].len() == 4
+                    && parts[0]
+                        .bytes()
+                        .chain(parts[1].bytes())
+                        .all(|b| b.is_ascii_digit())
+                    && parts[2].bytes().all(|b| b.is_ascii_hexdigit())
+            }
+    })
+}
+
+fn talk_texts(talk: &Talk) -> impl Iterator<Item = &str> {
+    talk.turns.iter().map(|t| t.body.as_str()).chain(
+        talk.turns
+            .iter()
+            .flat_map(|t| &t.messages)
+            .chain(&talk.pending_messages)
+            .flat_map(|m| {
+                std::iter::once(m.body.as_str()).chain(m.display.as_ref().map(|d| d.facts.as_str()))
+            }),
+    )
+}
+
 pub(super) fn has_findings(talk: &Talk) -> bool {
-    talk.turns
-        .iter()
-        .any(|t| t.body.contains('R') || t.messages.iter().any(|m| m.body.contains('R')))
-        || talk.pending_messages.iter().any(|m| m.body.contains('R'))
+    talk_texts(talk).any(has_finding_reference)
+}
+pub(super) fn has_references(talk: &Talk) -> bool {
+    talk_texts(talk).any(needs_index)
+}
+
+fn cache_lock<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
+    state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Owned by one UI, shared by its clones. Only metadata is inspected on cache
+/// hits. Each revision retains its ordinary index and lazily builds review
+/// references at most once; ordinary prose never parses run states.
+#[derive(Debug, Default)]
+pub(super) struct IndexCache {
+    snapshot: Mutex<Option<Snapshot>>,
+    reviews: Mutex<Option<ReviewSnapshot>>,
+}
+#[derive(Debug)]
+struct Snapshot {
+    roots: [PathBuf; 4],
+    stores: [Stamps; 4],
+    ordinary: Arc<IdIndex>,
+    findings: Option<Arc<IdIndex>>,
+}
+#[derive(Debug)]
+struct ReviewSnapshot {
+    root: PathBuf,
+    stamps: Stamps,
+    index: Arc<IdIndex>,
+}
+impl IndexCache {
+    pub(super) fn get(
+        &self,
+        runs: &FsPath,
+        queue: &Queue,
+        questions: &Questions,
+        talks: &Talks,
+        findings: bool,
+    ) -> Arc<IdIndex> {
+        let roots = [
+            runs.to_owned(),
+            queue.root().to_owned(),
+            questions.root().to_owned(),
+            talks.root().to_owned(),
+        ];
+        let stores = std::array::from_fn(|i| store_stamps(&roots[i], i == 0));
+        let mut slot = cache_lock(&self.snapshot);
+        if slot
+            .as_ref()
+            .is_none_or(|s| s.roots != roots || s.stores != stores)
+        {
+            *slot = Some(Snapshot {
+                ordinary: Arc::new(IdIndex::from_stamps(&stores)),
+                roots,
+                stores,
+                findings: None,
+            });
+        }
+        let snapshot = slot.as_mut().expect("initialized snapshot");
+        if findings {
+            Arc::clone(snapshot.findings.get_or_insert_with(|| {
+                let mut reviews = cache_lock(&self.reviews);
+                if reviews
+                    .as_ref()
+                    .is_none_or(|r| r.root != runs || r.stamps != snapshot.stores[0])
+                {
+                    let mut index = IdIndex::default();
+                    index.findings(runs);
+                    *reviews = Some(ReviewSnapshot {
+                        root: runs.to_owned(),
+                        stamps: snapshot.stores[0].clone(),
+                        index: Arc::new(index),
+                    });
+                }
+                let mut index = (*snapshot.ordinary).clone();
+                index.entries.extend(
+                    reviews
+                        .as_ref()
+                        .expect("initialized reviews")
+                        .index
+                        .entries
+                        .iter()
+                        .cloned(),
+                );
+                Arc::new(index)
+            }))
+        } else {
+            Arc::clone(&snapshot.ordinary)
+        }
+    }
+
+    pub(super) fn for_talk(&self, home: &FsPath, talk: &Talk) -> Arc<IdIndex> {
+        if !has_references(talk) {
+            return Arc::new(IdIndex::default());
+        }
+        self.get(
+            &home.join("runs"),
+            &Queue::at(home.join("queue")),
+            &Questions::at(home.join("questions")),
+            &Talks::at(home.join("talks")),
+            has_findings(talk),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -289,7 +447,16 @@ mod tests {
     fn references_require_unique_real_destinations() {
         let mut index = index();
         assert!(index.resolve("ffff", true).is_none());
-        assert!(index.resolve("dead", false).is_none());
+        assert!(index.resolve("dead", false).is_some());
+        let parts = index.parts("dead の修正を待つ。beef は未登録", false);
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|p| p.href.is_some())
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>(),
+            ["dead"]
+        );
         assert!(index.resolve("dead", true).is_some());
         assert!(index.resolve("task@dead", false).is_some());
         assert!(index.resolve("6a06", false).is_some());
@@ -316,6 +483,13 @@ mod tests {
         assert!(index.resolve("20260908-205802-6a06", false).is_some());
         index.add("finding", "R2-1-3", "#/runs/other/report".into());
         assert!(index.resolve("R2-1-3", false).is_none());
+        index.add(
+            "run",
+            "20260909-000000-dead",
+            page_href("runs", "20260909-000000-dead"),
+        );
+        assert!(index.resolve("dead", false).is_none());
+        assert!(index.resolve("task@dead", false).is_some());
     }
 
     #[test]
@@ -341,20 +515,20 @@ mod tests {
     #[test]
     fn references_link_markdown_text_and_code_but_not_opaque_nodes() {
         let mut nodes = md::to_nodes(
-            "6a06 **12ba** `dead 6a06` [6a06](https://example.org)\n\n```\n6a06\n```",
+            "6a06 **12ba** dead `dead 6a06` [6a06](https://example.org)\n\n```\n6a06\n```",
             &md::ImageBase::None,
         );
         index().markdown(&mut nodes);
         let json = serde_json::to_value(&nodes).unwrap();
         let encoded = json.to_string();
-        assert_eq!(encoded.matches("internal_link").count(), 4);
+        assert_eq!(encoded.matches("internal_link").count(), 5);
         assert!(encoded.contains("code_block"));
         assert!(encoded.contains("https://example.org"));
         assert!(encoded.contains("\"type\":\"code\""));
     }
 
     #[test]
-    fn references_load_only_readable_existing_store_records() {
+    fn references_load_only_existing_store_records() {
         let temp = tempfile::tempdir().unwrap();
         let queue = Queue::at(temp.path().join("queue"));
         let mut task = Task::new(
@@ -379,12 +553,14 @@ mod tests {
         questions.put(&mut question).unwrap();
         let runs = temp.path().join("runs");
         std::fs::create_dir_all(runs.join("20260908-205802-6a06")).unwrap();
-        std::fs::write(runs.join("20260908-205802-6a06/run.json"), "{}").unwrap();
-        let index = IdIndex::load(
+
+        let cache = IndexCache::default();
+        let index = cache.get(
             &runs,
             &queue,
             &questions,
             &Talks::at(temp.path().join("talks")),
+            false,
         );
         assert!(index.resolve("12ba", false).is_some());
         assert!(index.resolve("6a06", false).is_none());
@@ -395,12 +571,138 @@ mod tests {
                 .starts_with("#/questions/")
         );
         std::fs::remove_file(queue.path_of(&task.id)).unwrap();
-        let refreshed = IdIndex::load(
+        let refreshed = cache.get(
             &runs,
             &queue,
             &questions,
             &Talks::at(temp.path().join("talks")),
+            false,
         );
         assert!(refreshed.resolve("12ba", false).is_none());
+    }
+    #[test]
+    fn reference_cache_reuses_metadata_indexes_and_invalidates_removed_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let runs = temp.path().join("runs");
+        let queue = Queue::at(temp.path().join("queue"));
+        let questions = Questions::at(temp.path().join("questions"));
+        let talks = Talks::at(temp.path().join("talks"));
+        let cache = IndexCache::default();
+        let run_dir = runs.join("20260908-205802-6a06");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        // Ordinary references only need the recorded id, not a run-state decode.
+        std::fs::write(run_dir.join("run.json"), "metadata-only fixture").unwrap();
+        let metadata_dir = runs.join("20260908-205802-7b07");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        std::fs::write(metadata_dir.join("run.json"), "metadata-only fixture").unwrap();
+        let get = |findings| cache.get(&runs, &queue, &questions, &talks, findings);
+        let mut run = RunState::new(
+            temp.path().into(),
+            "main".into(),
+            "base".into(),
+            "instruction".into(),
+            Config::default(),
+        );
+        run.id = "20260908-205802-6a06".into();
+        run.reviews = serde_json::from_value(serde_json::json!([{
+            "round": 1, "head": "base", "reviews": [{ "reviewer": 1, "agent": "reviewer",
+                "findings": [{ "id": "R2-1-3", "severity": "major", "title": "test finding" }] }]
+        }]))
+        .unwrap();
+        run.save_under(temp.path()).unwrap();
+        let first = get(false);
+        assert!(first.resolve("6a06", false).is_some());
+        assert!(first.resolve("7b07", false).is_some());
+        assert!(Arc::ptr_eq(&first, &get(false)));
+        assert!(cache_lock(&cache.reviews).is_none());
+        assert!(first.resolve("R2-1-3", false).is_none());
+        let reviewed = get(true);
+        assert!(reviewed.resolve("R2-1-3", false).is_some());
+        assert!(Arc::ptr_eq(&reviewed, &get(true)));
+        let reviews = Arc::clone(&cache_lock(&cache.reviews).as_ref().unwrap().index);
+        let mut task = Task::new(
+            "target".into(),
+            "instruction".into(),
+            temp.path().into(),
+            Source::Human,
+        );
+        task.id = "20260908-205803-dead".into();
+        queue.put(&mut task).unwrap();
+        let changed = get(false);
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert!(changed.resolve("dead", false).is_some());
+        get(true);
+        assert!(Arc::ptr_eq(
+            &reviews,
+            &cache_lock(&cache.reviews).as_ref().unwrap().index
+        ));
+        std::fs::remove_file(queue.path_of(&task.id)).unwrap();
+        assert!(get(false).resolve("dead", false).is_none());
+        std::fs::remove_file(run_dir.join("run.json")).unwrap();
+        assert!(get(false).resolve("6a06", false).is_none());
+        get(true);
+        assert!(!Arc::ptr_eq(
+            &reviews,
+            &cache_lock(&cache.reviews).as_ref().unwrap().index
+        ));
+    }
+
+    #[test]
+    fn reference_index_and_review_loading_require_complete_candidates() {
+        for text in [
+            "Reply is Ready",
+            "R",
+            "R2",
+            "R2-1",
+            "xR2-1-3",
+            "R2-1-3suffix",
+        ] {
+            assert!(!has_finding_reference(text), "{text}");
+            assert!(!needs_index(text), "{text}");
+        }
+        for text in ["R2-1-3", "(R12-34-56).", "R2-1-3の修正"] {
+            assert!(has_finding_reference(text), "{text}");
+            assert!(needs_index(text), "{text}");
+        }
+        for text in ["dead の修正を待つ", "chat@6f0d", "20260908-205802-c9eb"] {
+            assert!(needs_index(text), "{text}");
+            assert!(!has_finding_reference(text), "{text}");
+        }
+    }
+    #[test]
+    fn talk_views_build_the_shared_index_lazily() {
+        let home = tempfile::tempdir().unwrap();
+        let mut talk: Talk = serde_json::from_value(serde_json::json!({
+            "schema": 1, "id": "20260908-205806-6f0d", "repo": ".", "agent": "test", "status": "open",
+            "turns": [], "created_at": "2026-09-08T20:58:02Z", "updated_at": "2026-09-08T20:58:02Z",
+            "seat": crate::agent::SeatState::new("chat", "test", 1)
+        })).unwrap();
+        talk.turns.push(talk::Turn {
+            sender: None,
+            who: talk::Who::Agent,
+            body: "Reply is Ready".into(),
+            at: talk.created_at,
+            attachments: Vec::new(),
+            usage: None,
+            breaks: None,
+            messages: Vec::new(),
+            posted_by: None,
+        });
+        let cache = IndexCache::default();
+        TalkView::with_config(talk.clone(), false, None, home.path(), &cache);
+        assert!(cache_lock(&cache.snapshot).is_none());
+        assert!(cache_lock(&cache.reviews).is_none());
+        talk.turns[0].body = "dead の修正を待つ".into();
+        TalkView::with_config(talk.clone(), false, None, home.path(), &cache);
+        let index = Arc::clone(&cache_lock(&cache.snapshot).as_ref().unwrap().ordinary);
+        assert!(cache_lock(&cache.reviews).is_none());
+        TalkView::with_config(talk.clone(), false, None, home.path(), &cache);
+        assert!(Arc::ptr_eq(
+            &index,
+            &cache_lock(&cache.snapshot).as_ref().unwrap().ordinary
+        ));
+        talk.turns[0].body = "R2-1-3 の修正を待つ".into();
+        TalkView::with_config(talk, false, None, home.path(), &cache);
+        assert!(cache_lock(&cache.reviews).is_some());
     }
 }

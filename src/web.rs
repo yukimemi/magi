@@ -304,6 +304,7 @@ pub struct Ui {
     notices: Notices,
     talks: Talks,
     runs: PathBuf,
+    references: Arc<id_links::IndexCache>,
     home: PathBuf,
     repo: PathBuf,
     /// Where the runs' worktrees live, for the health disk figures.
@@ -416,6 +417,7 @@ impl Ui {
             notices: Notices::at(home.join("notifications")),
             talks,
             runs,
+            references: Arc::default(),
             home,
             repo,
             // The default location, overridden by `with_worktrees_root` - a
@@ -7204,23 +7206,21 @@ struct TalkView {
 impl TalkView {
     /// Reads the talk's repository config itself; a config that cannot be
     /// read leaves the window unknown but never fails the conversation.
-    fn new(talk: Talk, thinking: bool, home: &FsPath) -> Self {
+    fn new(talk: Talk, thinking: bool, ui: &Ui) -> Self {
         let cfg = Config::discover(&talk.repo, None).ok().map(|(cfg, _)| cfg);
-        Self::with_config(talk, thinking, cfg.as_ref(), home)
+        Self::with_config(talk, thinking, cfg.as_ref(), &ui.home, &ui.references)
     }
 
     /// As [`Self::new`], with the config already in hand (the list reads one
     /// per repository, not one per conversation).
-    fn with_config(talk: Talk, thinking: bool, cfg: Option<&Config>, home: &FsPath) -> Self {
-        let mut references = id_links::IdIndex::load(
-            &home.join("runs"),
-            &Queue::at(home.join("queue")),
-            &Questions::at(home.join("questions")),
-            &Talks::at(home.join("talks")),
-        );
-        if id_links::has_findings(&talk) {
-            references.findings(&home.join("runs"));
-        }
+    fn with_config(
+        talk: Talk,
+        thinking: bool,
+        cfg: Option<&Config>,
+        home: &FsPath,
+        cache: &id_links::IndexCache,
+    ) -> Self {
+        let references = cache.for_talk(home, &talk);
         Self::with_references(talk, thinking, cfg, home, &references)
     }
 
@@ -7533,10 +7533,17 @@ async fn talks_list(
     blocking(move || {
         let mut configs: HashMap<PathBuf, Option<Config>> = HashMap::new();
         let talks = ui.talks.list();
-        let mut references = id_links::IdIndex::load(&ui.runs, &ui.queue, &ui.questions, &ui.talks);
-        if talks.iter().any(id_links::has_findings) {
-            references.findings(&ui.runs);
-        }
+        let references = if talks.iter().any(id_links::has_references) {
+            ui.references.get(
+                &ui.runs,
+                &ui.queue,
+                &ui.questions,
+                &ui.talks,
+                talks.iter().any(id_links::has_findings),
+            )
+        } else {
+            Arc::new(id_links::IdIndex::default())
+        };
         Ok(Json(
             talks
                 .into_iter()
@@ -7603,7 +7610,7 @@ async fn talk_post(
         };
         let talk = talk::begin_with(&ui.talks, &cfg, repo, body.agent.as_deref(), &preferred)?;
         let thinking = ui.is_thinking(&talk.id);
-        Ok(TalkView::new(talk, thinking, &ui.home))
+        Ok(TalkView::new(talk, thinking, &ui))
     })
     .await?;
     Ok((StatusCode::CREATED, Json(view)))
@@ -7648,7 +7655,7 @@ async fn talk_detail(
             })
             .collect();
         Ok(Json(TalkDetailView {
-            view: TalkView::with_config(talk, thinking, cfg.as_ref(), &ui.home),
+            view: TalkView::with_config(talk, thinking, cfg.as_ref(), &ui.home, &ui.references),
             tasks,
             task_progress,
             roster,
@@ -7859,7 +7866,7 @@ async fn talk_say(
                                 None => None,
                             };
                             let thinking = ui.is_thinking(&id);
-                            Ok((TalkView::new(talk, thinking, &ui.home), claim))
+                            Ok((TalkView::new(talk, thinking, &ui), claim))
                         }
                     })
                     .await;
@@ -7990,7 +7997,7 @@ async fn talk_say(
     // 202: the operator's message is recorded and a turn is running.
     Ok((
         StatusCode::ACCEPTED,
-        Json(TalkView::new(queued, thinking, &ui.home)),
+        Json(TalkView::new(queued, thinking, &ui)),
     ))
 }
 
@@ -8031,7 +8038,7 @@ async fn talk_pending_resume(
         })
         .await?
     };
-    let view = TalkView::new(talk.clone(), true, &ui.home);
+    let view = TalkView::new(talk.clone(), true, &ui);
     let talks = ui.talks.clone();
     tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
     Ok((StatusCode::ACCEPTED, Json(view)))
@@ -8238,7 +8245,7 @@ async fn talk_pending_clear(
             ));
         }
         let thinking = ui.is_thinking(&talk.id);
-        Ok(Json(TalkView::new(talk, thinking, &ui.home)))
+        Ok(Json(TalkView::new(talk, thinking, &ui)))
     })
     .await
 }
@@ -8284,7 +8291,7 @@ async fn talk_pending_edit(
                 None => None,
             };
             let thinking = ui.is_thinking(&id);
-            Ok((TalkView::new(talk, thinking, &ui.home), claim))
+            Ok((TalkView::new(talk, thinking, &ui), claim))
         }
     })
     .await?;
@@ -8387,7 +8394,7 @@ async fn talk_agent(
         Err(_) => false,
     };
     let talk = switched?;
-    Ok(Json(TalkView::new(talk, draining, &ui.home)))
+    Ok(Json(TalkView::new(talk, draining, &ui)))
 }
 
 /// The body of `POST /api/talks/{id}/persona`.
@@ -8471,7 +8478,7 @@ async fn talk_persona(
         Err(_) => false,
     };
     let talk = switched?;
-    Ok(Json(TalkView::new(talk, draining, &ui.home)))
+    Ok(Json(TalkView::new(talk, draining, &ui)))
 }
 
 /// The body of `POST /api/talks/{id}/implementers`.
@@ -8552,7 +8559,7 @@ async fn talk_implementers(
         Err(_) => false,
     };
     let talk = switched?;
-    Ok(Json(TalkView::new(talk, draining, &ui.home)))
+    Ok(Json(TalkView::new(talk, draining, &ui)))
 }
 
 /// `POST /api/talks/{id}/close`.
@@ -8565,7 +8572,7 @@ async fn talk_close(
         let mut talk = ui.talks.get(&id)?;
         talk::close(&mut talk, &ui.talks)?;
         let thinking = ui.is_thinking(&talk.id);
-        Ok(Json(TalkView::new(talk, thinking, &ui.home)))
+        Ok(Json(TalkView::new(talk, thinking, &ui)))
     })
     .await
 }
@@ -8580,7 +8587,7 @@ async fn talk_reopen(
         let mut talk = ui.talks.get(&id)?;
         talk::reopen(&mut talk, &ui.talks)?;
         let thinking = ui.is_thinking(&talk.id);
-        Ok(Json(TalkView::new(talk, thinking, &ui.home)))
+        Ok(Json(TalkView::new(talk, thinking, &ui)))
     })
     .await
 }
@@ -12573,7 +12580,13 @@ mod tests {
             posted_by: None,
         });
         ui.talks.put(&mut conversation).unwrap();
-        let view = TalkView::with_config(ui.talks.get(&id).unwrap(), false, None, &ui.home);
+        let view = TalkView::with_config(
+            ui.talks.get(&id).unwrap(),
+            false,
+            None,
+            &ui.home,
+            &ui.references,
+        );
         assert_eq!(view.talk.turns[0].sender, Some(talk::Sender::Operator));
         assert_eq!(
             view.talk.turns[1].messages[0].sender,
@@ -12628,7 +12641,7 @@ mod tests {
         );
         let saved = ui.talks.get(&id).unwrap();
         assert_eq!(saved.pending_messages[0].display, Some(display.clone()));
-        let view = TalkView::with_config(saved, false, None, &ui.home);
+        let view = TalkView::with_config(saved, false, None, &ui.home, &ui.references);
         assert!(
             view.talk.turns[0].messages[0].display.is_none(),
             "operator copy stays literal"
@@ -12660,7 +12673,13 @@ mod tests {
         reply.excerpt = body.chars().take(240).collect(); // old saved quote
         saved.turns[1].messages[0].display = None; // old MAGI send
         ui.talks.put(&mut saved).unwrap();
-        let view = TalkView::with_config(ui.talks.get(&id).unwrap(), false, None, &ui.home);
+        let view = TalkView::with_config(
+            ui.talks.get(&id).unwrap(),
+            false,
+            None,
+            &ui.home,
+            &ui.references,
+        );
         assert_eq!(view.turn_messages_md[1][0], queued_md);
         assert_eq!(view.talk.turns[1].messages[0].display, Some(display));
         assert!(
@@ -12702,11 +12721,13 @@ mod tests {
             assert!(body.contains("magi answer"));
             let mut legacy_pending = conversation.clone();
             legacy_pending.pending_messages[0].display = None;
-            let legacy_view = TalkView::with_config(legacy_pending, false, None, &ui.home);
+            let legacy_view =
+                TalkView::with_config(legacy_pending, false, None, &ui.home, &ui.references);
             let legacy_md = serde_json::to_string(&legacy_view.pending_messages_md[0]).unwrap();
             assert!(legacy_md.contains("Question consultation"));
             assert!(!legacy_md.contains("magi answer"));
-            let view = TalkView::with_config(conversation.clone(), false, None, &ui.home);
+            let view =
+                TalkView::with_config(conversation.clone(), false, None, &ui.home, &ui.references);
             assert!(
                 view.turn_messages_md[0][0].is_none(),
                 "operator copy stays literal"
@@ -12736,14 +12757,15 @@ mod tests {
                 Some(crate::prompt::chat_consult_display(&question))
             );
             talk::drain(&mut conversation, &ui.talks).unwrap();
-            let view = TalkView::with_config(conversation.clone(), false, None, &ui.home);
+            let view =
+                TalkView::with_config(conversation.clone(), false, None, &ui.home, &ui.references);
             assert_eq!(view.turn_messages_md[1][0], Some(queued_md));
             assert_eq!(conversation.turns[1].messages[0].body, body);
 
             // Historical consultations lack a snapshot: show a safe placeholder
             // rather than parsing instructions or reconstructing mutable facts.
             conversation.turns[1].messages[0].display = None;
-            let view = TalkView::with_config(conversation, false, None, &ui.home);
+            let view = TalkView::with_config(conversation, false, None, &ui.home, &ui.references);
             let legacy = serde_json::to_string(&view.turn_messages_md[1][0]).unwrap();
             assert!(legacy.contains("Question consultation"));
             assert!(!legacy.contains("magi answer"));
@@ -12802,7 +12824,13 @@ mod tests {
                 notice: body.clone(),
             });
         ui.talks.put(&mut conversation).unwrap();
-        let view = TalkView::with_config(ui.talks.get(&id).unwrap(), false, None, &ui.home);
+        let view = TalkView::with_config(
+            ui.talks.get(&id).unwrap(),
+            false,
+            None,
+            &ui.home,
+            &ui.references,
+        );
         assert_eq!(
             view.talk.turns[0].messages[0].display,
             Some(display.clone())
@@ -12816,7 +12844,7 @@ mod tests {
         conversation.completion_notices[0]
             .notice
             .push_str("different");
-        let view = TalkView::with_config(conversation, false, None, &ui.home);
+        let view = TalkView::with_config(conversation, false, None, &ui.home, &ui.references);
         assert!(view.talk.turns[0].messages.is_empty());
         assert!(view.talk.pending_messages.is_empty());
     }
@@ -13029,7 +13057,13 @@ mod tests {
         assert!(!stored.contains("data:image"));
         let mut orphan = ui.talks.get(&id).unwrap();
         orphan.persona = "../custom/日本語".into();
-        let view = TalkView::with_config(orphan, false, Some(&cfg), home.path());
+        let view = TalkView::with_config(
+            orphan,
+            false,
+            Some(&cfg),
+            home.path(),
+            &id_links::IndexCache::default(),
+        );
         assert!(view.persona_avatar.contains("persona=..%2Fcustom%2F"));
     }
 
@@ -13087,6 +13121,7 @@ mod tests {
             false,
             None,
             &restarted.home,
+            &restarted.references,
         );
         assert_eq!(view.magi_avatar, changed.as_str().unwrap());
         std::fs::write(magi_icon_path(home.path()), "invalid").unwrap();

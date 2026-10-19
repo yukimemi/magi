@@ -3448,7 +3448,15 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
     );
     target.id = "20260908-205803-12ba".into();
     target.status = TaskStatus::Held;
-    target.hold_reason = Some("12ba の修正を待つ".into());
+    target.hold_reason = Some("dead の修正を待つ".into());
+    let mut alphabetic = Task::new(
+        "Alphabetic id".into(),
+        "Target".into(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    alphabetic.id = "20260908-205804-dead".into();
+    queue.put(&mut alphabetic).unwrap();
     target.last_error = Some("See task@12ba and question d678".into());
     queue.put(&mut target).unwrap();
     let talks = Talks::at(home.join("talks"));
@@ -3463,7 +3471,7 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
     talk::record(
         &mut chat,
         &talks,
-        "Task 12ba and `12ba`. Unknown 0000.\n\n```\n12ba\n```",
+        "Task 12ba and `12ba`. dead の修正を待つ。Unknown 0000.\n\n```\n12ba\n```",
         Vec::new(),
     )
     .unwrap();
@@ -3562,17 +3570,17 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
     let out = browser.eval(&page, r##"(() => {
       const turn = document.querySelector('.turn[data-who=agent]');
       const links = [...turn.querySelectorAll('a')];
-      const out = { code: !!turn.querySelector('a code'), blockLinks: turn.querySelectorAll('pre a').length,
+      const out = { alphabetic: !!turn.querySelector('a[href="#/tasks/20260908-205804-dead"]'), code: !!turn.querySelector('a code'), blockLinks: turn.querySelectorAll('pre a').length,
         sameTab: links.every(a => !a.target), unknown: links.some(a => a.textContent === '0000') };
       links[0].click();
       return out;
     })()"##).await.unwrap();
     assert_eq!(
         out,
-        serde_json::json!({ "code": true, "blockLinks": 0, "sameTab": true, "unknown": false })
+        serde_json::json!({ "alphabetic": true, "code": true, "blockLinks": 0, "sameTab": true, "unknown": false })
     );
     browser.wait_for(&page,
-        "location.hash === '#/tasks/20260908-205803-12ba' && !!document.querySelector('#task-note a') && !!document.querySelector('#task-error a')",
+        "location.hash === '#/tasks/20260908-205803-12ba' && !!document.querySelector('#task-note a[href=\"#/tasks/20260908-205804-dead\"]') && !!document.querySelector('#task-error a')",
         Duration::from_secs(30)).await.expect("task note and error references");
     assert_eq!(
         browser
