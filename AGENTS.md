@@ -1269,8 +1269,14 @@ cannot hand a round back), shared by both callers, and touching neither the
 task's attempts nor land's own rebase budget. A round is judged by what git
 says - rebase no longer in progress, nothing unmerged, no markers left in a
 path that conflicted, the base an ancestor of the result - never by the
-fixer's report; whether the tree builds is left to the review and gate that
-follow. When the rounds are spent, the fixer hit its quota, or it could not
+fixer's report. `git::rebase_start` records HEAD after each pick with
+`--empty=drop --exec` and saves Git's exact pick list at the first conflict
+in scratch-local gitdir files. Keep the todo order and recording exec commands
+intact across fixer turns and resumes. Only picks whose HEAD did not advance
+need content verification (`absorbed_in_result` permits later branch edits).
+Missing or inconsistent records stop the rebase; author/date/subject matching
+is not evidence of survival. Whether the tree builds is left to the review
+and gate that follow. When the rounds are spent, the fixer hit its quota, or it could not
 finish, the branch ref is restored, the worktree removed and the old
 behaviour applies: `base_sync.conflict` (or land's `stop`) carries what was
 tried - rounds spent and the paths still conflicted - for the conductor to

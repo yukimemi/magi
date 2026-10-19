@@ -306,9 +306,9 @@ async fn finish(
     // vanishing. Find the commits that are neither in the result nor already
     // on the base.
     let dropped = if unmerged.is_empty() && marked.is_empty() && !emptied && !head.is_empty() {
-        dropped_commits(&repo, onto_sha, orig, &head).await
+        dropped_commits(&repo, scratch, onto_sha, orig, &head).await
     } else {
-        Vec::new()
+        Ok(Vec::new())
     };
 
     let problem = if !unmerged.is_empty() {
@@ -320,15 +320,20 @@ async fn finish(
             "the rebase ended with none of the branch's commits applied (all skipped)",
             touched.to_vec(),
         ))
-    } else if !dropped.is_empty() {
-        Some((
-            "the rebase dropped some of the branch's commits (skipped?)",
-            dropped,
-        ))
     } else if head.is_empty() || !git::is_ancestor(&repo, onto_sha, &head).await {
         Some((
             "the rebase ended without the base in the result (abandoned or skipped)",
             touched.to_vec(),
+        ))
+    } else if let Err(error) = &dropped {
+        Some((
+            "the rebase record could not be verified",
+            vec![format!("{error:#}")],
+        ))
+    } else if !dropped.as_ref().unwrap().is_empty() {
+        Some((
+            "the rebase dropped some of the branch's commits (skipped?)",
+            dropped.unwrap(),
         ))
     } else {
         None
@@ -351,111 +356,37 @@ async fn finish(
     }
 }
 
-/// Subjects of the commits `orig` had over `onto_sha` that the rebased `head`
-/// no longer represents. Empty when all survive or the check could not run
-/// (the other checks still apply).
-///
-/// Commits are matched by what a rebase preserves (author, author date,
-/// subject), not by patch-id: a commit the fixer resolved has a new patch-id
-/// by design. A commit whose patch already exists on the base is not expected
-/// in the result, and one with a patch twin in the result is verified by content like any other candidate.
-async fn dropped_commits(repo: &Path, onto_sha: &str, orig: &str, head: &str) -> Vec<String> {
-    let Ok((unmatched, _)) = git::cherry(repo, onto_sha, orig).await else {
-        return Vec::new();
-    };
-    if unmatched.is_empty() {
-        return Vec::new();
-    }
-    let (Ok(origin), Ok(result)) = (
-        git::commit_keys(repo, &format!("{onto_sha}..{orig}")).await,
-        git::commit_keys(repo, &format!("{onto_sha}..{head}")).await,
-    ) else {
-        return Vec::new();
-    };
-    let expected: Vec<git::CommitKey> = origin
-        .into_iter()
-        .filter(|c| unmatched.contains(&c.sha))
-        .collect();
-    let have: Vec<String> = result.iter().map(|c| c.key.clone()).collect();
-    let mut taken = vec![false; result.len()];
+/// Only a pick whose exec observed the previous HEAD could have been skipped.
+/// Content checks distinguish a genuine loss from a change already upstream.
+async fn dropped_commits(
+    repo: &Path,
+    scratch: &Path,
+    onto_sha: &str,
+    orig: &str,
+    head: &str,
+) -> Result<Vec<String>> {
+    let record = git::rebase_record(scratch).await?;
+    anyhow::ensure!(
+        record.heads.last().map(String::as_str) == Some(head),
+        "rebase final HEAD disagrees with record"
+    );
+    let mut previous = onto_sha;
     let mut lost = Vec::new();
-    let mut unverified = Vec::new();
-    // Content-verified candidates first: one whose exact change is present as
-    // a result commit under its key has claimed that survivor, so it cannot
-    // also be taken as evidence for a different, unverified commit. (One
-    // absorbed upstream matches nothing and claims nothing.)
-    for c in missing_commits(&expected, &have) {
-        // Git also drops a commit on its own when its change is already on
-        // the base under a different patch (e.g. folded into one upstream
-        // commit). Absorption alone is insufficient: the fixer may remove it
-        // again. Verify its paths in the final result, allowing only changes
-        // explained by the base and the original branch's later commits.
-        if absorbed_in_result(repo, &c.sha, onto_sha, orig, head).await {
-            continue;
+    for (sha, picked_head) in record.picks.iter().zip(&record.heads) {
+        if picked_head == previous
+            && !absorbed_in_result(repo, sha, onto_sha, orig, head).await?
+            && !already_in_result(repo, sha, orig, head).await?
+        {
+            lost.push(git::git(repo, &["show", "-s", "--format=%s", sha]).await?);
         }
-        if !already_in_result(repo, &c.sha, orig, head).await {
-            unverified.push(c);
-            continue;
-        }
-        let mine = change_lines(repo, &c.sha).await;
-        for (i, r) in result.iter().enumerate() {
-            if !taken[i] && r.key == c.key && change_lines(repo, &r.sha).await == mine {
-                taken[i] = true;
-                break;
-            }
-        }
+        previous = picked_head;
     }
-    // The rest may have survived with a conflict-resolved (new) content. A
-    // result commit under the same key that touches one of its paths, and is
-    // not already accounted for, is that survivor.
-    for c in unverified {
-        let mine = commit_paths(repo, &c.sha).await;
-        let mut found = false;
-        for (i, r) in result.iter().enumerate() {
-            if taken[i] || r.key != c.key {
-                continue;
-            }
-            let theirs = commit_paths(repo, &r.sha).await;
-            if theirs.iter().any(|p| mine.contains(p)) {
-                taken[i] = true;
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            lost.push(c.key.rsplit('\u{1f}').next().unwrap_or(&c.key).to_owned());
-        }
-    }
-    lost
-}
-
-/// The added/removed lines of `sha`'s patch, headers and hunk positions left
-/// out, so a commit that was merely re-applied at a different offset compares
-/// equal to its original.
-async fn change_lines(repo: &Path, sha: &str) -> Vec<String> {
-    git::git(
-        repo,
-        &["diff-tree", "-p", "-U0", "--no-commit-id", "--root", sha],
-    )
-    .await
-    .map(|o| {
-        o.lines()
-            .filter(|l| {
-                !(l.starts_with("diff ")
-                    || l.starts_with("index ")
-                    || l.starts_with("@@")
-                    || l.starts_with("--- ")
-                    || l.starts_with("+++ "))
-            })
-            .map(str::to_owned)
-            .collect()
-    })
-    .unwrap_or_default()
+    Ok(lost)
 }
 
 /// Paths `sha` changes, NUL-separated from git so a quoted name is never
-/// misread. Empty when git cannot say.
-async fn commit_paths(repo: &Path, sha: &str) -> Vec<String> {
+/// misread. Read failures propagate to the rebase verdict.
+async fn commit_paths(repo: &Path, sha: &str) -> Result<Vec<String>> {
     git::git(
         repo,
         &[
@@ -475,17 +406,17 @@ async fn commit_paths(repo: &Path, sha: &str) -> Vec<String> {
             .map(str::to_owned)
             .collect()
     })
-    .unwrap_or_default()
 }
 
 /// `mode type blob` of `path` at `rev`, or `None` when it does not exist
 /// there. Unlike `rev-parse rev:path` this carries the file mode.
-async fn entry(repo: &Path, rev: &str, path: &str) -> Option<String> {
-    let out = git::git(repo, &["ls-tree", rev, "--", path]).await.ok()?;
-    out.split('\t')
+async fn entry(repo: &Path, rev: &str, path: &str) -> Result<Option<String>> {
+    let out = git::git(repo, &["--literal-pathspecs", "ls-tree", rev, "--", path]).await?;
+    Ok(out
+        .split('\t')
         .next()
         .filter(|e| !e.is_empty())
-        .map(str::to_owned)
+        .map(str::to_owned))
 }
 
 /// Is `sha`'s change represented in `head`?
@@ -496,24 +427,24 @@ async fn entry(repo: &Path, rev: &str, path: &str) -> Option<String> {
 /// `sha` left there, or what the branch's final tip `orig` has there (a later
 /// commit may have changed the path again). Mode is part of that comparison,
 /// and paths come NUL-separated so a quoted name is never misread.
-async fn already_in_result(repo: &Path, sha: &str, orig: &str, head: &str) -> bool {
-    if replay_is_noop(repo, sha, head).await {
-        return true;
+async fn already_in_result(repo: &Path, sha: &str, orig: &str, head: &str) -> Result<bool> {
+    if replay_is_noop(repo, sha, head).await? {
+        return Ok(true);
     }
-    for p in &commit_paths(repo, sha).await {
-        let got = entry(repo, head, p).await;
-        if got != entry(repo, sha, p).await && got != entry(repo, orig, p).await {
-            return false;
+    for p in &commit_paths(repo, sha).await? {
+        let got = entry(repo, head, p).await?;
+        if got != entry(repo, sha, p).await? && got != entry(repo, orig, p).await? {
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 /// Does merging `sha` (against its parent) into `head` cleanly yield `head`'s
-/// own tree? False when it conflicts, changes anything, or git cannot say.
-async fn replay_is_noop(repo: &Path, sha: &str, head: &str) -> bool {
+/// own tree? Conflicts and changes return false; read failures propagate.
+async fn replay_is_noop(repo: &Path, sha: &str, head: &str) -> Result<bool> {
     let base = format!("{sha}^");
-    let Ok(out) = git::git_raw(
+    let out = git::git_raw(
         repo,
         &[
             "merge-tree",
@@ -523,18 +454,22 @@ async fn replay_is_noop(repo: &Path, sha: &str, head: &str) -> bool {
             sha,
         ],
     )
-    .await
-    else {
-        return false;
-    };
+    .await?;
+    anyhow::ensure!(
+        out.code == Some(0) || out.code == Some(1),
+        "merge-tree failed: {}",
+        out.stderr
+    );
     if !out.ok() {
-        return false;
+        return Ok(false);
     }
-    let merged = out.stdout.lines().next().unwrap_or("").trim();
-    match git::tree_of(repo, head).await {
-        Ok(t) => !merged.is_empty() && merged == t,
-        Err(_) => false,
-    }
+    let merged = out
+        .stdout
+        .lines()
+        .next()
+        .context("merge-tree returned no tree")?
+        .trim();
+    Ok(merged == git::tree_of(repo, head).await?)
 }
 
 /// An absorbed change may be superseded by later branch commits, so replaying
@@ -543,23 +478,25 @@ async fn replay_is_noop(repo: &Path, sha: &str, head: &str) -> bool {
 /// the result (including modes). Project all four trees onto just those paths
 /// first: conflicts elsewhere cannot invalidate this commit's surviving effect.
 /// A conflict on a candidate path or a failed lookup is not evidence of survival.
-async fn absorbed_in_result(repo: &Path, sha: &str, onto: &str, orig: &str, head: &str) -> bool {
-    if !replay_is_noop(repo, sha, onto).await {
-        return false;
+async fn absorbed_in_result(
+    repo: &Path,
+    sha: &str,
+    onto: &str,
+    orig: &str,
+    head: &str,
+) -> Result<bool> {
+    if !replay_is_noop(repo, sha, onto).await? {
+        return Ok(false);
     }
-    let paths = commit_paths(repo, sha).await;
+    let paths = commit_paths(repo, sha).await?;
     if paths.is_empty() {
-        return false;
+        return Ok(false);
     }
-    let (Some(base), Some(upstream), Some(branch), Some(result)) = (
-        path_tree(repo, sha, &paths).await,
-        path_tree(repo, onto, &paths).await,
-        path_tree(repo, orig, &paths).await,
-        path_tree(repo, head, &paths).await,
-    ) else {
-        return false;
-    };
-    let Ok(out) = git::git_raw(
+    let base = path_tree(repo, sha, &paths).await?;
+    let upstream = path_tree(repo, onto, &paths).await?;
+    let branch = path_tree(repo, orig, &paths).await?;
+    let result = path_tree(repo, head, &paths).await?;
+    let out = git::git_raw(
         repo,
         &[
             "merge-tree",
@@ -569,21 +506,28 @@ async fn absorbed_in_result(repo: &Path, sha: &str, onto: &str, orig: &str, head
             &branch,
         ],
     )
-    .await
-    else {
-        return false;
-    };
+    .await?;
+    anyhow::ensure!(
+        out.code == Some(0) || out.code == Some(1),
+        "merge-tree failed: {}",
+        out.stderr
+    );
     if !out.ok() {
-        return false;
+        return Ok(false);
     }
-    out.stdout.lines().next().is_some_and(|tree| tree == result)
+    Ok(out
+        .stdout
+        .lines()
+        .next()
+        .context("merge-tree returned no tree")?
+        == result)
 }
 
 /// A tree containing only the candidate paths, under stable synthetic names.
 /// Preserve each entry's object and mode, and leave missing entries absent.
 /// Flattening the names lets mktree handle nested and unusual paths without
 /// an index or a working tree, and keeps unrelated paths out of the merge.
-async fn path_tree(repo: &Path, rev: &str, paths: &[String]) -> Option<String> {
+async fn path_tree(repo: &Path, rev: &str, paths: &[String]) -> Result<String> {
     use crate::proc::Quiet as _;
     use std::fmt::Write as _;
     use std::process::Stdio;
@@ -595,11 +539,12 @@ async fn path_tree(repo: &Path, rev: &str, paths: &[String]) -> Option<String> {
             repo,
             &["--literal-pathspecs", "ls-tree", "-z", rev, "--", path],
         )
-        .await
-        .ok()?;
+        .await?;
         if !out.is_empty() {
-            let (entry, _) = out.split_once('\t')?;
-            writeln!(entries, "{entry}\t{i:016x}").ok()?;
+            let (entry, _) = out
+                .split_once('\t')
+                .context("ls-tree returned an invalid entry")?;
+            writeln!(entries, "{entry}\t{i:016x}")?;
         }
     }
     #[cfg(test)]
@@ -612,35 +557,17 @@ async fn path_tree(repo: &Path, rev: &str, paths: &[String]) -> Option<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
-        .ok()?;
-    let mut stdin = child.stdin.take()?;
-    stdin.write_all(entries.as_bytes()).await.ok()?;
+        .spawn()?;
+    let mut stdin = child.stdin.take().context("mktree stdin missing")?;
+    stdin.write_all(entries.as_bytes()).await?;
     drop(stdin);
-    let out = child.wait_with_output().await.ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8(out.stdout).ok()?.trim().to_owned())
-}
-
-/// The pure half of [`dropped_commits`]: the `expected` commits that may be
-/// missing from the result, judged by key. Keys are counted (a multiset); when
-/// the result holds fewer commits under a key than were expected, *every*
-/// expected commit with that key is a candidate, because the key cannot say
-/// which of them survived. The caller verifies each candidate by content
-/// ([`already_in_result`]); a patch twin in the result is not excused here for
-/// the same reason.
-fn missing_commits(expected: &[git::CommitKey], have: &[String]) -> Vec<git::CommitKey> {
-    expected
-        .iter()
-        .filter(|c| {
-            let want = expected.iter().filter(|e| e.key == c.key).count();
-            let got = have.iter().filter(|k| **k == c.key).count();
-            got < want
-        })
-        .cloned()
-        .collect()
+    let out = child.wait_with_output().await?;
+    anyhow::ensure!(
+        out.status.success(),
+        "mktree failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(String::from_utf8(out.stdout)?.trim().to_owned())
 }
 
 /// Give up: abort whatever is standing, drop the worktree and put the branch
@@ -672,6 +599,7 @@ fn reason(spent: usize, cap: usize, paths: &[String], said: &str, what: &str) ->
         "conflict not resolved after {spent} of {cap} fixer round(s) ({what}); remaining \
          conflicted path(s): {list}"
     );
+    let said = git::rebase_said(said);
     let said = said.trim();
     if !said.is_empty() {
         s.push_str("; git said: ");
@@ -737,41 +665,6 @@ mod tests {
     use super::*;
     use crate::proc::Quiet as _;
 
-    fn ck(sha: &str, subject: &str) -> git::CommitKey {
-        git::CommitKey {
-            sha: sha.to_owned(),
-            key: format!("n\u{1f}e\u{1f}1 +0000\u{1f}{subject}"),
-        }
-    }
-
-    #[test]
-    fn nothing_is_missing_when_every_key_is_present() {
-        let exp = [ck("a", "one"), ck("b", "two")];
-        let have = vec![exp[1].key.clone(), exp[0].key.clone()];
-        assert!(missing_commits(&exp, &have).is_empty());
-    }
-
-    #[test]
-    fn a_dropped_commit_is_named_by_subject() {
-        let exp = [ck("a", "one"), ck("b", "two")];
-        let have = vec![exp[1].key.clone()];
-        assert_eq!(missing_commits(&exp, &have), vec![exp[0].clone()]);
-    }
-
-    #[test]
-    fn duplicate_keys_are_counted_not_collapsed() {
-        let exp = [ck("a", "same"), ck("b", "same")];
-        let have = vec![exp[0].key.clone()];
-        assert_eq!(missing_commits(&exp, &have), exp.to_vec());
-    }
-
-    #[test]
-    fn a_commit_without_a_key_match_is_a_candidate_even_if_a_twin_exists() {
-        let exp = [ck("a", "same"), ck("b", "same")];
-        let have = vec![exp[1].key.clone()];
-        assert_eq!(missing_commits(&exp, &have).len(), 2);
-    }
-
     fn sh(dir: &Path, args: &[&str]) {
         let o = std::process::Command::new("git")
             .quiet()
@@ -784,6 +677,15 @@ mod tests {
             "{args:?}: {}",
             String::from_utf8_lossy(&o.stderr)
         );
+    }
+
+    async fn record(d: &Path, picks: &[String], heads: &[String]) {
+        for (name, values) in [("magi-rebase-picks", picks), ("magi-rebase-heads", heads)] {
+            let path = git::git(d, &["rev-parse", "--git-path", name])
+                .await
+                .unwrap();
+            std::fs::write(d.join(path), values.join("\n") + "\n").unwrap();
+        }
     }
 
     #[tokio::test]
@@ -802,8 +704,8 @@ mod tests {
         let sha = git::git(d, &["rev-parse", "HEAD"]).await.unwrap();
         let base = git::git(d, &["rev-parse", "HEAD~1"]).await.unwrap();
         // The result is the base: same blob, lost mode.
-        assert!(!already_in_result(d, &sha, &sha, &base).await);
-        assert!(already_in_result(d, &sha, &sha, &sha).await);
+        assert!(!already_in_result(d, &sha, &sha, &base).await.unwrap());
+        assert!(already_in_result(d, &sha, &sha, &sha).await.unwrap());
     }
 
     async fn commit(d: &Path, msg: &str) -> String {
@@ -842,7 +744,7 @@ mod tests {
         let absent = path_tree(d, &removed, &paths).await.unwrap();
         assert_ne!(absent, tree);
         assert_eq!(absent, path_tree(d, &removed, &[]).await.unwrap());
-        assert!(path_tree(d, "not-a-revision", &paths).await.is_none());
+        assert!(path_tree(d, "not-a-revision", &paths).await.is_err());
     }
 
     #[tokio::test]
@@ -861,7 +763,7 @@ mod tests {
         let up = body.replacen("old", "new", 1).replace("end", "end plus");
         std::fs::write(d.join("f.txt"), up).unwrap();
         let head = commit(d, "upstream").await;
-        assert!(already_in_result(d, &c, &c, &head).await);
+        assert!(already_in_result(d, &c, &c, &head).await.unwrap());
     }
 
     #[tokio::test]
@@ -875,7 +777,7 @@ mod tests {
         let base = commit(d, "base").await;
         std::fs::write(d.join("日本語.txt"), "x\n").unwrap();
         let c = commit(d, "c").await;
-        assert!(!already_in_result(d, &c, &c, &base).await);
+        assert!(!already_in_result(d, &c, &c, &base).await.unwrap());
     }
 
     async fn commit_dated(d: &Path, msg: &str) -> String {
@@ -893,7 +795,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_surviving_resolved_commit_sharing_a_key_with_an_absorbed_one_is_not_lost() {
+    async fn a_recorded_resolved_pick_after_an_absorbed_one_is_not_lost() {
         let t = tempfile::tempdir().unwrap();
         let d = t.path();
         sh(d, &["init", "-q", "-b", "main"]);
@@ -915,7 +817,21 @@ mod tests {
         // The rebase result: first commit omitted as empty, second resolved.
         std::fs::write(d.join("b.txt"), "other\nb\n").unwrap();
         let head = commit_dated(d, "same").await;
-        assert!(dropped_commits(d, &onto, &orig, &head).await.is_empty());
+        record(
+            d,
+            &[
+                git::rev_parse(d, &format!("{orig}^")).await.unwrap(),
+                orig.clone(),
+            ],
+            &[onto.clone(), head.clone()],
+        )
+        .await;
+        assert!(
+            dropped_commits(d, d, &onto, &orig, &head)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -946,7 +862,75 @@ mod tests {
         )
         .unwrap();
         let head = commit_dated(d, "same").await;
-        assert_eq!(dropped_commits(d, &onto, &orig, &head).await, vec!["same"]);
+        record(
+            d,
+            &[
+                git::rev_parse(d, &format!("{orig}^")).await.unwrap(),
+                orig.clone(),
+            ],
+            &[onto.clone(), head.clone()],
+        )
+        .await;
+        assert_eq!(
+            dropped_commits(d, d, &onto, &orig, &head).await.unwrap(),
+            vec!["same"]
+        );
+    }
+
+    #[tokio::test]
+    async fn git_records_a_skipped_middle_pick_after_an_applied_pick() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        sh(d, &["init", "-q", "-b", "main"]);
+        sh(d, &["config", "user.name", "t"]);
+        sh(d, &["config", "user.email", "t@example.com"]);
+        std::fs::write(d.join("f"), "base\n").unwrap();
+        let base = commit(d, "base").await;
+        sh(d, &["checkout", "-q", "-b", "topic"]);
+        std::fs::write(d.join("absorbed"), "upstream too\n").unwrap();
+        commit(d, "already upstream").await;
+        std::fs::write(d.join("a"), "first\n").unwrap();
+        let first = commit(d, "first").await;
+        std::fs::write(d.join("f"), "middle\n").unwrap();
+        let middle = commit(d, "lost middle").await;
+        std::fs::write(d.join("z"), "last\n").unwrap();
+        let orig = commit(d, "last").await;
+        sh(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("absorbed"), "upstream too\n").unwrap();
+        commit(d, "patch twin").await;
+        std::fs::write(d.join("f"), "upstream\n").unwrap();
+        let onto = commit(d, "upstream").await;
+        let scratch = d.join("scratch");
+        let git::RebaseStart::Conflicted(why) = git::rebase_start(d, &scratch, "topic", &onto)
+            .await
+            .unwrap()
+        else {
+            panic!("expected a conflict");
+        };
+        assert!(!why.contains("Executing:"), "{why}");
+        let skipped = git::git_raw(&scratch, &["rebase", "--skip"]).await.unwrap();
+        assert!(skipped.ok(), "{}", skipped.stderr);
+        let head = git::rev_parse(&scratch, "HEAD").await.unwrap();
+        let record = git::rebase_record(&scratch).await.unwrap();
+        assert_eq!(record.picks, vec![first, middle, orig.clone()]);
+        assert_eq!(record.heads[0], record.heads[1]);
+        assert_ne!(record.heads[1], record.heads[2]);
+        assert_eq!(
+            dropped_commits(d, &scratch, &onto, &orig, &head)
+                .await
+                .unwrap(),
+            vec!["lost middle"]
+        );
+        git::rebase_abort(d, &scratch).await;
+        assert!(git::is_ancestor(d, &base, &head).await);
+    }
+
+    #[test]
+    fn recording_diagnostics_do_not_hide_other_git_output() {
+        assert_eq!(
+            git::rebase_said("before\nExecuting: record\nafter\n"),
+            "before\nafter"
+        );
     }
 
     // Exercise the actual rebase and finish path. C0 conflicts in another
@@ -957,6 +941,15 @@ mod tests {
         absorbed: bool,
         extra_hunk: bool,
         unrelated_conflict: bool,
+    ) -> Rebased {
+        rebase_successive_edits_record(absorbed, extra_hunk, unrelated_conflict, None).await
+    }
+
+    async fn rebase_successive_edits_record(
+        absorbed: bool,
+        extra_hunk: bool,
+        unrelated_conflict: bool,
+        damage: Option<&str>,
     ) -> Rebased {
         crate::run::pin_test_home();
         let t = tempfile::tempdir().unwrap();
@@ -1084,7 +1077,7 @@ mod tests {
         );
         let head = git::rev_parse(&scratch, "HEAD").await.unwrap();
         // The old final-tree-only check cannot account for C1 in any case.
-        assert!(!already_in_result(d, &c1, &orig, &head).await);
+        assert!(!already_in_result(d, &c1, &orig, &head).await.unwrap());
         let mut state = RunState::new(
             d.to_path_buf(),
             "main".into(),
@@ -1092,6 +1085,23 @@ mod tests {
             "rebase".into(),
             crate::config::Config::default(),
         );
+        if let Some(damage) = damage {
+            let path = git::git(&scratch, &["rev-parse", "--git-path", "magi-rebase-heads"])
+                .await
+                .unwrap();
+            match damage {
+                "missing" => std::fs::remove_file(&path).unwrap(),
+                "count" => std::fs::write(&path, "").unwrap(),
+                "final" => {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    let mut heads: Vec<_> = text.lines().map(str::to_owned).collect();
+                    *heads.last_mut().unwrap() = onto.clone();
+                    std::fs::write(&path, heads.join("\n") + "\n").unwrap();
+                }
+                "invalid" => std::fs::write(&path, "invalid\n").unwrap(),
+                _ => unreachable!(),
+            }
+        }
         let outcome = finish(
             &mut state,
             &scratch,
@@ -1105,6 +1115,17 @@ mod tests {
         .unwrap();
         std::fs::remove_dir_all(state.dir()).ok();
         outcome
+    }
+
+    #[tokio::test]
+    async fn missing_or_inconsistent_rebase_records_stop_the_rebase() {
+        for damage in ["missing", "count", "final", "invalid"] {
+            let outcome = rebase_successive_edits_record(true, false, false, Some(damage)).await;
+            assert!(
+                matches!(outcome, Rebased::Stopped(why) if why.contains("record could not be verified")),
+                "{damage}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1201,7 +1222,7 @@ mod tests {
         let skipped = git::git_raw(&scratch, &["rebase", "--skip"]).await.unwrap();
         assert!(skipped.ok(), "{}", skipped.stderr);
         let head = git::rev_parse(&scratch, "HEAD").await.unwrap();
-        assert!(replay_is_noop(d, &c1, &onto).await);
+        assert!(replay_is_noop(d, &c1, &onto).await.unwrap());
         // The later branch commit edits a different hunk, so the clean merge
         // still requires "new" on line one. The final result has "theirs".
         let expected = git::git_raw(
@@ -1217,8 +1238,17 @@ mod tests {
         .await
         .unwrap();
         assert!(expected.ok(), "{}", expected.stderr);
-        assert!(!absorbed_in_result(d, &c1, &onto, &orig, &head).await);
-        assert_eq!(dropped_commits(d, &onto, &orig, &head).await, vec!["c1"]);
+        assert!(
+            !absorbed_in_result(d, &c1, &onto, &orig, &head)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            dropped_commits(d, &scratch, &onto, &orig, &head)
+                .await
+                .unwrap(),
+            vec!["c1"]
+        );
         let mut state = RunState::new(
             d.to_path_buf(),
             "main".into(),
@@ -1280,6 +1310,18 @@ mod tests {
         // extra.txt remains "initial\n"
         let head = commit_dated(d, "c2").await;
 
-        assert_eq!(dropped_commits(d, &onto, &orig, &head).await, vec!["c1"]);
+        let c0 = git::rev_parse(d, &format!("{orig}~2")).await.unwrap();
+        let c1 = git::rev_parse(d, &format!("{orig}^")).await.unwrap();
+        let resolved = git::rev_parse(d, &format!("{head}^")).await.unwrap();
+        record(
+            d,
+            &[c0, c1, orig.clone()],
+            &[resolved.clone(), resolved, head.clone()],
+        )
+        .await;
+        assert_eq!(
+            dropped_commits(d, d, &onto, &orig, &head).await.unwrap(),
+            vec!["c1"]
+        );
     }
 }
