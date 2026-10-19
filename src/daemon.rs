@@ -917,6 +917,11 @@ where
         };
     }
     match action {
+        a if a.maintenance() => ActionDecision::Skip,
+        ask::ChoiceAction::ResumeRun { .. }
+        | ask::ChoiceAction::ReleaseTask { .. }
+        | ask::ChoiceAction::RerunChecks { .. }
+        | ask::ChoiceAction::AbandonRun { .. } => unreachable!(),
         ask::ChoiceAction::Requeue => ActionDecision::Requeue,
         ask::ChoiceAction::Hold => ActionDecision::Hold,
         ask::ChoiceAction::Done => ActionDecision::Done,
@@ -972,6 +977,9 @@ where
                     } else {
                         ActionDecision::Resume(run.clone())
                     }
+                }
+                Ok(s) if s.liveness(false) == Liveness::Live => {
+                    ActionDecision::Refuse("run already has a live driver".into())
                 }
                 Ok(s) if s.status.resumable() && !s.released() && !exhausted_review_budget(&s) => {
                     ActionDecision::Resume(run.clone())
@@ -1137,6 +1145,283 @@ pub(crate) fn task_of_question<'a>(tasks: &'a [Task], q: &ask::Question) -> Opti
     tasks.iter().find(|t| t.runs.contains(&q.run))
 }
 
+/// Legacy conductor prose never becomes a maintenance command by inference.
+/// Replace unsupported open labels under the question lock before dispatch.
+fn repair_choice_offers(questions: &Questions) {
+    for q in questions.list().into_iter().filter(|q| {
+        q.status.open()
+            && q.node == crate::conduct::NODE
+            && q.choices
+                .iter()
+                .any(|c| crate::choice_effect::describe(q, c).is_none())
+    }) {
+        let _ = questions.update(&q.id, |current| {
+            if current.status.open() {
+                crate::choice_effect::executable_conductor(current);
+                if let Some(deputy) = &mut current.deputy {
+                    deputy.brief = crate::deputy::brief(
+                        &current.run,
+                        &current.detail,
+                        &current.choices,
+                        &current.actions,
+                    );
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Apply answered typed choices. Only the daemon calls this in production;
+/// deputies settle the question and never execute its actions.
+pub async fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
+    apply_maintenance_choices(queue, questions, home).await;
+    apply_task_choice_actions(queue, questions, home);
+}
+
+/// Apply bounded maintenance effects independently of question ownership: a
+/// release watcher need not have a queue task, and a predecessor is another run.
+async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &Path) {
+    use crate::release_watch::{GhForge, ReleaseForge};
+    for q in questions.list() {
+        let Some(action) = q.chosen_action().filter(|a| a.maintenance()) else {
+            continue;
+        };
+        if asker_may_still_read(questions, &q, home) || !crate::run::is_run_id(&q.id) {
+            continue;
+        }
+        let dir = home.join("choice-actions");
+        if std::fs::create_dir_all(&dir).is_err() {
+            continue;
+        }
+        let Ok(lock) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(format!("{}.lock", q.id)))
+        else {
+            continue;
+        };
+        if crate::pr_head::try_lock_file(&lock).is_err() {
+            continue;
+        }
+        let fresh = !home
+            .join("choice-actions")
+            .join(format!("{}.json", q.id))
+            .exists();
+        let result = async {
+            let receipt = dir.join(format!("{}.json", q.id));
+            if receipt.exists() {
+                let prior: serde_json::Value = serde_json::from_slice(&std::fs::read(&receipt)?)?;
+                anyhow::ensure!(
+                    prior.get("status").and_then(|s| s.as_str()) == Some("applied"),
+                    "previous maintenance attempt did not confirm completion; inspect its receipt"
+                );
+                return Ok::<_, anyhow::Error>(());
+            }
+            // Never retry an uncertain external effect. The receipt is written
+            // before calling gh, exactly like release_watch's rerun record.
+            let record = |status: &str| -> anyhow::Result<()> {
+                let tmp = receipt.with_extension("tmp");
+                std::fs::write(
+                    &tmp,
+                    serde_json::to_vec(&serde_json::json!({
+                        "action": action, "status": status,
+                    }))?,
+                )?;
+                std::fs::rename(tmp, &receipt)?;
+                Ok(())
+            };
+            let applied = async {
+                match action {
+                    ask::ChoiceAction::ResumeRun { run } => {
+                        crate::resume::validate(home, run)?;
+                        record("started")?;
+                        if let Some(listed) = queue
+                            .list()
+                            .into_iter()
+                            .find(|t| t.runs.last() == Some(run))
+                        {
+                            let _claim = queue.claim(&listed.id)?;
+                            let mut task = queue.get(&listed.id)?;
+                            anyhow::ensure!(
+                                task.runs.last() == Some(run)
+                                    && !matches!(
+                                        task.status,
+                                        TaskStatus::Running | TaskStatus::Done
+                                    ),
+                                "run queue owner changed"
+                            );
+                            anyhow::ensure!(
+                                !task.operator_held()
+                                    && task.operator_decided_at.is_none_or(|at| at <= q.asked_at),
+                                "resume was superseded by an operator hold or newer operator decision"
+                            );
+                            task.release_operator("choice", Some(&q.id));
+                            task.resume_override = Some(crate::queue::OperatorResume {
+                                question_id: q.id.clone(),
+                                at: Timestamp::now(),
+                                conductor_rehold: None,
+                                forced: true,
+                                pinned_run: Some(run.clone()),
+                            });
+                            task.mark_action_applied(&q.id);
+                            queue.put(&mut task)?;
+                        } else {
+                            crate::resume::validate_unqueued(home, run)?;
+                            crate::resume::start(run.clone());
+                        }
+                    }
+                    ask::ChoiceAction::ReleaseTask {
+                        task,
+                        held_at,
+                        reason,
+                    } => {
+                        anyhow::ensure!(
+                            queue.resolve_id(task)? == *task,
+                            "task action requires an exact task ID"
+                        );
+                        let _claim = queue.claim(task)?;
+                        let mut task = queue.get(task)?;
+                        if task.action_applied(&q.id) {
+                            return Ok(());
+                        }
+                        // Filing this conductor question temporarily wraps the
+                        // original hold in a Blocked state. Restore only that
+                        // exact blocker on the local copy before checking the
+                        // hold binding; unrelated waits never authorize release.
+                        if q.node == crate::conduct::NODE
+                            && q.run == task.id
+                            && task.status == TaskStatus::Blocked
+                            && task.blocked_from == Some(TaskStatus::Held)
+                            && task.blocked_by.as_slice() == [q.id.as_str()]
+                        {
+                            task.unblock(&q.id);
+                        }
+                        anyhow::ensure!(
+                            task.status == TaskStatus::Held
+                                && task.held_at == Some(*held_at)
+                                && task.hold_reason.as_deref() == reason.as_deref()
+                                && task.operator_decided_at.is_none_or(|at| at <= q.asked_at),
+                            "task no longer has the hold this question names"
+                        );
+                        task.release_operator("choice", Some(&q.id));
+                        task.mark_action_applied(&q.id);
+                        queue.put(&mut task)?;
+                    }
+                    ask::ChoiceAction::AbandonRun { run } => {
+                        record("started")?;
+                        crate::driver::abandon_proven_dead(home, run)?;
+                    }
+                    ask::ChoiceAction::RerunChecks {
+                        repo,
+                        pr,
+                        head,
+                        runs,
+                    } => {
+                        anyhow::ensure!(
+                            !runs.is_empty()
+                                && runs.len() <= 20
+                                && runs
+                                    .iter()
+                                    .all(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+                                && !pr.starts_with('-'),
+                            "invalid rerun targets"
+                        );
+                        let snap = GhForge.snapshot(repo, pr).await?;
+                        anyhow::ensure!(
+                            snap.head == *head && snap.state == crate::land::PrLifecycle::Open,
+                            "pull request head or lifecycle changed"
+                        );
+                        anyhow::ensure!(
+                            runs.iter().all(|r| snap
+                                .checks
+                                .iter()
+                                .any(|c| c.run.as_ref() == Some(r)
+                                    && crate::release_watch::is_failed(c.verdict))),
+                            "named workflow is no longer failed on this pull request"
+                        );
+                        record("started")?;
+                        let rerun_lock = std::fs::OpenOptions::new()
+                            .create(true)
+                            .truncate(false)
+                            .write(true)
+                            .open(dir.join("reruns.lock"))?;
+                        crate::pr_head::try_lock_file(&rerun_lock)?;
+                        let ledger = dir.join("reruns.json");
+                        let mut recorded: std::collections::BTreeSet<String> = if ledger.exists() {
+                            serde_json::from_slice(&std::fs::read(&ledger)?)?
+                        } else {
+                            Default::default()
+                        };
+                        for run in runs {
+                            let key = serde_json::to_string(&(&q.id, repo, pr, head, run))?;
+                            if !recorded.insert(key) {
+                                continue;
+                            }
+                            let tmp = ledger.with_extension("tmp");
+                            std::fs::write(&tmp, serde_json::to_vec(&recorded)?)?;
+                            std::fs::rename(tmp, &ledger)?;
+                            GhForge.rerun(repo, run).await?;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            match applied {
+                Ok(()) => record("applied"),
+                Err(e) => {
+                    record(&format!("refused or failed: {e:#}"))?;
+                    Err(e)
+                }
+            }
+        }
+        .await;
+        // Retire the originating blocker as well as the target operation.
+        // A foreign resume leaves its issuer held instead of competing beside
+        // the execution just started. Other successful maintenance lets the
+        // original task retry its normal, guarded path.
+        if home
+            .join("choice-actions")
+            .join(format!("{}.json", q.id))
+            .exists()
+            && let Some(listed) = task_of_question(&queue.list(), &q)
+            && !listed.action_applied(&q.id)
+            && let Ok(_claim) = queue.claim(&listed.id)
+            && let Ok(mut origin) = queue.get(&listed.id)
+        {
+            if !origin.operator_held()
+                && origin.operator_decided_at.is_none_or(|at| at <= q.asked_at)
+                && !matches!(origin.status, TaskStatus::Running | TaskStatus::Done)
+            {
+                if result.is_err() || matches!(action, ask::ChoiceAction::ResumeRun { .. }) {
+                    origin.hold_machine(Some(format!(
+                        "Maintenance choice {} settled; inspect its target before releasing this task",
+                        q.id
+                    )));
+                } else {
+                    origin.unblock(&q.id);
+                }
+            }
+            origin.mark_action_applied(&q.id);
+            let _ = queue.put(&mut origin);
+        }
+        if let Err(e) = result
+            && fresh
+        {
+            notices::raise_in(
+                home,
+                Notice::warn(
+                    &format!("action:{}", q.id),
+                    format!("Choice action {} was not completed: {e:#}", q.id),
+                ),
+            );
+        }
+    }
+}
+
 /// Carry out the [`ask::ChoiceAction`] attached to each answered choice, once.
 ///
 /// Runs on every poll before the conductor looks at the queue. The task is
@@ -1145,14 +1430,14 @@ pub(crate) fn task_of_question<'a>(tasks: &'a [Task], q: &ask::Question) -> Opti
 /// records a pinned [`crate::queue::OperatorResume`], which `crate::conduct`
 /// honours (no re-hold, no requeue) until the task runs and [`attempt`]'s
 /// ordinary `unfinished_run` logic resumes that same run.
-pub(crate) fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
+pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
     let tasks = queue.list();
     for q in questions.list() {
         // Dismissal is committed by the question writer, never a resume.
         if q.resolution().as_deref() == Some(crate::merge_decision::DISMISS) {
             continue;
         }
-        if q.chosen_action().is_none() {
+        if q.chosen_action().is_none_or(|a| a.maintenance()) {
             continue;
         }
         let Some(listed) = task_of_question(&tasks, &q) else {
@@ -2893,8 +3178,9 @@ async fn poll(
 
         // Deterministic: no model, run before the conductor sees anything so
         // its input reflects the queue's current, already-resolved state.
+        repair_choice_offers(&questions);
         resolve_blockers(queue, &questions);
-        apply_choice_actions(queue, &questions, home);
+        apply_choice_actions(queue, &questions, home).await;
         triage::apply_answers(queue, &questions);
         reconcile_task_questions(queue, &questions);
         // Tell the chat a filed task or watched command has ended. Reconciled
@@ -3415,19 +3701,16 @@ async fn attempt(
     } else {
         starter_with_implementers(task, previous.as_ref(), proposed)
     };
-    // A repair pin must never degrade into a new competition or takeover if
-    // the owner disappears between the answer and dispatch.
+    // An explicit resume pin must never degrade into a new competition or
+    // takeover, including when its run stops being eligible after the answer.
     if let Some(pin) = &task.resume_override
         && let Some(run) = &pin.pinned_run
-        && Questions::open().get(&pin.question_id).map_or(true, |q| {
-            q.node == land::APPROVAL_NODE && q.resolution().as_deref() == Some(land::REPAIR)
-        })
         && starter != Starter::Resume(run.clone())
     {
         let run = run.clone();
-        task.notice_cause("repair-owner", Some(&run), None);
+        task.notice_cause("resume-owner", Some(&run), None);
         task.hold_machine(Some(format!(
-            "repair owner cannot resume; inspect `magi show {run}` and restore the existing run before `magi task release {}`; no replacement task was started",
+            "pinned run cannot resume; inspect `magi show {run}` and restore the existing run before `magi task release {}`; no replacement task was started",
             task.id
         )));
         record(queue, task);
@@ -10437,7 +10720,7 @@ mod tests {
             }
             queue.put(&mut task).unwrap();
 
-            apply_choice_actions(&queue, &questions, dir.path());
+            apply_task_choice_actions(&queue, &questions, dir.path());
             let after = queue.get(&task.id).unwrap();
             assert!(after.operator_held());
             assert_eq!(after.hold_source, task.hold_source);
@@ -10470,7 +10753,7 @@ mod tests {
             }
             // Reconciliation is idempotent, and automatic recovery cannot
             // reopen this owner after it observes the rejected repair answer.
-            apply_choice_actions(&queue, &questions, dir.path());
+            apply_task_choice_actions(&queue, &questions, dir.path());
             let still_held = queue.get(&task.id).unwrap();
             assert!(still_held.operator_held());
             assert_eq!(still_held.hold_reason, after.hold_reason);
@@ -10522,7 +10805,7 @@ mod tests {
                 questions.beat(&q.id, ask::WaiterKind::Deputy);
                 for _ in 0..2 {
                     resolve_blockers(&queue, &questions);
-                    apply_choice_actions(&queue, &questions, &home);
+                    apply_task_choice_actions(&queue, &questions, &home);
                     let waiting = queue.get(&t.id).unwrap();
                     assert_eq!(waiting.status, TaskStatus::Blocked);
                     assert_eq!(waiting.blocked_by, [q.id.clone()]);
@@ -10537,7 +10820,7 @@ mod tests {
                 // Releasing the blocker and applying the operation share one save.
                 resolve_blockers(&queue, &questions);
                 assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Blocked);
-                apply_choice_actions(&queue, &questions, &home);
+                apply_task_choice_actions(&queue, &questions, &home);
                 let after = queue.get(&t.id).unwrap();
                 assert_eq!(
                     after.status,
@@ -10560,7 +10843,7 @@ mod tests {
                 }
                 let expected = changed.status;
                 queue.put(&mut changed).unwrap();
-                apply_choice_actions(&queue, &questions, &home);
+                apply_task_choice_actions(&queue, &questions, &home);
                 assert_eq!(queue.get(&t.id).unwrap().status, expected);
             }
         }
@@ -10581,7 +10864,7 @@ mod tests {
         let mut q = action_question(&state.id, resume_action(&state.id));
         questions.put(&mut q).unwrap();
 
-        apply_choice_actions(&queue, &questions, &home);
+        apply_task_choice_actions(&queue, &questions, &home);
         let after = queue.get(&t.id).unwrap();
         assert_eq!(after.status, TaskStatus::Queued);
         assert!(!after.fresh_start);
@@ -10594,7 +10877,7 @@ mod tests {
         let mut again = queue.get(&t.id).unwrap();
         again.hold_machine(Some("later".into()));
         queue.put(&mut again).unwrap();
-        apply_choice_actions(&queue, &questions, &home);
+        apply_task_choice_actions(&queue, &questions, &home);
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
     }
 
@@ -10616,7 +10899,7 @@ mod tests {
 
         // Delivered, and the agent then died: the task is still held, so the
         // chosen action applies.
-        apply_choice_actions(&queue, &questions, &home);
+        apply_task_choice_actions(&queue, &questions, &home);
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
         assert!(queue.get(&t.id).unwrap().action_applied(&q.id));
 
@@ -10624,7 +10907,7 @@ mod tests {
         let mut again = queue.get(&t.id).unwrap();
         again.hold_machine(Some("later".into()));
         queue.put(&mut again).unwrap();
-        apply_choice_actions(&queue, &questions, &home);
+        apply_task_choice_actions(&queue, &questions, &home);
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
     }
 
@@ -10643,11 +10926,11 @@ mod tests {
         questions.put(&mut q).unwrap();
 
         questions.beat(&q.id, crate::ask::WaiterKind::Asker);
-        apply_choice_actions(&queue, &questions, &home);
+        apply_task_choice_actions(&queue, &questions, &home);
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
 
         std::fs::remove_file(questions.root().join(format!("{}.lease", q.id))).unwrap();
-        apply_choice_actions(&queue, &questions, &home);
+        apply_task_choice_actions(&queue, &questions, &home);
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Queued);
     }
 
@@ -10706,17 +10989,17 @@ mod tests {
             crate::waiter::Action::Deliver(_)
         ));
         // ... and the daemon waits while the task runs, then applies once.
-        apply_choice_actions(&queue, &questions, &home);
+        apply_task_choice_actions(&queue, &questions, &home);
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Running);
         let mut back = queue.get(&t.id).unwrap();
         back.hold_machine(Some("later".into()));
         queue.put(&mut back).unwrap();
-        apply_choice_actions(&queue, &questions, &home);
+        apply_task_choice_actions(&queue, &questions, &home);
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Done);
         let mut again = queue.get(&t.id).unwrap();
         again.hold_machine(Some("again".into()));
         queue.put(&mut again).unwrap();
-        apply_choice_actions(&queue, &questions, &home);
+        apply_task_choice_actions(&queue, &questions, &home);
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
     }
 }

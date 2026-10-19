@@ -121,9 +121,9 @@ pub fn brief(
     let mut s = format!(
         "Task {task_id} (`magi task show {task_id}`) is blocked on this question. \
          The conductor asked because: {}\n\n\
-         When the owner answers, magi records the question and the answer on the \
-         task and unblocks it, and the answer becomes part of the instructions of \
-         the task's next attempt.",
+         When the owner answers, the daemon applies the exact attached action \
+         once, after rechecking its preconditions. You only record the choice; \
+         you never execute maintenance or edit repository or run records.",
         if reason.is_empty() {
             "(it recorded no reasoning)"
         } else {
@@ -136,7 +136,7 @@ pub fn brief(
             match actions.get(c) {
                 Some(a) => s.push_str(&format!("\n- `{c}`: also {}", a.describe())),
                 None => s.push_str(&format!(
-                    "\n- `{c}`: recorded on the task as the answer and the task is unblocked"
+                    "\n- `{c}`: no executable operation; keep held and ask for a supported choice"
                 )),
             }
         }
@@ -229,7 +229,9 @@ pub fn generic_brief(
             match actions.get(c) {
                 Some(a) => s.push_str(&format!("\n- `{c}`: also {}", a.describe())),
                 None => s.push_str(&format!(
-                    "\n- `{c}`: recorded as the answer (nothing more is known)"
+                    "\n- `{c}`: {}",
+                    crate::choice_effect::describe(q, c)
+                        .unwrap_or_else(|| "unsupported legacy choice; do not settle".into())
                 )),
             }
         }
@@ -669,8 +671,9 @@ impl Job {
         let unread = q.unread_from_owner();
         let snapshot = q.thread.len();
         let current_brief = format!(
-            "{}\n\n{}",
+            "{}\n\n{}\n\n{}",
             dep.brief,
+            crate::choice_effect::brief(&q),
             crate::queue::dependency_facts(
                 &crate::queue::Queue::at(self.home.join("queue")),
                 &self.store

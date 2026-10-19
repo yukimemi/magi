@@ -579,7 +579,7 @@ fn file_question(
         choices,
     );
     q.triage_generation = Some(task.resumption.as_ref().map_or(0, |r| r.generation));
-    questions.put(&mut q).ok()?;
+    questions.put_executable(&mut q).ok()?;
     Some(q)
 }
 
@@ -901,7 +901,7 @@ fn ask_about_stuck_roots(
     {
         if !frozen.contains_key(&q.run) {
             q.abandon("nothing waits on this task anymore");
-            let _ = questions.put(&mut q);
+            let _ = questions.put_executable(&mut q);
         }
     }
 
@@ -958,7 +958,7 @@ fn ask_about_stuck_roots(
             choices,
         );
         question.triage_generation = Some(root.resumption.as_ref().map_or(0, |r| r.generation));
-        if questions.put(&mut question).is_ok() {
+        if questions.put_executable(&mut question).is_ok() {
             report.asked.push(root.id.clone());
         }
     }

@@ -130,7 +130,11 @@ pub fn decide_owned(
     match q.status {
         QuestionStatus::Abandoned => Action::Idle,
         QuestionStatus::Answered => match q.resolution() {
-            _ if daemon_owns_action && q.chosen_action().is_some() => Action::Idle,
+            _ if q.chosen_action().is_some_and(|a| a.maintenance())
+                || (daemon_owns_action && q.chosen_action().is_some()) =>
+            {
+                Action::Idle
+            }
             Some(a) if !q.answer_delivered && !seat_busy => Action::Deliver(Word::Answered(a)),
             _ => Action::Idle,
         },
@@ -213,7 +217,11 @@ impl Waiter {
     /// Whether the daemon applies this question's chosen action, so the
     /// waiter must not deliver the answer (see [`decide_owned`]).
     fn daemon_owns_action(&self, q: &Question) -> bool {
-        crate::daemon::task_of_question(&crate::queue::Queue::at(self.home.join("queue")).list(), q)
+        q.chosen_action().is_some_and(|a| a.maintenance())
+            || crate::daemon::task_of_question(
+                &crate::queue::Queue::at(self.home.join("queue")).list(),
+                q,
+            )
             .is_some_and(|t| crate::daemon::action_standing(t, q).daemon_owns())
     }
 
@@ -454,12 +462,18 @@ impl Waiter {
         };
         // Applied, stale and pending are all stop conditions; only a busy task
         // (or no action at all) is delivered to.
-        let task_still_ours = || match &task_id {
-            Some(id) => queue
-                .get(id)
-                .map(|t| !crate::daemon::action_standing(&t, &q).daemon_owns())
-                .unwrap_or(true),
-            None => true,
+        let task_still_ours = || {
+            if q.chosen_action().is_some_and(|a| a.maintenance()) {
+                false
+            } else {
+                match &task_id {
+                    Some(id) => queue
+                        .get(id)
+                        .map(|t| !crate::daemon::action_standing(&t, &q).daemon_owns())
+                        .unwrap_or(true),
+                    None => true,
+                }
+            }
         };
         if !task_still_ours() {
             return Ok(());

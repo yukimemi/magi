@@ -60,7 +60,8 @@ use crate::run::RunStatus;
 /// Schema 9 preserves individual original triggers inside whole-field replacements.
 /// Schema 10 records the operator decision generation for built-in triage.
 /// Schema 11 binds merge decisions to the displayed PR and head.
-pub const SCHEMA: u32 = 11;
+/// Schema 12 adds closed, daemon-applied maintenance choice actions.
+pub const SCHEMA: u32 = 12;
 
 /// How often the wait re-reads the question file.
 ///
@@ -251,6 +252,36 @@ pub enum ChoiceAction {
         /// The run to continue. Must still be the task's latest run.
         run: String,
     },
+    /// Resume a named execution through the shared driver service.
+    ResumeRun {
+        /// Exact run ID; never a prefix resolved at application time.
+        run: String,
+    },
+    /// Release only the exact hold the question was filed about.
+    ReleaseTask {
+        /// Exact queue task ID.
+        task: String,
+        /// Start of the hold observed when filing the question.
+        held_at: jiff::Timestamp,
+        /// Exact hold reason (including its absence) observed when filing.
+        reason: Option<String>,
+    },
+    /// Rerun these failed workflow runs once, on this exact PR head.
+    RerunChecks {
+        /// Repository used for forge access.
+        repo: PathBuf,
+        /// Named pull request URL or number.
+        pr: String,
+        /// Commit whose checks the owner saw.
+        head: String,
+        /// Failed workflow run IDs, bounded to twenty.
+        runs: Vec<String>,
+    },
+    /// End a predecessor only after the shared driver judge proves it dead.
+    AbandonRun {
+        /// Exact predecessor run ID.
+        run: String,
+    },
     /// Requeue the task as a fresh competition.
     Requeue,
     /// Hold the task until the operator releases it.
@@ -260,12 +291,38 @@ pub enum ChoiceAction {
 }
 
 impl ChoiceAction {
+    /// Queue owners affected by a named maintenance action.
+    pub fn targets(&self, task: &crate::queue::Task) -> bool {
+        match self {
+            Self::ReleaseTask { task: id, .. } => task.id == *id,
+            Self::ResumeRun { run } | Self::AbandonRun { run } | Self::Resume { run } => {
+                task.runs.contains(run)
+            }
+            _ => false,
+        }
+    }
+
+    /// Maintenance effects are applied exclusively by the daemon.
+    pub fn maintenance(&self) -> bool {
+        matches!(
+            self,
+            Self::ResumeRun { .. }
+                | Self::ReleaseTask { .. }
+                | Self::RerunChecks { .. }
+                | Self::AbandonRun { .. }
+        )
+    }
+
     /// Parse a `--action` value: `<label>=<verb>`, where the verb is
     /// `resume[:<run>]`, `requeue`, `hold` or `done`. A `resume` without a run takes
     /// `default_run` (the asker's own `MAGI_RUN`). Returns the label and its
     /// action; whether the label is one of the choices is the caller's check.
     pub fn parse(spec: &str, default_run: &str) -> Result<(String, Self)> {
-        let Some((label, verb)) = spec.rsplit_once('=') else {
+        let split = spec
+            .find("={")
+            .map(|at| (&spec[..at], &spec[at + 1..]))
+            .or_else(|| spec.rsplit_once('='));
+        let Some((label, verb)) = split else {
             bail!("`--action {spec}` must look like `<choice>=<resume[:run]|requeue|hold|done>`");
         };
         let label = label.trim();
@@ -273,7 +330,17 @@ impl ChoiceAction {
             bail!("`--action {spec}` names no choice before `=`");
         }
         let verb = verb.trim();
+        if verb.starts_with('{') {
+            let action = serde_json::from_str(verb).context("parse typed choice action")?;
+            return Ok((label.to_owned(), action));
+        }
         let action = match verb.split_once(':') {
+            Some(("resumerun", run)) if !run.trim().is_empty() => Self::ResumeRun {
+                run: run.trim().into(),
+            },
+            Some(("abandonrun", run)) if !run.trim().is_empty() => Self::AbandonRun {
+                run: run.trim().into(),
+            },
             Some(("resume", run)) if !run.trim().is_empty() => Self::Resume {
                 run: run.trim().to_owned(),
             },
@@ -334,6 +401,10 @@ impl ChoiceAction {
     pub fn describe(&self) -> String {
         match self {
             Self::Resume { run } => format!("resume run {}", short(run)),
+            Self::ResumeRun { run } => format!("resume run {}", short(run)),
+            Self::ReleaseTask { task, .. } => format!("release held task {}", short(task)),
+            Self::RerunChecks { pr, .. } => format!("rerun failed checks of {pr} once"),
+            Self::AbandonRun { run } => format!("abandon proven stopped run {}", short(run)),
             Self::Requeue => "requeue the task".to_owned(),
             Self::Hold => "hold the task until the operator releases it".to_owned(),
             Self::Done => "mark the task done".to_owned(),
@@ -1414,6 +1485,23 @@ impl Questions {
         Ok((q, out))
     }
 
+    /// File a component-owned question only when every choice has an effect.
+    /// Legacy records remain readable; this is deliberately a creation check.
+    pub fn put_executable(&self, q: &mut Question) -> Result<()> {
+        anyhow::ensure!(
+            q.actions.keys().all(|c| q.choices.contains(c)),
+            "question action names an unoffered choice"
+        );
+        for label in &q.choices {
+            anyhow::ensure!(
+                crate::choice_effect::describe(q, label).is_some(),
+                "question node {} offers an unsupported choice: {label}",
+                q.node
+            );
+        }
+        self.put(q)
+    }
+
     /// Write a question, atomically, so a process killed mid-write leaves the
     /// previous state readable rather than a truncated file that would strand
     /// the run waiting on it.
@@ -2269,7 +2357,7 @@ mod tests {
             ],
             "the on-disk field set is a contract with the front end"
         );
-        assert_eq!(open["schema"], 11);
+        assert_eq!(open["schema"], 12);
         assert_eq!(open["merge_target"], serde_json::Value::Null);
         assert_eq!(open["triage_generation"], serde_json::Value::Null);
         assert_eq!(open["thread"], serde_json::json!([]));
@@ -2321,7 +2409,7 @@ mod tests {
         let saved = store.get(&q.id).unwrap();
         assert_eq!(saved, q);
         let mut body = serde_json::to_value(&saved).unwrap();
-        assert_eq!(body["schema"], 11);
+        assert_eq!(body["schema"], 12);
         assert_eq!(
             body["merge_target"],
             serde_json::json!({

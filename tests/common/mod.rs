@@ -286,7 +286,7 @@ if has "You are the conductor's deputy"; then
   # A merge approval's deputy acting on a mixed reply: the test writes what a
   # careful reader would run (`magi task add --hold ...`, `magi ask --settle
   # ...`) to deputy-actions.sh, with the real CLI, and this runs it.
-  if has "approval to merge a pull request" && [ -f deputy-actions.sh ]; then
+  if { has "approval to merge a pull request" || has "Maintenance"; } && [ -f deputy-actions.sh ]; then
     qid=$(printf '%s\n' "$prompt" | sed -n 's/^## The question (\(.*\))$/\1/p' | head -1)
     . ./deputy-actions.sh
   fi

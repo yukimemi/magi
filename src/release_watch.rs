@@ -146,7 +146,7 @@ impl WatchState {
     }
 }
 
-fn is_failed(v: Verdict) -> bool {
+pub(crate) fn is_failed(v: Verdict) -> bool {
     v == Verdict::Fail
 }
 
@@ -267,6 +267,24 @@ fn human_message(pr: &str) -> String {
     format!("Release PR {pr} is stuck and needs a human")
 }
 
+fn failed_workflows(snap: &RollupView) -> Vec<String> {
+    snap.checks
+        .iter()
+        .filter(|c| is_failed(c.verdict))
+        .filter_map(|c| c.run.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn maintenance_choices(snap: &RollupView) -> Vec<String> {
+    let mut choices = vec![HOLD.to_owned(), LEAVE_IT.to_owned()];
+    if !failed_workflows(snap).is_empty() {
+        choices.insert(0, RERUN_AGAIN.to_owned());
+    }
+    choices
+}
+
 fn question_detail(snap: &RollupView, why: Why, st: &WatchState) -> String {
     let mut s = String::new();
     s.push_str(&format!("Pull request: {}\n\n", snap.url));
@@ -298,6 +316,12 @@ fn question_detail(snap: &RollupView, why: Why, st: &WatchState) -> String {
          Nothing is merged or pushed by magi; silence is a hold.\n",
         st.reruns.len()
     ));
+    if failed_workflows(snap).is_empty() {
+        s = s.replace(
+            &format!("- `{RERUN_AGAIN}`: rerun the failed jobs once more.\n"),
+            "",
+        );
+    }
     s
 }
 
@@ -451,7 +475,9 @@ pub(crate) fn deputy_brief(q: &Question, home: &Path) -> String {
     s.push_str("\n\nWhat each option does:");
     for c in &q.choices {
         let what = match c.as_str() {
-            RERUN_AGAIN => "forget the reruns already made and rerun the failed jobs once more",
+            RERUN_AGAIN => {
+                "the daemon reruns the recorded failed workflows once if the PR head still matches"
+            }
             HOLD if q.choices.iter().any(|c| c == land::APPROVE) => {
                 "leave the pull request open and unmerged; ask again only when the head moves"
             }
@@ -833,7 +859,7 @@ impl Watcher {
         if let Some(id) = st.question.clone() {
             match self.questions().get(&id) {
                 Ok(q) if q.status.open() => return,
-                Ok(q) => self.apply_answer(&pr, &mut st, &snap, &q),
+                Ok(q) => self.apply_answer(&pr, &mut st, &snap, &q, now),
                 Err(_) => st.question = None,
             }
             // Whatever was decided, the record is saved before anything else.
@@ -874,9 +900,20 @@ impl Watcher {
                     "release-watch".to_owned(),
                     format!("Release PR {pr} is stuck: what now?"),
                     question_detail(&snap, why, &st),
-                    vec![RERUN_AGAIN.to_owned(), HOLD.to_owned(), LEAVE_IT.to_owned()],
+                    maintenance_choices(&snap),
                 );
-                match self.questions().put(&mut q) {
+                if q.choices.iter().any(|c| c == RERUN_AGAIN) {
+                    q.actions.insert(
+                        RERUN_AGAIN.into(),
+                        crate::ask::ChoiceAction::RerunChecks {
+                            repo: repo.to_path_buf(),
+                            pr: snap.url.clone(),
+                            head: snap.head.clone(),
+                            runs: failed_workflows(&snap).into_iter().take(20).collect(),
+                        },
+                    );
+                }
+                match self.questions().put_executable(&mut q) {
                     Ok(()) => st.question = Some(q.id.clone()),
                     Err(e) => tracing::warn!("could not file the question for {pr}: {e:#}"),
                 }
@@ -976,7 +1013,7 @@ impl Watcher {
                             head: snap.head.clone(),
                             language: "en".into(),
                         });
-                        match self.questions().put(&mut q) {
+                        match self.questions().put_executable(&mut q) {
                             Ok(()) => st.question = Some(q.id.clone()),
                             Err(e) => tracing::warn!("could not file the question for {pr}: {e:#}"),
                         }
@@ -1283,7 +1320,7 @@ impl Watcher {
             ),
             vec![RETRY.to_owned(), LEAVE_IT.to_owned()],
         );
-        match self.questions().put(&mut q) {
+        match self.questions().put_executable(&mut q) {
             Ok(()) => st.question = Some(q.id.clone()),
             Err(e) => tracing::warn!("could not file the question for {pr}: {e:#}"),
         }
@@ -1326,7 +1363,14 @@ impl Watcher {
     }
 
     /// Apply a settled question's outcome to the record, once.
-    fn apply_answer(&self, pr: &str, st: &mut WatchState, snap: &RollupView, q: &Question) {
+    fn apply_answer(
+        &self,
+        pr: &str,
+        st: &mut WatchState,
+        snap: &RollupView,
+        q: &Question,
+        now: i64,
+    ) {
         st.question = None;
         if st.applied.contains(&q.id) {
             return;
@@ -1338,6 +1382,15 @@ impl Watcher {
         match &q.answer {
             Some(Answer::Choice(c)) if c == RERUN_AGAIN => {
                 st.held = None;
+                if let Some(crate::ask::ChoiceAction::RerunChecks { runs, .. }) = q.chosen_action()
+                {
+                    // The daemon owns the external call. Suppress the watcher's
+                    // automatic rerun, including across a watcher restart.
+                    for run in runs {
+                        st.reruns.insert(run.clone(), now);
+                    }
+                    return;
+                }
                 for c in snap.checks.iter().filter(|c| is_failed(c.verdict)) {
                     if let Some(r) = &c.run {
                         st.reruns.remove(r);
@@ -1753,14 +1806,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rerun_again_reruns_exactly_once_more() {
+    async fn legacy_rerun_again_reruns_exactly_once_more() {
         let (_d, fake, w, id) = escalated().await;
+        w.questions()
+            .update(&id, |q| {
+                q.actions.clear();
+                Ok(())
+            })
+            .unwrap();
         answer(&w, &id, RERUN_AGAIN);
         let repo = PathBuf::from("/nowhere");
         let no = || false;
         w.lap(std::slice::from_ref(&repo), 3600, 3000, &no).await;
         w.lap(&[repo], 3600, 3001, &no).await;
         assert_eq!(fake.reruns.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn typed_rerun_is_left_to_the_daemon_instead_of_the_watcher() {
+        let (_d, fake, w, id) = escalated().await;
+        let q = w.questions().get(&id).unwrap();
+        assert!(
+            matches!(q.actions.get(RERUN_AGAIN), Some(crate::ask::ChoiceAction::RerunChecks { head, runs, .. })
+            if head == "h1" && runs == &["11"])
+        );
+        answer(&w, &id, RERUN_AGAIN);
+        w.lap(&[PathBuf::from("/nowhere")], 3600, 3000, &|| false)
+            .await;
+        assert_eq!(
+            fake.reruns.lock().unwrap().len(),
+            1,
+            "only the earlier automatic rerun"
+        );
+    }
+
+    #[test]
+    fn no_failed_workflow_means_no_rerun_choice() {
+        let snap = open(vec![check("external", Verdict::Fail, None)]);
+        assert_eq!(maintenance_choices(&snap), vec![HOLD, LEAVE_IT]);
     }
 
     #[tokio::test]

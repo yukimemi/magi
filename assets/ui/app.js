@@ -5093,7 +5093,8 @@ function updateAskCard(row, question, { compact = false } = {}) {
   row.dataset.questionId = question.id;
   const status = String(question.status || "open");
   const open = status === "open";
-  const choices = Array.isArray(question.choices) ? question.choices : [];
+  const choices = (Array.isArray(question.choices) ? question.choices : [])
+    .filter(choice => !question.choice_effects || !!question.choice_effects[choice]);
 
   /* The land loop's approval question. It is detected here rather than
      styled by the server, because the client is what knows the difference
@@ -5215,7 +5216,7 @@ function updateAskCard(row, question, { compact = false } = {}) {
 
   /* The choice set is keyed with the treatment as well, so a question that
      turns out to be a merge approval cannot keep a row of plain buttons. */
-  const choiceKey = `${merge ? "merge" : "plain"}:${choices.join("\u0000")}`;
+  const choiceKey = `${merge ? "merge" : "plain"}:${choices.join("\u0000")}:${JSON.stringify(question.choice_effects || {})}`;
   if (row.dataset.choiceKey !== choiceKey) {
     row.dataset.choiceKey = choiceKey;
     row.dataset.armed = "";
@@ -5225,13 +5226,23 @@ function updateAskCard(row, question, { compact = false } = {}) {
     clear(r.choices);
     clear(r.stakes);
     if (merge) {
-      renderStakes(row, question);
+      renderStakes(row, { ...question, choices });
+      for (const choice of choices) {
+        if (question.choice_effects?.[choice]) r.stakes.append(el("p", {
+          class: "muted", text: `${choice}: ${question.choice_effects[choice]}`,
+        }));
+      }
     } else {
       for (const choice of choices) {
-        r.choices.append(el("button", {
+        const btn = el("button", {
           class: "btn", type: "button", text: choice,
           onclick: () => answerQuestion(question.id, { choice }, row),
-        }));
+        });
+        const effect = question.choice_effects?.[choice];
+        r.choices.append(el("div", { class: "choice-item" },
+          btn,
+          effect ? el("span", { class: "choice-effect", text: effect }) : null,
+        ));
       }
     }
   }
@@ -5242,7 +5253,7 @@ function updateAskCard(row, question, { compact = false } = {}) {
     : merge
       ? "Read the panel, then decide. Nothing merges until you say so twice."
       : choices.length
-        ? "Pick one. The run resumes as soon as you do."
+        ? "Pick a choice to apply its listed effect."
         : "No options were offered \u2014 answer in your own words.");
   show(r.hint, open && !waitingOnAgent);
   show(r.stakes, open && merge);

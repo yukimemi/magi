@@ -2636,6 +2636,8 @@ pub struct ConductTask {
     pub last_error: Option<String>,
     /// The reason an operator or machine placed a hold.
     pub hold_reason: Option<String>,
+    /// Start of the current hold, for an exact ReleaseTask binding.
+    pub held_at: Option<String>,
     /// `manual` or `machine` when the hold source is known.
     pub hold_source: Option<String>,
     /// This task's current `crate::queue::Task::blocked_by`, if any.
@@ -2757,6 +2759,9 @@ fn conduct_task_block(t: &ConductTask) -> String {
             .as_deref()
             .unwrap_or("unknown (legacy record)");
         let _ = writeln!(s, "  hold_source: {source}");
+    }
+    if let Some(at) = &t.held_at {
+        let _ = writeln!(s, "  held_at: {at}");
     }
     if let Some(reason) = &t.hold_reason {
         let source = t.hold_source.as_deref().unwrap_or("legacy");
@@ -2942,6 +2947,13 @@ pub fn conduct(
          `daemon: recheck and retry` (release/requeue the task, rerunning all ownership checks) \
          or `daemon: hold the task` (leave it held). Attach structured `actions`: \
          {\"daemon: recheck and retry\":{\"do\":\"requeue\"},\"daemon: hold the task\":{\"do\":\"hold\"}}. \
+         Maintenance choices MUST carry typed actions: \
+         {\"do\":\"resumerun\",\"run\":\"<exact run id>\"}, \
+         {\"do\":\"releasetask\",\"task\":\"<task id>\",\"held_at\":\"<hold timestamp>\",\"reason\":\"<exact hold reason>\"}, \
+         {\"do\":\"rerunchecks\",\"repo\":\"<repo>\",\"pr\":\"<PR URL>\",\"head\":\"<head SHA>\",\"runs\":[\"<failed workflow run id>\"]}, \
+         or {\"do\":\"abandonrun\",\"run\":\"<stale predecessor id>\"}. \
+         Never offer operator record edits, shell commands, or an unmapped choice. \
+         When facts needed to bind an action are unknown, offer hold only. \
          The daemon applies the chosen queue operation; neither answer overrides the liveness judge.\n\n\
          You may also `ask` the operator instead of choosing a recovery — \
          see below.\n\n",
@@ -3883,6 +3895,7 @@ mod tests {
             max_attempts: 2,
             last_error: None,
             hold_reason: None,
+            held_at: None,
             hold_source: None,
             blocked_by: Vec::new(),
             answers: Vec::new(),

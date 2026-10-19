@@ -741,7 +741,16 @@ fn unasked_questions() -> Vec<Question> {
         )
     };
     vec![
-        q(magi::conduct::NODE, "conduct", &["a", "b"]),
+        {
+            let mut conduct = q(magi::conduct::NODE, "conduct", &["a", "b"]);
+            conduct
+                .actions
+                .insert("a".into(), magi::ask::ChoiceAction::Requeue);
+            conduct
+                .actions
+                .insert("b".into(), magi::ask::ChoiceAction::Hold);
+            conduct
+        },
         q(magi::land::APPROVAL_NODE, "land", &["merge", "hold"]),
         q(
             magi::bump::NOTICE_NODE,
@@ -948,6 +957,472 @@ async fn deputy_non_hold_owner_choices_remain_independent_of_consultation_destin
         assert_eq!(answered.resolution().as_deref(), Some(choice));
         assert_eq!(answered.consult, q.consult);
         assert_eq!(answered.thread.iter().filter(|t| t.who == Who::Agent && t.body.starts_with("Settled as")).count(), 1);
+    }
+}
+}
+
+#[test]
+fn every_question_choice_has_a_mapped_execution_effect() {
+    let mut all = unasked_questions();
+    let mut release = all[2].clone();
+    release.choices.extend(
+        [
+            magi::release_watch::RERUN_AGAIN,
+            magi::release_watch::RETRY,
+            magi::land::APPROVE,
+        ]
+        .map(str::to_owned),
+    );
+    all.push(release);
+    let mut posting = all[5].clone();
+    posting.choices.extend(
+        [
+            magi::github_text::POST_ORIGINAL,
+            magi::github_text::USE_REWRITE,
+        ]
+        .map(str::to_owned),
+    );
+    all.push(posting);
+    for q in all {
+        for label in &q.choices {
+            assert!(
+                magi::choice_effect::describe(&q, label).is_some(),
+                "{} / {} offers an unmapped choice: {label}",
+                q.node,
+                q.seat
+            );
+        }
+    }
+    let mut q = unasked_questions().remove(0);
+    q.choices.push("operator: edit the run record".into());
+    assert!(magi::choice_effect::describe(&q, q.choices.last().unwrap()).is_none());
+}
+
+fn maintenance_question(s: &Scene, action: magi::ask::ChoiceAction) -> Question {
+    let mut q = Question::new(
+        TASK.into(),
+        magi::conduct::NODE.into(),
+        "conduct".into(),
+        "Maintenance".into(),
+        String::new(),
+        vec!["daemon: execute".into()],
+    );
+    q.actions.insert(q.choices[0].clone(), action);
+    s.store.put_executable(&mut q).unwrap();
+    q
+}
+
+common::e2e! {
+async fn maintenance_release_is_bound_to_the_hold_and_applies_once_after_settle() {
+    use magi::queue::{Queue, Source, Task, TaskStatus};
+    use magi::ask::{Answer, ChoiceAction};
+    let s = scene(home_lock().await);
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    let queue = Queue::at(s.home.join("queue"));
+    let mut task = Task::new("held".into(), "work".into(), s.fx.repo.clone(), Source::Human);
+    task.hold_machine(Some("waiting for a repair".into()));
+    queue.put(&mut task).unwrap();
+    let action = ChoiceAction::ReleaseTask { task: task.id.clone(),
+        held_at: task.held_at.unwrap(), reason: task.hold_reason.clone() };
+    let mut q = maintenance_question(&s, action.clone());
+    q.say("daemon: execute").unwrap();
+    s.store.put(&mut q).unwrap();
+    script(&s, &["MAGI ask --settle \"$qid\" --choice 'daemon: execute' --quote 'daemon: execute'"]);
+    turn(&mut deputies(&s, 2)).await;
+    assert_actions_succeeded(&s, 1);
+    assert_eq!(s.store.get(&q.id).unwrap().status, QuestionStatus::Answered);
+    assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Held,
+        "a deputy records the answer and applies nothing");
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    let released = queue.get(&task.id).unwrap();
+    assert_eq!(released.status, TaskStatus::Queued);
+    assert!(released.action_applied(&q.id));
+    // Reopening the stores simulates a daemon restart. A fresh manual hold
+    // cannot be released by an old settled question.
+    task = released;
+    task.hold_machine(Some("another hold".into()));
+    queue.put(&mut task).unwrap();
+    magi::daemon::apply_choice_actions(&Queue::at(s.home.join("queue")),
+        &Questions::at(s.home.join("questions")), &s.home).await;
+    assert_eq!(queue.get(&task.id).unwrap().hold_reason.as_deref(), Some("another hold"));
+    // A different question bound to the original hold must refuse as well.
+    let mut stale = maintenance_question(&s, action);
+    stale.answer(Answer::Choice(stale.choices[0].clone())).unwrap();
+    s.store.put(&mut stale).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Held);
+    assert!(!queue.get(&task.id).unwrap().action_applied(&stale.id));
+    // Already released by hand is a refusal, never a second resumption.
+    let action = ChoiceAction::ReleaseTask { task: task.id.clone(),
+        held_at: task.held_at.unwrap(), reason: task.hold_reason.clone() };
+    let mut late = maintenance_question(&s, action);
+    late.answer(Answer::Choice(late.choices[0].clone())).unwrap();
+    s.store.put(&mut late).unwrap();
+    task.release_operator("manual", None);
+    queue.put(&mut task).unwrap();
+    let generation = task.resumption.as_ref().unwrap().generation;
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    assert_eq!(queue.get(&task.id).unwrap().resumption.unwrap().generation, generation);
+    task.hold_manual(Some("operator parked".into()));
+    queue.put(&mut task).unwrap();
+    let mut manual = maintenance_question(&s, ChoiceAction::ReleaseTask { task: task.id.clone(),
+        held_at: task.held_at.unwrap(), reason: task.hold_reason.clone() });
+    manual.say("daemon: execute").unwrap();
+    s.store.put(&mut manual).unwrap();
+    turn(&mut deputies(&s, 2)).await;
+    assert_eq!(s.store.get(&manual.id).unwrap().status, QuestionStatus::Open,
+        "a deputy cannot settle a typed release of an operator-held target");
+    assert!(queue.get(&task.id).unwrap().operator_held());
+}
+}
+
+common::e2e! {
+async fn maintenance_ownerless_resume_refuses_work_on_another_run() {
+    use magi::{ask::{Answer, ChoiceAction}, run::{RunState, RunStatus}};
+    let s = scene(home_lock().await);
+    let queue = magi::queue::Queue::at(s.home.join("queue"));
+    let mut run = RunState::new(s.fx.repo.clone(), "main".into(), "base".into(),
+        "work".into(), s.fx.config.clone());
+    run.status = RunStatus::Stalled;
+    run.driver_exited = true;
+    run.save_under(&s.home).unwrap();
+    let other = "20261019-000001-bbbb";
+    std::fs::write(s.home.join("daemon.json"), serde_json::to_vec(&serde_json::json!({
+        "updated_at": Timestamp::now(),
+        "current": [{"task": TASK, "run": other}],
+    })).unwrap()).unwrap();
+    assert_eq!(magi::daemon::current_work(&s.home, Timestamp::now())[0].run, other);
+    let mut q = maintenance_question(&s, ChoiceAction::ResumeRun { run: run.id.clone() });
+    q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+    s.store.put(&mut q).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    let receipt = s.home.join("choice-actions").join(format!("{}.json", q.id));
+    let body = std::fs::read_to_string(&receipt).unwrap();
+    assert!(body.contains("the loop is running run"), "{body}");
+    assert_eq!(serde_json::to_value(RunState::load_under(&run.id, &s.home).unwrap()).unwrap(),
+        serde_json::to_value(&run).unwrap());
+    assert!(queue.list().is_empty());
+    // A refused choice cannot start later when the daemon becomes idle.
+    std::fs::remove_file(s.home.join("daemon.json")).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    assert_eq!(std::fs::read_to_string(receipt).unwrap(), body);
+    assert_eq!(serde_json::to_value(RunState::load_under(&run.id, &s.home).unwrap()).unwrap(),
+        serde_json::to_value(&run).unwrap());
+}
+}
+
+common::e2e! {
+async fn maintenance_resume_refuses_a_live_driver_and_abandon_refuses_unknown() {
+    use magi::{ask::{Answer, ChoiceAction}, run::{RunState, RunStatus}};
+    let s = scene(home_lock().await);
+    let queue = magi::queue::Queue::at(s.home.join("queue"));
+    let mut run = RunState::new(s.fx.repo.clone(), "main".into(), "base".into(),
+        "work".into(), s.fx.config.clone());
+    run.status = RunStatus::Stalled;
+    run.driver_pid = Some(std::process::id());
+    run.driver_started_at = magi::proc::process_started_at(std::process::id());
+    assert!(run.driver_started_at.is_some(), "the test requires process identity");
+    run.driver_exited = false;
+    run.save_under(&s.home).unwrap();
+    let mut q = maintenance_question(&s, ChoiceAction::ResumeRun { run: run.id.clone() });
+    q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+    s.store.put(&mut q).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    let receipt = std::fs::read_to_string(s.home.join("choice-actions").join(format!("{}.json", q.id))).unwrap();
+    assert!(receipt.contains("live driver"), "{receipt}");
+    assert_eq!(RunState::load_under(&run.id, &s.home).unwrap().status, RunStatus::Stalled);
+    run.driver_pid = None;
+    run.driver_started_at = None;
+    run.save_under(&s.home).unwrap();
+    let mut q = maintenance_question(&s, ChoiceAction::AbandonRun { run: run.id.clone() });
+    q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+    s.store.put(&mut q).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    assert_eq!(RunState::load_under(&run.id, &s.home).unwrap().status, RunStatus::Stalled);
+    // Explicit stopped-driver evidence is accepted by the shared judge.
+    run.driver_exited = true;
+    run.save_under(&s.home).unwrap();
+    let mut q = maintenance_question(&s, ChoiceAction::AbandonRun { run: run.id.clone() });
+    q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+    s.store.put(&mut q).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    assert_eq!(RunState::load_under(&run.id, &s.home).unwrap().status, RunStatus::Failed);
+}
+}
+
+common::e2e! {
+#[cfg(unix)]
+async fn maintenance_reruns_are_recorded_before_forge_calls_and_survive_restart() {
+    use magi::ask::{Answer, ChoiceAction};
+    use std::os::unix::fs::PermissionsExt;
+    let s = scene(home_lock().await);
+    let bin = s.fx.tmp.path().join("choice-forge");
+    std::fs::create_dir_all(&bin).unwrap();
+    let snapshot = s.fx.tmp.path().join("choice-pr.json");
+    let log = s.fx.tmp.path().join("choice-reruns.log");
+    let gh = bin.join("gh");
+    std::fs::write(&gh, r#"#!/bin/sh
+case "$1 $2" in
+  'pr view') cat "$CHOICE_PR" ;;
+  'run rerun')
+    test -s "$CHOICE_HOME/choice-actions/reruns.json" || exit 19
+    grep -q "$3" "$CHOICE_HOME/choice-actions/reruns.json" || exit 20
+    printf '%s\n' "$3" >> "$CHOICE_LOG" ;;
+  *) exit 17 ;;
+esac
+"#).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    // SAFETY: e2e! isolates this test in a child; no other test shares PATH.
+    unsafe {
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        std::env::set_var("CHOICE_PR", &snapshot);
+        std::env::set_var("CHOICE_HOME", &s.home);
+        std::env::set_var("CHOICE_LOG", &log);
+    }
+    let write_snapshot = |head: &str| {
+        std::fs::write(&snapshot, serde_json::to_vec(&serde_json::json!({
+            "url": "https://github.com/o/r/pull/7", "number": 7, "state": "OPEN",
+            "headRefOid": head, "statusCheckRollup": [{
+                "__typename": "CheckRun", "name": "CI", "status": "COMPLETED",
+                "conclusion": "FAILURE", "detailsUrl": "https://github.com/o/r/actions/runs/42/job/1"
+            }]
+        })).unwrap()).unwrap();
+    };
+    write_snapshot("head");
+    let action = ChoiceAction::RerunChecks { repo: s.fx.repo.clone(),
+        pr: "https://github.com/o/r/pull/7".into(), head: "head".into(), runs: vec!["42".into()] };
+    let queue = magi::queue::Queue::at(s.home.join("queue"));
+    let mut q = maintenance_question(&s, action.clone());
+    q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+    s.store.put(&mut q).unwrap();
+    assert!(!log.exists(), "recording an answer applies nothing");
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "42\n");
+    let restarted = Questions::at(s.home.join("questions"));
+    magi::daemon::apply_choice_actions(&queue, &restarted, &s.home).await;
+    // A fresh explicit owner choice can authorize one more bounded rerun.
+    let mut duplicate = maintenance_question(&s, action.clone());
+    duplicate.answer(Answer::Choice(duplicate.choices[0].clone())).unwrap();
+    s.store.put(&mut duplicate).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &restarted, &s.home).await;
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "42\n42\n");
+    write_snapshot("different-head");
+    let mut stale = maintenance_question(&s, action.clone());
+    stale.answer(Answer::Choice(stale.choices[0].clone())).unwrap();
+    s.store.put(&mut stale).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &restarted, &s.home).await;
+    let receipt = std::fs::read_to_string(s.home.join("choice-actions").join(format!("{}.json", stale.id))).unwrap();
+    assert!(receipt.contains("head or lifecycle changed"), "{receipt}");
+    // A failed durable write prevents an external call.
+    write_snapshot("head");
+    let snapshot_body = std::fs::read_to_string(&snapshot).unwrap().replace("/runs/42/", "/runs/43/");
+    std::fs::write(&snapshot, snapshot_body).unwrap();
+    let mut unsaved_action = action;
+    if let ChoiceAction::RerunChecks { runs, .. } = &mut unsaved_action { runs[0] = "43".into(); }
+    let mut unsaved = maintenance_question(&s, unsaved_action);
+    unsaved.answer(Answer::Choice(unsaved.choices[0].clone())).unwrap();
+    s.store.put(&mut unsaved).unwrap();
+    std::fs::create_dir(s.home.join("choice-actions").join(format!("{}.tmp", unsaved.id))).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &restarted, &s.home).await;
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "42\n42\n");
+}
+}
+
+#[test]
+fn maintenance_choice_without_a_queue_owner_is_never_delivered_to_an_asker() {
+    let mut q = unasked_questions().remove(0);
+    q.cwd = Some("repo".into());
+    q.actions.insert(
+        q.choices[0].clone(),
+        magi::ask::ChoiceAction::ResumeRun {
+            run: "named".into(),
+        },
+    );
+    q.answer(magi::ask::Answer::Choice(q.choices[0].clone()))
+        .unwrap();
+    assert_eq!(
+        magi::waiter::decide_owned(&q, None, false, 3600, Timestamp::now(), false),
+        magi::waiter::Action::Idle
+    );
+}
+
+fn conductor_maintenance_question(
+    s: &Scene,
+    queue: &magi::queue::Queue,
+    task: &magi::queue::Task,
+    action: magi::ask::ChoiceAction,
+) -> Question {
+    magi::conduct::apply(
+        queue,
+        &s.store,
+        &magi::conduct::Verdict {
+            decisions: vec![magi::conduct::Decision {
+                id: task.id.clone(),
+                question: Some("Maintenance".into()),
+                choices: vec!["daemon: execute".into()],
+                actions: std::collections::BTreeMap::from([("daemon: execute".into(), action)]),
+                ..Default::default()
+            }],
+        },
+    )
+    .unwrap();
+    s.store
+        .list()
+        .into_iter()
+        .find(|q| q.run == task.id && q.node == magi::conduct::NODE)
+        .unwrap()
+}
+
+common::e2e! {
+async fn maintenance_conductor_release_restores_its_original_hold_once() {
+    use magi::{ask::{Answer, ChoiceAction}, queue::{Queue, Source, Task, TaskStatus}};
+    let s = scene(home_lock().await);
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    let queue = Queue::at(s.home.join("queue"));
+    let mut task = Task::new("held".into(), "work".into(), s.fx.repo.clone(), Source::Human);
+    task.hold_machine(Some("waiting for repair".into()));
+    queue.put(&mut task).unwrap();
+    let action = ChoiceAction::ReleaseTask { task: task.id.clone(),
+        held_at: task.held_at.unwrap(), reason: task.hold_reason.clone() };
+    let mut q = conductor_maintenance_question(&s, &queue, &task, action);
+    let blocked = queue.get(&task.id).unwrap();
+    assert_eq!(blocked.status, TaskStatus::Blocked);
+    assert_eq!(blocked.blocked_from, Some(TaskStatus::Held));
+    assert_eq!(blocked.blocked_by, vec![q.id.clone()]);
+    assert_eq!(blocked.held_at, task.held_at);
+    q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+    s.store.put(&mut q).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    let released = queue.get(&task.id).unwrap();
+    assert_eq!(released.status, TaskStatus::Queued);
+    assert!(released.blocked_by.is_empty());
+    assert!(released.action_applied(&q.id));
+    assert_eq!(released.resumption.as_ref().unwrap().cleared_reason, task.hold_reason);
+    magi::daemon::apply_choice_actions(&Queue::at(s.home.join("queue")),
+        &Questions::at(s.home.join("questions")), &s.home).await;
+    assert_eq!(queue.get(&task.id).unwrap().resumption.as_ref().unwrap().generation,
+        released.resumption.as_ref().unwrap().generation);
+}
+}
+
+common::e2e! {
+async fn maintenance_resume_preserves_operator_decisions_after_deputy_settle() {
+    use magi::{ask::ChoiceAction, queue::{Queue, Source, Task, TaskStatus}, run::{RunState, RunStatus}};
+    let s = scene(home_lock().await);
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    let queue = Queue::at(s.home.join("queue"));
+    for manual_hold in [true, false] {
+        let mut run = RunState::new(s.fx.repo.clone(), "main".into(), "base".into(),
+            "work".into(), s.fx.config.clone());
+        run.status = RunStatus::Stalled;
+        run.driver_exited = true;
+        run.save_under(&s.home).unwrap();
+        let mut task = Task::new("resume".into(), "work".into(), s.fx.repo.clone(), Source::Human);
+        task.runs.push(run.id.clone());
+        task.hold_machine(Some("waiting for resume".into()));
+        queue.put(&mut task).unwrap();
+        let mut q = conductor_maintenance_question(&s, &queue, &task,
+            ChoiceAction::ResumeRun { run: run.id.clone() });
+        q.say("daemon: execute").unwrap();
+        s.store.put(&mut q).unwrap();
+        script(&s, &["MAGI ask --settle \"$qid\" --choice 'daemon: execute' --quote 'daemon: execute'"]);
+        turn(&mut deputies(&s, 2)).await;
+        assert_actions_succeeded(&s, 1);
+        assert_eq!(s.store.get(&q.id).unwrap().status, QuestionStatus::Answered);
+        task = queue.get(&task.id).unwrap();
+        assert_eq!(task.status, TaskStatus::Blocked, "settling applies nothing");
+        if manual_hold {
+            task.hold_manual(Some("operator parked after settle".into()));
+        } else {
+            task.release_operator("manual", None);
+        }
+        assert!(task.operator_decided_at.unwrap() > q.asked_at);
+        queue.put(&mut task).unwrap();
+        let run_before = std::fs::read(s.home.join("runs").join(&run.id).join("run.json")).unwrap();
+        for _ in 0..2 {
+            magi::daemon::apply_choice_actions(&Queue::at(s.home.join("queue")),
+                &Questions::at(s.home.join("questions")), &s.home).await;
+            let after = queue.get(&task.id).unwrap();
+            assert_eq!(after.status, task.status);
+            assert_eq!(after.hold_reason, task.hold_reason);
+            assert_eq!(after.operator_decided_at, task.operator_decided_at);
+            assert_eq!(after.resumption.as_ref().map(|r| r.generation),
+                task.resumption.as_ref().map(|r| r.generation));
+            assert!(after.resume_override.is_none());
+            assert_eq!(std::fs::read(s.home.join("runs").join(&run.id).join("run.json")).unwrap(), run_before);
+        }
+        let receipt = std::fs::read_to_string(s.home.join("choice-actions").join(format!("{}.json", q.id))).unwrap();
+        assert!(receipt.contains("superseded by an operator hold or newer operator decision"), "{receipt}");
+    }
+}
+}
+
+common::e2e! {
+async fn maintenance_named_resume_never_replaces_an_exhausted_run() {
+    use magi::{ask::{Answer, ChoiceAction}, queue::{Queue, Source, Task, TaskStatus},
+        run::{ReviewRound, RunState, RunStatus}};
+    let s = scene(home_lock().await);
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    let queue = Queue::at(s.home.join("queue"));
+    let mut config = s.fx.config.clone();
+    config.disk.min_free_bytes = 0;
+    config.disk.auto_fold = false;
+    config.disk.cache_limit_bytes = 0;
+    config.graph.review_rounds = 1;
+    let config_path = s.fx.tmp.path().join("resume.toml");
+    std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+    let opts = magi::daemon::Opts { repo: s.fx.repo.clone(), config: Some(config_path),
+        worktrees_root: Some(s.fx.tmp.path().join("worktrees")), ..Default::default() };
+    for exhausted_before_answer in [true, false] {
+        let mut task = Task::new("resume existing work".into(), "work".into(), s.fx.repo.clone(), Source::Human);
+        let mut run = RunState::new(s.fx.repo.clone(), "main".into(), "base".into(),
+            task.instruction.clone(), config.clone());
+        run.status = RunStatus::Blocked;
+        run.driver_exited = true;
+        run.pr_publication_pending = false;
+        let round = ReviewRound { round: 1, head: "base".into(), verified_head: None,
+            verified_at: None, reviews: Vec::new(), e2e: Vec::new(), verify_retried: false,
+            e2e_deferred: false, e2e_defer_reason: None, fix: None, blocking: 0,
+            answered: 1, expected: 1, clean: false, progressed: true, vote_split: false,
+            reconsideration: Vec::new(), verdict: None };
+        if exhausted_before_answer { run.reviews.push(round.clone()); }
+        run.save_under(&s.home).unwrap();
+        task.runs.push(run.id.clone());
+        task.hold_machine(Some("waiting for resume".into()));
+        queue.put(&mut task).unwrap();
+        assert!(task.review_of.is_none() && task.replacement.is_none() && task.pr_recovery.is_none());
+        let mut q = conductor_maintenance_question(&s, &queue, &task,
+            ChoiceAction::ResumeRun { run: run.id.clone() });
+        q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+        s.store.put(&mut q).unwrap();
+        magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+        task = queue.get(&task.id).unwrap();
+        assert_eq!(task.status, TaskStatus::Queued);
+        assert_eq!(task.resume_override.as_ref().unwrap().pinned_run.as_deref(), Some(run.id.as_str()));
+        // Also protect a pin that was accepted while budget remained but is
+        // no longer resumable by the time the daemon dispatches the attempt.
+        if !exhausted_before_answer {
+            run.reviews.push(round);
+            run.save_under(&s.home).unwrap();
+        }
+        let path = s.home.join("runs").join(&run.id).join("run.json");
+        let before = std::fs::read(&path).unwrap();
+        let runs_before = std::fs::read_dir(s.home.join("runs")).unwrap()
+            .map(|entry| entry.unwrap().file_name()).collect::<std::collections::BTreeSet<_>>();
+        let claim = queue.claim(&task.id).unwrap();
+        magi::daemon::run_claimed(&opts, &queue, &mut task).await;
+        drop(claim);
+        let stored = queue.get(&task.id).unwrap();
+        assert_eq!(stored.status, TaskStatus::Held);
+        assert!(stored.hold_reason.as_deref().unwrap().contains("pinned run cannot resume"), "{:?}", stored.hold_reason);
+        assert_eq!(stored.runs, vec![run.id.clone()]);
+        assert_eq!(stored.attempts, 0, "no new competition or graph execution");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let runs_after = std::fs::read_dir(s.home.join("runs")).unwrap()
+            .map(|entry| entry.unwrap().file_name()).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(runs_after, runs_before, "no replacement run was minted");
     }
 }
 }
