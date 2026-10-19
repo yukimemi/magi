@@ -293,7 +293,6 @@ mod id_links;
 type Stamps = HashMap<String, (u128, u64)>;
 
 /// Metadata only: no task instructions or conversation bodies are read here.
-#[cfg(test)]
 fn store_stamps(root: &FsPath, runs: bool) -> Stamps {
     try_store_stamps(root, runs).unwrap_or_default()
 }
@@ -8324,7 +8323,13 @@ async fn talk_core(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResu
         let id = resolve_talk(&ui.talks, &id)?;
         let talk = ui.talks.get(&id)?;
         let thinking = ui.is_thinking(&id);
-        Ok(Json(TalkView::with_config(talk, thinking, None, &ui.home, &ui.references)))
+        Ok(Json(TalkView::with_config(
+            talk,
+            thinking,
+            None,
+            &ui.home,
+            &ui.references,
+        )))
     })
     .await
 }

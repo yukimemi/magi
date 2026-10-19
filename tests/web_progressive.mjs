@@ -14,6 +14,7 @@ function harness() {
   const requests = [];
   const renders = [];
   const notices = [];
+  const failures = [];
   const state = { detail: { id: null }, runs: [], talkDetail: { id: 'a' }, talkWaits: new Map(), stats: null, queue: [], taskDetail: { id: null } };
   const get = (url, options) => new Promise((resolve, reject) => requests.push({ url, options, resolve, reject }));
   const api = runInNewContext(`${sections}\n${runs}\n${talks}\n${tasks}\n${stats}\n({loadRun, loadTalk, loadTask, loadStats, cancelDetailSections, sectionRequest})`, {
@@ -24,8 +25,9 @@ function harness() {
     renderTalk: () => renders.push(state.talkDetail.talk), renderStats: () => renders.push(state.stats),
     renderStatsQueue: counts => renders.push({ queue: counts }),
     show() {}, sectionNotice: (...args) => notices.push(args), trackTalkThinking() {}, rememberTalkChoices() {}, endTalkTurn() {},
+    ok() {}, failFor: (...args) => failures.push(args), shortId: id => id,
   });
-  return { api, requests, renders, notices, state };
+  return { api, requests, renders, notices, failures, state };
 }
 test('run core renders before slow report; successful cards do not fetch text', async () => {
   const h = harness();
@@ -250,4 +252,5 @@ test('queue-only dashboard refresh preserves run history without requesting it a
   await done;
   assert.equal(h.state.stats.useful, 'history');
   assert.equal(h.renders[0].queue.queued, 9);
+  assert.equal(h.failures.length, 0);
 });

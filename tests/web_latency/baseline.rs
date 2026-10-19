@@ -38,7 +38,7 @@ async fn baseline_talk_detail(
             })
             .collect();
         Ok(Json(TalkDetailView {
-            view: TalkView::with_config(talk, thinking, cfg.as_ref(), &ui.home),
+            view: TalkView::with_config(talk, thinking, cfg.as_ref(), &ui.home, &ui.references),
             tasks,
             task_progress,
             roster,
