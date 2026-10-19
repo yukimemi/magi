@@ -87,7 +87,6 @@ use jiff::Timestamp;
 
 use crate::ask::{Question, QuestionStatus, Questions};
 use crate::config::Config;
-use crate::disk;
 use crate::queue::{HoldSource, OperatorResume, Queue, Task, TaskStatus};
 
 /// Node recorded on every question this module files - `crate::conduct::NODE`
@@ -422,8 +421,7 @@ fn machine_cause_resolved(task: &Task, cfg: &Config) -> Option<bool> {
         // one possible cause is gone by construction, no measurement needed.
         return Some(true);
     }
-    let free = disk::free_bytes(&repo_for(task)).ok()?;
-    Some(disk::gate(free, min).is_none())
+    Some(crate::daemon::disk_gate(&repo_for(task), cfg).is_none())
 }
 
 /// Is a `HoldSource::Manual` hold old enough to earn a "still wanted?"

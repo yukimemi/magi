@@ -1257,7 +1257,22 @@ impl Runner {
 
     /// Validate ownership and persist the driver claim in one critical section.
     fn claim_driver(&mut self) -> Result<DriverExecution<'_>> {
-        let owner = crate::pr_head::owner_lock(&crate::run::home(), &self.state.id)?;
+        let owner = match crate::pr_head::owner_lock(&crate::run::home(), &self.state.id) {
+            Ok(owner) => owner,
+            Err(error) => {
+                let detail = format!("worktree maintenance or ownership update: {error:#}");
+                // Admission did not own run.json: retain this resource outcome
+                // in memory for queue settlement without overwriting a concurrent
+                // retirement or publication transaction.
+                self.state.resource_block = Some(crate::run::ResourceBlock {
+                    node: "start".into(),
+                    kind: "worktree maintenance".into(),
+                    detail: detail.clone(),
+                    at: Timestamp::now(),
+                });
+                return Err(crate::repo_lock::ResourceBlocked(detail).into());
+            }
+        };
         let disk = RunState::load(&self.state.id)?;
         crate::pr_head::ensure_owner(&disk)?;
         if disk.liveness(false) == crate::run::Liveness::Live {
@@ -9154,7 +9169,12 @@ fn record_repository_block(state: &mut RunState, error: &anyhow::Error) {
     if error.is::<crate::repo_lock::ResourceBlocked>() {
         state.resource_block = Some(crate::run::ResourceBlock {
             node: "repository".into(),
-            kind: "repository coordination".into(),
+            kind: if error.to_string().contains("disk pressure") {
+                "disk pressure"
+            } else {
+                "repository coordination"
+            }
+            .into(),
             detail: error.to_string(),
             at: Timestamp::now(),
         });
@@ -9449,7 +9469,9 @@ async fn wave(
         {
             state.resource_block = Some(crate::run::ResourceBlock {
                 node: node.to_owned(),
-                kind: if why.contains("repository coordination") {
+                kind: if why.contains("disk pressure") {
+                    "disk pressure"
+                } else if why.contains("repository coordination") {
                     "repository coordination"
                 } else {
                     "parallel slot"
@@ -10465,28 +10487,98 @@ async fn run_commands(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let spawned = cmd.spawn();
+        let mut outputs = Vec::new();
+        let protected = (|| -> Result<()> {
+            if let Some(guard) = crate::retention::OutputLease::borrow(cwd)? {
+                outputs.push(guard);
+            }
+            if let Some(cache) = state.config.cache_dir() {
+                outputs.push(crate::retention::OutputLease::cache(
+                    &crate::run::home(),
+                    &cache,
+                    false,
+                )?);
+            }
+            Ok(())
+        })();
+        if let Err(e) = protected {
+            out.push(CommandOutcome {
+                command: command.clone(),
+                code: None,
+                output_tail: format!("output ownership unavailable: {e:#}"),
+                duration_ms: 0,
+                resource_blocked: true,
+            });
+            continue;
+        }
+        let spawned = crate::seat_process::Running::spawn(cmd, None, outputs);
         let (code, body) = match spawned {
-            Ok(child) => {
-                // Captured before the child is consumed below: `kill_on_drop`
-                // only *asks* the process to die when the timeout branch
-                // drops it, and the pid is the only way anyone downstream can
-                // later check whether that request actually took.
-                let pid = child.id();
-                match tokio::time::timeout(timeout, child.wait_with_output()).await {
-                    Ok(Ok(o)) => {
-                        let mut body = String::from_utf8_lossy(&o.stdout).into_owned();
-                        body.push_str(&String::from_utf8_lossy(&o.stderr));
-                        (o.status.code(), body)
+            Ok(mut running) => {
+                let pid = running.child().id();
+                let (stdout, out_reader) = agent::drain(running.child().stdout.take());
+                let (stderr, err_reader) = agent::drain(running.child().stderr.take());
+                let mut paths = vec![cwd.to_owned()];
+                if let Some(cache) = state.config.cache_dir() {
+                    paths.push(cache);
+                }
+                let mut pressure = None;
+                let status = tokio::select! {
+                    status = tokio::time::timeout(timeout, running.child().wait()) => Some(status),
+                    reason = crate::retention::emergency(paths, state.config.disk.min_free_bytes) => {
+                        pressure = Some(reason); None
                     }
-                    Ok(Err(e)) => (None, format!("failed to run: {e}")),
-                    Err(_) => {
-                        if let Some(pid) = pid {
+                };
+                let (code, failure) = match status {
+                    Some(Ok(Ok(status))) => (
+                        status.code(),
+                        status
+                            .code()
+                            .is_none()
+                            .then(|| format!("command terminated: {status}")),
+                    ),
+                    Some(Ok(Err(error))) => {
+                        (None, Some(format!("failed waiting for command: {error}")))
+                    }
+                    Some(Err(_)) => {
+                        // Leased cleanup confirms process-tree death itself.
+                        // Unleased commands still need the caller's PID check
+                        // after kill-on-drop, before releasing cache ownership.
+                        if !running.coordinated()
+                            && let Some(pid) = pid
+                        {
                             timed_out_pids.push(pid);
                         }
-                        (None, format!("timed out after {}s", timeout.as_secs()))
+                        (
+                            None,
+                            Some(format!("timed out after {}s", timeout.as_secs())),
+                        )
                     }
+                    None => (None, None),
+                };
+                running.finish().await;
+                if let Some(reason) = pressure {
+                    state.resource_block = Some(crate::run::ResourceBlock {
+                        node: node.to_owned(),
+                        kind: "disk pressure".to_owned(),
+                        detail: reason.clone(),
+                        at: Timestamp::now(),
+                    });
+                    out.push(CommandOutcome {
+                        command: command.clone(),
+                        code: None,
+                        output_tail: reason,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        resource_blocked: true,
+                    });
+                    break;
                 }
+                let mut body = agent::collect(&stdout, out_reader, Duration::from_secs(2)).await;
+                body.push_str(&agent::collect(&stderr, err_reader, Duration::from_secs(2)).await);
+                if let Some(failure) = failure {
+                    body.push('\n');
+                    body.push_str(&failure);
+                }
+                (code, body)
             }
             Err(e) => (None, format!("failed to spawn `{}`: {e}", shell[0])),
         };
@@ -11202,11 +11294,27 @@ async fn remove_preserved_worktree(repo: &Path, path: &Path) -> Result<()> {
 /// directory some other process or test pinned into that `OnceLock` first,
 /// not the one the caller actually resolved its `runs` and `state` from.
 pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> Result<Vec<String>> {
-    if crate::pr_recovery::sources_retained(home, &state.id) {
-        return Ok(Vec::new());
+    if let Some(reason) = crate::pr_recovery::source_retention_reason(home, &state.id) {
+        bail!("refusing fold: {reason}");
     }
     if !state.candidate_preservation.is_empty() {
         bail!("candidate preservation incomplete; refusing cleanup");
+    }
+    // Serialize ordinary folding with the same starts/resumes as target-only
+    // eviction. Otherwise a second janitor could remove the whole worktree
+    // around a live output borrower even though target eviction was fenced.
+    std::fs::create_dir_all(home.join("runs").join(&state.id))?;
+    let _owner = crate::pr_head::owner_lock(home, &state.id)?;
+    let _driver = crate::driver::maintenance(home, &state.id)?;
+    let mut output_guards = Vec::new();
+    for entry in std::fs::read_dir(state.worktree_root())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if entry.path().join(".git").is_file() {
+            output_guards.push(crate::retention::OutputLease::take(&entry.path(), true)?);
+        }
     }
     let repo = state.repo.clone();
     // CLI, Web and automatic cleanup all enter here, independently of
@@ -15120,6 +15228,56 @@ mod tests {
             RunStatus::Blocked,
             "must not read as resource-blocked on a lease it never asked for"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verification_commands_distinguish_timeouts_signals_and_exit_codes() {
+        crate::run::pin_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.disk.min_free_bytes = 0;
+        let mut state = RunState::new(
+            tmp.path().to_owned(),
+            "main".into(),
+            "base".into(),
+            "verification evidence".into(),
+            config,
+        );
+        let (outcomes, pids) = run_commands(
+            &mut state,
+            "gate",
+            "gate",
+            1,
+            &["sh".into(), "-c".into()],
+            &[
+                "printf before-timeout; exec sleep 30".into(),
+                "kill -TERM $$".into(),
+                "exit 7".into(),
+                "printf success".into(),
+            ],
+            tmp.path(),
+            Duration::from_secs(1),
+        )
+        .await;
+        wait_for_timed_out_children_to_die(&pids).await;
+        assert_eq!(
+            pids.len(),
+            1,
+            "unleased timeout retains its death-check PID"
+        );
+        assert_eq!(outcomes.len(), 4);
+        assert_eq!(outcomes[0].code, None);
+        assert!(outcomes[0].output_tail.contains("before-timeout"));
+        assert!(outcomes[0].output_tail.contains("timed out after 1s"));
+        assert_eq!(outcomes[1].code, None);
+        assert!(outcomes[1].output_tail.contains("command terminated:"));
+        assert!(!outcomes[1].output_tail.contains("timed out"));
+        assert_eq!(outcomes[2].code, Some(7));
+        assert!(!outcomes[2].output_tail.contains("timed out"));
+        assert_eq!(outcomes[3].code, Some(0));
+        assert_eq!(outcomes[3].output_tail, "success");
+        assert!(outcomes.iter().all(|outcome| !outcome.resource_blocked));
     }
 
     /// The addendum's second gap: a `verify.gate` command running for real

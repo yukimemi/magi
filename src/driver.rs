@@ -35,7 +35,7 @@ impl Identity {
 /// Release ownership when the guard ends, even if a concurrent fork still
 /// holds a copy of the file description before exec closes it. Explicitly
 /// unlock before close so a completed execution can resume immediately.
-struct ExecutionLease {
+pub(crate) struct ExecutionLease {
     _file: File,
 }
 
@@ -59,6 +59,10 @@ fn lease(home: &Path, id: &str) -> Result<ExecutionLease> {
         .open(home.join("runs").join(id).join("driver.lock"))?;
     crate::pr_head::try_lock_file(&file).context("run execution lease unavailable")?;
     Ok(ExecutionLease { _file: file })
+}
+
+pub(crate) fn maintenance(home: &Path, id: &str) -> Result<ExecutionLease> {
+    lease(home, id)
 }
 
 /// A held lease is evidence of an execution, including within a long-lived

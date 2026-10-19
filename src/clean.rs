@@ -85,6 +85,7 @@ pub async fn housekeep(
     now: Timestamp,
 ) -> Housekeeping {
     let mut out = Housekeeping::default();
+    crate::retention::sweep(home, &cfg.disk, now).await;
     if cfg.disk.auto_fold {
         let runs = home.join("runs");
         match fold_due(&runs, home, worktrees_root, &cfg.disk, now).await {
@@ -211,7 +212,8 @@ pub async fn fold_due(
         .collect();
     ids.sort_unstable();
     for id in ids {
-        if crate::pr_recovery::sources_retained(home, &id) {
+        if let Some(reason) = crate::pr_recovery::source_retention_reason(home, &id) {
+            tracing::info!(%id, %reason, "housekeep: source retained; fold refused");
             continue;
         }
         if crate::daemon::is_working_on(home, &id, now) {
@@ -883,7 +885,17 @@ pub fn prune_cache_if_over_limit(
     let Some(cache) = cfg.cache_dir() else {
         return Ok(None);
     };
-    prune_cache(home, &cache, cfg.disk.cache_limit_bytes)
+    let limit = crate::disk::free_bytes(&cache)
+        .ok()
+        .map_or(cfg.disk.cache_limit_bytes, |free| {
+            crate::disk::pressure_limit(
+                dir_size(&cache),
+                cfg.disk.cache_limit_bytes,
+                cfg.disk.min_free_bytes,
+                free,
+            )
+        });
+    prune_cache(home, &cache, limit)
 }
 
 /// The cache's path, size and cap, for `magi cache show` and the health view.
@@ -2242,12 +2254,15 @@ mod tests {
             );
             let mut historical = RunState::load_under(&id, home).unwrap();
             assert!(!historical.candidates[0].folded);
+            let error = crate::graph::fold_run(&mut historical, true, home)
+                .await
+                .unwrap_err();
             assert!(
-                crate::graph::fold_run(&mut historical, true, home)
-                    .await
-                    .unwrap()
-                    .is_empty()
+                error
+                    .to_string()
+                    .contains("explicitly retained recovery source")
             );
+            assert!(!historical.candidates[0].folded);
             assert!(
                 worktree.exists(),
                 "every automatic fold entry preserves retained sources"

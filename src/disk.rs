@@ -35,7 +35,9 @@ pub fn gate(free: u64, min_free: u64) -> Option<String> {
 /// both, so translating the text cannot stop triage's auto-requeue.
 const SHORT_EN: &str = "not enough free space to start a run:";
 const SHORT_JA: &str = "run を開始するための空き容量が不足しています:";
-/// Prefix of the reason for a failed measurement, per language.
+/// Prefix of a resource hold after emergency writer termination.
+pub const RUNNING_PRESSURE: &str = "disk pressure while a run was writing: ";
+/// Prefix of a failed free-space measurement.
 pub const UNMEASURED_EN: &str = "could not measure free space on ";
 /// See [`UNMEASURED_EN`].
 pub const UNMEASURED_JA: &str = "空き容量を測定できませんでした: ";
@@ -80,15 +82,27 @@ pub fn unmeasured_in(
 /// Is `reason` one of this module's disk-gate reasons, in either language?
 /// What triage reads back to decide a hold is disk pressure.
 pub fn is_gate_reason(reason: &str) -> bool {
-    [SHORT_EN, SHORT_JA, UNMEASURED_EN, UNMEASURED_JA]
-        .iter()
-        .any(|p| reason.starts_with(p))
+    [
+        SHORT_EN,
+        SHORT_JA,
+        UNMEASURED_EN,
+        UNMEASURED_JA,
+        RUNNING_PRESSURE,
+    ]
+    .iter()
+    .any(|p| reason.starts_with(p))
 }
 
 /// Is `size` past `limit`? One comparison, shared by the janitor and the
 /// health view, so both answer "is the cache over its cap" identically.
 pub fn over_limit(size: u64, limit: u64) -> bool {
     size > limit
+}
+
+/// A cache's target size under its cap and the volume's free-space floor.
+/// Pressure can reclaim idle cache files below the ordinary size cap.
+pub fn pressure_limit(size: u64, cap: u64, min_free: u64, free: u64) -> u64 {
+    cap.min(size.saturating_sub(min_free.saturating_sub(free)))
 }
 
 /// The path a rendered command sets `CARGO_TARGET_DIR=` to, if any.
@@ -776,5 +790,16 @@ mod tests {
         assert_eq!(out.files, 1);
         assert_eq!(out.remaining, 0);
         assert!(!t.path().join("a").exists(), "empty chain swept");
+    }
+}
+
+#[cfg(test)]
+mod pressure_tests {
+    #[test]
+    fn pressure_reclaims_below_cap_without_underflow() {
+        assert_eq!(super::pressure_limit(100, 200, 80, 30), 50);
+        assert_eq!(super::pressure_limit(100, 200, 80, 100), 100);
+        assert_eq!(super::pressure_limit(100, 200, 800, 0), 0);
+        assert_eq!(super::pressure_limit(100, 50, 0, 0), 50);
     }
 }

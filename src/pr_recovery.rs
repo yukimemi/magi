@@ -73,7 +73,26 @@ pub fn retain_sources(task: &crate::queue::Task, home: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn sources_retained(home: &Path, id: &str) -> bool {
+/// Return the retention reason rather than silently treating fold as successful.
+pub(crate) fn source_retention_reason(home: &Path, id: &str) -> Option<String> {
+    if explicit_sources_retained(home, id) {
+        return Some("explicitly retained recovery source".into());
+    }
+    crate::queue::Queue::at(home.join("queue"))
+        .list()
+        .iter()
+        .find(|task| {
+            task.status != crate::queue::TaskStatus::Done && task.runs.iter().any(|run| run == id)
+        })
+        .map(|task| {
+            format!(
+                "source of unfinished task {}; inspect recovery lineage before folding",
+                task.id
+            )
+        })
+}
+
+pub(crate) fn explicit_sources_retained(home: &Path, id: &str) -> bool {
     home.join("runs")
         .join(id)
         .join(RETAIN_SOURCES)

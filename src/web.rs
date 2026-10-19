@@ -2690,6 +2690,8 @@ struct DiskView {
     /// The shared build cache's size, when the config names one.
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_bytes: Option<u64>,
+    /// Last bounded cleanup report, including retention and failure reasons.
+    retention: Option<crate::retention::Report>,
 }
 
 impl DiskView {
@@ -2703,6 +2705,11 @@ impl DiskView {
             runs_bytes: crate::disk::dir_size(&ui.runs),
             worktrees_bytes: crate::disk::dir_size(&ui.worktrees_root),
             cache_bytes,
+            retention: ui
+                .runs
+                .parent()
+                .and_then(|home| std::fs::read(home.join("retention.json")).ok())
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok()),
         }
     }
 }
