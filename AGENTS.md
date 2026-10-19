@@ -2636,7 +2636,37 @@ with `magi answer` or puts the decision points to the owner in the chat.
   (`ask::SCHEMA` 6, `#[serde(default)]`) only records that the chat was asked, so
   a second tap is a no-op. Written through `Questions::update`.
 - **The talk-turn gate is cross-process.** `Ui::talk_turns` (in-process, source of the 409 / queued / busy responses) is layered with an on-disk lease, `<talks>/<id>.turn` (`Talks::claim_turn` -> `talk::TurnLease`; not a `*.json`, so `list` ignores it and `revision` skips it). Content `{token, pid, beat_at}`; held means a beat within `ask::LEASE_TTL` (90 s), no pid checks. Acquire is `create_new`; a stale or unreadable lease is replaced only under a short-lived exclusive `<id>.turn.lock` (aged out after 10 s), so one taker wins. Release / beat only act while the file still carries the guard's own token. The web claim inserts into `live` first, then takes the lease, and undoes the insert if the lease is refused; `is_thinking` is `live` or `Talks::turn_held`. `talk::respond` and `talk::say` take a `&TurnLease` for that talk (checked against the talk's id) and run the turn inside `TurnLease::beating` every `talk::TURN_BEAT` (20 s), no extra task, so a starter without a lease does not compile; `turn` stays private. A crashed turn leaves the talk busy for up to 90 s. `magi answer --ask-chat` (`consult::start_turn`) takes the lease *before* `consult::begin`, then drains the draft and runs the turn synchronously; a lease held elsewhere is reported (`Started::Busy`, non-zero exit) and leaves no consult record or draft. `say` against a lease held by another process answers 409 (`TalkTurnStart::Foreign`) rather than queueing, since no local drain loop would ever answer that draft. Every change to an existing lease (takeover, beat, release) happens under the `.turn.lock`, new leases are published by hard-linking a complete file, and a beat that finds the lease taken over stops the turn. Publication (`publish_exclusive`) is `hard_link` first; only an *unsupported* error falls back to an exclusive `create_new` of the path itself, written through that handle (never a `rename` over it), and `lease_blocks` treats an empty file younger than 10 s as held. Removing a lock is `remove_if_carries` (rename aside, verify, restore exclusively), used by both `TurnLock::take` and its `Drop`; no path-only compare-and-unlink exists, so a fourth party publishing during the microseconds the file is aside can still overlap with the displaced holder until TTL (warned). A guard releases the on-disk lease before the in-process slot.
-- **Write access lasts while a handed-over question is open.** `talk::turn` lets a turn write, with the question store as a writable root, whenever `consult::pending_consults` finds an open question whose `Question::consult` names this talk - so the owner's later decision turn can still run `magi answer`. Answered or abandoned questions stop counting and the chat is read-only again. The prompt limits the write to `magi answer`; the sandbox does not.
+- **Consultation activity is persisted separately from question resolution.**
+  `consult::active_consult` / `pending_consults` exclude answered/abandoned
+  questions and questions with `consult_outcome`. `magi answer --reply-other`
+  saves the latest whole owner send as an evidenced note and ends consultation
+  without changing `Question::answer`, Open status, choice actions or waiter.
+  The next turn becomes ordinary only when no active consultation remains.
+  Keep the invocation's initial scope throughout; closing a question mid-turn
+  must not unlock other writes in that same process.
+- **Additional writes have a closed consent inventory.** Consultation control
+  permits only `task add|release|hold|done|priority` beyond `magi answer`.
+  `consult::TaskOperation` binds exact operation/arguments and full resolved task
+  ids to a real latest owner send after delivery, quoted whole with `--quote`.
+  The owner instruction is `task-operation: <typed JSON>` (README has examples),
+  not a substring, assistant interpretation or batch instruction. Natural
+  language outside that grammar needs the exact required instruction presented
+  once. Task add permits positional text, optional `--solo` and the conversation
+  repository with default execution options. Keep existing claims/state checks.
+  Hold the conversation evidence lock from validation through queue publication
+  and `done` history writes. Task add releases preliminary evidence before async
+  preparation, then reacquires the lock and validates the latest persisted talk
+  again immediately before publication. Destructive operations and other task mutations
+  stay excluded; answer-specific stricter effect policies are unchanged.
+- **Scope and grants travel together.** `MAGI_TURN_SCOPE` carries the invocation
+  scope into supported CLI commands even after consultation ends. Investigation
+  permits diagnostics only; control permits the closed write inventory. Grant
+  questions, evidence locks and queue storage, plus exact history directories for
+  evidenced `done`, never the whole state root or a sandbox bypass. The CLI is
+  the authorization boundary; writable directories alone do not enforce policy.
+  Both delivery and per-turn scope prompts must explain available writes and
+  that an alternative note leaves the question/waiter unresolved.
+
 - **No new seat, no new waiter.** The text goes in through `talk::queue`, and
   the talk's own turn gate and session run it. The web route starts the drain
   when the turn slot is free; the CLI takes the lease and runs the turn itself
@@ -3033,6 +3063,12 @@ originating conversation/send and recommendation fingerprints; `Question::consul
 is delivery history and stays intact after settlement. The full action/route
 matrix is in README.md. The CLI holds the talk evidence guard through the
 question write for ordinary decisions too, preventing queued retraction races.
+Consultation task writes use the same latest-real-send and evidence-lock rule,
+but their closed typed operation policy is centralized in
+`consult::authorize_task_operation`; a matching task id alone is never consent.
+`consult::record_other` stores a literal alternative as a note only, never as
+answer authority or an execution effect. Neither path grants destructive powers.
+
 
 Local release-watch approval cards also persist `merge_target`. Older cards may
 recover it only from their matching watch record's `asked_head`, never from a

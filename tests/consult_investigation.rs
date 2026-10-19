@@ -267,6 +267,12 @@ async fn consultation_investigates_on_delivery_and_natural_followup_then_returns
     assert!(!answered.status.open());
     assert_eq!(answered.consult, f.question.consult);
     assert_eq!(answered.waiter, f.question.waiter);
+    f.question = answered;
+    f.say("Now continue our ordinary conversation.").await;
+    let prompt = std::fs::read_to_string(f.trace.join("6.prompt")).unwrap();
+    assert!(prompt.contains("Current turn scope: ordinary repository conversation"));
+    assert!(!prompt.contains("Current turn scope: consultation control"));
+
 }
 }
 
@@ -374,5 +380,43 @@ async fn unresolved_consultation_repository_does_not_fall_back_to_question_cwd()
     assert!(reply.contains("Investigation pending"));
     assert!(reply.contains("cannot resolve consulted task repository"));
     assert!(reply.contains("restore that metadata"));
+}
+}
+
+common::e2e! {
+async fn ending_one_consultation_keeps_other_consults_then_restores_the_next_turn() {
+    let mut f = Fixture::new().await;
+    std::fs::write(&f.mode, "control").unwrap();
+    f.delivery().await;
+    let mut other = magi::ask::Question::new(
+        f.question.run.clone(), "implement".into(), "implement".into(),
+        "Another decision".into(), "".into(), vec!["A".into(), "B".into()],
+    );
+    f.questions.put(&mut other).unwrap();
+    magi::consult::begin(&f.questions, &f.talks, &other, &f.talk).unwrap();
+    // Drain the actual delivery and persist a later authentic owner send.
+    f.talk = f.talks.get(&f.talk.id).unwrap();
+    talk::drain(&mut f.talk, &f.talks).unwrap().unwrap();
+    let words = "Reimplement from scratch instead";
+    talk::record(&mut f.talk, &f.talks, words, Vec::new()).unwrap();
+    let guard = f.talks.answer_guard().unwrap();
+    f.questions.update(&f.question.id, |q| magi::consult::record_other(q, &f.talk, words, Some(words))).unwrap();
+    drop(guard);
+    f.question = f.questions.get(&f.question.id).unwrap();
+    assert!(f.question.status.open());
+    assert!(f.question.answer.is_none());
+    assert!(magi::consult::pending_consults(&f.questions, &f.talk.id));
+    f.say("One question is still pending.").await;
+    let prompt = std::fs::read_to_string(f.trace.join("1.prompt")).unwrap();
+    assert!(prompt.contains("Current turn scope: consultation control"));
+    talk::record(&mut f.talk, &f.talks, words, Vec::new()).unwrap();
+    let guard = f.talks.answer_guard().unwrap();
+    f.questions.update(&other.id, |q| magi::consult::record_other(q, &f.talk, words, Some(words))).unwrap();
+    drop(guard);
+    assert!(!magi::consult::pending_consults(&f.questions, &f.talk.id));
+    f.say("Continue our ordinary conversation.").await;
+    let prompt = std::fs::read_to_string(f.trace.join("2.prompt")).unwrap();
+    assert!(prompt.contains("Current turn scope: ordinary repository conversation"));
+    assert!(!prompt.contains("Current turn scope: consultation control"));
 }
 }

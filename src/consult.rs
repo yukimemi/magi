@@ -82,12 +82,165 @@ pub fn chat_talk_of(tasks: &[Task], start: &Task) -> Option<String> {
 /// Decided from the question store, not from the newest turn's wording: the
 /// owner's decision usually arrives in a later turn that carries no hand-over
 /// heading, and `magi answer` still has to be able to write then. Answered or
-/// abandoned questions stop counting, so the turn goes back to read-only.
+/// abandoned questions and ended consultations stop counting, restoring normal
+/// permissions on the next turn.
 pub fn pending_consults(questions: &Questions, talk_id: &str) -> bool {
-    questions
-        .list()
+    questions.list().iter().any(|q| active_consult(q, talk_id))
+}
+
+/// Consultation activity is separate from the question's waiting state.
+pub fn active_consult(q: &Question, talk_id: &str) -> bool {
+    q.status.open()
+        && q.consult_outcome.is_none()
+        && q.consult.as_ref().is_some_and(|c| c.talk == talk_id)
+}
+
+/// A non-answer never wakes a waiter or executes a choice action.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConsultOutcome {
+    /// Literal owner outcome, with no execution effect.
+    pub text: String,
+    /// Complete latest owner send used as evidence.
+    pub instruction: String,
+    /// Originating conversation.
+    pub talk: String,
+    /// Persisted conversation turn index.
+    pub turn: usize,
+    /// Persisted send index within the turn.
+    pub message: usize,
+    /// Time consultation ended.
+    pub at: Timestamp,
+}
+
+/// Closed inventory of additional consultation operations. Every execution
+/// argument is bound by the owner's complete instruction, not just a task id.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum TaskOperation {
+    /// File work in the conversation's repository with default execution options.
+    Add {
+        /// Complete task text.
+        instruction: String,
+        /// Whether to use one implementer.
+        solo: bool,
+    },
+    /// Release a held or finished task.
+    Release {
+        /// Full resolved task id.
+        task: String,
+    },
+    /// Hold a task for the owner.
+    Hold {
+        /// Full resolved task id.
+        task: String,
+        /// Complete hold reason.
+        reason: String,
+    },
+    /// Mark work finished without running it.
+    Done {
+        /// Full resolved task id.
+        task: String,
+    },
+    /// Adjust the queue priority.
+    Priority {
+        /// Full resolved task id.
+        task: String,
+        /// New priority.
+        priority: i32,
+    },
+}
+
+impl TaskOperation {
+    /// A literal, unambiguous individual instruction; JSON avoids shell parsing.
+    pub fn instruction(&self) -> String {
+        format!(
+            "task-operation: {}",
+            serde_json::to_string(self).expect("task operation")
+        )
+    }
+}
+
+fn delivered_instruction<'a>(
+    q: &Question,
+    talk: &'a Talk,
+    quote: Option<&str>,
+) -> Result<(usize, usize, &'a str)> {
+    if !active_consult(q, &talk.id) {
+        bail!("no active consultation in this conversation");
+    }
+    let (turn, message, words) = current_instruction(talk)
+        .context("no current persisted owner instruction; drain newer messages first")?;
+    if quote != Some(words) {
+        bail!("--quote must equal the entire latest persisted owner message");
+    }
+    let delivery = talk
+        .turns
         .iter()
-        .any(|q| q.status.open() && q.consult.as_ref().is_some_and(|c| c.talk == talk_id))
+        .position(|t| {
+            t.who == talk::Who::Operator
+                && t.body.contains(crate::prompt::CHAT_CONSULT_HEADING)
+                && t.body.contains(&q.id)
+        })
+        .context("question has not been delivered")?;
+    let consult = q.consult.as_ref().expect("active consult");
+    if turn < delivery
+        || talk.turns[turn].at < consult.at
+        || (turn == delivery
+            && !talk.turns[turn].messages[..message].iter().any(|m| {
+                m.body.contains(crate::prompt::CHAT_CONSULT_HEADING) && m.body.contains(&q.id)
+            }))
+    {
+        bail!("owner instruction must follow consultation delivery");
+    }
+    Ok((turn, message, words))
+}
+
+/// Caller holds the conversation evidence lock until the queue mutation ends.
+pub fn authorize_task_operation(
+    questions: &Questions,
+    talk: &Talk,
+    operation: &TaskOperation,
+    quote: Option<&str>,
+) -> Result<()> {
+    let expected = operation.instruction();
+    if !questions.list().iter().any(|q| {
+        delivered_instruction(q, talk, quote).is_ok_and(|(_, _, words)| {
+            words
+                .strip_prefix("task-operation: ")
+                .and_then(|json| serde_json::from_str::<TaskOperation>(json).ok())
+                .as_ref()
+                == Some(operation)
+        })
+    }) {
+        bail!(
+            "task operation requires individual post-delivery owner evidence and --quote of the entire latest send; required instruction: {expected}"
+        );
+    }
+    Ok(())
+}
+
+/// Store an evidenced alternative and end only the consultation. Caller keeps
+/// the conversation evidence lock until Questions::update publishes the note.
+pub fn record_other(q: &mut Question, talk: &Talk, text: &str, quote: Option<&str>) -> Result<()> {
+    if text.trim().is_empty() || q.free_text() || q.choices.iter().any(|c| c == text) {
+        bail!("--reply-other requires a nonempty outcome outside the offered choices");
+    }
+    let (turn, message, words) = delivered_instruction(q, talk, quote)?;
+    // A note is the owner's literal decision, never an assistant paraphrase
+    // that could smuggle an execution authorization into retained evidence.
+    if words != text {
+        bail!("--reply-other must equal the owner's entire latest message");
+    }
+    q.schema = crate::ask::SCHEMA;
+    q.consult_outcome = Some(ConsultOutcome {
+        text: text.to_owned(),
+        instruction: words.to_owned(),
+        talk: talk.id.clone(),
+        turn,
+        message,
+        at: Timestamp::now(),
+    });
+    Ok(())
 }
 
 /// Record the hand-over and queue the question as the chat's next message.
@@ -566,8 +719,9 @@ pub fn authorized_answers(questions: &Questions, talk: &Talk) -> bool {
 
 /// The complete standing-turn write grant, also used by sandbox regressions.
 /// Consultations and bound owner decisions need question/evidence locks;
-/// authorized dismissals additionally need queue claims and the exact run's
-/// ownership/state writes. Never grant the whole home or lift the sandbox.
+/// active consultations additionally need queue storage. Evidenced `done` and
+/// dismissal effects need their exact run history/state directories. Never
+/// grant the whole home or lift the sandbox.
 pub fn answer_write_roots(
     questions: &Questions,
     talks: &Talks,
@@ -584,6 +738,23 @@ pub fn answer_write_roots(
         questions.root().to_path_buf(),
         talks.answer_lock_root(),
     ]);
+    if pending_consults(questions, &talk.id) {
+        roots.insert(home.join("queue"));
+        if let Some(words) = quote
+            && let Some(json) = words.strip_prefix("task-operation: ")
+            && let Ok(op @ TaskOperation::Done { .. }) = serde_json::from_str::<TaskOperation>(json)
+            && authorize_task_operation(questions, talk, &op, quote).is_ok()
+            && let TaskOperation::Done { task } = op
+            && let Ok(task) = crate::queue::Queue::at(home.join("queue")).get(&task)
+        {
+            for run in task.runs.iter().filter(|id| crate::run::is_run_id(id)) {
+                let path = home.join("runs").join(run);
+                if path.is_dir() {
+                    roots.insert(path);
+                }
+            }
+        }
+    }
     for q in questions.list() {
         if q.status.open()
             && q.node == crate::land::APPROVAL_NODE
@@ -2331,6 +2502,8 @@ mod tests {
         crate::prompt::chat_consult(&q)
             .replace("@@", raw_detail)
             .replace(crate::prompt::CHAT_CONSULT_DEFUSED, "It is still open.")
+            // Keep the historical closer; current delivery has a different policy.
+            .replace("additional evidenced task operations follow the protocol above. Do not edit the repository.", "make: do not edit the repository.")
     }
 
     #[test]

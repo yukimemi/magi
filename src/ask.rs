@@ -61,7 +61,8 @@ use crate::run::RunStatus;
 /// Schema 10 records the operator decision generation for built-in triage.
 /// Schema 11 binds merge decisions to the displayed PR and head.
 /// Schema 12 adds closed, daemon-applied maintenance choice actions.
-pub const SCHEMA: u32 = 12;
+/// Schema 13 records an ended consultation without resolving its question.
+pub const SCHEMA: u32 = 13;
 
 /// How often the wait re-reads the question file.
 ///
@@ -697,6 +698,9 @@ pub struct Question {
     /// Persisted owner evidence for a standing conversation answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer_authority: Option<crate::consult::AnswerAuthority>,
+    /// Owner decision outside the choices; ends consultation without answering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consult_outcome: Option<crate::consult::ConsultOutcome>,
     /// Independent task facts behind a conductor question. Answered questions
     /// with unchanged facts must not be regenerated just to ask again.
     #[serde(default)]
@@ -760,6 +764,7 @@ impl Question {
             deputy: None,
             consult: None,
             answer_authority: None,
+            consult_outcome: None,
             decision_context: None,
         }
     }
@@ -2357,7 +2362,7 @@ mod tests {
             ],
             "the on-disk field set is a contract with the front end"
         );
-        assert_eq!(open["schema"], 12);
+        assert_eq!(open["schema"], 13);
         assert_eq!(open["merge_target"], serde_json::Value::Null);
         assert_eq!(open["triage_generation"], serde_json::Value::Null);
         assert_eq!(open["thread"], serde_json::json!([]));
@@ -2409,7 +2414,7 @@ mod tests {
         let saved = store.get(&q.id).unwrap();
         assert_eq!(saved, q);
         let mut body = serde_json::to_value(&saved).unwrap();
-        assert_eq!(body["schema"], 12);
+        assert_eq!(body["schema"], 13);
         assert_eq!(
             body["merge_target"],
             serde_json::json!({

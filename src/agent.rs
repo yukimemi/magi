@@ -437,13 +437,13 @@ pub(crate) async fn invoke_leased(
     let readonly = inv.scope == InvocationScope::ConsultationInvestigation;
     let inv = &Invocation {
         allow_write: inv.allow_write && !readonly,
-        unsandboxed: inv.unsandboxed && !readonly,
+        unsandboxed: inv.unsandboxed && inv.scope == InvocationScope::Repository,
         writable: if readonly { &[] } else { inv.writable },
         ..inv.clone()
     };
     let scope = match inv.scope {
         InvocationScope::ConsultationControl => Some(
-            "Current turn scope: consultation control. This replaces all earlier per-turn scope restrictions, including investigation's prohibition on answering. Repository access is suspended. Use supplied context and supported read-only magi control-plane diagnostics; do not inspect repository files/history, fetch, test or edit. If evidence is needed (including an operator request to investigate), return ONLY a JSON object {\"investigate_question\":\"<full open question id>\"}. The launcher will attempt a coordinated read-only continuation in this same conversation. Do not answer or resolve the question to obtain access. Owner decisions still require magi answer with exact required evidence.",
+            "Current turn scope: consultation control. This replaces all earlier per-turn scope restrictions, including investigation's prohibition on answering. Repository access is suspended. Use supplied context and supported read-only magi control-plane diagnostics; do not inspect repository files/history, fetch, test or edit. If evidence is needed (including an operator request to investigate), return ONLY a JSON object {\"investigate_question\":\"<full open question id>\"}. The launcher will attempt a coordinated read-only continuation in this same conversation. Do not answer or resolve the question to obtain access. Only magi answer settles a question. Additional writes are limited to individually evidenced task add, release, hold, done and priority; use --quote of the entire latest persisted owner send after delivery. No direct merge, discard, withdrawal, posting or other write commands; existing answer-specific effect checks remain in force. These restrictions last this whole invocation even after consultation ends. Consultation task instructions use the literal task-operation JSON protocol explained below. --reply-other records the owner's literal decision and ends consultation only, leaving the question open and waiter held. Owner decisions still require magi answer with exact required evidence.",
         ),
         InvocationScope::ConsultationInvestigation => Some(
             "Current turn scope: consultation investigation. This supersedes earlier control-only restrictions for this invocation. Investigate repository evidence within the standing conversation's read-only permissions. No repository edits, fetch or other Git/network mutations; use existing history and files. Do not run tests that write into the repository. Do not answer, close, withdraw, discard or resume anything, or invoke magi answer. Return evidence and remaining decision points; the next operator turn returns to consultation control while the question remains open.",
@@ -457,6 +457,10 @@ pub(crate) async fn invoke_leased(
     if let Some(scope) = scope {
         prompt.push_str("\n\n");
         prompt.push_str(scope);
+        if inv.scope == InvocationScope::ConsultationControl {
+            prompt.push_str("\n\n");
+            prompt.push_str(crate::prompt::CONSULT_WRITES);
+        }
     }
     if let Some(lease) = lease.as_ref().filter(|lease| lease.delegated) {
         prompt.push_str(&format!("\n\nRepository coordination: the launcher holds the exclusive repository lock at {} for this invocation. Do not acquire a second lock or release/delete it. Repository access remains read-only.", lease.path.display()));
@@ -535,6 +539,14 @@ pub(crate) async fn invoke_leased(
         .env("MAGI_TURN", seat.turns.to_string())
         .env("MAGI_RUN", inv.run)
         .env("MAGI_NODE", inv.node)
+        .env(
+            "MAGI_TURN_SCOPE",
+            match inv.scope {
+                InvocationScope::ConsultationControl => "consultation-control",
+                InvocationScope::ConsultationInvestigation => "consultation-investigation",
+                InvocationScope::Repository => "repository",
+            },
+        )
         .env("MAGI_PROMPT_FILE", &prompt_path)
         .env("MAGI_ALLOW_WRITE", if inv.allow_write { "1" } else { "0" })
         .env("GIT_TERMINAL_PROMPT", "0")

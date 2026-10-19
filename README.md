@@ -526,12 +526,44 @@ evidence with the literal replacement title; it cannot reuse old thread text.
 | Fix findings and re-review | `<id>: fix findings and re-review` | Yes | Offered/recoverable repair, same run and PR, bounded review and fresh approval |
 | Ordinary queue/conductor/agent questions; retry, rerun, requeue, resume, release recovery | `<id>: <exact choice>` | Yes, except destructive effects | Existing claims, operator holds, task generation and recovery state |
 | Free-text questions | `<id>: <complete answer>` | No: no offered choice to bind | Existing asker/waiter dispatch |
+| Consultation task add / release / hold / done / priority | Latest whole post-delivery owner send: `task-operation: <typed JSON operation>`, quoted whole with `magi task --quote ...` | No | Full resolved task id and exact arguments; existing queue claims/state checks; add uses this conversation's repository, positional text and optional `--solo` only |
+| Outcome outside the offered choices | `magi answer <id> --reply-other <entire latest owner send> --quote <same send>` | No | Saves an evidence note and ends consultation only; question remains Open, waiter remains held, no answer or choice action |
 | Withdrawal / PR closure / `reimplement:<agent>` | `<id>: <exact consequence token>` | No | Existing closure confirmation, owner claim and replacement transitions |
 | Triage discard, dependency discard/detach, divergence overwrite, structured `done`, conductor complete/configure | `<id>: <exact consequence token>` | No | Individual explicit consequence; existing consumer checks |
 | Merge (land and release-watch approvals) | `<id>: merge <displayed head>` | No | Recorded PR/head (legacy release cards recover only their matching watch record); final head, review, gate and owner checks still apply |
 | Guarded `post original` / `use rewrite` | `<id>: <choice> <question/content fingerprint>` (reported by CLI) | No | Explicit saved content binding; final posting gate |
 | Guarded `use fallback` | `<id>: use fallback` | Yes | Existing safe fallback and posting gate |
 | Guarded `use my text` | `<id>: use my text <question/content fingerprint>` followed by a newline and the literal replacement title | No | Persisted owner title and final posting gate; a choice token alone supplies no title |
+
+For consultation task operations, the CLI accepts a closed typed instruction rather
+than inferring execution arguments from prose. For example, the owner's complete
+send `task-operation: {"add":{"instruction":"Reimplement from scratch","solo":true}}`
+authorizes `magi task --quote '<that entire send>' add --solo 'Reimplement from scratch'`.
+Other payloads are `{"release":{"task":"<full task id>"}}`,
+`{"hold":{"task":"<full task id>","reason":"Wait for replacement"}}`,
+`{"done":{"task":"<full task id>"}}`, and
+`{"priority":{"task":"<full task id>","priority":5}}`, each prefixed with
+`task-operation: `. JSON whitespace does not matter; every field does. A missing,
+stale, queued, pre-delivery, generated, conditional or mismatched instruction is
+refused. The chat presents the required instruction once when natural language
+does not bind it; it must not promise unsupported writes. Task operations need
+separate owner instructions and should precede `--reply-other`.
+
+Only `magi answer` settles a question. `--reply-other` deliberately does not
+wake its waiter or interpret the decision as a choice action; it prints that the
+question and wait remain. Its note retains the conversation, send and literal
+owner evidence. Answered/abandoned questions and ended consultations no longer
+restrict the **next** turn, provided no other consultation remains active.
+The current invocation retains its original restrictions throughout. Additional
+queue writes never authorize merge, discard, withdrawal, public posting or other
+mutations; existing answer-specific effect rules above still apply.
+
+The launcher grants only question/evidence locks, queue storage, and exact run
+history directories needed for an evidenced `done` (plus existing answer-effect
+grants). It does not grant the whole state root or bypass the sandbox, including
+when ordinary chat editing is enabled. The supported CLI is an authorization
+boundary; filesystem grants cannot prevent an agent from directly editing an
+allowed store, so prompts still prohibit those writes.
 
 All three consultation destinations (same chat, other chat, never consulted)
 use this matrix. The CLI and standing turn write grant share evidence validation;

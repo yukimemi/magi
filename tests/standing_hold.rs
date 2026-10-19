@@ -184,6 +184,9 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
                 } else {
                     vec![]
                 };
+                if destination == "same" {
+                    expected_roots.push(tmp.path().join("queue"));
+                }
                 if choice == magi::merge_decision::DISMISS && authorized {
                     expected_roots.extend([
                         tmp.path().join("queue"),
@@ -191,9 +194,10 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
                     ]);
                 }
                 expected_roots.sort();
+                expected_roots.dedup();
                 assert_eq!(
                     roots, expected_roots,
-                    "only an authorized dismissal widens execution access"
+                    "active consultations grant queue access; only an authorized dismissal grants run access"
                 );
                 let env = &mut cfg.agents[0].env;
                 env.insert("PROFILE".into(), String::new());

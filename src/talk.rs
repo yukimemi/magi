@@ -2344,7 +2344,7 @@ fn validate_investigation(
         bail!("conversation closed; investigation cancelled");
     }
     let q = questions.get(question)?;
-    if q.id != question || !q.status.open() || !q.consult.as_ref().is_some_and(|c| c.talk == talk) {
+    if q.id != question || !crate::consult::active_consult(&q, talk) {
         bail!("question is no longer open for consultation in this conversation");
     }
     Ok(q.consult.expect("validated consultation"))
@@ -2451,14 +2451,10 @@ async fn turn(
         .filter_map(|a| store.attachment_path(&talk.id, a))
         .collect();
 
-    // A question handed to this conversation is answered with `magi answer`,
-    // which writes the question store; a read-only sandbox refuses that. So
-    // while such a question is still open - the hand-over turn and the turns
-    // in which the owner decides - the turn may write, with the question store
-    // as a writable root, plus execution roots for an authorized dismissal.
-    // It goes back to read-only once the question is
-    // answered or abandoned. As for the deputy, what the seat may touch beyond
-    // that rests on the prompt, not the sandbox.
+    // Active consultations need question/evidence and limited control-plane
+    // write roots. Persisted closure or an alternative outcome restores the
+    // next turn's ordinary permissions. The current invocation keeps its scope;
+    // the CLI rechecks individual owner authority for every additional write.
     // `try_home`, not `Questions::open`: a unit test that never pinned a home
     // has no store to consult, and must not abort the turn on `run::home()`.
     let questions =
@@ -2598,9 +2594,8 @@ async fn turn(
                     .list()
                     .iter()
                     .filter(|q| {
-                        q.status.open()
+                        crate::consult::active_consult(q, &talk.id)
                             && q.node == crate::land::APPROVAL_NODE
-                            && q.consult.as_ref().is_some_and(|c| c.talk == talk.id)
                     })
                     .map(crate::prompt::chat_consult)
                     .collect::<Vec<_>>()
@@ -3006,10 +3001,13 @@ fn attachment_note(store: &Talks, talk_id: &str, attachments: &[Attachment]) -> 
 /// its own - that would compete with filing through the queue.
 /// What a turn may do: `(allow_write, unsandboxed)`. Only the repository's own
 /// `[talk] allow_write` lifts the CLI sandbox (codex's counterpart of claude's
-/// `bypassPermissions`); a turn writable merely because a handed-over question
-/// is open keeps the sandbox and gets just the question store as a writable root.
+/// `bypassPermissions`) on ordinary turns. Consultation always keeps the sandbox
+/// and uses only its explicit control-plane writable roots.
 pub(crate) fn turn_access(talk_allow_write: bool, consulted: bool) -> (bool, bool) {
-    (talk_allow_write || consulted, talk_allow_write)
+    (
+        talk_allow_write || consulted,
+        talk_allow_write && !consulted,
+    )
 }
 
 /// `allow_write` only ever adds an extra permission on top of that; it never
@@ -3502,7 +3500,7 @@ mod tests {
         assert_eq!(turn_access(true, false), (true, true));
         // A handed-over question opens the question store, never the sandbox.
         assert_eq!(turn_access(false, true), (true, false));
-        assert_eq!(turn_access(true, true), (true, true));
+        assert_eq!(turn_access(true, true), (true, false));
     }
 
     #[test]
