@@ -2557,3 +2557,130 @@ fn consult_task_hold_priority_and_done_keep_queue_claims_and_exact_run_grants() 
     }
     assert!(f.questions.get(&f.qid).unwrap().answer.is_none());
 }
+
+#[test]
+fn ordinary_chat_task_add_does_not_require_an_existing_talk_record() {
+    let f = fixture();
+    assert!(
+        Command::new("git")
+            .arg("init")
+            .current_dir(f.tmp.path())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_magi"))
+        .args(["task", "add", "Independent work"])
+        .current_dir(f.tmp.path())
+        .env("MAGI_HOME", f.tmp.path())
+        .env("MAGI_CONFIG_DIR", "")
+        .env("MAGI_RUN", "missing-standing-chat")
+        .env("MAGI_NODE", magi::queue::CHAT_NODE)
+        .env("MAGI_TURN_SCOPE", "repository")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let tasks = magi::queue::Queue::at(f.tmp.path().join("queue")).list();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].instruction, "Independent work");
+}
+
+#[cfg(unix)]
+#[test]
+fn consult_task_add_rechecks_owner_evidence_after_async_preparation() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = fixture();
+    assert!(
+        Command::new("git")
+            .arg("init")
+            .current_dir(f.tmp.path())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let words = magi::consult::TaskOperation::Add {
+        instruction: "Reimplement from scratch".into(),
+        solo: true,
+    }
+    .instruction();
+    consult_owner(&f, &words);
+    let bin = f.tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let marker = f.tmp.path().join("preparing");
+    let resume = f.tmp.path().join("continue");
+    let git = magi::config::find_program_on("git", &std::env::var_os("PATH").unwrap()).unwrap();
+    let wrapper = bin.join("git");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+if [ "$1" = rev-parse ] && [ "$2" = --show-toplevel ]; then
+    touch "$PREP_MARKER"
+    attempts=0
+    while [ ! -f "$PREP_CONTINUE" ]; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 2000 ] || exit 1
+        sleep 0.01
+    done
+fi
+exec "$REAL_GIT" "$@"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_magi"))
+        .args([
+            "task",
+            "--quote",
+            &words,
+            "add",
+            "--solo",
+            "Reimplement from scratch",
+        ])
+        .current_dir(f.tmp.path())
+        .env("MAGI_HOME", f.tmp.path())
+        .env("MAGI_CONFIG_DIR", "")
+        .env("MAGI_RUN", &f.talk_id)
+        .env("MAGI_NODE", magi::queue::CHAT_NODE)
+        .env("MAGI_TURN_SCOPE", "consultation-control")
+        .env("PATH", path)
+        .env("REAL_GIT", git)
+        .env("PREP_MARKER", &marker)
+        .env("PREP_CONTINUE", &resume)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let reached = marker.exists();
+    let talks = Talks::at(f.tmp.path().join("talks"));
+    let mut t = talks.get(&f.talk_id).unwrap();
+    let retraction = talk::queue(&mut t, &talks, "Stop; do not file that task", vec![]);
+    std::fs::write(&resume, "continue").unwrap();
+    let out = child.wait_with_output().unwrap();
+    retraction.unwrap();
+    assert!(
+        reached,
+        "preparation did not reach the asynchronous repository check: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("post-delivery owner evidence"));
+    assert!(
+        magi::queue::Queue::at(f.tmp.path().join("queue"))
+            .list()
+            .is_empty()
+    );
+}

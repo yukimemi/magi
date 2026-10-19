@@ -3017,47 +3017,48 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
 }
 
 async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) -> Result<()> {
-    let talks = magi::talk::Talks::open();
-    let questions = ask::Questions::open();
     let seat = agent_env();
-    let talk = seat
+    let scoped = consultation_scope();
+    let chat = seat
         .as_ref()
-        .filter(|(_, node)| node == magi::queue::CHAT_NODE)
-        .map(|(run, _)| talks.get(run))
-        .transpose()?;
-    // Capture the invocation context before any operation can end consultation.
-    let restricted = consultation_scope()
-        || talk
-            .as_ref()
-            .is_some_and(|t| magi::consult::pending_consults(&questions, &t.id));
-    if restricted
-        && !seat
-            .as_ref()
-            .is_some_and(|(_, node)| node == magi::queue::CHAT_NODE)
-    {
+        .filter(|(_, node)| node == magi::queue::CHAT_NODE);
+    // Ordinary queue commands neither need a global home nor conversation
+    // storage. A chat's provenance alone does not require its talk to exist.
+    let stores =
+        (scoped || chat.is_some()).then(|| (magi::talk::Talks::open(), ask::Questions::open()));
+    let restricted = scoped
+        || chat.is_some_and(|(run, _)| {
+            magi::consult::pending_consults(&stores.as_ref().expect("chat stores").1, run)
+        });
+    if restricted && chat.is_none() {
         bail!("consultation task operations require the standing chat seat");
     }
-    let _evidence = if restricted {
-        Some(talks.answer_guard()?)
+    let mut evidence = if restricted {
+        Some(
+            stores
+                .as_ref()
+                .expect("consultation stores")
+                .0
+                .answer_guard()?,
+        )
     } else {
         None
     };
     let talk = if restricted {
         Some(
-            talks.get(
-                &seat
-                    .as_ref()
-                    .context("consultation requires a chat seat")?
-                    .0,
-            )?,
+            stores
+                .as_ref()
+                .expect("consultation stores")
+                .0
+                .get(&chat.expect("chat seat").0)?,
         )
     } else {
-        talk
+        None
     };
     let authorize = |op: magi::consult::TaskOperation| -> Result<()> {
         if restricted {
             magi::consult::authorize_task_operation(
-                &questions,
+                &stores.as_ref().expect("consultation stores").1,
                 talk.as_ref().context("missing chat")?,
                 &op,
                 quote,
@@ -3118,6 +3119,10 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                     solo,
                 })?;
             }
+            // Preparation can await repository discovery and a duplicate judge
+            // for longer than the evidence lock's TTL. Let owner messages be
+            // saved during that work; reacquire and revalidate before publishing.
+            drop(evidence.take());
             if let Some(why) = mistyped_command(
                 "magi task add",
                 &instruction,
@@ -3163,6 +3168,26 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                 )
                 .await?;
             }
+            let _publish_evidence = if restricted {
+                let (talks, questions) = stores.as_ref().expect("consultation stores");
+                let guard = talks.answer_guard()?;
+                let fresh = talks.get(&chat.expect("chat seat").0)?;
+                magi::consult::authorize_task_operation(
+                    questions,
+                    &fresh,
+                    &magi::consult::TaskOperation::Add {
+                        instruction: text.clone(),
+                        solo,
+                    },
+                    quote,
+                )?;
+                if std::fs::canonicalize(&fresh.repo)? != repo {
+                    bail!("conversation repository changed during task preparation");
+                }
+                Some(guard)
+            } else {
+                None
+            };
             let mut task = Task::new(title, text, repo, source);
             if let Some(reason) = hold {
                 task.hold_manual(Some(reason));
@@ -6479,6 +6504,69 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
         assert!(
             released.hold_reason.is_none(),
             "release must clear the reason"
+        );
+    }
+
+    #[test]
+    fn ordinary_task_commands_do_not_require_a_global_home() {
+        const CHILD: &str = "MAGI_TEST_QUEUE_WITHOUT_HOME";
+        if std::env::var_os(CHILD).is_some() {
+            let tmp = tempfile::tempdir().unwrap();
+            let q = Queue::at(tmp.path().join("queue"));
+            let mut task = Task::new(
+                "work".into(),
+                "work".into(),
+                tmp.path().into(),
+                Source::Human,
+            );
+            q.put(&mut task).unwrap();
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                for command in [
+                    TaskCmd::Hold {
+                        id: task.id.clone(),
+                        reason: vec!["Wait".into()],
+                    },
+                    TaskCmd::Priority {
+                        id: task.id.clone(),
+                        priority: 5,
+                    },
+                    TaskCmd::Implementers {
+                        id: task.id.clone(),
+                        count: 1,
+                    },
+                    TaskCmd::Release {
+                        id: task.id.clone(),
+                    },
+                    TaskCmd::List {
+                        all: true,
+                        json: false,
+                    },
+                ] {
+                    task_cmd_on(command, q.clone()).await.unwrap();
+                }
+            });
+            return;
+        }
+        // A fresh test process has no OnceLock home from unrelated tests, and
+        // removing launcher context prevents the host environment masking this.
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::ordinary_task_commands_do_not_require_a_global_home",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("MAGI_HOME")
+            .env_remove("MAGI_RUN")
+            .env_remove("MAGI_NODE")
+            .env_remove("MAGI_TURN_SCOPE")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
         );
     }
 

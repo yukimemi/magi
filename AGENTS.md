@@ -2654,7 +2654,9 @@ with `magi answer` or puts the decision points to the owner in the chat.
   once. Task add permits positional text, optional `--solo` and the conversation
   repository with default execution options. Keep existing claims/state checks.
   Hold the conversation evidence lock from validation through queue publication
-  and `done` history writes. Destructive operations and other task mutations
+  and `done` history writes. Task add releases preliminary evidence before async
+  preparation, then reacquires the lock and validates the latest persisted talk
+  again immediately before publication. Destructive operations and other task mutations
   stay excluded; answer-specific stricter effect policies are unchanged.
 - **Scope and grants travel together.** `MAGI_TURN_SCOPE` carries the invocation
   scope into supported CLI commands even after consultation ends. Investigation
