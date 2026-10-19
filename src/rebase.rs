@@ -392,9 +392,10 @@ async fn dropped_commits(repo: &Path, onto_sha: &str, orig: &str, head: &str) ->
         // isolated replay there conflict. Only a successful replay leaving
         // the base's entire tree (including modes) unchanged proves absorption;
         // a later edit to the same file alone cannot excuse a skipped change.
-        if !replay_is_noop(repo, &c.sha, onto_sha).await
-            && !already_in_result(repo, &c.sha, orig, head).await
-        {
+        if replay_is_noop(repo, &c.sha, onto_sha).await {
+            continue;
+        }
+        if !already_in_result(repo, &c.sha, orig, head).await {
             unverified.push(c);
             continue;
         }
@@ -965,5 +966,45 @@ mod tests {
         };
         assert!(why.contains("the rebase dropped some of the branch's commits (skipped?)"));
         assert!(why.contains("c1"));
+    }
+
+    #[tokio::test]
+    async fn a_partially_absorbed_commit_missing_an_unrelated_hunk_is_dropped() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        sh(d, &["init", "-q", "-b", "main"]);
+        sh(d, &["config", "user.name", "t"]);
+        sh(d, &["config", "user.email", "t@example.com"]);
+        std::fs::write(d.join("c0.txt"), "base c0\n").unwrap();
+        let body = "old\n1\n2\n3\n4\n5\n6\n7\n8\n9\nlast\n";
+        std::fs::write(d.join("f.txt"), body).unwrap();
+        std::fs::write(d.join("extra.txt"), "initial\n").unwrap();
+        let base = commit(d, "base").await;
+
+        // Branch commits: C0, C1 (touches f.txt AND extra.txt), C2
+        std::fs::write(d.join("c0.txt"), "branch c0\n").unwrap();
+        commit_dated(d, "c0").await;
+        std::fs::write(d.join("f.txt"), body.replacen("old", "new", 1)).unwrap();
+        std::fs::write(d.join("extra.txt"), "c1 edit\n").unwrap();
+        commit_dated(d, "c1").await;
+        std::fs::write(d.join("f.txt"), body.replacen("old", "newer", 1)).unwrap();
+        let orig = commit_dated(d, "c2").await;
+
+        // Upstream absorbed C1's f.txt edit, but NOT extra.txt
+        sh(d, &["checkout", "-q", "-b", "up", &base]);
+        std::fs::write(d.join("c0.txt"), "upstream c0\n").unwrap();
+        let up = body.replacen("old", "new", 1).replace("last", "tail");
+        std::fs::write(d.join("f.txt"), &up).unwrap();
+        let onto = commit(d, "upstream").await;
+
+        // Result: C0 resolved, C1 was skipped or dropped despite extra.txt missing, C2 applied
+        std::fs::write(d.join("c0.txt"), "resolved c0\n").unwrap();
+        commit_dated(d, "c0").await;
+        let res = up.replacen("new", "newer", 1);
+        std::fs::write(d.join("f.txt"), &res).unwrap();
+        // extra.txt remains "initial\n"
+        let head = commit_dated(d, "c2").await;
+
+        assert_eq!(dropped_commits(d, &onto, &orig, &head).await, vec!["c1"]);
     }
 }
