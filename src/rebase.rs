@@ -1146,6 +1146,9 @@ mod tests {
         sh(d, &["init", "-q", "-b", "main"]);
         sh(d, &["config", "user.name", "t"]);
         sh(d, &["config", "user.email", "t@example.com"]);
+        // This fixture controls each resolution itself; inherited rerere can
+        // interfere with that sequence (including MERGE_RR lock contention).
+        sh(d, &["config", "rerere.enabled", "false"]);
         let body =
             "old\n1\n2\n3\n4\n5\n6\n7\n8\n9\nlater\n10\n11\n12\n13\n14\n15\n16\n17\n18\nend\n";
         std::fs::write(d.join("f.txt"), body).unwrap();
@@ -1184,7 +1187,13 @@ mod tests {
         let continued = git::git_raw(&scratch, &["rebase", "--continue"])
             .await
             .unwrap();
-        assert!(!continued.ok());
+        assert_eq!(
+            continued.code,
+            Some(1),
+            "{}\n{}",
+            continued.stdout,
+            continued.stderr
+        );
         assert_eq!(git::rev_parse(&scratch, "REBASE_HEAD").await.unwrap(), c1);
         let skipped = git::git_raw(&scratch, &["rebase", "--skip"]).await.unwrap();
         assert!(skipped.ok(), "{}", skipped.stderr);
