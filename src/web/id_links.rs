@@ -45,6 +45,23 @@ pub(super) struct Part {
     href: Option<String>,
 }
 
+/// The client watches only ranges that can change when a store revision moves.
+/// Keep candidate recognition here alongside the resolver, not in client regexes.
+#[derive(Serialize)]
+pub(super) struct TextResolution {
+    parts: Vec<Part>,
+    watch: bool,
+}
+
+impl IdIndex {
+    fn text_resolution(&self, text: &str, code: bool) -> TextResolution {
+        TextResolution {
+            parts: self.parts(text, code),
+            watch: needs_index(text),
+        }
+    }
+}
+
 pub(super) fn page_href(route: &str, id: &str) -> String {
     format!("#/{route}/{}", encode_segment(id))
 }
@@ -270,7 +287,7 @@ impl IdIndex {
 pub(super) async fn resolve_text(
     State(ui): State<Arc<Ui>>,
     Json(texts): Json<Vec<TextRequest>>,
-) -> ApiResult<Json<Vec<Vec<Part>>>> {
+) -> ApiResult<Json<Vec<TextResolution>>> {
     if texts.len() > 64 || texts.iter().map(|t| t.text.len()).sum::<usize>() > 65_536 {
         return Err(ApiError::bad_request("reference batch too large"));
     }
@@ -287,7 +304,10 @@ pub(super) async fn resolve_text(
             Arc::new(IdIndex::default())
         };
         Ok(Json(
-            texts.iter().map(|t| index.parts(&t.text, t.code)).collect(),
+            texts
+                .iter()
+                .map(|t| index.text_resolution(&t.text, t.code))
+                .collect(),
         ))
     })
     .await
@@ -721,6 +741,29 @@ mod tests {
             &reviews,
             &cache_lock(&cache.reviews).as_ref().unwrap().index
         ));
+    }
+
+    #[test]
+    fn text_resolution_watches_only_candidate_ranges() {
+        let index = IdIndex::default();
+        for text in ["Reply is Ready", "ordinary prose", "R", "", "12345"] {
+            let result = index.text_resolution(text, false);
+            assert!(!result.watch, "{text}");
+            assert!(result.parts.iter().all(|p| p.href.is_none()));
+        }
+        // Missing candidates still need watching: a later store revision can
+        // create their destinations. Alphabetic hex and source labels count too.
+        for text in [
+            "12ba",
+            "dead",
+            "chat@6f0d",
+            "20260908-205802-c9eb",
+            "R2-1-3",
+        ] {
+            for code in [false, true] {
+                assert!(index.text_resolution(text, code).watch, "{text}");
+            }
+        }
     }
 
     #[test]

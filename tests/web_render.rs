@@ -3589,6 +3589,53 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
             .unwrap(),
         true
     );
+    // Only candidate-bearing ranges may be resent after their first resolution.
+    assert_eq!(
+        browser
+            .eval(
+                &page,
+                r##"(async () => {
+      const original = window.fetch;
+      const plain = 'Reference probe ordinary prose';
+      const candidate = 'Reference probe candidate 12ba';
+      const counts = { plain: 0, candidate: 0 };
+      window.fetch = (url, init) => {
+        if (url === '/api/references') {
+          for (const item of JSON.parse(init.body)) {
+            if (item.text === plain) counts.plain++;
+            if (item.text === candidate) counts.candidate++;
+          }
+        }
+        return original(url, init);
+      };
+      const div = document.createElement('div'); document.body.append(div);
+      try {
+        deck.linkify(div, plain);
+        deck.linkify(div, candidate);
+        const settled = async () => {
+          for (let i = 0; i < 300; i++) {
+            if (div.querySelector('a')) return;
+            await new Promise(resolve => setTimeout(resolve, 10));
+          }
+          throw new Error('reference probe did not resolve');
+        };
+        await settled();
+        // A resolved anchor means the whole batch, including prose, was applied.
+        deck.refreshReferences();
+        for (let i = 0; i < 300 && counts.candidate < 2; i++) {
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        return counts;
+      } finally {
+        window.fetch = original;
+        div.remove();
+      }
+    })()"##
+            )
+            .await
+            .unwrap(),
+        serde_json::json!({ "plain": 1, "candidate": 2 })
+    );
     // A delayed decorator must never overwrite a newer text value or navigate.
     browser.eval(&page, r##"(() => {
       const original = window.fetch;

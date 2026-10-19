@@ -345,8 +345,10 @@ function linkify(node, value, opts) {
 
 /* The server owns token boundaries and existence checks. Retain weak handles
    to decorated ranges so store revisions can recheck both missing and linked
-   references. A generation and contiguous-node check reject late responses;
-   unchanged results preserve selection. Nothing here changes the route. */
+   references. The server retires ranges without ID candidates after their first
+   check, so revisions never resend ordinary prose. A generation and contiguous-node
+   check reject late responses; unchanged results preserve selection. Nothing here
+   changes the route. */
 const referenceRanges = new Set();
 let referencePending = [];
 let referenceTimer = null;
@@ -387,8 +389,11 @@ function referenceText(text, code = false, href = null, styled = false) {
   if (text && text.length <= 16000) {
     const item = { nodes, text, code, styled, generation: 0, signature: JSON.stringify(parts) };
     nodes[0].referenceRange = item; // The DOM retains its range; the registry does not.
-    referenceRanges.add(new WeakRef(item));
-    queueReference(item);
+    item.handle = new WeakRef(item);
+    referenceRanges.add(item.handle);
+    // Markdown internal links already carry a server-validated destination.
+    // Watch for later store changes without repeating that initial resolution.
+    if (!href) queueReference(item);
   }
   return nodes[0];
 }
@@ -430,9 +435,10 @@ async function flushReferences() {
       const results = await postJson("/api/references", batch.map(({ item }) => ({ text: item.text, code: item.code })));
       batch.forEach(({ item, generation }, i) => {
         if (item.generation !== generation || !currentReference(item) || !results[i]) return;
-        const signature = JSON.stringify(results[i]);
+        if (!results[i].watch) referenceRanges.delete(item.handle);
+        const signature = JSON.stringify(results[i].parts);
         if (item.signature === signature) return;
-        const nodes = referenceNodes(results[i], item.styled);
+        const nodes = referenceNodes(results[i].parts, item.styled);
         item.nodes[0].before(...nodes);
         for (const old of item.nodes) old.remove();
         item.nodes = nodes;
