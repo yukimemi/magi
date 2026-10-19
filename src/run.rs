@@ -230,7 +230,6 @@ use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 ///
 /// Schema 16 records empty-attempt retirement. Older executors must reject
 /// retired runs rather than ignoring the new execution fence.
-
 pub const SCHEMA: u32 = 16;
 
 /// Why a pass over a run stopped at a node boundary, recorded when it
