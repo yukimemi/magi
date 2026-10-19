@@ -320,6 +320,107 @@ fn declared_outputs(target: &Path) -> Result<Vec<PathBuf>> {
     Ok(outputs.into_iter().collect())
 }
 
+#[derive(Serialize, Deserialize)]
+struct CargoResidue {
+    target: PathBuf,
+    files: std::collections::BTreeMap<PathBuf, Vec<u8>>,
+}
+
+// Keep the exact metadata as historical evidence. An old proof cannot adopt
+// newly added files, changed metadata, symlinks or a different worktree.
+fn residue_files(
+    target: &Path,
+    outputs: &[PathBuf],
+) -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>> {
+    let mut files = std::collections::BTreeMap::new();
+    let mut dirs = vec![target.to_owned()];
+    let mut bytes = 0usize;
+    let mut entries = 0usize;
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            entries += 1;
+            ensure!(entries <= 4096, "residue inventory too large");
+            let metadata = std::fs::symlink_metadata(&path)?;
+            ensure!(
+                !metadata.file_type().is_symlink(),
+                "symlink in Cargo residue"
+            );
+            if metadata.is_dir() {
+                dirs.push(path);
+            } else {
+                ensure!(metadata.is_file(), "non-file in Cargo residue");
+                if outputs.contains(&path) {
+                    continue;
+                }
+                ensure!(metadata.len() <= 1024 * 1024, "residue file too large");
+                let body = std::fs::read(&path)?;
+                bytes = bytes.saturating_add(body.len());
+                ensure!(bytes <= 8 * 1024 * 1024, "residue inventory too large");
+                files.insert(path.strip_prefix(target)?.to_owned(), body);
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn residue_proof(home: &Path, id: &str, worktree: &Path) -> Result<PathBuf> {
+    Ok(home
+        .join("runs")
+        .join(id)
+        .join("build-residue")
+        .join(worktree.file_name().context("missing worktree name")?))
+}
+
+fn record_residue(home: &Path, id: &str, target: &Path, outputs: &[PathBuf]) -> Result<()> {
+    let files = residue_files(target, outputs)?;
+    for (relative, body) in &files {
+        let path = target.join(relative);
+        let identity = matches!(relative.to_str(), Some("CACHEDIR.TAG" | ".rustc_info.json"));
+        let lock = matches!(
+            relative.to_str(),
+            Some("debug/.cargo-lock" | "release/.cargo-lock")
+        ) && body.is_empty();
+        let dep_info = path.extension().is_some_and(|ext| ext == "d")
+            && outputs.iter().any(|output| {
+                output.parent() == path.parent()
+                    && (output.file_stem() == path.file_stem()
+                        || output.file_stem().is_some_and(|stem| {
+                            stem.to_string_lossy()
+                                == format!(
+                                    "lib{}",
+                                    path.file_stem().unwrap_or_default().to_string_lossy()
+                                )
+                        }))
+            });
+        ensure!(identity || lock || dep_info, "unproven Cargo residue");
+    }
+    let proof = residue_proof(home, id, target.parent().context("missing worktree")?)?;
+    std::fs::create_dir_all(proof.parent().context("missing proof directory")?)?;
+    let tmp = proof.with_extension("tmp");
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec(&CargoResidue {
+            target: target.to_owned(),
+            files,
+        })?,
+    )?;
+    std::fs::rename(tmp, proof)?;
+    Ok(())
+}
+
+async fn verify_residue(home: &Path, id: &str, worktree: &Path) -> Result<Vec<File>> {
+    let target = cargo_target(worktree).await?;
+    let locks = cargo_locks(&target)?;
+    let proof: CargoResidue =
+        serde_json::from_slice(&std::fs::read(residue_proof(home, id, worktree)?)?)?;
+    ensure!(
+        proof.target == target && proof.files == residue_files(&target, &[])?,
+        "Cargo residue changed or contains unproven files"
+    );
+    Ok(locks)
+}
+
 /// Supplemental exclusion for Cargo builds launched outside the managed seats.
 pub(crate) fn cargo_locks(target: &Path) -> Result<Vec<File>> {
     let mut held = Vec::new();
@@ -500,6 +601,11 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
                     &serde_json::json!({"target":target,"bytes":current_size,"at":now,"action":"reclaim-declared-outputs","files":outputs}),
                 )?,
             )?;
+            // Unknown leftovers still permit artifact-only eviction, but never
+            // authorize retirement. Only a complete proven residue is adopted.
+            if let Err(error) = record_residue(home, &id, &target, &outputs) {
+                report.retained.push(format!("{id}: residue not adopted for retirement: {error:#}"));
+            }
             for output in &outputs {
                 std::fs::remove_file(output)?;
             }
@@ -724,11 +830,18 @@ async fn retire_empty(
                 );
                 let paths = worktrees(&state).await?;
                 let mut guards = Vec::new();
+                let mut cargo_guards = Vec::new();
                 for path in &paths {
                     guards.push(OutputLease::take(path, true)?);
                     ensure!(
                         git::rev_parse(path, "HEAD").await? == state.base_commit,
                         "unique or unrecorded commits"
+                    );
+                    ensure!(
+                        git::git(path, &["status", "--porcelain", "--untracked-files=all"])
+                            .await?
+                            .is_empty(),
+                        "tracked or untracked source changes"
                     );
                     ensure!(
                         git::git(
@@ -737,13 +850,21 @@ async fn retire_empty(
                                 "status",
                                 "--porcelain",
                                 "--untracked-files=all",
-                                "--ignored"
+                                "--ignored",
+                                "--",
+                                ".",
+                                ":(exclude)target"
                             ]
                         )
                         .await?
                         .is_empty(),
                         "source changes, ignored files or build outputs"
                     );
+                    match std::fs::symlink_metadata(path.join("target")) {
+                        Ok(_) => cargo_guards.extend(verify_residue(home, id, path).await?),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
                     for checkpoint in [
                         "rebase-merge",
                         "rebase-apply",
@@ -1213,6 +1334,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reclaimed_cargo_residue_allows_retirement_only_while_exact_and_unowned() {
+        let f = Fx::new().await;
+        let source = f.run("0000", true).await;
+        let empty = f.run("0001", false).await;
+        let changed = f.run("0002", false).await;
+        let unknown = f.run("0003", false).await;
+        let unproven = f.run("0004", false).await;
+        f.task(&[
+            source.clone(),
+            empty.clone(),
+            changed.clone(),
+            unknown.clone(),
+            unproven.clone(),
+        ]);
+        for run in [&empty, &changed, &unknown] {
+            Fx::target(&run.candidates[0].worktree);
+        }
+        let reviewer = empty.worktree_root().join("review-1");
+        git::worktree_add_detached(&f.repo, &reviewer, &f.base)
+            .await
+            .unwrap();
+        Fx::target(&reviewer);
+        let mut disk = Fx::disk();
+        disk.auto_fold = false;
+        let report = sweep(&f.home, &disk, Fx::now()).await;
+        assert_eq!(report.freed_bytes, 800, "{report:?}");
+        let wt = &empty.candidates[0].worktree;
+        assert!(wt.join("target/debug/output.d").exists());
+        assert!(!wt.join("target/debug/output").exists());
+        let proof_path = residue_proof(&f.home, &empty.id, wt).unwrap();
+        let proof: CargoResidue =
+            serde_json::from_slice(&std::fs::read(&proof_path).unwrap()).unwrap();
+        assert_eq!(
+            proof.files[Path::new("debug/output.d")],
+            std::fs::read(wt.join("target/debug/output.d")).unwrap()
+        );
+        std::fs::write(
+            changed.candidates[0].worktree.join("target/debug/output.d"),
+            "owner notes",
+        )
+        .unwrap();
+        std::fs::write(
+            unknown.candidates[0].worktree.join("target/debug/notes"),
+            "keep",
+        )
+        .unwrap();
+        Fx::target(&unproven.candidates[0].worktree);
+        std::fs::remove_file(unproven.candidates[0].worktree.join("target/debug/output")).unwrap();
+        disk.auto_fold = true;
+        let locks = cargo_locks(&wt.join("target")).unwrap();
+        let mut report = Report::default();
+        retire_empty(&f.home, &disk, Fx::now(), &mut report).await;
+        assert_eq!(report.retired, 0, "{report:?}");
+        assert!(
+            report
+                .retained
+                .iter()
+                .any(|reason| reason.contains("Cargo build"))
+        );
+        drop(locks);
+        retire_empty(&f.home, &disk, Fx::now(), &mut report).await;
+        assert_eq!(report.retired, 1, "{report:?}");
+        assert!(!wt.exists());
+        assert!(!reviewer.exists());
+        assert!(
+            residue_proof(&f.home, &empty.id, &reviewer)
+                .unwrap()
+                .exists()
+        );
+        assert!(
+            proof_path.exists(),
+            "metadata evidence outlives the worktree"
+        );
+        assert_eq!(
+            RunState::load_under(&empty.id, &f.home).unwrap().retired_to,
+            Some(source.id)
+        );
+        for run in [&changed, &unknown, &unproven] {
+            assert!(run.candidates[0].worktree.exists());
+            assert!(
+                RunState::load_under(&run.id, &f.home)
+                    .unwrap()
+                    .retired_to
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn empty_backlog_retires_to_useful_older_source_in_bounded_idempotent_passes() {
         let f = Fx::new().await;
         let source = f.run("0000", true).await;
@@ -1458,6 +1668,7 @@ mod tests {
         let pid_file = f.repo.join("child-pid");
         let mut cmd = tokio::process::Command::new("sh");
         cmd.args(["-c", "sleep 30 & echo $! > \"$CHILD_PID_FILE\"; wait"])
+            .quiet()
             .env("CHILD_PID_FILE", &pid_file)
             .process_group(0)
             .kill_on_drop(true);

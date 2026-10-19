@@ -2254,12 +2254,15 @@ mod tests {
             );
             let mut historical = RunState::load_under(&id, home).unwrap();
             assert!(!historical.candidates[0].folded);
+            let error = crate::graph::fold_run(&mut historical, true, home)
+                .await
+                .unwrap_err();
             assert!(
-                crate::graph::fold_run(&mut historical, true, home)
-                    .await
-                    .unwrap()
-                    .is_empty()
+                error
+                    .to_string()
+                    .contains("explicitly retained recovery source")
             );
+            assert!(!historical.candidates[0].folded);
             assert!(
                 worktree.exists(),
                 "every automatic fold entry preserves retained sources"
