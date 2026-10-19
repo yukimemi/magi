@@ -650,15 +650,15 @@ candidates onto the winner. Decisions are pure and live in `src/graft.rs`.
   consequence accepted on purpose: a graft handover is sticky for the later
   fix, gate-fix, land and rebase rounds of the same run. Between agents the
   worktree is restored to the pre-graft commit.
-- **The valve.** `RunState::graft` (`GraftRecord`, `#[serde(default)]`, so
-  `run::SCHEMA` is unchanged) saves `pre` and `Running` *before* the fixer is
+- **Recovery and measurement.** `RunState::graft` (`GraftRecord`,
+  `#[serde(default)]`, so `run::SCHEMA` is unchanged) saves `pre` and `Running` *before* the fixer is
   called. After it: a failure, a dropped stream, quota, an unusable reply, no
-  change, or `lines > graft::limit(W)` restores `pre` (`git::restore_to`:
-  `reset --hard` plus `clean -fd`, never `-x`, so setup products survive) and
-  the run goes on as if graft were off. `W` is the winner's changed lines
-  against the base, `lines` the graft's own (numstat added + removed, binary or
-  unmeasurable = rejected), and the limit is `min(400, max(40, ceil(W/4)))`:
-  a quarter keeps it a supplement, half would let it replace the winner. A
+  change restores `pre` (`git::restore_to`: `reset --hard` plus `clean -fd`,
+  never `-x`, so setup products survive) and the run goes on as if graft were
+  off. Changed lines (numstat added + removed) are measured for observability
+  only: there is no size limit, and binary or unmeasurable changes are allowed
+  with `lines: None`. `GraftRecord::limit` is retained only for historical
+  records; new records use `None`, and reports do not display a limit. A
   quota hit pushes `QuotaLoss { node: "graft" }` like other fixer nodes; the
   refund rule (`Verdict::quota_hit`) is unchanged and graft never stalls or
   blocks the run. A record found `Running` on re-entry is restored to `pre` and

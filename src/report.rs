@@ -588,11 +588,10 @@ pub fn run(state: &RunState) -> String {
 
     if let Some(g) = &state.graft {
         let _ = writeln!(s, "\n{}", bold("graft"));
-        let size = match (g.lines, g.limit) {
-            (Some(l), Some(m)) => format!("  {l} changed lines (limit {m})"),
-            (None, Some(m)) => format!("  limit {m} changed lines"),
-            _ => String::new(),
-        };
+        let size = g.lines.map_or_else(
+            || "  changed lines unavailable".to_owned(),
+            |n| format!("  {n} changed lines"),
+        );
         let _ = match &g.outcome {
             crate::run::GraftOutcome::Applied => writeln!(s, "  {}{size}", green("applied")),
             crate::run::GraftOutcome::WaitingForRestore => {

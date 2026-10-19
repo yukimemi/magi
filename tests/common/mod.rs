@@ -519,12 +519,17 @@ fi
 # there is no finding id to echo back. `MOCK_GATE_FIX_NOOP` leaves the tree as
 # it is, for a fixer that cannot help.
 # The graft round (`prompt::graft`). `MOCK_GRAFT` picks the behaviour: `apply`
-# commits a small file, `huge` commits a diff far over the size limit, `fail`
+# commits a small file, `huge` commits 500 lines, `fail`
 # exits non-zero, `noop` changes nothing, `dirty` leaves the work uncommitted.
 if has "# Graft the runner-up strengths"; then
   case "$MOCK_GRAFT" in
     fail) echo "graft failed" >&2; exit 1 ;;
     noop) ;;
+    binary)
+      printf '\000ported' > grafted.txt
+      git add -A >/dev/null 2>&1
+      git commit -q -m "graft binary strength" >/dev/null 2>&1
+      ;;
     huge)
       i=0; : > grafted.txt
       while [ "$i" -lt 500 ]; do echo "line $i" >> grafted.txt; i=$((i + 1)); done
@@ -645,6 +650,9 @@ fi
 
 # Anything else is the implementation node.
 echo "content from $seat" > note.txt
+if [ -n "$MOCK_WINNER_BINARY" ]; then
+  printf '\000winner' > winner.bin
+fi
 git add -A >/dev/null 2>&1
 git commit -q -m "add note from $seat" >/dev/null 2>&1
 if [ -n "$MOCK_IMPL_TWO_COMMITS" ]; then
