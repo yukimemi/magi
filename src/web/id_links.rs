@@ -10,6 +10,27 @@ struct Entry {
     kind: &'static str,
     id: String,
     href: String,
+    record: Option<Arc<RecordValidation>>,
+}
+
+#[derive(Debug)]
+struct RecordValidation {
+    root: PathBuf,
+    valid: std::sync::OnceLock<bool>,
+}
+
+impl Entry {
+    fn valid(&self) -> bool {
+        self.record.as_ref().is_none_or(|record| {
+            *record.valid.get_or_init(|| match self.kind {
+                "run" => read_run(&record.root, &self.id).is_ok(),
+                "task" => Queue::at(record.root.clone()).get(&self.id).is_ok(),
+                "question" => Questions::at(record.root.clone()).get(&self.id).is_ok(),
+                "chat" => Talks::at(record.root.clone()).get(&self.id).is_ok(),
+                _ => false,
+            })
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -29,9 +50,18 @@ pub(super) fn page_href(route: &str, id: &str) -> String {
 }
 
 impl IdIndex {
-    fn from_stamps(stores: &[Stamps; 4]) -> Self {
+    fn from_stamps(
+        roots: &[PathBuf; 4],
+        stores: &[Stamps; 4],
+        previous: Option<&Snapshot>,
+    ) -> Self {
+        let prior: HashMap<_, _> = previous
+            .into_iter()
+            .flat_map(|s| &s.ordinary.entries)
+            .map(|entry| ((entry.kind, entry.id.as_str()), entry))
+            .collect();
         let mut index = Self::default();
-        for ((kind, route), ids) in [
+        for (i, ((kind, route), ids)) in [
             ("run", "runs"),
             ("task", "tasks"),
             ("question", "questions"),
@@ -39,9 +69,27 @@ impl IdIndex {
         ]
         .into_iter()
         .zip(stores)
+        .enumerate()
         {
-            for id in ids.keys() {
-                index.add(kind, id, page_href(route, id));
+            for (id, stamp) in ids {
+                // A filename supplies a candidate. Only referenced candidates are
+                // decoded, once per file revision, using the destination's reader.
+                let record = previous
+                    .filter(|s| s.roots[i] == roots[i] && s.stores[i].get(id) == Some(stamp))
+                    .and_then(|_| prior.get(&(kind, id.as_str())))
+                    .and_then(|entry| entry.record.clone())
+                    .unwrap_or_else(|| {
+                        Arc::new(RecordValidation {
+                            root: roots[i].clone(),
+                            valid: std::sync::OnceLock::new(),
+                        })
+                    });
+                index.entries.push(Entry {
+                    kind,
+                    id: id.clone(),
+                    href: page_href(route, id),
+                    record: Some(record),
+                });
             }
         }
         index
@@ -72,6 +120,7 @@ impl IdIndex {
             kind,
             id: id.to_owned(),
             href,
+            record: None, // Findings were decoded with their run; unit fixtures are trusted.
         });
     }
 
@@ -91,12 +140,14 @@ impl IdIndex {
             .iter()
             .filter(eligible)
             .filter(|e| e.id == id)
+            .filter(|e| e.valid())
             .collect();
         let matches = if exact.is_empty() && short {
             self.entries
                 .iter()
                 .filter(eligible)
                 .filter(|e| crate::queue::short(&e.id) == id)
+                .filter(|e| e.valid())
                 .collect()
         } else {
             exact
@@ -309,8 +360,8 @@ fn cache_lock<T>(state: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// Owned by one UI, shared by its clones. Only metadata is inspected on cache
-/// hits. Each revision retains its ordinary index and lazily builds review
-/// references at most once; ordinary prose never parses run states.
+/// hits. Candidate records are decoded only when referenced, and validation
+/// results survive unrelated store updates. Review history is also lazy.
 #[derive(Debug, Default)]
 pub(super) struct IndexCache {
     snapshot: Mutex<Option<Snapshot>>,
@@ -351,7 +402,7 @@ impl IndexCache {
             .is_none_or(|s| s.roots != roots || s.stores != stores)
         {
             *slot = Some(Snapshot {
-                ordinary: Arc::new(IdIndex::from_stamps(&stores)),
+                ordinary: Arc::new(IdIndex::from_stamps(&roots, &stores, slot.as_ref())),
                 roots,
                 stores,
                 findings: None,
@@ -590,8 +641,6 @@ mod tests {
         let cache = IndexCache::default();
         let run_dir = runs.join("20260908-205802-6a06");
         std::fs::create_dir_all(&run_dir).unwrap();
-        // Ordinary references only need the recorded id, not a run-state decode.
-        std::fs::write(run_dir.join("run.json"), "metadata-only fixture").unwrap();
         let metadata_dir = runs.join("20260908-205802-7b07");
         std::fs::create_dir_all(&metadata_dir).unwrap();
         std::fs::write(metadata_dir.join("run.json"), "metadata-only fixture").unwrap();
@@ -612,7 +661,22 @@ mod tests {
         run.save_under(temp.path()).unwrap();
         let first = get(false);
         assert!(first.resolve("6a06", false).is_some());
-        assert!(first.resolve("7b07", false).is_some());
+        let validated = |index: &IdIndex, id: &str| {
+            Arc::clone(
+                index
+                    .entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .unwrap()
+                    .record
+                    .as_ref()
+                    .unwrap(),
+            )
+        };
+        let invalid_record = validated(&first, "20260908-205802-7b07");
+        assert!(invalid_record.valid.get().is_none());
+        assert!(first.resolve("7b07", false).is_none());
+        assert_eq!(invalid_record.valid.get(), Some(&false));
         assert!(Arc::ptr_eq(&first, &get(false)));
         assert!(cache_lock(&cache.reviews).is_none());
         assert!(first.resolve("R2-1-3", false).is_none());
@@ -631,6 +695,18 @@ mod tests {
         let changed = get(false);
         assert!(!Arc::ptr_eq(&first, &changed));
         assert!(changed.resolve("dead", false).is_some());
+        assert!(Arc::ptr_eq(
+            &invalid_record,
+            &validated(&changed, "20260908-205802-7b07")
+        ));
+        assert!(Arc::ptr_eq(
+            &validated(&first, "20260908-205802-6a06"),
+            &validated(&changed, "20260908-205802-6a06")
+        ));
+        assert_eq!(
+            validated(&changed, "20260908-205802-6a06").valid.get(),
+            Some(&true)
+        );
         get(true);
         assert!(Arc::ptr_eq(
             &reviews,
@@ -704,5 +780,117 @@ mod tests {
         talk.turns[0].body = "R2-1-3 の修正を待つ".into();
         TalkView::with_config(talk, false, None, home.path(), &cache);
         assert!(cache_lock(&cache.reviews).is_some());
+    }
+    #[test]
+    fn references_validate_all_record_kinds_and_refresh_after_repairs_and_corruption() {
+        let home = tempfile::tempdir().unwrap();
+        let roots = [
+            home.path().join("runs"),
+            home.path().join("queue"),
+            home.path().join("questions"),
+            home.path().join("talks"),
+        ];
+        let queue = Queue::at(roots[1].clone());
+        let questions = Questions::at(roots[2].clone());
+        let talks = Talks::at(roots[3].clone());
+        let cache = IndexCache::default();
+        let mut run = RunState::new(
+            home.path().into(),
+            "main".into(),
+            "base".into(),
+            "instruction".into(),
+            Config::default(),
+        );
+        run.id = "20260908-205802-6a06".into();
+        let mut task = Task::new(
+            "task".into(),
+            "instruction".into(),
+            home.path().into(),
+            Source::Human,
+        );
+        task.id = "20260908-205803-12ba".into();
+        let mut question = ask::Question::new(
+            run.id.clone(),
+            "merge".into(),
+            "operator".into(),
+            "Approve?".into(),
+            "detail".into(),
+            Vec::new(),
+        );
+        question.id = "20260908-205805-d678".into();
+        question.status = ask::QuestionStatus::Answered;
+        let talk: Talk = serde_json::from_value(serde_json::json!({
+            "schema": talk::SCHEMA, "id": "20260908-205806-6f0d", "repo": ".", "agent": "test", "status": "open",
+            "turns": [], "created_at": "2026-09-08T20:58:02Z", "updated_at": "2026-09-08T20:58:02Z",
+            "seat": crate::agent::SeatState::new("chat", "test", 1)
+        })).unwrap();
+        let records = [
+            (
+                run.id.as_str(),
+                roots[0].join(&run.id).join("run.json"),
+                serde_json::to_vec(&run).unwrap(),
+            ),
+            (
+                task.id.as_str(),
+                queue.path_of(&task.id),
+                serde_json::to_vec(&task).unwrap(),
+            ),
+            (
+                question.id.as_str(),
+                questions.path_of(&question.id),
+                serde_json::to_vec(&question).unwrap(),
+            ),
+            (
+                talk.id.as_str(),
+                talks.root().join(format!("{}.json", talk.id)),
+                serde_json::to_vec(&talk).unwrap(),
+            ),
+        ];
+        for (i, (_, path, _)) in records.iter().enumerate() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, if i % 2 == 0 { "invalid JSON" } else { "{}" }).unwrap();
+        }
+        let get = || cache.get(&roots[0], &queue, &questions, &talks, false);
+        let invalid = get();
+        for (id, _, _) in &records {
+            assert!(invalid.resolve(id, false).is_none(), "{id}");
+            assert!(
+                invalid.resolve(crate::queue::short(id), false).is_none(),
+                "{id}"
+            );
+            let prose = format!("{} `{id}`", crate::queue::short(id));
+            assert!(
+                invalid
+                    .parts(&prose, false)
+                    .iter()
+                    .all(|p| p.href.is_none())
+            );
+            let mut nodes = md::to_nodes(&prose, &md::ImageBase::None);
+            invalid.markdown(&mut nodes);
+            assert!(
+                !serde_json::to_string(&nodes)
+                    .unwrap()
+                    .contains("internal_link")
+            );
+        }
+        assert!(Arc::ptr_eq(&invalid, &get()));
+        for (_, path, valid) in &records {
+            std::fs::write(path, valid).unwrap();
+        }
+        let repaired = get();
+        for (id, _, _) in &records {
+            assert!(repaired.resolve(id, false).is_some(), "{id}");
+            assert!(
+                repaired.resolve(crate::queue::short(id), false).is_some(),
+                "{id}"
+            );
+        }
+        for (_, path, _) in &records {
+            std::fs::write(path, "broken again").unwrap();
+        }
+        let corrupted = get();
+        for (id, _, _) in &records {
+            assert!(corrupted.resolve(id, false).is_none(), "{id}");
+        }
     }
 }
