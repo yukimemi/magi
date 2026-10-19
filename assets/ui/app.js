@@ -6105,29 +6105,34 @@ function applyTalkSections(detail) {
 
 async function loadTalk(id, { background = false } = {}) {
   const detail = state.talkDetail;
-  const request = nextTalkRequest(id);
   const wait = state.talkWaits.get(id);
   const observed = wait && { generation: wait.generation, startedAt: Date.now() };
   const current = () => state.talkDetail === detail && state.talkDetail.id === id;
   const retry = () => loadTalk(id, { background: true });
   sectionNotice("talk-meta", "talk-core-state", detail.talk ? "" : "Loading conversation…");
   const core = sectionRequest(`talk:${id}:core`, `${API.talk(id)}/core`, talk => {
-    if (!current()) return;
     trackTalkThinking(talk, observed);
+    if (!current()) return;
     detail.talk = { ...detail.talk, ...talk };
     applyTalkSections(detail);
     sectionNotice("talk-meta", "talk-core-state", "");
     renderTalk();
+    ok();
   }, error => {
+    if (error.status === 404) endTalkTurn(id);
     if (!current()) return;
     if (error.status === 404) {
-      endTalkTurn(id);
       detail.talk = null;
       detail.gone = true;
       renderTalk();
+      ok();
+      return;
     }
     sectionNotice("talk-meta", "talk-core-state", `Conversation: ${error.message}`, retry);
+    failFor(background, `Could not load conversation ${shortId(id)}: ${error.message}`, error);
   }, false, background);
+  // Waiting conversations outside the visible detail need only liveness.
+  if (!current()) return core;
   sectionNotice("talk-task-progress", "talk-sections-state", detail.sections ? "" : "Loading related tasks and choices…");
   const sections = sectionRequest(`talk:${id}:sections`, `${API.talk(id)}/sections`, data => {
     if (!current()) return;
@@ -6893,6 +6898,8 @@ async function startTalk() {
     renderTalks();
     announce("Conversation opened.");
     location.hash = `#/chat/${talk.id}`;
+    // Apply navigation before starting requests: hashchange cancels old sections.
+    applyRoute();
     loadTalk(talk.id, { background: true });
     ok();
   } catch (failure) {
@@ -9449,13 +9456,21 @@ async function loadStats({ background = false, queueOnly = false } = {}) {
   const queue = sectionRequest("stats:queue", `${API.stats}/queue`, counts => {
     renderStatsQueue(counts);
     sectionNotice("stats-queue-tiles", "stats-queue-state", "");
-  }, error => sectionNotice("stats-queue-tiles", "stats-queue-state", `Queue: ${error.message}`, () => loadStats()));
+    ok();
+  }, error => {
+    sectionNotice("stats-queue-tiles", "stats-queue-state", `Queue: ${error.message}`, () => loadStats());
+    failFor(background, `Could not load statistics: ${error.message}`, error);
+  });
   if (queueOnly) return queue;
   const history = sectionRequest(key, query ? `${API.stats}?${query}` : API.stats, stats => {
     state.stats = stats;
     sectionNotice("stats-h", "stats-load-state", "");
     renderStats();
-  }, error => sectionNotice("stats-h", "stats-load-state", `Statistics: ${error.message}`, () => loadStats()));
+    ok();
+  }, error => {
+    sectionNotice("stats-h", "stats-load-state", `Statistics: ${error.message}`, () => loadStats());
+    failFor(background, `Could not load statistics: ${error.message}`, error);
+  });
   await Promise.allSettled([queue, history]);
 }
 
