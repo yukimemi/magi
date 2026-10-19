@@ -10511,13 +10511,10 @@ async fn run_commands(
             });
             continue;
         }
-        #[cfg(unix)]
-        cmd.process_group(0);
-        let spawned = cmd.spawn();
+        let spawned = crate::seat_process::Running::spawn(cmd, None, outputs);
         let (code, body) = match spawned {
-            Ok(child) => {
-                let pid = child.id();
-                let mut running = crate::seat_process::Running::with_outputs(child, None, outputs);
+            Ok(mut running) => {
+                let pid = running.child().id();
                 let (stdout, out_reader) = agent::drain(running.child().stdout.take());
                 let (stderr, err_reader) = agent::drain(running.child().stderr.take());
                 let mut paths = vec![cwd.to_owned()];
