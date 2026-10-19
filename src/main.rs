@@ -6550,6 +6550,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
         // A fresh test process has no OnceLock home from unrelated tests, and
         // removing launcher context prevents the host environment masking this.
         let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .quiet()
             .args([
                 "--exact",
                 "tests::ordinary_task_commands_do_not_require_a_global_home",
