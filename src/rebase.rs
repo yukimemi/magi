@@ -387,9 +387,14 @@ async fn dropped_commits(repo: &Path, onto_sha: &str, orig: &str, head: &str) ->
     for c in missing_commits(&expected, &have) {
         // Git also drops a commit on its own when its change is already on
         // the base under a different patch (e.g. folded into one upstream
-        // commit). That is not a loss: every path it touched holds the same
-        // content in the result.
-        if !already_in_result(repo, &c.sha, orig, head).await {
+        // commit). Verify the whole change against the base as well: later
+        // branch commits may supersede its lines in the result, making an
+        // isolated replay there conflict. Only a successful replay leaving
+        // the base's entire tree (including modes) unchanged proves absorption;
+        // a later edit to the same file alone cannot excuse a skipped change.
+        if !replay_is_noop(repo, &c.sha, onto_sha).await
+            && !already_in_result(repo, &c.sha, orig, head).await
+        {
             unverified.push(c);
             continue;
         }
@@ -823,5 +828,142 @@ mod tests {
         .unwrap();
         let head = commit_dated(d, "same").await;
         assert_eq!(dropped_commits(d, &onto, &orig, &head).await, vec!["same"]);
+    }
+
+    // Exercise the actual rebase and finish path. C0 conflicts in another
+    // file; C1 and C2 successively change the first line of f.txt. Upstream
+    // also changes a distant line, so neither C1 nor the original tip has
+    // the result's whole-file snapshot.
+    async fn rebase_successive_edits(absorbed: bool, extra_hunk: bool) -> Rebased {
+        crate::run::pin_test_home();
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        sh(d, &["init", "-q", "-b", "main"]);
+        sh(d, &["config", "user.name", "t"]);
+        sh(d, &["config", "user.email", "t@example.com"]);
+        let body = "old\n1\n2\n3\n4\n5\n6\n7\n8\n9\nend\n";
+        std::fs::write(d.join("f.txt"), body).unwrap();
+        std::fs::write(d.join("conflict.txt"), "old\n").unwrap();
+        let base = commit(d, "base").await;
+        sh(d, &["checkout", "-q", "-b", "topic"]);
+        std::fs::write(d.join("conflict.txt"), "branch\n").unwrap();
+        commit(d, "c0").await;
+        let mut middle = body.replacen("old", "new", 1);
+        if extra_hunk {
+            middle = middle.replace("\n5\n", "\nmissing\n");
+        }
+        std::fs::write(d.join("f.txt"), &middle).unwrap();
+        let c1 = commit(d, "c1").await;
+        std::fs::write(d.join("f.txt"), middle.replacen("new", "newer", 1)).unwrap();
+        let orig = commit(d, "c2").await;
+        sh(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("conflict.txt"), "branch plus upstream\n").unwrap();
+        let mut upstream = body
+            .replacen("old", if absorbed { "new" } else { "theirs" }, 1)
+            .replace("end", "upstream tail");
+        if extra_hunk {
+            upstream = upstream.replace("\n5\n", "\nupstream middle\n");
+        }
+        std::fs::write(d.join("f.txt"), &upstream).unwrap();
+        let onto = commit(d, "upstream composite").await;
+        // The composite has no patch-id twin for C1.
+        assert!(git::cherry(d, &onto, &orig).await.unwrap().0.contains(&c1));
+        let scratch = d.join("scratch");
+        assert!(matches!(
+            git::rebase_start(d, &scratch, "topic", &onto)
+                .await
+                .unwrap(),
+            git::RebaseStart::Conflicted(_)
+        ));
+        std::fs::write(
+            scratch.join("conflict.txt"),
+            "branch plus upstream resolved\n",
+        )
+        .unwrap();
+        sh(&scratch, &["add", "conflict.txt"]);
+        let continued = git::git_raw(
+            &scratch,
+            &["-c", "core.editor=true", "rebase", "--continue"],
+        )
+        .await
+        .unwrap();
+        if absorbed && !extra_hunk {
+            // C1 becomes empty automatically; C2 applies normally.
+            assert!(continued.ok(), "{}", continued.stderr);
+        } else {
+            assert!(!continued.ok());
+            assert_eq!(git::unmerged_paths(&scratch).await.unwrap(), vec!["f.txt"]);
+            let skipped = git::git_raw(&scratch, &["rebase", "--skip"]).await.unwrap();
+            if !absorbed {
+                // C2 now conflicts because its predecessor was really skipped.
+                assert!(!skipped.ok());
+                std::fs::write(
+                    scratch.join("f.txt"),
+                    upstream.replacen("theirs", "newer", 1),
+                )
+                .unwrap();
+                sh(&scratch, &["add", "f.txt"]);
+                let resolved = git::git_raw(
+                    &scratch,
+                    &["-c", "core.editor=true", "rebase", "--continue"],
+                )
+                .await
+                .unwrap();
+                assert!(resolved.ok(), "{}", resolved.stderr);
+            } else {
+                assert!(skipped.ok(), "{}", skipped.stderr);
+            }
+        }
+        assert!(!git::rebase_in_progress(&scratch).await);
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("f.txt")).unwrap(),
+            upstream.replacen(if absorbed { "new" } else { "theirs" }, "newer", 1)
+        );
+        let head = git::rev_parse(&scratch, "HEAD").await.unwrap();
+        // The old final-tree-only check cannot account for C1 in any case.
+        assert!(!already_in_result(d, &c1, &orig, &head).await);
+        let mut state = RunState::new(
+            d.to_path_buf(),
+            "main".into(),
+            base,
+            "rebase".into(),
+            crate::config::Config::default(),
+        );
+        let outcome = finish(
+            &mut state,
+            &scratch,
+            "topic",
+            &orig,
+            &onto,
+            &["conflict.txt".into()],
+            "",
+        )
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(state.dir()).ok();
+        outcome
+    }
+
+    #[tokio::test]
+    async fn an_absorbed_middle_commit_superseded_by_a_later_edit_is_applied() {
+        assert_eq!(rebase_successive_edits(true, false).await, Rebased::Applied);
+    }
+
+    #[tokio::test]
+    async fn a_skipped_middle_commit_superseded_by_a_later_edit_is_dropped() {
+        let Rebased::Stopped(why) = rebase_successive_edits(false, false).await else {
+            panic!("a skipped middle commit must stop the rebase");
+        };
+        assert!(why.contains("the rebase dropped some of the branch's commits (skipped?)"));
+        assert!(why.contains("c1"));
+    }
+
+    #[tokio::test]
+    async fn a_partially_absorbed_middle_commit_with_a_skipped_hunk_is_dropped() {
+        let Rebased::Stopped(why) = rebase_successive_edits(true, true).await else {
+            panic!("an unabsorbed hunk must stop the rebase");
+        };
+        assert!(why.contains("the rebase dropped some of the branch's commits (skipped?)"));
+        assert!(why.contains("c1"));
     }
 }
