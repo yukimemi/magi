@@ -715,13 +715,22 @@ enum TaskCmd {
         /// Task id or unambiguous prefix/suffix.
         id: String,
     },
-    /// Recover an existing task PR from its explicitly approved public commit.
+    /// Recover an existing task PR with an explicit source and delivery disposition.
     RecoverPr {
         id: String,
         #[arg(long)]
         pr: String,
         #[arg(long)]
         head: String,
+        /// Explicit delivery or local-review contract (replaces inherited merge mode).
+        #[arg(long, value_enum)]
+        disposition: magi::pr_recovery::Disposition,
+        /// Full source commit containing the selected public implementation and reviewed fixes.
+        #[arg(long)]
+        source_head: Option<String>,
+        /// Complete configuration replacement, following the usual --config semantics.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
     /// Change a queued or held task's implementers (1 = Solo; old work may restart).
     Implementers {
@@ -3253,7 +3262,14 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             Ok(())
         }
 
-        TaskCmd::RecoverPr { id, pr, head } => {
+        TaskCmd::RecoverPr {
+            id,
+            pr,
+            head,
+            disposition,
+            source_head,
+            config: config_path,
+        } => {
             let resolved = q.resolve_id(&id)?;
             let _claim = q
                 .claim(&resolved)
@@ -3267,15 +3283,35 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 url: pr,
                 branch: format!("magi/task-{}", t.id),
                 head,
+                source_head,
+                disposition: Some(disposition),
                 instruction: t.instruction.clone(),
                 approved_at: jiff::Timestamp::now(),
             };
             selected.check_task(&t.id, &t.instruction)?;
-            let explicit = t.overrides.as_ref().and_then(|o| o.config.as_deref());
+            let overrides = t
+                .overrides
+                .get_or_insert_with(|| magi::queue::RunOverrides {
+                    inherit_daemon_options: true,
+                    ..Default::default()
+                });
+            if let Some(path) = config_path {
+                overrides.config = Some(std::path::absolute(path)?);
+                overrides.inherit_daemon_options = false;
+            }
+            let old_merge = overrides.merge.replace(
+                match disposition {
+                    magi::pr_recovery::Disposition::Land => "pr",
+                    magi::pr_recovery::Disposition::Review => "none",
+                }
+                .into(),
+            );
+            let explicit = overrides.config.as_deref();
             let (mut config, _) = Config::discover_fetched(&t.repo, explicit).await?;
             if let Some(overrides) = &t.overrides {
                 overrides.apply(&mut config);
             }
+            selected.configure(&mut config)?;
             let base = magi::git::merge_base_branch(
                 &t.repo,
                 &config.merge.remote,
@@ -3285,6 +3321,7 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             selected
                 .verify(&t.repo, &config.merge.remote, &base, &selected.head)
                 .await?;
+            selected.verify_source(&t.repo).await?;
             refuse_duplicates(
                 &q,
                 &magi::run::home().join("runs"),
@@ -3303,7 +3340,10 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             t.resume_override = None;
             t.fresh_start = true;
             q.put(&mut t)?;
-            println!("queued selected public head for {}", t.short());
+            println!(
+                "queued selected source for {}; disposition={disposition:?}, inherited merge={old_merge:?} replaced explicitly",
+                t.short()
+            );
             Ok(())
         }
 
@@ -5085,7 +5125,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_pr_recovery_cli_requires_explicit_url_and_head() {
+    fn selected_pr_recovery_cli_requires_explicit_url_head_and_disposition() {
         let parsed = Cli::try_parse_from([
             "magi",
             "task",
@@ -5095,6 +5135,8 @@ mod tests {
             "https://example.test/team/project/pull/1",
             "--head",
             "aabb",
+            "--disposition",
+            "review",
         ])
         .unwrap();
         assert!(matches!(
@@ -5103,6 +5145,19 @@ mod tests {
                 command: TaskCmd::RecoverPr { .. }
             })
         ));
+        assert!(
+            Cli::try_parse_from([
+                "magi",
+                "task",
+                "recover-pr",
+                "t",
+                "--pr",
+                "url",
+                "--head",
+                "sha"
+            ])
+            .is_err()
+        );
         assert!(Cli::try_parse_from(["magi", "task", "recover-pr", "t", "--pr", "url"]).is_err());
         assert!(Cli::try_parse_from(["magi", "task", "recover-pr", "t", "--head", "sha"]).is_err());
     }

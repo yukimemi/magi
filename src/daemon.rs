@@ -1449,6 +1449,13 @@ fn settle_in(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usiz
         return;
     }
     match verdict.status {
+        RunStatus::Merged | RunStatus::Ready
+            if task.pr_recovery.as_ref().is_some_and(|s| {
+                s.disposition != Some(crate::pr_recovery::Disposition::Review)
+            }) =>
+        {
+            task.hold_manual(Some("Public delivery is not confirmed. Inspect the selected PR and run, then use recover-pr --disposition land with the intended source and validation configuration.".into()));
+        }
         RunStatus::Merged | RunStatus::Ready => task.succeed(),
         RunStatus::AlreadyInBase => task.already_landed(detail),
         RunStatus::Stalled if verdict.quota_hit => task.stall(detail),
@@ -1668,7 +1675,33 @@ fn settle_and_diagnose(
         return;
     }
     let unresolved = task.hold_notice_cause.clone();
-    settle_in(task, verdict, detail, max_attempts, p);
+    if !verdict.parked
+        && task
+            .pr_recovery
+            .as_ref()
+            .is_some_and(|s| s.disposition != Some(crate::pr_recovery::Disposition::Review))
+        && matches!(
+            verdict.status,
+            RunStatus::Ready | RunStatus::Merged | RunStatus::AlreadyInBase
+        )
+    {
+        if state.pr_recovery == task.pr_recovery && state.public_delivery_complete() {
+            task.succeed();
+        } else {
+            task.hold_manual(Some("Selected PR delivery is incomplete: local review or publication is not a confirmed public merge. Inspect the run and PR; use recover-pr --disposition land with --source-head <reviewed-full-SHA> and the required verification configuration. No automatic new attempt will start.".into()));
+        }
+    } else if !verdict.parked
+        && task.pr_recovery.is_some()
+        && matches!(
+            verdict.status,
+            RunStatus::Blocked | RunStatus::Failed | RunStatus::Gating
+        )
+        && !verdict.quota_hit
+    {
+        task.hold_unrequested_retry(Some(format!("Selected recovery stopped: {detail}. Inspect the retained source and run; correct the cause before explicitly releasing or selecting again. No automatic replacement will start.")));
+    } else {
+        settle_in(task, verdict, detail, max_attempts, p);
+    }
     if state.prep_failure.is_some() {
         // Minting a run whose candidates could not be prepared is not work
         // on a newly approved attempt. Keep the unresolved outcome anchor.
@@ -3169,6 +3202,20 @@ async fn attempt(
         );
     }
 
+    let unfinished = (!task.fresh_start)
+        .then(|| unfinished_run(&task.runs, task.short()))
+        .flatten()
+        .filter(|id| RunState::load(id).is_ok_and(|run| may_resume_run(&run, task)));
+    let previous = task.runs.last().and_then(|id| RunState::load(id).ok());
+    let saved_recovery = previous.as_ref().filter(|run| {
+        task.replacement.is_none()
+            && task.pr_recovery.as_ref().is_some_and(|selected| {
+                selected.check_task(&task.id, &task.instruction).is_ok()
+                    && selected_starter(selected, Some(run), unfinished.as_deref())
+                        == Starter::Resume(run.id.clone())
+            })
+    });
+
     // The repository's magi.toml comes from `<remote>/<base>`, fetched now. A
     // failure here is the network's or the operator's, not the task's: hold
     // without spending an attempt, never fall back to a possibly stale copy.
@@ -3177,30 +3224,53 @@ async fn attempt(
         Some(_) => opts.config.as_deref(),
         None => opts.config.as_deref(),
     };
-    if let Err(e) = Config::discover_fetched(&repo, explicit).await {
-        let reason = format!("[config] {e:#}");
-        record_config_failure(task, &e);
-        task.last_error = Some(reason.clone());
-        task.hold_machine(Some(reason.clone()));
-        record(queue, task);
-        tracing::warn!("holding {}: {reason}", task.short());
-        return Vec::new();
-    }
-    let mut config = match prepare_for(&repo, opts, task) {
-        Ok(c) => c,
-        Err(e) => {
-            // A setup failure spends an attempt even though no run was minted.
-            // Without that, a task naming a repository that does not exist
-            // would be retried at every poll for as long as the daemon lives.
-            task.attempts += 1;
-            task.fail_startup(
-                "startup-config",
-                format!("config: {e:#}"),
-                opts.max_attempts,
-            );
+    let (mut config, layers) = if let Some(run) = saved_recovery {
+        // A matching resume owns its resolved configuration and evidence;
+        // current layers and inherited overrides only configure new work.
+        let mut saved = run.clone();
+        if let Err(e) = saved.configure_recovery_resume() {
+            task.hold_manual(Some(format!("[recovery] saved run {} cannot resume: {e:#}. Inspect its saved configuration and evidence before requesting a new selection.", run.id)));
             record(queue, task);
             return Vec::new();
         }
+        (saved.config, Vec::new())
+    } else {
+        let (mut config, layers) = match Config::discover_fetched(&repo, explicit).await {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                let reason = format!("[config] {e:#}");
+                record_config_failure(task, &e);
+                task.last_error = Some(reason.clone());
+                task.hold_machine(Some(reason));
+                record(queue, task);
+                return Vec::new();
+            }
+        };
+        if let Err(e) = apply_options(&mut config, opts, task) {
+            task.hold_manual(Some(format!(
+                "[config] {e:#}; correct the merge override before releasing the task"
+            )));
+            record(queue, task);
+            return Vec::new();
+        }
+        if let Some(selected) = &task.pr_recovery
+            && let Err(e) = selected.configure(&mut config)
+        {
+            task.hold_manual(Some(format!("[recovery] {e:#}. No run started; select the PR again with an explicit disposition and corrected configuration.")));
+            record(queue, task);
+            return Vec::new();
+        }
+        (config, layers)
+    };
+    let config_evidence = crate::pr_recovery::ConfigEvidence {
+        layers,
+        overrides: task.overrides.clone(),
+        daemon_merge: task
+            .overrides
+            .as_ref()
+            .is_none_or(|o| o.inherit_daemon_options)
+            .then(|| opts.merge.clone())
+            .flatten(),
     };
     apply_task_implementers(&mut config, task);
     if let Some(replacement) = &task.replacement {
@@ -3287,16 +3357,11 @@ async fn attempt(
     // `crate::conduct` is what actually offers a better answer than
     // `Runner::start` here (see `Recovery::Review`), once this task's next
     // failure shows it up as `held`/`failed` with the run state unreadable.
-    let unfinished = (!task.fresh_start)
-        .then(|| unfinished_run(&task.runs, task.short()))
-        .flatten()
-        .filter(|id| RunState::load(id).is_ok_and(|run| may_resume_run(&run, task)));
     // `crate::conduct` chose `Review` for this task on an earlier cycle: its
     // branch survived, and this reopens exactly that branch as a
     // review-only pass rather than resuming or competing again. Consumed
     // (cleared) here whichever way this goes, so it never outlives this one
     // attempt - see `queue::Task::review_branch`.
-    let previous = task.runs.last().and_then(|id| RunState::load(id).ok());
     let review_branch = take_review_branch(task, previous.as_ref());
     let branch_exists = match &review_branch {
         Some(branch) => crate::git::branch_exists(&repo, branch)
@@ -3466,9 +3531,10 @@ async fn attempt(
                     r.state.config.merge.mode = MergeMode::Pr;
                     r.state.config.graph.land_approval = true;
                 }
-                // A replacement always publishes a new PR and asks for a new
-                // decision. Other runs retain their original merge override.
-                if task.replacement.is_none() && let Some(mode) = task
+                // Replacements publish a new PR and ask again. Selected PR
+                // recoveries keep their saved disposition; ordinary runs can
+                // retain the task's merge override.
+                if task.replacement.is_none() && task.pr_recovery.is_none() && let Some(mode) = task
                     .overrides
                     .as_ref()
                     .and_then(|o| o.merge.as_deref())
@@ -3624,6 +3690,9 @@ async fn attempt(
             return Vec::new();
         }
     };
+    if task.pr_recovery.is_some() && !matches!(starter, Starter::Resume(_)) {
+        runner.state.recovery_config = Some(config_evidence);
+    }
     if let Some(replacement) = &task.replacement {
         if matches!(starter, Starter::Start) {
             runner.state.instruction.push_str(&format!(
@@ -3972,21 +4041,30 @@ fn apply_task_implementers(config: &mut Config, task: &Task) {
 /// (`Task::overrides`, filed by `magi run` / `magi review`) take precedence
 /// over the loop's, so handing a hand-started task to a daemon changes nothing
 /// about what it does.
+#[cfg(test)]
 fn prepare_for(repo: &Path, opts: &Opts, task: &Task) -> Result<Config> {
-    let Some(o) = &task.overrides else {
-        return prepare(repo, opts);
+    let explicit = match &task.overrides {
+        Some(o) if !o.inherit_daemon_options => o.config.as_deref(),
+        _ => opts.config.as_deref(),
     };
-    // A task filed by `magi run` / `magi review` was configured by that
-    // command line alone: the loop's own `--config` / `--merge` must not leak
-    // in, or the same command would behave differently with a loop alive.
-    let own = Opts {
-        config: o.config.clone(),
-        merge: None,
-        ..opts.clone()
-    };
-    let mut config = prepare(repo, if o.inherit_daemon_options { opts } else { &own })?;
-    o.apply(&mut config);
+    let (mut config, _) = Config::discover(repo, explicit)?;
+    apply_options(&mut config, opts, task)?;
     Ok(config)
+}
+
+fn apply_options(config: &mut Config, opts: &Opts, task: &Task) -> Result<()> {
+    if task
+        .overrides
+        .as_ref()
+        .is_none_or(|o| o.inherit_daemon_options)
+        && let Some(mode) = opts.merge.as_deref()
+    {
+        config.merge.mode = merge_mode(mode)?;
+    }
+    if let Some(o) = &task.overrides {
+        o.apply(config);
+    }
+    Ok(())
 }
 
 /// Load the config for a task's repository, with the merge override applied.
@@ -5060,6 +5138,8 @@ mod tests {
             url: "url".into(),
             branch: format!("magi/task-{}", t.id),
             head: "a".repeat(40),
+            source_head: None,
+            disposition: Some(crate::pr_recovery::Disposition::Review),
             instruction: t.instruction.clone(),
             approved_at: Timestamp::now(),
         };

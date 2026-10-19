@@ -200,7 +200,7 @@ pub enum Section {
         /// Title, tone and default state.
         #[serde(flatten)]
         head: Head,
-        /// `passed`, `passed_no_commands` or `failed`.
+        /// `passed`, `not_configured` or `failed`.
         status: &'static str,
         /// Per-command results.
         commands: Vec<CommandView>,
@@ -565,7 +565,7 @@ pub struct BaseSyncView {
 pub struct MergeView {
     /// Merge mode, lowercase.
     pub mode: String,
-    /// `not_landed_by_design`, `ok`, `empty` or `not_merged`.
+    /// `not_landed_by_design`, `published`, `ok`, `empty` or `not_merged`.
     pub state: &'static str,
     /// First line of magi's own detail.
     pub detail: String,
@@ -1419,12 +1419,22 @@ pub fn build_with(
         GateStatus::NotRun => {}
         gs => {
             let st = match gs {
-                GateStatus::PassedWithNoCommands => "passed_no_commands",
+                GateStatus::NotConfigured => "not_configured",
                 GateStatus::Passed => "passed",
                 _ => "failed",
             };
             sections.push(Section::Gate {
-                head: head("gate", if gs.ok() { Tone::Ok } else { Tone::Fail }, true),
+                head: head(
+                    "gate",
+                    if gs == GateStatus::NotConfigured {
+                        Tone::Neutral
+                    } else if gs.ok() {
+                        Tone::Ok
+                    } else {
+                        Tone::Fail
+                    },
+                    true,
+                ),
                 status: st,
                 commands: state.gate.iter().map(|o| command(o, false)).collect(),
             });
@@ -1435,10 +1445,12 @@ pub fn build_with(
         let by_design = m.mode == MergeMode::None;
         let (st, tone) = if by_design {
             ("not_landed_by_design", Tone::Neutral)
-        } else if m.ok {
-            ("ok", Tone::Ok)
         } else if m.empty {
             ("empty", Tone::Warn)
+        } else if m.ok && state.status == crate::run::RunStatus::Merged {
+            ("ok", Tone::Ok)
+        } else if m.ok && m.mode == MergeMode::Pr {
+            ("published", Tone::Neutral)
         } else {
             ("not_merged", Tone::Warn)
         };

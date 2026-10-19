@@ -441,7 +441,7 @@ pub enum RunStatus {
     Landing,
     /// Winner merged.
     Merged,
-    /// Winner passed the gate; merge was not requested.
+    /// Local review or publication finished; no public merge is confirmed.
     Ready,
     /// The judgement did not gather enough judges (e.g. rate limiting took out
     /// seats), so the verdict is not trustworthy. The run stopped and kept its
@@ -1705,9 +1705,8 @@ pub enum GateStatus {
     /// build cache could not be acquired or confirmed fresh in time) and
     /// needs a retry.
     NotRun,
-    /// Ran with zero commands configured (`verify.gate` is empty) and
-    /// therefore vacuously passed — there was nothing to check.
-    PassedWithNoCommands,
+    /// No gate commands were configured. This is not successful verification.
+    NotConfigured,
     /// Ran one or more commands, and every one of them exited 0.
     Passed,
     /// Ran one or more commands, and at least one did not exit 0.
@@ -1717,7 +1716,7 @@ pub enum GateStatus {
 impl GateStatus {
     /// May a run in this state proceed to merge?
     pub fn ok(self) -> bool {
-        matches!(self, Self::PassedWithNoCommands | Self::Passed)
+        matches!(self, Self::Passed)
     }
 }
 
@@ -1726,7 +1725,7 @@ impl GateStatus {
 pub struct MergeOutcome {
     /// Requested mode.
     pub mode: MergeMode,
-    /// Did it land?
+    /// Did the requested operation succeed? Publication and no-op success do not prove a merge.
     pub ok: bool,
     /// Command output, or the command the operator should run.
     #[serde(default)]
@@ -2055,9 +2054,16 @@ pub struct RunState {
     /// Operator-selected source and original public lease, distinct from repaired HEAD.
     #[serde(default)]
     pub pr_recovery: Option<crate::pr_recovery::Selection>,
+    /// Actual ordered load inputs (remote-layer paths contain their source commit).
+    /// The resolved commands are retained in `config`, without re-rendering provenance.
+    #[serde(default)]
+    pub recovery_config: Option<crate::pr_recovery::ConfigEvidence>,
     /// Last head successfully pushed by this run; never an observed remote tip.
     #[serde(default)]
     pub pr_pushed_head: Option<String>,
+    /// Public PR head observed when the forge confirmed its merge; absent on old records.
+    #[serde(default)]
+    pub pr_merged_head: Option<String>,
     /// Last title posted by this run, used to preserve human title edits.
     #[serde(default)]
     pub pr_posted_title: Option<String>,
@@ -2106,7 +2112,7 @@ pub struct RunState {
     #[serde(default)]
     pub gate: Vec<CommandOutcome>,
     /// Did `gate()` actually record an attempt — zero commands configured
-    /// and vacuously passed, or one or more commands that ran to
+    /// (not configured), or one or more commands that ran to
     /// completion — as opposed to never having run, or having last hit a
     /// resource-blocked retry?
     ///
@@ -2462,7 +2468,9 @@ impl RunState {
             enabled_worktree_config: false,
             pr_head: None,
             pr_recovery: None,
+            recovery_config: None,
             pr_pushed_head: None,
+            pr_merged_head: None,
             pr_posted_title: None,
             pr_publication_pending: false,
             pr_taken_over_by: None,
@@ -2667,6 +2675,105 @@ impl RunState {
         }
     }
 
+    /// Resolve legacy delivery intent only from an already published PR and approval binding.
+    fn recovery_disposition(&self) -> Option<crate::pr_recovery::Disposition> {
+        let selected = self.pr_recovery.as_ref()?;
+        selected.disposition.or_else(|| {
+            (self.config.merge.mode == MergeMode::Pr
+                && self.land_approval.is_some()
+                && self.pr.as_ref().is_some_and(|pr| pr.url == selected.url))
+            .then_some(crate::pr_recovery::Disposition::Land)
+        })
+    }
+
+    /// Validate a resumed recovery against its own durable configuration and landing records.
+    pub fn configure_recovery_resume(&mut self) -> anyhow::Result<()> {
+        if let Some(mut selected) = self.pr_recovery.clone() {
+            selected.disposition = self.recovery_disposition();
+            selected.configure(&mut self.config)?;
+        }
+        Ok(())
+    }
+
+    /// Only a confirmed merge of the selected public PR completes a delivery task.
+    pub fn public_delivery_complete(&self) -> bool {
+        self.status == RunStatus::Merged
+            && self.config.merge.mode == MergeMode::Pr
+            && self
+                .merge
+                .as_ref()
+                .is_some_and(|m| m.ok && !m.empty && m.mode == MergeMode::Pr)
+            && self.pr.as_ref().is_some_and(|p| {
+                p.state.eq_ignore_ascii_case("merged")
+                    && self.pr_recovery.as_ref().is_some_and(|s| {
+                        s.url == p.url
+                            && self.recovery_disposition()
+                                == Some(crate::pr_recovery::Disposition::Land)
+                    })
+            })
+            && self.pr_pushed_head.as_deref().is_some_and(|head| {
+                self.pr_merged_head.as_deref() == Some(head)
+                    && self.check_delivery_evidence(head).is_ok()
+                    && self.land_approval.as_ref().is_some_and(|a| {
+                        a.head == head
+                            && crate::ask::Questions::open()
+                                .get(&a.question)
+                                .is_ok_and(|q| {
+                                    q.run == self.id
+                                        && q.node == crate::land::APPROVAL_NODE
+                                        && crate::land::approval(q.resolution().as_deref())
+                                            == crate::land::Approval::Merge
+                                        && q.merge_target.as_ref().is_some_and(|t| {
+                                            t.head == head
+                                                && self.pr.as_ref().is_some_and(|p| t.pr == p.url)
+                                        })
+                                })
+                    })
+            })
+    }
+
+    /// Validate evidence for exactly the head about to be published or merged.
+    pub fn check_delivery_evidence(&self, head: &str) -> anyhow::Result<()> {
+        if self.recovery_disposition() != Some(crate::pr_recovery::Disposition::Land) {
+            return Ok(());
+        }
+        let commands_match = |outcomes: &[CommandOutcome], commands: &[String]| {
+            !commands.is_empty()
+                && outcomes.len() == commands.len()
+                && outcomes
+                    .iter()
+                    .zip(commands)
+                    .all(|(o, c)| o.ok() && &o.command == c)
+        };
+        anyhow::ensure!(
+            self.gate_ran
+                && self.gate_head.as_deref() == Some(head)
+                && commands_match(&self.gate, &self.config.verify.gate),
+            "delivery requires successful configured gate commands on the exact final head; request a fresh recovery review"
+        );
+        anyhow::ensure!(
+            self.reviews.last().is_some_and(|r| r.clean
+                && r.expected > 0
+                && r.answered == r.expected
+                && r.head == head
+                && r.verified_head.as_deref() == Some(head)
+                && commands_match(&r.e2e, &self.config.verify.e2e)),
+            "delivery requires complete clean review and configured e2e commands on the exact final head; request a fresh recovery review"
+        );
+        Ok(())
+    }
+
+    /// Empty verification can finish an intentional workflow, without claiming a test pass.
+    pub fn gate_allows_progress(&self) -> bool {
+        self.gate_status().ok()
+            || (self
+                .pr_recovery
+                .as_ref()
+                .is_none_or(|s| s.disposition == Some(crate::pr_recovery::Disposition::Review))
+                && self.gate_ran
+                && self.gate_status() == GateStatus::NotConfigured)
+    }
+
     /// Note something in the run log and on the tracing stream.
     pub fn event(&mut self, node: &str, message: impl Into<String>) {
         let message = message.into();
@@ -2681,15 +2788,14 @@ impl RunState {
     /// The honest state of the final gate.
     ///
     /// Never derive this from `gate.is_empty()` alone anywhere else in the
-    /// codebase — `NotRun` and `PassedWithNoCommands` both leave `gate`
+    /// codebase — `NotRun` and `NotConfigured` both leave `gate`
     /// empty, and only this method (backed by [`Self::gate_ran`]) tells them
-    /// apart. See `SCHEMA`'s doc for schema 7 for what conflating them used
-    /// to do.
+    /// apart. An empty attempt is never verification evidence.
     pub fn gate_status(&self) -> GateStatus {
         if !self.gate_ran {
             GateStatus::NotRun
         } else if self.gate.is_empty() {
-            GateStatus::PassedWithNoCommands
+            GateStatus::NotConfigured
         } else if self.gate.iter().all(CommandOutcome::ok) {
             GateStatus::Passed
         } else {
@@ -4547,15 +4653,15 @@ mod tests {
     }
 
     #[test]
-    fn gate_status_tells_not_run_apart_from_passed_with_no_commands() {
+    fn gate_status_tells_not_run_apart_from_not_configured() {
         let mut s = state();
         assert_eq!(s.gate_status(), GateStatus::NotRun);
 
         s.gate_ran = true;
         assert_eq!(
             s.gate_status(),
-            GateStatus::PassedWithNoCommands,
-            "an empty gate must read as a real pass once gate_ran says it actually ran"
+            GateStatus::NotConfigured,
+            "an empty gate is not configured even when gate_ran records an attempt"
         );
 
         s.gate = vec![CommandOutcome {
@@ -4764,7 +4870,7 @@ mod tests {
         // `verify.gate` empty, `gate` empty, schema 6. It must come back as
         // "not yet run" so the next `gate()` call re-attempts it — and for a
         // repo with no gate commands configured, that resolves instantly to
-        // `PassedWithNoCommands` instead of staying stuck forever.
+        // `NotConfigured` instead of staying stuck forever.
         let mut value = serde_json::to_value(state()).expect("serialize state");
         let object = value.as_object_mut().expect("state object");
         object.insert("schema".to_owned(), serde_json::json!(6));
