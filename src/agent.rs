@@ -1840,6 +1840,8 @@ mod tests {
     /// Test-only command agent implemented by this test binary itself. Unlike
     /// `echo` and `sleep`, it is available wherever the Rust tests run.
     fn command_helper(mode: &str) -> AgentSpec {
+        // Invocation's disk monitor reads run state even without a build cache.
+        crate::run::pin_test_home();
         AgentSpec {
             id: "helper".to_owned(),
             kind: AgentKind::Command,
