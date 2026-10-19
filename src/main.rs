@@ -368,6 +368,9 @@ enum Command {
     /// something worth doing but out of scope runs `magi task add`, and the
     /// task is attributed to its run rather than to a passing human.
     Task {
+        /// Entire latest owner send authorizing one consultation task operation.
+        #[arg(long, global = true)]
+        quote: Option<String>,
         /// What to do with the queue.
         #[command(subcommand)]
         command: TaskCmd,
@@ -540,8 +543,11 @@ enum Command {
         /// The answer: an offered label, supported internal action alias, or free text.
         #[arg(long, conflicts_with_all = ["list", "say", "ask_chat"])]
         reply: Option<String>,
+        /// Record the owner's literal alternative and end consultation only; the question stays open.
+        #[arg(long, requires = "quote", conflicts_with_all = ["reply", "say", "ask_chat", "list", "recovery_consent"])]
+        reply_other: Option<String>,
         /// Entire latest persisted owner send for a chat decision. Direct: `<full-id>: <choice>`; explicit batch instructions bind the preceding recommendations. Merge, public content and destructive effects retain specific consent requirements.
-        #[arg(long, requires = "reply")]
+        #[arg(long)]
         quote: Option<String>,
         /// Agent interpretation of the complete latest owner send approving
         /// the single persisted internal resume/keep-held recommendation.
@@ -991,7 +997,11 @@ async fn async_main() -> Result<()> {
     // Overlap the release check with the command: a run spends minutes waiting
     // on agent latency, so this is free, and it is drained with a bounded wait
     // so a slow network cannot delay the exit.
-    let pending = spawn_update_check(&command);
+    let pending = if consultation_scope() {
+        None
+    } else {
+        spawn_update_check(&command)
+    };
     let result = dispatch(command).await;
     updater::finalize(pending, std::time::Duration::from_millis(1500)).await;
     result
@@ -1191,7 +1201,57 @@ fn exit_status(result: Result<()>, status: RunStatus, left_pr: bool) -> Result<(
     })
 }
 
+fn consultation_scope() -> bool {
+    matches!(
+        std::env::var("MAGI_TURN_SCOPE").as_deref(),
+        Ok("consultation-control" | "consultation-investigation")
+    )
+}
+
+fn consultation_command_allowed(command: &Command, investigation: bool) -> bool {
+    match command {
+        Command::Task {
+            command: TaskCmd::List { .. } | TaskCmd::Show { .. },
+            ..
+        }
+        | Command::List { .. }
+        | Command::Show { .. }
+        | Command::Stats { .. } => true,
+        Command::Task {
+            command:
+                TaskCmd::Add { .. }
+                | TaskCmd::Hold { .. }
+                | TaskCmd::Release { .. }
+                | TaskCmd::Done { .. }
+                | TaskCmd::Priority { .. },
+            ..
+        } => !investigation,
+        Command::Answer {
+            say,
+            ask_chat,
+            reply,
+            reply_other,
+            ..
+        } => {
+            say.is_none()
+                && !ask_chat
+                && (!investigation || (reply.is_none() && reply_other.is_none()))
+        }
+        _ => false,
+    }
+}
+
 async fn dispatch(command: Command) -> Result<()> {
+    if consultation_scope()
+        && !consultation_command_allowed(
+            &command,
+            std::env::var("MAGI_TURN_SCOPE").as_deref() == Ok("consultation-investigation"),
+        )
+    {
+        bail!(
+            "command excluded by this invocation's consultation scope; only supported diagnostics, evidenced task operations and magi answer are available"
+        );
+    }
     match command {
         Command::Run {
             command,
@@ -1718,9 +1778,22 @@ async fn dispatch(command: Command) -> Result<()> {
             ask_chat,
             list,
             recovery_consent,
-        } => answer_cmd(id, reply, quote, say, ask_chat, list, recovery_consent).await,
+            reply_other,
+        } => {
+            answer_cmd(AnswerArgs {
+                id,
+                reply,
+                quote,
+                say,
+                ask_chat,
+                list,
+                recovery_consent,
+                reply_other,
+            })
+            .await
+        }
 
-        Command::Task { command } => task_cmd(command).await,
+        Command::Task { command, quote } => task_cmd(command, quote).await,
 
         Command::Talk { command } => match command {
             TalkCmd::Post { talk_id, message } => talk_post(&talk_id, &message),
@@ -2632,7 +2705,7 @@ fn resolved_before_the_wait_even_starts(q: &ask::Question) -> Result<Option<Stri
 
 /// `magi answer`: reply or ask back from the terminal, so the phone is a
 /// convenience and never the only way to unblock a run.
-async fn answer_cmd(
+struct AnswerArgs {
     id: Option<String>,
     reply: Option<String>,
     quote: Option<String>,
@@ -2640,7 +2713,20 @@ async fn answer_cmd(
     ask_chat: bool,
     list: bool,
     recovery_consent: Option<String>,
-) -> Result<()> {
+    reply_other: Option<String>,
+}
+
+async fn answer_cmd(args: AnswerArgs) -> Result<()> {
+    let AnswerArgs {
+        id,
+        reply,
+        quote,
+        say,
+        ask_chat,
+        list,
+        recovery_consent,
+        reply_other,
+    } = args;
     let store = ask::Questions::open();
     let open: Vec<ask::Question> = store
         .list()
@@ -2648,7 +2734,9 @@ async fn answer_cmd(
         .filter(|q| q.status.open())
         .collect();
 
-    if list || (id.is_none() && reply.is_none() && say.is_none() && !ask_chat) {
+    if list
+        || (id.is_none() && reply.is_none() && reply_other.is_none() && say.is_none() && !ask_chat)
+    {
         if open.is_empty() {
             println!("nothing is waiting on you");
             return Ok(());
@@ -2688,6 +2776,25 @@ async fn answer_cmd(
             .context("nothing is waiting on you")?,
     };
 
+    if let Some(text) = reply_other {
+        let (run, node) = agent_env().context("--reply-other requires the consulted chat seat")?;
+        if node != magi::queue::CHAT_NODE {
+            bail!("--reply-other requires the consulted chat seat");
+        }
+        let talks = magi::talk::Talks::open();
+        // Never wait on the evidence lock while holding a question lock.
+        let _guard = talks.answer_guard()?;
+        let talk = talks.get(&run)?;
+        store.update(&q.id, |r| {
+            magi::consult::record_other(r, &talk, &text, quote.as_deref())
+        })?;
+        println!(
+            "consultation ended for {}; decision recorded as a note. Question remains open and its waiter remains held; no choice action executed.",
+            q.short()
+        );
+        return Ok(());
+    }
+
     if ask_chat {
         let talks = magi::talk::Talks::open();
         let tasks = Queue::open().list();
@@ -2725,7 +2832,7 @@ async fn answer_cmd(
         return Ok(());
     }
 
-    if reply.is_none() && !q.status.open() {
+    if reply.is_none() && (!q.status.open() || q.consult_outcome.is_some()) {
         // Nothing left to answer: show what was decided and what the deputy
         // reported beside it.
         print_question_record(&q);
@@ -2831,6 +2938,10 @@ async fn answer_cmd(
 fn print_question_record(q: &ask::Question) {
     println!("{}  {}", q.short(), q.summary);
     println!("      status: {}", q.status.as_str());
+    if let Some(outcome) = &q.consult_outcome {
+        println!("      consultation ended: {}", outcome.text);
+        println!("      note only: question and waiter unchanged; no choice action executed");
+    }
     if let Some(answer) = &q.answer {
         let (kind, text) = match answer {
             ask::Answer::Choice(text) => ("chosen", text),
@@ -2891,8 +3002,8 @@ async fn refuse_duplicates(
     Ok(())
 }
 
-async fn task_cmd(command: TaskCmd) -> Result<()> {
-    task_cmd_on(command, Queue::open()).await
+async fn task_cmd(command: TaskCmd, quote: Option<String>) -> Result<()> {
+    task_cmd_with_quote(command, Queue::open(), quote.as_deref()).await
 }
 
 /// [`task_cmd`], against an explicit queue rather than the operator's own -
@@ -2900,7 +3011,74 @@ async fn task_cmd(command: TaskCmd) -> Result<()> {
 /// `Queue::open` reads, which only the first caller in the binary may do (see
 /// `run::set_home`'s doc and `run_rm_cmd_guards_and_removes`, the test that
 /// already claims that spot).
+#[cfg(test)]
 async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
+    task_cmd_with_quote(command, q, None).await
+}
+
+async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) -> Result<()> {
+    let talks = magi::talk::Talks::open();
+    let questions = ask::Questions::open();
+    let seat = agent_env();
+    let talk = seat
+        .as_ref()
+        .filter(|(_, node)| node == magi::queue::CHAT_NODE)
+        .map(|(run, _)| talks.get(run))
+        .transpose()?;
+    // Capture the invocation context before any operation can end consultation.
+    let restricted = consultation_scope()
+        || talk
+            .as_ref()
+            .is_some_and(|t| magi::consult::pending_consults(&questions, &t.id));
+    if restricted
+        && !seat
+            .as_ref()
+            .is_some_and(|(_, node)| node == magi::queue::CHAT_NODE)
+    {
+        bail!("consultation task operations require the standing chat seat");
+    }
+    let _evidence = if restricted {
+        Some(talks.answer_guard()?)
+    } else {
+        None
+    };
+    let talk = if restricted {
+        Some(
+            talks.get(
+                &seat
+                    .as_ref()
+                    .context("consultation requires a chat seat")?
+                    .0,
+            )?,
+        )
+    } else {
+        talk
+    };
+    let authorize = |op: magi::consult::TaskOperation| -> Result<()> {
+        if restricted {
+            magi::consult::authorize_task_operation(
+                &questions,
+                talk.as_ref().context("missing chat")?,
+                &op,
+                quote,
+            )?;
+        }
+        Ok(())
+    };
+    if restricted
+        && !matches!(
+            &command,
+            TaskCmd::Add { .. }
+                | TaskCmd::Release { .. }
+                | TaskCmd::Hold { .. }
+                | TaskCmd::Done { .. }
+                | TaskCmd::Priority { .. }
+                | TaskCmd::List { .. }
+                | TaskCmd::Show { .. }
+        )
+    {
+        bail!("task operation is excluded during consultation");
+    }
     match command {
         TaskCmd::Add {
             instruction,
@@ -2917,6 +3095,29 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             json,
             implementers,
         } => {
+            if restricted {
+                let t = talk.as_ref().context("missing chat")?;
+                if instruction.is_empty()
+                    || file.is_some()
+                    || issue.is_some()
+                    || title.is_some()
+                    || priority != 0
+                    || hold.is_some()
+                    || urgent
+                    || !attach.is_empty()
+                    || force
+                    || implementers.is_some()
+                    || std::fs::canonicalize(&repo)? != std::fs::canonicalize(&t.repo)?
+                {
+                    bail!(
+                        "consultation task add supports positional text, --solo and the conversation repository only; other execution options need an ordinary turn"
+                    );
+                }
+                authorize(magi::consult::TaskOperation::Add {
+                    instruction: instruction.join(" "),
+                    solo,
+                })?;
+            }
             if let Some(why) = mistyped_command(
                 "magi task add",
                 &instruction,
@@ -3144,6 +3345,10 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
 
         TaskCmd::Hold { id, reason } => {
             let resolved = q.resolve_id(&id)?;
+            authorize(magi::consult::TaskOperation::Hold {
+                task: resolved.clone(),
+                reason: reason.join(" "),
+            })?;
             let _claim = q
                 .claim(&resolved)
                 .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
@@ -3185,6 +3390,10 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
 
         TaskCmd::Priority { id, priority } => {
             let resolved = q.resolve_id(&id)?;
+            authorize(magi::consult::TaskOperation::Priority {
+                task: resolved.clone(),
+                priority,
+            })?;
             // Claimed the same way the phone's edit routes are: a `.lock`
             // means a daemon owns this task's file right now, and a write
             // from here would be lost under its next save - or worse, land
@@ -3273,7 +3482,14 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
         }
 
         TaskCmd::Done { id } => {
-            let mut t = q.get(&id)?;
+            let resolved = q.resolve_id(&id)?;
+            authorize(magi::consult::TaskOperation::Done {
+                task: resolved.clone(),
+            })?;
+            let _claim = q
+                .claim(&resolved)
+                .context("task is claimed by a running daemon")?;
+            let mut t = q.get(&resolved)?;
             t.succeed();
             // Closing a task by hand (a manual GitHub merge, say) is just as
             // much a finished story as the loop's own `Merged`/`Ready` path -
@@ -3286,6 +3502,9 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
 
         TaskCmd::Release { id } => {
             let resolved = q.resolve_id(&id)?;
+            authorize(magi::consult::TaskOperation::Release {
+                task: resolved.clone(),
+            })?;
             let _claim = q
                 .claim(&resolved)
                 .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
@@ -5176,7 +5395,8 @@ mod tests {
         assert!(matches!(
             parsed.command,
             Some(Command::Task {
-                command: TaskCmd::RecoverPr { .. }
+                command: TaskCmd::RecoverPr { .. },
+                ..
             })
         ));
         assert!(
@@ -5206,6 +5426,7 @@ mod tests {
         match done.command {
             Some(Command::Task {
                 command: TaskCmd::Done { id },
+                ..
             }) => assert_eq!(id, "199c"),
             other => panic!("expected TaskCmd::Done, got {other:?}"),
         }
@@ -5214,7 +5435,8 @@ mod tests {
         assert!(matches!(
             released.command,
             Some(Command::Task {
-                command: TaskCmd::Release { .. }
+                command: TaskCmd::Release { .. },
+                ..
             })
         ));
 
@@ -5239,6 +5461,7 @@ mod tests {
         match solo.command {
             Some(Command::Task {
                 command: TaskCmd::Add { solo, .. },
+                ..
             }) => assert!(solo),
             other => panic!("expected TaskCmd::Add, got {other:?}"),
         }
@@ -5247,6 +5470,7 @@ mod tests {
         match plain.command {
             Some(Command::Task {
                 command: TaskCmd::Add { solo, .. },
+                ..
             }) => assert!(!solo, "omitting --solo must not turn it on"),
             other => panic!("expected TaskCmd::Add, got {other:?}"),
         }
@@ -5261,6 +5485,7 @@ mod tests {
         match cli.command {
             Some(Command::Task {
                 command: TaskCmd::Add { attach, .. },
+                ..
             }) => assert_eq!(attach, [PathBuf::from("a.png"), PathBuf::from("b.png")]),
             other => panic!("expected TaskCmd::Add, got {other:?}"),
         }
@@ -5269,6 +5494,7 @@ mod tests {
         match cli.command {
             Some(Command::Task {
                 command: TaskCmd::Edit { attach, .. },
+                ..
             }) => assert_eq!(attach, [PathBuf::from("a.png")]),
             other => panic!("expected TaskCmd::Edit, got {other:?}"),
         }
@@ -5345,6 +5571,7 @@ mod tests {
         {
             Some(Command::Task {
                 command: TaskCmd::Implementers { id, count },
+                ..
             }) => {
                 assert_eq!(id, "abcd");
                 assert_eq!(count, 1);
@@ -5428,7 +5655,7 @@ mod tests {
                     args.push("--clear");
                 }
                 let cli = Cli::try_parse_from(args).unwrap();
-                let Some(Command::Task { command }) = cli.command else {
+                let Some(Command::Task { command, .. }) = cli.command else {
                     panic!("task command")
                 };
                 task_cmd_on(command, q.clone()).await.unwrap();
@@ -5487,6 +5714,7 @@ mod tests {
         match urgent.command {
             Some(Command::Task {
                 command: TaskCmd::Add { urgent, .. },
+                ..
             }) => assert!(urgent),
             other => panic!("expected TaskCmd::Add, got {other:?}"),
         }
@@ -5495,6 +5723,7 @@ mod tests {
         match plain.command {
             Some(Command::Task {
                 command: TaskCmd::Add { urgent, .. },
+                ..
             }) => assert!(!urgent, "omitting --urgent must not turn it on"),
             other => panic!("expected TaskCmd::Add, got {other:?}"),
         }
@@ -6159,6 +6388,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
         match with_reason.command {
             Some(Command::Task {
                 command: TaskCmd::Hold { id, reason },
+                ..
             }) => {
                 assert_eq!(id, "199c");
                 assert_eq!(reason, vec!["waiting", "on", "3ed9"]);
@@ -6170,6 +6400,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
         match bare.command {
             Some(Command::Task {
                 command: TaskCmd::Hold { id, reason },
+                ..
             }) => {
                 assert_eq!(id, "199c");
                 assert!(reason.is_empty(), "a bare hold gives no reason");
@@ -6184,6 +6415,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
         match bare.command {
             Some(Command::Task {
                 command: TaskCmd::Triage { config },
+                ..
             }) => assert!(config.is_none()),
             other => panic!("expected TaskCmd::Triage, got {other:?}"),
         }
@@ -6193,6 +6425,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
         match with_config.command {
             Some(Command::Task {
                 command: TaskCmd::Triage { config },
+                ..
             }) => assert_eq!(config, Some(PathBuf::from("custom.toml"))),
             other => panic!("expected TaskCmd::Triage, got {other:?}"),
         }
@@ -6204,6 +6437,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
         match parsed.command {
             Some(Command::Task {
                 command: TaskCmd::Priority { id, priority },
+                ..
             }) => {
                 assert_eq!(id, "199c");
                 assert_eq!(priority, -3);
@@ -6715,6 +6949,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
                             instruction,
                             ..
                         },
+                    ..
                 }) => {
                     assert_eq!(implementers, Some(2));
                     assert_eq!(instruction, vec!["some", "text"]);

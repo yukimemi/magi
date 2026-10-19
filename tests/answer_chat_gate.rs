@@ -2232,3 +2232,328 @@ fn recovery_quote_whitespace_still_requires_the_exact_complete_owner_send() {
         assert!(String::from_utf8_lossy(&out.stderr).contains("stale persisted evidence"));
     }
 }
+
+fn consult_owner(f: &Fixture, words: &str) {
+    let talks = Talks::at(f.tmp.path().join("talks"));
+    let mut t = talks.get(&f.talk_id).unwrap();
+    t.pending.clear();
+    t.pending_messages.clear();
+    t.pending_breaks = None;
+    t.turns.push(talk::Turn {
+        sender: Some(talk::Sender::Operator),
+        breaks: Some(Vec::new()),
+        messages: vec![talk::Message {
+            sender: Some(talk::Sender::Operator),
+            display: None,
+            body: words.into(),
+            attachments: vec![],
+            reply: None,
+        }],
+        posted_by: None,
+        who: talk::Who::Operator,
+        body: words.into(),
+        at: Timestamp::now(),
+        attachments: vec![],
+        usage: None,
+    });
+    talks.put(&mut t).unwrap();
+}
+
+fn consult_command(f: &Fixture, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_magi"))
+        .args(args)
+        .current_dir(f.tmp.path())
+        .env("MAGI_HOME", f.tmp.path())
+        .env("MAGI_CONFIG_DIR", f.tmp.path().join("config"))
+        .env("MAGI_RUN", &f.talk_id)
+        .env("MAGI_NODE", magi::queue::CHAT_NODE)
+        .env("MAGI_TURN_SCOPE", "consultation-control")
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn consult_task_add_binds_current_owner_operation_and_execution_arguments() {
+    use magi::consult::TaskOperation;
+    let f = fixture();
+    assert!(
+        Command::new("git")
+            .arg("init")
+            .current_dir(f.tmp.path())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let op = TaskOperation::Add {
+        instruction: "Reimplement from scratch".into(),
+        solo: true,
+    };
+    let words = op.instruction();
+    consult_owner(&f, &words);
+    let queue = magi::queue::Queue::at(f.tmp.path().join("queue"));
+    for args in [
+        vec!["task", "add", "--solo", "Reimplement from scratch"],
+        vec![
+            "task",
+            "add",
+            "--quote",
+            &words,
+            "--solo",
+            "Port the old code",
+        ],
+        vec!["task", "add", "--quote", &words, "Reimplement from scratch"],
+        vec![
+            "task",
+            "add",
+            "--quote",
+            &words,
+            "--solo",
+            "--urgent",
+            "Reimplement from scratch",
+        ],
+    ] {
+        let out = consult_command(&f, &args);
+        assert!(
+            !out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(queue.list().is_empty());
+    }
+    let out = consult_command(
+        &f,
+        &[
+            "task",
+            "add",
+            "--quote",
+            &words,
+            "--solo",
+            "Reimplement from scratch",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let tasks = queue.list();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].instruction, "Reimplement from scratch");
+    assert!(tasks[0].solo);
+    assert_eq!(tasks[0].chat_talk(), Some(f.talk_id.as_str()));
+    consult_owner(&f, "Wait; do not file that task");
+    let out = consult_command(
+        &f,
+        &[
+            "task",
+            "add",
+            "--quote",
+            &words,
+            "--solo",
+            "Reimplement from scratch",
+        ],
+    );
+    assert!(!out.status.success());
+    assert_eq!(queue.list().len(), 1);
+}
+
+#[test]
+fn consult_task_evidence_rejects_wrong_target_predelivery_queued_and_generated_sends() {
+    use magi::consult::TaskOperation;
+    let f = fixture();
+    let mut task = magi::queue::Task::new(
+        "old work".into(),
+        "old work".into(),
+        f.tmp.path().into(),
+        magi::queue::Source::Human,
+    );
+    task.hold_manual(None);
+    let queue = magi::queue::Queue::at(f.tmp.path().join("queue"));
+    queue.put(&mut task).unwrap();
+    let words = TaskOperation::Release {
+        task: task.id.clone(),
+    }
+    .instruction();
+    consult_owner(&f, &words);
+    let out = consult_command(&f, &["task", "priority", &task.id, "5", "--quote", &words]);
+    assert!(!out.status.success());
+    let talks = Talks::at(f.tmp.path().join("talks"));
+    let mut t = talks.get(&f.talk_id).unwrap();
+    let original = t.clone();
+    t.pending = "Stop".into();
+    t.pending_messages.clear();
+    talks.put(&mut t).unwrap();
+    assert!(
+        !consult_command(&f, &["task", "release", &task.id, "--quote", &words])
+            .status
+            .success()
+    );
+    t = original.clone();
+    t.turns.last_mut().unwrap().messages[0].sender = Some(talk::Sender::Magi);
+    t.turns.last_mut().unwrap().sender = Some(talk::Sender::Magi);
+    talks.put(&mut t).unwrap();
+    assert!(
+        !consult_command(&f, &["task", "release", &task.id, "--quote", &words])
+            .status
+            .success()
+    );
+    t = original.clone();
+    t.turns.last_mut().unwrap().at = "2000-01-01T00:00:00Z".parse().unwrap();
+    talks.put(&mut t).unwrap();
+    assert!(
+        !consult_command(&f, &["task", "release", &task.id, "--quote", &words])
+            .status
+            .success()
+    );
+    talks.put(&mut original.clone()).unwrap();
+    let wrong = TaskOperation::Release {
+        task: "different-task".into(),
+    }
+    .instruction();
+    consult_owner(&f, &wrong);
+    assert!(
+        !consult_command(&f, &["task", "release", &task.id, "--quote", &wrong])
+            .status
+            .success()
+    );
+    consult_owner(&f, &words);
+    let out = consult_command(&f, &["task", "release", &task.id, "--quote", &words]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(queue.get(&task.id).unwrap().status.runnable());
+}
+
+#[test]
+fn consult_other_is_a_note_without_answer_or_choice_effect_and_invocation_stays_restricted() {
+    let f = fixture();
+    let words = "Reimplement from scratch instead of porting";
+    consult_owner(&f, words);
+    assert!(
+        !consult_command(
+            &f,
+            &[
+                "answer",
+                &f.qid,
+                "--reply-other",
+                words,
+                "--quote",
+                "old words"
+            ]
+        )
+        .status
+        .success()
+    );
+    let out = consult_command(
+        &f,
+        &["answer", &f.qid, "--reply-other", words, "--quote", words],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("waiter remains held"));
+    let q = f.questions.get(&f.qid).unwrap();
+    assert!(q.status.open());
+    assert!(q.answer.is_none());
+    assert_eq!(q.consult_outcome.unwrap().text, words);
+    assert!(!magi::consult::pending_consults(&f.questions, &f.talk_id));
+    for args in [
+        vec!["task", "rm", "anything"],
+        vec!["run", "rm", "anything"],
+        vec!["task", "urgent", "anything"],
+    ] {
+        let out = consult_command(&f, &args);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("consultation scope"));
+    }
+    let op = magi::consult::TaskOperation::Release {
+        task: "anything".into(),
+    }
+    .instruction();
+    consult_owner(&f, &op);
+    assert!(
+        !consult_command(&f, &["task", "release", "anything", "--quote", &op])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn consult_task_hold_priority_and_done_keep_queue_claims_and_exact_run_grants() {
+    use magi::consult::TaskOperation;
+    let f = fixture();
+    let queue = magi::queue::Queue::at(f.tmp.path().join("queue"));
+    let mut task = magi::queue::Task::new(
+        "old work".into(),
+        "old work".into(),
+        f.tmp.path().into(),
+        magi::queue::Source::Human,
+    );
+    task.runs = vec!["20260902-000000-abcd".into(), "20260902-000000-cdef".into()];
+    for run in &task.runs {
+        std::fs::create_dir_all(f.tmp.path().join("runs").join(run)).unwrap();
+    }
+    queue.put(&mut task).unwrap();
+    for (op, args) in [
+        (
+            TaskOperation::Hold {
+                task: task.id.clone(),
+                reason: "Wait for replacement".into(),
+            },
+            vec!["task", "hold", &task.id, "Wait for replacement"],
+        ),
+        (
+            TaskOperation::Priority {
+                task: task.id.clone(),
+                priority: 5,
+            },
+            vec!["task", "priority", &task.id, "5"],
+        ),
+        (
+            TaskOperation::Done {
+                task: task.id.clone(),
+            },
+            vec!["task", "done", &task.id],
+        ),
+    ] {
+        let words = op.instruction();
+        consult_owner(&f, &words);
+        let claim = queue.claim(&task.id).unwrap();
+        let mut quoted_args = vec!["task", "--quote", &words];
+        quoted_args.extend_from_slice(&args[1..]);
+        let args = quoted_args;
+        assert!(!consult_command(&f, &args).status.success());
+        drop(claim);
+        let talks = Talks::at(f.tmp.path().join("talks"));
+        let t = talks.get(&f.talk_id).unwrap();
+        let roots = magi::consult::answer_write_roots(&f.questions, &talks, &t);
+        assert!(roots.contains(&queue.root().to_path_buf()));
+        assert!(!roots.contains(&f.tmp.path().to_path_buf()));
+        assert!(!roots.contains(&f.tmp.path().join("runs")));
+        for run in &task.runs {
+            assert_eq!(
+                roots.contains(&f.tmp.path().join("runs").join(run)),
+                matches!(op, TaskOperation::Done { .. })
+            );
+        }
+        let out = consult_command(&f, &args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let saved = queue.get(&task.id).unwrap();
+        match op {
+            TaskOperation::Hold { .. } => assert!(saved.operator_held()),
+            TaskOperation::Priority { .. } => assert_eq!(saved.priority, 5),
+            TaskOperation::Done { .. } => assert_eq!(saved.status, magi::queue::TaskStatus::Done),
+            _ => unreachable!(),
+        }
+    }
+    assert!(f.questions.get(&f.qid).unwrap().answer.is_none());
+}
