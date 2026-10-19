@@ -964,6 +964,9 @@ mod tests {
         sh(d, &["init", "-q", "-b", "main"]);
         sh(d, &["config", "user.name", "t"]);
         sh(d, &["config", "user.email", "t@example.com"]);
+        // Keep Git checkouts consistent with this fixture's LF byte strings,
+        // even when the host enables automatic CRLF conversion.
+        sh(d, &["config", "core.autocrlf", "false"]);
         let body = "old\n1\n2\n3\n4\n5\n6\n7\n8\n9\nend\n";
         std::fs::write(d.join("f.txt"), body).unwrap();
         std::fs::write(d.join("conflict.txt"), "old\n").unwrap();
