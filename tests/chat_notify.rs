@@ -981,7 +981,13 @@ async fn question_targets_control_automatic_turns_independently_of_labels() {
         q.answer(if choices.is_empty() {
             Answer::Text("keep held".into())
         } else {
-            Answer::Choice("no".into())
+            // Unmapped conductor labels become an executable hold. Decision
+            // identity still comes from the target, independently of labels.
+            assert_eq!(q.choices.len(), 1);
+            let label = q.choices[0].clone();
+            assert_eq!(q.actions.get(&label), Some(&magi::ask::ChoiceAction::Hold));
+            assert!(!choices.contains(&label));
+            Answer::Choice(label)
         })
         .unwrap();
         questions.put(&mut q).unwrap();
@@ -1099,7 +1105,13 @@ async fn different_settings_on_one_task_require_distinct_decisions_and_chat_turn
     let mut talk = w.talks.get(&w.talk_id).unwrap();
     talk::clear_pending(&mut talk, &w.talks).unwrap();
     let mut q = questions.list().pop().unwrap();
-    q.answer(Answer::Choice("SQLite".into())).unwrap();
+    // A setting target identifies the decision; it does not implement a
+    // configuration edit. Only the safe hold can be offered without an action.
+    assert_eq!(q.choices.len(), 1);
+    let label = q.choices[0].clone();
+    assert_eq!(q.actions.get(&label), Some(&magi::ask::ChoiceAction::Hold));
+    assert!(!d.choices.contains(&label));
+    q.answer(Answer::Choice(label)).unwrap();
     questions.put(&mut q).unwrap();
     w.queue
         .modify(&t.id, |task| {
