@@ -10481,7 +10481,7 @@ async fn run_commands(
         return (Vec::new(), Vec::new());
     }
     let mut out = Vec::new();
-    let timed_out_pids = Vec::new();
+    let mut timed_out_pids = Vec::new();
     let total = commands.len();
     for (idx, command) in commands.iter().enumerate() {
         state.task_command(task, node, attempt, command, idx + 1, total, timeout);
@@ -10527,6 +10527,7 @@ async fn run_commands(
         let spawned = cmd.spawn();
         let (code, body) = match spawned {
             Ok(child) => {
+                let pid = child.id();
                 let mut running = crate::seat_process::Running::with_outputs(child, None, outputs);
                 let (stdout, out_reader) = agent::drain(running.child().stdout.take());
                 let (stderr, err_reader) = agent::drain(running.child().stderr.take());
@@ -10541,9 +10542,32 @@ async fn run_commands(
                         pressure = Some(reason); None
                     }
                 };
-                let code = match status {
-                    Some(Ok(Ok(status))) => status.code(),
-                    _ => None,
+                let (code, failure) = match status {
+                    Some(Ok(Ok(status))) => (
+                        status.code(),
+                        status
+                            .code()
+                            .is_none()
+                            .then(|| format!("command terminated: {status}")),
+                    ),
+                    Some(Ok(Err(error))) => {
+                        (None, Some(format!("failed waiting for command: {error}")))
+                    }
+                    Some(Err(_)) => {
+                        // Leased cleanup confirms process-tree death itself.
+                        // Unleased commands still need the caller's PID check
+                        // after kill-on-drop, before releasing cache ownership.
+                        if !running.coordinated()
+                            && let Some(pid) = pid
+                        {
+                            timed_out_pids.push(pid);
+                        }
+                        (
+                            None,
+                            Some(format!("timed out after {}s", timeout.as_secs())),
+                        )
+                    }
+                    None => (None, None),
                 };
                 running.finish().await;
                 if let Some(reason) = pressure {
@@ -10564,8 +10588,9 @@ async fn run_commands(
                 }
                 let mut body = agent::collect(&stdout, out_reader, Duration::from_secs(2)).await;
                 body.push_str(&agent::collect(&stderr, err_reader, Duration::from_secs(2)).await);
-                if code.is_none() {
-                    body.push_str("\ncommand failed or timed out; process tree stopped");
+                if let Some(failure) = failure {
+                    body.push('\n');
+                    body.push_str(&failure);
                 }
                 (code, body)
             }
@@ -15219,6 +15244,56 @@ mod tests {
             RunStatus::Blocked,
             "must not read as resource-blocked on a lease it never asked for"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verification_commands_distinguish_timeouts_signals_and_exit_codes() {
+        crate::run::pin_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.disk.min_free_bytes = 0;
+        let mut state = RunState::new(
+            tmp.path().to_owned(),
+            "main".into(),
+            "base".into(),
+            "verification evidence".into(),
+            config,
+        );
+        let (outcomes, pids) = run_commands(
+            &mut state,
+            "gate",
+            "gate",
+            1,
+            &["sh".into(), "-c".into()],
+            &[
+                "printf before-timeout; exec sleep 30".into(),
+                "kill -TERM $$".into(),
+                "exit 7".into(),
+                "printf success".into(),
+            ],
+            tmp.path(),
+            Duration::from_secs(1),
+        )
+        .await;
+        wait_for_timed_out_children_to_die(&pids).await;
+        assert_eq!(
+            pids.len(),
+            1,
+            "unleased timeout retains its death-check PID"
+        );
+        assert_eq!(outcomes.len(), 4);
+        assert_eq!(outcomes[0].code, None);
+        assert!(outcomes[0].output_tail.contains("before-timeout"));
+        assert!(outcomes[0].output_tail.contains("timed out after 1s"));
+        assert_eq!(outcomes[1].code, None);
+        assert!(outcomes[1].output_tail.contains("command terminated:"));
+        assert!(!outcomes[1].output_tail.contains("timed out"));
+        assert_eq!(outcomes[2].code, Some(7));
+        assert!(!outcomes[2].output_tail.contains("timed out"));
+        assert_eq!(outcomes[3].code, Some(0));
+        assert_eq!(outcomes[3].output_tail, "success");
+        assert!(outcomes.iter().all(|outcome| !outcome.resource_blocked));
     }
 
     /// The addendum's second gap: a `verify.gate` command running for real

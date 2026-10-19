@@ -606,12 +606,27 @@ async fn an_operator_held_task_refuses_a_verbatim_merge_settle() {
     task.runs.push(land.run.clone());
     task.hold_manual(Some("operator says wait".to_owned()));
     queue.put(&mut task).unwrap();
+    assert!(queue.get(&task.id).unwrap().operator_held());
+    // Verify that the nested CLI can read the fixture too; a mismatched
+    // binary or home must not look like a failure of the hold policy.
+    let inspect = format!("MAGI task show {} > /dev/null", task.id);
     script(&s, &[
+        &inspect,
         "MAGI ask --settle \"$qid\" --choice merge --quote 'マージしていいよ'",
     ]);
 
     turn(&mut deputies(&s, 2)).await;
 
+    let statuses = std::fs::read_to_string(s.fx.repo.join("deputy-action-status")).unwrap();
+    let output = std::fs::read_to_string(s.fx.repo.join("deputy-action-output")).unwrap();
+    let statuses: Vec<_> = statuses.lines().collect();
+    assert_eq!(statuses.len(), 2, "{output}");
+    assert_eq!(statuses[0], "0", "the CLI must read the held task: {output}");
+    assert_ne!(statuses[1], "0", "the CLI must refuse settlement: {output}");
+    assert!(output.contains("held by the operator"), "{output}");
+    let held = queue.get(&task.id).unwrap();
+    assert!(held.operator_held(), "settlement must preserve the operator hold");
+    assert_eq!(held.runs, task.runs);
     let q = s.store.get(&land.id).unwrap();
     assert_eq!(q.status, QuestionStatus::Open, "{:?}", q.thread);
     assert!(q.answer.is_none());
