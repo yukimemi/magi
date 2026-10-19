@@ -20,11 +20,17 @@ the cap, but does not override grace, ownership or the per-pass budget.
 Only plain, canonical, registered worktrees are eligible. A legacy `target` must
 be ignored, contain no tracked files, carry Cargo's cache tag and rustc identity,
 and contain only recognized Cargo root entries (`debug`, `release`, the tag and
-identity). Symlinks and unknown entries are retained. Other ignored directories,
-custom target locations and cross-compilation layouts are deliberately not
-adopted automatically. Adoption/deletion is recorded in the run's
-`build-outputs.json`. This is permission to evict that generated Cargo tree,
-not permission to delete arbitrary ignored files elsewhere in the checkout.
+identity). These checks do not authorize recursive deletion. Cleanup removes only
+regular artifact files declared as outputs in rustc dep-info (`.d`) records in
+`debug`, `release` or their `deps` directories, with matching artifact names and
+recognized binary/library extensions and compiler-artifact signatures. Text that
+replaced a stale output remains. Dependency inputs never authorize deletion.
+Canonical paths and plain-file checks exclude symlinks and traversal. Unknown
+files, including notes anywhere under a profile, build-script outputs, incremental
+caches and dep-info metadata remain. Unsupported or missing dep-info retains the
+outputs for inspection. Custom locations and cross-compilation layouts are not
+adopted automatically. The exact deletion list is recorded before removal in the
+run's `build-outputs.json`; a Cargo tag alone never owns all ignored contents.
 
 Deletion requires confirmed driver death, no daemon claim, the public-owner lock,
 the execution lease, an exclusive worktree-output lease and the Cargo profile
@@ -43,7 +49,15 @@ leases until the CLI and discovered descendants terminate. These protections do
 not depend on optional repository coordination configuration. Automatic output
 reclamation is disabled outside Unix process containment.
 
-Every 30 seconds of daemon polling, cleanup can reclaim inactive targets while
+The sweep runs its filesystem walks, metadata loads and history inspection on a
+blocking worker, keeping the async runtime available for heartbeats and claims.
+Registration inventory is shared per repository within a pass. Logical sizes are
+cached for five minutes in `output-measurements.json`; low free space bypasses
+that cache, and reclaimed outputs invalidate their entry. Disabled output eviction
+does not enumerate or measure targets. Deletion always revalidates registration,
+ownership and current output lengths, regardless of cached inventory size.
+
+Every 30 seconds of daemon polling, cleanup can reclaim inactive artifacts while
 other runs are busy, then attempts shared-cache pruning through its ownership
 protocol. Continued pressure asks active runs to checkpoint and park. Managed
 seat and verification waits also measure their checkout/cache volumes every five
@@ -86,8 +100,15 @@ is not released or completed. No PR is closed and no question is answered.
 `retired_to` prevents execution independently of run status, before any worktree
 is removed. Reports, branch refs and the retirement event remain. Interrupted
 removal can retry its proof and finish; it never revives the obsolete attempt.
-The ordinary fold path also preserves every source still referenced by an
-unfinished queue task; retirement of a proved-empty attempt uses its own proof.
+On ordinary release, resume follows `retired_to` to its recorded authority within
+the task's history, checking repository identity, cycles and resumability. If the
+authority cannot be validated or no longer matches the task's authorized
+instructions, the task is held rather than starting a replacement competition.
+Explicit fresh competitions and selected public-head recovery retain their normal
+precedence. The ordinary fold path preserves every source still referenced by an
+unfinished queue task and reports the task and refusal reason; explicit folds
+return an error and automatic folds log the reason. Retirement of a proved-empty
+attempt uses its own proof.
 The existing `Superseded` status is not used to retire unfinished work because
 it has separate settlement and publication effects. Historical recovery sources
 retained by an earlier explicit recovery stay retained, even if that means a

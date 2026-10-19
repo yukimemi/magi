@@ -126,8 +126,16 @@ async fn worktrees(state: &RunState) -> Result<Vec<PathBuf>> {
     if !plain_dir(&root) {
         return Ok(Vec::new());
     }
-    let root = root.canonicalize()?;
     let list = git::git(&state.repo, &["worktree", "list", "--porcelain"]).await?;
+    registered_worktrees(state, &list)
+}
+
+fn registered_worktrees(state: &RunState, list: &str) -> Result<Vec<PathBuf>> {
+    let root = state.worktree_root();
+    if !plain_dir(&root) {
+        return Ok(Vec::new());
+    }
+    let root = root.canonicalize()?;
     let mut paths = Vec::new();
     for path in list.lines().filter_map(|l| l.strip_prefix("worktree ")) {
         let path = PathBuf::from(path);
@@ -143,7 +151,7 @@ async fn worktrees(state: &RunState) -> Result<Vec<PathBuf>> {
 }
 
 /// Recognize Cargo's generated directory, never merely an ignored directory.
-/// Unknown top-level entries and any symlink make legacy adoption fail closed.
+/// Unknown root entries and symlinked cache identity/profile paths fail closed.
 async fn cargo_target(worktree: &Path) -> Result<PathBuf> {
     let target = worktree.join("target");
     ensure!(plain_dir(&target), "target absent or not a plain directory");
@@ -160,6 +168,13 @@ async fn cargo_target(worktree: &Path) -> Result<PathBuf> {
             .ok(),
         "target is not ignored"
     );
+    for name in ["CACHEDIR.TAG", ".rustc_info.json"] {
+        let path = target.join(name);
+        ensure!(
+            std::fs::symlink_metadata(&path)?.is_file() && path.canonicalize()? == path,
+            "cache identity is not a plain file"
+        );
+    }
     let tag = std::fs::read_to_string(target.join("CACHEDIR.TAG"))?;
     ensure!(
         tag.starts_with("Signature: 8a477f597d28d172789f06886806bc55d"),
@@ -182,23 +197,127 @@ async fn cargo_target(worktree: &Path) -> Result<PathBuf> {
             ),
             "unrecognized target entry {name}"
         );
+        if matches!(name, "debug" | "release") {
+            ensure!(
+                plain_dir(&entry.path()) && entry.path().canonicalize()? == entry.path(),
+                "profile is not a plain directory"
+            );
+        }
     }
-    ensure!(no_symlinks(&target)?, "symlink in build outputs");
     Ok(target)
 }
-fn no_symlinks(path: &Path) -> Result<bool> {
-    let meta = std::fs::symlink_metadata(path)?;
-    if meta.file_type().is_symlink() {
-        return Ok(false);
-    }
-    if meta.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            if !no_symlinks(&entry?.path())? {
-                return Ok(false);
+
+fn artifact_signature(path: &Path) -> Result<bool> {
+    use std::io::Read as _;
+    let mut header = [0; 8];
+    let n = File::open(path)?.read(&mut header)?;
+    let header = &header[..n];
+    Ok(header.starts_with(b"\x7fELF")
+        || header.starts_with(b"!<arch>\n")
+        || header.starts_with(b"rust\0\0\0")
+        || header.starts_with(b"MZ\x90\0")
+        || [
+            [0xfe, 0xed, 0xfa, 0xce],
+            [0xce, 0xfa, 0xed, 0xfe],
+            [0xfe, 0xed, 0xfa, 0xcf],
+            [0xcf, 0xfa, 0xed, 0xfe],
+            [0xca, 0xfe, 0xba, 0xbe],
+            [0xca, 0xfe, 0xba, 0xbf],
+        ]
+        .iter()
+        .any(|magic| header.starts_with(magic)))
+}
+
+/// Legacy tags identify a cache, not ownership of every file inside it.
+/// Only direct rustc outputs named by dep-info may be reclaimed. Build-script
+/// output, incremental caches, unknown files and the manifests themselves stay.
+fn declared_outputs(target: &Path) -> Result<Vec<PathBuf>> {
+    let mut outputs = std::collections::BTreeSet::new();
+    for profile in ["debug", "release"] {
+        for dir in [target.join(profile), target.join(profile).join("deps")] {
+            if !plain_dir(&dir) || dir.canonicalize()? != dir {
+                continue;
+            }
+            for entry in std::fs::read_dir(&dir)? {
+                let path = entry?.path();
+                if path.extension().is_none_or(|ext| ext != "d")
+                    || !std::fs::symlink_metadata(&path)?.is_file()
+                    || std::fs::metadata(&path)?.len() > 1024 * 1024
+                    || path.canonicalize()? != path
+                {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path)?;
+                for line in body.lines() {
+                    let Some((names, dependencies)) = line.split_once(": ") else {
+                        continue;
+                    };
+                    if dependencies.trim().is_empty() {
+                        continue;
+                    }
+                    // Rustc escapes spaces and backslashes in Make paths.
+                    // Unsupported Make syntax fails closed for that record.
+                    let mut words = Vec::new();
+                    let mut word = String::new();
+                    let mut escaped = false;
+                    for c in names.chars() {
+                        if escaped {
+                            word.push(c);
+                            escaped = false;
+                        } else if c == '\\' {
+                            escaped = true;
+                        } else if c.is_whitespace() {
+                            if !word.is_empty() {
+                                words.push(std::mem::take(&mut word));
+                            }
+                        } else {
+                            word.push(c);
+                        }
+                    }
+                    if escaped || word.contains(['$', '%']) {
+                        continue;
+                    }
+                    if !word.is_empty() {
+                        words.push(word);
+                    }
+                    for name in words {
+                        let output = PathBuf::from(name);
+                        let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                        let output_stem = output.file_stem().unwrap_or_default().to_string_lossy();
+                        let artifact_name =
+                            output_stem == stem || output_stem == format!("lib{stem}");
+                        let artifact_kind = output.extension().is_none_or(|ext| {
+                            matches!(
+                                ext.to_str(),
+                                Some(
+                                    "rlib"
+                                        | "rmeta"
+                                        | "so"
+                                        | "dylib"
+                                        | "a"
+                                        | "lib"
+                                        | "dll"
+                                        | "exe"
+                                        | "pdb"
+                                )
+                            )
+                        });
+                        if artifact_name
+                            && artifact_kind
+                            && output.parent() == Some(dir.as_path())
+                            && output.extension().is_none_or(|ext| ext != "d")
+                            && std::fs::symlink_metadata(&output).is_ok_and(|m| m.is_file())
+                            && output.canonicalize().is_ok_and(|p| p == output)
+                            && artifact_signature(&output)?
+                        {
+                            outputs.insert(output);
+                        }
+                    }
+                }
             }
         }
     }
-    Ok(true)
+    Ok(outputs.into_iter().collect())
 }
 
 /// Supplemental exclusion for Cargo builds launched outside the managed seats.
@@ -207,6 +326,10 @@ pub(crate) fn cargo_locks(target: &Path) -> Result<Vec<File>> {
     for profile in ["debug", "release"] {
         let lock = target.join(profile).join(".cargo-lock");
         if lock.exists() {
+            ensure!(
+                std::fs::symlink_metadata(&lock)?.is_file() && lock.canonicalize()? == lock,
+                "Cargo lock is not a plain file"
+            );
             let file = OpenOptions::new().read(true).write(true).open(lock)?;
             crate::pr_head::try_lock_file(&file).context("Cargo build is active")?;
             held.push(file);
@@ -218,6 +341,24 @@ pub(crate) fn cargo_locks(target: &Path) -> Result<Vec<File>> {
 /// All repositories share one cap and one per-pass deletion budget. The report
 /// survives a restart and explains every skipped run/target or failed operation.
 pub(crate) async fn sweep(home: &Path, disk: &crate::config::Disk, now: Timestamp) -> Report {
+    let home = home.to_owned();
+    let disk = disk.clone();
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || runtime.block_on(sweep_inner(&home, &disk, now)))
+        .await
+        .unwrap_or_else(|e| Report {
+            failures: vec![format!("retention worker failed: {e}")],
+            ..Report::default()
+        })
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct Measurement {
+    at: Option<Timestamp>,
+    bytes: u64,
+}
+
+async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) -> Report {
     let mut report = Report {
         checked_at: Some(now),
         limit_bytes: disk.worktree_limit_bytes,
@@ -234,6 +375,14 @@ pub(crate) async fn sweep(home: &Path, disk: &crate::config::Disk, now: Timestam
         return report;
     };
     let mut targets = Vec::new();
+    let mut registrations = std::collections::HashMap::new();
+    let measurements_path = home.join("output-measurements.json");
+    let mut measurements: std::collections::BTreeMap<PathBuf, Measurement> =
+        std::fs::read(&measurements_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+    let mut observed = std::collections::BTreeSet::new();
     let mut ids: Vec<_> = std::fs::read_dir(home.join("runs"))
         .into_iter()
         .flatten()
@@ -254,7 +403,22 @@ pub(crate) async fn sweep(home: &Path, disk: &crate::config::Disk, now: Timestam
                 continue;
             }
         };
-        let paths = match worktrees(&state).await {
+        if disk.worktree_limit_bytes == 0 {
+            continue;
+        }
+        let list = match registrations.entry(state.repo.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                match git::git(&state.repo, &["worktree", "list", "--porcelain"]).await {
+                    Ok(list) => entry.insert(list),
+                    Err(e) => {
+                        report.failures.push(format!("{id}: {e:#}"));
+                        continue;
+                    }
+                }
+            }
+        };
+        let paths = match registered_worktrees(&state, list) {
             Ok(paths) => paths,
             Err(e) => {
                 report.failures.push(format!("{id}: {e:#}"));
@@ -265,7 +429,20 @@ pub(crate) async fn sweep(home: &Path, disk: &crate::config::Disk, now: Timestam
             if !path.join("target").exists() {
                 continue;
             }
-            let size = crate::disk::dir_size(&path.join("target"));
+            let target = path.join("target");
+            observed.insert(target.clone());
+            let pressure =
+                crate::disk::free_bytes(&path).map_or(true, |free| free < disk.min_free_bytes);
+            let measurement = measurements.entry(target).or_default();
+            if pressure
+                || measurement
+                    .at
+                    .is_none_or(|at| crate::clean::due(now, at, 300))
+            {
+                measurement.bytes = crate::disk::dir_size(&path.join("target"));
+                measurement.at = Some(now);
+            }
+            let size = measurement.bytes;
             report.measured_bytes = report.measured_bytes.saturating_add(size);
             targets.push((state.updated_at, id.clone(), path, size));
         }
@@ -307,7 +484,11 @@ pub(crate) async fn sweep(home: &Path, disk: &crate::config::Disk, now: Timestam
             );
             let target = cargo_target(&path).await?;
             let _cargo = cargo_locks(&target)?;
-            let current_size = crate::disk::dir_size(&target);
+            let outputs = declared_outputs(&target)?;
+            ensure!(!outputs.is_empty(), "no dep-info-proven outputs; unknown files retained");
+            let current_size = outputs.iter().try_fold(0u64, |bytes, p| {
+                Ok::<_, std::io::Error>(bytes.saturating_add(std::fs::metadata(p)?.len()))
+            })?;
             ensure!(report.freed_bytes.saturating_add(current_size) <= disk.worktree_reclaim_bytes,
                 "target grew beyond remaining per-pass budget");
             // Record adoption before deletion; interrupted deletion is revalidated
@@ -316,23 +497,33 @@ pub(crate) async fn sweep(home: &Path, disk: &crate::config::Disk, now: Timestam
             std::fs::write(
                 ledger,
                 serde_json::to_vec(
-                    &serde_json::json!({"target":target,"bytes":current_size,"at":now,"action":"reclaim"}),
+                    &serde_json::json!({"target":target,"bytes":current_size,"at":now,"action":"reclaim-declared-outputs","files":outputs}),
                 )?,
             )?;
-            std::fs::remove_dir_all(&target)?;
+            for output in &outputs {
+                std::fs::remove_file(output)?;
+            }
+            measurements.remove(&target);
+            report.retained.push(format!("{id}: unmanifested files and Cargo metadata retained"));
             Ok::<_, anyhow::Error>(current_size)
         }
         .await;
         match result {
             Ok(freed) => {
                 report.freed_bytes = report.freed_bytes.saturating_add(freed);
-                remaining = remaining.saturating_sub(size);
+                remaining = remaining.saturating_sub(freed);
             }
             Err(e) => report.retained.push(format!(
                 "{id}/{}: {e:#}",
                 path.file_name().unwrap_or_default().to_string_lossy()
             )),
         }
+    }
+    measurements.retain(|path, _| observed.contains(path));
+    if let Ok(body) = serde_json::to_vec(&measurements)
+        && let Err(e) = std::fs::write(&measurements_path, body)
+    {
+        report.failures.push(format!("output measurements: {e}"));
     }
     retire_empty(home, disk, now, &mut report).await;
     if !report.failures.is_empty()
@@ -800,7 +991,16 @@ mod tests {
         fn target(wt: &Path) {
             let target = wt.join("target");
             std::fs::create_dir_all(target.join("debug")).unwrap();
-            std::fs::write(target.join("debug/output"), [1; 200]).unwrap();
+            let mut artifact = [1; 200];
+            artifact[..4].copy_from_slice(b"\x7fELF");
+            std::fs::write(target.join("debug/output"), artifact).unwrap();
+            let output = target
+                .join("debug/output")
+                .display()
+                .to_string()
+                .replace('\\', "\\\\")
+                .replace(' ', "\\ ");
+            std::fs::write(target.join("debug/output.d"), format!("{output}: source\n")).unwrap();
             std::fs::write(target.join("debug/.cargo-lock"), "").unwrap();
             std::fs::write(
                 target.join("CACHEDIR.TAG"),
@@ -855,10 +1055,28 @@ mod tests {
         Fx::target(&other.candidates[0].worktree);
         let guard = OutputLease::borrow(&candidate).unwrap().unwrap();
         let out = sweep(&f.home, &Fx::disk(), Fx::now()).await;
-        assert!(candidate.join("target").exists(), "active writer protected");
-        assert!(!state.worktree_root().join("review-1/target").exists());
-        assert!(!state.worktree_root().join("review-2/target").exists());
-        assert!(!other.candidates[0].worktree.join("target").exists());
+        assert!(
+            candidate.join("target/debug/output").exists(),
+            "active writer protected"
+        );
+        assert!(
+            !state
+                .worktree_root()
+                .join("review-1/target/debug/output")
+                .exists()
+        );
+        assert!(
+            !state
+                .worktree_root()
+                .join("review-2/target/debug/output")
+                .exists()
+        );
+        assert!(
+            !other.candidates[0]
+                .worktree
+                .join("target/debug/output")
+                .exists()
+        );
         assert!(out.freed_bytes >= 600);
         drop(guard);
         let out = sweep(&f.home, &Fx::disk(), Fx::now()).await;
@@ -875,6 +1093,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dep_info_reclamation_preserves_unmanifested_nested_files() {
+        let f = Fx::new().await;
+        let state = f.run("cc01", false).await;
+        let wt = &state.candidates[0].worktree;
+        Fx::target(wt);
+        for dir in ["debug", "release", "debug/deps", "debug/build/script/out"] {
+            let dir = wt.join("target").join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("notes.txt"), "user evidence").unwrap();
+        }
+        // A dep-info dependency is an input, never deletion authority.
+        let manifest = wt.join("target/debug/output.d");
+        let output = wt.join("target/debug/output");
+        std::fs::write(
+            &manifest,
+            format!(
+                "{}: {}\n",
+                output.display(),
+                wt.join("target/debug/notes.txt").display()
+            ),
+        )
+        .unwrap();
+        let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+        assert_eq!(report.freed_bytes, 200);
+        assert!(!output.exists());
+        for dir in ["debug", "release", "debug/deps", "debug/build/script/out"] {
+            assert_eq!(
+                std::fs::read_to_string(wt.join("target").join(dir).join("notes.txt")).unwrap(),
+                "user evidence"
+            );
+        }
+        // Metadata remains available for inspection and future safe rebuilds.
+        assert!(manifest.exists());
+        assert!(report.retained.iter().any(|s| s.contains("unmanifested")));
+        std::fs::write(&output, "user note replacing an old binary").unwrap();
+        let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+        assert_eq!(report.freed_bytes, 0);
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            "user note replacing an old binary"
+        );
+    }
+
+    #[tokio::test]
+    async fn measurement_cache_expires_and_disabled_eviction_does_not_walk_outputs() {
+        let f = Fx::new().await;
+        let state = f.run("cc02", false).await;
+        let wt = &state.candidates[0].worktree;
+        Fx::target(wt);
+        let mut disk = Fx::disk();
+        disk.worktree_limit_bytes = u64::MAX;
+        let now = Fx::now();
+        let first = sweep(&f.home, &disk, now).await;
+        std::fs::write(wt.join("target/debug/output"), [1; 1000]).unwrap();
+        assert_eq!(
+            sweep(&f.home, &disk, now).await.measured_bytes,
+            first.measured_bytes
+        );
+        assert!(
+            sweep(&f.home, &disk, now + jiff::SignedDuration::from_secs(301))
+                .await
+                .measured_bytes
+                > first.measured_bytes
+        );
+        disk.worktree_limit_bytes = 0;
+        assert_eq!(sweep(&f.home, &disk, now).await.measured_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn unfinished_source_fold_reports_its_retention_reason() {
+        let f = Fx::new().await;
+        let mut source = f.run("cc03", true).await;
+        let task = f.task(&[source.clone()]);
+        let error = crate::graph::fold_run(&mut source, true, &f.home)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(&task.id));
+        assert!(source.candidates[0].worktree.exists());
+        crate::pr_recovery::retain_sources(&task, &f.home).unwrap();
+        let error = crate::graph::fold_run(&mut source, true, &f.home)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("explicitly retained"));
+    }
+
+    #[tokio::test]
     async fn unknown_targets_cargo_owners_and_driver_resumes_are_protected() {
         let f = Fx::new().await;
         let state = f.run("cccc", false).await;
@@ -884,7 +1188,11 @@ mod tests {
         assert!(cargo_target(wt).await.is_err());
         std::fs::remove_file(wt.join("target/notes")).unwrap();
         std::os::unix::fs::symlink(f.repo.join("source"), wt.join("target/debug/link")).unwrap();
-        assert!(cargo_target(wt).await.is_err());
+        assert!(
+            !declared_outputs(&wt.join("target"))
+                .unwrap()
+                .contains(&wt.join("target/debug/link"))
+        );
         std::fs::remove_file(wt.join("target/debug/link")).unwrap();
         let cargo = cargo_locks(&wt.join("target")).unwrap();
         let out = sweep(&f.home, &Fx::disk(), Fx::now()).await;
@@ -944,6 +1252,15 @@ mod tests {
         let retired = RunState::load_under(&runs[3].id, &f.home).unwrap();
         assert_eq!(retired.retired_to.as_ref(), Some(&source.id));
         assert!(crate::pr_head::ensure_owner_record(&retired, Some(&retired)).is_err());
+        let mut released = task.clone();
+        released.release();
+        assert_eq!(
+            crate::daemon::unfinished_run_with(&released.runs, released.short(), |id| {
+                RunState::load_under(id, &f.home)
+            }),
+            Some(source.id.clone())
+        );
+
         assert!(
             f.home
                 .join("runs")
@@ -967,15 +1284,16 @@ mod tests {
         let empty = f.run("ffff", false).await;
         let task = f.task(&[a.clone(), b.clone(), empty.clone()]);
         assert!(
-            crate::pr_recovery::sources_retained(&f.home, &a.id),
+            crate::pr_recovery::source_retention_reason(&f.home, &a.id).is_some(),
             "unfinished queue history protects older source branches from ordinary folding"
         );
         let mut prior = a.clone();
         assert!(
             crate::graph::fold_run(&mut prior, true, &f.home)
                 .await
-                .unwrap()
-                .is_empty()
+                .unwrap_err()
+                .to_string()
+                .contains(&task.id)
         );
         let mut report = Report::default();
         retire_empty(&f.home, &Fx::disk(), Fx::now(), &mut report).await;

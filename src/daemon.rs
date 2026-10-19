@@ -3547,6 +3547,20 @@ async fn attempt(
         .flatten()
         .filter(|id| RunState::load(id).is_ok_and(|run| may_resume_run(&run, task)));
     let previous = task.runs.last().and_then(|id| RunState::load(id).ok());
+    if !task.fresh_start
+        && task.pr_recovery.is_none()
+        && task.review_branch.is_none()
+        && task.resume_override.is_none()
+        && previous
+            .as_ref()
+            .is_some_and(|run| run.retired_to.is_some())
+        && unfinished.is_none()
+    {
+        task.hold_unrequested_retry(Some("Recorded recovery authority is unavailable, no longer resumable or no longer authorized for these instructions. Inspect the retained lineage and select a recovery source explicitly; no replacement competition was started.".into()));
+        record(queue, task);
+        return Vec::new();
+    }
+
     let saved_recovery = previous.as_ref().filter(|run| {
         task.replacement.is_none()
             && task.pr_recovery.as_ref().is_some_and(|selected| {
@@ -4963,30 +4977,39 @@ fn unfinished_run(runs: &[String], short: &str) -> Option<String> {
 
 /// [`unfinished_run`] with an injected state reader. Tests provide their
 /// fixtures directly rather than touching the process-global run home.
-fn unfinished_run_with<F>(runs: &[String], short: &str, load: F) -> Option<String>
+pub(crate) fn unfinished_run_with<F>(runs: &[String], short: &str, mut load: F) -> Option<String>
 where
-    F: FnOnce(&str) -> Result<RunState>,
+    F: FnMut(&str) -> Result<RunState>,
 {
-    let id = runs.last()?;
-    match load(id) {
-        // A run some process is driving right now is not "unfinished" in the
-        // sense of waiting to be picked up: a run started by hand is in
-        // `runs` while it is still executing, and resuming it here
-        // would put a second driver on the same worktrees.
-        Ok(s)
-            if s.status.resumable()
-                && !s.released()
-                && s.retired_to.is_none()
-                && !exhausted_review_budget(&s)
-                && s.liveness(false) != crate::run::Liveness::Live =>
-        {
-            Some(id.clone())
+    let mut id = runs.last()?.clone();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut repo = None;
+    loop {
+        if !runs.contains(&id) || !visited.insert(id.clone()) {
+            tracing::warn!("invalid or cyclic recovery authority for task {short}");
+            return None;
         }
-        Ok(_) => None,
-        Err(e) => {
-            tracing::warn!("could not read run {id} for task {short}: {e:#}");
-            None
+        let state = match load(&id) {
+            Ok(state) if state.id == id => state,
+            Ok(_) => return None,
+            Err(e) => {
+                tracing::warn!("could not read run {id} for task {short}: {e:#}");
+                return None;
+            }
+        };
+        if repo.as_ref().is_some_and(|repo| *repo != state.repo) {
+            return None;
         }
+        repo = Some(state.repo.clone());
+        if let Some(authority) = state.retired_to {
+            id = authority;
+            continue;
+        }
+        return (state.status.resumable()
+            && !state.released()
+            && !exhausted_review_budget(&state)
+            && state.liveness(false) != crate::run::Liveness::Live)
+            .then_some(id);
     }
 }
 
@@ -10504,6 +10527,43 @@ mod tests {
             Some(run.id.clone()),
             "a spent review budget must not turn a failed publication into a re-competition"
         );
+    }
+
+    #[test]
+    fn retired_resume_requires_a_valid_same_repository_authority() {
+        let mut source = run_state(RunStatus::Blocked);
+        let mut empty = run_state(RunStatus::Blocked);
+        empty.retired_to = Some(source.id.clone());
+        let runs = vec![source.id.clone(), empty.id.clone()];
+        let resolve = |source: &RunState, empty: &RunState| {
+            unfinished_run_with(&runs, "fixture", |id| {
+                if id == source.id {
+                    Ok(source.clone())
+                } else if id == empty.id {
+                    Ok(empty.clone())
+                } else {
+                    bail!("unreadable authority")
+                }
+            })
+        };
+        assert_eq!(resolve(&source, &empty), Some(source.id.clone()));
+        assert_eq!(
+            choose_starter(None, false, resolve(&source, &empty).as_deref()),
+            Starter::Resume(source.id.clone())
+        );
+        source.retired_to = Some(empty.id.clone());
+        assert!(
+            resolve(&source, &empty).is_none(),
+            "cycles do not revive obsolete runs"
+        );
+        source.retired_to = None;
+        source.repo = PathBuf::from("/another-repository");
+        assert!(resolve(&source, &empty).is_none());
+        source.repo = empty.repo.clone();
+        source.released_to = Some("later".into());
+        assert!(resolve(&source, &empty).is_none());
+        empty.retired_to = Some("unlisted-run".into());
+        assert!(resolve(&source, &empty).is_none());
     }
 
     #[test]
