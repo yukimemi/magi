@@ -279,3 +279,49 @@ test('queue-only dashboard refresh preserves run history without requesting it a
   assertNoFailures(h);
   assert.equal(h.successes.length, 1);
 });
+
+for (const queueOnly of [false, true]) {
+  test(`pending dashboard updates schedule one trailing refresh per invalidated section (queueOnly=${queueOnly})`, async () => {
+    const h = harness();
+    const first = h.api.loadStats();
+    const updates = [
+      h.api.loadStats({ background: true, queueOnly }),
+      h.api.loadStats({ background: true, queueOnly }),
+    ];
+    let completed = false;
+    const done = Promise.all([first, ...updates]).then(() => { completed = true; });
+    assert.equal(h.requests.length, 2);
+    h.requests[0].resolve({ queued: 1 });
+    h.requests[1].resolve({ version: 1 });
+    await flush();
+    assert.equal(completed, false);
+    assert.equal(h.requests.length, queueOnly ? 3 : 4);
+    assert.ok(h.requests.every(r => !r.options.signal.aborted));
+    assert.equal(h.requests[2].url, 'stats/queue');
+    h.requests[2].resolve({ queued: 2 });
+    if (!queueOnly) {
+      await flush();
+      assert.equal(completed, false);
+      assert.equal(h.requests[3].url, h.requests[1].url);
+      h.requests[3].resolve({ version: 2 });
+    }
+    await done;
+    assert.equal(h.state.stats.version, queueOnly ? 1 : 2);
+    assert.equal(h.renders.filter(r => r && r.queue).at(-1).queue.queued, 2);
+    assert.equal(h.renders.filter(r => r && r.version).at(-1).version, queueOnly ? 1 : 2);
+    assert.equal(h.requests.length, queueOnly ? 3 : 4);
+    assert.equal(h.failures.length, 0);
+  });
+}
+
+test('ordinary duplicate dashboard loads join pending requests without trailing refreshes', async () => {
+  const h = harness();
+  const first = h.api.loadStats();
+  const second = h.api.loadStats();
+  assert.equal(h.requests.length, 2);
+  h.requests[0].resolve({ queued: 1 });
+  h.requests[1].resolve({ version: 1 });
+  await Promise.all([first, second]);
+  assert.equal(h.requests.length, 2);
+  assert.equal(h.state.stats.version, 1);
+});
