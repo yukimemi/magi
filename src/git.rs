@@ -1025,39 +1025,97 @@ pub async fn cherry(repo: &Path, upstream: &str, head: &str) -> Result<(Vec<Stri
     Ok((unmatched, matched))
 }
 
-/// One commit as a rebase preserves it: the sha plus the attributes git keeps
-/// when it replays a commit (author name, email, author date, subject). A
-/// replayed commit changes sha and patch-id, but not these.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommitKey {
-    /// The commit id.
-    pub sha: String,
-    /// Author name, email, author date and subject, joined.
-    pub key: String,
+/// Git's pick order and the HEAD observed by the exec following each pick.
+#[derive(Debug)]
+pub struct RebaseRecord {
+    /// Full original commit ids in Git's replay order.
+    pub picks: Vec<String>,
+    /// Full HEAD ids observed immediately after those picks.
+    pub heads: Vec<String>,
 }
 
-/// The non-merge commits in `range`, oldest first, with their [`CommitKey`].
-pub async fn commit_keys(repo: &Path, range: &str) -> Result<Vec<CommitKey>> {
-    let out = git(
-        repo,
-        &[
-            "log",
-            "--no-merges",
-            "--reverse",
-            "--date=raw",
-            "--format=%H%x1f%an%x1f%ae%x1f%ad%x1f%s",
-            range,
-        ],
-    )
-    .await?;
-    Ok(out
-        .lines()
-        .filter_map(|l| l.split_once('\u{1f}'))
-        .map(|(sha, key)| CommitKey {
-            sha: sha.to_owned(),
-            key: key.to_owned(),
-        })
-        .collect())
+const REBASE_EXEC: &str = "git rev-parse HEAD >> \"$(git rev-parse --git-path magi-rebase-heads)\"";
+
+async fn rebase_file(scratch: &Path, name: &str) -> Result<PathBuf> {
+    let path = git(scratch, &["rev-parse", "--git-path", name]).await?;
+    let path = Path::new(path.trim());
+    Ok(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        scratch.join(path)
+    })
+}
+
+async fn full_commit(scratch: &Path, sha: &str) -> Result<String> {
+    anyhow::ensure!(
+        !sha.is_empty() && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid rebase commit id: {sha}"
+    );
+    rev_parse(scratch, &format!("{sha}^{{commit}}")).await
+}
+
+/// Save Git's exact picks before a fixer can change its todo list. Resolve
+/// abbreviations while the sequencer still exists; ambiguity is an error.
+async fn save_rebase_picks(scratch: &Path) -> Result<()> {
+    let mut picks = Vec::new();
+    for name in ["rebase-merge/done", "rebase-merge/git-rebase-todo"] {
+        let text = std::fs::read_to_string(rebase_file(scratch, name).await?)?;
+        for line in text.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut words = line.split_whitespace();
+            match words.next() {
+                Some("pick" | "p") => {
+                    picks.push(
+                        full_commit(scratch, words.next().context("pick without commit")?).await?,
+                    );
+                }
+                Some("exec" | "x")
+                    if line
+                        .split_once(' ')
+                        .is_some_and(|(_, cmd)| cmd == REBASE_EXEC) => {}
+                _ => bail!("unexpected rebase instruction: {line}"),
+            }
+        }
+    }
+    let path = rebase_file(scratch, "magi-rebase-picks").await?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, picks.join("\n") + "\n")?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
+/// Read a completed rebase's durable record, rejecting missing or corrupt data.
+pub async fn rebase_record(scratch: &Path) -> Result<RebaseRecord> {
+    let mut lists = Vec::new();
+    for name in ["magi-rebase-picks", "magi-rebase-heads"] {
+        let text = std::fs::read_to_string(rebase_file(scratch, name).await?)
+            .with_context(|| format!("read {name}"))?;
+        let mut commits = Vec::new();
+        for sha in text.lines() {
+            let full = full_commit(scratch, sha).await?;
+            anyhow::ensure!(full == sha, "non-full commit id in {name}");
+            commits.push(full);
+        }
+        lists.push(commits);
+    }
+    let heads = lists.pop().unwrap();
+    let picks = lists.pop().unwrap();
+    anyhow::ensure!(
+        !picks.is_empty() && picks.len() == heads.len(),
+        "rebase pick/HEAD count mismatch"
+    );
+    Ok(RebaseRecord { picks, heads })
+}
+
+/// Strip only the diagnostics emitted by our recording exec.
+pub fn rebase_said(text: &str) -> String {
+    text.trim()
+        .split(['\r', '\n'])
+        .filter(|line| !line.trim_start().starts_with("Executing:"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// How [`rebase_start`] ended.
@@ -1109,17 +1167,28 @@ pub async fn rebase_start(
     )
     .await?;
 
-    let out = git_raw(scratch, &["rebase", onto]).await?;
+    std::fs::write(rebase_file(scratch, "magi-rebase-heads").await?, "")?;
+    let out = git_raw(
+        scratch,
+        &["rebase", "--empty=drop", "--exec", REBASE_EXEC, onto],
+    )
+    .await?;
     if out.ok() {
         worktree_remove(repo, scratch).await.ok();
         return Ok(RebaseStart::Applied);
     }
-    let why = if out.stderr.trim().is_empty() {
+    let why = rebase_said(&if out.stderr.trim().is_empty() {
         out.stdout.trim().to_owned()
     } else {
         out.stderr.trim().to_owned()
-    };
+    });
     if rebase_in_progress(scratch).await {
+        if let Err(error) = save_rebase_picks(scratch).await {
+            rebase_abort(repo, scratch).await;
+            return Ok(RebaseStart::Failed(format!(
+                "cannot record rebase picks: {error:#}"
+            )));
+        }
         return Ok(RebaseStart::Conflicted(why));
     }
     worktree_remove(repo, scratch).await.ok();

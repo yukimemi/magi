@@ -1576,8 +1576,8 @@ pub fn rebase_conflict(c: &RebaseConflict<'_>) -> String {
             has finished.\n\
          3. Do not run `git rebase --abort` or `--skip`, do not reset or move \
             the branch, and do not push. Leave no conflict markers behind. Keep \
-            every commit's subject and author as they are: a commit that \
-            goes missing from the result fails the rebase.\n\
+            the recording exec commands and pick order in the rebase todo: \
+            Git's recorded picks are checked for lost commits.\n\
          4. Aim for a tree that builds and passes the project's checks against \
             the new base; if the base added a rule the branch's code now \
             violates, fix that too.\n\
