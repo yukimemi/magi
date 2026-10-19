@@ -212,7 +212,8 @@ pub async fn fold_due(
         .collect();
     ids.sort_unstable();
     for id in ids {
-        if crate::pr_recovery::sources_retained(home, &id) {
+        if let Some(reason) = crate::pr_recovery::source_retention_reason(home, &id) {
+            tracing::info!(%id, %reason, "housekeep: source retained; fold refused");
             continue;
         }
         if crate::daemon::is_working_on(home, &id, now) {

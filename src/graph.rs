@@ -11272,8 +11272,8 @@ async fn remove_preserved_worktree(repo: &Path, path: &Path) -> Result<()> {
 /// directory some other process or test pinned into that `OnceLock` first,
 /// not the one the caller actually resolved its `runs` and `state` from.
 pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> Result<Vec<String>> {
-    if crate::pr_recovery::sources_retained(home, &state.id) {
-        return Ok(Vec::new());
+    if let Some(reason) = crate::pr_recovery::source_retention_reason(home, &state.id) {
+        bail!("refusing fold: {reason}");
     }
     if !state.candidate_preservation.is_empty() {
         bail!("candidate preservation incomplete; refusing cleanup");
