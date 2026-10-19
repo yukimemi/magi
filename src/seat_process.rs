@@ -319,6 +319,8 @@ fn stop(child: &mut Child, group: Option<u32>, owner: Option<&std::ffi::OsStr>) 
 
 #[cfg(all(test, unix))]
 mod tests {
+    use crate::proc::Quiet as _;
+
     /// Executed in a separate copy of the test binary. No interpreter or
     /// compiler dependency: reproduce fork/setsid/reparent without source edits.
     #[test]
@@ -336,6 +338,7 @@ mod tests {
             panic!(
                 "helper exec failed: {}",
                 std::process::Command::new(std::env::current_exe().unwrap())
+                    .quiet()
                     .args(["--exact", "seat_process::tests::orphan_tool_helper"])
                     .env_remove("MAGI_PROCESS_OWNER")
                     .exec()
