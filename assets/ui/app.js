@@ -9460,7 +9460,7 @@ async function loadStats({ background = false, queueOnly = false } = {}) {
   }, error => {
     sectionNotice("stats-queue-tiles", "stats-queue-state", `Queue: ${error.message}`, () => loadStats());
     failFor(background, `Could not load statistics: ${error.message}`, error);
-  });
+  }, false, background);
   if (queueOnly) return queue;
   const history = sectionRequest(key, query ? `${API.stats}?${query}` : API.stats, stats => {
     state.stats = stats;
@@ -9470,7 +9470,7 @@ async function loadStats({ background = false, queueOnly = false } = {}) {
   }, error => {
     sectionNotice("stats-h", "stats-load-state", `Statistics: ${error.message}`, () => loadStats());
     failFor(background, `Could not load statistics: ${error.message}`, error);
-  });
+  }, false, background);
   await Promise.allSettled([queue, history]);
 }
 
