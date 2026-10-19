@@ -188,6 +188,14 @@ pub enum Node {
         /// The link's inline text.
         children: Vec<Node>,
     },
+    /// An application route verified against the server's stores, never a
+    /// destination supplied by Markdown.
+    InternalLink {
+        /// The verified hash route.
+        href: String,
+        /// Inline content, optionally retaining code styling.
+        children: Vec<Node>,
+    },
     /// An image. Only ever produced for a `data:` image URI or a resolved
     /// question panel asset; anything else becomes [`Node::Text`] instead,
     /// see [`normalize_image`].
@@ -356,7 +364,8 @@ fn plain_text(nodes: &[Node]) -> String {
             | Node::Strikethrough { children }
             | Node::BlockQuote { children }
             | Node::ListItem { children, .. }
-            | Node::Link { children, .. } => out.push_str(&plain_text(children)),
+            | Node::Link { children, .. }
+            | Node::InternalLink { children, .. } => out.push_str(&plain_text(children)),
             Node::BulletList { .. }
             | Node::OrderedList { .. }
             | Node::Table { .. }

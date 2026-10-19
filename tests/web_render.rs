@@ -1986,7 +1986,7 @@ async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
             r#"(async () => {
       const source = await (await fetch('/app.js')).text();
       window.deck = new Function(source.replace('queue: "/api/queue"', 'queue: "/api/queue?test_client=1"').replace(/\nboot\(\);\s*$/, `
-        return { setChip, RUN_STATUS, TASK_STATUS, QUESTION_STATUS, TALK_STATUS, settingsState, renderSettings, loadSettings, saveSettings, linkify, truncateLabel, state, loadHealth, loadLoop, loadTalk, tickTalkWaits, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter, reviewPassed, voteTag, reviewStamp };
+        return { setChip, RUN_STATUS, TASK_STATUS, QUESTION_STATUS, TALK_STATUS, settingsState, renderSettings, loadSettings, saveSettings, linkify, refreshReferences, truncateLabel, state, loadHealth, loadLoop, loadTalk, tickTalkWaits, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter, reviewPassed, voteTag, reviewStamp };
       `))();
       await Promise.all([deck.loadQueue(), deck.loadRuns(), deck.loadTalks()]);
     })()"#,
@@ -3440,15 +3440,63 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
     let fx = common::fixture(guard, common::Judges::Unanimous, false);
     let home = fx.tmp.path().join("magi-home");
     let queue = Queue::at(home.join("queue"));
-    seed_tasks(&queue, &fx.repo, "run");
-    let base = serve(
-        &home,
-        queue.clone(),
-        Talks::at(home.join("talks")),
-        home.join("runs"),
-        &fx.repo,
+    let mut target = Task::new(
+        "Reference target".into(),
+        "Target".into(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    target.id = "20260908-205803-12ba".into();
+    target.status = TaskStatus::Held;
+    target.hold_reason = Some("dead の修正を待つ".into());
+    let mut alphabetic = Task::new(
+        "Alphabetic id".into(),
+        "Target".into(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    alphabetic.id = "20260908-205804-dead".into();
+    queue.put(&mut alphabetic).unwrap();
+    target.last_error = Some("See task@12ba and question d678".into());
+    queue.put(&mut target).unwrap();
+    let talks = Talks::at(home.join("talks"));
+    let mut chat = talk::begin(&talks, &fx.config, fx.repo.clone(), None).unwrap();
+    talks.remove(&chat.id).unwrap();
+    chat.id = "20260908-205806-6f0d".into();
+    std::fs::write(
+        home.join("talks").join(format!("{}.json", chat.id)),
+        serde_json::to_vec(&chat).unwrap(),
     )
-    .await;
+    .unwrap();
+    talk::record(
+        &mut chat,
+        &talks,
+        "Task 12ba and `12ba`. dead の修正を待つ。Unknown 0000.\n\n```\n12ba\n```",
+        Vec::new(),
+    )
+    .unwrap();
+    chat.turns[0].who = talk::Who::Agent;
+    chat.turns[0].sender = None;
+    chat.turns[0].messages.clear();
+    talks.put(&mut chat).unwrap();
+    target.source = Source::Agent {
+        run: chat.id.clone(),
+        node: magi::queue::CHAT_NODE.into(),
+    };
+    queue.put(&mut target).unwrap();
+    let questions = magi::ask::Questions::at(home.join("questions"));
+    let mut question = magi::ask::Question::new(
+        "run".into(),
+        "merge".into(),
+        "operator".into(),
+        "Recorded approval".into(),
+        "detail".into(),
+        Vec::new(),
+    );
+    question.id = "20260908-205805-d678".into();
+    question.status = magi::ask::QuestionStatus::Answered;
+    questions.put(&mut question).unwrap();
+    let base = serve(&home, queue.clone(), talks, home.join("runs"), &fx.repo).await;
     let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
     let page = browser
         .open_page(&format!("{base}#/queue"), 1280, 900, false)
@@ -3506,6 +3554,166 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
     );
     assert_eq!(out["bold"], 0);
     assert_eq!(out["text"], true);
+    browser
+        .eval(
+            &page,
+            &format!(
+                "window.referenceDocument = document; location.hash = '#/chat/{}'; true",
+                chat.id
+            ),
+        )
+        .await
+        .unwrap();
+    browser.wait_for(&page,
+        "document.querySelectorAll('.turn[data-who=agent] a[href=\"#/tasks/20260908-205803-12ba\"]').length === 2",
+        Duration::from_secs(30)).await.expect("Markdown text and code references");
+    let out = browser.eval(&page, r##"(() => {
+      const turn = document.querySelector('.turn[data-who=agent]');
+      const links = [...turn.querySelectorAll('a')];
+      const out = { alphabetic: !!turn.querySelector('a[href="#/tasks/20260908-205804-dead"]'), code: !!turn.querySelector('a code'), blockLinks: turn.querySelectorAll('pre a').length,
+        sameTab: links.every(a => !a.target), unknown: links.some(a => a.textContent === '0000') };
+      links[0].click();
+      return out;
+    })()"##).await.unwrap();
+    assert_eq!(
+        out,
+        serde_json::json!({ "alphabetic": true, "code": true, "blockLinks": 0, "sameTab": true, "unknown": false })
+    );
+    browser.wait_for(&page,
+        "location.hash === '#/tasks/20260908-205803-12ba' && !!document.querySelector('#task-note a[href=\"#/tasks/20260908-205804-dead\"]') && !!document.querySelector('#task-error a')",
+        Duration::from_secs(30)).await.expect("task note and error references");
+    assert_eq!(
+        browser
+            .eval(&page, "window.referenceDocument === document")
+            .await
+            .unwrap(),
+        true
+    );
+    // Only candidate-bearing ranges may be resent after their first resolution.
+    assert_eq!(
+        browser
+            .eval(
+                &page,
+                r##"(async () => {
+      const original = window.fetch;
+      const plain = 'Reference probe ordinary prose';
+      const candidate = 'Reference probe candidate 12ba';
+      const counts = { plain: 0, candidate: 0 };
+      window.fetch = (url, init) => {
+        if (url === '/api/references') {
+          for (const item of JSON.parse(init.body)) {
+            if (item.text === plain) counts.plain++;
+            if (item.text === candidate) counts.candidate++;
+          }
+        }
+        return original(url, init);
+      };
+      const div = document.createElement('div'); document.body.append(div);
+      try {
+        deck.linkify(div, plain);
+        deck.linkify(div, candidate);
+        const settled = async () => {
+          for (let i = 0; i < 300; i++) {
+            if (div.querySelector('a')) return;
+            await new Promise(resolve => setTimeout(resolve, 10));
+          }
+          throw new Error('reference probe did not resolve');
+        };
+        await settled();
+        // A resolved anchor means the whole batch, including prose, was applied.
+        deck.refreshReferences();
+        for (let i = 0; i < 300 && counts.candidate < 2; i++) {
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        return counts;
+      } finally {
+        window.fetch = original;
+        div.remove();
+      }
+    })()"##
+            )
+            .await
+            .unwrap(),
+        serde_json::json!({ "plain": 1, "candidate": 2 })
+    );
+    // A delayed decorator must never overwrite a newer text value or navigate.
+    browser.eval(&page, r##"(() => {
+      const original = window.fetch;
+      window.fetch = (url, init) => {
+        if (url !== '/api/references') return original(url, init);
+        window.fetch = original;
+        return new Promise(resolve => { window.referenceRelease = () => resolve(original(url, init)); });
+      };
+      const div = document.createElement('div'); div.id = 'reference-race'; document.body.append(div);
+      deck.linkify(div, '12ba');
+      return true;
+    })()"##).await.unwrap();
+    browser
+        .wait_for(
+            &page,
+            "typeof window.referenceRelease === 'function'",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        browser
+            .eval(
+                &page,
+                r##"(async () => {
+      const div = document.getElementById('reference-race');
+      div.textContent = 'changed';
+      window.referenceRelease();
+      await new Promise(resolve => setTimeout(resolve, 200));
+      return div.textContent === 'changed' && !div.querySelector('a')
+        && location.hash === '#/tasks/20260908-205803-12ba';
+    })()"##
+            )
+            .await
+            .unwrap(),
+        true
+    );
+    browser.eval(&page, r##"(() => {
+      const source = document.querySelector('#task-meta a[href="#/chat/20260908-205806-6f0d"]');
+      const approval = document.querySelector('#task-error a[href="#/questions/20260908-205805-d678"]');
+      if (!source || !approval) throw new Error('missing source or approval reference');
+      approval.click(); return true;
+    })()"##).await.unwrap();
+    browser.wait_for(&page,
+        "location.hash === '#/questions/20260908-205805-d678' && document.activeElement.classList.contains('ask-summary') && document.activeElement.textContent === 'Recorded approval'",
+        Duration::from_secs(30)).await.expect("answered question permalink focuses its card");
+    browser.eval(&page, r##"(() => {
+      const div = document.createElement('div'); div.id = 'reference-live'; document.body.append(div);
+      deck.linkify(div, '9abc'); return true;
+    })()"##).await.unwrap();
+    let mut late = Task::new(
+        "Late reference".into(),
+        "Target".into(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    late.id = "20260908-205809-9abc".into();
+    queue.put(&mut late).unwrap();
+    browser
+        .eval(&page, "deck.refreshReferences(); true")
+        .await
+        .unwrap();
+    browser
+        .wait_for(
+            &page,
+            "!!document.querySelector('#reference-live a')",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    std::fs::remove_file(queue.path_of(&late.id)).unwrap();
+    browser
+        .eval(&page, "deck.refreshReferences(); true")
+        .await
+        .unwrap();
+    browser.wait_for(&page,
+        "!document.querySelector('#reference-live a') && document.getElementById('reference-live').textContent === '9abc' && location.hash === '#/questions/20260908-205805-d678'",
+        Duration::from_secs(30)).await.expect("store changes invalidate references without navigating");
 }
 
 #[tokio::test]
@@ -3929,8 +4137,12 @@ async fn queue_compact_controls_and_edit_save_fit_and_preserve_drafts() {
           }}
           const originalFetch = window.fetch;
           const calls = [];
+          // Reference decoration also POSTs while refreshed cards render.
+          // Observe and refuse only this task's writes, preserving those reads.
+          const isTaskWrite = (url, options) => options?.method === 'POST'
+            && url.startsWith(`/api/queue/${{id}}/`);
           window.fetch = async (url, options) => {{
-            if (options?.method === 'POST') {{
+            if (isTaskWrite(url, options)) {{
               calls.push(url);
               return new Response(JSON.stringify({{error: 'Refused'}}), {{status: 409}});
             }}
@@ -3947,7 +4159,7 @@ async fn queue_compact_controls_and_edit_save_fit_and_preserve_drafts() {
           assert(dialog.open && document.querySelector('#task-edit-error').textContent.includes('Title and instruction saved'), 'partial save explained');
           calls.length = 0;
           window.fetch = async (url, options) => {{
-            if (options?.method === 'POST') calls.push(url);
+            if (isTaskWrite(url, options)) calls.push(url);
             return originalFetch(url, options);
           }};
           await deck.saveTaskEdit();
