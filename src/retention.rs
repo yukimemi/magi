@@ -1669,7 +1669,8 @@ mod tests {
         for (cancel, clear_owner) in [(false, true), (true, true), (false, false), (true, false)] {
             let pid_file = f.repo.join(format!("orphan-{cancel}-{clear_owner}"));
             let mut cmd = tokio::process::Command::new(std::env::current_exe().unwrap());
-            cmd.args(["--exact", "seat_process::tests::orphan_tool_helper"])
+            cmd.quiet()
+                .args(["--exact", "seat_process::tests::orphan_tool_helper"])
                 .env("MAGI_TEST_ORPHAN_PID", &pid_file)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
