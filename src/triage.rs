@@ -511,6 +511,15 @@ fn interpret_answer(q: &Question) -> AnswerAction {
     }
 }
 
+/// Legacy triage has a fixed issuer-owned keep-held slot. Its resume slot
+/// may requeue, so it deliberately does not qualify for contextual resume.
+pub(crate) fn contextual_keep_held(q: &Question, label: &str) -> bool {
+    q.node == NODE
+        && q.seat == SEAT
+        && q.actions.is_empty()
+        && q.choices.get(1).is_some_and(|c| c == label)
+}
+
 /// The note [`already_applied`] looks for, appended to (never replacing)
 /// whatever [`Task::hold_reason`] already said - the original cause is still
 /// worth reading in `magi task show` after the operator answers "not yet",

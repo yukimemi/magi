@@ -383,6 +383,9 @@ async fn selected_fixture() -> (
     let home = home_lock().await;
     let mut fx = fixture(home, Judges::Unanimous, false);
     let bin = forge(fx.tmp.path());
+    // Shell mocks create tiny fixtures. Keep disk preflight enabled without
+    // inheriting the production workload's 8 GiB requirement from the host.
+    fx.config.disk.min_free_bytes = 1024 * 1024;
     pr_config(&mut fx);
     let first = attempt(&fx.repo, &fx.config).await;
     let public = first.pr_pushed_head.clone().unwrap();
@@ -599,7 +602,11 @@ async fn assert_recovery_resume_uses_saved_config(legacy: bool) {
     );
     let id = task.runs.last().unwrap().clone();
     let mut state = RunState::load(&id).unwrap();
-    assert!(state.parked, "{:?}", state.events);
+    assert!(
+        state.parked,
+        "hold={:?}, error={:?}, events={:?}",
+        task.hold_reason, task.last_error, state.events
+    );
     let approval = state.land_approval.clone().unwrap();
     let head = state.pr_pushed_head.clone().unwrap();
     let history = task.runs.clone();

@@ -471,7 +471,37 @@ binds the immediately preceding persona reply. Recommendations use one list row
 `<question-id>: <exact choice>` per question, or separate ID and choice table
 cells. Duplicate/conflicting rows, conditions, quoted examples and generated
 messages confer no authority. Unique short IDs remain supported in recommendations;
-full IDs are preferred and required for individual non-hold instructions.
+full IDs remain required for guarded individual non-hold instructions.
+
+For low-risk internal recovery, structured resume and keep-held actions support
+`resume-run` / `resume run` / `再開` / `実行を再開する` and
+`keep-held` / `hold` / `保留` aliases independently of localized labels. Unique short question IDs work for explicit `<id>: <action>` replies
+(and `<id> resume run` without a colon).
+The assistant normalizes the alias before both authorization and answer storage;
+an explicit recovery reply can use persisted owner evidence without `--quote`.
+
+For natural conversation, the assistant first presents a single recommendation
+row, for example `<question-id>: resume-run`. Publication saves the canonical
+choice, action, target run and question fingerprint with that persona reply.
+On the next owner turn, the assistant interprets contextual approval such as
+`はい、それで進めてください` or “yes do that”, then runs
+`magi answer <id> --reply resume-run --recovery-consent '<entire real latest owner send>'`.
+`--recovery-consent` records the assistant's interpretation; it must reproduce
+the full persisted send exactly. `--quote` is optional here; if provided it must
+match the same full send. Operators need not type internal IDs or labels again.
+This mechanism uses the existing question/evidence locks and directory grants.
+It never synthesizes an owner quote or retrospectively binds old recommendations.
+Generated notices can interleave without authorizing or retracting a decision.
+Later owner sends, changed targets, multiple recommendations and ambiguous intent
+require a fresh interpretation or clarification. Do not repeat confirmation after
+clear approval of the single current recommendation.
+
+Only structured internal resume/hold effects qualify, with issuer-specific
+support for legacy triage keep-held (its resume may requeue and is excluded).
+Requeue, completion, destructive effects, merge and public posting retain their
+separate consent requirements. Recording recovery does not create a competition,
+release ownership or approve a pending merge: the existing daemon applies the
+answer once, validates the current target and keeps all approval boundaries.
 
 Recommendation manifests persist the reply fingerprint and each question's
 choices, actions, PR/head and content fingerprint at publication. Changed facts,

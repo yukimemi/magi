@@ -536,12 +536,16 @@ enum Command {
     Answer {
         /// Question id or unambiguous prefix/suffix. Omit for the oldest open one.
         id: Option<String>,
-        /// The answer: one of the offered choices, or free text.
+        /// The answer: an offered label, supported internal action alias, or free text.
         #[arg(long, conflicts_with_all = ["list", "say", "ask_chat"])]
         reply: Option<String>,
         /// Entire latest persisted owner send for a chat decision. Direct: `<full-id>: <choice>`; explicit batch instructions bind the preceding recommendations. Merge, public content and destructive effects retain specific consent requirements.
         #[arg(long, requires = "reply")]
         quote: Option<String>,
+        /// Agent interpretation of the complete latest owner send approving
+        /// the single persisted internal resume/keep-held recommendation.
+        #[arg(long, requires = "reply")]
+        recovery_consent: Option<String>,
         /// Speak back without deciding: a clarifying question, a request for
         /// more context. The run stays parked; the agent picks the
         /// conversation back up with `magi ask --thread`. Exclusive with
@@ -1712,7 +1716,8 @@ async fn dispatch(command: Command) -> Result<()> {
             say,
             ask_chat,
             list,
-        } => answer_cmd(id, reply, quote, say, ask_chat, list).await,
+            recovery_consent,
+        } => answer_cmd(id, reply, quote, say, ask_chat, list, recovery_consent).await,
 
         Command::Task { command } => task_cmd(command).await,
 
@@ -2620,6 +2625,7 @@ async fn answer_cmd(
     say: Option<String>,
     ask_chat: bool,
     list: bool,
+    recovery_consent: Option<String>,
 ) -> Result<()> {
     let store = ask::Questions::open();
     let open: Vec<ask::Question> = store
@@ -2642,7 +2648,14 @@ async fn answer_cmd(
                     .choices
                     .iter()
                     .map(|c| match q.actions.get(c) {
-                        Some(a) => format!("{c} [{}]", a.describe()),
+                        Some(a) => {
+                            let alias = match a {
+                                ask::ChoiceAction::Resume { .. } => "; alias: resume-run",
+                                ask::ChoiceAction::Hold => "; alias: keep-held",
+                                _ => "",
+                            };
+                            format!("{c} [{}{alias}]", a.describe())
+                        }
                         None => c.clone(),
                     })
                     .collect();
@@ -2732,20 +2745,27 @@ async fn answer_cmd(
             } else {
                 None
             };
+            let answer = match &answer {
+                ask::Answer::Choice(value) => ask::Answer::Choice(r.resolve_reply(value)?.to_owned()),
+                other => other.clone(),
+            };
             if let Some((run, node)) = &seat {
                 magi::consult::refuse_operator_held(r, node, &tasks)?;
                 let reply = match &answer {
                     ask::Answer::Choice(s) | ask::Answer::Text(s) => s,
                 };
-                r.answer_authority = magi::consult::authorize_answer(
-                    r,
-                    &talks,
-                    &store,
-                    run,
-                    node,
-                    reply,
-                    quote.as_deref(),
-                )?;
+                r.answer_authority = if let Some(words) = recovery_consent.as_deref() {
+                    if quote.as_deref().is_some_and(|quote| quote != words) {
+                        bail!("stale persisted evidence: --quote and --recovery-consent must contain the same entire owner send");
+                    }
+                    magi::consult::authorize_recovery(r, &talks, &store, (run, node), reply, words)?
+                } else {
+                    magi::consult::authorize_answer(
+                        r, &talks, &store, run, node, reply, quote.as_deref(),
+                    )?
+                };
+            } else if recovery_consent.is_some() {
+                bail!("missing context: --recovery-consent requires a standing conversation seat");
             }
             r.answer(answer.clone())?;
             // Returning the guard retains it through Questions::update's atomic
