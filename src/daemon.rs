@@ -1268,6 +1268,7 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                             task.mark_action_applied(&q.id);
                             queue.put(&mut task)?;
                         } else {
+                            crate::resume::validate_unqueued(home, run)?;
                             crate::resume::start(run.clone());
                         }
                     }

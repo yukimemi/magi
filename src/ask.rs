@@ -2357,7 +2357,7 @@ mod tests {
             ],
             "the on-disk field set is a contract with the front end"
         );
-        assert_eq!(open["schema"], 11);
+        assert_eq!(open["schema"], 12);
         assert_eq!(open["merge_target"], serde_json::Value::Null);
         assert_eq!(open["triage_generation"], serde_json::Value::Null);
         assert_eq!(open["thread"], serde_json::json!([]));
@@ -2409,7 +2409,7 @@ mod tests {
         let saved = store.get(&q.id).unwrap();
         assert_eq!(saved, q);
         let mut body = serde_json::to_value(&saved).unwrap();
-        assert_eq!(body["schema"], 11);
+        assert_eq!(body["schema"], 12);
         assert_eq!(
             body["merge_target"],
             serde_json::json!({

@@ -1077,6 +1077,41 @@ async fn maintenance_release_is_bound_to_the_hold_and_applies_once_after_settle(
 }
 
 common::e2e! {
+async fn maintenance_ownerless_resume_refuses_work_on_another_run() {
+    use magi::{ask::{Answer, ChoiceAction}, run::{RunState, RunStatus}};
+    let s = scene(home_lock().await);
+    let queue = magi::queue::Queue::at(s.home.join("queue"));
+    let mut run = RunState::new(s.fx.repo.clone(), "main".into(), "base".into(),
+        "work".into(), s.fx.config.clone());
+    run.status = RunStatus::Stalled;
+    run.driver_exited = true;
+    run.save_under(&s.home).unwrap();
+    let other = "20261019-000001-bbbb";
+    std::fs::write(s.home.join("daemon.json"), serde_json::to_vec(&serde_json::json!({
+        "updated_at": Timestamp::now(),
+        "current": [{"task": TASK, "run": other}],
+    })).unwrap()).unwrap();
+    assert_eq!(magi::daemon::current_work(&s.home, Timestamp::now())[0].run, other);
+    let mut q = maintenance_question(&s, ChoiceAction::ResumeRun { run: run.id.clone() });
+    q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+    s.store.put(&mut q).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    let receipt = s.home.join("choice-actions").join(format!("{}.json", q.id));
+    let body = std::fs::read_to_string(&receipt).unwrap();
+    assert!(body.contains("the loop is running run"), "{body}");
+    assert_eq!(serde_json::to_value(RunState::load_under(&run.id, &s.home).unwrap()).unwrap(),
+        serde_json::to_value(&run).unwrap());
+    assert!(queue.list().is_empty());
+    // A refused choice cannot start later when the daemon becomes idle.
+    std::fs::remove_file(s.home.join("daemon.json")).unwrap();
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    assert_eq!(std::fs::read_to_string(receipt).unwrap(), body);
+    assert_eq!(serde_json::to_value(RunState::load_under(&run.id, &s.home).unwrap()).unwrap(),
+        serde_json::to_value(&run).unwrap());
+}
+}
+
+common::e2e! {
 async fn maintenance_resume_refuses_a_live_driver_and_abandon_refuses_unknown() {
     use magi::{ask::{Answer, ChoiceAction}, run::{RunState, RunStatus}};
     let s = scene(home_lock().await);

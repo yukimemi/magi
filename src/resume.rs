@@ -23,6 +23,23 @@ pub(crate) fn validate(home: &Path, id: &str) -> Result<crate::run::RunState> {
     Ok(state)
 }
 
+/// Resumes outside the queue must not bypass the daemon's execution limits.
+/// Shared by Web requests and owner choices without a queue owner.
+pub(crate) fn validate_unqueued(home: &Path, id: &str) -> Result<()> {
+    validate(home, id)?;
+    if let Some(work) = crate::daemon::current_work(home, jiff::Timestamp::now())
+        .into_iter()
+        .next()
+    {
+        anyhow::bail!(
+            "the loop is running run {} right now; stop it first, or wait for \
+             it to finish, before resuming a run by hand.",
+            crate::run::short_of(&work.run)
+        );
+    }
+    Ok(())
+}
+
 pub(crate) async fn execute(id: &str) {
     match crate::graph::Runner::resume(id) {
         Ok(mut runner) => {

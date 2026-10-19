@@ -3874,21 +3874,8 @@ async fn run_resume(
         })
         .await?
     };
-    crate::resume::validate(&ui.home, &id).map_err(|e| ApiError::conflict(e.to_string()))?;
-    // Refused whenever the loop is running anything at all, not merely when
-    // it is on this run: a manual resume racing a loop-driven run over the
-    // same agent quota is the thing this guard exists to prevent, whether
-    // the loop's own concurrency is one run or several.
-    if let Some(work) = crate::daemon::current_work(&ui.home, jiff::Timestamp::now())
-        .into_iter()
-        .next()
-    {
-        return Err(ApiError::conflict(format!(
-            "the loop is running run {} right now; stop it first, or wait for \
-             it to finish, before resuming a run by hand.",
-            crate::run::short_of(&work.run)
-        )));
-    }
+    crate::resume::validate_unqueued(&ui.home, &id)
+        .map_err(|e| ApiError::conflict(e.to_string()))?;
     let _resume = ui.begin_resume(&id)?;
 
     // The same shape the list route returns, so the phone updates the card it
