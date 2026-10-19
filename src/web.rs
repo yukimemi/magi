@@ -23539,7 +23539,10 @@ mod tests {
             assert!(!actual.status.open());
             let parsed = ui.monitor.queue_index.lock().unwrap().reparsed;
             question_origin_inputs(&ui, std::slice::from_ref(&question)).unwrap();
-            assert_eq!(ui.monitor.queue_index.lock().unwrap().reparsed, parsed);
+            // Without Unix file identity, every readable record must be
+            // reparsed to detect same-size, same-mtime replacements safely.
+            let expected = parsed + if cfg!(unix) { 0 } else { 1002 };
+            assert_eq!(ui.monitor.queue_index.lock().unwrap().reparsed, expected);
         }
         child.followup.as_mut().unwrap().origin_task = Some(parent.id.clone());
         ui.queue.put(&mut child).unwrap();
@@ -23627,7 +23630,8 @@ mod tests {
         assert_eq!(stats_queue(State(ui.clone())).await.unwrap().0.queued, 1);
         let parsed = ui.monitor.queue_index.lock().unwrap().reparsed;
         assert_eq!(stats_queue(State(ui.clone())).await.unwrap().0.queued, 1);
-        assert_eq!(ui.monitor.queue_index.lock().unwrap().reparsed, parsed);
+        let expected = parsed + usize::from(!cfg!(unix));
+        assert_eq!(ui.monitor.queue_index.lock().unwrap().reparsed, expected);
         task.status = crate::queue::TaskStatus::Held;
         ui.queue.put(&mut task).unwrap();
         assert_eq!(stats_queue(State(ui.clone())).await.unwrap().0.held, 1);

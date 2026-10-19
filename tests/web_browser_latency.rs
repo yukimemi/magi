@@ -16,7 +16,9 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 // This test process contains the server and CDP driver; Chrome is a separate
 // child and excluded. Idle samples do no browser evaluation until the end.
@@ -279,7 +281,9 @@ async fn browser_history_latency() {
         tokio::time::sleep(Duration::from_secs(2)).await;
         #[cfg(unix)]
         let cpu_before = cpu_seconds();
+        #[cfg(unix)]
         let before = requests.load(Ordering::Relaxed);
+        #[cfg(unix)]
         let start = Instant::now();
         tokio::time::sleep(Duration::from_secs(10)).await;
         #[cfg(unix)]
