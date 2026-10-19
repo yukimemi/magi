@@ -257,9 +257,14 @@ impl TaskCounts {
     /// already read, so it needs no root of its own and stays trivially
     /// testable against a hand-built slice.
     pub fn of(tasks: &[Task]) -> Self {
+        Self::of_statuses(tasks.iter().map(|task| task.status))
+    }
+
+    /// Count current statuses from a reconciled display projection.
+    pub(crate) fn of_statuses(statuses: impl IntoIterator<Item = TaskStatus>) -> Self {
         let mut counts = Self::default();
-        for t in tasks {
-            match t.status {
+        for status in statuses {
+            match status {
                 TaskStatus::Queued => counts.queued += 1,
                 TaskStatus::Running => counts.running += 1,
                 TaskStatus::Done => counts.done += 1,
@@ -2684,6 +2689,14 @@ impl Queue {
 
     /// Expand an id prefix to exactly one task id.
     pub fn resolve_id(&self, prefix: &str) -> Result<String> {
+        if !prefix.is_empty()
+            && prefix != "."
+            && prefix != ".."
+            && !prefix.contains(['/', '\\'])
+            && self.path_of(prefix).is_file()
+        {
+            return Ok(prefix.to_owned());
+        }
         let ids = record_ids(&self.root, "json")?;
         match resolve_reference(prefix, ids.iter().map(String::as_str)) {
             Reference::Found(id) => Ok(id),

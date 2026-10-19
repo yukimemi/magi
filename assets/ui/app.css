@@ -587,7 +587,7 @@ main {
   transition: transform .18s var(--ease);
 }
 .btn:active { transform: scale(.97); }
-.btn:disabled { opacity: .5; cursor: default; }
+.btn:disabled, .btn[aria-disabled="true"] { opacity: .5; cursor: default; }
 
 /* Gold is the verdict colour in the mark, so it is the commit action here and
    nowhere else. */

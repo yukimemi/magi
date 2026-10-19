@@ -860,8 +860,8 @@ async function request(url, init) {
   return res;
 }
 
-const getJson = (url) => request(url).then((r) => r.json());
-const getText = (url) => request(url).then((r) => r.text());
+const getJson = (url, options) => request(url, options).then((r) => r.json());
+const getText = (url, options) => request(url, options).then((r) => r.text());
 
 const postJson = (url, body) =>
   request(url, {
@@ -2925,6 +2925,7 @@ function renderTaskDeleteBox(host, task, box) {
 
 /* A change to one task: the Queue, and the detail page when it is that task. */
 async function refreshTask(id) {
+  cancelDetailSections(`task:${id}:`);
   const jobs = [loadQueue()];
   if (state.taskDetail.id === id) jobs.push(loadTask(id));
   await Promise.all(jobs);
@@ -3350,12 +3351,8 @@ function renderStats() {
     );
   }
 
-  /* stats-body stays visible whenever there is anything to show at all -
-     which, unlike the run-only panels below, includes the queue: a home
-     that has never run a competition can still have tasks queued, and the
-     queue counts this dashboard promises are not derived from run history.
-     Only stats-runs-section (KPIs, verdicts, agents, reviewers) is gated on
-     noRuns; the queue panel is rendered unconditionally, right below. */
+  /* Run history reveals its own panels. The independent queue panel is
+     already visible even when this slower response has not arrived. */
   show($("stats-body"), true);
   show($("stats-empty"), noRuns);
   show($("stats-runs-section"), !noRuns);
@@ -3957,7 +3954,11 @@ function renderStatsBumps(b) {
    Queued and Failed both land on "upnext" - the same section queueSection()
    itself puts them in, since a card's own chip already tells them apart. */
 function renderStatsQueue(q) {
+  if (!q) return; // Run-only refreshes retain independently loaded queue counts.
   const root = $("stats-queue-tiles");
+  const signature = JSON.stringify(q);
+  if (root.dataset.counts === signature) return;
+  root.dataset.counts = signature;
   clear(root);
   const sectionTile = (label, value, tone, sectionKey) => statsTile(label, value, tone, {
     onClick: () => openQueueSectionFocus(sectionKey),
@@ -5087,6 +5088,31 @@ function renderPostingComparison(parent, view) {
   parent.append(after);
 }
 
+function updateQuestionOrigin(row, question) {
+  const r = row.refs;
+  const open = question.status === "open";
+  const hasChat = typeof question.origin_chat === "string" && question.origin_chat !== "";
+  const canConsult = open && hasChat && question.can_consult_chat === true;
+  show(r.consultBox, hasChat);
+  show(r.consultBtn, canConsult);
+  show(r.chatLink, hasChat);
+  setAttr(r.chatLink, "href", hasChat ? `#/chat/${encodeURIComponent(question.origin_chat)}` : null);
+  setText(r.chatLink, question.origin_chat_closed ? "Open chat (closed)" : "Open chat");
+  r.consultBtn.disabled = Boolean(question.consult) || r.consultPending === true;
+  setText(r.consultBtn, question.consult
+    ? "Asked the chat agent"
+    : question.origin_chat_closed ? "Reopen chat and ask" : "Ask the chat agent");
+  r.consultBtn.onclick = () => consultChat(question.id, row);
+}
+
+function renderQuestionOrigins() {
+  const questions = new Map((state.questions || []).map(question => [question.id, question]));
+  for (const row of document.querySelectorAll(".ask")) {
+    const question = questions.get(row.dataset.questionId);
+    if (question) updateQuestionOrigin(row, question);
+  }
+}
+
 function updateAskCard(row, question, { compact = false } = {}) {
   const r = row.refs;
   updateQuestionIdentity(r.identity, question.id);
@@ -5179,18 +5205,7 @@ function updateAskCard(row, question, { compact = false } = {}) {
 
   r.saySend.onclick = () => sayToQuestion(question.id, r.sayText.value, row);
   show(r.sayBox, open);
-  const hasChat = typeof question.origin_chat === "string" && question.origin_chat !== "";
-  const canConsult = open && hasChat && question.can_consult_chat === true;
-  show(r.consultBox, hasChat);
-  show(r.consultBtn, canConsult);
-  show(r.chatLink, hasChat);
-  setAttr(r.chatLink, "href", hasChat ? `#/chat/${encodeURIComponent(question.origin_chat)}` : null);
-  setText(r.chatLink, question.origin_chat_closed ? "Open chat (closed)" : "Open chat");
-  r.consultBtn.disabled = Boolean(question.consult);
-  setText(r.consultBtn, question.consult
-    ? "Asked the chat agent"
-    : question.origin_chat_closed ? "Reopen chat and ask" : "Ask the chat agent");
-  r.consultBtn.onclick = () => consultChat(question.id, row);
+  updateQuestionOrigin(row, question);
   r.sayText.disabled = waitingOnAgent || textUnavailable;
   r.saySend.disabled = waitingOnAgent || textUnavailable;
 
@@ -5377,6 +5392,8 @@ async function sayToQuestion(id, text, row) {
    The question stays open; the chat agent answers it or asks the owner there. */
 async function consultChat(id, row) {
   const r = row.refs;
+  if (r.consultPending) return;
+  r.consultPending = true;
   r.consultBtn.disabled = true;
   try {
     const said = await postJson(API.questionConsult(id), {});
@@ -5391,7 +5408,10 @@ async function consultChat(id, row) {
     }
     setText(r.error, error.message);
     show(r.error, true);
-    r.consultBtn.disabled = false;
+  } finally {
+    r.consultPending = false;
+    const current = (state.questions || []).find(question => question.id === id);
+    if (current) updateQuestionOrigin(row, current);
   }
 }
 
@@ -6014,6 +6034,52 @@ function talkShell(id, summary) {
   };
 }
 
+// A section owns its request until navigation or completion. Repeated refresh
+// signals join pending work instead of continually superseding slow responses.
+const detailSections = new Map();
+function cancelDetailSections(prefix = "") {
+  for (const [key, job] of detailSections) {
+    if (!key.startsWith(prefix)) continue;
+    job.controller.abort();
+    detailSections.delete(key);
+  }
+}
+function sectionRequest(key, url, accept, reject, text = false, refresh = false) {
+  if (detailSections.has(key)) {
+    const pending = detailSections.get(key);
+    if (refresh) pending.refresh = () => sectionRequest(key, url, accept, reject, text);
+    return pending.promise;
+  }
+  const controller = new AbortController();
+  const job = { controller };
+  detailSections.set(key, job);
+  job.promise = (text ? getText : getJson)(url, { signal: controller.signal })
+    .then(value => { if (detailSections.get(key) === job) return accept(value); })
+    .catch(error => { if (detailSections.get(key) === job && error.name !== "AbortError") return reject(error); })
+    .finally(() => {
+      if (detailSections.get(key) !== job) return;
+      detailSections.delete(key);
+      if (job.refresh) return job.refresh();
+    });
+  return job.promise;
+}
+function sectionNotice(anchorId, key, message, retry) {
+  const anchor = $(anchorId);
+  if (!anchor) return;
+  let box = $(key);
+  if (!box) {
+    box = el("div", { id: key, role: "status", class: "view-sub" });
+    anchor.after(box);
+  }
+  const signature = `${message}:${Boolean(retry)}`;
+  if (box.dataset.signature === signature) return;
+  box.dataset.signature = signature;
+  clear(box);
+  if (message) box.append(el("span", { text: message }));
+  if (retry) box.append(el("button", { type: "button", class: "btn btn-quiet", text: "Retry", onclick: retry }));
+  show(box, Boolean(message));
+}
+
 const talkDetailRequests = new Map();
 function nextTalkRequest(id) {
   const request = (talkDetailRequests.get(id) || 0) + 1;
@@ -6025,49 +6091,69 @@ function nextTalkRequest(id) {
    snapshot until a fresh detail arrives, and supersede older reads. */
 function acceptTalkUpdate(talk) {
   if (state.talkDetail.id !== talk.id) return;
+  cancelDetailSections();
   state.talkDetail.talk = { ...state.talkDetail.talk, ...talk };
   loadTalk(talk.id, { background: true });
 }
 
+function applyTalkSections(detail) {
+  if (!detail.talk || !detail.sections) return;
+  const { context, context_for, ...metadata } = detail.sections;
+  Object.assign(detail.talk, metadata);
+  if (context_for === detail.talk.updated_at) detail.talk.context = context;
+}
+
 async function loadTalk(id, { background = false } = {}) {
   const detail = state.talkDetail;
-  const request = nextTalkRequest(id);
   const wait = state.talkWaits.get(id);
   const observed = wait && { generation: wait.generation, startedAt: Date.now() };
-  try {
-    const talk = await getJson(API.talk(id));
-    if (request !== talkDetailRequests.get(id)) return;
+  const current = () => state.talkDetail === detail && state.talkDetail.id === id;
+  const retry = () => loadTalk(id, { background: true });
+  sectionNotice("talk-meta", "talk-core-state", detail.talk ? "" : "Loading conversation…");
+  const core = sectionRequest(`talk:${id}:core`, `${API.talk(id)}/core`, talk => {
     trackTalkThinking(talk, observed);
-    if (state.talkDetail.id !== id) return;
-    if (state.talkDetail !== detail) return;
-    state.talkDetail.talk = talk;
-    state.talkDetail.roster = Array.isArray(talk.roster) ? talk.roster : [];
-    state.talkDetail.personas = Array.isArray(talk.personas) ? talk.personas : [];
-    rememberTalkChoices(talk.repo, state.talkDetail.roster, state.talkDetail.personas);
+    if (!current()) return;
+    detail.talk = { ...detail.talk, ...talk };
+    applyTalkSections(detail);
+    sectionNotice("talk-meta", "talk-core-state", "");
     renderTalk();
     ok();
-  } catch (error) {
-    if (request !== talkDetailRequests.get(id)) return;
-    if (state.talkDetail.id === id && state.talkDetail !== detail) return;
-    /* 404 means the conversation is gone: nothing will ever end its wait by
-       growing the transcript, so settle it here. Other errors keep the wait
-       and are retried. */
+  }, error => {
+    if (error.status === 404) endTalkTurn(id);
+    if (!current()) return;
     if (error.status === 404) {
-      endTalkTurn(id);
-      if (state.talkDetail.id === id) {
-        state.talkDetail.talk = null;
-        state.talkDetail.roster = [];
-        state.talkDetail.personas = [];
-        state.talkDetail.gone = true;
-        ok();
-        renderTalk();
-      }
+      detail.talk = null;
+      detail.gone = true;
+      renderTalk();
+      ok();
       return;
     }
-    if (state.talkDetail.id === id) {
-      failFor(background, `Could not load conversation ${shortId(id)}: ${error.message}`, error);
+    sectionNotice("talk-meta", "talk-core-state", `Conversation: ${error.message}`, retry);
+    failFor(background, `Could not load conversation ${shortId(id)}: ${error.message}`, error);
+  }, false, background);
+  // Waiting conversations outside the visible detail need only liveness.
+  if (!current()) return core;
+  sectionNotice("talk-task-progress", "talk-sections-state", detail.sections ? "" : "Loading related tasks and choices…");
+  const sections = sectionRequest(`talk:${id}:sections`, `${API.talk(id)}/sections`, data => {
+    if (!current()) return;
+    detail.sections = data;
+    detail.sectionsError = false;
+    detail.roster = data.roster;
+    detail.personas = data.personas;
+    if (detail.talk) {
+      applyTalkSections(detail);
+      rememberTalkChoices(detail.talk.repo, data.roster, data.personas);
     }
-  }
+    sectionNotice("talk-task-progress", "talk-sections-state", "");
+    renderTalk();
+  }, error => {
+    if (current()) {
+      detail.sectionsError = true;
+      sectionNotice("talk-task-progress", "talk-sections-state", `Related information: ${error.message}`, retry);
+      renderTalk();
+    }
+  }, false, background);
+  await Promise.allSettled([core, sections]);
 }
 
 /* The server uses Done alone as completion, for the same tasks as the list. */
@@ -6167,12 +6253,19 @@ function renderTalk() {
   if (!talk) {
     const gone = Boolean(state.talkDetail.gone);
     const summary = gone ? null : state.talkDetail.summary;
-    setText($("talk-h"), gone ? "This conversation no longer exists." : "Loading conversation…");
+    const title = summary && summary.title ? summary.title : "Loading conversation…";
+    setText($("talk-h"), gone ? "This conversation no longer exists." : title);
+    const repoName = summary && typeof summary.repo === "string" ? summary.repo.split(/[\\/]/).filter(Boolean).pop() : "";
+    const meta = summary ? `${shortId(state.talkDetail.id)}${repoName ? ` · ${repoName}` : ""}` : "";
     setText(
       $("talk-meta"),
-      gone ? `${shortId(state.talkDetail.id)} · It was deleted. Pick another conversation from the list.` : "",
+      gone ? `${shortId(state.talkDetail.id)} · It was deleted. Pick another conversation from the list.` : meta,
     );
-    clear($("talk-status"));
+    const head = $("talk-status");
+    clear(head);
+    if (summary && summary.status) {
+      head.append(chip(summary.status, TALK_STATUS));
+    }
     clear($("talk-turns"));
     show($("talk-tasks-panel"), false);
     show($("talk-task-progress"), !gone);
@@ -6234,6 +6327,14 @@ function renderTalk() {
   setAttr($("talk-meta"), "title", `${talk.id}\nstarted ${started.title}`);
 
   const turnsMd = talkTurnsMd(talk);
+  const previousTail = $("talk-turns").lastElementChild;
+  const viewportBottom = $("main").dataset.split === "1"
+    ? $("view-talk").getBoundingClientRect().bottom : window.innerHeight;
+  const followingTail = !previousTail || previousTail.getBoundingClientRect().bottom <= viewportBottom + 80;
+  const shownDetail = state.talkDetail;
+  const scrollCurrentTalk = () => {
+    if (state.talkDetail === shownDetail && state.route.name === "talk") scrollToLastTurn("talk-turns");
+  };
   syncList(
     $("talk-turns"),
     turns.flatMap((turn, i) => {
@@ -6255,9 +6356,9 @@ function renderTalk() {
     && turns[turns.length - 1].body === wait.pending.body;
   if (state.openingTalk) {
     state.openingTalk = false;
-    if (turnCount > 0) requestAnimationFrame(() => scrollToLastTurn("talk-turns"));
-  } else if (turnCount > state.prevTalkTurnCount && !lastIsPending) {
-    requestAnimationFrame(() => scrollToLastTurn("talk-turns"));
+    if (turnCount > 0) requestAnimationFrame(scrollCurrentTalk);
+  } else if (followingTail && turnCount > state.prevTalkTurnCount && !lastIsPending) {
+    requestAnimationFrame(scrollCurrentTalk);
   }
   state.prevTalkTurnCount = turnCount;
 
@@ -6291,6 +6392,7 @@ let talkAgentSwitching = false;
 function renderTalkAgent(talk, busy, loading = false) {
   const box = $("talk-agent-box");
   const select = $("talk-agent");
+  loading = loading || !state.talkDetail.sections || state.talkDetail.sectionsError;
   const roster = state.talkDetail.roster || [];
   show(box, loading || roster.length > 0);
   if (document.activeElement !== select) {
@@ -6306,7 +6408,7 @@ function renderTalkAgent(talk, busy, loading = false) {
     }
     select.value = talk.agent;
   }
-  select.disabled = busy || talkAgentSwitching || talkPersonaSwitching || talkImplementersSwitching
+  select.disabled = loading || busy || talkAgentSwitching || talkPersonaSwitching || talkImplementersSwitching
     || String(talk.status || "open") !== "open" || roster.length < 2;
 }
 
@@ -6386,6 +6488,7 @@ $("talk-persona-box").querySelector(".talk-agent-label").prepend(talkPersonaAvat
 function renderTalkPersona(talk, busy, loading = false) {
   const box = $("talk-persona-box");
   const select = $("talk-persona");
+  loading = loading || !state.talkDetail.sections || state.talkDetail.sectionsError;
   const personas = state.talkDetail.personas || [];
   show(box, loading || personas.length > 0);
   const current = talk.persona || "default";
@@ -6398,7 +6501,7 @@ function renderTalkPersona(talk, busy, loading = false) {
     for (const p of entries) select.append(el("option", { value: p.id, text: p.name }));
     select.value = current;
   }
-  select.disabled = busy || talkPersonaSwitching || talkAgentSwitching || talkImplementersSwitching
+  select.disabled = loading || busy || talkPersonaSwitching || talkAgentSwitching || talkImplementersSwitching
     || String(talk.status || "open") !== "open";
 }
 
@@ -6795,6 +6898,8 @@ async function startTalk() {
     renderTalks();
     announce("Conversation opened.");
     location.hash = `#/chat/${talk.id}`;
+    // Apply navigation before starting requests: hashchange cancels old sections.
+    applyRoute();
     loadTalk(talk.id, { background: true });
     ok();
   } catch (failure) {
@@ -7414,9 +7519,19 @@ function renderReportCards() {
   const note = $("run-report-note");
   const toggle = $("report-raw-toggle");
   let reason = null;
-  if (!view) reason = null;
-  else if (view.error) reason = `Structured report unavailable (${view.error}); showing the raw text.`;
-  else if (view.schema !== REPORT_VIEW_SCHEMA || !Array.isArray(view.sections)) {
+  if (!view) {
+    if (state.detail.reportLoading) {
+      setText(raw, "Loading report…");
+      show(box, false);
+      show(raw, true);
+      show(toggle, false);
+      show(note, false);
+      return;
+    }
+    reason = null;
+  } else if (view.error) {
+    reason = `Structured report unavailable (${view.error}); showing the raw text.`;
+  } else if (view.schema !== REPORT_VIEW_SCHEMA || !Array.isArray(view.sections)) {
     reason = `Structured report schema ${view.schema} is not understood; showing the raw text.`;
   }
   const runId = state.detail.id;
@@ -7429,7 +7544,10 @@ function renderReportCards() {
   show(box, cards);
   show(raw, !cards);
   show($("wrap-toggle"), !cards);
-  if (!cards) return;
+  if (!cards) {
+    setText(raw, state.detail.report || "Loading text report…");
+    return;
+  }
   /* Rebuild only when the data moved, so a refresh does not disturb a card
      the operator is reading. */
   const sig = `${runId}\n${JSON.stringify(view)}`;
@@ -7458,27 +7576,35 @@ function renderRunDetail() {
   applyRunTab();
   renderReportCards();
 
-  if (!run) {
-    setText($("run-h"), "Loading run\u2026");
-    setText($("run-meta"), "");
-    clear($("run-status"));
-    /* Both of these are about a specific run, and a question belonging to a
-       different one is not merely stale, it is wrong. */
+  if (!run || run.isShell) {
+    const summary = (state.runs || []).find((r) => r.id === state.detail.id);
+    if (summary) {
+      const parkedNow = isWaiting(summary) || openFor(summary.id).length > 0;
+      const status = parkedNow && summary.badge_status !== "superseded" && summary.badge_status !== "stale" ? "waiting" : displayedRunStatus(summary);
+      const head = $("run-status");
+      clear(head);
+      head.append(chip(status, RUN_STATUS));
+      setText($("run-h"), summary.task_title || summary.id);
+      setText($("run-meta"), `${shortId(summary.id)} · ${summary.repo || ""}`);
+    } else {
+      setText($("run-h"), "Loading run\u2026");
+      setText($("run-meta"), "");
+      clear($("run-status"));
+    }
     show($("run-ask-panel"), false);
     show($("run-land-panel"), false);
     show($("run-active-panel"), false);
-    /* The fab and its sheet stay reachable across this route (see
-       applyRoute), so a switch to a different run id \u2014 the daemon strip's
-       currentRunLink, or back/forward between two run pages \u2014 must not leave
-       the previous run's Resume/Fold/Delete buttons sitting in the sheet:
-       their onclick closures still carry the old id, and Delete says itself
-       "cannot be undone". Clearing here, before the new run's data arrives,
-       is what used to happen for free when the whole panel was hidden. */
+    for (const panel of ["run-advise-panel", "run-verdict", "run-cands-panel", "run-reviews-panel", "run-passes-panel", "run-handovers-panel", "run-quota-panel"]) show($(panel), false);
+    clear($("run-instruction"));
+    delete $("run-instruction").dataset.forRun;
     clear($("run-task-box"));
     clear($("run-actions-box"));
     clear($("run-fold-merged-box"));
     clear($("run-delete-box"));
-    setText($("run-report"), report === null ? "Loading\u2026" : report);
+    renderReportCards();
+    clear($("run-events"));
+    delete $("run-events").dataset.signature;
+    show($("run-alert"), false);
     return;
   }
 
@@ -7561,8 +7687,12 @@ function renderRunDetail() {
   }
 
   syncRunPanels(run);
-  renderAsks(run);
-  renderLand(run);
+  if (state.detail.evidenceError) {
+    setRunEvidencePending(Boolean(state.detail.evidencePending));
+  } else {
+    renderAsks(run);
+    renderLand(run);
+  }
   renderActive(run);
   renderAdvise(run);
   renderVerdict(run);
@@ -7573,9 +7703,13 @@ function renderRunDetail() {
   renderPasses(run);
   renderTimeline(run);
   renderRunTaskEntry(run);
-  renderRunActions(run);
-  renderRunFoldMerged(run);
-  renderRunDelete(run);
+  if (state.detail.evidenceError || state.detail.evidencePending) {
+    setRunEvidencePending(Boolean(state.detail.evidencePending));
+  } else {
+    renderRunActions(run);
+    renderRunFoldMerged(run);
+    renderRunDelete(run);
+  }
 
   setText($("run-report"), report === null ? "Loading\u2026" : report);
 }
@@ -7711,7 +7845,8 @@ async function foldRun(id) {
       ? `Folded ${shortId(id)}: ${n} worktree${n === 1 ? "" : "s"} and branches removed.`
       : `Run ${shortId(id)} had nothing left to fold.`);
     closeRunActions();
-    await loadRun(id);
+    cancelDetailSections(`run:${id}:`);
+    if (state.detail.id === id) await loadRun(id);
   } catch (error) {
     /* The alert banner sits in normal flow, under the sheet's own top-layer
        backdrop, so it must close first or the failure is unreadable. */
@@ -7729,7 +7864,8 @@ async function resumeRun(id) {
     ok();
     announce(`Run ${shortId(id)} is being resumed. The card will follow it.`);
     closeRunActions();
-    await loadRun(id);
+    cancelDetailSections(`run:${id}:`);
+    if (state.detail.id === id) await loadRun(id);
   } catch (error) {
     closeRunActions();
     fail(`Could not resume run ${shortId(id)}: ${error.message}`);
@@ -7809,7 +7945,8 @@ async function foldMergedRun(id, prUrl) {
     announce(`Recorded ${shortId(id)} as merged via ${url}: ${out.before} → ${out.after}.`);
     armedFoldMerged = null;
     closeRunActions();
-    await loadRun(id);
+    cancelDetailSections(`run:${id}:`);
+    if (state.detail.id === id) await loadRun(id);
   } catch (error) {
     closeRunActions();
     fail(`Could not record ${shortId(id)} as merged: ${error.message}`);
@@ -9103,6 +9240,9 @@ function renderTimeline(run) {
   show($("run-events-note"), events.length > 0);
 
   const list = $("run-events");
+  const signature = JSON.stringify([run.id, events]);
+  if (list.dataset.signature === signature) return;
+  list.dataset.signature = signature;
   clear(list);
   for (const group of groupEvents(events)) {
     list.append(el("li", { class: "tl-group" },
@@ -9173,7 +9313,7 @@ function renderStoreList(partial, render) {
 }
 
 function mergeStore(name, rows, delta) {
-  const merged = new Map(state[name].map((row) => [row.id, row]));
+  const merged = new Map((state[name] || []).map((row) => [row.id, row]));
   for (const id of delta.removed) merged.delete(id);
   // A changed file that could not be decoded is absent from the API too.
   for (const id of delta.changed) merged.delete(id);
@@ -9189,8 +9329,22 @@ function loadStore(name, url, change, apply) {
   let flight = storeReads.get(name);
   if (flight) {
     // An explicit refresh needs a whole read even if followed by a delta.
+    const previous = flight.pending && flight.pending.change;
+    if (change && previous && change.rev === previous.rev) {
+      // The question and queue refresh paths can enqueue the same event.
+      // Keep a delta chain already merged through that revision.
+      change = previous;
+    } else if (change && change.delta && previous && previous.delta && change.delta.base === previous.rev) {
+      const changed = new Set(previous.delta.changed);
+      const removed = new Set(previous.delta.removed);
+      for (const id of change.delta.removed) { changed.delete(id); removed.add(id); }
+      for (const id of change.delta.changed) { removed.delete(id); changed.add(id); }
+      change = { rev: change.rev, delta: {
+        base: previous.delta.base, changed: [...changed], removed: [...removed],
+      } };
+    }
     flight.pending = {
-      change: change || (flight.pending && flight.pending.change),
+      change: change || previous,
       whole: !change || Boolean(flight.pending && flight.pending.whole),
     };
     return flight.promise;
@@ -9214,22 +9368,46 @@ function loadStore(name, url, change, apply) {
         try {
           const endpoint = partial
             ? `${url}${url.includes("?") ? "&" : "?"}ids=${encodeURIComponent(delta.changed.join(","))}` : url;
-          let rows = await getJson(endpoint);
+          let rows;
+          const paged = !partial && (name === "queue" || name === "talks");
+          if (paged) {
+            let cursor = null;
+            const collected = new Map();
+            do {
+              const page = await getJson(`${url}/page${cursor ? `?before=${encodeURIComponent(cursor)}` : ""}`);
+              for (const row of page.rows) collected.set(row.id, row);
+              // Keep the old snapshot while refreshing; remove deleted rows
+              // only after a complete enumeration. New pages retain DOM nodes.
+              const visible = new Map((state[name] || []).map(row => [row.id, row]));
+              for (const row of collected.values()) visible.set(row.id, row);
+              apply(mergeStore(name, [...visible.values()], { changed: [], removed: [] }), true, observed, page.rows);
+              cursor = page.next;
+              sectionNotice(`${name}-h`, `${name}-load-state`, cursor ? "Loading older entries…" : "");
+              // Finish the frozen membership walk even under continuous
+              // writes. Queued deltas reconcile it after every page is shown.
+            } while (cursor);
+            rows = mergeStore(name, [...collected.values()], {
+              changed: (state[name] || []).map(row => row.id), removed: [],
+            });
+          } else {
+            rows = await getJson(endpoint);
+          }
           if (partial && name === "runs" && delta.changed.some((id) =>
             state.runs.some((run) => run.id === id) && !rows.some((row) => row.id === id))) {
             rows = await getJson(url);
             apply(rows, false, observed, rows);
           } else {
-            apply(partial ? mergeStore(name, rows, delta) : rows, partial, observed, rows);
+            apply(partial ? mergeStore(name, rows, delta) : rows, partial || paged, observed, rows);
           }
           // Only successful reads acknowledge the target. A later notification
           // may already be queued; its base will be checked on the next read.
           if (target) state.rev[name] = target.rev;
           cancelStoreRetry(name);
+          sectionNotice(`${name === "queue" ? "queue" : name}-h`, `${name}-load-state`, "");
           ok();
         } catch (error) {
           state.rev[name] = null;
-          failBackground(`Could not load ${name}: ${error.message}`, error);
+          sectionNotice(`${name}-h`, `${name}-load-state`, `Could not load ${name}: ${error.message}`, () => loadStore(name, url, null, apply));
           // Even the final change must recover while SSE stays connected:
           // health otherwise polls without applying revisions in that state.
           cancelStoreRetry(name);
@@ -9260,19 +9438,40 @@ function loadQueue(change) {
   });
 }
 
-async function loadStats({ background = false } = {}) {
-  try {
-    const params = new URLSearchParams();
-    if (state.statsRepo) params.set("repo", state.statsRepo);
-    if (state.statsAll) params.set("all", "true");
-    const query = params.toString();
-    const url = query ? `${API.stats}?${query}` : API.stats;
-    state.stats = await getJson(url);
+async function loadStats({ background = false, queueOnly = false } = {}) {
+  const params = new URLSearchParams({ runs_only: "true" });
+  if (state.statsRepo) params.set("repo", state.statsRepo);
+  if (state.statsAll) params.set("all", "true");
+  const query = params.toString();
+  const key = `stats:${query}`;
+  for (const [name, job] of detailSections) {
+    if (!queueOnly && name.startsWith("stats:") && name !== "stats:queue" && name !== key) {
+      job.controller.abort();
+      detailSections.delete(name);
+    }
+  }
+  if (!queueOnly) sectionNotice("stats-h", "stats-load-state", state.stats ? "Updating statistics…" : "Loading statistics…");
+  show($("stats-queue-scope-note"), !!state.statsRepo);
+  sectionNotice("stats-queue-tiles", "stats-queue-state", state.stats ? "Updating queue…" : "Loading queue…");
+  const queue = sectionRequest("stats:queue", `${API.stats}/queue`, counts => {
+    renderStatsQueue(counts);
+    sectionNotice("stats-queue-tiles", "stats-queue-state", "");
+    ok();
+  }, error => {
+    sectionNotice("stats-queue-tiles", "stats-queue-state", `Queue: ${error.message}`, () => loadStats());
+    failFor(background, `Could not load statistics: ${error.message}`, error);
+  });
+  if (queueOnly) return queue;
+  const history = sectionRequest(key, query ? `${API.stats}?${query}` : API.stats, stats => {
+    state.stats = stats;
+    sectionNotice("stats-h", "stats-load-state", "");
     renderStats();
     ok();
-  } catch (error) {
-    failFor(background, `Could not load stats: ${error.message}`, error);
-  }
+  }, error => {
+    sectionNotice("stats-h", "stats-load-state", `Statistics: ${error.message}`, () => loadStats());
+    failFor(background, `Could not load statistics: ${error.message}`, error);
+  });
+  await Promise.allSettled([queue, history]);
 }
 
 /* The repository selector's change handler - switches state.statsRepo and
@@ -9291,9 +9490,41 @@ function selectStatsRepo(value) {
    a backlog of them would mean the loop had been stalled for days — and one
    fetch keeps the runs list, the ask bar and the open run in agreement about
    which runs are parked. */
-async function loadQuestions() {
-  try {
-    const list = await getJson(API.questions);
+let questionOriginGeneration = 0;
+let questionOriginController = null;
+
+function loadQuestionOrigins() {
+  const generation = ++questionOriginGeneration;
+  if (questionOriginController) questionOriginController.abort();
+  const controller = new AbortController();
+  questionOriginController = controller;
+  sectionNotice("questions-h", "questions-origin-state", "Loading question origins…");
+  return getJson(`${API.questions}/origins`, { signal: controller.signal }).then(origins => {
+    if (generation !== questionOriginGeneration) return;
+    const byId = new Map(origins.map(origin => [origin.id, origin]));
+    let incomplete = false;
+    state.questions = state.questions.map(question => {
+      const origin = byId.get(question.id);
+      if (!origin || origin.record_revision !== question.record_revision) {
+        incomplete = true;
+        return { ...question, can_consult_chat: false };
+      }
+      return { ...question, origin_chat: origin.origin_chat,
+        origin_chat_closed: origin.origin_chat_closed, can_consult_chat: origin.can_consult_chat };
+    });
+    renderQuestionOrigins();
+    sectionNotice("questions-h", "questions-origin-state", incomplete ? "Questions changed while loading origins. Retry." : "", incomplete ? () => loadQuestions() : null);
+  }).catch(error => {
+    if (generation !== questionOriginGeneration || error.name === "AbortError") return;
+    sectionNotice("questions-h", "questions-origin-state", `Question origins: ${error.message}`, () => loadQuestions());
+  });
+}
+
+function loadQuestions() {
+  ++questionOriginGeneration;
+  if (questionOriginController) questionOriginController.abort();
+  sectionNotice("questions-h", "questions-origin-state", "");
+  return loadStore("questions", `${API.questions}/core`, null, list => {
     state.questions = sortQuestions(Array.isArray(list) ? list : []);
     renderQuestions();
     renderAskBar();
@@ -9306,10 +9537,9 @@ async function loadQuestions() {
     renderRuns();
     renderQueue();
     if (state.route.name === "run" && state.detail.run) renderRunDetail();
-    ok();
-  } catch (error) {
-    failBackground(`Could not load questions: ${error.message}`, error);
-  }
+    if (state.questions.length) loadQuestionOrigins();
+    else sectionNotice("questions-h", "questions-origin-state", "");
+  });
 }
 
 /* ---- notification centre ------------------------------------------------
@@ -9536,33 +9766,157 @@ async function loadHealth({ applyRevisions = false, explicit = false } = {}) {
   }
 }
 
-async function loadRun(id, { background = false } = {}) {
-  const fresh = state.detail.id !== id;
-  if (fresh) state.detail = { id, run: null, report: null, reportView: null };
-  renderRunDetail();
+const runDetailRequests = new Map();
+function nextRunRequest(id) {
+  const request = (runDetailRequests.get(id) || 0) + 1;
+  runDetailRequests.set(id, request);
+  return request;
+}
 
-  const [run, report, view] = await Promise.allSettled([
-    getJson(API.run(id)), getText(API.report(id)), getJson(API.reportJson(id)),
-  ]);
+function runShell(id, summary) {
+  return {
+    id,
+    run: summary ? { ...summary, isShell: true } : null,
+    report: null,
+    reportView: null,
+    reportLoading: true,
+  };
+}
 
-  if (state.detail.id !== id) return;   /* the operator navigated away */
+function loadRawReport(id) {
+  const detail = state.detail;
+  return sectionRequest(`run:${id}:raw`, API.report(id), text => {
+    if (state.detail !== detail) return;
+    detail.report = text;
+    sectionNotice("run-report-note", "run-raw-state", "");
+    renderReportCards();
+  }, error => {
+    if (state.detail !== detail) return;
+    sectionNotice("run-report-note", "run-raw-state", `Text report: ${error.message}`, () => loadRawReport(id));
+  }, true);
+}
 
-  if (run.status === "fulfilled") {
-    state.detail.run = run.value;
-    ok();
-  } else {
-    failFor(background, `Could not load run ${shortId(id)}: ${run.reason.message}`, run.reason);
+/* Retain editable fields and focus while related evidence is being checked.
+   aria-disabled plus capture guards also leaves a focused button in place. */
+function setRunEvidencePending(pending) {
+  state.detail.evidencePending = pending;
+  for (const id of ["run-ask-panel", "run-land-panel", "run-actions-box", "run-fold-merged-box", "run-delete-box"]) {
+    const box = $(id);
+    if (!box) continue;
+    if (!box.dataset.evidenceGuard) {
+      box.dataset.evidenceGuard = "true";
+      for (const event of ["click", "submit"]) box.addEventListener(event, e => {
+        if (e.target.closest(".ask-panel, .question-identity")) return;
+        if ((state.detail.evidencePending || state.detail.evidenceError)
+            && (e.type === "submit" || e.target.closest("button, input[type=submit]"))) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+        }
+      }, true);
+    }
+    for (const button of box.querySelectorAll("button, input[type=submit]")) {
+      if (button.closest(".ask-panel, .question-identity")) continue;
+      if (pending || state.detail.evidenceError) {
+        if (!button.hasAttribute("data-evidence-disabled")) {
+          button.dataset.evidenceDisabled = button.getAttribute("aria-disabled") || "";
+        }
+        button.setAttribute("aria-disabled", "true");
+      } else if (button.hasAttribute("data-evidence-disabled")) {
+        const previous = button.dataset.evidenceDisabled;
+        if (previous) button.setAttribute("aria-disabled", previous);
+        else button.removeAttribute("aria-disabled");
+        delete button.dataset.evidenceDisabled;
+      }
+    }
   }
-  state.detail.report = report.status === "fulfilled"
-    ? report.value
-    : `The report could not be rendered: ${report.reason.message}`;
-  /* A failed or unknown-schema structured view is kept as a reason, never as
-     an empty report: renderReportCards falls back to the raw text with it. */
-  state.detail.reportView = view.status === "fulfilled"
-    ? view.value
-    : { error: view.reason && view.reason.message ? view.reason.message : "request failed" };
+}
 
-  renderRunDetail();
+async function loadRun(id, { background = false } = {}) {
+  const requestId = nextRunRequest(id);
+  if (state.detail.id !== id) {
+    state.detail = runShell(id, (state.runs || []).find(r => r.id === id));
+    sectionNotice("run-report-note", "run-report-state", "");
+    sectionNotice("run-report-note", "run-raw-state", "");
+    renderRunDetail();
+  }
+  const detail = state.detail;
+  const retry = () => loadRun(id, { background: true });
+  sectionNotice("run-meta", "run-core-state", detail.run && !detail.run.isShell ? "" : "Loading run…");
+  // Stage the two new responses without discarding the displayed snapshot.
+  // Shared staging also supports sectionRequest's coalesced trailing refresh.
+  detail.core = null;
+  detail.evidence = null;
+  const retain = background && detail.run && !detail.run.isShell;
+  if (!retain) {
+    detail.evidenceError = true;
+    renderRunDetail();
+  }
+  setRunEvidencePending(true);
+  sectionNotice("run-meta", "run-evidence-state", "Loading related status…");
+  const applyEvidence = () => {
+    if (!detail.core || !detail.evidence) return;
+    if (!detail.core.updated_at || detail.core.updated_at !== detail.evidence.updated_at) {
+      sectionNotice("run-meta", "run-evidence-state", "Run changed while loading related status. Retry.", retry);
+      return;
+    }
+    const unchanged = JSON.stringify(detail.run) === JSON.stringify(detail.evidence);
+    detail.run = detail.evidence;
+    detail.evidenceError = false;
+    detail.evidencePending = false;
+    sectionNotice("run-meta", "run-evidence-state", "");
+    if (!unchanged) renderRunDetail();
+    setRunEvidencePending(false);
+  };
+  const core = sectionRequest(`run:${id}:core`, `${API.run(id)}/core`, run => {
+    if (state.detail !== detail) return;
+    detail.core = run;
+    sectionNotice("run-meta", "run-core-state", "");
+    if (!retain) {
+      detail.run = run;
+      detail.evidenceError = true;
+      renderRunDetail();
+      setRunEvidencePending(true);
+    }
+    applyEvidence();
+  }, error => {
+    if (state.detail === detail) {
+      detail.core = null;
+      detail.evidenceError = true;
+      sectionNotice("run-meta", "run-core-state", `Run: ${error.message}`, retry);
+      if (!retain) renderRunDetail();
+      setRunEvidencePending(false);
+    }
+  }, false, background);
+  const evidence = sectionRequest(`run:${id}:evidence`, API.run(id), run => {
+    if (state.detail !== detail) return;
+    detail.evidence = run;
+    applyEvidence();
+  }, error => {
+    if (state.detail !== detail) return;
+    detail.evidence = null;
+    detail.evidenceError = true;
+    sectionNotice("run-meta", "run-evidence-state", `Related status: ${error.message}`, retry);
+    if (!retain) renderRunDetail();
+    setRunEvidencePending(false);
+  }, false, background);
+  const report = sectionRequest(`run:${id}:report`, API.reportJson(id), view => {
+    if (state.detail !== detail) return;
+    detail.reportView = view;
+    state.detail.reportLoading = false;
+    sectionNotice("run-report-note", "run-report-state", "");
+    renderReportCards();
+    if (state.rawReport || view.schema !== REPORT_VIEW_SCHEMA || !Array.isArray(view.sections)) return loadRawReport(id);
+  }, error => {
+    if (state.detail !== detail) return;
+    state.detail.reportLoading = false;
+    sectionNotice("run-report-note", "run-report-state", `Report: ${error.message}`, retry);
+    if (!detail.reportView) {
+      detail.reportView = { error: error.message };
+      renderReportCards();
+      return loadRawReport(id);
+    }
+  }, false, background);
+  await Promise.allSettled([core, evidence, report]);
 }
 
 /* Named with a trailing underscore because `applyRevisions` is also the option
@@ -9606,7 +9960,9 @@ async function applyRevisions_(source) {
   if (taskStale && state.taskDetail.id) {
     jobs.push(loadTask(state.taskDetail.id, { background: true }));
   }
-  if (statsStale && state.route.name === "stats") jobs.push(loadStats({ background: true }));
+  if (statsStale && state.route.name === "stats") {
+    jobs.push(loadStats({ background: true, queueOnly: runsRev === state.rev.runs }));
+  }
   if (questionsRev !== state.rev.questions) {
     state.rev.questions = questionsRev;
     jobs.push(loadQuestions());
@@ -9862,6 +10218,7 @@ function markSelected() {
 function applyRoute() {
   const route = parseRoute();
   const changed = route.name !== state.route.name || route.id !== state.route.id;
+  if (changed) cancelDetailSections();
   state.route = route;
 
   const split = splitPanes(route, Boolean(splitMedia && splitMedia.matches));
@@ -10390,21 +10747,53 @@ function renderSettings() {
  * Everything here comes from GET /api/queue/{id}: the server reads every run
  * in Task.runs and says what kind of attempt each was and how it ended, so
  * this only lays it out. */
+const taskDetailRequests = new Map();
+function nextTaskRequest(id) {
+  const request = (taskDetailRequests.get(id) || 0) + 1;
+  taskDetailRequests.set(id, request);
+  return request;
+}
+
+function taskShell(id, summary) {
+  return {
+    id,
+    task: summary ? { ...summary, isShell: true } : null,
+    error: null,
+  };
+}
+
 async function loadTask(id, { background = false } = {}) {
-  if (state.taskDetail.id !== id) state.taskDetail = { id, task: null, error: null };
-  renderTask();
-  try {
-    const task = await getJson(API.task(id));
-    if (state.taskDetail.id !== id) return;   /* navigated away */
-    state.taskDetail.task = task;
-    state.taskDetail.error = null;
-    ok();
-  } catch (e) {
-    if (state.taskDetail.id !== id) return;
-    state.taskDetail.error = e.message;
-    failFor(background, `Could not load task ${shortId(id)}: ${e.message}`, e);
+  const req = nextTaskRequest(id);
+  if (state.taskDetail.id !== id) {
+    state.taskDetail = taskShell(id, (state.queue || []).find(t => t.id === id));
   }
+  const detail = state.taskDetail;
+  const retry = () => loadTask(id, { background: true });
   renderTask();
+  sectionNotice("task-meta", "task-core-state", detail.task && !detail.task.isShell ? "" : "Loading task…");
+  const core = sectionRequest(`task:${id}:core`, `${API.task(id)}/core`, task => {
+    if (state.taskDetail !== detail) return;
+    if (!detail.task || detail.task.isShell || detail.task.coreOnly) detail.task = { ...task, coreOnly: true };
+    sectionNotice("task-meta", "task-core-state", "");
+    renderTask();
+  }, error => {
+    if (state.taskDetail === detail) sectionNotice("task-meta", "task-core-state", `Task: ${error.message}`, retry);
+  }, false, background);
+  sectionNotice("task-attempts-count", "task-history-state", detail.task && !detail.task.coreOnly && !detail.task.isShell ? "" : "Loading history and dependencies…");
+  const history = sectionRequest(`task:${id}:history`, API.task(id), task => {
+    if (state.taskDetail !== detail) return;
+    detail.task = task;
+    detail.error = null;
+    sectionNotice("task-attempts-count", "task-history-state", "");
+    renderTask();
+  }, error => {
+    if (state.taskDetail === detail) {
+      detail.error = error.message;
+      renderTaskActions(null);
+      sectionNotice("task-attempts-count", "task-history-state", `History and dependencies: ${error.message}`, retry);
+    }
+  }, false, background);
+  await Promise.allSettled([core, history]);
 }
 
 function renderTask() {
@@ -10412,16 +10801,37 @@ function renderTask() {
   setAttr($("view-task"), "data-task-id", task ? task.id : null);
   const head = $("task-status");
   clear(head);
-  if (!task) {
-    setText($("task-h"), error ? `Task ${shortId(id || "")} could not be loaded` : "Loading task\u2026");
-    setText($("task-meta"), error || "");
+  if (!task || task.isShell) {
+    const summary = (state.queue || []).find((t) => t.id === id);
+    if (summary) {
+      const status = String(summary.status_str || summary.status || "");
+      head.append(chip(status, TASK_STATUS));
+      if (summary.urgent === true) head.append(urgentTag());
+      setText($("task-h"), summary.title || shortId(summary.id));
+      const repoName = typeof summary.repo === "string" ? summary.repo.split(/[\\/]/).filter(Boolean).pop() : "";
+      const metaBits = [
+        shortId(summary.id),
+        summary.source_label,
+        repoName,
+        summary.solo ? "solo" : "",
+      ].filter(Boolean);
+      setText($("task-meta"), metaBits.join(" · "));
+    } else {
+      setText($("task-h"), error ? `Task ${shortId(id || "")} could not be loaded` : "Loading task\u2026");
+      setText($("task-meta"), error || "");
+    }
     show($("task-why-panel"), false);
+    renderTaskFollowup(null);
+    clear($("task-instruction"));
+    delete $("task-instruction").dataset.forTask;
     clear($("task-runs"));
+    delete $("task-runs").dataset.signature;
     clear($("task-flow"));
     setText($("task-flow-summary"), "");
     setText($("task-attempts-count"), "");
     renderTaskActions(null);
-    return;
+    if (!task) return;
+    if (task.isShell) return;
   }
   const status = String(task.status_str || task.status || "");
   head.append(chip(status, TASK_STATUS));
@@ -10434,7 +10844,7 @@ function renderTask() {
     task.source_label,
     repoName,
     task.solo ? "solo" : "",
-    `${spent} of ${task.max_attempts} attempts used`,
+    task.coreOnly ? `${spent} attempts used` : `${spent} of ${task.max_attempts} attempts used`,
   ].filter(Boolean);
   const metaKids = [];
   metaBits.forEach((bit, i) => {
@@ -10459,7 +10869,15 @@ function renderTask() {
     box.dataset.forTask = stamp;
     renderMd(box, task.instruction_md);
   }
-  renderTaskActions(task);
+  renderTaskActions(task.coreOnly || error ? null : task);
+  if (task.coreOnly) {
+    clear($("task-runs"));
+    delete $("task-runs").dataset.signature;
+    clear($("task-flow"));
+    setText($("task-flow-summary"), "");
+    setText($("task-attempts-count"), "");
+    return;
+  }
 
   const history = Array.isArray(task.history) ? task.history : [];
   const passesTotal = Number(task.passes_total) || history.length;
@@ -10475,6 +10893,9 @@ function renderTask() {
     : "");
   show($("task-unreadable"), unreadable > 0);
 
+  const historySignature = JSON.stringify([task.id, task.history, task.flow, task.followup_origin]);
+  if ($("task-runs").dataset.signature === historySignature) return;
+  $("task-runs").dataset.signature = historySignature;
   renderTaskFlow(task.flow);
   renderTaskFollowup(task.followup_origin);
 
@@ -10945,6 +11366,7 @@ function wire() {
 
   $("report-raw-toggle").addEventListener("click", () => {
     state.rawReport = !state.rawReport;
+    if (state.rawReport) loadRawReport(state.detail.id);
     renderReportCards();
   });
 
@@ -11046,6 +11468,7 @@ async function boot() {
      falls back to health's own count until /api/questions has answered. So
      all five now share one round trip, and renderRuns runs once more after
      to pick up whichever of health/runs landed second. */
+  subscribe();
   await Promise.allSettled([
     loadHealth(), loadRuns(), loadQueue(), loadQuestions(), loadTalks(), loadNotifications(),
   ]);
@@ -11059,7 +11482,6 @@ async function boot() {
   }
   renderRuns();
 
-  subscribe();
   setInterval(() => {
     if (document.hidden) return;
     loadHealth({ applyRevisions: !state.streamOpen });

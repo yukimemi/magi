@@ -290,6 +290,324 @@ impl Default for Opts {
 
 mod id_links;
 
+type Stamps = HashMap<String, (u128, u64)>;
+
+/// Metadata only: no task instructions or conversation bodies are read here.
+fn store_stamps(root: &FsPath, runs: bool) -> Stamps {
+    try_store_stamps(root, runs).unwrap_or_default()
+}
+
+fn try_store_stamps(root: &FsPath, runs: bool) -> std::io::Result<Stamps> {
+    try_stamps(root, runs, false)
+}
+
+fn try_stamps(root: &FsPath, runs: bool, all_entries: bool) -> std::io::Result<Stamps> {
+    use std::hash::{Hash as _, Hasher as _};
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(e),
+    };
+    let mut stamps = HashMap::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = if runs {
+            entry.path().join("run.json")
+        } else {
+            entry.path()
+        };
+        if !runs && !all_entries && path.extension().is_none_or(|ext| ext != "json") {
+            continue;
+        }
+        let identity = match file_identity(&path) {
+            Ok(identity) => identity,
+            Err(e) if runs && e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let modified = identity
+            .modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let mut hasher = std::hash::DefaultHasher::new();
+        identity.hash(&mut hasher);
+        let id = if runs || all_entries {
+            entry.file_name().to_string_lossy().into_owned()
+        } else {
+            path.file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        };
+        stamps.insert(id, (modified.as_nanos(), hasher.finish()));
+    }
+    Ok(stamps)
+}
+
+#[derive(Debug, Serialize)]
+struct Delta {
+    base: u64,
+    changed: Vec<String>,
+    removed: Vec<String>,
+}
+
+fn diff_stamps(previous: &Stamps, next: &Stamps, base: u64) -> Delta {
+    let mut changed: Vec<_> = next
+        .iter()
+        .filter(|(id, stamp)| previous.get(*id) != Some(*stamp))
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut removed: Vec<_> = previous
+        .keys()
+        .filter(|id| !next.contains_key(*id))
+        .cloned()
+        .collect();
+    changed.sort_unstable();
+    removed.sort_unstable();
+    Delta {
+        base,
+        changed,
+        removed,
+    }
+}
+
+/// Change detection token for recorded runs under `runs`.
+#[cfg(test)]
+fn runs_revision(runs: &FsPath) -> u64 {
+    stamps_revision(&store_stamps(runs, true))
+}
+
+/// Opaque tokens use the exact metadata snapshot behind the delta, in both
+/// health and SSE. Nanoseconds and length also detect same-millisecond writes
+/// and deleting an older conversation (a newest-mtime token cannot do that).
+fn stamps_revision(stamps: &Stamps) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    if stamps.is_empty() {
+        return 0;
+    }
+    let mut entries: Vec<_> = stamps.iter().collect();
+    entries.sort_unstable();
+    let mut hasher = std::hash::DefaultHasher::new();
+    entries.hash(&mut hasher);
+    hasher.finish().max(1)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChangeNotification {
+    pub payload: serde_json::Value,
+}
+
+#[derive(Default, Debug)]
+pub(crate) struct QueueIndex {
+    // Retain parsed records only while their file identity is unchanged.
+    records: HashMap<String, (FileIdentity, Arc<TaskRelation>)>,
+    #[cfg(test)]
+    reparsed: usize,
+}
+
+#[derive(Clone, Debug)]
+struct TaskRelation {
+    id: String,
+    status: Option<crate::queue::TaskStatus>,
+    priority: i32,
+    runs: Vec<String>,
+    source: Source,
+}
+
+impl From<Task> for TaskRelation {
+    fn from(task: Task) -> Self {
+        Self {
+            id: task.id,
+            status: Some(task.status),
+            priority: task.priority,
+            runs: task.runs,
+            source: task.source,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct FileIdentity {
+    modified: std::time::SystemTime,
+    len: u64,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64),
+}
+
+fn file_identity(path: &FsPath) -> std::io::Result<FileIdentity> {
+    let meta = path.metadata()?;
+    Ok(FileIdentity {
+        modified: meta.modified()?,
+        len: meta.len(),
+        #[cfg(unix)]
+        identity: {
+            use std::os::unix::fs::MetadataExt as _;
+            (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec())
+        },
+    })
+}
+
+type Revisions = (u64, u64, u64, u64, u64, u64);
+type MonitorSnapshot = Option<(Revisions, [Stamps; 3])>;
+
+#[derive(Debug)]
+pub(crate) struct SharedMonitor {
+    pub broadcaster: tokio::sync::broadcast::Sender<ChangeNotification>,
+    pub latest: Arc<Mutex<MonitorSnapshot>>,
+    pub worker_started: std::sync::atomic::AtomicBool,
+    pub queue_index: Arc<Mutex<QueueIndex>>,
+    list_walks: Mutex<Vec<ListWalk>>,
+}
+
+/// Keep a failed store's last observation without suppressing healthy stores.
+fn monitor_scan(ui: &Ui, previous: MonitorSnapshot) -> (Revisions, [Stamps; 3]) {
+    let (mut rev, mut stamps) = previous.unwrap_or_default();
+    for (index, root, runs) in [
+        (0, ui.queue.root(), false),
+        (1, ui.runs.as_path(), true),
+        (2, ui.talks.root(), false),
+    ] {
+        if let Ok(next) = try_store_stamps(root, runs) {
+            let value = stamps_revision(&next);
+            match index {
+                0 => rev.0 = value,
+                1 => rev.1 = value,
+                _ => rev.3 = value,
+            }
+            stamps[index] = next;
+        }
+    }
+    if let Ok(next) = try_stamps(ui.questions.root(), false, true) {
+        rev.2 = stamps_revision(&next);
+    }
+    if let Ok(next) = try_stamps(ui.notices.root(), false, true) {
+        rev.4 = stamps_revision(&next);
+    }
+    rev.5 = ui.lock_loop().rev;
+    (rev, stamps)
+}
+
+impl SharedMonitor {
+    pub fn new() -> Self {
+        let (tx, _) = tokio::sync::broadcast::channel(64);
+        Self {
+            broadcaster: tx,
+            latest: Arc::default(),
+            worker_started: std::sync::atomic::AtomicBool::new(false),
+            queue_index: Arc::default(),
+            list_walks: Mutex::default(),
+        }
+    }
+
+    async fn revisions(&self, ui: &Arc<Ui>) -> ApiResult<Revisions> {
+        let mut receiver = self.broadcaster.subscribe();
+        self.ensure_worker(ui);
+        loop {
+            if let Some((revisions, _)) = self
+                .latest
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+            {
+                return Ok(*revisions);
+            }
+            tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+                .await
+                .map_err(|_| ApiError::internal("Store monitoring is unavailable; retry"))?
+                .map_err(|_| ApiError::internal("Store monitoring restarted; retry"))?;
+        }
+    }
+
+    pub fn ensure_worker(&self, ui: &Arc<Ui>) {
+        if self
+            .worker_started
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return;
+        }
+
+        let weak_ui = Arc::downgrade(ui);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(POLL);
+            loop {
+                ticker.tick().await;
+                let Some(ui) = weak_ui.upgrade() else {
+                    break;
+                };
+
+                let previous = ui
+                    .monitor
+                    .latest
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                let state = Arc::clone(&ui);
+                let scan =
+                    tokio::task::spawn_blocking(move || monitor_scan(&state, previous)).await;
+
+                // A slow filesystem must not turn missed ticks into a busy loop.
+                ticker.reset();
+                let Ok((revisions, next_stamps)) = scan else {
+                    continue;
+                };
+
+                let mut latest_guard = match ui.monitor.latest.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+
+                let previous = latest_guard.take();
+                let (last_rev, prev_stamps) = match previous {
+                    Some((r, s)) => (Some(r), Some(s)),
+                    None => (None, None),
+                };
+
+                if last_rev == Some(revisions) {
+                    *latest_guard = Some((revisions, prev_stamps.unwrap_or(next_stamps)));
+                    continue;
+                }
+
+                let mut payload = serde_json::json!({
+                    "queue_rev": revisions.0,
+                    "runs_rev": revisions.1,
+                    "questions_rev": revisions.2,
+                    "talks_rev": revisions.3,
+                    "notifications_rev": revisions.4,
+                    "loop_rev": revisions.5,
+                });
+
+                if let (Some(base), Some(prev)) = (last_rev, prev_stamps.as_ref()) {
+                    for (index, (key, rev)) in [
+                        ("queue_delta", base.0),
+                        ("runs_delta", base.1),
+                        ("talks_delta", base.3),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let delta = diff_stamps(&prev[index], &next_stamps[index], rev);
+                        if delta.changed.len() + delta.removed.len() > 0
+                            && delta.changed.len() <= 50
+                        {
+                            payload[key] = serde_json::to_value(delta).expect("serializable delta");
+                        }
+                    }
+                }
+
+                *latest_guard = Some((revisions, next_stamps));
+                drop(latest_guard);
+
+                let _ = ui.monitor.broadcaster.send(ChangeNotification { payload });
+            }
+        });
+    }
+}
+
 /// Everything the handlers touch.
 ///
 /// The queue, the runs directory and the magi home are fields rather than
@@ -367,6 +685,7 @@ pub struct Ui {
     /// [`BusyQueueGate`].
     #[cfg(test)]
     busy_queue_gate: Arc<Mutex<Option<BusyQueueGate>>>,
+    pub(crate) monitor: Arc<SharedMonitor>,
 }
 
 /// A one-shot stop point the busy branch's queued-draft write can be made to
@@ -436,7 +755,100 @@ impl Ui {
             launch: launch_daemon,
             #[cfg(test)]
             busy_queue_gate: Arc::default(),
+            monitor: Arc::new(SharedMonitor::new()),
         }
+    }
+
+    /// Refresh metadata on every lookup, including external-process writes. Only
+    /// changed records are parsed. Never publish a partial scan as an empty set.
+    fn indexed_tasks(&self) -> ApiResult<Vec<Arc<TaskRelation>>> {
+        let mut index = self
+            .monitor
+            .queue_index
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let entries = match std::fs::read_dir(self.queue.root()) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                index.records.clear();
+                return Ok(Vec::new());
+            }
+            Err(e) => return Err(anyhow::Error::from(e).into()),
+        };
+        let mut seen = HashSet::new();
+        for entry in entries {
+            let path = entry.map_err(anyhow::Error::from)?.path();
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let stamp = file_identity(&path).map_err(anyhow::Error::from)?;
+            seen.insert(id.to_owned());
+            // On platforms without inode/ctime, re-read rather than trust a
+            // same-size replacement with a preserved modification timestamp.
+            if !cfg!(unix) || index.records.get(id).is_none_or(|(old, _)| *old != stamp) {
+                let Ok(task) = self.queue.get(id) else {
+                    // Isolate an unreadable record, as Queue::list does. Keep
+                    // its last known relationship so a lookup of THAT task
+                    // still fails on the authoritative read below. Never let
+                    // unrelated corruption disable every run and conversation.
+                    // Counts must not present its previous status as current.
+                    if let Some((_, record)) = index.records.get_mut(id) {
+                        Arc::make_mut(record).status = None;
+                    }
+                    continue;
+                };
+                #[cfg(test)]
+                {
+                    index.reparsed += 1;
+                }
+                if file_identity(&path).map_err(anyhow::Error::from)? != stamp {
+                    return Err(ApiError::conflict("Queue changed during read; retry"));
+                }
+                index
+                    .records
+                    .insert(id.to_owned(), (stamp, Arc::new(TaskRelation::from(task))));
+            }
+        }
+        index.records.retain(|id, _| seen.contains(id));
+        let mut tasks: Vec<_> = index
+            .records
+            .values()
+            .map(|(_, task)| task.clone())
+            .collect();
+        tasks.sort_unstable_by(|a, b| b.priority.cmp(&a.priority).then_with(|| b.id.cmp(&a.id)));
+        Ok(tasks)
+    }
+
+    fn find_task_for_run(&self, run_id: &str) -> ApiResult<Option<Task>> {
+        let Some(record) = self
+            .indexed_tasks()?
+            .into_iter()
+            .find(|task| task.runs.iter().any(|id| id == run_id))
+        else {
+            return Ok(None);
+        };
+        let task = self.queue.get(&record.id)?;
+        if !task.runs.iter().any(|id| id == run_id) {
+            return Err(ApiError::conflict("Task relationship changed; retry"));
+        }
+        Ok(Some(task))
+    }
+
+    fn find_tasks_for_talk(&self, talk_id: &str) -> ApiResult<Vec<Task>> {
+        self.indexed_tasks()?
+            .into_iter()
+            .filter(|task| matches!(&task.source, Source::Agent { run, .. } if run == talk_id))
+            .map(|record| {
+                let task = self.queue.get(&record.id)?;
+                if !matches!(&task.source, Source::Agent { run, .. } if run == talk_id) {
+                    return Err(ApiError::conflict("Task relationship changed; retry"));
+                }
+                Ok(task)
+            })
+            .collect()
     }
 
     /// The operator's own state: `<home>/queue`, `<home>/questions`,
@@ -913,6 +1325,7 @@ impl Ui {
             .route("/api/upgrade", post(upgrade_post))
             .route("/api/runs", get(runs_list))
             .route("/api/runs/{id}", get(run_detail).delete(run_delete))
+            .route("/api/runs/{id}/core", get(run_core))
             .route("/api/runs/{id}/report", get(run_report))
             .route("/api/runs/{id}/report.json", get(run_report_json))
             .route("/api/runs/{id}/graft.diff", get(run_graft_diff))
@@ -920,9 +1333,12 @@ impl Ui {
             .route("/api/runs/{id}/fold-merged", post(run_fold_merged))
             .route("/api/runs/{id}/resume", post(run_resume))
             .route("/api/queue", get(queue_list))
+            .route("/api/queue/page", get(queue_page))
             .route("/api/search", get(search_get))
             .route("/api/queue/{id}", get(task_detail).delete(queue_delete))
+            .route("/api/queue/{id}/core", get(task_core))
             .route("/api/stats", get(stats_get))
+            .route("/api/stats/queue", get(stats_queue))
             .route("/api/repos", get(repos_list))
             .route("/api/settings", get(settings_get))
             .route("/api/settings/roles", put(settings_put_roles))
@@ -935,6 +1351,8 @@ impl Ui {
             .route("/api/queue/{id}/edit", post(queue_edit))
             .route("/api/queue/{id}/done", post(queue_done))
             .route("/api/questions", get(questions_list))
+            .route("/api/questions/core", get(questions_core))
+            .route("/api/questions/origins", get(question_origins))
             .route("/api/questions/{id}/answer", post(question_answer))
             .route("/api/questions/{id}/say", post(question_say))
             .route("/api/questions/{id}/consult", post(question_consult))
@@ -957,7 +1375,10 @@ impl Ui {
                 post(notification_dismiss),
             )
             .route("/api/talks", get(talks_list).post(talk_post))
+            .route("/api/talks/page", get(talks_page))
             .route("/api/talks/{id}", get(talk_detail).delete(talk_delete))
+            .route("/api/talks/{id}/core", get(talk_core))
+            .route("/api/talks/{id}/sections", get(talk_sections))
             .route("/api/talks/{id}/say", post(talk_say))
             .route("/api/talks/{id}/pending/resume", post(talk_pending_resume))
             .route("/api/talks/{id}/pending/clear", post(talk_pending_clear))
@@ -2329,6 +2750,7 @@ impl DaemonView {
 }
 
 async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
+    let revisions = ui.monitor.revisions(&ui).await?;
     blocking(move || {
         // One read of the status file for the two fields that describe it, so
         // `daemon` and `loop` in the same answer cannot disagree about who is
@@ -2343,19 +2765,27 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
         let cfg = deputy_config(&ui.repo);
         let update = cached_update_view(cfg.as_ref());
         let upgrade = updater::read_progress(&ui.home).map(|p| upgrade_progress_view(&ui, p));
+        let questions = ui.questions.list();
         Ok(Json(HealthView {
             version: env!("CARGO_PKG_VERSION"),
             home: ui.home.display().to_string(),
-            queue_rev: stamps_revision(&store_stamps(ui.queue.root(), false)),
-            runs_rev: runs_revision(&ui.runs),
-            questions_rev: ui.questions.revision(),
-            talks_rev: stamps_revision(&store_stamps(ui.talks.root(), false)),
-            notifications_rev: ui.notices.revision(),
+            queue_rev: revisions.0,
+            runs_rev: revisions.1,
+            questions_rev: revisions.2,
+            talks_rev: revisions.3,
+            notifications_rev: stamps_revision(
+                &try_stamps(ui.notices.root(), false, true).map_err(anyhow::Error::from)?,
+            ),
             notifications_unread: ui.notices.count_unread(),
             loop_rev,
             runs_unreadable: runs_unreadable(&ui.runs),
-            questions_open: ui.questions.count_open(),
-            questions_needs_owner: ui.questions.count_needs_owner(),
+            questions_open: questions.iter().filter(|q| q.status.open()).count(),
+            questions_needs_owner: questions
+                .iter()
+                .filter(|q| {
+                    q.status.open() && (!q.waiting_on_agent() || ui.questions.deputy_exhausted(q))
+                })
+                .count(),
             daemon: DaemonView::of(reading.clone()),
             looping: ui.loop_view(reading),
             disk: DiskView::of(&ui, cfg.as_ref()),
@@ -3585,6 +4015,26 @@ impl RunDetailView {
     }
 }
 
+/// Core content needs neither the queue nor question/liveness evidence.
+async fn run_core(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<RunDetailView>> {
+    blocking(move || {
+        let id = resolve_run(&ui.runs, &id)?;
+        let state = read_run(&ui.runs, &id)?;
+        Ok(Json(RunDetailView::of(
+            state,
+            false,
+            crate::run::Liveness::Unknown,
+            None,
+            None,
+            None,
+        )))
+    })
+    .await
+}
+
 async fn run_detail(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
@@ -3594,33 +4044,47 @@ async fn run_detail(
         let state = read_run(&ui.runs, &id)?;
         let daemon_claims = crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
         let live = state.liveness(daemon_claims);
-        let waiting = !ui.questions.open_for(&id).is_empty();
+        crate::queue::record_ids(ui.questions.root(), "json")?;
+        let waiting = ui
+            .questions
+            .list()
+            .iter()
+            .any(|q| q.run == id && q.status.open());
+        let max_attempts = daemon::Opts::default().max_attempts;
+
+        let matching_task = ui.find_task_for_run(&id)?;
+
         let superseded_by = state
             .pr_taken_over_by
             .clone()
-            .or_else(|| ui.queue.superseded_by(&id))
+            .or_else(|| {
+                matching_task
+                    .as_ref()
+                    .and_then(|t| t.successor_of(&id).cloned())
+            })
             .as_deref()
             .map(crate::run::short_of)
             .map(str::to_owned);
+
         // Best-effort: an unreadable head (mid-write, or deleted) just means
         // this run's own status stands on its own, same as no later attempt
         // existing at all.
-        let latest_attempt = ui.queue.latest_attempt(&id).and_then(|head_id| {
-            read_run(&ui.runs, &head_id).ok().map(|head| LatestAttempt {
-                short: head.short().to_owned(),
-                resolved: matches!(head.status, RunStatus::Merged | RunStatus::Ready),
-                status: head.status,
-                done: head.status.done(),
-                id: head.id,
-            })
-        });
-        let max_attempts = daemon::Opts::default().max_attempts;
-        let task = ui
-            .queue
-            .list()
-            .into_iter()
-            .find(|t| t.runs.contains(&id))
+        let latest_attempt = matching_task
+            .as_ref()
+            .and_then(|t| t.runs.last().filter(|last| **last != id).cloned())
+            .and_then(|head_id| {
+                read_run(&ui.runs, &head_id).ok().map(|head| LatestAttempt {
+                    short: head.short().to_owned(),
+                    resolved: matches!(head.status, RunStatus::Merged | RunStatus::Ready),
+                    status: head.status,
+                    done: head.status.done(),
+                    id: head.id,
+                })
+            });
+
+        let task = matching_task
             .map(|t| task_outcome(&t, &id, max_attempts, |r| read_run(&ui.runs, r).ok()));
+
         Ok(Json(RunDetailView::of(
             state,
             waiting,
@@ -4236,7 +4700,8 @@ async fn queue_list(
 ) -> ApiResult<Json<Vec<TaskView>>> {
     blocking(move || {
         let tasks = ui.queue.list();
-        let inv = crate::blockers::Inventory::load(&ui.queue, &ui.questions);
+        let inv =
+            crate::blockers::Inventory::load_with_tasks(&ui.queue, &ui.questions, tasks.clone());
         Ok(Json(
             tasks
                 .into_iter()
@@ -4244,6 +4709,184 @@ async fn queue_list(
                 .map(|t| TaskView::with_inventory(t, &inv))
                 .collect(),
         ))
+    })
+    .await
+}
+
+/// Cursor pages read a bounded number of records, never the older transcripts
+/// or instructions. Cursors advance through a frozen file-name snapshot,
+/// including corrupt rows, so skipped/deleted records cannot repeat a page.
+/// Concurrent inserts are reconciled by a trailing store refresh.
+#[derive(Debug, Default, Deserialize)]
+struct PageQuery {
+    before: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StorePage<T> {
+    rows: Vec<T>,
+    next: Option<String>,
+}
+
+const STORE_PAGE_SIZE: usize = 16;
+
+/// Freeze only membership for one bounded cursor walk. Statuses and bodies are
+/// always read from disk; writes/deletions during the walk are reconciled by
+/// the next store revision. Never rescan the entire directory for every page.
+#[derive(Debug)]
+struct ListWalk {
+    token: u64,
+    talks: bool,
+    opened: std::time::Instant,
+    ids: Arc<Vec<String>>,
+}
+
+fn page_ids(ui: &Ui, talks: bool, q: PageQuery) -> ApiResult<(Vec<String>, Option<String>)> {
+    let mut walks = ui
+        .monitor
+        .list_walks
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    walks.retain(|walk| walk.opened.elapsed() < Duration::from_secs(120));
+    let (token, ids, offset) = if let Some(cursor) = q.before {
+        let (token, offset) = cursor
+            .split_once(':')
+            .ok_or_else(|| ApiError::bad_request("Invalid list cursor"))?;
+        let token = token
+            .parse::<u64>()
+            .map_err(|_| ApiError::bad_request("Invalid list cursor"))?;
+        let offset = offset
+            .parse::<usize>()
+            .map_err(|_| ApiError::bad_request("Invalid list cursor"))?;
+        let walk = walks
+            .iter()
+            .find(|walk| walk.token == token && walk.talks == talks)
+            .ok_or_else(|| ApiError::conflict("List cursor expired; retry the list"))?;
+        (token, walk.ids.clone(), offset)
+    } else {
+        let root = if talks {
+            ui.talks.root()
+        } else {
+            ui.queue.root()
+        };
+        let mut ids = crate::queue::record_ids(root, "json")?;
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        let ids = Arc::new(ids);
+        let mut token = crate::rng::entropy();
+        while walks.iter().any(|walk| walk.token == token) {
+            token = crate::rng::entropy();
+        }
+        // Four clients can enumerate both stores and overlap a refresh. Bound
+        // retained membership snapshots; an evicted cursor explicitly retries.
+        if walks.len() >= 16 {
+            walks.remove(0);
+        }
+        walks.push(ListWalk {
+            token,
+            talks,
+            opened: std::time::Instant::now(),
+            ids: ids.clone(),
+        });
+        (token, ids, 0)
+    };
+    if offset > ids.len() {
+        return Err(ApiError::bad_request("Invalid list cursor"));
+    }
+    let end = offset.saturating_add(STORE_PAGE_SIZE).min(ids.len());
+    let next = (end < ids.len()).then(|| format!("{token}:{end}"));
+    Ok((ids[offset..end].to_vec(), next))
+}
+
+async fn queue_page(
+    State(ui): State<Arc<Ui>>,
+    Query(q): Query<PageQuery>,
+) -> ApiResult<Json<StorePage<TaskView>>> {
+    blocking(move || {
+        let (ids, next) = page_ids(&ui, false, q)?;
+        let tasks: Vec<_> = ids
+            .into_iter()
+            .filter_map(|id| ui.queue.get(&id).ok())
+            .collect();
+        let inv = crate::blockers::Inventory::load_for_tasks(&ui.queue, &ui.questions, &tasks);
+        let rows = tasks
+            .into_iter()
+            .map(|task| TaskView::with_inventory(task, &inv))
+            .collect();
+        Ok(Json(StorePage { rows, next }))
+    })
+    .await
+}
+
+/// List-only projection: retain every turn timestamp for exact unread counts,
+/// but do not ship transcripts, parse Markdown or discover repository config.
+/// Opening a conversation obtains its full context window and controls.
+#[derive(Serialize)]
+struct TalkListView {
+    id: String,
+    repo: PathBuf,
+    agent: String,
+    status: talk::TalkStatus,
+    turns: Vec<TalkListTurn>,
+    thinking: bool,
+    context: talk::ContextUsage,
+    created_at: Timestamp,
+    updated_at: Timestamp,
+}
+
+#[derive(Serialize)]
+struct TalkListTurn {
+    who: talk::Who,
+    at: Timestamp,
+    body: String,
+}
+
+async fn talks_page(
+    State(ui): State<Arc<Ui>>,
+    Query(q): Query<PageQuery>,
+) -> ApiResult<Json<StorePage<TalkListView>>> {
+    blocking(move || {
+        let (ids, next) = page_ids(&ui, true, q)?;
+        let rows = ids
+            .into_iter()
+            .filter_map(|id| ui.talks.get(&id).ok())
+            .map(|talk| TalkListView {
+                thinking: ui.is_thinking(&talk.id),
+                context: talk::context_usage(&talk, None),
+                turns: talk
+                    .turns
+                    .iter()
+                    .map(|turn| TalkListTurn {
+                        who: turn.who,
+                        at: turn.at,
+                        body: turn
+                            .body
+                            .lines()
+                            .next()
+                            .unwrap_or_default()
+                            .chars()
+                            .take(240)
+                            .collect(),
+                    })
+                    .collect(),
+                id: talk.id,
+                repo: talk.repo,
+                agent: talk.agent,
+                status: talk.status,
+                created_at: talk.created_at,
+                updated_at: talk.updated_at,
+            })
+            .collect();
+        Ok(Json(StorePage { rows, next }))
+    })
+    .await
+}
+
+async fn stats_queue(State(ui): State<Arc<Ui>>) -> ApiResult<Json<TaskCountsView>> {
+    blocking(move || {
+        let tasks = ui.indexed_tasks()?;
+        Ok(Json(TaskCountsView::from(
+            crate::queue::TaskCounts::of_statuses(tasks.iter().filter_map(|task| task.status)),
+        )))
     })
     .await
 }
@@ -5494,6 +6137,14 @@ fn mark_badges(ui: &Ui, task: &Task, history: &mut [TaskRunView]) {
     }
 }
 
+async fn task_core(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResult<Json<TaskView>> {
+    blocking(move || {
+        let id = resolve_task(&ui.queue, &id)?;
+        Ok(Json(TaskView::from(ui.queue.get(&id)?)))
+    })
+    .await
+}
+
 async fn task_detail(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
@@ -5504,7 +6155,15 @@ async fn task_detail(
             .queue
             .get(&id)
             .map_err(|e| ApiError::not_found(format!("{e:#}")))?;
-        let inv = crate::blockers::Inventory::load(&ui.queue, &ui.questions);
+        let inv = if task.status == TaskStatus::Blocked {
+            Some(crate::blockers::Inventory::load_for(
+                &ui.queue,
+                &ui.questions,
+                &task,
+            ))
+        } else {
+            None
+        };
         let mut history = task_history(&task, |id| read_run(&ui.runs, id).ok());
         mark_badges(&ui, &task, &mut history);
         let runs_unreadable = history.iter().filter(|h| !h.readable).count();
@@ -5517,16 +6176,20 @@ async fn task_detail(
             )
         });
         let flow = task_flow(&task, &history, max_attempts, origin.as_ref());
+        let task_view = match inv.as_ref() {
+            Some(inv) => TaskView::with_inventory(task, inv),
+            None => TaskView::from(task),
+        };
         Ok(Json(TaskDetailView {
             max_attempts,
             flow,
             followup_origin: origin,
             passes_total: history.len(),
-            runs_distinct: distinct_runs(&task.runs),
+            runs_distinct: distinct_runs(&task_view.task.runs),
             history,
             runs_unreadable,
             attempts_note: ATTEMPTS_NOTE,
-            task: TaskView::with_inventory(task, &inv),
+            task: task_view,
         }))
     })
     .await
@@ -5829,7 +6492,7 @@ struct StatsView {
     advisors: Vec<AdvisorStatsView>,
     e2e: E2eStatsView,
     release_bumps: ReleaseBumpStatsView,
-    queue: TaskCountsView,
+    queue: Option<TaskCountsView>,
     /// Same count and same meaning as [`HealthView::runs_unreadable`] - see
     /// that field's doc. Asserted to match it in
     /// `stats_runs_unreadable_matches_health`.
@@ -5902,6 +6565,8 @@ struct StatsQuery {
     repo: Option<String>,
     /// `?all=true` keeps agents that are no longer in the roster.
     all: bool,
+    /// The dashboard fetches queue counts independently of run history.
+    runs_only: bool,
 }
 
 /// `GET /api/stats` - task and run statistics for the dashboard, aggregated
@@ -5950,7 +6615,8 @@ async fn stats_get(
             &jiff::tz::TimeZone::system(),
             STATS_DAILY_DAYS,
         );
-        let queue_counts = crate::queue::TaskCounts::of(&ui.queue.list());
+        let queue_counts = (!q.runs_only)
+            .then(|| TaskCountsView::from(crate::queue::TaskCounts::of(&ui.queue.list())));
         Ok(Json(StatsView {
             totals: StatsTotalsView::from(&collected.totals),
             agents: collected.agents.iter().map(AgentStatsView::from).collect(),
@@ -5966,7 +6632,7 @@ async fn stats_get(
                 .collect(),
             e2e: E2eStatsView::from(&collected.e2e),
             release_bumps: ReleaseBumpStatsView::from(&collected.release_bumps),
-            queue: TaskCountsView::from(queue_counts),
+            queue: queue_counts,
             runs_unreadable: runs_unreadable(&ui.runs),
             repos,
             daily: daily.iter().map(DailyStatsView::from).collect(),
@@ -6246,48 +6912,23 @@ async fn mutate(
 /// The change stream: one revision number per store, on connect and whenever
 /// any of them moves.
 ///
-/// The poll runs in one spawned task per client, which is affordable because
-/// the work is a directory scan and a `stat` per file. It stops as soon as the
-/// receiver is gone, so a phone that walks out of range costs nothing after
-/// its next tick - there is no session and no cleanup to forget.
+/// One shared worker scans stores; clients only forward its notifications.
 async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
+    ui.monitor.ensure_worker(&ui);
+    let mut broadcast_rx = ui.monitor.broadcaster.subscribe();
     let (tx, rx) = tokio::sync::mpsc::channel::<Event>(4);
+
+    let state = Arc::clone(&ui);
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(POLL);
-        let mut last: Option<(u64, u64, u64, u64, u64, u64)> = None;
-        let mut stamps: Option<[Stamps; 3]> = None;
-        loop {
-            // The first tick completes immediately, which is what makes the
-            // stream announce the current revisions on connect.
-            ticker.tick().await;
-            let state = Arc::clone(&ui);
-            let revisions = tokio::task::spawn_blocking(move || {
-                let stamps = [
-                    store_stamps(state.queue.root(), false),
-                    store_stamps(&state.runs, true),
-                    store_stamps(state.talks.root(), false),
-                ];
-                let revisions = (
-                    stamps_revision(&stamps[0]),
-                    stamps_revision(&stamps[1]),
-                    state.questions.revision(),
-                    stamps_revision(&stamps[2]),
-                    state.notices.revision(),
-                    // The loop's counter is in-process state rather than a
-                    // file, so nothing the three stats above look at would
-                    // tell this phone that another one started the loop.
-                    state.lock_loop().rev,
-                );
-                (revisions, stamps)
-            })
-            .await;
-            let Ok((revisions, next_stamps)) = revisions else {
-                break;
+        let initial_revisions = {
+            let guard = match state.monitor.latest.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
             };
-            if last == Some(revisions) {
-                continue;
-            }
-            let mut payload = serde_json::json!({
+            guard.as_ref().map(|(r, _)| *r)
+        };
+        if let Some(revisions) = initial_revisions {
+            let initial_payload = serde_json::json!({
                 "queue_rev": revisions.0,
                 "runs_rev": revisions.1,
                 "questions_rev": revisions.2,
@@ -6295,120 +6936,61 @@ async fn events(State(ui): State<Arc<Ui>>) -> impl IntoResponse {
                 "notifications_rev": revisions.4,
                 "loop_rev": revisions.5,
             });
-            if let (Some(base), Some(previous)) = (last, stamps.as_ref()) {
-                for (index, (key, rev)) in [
-                    ("queue_delta", base.0),
-                    ("runs_delta", base.1),
-                    ("talks_delta", base.3),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    let delta = diff_stamps(&previous[index], &next_stamps[index], rev);
-                    // Empty diffs may mean a non-file dependency moved. Read whole.
-                    if delta.changed.len() + delta.removed.len() > 0 && delta.changed.len() <= 50 {
-                        payload[key] = serde_json::to_value(delta).expect("serializable delta");
-                    }
+
+            if let Ok(event) = Event::default().event("change").json_data(initial_payload) {
+                if tx.send(event).await.is_err() {
+                    return;
                 }
             }
-            last = Some(revisions);
-            stamps = Some(next_stamps);
-            // Giving up beats looping if the receiver is gone.
-            let Ok(event) = Event::default().event("change").json_data(payload) else {
-                break;
-            };
-            if tx.send(event).await.is_err() {
-                break;
+        }
+
+        loop {
+            match tokio::select! {
+                _ = tx.closed() => return,
+                value = broadcast_rx.recv() => value,
+            } {
+                Ok(notif) => {
+                    let Ok(event) = Event::default().event("change").json_data(notif.payload)
+                    else {
+                        break;
+                    };
+                    if tx.send(event).await.is_err() {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    let revs = {
+                        let guard = match state.monitor.latest.lock() {
+                            Ok(g) => g,
+                            Err(p) => p.into_inner(),
+                        };
+                        guard.as_ref().map(|(r, _)| *r)
+                    };
+                    if let Some(revs) = revs {
+                        let payload = serde_json::json!({
+                            "queue_rev": revs.0,
+                            "runs_rev": revs.1,
+                            "questions_rev": revs.2,
+                            "talks_rev": revs.3,
+                            "notifications_rev": revs.4,
+                            "loop_rev": revs.5,
+                        });
+                        if let Ok(event) = Event::default().event("change").json_data(payload) {
+                            if tx.send(event).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
+                }
             }
         }
     });
+
     Sse::new(ReceiverStream::new(rx).map(Ok::<Event, Infallible>))
         .keep_alive(KeepAlive::new().interval(KEEPALIVE))
-}
-
-type Stamps = HashMap<String, (u128, u64)>;
-
-/// Metadata only: no task instructions or conversation bodies are read here.
-fn store_stamps(root: &FsPath, runs: bool) -> Stamps {
-    std::fs::read_dir(root)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let path = if runs {
-                entry.path().join("run.json")
-            } else {
-                entry.path()
-            };
-            if !runs && path.extension().is_none_or(|ext| ext != "json") {
-                return None;
-            }
-            let metadata = path.metadata().ok()?;
-            let modified = metadata
-                .modified()
-                .ok()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?;
-            let id = if runs {
-                entry.file_name().to_string_lossy().into_owned()
-            } else {
-                path.file_stem()?.to_string_lossy().into_owned()
-            };
-            Some((id, (modified.as_nanos(), metadata.len())))
-        })
-        .collect()
-}
-
-#[derive(Debug, Serialize)]
-struct Delta {
-    base: u64,
-    changed: Vec<String>,
-    removed: Vec<String>,
-}
-
-fn diff_stamps(previous: &Stamps, next: &Stamps, base: u64) -> Delta {
-    let mut changed: Vec<_> = next
-        .iter()
-        .filter(|(id, stamp)| previous.get(*id) != Some(*stamp))
-        .map(|(id, _)| id.clone())
-        .collect();
-    let mut removed: Vec<_> = previous
-        .keys()
-        .filter(|id| !next.contains_key(*id))
-        .cloned()
-        .collect();
-    changed.sort_unstable();
-    removed.sort_unstable();
-    Delta {
-        base,
-        changed,
-        removed,
-    }
-}
-
-/// Change detection token for recorded runs under `runs`.
-///
-/// Combines the id and `run.json` modification time of each run, so adding,
-/// updating, or deleting any run — even an older one — moves the revision and
-/// notifies connected clients via the change stream. Returns 0 when no runs
-/// exist.
-fn runs_revision(runs: &FsPath) -> u64 {
-    stamps_revision(&store_stamps(runs, true))
-}
-
-/// Opaque tokens use the exact metadata snapshot behind the delta, in both
-/// health and SSE. Nanoseconds and length also detect same-millisecond writes
-/// and deleting an older conversation (a newest-mtime token cannot do that).
-fn stamps_revision(stamps: &Stamps) -> u64 {
-    use std::hash::{Hash as _, Hasher as _};
-    if stamps.is_empty() {
-        return 0;
-    }
-    let mut entries: Vec<_> = stamps.iter().collect();
-    entries.sort_unstable();
-    let mut hasher = std::hash::DefaultHasher::new();
-    entries.hash(&mut hasher);
-    hasher.finish().max(1)
 }
 
 /// Run ids under `runs`, newest first.
@@ -6458,9 +7040,13 @@ pub fn runs_unreadable(runs: &FsPath) -> usize {
         .count()
 }
 
+fn plain_record_id(id: &str) -> bool {
+    !id.is_empty() && id != "." && id != ".." && !id.contains(['/', '\\'])
+}
+
 /// Expand an id or short id to exactly one run id.
 fn resolve_run(runs: &FsPath, id: &str) -> ApiResult<String> {
-    if runs.join(id).join("run.json").is_file() {
+    if plain_record_id(id) && runs.join(id).join("run.json").is_file() {
         return Ok(id.to_owned());
     }
     pick(run_ids(runs), id, "run")
@@ -6468,10 +7054,11 @@ fn resolve_run(runs: &FsPath, id: &str) -> ApiResult<String> {
 
 /// Expand an id or short id to exactly one task id.
 fn resolve_task(queue: &Queue, id: &str) -> ApiResult<String> {
-    if queue.path_of(id).is_file() {
+    if plain_record_id(id) && queue.path_of(id).is_file() {
         return Ok(id.to_owned());
     }
-    pick(queue.list().into_iter().map(|t| t.id).collect(), id, "task")
+    let ids = crate::queue::record_ids(queue.root(), "json").unwrap_or_default();
+    pick(ids, id, "task")
 }
 
 /// A question as the phone reads it.
@@ -6487,6 +7074,7 @@ fn resolve_task(queue: &Queue, id: &str) -> ApiResult<String> {
 #[derive(Debug, Serialize)]
 struct QuestionView {
     choice_effects: std::collections::BTreeMap<String, String>,
+    record_revision: String,
     #[serde(flatten)]
     question: Question,
     detail_md: Vec<md::Node>,
@@ -6586,6 +7174,7 @@ impl QuestionView {
                     crate::choice_effect::describe(&question, c).map(|effect| (c.clone(), effect))
                 })
                 .collect(),
+            record_revision: question_record_revision(&question),
             detail_md: md::to_nodes(&question.detail, &base),
             posting_view: posting_view(&question, &base),
             thread_bodies_md: question
@@ -6685,17 +7274,150 @@ fn holder_of(q: &Question, lease: Option<&ask::Lease>) -> Option<&'static str> {
 /// told an agent at 3am. `ask::Questions::list` already ranks open first.
 async fn questions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<QuestionView>>> {
     blocking(move || {
-        let (tasks, talks) = (ui.queue.list(), ui.talks.list());
+        let questions = ui.questions.list();
+        let (tasks, talks) = question_origin_inputs(&ui, &questions)?;
         Ok(Json(
-            question_views(ui.questions.list(), &ui.questions, || {
-                deputy_config(&ui.repo)
-            })
-            .into_iter()
-            .map(|v| v.with_origin(&tasks, &talks))
-            .collect(),
+            question_views(questions, &ui.questions, || deputy_config(&ui.repo))
+                .into_iter()
+                .map(|view| view.with_origin(&tasks, &talks))
+                .collect(),
         ))
     })
     .await
+}
+
+/// Question content and answer controls never wait for task/chat provenance.
+async fn questions_core(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<QuestionView>>> {
+    blocking(move || {
+        Ok(Json(question_views(
+            ui.questions.list(),
+            &ui.questions,
+            || deputy_config(&ui.repo),
+        )))
+    })
+    .await
+}
+
+fn question_record_revision(question: &Question) -> String {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hash = std::hash::DefaultHasher::new();
+    serde_json::to_vec(question)
+        .expect("serializable question")
+        .hash(&mut hash);
+    format!("{:016x}", hash.finish())
+}
+
+#[derive(Serialize)]
+struct QuestionOriginView {
+    id: String,
+    record_revision: String,
+    origin_chat: Option<String>,
+    origin_chat_closed: bool,
+    can_consult_chat: bool,
+}
+
+async fn question_origins(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<QuestionOriginView>>> {
+    blocking(move || {
+        let questions = ui.questions.list();
+        let (tasks, talks) = question_origin_inputs(&ui, &questions)?;
+        Ok(Json(
+            questions
+                .into_iter()
+                .map(|question| {
+                    let consult = crate::consult::origin_talk(&tasks, &talks, &question);
+                    let can_consult_chat = consult.is_some();
+                    let talk = consult
+                        .or_else(|| crate::consult::associated_talk(&tasks, &talks, &question));
+                    QuestionOriginView {
+                        record_revision: question_record_revision(&question),
+                        id: question.id,
+                        origin_chat_closed: talk.as_ref().is_some_and(|talk| !talk.status.open()),
+                        origin_chat: talk.map(|talk| talk.id),
+                        can_consult_chat,
+                    }
+                })
+                .collect(),
+        ))
+    })
+    .await
+}
+
+/// Only the task ancestry and chats these questions actually reference. Run
+/// mappings share the reconciled queue index; exact task references bypass it.
+/// No question means no task/chat I/O, including no index reconciliation.
+fn question_origin_inputs(ui: &Ui, questions: &[Question]) -> ApiResult<(Vec<Task>, Vec<Talk>)> {
+    fn task_for_run(
+        ui: &Ui,
+        index: &mut Option<Vec<Arc<TaskRelation>>>,
+        run: &str,
+        loaded: &HashMap<String, Task>,
+    ) -> ApiResult<Option<Task>> {
+        if !plain_record_id(run) {
+            return Ok(None);
+        }
+        if index.is_none() {
+            *index = Some(ui.indexed_tasks()?);
+        }
+        Ok(index
+            .as_ref()
+            .expect("loaded index")
+            .iter()
+            .find(|task| task.runs.iter().any(|id| id == run))
+            .and_then(|task| {
+                loaded
+                    .get(&task.id)
+                    .cloned()
+                    .or_else(|| ui.queue.get(&task.id).ok())
+            })
+            .filter(|task| task.runs.iter().any(|id| id == run)))
+    }
+    let direct_task = |id: &str, loaded: &HashMap<String, Task>| {
+        plain_record_id(id)
+            .then(|| loaded.get(id).cloned().or_else(|| ui.queue.get(id).ok()))
+            .flatten()
+            .filter(|task| task.id == id)
+    };
+    let mut index = None;
+    let mut tasks = HashMap::new();
+    let mut talks = HashMap::new();
+    for question in questions {
+        let mut current = if question.node == crate::conduct::NODE {
+            direct_task(&question.run, &tasks)
+        } else {
+            task_for_run(ui, &mut index, &question.run, &tasks)?
+        };
+        let mut seen = HashSet::new();
+        for _ in 0..=crate::followup::MAX_FOLLOWUP_GENERATION {
+            let Some(task) = current.take() else {
+                break;
+            };
+            if !seen.insert(task.id.clone()) {
+                break;
+            }
+            let chat = task.chat_talk().map(str::to_owned);
+            let followup = task.followup.clone();
+            tasks.insert(task.id.clone(), task);
+            if let Some(chat) = chat {
+                if plain_record_id(&chat)
+                    && !talks.contains_key(&chat)
+                    && let Ok(talk) = ui.talks.get(&chat)
+                {
+                    talks.insert(chat, talk);
+                }
+                break;
+            }
+            let Some(followup) = followup else {
+                break;
+            };
+            current = match followup.origin_task {
+                Some(id) => direct_task(&id, &tasks),
+                None => task_for_run(ui, &mut index, &followup.run, &tasks)?,
+            };
+        }
+    }
+    let mut tasks: Vec<Task> = tasks.into_values().collect();
+    tasks.sort_unstable_by(|a, b| b.priority.cmp(&a.priority).then_with(|| b.id.cmp(&a.id)));
+    Ok((tasks, talks.into_values().collect()))
 }
 
 /// `GET /api/notifications`: not dismissed, newest first, with the unread
@@ -6806,7 +7528,8 @@ async fn question_answer(
             .questions
             .update(&q.id, |r| r.answer(answer))
             .map_err(ApiError::bad_request_from)?;
-        let (tasks, talks) = (ui.queue.list(), ui.talks.list());
+        let (tasks, talks) =
+            question_origin_inputs(&ui, std::slice::from_ref(&q)).unwrap_or_default();
         Ok(Json(
             QuestionView::of(q, &ui.questions, cfg.as_ref()).with_origin(&tasks, &talks),
         ))
@@ -6881,7 +7604,8 @@ async fn question_say(
                 r.say(body.body)
             })
             .map_err(question_text_error)?;
-        let (tasks, talks) = (ui.queue.list(), ui.talks.list());
+        let (tasks, talks) =
+            question_origin_inputs(&ui, std::slice::from_ref(&q)).unwrap_or_default();
         Ok(Json(
             QuestionView::of(q, &ui.questions, cfg.as_ref()).with_origin(&tasks, &talks),
         ))
@@ -6916,7 +7640,7 @@ async fn question_consult(
                     q.status.as_str()
                 )));
             }
-            let (tasks, talks) = (ui.queue.list(), ui.talks.list());
+            let (tasks, talks) = question_origin_inputs(&ui, std::slice::from_ref(&q))?;
             let Some(talk) = crate::consult::origin_talk(&tasks, &talks, &q) else {
                 return Err(ApiError::conflict(format!(
                     "question {} has no chat to ask",
@@ -6964,7 +7688,7 @@ async fn question_consult(
 
 /// Expand an id or short id to exactly one question id.
 fn resolve_question(store: &Questions, id: &str) -> ApiResult<String> {
-    if store.path_of(id).is_file() {
+    if plain_record_id(id) && store.path_of(id).is_file() {
         return Ok(id.to_owned());
     }
     pick(
@@ -7501,7 +8225,15 @@ async fn talks_list(
 ) -> ApiResult<Json<Vec<TalkView>>> {
     blocking(move || {
         let mut configs: HashMap<PathBuf, Option<Config>> = HashMap::new();
-        let talks = ui.talks.list();
+        let talks = q.ids.as_ref().map_or_else(
+            || ui.talks.list(),
+            |ids| {
+                ids.split(',')
+                    .filter(|id| plain_record_id(id))
+                    .filter_map(|id| ui.talks.get(id).ok())
+                    .collect()
+            },
+        );
         let references = if talks.iter().any(id_links::has_references) {
             ui.references.get(
                 &ui.runs,
@@ -7585,6 +8317,83 @@ async fn talk_post(
     Ok((StatusCode::CREATED, Json(view)))
 }
 
+/// Transcript first: unrelated queue history and repository probes are deferred.
+async fn talk_core(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResult<Json<TalkView>> {
+    blocking(move || {
+        let id = resolve_talk(&ui.talks, &id)?;
+        let talk = ui.talks.get(&id)?;
+        let thinking = ui.is_thinking(&id);
+        Ok(Json(TalkView::with_config(
+            talk,
+            thinking,
+            None,
+            &ui.home,
+            &ui.references,
+        )))
+    })
+    .await
+}
+
+async fn talk_sections(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    blocking(move || {
+        let id = resolve_talk(&ui.talks, &id)?;
+        let talk = ui.talks.get(&id)?;
+        let tasks = ui.find_tasks_for_talk(&talk.id)?;
+        let task_progress = talk_task_progress(&tasks);
+        let tasks: Vec<_> = tasks
+            .into_iter()
+            .map(|task| {
+                serde_json::json!({
+                    "id": task.id, "title": task.title, "status_str": task.status.as_str(),
+                })
+            })
+            .collect();
+        let cfg = Config::discover(&talk.repo, None).ok().map(|(cfg, _)| cfg);
+        let roster: Vec<_> = cfg
+            .as_ref()
+            .map(|cfg| {
+                cfg.agents
+                    .iter()
+                    .map(|a| RosterEntry {
+                        id: a.id.clone(),
+                        kind: a.kind,
+                        runnable: agent::installed(a),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let specs = cfg
+            .as_ref()
+            .map(|cfg| cfg.talk.personas.clone())
+            .unwrap_or_default();
+        let personas: Vec<_> = persona::catalog(&specs)
+            .into_iter()
+            .map(|p| PersonaEntry {
+                avatar: avatar_url(&ui.home, &talk.id, &p),
+                id: p.id,
+                name: p.name,
+            })
+            .collect();
+        let active_persona = persona::find(&specs, &talk.persona)
+            .unwrap_or_else(|| persona::find(&specs, persona::DEFAULT_ID).expect("default"));
+        let persona_name = (!active_persona.is_default()).then(|| active_persona.name.clone());
+        let persona_avatar = avatar_url(&ui.home, &talk.id, &active_persona);
+        Ok(Json(serde_json::json!({
+            "tasks": tasks, "task_progress": task_progress,
+            "roster": roster, "personas": personas,
+            "context": talk::context_usage(&talk, cfg.as_ref()),
+            "context_for": talk.updated_at,
+            "operator_name": cfg.as_ref().and_then(|cfg| cfg.talk.operator_name()),
+            "persona_name": persona_name,
+            "persona_avatar": persona_avatar,
+        })))
+    })
+    .await
+}
+
 /// `GET /api/talks/{id}`.
 async fn talk_detail(
     State(ui): State<Arc<Ui>>,
@@ -7594,7 +8403,7 @@ async fn talk_detail(
         let id = resolve_talk(&ui.talks, &id)?;
         let talk = ui.talks.get(&id)?;
         let thinking = ui.is_thinking(&talk.id);
-        let tasks = talk::tasks_of(&ui.queue, &talk.id);
+        let tasks = ui.find_tasks_for_talk(&talk.id)?;
         let task_progress = talk_task_progress(&tasks);
         let tasks = tasks.into_iter().map(TaskView::from).collect();
         let cfg = Config::discover(&talk.repo, None).ok().map(|(cfg, _)| cfg);
@@ -8579,9 +9388,28 @@ async fn talk_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiRe
     .await
 }
 
+fn talk_ids(root: &FsPath) -> Vec<String> {
+    std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                path.file_stem().and_then(|s| s.to_str()).map(str::to_owned)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Expand an id or short id to exactly one talk id.
 fn resolve_talk(store: &Talks, id: &str) -> ApiResult<String> {
-    pick(store.list().into_iter().map(|t| t.id).collect(), id, "talk")
+    if plain_record_id(id) && store.path_of(id).is_file() {
+        return Ok(id.to_owned());
+    }
+    pick(talk_ids(store.root()), id, "talk")
 }
 
 /// `POST /api/talks/{id}/attachments` - upload one image to attach to a
@@ -17513,6 +18341,32 @@ mod tests {
     /// driving this run right now — otherwise a seat from a killed process's
     /// last wave would read as live forever.
     #[tokio::test]
+    async fn run_core_survives_unavailable_related_stores() {
+        let home = TempDir::new().unwrap();
+        let ui = delta_test_ui(home.path());
+        let state = RunState::new(
+            PathBuf::from("/repo/magi"),
+            "main".into(),
+            "0123456789abcdef".into(),
+            "Useful core instructions".into(),
+            Config::default(),
+        );
+        let dir = ui.runs.join(&state.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("run.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+        std::fs::write(ui.questions.root(), "unavailable").unwrap();
+        std::fs::write(ui.queue.root(), "unavailable").unwrap();
+        let core = run_core(State(ui.clone()), Path(state.id.clone()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(core.state.instruction, state.instruction);
+        assert_eq!(core.state.updated_at, state.updated_at);
+        assert!(core.task.is_none());
+        assert!(run_detail(State(ui), Path(state.id)).await.is_err());
+    }
+
+    #[tokio::test]
     async fn run_detail_reports_active_seats_and_whether_a_daemon_confirms_them() {
         let f = Fixture::start().await;
         // Matches `write_daemon`'s hard-coded `current.run`, so the second
@@ -18904,8 +19758,8 @@ mod tests {
         // A refresh must never navigate: the loaders still check that their
         // subject is the one on screen, and crossing the breakpoint only
         // re-reads the hash.
-        assert!(APP_JS.contains("if (state.detail.id !== id) return;"));
-        assert!(APP_JS.contains("if (state.taskDetail.id !== id) return;"));
+        assert!(APP_JS.contains("if (state.detail !== detail) return;"));
+        assert!(APP_JS.contains("if (state.taskDetail !== detail) return;"));
         assert!(APP_JS.contains("if (state.talkDetail.id !== id) return;"));
         assert!(APP_JS.contains("const relayout = () => applyRoute();"));
 
@@ -19253,9 +20107,19 @@ mod tests {
         });
         f.talks().put(&mut on_disk).expect("record a turn");
 
-        let after = f.get("/api/health").await.json()["talks_rev"]
-            .as_u64()
-            .expect("talks_rev");
+        let after = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let revision = f.get("/api/health").await.json()["talks_rev"]
+                    .as_u64()
+                    .unwrap();
+                if revision != before {
+                    break revision;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("shared monitor observes external turn");
         assert_ne!(
             before, after,
             "a phone must be able to notice a talk's reply without polling every store"
@@ -19404,6 +20268,30 @@ mod tests {
             home.to_owned(),
             PathBuf::from("/repo/magi"),
         ))
+    }
+
+    #[test]
+    fn monitor_scan_isolates_store_failures_and_recovers() {
+        let home = TempDir::new().unwrap();
+        let ui = delta_test_ui(home.path());
+        std::fs::create_dir_all(ui.questions.root()).unwrap();
+        std::fs::write(ui.questions.root().join("q.json"), "{}").unwrap();
+        let before = monitor_scan(&ui, None);
+        std::fs::rename(ui.questions.root(), home.path().join("saved-questions")).unwrap();
+        std::fs::write(ui.questions.root(), "not a directory").unwrap();
+        std::fs::create_dir_all(ui.talks.root()).unwrap();
+        std::fs::write(ui.talks.root().join("new.json"), "{}").unwrap();
+        let during = monitor_scan(&ui, Some(before.clone()));
+        assert_eq!(during.0.2, before.0.2);
+        assert_ne!(during.0.3, before.0.3);
+        assert!(during.1[2].contains_key("new"));
+        std::fs::remove_file(ui.questions.root()).unwrap();
+        let after = monitor_scan(&ui, Some(during));
+        assert_eq!(after.0.2, 0);
+        assert_eq!(after.0.3, stamps_revision(&after.1[2]));
+        // A failed first scan also permits healthy stores to publish.
+        std::fs::write(ui.questions.root(), "not a directory").unwrap();
+        assert_eq!(monitor_scan(&ui, None).0.3, after.0.3);
     }
 
     #[tokio::test]
@@ -22192,7 +23080,7 @@ mod tests {
         assert!(APP_JS.contains("show($(\"task-actions-fab\"), route.name === \"task\")"));
         assert!(APP_JS.contains("if (route.name !== \"task\") closeTaskActions();"));
         // Refreshed whenever the detail redraws, including the loading state.
-        assert!(APP_JS.contains("renderTaskActions(task);"));
+        assert!(APP_JS.contains("renderTaskActions(task.coreOnly || error ? null : task);"));
         assert!(APP_JS.contains("renderTaskActions(null);"));
         // Same renderers and routes as the Queue card, no new endpoint.
         let sheet = APP_JS
@@ -22491,5 +23379,616 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn resolve_talk_and_task_avoid_deserializing_corrupt_or_unrelated_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let queue = Queue::at(dir.path().join("queue"));
+        let talks = Talks::at(dir.path().join("talks"));
+        std::fs::create_dir_all(queue.root()).unwrap();
+        std::fs::create_dir_all(talks.root()).unwrap();
+
+        // Put a corrupt json file in both stores
+        std::fs::write(queue.root().join("corrupt-task.json"), "invalid json").unwrap();
+        std::fs::write(talks.root().join("corrupt-talk.json"), "invalid json").unwrap();
+
+        // Valid task and talk
+        let mut task = Task::new(
+            "title".into(),
+            "inst".into(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        task.id = "20261019-123456-abcd".into();
+        // Write manually so it's a valid file
+        std::fs::write(
+            queue.path_of(&task.id),
+            serde_json::to_string(&task).unwrap(),
+        )
+        .unwrap();
+
+        let talk_id = "20261019-234567-cdef";
+        seed_talk_at(&talks, talk_id, "open");
+
+        // Exact match should succeed without failing on the corrupt json file
+        assert_eq!(resolve_task(&queue, &task.id).unwrap(), task.id);
+        assert_eq!(resolve_talk(&talks, talk_id).unwrap(), talk_id);
+
+        // Prefix match should also succeed by scanning file names without deserializing corrupt file
+        assert_eq!(resolve_task(&queue, "abcd").unwrap(), task.id);
+        assert_eq!(resolve_talk(&talks, "cdef").unwrap(), talk_id);
+    }
+
+    #[tokio::test]
+    async fn question_core_and_empty_origins_do_not_touch_unavailable_histories() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        // A full history traversal would fail even with no questions.
+        std::fs::write(ui.queue.root(), "not a directory").unwrap();
+        std::fs::write(ui.talks.root(), "not a directory").unwrap();
+        assert!(
+            questions_list(State(ui.clone()))
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        assert!(
+            question_origins(State(ui.clone()))
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        let mut question = Question::new(
+            "run-history".into(),
+            "review".into(),
+            "seat".into(),
+            "Useful question".into(),
+            "Useful detail".into(),
+            vec![],
+        );
+        ui.questions.put(&mut question).unwrap();
+        let core = questions_core(State(ui.clone())).await.unwrap().0;
+        assert_eq!(core.len(), 1);
+        assert_eq!(core[0].question.summary, "Useful question");
+        assert!(!core[0].can_consult_chat);
+        assert!(core[0].origin_chat.is_none());
+        assert_eq!(core[0].record_revision, question_record_revision(&question));
+        assert!(question_origins(State(ui.clone())).await.is_err());
+        assert_eq!(ui.monitor.queue_index.lock().unwrap().reparsed, 0);
+    }
+
+    #[test]
+    fn question_origin_lookup_matches_legacy_with_large_and_changing_histories() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let chat_id = seed_talk_at(&ui.talks, "chat-origin", "closed");
+        for i in 0..1000 {
+            let mut task = Task::new(
+                "unrelated".into(),
+                "instruction ".repeat(256),
+                PathBuf::from("/repo"),
+                Source::Human,
+            );
+            task.id = format!("history-{i:04}");
+            ui.queue.put(&mut task).unwrap();
+            let id = seed_talk_at(&ui.talks, &task.id, "open");
+            let mut talk = ui.talks.get(&id).unwrap();
+            talk.pending = "history ".repeat(256);
+            ui.talks.put(&mut talk).unwrap();
+        }
+        let mut parent = Task::new(
+            "parent".into(),
+            "body".into(),
+            PathBuf::from("/repo"),
+            Source::Agent {
+                run: chat_id.clone(),
+                node: crate::queue::CHAT_NODE.into(),
+            },
+        );
+        parent.id = "task-parent".into();
+        parent.runs = vec!["run-parent".into()];
+        ui.queue.put(&mut parent).unwrap();
+        let mut child = Task::new(
+            "child".into(),
+            "body".into(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        child.id = "task-child".into();
+        child.runs = vec!["run-child".into()];
+        child.followup = Some(crate::queue::FollowUp {
+            run: "run-parent".into(),
+            origin_task: Some(parent.id.clone()),
+            pr: "https://example.invalid/pr/1".into(),
+            findings: vec![],
+            generation: 1,
+        });
+        ui.queue.put(&mut child).unwrap();
+        let mut question = Question::new(
+            child.id.clone(),
+            crate::conduct::NODE.into(),
+            "seat".into(),
+            "Continue?".into(),
+            String::new(),
+            vec![],
+        );
+        let (tasks, talks) = question_origin_inputs(&ui, std::slice::from_ref(&question)).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(talks.len(), 1);
+        assert_eq!(
+            ui.monitor.queue_index.lock().unwrap().reparsed,
+            0,
+            "exact ancestry bypasses the index"
+        );
+        assert_eq!(
+            crate::consult::origin_talk(&tasks, &talks, &question)
+                .unwrap()
+                .id,
+            chat_id
+        );
+        question.run = "run-child".into();
+        question.node = "review".into();
+        for origin_task in [Some(parent.id.clone()), None] {
+            child.followup.as_mut().unwrap().origin_task = origin_task;
+            ui.queue.put(&mut child).unwrap();
+            let (tasks, talks) =
+                question_origin_inputs(&ui, std::slice::from_ref(&question)).unwrap();
+            let actual = crate::consult::associated_talk(&tasks, &talks, &question).unwrap();
+            let expected =
+                crate::consult::associated_talk(&ui.queue.list(), &ui.talks.list(), &question)
+                    .unwrap();
+            assert_eq!(actual.id, expected.id);
+            assert!(!actual.status.open());
+            let parsed = ui.monitor.queue_index.lock().unwrap().reparsed;
+            question_origin_inputs(&ui, std::slice::from_ref(&question)).unwrap();
+            // Without Unix file identity, every readable record must be
+            // reparsed to detect same-size, same-mtime replacements safely.
+            let expected = parsed + if cfg!(unix) { 0 } else { 1002 };
+            assert_eq!(ui.monitor.queue_index.lock().unwrap().reparsed, expected);
+        }
+        child.followup.as_mut().unwrap().origin_task = Some(parent.id.clone());
+        ui.queue.put(&mut child).unwrap();
+        std::fs::remove_file(ui.queue.path_of(&parent.id)).unwrap();
+        let (tasks, talks) = question_origin_inputs(&ui, std::slice::from_ref(&question)).unwrap();
+        assert!(crate::consult::origin_talk(&tasks, &talks, &question).is_none());
+        child.origin_chat = Some(chat_id.clone());
+        ui.queue.put(&mut child).unwrap();
+        let (tasks, talks) = question_origin_inputs(&ui, std::slice::from_ref(&question)).unwrap();
+        assert_eq!(
+            crate::consult::origin_talk(&tasks, &talks, &question)
+                .unwrap()
+                .id,
+            chat_id
+        );
+        let revision = question_record_revision(&question);
+        question.abandon("settled elsewhere");
+        assert_ne!(revision, question_record_revision(&question));
+        assert!(crate::consult::origin_talk(&tasks, &talks, &question).is_none());
+        assert!(crate::consult::associated_talk(&tasks, &talks, &question).is_some());
+        std::fs::remove_file(ui.talks.path_of(&chat_id)).unwrap();
+        let (tasks, talks) = question_origin_inputs(&ui, std::slice::from_ref(&question)).unwrap();
+        assert!(crate::consult::associated_talk(&tasks, &talks, &question).is_none());
+    }
+
+    #[test]
+    fn list_cursors_freeze_membership_and_expire_explicitly() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        std::fs::create_dir_all(ui.queue.root()).unwrap();
+        for i in 0..40 {
+            std::fs::write(ui.queue.path_of(&format!("record-{i:04}")), "broken").unwrap();
+        }
+        let (first, cursor) = page_ids(&ui, false, PageQuery::default()).unwrap();
+        assert_eq!(first.len(), STORE_PAGE_SIZE);
+        let cursor = cursor.unwrap();
+        std::fs::write(ui.queue.path_of("record-9999"), "broken").unwrap();
+        std::fs::remove_file(ui.queue.path_of(&first[0])).unwrap();
+        let (second, _) = page_ids(
+            &ui,
+            false,
+            PageQuery {
+                before: Some(cursor.clone()),
+            },
+        )
+        .unwrap();
+        assert_eq!(second[0], "record-0023");
+        assert!(second.iter().all(|id| !first.contains(id)));
+        assert!(
+            page_ids(
+                &ui,
+                true,
+                PageQuery {
+                    before: Some(cursor.clone())
+                }
+            )
+            .is_err()
+        );
+        let (fresh, _) = page_ids(&ui, false, PageQuery::default()).unwrap();
+        assert_eq!(fresh[0], "record-9999");
+        ui.monitor.list_walks.lock().unwrap().clear();
+        assert!(
+            page_ids(
+                &ui,
+                false,
+                PageQuery {
+                    before: Some(cursor)
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_queue_index_counts_only_fresh_readable_statuses() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let mut task = Task::new(
+            "task".into(),
+            "body".into(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        ui.queue.put(&mut task).unwrap();
+        assert_eq!(stats_queue(State(ui.clone())).await.unwrap().0.queued, 1);
+        let parsed = ui.monitor.queue_index.lock().unwrap().reparsed;
+        assert_eq!(stats_queue(State(ui.clone())).await.unwrap().0.queued, 1);
+        let expected = parsed + usize::from(!cfg!(unix));
+        assert_eq!(ui.monitor.queue_index.lock().unwrap().reparsed, expected);
+        task.status = crate::queue::TaskStatus::Held;
+        ui.queue.put(&mut task).unwrap();
+        assert_eq!(stats_queue(State(ui.clone())).await.unwrap().0.held, 1);
+        std::fs::write(ui.queue.path_of(&task.id), "broken").unwrap();
+        assert_eq!(stats_queue(State(ui.clone())).await.unwrap().0.held, 0);
+        ui.queue.put(&mut task).unwrap();
+        assert_eq!(stats_queue(State(ui.clone())).await.unwrap().0.held, 1);
+        std::fs::remove_file(ui.queue.path_of(&task.id)).unwrap();
+        assert_eq!(stats_queue(State(ui)).await.unwrap().0.held, 0);
+    }
+
+    #[tokio::test]
+    async fn health_notifications_revision_is_fresh_between_monitor_ticks() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        *ui.monitor.latest.lock().unwrap() = Some(((0, 0, 0, 0, 0, 0), Default::default()));
+        let before = health(State(ui.clone())).await.unwrap().0;
+        ui.notices.raise(Notice::warn("task:1", "held")).unwrap();
+        let after = health(State(ui)).await.unwrap().0;
+        assert_ne!(before.notifications_rev, after.notifications_rev);
+        assert_eq!(after.notifications_unread, 1);
+    }
+
+    #[tokio::test]
+    async fn list_pages_bound_history_and_keep_dependency_evidence() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let queue = &ui.queue;
+        let talks = &ui.talks;
+        for i in 0..1000 {
+            let id = format!("20261019-{i:06}-page");
+            let mut task = Task::new(
+                "task".into(),
+                "instruction".repeat(100),
+                PathBuf::from("/repo/magi"),
+                Source::Human,
+            );
+            task.id = id.clone();
+            if i == 0 {
+                task.status = crate::queue::TaskStatus::Held;
+            } else if i == 999 {
+                task.status = crate::queue::TaskStatus::Blocked;
+                task.blocked_by = vec!["20261019-000000-page".into()];
+            }
+            queue.put(&mut task).unwrap();
+            seed_talk_at(talks, &id, "open");
+        }
+        let page = serde_json::to_value(
+            queue_page(State(ui.clone()), Query(PageQuery::default()))
+                .await
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        assert_eq!(page["rows"].as_array().unwrap().len(), STORE_PAGE_SIZE);
+        assert_eq!(page["rows"][0]["id"], "20261019-000999-page");
+        assert!(
+            !page["rows"][0]["stuck_roots"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let cursor = page["next"].as_str().unwrap();
+        let last_id = page["rows"].as_array().unwrap().last().unwrap()["id"]
+            .as_str()
+            .unwrap();
+        // Deleting an already enumerated file cannot shift or repeat a page.
+        std::fs::remove_file(queue.path_of(last_id)).unwrap();
+        let next = serde_json::to_value(
+            queue_page(
+                State(ui.clone()),
+                Query(PageQuery {
+                    before: Some(cursor.into()),
+                }),
+            )
+            .await
+            .unwrap()
+            .0,
+        )
+        .unwrap();
+        assert_eq!(next["rows"].as_array().unwrap().len(), STORE_PAGE_SIZE);
+        assert!(next["rows"][0]["id"].as_str().unwrap() < last_id);
+        let chats = serde_json::to_value(
+            talks_page(State(ui.clone()), Query(PageQuery::default()))
+                .await
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        assert_eq!(chats["rows"].as_array().unwrap().len(), STORE_PAGE_SIZE);
+        assert!(chats["rows"][0].get("pending").is_none());
+        assert!(chats["rows"][0].get("turn_bodies_md").is_none());
+        let counts = serde_json::to_value(stats_queue(State(ui)).await.unwrap().0).unwrap();
+        assert_eq!(counts["held"], 1);
+        assert_eq!(counts["blocked"], 1);
+        assert_eq!(counts["queued"], 997);
+    }
+
+    #[test]
+    fn queue_index_observes_external_replacement_deletion_and_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(dir.path());
+        let mut task = Task::new(
+            "task".into(),
+            "body".into(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        task.runs = vec!["run-a".into()];
+        ui.queue.put(&mut task).unwrap();
+        assert!(ui.find_task_for_run("run-a").unwrap().is_some());
+        task.runs = vec!["run-b".into()];
+        let path = ui.queue.path_of(&task.id);
+        let modified = path.metadata().unwrap().modified().unwrap();
+        let replacement = path.with_extension("replacement");
+        let bytes = serde_json::to_vec_pretty(&task).unwrap();
+        assert_eq!(bytes.len() as u64, path.metadata().unwrap().len());
+        std::fs::write(&replacement, &bytes).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(ui.find_task_for_run("run-a").unwrap().is_none());
+        assert!(ui.find_task_for_run("run-b").unwrap().is_some());
+        std::fs::write(&path, "broken").unwrap();
+        assert!(ui.find_task_for_run("run-b").is_err());
+        std::fs::write(&path, bytes).unwrap();
+        assert!(ui.find_task_for_run("run-b").unwrap().is_some());
+        std::fs::remove_file(ui.queue.path_of(&task.id)).unwrap();
+        assert!(ui.find_task_for_run("run-b").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn conversation_core_is_independent_of_unreadable_related_history() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let id = seed_talk_at(&ui.talks, "20261019-000000-core", "open");
+        std::fs::create_dir_all(ui.queue.root()).unwrap();
+        std::fs::write(ui.queue.root().join("unreadable.json"), "broken").unwrap();
+        let Json(core) = talk_core(State(ui.clone()), Path(id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(core.talk.id, id);
+        assert!(talk_sections(State(ui), Path(id)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn unrelated_corrupt_task_does_not_break_run_or_talk_relationships() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let talk_id = seed_talk_at(&ui.talks, "20261019-000000-core", "open");
+        let mut run = RunState::new(
+            PathBuf::from("/repo"),
+            "main".into(),
+            "01234567".into(),
+            "Useful run".into(),
+            Config::default(),
+        );
+        run.save_under(home.path()).unwrap();
+        let mut task = Task::new(
+            "Related".into(),
+            "body".into(),
+            PathBuf::from("/repo"),
+            Source::Agent {
+                run: talk_id.clone(),
+                node: "chat".into(),
+            },
+        );
+        task.runs = vec![run.id.clone()];
+        ui.queue.put(&mut task).unwrap();
+        std::fs::write(ui.queue.root().join("unrelated.json"), "broken").unwrap();
+        assert_eq!(ui.find_task_for_run(&run.id).unwrap().unwrap().id, task.id);
+        assert_eq!(ui.find_tasks_for_talk(&talk_id).unwrap()[0].id, task.id);
+        assert!(
+            run_detail(State(ui.clone()), Path(run.id.clone()))
+                .await
+                .is_ok()
+        );
+        assert!(
+            talk_sections(State(ui.clone()), Path(talk_id.clone()))
+                .await
+                .is_ok()
+        );
+        // Previously indexed corruption must not masquerade as no relationship.
+        std::fs::write(ui.queue.path_of(&task.id), "broken").unwrap();
+        assert!(ui.find_task_for_run(&run.id).is_err());
+        assert!(ui.find_tasks_for_talk(&talk_id).is_err());
+        ui.queue.put(&mut task).unwrap();
+        assert!(ui.find_task_for_run(&run.id).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn conversation_sections_omit_large_task_instructions() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let id = seed_talk_at(&ui.talks, "20261019-000000-core", "open");
+        let mut task = Task::new(
+            "filed task".into(),
+            "large instruction ".repeat(65536),
+            PathBuf::from("/repo"),
+            Source::Agent {
+                run: id.clone(),
+                node: "chat".into(),
+            },
+        );
+        ui.queue.put(&mut task).unwrap();
+        let Json(sections) = talk_sections(State(ui), Path(id)).await.unwrap();
+        assert_eq!(sections["tasks"][0]["id"], task.id);
+        assert_eq!(sections["tasks"][0]["status_str"], task.status.as_str());
+        assert!(sections["tasks"][0].get("instruction").is_none());
+        assert!(serde_json::to_vec(&sections).unwrap().len() < 8192);
+    }
+
+    #[test]
+    fn exact_record_lookup_rejects_paths_and_preserves_short_id_ambiguity() {
+        let home = tempfile::tempdir().unwrap();
+        let talks = Talks::at(home.path().join("talks"));
+        seed_talk_at(&talks, "20261019-000001-abcd", "open");
+        seed_talk_at(&talks, "20261019-000002-abcd", "open");
+        std::fs::write(home.path().join("outside.json"), "{}").unwrap();
+        assert!(resolve_talk(&talks, "../outside").is_err());
+        assert!(resolve_talk(&talks, "abcd").is_err());
+        assert_eq!(
+            resolve_talk(&talks, "20261019-000001-abcd").unwrap(),
+            "20261019-000001-abcd"
+        );
+    }
+
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/web_latency/baseline.rs"
+    ));
+
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/web_latency/lists.rs"
+    ));
+
+    #[tokio::test]
+    #[ignore = "local performance measurement; see docs/web-responsiveness.md"]
+    async fn web_history_latency_measurement() {
+        use std::time::Instant;
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let id = seed_talk_at(&ui.talks, "20261019-000000-core", "open");
+        let mut template = ui.talks.get(&id).unwrap();
+        template.turns = serde_json::from_value(serde_json::json!([{
+            "who": "operator", "body": "Show the accumulated work and its current status.",
+            "at": Timestamp::now().to_string(),
+        }]))
+        .unwrap();
+        std::fs::write(
+            ui.talks.path_of(&id),
+            serde_json::to_vec(&template).unwrap(),
+        )
+        .unwrap();
+        let count = std::env::var("MAGI_BENCH_RECORDS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(1000);
+        for i in 0..count {
+            template.id = format!("20261019-{i:06}-history");
+            template.pending = "history ".repeat(2048);
+            std::fs::write(
+                ui.talks.path_of(&template.id),
+                serde_json::to_vec(&template).unwrap(),
+            )
+            .unwrap();
+            let mut task = Task::new(
+                "old task".into(),
+                "instruction ".repeat(2048),
+                PathBuf::from("/repo"),
+                Source::Human,
+            );
+            task.id = format!("20261019-{i:06}-task");
+            ui.queue.put(&mut task).unwrap();
+        }
+        for baseline in [true, false] {
+            for clients in [1, 4] {
+                let parsed_before = ui.monitor.queue_index.lock().unwrap().reparsed;
+                let mut samples = Vec::new();
+                for _ in 0..12 {
+                    let mut jobs = Vec::new();
+                    for _ in 0..clients {
+                        let ui = ui.clone();
+                        let id = id.clone();
+                        jobs.push(tokio::spawn(async move {
+                            let start = Instant::now();
+                            if baseline {
+                                let response =
+                                    baseline_talk_detail(State(ui), Path(id)).await.unwrap().0;
+                                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                                return (
+                                    elapsed,
+                                    elapsed,
+                                    serde_json::to_vec(&response).unwrap().len(),
+                                );
+                            }
+                            let core = talk_core(State(ui.clone()), Path(id.clone()));
+                            let secondary = talk_sections(State(ui), Path(id));
+                            let (first, total) = tokio::join!(
+                                async {
+                                    let value = core.await.unwrap().0;
+                                    (
+                                        start.elapsed().as_secs_f64() * 1000.0,
+                                        serde_json::to_vec(&value).unwrap().len(),
+                                    )
+                                },
+                                async {
+                                    let value = secondary.await.unwrap().0;
+                                    (
+                                        start.elapsed().as_secs_f64() * 1000.0,
+                                        serde_json::to_vec(&value).unwrap().len(),
+                                    )
+                                }
+                            );
+                            (first.0, first.0.max(total.0), first.1 + total.1)
+                        }));
+                    }
+                    for job in jobs {
+                        samples.push(job.await.unwrap());
+                    }
+                }
+                let mut first: Vec<_> = samples.iter().map(|s| s.0).collect();
+                let mut total: Vec<_> = samples.iter().map(|s| s.1).collect();
+                first.sort_by(f64::total_cmp);
+                total.sort_by(f64::total_cmp);
+                let n = first.len();
+                let parsed = ui.monitor.queue_index.lock().unwrap().reparsed - parsed_before;
+                println!(
+                    "baseline={baseline} records={count} clients={clients} first_ms p50={:.2} p95={:.2}; complete_ms p50={:.2} p95={:.2}; bytes={}; indexed_task_parses={parsed}",
+                    first[n / 2],
+                    first[(n * 95 / 100).min(n - 1)],
+                    total[n / 2],
+                    total[(n * 95 / 100).min(n - 1)],
+                    samples[0].2
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn app_js_contains_progressive_rendering_and_decoupled_reports() {
+        // Assert that app.js decouples loadRun and does not block on Promise.allSettled for reports
+        assert!(!APP_JS.contains("Promise.allSettled([\n    getJson(API.run(id)), getText(API.report(id)), getJson(API.reportJson(id))"));
+        assert!(APP_JS.contains("function nextRunRequest(id)"));
+        assert!(APP_JS.contains("function runShell(id, summary)"));
+        assert!(APP_JS.contains("function nextTaskRequest(id)"));
+        assert!(APP_JS.contains("function taskShell(id, summary)"));
+        assert!(APP_JS.contains("state.detail.reportLoading = false;"));
     }
 }

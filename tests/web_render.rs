@@ -204,6 +204,7 @@ enum ClientProbe {
     Settings,
     Questions,
     Connection,
+    Run,
     Upgrade,
 }
 
@@ -242,6 +243,7 @@ async fn serve_with_client_probe(
         ClientProbe::Questions => Some(
             "state, shortId, renderQuestions, renderAsks, openPanel, closePanel, focusFirstAsk",
         ),
+        ClientProbe::Run => Some("state, loadRun"),
         ClientProbe::Upgrade => {
             Some("state, upgrade, renderLoop, renderUpgradeError, loadHealth, ok")
         }
@@ -1985,7 +1987,8 @@ async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
             page,
             r#"(async () => {
       const source = await (await fetch('/app.js')).text();
-      window.deck = new Function(source.replace('queue: "/api/queue"', 'queue: "/api/queue?test_client=1"').replace(/\nboot\(\);\s*$/, `
+      // Tag the final queue URL, after page paths and cursors are constructed.
+      window.deck = new Function(source.replace('fetch(url, init)', 'fetch(url.startsWith("/api/queue") ? url + (url.includes("?") ? "&" : "?") + "test_client=1" : url, init)').replace(/\nboot\(\);\s*$/, `
         return { setChip, RUN_STATUS, TASK_STATUS, QUESTION_STATUS, TALK_STATUS, settingsState, renderSettings, loadSettings, saveSettings, linkify, refreshReferences, truncateLabel, state, loadHealth, loadLoop, loadTalk, tickTalkWaits, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, loadRuns, loadTalks, applyRevisions_, storeReads, statsAgentTone, statsBarPlan, statsBarRows, statsScatterPlan, renderStatsReviewerScatter, reviewPassed, voteTag, reviewStamp };
       `))();
       await Promise.all([deck.loadQueue(), deck.loadRuns(), deck.loadTalks()]);
@@ -2161,7 +2164,7 @@ async fn delta_client_merges_rows_coalesces_and_recovers() {
       await deck.loadQueue({{rev: 2, delta: {{base: 1, changed: [{id:?}], removed: []}}}});
       return {{same: sameRow === deck.state.queue.find(t => t.id === {unchanged:?}),
         title: deck.state.queue.find(t => t.id === {id:?}).title,
-        partial: performance.getEntriesByType('resource').some(r => r.name.includes('/api/queue?test_client=1&ids='))}};
+        partial: performance.getEntriesByType('resource').some(r => r.name.includes('/api/queue?ids=') && r.name.includes('test_client=1'))}};
     }})()"#)).await.unwrap();
     assert_eq!(check["same"], true);
     assert_eq!(check["partial"], true);
@@ -2172,7 +2175,7 @@ async fn delta_client_merges_rows_coalesces_and_recovers() {
       const requests = [];
       let release;
       window.fetch = async (url, options) => {
-        if (String(url).includes('/api/queue?test_client=1')) {
+        if (String(url).startsWith('/api/queue') && String(url).includes('test_client=1')) {
           requests.push(String(url));
           if (requests.length === 1) await new Promise(resolve => release = resolve);
         }
@@ -2184,7 +2187,7 @@ async fn delta_client_merges_rows_coalesces_and_recovers() {
       release();
       await first;
       window.fetch = native;
-      const coalesced = {before, count: requests.length, fallback: requests[1] === '/api/queue?test_client=1', rev: deck.state.rev.queue};
+      const coalesced = {before, count: requests.length, chained: requests[1] === '/api/queue?ids=&test_client=1', rev: deck.state.rev.queue};
       window.fetch = async () => { throw new Error('test read failed'); };
       await deck.loadQueue({rev: 21, delta: {base: 20, changed: [], removed: []}});
       const failedRev = deck.state.rev.queue;
@@ -2192,11 +2195,11 @@ async fn delta_client_merges_rows_coalesces_and_recovers() {
       performance.clearResourceTimings();
       await deck.loadQueue({rev: 22, delta: {base: 21, changed: [], removed: []}});
       return {coalesced, failedRev, recovered: deck.state.rev.queue === 22,
-        whole: performance.getEntriesByType('resource').some(r => r.name.endsWith('/api/queue?test_client=1'))};
+        whole: performance.getEntriesByType('resource').some(r => r.name.endsWith('/api/queue/page?test_client=1'))};
     })()"#).await.unwrap();
     assert_eq!(
         result["coalesced"],
-        serde_json::json!({"before": 1, "count": 2, "fallback": true, "rev": 20})
+        serde_json::json!({"before": 1, "count": 2, "chained": true, "rev": 20})
     );
     assert!(result["failedRev"].is_null());
     assert_eq!(result["recovered"], true);
@@ -2236,7 +2239,7 @@ async fn delta_client_merges_rows_coalesces_and_recovers() {
         )
         .await
         .expect("failed final event retries without another notification");
-    let retry = browser.eval(&page, "performance.getEntriesByType('resource').some(r => r.name.endsWith('/api/queue?test_client=1'))").await.unwrap();
+    let retry = browser.eval(&page, "performance.getEntriesByType('resource').some(r => r.name.endsWith('/api/queue/page?test_client=1'))").await.unwrap();
     assert_eq!(retry, true);
     browser.close_page(&page).await;
 }
@@ -2440,7 +2443,8 @@ async fn unreachable_banner_waits_out_transient_failures() {
     assert_eq!(r["storeQuiet"], true);
     assert_eq!(r["loopQuiet"], true);
     assert_eq!(r["talkFirstQuiet"], true);
-    assert_eq!(r["talkPolls"], 2);
+    // The visible chat loads core + sections; the other wait polls core only.
+    assert_eq!(r["talkPolls"], 3);
     assert_eq!(r["talkFailures"], 0);
     assert_eq!(r["talkEarlyQuiet"], true);
     assert_eq!(r["parallelFailures"], 2);
@@ -4777,6 +4781,14 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
             .eval(&page, "deck.loadHealth({ applyRevisions: true })")
             .await
             .expect("queue refresh");
+        browser
+            .wait_for(
+                &page,
+                "(async () => { await deck.loadHealth({ applyRevisions: true }); return document.getElementById('talk-task-progress').textContent.includes('all 7 complete'); })()",
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("shared monitor observes completed tasks");
         let got = browser
             .eval(
                 &page,
@@ -4805,10 +4817,20 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
             const native = window.fetch;
             let details = 0;
             window.fetch = (...args) => {
-                if (String(args[0]).endsWith('/api/talks/' + deck.state.talkDetail.id)) details++;
+                if (String(args[0]).endsWith('/api/talks/' + deck.state.talkDetail.id + '/core')) details++;
                 return native(...args);
             };
-            try { await deck.loadHealth({ applyRevisions: true }); } finally { window.fetch = native; }
+            try {
+                const deadline = performance.now() + 10000;
+                do {
+                    const health = await (await native('/api/health')).json();
+                    if (health.queue_rev !== deck.state.rev.queue && health.talks_rev !== deck.state.rev.talks) {
+                        await deck.applyRevisions_(health);
+                        break;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 50));
+                } while (performance.now() < deadline);
+            } finally { window.fetch = native; }
             return { details, text: document.getElementById('talk-task-progress').textContent };
         })()"#,
             )
@@ -4822,26 +4844,32 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
         let got = browser.eval(&page, r#"(async () => {
             const native = window.fetch, id = deck.state.talkDetail.id;
             const snapshot = structuredClone(deck.state.talkDetail.talk);
+            const sections = structuredClone(deck.state.talkDetail.sections);
             const pending = [];
             const response = body => ({ ok: true, status: 200, headers: new Headers(), json: async () => body });
             const out = {};
             window.fetch = () => new Promise(resolve => pending.push(resolve));
             try {
                 const old = deck.loadTalk(id), fresh = deck.loadTalk(id);
-                pending.shift()(response({ ...snapshot, tasks: [], task_progress: { state: 'none', total: 0, done: 0, counts: {}, unfinished_ids: [] } }));
-                await old;
-                out.oldIgnored = deck.state.talkDetail.talk.tasks.length === 7;
-                pending.shift()(response(snapshot)); await fresh;
+                out.coalesced = pending.length === 2;
+                pending.shift()(response(snapshot));
+                pending.shift()(response(sections));
+                await Promise.all([old, fresh]);
                 deck.acceptTalkUpdate({ id, status: 'closed' });
                 out.preserved = deck.state.talkDetail.talk.task_progress.total === 7
                     && deck.state.talkDetail.talk.tasks.length === 7;
-                // Supersede the operation's refresh with a newer read.
+                // A newer operation cancels both sections of the older read.
+                const stale = pending.splice(0);
+                deck.acceptTalkUpdate({ id, status: 'open' });
                 const latest = deck.loadTalk(id);
-                const operationRead = pending.shift();
-                pending.shift()(response(snapshot)); await latest;
-                operationRead({ ok: false, status: 404, headers: new Headers(), text: async () => '{}' });
+                pending.shift()(response(snapshot));
+                pending.shift()(response(sections));
+                await latest;
+                stale[0]({ ok: false, status: 404, headers: new Headers(), text: async () => '{}' });
+                stale[1](response({ ...sections, tasks: [], task_progress: { state: 'none', total: 0, done: 0, counts: {}, unfinished_ids: [] } }));
                 await new Promise(resolve => setTimeout(resolve, 0));
-                out.stale404Ignored = !deck.state.talkDetail.gone && !!deck.state.talkDetail.talk;
+                out.stale404Ignored = !deck.state.talkDetail.gone && !!deck.state.talkDetail.talk
+                    && deck.state.talkDetail.talk.tasks.length === 7;
                 deck.renderTalkTasks({ id });
                 out.unknown = document.getElementById('talk-task-progress-text').textContent.includes('not loaded yet');
                 deck.renderTalkTasks({ id, tasks: [], task_progress: { state: 'none', total: 0, done: 0, counts: {}, unfinished_ids: [] } });
@@ -4851,7 +4879,7 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
             return out;
         })()"#).await.expect("operation and read races");
         for key in [
-            "oldIgnored",
+            "coalesced",
             "preserved",
             "stale404Ignored",
             "unknown",
@@ -4861,4 +4889,90 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
         }
         browser.close_page(&page).await;
     }
+}
+
+#[tokio::test]
+async fn run_refresh_keeps_question_focus_and_blocks_stale_actions() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP run refresh focus: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let mut run = RunState::new(
+        fx.repo.clone(),
+        "main".into(),
+        "0000000".into(),
+        "Check focus".into(),
+        fx.config.clone(),
+    );
+    run.save_under(&home).unwrap();
+    let questions = magi::ask::Questions::at(home.join("questions"));
+    let mut q = magi::ask::Question::new(
+        run.id.clone(),
+        "review".into(),
+        "seat".into(),
+        "Keep typing".into(),
+        "Details".into(),
+        vec![],
+    );
+    questions.put(&mut q).unwrap();
+    let base = serve_with_client_probe(
+        &home,
+        Queue::at(home.join("queue")),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Run,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    let page = browser
+        .open_page(&format!("{base}#/runs/{}", run.id), 1280, 900, false)
+        .await
+        .unwrap();
+    browser.wait_for(&page,
+        "window.deck && deck.state.detail.evidenceError === false && !!document.querySelector('#run-asks textarea')",
+        Duration::from_secs(30)).await.unwrap();
+    let out = browser.eval(&page, r#"(async () => {
+      const box = document.querySelector('#run-asks textarea');
+      const panel = document.querySelector('#run-ask-panel');
+      box.value = 'An unfinished answer'; box.focus(); box.setSelectionRange(3, 8);
+      const originalFetch = window.fetch;
+      let release;
+      const barrier = new Promise(r => release = r);
+      let fail = false;
+      window.fetch = async (...args) => {
+        if (String(args[0]).match(/\/api\/runs\/[^/]+(?:\/core)?$/)) {
+          await barrier;
+          if (fail) throw new Error('deliberate failure');
+        }
+        return originalFetch(...args);
+      };
+      const refresh = deck.loadRun(deck.state.detail.id, {background: true});
+      const button = [...document.querySelectorAll('#run-asks button')].find(b => b.textContent === 'Send answer');
+      let clicked = 0;
+      button.addEventListener('click', () => clicked++);
+      button.click();
+      const pending = document.activeElement === box && !panel.hidden
+        && box.value === 'An unfinished answer' && clicked === 0
+        && button.getAttribute('aria-disabled') === 'true';
+      release(); await refresh;
+      const success = document.activeElement === box && box.selectionStart === 3 && box.selectionEnd === 8;
+      // A failed secondary refresh must leave the same editable DOM present.
+      fail = true;
+      await deck.loadRun(deck.state.detail.id, {background: true});
+      button.click();
+      const failure = document.activeElement === box && !panel.hidden
+        && box.value === 'An unfinished answer' && clicked === 0;
+      window.fetch = originalFetch;
+      return {pending, success, failure};
+    })()"#).await.unwrap();
+    assert_eq!(
+        out,
+        serde_json::json!({"pending": true, "success": true, "failure": true})
+    );
+    browser.close_page(&page).await;
 }
