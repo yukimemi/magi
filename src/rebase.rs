@@ -540,8 +540,9 @@ async fn replay_is_noop(repo: &Path, sha: &str, head: &str) -> bool {
 /// An absorbed change may be superseded by later branch commits, so replaying
 /// it alone onto the result can conflict. Starting at `sha`, merge only those
 /// later changes with the base and require every path `sha` touched to match
-/// the result (including modes). A clean merge is evidence; a conflict or a
-/// failed lookup is not. Unrelated later edits cannot explain erasing its lines.
+/// the result (including modes). Project all four trees onto just those paths
+/// first: conflicts elsewhere cannot invalidate this commit's surviving effect.
+/// A conflict on a candidate path or a failed lookup is not evidence of survival.
 async fn absorbed_in_result(repo: &Path, sha: &str, onto: &str, orig: &str, head: &str) -> bool {
     if !replay_is_noop(repo, sha, onto).await {
         return false;
@@ -550,14 +551,22 @@ async fn absorbed_in_result(repo: &Path, sha: &str, onto: &str, orig: &str, head
     if paths.is_empty() {
         return false;
     }
+    let (Some(base), Some(upstream), Some(branch), Some(result)) = (
+        path_tree(repo, sha, &paths).await,
+        path_tree(repo, onto, &paths).await,
+        path_tree(repo, orig, &paths).await,
+        path_tree(repo, head, &paths).await,
+    ) else {
+        return false;
+    };
     let Ok(out) = git::git_raw(
         repo,
         &[
             "merge-tree",
             "--write-tree",
-            &format!("--merge-base={sha}"),
-            onto,
-            orig,
+            &format!("--merge-base={base}"),
+            &upstream,
+            &branch,
         ],
     )
     .await
@@ -567,23 +576,52 @@ async fn absorbed_in_result(repo: &Path, sha: &str, onto: &str, orig: &str, head
     if !out.ok() {
         return false;
     }
-    let merged = out.stdout.lines().next().unwrap_or("").trim();
-    if merged.is_empty() {
-        return false;
+    out.stdout.lines().next().is_some_and(|tree| tree == result)
+}
+
+/// A tree containing only the candidate paths, under stable synthetic names.
+/// Preserve each entry's object and mode, and leave missing entries absent.
+/// Flattening the names lets mktree handle nested and unusual paths without
+/// an index or a working tree, and keeps unrelated paths out of the merge.
+async fn path_tree(repo: &Path, rev: &str, paths: &[String]) -> Option<String> {
+    use crate::proc::Quiet as _;
+    use std::fmt::Write as _;
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut entries = String::new();
+    for (i, path) in paths.iter().enumerate() {
+        let out = git::git(
+            repo,
+            &["--literal-pathspecs", "ls-tree", "-z", rev, "--", path],
+        )
+        .await
+        .ok()?;
+        if !out.is_empty() {
+            let (entry, _) = out.split_once('\t')?;
+            writeln!(entries, "{entry}\t{i:016x}").ok()?;
+        }
     }
-    let mut args = vec![
-        "--literal-pathspecs",
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--ignore-submodules=none",
-        "--quiet",
-        merged,
-        head,
-        "--",
-    ];
-    args.extend(paths.iter().map(String::as_str));
-    git::git_raw(repo, &args).await.is_ok_and(|out| out.ok())
+    #[cfg(test)]
+    crate::web::request_cost::git();
+    let mut child = tokio::process::Command::new("git")
+        .args(["mktree"])
+        .current_dir(repo)
+        .quiet()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    stdin.write_all(entries.as_bytes()).await.ok()?;
+    drop(stdin);
+    let out = child.wait_with_output().await.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8(out.stdout).ok()?.trim().to_owned())
 }
 
 /// The pure half of [`dropped_commits`]: the `expected` commits that may be
@@ -775,6 +813,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn candidate_path_trees_preserve_modes_deletions_and_unusual_names() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        sh(d, &["init", "-q", "-b", "main"]);
+        sh(d, &["config", "user.name", "t"]);
+        sh(d, &["config", "user.email", "t@example.com"]);
+        sh(d, &["config", "core.fileMode", "true"]);
+        let path = if cfg!(windows) {
+            "nested/日本語 [literal].txt"
+        } else {
+            "nested/日本語\tline\n.txt"
+        };
+        std::fs::create_dir(d.join("nested")).unwrap();
+        std::fs::write(d.join(path), "contents\n").unwrap();
+        std::fs::write(d.join("g.txt"), "old\n").unwrap();
+        let base = commit(d, "base").await;
+        let paths = vec![path.to_owned()];
+        let tree = path_tree(d, &base, &paths).await.unwrap();
+        std::fs::write(d.join("g.txt"), "unrelated\n").unwrap();
+        let other = commit(d, "unrelated path").await;
+        assert_eq!(path_tree(d, &other, &paths).await.unwrap(), tree);
+        sh(d, &["update-index", "--chmod=+x", path]);
+        sh(d, &["commit", "-q", "-m", "chmod"]);
+        assert_ne!(path_tree(d, "HEAD", &paths).await.unwrap(), tree);
+        std::fs::remove_file(d.join(path)).unwrap();
+        let removed = commit(d, "delete").await;
+        let absent = path_tree(d, &removed, &paths).await.unwrap();
+        assert_ne!(absent, tree);
+        assert_eq!(absent, path_tree(d, &removed, &[]).await.unwrap());
+        assert!(path_tree(d, "not-a-revision", &paths).await.is_none());
+    }
+
+    #[tokio::test]
     async fn a_change_inside_a_larger_upstream_edit_is_in_the_result() {
         let t = tempfile::tempdir().unwrap();
         let d = t.path();
@@ -882,7 +953,11 @@ mod tests {
     // file; C1 and C2 successively change the first line of f.txt. Upstream
     // also changes a distant line, so neither C1 nor the original tip has
     // the result's whole-file snapshot.
-    async fn rebase_successive_edits(absorbed: bool, extra_hunk: bool) -> Rebased {
+    async fn rebase_successive_edits(
+        absorbed: bool,
+        extra_hunk: bool,
+        unrelated_conflict: bool,
+    ) -> Rebased {
         crate::run::pin_test_home();
         let t = tempfile::tempdir().unwrap();
         let d = t.path();
@@ -892,6 +967,9 @@ mod tests {
         let body = "old\n1\n2\n3\n4\n5\n6\n7\n8\n9\nend\n";
         std::fs::write(d.join("f.txt"), body).unwrap();
         std::fs::write(d.join("conflict.txt"), "old\n").unwrap();
+        if unrelated_conflict {
+            std::fs::write(d.join("g.txt"), "old\n").unwrap();
+        }
         let base = commit(d, "base").await;
         sh(d, &["checkout", "-q", "-b", "topic"]);
         std::fs::write(d.join("conflict.txt"), "branch\n").unwrap();
@@ -903,6 +981,9 @@ mod tests {
         std::fs::write(d.join("f.txt"), &middle).unwrap();
         let c1 = commit(d, "c1").await;
         std::fs::write(d.join("f.txt"), middle.replacen("new", "newer", 1)).unwrap();
+        if unrelated_conflict {
+            std::fs::write(d.join("g.txt"), "branch\n").unwrap();
+        }
         let orig = commit(d, "c2").await;
         sh(d, &["checkout", "-q", "main"]);
         std::fs::write(d.join("conflict.txt"), "branch plus upstream\n").unwrap();
@@ -913,6 +994,9 @@ mod tests {
             upstream = upstream.replace("\n5\n", "\nupstream middle\n");
         }
         std::fs::write(d.join("f.txt"), &upstream).unwrap();
+        if unrelated_conflict {
+            std::fs::write(d.join("g.txt"), "upstream\n").unwrap();
+        }
         let onto = commit(d, "upstream composite").await;
         // The composite has no patch-id twin for C1.
         assert!(git::cherry(d, &onto, &orig).await.unwrap().0.contains(&c1));
@@ -936,8 +1020,36 @@ mod tests {
         .await
         .unwrap();
         if absorbed && !extra_hunk {
-            // C1 becomes empty automatically; C2 applies normally.
-            assert!(continued.ok(), "{}", continued.stderr);
+            // C1 becomes empty automatically. C2 may conflict on a path C1
+            // never touched, while its f.txt change has applied correctly.
+            if unrelated_conflict {
+                assert!(!continued.ok());
+                assert_eq!(git::unmerged_paths(&scratch).await.unwrap(), vec!["g.txt"]);
+                assert_eq!(git::rev_parse(&scratch, "REBASE_HEAD").await.unwrap(), orig);
+                std::fs::write(scratch.join("g.txt"), "branch plus upstream resolved\n").unwrap();
+                sh(&scratch, &["add", "g.txt"]);
+                let resolved = git::git_raw(&scratch, &["rebase", "--continue"])
+                    .await
+                    .unwrap();
+                assert!(resolved.ok(), "{}", resolved.stderr);
+                // A whole-tree merge would reject the correctly rebased C1
+                // solely because of the unrelated g.txt conflict.
+                let full = git::git_raw(
+                    d,
+                    &[
+                        "merge-tree",
+                        "--write-tree",
+                        &format!("--merge-base={c1}"),
+                        &onto,
+                        &orig,
+                    ],
+                )
+                .await
+                .unwrap();
+                assert_eq!(full.code, Some(1));
+            } else {
+                assert!(continued.ok(), "{}", continued.stderr);
+            }
         } else {
             assert!(!continued.ok());
             assert_eq!(git::unmerged_paths(&scratch).await.unwrap(), vec!["f.txt"]);
@@ -994,12 +1106,23 @@ mod tests {
 
     #[tokio::test]
     async fn an_absorbed_middle_commit_superseded_by_a_later_edit_is_applied() {
-        assert_eq!(rebase_successive_edits(true, false).await, Rebased::Applied);
+        assert_eq!(
+            rebase_successive_edits(true, false, false).await,
+            Rebased::Applied
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unrelated_later_conflict_does_not_hide_an_absorbed_commit() {
+        assert_eq!(
+            rebase_successive_edits(true, false, true).await,
+            Rebased::Applied
+        );
     }
 
     #[tokio::test]
     async fn a_skipped_middle_commit_superseded_by_a_later_edit_is_dropped() {
-        let Rebased::Stopped(why) = rebase_successive_edits(false, false).await else {
+        let Rebased::Stopped(why) = rebase_successive_edits(false, false, false).await else {
             panic!("a skipped middle commit must stop the rebase");
         };
         assert!(why.contains("the rebase dropped some of the branch's commits (skipped?)"));
@@ -1008,7 +1131,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_partially_absorbed_middle_commit_with_a_skipped_hunk_is_dropped() {
-        let Rebased::Stopped(why) = rebase_successive_edits(true, true).await else {
+        let Rebased::Stopped(why) = rebase_successive_edits(true, true, false).await else {
             panic!("an unabsorbed hunk must stop the rebase");
         };
         assert!(why.contains("the rebase dropped some of the branch's commits (skipped?)"));
