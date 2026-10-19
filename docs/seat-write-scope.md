@@ -218,12 +218,29 @@ the child and reservation instead of releasing them. This cleanup must finish
 before another local editor can start or an external updater can take a reader's
 OS lock.
 
+Before spawning, the launcher also creates a liveness pipe with a writer
+inherited by the CLI and its tools. Cleanup retains repository, worktree-output
+and cache leases until EOF on that pipe, including on normal CLI completion.
+Thus a tool that forks into a separate session and becomes reparented before
+cleanup can no longer release ownership merely by disappearing from the CLI's
+process tree. An undiscovered tool may finish naturally while cleanup waits;
+there is no timeout that converts an unknown writer into permission to reclaim.
+A wait exceeding one second logs a retention warning; pipe read errors retain
+the leases and log an error. Each invocation also gets
+a fresh `MAGI_PROCESS_OWNER` environment token. Cleanup discovers processes
+with that token even after reparenting and freezes/kills them with the other
+tools. This covers tool launchers that close extra descriptors but preserve
+their inherited environment; the pipe independently covers environment-clearing
+tools that preserve the descriptor.
+
 Registered invocations currently require Unix process containment. Windows
 registered seats fail before spawning until equivalent job containment is
 implemented; the low-level Windows lock implementation alone is insufficient.
-Wrappers must not daemonize/reparent tools before their CLI reports completion;
-deliberately escaped processes and abrupt launcher process death are outside
-this containment contract. Do not register such launchers as coordinated.
+Wrappers/tools must preserve the inherited liveness descriptor or the
+`MAGI_PROCESS_OWNER` token when detaching from the CLI. Processes that discard
+both ownership witnesses before reparenting, and abrupt launcher process death,
+are outside this containment contract. Do not register launchers that discard
+both witnesses while leaving tools running.
 
 macOS/Linux enforcement depends on the installed CLI and OS sandbox. Windows
 sandbox behavior and Antigravity terminal restrictions have not been validated

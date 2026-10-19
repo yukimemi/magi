@@ -597,18 +597,11 @@ pub(crate) async fn invoke_leased(
         cmd.env_remove("CARGO_TARGET_DIR");
     }
 
-    #[cfg(unix)]
-    if lease.is_some() || !outputs.is_empty() {
-        cmd.process_group(0);
-    }
     // The final consultation/turn check is synchronous: no await separates
     // it from spawning and transferring the lease to Running.
     start_check()?;
-    let child = cmd
-        .spawn()
+    let mut running = crate::seat_process::Running::spawn(cmd, lease, outputs)
         .with_context(|| format!("spawn `{}` for seat {}", plan.argv[0], seat.key))?;
-    // No await occurs between spawn and transfer to the cancellation owner.
-    let mut running = crate::seat_process::Running::with_outputs(child, lease, outputs);
     // Feed stdin from a task rather than inline: a `command` agent that never
     // reads its stdin, or a prompt larger than the pipe buffer, would
     // otherwise deadlock here before the process is ever waited on.

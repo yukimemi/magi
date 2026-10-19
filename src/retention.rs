@@ -14,7 +14,8 @@ use std::{
 };
 
 /// An OS lease on a worktree's outputs, independent of repository coordination.
-/// Kept by the process cleanup owner until discovered descendants terminate.
+/// Kept by the process cleanup owner until descendants terminate, including
+/// reparented tools retaining the inherited liveness witness.
 #[derive(Debug)]
 pub(crate) struct OutputLease {
     _file: File,
@@ -1659,6 +1660,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orphaned_tool_keeps_output_and_cache_leases_after_cli_exit() {
+        let f = Fx::new().await;
+        let run = f.run("abcd", false).await;
+        let wt = &run.candidates[0].worktree;
+        let cache = f.repo.join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        for (cancel, clear_owner) in [(false, true), (true, true), (false, false), (true, false)] {
+            let pid_file = f.repo.join(format!("orphan-{cancel}-{clear_owner}"));
+            let mut cmd = tokio::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", "seat_process::tests::orphan_tool_helper"])
+                .env("MAGI_TEST_ORPHAN_PID", &pid_file)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+            if clear_owner {
+                cmd.env("MAGI_TEST_CLEAR_OWNER", "1");
+            } else {
+                cmd.env("MAGI_TEST_CLOSE_FDS", "1");
+            }
+            let mut running = crate::seat_process::Running::spawn(
+                cmd,
+                None,
+                vec![
+                    OutputLease::borrow(wt).unwrap().unwrap(),
+                    OutputLease::cache(&f.home, &cache, false).unwrap(),
+                ],
+            )
+            .unwrap();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), running.child().wait())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .success()
+            );
+            let pid: i32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+            struct KillTool(Option<i32>);
+            impl Drop for KillTool {
+                fn drop(&mut self) {
+                    // SAFETY: PID from our helper; kill also bounds panic paths.
+                    if let Some(pid) = self.0 {
+                        unsafe { libc::kill(pid, libc::SIGKILL) };
+                    }
+                }
+            }
+            let mut tool = KillTool(Some(pid));
+            // The CLI has already exited and cannot supply a parent-tree
+            // relationship. Either the witness or inherited environment must
+            // retain ownership; test each independently.
+            assert!(OutputLease::take(wt, true).is_err());
+            let finish = if cancel {
+                drop(running);
+                None
+            } else {
+                Some(tokio::spawn(async move { running.finish().await }))
+            };
+            if clear_owner {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                assert!(crate::proc::pid_alive(pid as u32));
+                assert!(OutputLease::take(wt, true).is_err(), "cancel={cancel}");
+                assert!(OutputLease::cache(&f.home, &cache, true).is_err());
+                assert!(
+                    crate::cache::maintenance_prune(&f.home, &cache, 0)
+                        .unwrap()
+                        .is_none()
+                );
+                if let Some(finish) = &finish {
+                    assert!(!finish.is_finished());
+                }
+                // Witness-only ownership waits for natural/external tool exit.
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+            if let Some(finish) = finish {
+                tokio::time::timeout(std::time::Duration::from_secs(5), finish)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if OutputLease::take(wt, true).is_ok()
+                        && OutputLease::cache(&f.home, &cache, true).is_ok()
+                    {
+                        // Token-owned orphans must be stopped by cleanup itself.
+                        if !clear_owner {
+                            assert!(!crate::proc::pid_alive(pid as u32));
+                        }
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            tool.0 = None;
+        }
+    }
+
+    #[tokio::test]
     async fn cancellation_keeps_output_and_cache_ownership_until_tools_terminate() {
         let f = Fx::new().await;
         let run = f.run("abcd", false).await;
@@ -1672,15 +1773,15 @@ mod tests {
             .env("CHILD_PID_FILE", &pid_file)
             .process_group(0)
             .kill_on_drop(true);
-        let child = cmd.spawn().unwrap();
-        let running = crate::seat_process::Running::with_outputs(
-            child,
+        let running = crate::seat_process::Running::spawn(
+            cmd,
             None,
             vec![
                 OutputLease::borrow(wt).unwrap().unwrap(),
                 OutputLease::cache(&f.home, &cache, false).unwrap(),
             ],
-        );
+        )
+        .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while !pid_file.exists() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
