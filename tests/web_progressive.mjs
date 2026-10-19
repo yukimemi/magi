@@ -15,6 +15,7 @@ function harness() {
   const renders = [];
   const notices = [];
   const failures = [];
+  const successes = [];
   const state = { detail: { id: null }, runs: [], talkDetail: { id: 'a' }, talkWaits: new Map(), stats: null, queue: [], taskDetail: { id: null } };
   const get = (url, options) => new Promise((resolve, reject) => requests.push({ url, options, resolve, reject }));
   const api = runInNewContext(`${sections}\n${runs}\n${talks}\n${tasks}\n${stats}\n({loadRun, loadTalk, loadTask, loadStats, cancelDetailSections, sectionRequest})`, {
@@ -25,34 +26,40 @@ function harness() {
     renderTalk: () => renders.push(state.talkDetail.talk), renderStats: () => renders.push(state.stats),
     renderStatsQueue: counts => renders.push({ queue: counts }),
     show() {}, sectionNotice: (...args) => notices.push(args), trackTalkThinking() {}, rememberTalkChoices() {}, endTalkTurn() {},
-    ok() {}, failFor: (...args) => failures.push(args), shortId: id => id,
+    ok: (...args) => successes.push(args), failFor: (...args) => failures.push(args), shortId: id => id,
   });
-  return { api, requests, renders, notices, failures, state };
+  return { api, requests, renders, notices, failures, successes, state };
+}
+function assertNoFailures(h) {
+  assert.equal(h.failures.length, 0, 'successful loads must not call failFor');
+  assert.equal(h.notices.filter(n => typeof n[3] === 'function').length, 0, 'successful loads must not offer failure retries');
 }
 test('run core renders before slow report; successful cards do not fetch text', async () => {
   const h = harness();
   const done = h.api.loadRun('a');
-  h.requests.find(r => r.url === 'run/a/core').resolve({ id: 'a', useful: true });
+  h.requests.find(r => r.url === 'run/a/core').resolve({ id: 'a', updated_at: 'now', useful: true });
   await flush();
   assert.equal(h.state.detail.run.useful, true);
   assert.equal(h.state.detail.reportLoading, true);
-  h.requests.find(r => r.url === 'run/a').resolve({ id: 'a', useful: true });
+  h.requests.find(r => r.url === 'run/a').resolve({ id: 'a', updated_at: 'now', useful: true });
   h.requests.find(r => r.url === 'report/a').resolve({ schema: 1, sections: [] });
   await done;
   assert.equal(h.state.detail.reportLoading, false);
   assert.equal(h.requests.length, 3);
+  assertNoFailures(h);
 });
 test('unknown schema triggers real text fallback independently', async () => {
   const h = harness();
   const done = h.api.loadRun('a');
-  h.requests[0].resolve({ id: 'a' });
-  h.requests[1].resolve({ id: 'a' });
+  h.requests[0].resolve({ id: 'a', updated_at: 'now' });
+  h.requests[1].resolve({ id: 'a', updated_at: 'now' });
   h.requests[2].resolve({ schema: 999 });
   await flush();
   assert.equal(h.requests[3].url, 'raw/a');
   h.requests[3].resolve('Readable report');
   await done;
   assert.equal(h.state.detail.report, 'Readable report');
+  assertNoFailures(h);
 });
 test('navigation aborts reads and rejects late responses even on return to same id', async () => {
   const h = harness();
@@ -61,26 +68,28 @@ test('navigation aborts reads and rejects late responses even on return to same 
   h.state.detail = { id: null };
   const next = h.api.loadRun('a');
   assert.equal(h.requests[0].options.signal.aborted, true);
-  h.requests[3].resolve({ id: 'a', version: 2 });
-  h.requests[4].resolve({ id: 'a', version: 2 });
+  h.requests[3].resolve({ id: 'a', updated_at: 'now', version: 2 });
+  h.requests[4].resolve({ id: 'a', updated_at: 'now', version: 2 });
   h.requests[5].resolve({ schema: 1, sections: [] });
   await next;
-  h.requests[0].resolve({ id: 'a', version: 1 });
+  h.requests[0].resolve({ id: 'a', updated_at: 'now', version: 1 });
   h.requests[1].reject(new Error('late failure'));
   h.requests[2].resolve({ schema: 1, sections: [] });
   await old;
   assert.equal(h.state.detail.run.version, 2);
   assert.ok(!h.notices.some(n => n[2].includes('late failure')));
+  assertNoFailures(h);
 });
 test('pending refresh joins work, and failure retains useful report and run', async () => {
   const h = harness();
   const first = h.api.loadRun('a');
   const second = h.api.loadRun('a');
   assert.equal(h.requests.length, 3);
-  h.requests[0].resolve({ id: 'a', useful: true });
-  h.requests[1].resolve({ id: 'a', useful: true });
+  h.requests[0].resolve({ id: 'a', updated_at: 'now', useful: true });
+  h.requests[1].resolve({ id: 'a', updated_at: 'now', useful: true });
   h.requests[2].resolve({ schema: 1, sections: ['kept'] });
   await Promise.all([first, second]);
+  assertNoFailures(h);
   const refresh = h.api.loadRun('a', { background: true });
   h.requests[3].reject(new Error('core unavailable'));
   h.requests[4].reject(new Error('evidence unavailable'));
@@ -88,7 +97,9 @@ test('pending refresh joins work, and failure retains useful report and run', as
   await refresh;
   assert.equal(h.state.detail.run.useful, true);
   assert.equal(h.state.detail.reportView.sections[0], 'kept');
-  assert.equal(typeof h.notices.at(-1)[3], 'function');
+  for (const message of ['core unavailable', 'evidence unavailable', 'report unavailable']) {
+    assert.ok(h.notices.some(n => n[2].includes(message) && typeof n[3] === 'function'));
+  }
 });
 test('conversation transcript survives failed secondary information in either order', async () => {
   const h = harness();
@@ -99,7 +110,8 @@ test('conversation transcript survives failed secondary information in either or
   h.requests[1].reject(new Error('queue unavailable'));
   await done;
   assert.equal(h.state.talkDetail.talk.turns.length, 1);
-  assert.equal(typeof h.notices.at(-1)[3], 'function');
+  assert.ok(h.notices.some(n => n[2].includes('queue unavailable') && typeof n[3] === 'function'));
+  assert.equal(h.failures.length, 0);
 });
 test('dashboard filter changes discard reversed responses', async () => {
   const h = harness();
@@ -117,6 +129,7 @@ test('dashboard filter changes discard reversed responses', async () => {
   await first;
   assert.equal(h.state.stats.repo, 'second');
   assert.equal(h.requests.find(r => r.url.includes('repo=first')).options.signal.aborted, true);
+  assertNoFailures(h);
 });
 
 test('a change during a slow read schedules one trailing refresh without parallel duplicates', async () => {
@@ -125,17 +138,18 @@ test('a change during a slow read schedules one trailing refresh without paralle
   h.api.loadRun('a', { background: true });
   h.api.loadRun('a', { background: true });
   assert.equal(h.requests.length, 3);
-  h.requests[0].resolve({ id: 'a', version: 1 });
-  h.requests[1].resolve({ id: 'a', version: 1 });
+  h.requests[0].resolve({ id: 'a', updated_at: 'now', version: 1 });
+  h.requests[1].resolve({ id: 'a', updated_at: 'now', version: 1 });
   h.requests[2].resolve({ schema: 1, sections: [] });
   await flush();
   assert.equal(h.requests.length, 6);
-  h.requests[3].resolve({ id: 'a', version: 2 });
-  h.requests[4].resolve({ id: 'a', version: 2 });
+  h.requests[3].resolve({ id: 'a', updated_at: 'now', version: 2 });
+  h.requests[4].resolve({ id: 'a', updated_at: 'now', version: 2 });
   h.requests[5].resolve({ schema: 1, sections: [] });
   await first;
   assert.equal(h.state.detail.run.version, 2);
   assert.equal(h.requests.length, 6);
+  assertNoFailures(h);
 });
 
 test('task instructions are useful while history fails, without complete action evidence', async () => {
@@ -149,6 +163,7 @@ test('task instructions are useful while history fails, without complete action 
   await done;
   assert.equal(h.state.taskDetail.task.instruction, 'Useful instructions');
   assert.equal(h.state.taskDetail.error, 'history unavailable');
+  assert.ok(h.notices.some(n => n[2].includes('history unavailable') && typeof n[3] === 'function'));
 });
 
 test('late task core cannot downgrade an already complete detail', async () => {
@@ -160,6 +175,7 @@ test('late task core cannot downgrade an already complete detail', async () => {
   await done;
   assert.equal(h.state.taskDetail.task.instruction, 'Full');
   assert.equal(h.state.taskDetail.task.coreOnly, undefined);
+  assertNoFailures(h);
 });
 
 for (const evidenceFirst of [false, true]) {
@@ -179,6 +195,7 @@ for (const evidenceFirst of [false, true]) {
       await done;
       assert.equal(h.state.detail.evidenceError, !matches);
       if (!matches) assert.equal(h.state.detail.run.useful, true);
+      else assertNoFailures(h);
     });
   }
 }
@@ -192,6 +209,7 @@ for (const failure of [false, true]) {
     h.requests[1].resolve(saved);
     h.requests[2].resolve({ schema: 1, sections: [] });
     await initial;
+    assertNoFailures(h);
     const rendered = h.renders.length;
     const refresh = h.api.loadRun('a', { background: true });
     assert.equal(h.state.detail.run, saved);
@@ -209,6 +227,8 @@ for (const failure of [false, true]) {
     assert.equal(h.state.detail.evidencePending, false);
     assert.equal(h.state.detail.evidenceError, failure);
     assert.equal(h.state.detail.run.updated_at, failure ? 'before' : 'after');
+    if (failure) assert.ok(h.notices.some(n => n[2].includes('temporary failure') && typeof n[3] === 'function'));
+    else assertNoFailures(h);
   });
 }
 
@@ -225,6 +245,7 @@ test('unchanged background evidence does not rebuild focused action controls', a
   h.requests[5].resolve({ schema: 1, sections: [] });
   await refresh;
   assert.equal(h.renders.filter(r => r && r.id === 'a').length, rendered);
+  assertNoFailures(h);
 });
 
 
@@ -239,6 +260,9 @@ test('dashboard queue is useful while history is pending and survives its failur
   await done;
   assert.equal(h.renders[0].queue.queued, 17);
   assert.ok(h.notices.some(n => n[2].includes('history offline') && typeof n[3] === 'function'));
+  assert.equal(h.failures.length, 1);
+  assert.ok(h.failures[0][1].includes('history offline'));
+  assert.equal(h.failures[0][2].message, 'history offline');
 });
 
 
@@ -252,5 +276,6 @@ test('queue-only dashboard refresh preserves run history without requesting it a
   await done;
   assert.equal(h.state.stats.useful, 'history');
   assert.equal(h.renders[0].queue.queued, 9);
-  assert.equal(h.failures.length, 0);
+  assertNoFailures(h);
+  assert.equal(h.successes.length, 1);
 });
