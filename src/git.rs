@@ -402,7 +402,7 @@ pub async fn diff_stat(worktree: &Path, base: &str, head: &str) -> Result<String
 
 /// Total changed lines (added + removed) between two revisions, from
 /// `--numstat`. `None` when git could not say, or a binary file changed
-/// (numstat prints `-` for it): a size that cannot be measured is not small.
+/// (numstat prints `-` for it). This measurement does not determine acceptance.
 pub async fn changed_lines(worktree: &Path, base: &str, head: &str) -> Option<usize> {
     let out = git_raw(worktree, &["diff", "--numstat", base, head])
         .await

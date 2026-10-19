@@ -949,8 +949,6 @@ pub struct GraftView {
     pub sources: Vec<String>,
     /// Changed lines the graft introduced (supporting information).
     pub lines: Option<usize>,
-    /// The size limit.
-    pub limit: Option<usize>,
     /// What the judges asked for, with what the fixer's report confirms.
     pub requested: Vec<GraftStrengthView>,
     /// Counts of confirmed, rejected and unconfirmed requests.
@@ -1083,7 +1081,6 @@ fn graft_view(
         winner: state.tally.as_ref().map(|t| t.winner.to_string()),
         sources,
         lines: g.lines,
-        limit: g.limit,
         unconfirmed_count: requested.len() - adopted_count - rejected_count,
         adopted_count,
         rejected_count,
@@ -1850,7 +1847,7 @@ mod tests {
         assert_eq!(g["agent"], "astra");
         assert_eq!(g["handovers"][0]["from"], "sonnet");
         assert_eq!(g["lines"], 25);
-        assert_eq!(g["limit"], 227);
+        assert!(g.get("limit").is_none());
         let st: Vec<_> = g["requested"]
             .as_array()
             .expect("a")
@@ -1862,6 +1859,29 @@ mod tests {
         assert_eq!(g["adopted_count"], 1);
         assert_eq!(g["unconfirmed_count"], 1);
         assert_eq!(g["diff_available"], true);
+    }
+
+    #[test]
+    fn historical_graft_limits_are_readable_but_not_displayed() {
+        let mut s = state();
+        let old = serde_json::to_value(graft_record(crate::run::GraftOutcome::Applied)).unwrap();
+        assert_eq!(old["limit"], 227);
+        let mut record: crate::run::GraftRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(record.limit, Some(227));
+        record.lines = None;
+        s.graft = Some(record);
+        let view = graft_json(&s, None);
+        assert!(view["graft"]["lines"].is_null());
+        assert!(view["graft"].get("limit").is_none());
+        let text = crate::report::run(&s);
+        assert!(text.contains("changed lines unavailable"));
+        assert!(!text.contains("limit 227"));
+        assert!(!text.contains("0 changed lines"));
+
+        s.graft.as_mut().unwrap().lines = Some(25);
+        let text = crate::report::run(&s);
+        assert!(text.contains("25 changed lines"));
+        assert!(!text.contains("limit 227"));
     }
 
     #[test]

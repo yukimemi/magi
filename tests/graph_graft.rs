@@ -1,6 +1,6 @@
 //! End-to-end: the graft phase ports the losers' judge-named strengths onto
 //! the winner, is skipped when there is nothing to port, and is rolled back
-//! (never failing the run) when the fixer fails or its diff is too large.
+//! (never failing the run) when the fixer fails.
 mod common;
 
 use common::{Fixture, Judges, fixture};
@@ -52,7 +52,8 @@ async fn a_graft_is_applied_and_reviewed_like_any_other_change() {
     let g = state.graft.as_ref().expect("graft record");
     assert_eq!(g.outcome, GraftOutcome::Applied, "{:?}", graft_events(state));
     assert!(g.post.is_some() && g.post.as_deref() != Some(g.pre.as_str()));
-    assert!(g.lines.unwrap() <= g.limit.unwrap());
+    assert_eq!(g.lines, Some(1));
+    assert_eq!(g.limit, None);
     assert!(winner_has(state, "grafted.txt"));
     // The review that follows saw the grafted tree.
     assert!(!state.reviews.is_empty());
@@ -63,6 +64,8 @@ async fn a_graft_is_applied_and_reviewed_like_any_other_change() {
         .expect("graft prompt artifact");
     assert!(prompt.contains("# Graft the runner-up strengths"));
     assert!(prompt.contains("mock strength of B"));
+    assert!(!prompt.contains("changed lines"));
+    assert!(!prompt.contains("discarded whole"));
     for agent in ["alpha", "beta", "gamma"] {
         assert!(!prompt.contains(agent), "graft prompt leaked `{agent}`");
     }
@@ -103,7 +106,7 @@ async fn judges_naming_no_strengths_leave_the_winner_untouched() {
 }
 
 common::e2e! {
-async fn a_graft_over_the_size_limit_is_rolled_back() {
+async fn a_large_graft_is_applied_measured_and_reviewed() {
     let home = common::home_lock().await;
     let mut fx = fixture(home, Judges::Unanimous, false);
     with_env(&mut fx, &[("MOCK_STRENGTHS", "1"), ("MOCK_GRAFT", "huge")]);
@@ -111,9 +114,11 @@ async fn a_graft_over_the_size_limit_is_rolled_back() {
     let state = &runner.state;
 
     let g = state.graft.as_ref().expect("graft record");
-    assert!(matches!(&g.outcome, GraftOutcome::RolledBack(why) if why.contains("limit")), "{g:?}");
-    assert!(!winner_has(state, "grafted.txt"));
-    assert_eq!(state.status, RunStatus::Ready, "the run goes on as if graft were off");
+    assert_eq!(g.outcome, GraftOutcome::Applied);
+    assert_eq!(g.lines, Some(500));
+    assert_eq!(g.limit, None);
+    assert!(winner_has(state, "grafted.txt"));
+    assert_eq!(state.status, RunStatus::Ready);
     assert!(!state.reviews.is_empty());
 }
 }
@@ -141,5 +146,24 @@ async fn a_graft_that_changes_nothing_is_recorded_as_rolled_back() {
     let runner = run(&fx).await;
     let g = runner.state.graft.as_ref().expect("graft record");
     assert!(matches!(&g.outcome, GraftOutcome::RolledBack(w) if w.contains("nothing")), "{g:?}");
+}
+}
+
+common::e2e! {
+async fn binary_changes_do_not_prevent_grafting_or_review() {
+    let home = common::home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    with_env(&mut fx, &[("MOCK_STRENGTHS", "1"), ("MOCK_GRAFT", "binary"), ("MOCK_WINNER_BINARY", "1")]);
+    let runner = run(&fx).await;
+    let state = &runner.state;
+    let g = state.graft.as_ref().expect("graft record");
+    assert_eq!(g.outcome, GraftOutcome::Applied);
+    assert_eq!(g.lines, None);
+    assert_eq!(g.limit, None);
+    assert!(winner_has(state, "winner.bin"));
+    assert!(winner_has(state, "grafted.txt"));
+    assert!(!state.reviews.is_empty());
+    assert_eq!(state.status, RunStatus::Ready);
+    assert!(graft_events(state).contains(&"applied: changed lines unavailable"));
 }
 }

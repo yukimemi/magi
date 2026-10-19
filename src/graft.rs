@@ -1,22 +1,15 @@
-//! The graft phase's decisions: whether it runs, what it is told, and whether
-//! its result is small enough to keep.
+//! The graft phase's decisions: whether it runs and what it is told.
 //!
 //! Between the tally and the review loop a fixer round ports the strengths
 //! the judges attributed to the losing candidates onto the winner
 //! (`graph::Runner::graft`). Everything that can be decided without I/O lives
-//! here so the skip conditions and the size valve are unit-tested directly.
+//! here so the skip conditions are unit-tested directly.
 
 use std::collections::BTreeSet;
 
 use crate::blind;
 use crate::run::RunState;
 
-/// Smallest line budget a graft gets, however small the winner is.
-pub const MIN_LIMIT: usize = 40;
-/// Largest line budget a graft gets, however large the winner is.
-pub const MAX_LIMIT: usize = 400;
-/// The graft may change at most one `RATIO`th of the winner's own diff.
-pub const RATIO: usize = 4;
 /// Strengths kept per candidate, and characters kept per strength.
 const MAX_ITEMS: usize = 8;
 const MAX_CHARS: usize = 400;
@@ -136,20 +129,6 @@ pub fn plan(state: &RunState) -> Result<Plan, Skip> {
         return Err(Skip::NoStrengths);
     }
     Ok(Plan { winner, strengths })
-}
-
-/// The most changed lines a graft may add to a winner whose own diff against
-/// the base is `winner_lines`: a quarter of it, never under [`MIN_LIMIT`] and
-/// never over [`MAX_LIMIT`]. A quarter keeps the graft a supplement; half
-/// would let it turn the winner into something else.
-pub fn limit(winner_lines: usize) -> usize {
-    winner_lines.div_ceil(RATIO).clamp(MIN_LIMIT, MAX_LIMIT)
-}
-
-/// Is a graft that changed `lines` (`None`: not measurable, or binary) within
-/// `limit`? An unmeasurable change is rejected.
-pub fn within_budget(lines: Option<usize>, limit: usize) -> bool {
-    lines.is_some_and(|l| l <= limit)
 }
 
 /// The reason a record in a non-final state is rolled back on resume.
@@ -305,23 +284,5 @@ mod tests {
         ];
         let p = plan(&s).unwrap();
         assert_eq!(p.strengths[0].2, vec!["Same point", "another"]);
-    }
-
-    #[test]
-    fn the_limit_is_a_quarter_clamped() {
-        assert_eq!(limit(0), 40);
-        assert_eq!(limit(160), 40);
-        assert_eq!(limit(161), 41);
-        assert_eq!(limit(1000), 250);
-        assert_eq!(limit(1600), 400);
-        assert_eq!(limit(1_000_000), 400);
-    }
-
-    #[test]
-    fn the_budget_is_inclusive_and_rejects_the_unmeasurable() {
-        assert!(within_budget(Some(40), 40));
-        assert!(!within_budget(Some(41), 40));
-        assert!(within_budget(Some(0), 40));
-        assert!(!within_budget(None, 400));
     }
 }

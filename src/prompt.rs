@@ -1443,7 +1443,6 @@ pub fn graft(
     instruction: &str,
     winner: char,
     strengths: &[(char, String, Vec<String>)],
-    limit: usize,
     language: &str,
 ) -> String {
     let mut s = format!(
@@ -1472,13 +1471,10 @@ pub fn graft(
             need its code; never check it out here or merge it.\n\
          2. Adapt each one to the winner's design and naming. Never replace \
             the winner's approach with another candidate's.\n\
-         3. Keep the diff small: at most about {limit} changed lines in total. \
-            A larger change is discarded whole. Skip a strength that does not \
-            fit that.\n\
-         4. Keep the tests passing, and commit the change in this worktree. If \
+         3. Keep the tests passing, and commit the change in this worktree. If \
             nothing is worth porting, change nothing.\n\
-         5. Never name yourself, your vendor, or your model, anywhere.\n\
-         6. If you start something in the background (a test run, a build), \
+         4. Never name yourself, your vendor, or your model, anywhere.\n\
+         5. If you start something in the background (a test run, a build), \
             do not end your reply while it is still pending.\n\n\
          # Output\n\n\
          Your reasoning first, then exactly one fenced json block, last:\n\n\
@@ -3774,9 +3770,28 @@ mod tests {
     }
 
     #[test]
+    fn graft_preserves_scope_and_reporting_without_a_line_budget() {
+        let p = graft(
+            "task",
+            'A',
+            &[('B', "loser".into(), vec!["strength".into()])],
+            "en",
+        );
+        assert!(p.contains("# Graft the runner-up strengths"));
+        assert!(p.contains("[B1] strength"));
+        assert!(p.contains("Port only the strengths listed above"));
+        assert!(p.contains("Never replace"));
+        assert!(p.contains("`addressed`"));
+        assert!(p.contains("`rejected`"));
+        assert!(!p.contains("changed lines"));
+        assert!(!p.contains("discarded whole"));
+        assert!(!p.contains("Keep the diff small"));
+    }
+
+    #[test]
     fn non_worktree_and_resume_prompts_preserve_parent_ownership() {
         for p in [
-            graft("t", 'A', &[], 10, "en"),
+            graft("t", 'A', &[], "en"),
             change_summary("a", "b", &[], ""),
             resume_incomplete("missing report"),
             resume_after_drop("lost stream"),

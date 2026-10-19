@@ -953,7 +953,7 @@ pub struct GraftRecord {
     /// Changed lines (added + removed) the graft introduced, when measured.
     #[serde(default)]
     pub lines: Option<usize>,
-    /// The size limit that applied.
+    /// Historical size limit, retained for old records only. New grafts use `None`.
     #[serde(default)]
     pub limit: Option<usize>,
     /// Agent that answered the round.

@@ -585,8 +585,8 @@ pub struct Graph {
     /// losing candidates onto the winner (`graph::Runner::graft`). Skipped
     /// for a single candidate, a run with no winner or no quorum, and when
     /// no judge recorded a strength for a loser. Best-effort: a failure, a
-    /// quota hit, no change or a diff over the size limit restores the
-    /// winner's pre-graft commit and the run carries on as if this were off.
+    /// quota hit or no change restores the winner's pre-graft commit and the
+    /// run carries on as if this were off.
     /// On by default.
     pub graft_runner_up: bool,
 }

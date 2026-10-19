@@ -4119,10 +4119,9 @@ impl Runner {
     /// the winner, once, between the tally and the review loop.
     ///
     /// Best-effort by construction: it returns nothing and fails nothing. A
-    /// skip, a fixer that failed or hit quota, a round that changed nothing
-    /// and a result over the size limit ([`graft::limit`]) all leave the
-    /// winner exactly at the commit it had before (`GraftRecord::pre`) and the
-    /// run carries on as if the phase were off. See [`graft`] for the
+    /// skip, a fixer that failed or hit quota, or a round that changed nothing
+    /// all leave the winner at its previous commit (`GraftRecord::pre`), and
+    /// the run carries on as if the phase were off. See [`graft`] for the
     /// decisions and `AGENTS.md` for the invariants.
     ///
     /// The one exception is a rollback that could not be confirmed: the
@@ -4242,20 +4241,13 @@ impl Runner {
             return Ok(());
         }
         let pre = git::rev_parse(&wt, "HEAD").await?;
-        let Some(winner_lines) = git::changed_lines(&wt, &self.state.base_commit, &pre).await
-        else {
-            self.graft_skipped("the winner's diff could not be measured");
-            self.state.save()?;
-            return Ok(());
-        };
-        let limit = graft::limit(winner_lines);
         // Saved before the fixer is called: a stop from here on is repaired
         // by the branch above on the next entry.
         self.state.graft = Some(GraftRecord {
             pre: pre.clone(),
             post: None,
             lines: None,
-            limit: Some(limit),
+            limit: None,
             agent: None,
             outcome: GraftOutcome::Running,
             requested: graft::requested(&plan),
@@ -4265,7 +4257,7 @@ impl Runner {
         self.state.event(
             "graft",
             format!(
-                "porting strengths of candidate(s) {} onto {} (limit {limit} changed lines)",
+                "porting strengths of candidate(s) {} onto {}",
                 plan.strengths
                     .iter()
                     .map(|(l, _, _)| l.to_string())
@@ -4280,7 +4272,6 @@ impl Runner {
             &self.state.instruction,
             plan.winner,
             &plan.strengths,
-            limit,
             &self.state.config.graph.language,
         );
         let timeout = Duration::from_secs(self.state.config.graph.timeout_fix);
@@ -4372,17 +4363,7 @@ impl Runner {
                 why = Some("the fixer changed nothing".to_owned());
             } else {
                 lines = git::changed_lines(&wt, &pre, &head).await;
-                if graft::within_budget(lines, limit) {
-                    post = Some(head);
-                } else {
-                    why = Some(format!(
-                        "{} changed lines against a limit of {limit}",
-                        lines.map_or_else(
-                            || "an unmeasurable number of".to_owned(),
-                            |l| l.to_string()
-                        )
-                    ));
-                }
+                post = Some(head);
             }
         }
         let (adoption, adoption_error) = match &out {
@@ -4395,8 +4376,11 @@ impl Runner {
                 self.state.event(
                     "graft",
                     format!(
-                        "applied: {} changed lines (limit {limit})",
-                        lines.unwrap_or(0)
+                        "applied: {}",
+                        lines.map_or_else(
+                            || "changed lines unavailable".to_owned(),
+                            |n| format!("{n} changed lines")
+                        )
                     ),
                 );
                 GraftOutcome::Applied
@@ -4418,7 +4402,7 @@ impl Runner {
             pre,
             post,
             lines,
-            limit: Some(limit),
+            limit: None,
             agent: Some(agent_id),
             outcome,
             requested,

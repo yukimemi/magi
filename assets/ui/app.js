@@ -7177,8 +7177,7 @@ const GRAFT_UNAVAILABLE = {
 /* Everything here is agent-authored text, so it only ever reaches the DOM
    through `text` / `textContent` or the server's markdown tree. */
 function renderGraft(runId, g) {
-  const lines = g.lines != null ? `${g.lines} changed lines${g.limit != null ? ` (limit ${g.limit})` : ""}`
-    : g.limit != null ? `limit ${g.limit} changed lines` : null;
+  const lines = g.lines != null ? `${g.lines} changed lines` : "changed lines unavailable";
   const diffBox = el("pre", { class: "rpre", text: "" });
   const diff = g.diff_available
     ? el("details", { class: "rout" }, el("summary", { text: "graft diff" }), diffBox)
