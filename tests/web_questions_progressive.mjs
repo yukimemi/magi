@@ -7,7 +7,7 @@ const loaders = source.slice(source.indexOf('let questionOriginGeneration ='), s
 const flush = () => new Promise(resolve => setImmediate(resolve));
 function harness() {
   const requests = [], notices = [], renders = [];
-  const state = { questions: [], route: { name: 'questions' }, detail: {} };
+  const state = { questions: null, route: { name: 'questions' }, detail: {} };
   const getJson = (url, options) => new Promise((resolve, reject) => requests.push({ url, options, resolve, reject }));
   const api = runInNewContext(`${loaders}\n({loadQuestions})`, {
     state, API: { questions: '/api/questions' }, AbortController, getJson,
@@ -22,6 +22,7 @@ const core = (revision = 'one') => ({ id: 'q', record_revision: revision, summar
 const origin = (revision = 'one') => ({ id: 'q', record_revision: revision, origin_chat: 'chat', can_consult_chat: true });
 test('question content arrives independently of slow and failing origins, with retry', async () => {
   const h = harness();
+  assert.equal(h.state.questions, null, 'first load starts with the production initial state');
   const done = h.api.loadQuestions();
   assert.equal(h.requests[0].url, '/api/questions/core');
   h.requests[0].resolve([core()]);

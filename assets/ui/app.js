@@ -9534,7 +9534,7 @@ function loadQuestions() {
   ++questionOriginGeneration;
   if (questionOriginController) questionOriginController.abort();
   return loadStore("questions", `${API.questions}/core`, null, list => {
-    const previousById = new Map(state.questions.map(question => [question.id, question]));
+    const previousById = new Map((state.questions || []).map(question => [question.id, question]));
     state.questions = sortQuestions((Array.isArray(list) ? list : []).map(question => {
       const previous = previousById.get(question.id);
       if (!previous || previous.record_revision !== question.record_revision) return question;
