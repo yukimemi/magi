@@ -70,26 +70,40 @@ test('an empty question store never asks for task/chat origins', async () => {
   assert.equal(h.requests.length, 1);
 });
 
-test('unchanged core rows retain origins until refreshed chat state arrives', async () => {
+test('background refresh neither clears nor sets the origins notice', async () => {
   const h = harness();
   const first = h.api.loadQuestions();
   h.requests[0].resolve([core()]);
   await first;
   assert.equal(h.notices.length, 1);
   assert.equal(h.notices[0][2], 'Loading question origins…');
+  h.requests[1].resolve([origin()]);
+  await flush();
+  const notices = h.notices.slice();
+  const refresh = h.api.loadQuestions();
+  assert.deepEqual(h.notices, notices);
+  h.requests[2].resolve([core()]);
+  await refresh;
+  assert.deepEqual(h.notices, notices, 'no notice is cleared or set while origins refresh');
+  h.requests[3].resolve([origin()]);
+  await flush();
+});
+
+test('unchanged core rows retain origins until refreshed chat state arrives', async () => {
+  const h = harness();
+  const first = h.api.loadQuestions();
+  h.requests[0].resolve([core()]);
+  await first;
   h.requests[1].resolve([{ ...origin(), origin_chat_closed: false }]);
   await flush();
 
-  const noticeCount = h.notices.length;
   const refresh = h.api.loadQuestions();
-  assert.equal(h.notices.length, noticeCount, 'refresh does not clear the notice');
   h.requests[2].resolve([core()]);
   await refresh;
   const row = h.renders.at(-1)[0];
   assert.equal(row.origin_chat, 'chat');
   assert.equal(row.origin_chat_closed, false);
   assert.equal(row.can_consult_chat, true, 'retained eligibility overrides the core default');
-  assert.equal(h.notices.length, noticeCount, 'background lookup does not show Loading');
   assert.equal(h.requests[3].url, '/api/questions/origins');
   h.requests[3].resolve([{ ...origin(), origin_chat: null, origin_chat_closed: true, can_consult_chat: false }]);
   await flush();
