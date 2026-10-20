@@ -3827,6 +3827,21 @@ async fn attempt(
         record(queue, task);
         return Vec::new();
     }
+    if let Some(reason) = retained_attempt_hold(
+        task,
+        &starter,
+        config.disk.retained_attempt_limit,
+        RunState::load,
+    ) {
+        // The review choice was consumed above. Preserve it across this hold
+        // so a later release cannot silently become a fresh implementation.
+        if let Starter::Review(branch) = &starter {
+            task.review_branch = Some(branch.clone());
+        }
+        task.hold_unrequested_retry(Some(reason));
+        record(queue, task);
+        return Vec::new();
+    }
     // Absolute paths of the files the task was filed with, re-read from the
     // task now so a file attached while it was held reaches a resumed run
     // too. A stored name whose file has gone is an error before any agent is
@@ -5054,6 +5069,40 @@ enum Starter {
     Resume(String),
     /// `crate::graph::Runner::start`: a fresh competition.
     Start,
+}
+
+/// A second bound independent of inputs and the resettable failure counter.
+/// Count recovery records, not history entries: resuming appends the same id.
+/// Unknown history is not evidence that a new set of worktrees is affordable.
+fn retained_attempt_hold(
+    task: &Task,
+    starter: &Starter,
+    limit: usize,
+    mut load: impl FnMut(&str) -> Result<RunState>,
+) -> Option<String> {
+    if limit == 0 || matches!(starter, Starter::Resume(_)) {
+        return None;
+    }
+    let mut retained = 0;
+    for id in task.runs.iter().collect::<std::collections::BTreeSet<_>>() {
+        let state = match load(id) {
+            Ok(state) if state.id == *id => state,
+            _ => {
+                return Some(format!(
+                    "[recovery-backlog] Cannot verify historical run {id}. Restore its record and inspect the recovery lineage before starting another attempt. Existing history was retained."
+                ));
+            }
+        };
+        if state.retired_to.is_some() || state.released() {
+            continue;
+        }
+        // Neither a completed status nor an empty candidate array proves that
+        // all recovery sources (including unrecorded preparation) were retired.
+        retained += 1;
+    }
+    (retained >= limit).then(|| format!(
+        "[recovery-backlog] {retained} unretired attempts reach the limit of {limit}. Resume an existing recovery owner or inspect the lineage and retire proved-obsolete attempts before creating another run. Releases, refunds and changed upstream inputs do not reset this limit. No source or historical report was removed."
+    ))
 }
 
 /// A selected public implementation overrides every historical candidate and pin.
@@ -10526,6 +10575,76 @@ mod tests {
             unfinished_run_with(&[run.id.clone()], "t", |_| Ok(run.clone())),
             Some(run.id.clone()),
             "a spent review budget must not turn a failed publication into a re-competition"
+        );
+    }
+
+    #[test]
+    fn retained_attempt_bound_survives_changed_bases_releases_and_duplicate_history() {
+        let mut task = Task::new(
+            "recover work".into(),
+            "recover work".into(),
+            PathBuf::from("/repo"),
+            crate::queue::Source::Human,
+        );
+        let mut history = std::collections::BTreeMap::new();
+        for index in 0..8 {
+            let mut run = run_state(RunStatus::Blocked);
+            run.id = format!("20260101-000000-{index:04}");
+            run.base_commit = format!("upstream-{index}");
+            // Seven empty newer attempts must not erase the old recovery owner.
+            if index > 0 {
+                run.candidates.clear();
+            }
+            task.runs.extend([run.id.clone(), run.id.clone()]);
+            history.insert(run.id.clone(), run);
+            task.requeue();
+        }
+        let check = |task: &Task, starter: &Starter, limit| {
+            retained_attempt_hold(task, starter, limit, |id| Ok(history[id].clone()))
+        };
+        assert!(
+            check(&task, &Starter::Start, 8)
+                .unwrap()
+                .contains("8 unretired")
+        );
+        assert!(check(&task, &Starter::Start, 9).is_none());
+        assert!(check(&task, &Starter::Review("existing".into()), 8).is_some());
+        task.release_operator("owner", None);
+        assert_eq!(task.attempts, 0);
+        let restored: Task = serde_json::from_slice(&serde_json::to_vec(&task).unwrap()).unwrap();
+        assert!(check(&restored, &Starter::Start, 8).is_some());
+        assert!(check(&restored, &Starter::Resume(task.runs[0].clone()), 8).is_none());
+        assert!(check(&restored, &Starter::Start, 0).is_none());
+    }
+
+    #[test]
+    fn retained_attempt_bound_requires_verified_retirement_not_completion_labels() {
+        let mut task = Task::new(
+            "recover work".into(),
+            "recover work".into(),
+            PathBuf::from("/repo"),
+            crate::queue::Source::Human,
+        );
+        let mut run = run_state(RunStatus::Superseded);
+        run.candidates.clear();
+        task.runs.push(run.id.clone());
+        assert!(retained_attempt_hold(&task, &Starter::Start, 1, |_| Ok(run.clone())).is_some());
+        run.retired_to = Some("authority".into());
+        assert!(retained_attempt_hold(&task, &Starter::Start, 1, |_| Ok(run.clone())).is_none());
+        run.retired_to = None;
+        run.released_to = Some("authority".into());
+        assert!(retained_attempt_hold(&task, &Starter::Start, 1, |_| Ok(run.clone())).is_none());
+        assert!(
+            retained_attempt_hold(&task, &Starter::Start, 8, |_| anyhow::bail!("unreadable"))
+                .unwrap()
+                .contains("Cannot verify")
+        );
+        // Resuming an existing owner needs no new inventory or worktree budget.
+        assert!(
+            retained_attempt_hold(&task, &Starter::Resume(run.id), 1, |_| {
+                panic!("resume must not load historical attempts")
+            })
+            .is_none()
         );
     }
 

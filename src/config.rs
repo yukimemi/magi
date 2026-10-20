@@ -892,8 +892,12 @@ pub struct Disk {
     pub cache_limit_bytes: u64,
     /// Aggregate retained worktree Cargo output cap; 0 disables reclamation.
     pub worktree_limit_bytes: u64,
-    /// Maximum whole-target bytes reclaimed per pass (never partial targets).
+    /// Maximum declared artifact bytes reclaimed per pass.
     pub worktree_reclaim_bytes: u64,
+    /// Maximum unretired attempts of one task before another run may be
+    /// created. Resumes do not create worktrees and remain allowed. Automatic
+    /// releases and upstream changes never reset this bound; 0 disables it.
+    pub retained_attempt_limit: usize,
 }
 
 impl Default for Disk {
@@ -905,6 +909,7 @@ impl Default for Disk {
             cache_limit_bytes: 10 * 1024 * 1024 * 1024,
             worktree_limit_bytes: 10 * 1024 * 1024 * 1024,
             worktree_reclaim_bytes: 16 * 1024 * 1024 * 1024,
+            retained_attempt_limit: 8,
         }
     }
 }

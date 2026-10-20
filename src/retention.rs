@@ -22,6 +22,12 @@ pub(crate) struct OutputLease {
 }
 
 impl OutputLease {
+    #[cfg(unix)]
+    pub(crate) fn descriptor(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self._file.as_raw_fd()
+    }
+
     pub(crate) fn borrow(worktree: &Path) -> Result<Option<Self>> {
         if !worktree.join(".git").is_file() {
             return Ok(None);
@@ -1657,6 +1663,58 @@ mod tests {
         );
         drop(guard);
         assert!(OutputLease::cache(&f.home, &cache, true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn launcher_death_does_not_release_live_tool_output_reservations() {
+        let f = Fx::new().await;
+        let run = f.run("abcd", false).await;
+        let wt = &run.candidates[0].worktree;
+        let mut helper = tokio::process::Command::new(std::env::current_exe().unwrap());
+        helper
+            .quiet()
+            .args(["--exact", "seat_process::tests::crashed_launcher_helper"])
+            .env("MAGI_TEST_CRASHED_LAUNCHER", &f.home)
+            .env("MAGI_TEST_WORKTREE", wt)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(8), helper.status())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
+        let pid: i32 = std::fs::read_to_string(f.home.join("tool.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        struct KillTool(i32);
+        impl Drop for KillTool {
+            fn drop(&mut self) {
+                // SAFETY: PID belongs to the bounded helper above.
+                unsafe { libc::kill(self.0, libc::SIGKILL) };
+            }
+        }
+        let tool = KillTool(pid);
+        assert!(OutputLease::take(wt, true).is_err());
+        assert!(OutputLease::cache(&f.home, &f.home.join("cache"), true).is_err());
+        drop(tool);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if OutputLease::take(wt, true).is_ok()
+                    && OutputLease::cache(&f.home, &f.home.join("cache"), true).is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

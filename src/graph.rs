@@ -1803,6 +1803,20 @@ impl Runner {
         {
             let branch = self.state.branch_for(label);
             let worktree = root.join(format!("cand-{label}"));
+            // Persist intent before Git can leave a partially created tree.
+            // Candidate registration follows setup, so it cannot inventory
+            // crashes or refusals during creation itself.
+            self.state.event(
+                "prep-intent",
+                serde_json::json!({
+                    "branch": branch,
+                    "worktree": worktree,
+                    "start": start,
+                    "picks": plan.picks,
+                })
+                .to_string(),
+            );
+            self.state.save()?;
             git::worktree_add_branch(&repo, &worktree, &branch, &start).await?;
             if self.state.config.blind.commit_msg_hook {
                 git::set_worktree_hooks_path(&worktree, &hooks_dir).await?;
@@ -13257,6 +13271,47 @@ mod tests {
             git::git(&repo, &["branch", "--list"]).await.unwrap().trim(),
             "* main"
         );
+    }
+
+    #[tokio::test]
+    async fn preparation_records_creation_intent_before_git_can_fail() {
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let mut runner = runner_at(RunStatus::Prep);
+        runner.state.repo = repo.clone();
+        runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
+        runner.state.config.graph.worktree_root = Some(tmp.path().join("wt"));
+        runner.state.config.blind.commit_msg_hook = false;
+        runner.roles.implementers = vec![spec("one")];
+        let label = blind::assign_labels(1, runner.state.seed)[0];
+        let branch = runner.state.branch_for(label);
+        // A conflicting branch makes Git refuse creation before a candidate
+        // can be registered. The durable intent must still identify it.
+        git::git(&repo, &["branch", &branch]).await.unwrap();
+        assert!(runner.prep().await.is_err());
+        let saved = RunState::load(&runner.state.id).unwrap();
+        assert!(saved.candidates.is_empty());
+        let event = saved
+            .events
+            .iter()
+            .find(|e| e.node == "prep-intent")
+            .unwrap();
+        let intent: serde_json::Value = serde_json::from_str(&event.message).unwrap();
+        assert_eq!(intent["branch"], branch);
+        assert_eq!(intent["start"], runner.state.base_commit);
+        assert_eq!(
+            intent["worktree"],
+            runner
+                .state
+                .worktree_root()
+                .join(format!("cand-{label}"))
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(intent["picks"], serde_json::json!([]));
     }
 
     #[tokio::test]

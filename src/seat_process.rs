@@ -56,6 +56,7 @@ impl Running {
             reader.set_read_timeout(Some(std::time::Duration::from_secs(1)))?;
             witness = Some(std::fs::File::from(OwnedFd::from(reader)));
             let fd = writer.as_raw_fd();
+            let output_fds: Vec<_> = outputs.iter().map(|lease| lease.descriptor()).collect();
             command.process_group(0);
             // SAFETY: only async-signal-safe fcntl runs after fork. Clear
             // CLOEXEC only in this child, never in the multithreaded launcher.
@@ -64,6 +65,14 @@ impl Running {
                 command.pre_exec(move || {
                     if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
                         return Err(std::io::Error::last_os_error());
+                    }
+                    // Tools also hold the actual output reservations. If the
+                    // launcher dies, its cleanup thread cannot keep a lease;
+                    // these inherited descriptors still exclude reclamation.
+                    for output in &output_fds {
+                        if libc::fcntl(*output, libc::F_SETFD, 0) == -1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
                     Ok(())
                 });
@@ -320,6 +329,39 @@ fn stop(child: &mut Child, group: Option<u32>, owner: Option<&std::ffi::OsStr>) 
 #[cfg(all(test, unix))]
 mod tests {
     use crate::proc::Quiet as _;
+
+    /// Exit without destructors to model loss of the launcher and its cleanup
+    /// thread while a tool still owns output descriptors.
+    #[test]
+    fn crashed_launcher_helper() {
+        let Some(root) = std::env::var_os("MAGI_TEST_CRASHED_LAUNCHER") else {
+            return;
+        };
+        let root = std::path::PathBuf::from(root);
+        let worktree = std::path::PathBuf::from(std::env::var_os("MAGI_TEST_WORKTREE").unwrap());
+        let outputs = vec![
+            crate::retention::OutputLease::borrow(&worktree)
+                .unwrap()
+                .unwrap(),
+            crate::retention::OutputLease::cache(&root, &root.join("cache"), false).unwrap(),
+        ];
+        let pid_file = root.join("tool.pid");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "echo $$ > \"$MAGI_TEST_TOOL_PID\"; exec sleep 10"])
+            .env("MAGI_TEST_TOOL_PID", &pid_file);
+        // A runtime is required by tokio's process registration even though
+        // the launcher deliberately never polls or drops the running process.
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _entered = runtime.enter();
+        let _running = super::Running::spawn(command, None, outputs).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !pid_file.exists() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::process::exit(0);
+    }
 
     /// Executed in a separate copy of the test binary. No interpreter or
     /// compiler dependency: reproduce fork/setsid/reparent without source edits.

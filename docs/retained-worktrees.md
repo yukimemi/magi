@@ -51,6 +51,9 @@ a cancelled invocation. The independent process cleanup owner retains these
 leases until the CLI and discovered descendants terminate. These protections do
 not depend on optional repository coordination configuration. Automatic output
 reclamation is disabled outside Unix process containment.
+Managed tools also inherit the actual output and shared-cache lock descriptors:
+loss of the launcher and its cleanup thread does not alone make those outputs
+eligible for reclamation while a surviving tool retains its descriptors.
 
 The sweep runs its filesystem walks, metadata loads and history inspection on a
 blocking worker, keeping the async runtime available for heartbeats and claims.
@@ -72,6 +75,21 @@ The reserve and cadence are safeguards, not a filesystem quota: unrelated
 writers and sudden allocations can still exhaust a volume between measurements.
 
 ## Recovery lineage and obsolete attempts
+
+`[disk] retained_attempt_limit` defaults to eight unretired, unreleased run
+records per task. Before creating a competition or review run, the daemon
+deduplicates the task's history and holds when this bound is reached. Unknown
+records also hold admission. Completed labels, empty candidate arrays, changing
+upstream commits, refunds and even explicit releases do not prove retirement or
+reset this count. The bound does not prevent resuming an existing owner, release
+a hold, choose a source or delete anything. A selected review source is preserved
+when admission holds. Verified retirement or ownership transfer frees a slot;
+an operator can deliberately change the configured limit (`0` disables it).
+This caps accumulation even when input changes create new failure generations.
+
+Before candidate creation, a durable `prep-intent` event records the planned
+branch, worktree, starting commit and cherry-picks. A creation failure or crash
+before candidate registration therefore leaves an inventory for diagnosis.
 
 `Task.recovery_budget` records failures against authored instructions, fetched
 base, resolved reference identities and candidate patch fingerprints. Branch
@@ -148,12 +166,22 @@ adds a bound across fresh automatic attempts and ordinary execution failures.
 No historical task or worktree is modified by the implementation tests. No
 operational cleanup task is created.
 
+The continuation checked the launcher-pinned upstream `4a3aa69` without moving
+the base. Its preparation failure hold and explicit retry protections are
+already present. Read-only inspection again found 218 history entries, 109
+distinct runs, three candidate-bearing runs, and 106 occurrences of the same
+referenced-commit cherry-pick failure. The two old useful candidates and the
+later candidate all remain recovery evidence. A completed task label does not
+authorize discarding that work. No local historical run was changed.
+
 Focused regression verification:
 
 ```sh
 RUSTUP_TOOLCHAIN=stable cargo test --locked --lib retention::tests
 RUSTUP_TOOLCHAIN=stable cargo test --locked --lib cache::tests
+RUSTUP_TOOLCHAIN=stable cargo test --locked --lib retained_attempt_bound
+RUSTUP_TOOLCHAIN=stable cargo test --locked --lib preparation_records_creation_intent
 ```
 
-Full review and verification remain owned by the enclosing run: review with
-`--merge none`, then `cargo test --locked --all-targets` and `cargo make check`.
+Full review and verification remain owned by the enclosing run, including
+`cargo test --locked --all-targets` and `cargo make check`.
