@@ -174,6 +174,11 @@ base drift that change the patch require manual inspection. Explicit
 recovery-source retention and pending implementation
 preservation still refuse folding. Other terminal labels and successful PR
 publication alone do not establish a confirmed merge.
+Queue completion does not authorize folding historical sources either:
+`Done` tasks retain their historical `Superseded` and `Failed` sources until
+recovery lineage transfers them or a confirmed merge passes the source proof.
+This includes failed candidates with no recorded tally. A newer successful
+attempt alone does not prove that an older independent implementation landed.
 
 ## Observability and incident evidence
 

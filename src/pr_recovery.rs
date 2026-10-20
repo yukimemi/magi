@@ -98,10 +98,15 @@ pub(crate) fn source_retention_reason(home: &Path, state: &crate::run::RunState)
     crate::queue::Queue::at(home.join("queue"))
         .list()
         .iter()
-        .find(|task| task.status != crate::queue::TaskStatus::Done && task.runs.contains(&state.id))
+        // Queue completion does not prove that every historical candidate
+        // landed. In particular, Superseded and Failed-without-tally runs
+        // may still own independent implementations. Keep those sources
+        // until recovery transfers them or the merged-source preflight above
+        // can prove incorporation; Done is not deletion authority.
+        .find(|task| task.runs.contains(&state.id))
         .map(|task| {
             format!(
-                "source of unfinished task {}; inspect recovery lineage before folding",
+                "source of task {}; inspect recovery lineage before folding",
                 task.id
             )
         })

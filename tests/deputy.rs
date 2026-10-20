@@ -1040,6 +1040,8 @@ async fn maintenance_release_is_bound_to_the_hold_and_applies_once_after_settle(
     let action = ChoiceAction::ReleaseTask { task: task.id.clone(),
         held_at: task.held_at.unwrap(), reason: task.hold_reason.clone() };
     let mut q = maintenance_question(&s, action.clone());
+    assert_eq!(q.id.split('-').count(), 5, "exercise the current question ID format");
+    assert!(!magi::run::is_run_id(&q.id), "question IDs are independent of run IDs");
     q.say("daemon: execute").unwrap();
     s.store.put(&mut q).unwrap();
     script(&s, &["MAGI ask --settle \"$qid\" --choice 'daemon: execute' --quote 'daemon: execute'"]);
@@ -1052,6 +1054,9 @@ async fn maintenance_release_is_bound_to_the_hold_and_applies_once_after_settle(
     let released = queue.get(&task.id).unwrap();
     assert_eq!(released.status, TaskStatus::Queued);
     assert!(released.action_applied(&q.id));
+    let receipt = s.home.join("choice-actions").join(format!("{}.json", q.id));
+    let recorded: serde_json::Value = serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    assert_eq!(recorded["status"], "applied");
     // Reopening the stores simulates a daemon restart. A fresh manual hold
     // cannot be released by an old settled question.
     task = released;

@@ -2190,6 +2190,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_task_retains_independent_historical_sources_without_a_merge_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let runs = home.join("runs");
+        let wt = home.join("wt");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let queue = crate::queue::Queue::at(home.join("queue"));
+        let mut task = crate::queue::Task::new(
+            "completed".into(),
+            "retain independent historical changes".into(),
+            repo.clone(),
+            crate::queue::Source::Human,
+        );
+        let mut sources = Vec::new();
+        for (id, status) in [
+            ("20260801-000000-old1", RunStatus::Superseded),
+            ("20260801-000000-old2", RunStatus::Failed),
+        ] {
+            let (id, worktree) = due_run_with_winner_worktree(&runs, &wt, &repo, id, status).await;
+            std::fs::write(worktree.join("independent.txt"), &id).unwrap();
+            crate::git::git(&worktree, &["add", "independent.txt"])
+                .await
+                .unwrap();
+            crate::git::git(
+                &worktree,
+                &["commit", "-m", "Independent historical change"],
+            )
+            .await
+            .unwrap();
+            let head = crate::git::rev_parse(&worktree, "HEAD").await.unwrap();
+            let mut state = RunState::load_under(&id, home).unwrap();
+            state.driver_exited = true;
+            if status == RunStatus::Failed {
+                state.tally = None;
+            }
+            state.save_under(home).unwrap();
+            task.link_run(&id);
+            sources.push((id, worktree, head));
+        }
+        // A newer empty attempt and task completion are no proof that either
+        // independent historical implementation was incorporated.
+        let mut latest = RunState::new(
+            repo.clone(),
+            "main".into(),
+            crate::git::rev_parse(&repo, "main").await.unwrap(),
+            task.instruction.clone(),
+            crate::config::Config::default(),
+        );
+        latest.status = RunStatus::Ready;
+        latest.driver_exited = true;
+        latest.save_under(home).unwrap();
+        task.start(latest.id.clone());
+        task.succeed();
+        queue.put(&mut task).unwrap();
+
+        let (folded, unreadable) = fold_due(
+            &runs,
+            home,
+            &wt,
+            &Disk::default(),
+            ts("2026-09-05T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert_eq!((folded, unreadable), (0, 0));
+        for (id, worktree, head) in sources {
+            assert!(worktree.exists());
+            assert_eq!(
+                crate::git::rev_parse(&worktree, "HEAD").await.unwrap(),
+                head
+            );
+            let mut state = RunState::load_under(&id, home).unwrap();
+            assert!(!state.candidates[0].folded);
+            let error = crate::graph::fold_run(&mut state, true, home)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("source of task {}", task.id))
+            );
+            assert_eq!(
+                crate::git::rev_parse(&repo, &state.candidates[0].branch)
+                    .await
+                    .unwrap(),
+                head
+            );
+            assert!(worktree.exists());
+            assert!(runs.join(&id).join("run.json").exists());
+        }
+    }
+
+    #[tokio::test]
     async fn recovery_retains_historical_sources_after_success_and_automatic_cleanup() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();

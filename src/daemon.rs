@@ -1195,7 +1195,9 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
         let Some(action) = q.chosen_action().filter(|a| a.maintenance()) else {
             continue;
         };
-        if asker_may_still_read(questions, &q, home) || !crate::run::is_run_id(&q.id) {
+        // Receipt paths use question IDs, whose format is independent of run
+        // IDs. Apply the question store's filename safety rule to both eras.
+        if asker_may_still_read(questions, &q, home) || !ask::valid_asset_name(&q.id) {
             continue;
         }
         let dir = home.join("choice-actions");
