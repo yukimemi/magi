@@ -341,15 +341,18 @@ fn needs_index(text: &str) -> bool {
             || (id.len() == 4 && id.bytes().all(|b| b.is_ascii_hexdigit()))
             || {
                 let parts: Vec<_> = id.split('-').collect();
-                parts.len() == 3
+                (parts.len() == 3
+                    || parts.len() == 5 && parts[2..4].iter().all(|part| part.len() == 16))
                     && parts[0].len() == 8
                     && parts[1].len() == 6
-                    && parts[2].len() == 4
+                    && parts.last().is_some_and(|part| part.len() == 4)
                     && parts[0]
                         .bytes()
                         .chain(parts[1].bytes())
                         .all(|b| b.is_ascii_digit())
-                    && parts[2].bytes().all(|b| b.is_ascii_hexdigit())
+                    && parts[2..]
+                        .iter()
+                        .all(|part| part.bytes().all(|b| b.is_ascii_hexdigit()))
             }
     })
 }
@@ -775,6 +778,8 @@ mod tests {
             "R2-1",
             "xR2-1-3",
             "R2-1-3suffix",
+            "20261020-224346-000000000000f8ef-000000000000000-f8ef",
+            "20261020-224346-000000000000f8eg-0000000000000000-f8ef",
         ] {
             assert!(!has_finding_reference(text), "{text}");
             assert!(!needs_index(text), "{text}");
@@ -783,7 +788,12 @@ mod tests {
             assert!(has_finding_reference(text), "{text}");
             assert!(needs_index(text), "{text}");
         }
-        for text in ["dead の修正を待つ", "chat@6f0d", "20260908-205802-c9eb"] {
+        for text in [
+            "dead の修正を待つ",
+            "chat@6f0d",
+            "20260908-205802-c9eb",
+            "question@20261020-224346-000000000000f8ef-0000000000000000-f8ef",
+        ] {
             assert!(needs_index(text), "{text}");
             assert!(!has_finding_reference(text), "{text}");
         }
