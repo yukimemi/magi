@@ -344,6 +344,19 @@ impl AgentOutput {
     }
 }
 
+/// Typed context distinguishing an interrupted process from admission that
+/// never spawned one. ResourceBlocked remains in the error chain for parking.
+#[derive(Debug)]
+pub(crate) struct ExecutionInterrupted(pub String);
+
+impl std::fmt::Display for ExecutionInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "execution interrupted: {}", self.0)
+    }
+}
+
+impl std::error::Error for ExecutionInterrupted {}
+
 /// How long to keep reading a pipe after the child is gone.
 ///
 /// Bounded on purpose: a surviving grandchild can hold the write end open
@@ -652,7 +665,11 @@ pub(crate) async fn invoke_leased(
             (status.code(), false)
         }
         Some(Err(_)) | None => {
-            tracing::warn!(seat = %seat.key, secs = inv.timeout.as_secs(), "agent timed out");
+            if let Some(reason) = &pressure {
+                tracing::warn!(seat = %seat.key, %reason, "agent execution interrupted");
+            } else {
+                tracing::warn!(seat = %seat.key, secs = inv.timeout.as_secs(), "agent timed out");
+            }
             // Wait for CLI termination before releasing its repository lease.
             if !running.coordinated() {
                 running
@@ -678,7 +695,10 @@ pub(crate) async fn invoke_leased(
     tokio::fs::write(&out_path, &stdout).await.ok();
     tokio::fs::write(&err_path, &stderr).await.ok();
     if let Some(reason) = pressure {
-        return Err(crate::repo_lock::ResourceBlocked(reason).into());
+        return Err(
+            anyhow::Error::new(crate::repo_lock::ResourceBlocked(reason.clone()))
+                .context(ExecutionInterrupted(reason)),
+        );
     }
 
     let mut extracted = extract(spec.kind, &stdout);

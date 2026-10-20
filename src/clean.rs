@@ -212,10 +212,6 @@ pub async fn fold_due(
         .collect();
     ids.sort_unstable();
     for id in ids {
-        if let Some(reason) = crate::pr_recovery::source_retention_reason(home, &id) {
-            tracing::info!(%id, %reason, "housekeep: source retained; fold refused");
-            continue;
-        }
         if crate::daemon::is_working_on(home, &id, now) {
             continue;
         }
@@ -246,6 +242,10 @@ pub async fn fold_due(
                 continue;
             }
         };
+        if let Some(reason) = crate::pr_recovery::source_retention_reason(home, &state) {
+            tracing::info!(%id, %reason, "housekeep: source retained; fold refused");
+            continue;
+        }
         if state.schema != SCHEMA {
             tracing::info!(
                 "housekeep: run {id} was written by schema {} (this build speaks {SCHEMA}); \

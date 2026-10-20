@@ -83,16 +83,21 @@ pub fn retain_sources(task: &crate::queue::Task, home: &Path) -> Result<()> {
 }
 
 /// Return the retention reason rather than silently treating fold as successful.
-pub(crate) fn source_retention_reason(home: &Path, id: &str) -> Option<String> {
-    if explicit_sources_retained(home, id) {
+pub(crate) fn source_retention_reason(home: &Path, state: &crate::run::RunState) -> Option<String> {
+    if explicit_sources_retained(home, &state.id) {
         return Some("explicitly retained recovery source".into());
+    }
+    // A confirmed merge settles publication even while the queue is still
+    // held. Ready/Failed/Superseded and successful PR creation alone do not.
+    if state.status == crate::run::RunStatus::Merged
+        && state.merge.as_ref().is_some_and(|merged| merged.ok)
+    {
+        return None;
     }
     crate::queue::Queue::at(home.join("queue"))
         .list()
         .iter()
-        .find(|task| {
-            task.status != crate::queue::TaskStatus::Done && task.runs.iter().any(|run| run == id)
-        })
+        .find(|task| task.status != crate::queue::TaskStatus::Done && task.runs.contains(&state.id))
         .map(|task| {
             format!(
                 "source of unfinished task {}; inspect recovery lineage before folding",

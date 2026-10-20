@@ -178,11 +178,12 @@ enum AgentOutcome {
     Dropped(AgentOutput),
     /// Any other failure: a timeout, a bad exit code, an empty reply.
     Failed(String),
-    /// The agent was never spawned: a shared resource it needs (the build
-    /// cache's lease) stayed busy past `[graph] timeout_resource_wait`, or the
-    /// wait was abandoned because the run is parking. Not a failure of the
-    /// agent: it must not advance a fallback chain, enter seat history, cost
-    /// quota or spend an attempt. [`RunState::resource_block`] says why.
+    /// A resource prevented admission or interrupted execution. Not an agent
+    /// failure: never advance a fallback chain or spend an attempt on it.
+    /// Post-spawn interruptions carry a typed error into wave, which records
+    /// implementation preservation before returning this outcome. This outcome
+    /// alone is not proof that no source changes were made.
+    /// [`RunState::resource_block`] says why.
     ResourceBlocked(String),
 }
 
@@ -2380,6 +2381,16 @@ impl Runner {
                 .any(|(_, _, out)| FailClass::of(out).is_some());
         for (&i, (_wi, seat, out)) in todo.iter().zip(results) {
             if matches!(out, AgentOutcome::ResourceBlocked(_)) {
+                // Executed turns interrupted by disk pressure already carry
+                // a preservation barrier from wave. Admission-only waits do
+                // not. Keep the interrupted seat's session for recovery too.
+                if self
+                    .state
+                    .candidate_preservation
+                    .contains_key(&self.state.candidates[i].label)
+                {
+                    self.state.seats.insert(seat.key.clone(), seat);
+                }
                 continue;
             }
             let seat_key = seat.key.clone();
@@ -9408,6 +9419,7 @@ async fn wave(
                             "no parallel slot became free within {}s",
                             slot_limit.as_secs()
                         )),
+                        false,
                     );
                 }
             };
@@ -9437,6 +9449,10 @@ async fn wave(
                     },
                 ))
                 .await;
+            let interrupted = out
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.is::<agent::ExecutionInterrupted>());
             let out = match out {
                 Ok(o) if o.usable() => AgentOutcome::Ok(o),
                 Ok(o) if o.quota_exhausted() => AgentOutcome::Quota(o),
@@ -9458,7 +9474,7 @@ async fn wave(
                 }
                 Err(e) => AgentOutcome::Failed(e.to_string()),
             };
-            (i, seat, out)
+            (i, seat, out, interrupted)
         });
     }
     drop(spawned_tx);
@@ -9478,7 +9494,7 @@ async fn wave(
         let Some(joined) = joined else {
             break;
         };
-        let (i, seat, out) = match joined {
+        let (i, seat, out, interrupted) = match joined {
             Ok(v) => v,
             // No seat to clear: a panicked task never reported which one it
             // was. The defensive sweep below this loop is what stops that
@@ -9489,6 +9505,19 @@ async fn wave(
             }
         };
         state.seat_finished(&seat.key);
+        if interrupted
+            && node == "implement"
+            && let Some(label) = state
+                .candidates
+                .iter()
+                .find(|candidate| seat.key == format!("impl-{}", candidate.label))
+                .map(|candidate| candidate.label)
+        {
+            state.candidate_preservation.insert(
+                label,
+                "interrupted implementation awaiting persistence".into(),
+            );
+        }
         if let AgentOutcome::ResourceBlocked(why) = &out
             && state.resource_block.is_none()
         {
@@ -9505,7 +9534,12 @@ async fn wave(
                 detail: why.clone(),
                 at: Timestamp::now(),
             });
-            state.event("resource", format!("{node}: no agent was started - {why}"));
+            let activity = if interrupted {
+                "agent execution interrupted"
+            } else {
+                "no agent was started"
+            };
+            state.event("resource", format!("{node}: {activity} - {why}"));
         }
         record_jobs(state, node, round, &seat.key, &out);
         if let Err(e) = state.save() {
@@ -11319,7 +11353,7 @@ async fn remove_preserved_worktree(repo: &Path, path: &Path) -> Result<()> {
 /// directory some other process or test pinned into that `OnceLock` first,
 /// not the one the caller actually resolved its `runs` and `state` from.
 pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> Result<Vec<String>> {
-    if let Some(reason) = crate::pr_recovery::source_retention_reason(home, &state.id) {
+    if let Some(reason) = crate::pr_recovery::source_retention_reason(home, state) {
         bail!("refusing fold: {reason}");
     }
     if !state.candidate_preservation.is_empty() {
@@ -13501,6 +13535,101 @@ mod tests {
         });
         runner.state.save().unwrap();
         (tmp, runner)
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn disk_interrupted_implementation_preserves_edits_and_commits_before_resource_hold() {
+        for (committed, block_rescue) in [(false, false), (false, true), (true, false)] {
+            let (_tmp, mut runner) = preservation_resume_fixture().await;
+            runner.state.candidates.retain(|c| c.label == 'A');
+            runner.state.candidates[0].empty = false;
+            runner.state.candidates[0].summary.clear();
+            runner.state.tally = None;
+            runner.state.judge_skipped = false;
+            runner.state.status = RunStatus::Implementing;
+            // Force the real post-spawn watchdog, independently of available
+            // disk space. Dirty/committed work predates its first measurement.
+            runner.state.config.disk.min_free_bytes = u64::MAX;
+            let wt = runner.state.candidates[0].worktree.clone();
+            std::fs::write(
+                wt.join("interrupted-source"),
+                "retain implementation work\n",
+            )
+            .unwrap();
+            if committed {
+                git::rescue_commit(&wt, "implementation checkpoint")
+                    .await
+                    .unwrap();
+            }
+            let lock = git::git(
+                &wt,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "index.lock",
+                ],
+            )
+            .await
+            .unwrap();
+            if block_rescue {
+                std::fs::write(&lock, "fixture-owned lock").unwrap();
+            }
+            let mut implementer = spec("alpha");
+            implementer.command = vec!["sh".into(), "-c".into(), "exec sleep 30".into()];
+            runner.roles.implementers = vec![implementer];
+            runner.state.save().unwrap();
+            let result = runner.implement().await;
+            assert_eq!(result.is_err(), block_rescue);
+            assert_eq!(
+                runner.state.resource_block.as_ref().unwrap().kind,
+                "disk pressure"
+            );
+            assert!(
+                runner
+                    .state
+                    .events
+                    .iter()
+                    .any(|e| e.message.contains("agent execution interrupted"))
+            );
+            assert!(
+                runner
+                    .state
+                    .dir()
+                    .join("artifacts/candidate-A-recovery/staged.patch")
+                    .exists()
+            );
+            if block_rescue {
+                let saved = RunState::load(&runner.state.id).unwrap();
+                assert!(saved.candidate_preservation.contains_key(&'A'));
+                assert!(!saved.candidates[0].empty);
+                assert_eq!(
+                    std::fs::read_to_string(wt.join("interrupted-source")).unwrap(),
+                    "retain implementation work\n"
+                );
+                std::fs::remove_file(lock).unwrap();
+                runner.state = saved;
+            } else {
+                assert_eq!(runner.state.status, RunStatus::Blocked);
+                assert_eq!(runner.state.candidates[0].commits, 1);
+            }
+            // Recovery must save the candidate before deciding whether another
+            // implementation is needed. No implementer is available on retry.
+            runner.roles.implementers.clear();
+            runner.state.config.disk.min_free_bytes = 0;
+            runner.state.resource_block = None;
+            runner.implement().await.unwrap();
+            assert!(runner.state.candidate_preservation.is_empty());
+            assert_eq!(runner.state.candidates[0].commits, 1);
+            assert!(!runner.state.candidates[0].empty);
+            assert!(git::is_clean(&wt).await.unwrap());
+            assert!(
+                crate::run::read_artifact(&runner.state, "cand-A.patch")
+                    .unwrap()
+                    .contains("retain implementation work")
+            );
+        }
     }
 
     #[tokio::test]

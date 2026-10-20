@@ -71,6 +71,10 @@ seconds: below half `min_free_bytes`, or when measurement fails, they stop their
 owned process trees and record a disk resource hold. Partial source changes are
 kept for recovery; implementation rescue still runs. New starts and resumes
 remain subject to the ordinary free-space gate. A zero floor disables monitoring.
+Post-spawn interruption carries a typed resource error and durably marks the
+implementation for snapshot/rescue before entering the hold. A failed rescue
+keeps that barrier on disk; resume retries persistence before dispatching seats.
+Admission waits that never started a process do not mark candidates completed.
 The reserve and cadence are safeguards, not a filesystem quota: unrelated
 writers and sudden allocations can still exhaust a volume between measurements.
 
@@ -131,7 +135,7 @@ the task's history, checking repository identity, cycles and resumability. If th
 authority cannot be validated or no longer matches the task's authorized
 instructions, the task is held rather than starting a replacement competition.
 Explicit fresh competitions and selected public-head recovery retain their normal
-precedence. The ordinary fold path preserves every source still referenced by an
+precedence. The ordinary fold path preserves every unmerged source still referenced by an
 unfinished queue task and reports the task and refusal reason; explicit folds
 return an error and automatic folds log the reason. Retirement of a proved-empty
 attempt uses its own proof.
@@ -139,6 +143,16 @@ The existing `Superseded` status is not used to retire unfinished work because
 it has separate settlement and publication effects. Historical recovery sources
 retained by an earlier explicit recovery stay retained, even if that means a
 backlog needs a later owner decision rather than automatic deletion.
+The task write lock remains exclusive throughout history inspection and
+retirement: age alone cannot revoke a live writer, and unknown process liveness
+also retains ownership. A concurrent owner selection must wait until retirement
+has finished. Old locks with valid writer identities are recovered only after
+confirmed process death.
+
+Ordinary folding of a confirmed `Merged` run with a successful merge record
+does not wait for an unfinished queue task to settle. Explicit recovery-source
+retention and pending candidate preservation still refuse folding. Other terminal
+labels and successful PR publication alone do not establish a confirmed merge.
 
 ## Observability and incident evidence
 

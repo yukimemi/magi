@@ -1983,8 +1983,8 @@ fn copy_new(dir: &Path, src: &Path, name: &str) -> Result<(String, PathBuf)> {
     unreachable!("the counter never runs out")
 }
 
-/// How long a task's write lock may stand before it is read as left behind by
-/// a writer that died.
+/// Minimum age before a dead writer's lock may be recovered, and maximum wait
+/// for a contending writer. Age alone never revokes a live writer's ownership.
 const TASK_LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Guard for [`Queue::lock_task`]; removes the lock file on drop, but only
@@ -2022,6 +2022,22 @@ fn older_than_stale(path: &Path) -> bool {
         .ok()
         .and_then(|t| t.elapsed().ok())
         .is_some_and(|age| age > TASK_LOCK_STALE)
+}
+
+fn writer_may_be_gone(token: &str) -> bool {
+    let Some(pid) = token
+        .split_once('-')
+        .and_then(|(pid, _)| pid.parse::<u32>().ok())
+    else {
+        // Legacy/incomplete tokens have no valid writer identity. They remain
+        // subject to the age and compare/remove checks.
+        return true;
+    };
+    if pid == std::process::id() {
+        return false;
+    }
+    // Unknown process-table access must not steal a long-running retirement.
+    crate::proc::pid_status(pid) == Some(false)
 }
 
 /// How many levels of "a stale marker guarding a stale marker" are recovered
@@ -2074,7 +2090,7 @@ fn take_marker(path: &Path, token: &str, depth: u8) -> Option<(PathBuf, String)>
 fn remove_lock_if(path: &Path, token: &str, require_stale: bool, depth: u8) -> Option<bool> {
     let (marker, mine) = take_marker(path, token, depth)?;
     let still = std::fs::read_to_string(path).is_ok_and(|c| c == token)
-        && (!require_stale || older_than_stale(path));
+        && (!require_stale || older_than_stale(path) && writer_may_be_gone(token));
     if still {
         let _ = std::fs::remove_file(path);
     }
@@ -2351,9 +2367,9 @@ impl Queue {
     /// Exclusive right to rewrite task `id`'s record, held until the guard
     /// drops. Every writer ([`Queue::put`], [`Queue::link_run`]) takes it, so
     /// a process linking a run and the daemon saving a transition are
-    /// serialized instead of last-writer-wins. A lock older than
-    /// [`TASK_LOCK_STALE`] belongs to a writer that died mid-update and is
-    /// broken. Not the claim lock (`<id>.lock`), which a daemon holds for a
+    /// serialized instead of last-writer-wins. An old lock may be broken only
+    /// after its writer is confirmed dead (legacy tokens without a PID retain
+    /// age-based recovery). Not the claim lock (`<id>.lock`), held for a
     /// whole run.
     pub(crate) fn lock_task(&self, id: &str) -> Result<TaskLock> {
         std::fs::create_dir_all(&self.root)
@@ -5236,18 +5252,47 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_stolen_lock_leaves_the_new_holders_lock() {
+    fn dropping_a_replaced_lock_leaves_the_new_holders_token() {
         let dir = tempfile::tempdir().unwrap();
         let q = Queue::at(dir.path().to_path_buf());
         let lock = dir.path().join("t.write-lock");
         let a = q.lock_task("t").unwrap();
-        age_lock(&lock);
-        let b = q.lock_task("t").unwrap();
-        assert_ne!(a.token, b.token);
+        // Simulate a foreign/legacy writer replacing the file. A modern
+        // writer cannot acquire it while this guard's process is alive.
+        let replacement = owner_token();
+        std::fs::write(&lock, &replacement).unwrap();
         drop(a);
-        assert_eq!(std::fs::read_to_string(&lock).unwrap(), b.token);
-        drop(b);
-        assert!(!lock.exists());
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), replacement);
+    }
+
+    #[test]
+    fn aged_live_task_lock_excludes_updates_until_retirement_releases_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().to_path_buf());
+        let held = q.lock_task("t").unwrap();
+        let path = dir.path().join("t.write-lock");
+        age_lock(&path);
+        assert!(!break_stale(&path, &held.token));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let updater = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _write = q.lock_task("t").unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), held.token);
+        drop(held);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        updater.join().unwrap();
+        assert!(!path.exists());
     }
 
     #[test]

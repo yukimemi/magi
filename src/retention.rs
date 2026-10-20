@@ -1307,6 +1307,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmed_merged_source_folds_while_task_is_held_but_retention_still_wins() {
+        let f = Fx::new().await;
+        let mut source = f.run("cc04", true).await;
+        let mut task = f.task(&[source.clone()]);
+        task.hold_manual(Some("queue settlement pending".into()));
+        let queue = crate::queue::Queue::at(f.home.join("queue"));
+        queue.put(&mut task).unwrap();
+        source.merge = Some(crate::run::MergeOutcome {
+            mode: crate::config::MergeMode::Pr,
+            ok: true,
+            detail: "confirmed merged".into(),
+            empty: false,
+        });
+        // Publication success and terminal labels alone are insufficient.
+        for status in [RunStatus::Ready, RunStatus::Failed, RunStatus::Superseded] {
+            source.status = status;
+            assert!(
+                crate::graph::fold_run(&mut source, true, &f.home)
+                    .await
+                    .is_err()
+            );
+            assert!(source.candidates[0].worktree.exists());
+        }
+        git::git(
+            &f.repo,
+            &["merge", "--ff-only", &source.candidates[0].branch],
+        )
+        .await
+        .unwrap();
+        source.status = RunStatus::Merged;
+        source.save_under(&f.home).unwrap();
+        assert!(crate::pr_recovery::source_retention_reason(&f.home, &source).is_none());
+        crate::pr_recovery::retain_sources(&task, &f.home).unwrap();
+        assert!(
+            crate::graph::fold_run(&mut source, true, &f.home)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("explicitly retained")
+        );
+        // The fixture's explicit marker is removed only to exercise ordinary
+        // confirmed-merge cleanup; no production cleanup removes such markers.
+        std::fs::remove_file(
+            f.home
+                .join("runs")
+                .join(&source.id)
+                .join("retain-recovery-sources"),
+        )
+        .unwrap();
+        let (folded, unreadable) = crate::clean::fold_due(
+            &f.home.join("runs"),
+            &f.home,
+            &f.bay,
+            &Fx::disk(),
+            Fx::now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!((folded, unreadable), (1, 0));
+        assert!(!source.candidates[0].worktree.exists());
+        assert_eq!(
+            queue.get(&task.id).unwrap().status,
+            crate::queue::TaskStatus::Held
+        );
+    }
+
+    #[tokio::test]
     async fn unknown_targets_cargo_owners_and_driver_resumes_are_protected() {
         let f = Fx::new().await;
         let state = f.run("cccc", false).await;
@@ -1501,7 +1568,7 @@ mod tests {
         let empty = f.run("ffff", false).await;
         let task = f.task(&[a.clone(), b.clone(), empty.clone()]);
         assert!(
-            crate::pr_recovery::source_retention_reason(&f.home, &a.id).is_some(),
+            crate::pr_recovery::source_retention_reason(&f.home, &a).is_some(),
             "unfinished queue history protects older source branches from ordinary folding"
         );
         let mut prior = a.clone();
