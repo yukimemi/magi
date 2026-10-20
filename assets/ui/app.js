@@ -830,7 +830,13 @@ let nextTalkWaitGeneration = 1;
 
 /* ---- transport --------------------------------------------------------- */
 async function request(url, init) {
-  const res = await fetch(url, init);
+  const unbusy = pendingForRequest(init);
+  let res;
+  try {
+    res = await fetch(url, init);
+  } finally {
+    unbusy();
+  }
   if (!res.ok) {
     let details = {};
     let message = `${res.status} ${res.statusText || "request failed"}`;
@@ -11456,6 +11462,8 @@ function wire() {
 }
 
 /* ---- shared press feedback -------------------------------------------- */
+let pressedControl = null;
+let pressedAt = 0;
 const PRESS_TARGET = 'button, a[href], summary, [role="button"], [role="link"], [role="tab"], [role="radio"], [role="checkbox"], [role="switch"], [role="menuitem"], [data-press]';
 
 function wirePressFeedback() {
@@ -11472,6 +11480,7 @@ function wirePressFeedback() {
   document.addEventListener("pointerdown", (event) => {
     if (!event.isPrimary || event.button !== 0 || !(event.target instanceof Element)) return;
     clear();
+    pressedControl = null;
     const target = event.target.closest(PRESS_TARGET);
     if (!target || target.matches(":disabled") || target.closest('[inert], [aria-disabled="true"]')) return;
     if (target.matches('.task-card') && !splitMedia?.matches) return;
@@ -11479,6 +11488,8 @@ function wirePressFeedback() {
     const inner = event.target.closest('input, textarea, select, label, pre, [contenteditable], details');
     if (inner && inner !== target && target.contains(inner)) return;
 
+    pressedControl = target;
+    pressedAt = performance.now();
     let glow = null;
     // Read geometry before adding decorations. Multiline text, SVG and modal
     // top-layer content use colour feedback only; never paint above a dialog.
@@ -11535,16 +11546,32 @@ function wirePressFeedback() {
   for (const type of ["pointercancel", "scroll", "visibilitychange"]) {
     document.addEventListener(type, (event) => {
       if (event instanceof PointerEvent && current && event.pointerId !== current.pointerId) return;
+      pressedControl = null;
       clear();
     }, { capture: true, passive: true });
   }
-  window.addEventListener("blur", clear);
+  window.addEventListener("blur", () => { pressedControl = null; clear(); });
   window.addEventListener("resize", clear, { passive: true });
   reduced.addEventListener("change", clear);
 }
 
-// Call at the operation boundary, never from request(): background refreshes
-// must not light up a control. Preserve pre-existing accessibility state.
+// Consume a recent press only for a mutation; GET polling never marks a control.
+// Explicit pending scopes keep ownership of their existing accessibility state.
+function pendingForRequest(init) {
+  const target = pressedControl;
+  if ((init?.method || "GET").toUpperCase() === "GET" || !target ||
+      !target.isConnected || performance.now() - pressedAt > 600) return () => {};
+  pressedControl = null;
+  if (target.getAttribute("aria-busy") === "true") return () => {};
+  const previous = target.getAttribute("aria-busy");
+  target.setAttribute("aria-busy", "true");
+  return () => {
+    if (previous === null) target.removeAttribute("aria-busy");
+    else target.setAttribute("aria-busy", previous);
+  };
+}
+
+// Explicit operation scopes also cover keyboard activation and grouped controls.
 async function withPending(buttons, action) {
   const previous = buttons.map(button => button.getAttribute("aria-busy"));
   buttons.forEach(button => button.setAttribute("aria-busy", "true"));

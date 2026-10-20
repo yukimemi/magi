@@ -1897,6 +1897,47 @@ async fn settings_gear_is_reachable_on_a_phone_and_never_doubles_the_rail_link()
         "press feedback regressions"
     );
 
+    let pending = browser.eval(&page, r##"(async () => {
+      const source = await (await fetch('/app.js')).text();
+      let settle;
+      const client = new Function('fetch', source.replace(/\nboot\(\);\s*$/, `
+        return { request, press(target, age = 0) { pressedControl = target; pressedAt = performance.now() - age; } };
+      `))(() => new Promise((resolve, reject) => { settle = { resolve, reject }; }));
+      const button = document.createElement('button');
+      document.body.append(button);
+      const fails = [];
+      for (const [method, age, expected] of [['GET', 0, false], ['POST', 601, false], ['POST', 0, true], ['PATCH', 0, true]]) {
+        client.press(button, age);
+        const promise = client.request('/test', { method });
+        if ((button.getAttribute('aria-busy') === 'true') !== expected) fails.push(`${method}/${age}: pending state`);
+        settle.resolve(new Response('{}'));
+        await promise;
+        if (button.hasAttribute('aria-busy')) fails.push(`${method}: pending not cleared`);
+      }
+      for (const outcome of ['http', 'network']) {
+        button.setAttribute('aria-busy', 'false');
+        client.press(button);
+        const promise = client.request('/test', { method: 'POST' });
+        if (outcome === 'network') settle.reject(new Error('offline'));
+        else settle.resolve(new Response('{}', { status: 500 }));
+        try { await promise; fails.push('failure swallowed'); } catch {}
+        if (button.getAttribute('aria-busy') !== 'false') fails.push(`${outcome}: previous state lost`);
+      }
+      button.setAttribute('aria-busy', 'true');
+      client.press(button);
+      const promise = client.request('/test', { method: 'POST' });
+      settle.resolve(new Response('{}'));
+      await promise;
+      if (button.getAttribute('aria-busy') !== 'true') fails.push('explicit pending scope cleared');
+      button.remove();
+      return fails;
+    })()"##).await.expect("generic pending feedback");
+    assert_eq!(
+        pending,
+        serde_json::json!([]),
+        "pending feedback regressions"
+    );
+
     let geometry = browser
         .eval(
             &page,

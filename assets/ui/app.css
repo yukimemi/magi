@@ -2963,6 +2963,8 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
   --press-duration: 600ms;
   --press-release: 160ms;
   --press-scale: .975;
+  --press-busy-duration: 900ms;
+  --press-busy-opacity: .6;
 }
 :where(button, a[href], summary, [role="button"], [role="link"], [role="tab"], [role="radio"], [role="checkbox"], [role="switch"], [role="menuitem"], [data-press]) {
   -webkit-tap-highlight-color: transparent;
@@ -2978,6 +2980,11 @@ button.btn[data-pressed]:not(:disabled, [aria-disabled="true"], [aria-disabled="
 }
 button[aria-busy="true"] {
   box-shadow: inset 0 0 0 2px var(--press-color);
+  animation: press-busy var(--press-busy-duration) ease-in-out infinite alternate;
+}
+@keyframes press-busy {
+  from { opacity: 1; }
+  to { opacity: var(--press-busy-opacity); }
 }
 #press-feedback, #press-feedback * { pointer-events: none; }
 #press-feedback { position: fixed; inset: 0; z-index: 1000; overflow: hidden; }
@@ -3001,5 +3008,6 @@ button[aria-busy="true"] {
 @media (prefers-reduced-motion: reduce) {
   #press-feedback { display: none; }
   button.btn[data-pressed] { scale: none; }
+  button[aria-busy="true"] { animation: none; opacity: var(--press-busy-opacity); }
 }
 @media print { #press-feedback { display: none; } }
