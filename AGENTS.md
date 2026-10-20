@@ -1217,27 +1217,26 @@ run's deputy tasks naming this PR remain held with a `[superseded]` reason.
 Legacy PR heads (`magi/<run>/<label>`) are not migrated or automatically closed
 by task-head publication; existing evidence-based closure rules still apply.
 
-**A third, conditional reason to hold: a contested hand-off.** Both gates
-stay on by default, and `land_approval = false` still means an unattended
-merge for an ordinary run. The exception is a run whose review loop handed
-off over a finding the panel did not settle: the last round ended with a
-Major-or-above finding open *and* a reviewer's final vote (the revote where
-reconsideration answered, the initial vote otherwise) was reject. Findings
-raised in the budget's last round are never fixed or re-reviewed, so that is
-the one case an unattended merge would land over an explicit objection. Then
-`land` asks, with `approval_gate` unchanged (silence is a hold, only `merge`
-merges, a pending question parks the run), and the question says why it was
-filed and lists the findings and the rejecters. The PR is still opened; only
-the merge waits.
+**Conditional owner approval for internal review objections.**
+`land::approval_reasons` is the dedicated merge approval policy, independent
+of repair-choice availability. `graph.land_approval` asks about every merge.
+`graph.hold_contested_merge` (default on) asks when open Major-or-above
+findings OR a final rejecting vote remain, including a reject with zero Major
+findings. Final votes come from `ReviewRound::final_votes`: an answered
+reconsideration replaces the initial vote, otherwise the initial vote stands.
+The historical `ContestedHandoff` record describes the narrower AND case;
+it is evidence, not the approval policy.
 
-- The decision is one function, `ReviewRound::contested_handoff`, and its
-  result is a snapshot stored on `RunState::contested_handoff` when
-  `stop_reviewing` hands off (a reentry keeps the first record). `land` only
-  reads it, through `land::contested_to_ask`.
-- `graph.hold_contested_merge` (default on) is evaluated at land time, so
-  turning it off restores the unattended merge at once. With `land_approval`
-  on it changes nothing.
-- A question already filed before the record existed is reused as it is.
+With both controls off, ordinary new approvals are skipped. Existing questions
+and owner decisions cannot be bypassed by changing settings. Merge repair
+always requires a fresh owner decision, even without a changed head. Silence
+and hold never merge; head binding and owner authorization still apply.
+Question text and the phone panel snapshot all applicable approval reasons,
+final votes and reasons, and last-round internal findings including Minor.
+Deputies use the saved question evidence, never infer a legacy question's
+original reason from current settings. External PR comment resolution is
+separate from internal findings; fixer adoption reports and a green gate do
+not establish individual finding resolution.
 
 **Every land decision is about the head magi observed, never an older one.**
 After a push (a fix round or a rebase) `land` remembers the pushed SHA and
