@@ -39,7 +39,9 @@ pub struct Seed {
 /// Explicit CLI input, resolved once before a task is filed. Never built from prose.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Sources {
+    /// Starting commit, including its ancestry, selected by `--start-from`.
     pub start_from: Option<Input>,
+    /// Individual commits selected by `--pick-commit`, in application order.
     pub pick_commits: Vec<Input>,
 }
 
@@ -47,8 +49,11 @@ pub struct Sources {
 /// by structured source selection; old `RunState::seeds` remain legacy inference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Input {
+    /// Branch name or commit abbreviation originally supplied by the caller.
     pub token: String,
+    /// Full immutable commit identity resolved when the task was filed.
     pub sha: String,
+    /// Structured authorization for importing this commit.
     pub provenance: Provenance,
 }
 
@@ -57,16 +62,21 @@ pub struct Input {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Provenance {
+    /// Selected through an explicit source argument, independent of task text.
     ExplicitCli,
 }
 
+/// Validated immutable inputs used to prepare candidate worktrees.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Plan {
+    /// Starting commit instead of the configured base, when selected.
     pub start: Option<String>,
+    /// Single commits to apply in the caller's specified order.
     pub picks: Vec<String>,
 }
 
 impl Sources {
+    /// Resolve explicit CLI arguments to immutable commits without parsing prose.
     pub async fn resolve(
         repo: &Path,
         remote: &str,

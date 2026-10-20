@@ -4365,6 +4365,7 @@ fn resume_owner(
     instruction: &str,
     repo: &Path,
     source: Source,
+    sources: &magi::refs::Sources,
     file: bool,
 ) -> Result<Option<Task>> {
     if let Some(t) = queue
@@ -4383,6 +4384,7 @@ fn resume_owner(
         repo.to_path_buf(),
         source,
     );
+    t.sources = sources.clone();
     t.link_run(run_id);
     queue.put(&mut t)?;
     Ok(Some(t))
@@ -4412,6 +4414,7 @@ async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
             &runner.state.instruction,
             &runner.state.repo,
             Source::Human,
+            &runner.state.sources,
             false,
         )? {
             Some(t) => println!(
@@ -4439,6 +4442,7 @@ async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
         &runner.state.instruction,
         &runner.state.repo,
         task_source(None).await,
+        &runner.state.sources,
         true,
     )?
     .expect("file = true always yields an owner");
@@ -4930,7 +4934,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
         let repo = Path::new("/repo");
-        let own = |file| resume_owner(&queue, "run-1", "do it", repo, Source::Human, file);
+        let sources = magi::refs::Sources {
+            start_from: Some(magi::refs::Input {
+                token: "feature/selected".into(),
+                sha: "1".repeat(40),
+                provenance: magi::refs::Provenance::ExplicitCli,
+            }),
+            pick_commits: vec![magi::refs::Input {
+                token: "abc1234".into(),
+                sha: "2".repeat(40),
+                provenance: magi::refs::Provenance::ExplicitCli,
+            }],
+        };
+        // The saved run supplies structured inputs, never references in prose.
+        let sources: magi::refs::Sources =
+            serde_json::from_str(&serde_json::to_string(&sources).unwrap()).unwrap();
+        let own = |file| {
+            resume_owner(
+                &queue,
+                "run-1",
+                "do it",
+                repo,
+                Source::Human,
+                &sources,
+                file,
+            )
+        };
 
         assert!(own(false).unwrap().is_none());
         assert!(queue.list().is_empty());
@@ -4938,12 +4967,20 @@ mod tests {
         let filed = own(true).unwrap().expect("filed");
         assert_eq!(filed.status, TaskStatus::Queued);
         assert_eq!(filed.runs, vec!["run-1".to_owned()]);
+        assert_eq!(filed.sources, sources);
+        assert_eq!(queue.get(&filed.id).unwrap().sources, sources);
         assert_eq!(queue.list().len(), 1);
 
         for file in [false, true] {
             assert_eq!(own(file).unwrap().expect("owner").id, filed.id);
             assert_eq!(queue.list().len(), 1);
         }
+        // An existing owner's explicit edit (including clearing imports) wins
+        // over the run checkpoint, for both foreground and daemon resumes.
+        let mut edited = queue.get(&filed.id).unwrap();
+        edited.sources = magi::refs::Sources::default();
+        queue.put(&mut edited).unwrap();
+        assert_eq!(own(true).unwrap().unwrap().sources, edited.sources);
     }
 
     #[test]
