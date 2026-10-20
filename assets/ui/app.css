@@ -2969,7 +2969,9 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
 :where(button, a[href], summary, [role="button"], [role="link"], [role="tab"], [role="radio"], [role="checkbox"], [role="switch"], [role="menuitem"], [data-press]) {
   -webkit-tap-highlight-color: transparent;
 }
-:where([data-pressed], button:active, a[href]:active, summary:active, [role="button"]:active, [role="link"]:active, [role="tab"]:active, [role="radio"]:active, [role="checkbox"]:active, [role="switch"]:active, [role="menuitem"]:active, [data-press]:active:not(.task-card)):not(:disabled, [aria-disabled="true"], [aria-disabled="true"] *, [inert], [inert] *):not(:has(:active, [data-pressed])) {
+/* Only nested controls suppress the parent response; decorative SVG/span
+   descendants also become :active during a real pointer press. */
+:where([data-pressed], button:active, a[href]:active, summary:active, [role="button"]:active, [role="link"]:active, [role="tab"]:active, [role="radio"]:active, [role="checkbox"]:active, [role="switch"]:active, [role="menuitem"]:active, [data-press]:active:not(.task-card)):not(:disabled, [aria-disabled="true"], [aria-disabled="true"] *, [inert], [inert] *):not(:has(:where(button, a[href], summary, input, select, textarea, [role="button"], [role="link"], [role="tab"], [role="radio"], [role="checkbox"], [role="switch"], [role="menuitem"], [data-press]):is(:active, [data-pressed]))) {
   background-color: var(--sunk);
   opacity: .78;
 }

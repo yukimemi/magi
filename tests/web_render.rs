@@ -1888,6 +1888,11 @@ async fn settings_gear_is_reachable_on_a_phone_and_never_doubles_the_rail_link()
       if (button.hasAttribute('data-pressed') || document.querySelector('.press-glow')) fails.push('scroll did not clear');
       button.focus();
       if (getComputedStyle(button).outlineStyle === 'none') fails.push('missing focus outline');
+      host.setAttribute('data-press', '');
+      host.setAttribute('data-pressed', '');
+      button.setAttribute('data-pressed', '');
+      if (getComputedStyle(host).opacity !== '1') fails.push('nested control also pressed its parent');
+      if (getComputedStyle(button).opacity !== '0.78') fails.push('nested control lost feedback');
       host.remove();
       return fails;
     })()"##).await.expect("press feedback");
@@ -1964,6 +1969,15 @@ async fn settings_gear_is_reachable_on_a_phone_and_never_doubles_the_rail_link()
         .expect("measure gear");
     assert_eq!(geometry, serde_json::json!([]), "phone header: {geometry}");
 
+    // Motion-free feedback must survive an active decorative SVG descendant.
+    browser
+        .call(
+            Some(&page.session),
+            "Emulation.setEmulatedMedia",
+            serde_json::json!({"features": [{"name": "prefers-reduced-motion", "value": "reduce"}]}),
+        )
+        .await
+        .expect("reduce motion");
     // Tap it for real, at its centre.
     let point = browser
         .eval(
@@ -1985,7 +1999,40 @@ async fn settings_gear_is_reachable_on_a_phone_and_never_doubles_the_rail_link()
             )
             .await
             .expect("mouse");
+        if kind == "mousePressed" {
+            let pressed = browser
+                .eval(
+                    &page,
+                    r##"(() => {
+                      const gear = document.getElementById('settings-btn');
+                      return {
+                        childActive: !!gear.querySelector('svg:active'),
+                        opacity: getComputedStyle(gear).opacity,
+                        glow: !!document.querySelector('.press-glow'),
+                      };
+                    })()"##,
+                )
+                .await
+                .expect("measure reduced-motion press");
+            assert_eq!(
+                pressed["childActive"], true,
+                "SVG must be active: {pressed}"
+            );
+            assert_eq!(pressed["opacity"], "0.78", "link must react: {pressed}");
+            assert_eq!(
+                pressed["glow"], false,
+                "motion must be suppressed: {pressed}"
+            );
+        }
     }
+    browser
+        .call(
+            Some(&page.session),
+            "Emulation.setEmulatedMedia",
+            serde_json::json!({"features": []}),
+        )
+        .await
+        .expect("restore motion preference");
     browser
         .wait_for(
             &page,
