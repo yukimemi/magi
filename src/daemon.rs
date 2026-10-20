@@ -7530,6 +7530,8 @@ mod tests {
                 branch: format!("magi/task-{}", t.id),
                 head: "a".repeat(40),
                 source_head: None,
+                source_run: None,
+                source_proof: None,
                 disposition: Some(crate::pr_recovery::Disposition::Land),
                 instruction: t.instruction.clone(),
                 approved_at: Timestamp::now(),

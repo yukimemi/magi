@@ -163,8 +163,15 @@ worktree HEAD, HEAD/branch reflog and ORIG_HEAD must be incorporated in a single
 pinned fetched base. Independent losing candidates and detached reviewers retain
 the entire run. Git operation checkpoints, source changes and unknown ignored
 files also retain it; a target directory needs the existing Cargo residue proof.
-Missing base information or unproven squash/rebase ancestry retains sources for
-inspection. Explicit recovery-source retention and pending implementation
+For a squash merge, the recorded winner's complete cumulative binary patch
+(including modes and blob IDs) must exactly match a single-parent commit in
+the pinned fetched history since the run's base commit. Only ancestors of that
+proven winner qualify through this proof; independent losing commits and
+rewritten-away checkpoints still retain the entire run. Later base changes do
+not invalidate a matching historical squash. Missing base information or an
+unproven squash/rebase retains sources for inspection; conflict resolutions or
+base drift that change the patch require manual inspection. Explicit
+recovery-source retention and pending implementation
 preservation still refuse folding. Other terminal labels and successful PR
 publication alone do not establish a confirmed merge.
 

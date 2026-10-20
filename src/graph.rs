@@ -11607,8 +11607,8 @@ async fn verify_merged_fold_sources(
     }
     if !heads.is_empty() {
         // Never trust a run-wide merge label or the local checkout's branch.
-        // Pin the fetched base once; missing ancestry (including an unproven
-        // squash/rebase) keeps all sources and reports why.
+        // Pin the fetched base once. A squash does not preserve commit IDs:
+        // prove the winner's cumulative patch before accepting its ancestors.
         let reference = format!(
             "refs/remotes/{}/{}",
             state.config.merge.remote, state.base_branch
@@ -11616,16 +11616,90 @@ async fn verify_merged_fold_sources(
         let base = git::rev_parse(&state.repo, &reference)
             .await
             .context("cannot prove merged sources against the fetched base")?;
+        let mut squash_winner = None;
+        let mut checked_squash = false;
         for head in heads {
-            anyhow::ensure!(
-                git::git_raw(&state.repo, &["merge-base", "--is-ancestor", &head, &base])
+            if git::git_raw(&state.repo, &["merge-base", "--is-ancestor", &head, &base])
+                .await?
+                .ok()
+            {
+                continue;
+            }
+            if !checked_squash {
+                squash_winner = proven_squash_winner(state, &base).await?;
+                checked_squash = true;
+            }
+            let incorporated = if let Some(winner) = &squash_winner {
+                git::git_raw(&state.repo, &["merge-base", "--is-ancestor", &head, winner])
                     .await?
-                    .ok(),
+                    .ok()
+            } else {
+                false
+            };
+            anyhow::ensure!(
+                incorporated,
                 "recovery source {head} is not proven incorporated in {reference}; retaining the entire run"
             );
         }
     }
     Ok(cargo_guards)
+}
+
+/// Called only for a confirmed merged run. Its label admits proof, but does
+/// not prove that any particular local branch or recovery checkpoint landed.
+/// Match the complete binary patch, including modes and blob IDs, against a
+/// single-parent commit in the pinned fetched history. This works after later
+/// base commits too, without trusting the current base tree to still match.
+async fn proven_squash_winner(state: &RunState, base: &str) -> Result<Option<String>> {
+    let Some(winner) = state.winner() else {
+        return Ok(None);
+    };
+    let head = git::rev_parse(&state.repo, &winner.branch).await?;
+    if !git::git_raw(
+        &state.repo,
+        &["merge-base", "--is-ancestor", &state.base_commit, &head],
+    )
+    .await?
+    .ok()
+    {
+        return Ok(None);
+    }
+    let patch = fold_source_patch(&state.repo, &state.base_commit, &head).await?;
+    if patch.is_empty() {
+        return Ok(None);
+    }
+    let range = format!("{}..{base}", state.base_commit);
+    let commits = git::git(&state.repo, &["log", "--no-merges", "--format=%H", &range]).await?;
+    for commit in commits.lines() {
+        let parent = format!("{commit}^");
+        if fold_source_patch(&state.repo, &parent, commit).await? == patch {
+            return Ok(Some(head));
+        }
+    }
+    Ok(None)
+}
+
+async fn fold_source_patch(repo: &Path, from: &str, to: &str) -> Result<String> {
+    git::git(
+        repo,
+        &[
+            "-c",
+            "core.quotePath=true",
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--ignore-submodules=none",
+            "--submodule=short",
+            from,
+            to,
+            "--",
+        ],
+    )
+    .await
 }
 
 /// Remove `dir` if it exists and has nothing in it.

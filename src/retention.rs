@@ -1404,6 +1404,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merged_fold_proves_multi_commit_squash_and_retains_unpublished_sources() {
+        for variant in ["exact", "partial", "checkpoint", "loser"] {
+            let f = Fx::new().await;
+            let mut state = f.run("cc06", true).await;
+            let candidate = state.candidates[0].clone();
+            let intermediate = git::rev_parse(&candidate.worktree, "HEAD").await.unwrap();
+            std::fs::write(candidate.worktree.join("second"), [0, 1, 255, 42]).unwrap();
+            git::rescue_commit(&candidate.worktree, "second candidate change")
+                .await
+                .unwrap();
+            let head = git::rev_parse(&candidate.worktree, "HEAD").await.unwrap();
+            state.tally = Some(crate::run::Tally {
+                first_choice: Default::default(),
+                borda: Default::default(),
+                winner: 'A',
+                rankings: 0,
+                unanimous_initial: true,
+                deliberated: false,
+                changed_votes: 0,
+                unanimous_final: true,
+                tie_break: None,
+                judges: 0,
+                present: 0,
+                quorum: 0,
+                met_quorum: true,
+                uncontested: Some("fixture".into()),
+            });
+            // A reviewer pinned to an intermediate candidate commit must also
+            // be reclaimable, although neither commit ID lands in the squash.
+            let reviewer = state.worktree_root().join("review-1");
+            git::worktree_add_detached(&f.repo, &reviewer, &intermediate)
+                .await
+                .unwrap();
+            // Concurrent base changes and later base advances prevent a mere
+            // equality check against the current base tree from passing.
+            std::fs::write(f.repo.join("unrelated-before"), "base advance").unwrap();
+            git::rescue_commit(&f.repo, "advance before squash")
+                .await
+                .unwrap();
+            let published = if variant == "partial" {
+                &intermediate
+            } else {
+                &head
+            };
+            git::git(&f.repo, &["merge", "--squash", published])
+                .await
+                .unwrap();
+            git::git(&f.repo, &["commit", "-m", "squash candidate"])
+                .await
+                .unwrap();
+            let squash = git::rev_parse(&f.repo, "HEAD").await.unwrap();
+            assert!(
+                !git::git_raw(&f.repo, &["merge-base", "--is-ancestor", &head, &squash])
+                    .await
+                    .unwrap()
+                    .ok()
+            );
+            std::fs::write(f.repo.join("unrelated-after"), "later base advance").unwrap();
+            git::rescue_commit(&f.repo, "advance after squash")
+                .await
+                .unwrap();
+            git::git(&f.repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])
+                .await
+                .unwrap();
+            if variant == "checkpoint" {
+                // A reset hides unique work from HEAD, but not its reflog.
+                std::fs::write(reviewer.join("unpublished"), "reviewer checkpoint").unwrap();
+                git::rescue_commit(&reviewer, "unpublished checkpoint")
+                    .await
+                    .unwrap();
+                git::git(&reviewer, &["reset", "--hard", &intermediate])
+                    .await
+                    .unwrap();
+            }
+            if variant == "loser" {
+                let mut loser = candidate.clone();
+                loser.label = 'B';
+                loser.branch = "magi/cc06/B".into();
+                loser.worktree = state.worktree_root().join("cand-B");
+                git::worktree_add_branch(&f.repo, &loser.worktree, &loser.branch, &f.base)
+                    .await
+                    .unwrap();
+                std::fs::write(loser.worktree.join("unique"), "losing candidate").unwrap();
+                git::rescue_commit(&loser.worktree, "independent loser")
+                    .await
+                    .unwrap();
+                state.candidates.push(loser);
+            }
+            state.status = RunStatus::Merged;
+            state.merge = Some(crate::run::MergeOutcome {
+                mode: crate::config::MergeMode::Pr,
+                ok: true,
+                detail: "candidate A squash merged".into(),
+                empty: false,
+            });
+            state.save_under(&f.home).unwrap();
+            let result = crate::graph::fold_run(&mut state, true, &f.home).await;
+            if variant == "exact" {
+                result.unwrap();
+                assert!(!candidate.worktree.exists() && !reviewer.exists());
+                assert!(
+                    !git::branch_exists(&f.repo, &candidate.branch)
+                        .await
+                        .unwrap()
+                );
+                assert!(
+                    f.home
+                        .join("runs")
+                        .join(&state.id)
+                        .join("run.json")
+                        .exists()
+                );
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("not proven incorporated"),
+                    "{variant}"
+                );
+                assert!(
+                    candidate.worktree.exists() && reviewer.exists(),
+                    "{variant}"
+                );
+                assert!(
+                    git::branch_exists(&f.repo, &candidate.branch)
+                        .await
+                        .unwrap()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn merged_fold_preserves_independent_candidate_and_reviewer_commits_before_any_removal() {
         let f = Fx::new().await;
         let mut state = f.run("cc05", true).await;
