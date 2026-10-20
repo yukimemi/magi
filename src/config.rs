@@ -507,19 +507,16 @@ pub struct Graph {
     /// Silence is a hold. An unanswered approval never merges, and neither
     /// does any answer other than the word `merge`.
     pub land_approval: bool,
-    /// Ask the owner before merging a run whose review loop handed off over a
-    /// contested finding: the last round ended with a Major-or-above finding
-    /// still open *and* at least one reviewer's final vote (after
-    /// reconsideration) was reject. Findings raised in the last round are
-    /// never fixed or re-reviewed, so this is the one case an unattended
-    /// merge would land over a reviewer's explicit objection.
+    /// Ask the owner when open Major-or-above internal findings OR a final
+    /// rejecting reviewer vote remain. Final votes use reconsideration when
+    /// answered, otherwise the initial vote. On by default; even a reject with
+    /// zero Major findings requires approval when this control is enabled.
     ///
-    /// On. Interaction with [`Self::land_approval`]: when that is on, every
-    /// merge is asked about and this key changes nothing. When it is off,
-    /// this key alone decides whether a contested hand-off is asked about
-    /// (the question says why); every other run still merges unattended.
-    /// Read at land time, so turning it off restores the unattended merge at
-    /// once. The pull request is opened either way; only the merge waits.
+    /// `land_approval` independently asks about every merge. With both controls
+    /// off, new ordinary approvals are skipped. Neither control bypasses an
+    /// existing question or owner decision, nor the fresh approval required
+    /// after merge repair (including repair that leaves the head unchanged).
+    /// The pull request is opened either way; only the merge waits.
     pub hold_contested_merge: bool,
     /// After a run's pull request merges, file the findings its last review
     /// round left open as follow-up tasks (`crate::followup`) instead of

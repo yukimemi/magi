@@ -616,8 +616,8 @@ pub const HOLD: &str = "hold";
 /// A bounded repair followed by a new review and a fresh owner decision.
 pub const REPAIR: &str = "fix findings and re-review";
 
-/// Independent of the contested handoff's AND condition: either open Major
-/// findings or rejecting final votes qualify once review handed off.
+/// Whether review evidence offers a meaningful repair choice. This does not
+/// decide whether owner approval is required.
 pub fn repair_available(state: &RunState) -> bool {
     state.reviews.last().is_some_and(|r| {
         state.open_findings().iter().any(|f| f.severity.blocks())
@@ -625,6 +625,233 @@ pub fn repair_available(state: &RunState) -> bool {
                 .iter()
                 .any(|(_, _, v)| *v == crate::verdict::ReviewVote::Reject)
     })
+}
+
+/// All applicable reasons for consulting the owner, independent of repair choices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalReason {
+    EveryMerge,
+    OpenBlockingFindings,
+    FinalReject,
+    ExistingDecision,
+    AfterRepair,
+}
+
+/// Disabling fresh approval controls never bypasses an existing owner decision
+/// or the fresh decision owed after repair, even if repair kept the same head.
+pub fn approval_reasons(state: &RunState) -> Vec<ApprovalReason> {
+    let mut reasons = Vec::new();
+    if state.config.graph.land_approval {
+        reasons.push(ApprovalReason::EveryMerge);
+    }
+    if state.config.graph.hold_contested_merge {
+        if state.open_findings().iter().any(|f| f.severity.blocks()) {
+            reasons.push(ApprovalReason::OpenBlockingFindings);
+        }
+        if state.reviews.last().is_some_and(|r| {
+            r.final_votes()
+                .iter()
+                .any(|(_, _, v)| *v == crate::verdict::ReviewVote::Reject)
+        }) {
+            reasons.push(ApprovalReason::FinalReject);
+        }
+    }
+    if state.land_approval.is_some() {
+        reasons.push(ApprovalReason::ExistingDecision);
+    }
+    if !state.merge_repairs.is_empty() {
+        reasons.push(ApprovalReason::AfterRepair);
+    }
+    reasons
+}
+
+/// Persisted verbatim in the question and panel at creation. Deputies and
+/// resumed questions use that snapshot, never reconstruct past policy from
+/// today's settings. Fixer claims and successful gates are not resolutions.
+fn approval_evidence(state: &RunState) -> String {
+    let ja = words(&state.config.graph.language).html_lang == "ja";
+    let mut s = if ja {
+        "承認が必要な理由:\n"
+    } else {
+        "Approval required because:\n"
+    }
+    .to_owned();
+    for reason in approval_reasons(state) {
+        let label = match (reason, ja) {
+            (ApprovalReason::EveryMerge, false) => {
+                "land_approval=true: owner approval for every merge"
+            }
+            (ApprovalReason::EveryMerge, true) => {
+                "land_approval=true: すべてのマージに所有者の承認が必要"
+            }
+            (ApprovalReason::OpenBlockingFindings, false) => {
+                "hold_contested_merge=true: open Major-or-above internal findings"
+            }
+            (ApprovalReason::OpenBlockingFindings, true) => {
+                "hold_contested_merge=true: Major 以上の内部指摘が未解決"
+            }
+            (ApprovalReason::FinalReject, false) => {
+                "hold_contested_merge=true: final reviewer reject after reconsideration (even without Major findings)"
+            }
+            (ApprovalReason::FinalReject, true) => {
+                "hold_contested_merge=true: 再考後の最終票が reject（Major 指摘がなくても承認が必要）"
+            }
+            (ApprovalReason::ExistingDecision, false) => {
+                "existing owner decision: changing controls cannot bypass it"
+            }
+            (ApprovalReason::ExistingDecision, true) => {
+                "既存の所有者判断: 設定変更では迂回できません"
+            }
+            (ApprovalReason::AfterRepair, false) => {
+                "fresh owner approval after merge repair, even with an unchanged head"
+            }
+            (ApprovalReason::AfterRepair, true) => {
+                "マージ修復後の新しい所有者承認（head に変更がなくても必要）"
+            }
+        };
+        let _ = writeln!(s, "- {label}");
+    }
+    s.push_str(if ja {
+        "\n再考後の各レビュアーの最終票:\n"
+    } else {
+        "\nFinal reviewer votes after reconsideration:\n"
+    });
+    if let Some(round) = state.reviews.last() {
+        let votes = round.final_votes();
+        for r in &round.reviews {
+            let vote = votes
+                .iter()
+                .find(|(seat, _, _)| *seat == r.reviewer)
+                .map(|(_, _, v)| v.label())
+                .unwrap_or(if ja { "記録なし" } else { "not recorded" });
+            let _ = writeln!(s, "#{} ({}): {vote}", r.reviewer, r.agent);
+            let rv = round
+                .reconsideration
+                .iter()
+                .find(|rv| rv.reviewer == r.reviewer);
+            if let Some(rv) = rv.filter(|rv| rv.vote.is_some()) {
+                let initial = r.vote.map(|v| v.label()).unwrap_or("?");
+                let _ = writeln!(
+                    s,
+                    "  {}: {initial} → {vote}",
+                    if ja { "再考" } else { "reconsideration" }
+                );
+                let _ = writeln!(
+                    s,
+                    "  {}: {}",
+                    if ja { "理由" } else { "reason" },
+                    if rv.reason.trim().is_empty() {
+                        if ja { "記録なし" } else { "not recorded" }
+                    } else {
+                        &rv.reason
+                    }
+                );
+            } else {
+                let _ = writeln!(
+                    s,
+                    "  {}: {}",
+                    if ja {
+                        "初回票を保持・理由"
+                    } else {
+                        "initial vote retained; reason"
+                    },
+                    if r.summary.trim().is_empty() {
+                        if ja { "記録なし" } else { "not recorded" }
+                    } else {
+                        &r.summary
+                    }
+                );
+                if let Some(rv) = rv {
+                    let _ = writeln!(
+                        s,
+                        "  {}: {}",
+                        if ja {
+                            "再投票の回答なし"
+                        } else {
+                            "no reconsideration vote"
+                        },
+                        rv.failed.as_deref().unwrap_or(if ja {
+                            "理由の記録なし"
+                        } else {
+                            "reason not recorded"
+                        })
+                    );
+                }
+            }
+            if let Some(failed) = &r.failed {
+                let _ = writeln!(
+                    s,
+                    "  {}: {failed}",
+                    if ja { "回答なし" } else { "no answer" }
+                );
+            }
+        }
+    } else {
+        s.push_str(if ja {
+            "レビュー記録なし\n"
+        } else {
+            "No review recorded\n"
+        });
+    }
+    s.push_str(if ja { "\n内部レビュー指摘（最終ラウンド）: 採用申告や gate 成功だけでは個別指摘の解決確認にはなりません。\n" } else { "\nInternal review findings (last round): adoption claims or a passing gate alone do not confirm individual resolution.\n" });
+    for f in state.last_round_findings() {
+        let _ = writeln!(
+            s,
+            "[{}] {} {}:{}: {}\n{}",
+            f.id,
+            f.severity,
+            f.file.as_deref().unwrap_or("?"),
+            f.line.map(|l| l.to_string()).unwrap_or_else(|| "?".into()),
+            f.title,
+            f.detail
+        );
+        let mut evidence = false;
+        for fix in state.reviews.iter().filter_map(|r| r.fix.as_ref()).chain(
+            state
+                .operator_fixes
+                .iter()
+                .filter_map(|request| request.fix.as_ref()),
+        ) {
+            if fix.addressed.contains(&f.id) {
+                evidence = true;
+                let _ = writeln!(
+                    s,
+                    "  {} ({}): {}",
+                    if ja {
+                        "採用申告（解決未確認）"
+                    } else {
+                        "claimed addressed (resolution unconfirmed)"
+                    },
+                    fix.agent,
+                    fix.notes
+                );
+            }
+            for rejection in fix.rejected.iter().filter(|r| r.id == f.id) {
+                evidence = true;
+                let _ = writeln!(
+                    s,
+                    "  {}: {}",
+                    if ja { "不採用理由" } else { "declined" },
+                    rejection.why
+                );
+            }
+        }
+        if !evidence {
+            s.push_str(if ja {
+                "  採用・解決確認の記録なし\n"
+            } else {
+                "  No adoption or resolution evidence recorded\n"
+            });
+        }
+    }
+    if state.last_round_findings().is_empty() {
+        s.push_str(if ja {
+            "最終ラウンドに指摘の記録なし\n"
+        } else {
+            "No findings recorded in the last round\n"
+        });
+    }
+    s
 }
 
 /// Shared choices for web, CLI and consultation questions.
@@ -1005,8 +1232,8 @@ const EN: Words = Words {
     files_changed: "file(s) changed",
     commits: "Commits being squashed",
     no_commits: "No commit subjects could be read from the branch.",
-    comments: "Review comments",
-    no_comments: "Nothing outstanding at this observation.",
+    comments: "External PR review comments",
+    no_comments: "No unaddressed external PR comments at this observation. This does not mean internal findings are resolved.",
     diff: "Diff",
     truncated: "Truncated",
     lands_as: "They land as one commit titled",
@@ -1024,8 +1251,8 @@ const JA: Words = Words {
     files_changed: "ファイル変更",
     commits: "squash されるコミット",
     no_commits: "ブランチからコミット件名を読めませんでした。",
-    comments: "レビューコメント",
-    no_comments: "この時点で未対応のものはありません。",
+    comments: "外部 PR レビューコメント",
+    no_comments: "この時点で未対応の外部 PR コメントはありません。内部指摘の解決を意味するものではありません。",
     diff: "差分",
     truncated: "省略",
     lands_as: "これらは次の件名の1コミットとして入ります:",
@@ -1228,6 +1455,12 @@ pub fn approval_panel(
         esc(&pr.url),
     );
 
+    let _ = writeln!(
+        h,
+        "<section style=\"padding:12px;background:#fff8c5;border:1px solid #9a6700;border-radius:6px;white-space:pre-wrap\">{}</section>",
+        esc(&approval_evidence(state))
+    );
+
     // The task, verbatim: the operator's own words for what was asked, so the
     // panel does not make them reconstruct the request from a diffstat.
     let _ = writeln!(
@@ -1253,8 +1486,8 @@ pub fn approval_panel(
         );
     }
 
-    // The verdict from the round that actually cleared this for merge - the
-    // last one, since only that round's word is still standing.
+    // Only the last round's reviewer prose is current. Its votes and
+    // remaining findings are shown explicitly in the evidence above.
     if let Some(round) = state.reviews.last() {
         let _ = writeln!(
             h,
@@ -1461,9 +1694,8 @@ pub fn approval_panel(
     h
 }
 
-/// The contested hand-off `land` must ask about, if any: recorded by the
-/// review loop and not switched off by `graph.hold_contested_merge`. The one
-/// place `land` reads that record.
+/// Historical contested hand-off evidence for the question detail. Approval
+/// itself is decided by `approval_reasons`, including reject-only cases.
 fn contested_to_ask(state: &RunState) -> Option<ContestedHandoff> {
     if state.config.graph.hold_contested_merge {
         state.contested_handoff.clone()
@@ -1473,8 +1705,7 @@ fn contested_to_ask(state: &RunState) -> Option<ContestedHandoff> {
 }
 
 /// What a merge-approval question's deputy is told: the pull request, the run,
-/// what each answer does, and - when the run's record is readable - the
-/// contested hand-off the question was filed over.
+/// what each answer does, and the evidence saved when the question was filed.
 ///
 /// A snapshot taken when the deputy is attached, so it says so and points at
 /// `magi show` / `gh pr view` for anything current. `state` is `None` for a run
@@ -1504,6 +1735,13 @@ pub fn deputy_brief(q: &ask::Question, state: Option<&RunState>) -> String {
     if q.choices.iter().any(|c| c == REPAIR) {
         s.push_str("\n\n`fix findings and re-review` requests one repair and bounded re-review on the existing PR. It never approves a merge. Settle this choice only when the owner's whole latest message is exactly this label; otherwise discuss it with `--thread`. The driver performs the repair; do not edit or queue another task. Updated review and gate results require a fresh merge decision.");
     }
+    if q.detail.contains("Approval required because:") || q.detail.contains("承認が必要な理由:")
+    {
+        s.push_str("\n\nSaved approval evidence (at question creation):\n");
+        s.push_str(&q.detail);
+    } else {
+        s.push_str("\n\nApproval reasons and final review evidence were not recorded in this legacy question. Do not infer its original trigger from current settings; consult the saved panel and review history.");
+    }
     let Some(state) = state else {
         s.push_str(
             "\n\nThe run's record could not be read, so the pull request, the panel \
@@ -1522,25 +1760,7 @@ pub fn deputy_brief(q: &ask::Question, state: Option<&RunState>) -> String {
     if let Some(w) = state.winner() {
         s.push_str(&format!("\nWinning branch: `{}`.", w.branch));
     }
-    match contested_to_ask(state) {
-        Some(c) => {
-            s.push_str(
-                "\n\nThis question was filed although merge approvals are off, because \
-                 the review hand-off is contested. Open findings:",
-            );
-            for f in &c.findings {
-                let at = match (&f.file, f.line) {
-                    (Some(file), Some(line)) => format!(" ({file}:{line})"),
-                    (Some(file), None) => format!(" ({file})"),
-                    _ => String::new(),
-                };
-                s.push_str(&format!("\n- [{}] {}{at}: {}", f.id, f.severity, f.title));
-            }
-            let seats: Vec<String> = c.rejecters.iter().map(|(n, _)| format!("#{n}")).collect();
-            s.push_str(&format!("\nReviewers who rejected: {}.", seats.join(", ")));
-        }
-        None => s.push_str("\n\nThe review hand-off was not recorded as contested."),
-    }
+
     s
 }
 
@@ -1710,7 +1930,11 @@ async fn approval_gate(
                 APPROVAL_NODE.to_owned(),
                 "land".to_owned(),
                 w.approval_summary(pr.number, subject),
-                w.approval_detail(&pr.url, &state.base_branch, subject, contested),
+                format!(
+                    "{}\n\n{}",
+                    approval_evidence(state),
+                    w.approval_detail(&pr.url, &state.base_branch, subject, contested)
+                ),
                 approval_choices(state),
             );
             fresh.merge_target = Some(crate::merge_decision::Target {
@@ -3890,15 +4114,10 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 // The owner sees the panel before the one irreversible step,
                 // and an unanswered question is a hold: silence never merges.
                 //
-                // `land_approval` asks about every merge. With it off, a
-                // review hand-off the panel contested (a blocking finding
-                // open and a reject vote) is asked about all the same.
+                // The dedicated policy includes existing consent and post-repair
+                // decisions; repair choice availability never grants merge authority.
                 let contested = contested_to_ask(state);
-                if state.config.graph.land_approval
-                    || contested.is_some()
-                    || repair_available(state)
-                    || !state.merge_repairs.is_empty()
-                {
+                if !approval_reasons(state).is_empty() {
                     match approval_gate(state, &pr, &subject, contested.as_ref(), &seen.head)
                         .await?
                     {
@@ -6583,6 +6802,158 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     }
 
     #[test]
+    fn approval_policy_controls_are_independent_and_keep_all_reasons() {
+        for every in [false, true] {
+            for contested in [false, true] {
+                for major in [false, true] {
+                    for reject in [false, true] {
+                        let mut state = repair_state(major, reject);
+                        state.config.graph.land_approval = every;
+                        state.config.graph.hold_contested_merge = contested;
+                        let reasons = approval_reasons(&state);
+                        assert_eq!(reasons.contains(&ApprovalReason::EveryMerge), every);
+                        assert_eq!(
+                            reasons.contains(&ApprovalReason::OpenBlockingFindings),
+                            contested && major
+                        );
+                        assert_eq!(
+                            reasons.contains(&ApprovalReason::FinalReject),
+                            contested && reject
+                        );
+                        assert_eq!(
+                            reasons.len(),
+                            usize::from(every)
+                                + usize::from(contested && major)
+                                + usize::from(contested && reject)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn approval_policy_and_rendering_follow_reconsideration_in_both_directions() {
+        use crate::verdict::ReviewVote::{Approve, Reject};
+        for (initial_reject, final_vote) in [(true, Approve), (false, Reject)] {
+            let mut state = repair_state(false, initial_reject);
+            state.reviews[0]
+                .reconsideration
+                .push(crate::run::ReviewRevoteRecord {
+                    reviewer: 1,
+                    agent: "alpha".into(),
+                    vote: Some(final_vote),
+                    reason: "changed after reading the panel <evidence>".into(),
+                    failed: None,
+                });
+            assert_eq!(
+                approval_reasons(&state).contains(&ApprovalReason::FinalReject),
+                final_vote == Reject
+            );
+            for language in ["en", "ja"] {
+                state.config.graph.language = language.into();
+                let evidence = approval_evidence(&state);
+                assert!(evidence.contains(&format!("→ {}", final_vote.label())));
+                assert!(evidence.contains("changed after reading the panel <evidence>"));
+                let html = approval_panel(&state, &green_pr(), "", "", &[], "subject");
+                assert!(html.contains("changed after reading the panel &lt;evidence&gt;"));
+                assert!(!html.contains("<evidence>"));
+            }
+            state.reviews[0].reconsideration[0].vote = None;
+            state.reviews[0].reconsideration[0].failed = Some("timed out".into());
+            assert_eq!(
+                approval_reasons(&state).contains(&ApprovalReason::FinalReject),
+                initial_reject
+            );
+            assert!(approval_evidence(&state).contains("timed out"));
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_merge_paths_apply_controls_to_major_and_reject_independently() {
+        for every in [false, true] {
+            for contested in [false, true] {
+                for (major, reject) in [(false, false), (false, true), (true, false), (true, true)]
+                {
+                    let mut state = repair_state(major, reject);
+                    state.config.graph.land_approval = every;
+                    state.config.graph.hold_contested_merge = contested;
+                    let forge = Scripted::new(
+                        vec![seen("abc", Checks::Green, "CLEAN", false)],
+                        vec![(true, "")],
+                    );
+                    land_with(&mut state, URL, &forge).await.unwrap();
+                    let expected = every || (contested && (major || reject));
+                    assert_eq!(state.land_approval.is_some(), expected);
+                    assert_eq!(forge.calls().contains(&"merge"), !expected);
+                    if expected {
+                        assert!(state.parked);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_snapshot_exposes_minor_findings_and_survives_disabled_controls() {
+        let mut state = repair_state(false, true);
+        state.reviews[0].clean = true;
+        let mut finding = contested().findings.remove(0);
+        finding.severity = crate::verdict::Severity::Minor;
+        state.reviews[0].reviews[0].findings.push(finding);
+        assert!(state.open_findings().is_empty());
+        let mut pr = green_pr();
+        pr.review_comments.clear();
+        for language in ["en", "ja"] {
+            state.config.graph.language = language.into();
+            let html = approval_panel(&state, &pr, "", "", &[], "subject");
+            assert!(html.contains("[R3-1-1] minor"));
+            assert!(html.contains(if language == "ja" {
+                "内部指摘の解決を意味するものではありません"
+            } else {
+                "This does not mean internal findings are resolved"
+            }));
+            assert!(
+                html.find(if language == "ja" {
+                    "承認が必要な理由:"
+                } else {
+                    "Approval required because:"
+                })
+                .unwrap()
+                    < html.find("[R3-1-1]").unwrap()
+            );
+        }
+        state.config.graph.language = "en".into();
+        let observed = seen("abc", Checks::Green, "CLEAN", false);
+        assert_eq!(
+            approval_gate(&mut state, &observed.pr, "subject", None, "abc")
+                .await
+                .unwrap(),
+            ApprovalGate::Pending
+        );
+        let id = state.land_approval.as_ref().unwrap().question.clone();
+        let q = ask::Questions::open().get(&id).unwrap();
+        assert!(q.detail.starts_with("Approval required because:"));
+        assert!(q.detail.contains("final reviewer reject"));
+        assert!(q.detail.contains("[R3-1-1] minor"));
+        assert!(
+            q.detail
+                .contains("No adoption or resolution evidence recorded")
+        );
+        state.config.graph.land_approval = false;
+        state.config.graph.hold_contested_merge = false;
+        state.reviews.clear();
+        assert_eq!(approval_reasons(&state), [ApprovalReason::ExistingDecision]);
+        assert!(deputy_brief(&q, Some(&state)).contains("final reviewer reject"));
+        assert!(deputy_brief(&q, None).contains("[R3-1-1] minor"));
+        let forge = Scripted::new(vec![observed], vec![]);
+        land_with(&mut state, URL, &forge).await.unwrap();
+        assert!(!forge.calls().contains(&"merge"));
+        assert_eq!(state.land_approval.as_ref().unwrap().question, id);
+        assert_eq!(ask::Questions::open().get(&id).unwrap().detail, q.detail);
+    }
+
+    #[test]
     fn merge_repair_choice_covers_major_only_and_reject_only_without_contested_and() {
         for (major, reject) in [(true, false), (false, true), (true, true)] {
             let state = repair_state(major, reject);
@@ -6674,6 +7045,27 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             ApprovalGate::Repair
         );
         assert_eq!(state.merge_repairs.len(), 1);
+        state.land_approval = None;
+        state.config.graph.land_approval = false;
+        state.config.graph.hold_contested_merge = false;
+        state.reviews.clear();
+        assert_eq!(approval_reasons(&state), [ApprovalReason::AfterRepair]);
+        assert_eq!(
+            approval_gate(&mut state, &pr, "feat: x", None, "abc")
+                .await
+                .unwrap(),
+            ApprovalGate::Pending
+        );
+        let fresh_id = &state.land_approval.as_ref().unwrap().question;
+        assert_ne!(fresh_id, &id);
+        let fresh = store.get(fresh_id).unwrap();
+        assert!(
+            fresh
+                .detail
+                .contains("fresh owner approval after merge repair")
+        );
+        assert!(fresh.detail.contains("No review recorded"));
+        assert!(!fresh.detail.contains("precise rejection reason"));
     }
 
     #[tokio::test]
@@ -6990,10 +7382,10 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         state.contested_handoff = Some(contested());
         let b = deputy_brief(&q, Some(&state));
         assert!(b.contains("https://example.test/pull/7"), "{b}");
-        assert!(b.contains("[R3-1-1] major (src/a.rs:1)"), "{b}");
-        assert!(b.contains("#1"), "the rejecting seat: {b}");
+        assert!(b.contains("not recorded in this legacy question"), "{b}");
+        assert!(!b.contains("This question was filed although"));
         state.contested_handoff = None;
-        assert!(deputy_brief(&q, Some(&state)).contains("not recorded as contested"));
+        assert!(deputy_brief(&q, Some(&state)).contains("not recorded in this legacy question"));
     }
 
     #[test]

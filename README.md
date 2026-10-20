@@ -585,6 +585,21 @@ than a consultation-destination error. For chat answers, operator-held refusal
 is specific to approval questions; ordinary triage, dependency and recovery questions remain
 answerable, and recording their answers does not itself lift the task's hold.
 
+Merge approval uses two independent controls: `land_approval=true` asks for
+every merge; `hold_contested_merge=true` asks for unresolved Major-or-above
+internal findings **or** a final rejecting reviewer vote, even with zero Major
+findings. Final votes include answered reconsideration, falling back to the
+initial vote otherwise. With both controls off, ordinary new approvals are
+skipped. Existing questions and owner decisions, and fresh approval after
+merge repair, cannot be bypassed by disabling these controls.
+
+The question and phone panel show all applicable approval reasons, each final
+vote and its reason, and last-round internal findings (including Minor) with
+available adoption evidence. A fixer claiming a finding was addressed, or a
+green gate, does not prove its resolution. External PR comments are reported
+separately; no outstanding external comments does not imply internal findings
+were resolved. Saved questions retain their original evidence on resume.
+
 When review hands off with unresolved Major findings or final rejecting votes,
 the decision also offers **fix findings and re-review**. Selecting it runs one
 repair and a fresh bounded review and gate on the same PR branch, under the
