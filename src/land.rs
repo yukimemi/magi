@@ -686,7 +686,6 @@ fn approval_excerpt(text: &str, max_chars: usize) -> String {
 /// resumed questions use that snapshot, never reconstruct past policy from
 /// today's settings. Fixer claims and successful gates are not resolutions.
 fn approval_evidence(state: &RunState) -> String {
-    const SHOWN: usize = 8;
     const TITLE_CHARS: usize = 100;
     const REASON_CHARS: usize = 300;
     let reason = |text: &str| approval_excerpt(text, REASON_CHARS);
@@ -817,7 +816,7 @@ fn approval_evidence(state: &RunState) -> String {
     }
     s.push_str(if ja { "\n内部レビュー指摘（最終ラウンド）: 採用申告や gate 成功だけでは個別指摘の解決確認にはなりません。\n" } else { "\nInternal review findings (last round): adoption claims or a passing gate alone do not confirm individual resolution.\n" });
     let findings = state.last_round_findings();
-    for f in findings.iter().take(SHOWN) {
+    for f in &findings {
         let _ = writeln!(
             s,
             "[{}] {} {}:{}: {}\n{}",
@@ -866,18 +865,6 @@ fn approval_evidence(state: &RunState) -> String {
                 "  No adoption or resolution evidence recorded\n"
             });
         }
-    }
-    if findings.len() > SHOWN {
-        let more = findings.len() - SHOWN;
-        let _ = writeln!(
-            s,
-            "{}",
-            if ja {
-                format!("ほか {more} 件の内部指摘を省略（実行記録を参照）")
-            } else {
-                format!("{more} more internal findings omitted (see run records)")
-            }
-        );
     }
     if findings.is_empty() {
         s.push_str(if ja {
@@ -6989,7 +6976,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     }
 
     #[tokio::test]
-    async fn approval_evidence_bounds_findings_and_unicode_reasons_in_question_and_panel() {
+    async fn approval_evidence_keeps_all_findings_and_bounds_unicode_prose() {
         let mut state = repair_state(false, true);
         state.config.graph.land_approval = false;
         let long_reason = format!("{}REASON_TAIL", "拒否🦀".repeat(200));
@@ -6999,16 +6986,20 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         for i in 1..=10 {
             let mut finding = contested().findings.remove(0);
             finding.id = format!("R1-1-{i}");
-            finding.severity = crate::verdict::Severity::Minor;
+            finding.severity = if i == 9 {
+                crate::verdict::Severity::Major
+            } else {
+                crate::verdict::Severity::Minor
+            };
             finding.title = long_title.clone();
             finding.detail = long_detail.clone();
             state.reviews[0].reviews[0].findings.push(finding);
         }
         state.reviews[0].fix = Some(crate::run::FixRecord {
             agent: "fixer".into(),
-            addressed: vec!["R1-1-1".into()],
+            addressed: vec!["R1-1-9".into()],
             rejected: vec![crate::verdict::Rejection {
-                id: "R1-1-2".into(),
+                id: "R1-1-10".into(),
                 why: long_reason.clone(),
             }],
             notes: long_detail.clone(),
@@ -7017,7 +7008,13 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             duration_ms: 0,
             continuation: None,
         });
-        assert_eq!(approval_reasons(&state), [ApprovalReason::FinalReject]);
+        assert_eq!(
+            approval_reasons(&state),
+            [
+                ApprovalReason::OpenBlockingFindings,
+                ApprovalReason::FinalReject
+            ]
+        );
         let excerpt = approval_excerpt(&long_reason, 300);
         assert_eq!(excerpt.chars().count(), 300);
         assert!(excerpt.ends_with('…'));
@@ -7025,40 +7022,64 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(approval_excerpt(&boundary, 300), boundary);
         for language in ["en", "ja"] {
             state.config.graph.language = language.into();
-            for reconsidered in [false, true] {
+            for revote in [
+                None,
+                Some(crate::verdict::ReviewVote::Reject),
+                Some(crate::verdict::ReviewVote::Approve),
+            ] {
+                state.reviews[0].reviews[0].vote = Some(crate::verdict::ReviewVote::Reject);
                 state.reviews[0].reconsideration.clear();
-                if reconsidered {
+                if let Some(vote) = revote {
                     state.reviews[0].reviews[0].vote = Some(crate::verdict::ReviewVote::Approve);
                     state.reviews[0]
                         .reconsideration
                         .push(crate::run::ReviewRevoteRecord {
                             reviewer: 1,
                             agent: "alpha".into(),
-                            vote: Some(crate::verdict::ReviewVote::Reject),
+                            vote: Some(vote),
                             reason: long_reason.clone(),
                             failed: None,
                         });
                 }
                 let evidence = approval_evidence(&state);
-                assert!(evidence.contains("#1 (alpha): reject"));
+                let final_vote = revote.unwrap_or(crate::verdict::ReviewVote::Reject);
+                assert!(evidence.contains(&format!("#1 (alpha): {}", final_vote.label())));
+                assert!(approval_reasons(&state).contains(&ApprovalReason::OpenBlockingFindings));
+                assert_eq!(
+                    approval_reasons(&state).contains(&ApprovalReason::FinalReject),
+                    final_vote == crate::verdict::ReviewVote::Reject
+                );
                 assert!(evidence.contains(&excerpt));
                 assert!(evidence.contains("[R1-1-8] minor"));
-                assert!(!evidence.contains("[R1-1-9]"));
-                assert!(!evidence.contains("[R1-1-10]"));
+                assert!(evidence.contains("[R1-1-9] major"));
+                assert!(evidence.contains("[R1-1-10] minor"));
                 for tail in ["REASON_TAIL", "DETAIL_TAIL", "TITLE_TAIL"] {
                     assert!(!evidence.contains(tail));
                 }
-                assert!(evidence.contains(if language == "ja" {
-                    "ほか 2 件の内部指摘を省略"
-                } else {
-                    "2 more internal findings omitted"
-                }));
                 assert!(evidence.contains(if language == "ja" {
                     "採用申告（解決未確認）"
                 } else {
                     "claimed addressed (resolution unconfirmed)"
                 }));
                 assert!(evidence.contains(if language == "ja" {
+                    "不採用理由"
+                } else {
+                    "declined"
+                }));
+                let major_evidence = evidence
+                    .split("[R1-1-9] major")
+                    .nth(1)
+                    .unwrap()
+                    .split("[R1-1-10]")
+                    .next()
+                    .unwrap();
+                assert!(major_evidence.contains(if language == "ja" {
+                    "採用申告（解決未確認）"
+                } else {
+                    "claimed addressed (resolution unconfirmed)"
+                }));
+                let last_evidence = evidence.split("[R1-1-10] minor").nth(1).unwrap();
+                assert!(last_evidence.contains(if language == "ja" {
                     "不採用理由"
                 } else {
                     "declined"
