@@ -9498,13 +9498,17 @@ function selectStatsRepo(value) {
    which runs are parked. */
 let questionOriginGeneration = 0;
 let questionOriginController = null;
+let questionOriginsStarted = false;
 
 function loadQuestionOrigins() {
   const generation = ++questionOriginGeneration;
   if (questionOriginController) questionOriginController.abort();
   const controller = new AbortController();
   questionOriginController = controller;
-  sectionNotice("questions-h", "questions-origin-state", "Loading question origins…");
+  if (!questionOriginsStarted) {
+    questionOriginsStarted = true;
+    sectionNotice("questions-h", "questions-origin-state", "Loading question origins…");
+  }
   return getJson(`${API.questions}/origins`, { signal: controller.signal }).then(origins => {
     if (generation !== questionOriginGeneration) return;
     const byId = new Map(origins.map(origin => [origin.id, origin]));
@@ -9529,9 +9533,15 @@ function loadQuestionOrigins() {
 function loadQuestions() {
   ++questionOriginGeneration;
   if (questionOriginController) questionOriginController.abort();
-  sectionNotice("questions-h", "questions-origin-state", "");
   return loadStore("questions", `${API.questions}/core`, null, list => {
-    state.questions = sortQuestions(Array.isArray(list) ? list : []);
+    const previousById = new Map((state.questions || []).map(question => [question.id, question]));
+    state.questions = sortQuestions((Array.isArray(list) ? list : []).map(question => {
+      const previous = previousById.get(question.id);
+      if (!previous || previous.record_revision !== question.record_revision) return question;
+      // Core rows omit origins; retain them until the fresh lookup completes.
+      return { ...question, origin_chat: previous.origin_chat,
+        origin_chat_closed: previous.origin_chat_closed, can_consult_chat: previous.can_consult_chat };
+    }));
     renderQuestions();
     renderAskBar();
     /* A run's `waiting` only means something next to the questions, so both
