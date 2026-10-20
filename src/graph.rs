@@ -855,7 +855,13 @@ impl Runner {
         selection
             .verify(repo, &config.merge.remote, &base_branch, &selection.head)
             .await?;
-        selection.verify_source(repo).await?;
+        Box::pin(selection.verify_source(repo)).await?;
+        if let Some(proof) = &selection.source_proof {
+            anyhow::ensure!(
+                git::is_ancestor(repo, &proof.new_base, &base_commit).await,
+                "source rebase base is outside the fetched landing base"
+            );
+        }
         let roles = config.resolve_roles()?;
         let max_parallel = config.graph.max_parallel.max(1);
         let mut state = RunState::new(
@@ -1190,6 +1196,11 @@ impl Runner {
     /// Blocked / Stalled / Failed, or died with an error, is announced to the
     /// notification centre. Best-effort: see [`crate::notices::raise`].
     pub async fn execute(&mut self) -> Result<()> {
+        if let Some(selection) = &self.state.pr_recovery
+            && (selection.source_proof.is_some() || selection.source_run.is_some())
+        {
+            Box::pin(selection.verify_source(&self.state.repo)).await?;
+        }
         // Queue claims cover daemon work; this also serializes manual drivers
         // consuming a repair answer, including the new review and decision.
         let _repair_claim = if self.state.config.graph.selected_implementer.is_some()
@@ -12170,6 +12181,8 @@ mod tests {
             branch: "magi/task-selected".into(),
             head: head.clone(),
             source_head: None,
+            source_run: None,
+            source_proof: None,
             disposition: Some(crate::pr_recovery::Disposition::Review),
             instruction: "preserve measured behavior".into(),
             approved_at: jiff::Timestamp::now(),
