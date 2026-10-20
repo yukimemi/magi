@@ -630,10 +630,15 @@ pub fn repair_available(state: &RunState) -> bool {
 /// All applicable reasons for consulting the owner, independent of repair choices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalReason {
+    /// Universal owner approval is enabled for every merge.
     EveryMerge,
+    /// Contested-merge approval is enabled and blocking findings remain open.
     OpenBlockingFindings,
+    /// Contested-merge approval is enabled and a final reviewer vote rejects.
     FinalReject,
+    /// An existing owner decision must be honored even if controls change.
     ExistingDecision,
+    /// Merge repair requires a fresh owner decision, even on the same head.
     AfterRepair,
 }
 
@@ -665,10 +670,26 @@ pub fn approval_reasons(state: &RunState) -> Vec<ApprovalReason> {
     reasons
 }
 
+/// Bound free-form approval evidence by characters, including an explicit
+/// ellipsis when abbreviated. Keep UTF-8 text intact in questions and panels.
+fn approval_excerpt(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_owned()
+    } else {
+        let mut excerpt: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+        excerpt.push('…');
+        excerpt
+    }
+}
+
 /// Persisted verbatim in the question and panel at creation. Deputies and
 /// resumed questions use that snapshot, never reconstruct past policy from
 /// today's settings. Fixer claims and successful gates are not resolutions.
 fn approval_evidence(state: &RunState) -> String {
+    const SHOWN: usize = 8;
+    const TITLE_CHARS: usize = 100;
+    const REASON_CHARS: usize = 300;
+    let reason = |text: &str| approval_excerpt(text, REASON_CHARS);
     let ja = words(&state.config.graph.language).html_lang == "ja";
     let mut s = if ja {
         "承認が必要な理由:\n"
@@ -740,11 +761,11 @@ fn approval_evidence(state: &RunState) -> String {
                     s,
                     "  {}: {}",
                     if ja { "理由" } else { "reason" },
-                    if rv.reason.trim().is_empty() {
+                    reason(if rv.reason.trim().is_empty() {
                         if ja { "記録なし" } else { "not recorded" }
                     } else {
                         &rv.reason
-                    }
+                    })
                 );
             } else {
                 let _ = writeln!(
@@ -755,11 +776,11 @@ fn approval_evidence(state: &RunState) -> String {
                     } else {
                         "initial vote retained; reason"
                     },
-                    if r.summary.trim().is_empty() {
+                    reason(if r.summary.trim().is_empty() {
                         if ja { "記録なし" } else { "not recorded" }
                     } else {
                         &r.summary
-                    }
+                    })
                 );
                 if let Some(rv) = rv {
                     let _ = writeln!(
@@ -770,19 +791,20 @@ fn approval_evidence(state: &RunState) -> String {
                         } else {
                             "no reconsideration vote"
                         },
-                        rv.failed.as_deref().unwrap_or(if ja {
+                        reason(rv.failed.as_deref().unwrap_or(if ja {
                             "理由の記録なし"
                         } else {
                             "reason not recorded"
-                        })
+                        }))
                     );
                 }
             }
             if let Some(failed) = &r.failed {
                 let _ = writeln!(
                     s,
-                    "  {}: {failed}",
-                    if ja { "回答なし" } else { "no answer" }
+                    "  {}: {}",
+                    if ja { "回答なし" } else { "no answer" },
+                    reason(failed)
                 );
             }
         }
@@ -794,7 +816,8 @@ fn approval_evidence(state: &RunState) -> String {
         });
     }
     s.push_str(if ja { "\n内部レビュー指摘（最終ラウンド）: 採用申告や gate 成功だけでは個別指摘の解決確認にはなりません。\n" } else { "\nInternal review findings (last round): adoption claims or a passing gate alone do not confirm individual resolution.\n" });
-    for f in state.last_round_findings() {
+    let findings = state.last_round_findings();
+    for f in findings.iter().take(SHOWN) {
         let _ = writeln!(
             s,
             "[{}] {} {}:{}: {}\n{}",
@@ -802,8 +825,8 @@ fn approval_evidence(state: &RunState) -> String {
             f.severity,
             f.file.as_deref().unwrap_or("?"),
             f.line.map(|l| l.to_string()).unwrap_or_else(|| "?".into()),
-            f.title,
-            f.detail
+            approval_excerpt(&f.title, TITLE_CHARS),
+            reason(&f.detail)
         );
         let mut evidence = false;
         for fix in state.reviews.iter().filter_map(|r| r.fix.as_ref()).chain(
@@ -823,7 +846,7 @@ fn approval_evidence(state: &RunState) -> String {
                         "claimed addressed (resolution unconfirmed)"
                     },
                     fix.agent,
-                    fix.notes
+                    reason(&fix.notes)
                 );
             }
             for rejection in fix.rejected.iter().filter(|r| r.id == f.id) {
@@ -832,7 +855,7 @@ fn approval_evidence(state: &RunState) -> String {
                     s,
                     "  {}: {}",
                     if ja { "不採用理由" } else { "declined" },
-                    rejection.why
+                    reason(&rejection.why)
                 );
             }
         }
@@ -844,7 +867,19 @@ fn approval_evidence(state: &RunState) -> String {
             });
         }
     }
-    if state.last_round_findings().is_empty() {
+    if findings.len() > SHOWN {
+        let more = findings.len() - SHOWN;
+        let _ = writeln!(
+            s,
+            "{}",
+            if ja {
+                format!("ほか {more} 件の内部指摘を省略（実行記録を参照）")
+            } else {
+                format!("{more} more internal findings omitted (see run records)")
+            }
+        );
+    }
+    if findings.is_empty() {
         s.push_str(if ja {
             "最終ラウンドに指摘の記録なし\n"
         } else {
@@ -6951,6 +6986,97 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert!(!forge.calls().contains(&"merge"));
         assert_eq!(state.land_approval.as_ref().unwrap().question, id);
         assert_eq!(ask::Questions::open().get(&id).unwrap().detail, q.detail);
+    }
+
+    #[tokio::test]
+    async fn approval_evidence_bounds_findings_and_unicode_reasons_in_question_and_panel() {
+        let mut state = repair_state(false, true);
+        state.config.graph.land_approval = false;
+        let long_reason = format!("{}REASON_TAIL", "拒否🦀".repeat(200));
+        let long_detail = format!("{}DETAIL_TAIL", "詳細🦀".repeat(200));
+        let long_title = format!("{}TITLE_TAIL", "題🦀".repeat(100));
+        state.reviews[0].reviews[0].summary = long_reason.clone();
+        for i in 1..=10 {
+            let mut finding = contested().findings.remove(0);
+            finding.id = format!("R1-1-{i}");
+            finding.severity = crate::verdict::Severity::Minor;
+            finding.title = long_title.clone();
+            finding.detail = long_detail.clone();
+            state.reviews[0].reviews[0].findings.push(finding);
+        }
+        state.reviews[0].fix = Some(crate::run::FixRecord {
+            agent: "fixer".into(),
+            addressed: vec!["R1-1-1".into()],
+            rejected: vec![crate::verdict::Rejection {
+                id: "R1-1-2".into(),
+                why: long_reason.clone(),
+            }],
+            notes: long_detail.clone(),
+            committed: false,
+            failed: None,
+            duration_ms: 0,
+            continuation: None,
+        });
+        assert_eq!(approval_reasons(&state), [ApprovalReason::FinalReject]);
+        let excerpt = approval_excerpt(&long_reason, 300);
+        assert_eq!(excerpt.chars().count(), 300);
+        assert!(excerpt.ends_with('…'));
+        let boundary = "拒".repeat(300);
+        assert_eq!(approval_excerpt(&boundary, 300), boundary);
+        for language in ["en", "ja"] {
+            state.config.graph.language = language.into();
+            for reconsidered in [false, true] {
+                state.reviews[0].reconsideration.clear();
+                if reconsidered {
+                    state.reviews[0].reviews[0].vote = Some(crate::verdict::ReviewVote::Approve);
+                    state.reviews[0]
+                        .reconsideration
+                        .push(crate::run::ReviewRevoteRecord {
+                            reviewer: 1,
+                            agent: "alpha".into(),
+                            vote: Some(crate::verdict::ReviewVote::Reject),
+                            reason: long_reason.clone(),
+                            failed: None,
+                        });
+                }
+                let evidence = approval_evidence(&state);
+                assert!(evidence.contains("#1 (alpha): reject"));
+                assert!(evidence.contains(&excerpt));
+                assert!(evidence.contains("[R1-1-8] minor"));
+                assert!(!evidence.contains("[R1-1-9]"));
+                assert!(!evidence.contains("[R1-1-10]"));
+                for tail in ["REASON_TAIL", "DETAIL_TAIL", "TITLE_TAIL"] {
+                    assert!(!evidence.contains(tail));
+                }
+                assert!(evidence.contains(if language == "ja" {
+                    "ほか 2 件の内部指摘を省略"
+                } else {
+                    "2 more internal findings omitted"
+                }));
+                assert!(evidence.contains(if language == "ja" {
+                    "採用申告（解決未確認）"
+                } else {
+                    "claimed addressed (resolution unconfirmed)"
+                }));
+                assert!(evidence.contains(if language == "ja" {
+                    "不採用理由"
+                } else {
+                    "declined"
+                }));
+                let html = approval_panel(&state, &green_pr(), "", "", &[], "subject");
+                assert!(html.contains(&esc(&evidence)));
+                assert_eq!(
+                    approval_gate(&mut state, &green_pr(), "subject", None, "abc")
+                        .await
+                        .unwrap(),
+                    ApprovalGate::Pending
+                );
+                let id = &state.land_approval.take().unwrap().question;
+                let q = ask::Questions::open().get(id).unwrap();
+                assert!(q.detail.starts_with(&evidence));
+            }
+            state.reviews[0].reviews[0].vote = Some(crate::verdict::ReviewVote::Reject);
+        }
     }
 
     #[test]
