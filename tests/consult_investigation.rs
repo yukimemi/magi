@@ -68,7 +68,13 @@ case "$(cat "$MAGI_PROMPT_FILE")" in
   *)
     case "$(cat "$MODE")" in
       investigate|nested|investigation-failed|investigation-timeout) printf '%s\n' "$REQUEST_EVENT";;
-      spawn-failed) rm "$0"; printf '%s\n' "$REQUEST_EVENT";;
+      spawn-failed)
+        # Keep this PATH entry executable so resolution cannot reach a host CLI.
+        # Replace the inode so the current shell can finish reading its script.
+        rm "$0"
+        printf '#!%s/missing-interpreter\n' "$TRACE" > "$0"
+        chmod +x "$0"
+        printf '%s\n' "$REQUEST_EVENT";;
       closed) cp "$CLOSED_RECORD" "$TALK_RECORD"; printf '%s\n' "$REQUEST_EVENT";;
       failed) printf '%s\n' "$REQUEST_EVENT"; exit 1;;
       malformed) printf '%s\n' "$MALFORMED_EVENT";;
@@ -492,6 +498,15 @@ async fn standalone_investigation_request_outside_consultation_is_not_executed_o
 common::e2e! {
 async fn investigation_spawn_failure_is_failed_instead_of_pending() {
     let mut f = Fixture::new().await;
+    // A later executable on PATH must never be launched when the fixture fails.
+    // Put a harmless sentinel ahead of inherited host executables.
+    let fallback = f._tmp.path().join("fallback");
+    std::fs::create_dir(&fallback).unwrap();
+    let fallback_cli = fallback.join("codex");
+    std::fs::write(&fallback_cli, "#!/bin/sh\n: > \"$TRACE/unexpected-fallback\"\nexit 99\n").unwrap();
+    std::fs::set_permissions(&fallback_cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cli_path = format!("{}:{}:{}", f._tmp.path().display(), fallback.display(), f.cfg.agents[0].env["PATH"]);
+    f.cfg.agents[0].env.insert("PATH".into(), cli_path);
     std::fs::write(&f.mode, "spawn-failed").unwrap();
     f.delivery().await;
     assert_eq!(f.talk.investigation_state, Some(talk::InvestigationState::Failed));
@@ -499,6 +514,8 @@ async fn investigation_spawn_failure_is_failed_instead_of_pending() {
     assert_eq!(talk::sender(notice, None), talk::Sender::Magi);
     assert!(notice.messages[0].display.as_ref().unwrap().facts.contains("失敗"));
     assert!(!f.trace.join("1.prompt").exists());
+    assert!(!f.trace.join("unexpected-fallback").exists());
+    assert!(f._tmp.path().join("codex").is_file());
 }
 }
 
