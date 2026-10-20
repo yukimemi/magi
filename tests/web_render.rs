@@ -1858,6 +1858,17 @@ async fn settings_gear_is_reachable_on_a_phone_and_never_doubles_the_rail_link()
         )
         .await
         .expect("client ready");
+    // Glow assertions require motion regardless of the runner's OS settings.
+    // The real press below separately exercises reduced motion, then restores
+    // the OS preference after both modes have been checked.
+    browser
+        .call(
+            Some(&page.session),
+            "Emulation.setEmulatedMedia",
+            serde_json::json!({"features": [{"name": "prefers-reduced-motion", "value": "no-preference"}]}),
+        )
+        .await
+        .expect("enable motion for glow assertions");
     let feedback = browser.eval(&page, r##"(() => {
       const fails = [];
       const host = document.createElement('div');
