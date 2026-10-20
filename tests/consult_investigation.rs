@@ -71,6 +71,7 @@ case "$(cat "$MAGI_PROMPT_FILE")" in
       spawn-failed) rm "$0"; printf '%s\n' "$REQUEST_EVENT";;
       closed) cp "$CLOSED_RECORD" "$TALK_RECORD"; printf '%s\n' "$REQUEST_EVENT";;
       failed) printf '%s\n' "$REQUEST_EVENT"; exit 1;;
+      malformed) printf '%s\n' "$MALFORMED_EVENT";;
       quoted) printf '%s\n' "$QUOTED_EVENT";;
       *) printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Control reply."}}';;
     esac;;
@@ -182,6 +183,13 @@ esac
         cfg.agents[0].env.insert(
             "QUOTED_EVENT".into(),
             event(format!("```json\n{request}\n```")),
+        );
+        cfg.agents[0].env.insert(
+            "MALFORMED_EVENT".into(),
+            event(format!(
+                "{{\"extra\":true,\"investigate_question\":\"{}\"",
+                question.id
+            )),
         );
         Self {
             _tmp: tmp,
@@ -441,6 +449,7 @@ async fn invalid_nested_and_failed_investigations_are_magi_not_persona_replies()
     f.delivery().await;
     for (mode, expected) in [
         ("quoted", talk::InvestigationState::InvalidControl),
+        ("malformed", talk::InvestigationState::InvalidControl),
         ("nested", talk::InvestigationState::InvalidControl),
         ("investigation-failed", talk::InvestigationState::Failed),
         ("investigation-timeout", talk::InvestigationState::TimedOut),

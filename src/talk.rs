@@ -2455,16 +2455,39 @@ fn investigation_response(text: &str) -> InvestigationResponse {
             }
             InvestigationResponse::Invalid
         }
-        Err(_)
-            if candidate
-                .trim_start_matches('{')
-                .trim_start()
-                .starts_with("\"investigate_question\"") =>
-        {
-            InvestigationResponse::Invalid
-        }
+        Err(_) if has_investigation_key(candidate) => InvestigationResponse::Invalid,
         _ => InvestigationResponse::Prose,
     }
+}
+
+/// Inspect top-level keys as they arrive, before requiring the value or closing
+/// delimiter. Nested examples and strings containing the protocol are data.
+fn has_investigation_key(text: &str) -> bool {
+    struct Keys<'a>(&'a mut bool);
+    impl<'de> serde::de::Visitor<'de> for Keys<'_> {
+        type Value = ();
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an investigation control object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "investigate_question" {
+                    *self.0 = true;
+                    break;
+                }
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+    let mut found = false;
+    let mut parser = serde_json::Deserializer::from_str(text);
+    // Parsing can fail after the reserved key was seen. That failure must not
+    // turn the incomplete control object back into a persona response.
+    let _ = serde::Deserializer::deserialize_map(&mut parser, Keys(&mut found));
+    found
 }
 
 fn legacy_investigation_state(body: &str) -> Option<InvestigationState> {
@@ -3826,6 +3849,11 @@ mod tests {
             r#"{"investigate_question":false}"#.into(),
             r#"{"investigate_question":"q","extra":true}"#.into(),
             r#"{"investigate_question":"q""#.into(),
+            r#"{"extra":true,"investigate_question":"q""#.into(),
+            r#"{"extra":[{"nested":true}],"investigate_question":"q""#.into(),
+            r#"{"extra":true,"investigate_question":"#.into(),
+            r#"{"extra":true,"investigate_questio\u006e":"q""#.into(),
+            "```json\n{\"extra\":true,\"investigate_question\":\"q\"\n```".into(),
         ] {
             assert_eq!(
                 investigation_response(&text),
@@ -3837,6 +3865,9 @@ mod tests {
             format!("The protocol uses {request}."),
             format!("Example:\n```json\n{request}\n```"),
             r#"{"example":{"investigate_question":"q"}}"#.into(),
+            r#"{"example":{"investigate_question":"q"}"#.into(),
+            r#"{"example":"investigate_question","extra":true"#.into(),
+            r#"{"example":"\"investigate_question\":\"q\"""#.into(),
         ] {
             assert_eq!(investigation_response(&text), InvestigationResponse::Prose);
         }
@@ -3850,6 +3881,7 @@ mod tests {
             r#"{"investigate_question":"old"}"#,
             "```json\n{\"investigate_question\":\"old\"}\n```",
             "Investigation pending for question old: arbitrary internal exception",
+            r#"{"extra":true,"investigate_question":"old""#,
         ] {
             let mut old = ctx_talk("a", vec![reply(body, None)]);
             old.turns[0].sender = Some(Sender::Persona);
