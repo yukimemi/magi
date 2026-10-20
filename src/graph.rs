@@ -178,11 +178,12 @@ enum AgentOutcome {
     Dropped(AgentOutput),
     /// Any other failure: a timeout, a bad exit code, an empty reply.
     Failed(String),
-    /// The agent was never spawned: a shared resource it needs (the build
-    /// cache's lease) stayed busy past `[graph] timeout_resource_wait`, or the
-    /// wait was abandoned because the run is parking. Not a failure of the
-    /// agent: it must not advance a fallback chain, enter seat history, cost
-    /// quota or spend an attempt. [`RunState::resource_block`] says why.
+    /// A resource prevented admission or interrupted execution. Not an agent
+    /// failure: never advance a fallback chain or spend an attempt on it.
+    /// Post-spawn interruptions carry a typed error into wave, which records
+    /// implementation preservation before returning this outcome. This outcome
+    /// alone is not proof that no source changes were made.
+    /// [`RunState::resource_block`] says why.
     ResourceBlocked(String),
 }
 
@@ -1268,7 +1269,22 @@ impl Runner {
 
     /// Validate ownership and persist the driver claim in one critical section.
     fn claim_driver(&mut self) -> Result<DriverExecution<'_>> {
-        let owner = crate::pr_head::owner_lock(&crate::run::home(), &self.state.id)?;
+        let owner = match crate::pr_head::owner_lock(&crate::run::home(), &self.state.id) {
+            Ok(owner) => owner,
+            Err(error) => {
+                let detail = format!("worktree maintenance or ownership update: {error:#}");
+                // Admission did not own run.json: retain this resource outcome
+                // in memory for queue settlement without overwriting a concurrent
+                // retirement or publication transaction.
+                self.state.resource_block = Some(crate::run::ResourceBlock {
+                    node: "start".into(),
+                    kind: "worktree maintenance".into(),
+                    detail: detail.clone(),
+                    at: Timestamp::now(),
+                });
+                return Err(crate::repo_lock::ResourceBlocked(detail).into());
+            }
+        };
         let disk = RunState::load(&self.state.id)?;
         crate::pr_head::ensure_owner(&disk)?;
         if disk.liveness(false) == crate::run::Liveness::Live {
@@ -1367,6 +1383,7 @@ impl Runner {
             && self.state.status == RunStatus::Blocked
             && self.state.tally.is_none()
             && self.state.candidate_preservation.is_empty()
+            && self.state.interrupted_implementations.is_empty()
         {
             bail!(
                 "selected implementation is held; explicitly release the owning task to retry it"
@@ -1788,6 +1805,20 @@ impl Runner {
         {
             let branch = self.state.branch_for(label);
             let worktree = root.join(format!("cand-{label}"));
+            // Persist intent before Git can leave a partially created tree.
+            // Candidate registration follows setup, so it cannot inventory
+            // crashes or refusals during creation itself.
+            self.state.event(
+                "prep-intent",
+                serde_json::json!({
+                    "branch": branch,
+                    "worktree": worktree,
+                    "start": start,
+                    "picks": plan.picks,
+                })
+                .to_string(),
+            );
+            self.state.save()?;
             git::worktree_add_branch(&repo, &worktree, &branch, &start).await?;
             if self.state.config.blind.commit_msg_hook {
                 git::set_worktree_hooks_path(&worktree, &hooks_dir).await?;
@@ -2259,7 +2290,11 @@ impl Runner {
             .candidates
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.commits == 0 && c.failed.is_none() && !c.empty)
+            .filter(|(_, c)| {
+                (c.commits == 0 || self.state.interrupted_implementations.contains(&c.label))
+                    && c.failed.is_none()
+                    && !c.empty
+            })
             .map(|(i, _)| i)
             .collect();
         if todo.is_empty() {
@@ -2351,6 +2386,16 @@ impl Runner {
                 .any(|(_, _, out)| FailClass::of(out).is_some());
         for (&i, (_wi, seat, out)) in todo.iter().zip(results) {
             if matches!(out, AgentOutcome::ResourceBlocked(_)) {
+                // Executed turns interrupted by disk pressure already carry
+                // a preservation barrier from wave. Admission-only waits do
+                // not. Keep the interrupted seat's session for recovery too.
+                if self
+                    .state
+                    .candidate_preservation
+                    .contains_key(&self.state.candidates[i].label)
+                {
+                    self.state.seats.insert(seat.key.clone(), seat);
+                }
                 continue;
             }
             let seat_key = seat.key.clone();
@@ -2366,6 +2411,7 @@ impl Runner {
             let exhausted_the_fallback_chain = FailClass::of(&out).is_some();
             self.state.seats.insert(seat.key.clone(), seat);
             let label = self.state.candidates[i].label;
+            self.state.interrupted_implementations.remove(&label);
 
             let (summary, duration, failed, verified_claim) = match out {
                 AgentOutcome::Ok(o) => {
@@ -2462,6 +2508,7 @@ impl Runner {
                 .position(|c| c.label == label)
                 .context("pending candidate is missing")?;
             let c = self.state.candidates[i].clone();
+            let interrupted = self.state.interrupted_implementations.contains(&label);
             let result = async {
                 let wait = crate::repo_lock::WaitPolicy::new(
                     Duration::from_secs(self.state.config.graph.timeout_resource_wait),
@@ -2512,7 +2559,12 @@ impl Runner {
                 c.commits = commits;
                 c.stat = stat;
                 c.files = files;
-                c.empty = commits == 0 || patch.trim().is_empty();
+                let no_changes = commits == 0 || patch.trim().is_empty();
+                c.empty = no_changes && !interrupted;
+                if interrupted && no_changes {
+                    c.failed = None;
+                    c.verified_noop = None;
+                }
                 if !c.empty {
                     c.failed = None;
                     c.verified_noop = None;
@@ -2527,6 +2579,9 @@ impl Runner {
             match result {
                 Ok(()) => {
                     self.state.candidate_preservation.remove(&label);
+                    if !interrupted || self.state.candidates[i].files > 0 {
+                        self.state.interrupted_implementations.remove(&label);
+                    }
                 }
                 Err(e) => {
                     let reason = format!("candidate {label} preservation failed: {e:#}");
@@ -9165,7 +9220,12 @@ fn record_repository_block(state: &mut RunState, error: &anyhow::Error) {
     if error.is::<crate::repo_lock::ResourceBlocked>() {
         state.resource_block = Some(crate::run::ResourceBlock {
             node: "repository".into(),
-            kind: "repository coordination".into(),
+            kind: if error.to_string().contains("disk pressure") {
+                "disk pressure"
+            } else {
+                "repository coordination"
+            }
+            .into(),
             detail: error.to_string(),
             at: Timestamp::now(),
         });
@@ -9374,6 +9434,7 @@ async fn wave(
                             "no parallel slot became free within {}s",
                             slot_limit.as_secs()
                         )),
+                        false,
                     );
                 }
             };
@@ -9403,6 +9464,10 @@ async fn wave(
                     },
                 ))
                 .await;
+            let interrupted = out
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.is::<agent::ExecutionInterrupted>());
             let out = match out {
                 Ok(o) if o.usable() => AgentOutcome::Ok(o),
                 Ok(o) if o.quota_exhausted() => AgentOutcome::Quota(o),
@@ -9424,7 +9489,7 @@ async fn wave(
                 }
                 Err(e) => AgentOutcome::Failed(e.to_string()),
             };
-            (i, seat, out)
+            (i, seat, out, interrupted)
         });
     }
     drop(spawned_tx);
@@ -9444,7 +9509,7 @@ async fn wave(
         let Some(joined) = joined else {
             break;
         };
-        let (i, seat, out) = match joined {
+        let (i, seat, out, interrupted) = match joined {
             Ok(v) => v,
             // No seat to clear: a panicked task never reported which one it
             // was. The defensive sweep below this loop is what stops that
@@ -9455,12 +9520,28 @@ async fn wave(
             }
         };
         state.seat_finished(&seat.key);
+        if interrupted
+            && node == "implement"
+            && let Some(label) = state
+                .candidates
+                .iter()
+                .find(|candidate| seat.key == format!("impl-{}", candidate.label))
+                .map(|candidate| candidate.label)
+        {
+            state.candidate_preservation.insert(
+                label,
+                "interrupted implementation awaiting persistence".into(),
+            );
+            state.interrupted_implementations.insert(label);
+        }
         if let AgentOutcome::ResourceBlocked(why) = &out
             && state.resource_block.is_none()
         {
             state.resource_block = Some(crate::run::ResourceBlock {
                 node: node.to_owned(),
-                kind: if why.contains("repository coordination") {
+                kind: if why.contains("disk pressure") {
+                    "disk pressure"
+                } else if why.contains("repository coordination") {
                     "repository coordination"
                 } else {
                     "parallel slot"
@@ -9469,7 +9550,12 @@ async fn wave(
                 detail: why.clone(),
                 at: Timestamp::now(),
             });
-            state.event("resource", format!("{node}: no agent was started - {why}"));
+            let activity = if interrupted {
+                "agent execution interrupted"
+            } else {
+                "no agent was started"
+            };
+            state.event("resource", format!("{node}: {activity} - {why}"));
         }
         record_jobs(state, node, round, &seat.key, &out);
         if let Err(e) = state.save() {
@@ -10476,28 +10562,98 @@ async fn run_commands(
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        let spawned = cmd.spawn();
+        let mut outputs = Vec::new();
+        let protected = (|| -> Result<()> {
+            if let Some(guard) = crate::retention::OutputLease::borrow(cwd)? {
+                outputs.push(guard);
+            }
+            if let Some(cache) = state.config.cache_dir() {
+                outputs.push(crate::retention::OutputLease::cache(
+                    &crate::run::home(),
+                    &cache,
+                    false,
+                )?);
+            }
+            Ok(())
+        })();
+        if let Err(e) = protected {
+            out.push(CommandOutcome {
+                command: command.clone(),
+                code: None,
+                output_tail: format!("output ownership unavailable: {e:#}"),
+                duration_ms: 0,
+                resource_blocked: true,
+            });
+            continue;
+        }
+        let spawned = crate::seat_process::Running::spawn(cmd, None, outputs);
         let (code, body) = match spawned {
-            Ok(child) => {
-                // Captured before the child is consumed below: `kill_on_drop`
-                // only *asks* the process to die when the timeout branch
-                // drops it, and the pid is the only way anyone downstream can
-                // later check whether that request actually took.
-                let pid = child.id();
-                match tokio::time::timeout(timeout, child.wait_with_output()).await {
-                    Ok(Ok(o)) => {
-                        let mut body = String::from_utf8_lossy(&o.stdout).into_owned();
-                        body.push_str(&String::from_utf8_lossy(&o.stderr));
-                        (o.status.code(), body)
+            Ok(mut running) => {
+                let pid = running.child().id();
+                let (stdout, out_reader) = agent::drain(running.child().stdout.take());
+                let (stderr, err_reader) = agent::drain(running.child().stderr.take());
+                let mut paths = vec![cwd.to_owned()];
+                if let Some(cache) = state.config.cache_dir() {
+                    paths.push(cache);
+                }
+                let mut pressure = None;
+                let status = tokio::select! {
+                    status = tokio::time::timeout(timeout, running.child().wait()) => Some(status),
+                    reason = crate::retention::emergency(paths, state.config.disk.min_free_bytes) => {
+                        pressure = Some(reason); None
                     }
-                    Ok(Err(e)) => (None, format!("failed to run: {e}")),
-                    Err(_) => {
-                        if let Some(pid) = pid {
+                };
+                let (code, failure) = match status {
+                    Some(Ok(Ok(status))) => (
+                        status.code(),
+                        status
+                            .code()
+                            .is_none()
+                            .then(|| format!("command terminated: {status}")),
+                    ),
+                    Some(Ok(Err(error))) => {
+                        (None, Some(format!("failed waiting for command: {error}")))
+                    }
+                    Some(Err(_)) => {
+                        // Leased cleanup confirms process-tree death itself.
+                        // Unleased commands still need the caller's PID check
+                        // after kill-on-drop, before releasing cache ownership.
+                        if !running.coordinated()
+                            && let Some(pid) = pid
+                        {
                             timed_out_pids.push(pid);
                         }
-                        (None, format!("timed out after {}s", timeout.as_secs()))
+                        (
+                            None,
+                            Some(format!("timed out after {}s", timeout.as_secs())),
+                        )
                     }
+                    None => (None, None),
+                };
+                running.finish().await;
+                if let Some(reason) = pressure {
+                    state.resource_block = Some(crate::run::ResourceBlock {
+                        node: node.to_owned(),
+                        kind: "disk pressure".to_owned(),
+                        detail: reason.clone(),
+                        at: Timestamp::now(),
+                    });
+                    out.push(CommandOutcome {
+                        command: command.clone(),
+                        code: None,
+                        output_tail: reason,
+                        duration_ms: started.elapsed().as_millis() as u64,
+                        resource_blocked: true,
+                    });
+                    break;
                 }
+                let mut body = agent::collect(&stdout, out_reader, Duration::from_secs(2)).await;
+                body.push_str(&agent::collect(&stderr, err_reader, Duration::from_secs(2)).await);
+                if let Some(failure) = failure {
+                    body.push('\n');
+                    body.push_str(&failure);
+                }
+                (code, body)
             }
             Err(e) => (None, format!("failed to spawn `{}`: {e}", shell[0])),
         };
@@ -11213,11 +11369,27 @@ async fn remove_preserved_worktree(repo: &Path, path: &Path) -> Result<()> {
 /// directory some other process or test pinned into that `OnceLock` first,
 /// not the one the caller actually resolved its `runs` and `state` from.
 pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> Result<Vec<String>> {
-    if crate::pr_recovery::sources_retained(home, &state.id) {
-        return Ok(Vec::new());
+    if let Some(reason) = crate::pr_recovery::source_retention_reason(home, state) {
+        bail!("refusing fold: {reason}");
     }
-    if !state.candidate_preservation.is_empty() {
+    if !state.candidate_preservation.is_empty() || !state.interrupted_implementations.is_empty() {
         bail!("candidate preservation incomplete; refusing cleanup");
+    }
+    // Serialize ordinary folding with the same starts/resumes as target-only
+    // eviction. Otherwise a second janitor could remove the whole worktree
+    // around a live output borrower even though target eviction was fenced.
+    std::fs::create_dir_all(home.join("runs").join(&state.id))?;
+    let _owner = crate::pr_head::owner_lock(home, &state.id)?;
+    let _driver = crate::driver::maintenance(home, &state.id)?;
+    let mut output_guards = Vec::new();
+    for entry in std::fs::read_dir(state.worktree_root())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if entry.path().join(".git").is_file() {
+            output_guards.push(crate::retention::OutputLease::take(&entry.path(), true)?);
+        }
     }
     let repo = state.repo.clone();
     // CLI, Web and automatic cleanup all enter here, independently of
@@ -11229,6 +11401,16 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> R
             state.save_under(home)?;
             return Err(e);
         }
+    };
+    // A merged PR proves only its published change. Preflight every source
+    // before removing anything; a losing candidate or detached reviewer can
+    // still retain independent commits or Git recovery checkpoints.
+    let _source_outputs = if state.status == RunStatus::Merged
+        && state.merge.as_ref().is_some_and(|merge| merge.ok)
+    {
+        verify_merged_fold_sources(state, drop_winner, home).await?
+    } else {
+        Vec::new()
     };
     let root = state.worktree_root();
     let winner = state.tally.as_ref().map(|t| t.winner);
@@ -11292,6 +11474,232 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> R
     }
     state.save_under(home)?;
     Ok(removed)
+}
+
+async fn verify_merged_fold_sources(
+    state: &RunState,
+    drop_winner: bool,
+    home: &Path,
+) -> Result<Vec<std::fs::File>> {
+    let winner = state.tally.as_ref().map(|t| t.winner);
+    let mut heads = BTreeSet::new();
+    for candidate in &state.candidates {
+        if Some(candidate.label) == winner && !drop_winner {
+            continue;
+        }
+        match std::fs::symlink_metadata(&candidate.worktree) {
+            Ok(_) => anyhow::ensure!(
+                candidate.worktree.parent() == Some(state.worktree_root().as_path()),
+                "candidate recovery source is outside the inventoried run root: {}",
+                candidate.worktree.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && candidate.folded => {}
+            Err(error) => {
+                return Err(error).context(format!(
+                    "cannot inspect candidate recovery source: {}",
+                    candidate.worktree.display()
+                ));
+            }
+        }
+        if git::branch_exists(&state.repo, &candidate.branch).await? {
+            heads.insert(git::rev_parse(&state.repo, &candidate.branch).await?);
+            heads.extend(
+                git::git(
+                    &state.repo,
+                    &["reflog", "show", "--format=%H", &candidate.branch],
+                )
+                .await?
+                .lines()
+                .map(str::to_owned),
+            );
+        }
+    }
+    let mut cargo_guards = Vec::new();
+    let entries = match std::fs::read_dir(state.worktree_root()) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries.into_iter().flatten() {
+        let path = entry?.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "non-directory or symlink recovery source retained: {}",
+            path.display()
+        );
+        if !drop_winner
+            && winner.is_some_and(|w| {
+                path.file_name()
+                    .is_some_and(|name| name == format!("cand-{w}").as_str())
+            })
+        {
+            continue;
+        }
+        anyhow::ensure!(
+            path.join(".git").is_file(),
+            "unregistered recovery source retained: {}",
+            path.display()
+        );
+        anyhow::ensure!(
+            git::git(
+                &path,
+                &[
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                    "--ignored",
+                    "--",
+                    ".",
+                    ":(exclude)target"
+                ]
+            )
+            .await?
+            .is_empty(),
+            "source changes or ignored recovery files retained: {}",
+            path.display()
+        );
+        match std::fs::symlink_metadata(path.join("target")) {
+            Ok(_) => {
+                cargo_guards.extend(crate::retention::verify_residue(home, &state.id, &path).await?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        for checkpoint in [
+            "rebase-merge",
+            "rebase-apply",
+            "sequencer",
+            "CHERRY_PICK_HEAD",
+            "MERGE_HEAD",
+            "REBASE_HEAD",
+            "REVERT_HEAD",
+            "BISECT_LOG",
+            "AUTO_MERGE",
+            "MERGE_MSG",
+        ] {
+            let location = git::git(
+                &path,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    checkpoint,
+                ],
+            )
+            .await?;
+            anyhow::ensure!(
+                matches!(std::fs::symlink_metadata(location.trim()), Err(ref e)
+                if e.kind() == std::io::ErrorKind::NotFound),
+                "Git recovery checkpoint retained: {checkpoint}"
+            );
+        }
+        heads.insert(git::rev_parse(&path, "HEAD").await?);
+        heads.extend(
+            git::git(&path, &["reflog", "show", "--format=%H", "HEAD"])
+                .await?
+                .lines()
+                .map(str::to_owned),
+        );
+        if let Ok(original) = git::rev_parse(&path, "ORIG_HEAD").await {
+            heads.insert(original);
+        }
+    }
+    if !heads.is_empty() {
+        // Never trust a run-wide merge label or the local checkout's branch.
+        // Pin the fetched base once. A squash does not preserve commit IDs:
+        // prove the winner's cumulative patch before accepting its ancestors.
+        let reference = format!(
+            "refs/remotes/{}/{}",
+            state.config.merge.remote, state.base_branch
+        );
+        let base = git::rev_parse(&state.repo, &reference)
+            .await
+            .context("cannot prove merged sources against the fetched base")?;
+        let mut squash_winner = None;
+        let mut checked_squash = false;
+        for head in heads {
+            if git::git_raw(&state.repo, &["merge-base", "--is-ancestor", &head, &base])
+                .await?
+                .ok()
+            {
+                continue;
+            }
+            if !checked_squash {
+                squash_winner = proven_squash_winner(state, &base).await?;
+                checked_squash = true;
+            }
+            let incorporated = if let Some(winner) = &squash_winner {
+                git::git_raw(&state.repo, &["merge-base", "--is-ancestor", &head, winner])
+                    .await?
+                    .ok()
+            } else {
+                false
+            };
+            anyhow::ensure!(
+                incorporated,
+                "recovery source {head} is not proven incorporated in {reference}; retaining the entire run"
+            );
+        }
+    }
+    Ok(cargo_guards)
+}
+
+/// Called only for a confirmed merged run. Its label admits proof, but does
+/// not prove that any particular local branch or recovery checkpoint landed.
+/// Match the complete binary patch, including modes and blob IDs, against a
+/// single-parent commit in the pinned fetched history. This works after later
+/// base commits too, without trusting the current base tree to still match.
+async fn proven_squash_winner(state: &RunState, base: &str) -> Result<Option<String>> {
+    let Some(winner) = state.winner() else {
+        return Ok(None);
+    };
+    let head = git::rev_parse(&state.repo, &winner.branch).await?;
+    if !git::git_raw(
+        &state.repo,
+        &["merge-base", "--is-ancestor", &state.base_commit, &head],
+    )
+    .await?
+    .ok()
+    {
+        return Ok(None);
+    }
+    let patch = fold_source_patch(&state.repo, &state.base_commit, &head).await?;
+    if patch.is_empty() {
+        return Ok(None);
+    }
+    let range = format!("{}..{base}", state.base_commit);
+    let commits = git::git(&state.repo, &["log", "--no-merges", "--format=%H", &range]).await?;
+    for commit in commits.lines() {
+        let parent = format!("{commit}^");
+        if fold_source_patch(&state.repo, &parent, commit).await? == patch {
+            return Ok(Some(head));
+        }
+    }
+    Ok(None)
+}
+
+async fn fold_source_patch(repo: &Path, from: &str, to: &str) -> Result<String> {
+    git::git(
+        repo,
+        &[
+            "-c",
+            "core.quotePath=true",
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--ignore-submodules=none",
+            "--submodule=short",
+            from,
+            to,
+            "--",
+        ],
+    )
+    .await
 }
 
 /// Remove `dir` if it exists and has nothing in it.
@@ -13152,6 +13560,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preparation_records_creation_intent_before_git_can_fail() {
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let mut runner = runner_at(RunStatus::Prep);
+        runner.state.repo = repo.clone();
+        runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
+        runner.state.config.graph.worktree_root = Some(tmp.path().join("wt"));
+        runner.state.config.blind.commit_msg_hook = false;
+        runner.roles.implementers = vec![spec("one")];
+        let label = blind::assign_labels(1, runner.state.seed)[0];
+        let branch = runner.state.branch_for(label);
+        // A conflicting branch makes Git refuse creation before a candidate
+        // can be registered. The durable intent must still identify it.
+        git::git(&repo, &["branch", &branch]).await.unwrap();
+        assert!(runner.prep().await.is_err());
+        let saved = RunState::load(&runner.state.id).unwrap();
+        assert!(saved.candidates.is_empty());
+        let event = saved
+            .events
+            .iter()
+            .find(|e| e.node == "prep-intent")
+            .unwrap();
+        let intent: serde_json::Value = serde_json::from_str(&event.message).unwrap();
+        assert_eq!(intent["branch"], branch);
+        assert_eq!(intent["start"], runner.state.base_commit);
+        assert_eq!(
+            intent["worktree"],
+            runner
+                .state
+                .worktree_root()
+                .join(format!("cand-{label}"))
+                .to_string_lossy()
+                .as_ref()
+        );
+        assert_eq!(intent["picks"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
     async fn preparation_retries_after_explicit_release_and_rebuilds_partial_candidates() {
         ask_test_home();
         let tmp = tempfile::tempdir().unwrap();
@@ -13338,6 +13787,159 @@ mod tests {
         });
         runner.state.save().unwrap();
         (tmp, runner)
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn disk_interrupted_empty_implementation_retries_after_reload_and_failed_checkpoint() {
+        for (solo, failed_checkpoint) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let (_tmp, mut runner) = preservation_resume_fixture().await;
+            if solo {
+                runner.state.candidates.retain(|c| c.label == 'A');
+            }
+            runner.state.candidates[0].empty = false;
+            runner.state.candidates[0].summary.clear();
+            runner.state.tally = None;
+            runner.state.judge_skipped = false;
+            runner.state.status = RunStatus::Implementing;
+            runner.state.config.disk.min_free_bytes = u64::MAX;
+            let mut implementer = spec("alpha");
+            implementer.command = vec!["sh".into(), "-c".into(), "exec sleep 30".into()];
+            runner.roles.implementers = vec![implementer];
+            let patch = runner.state.dir().join("artifacts/cand-A.patch");
+            if failed_checkpoint {
+                std::fs::create_dir_all(&patch).unwrap();
+            }
+            runner.state.save().unwrap();
+            assert_eq!(runner.implement().await.is_err(), failed_checkpoint);
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            assert_eq!(runner.state.status, RunStatus::Blocked);
+            assert!(runner.state.interrupted_implementations.contains(&'A'));
+            assert_eq!(runner.state.candidates[0].commits, 0);
+            assert!(!runner.state.candidates[0].empty);
+            assert!(runner.state.candidates[0].failed.is_none());
+            if failed_checkpoint {
+                assert!(runner.state.candidate_preservation.contains_key(&'A'));
+                std::fs::remove_dir(patch).unwrap();
+            }
+            runner.state.resource_block = None;
+            runner.state.config.disk.min_free_bytes = 0;
+            runner.roles.implementers[0].command = vec![
+                "sh".into(),
+                "-c".into(),
+                "printf 'retried empty interrupted seat\\n' > retry-source; echo completed".into(),
+            ];
+            runner.implement().await.unwrap();
+            assert!(runner.state.interrupted_implementations.is_empty());
+            assert!(runner.state.candidate_preservation.is_empty());
+            assert_eq!(runner.state.candidates[0].commits, 1);
+            assert!(!runner.state.candidates[0].empty);
+            assert!(
+                std::fs::read_to_string(runner.state.candidates[0].worktree.join("retry-source"))
+                    .unwrap()
+                    .contains("retried empty interrupted seat")
+            );
+            if !solo {
+                assert_eq!(runner.state.candidates[1].commits, 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn disk_interrupted_implementation_preserves_edits_and_commits_before_resource_hold() {
+        for (committed, block_rescue) in [(false, false), (false, true), (true, false)] {
+            let (_tmp, mut runner) = preservation_resume_fixture().await;
+            runner.state.candidates.retain(|c| c.label == 'A');
+            runner.state.candidates[0].empty = false;
+            runner.state.candidates[0].summary.clear();
+            runner.state.tally = None;
+            runner.state.judge_skipped = false;
+            runner.state.status = RunStatus::Implementing;
+            // Force the real post-spawn watchdog, independently of available
+            // disk space. Dirty/committed work predates its first measurement.
+            runner.state.config.disk.min_free_bytes = u64::MAX;
+            let wt = runner.state.candidates[0].worktree.clone();
+            std::fs::write(
+                wt.join("interrupted-source"),
+                "retain implementation work\n",
+            )
+            .unwrap();
+            if committed {
+                git::rescue_commit(&wt, "implementation checkpoint")
+                    .await
+                    .unwrap();
+            }
+            let lock = git::git(
+                &wt,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "index.lock",
+                ],
+            )
+            .await
+            .unwrap();
+            if block_rescue {
+                std::fs::write(&lock, "fixture-owned lock").unwrap();
+            }
+            let mut implementer = spec("alpha");
+            implementer.command = vec!["sh".into(), "-c".into(), "exec sleep 30".into()];
+            runner.roles.implementers = vec![implementer];
+            runner.state.save().unwrap();
+            let result = runner.implement().await;
+            assert_eq!(result.is_err(), block_rescue);
+            assert_eq!(
+                runner.state.resource_block.as_ref().unwrap().kind,
+                "disk pressure"
+            );
+            assert!(
+                runner
+                    .state
+                    .events
+                    .iter()
+                    .any(|e| e.message.contains("agent execution interrupted"))
+            );
+            assert!(
+                runner
+                    .state
+                    .dir()
+                    .join("artifacts/candidate-A-recovery/staged.patch")
+                    .exists()
+            );
+            if block_rescue {
+                let saved = RunState::load(&runner.state.id).unwrap();
+                assert!(saved.candidate_preservation.contains_key(&'A'));
+                assert!(!saved.candidates[0].empty);
+                assert_eq!(
+                    std::fs::read_to_string(wt.join("interrupted-source")).unwrap(),
+                    "retain implementation work\n"
+                );
+                std::fs::remove_file(lock).unwrap();
+                runner.state = saved;
+            } else {
+                assert_eq!(runner.state.status, RunStatus::Blocked);
+                assert_eq!(runner.state.candidates[0].commits, 1);
+            }
+            // Recovery must save the candidate before deciding whether another
+            // implementation is needed. No implementer is available on retry.
+            runner.roles.implementers.clear();
+            runner.state.config.disk.min_free_bytes = 0;
+            runner.state.resource_block = None;
+            runner.implement().await.unwrap();
+            assert!(runner.state.candidate_preservation.is_empty());
+            assert_eq!(runner.state.candidates[0].commits, 1);
+            assert!(!runner.state.candidates[0].empty);
+            assert!(git::is_clean(&wt).await.unwrap());
+            assert!(
+                crate::run::read_artifact(&runner.state, "cand-A.patch")
+                    .unwrap()
+                    .contains("retain implementation work")
+            );
+        }
     }
 
     #[tokio::test]
@@ -15133,6 +15735,56 @@ mod tests {
             RunStatus::Blocked,
             "must not read as resource-blocked on a lease it never asked for"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verification_commands_distinguish_timeouts_signals_and_exit_codes() {
+        crate::run::pin_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.disk.min_free_bytes = 0;
+        let mut state = RunState::new(
+            tmp.path().to_owned(),
+            "main".into(),
+            "base".into(),
+            "verification evidence".into(),
+            config,
+        );
+        let (outcomes, pids) = run_commands(
+            &mut state,
+            "gate",
+            "gate",
+            1,
+            &["sh".into(), "-c".into()],
+            &[
+                "printf before-timeout; exec sleep 30".into(),
+                "kill -TERM $$".into(),
+                "exit 7".into(),
+                "printf success".into(),
+            ],
+            tmp.path(),
+            Duration::from_secs(1),
+        )
+        .await;
+        wait_for_timed_out_children_to_die(&pids).await;
+        assert_eq!(
+            pids.len(),
+            1,
+            "unleased timeout retains its death-check PID"
+        );
+        assert_eq!(outcomes.len(), 4);
+        assert_eq!(outcomes[0].code, None);
+        assert!(outcomes[0].output_tail.contains("before-timeout"));
+        assert!(outcomes[0].output_tail.contains("timed out after 1s"));
+        assert_eq!(outcomes[1].code, None);
+        assert!(outcomes[1].output_tail.contains("command terminated:"));
+        assert!(!outcomes[1].output_tail.contains("timed out"));
+        assert_eq!(outcomes[2].code, Some(7));
+        assert!(!outcomes[2].output_tail.contains("timed out"));
+        assert_eq!(outcomes[3].code, Some(0));
+        assert_eq!(outcomes[3].output_tail, "success");
+        assert!(outcomes.iter().all(|outcome| !outcome.resource_blocked));
     }
 
     /// The addendum's second gap: a `verify.gate` command running for real

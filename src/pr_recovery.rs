@@ -82,7 +82,37 @@ pub fn retain_sources(task: &crate::queue::Task, home: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn sources_retained(home: &Path, id: &str) -> bool {
+/// Return the retention reason rather than silently treating fold as successful.
+pub(crate) fn source_retention_reason(home: &Path, state: &crate::run::RunState) -> Option<String> {
+    if explicit_sources_retained(home, &state.id) {
+        return Some("explicitly retained recovery source".into());
+    }
+    // A confirmed merge admits fold preflight even while the queue is held.
+    // fold_run must still prove each deletion target under its ownership and
+    // output locks. Ready/Failed/Superseded and PR creation alone do not qualify.
+    if state.status == crate::run::RunStatus::Merged
+        && state.merge.as_ref().is_some_and(|merged| merged.ok)
+    {
+        return None;
+    }
+    crate::queue::Queue::at(home.join("queue"))
+        .list()
+        .iter()
+        // Queue completion does not prove that every historical candidate
+        // landed. In particular, Superseded and Failed-without-tally runs
+        // may still own independent implementations. Keep those sources
+        // until recovery transfers them or the merged-source preflight above
+        // can prove incorporation; Done is not deletion authority.
+        .find(|task| task.runs.contains(&state.id))
+        .map(|task| {
+            format!(
+                "source of task {}; inspect recovery lineage before folding",
+                task.id
+            )
+        })
+}
+
+pub(crate) fn explicit_sources_retained(home: &Path, id: &str) -> bool {
     home.join("runs")
         .join(id)
         .join(RETAIN_SOURCES)

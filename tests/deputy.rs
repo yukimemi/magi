@@ -606,12 +606,27 @@ async fn an_operator_held_task_refuses_a_verbatim_merge_settle() {
     task.runs.push(land.run.clone());
     task.hold_manual(Some("operator says wait".to_owned()));
     queue.put(&mut task).unwrap();
+    assert!(queue.get(&task.id).unwrap().operator_held());
+    // Verify that the nested CLI can read the fixture too; a mismatched
+    // binary or home must not look like a failure of the hold policy.
+    let inspect = format!("MAGI task show {} > /dev/null", task.id);
     script(&s, &[
+        &inspect,
         "MAGI ask --settle \"$qid\" --choice merge --quote 'マージしていいよ'",
     ]);
 
     turn(&mut deputies(&s, 2)).await;
 
+    let statuses = std::fs::read_to_string(s.fx.repo.join("deputy-action-status")).unwrap();
+    let output = std::fs::read_to_string(s.fx.repo.join("deputy-action-output")).unwrap();
+    let statuses: Vec<_> = statuses.lines().collect();
+    assert_eq!(statuses.len(), 2, "{output}");
+    assert_eq!(statuses[0], "0", "the CLI must read the held task: {output}");
+    assert_ne!(statuses[1], "0", "the CLI must refuse settlement: {output}");
+    assert!(output.contains("held by the operator"), "{output}");
+    let held = queue.get(&task.id).unwrap();
+    assert!(held.operator_held(), "settlement must preserve the operator hold");
+    assert_eq!(held.runs, task.runs);
     let q = s.store.get(&land.id).unwrap();
     assert_eq!(q.status, QuestionStatus::Open, "{:?}", q.thread);
     assert!(q.answer.is_none());
@@ -1025,6 +1040,8 @@ async fn maintenance_release_is_bound_to_the_hold_and_applies_once_after_settle(
     let action = ChoiceAction::ReleaseTask { task: task.id.clone(),
         held_at: task.held_at.unwrap(), reason: task.hold_reason.clone() };
     let mut q = maintenance_question(&s, action.clone());
+    assert_eq!(q.id.split('-').count(), 5, "exercise the current question ID format");
+    assert!(!magi::run::is_run_id(&q.id), "question IDs are independent of run IDs");
     q.say("daemon: execute").unwrap();
     s.store.put(&mut q).unwrap();
     script(&s, &["MAGI ask --settle \"$qid\" --choice 'daemon: execute' --quote 'daemon: execute'"]);
@@ -1037,6 +1054,9 @@ async fn maintenance_release_is_bound_to_the_hold_and_applies_once_after_settle(
     let released = queue.get(&task.id).unwrap();
     assert_eq!(released.status, TaskStatus::Queued);
     assert!(released.action_applied(&q.id));
+    let receipt = s.home.join("choice-actions").join(format!("{}.json", q.id));
+    let recorded: serde_json::Value = serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+    assert_eq!(recorded["status"], "applied");
     // Reopening the stores simulates a daemon restart. A fresh manual hold
     // cannot be released by an old settled question.
     task = released;

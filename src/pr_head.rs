@@ -83,6 +83,13 @@ pub(crate) fn ensure_owner(state: &RunState) -> Result<()> {
 
 /// The same ownership check with an explicitly loaded disk record.
 pub(crate) fn ensure_owner_record(state: &RunState, disk: Option<&RunState>) -> Result<()> {
+    if let Some(next) = state
+        .retired_to
+        .as_ref()
+        .or_else(|| disk.and_then(|s| s.retired_to.as_ref()))
+    {
+        bail!("empty attempt was retired; inspect recovery authority {next}");
+    }
     if state
         .merge_decision
         .as_ref()

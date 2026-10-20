@@ -85,6 +85,7 @@ pub async fn housekeep(
     now: Timestamp,
 ) -> Housekeeping {
     let mut out = Housekeeping::default();
+    crate::retention::sweep(home, &cfg.disk, now).await;
     if cfg.disk.auto_fold {
         let runs = home.join("runs");
         match fold_due(&runs, home, worktrees_root, &cfg.disk, now).await {
@@ -211,9 +212,6 @@ pub async fn fold_due(
         .collect();
     ids.sort_unstable();
     for id in ids {
-        if crate::pr_recovery::sources_retained(home, &id) {
-            continue;
-        }
         if crate::daemon::is_working_on(home, &id, now) {
             continue;
         }
@@ -244,6 +242,10 @@ pub async fn fold_due(
                 continue;
             }
         };
+        if let Some(reason) = crate::pr_recovery::source_retention_reason(home, &state) {
+            tracing::info!(%id, %reason, "housekeep: source retained; fold refused");
+            continue;
+        }
         if state.schema != SCHEMA {
             tracing::info!(
                 "housekeep: run {id} was written by schema {} (this build speaks {SCHEMA}); \
@@ -883,7 +885,17 @@ pub fn prune_cache_if_over_limit(
     let Some(cache) = cfg.cache_dir() else {
         return Ok(None);
     };
-    prune_cache(home, &cache, cfg.disk.cache_limit_bytes)
+    let limit = crate::disk::free_bytes(&cache)
+        .ok()
+        .map_or(cfg.disk.cache_limit_bytes, |free| {
+            crate::disk::pressure_limit(
+                dir_size(&cache),
+                cfg.disk.cache_limit_bytes,
+                cfg.disk.min_free_bytes,
+                free,
+            )
+        });
+    prune_cache(home, &cache, limit)
 }
 
 /// The cache's path, size and cap, for `magi cache show` and the health view.
@@ -2178,6 +2190,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_task_retains_independent_historical_sources_without_a_merge_proof() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let runs = home.join("runs");
+        let wt = home.join("wt");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let queue = crate::queue::Queue::at(home.join("queue"));
+        let mut task = crate::queue::Task::new(
+            "completed".into(),
+            "retain independent historical changes".into(),
+            repo.clone(),
+            crate::queue::Source::Human,
+        );
+        let mut sources = Vec::new();
+        for (id, status) in [
+            ("20260801-000000-old1", RunStatus::Superseded),
+            ("20260801-000000-old2", RunStatus::Failed),
+        ] {
+            let (id, worktree) = due_run_with_winner_worktree(&runs, &wt, &repo, id, status).await;
+            std::fs::write(worktree.join("independent.txt"), &id).unwrap();
+            crate::git::git(&worktree, &["add", "independent.txt"])
+                .await
+                .unwrap();
+            crate::git::git(
+                &worktree,
+                &["commit", "-m", "Independent historical change"],
+            )
+            .await
+            .unwrap();
+            let head = crate::git::rev_parse(&worktree, "HEAD").await.unwrap();
+            let mut state = RunState::load_under(&id, home).unwrap();
+            state.driver_exited = true;
+            if status == RunStatus::Failed {
+                state.tally = None;
+            }
+            state.save_under(home).unwrap();
+            task.link_run(&id);
+            sources.push((id, worktree, head));
+        }
+        // A newer empty attempt and task completion are no proof that either
+        // independent historical implementation was incorporated.
+        let mut latest = RunState::new(
+            repo.clone(),
+            "main".into(),
+            crate::git::rev_parse(&repo, "main").await.unwrap(),
+            task.instruction.clone(),
+            crate::config::Config::default(),
+        );
+        latest.status = RunStatus::Ready;
+        latest.driver_exited = true;
+        latest.save_under(home).unwrap();
+        task.start(latest.id.clone());
+        task.succeed();
+        queue.put(&mut task).unwrap();
+
+        let (folded, unreadable) = fold_due(
+            &runs,
+            home,
+            &wt,
+            &Disk::default(),
+            ts("2026-09-05T00:00:00Z"),
+        )
+        .await
+        .unwrap();
+        assert_eq!((folded, unreadable), (0, 0));
+        for (id, worktree, head) in sources {
+            assert!(worktree.exists());
+            assert_eq!(
+                crate::git::rev_parse(&worktree, "HEAD").await.unwrap(),
+                head
+            );
+            let mut state = RunState::load_under(&id, home).unwrap();
+            assert!(!state.candidates[0].folded);
+            let error = crate::graph::fold_run(&mut state, true, home)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("source of task {}", task.id))
+            );
+            assert_eq!(
+                crate::git::rev_parse(&repo, &state.candidates[0].branch)
+                    .await
+                    .unwrap(),
+                head
+            );
+            assert!(worktree.exists());
+            assert!(runs.join(&id).join("run.json").exists());
+        }
+    }
+
+    #[tokio::test]
     async fn recovery_retains_historical_sources_after_success_and_automatic_cleanup() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
@@ -2242,12 +2349,15 @@ mod tests {
             );
             let mut historical = RunState::load_under(&id, home).unwrap();
             assert!(!historical.candidates[0].folded);
+            let error = crate::graph::fold_run(&mut historical, true, home)
+                .await
+                .unwrap_err();
             assert!(
-                crate::graph::fold_run(&mut historical, true, home)
-                    .await
-                    .unwrap()
-                    .is_empty()
+                error
+                    .to_string()
+                    .contains("explicitly retained recovery source")
             );
+            assert!(!historical.candidates[0].folded);
             assert!(
                 worktree.exists(),
                 "every automatic fold entry preserves retained sources"

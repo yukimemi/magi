@@ -2190,8 +2190,20 @@ fn short(id: &str) -> &str {
 
 fn new_id() -> String {
     let stamp = jiff::Zoned::now().strftime("%Y%m%d-%H%M%S");
-    let seed = crate::rng::entropy();
-    format!("{stamp}-{:04x}", (seed ^ (seed >> 32)) & 0xffff)
+    new_id_at(&stamp.to_string(), crate::rng::entropy())
+}
+
+fn new_id_at(stamp: &str, seed: u64) -> String {
+    // Questions can be created concurrently in one shared store. A 16-bit
+    // suffix is only a display label, not enough identity to keep distinct
+    // questions (and their panel scratch directories) from overwriting each
+    // other. The counter also separates calls with identical clock entropy.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(
+        "{stamp}-{seed:016x}-{sequence:016x}-{:04x}",
+        (seed ^ (seed >> 32)) & 0xffff
+    )
 }
 
 #[cfg(test)]
@@ -3090,6 +3102,47 @@ mod tests {
         );
         assert!(!q.panel);
         assert!(!s.panel_dir(&q.id).exists());
+    }
+
+    #[test]
+    fn concurrent_questions_keep_independent_records_and_panels_with_identical_entropy() {
+        let (_dir, s) = store();
+        let barrier = std::sync::Barrier::new(8);
+        let ids = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|worker| {
+                    let s = &s;
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        (0..16)
+                            .map(|index| {
+                                let mut q = choice_question();
+                                // Reproduce both the old four-digit collision
+                                // and a clock returning identical entropy.
+                                q.id = new_id_at("20261020-224346", 0xf8ef);
+                                q.summary = format!("worker {worker}, question {index}");
+                                assert!(valid_asset_name(&q.id));
+                                assert_eq!(q.short(), "f8ef");
+                                let html = format!("<p>{}</p>", q.summary);
+                                s.put_panel(&mut q, &html, &[]).unwrap();
+                                s.put(&mut q).unwrap();
+                                (q.id, q.summary, html)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(s.list().len(), ids.len());
+        for (id, summary, html) in ids {
+            assert_eq!(s.get(&id).unwrap().summary, summary);
+            assert_eq!(s.panel_html(&id).as_deref(), Some(html.as_str()));
+        }
     }
 
     #[test]

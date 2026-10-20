@@ -101,7 +101,6 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
                 );
                 let mut owner_task = None;
                 if choice == magi::merge_decision::DISMISS {
-                    q.run = q.id.clone();
                     let mut state = magi::run::RunState::new(
                         repo.clone(),
                         "main".into(),
@@ -109,7 +108,13 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
                         "Original task".into(),
                         Config::default(),
                     );
-                    state.id = q.run.clone();
+                    // Question IDs and run IDs have independent formats.
+                    // Exercise dismissal of a real run, rather than using a
+                    // question ID as a synthetic run directory name.
+                    q.run = state.id.clone();
+                    assert!(magi::run::is_run_id(&q.run));
+                    assert_eq!(q.id.split('-').count(), 5);
+                    assert_ne!(q.run, q.id);
                     state.status = magi::run::RunStatus::Landing;
                     state.parked = true;
                     state.driver_exited = true;

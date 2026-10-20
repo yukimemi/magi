@@ -51,6 +51,26 @@ fn write_config(fx: &common::Fixture) -> std::path::PathBuf {
     path
 }
 
+#[test]
+fn standalone_attempt_future_leaves_room_on_the_default_thread_stack() {
+    let opts = Opts::default();
+    let queue = Queue::at(std::path::PathBuf::from("unused-queue"));
+    let mut task = magi::queue::Task::new(
+        "review".into(),
+        "review".into(),
+        std::path::PathBuf::from("unused-repo"),
+        Source::Human,
+    );
+    // Construction does no I/O. Bound the frame rather than increasing the
+    // Windows test thread's stack to accommodate duplicated attempt futures.
+    let future = daemon::run_claimed(&opts, &queue, &mut task);
+    let bytes = std::mem::size_of_val(&future);
+    assert!(
+        bytes < 64 * 1024,
+        "standalone attempt future occupies {bytes} bytes"
+    );
+}
+
 common::e2e! {
 async fn a_review_with_no_loop_runs_against_its_own_claimed_task() {
     let home = home_lock().await;

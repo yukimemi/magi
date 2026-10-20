@@ -554,10 +554,83 @@ pub struct Task {
     /// which pass cost what. Kept across a release.
     #[serde(default)]
     pub passes: Vec<TaskPass>,
+    /// Durable failed-input budget, unaffected by automatic release/requeue.
+    #[serde(default)]
+    pub recovery_budget: Option<RecoveryBudget>,
+    /// Inputs resolved before starting the current automatic attempt. The
+    /// settlement uses this same identity even for review-only runs.
+    #[serde(default)]
+    pub recovery_admission: Option<RecoveryAdmission>,
+    /// Previously seen input generations. Switching inputs away and back does
+    /// not refund an exhausted generation without explicit operator authority.
+    #[serde(default)]
+    pub recovery_generations: Vec<RecoveryBudget>,
     /// When the task was filed.
     pub created_at: Timestamp,
     /// Last change to this file.
     pub updated_at: Timestamp,
+}
+
+/// Admission identity shared by start and settlement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryAdmission {
+    /// Fetched upstream commit before any run-local rebase.
+    pub base: String,
+    /// Resolved instruction references and explicit review source.
+    pub inputs: String,
+}
+
+/// Failures against one recovery input generation. An owner release explicitly
+/// starts a new generation; a machine requeue never replenishes it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecoveryBudget {
+    /// Authored instructions, not generated review scaffolding.
+    pub instruction: String,
+    /// Upstream commit used to prepare this generation.
+    pub base: String,
+    /// Referenced input commits, including their resolved identities.
+    pub inputs: String,
+    /// Stable processing stage of the last failure.
+    pub stage: String,
+    /// Failed passes, independent of the resettable claim counter.
+    pub failures: usize,
+    /// Fingerprint of actual candidate patches; equivalent rebased commits do
+    /// not count as progress. Unknown inputs never replenish the budget.
+    #[serde(default)]
+    pub progress: Option<String>,
+}
+
+fn recovery_progress(state: &crate::run::RunState) -> Option<String> {
+    use crate::proc::Quiet as _;
+    use std::hash::{Hash, Hasher};
+    let mut patches = Vec::new();
+    for candidate in state.candidates.iter().filter(|c| c.commits > 0) {
+        let output = std::process::Command::new("git")
+            .current_dir(&state.repo)
+            .args(["diff", "--binary", &state.base_commit, &candidate.branch])
+            .quiet()
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        patches.push(output.stdout);
+    }
+    patches.sort();
+    patches.dedup();
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    patches.hash(&mut hash);
+    Some(format!("{:x}", hash.finish()))
+}
+
+pub(crate) fn recovery_inputs(seeds: &[crate::refs::Seed]) -> String {
+    serde_json::to_string(
+        &seeds
+            .iter()
+            .map(|s| (&s.token, &s.sha, s.kind))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_default()
 }
 
 /// Facts a producer can independently attest about a held outcome.
@@ -840,6 +913,9 @@ impl Task {
             chat_notices: Vec::new(),
             hold_notice_cause: None,
             passes: Vec::new(),
+            recovery_budget: None,
+            recovery_admission: None,
+            recovery_generations: Vec::new(),
             created_at: now,
             updated_at: now,
         }
@@ -1719,6 +1795,9 @@ impl Task {
 
     /// Release on explicit operator authority, rather than automatic recovery.
     pub fn release_operator(&mut self, source: &str, question_id: Option<&str>) {
+        self.recovery_budget = None;
+        self.recovery_generations.clear();
+        self.recovery_admission = None;
         if self
             .resumption
             .as_ref()
@@ -1747,6 +1826,70 @@ impl Task {
         if let Some(previous) = self.resumption.replace(approval) {
             self.resumption_history.push(previous);
         }
+    }
+
+    /// Record a failed graph pass without allowing automatic requeues to refund it.
+    pub(crate) fn recovery_failed(&mut self, state: &crate::run::RunState) {
+        let (base, inputs) = self.recovery_admission.as_ref().map_or_else(
+            || (state.base_commit.clone(), recovery_inputs(&state.seeds)),
+            |a| (a.base.clone(), a.inputs.clone()),
+        );
+        let progress = recovery_progress(state);
+        let stage = if state.prep_failure.is_some() {
+            "preparation"
+        } else {
+            "execution"
+        };
+        let matches = |b: &RecoveryBudget| {
+            b.instruction == self.instruction
+                && b.base == base
+                && b.inputs == inputs
+                && (progress.is_none() || b.progress == progress)
+        };
+        if !self.recovery_budget.as_ref().is_some_and(matches) {
+            let previous = self
+                .recovery_generations
+                .iter()
+                .position(matches)
+                .map(|index| self.recovery_generations.remove(index));
+            if let Some(old) = self.recovery_budget.take() {
+                self.recovery_generations.push(old);
+            }
+            self.recovery_budget = previous;
+        }
+        if let Some(budget) = &mut self.recovery_budget {
+            budget.failures = budget.failures.saturating_add(1);
+            budget.stage = stage.to_owned();
+        } else {
+            self.recovery_budget = Some(RecoveryBudget {
+                instruction: self.instruction.clone(),
+                base,
+                inputs,
+                stage: stage.to_owned(),
+                failures: 1,
+                progress,
+            });
+        }
+    }
+
+    pub(crate) fn recovery_exhausted(
+        &self,
+        base: &str,
+        inputs: &str,
+        limit: usize,
+    ) -> Option<String> {
+        let same_input = |b: &&RecoveryBudget| {
+            b.instruction == self.instruction && b.base == base && b.inputs == inputs
+        };
+        let budget = self
+            .recovery_budget
+            .as_ref()
+            .filter(same_input)
+            .or_else(|| self.recovery_generations.iter().rev().find(same_input))?;
+        (budget.instruction == self.instruction && budget.base == base && budget.inputs == inputs
+            && budget.failures >= limit.max(1)).then(|| format!(
+                "[recovery-budget] {} failed passes against unchanged inputs ({}). Inspect the retained recovery sources and correct the cause, change the inputs, or explicitly release the task to approve another generation. Automatic requeue does not reset this budget.",
+                budget.failures, budget.stage))
     }
 
     /// Put a held or finished task back in line, with its attempt count reset
@@ -1840,13 +1983,13 @@ fn copy_new(dir: &Path, src: &Path, name: &str) -> Result<(String, PathBuf)> {
     unreachable!("the counter never runs out")
 }
 
-/// How long a task's write lock may stand before it is read as left behind by
-/// a writer that died.
+/// Minimum age before a dead writer's lock may be recovered, and maximum wait
+/// for a contending writer. Age alone never revokes a live writer's ownership.
 const TASK_LOCK_STALE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Guard for [`Queue::lock_task`]; removes the lock file on drop, but only
 /// while the file still carries this guard's owner token.
-struct TaskLock {
+pub(crate) struct TaskLock {
     path: PathBuf,
     token: String,
 }
@@ -1879,6 +2022,22 @@ fn older_than_stale(path: &Path) -> bool {
         .ok()
         .and_then(|t| t.elapsed().ok())
         .is_some_and(|age| age > TASK_LOCK_STALE)
+}
+
+fn writer_may_be_gone(token: &str) -> bool {
+    let Some(pid) = token
+        .split_once('-')
+        .and_then(|(pid, _)| pid.parse::<u32>().ok())
+    else {
+        // Legacy/incomplete tokens have no valid writer identity. They remain
+        // subject to the age and compare/remove checks.
+        return true;
+    };
+    if pid == std::process::id() {
+        return false;
+    }
+    // Unknown process-table access must not steal a long-running retirement.
+    crate::proc::pid_status(pid) == Some(false)
 }
 
 /// How many levels of "a stale marker guarding a stale marker" are recovered
@@ -1931,7 +2090,7 @@ fn take_marker(path: &Path, token: &str, depth: u8) -> Option<(PathBuf, String)>
 fn remove_lock_if(path: &Path, token: &str, require_stale: bool, depth: u8) -> Option<bool> {
     let (marker, mine) = take_marker(path, token, depth)?;
     let still = std::fs::read_to_string(path).is_ok_and(|c| c == token)
-        && (!require_stale || older_than_stale(path));
+        && (!require_stale || older_than_stale(path) && writer_may_be_gone(token));
     if still {
         let _ = std::fs::remove_file(path);
     }
@@ -2208,11 +2367,11 @@ impl Queue {
     /// Exclusive right to rewrite task `id`'s record, held until the guard
     /// drops. Every writer ([`Queue::put`], [`Queue::link_run`]) takes it, so
     /// a process linking a run and the daemon saving a transition are
-    /// serialized instead of last-writer-wins. A lock older than
-    /// [`TASK_LOCK_STALE`] belongs to a writer that died mid-update and is
-    /// broken. Not the claim lock (`<id>.lock`), which a daemon holds for a
+    /// serialized instead of last-writer-wins. An old lock may be broken only
+    /// after its writer is confirmed dead (legacy tokens without a PID retain
+    /// age-based recovery). Not the claim lock (`<id>.lock`), held for a
     /// whole run.
-    fn lock_task(&self, id: &str) -> Result<TaskLock> {
+    pub(crate) fn lock_task(&self, id: &str) -> Result<TaskLock> {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
         let path = self.root.join(format!("{id}.write-lock"));
@@ -5093,18 +5252,47 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_stolen_lock_leaves_the_new_holders_lock() {
+    fn dropping_a_replaced_lock_leaves_the_new_holders_token() {
         let dir = tempfile::tempdir().unwrap();
         let q = Queue::at(dir.path().to_path_buf());
         let lock = dir.path().join("t.write-lock");
         let a = q.lock_task("t").unwrap();
-        age_lock(&lock);
-        let b = q.lock_task("t").unwrap();
-        assert_ne!(a.token, b.token);
+        // Simulate a foreign/legacy writer replacing the file. A modern
+        // writer cannot acquire it while this guard's process is alive.
+        let replacement = owner_token();
+        std::fs::write(&lock, &replacement).unwrap();
         drop(a);
-        assert_eq!(std::fs::read_to_string(&lock).unwrap(), b.token);
-        drop(b);
-        assert!(!lock.exists());
+        assert_eq!(std::fs::read_to_string(&lock).unwrap(), replacement);
+    }
+
+    #[test]
+    fn aged_live_task_lock_excludes_updates_until_retirement_releases_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().to_path_buf());
+        let held = q.lock_task("t").unwrap();
+        let path = dir.path().join("t.write-lock");
+        age_lock(&path);
+        assert!(!break_stale(&path, &held.token));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let updater = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let _write = q.lock_task("t").unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), held.token);
+        drop(held);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        updater.join().unwrap();
+        assert!(!path.exists());
     }
 
     #[test]

@@ -890,6 +890,14 @@ pub struct Disk {
     /// pruning only costs the rebuild of the dropped files, not of the world)
     /// without letting one addled cache swallow the machine.
     pub cache_limit_bytes: u64,
+    /// Aggregate retained worktree Cargo output cap; 0 disables reclamation.
+    pub worktree_limit_bytes: u64,
+    /// Maximum declared artifact bytes reclaimed per pass.
+    pub worktree_reclaim_bytes: u64,
+    /// Maximum unretired attempts of one task before another run may be
+    /// created. Resumes do not create worktrees and remain allowed. Automatic
+    /// releases and upstream changes never reset this bound; 0 disables it.
+    pub retained_attempt_limit: usize,
 }
 
 impl Default for Disk {
@@ -899,6 +907,9 @@ impl Default for Disk {
             auto_fold: true,
             fold_grace_secs: 6 * 60 * 60,
             cache_limit_bytes: 10 * 1024 * 1024 * 1024,
+            worktree_limit_bytes: 10 * 1024 * 1024 * 1024,
+            worktree_reclaim_bytes: 16 * 1024 * 1024 * 1024,
+            retained_attempt_limit: 8,
         }
     }
 }

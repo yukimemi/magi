@@ -943,7 +943,10 @@ where
                         ActionDecision::Stale
                     } else if s.liveness(false) == Liveness::Live {
                         ActionDecision::Skip
-                    } else if s.status == RunStatus::Landing && !s.released() {
+                    } else if s.status == RunStatus::Landing
+                        && !s.released()
+                        && s.retired_to.is_none()
+                    {
                         ActionDecision::Resume(run.clone())
                     } else {
                         ActionDecision::Refuse("Owner stop decision cannot resume its original landing execution; inspect the existing run. No replacement or merge was started.".into())
@@ -981,7 +984,12 @@ where
                 Ok(s) if s.liveness(false) == Liveness::Live => {
                     ActionDecision::Refuse("run already has a live driver".into())
                 }
-                Ok(s) if s.status.resumable() && !s.released() && !exhausted_review_budget(&s) => {
+                Ok(s)
+                    if s.status.resumable()
+                        && !s.released()
+                        && s.retired_to.is_none()
+                        && !exhausted_review_budget(&s) =>
+                {
                     ActionDecision::Resume(run.clone())
                 }
                 Ok(_) => ActionDecision::Refuse((p.resume_cannot_progress)(
@@ -1187,7 +1195,9 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
         let Some(action) = q.chosen_action().filter(|a| a.maintenance()) else {
             continue;
         };
-        if asker_may_still_read(questions, &q, home) || !crate::run::is_run_id(&q.id) {
+        // Receipt paths use question IDs, whose format is independent of run
+        // IDs. Apply the question store's filename safety rule to both eras.
+        if asker_may_still_read(questions, &q, home) || !ask::valid_asset_name(&q.id) {
             continue;
         }
         let dir = home.join("choice-actions");
@@ -1947,13 +1957,21 @@ fn settle_and_diagnose(
         task.last_error = Some(detail.to_owned());
         task.diagnostic = None;
         task.attempts = task.attempts.saturating_sub(1);
-        task.hold_machine(Some(format!(
-            "{}{} stayed busy past the resource-wait limit before `{}` could start; \
+        if block.kind == "disk pressure" {
+            task.hold_machine(Some(format!(
+                "{}{}",
+                crate::disk::RUNNING_PRESSURE,
+                block.detail
+            )));
+        } else {
+            task.hold_machine(Some(format!(
+                "{}{} stayed busy past the resource-wait limit before `{}` could start; \
              no agent was asked and no attempt was spent",
-            crate::cache::RESOURCE_HOLD,
-            block.kind,
-            block.node
-        )));
+                crate::cache::RESOURCE_HOLD,
+                block.kind,
+                block.node
+            )));
+        }
         if let Some(pass) = state.passes.last() {
             task.record_pass(&state.id, pass.index, attempts_before, None);
         }
@@ -1986,6 +2004,15 @@ fn settle_and_diagnose(
         task.hold_unrequested_retry(Some(format!("Selected recovery stopped: {detail}. Inspect the retained source and run; correct the cause before explicitly releasing or selecting again. No automatic replacement will start.")));
     } else {
         settle_in(task, verdict, detail, max_attempts, p);
+    }
+    if !verdict.parked
+        && !verdict.quota_hit
+        && matches!(
+            verdict.status,
+            RunStatus::Blocked | RunStatus::Failed | RunStatus::Stalled
+        )
+    {
+        task.recovery_failed(state);
     }
     if state.prep_failure.is_some() {
         // Minting a run whose candidates could not be prepared is not work
@@ -3091,6 +3118,7 @@ async fn poll(
     // See `maybe_prune_cache_between_runs`'s own doc: this is the cache check
     // a congested queue would otherwise starve of the fully-idle branch below.
     let mut cache_last_checked: Option<Timestamp> = None;
+    let mut disk_last_checked: Option<Timestamp> = None;
     // See `Interrupt`'s own doc: in-memory only, advanced once per tick.
     let mut interrupt = Interrupt::Idle;
     // The `Pause` handed to each dispatched candidate's own `Runner` - see
@@ -3146,6 +3174,34 @@ async fn poll(
                 now,
             )
             .await;
+        }
+
+        if cache_check_due(disk_last_checked, now, 30) {
+            disk_last_checked = Some(now);
+            if let Ok(cfg) = prepare(&opts.repo, opts) {
+                crate::retention::sweep(home, &cfg.disk, now).await;
+                // Shared-cache ownership makes this safe even with other runs
+                // active. Reclaim idle outputs before asking writers to park.
+                if let Err(e) = clean::prune_cache_if_over_limit(&cfg, home) {
+                    tracing::warn!("disk pressure cache cleanup failed: {e:#}");
+                }
+                for current in lock(status).current.clone() {
+                    if let Ok(state) = RunState::load_under(&current.run, home)
+                        && let Some(reason) = disk_gate(&state.repo, &state.config)
+                    {
+                        if let Some(pause) = interrupt_pauses.get(&current.task) {
+                            pause.park_because(reason);
+                        }
+                        notices::raise_in(
+                            home,
+                            Notice::warn(
+                                "disk:pressure",
+                                "Disk pressure persists after cleanup; active runs were asked to checkpoint and park. New starts and resumes wait for free space.",
+                            ),
+                        );
+                    }
+                }
+            }
         }
 
         let stalled = stalled_tasks(queue, home, now);
@@ -3493,6 +3549,20 @@ async fn attempt(
         .flatten()
         .filter(|id| RunState::load(id).is_ok_and(|run| may_resume_run(&run, task)));
     let previous = task.runs.last().and_then(|id| RunState::load(id).ok());
+    if !task.fresh_start
+        && task.pr_recovery.is_none()
+        && task.review_branch.is_none()
+        && task.resume_override.is_none()
+        && previous
+            .as_ref()
+            .is_some_and(|run| run.retired_to.is_some())
+        && unfinished.is_none()
+    {
+        task.hold_unrequested_retry(Some("Recorded recovery authority is unavailable, no longer resumable or no longer authorized for these instructions. Inspect the retained lineage and select a recovery source explicitly; no replacement competition was started.".into()));
+        record(queue, task);
+        return Vec::new();
+    }
+
     let saved_recovery = previous.as_ref().filter(|run| {
         task.replacement.is_none()
             && task.pr_recovery.as_ref().is_some_and(|selected| {
@@ -3596,6 +3666,41 @@ async fn attempt(
     }
     let p = phrases(&config.graph.language);
     let start_failed = p.could_not_start;
+    // Resolve once for both admission and settlement. Review-only runs do not
+    // have seed records, and may rebase later; neither fact can refund a failed
+    // automatic generation. Include an explicit review source's current head.
+    if let Ok(base) =
+        crate::git::merge_base_branch(&repo, &config.merge.remote, config.merge.base.as_deref())
+            .await
+        && let Ok(head) =
+            crate::git::rev_parse(&repo, &format!("{}/{}", config.merge.remote, base)).await
+    {
+        let seeds = crate::refs::resolve(
+            &repo,
+            &head,
+            &config.merge.remote,
+            &format!("{}\n{}", task.title, instruction_for(task)),
+        )
+        .await;
+        let mut inputs = crate::queue::recovery_inputs(&seeds);
+        if let Some(branch) = task.review_of.as_ref().or(task.review_branch.as_ref()) {
+            let source = crate::git::rev_parse(&repo, branch)
+                .await
+                .unwrap_or_default();
+            inputs.push_str(&format!(";review:{branch}:{source}"));
+        }
+        if let Some(reason) = task.recovery_exhausted(
+            &head,
+            &inputs,
+            task.attempt_limit
+                .map_or(opts.max_attempts, std::num::NonZeroUsize::get),
+        ) {
+            task.hold_unrequested_retry(Some(reason));
+            record(queue, task);
+            return Vec::new();
+        }
+        task.recovery_admission = Some(crate::queue::RecoveryAdmission { base: head, inputs });
+    }
 
     // The free-space gate, checked *before* anything is minted: a task that
     // waits out a full disk costs nothing yet, and must not spend an attempt
@@ -3724,6 +3829,21 @@ async fn attempt(
         record(queue, task);
         return Vec::new();
     }
+    if let Some(reason) = retained_attempt_hold(
+        task,
+        &starter,
+        config.disk.retained_attempt_limit,
+        RunState::load,
+    ) {
+        // The review choice was consumed above. Preserve it across this hold
+        // so a later release cannot silently become a fresh implementation.
+        if let Starter::Review(branch) = &starter {
+            task.review_branch = Some(branch.clone());
+        }
+        task.hold_unrequested_retry(Some(reason));
+        record(queue, task);
+        return Vec::new();
+    }
     // Absolute paths of the files the task was filed with, re-read from the
     // task now so a file attached while it was held reaches a resumed run
     // too. A stored name whose file has gone is an error before any agent is
@@ -3748,7 +3868,9 @@ async fn attempt(
         Duration::from_secs(config.graph.timeout_resource_wait),
         move || startup_pause.parked() || startup_interrupt.parked(),
     );
-    let started = wait.scope(async { match &starter {
+    // Startup includes review takeover and recovery. Do not embed its large
+    // future in both the wait scope and the surrounding attempt stack frame.
+    let started = wait.scope(Box::pin(async { match &starter {
         Starter::Review(_) if task.pr_recovery.is_some() => {
             let selected = task.pr_recovery.clone().expect("selected recovery");
             match selected.check_task(&task.id, &task.instruction) {
@@ -3851,7 +3973,7 @@ async fn attempt(
                 r
             })
         }
-    }}).await;
+    }})).await;
     let mut runner = match started {
         Ok(r) => r,
         Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => {
@@ -4180,14 +4302,16 @@ pub fn foreign_loop(
 pub async fn run_claimed(opts: &Opts, queue: &Queue, task: &mut Task) {
     let status = Arc::new(Mutex::new(Status::new()));
     let stop = Stop::new();
-    attempt(
+    // An attempt embeds startup and graph futures. Keep it off the standalone
+    // caller's stack, on both the initial execution and withheld-text resume.
+    Box::pin(attempt(
         opts,
         queue,
         &status,
         &stop,
         crate::graph::Pause::new(),
         task,
-    )
+    ))
     .await;
     // A run parked on the owner's word about a withheld PR title/body has no
     // daemon to finish it. Nobody else will enforce `answer_timeout`, so wait
@@ -4222,14 +4346,14 @@ pub async fn run_claimed(opts: &Opts, queue: &Queue, task: &mut Task) {
             break;
         }
         resumes += 1;
-        attempt(
+        Box::pin(attempt(
             opts,
             queue,
             &status,
             &stop,
             crate::graph::Pause::new(),
             task,
-        )
+        ))
         .await;
     }
     hold_if_runnable(queue, task);
@@ -4568,7 +4692,7 @@ async fn triage_held(queue: &Queue, home: &Path, opts: &Opts) {
 /// A zero [`Config::disk::min_free_bytes`] opens the gate unconditionally -
 /// the operator opted out. A measurement failure is a gate, not a pass: both
 /// sides of "cannot tell" are served by not starting.
-fn disk_gate(repo: &Path, config: &Config) -> Option<String> {
+pub(crate) fn disk_gate(repo: &Path, config: &Config) -> Option<String> {
     disk_gate_with(repo, config, crate::disk::free_bytes)
 }
 
@@ -4584,10 +4708,32 @@ fn disk_gate_with<F: Fn(&Path) -> Result<u64>>(
     if min == 0 {
         return None;
     }
-    match free_bytes(repo) {
-        Ok(free) => crate::disk::gate_in(free, min, &config.graph.language),
-        Err(e) => Some(crate::disk::unmeasured_in(repo, &e, &config.graph.language)),
+    let mut paths = vec![repo.to_owned()];
+    if let Some(cache) = config.cache_dir() {
+        paths.push(cache);
     }
+    if let Some(root) = &config.graph.worktree_root {
+        paths.push(root.clone());
+    }
+    for path in paths {
+        let probe = if path == repo {
+            path.as_path()
+        } else {
+            path.ancestors().find(|p| p.exists()).unwrap_or(&path)
+        };
+        let reason = match free_bytes(probe) {
+            Ok(free) => crate::disk::gate_in(free, min, &config.graph.language),
+            Err(e) => Some(crate::disk::unmeasured_in(
+                probe,
+                &e,
+                &config.graph.language,
+            )),
+        };
+        if reason.is_some() {
+            return reason;
+        }
+    }
+    None
 }
 
 /// How long to wait before offering another task when a run lost a seat to a
@@ -4852,29 +4998,39 @@ fn unfinished_run(runs: &[String], short: &str) -> Option<String> {
 
 /// [`unfinished_run`] with an injected state reader. Tests provide their
 /// fixtures directly rather than touching the process-global run home.
-fn unfinished_run_with<F>(runs: &[String], short: &str, load: F) -> Option<String>
+pub(crate) fn unfinished_run_with<F>(runs: &[String], short: &str, mut load: F) -> Option<String>
 where
-    F: FnOnce(&str) -> Result<RunState>,
+    F: FnMut(&str) -> Result<RunState>,
 {
-    let id = runs.last()?;
-    match load(id) {
-        // A run some process is driving right now is not "unfinished" in the
-        // sense of waiting to be picked up: a run started by hand is in
-        // `runs` while it is still executing, and resuming it here
-        // would put a second driver on the same worktrees.
-        Ok(s)
-            if s.status.resumable()
-                && !s.released()
-                && !exhausted_review_budget(&s)
-                && s.liveness(false) != crate::run::Liveness::Live =>
-        {
-            Some(id.clone())
+    let mut id = runs.last()?.clone();
+    let mut visited = std::collections::BTreeSet::new();
+    let mut repo = None;
+    loop {
+        if !runs.contains(&id) || !visited.insert(id.clone()) {
+            tracing::warn!("invalid or cyclic recovery authority for task {short}");
+            return None;
         }
-        Ok(_) => None,
-        Err(e) => {
-            tracing::warn!("could not read run {id} for task {short}: {e:#}");
-            None
+        let state = match load(&id) {
+            Ok(state) if state.id == id => state,
+            Ok(_) => return None,
+            Err(e) => {
+                tracing::warn!("could not read run {id} for task {short}: {e:#}");
+                return None;
+            }
+        };
+        if repo.as_ref().is_some_and(|repo| *repo != state.repo) {
+            return None;
         }
+        repo = Some(state.repo.clone());
+        if let Some(authority) = state.retired_to {
+            id = authority;
+            continue;
+        }
+        return (state.status.resumable()
+            && !state.released()
+            && !exhausted_review_budget(&state)
+            && state.liveness(false) != crate::run::Liveness::Live)
+            .then_some(id);
     }
 }
 
@@ -4900,7 +5056,11 @@ where
         return false;
     };
     load(id).is_ok_and(|s| {
-        s.parked && s.status.resumable() && !s.released() && !exhausted_review_budget(&s)
+        s.parked
+            && s.status.resumable()
+            && !s.released()
+            && s.retired_to.is_none()
+            && !exhausted_review_budget(&s)
     })
 }
 
@@ -4915,6 +5075,40 @@ enum Starter {
     Resume(String),
     /// `crate::graph::Runner::start`: a fresh competition.
     Start,
+}
+
+/// A second bound independent of inputs and the resettable failure counter.
+/// Count recovery records, not history entries: resuming appends the same id.
+/// Unknown history is not evidence that a new set of worktrees is affordable.
+fn retained_attempt_hold(
+    task: &Task,
+    starter: &Starter,
+    limit: usize,
+    mut load: impl FnMut(&str) -> Result<RunState>,
+) -> Option<String> {
+    if limit == 0 || matches!(starter, Starter::Resume(_)) {
+        return None;
+    }
+    let mut retained = 0;
+    for id in task.runs.iter().collect::<std::collections::BTreeSet<_>>() {
+        let state = match load(id) {
+            Ok(state) if state.id == *id => state,
+            _ => {
+                return Some(format!(
+                    "[recovery-backlog] Cannot verify historical run {id}. Restore its record and inspect the recovery lineage before starting another attempt. Existing history was retained."
+                ));
+            }
+        };
+        if state.retired_to.is_some() || state.released() {
+            continue;
+        }
+        // Neither a completed status nor an empty candidate array proves that
+        // all recovery sources (including unrecorded preparation) were retired.
+        retained += 1;
+    }
+    (retained >= limit).then(|| format!(
+        "[recovery-backlog] {retained} unretired attempts reach the limit of {limit}. Resume an existing recovery owner or inspect the lineage and retire proved-obsolete attempts before creating another run. Releases, refunds and changed upstream inputs do not reset this limit. No source or historical report was removed."
+    ))
 }
 
 /// A selected public implementation overrides every historical candidate and pin.
@@ -7330,6 +7524,50 @@ mod tests {
             "diagnostic grew to {} bytes, unbounded",
             d.len()
         );
+    }
+
+    #[test]
+    fn selected_delivery_guards_survive_recovery_failure_accounting() {
+        for status in [RunStatus::Ready, RunStatus::Blocked, RunStatus::Failed] {
+            let mut t = task();
+            let mut state = run_state(status);
+            t.pr_recovery = Some(crate::pr_recovery::Selection {
+                url: "url".into(),
+                branch: format!("magi/task-{}", t.id),
+                head: "a".repeat(40),
+                source_head: None,
+                source_run: None,
+                source_proof: None,
+                disposition: Some(crate::pr_recovery::Disposition::Land),
+                instruction: t.instruction.clone(),
+                approved_at: Timestamp::now(),
+            });
+            state.pr_recovery = t.pr_recovery.clone();
+            t.start(state.id.clone());
+            settle_and_diagnose(
+                &mut t,
+                Verdict {
+                    status,
+                    left_pr: false,
+                    quota_hit: false,
+                    parked: false,
+                    no_viable_candidates: false,
+                },
+                "delivery stopped",
+                5,
+                &state,
+            );
+            assert_eq!(t.status, TaskStatus::Held);
+            let reason = t.hold_reason.as_deref().unwrap();
+            if status == RunStatus::Ready {
+                assert!(reason.contains("Selected PR delivery is incomplete"));
+                assert!(t.recovery_budget.is_none());
+            } else {
+                assert!(reason.contains("Selected recovery stopped"));
+                assert_eq!(t.recovery_budget.as_ref().unwrap().failures, 1);
+            }
+            assert!(t.pr_recovery.is_some());
+        }
     }
 
     #[test]
@@ -10346,6 +10584,113 @@ mod tests {
             Some(run.id.clone()),
             "a spent review budget must not turn a failed publication into a re-competition"
         );
+    }
+
+    #[test]
+    fn retained_attempt_bound_survives_changed_bases_releases_and_duplicate_history() {
+        let mut task = Task::new(
+            "recover work".into(),
+            "recover work".into(),
+            PathBuf::from("/repo"),
+            crate::queue::Source::Human,
+        );
+        let mut history = std::collections::BTreeMap::new();
+        for index in 0..8 {
+            let mut run = run_state(RunStatus::Blocked);
+            run.id = format!("20260101-000000-{index:04}");
+            run.base_commit = format!("upstream-{index}");
+            // Seven empty newer attempts must not erase the old recovery owner.
+            if index > 0 {
+                run.candidates.clear();
+            }
+            task.runs.extend([run.id.clone(), run.id.clone()]);
+            history.insert(run.id.clone(), run);
+            task.requeue();
+        }
+        let check = |task: &Task, starter: &Starter, limit| {
+            retained_attempt_hold(task, starter, limit, |id| Ok(history[id].clone()))
+        };
+        assert!(
+            check(&task, &Starter::Start, 8)
+                .unwrap()
+                .contains("8 unretired")
+        );
+        assert!(check(&task, &Starter::Start, 9).is_none());
+        assert!(check(&task, &Starter::Review("existing".into()), 8).is_some());
+        task.release_operator("owner", None);
+        assert_eq!(task.attempts, 0);
+        let restored: Task = serde_json::from_slice(&serde_json::to_vec(&task).unwrap()).unwrap();
+        assert!(check(&restored, &Starter::Start, 8).is_some());
+        assert!(check(&restored, &Starter::Resume(task.runs[0].clone()), 8).is_none());
+        assert!(check(&restored, &Starter::Start, 0).is_none());
+    }
+
+    #[test]
+    fn retained_attempt_bound_requires_verified_retirement_not_completion_labels() {
+        let mut task = Task::new(
+            "recover work".into(),
+            "recover work".into(),
+            PathBuf::from("/repo"),
+            crate::queue::Source::Human,
+        );
+        let mut run = run_state(RunStatus::Superseded);
+        run.candidates.clear();
+        task.runs.push(run.id.clone());
+        assert!(retained_attempt_hold(&task, &Starter::Start, 1, |_| Ok(run.clone())).is_some());
+        run.retired_to = Some("authority".into());
+        assert!(retained_attempt_hold(&task, &Starter::Start, 1, |_| Ok(run.clone())).is_none());
+        run.retired_to = None;
+        run.released_to = Some("authority".into());
+        assert!(retained_attempt_hold(&task, &Starter::Start, 1, |_| Ok(run.clone())).is_none());
+        assert!(
+            retained_attempt_hold(&task, &Starter::Start, 8, |_| anyhow::bail!("unreadable"))
+                .unwrap()
+                .contains("Cannot verify")
+        );
+        // Resuming an existing owner needs no new inventory or worktree budget.
+        assert!(
+            retained_attempt_hold(&task, &Starter::Resume(run.id), 1, |_| {
+                panic!("resume must not load historical attempts")
+            })
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn retired_resume_requires_a_valid_same_repository_authority() {
+        let mut source = run_state(RunStatus::Blocked);
+        let mut empty = run_state(RunStatus::Blocked);
+        empty.retired_to = Some(source.id.clone());
+        let runs = vec![source.id.clone(), empty.id.clone()];
+        let resolve = |source: &RunState, empty: &RunState| {
+            unfinished_run_with(&runs, "fixture", |id| {
+                if id == source.id {
+                    Ok(source.clone())
+                } else if id == empty.id {
+                    Ok(empty.clone())
+                } else {
+                    bail!("unreadable authority")
+                }
+            })
+        };
+        assert_eq!(resolve(&source, &empty), Some(source.id.clone()));
+        assert_eq!(
+            choose_starter(None, false, resolve(&source, &empty).as_deref()),
+            Starter::Resume(source.id.clone())
+        );
+        source.retired_to = Some(empty.id.clone());
+        assert!(
+            resolve(&source, &empty).is_none(),
+            "cycles do not revive obsolete runs"
+        );
+        source.retired_to = None;
+        source.repo = PathBuf::from("/another-repository");
+        assert!(resolve(&source, &empty).is_none());
+        source.repo = empty.repo.clone();
+        source.released_to = Some("later".into());
+        assert!(resolve(&source, &empty).is_none());
+        empty.retired_to = Some("unlisted-run".into());
+        assert!(resolve(&source, &empty).is_none());
     }
 
     #[test]
