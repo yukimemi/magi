@@ -1850,6 +1850,53 @@ async fn settings_gear_is_reachable_on_a_phone_and_never_doubles_the_rail_link()
         .wait_for(&page, "!!document.getElementById('settings-btn')", w)
         .await
         .expect("gear in the DOM");
+    browser
+        .wait_for(
+            &page,
+            "document.getElementById('runs-count').textContent !== 'Loading…'",
+            w,
+        )
+        .await
+        .expect("client ready");
+    let feedback = browser.eval(&page, r##"(() => {
+      const fails = [];
+      const host = document.createElement('div');
+      host.style.cssText = 'position:fixed;left:20px;top:200px;z-index:999';
+      host.innerHTML = '<button class="btn">Dynamic <span>button</span></button><fieldset disabled><button>Disabled</button></fieldset><div inert><button>Inert</button></div><div aria-disabled="true"><button>Unavailable</button></div><div data-press><input></div><button disabled>Disabled</button>';
+      document.body.append(host);
+      const button = host.firstElementChild;
+      const down = (node) => {
+        const r = node.getBoundingClientRect();
+        node.dispatchEvent(new PointerEvent('pointerdown', {bubbles:true, isPrimary:true, button:0, clientX:r.x+r.width/2, clientY:r.y+r.height/2}));
+      };
+      const clear = () => document.dispatchEvent(new PointerEvent('pointercancel'));
+      down(button.firstElementChild);
+      if (!button.hasAttribute('data-pressed')) fails.push('dynamic nested target did not press');
+      if (document.querySelectorAll('.press-glow').length !== 1) fails.push('missing glow');
+      if (getComputedStyle(document.querySelector('#press-feedback')).pointerEvents !== 'none') fails.push('overlay intercepts input');
+      down(button);
+      if (document.querySelectorAll('.press-glow').length !== 1) fails.push('glows accumulate');
+      clear();
+      if (button.hasAttribute('data-pressed') || document.querySelector('.press-glow')) fails.push('cancel did not clear');
+      for (const node of host.querySelectorAll('fieldset button, [inert] button, [aria-disabled] button, input, button:disabled')) {
+        down(node);
+        if (host.querySelector('[data-pressed]') || document.querySelector('.press-glow')) fails.push('unavailable or input target reacted');
+        clear();
+      }
+      down(button);
+      document.dispatchEvent(new Event('scroll'));
+      if (button.hasAttribute('data-pressed') || document.querySelector('.press-glow')) fails.push('scroll did not clear');
+      button.focus();
+      if (getComputedStyle(button).outlineStyle === 'none') fails.push('missing focus outline');
+      host.remove();
+      return fails;
+    })()"##).await.expect("press feedback");
+    assert_eq!(
+        feedback,
+        serde_json::json!([]),
+        "press feedback regressions"
+    );
+
     let geometry = browser
         .eval(
             &page,

@@ -286,7 +286,6 @@ a { color: inherit; text-decoration: none; }
   background: none; border: 1px solid transparent; border-radius: var(--radius-sm);
   color: var(--ink-2); cursor: pointer; font: inherit;
 }
-.icon-btn:active { background: var(--sunk); }
 .icon-btn { position: relative; }
 .bell .badge { position: absolute; top: 2px; right: 0; background: var(--rust); color: var(--badge-ink, #fff); }
 .icon-btn svg { width: 20px; height: 20px; }
@@ -586,7 +585,6 @@ main {
   font: 600 var(--t3)/1 var(--sans); cursor: pointer;
   transition: transform .18s var(--ease);
 }
-.btn:active { transform: scale(.97); }
 .btn:disabled, .btn[aria-disabled="true"] { opacity: .5; cursor: default; }
 
 /* Gold is the verdict colour in the mark, so it is the commit action here and
@@ -672,7 +670,10 @@ main {
 .card-snippet mark { background: rgba(240, 190, 40, .45); color: inherit; border-radius: 2px; padding: 0 1px; }
 .queue-focus-status { margin: 0 0 var(--s3); font-size: var(--t3); color: var(--ink-2); }
 .card-permalink { font-size: var(--t1); color: var(--ink-3); text-decoration: none; }
-.card-permalink:hover, .card-permalink:focus-visible { color: var(--ink-2); text-decoration: underline; }
+.card-permalink:focus-visible { color: var(--ink-2); text-decoration: underline; }
+@media (hover: hover) and (pointer: fine) {
+  .card-permalink:hover { color: var(--ink-2); text-decoration: underline; }
+}
 .queue-search-status { margin: calc(-1 * var(--s2)) 0 var(--s3); font-size: var(--t3); color: var(--ink-2); }
 
 /* The single-hit flash: a plain background pulse rather than color-mix(), for
@@ -704,7 +705,6 @@ main {
    this interface that is pending rather than settled, so it is not the same
    card edge as `merged` at a glance or in greyscale. */
 .card[data-tone="wait"] { border-left-color: var(--gold-line); border-left-style: dashed; }
-a.card:active { background: var(--sunk); }
 
 /* Jumped to from the dependency graph: a brief highlight so the card that
    scrolled into view is the one the eye lands on, not just wherever the
@@ -964,7 +964,9 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
   background: none; border: 1px solid transparent; border-radius: var(--radius-sm);
   font: 600 var(--t3)/1.3 var(--sans); color: var(--ink-2); cursor: pointer;
 }
-.state-chip:hover { background: var(--surface); }
+@media (hover: hover) and (pointer: fine) {
+  .state-chip:hover { background: var(--surface); }
+}
 .state-chip[aria-checked="true"] { color: var(--ink); background: var(--surface); border-color: var(--edge); box-shadow: var(--shadow); }
 .state-chip-count { font: 500 var(--t1) var(--mono); color: var(--ink-3); }
 
@@ -1320,7 +1322,9 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
    just a different color. */
 .dep-node[data-tone="wait"] rect { fill: var(--tint-gold); stroke: var(--gold-line); stroke-dasharray: 4 3; }
 .dep-node { cursor: pointer; }
-.dep-node:hover rect { stroke-width: 2.5; }
+@media (hover: hover) and (pointer: fine) {
+  .dep-node:hover rect { stroke-width: 2.5; }
+}
 .dep-node:focus-visible rect { stroke: var(--focus); stroke-width: 2.5; }
 
 /* ---- stats dashboard ----------------------------------------------------
@@ -1361,7 +1365,9 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
    :focus-visible rule, no new tokens. Hover reuses the same sunk background
    the Runs state chips already use for the same purpose. */
 .stats-tile:is(button) { font: inherit; color: inherit; text-align: inherit; cursor: pointer; width: 100%; }
-.stats-tile:is(button):hover { background: var(--sunk); }
+@media (hover: hover) and (pointer: fine) {
+  .stats-tile:is(button):hover { background: var(--sunk); }
+}
 
 .stats-banner {
   background: var(--tint-rust); color: var(--on-rust);
@@ -1394,7 +1400,9 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .verdict-donut-svg { width: 180px; height: 180px; flex: none; }
 .donut-ring { fill: none; stroke: var(--sunk); stroke-width: 26; }
 .donut-slice { fill: none; stroke: var(--vc); stroke-width: 26; cursor: pointer; }
-.donut-slice:hover { opacity: .8; }
+@media (hover: hover) and (pointer: fine) {
+  .donut-slice:hover { opacity: .8; }
+}
 .donut-total { font: 700 30px var(--sans); fill: var(--ink); text-anchor: middle; font-variant-numeric: tabular-nums; }
 .donut-total-label { font: 11px var(--sans); fill: var(--ink-3); text-anchor: middle; text-transform: uppercase; letter-spacing: .05em; }
 .verdict-legend { list-style: none; margin: 0; padding: 0; width: 100%; max-width: 360px; display: flex; flex-direction: column; gap: 2px; }
@@ -1403,7 +1411,9 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
   padding: 0 var(--s2); background: transparent; border: 0; border-radius: var(--radius-sm);
   font: inherit; font-size: var(--t3); color: var(--ink-2); cursor: pointer; text-align: left;
 }
-.verdict-legend-row:hover { background: var(--sunk); }
+@media (hover: hover) and (pointer: fine) {
+  .verdict-legend-row:hover { background: var(--sunk); }
+}
 .verdict-legend-row[data-zero] { opacity: .55; }
 .verdict-legend-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--vc); }
 .verdict-legend-name { flex: 1; }
@@ -1645,7 +1655,6 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
   cursor: pointer;
 }
 .run-actions-fab svg { width: 22px; height: 22px; }
-.run-actions-fab:active { transform: scale(.97); }
 
 /* Clears the fab so the last panel in run detail is never permanently hidden
    behind it. */
@@ -2012,7 +2021,6 @@ details.panel > summary + * { margin-top: var(--s2); }
   background: none; border: 1px solid var(--edge); border-radius: var(--radius-sm);
   color: var(--ink-2); cursor: pointer;
 }
-.attach-btn:active { background: var(--sunk); }
 .attach-btn svg { width: 20px; height: 20px; }
 
 /* A drag entering the composer or the transcript above it - see
@@ -2310,13 +2318,15 @@ details.panel > summary + * { margin-top: var(--s2); }
   main[data-split] > #view-task::-webkit-scrollbar-thumb,
   main[data-split] > #view-talk::-webkit-scrollbar-thumb,
   main[data-split] > .split-empty::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 999px; }
-  main[data-split] > #view-runs::-webkit-scrollbar-thumb:hover,
-  main[data-split] > #view-queue::-webkit-scrollbar-thumb:hover,
-  main[data-split] > #view-talks::-webkit-scrollbar-thumb:hover,
-  main[data-split] > #view-run::-webkit-scrollbar-thumb:hover,
-  main[data-split] > #view-task::-webkit-scrollbar-thumb:hover,
-  main[data-split] > #view-talk::-webkit-scrollbar-thumb:hover,
-  main[data-split] > .split-empty::-webkit-scrollbar-thumb:hover { background: var(--edge); }
+  @media (hover: hover) and (pointer: fine) {
+    main[data-split] > #view-runs::-webkit-scrollbar-thumb:hover,
+    main[data-split] > #view-queue::-webkit-scrollbar-thumb:hover,
+    main[data-split] > #view-talks::-webkit-scrollbar-thumb:hover,
+    main[data-split] > #view-run::-webkit-scrollbar-thumb:hover,
+    main[data-split] > #view-task::-webkit-scrollbar-thumb:hover,
+    main[data-split] > #view-talk::-webkit-scrollbar-thumb:hover,
+    main[data-split] > .split-empty::-webkit-scrollbar-thumb:hover { background: var(--edge); }
+  }
 
   /* Draggable divider: a thin strip over the preview column's left padding, so
      it never covers the list's scrollbar or its row ends. The visible line is
@@ -2327,7 +2337,11 @@ details.panel > summary + * { margin-top: var(--s2); }
     width: 8px; z-index: 2; cursor: col-resize; touch-action: none;
     background: transparent; outline: none;
   }
-  main[data-split] > .split-divider:hover,
+  @media (hover: hover) and (pointer: fine) {
+    main[data-split] > .split-divider:hover {
+      background: linear-gradient(to right, var(--gold-line) 0 2px, transparent 2px);
+    }
+  }
   main[data-split] > .split-divider:focus-visible,
   main[data-split] > .split-divider[data-dragging] {
     background: linear-gradient(to right, var(--gold-line) 0 2px, transparent 2px);
@@ -2366,7 +2380,9 @@ details.panel > summary + * { margin-top: var(--s2); }
     box-shadow: none; flex: none;
   }
   main[data-split] .cards > li > .card { flex: none; }
-  main[data-split] .card:hover { background: var(--sunk); }
+  @media (hover: hover) and (pointer: fine) {
+    main[data-split] .card:hover { background: var(--sunk); }
+  }
   main[data-split] .card[aria-current="true"] {
     background: var(--sunk); border-color: var(--gold-line);
     outline: 1px solid var(--gold-line);
@@ -2471,7 +2487,9 @@ details.panel > summary + * { margin-top: var(--s2); }
   font: 700 var(--t2)/1 var(--sans); letter-spacing: .08em; text-transform: uppercase;
   color: var(--ink-3); text-decoration: none;
 }
-#view-run .run-tab:hover { color: var(--ink); }
+@media (hover: hover) and (pointer: fine) {
+  #view-run .run-tab:hover { color: var(--ink); }
+}
 #view-run .run-tab[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--gold-line); }
 #view-run .run-tab .count { font: 500 var(--t1) var(--mono); letter-spacing: 0; }
 #view-run .run-tabpanel { display: flex; flex-direction: column; gap: var(--s4); min-width: 0; }
@@ -2936,3 +2954,52 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
 #talk-task-progress-open { max-width: 100%; white-space: normal; text-align: left; }
 .avatar-settings select { display: block; width: 100%; max-width: 100%; min-height: 44px; margin-block: var(--s3); }
 .avatar-settings .set-actions { flex-wrap: wrap; }
+
+/* Shared feedback: tune these tokens without changing individual controls.
+   --focus follows both explicit and system light/dark themes. */
+:root {
+  --press-color: var(--focus);
+  --press-opacity: .18;
+  --press-duration: 600ms;
+  --press-release: 160ms;
+  --press-scale: .975;
+}
+:where(button, a[href], summary, [role="button"], [role="link"], [role="tab"], [role="radio"], [role="checkbox"], [role="switch"], [role="menuitem"], [data-press]) {
+  -webkit-tap-highlight-color: transparent;
+}
+:where([data-pressed], button:active, a[href]:active, summary:active, [role="button"]:active, [role="link"]:active, [role="tab"]:active, [role="radio"]:active, [role="checkbox"]:active, [role="switch"]:active, [role="menuitem"]:active, [data-press]:active:not(.task-card)):not(:disabled, [aria-disabled="true"], [aria-disabled="true"] *, [inert], [inert] *):not(:has(:active, [data-pressed])) {
+  background-color: var(--sunk);
+  opacity: .78;
+}
+/* Scale only ordinary buttons; fixed controls and transform-positioned
+   elements keep their positioning. The independent scale property composes. */
+button.btn[data-pressed]:not(:disabled, [aria-disabled="true"], [aria-disabled="true"] *, [inert] *) {
+  scale: var(--press-scale);
+}
+button[aria-busy="true"] {
+  box-shadow: inset 0 0 0 2px var(--press-color);
+}
+#press-feedback, #press-feedback * { pointer-events: none; }
+#press-feedback { position: fixed; inset: 0; z-index: 1000; overflow: hidden; }
+.press-glow { position: fixed; overflow: hidden; }
+.press-glow.is-released { animation: press-fade var(--press-release) ease-out forwards; }
+.press-glow > span {
+  position: absolute;
+  left: var(--press-x); top: var(--press-y);
+  width: var(--press-size); height: var(--press-size);
+  margin-left: calc(var(--press-size) / -2); margin-top: calc(var(--press-size) / -2);
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--press-color), transparent 70%);
+  opacity: var(--press-opacity);
+  animation: press-glow var(--press-duration) var(--ease) both;
+}
+@keyframes press-fade { to { opacity: 0; } }
+@keyframes press-glow {
+  from { transform: scale(.15); }
+  to { transform: scale(1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  #press-feedback { display: none; }
+  button.btn[data-pressed] { scale: none; }
+}
+@media print { #press-feedback { display: none; } }
