@@ -106,6 +106,39 @@ impl MergeArg {
     }
 }
 
+/// Source selection is never inferred from task or conversation text.
+#[derive(Debug, Clone, Default, clap::Args)]
+struct SourceArgs {
+    /// Start at this branch/commit, including its ancestry; pinned to a full SHA.
+    #[arg(long, value_name = "BRANCH|COMMIT")]
+    start_from: Option<String>,
+    /// Apply one commit (not its ancestors), in argument order. Repeatable; SHA only.
+    #[arg(long, value_name = "COMMIT")]
+    pick_commit: Vec<String>,
+}
+
+impl SourceArgs {
+    fn supplied(&self) -> bool {
+        self.start_from.is_some() || !self.pick_commit.is_empty()
+    }
+
+    async fn resolve(&self, repo: &Path, config: &Config) -> Result<magi::refs::Sources> {
+        let sources = magi::refs::Sources::resolve(
+            repo,
+            &config.merge.remote,
+            self.start_from.as_deref(),
+            &self.pick_commit,
+        )
+        .await?;
+        let base =
+            magi::git::merge_base_branch(repo, &config.merge.remote, config.merge.base.as_deref())
+                .await?;
+        let base = magi::git::rev_parse(repo, &format!("{}/{base}", config.merge.remote)).await?;
+        sources.plan(repo, &base).await?;
+        Ok(sources)
+    }
+}
+
 /// Execution knobs a competition run takes, shared by `magi run <instruction>`
 /// and the free-text fallback of `magi run rm <words...>` (see [`RunCmd::Rm`]):
 /// once clap commits to the `rm` subcommand it stops recognising `Run`'s own
@@ -115,6 +148,8 @@ impl MergeArg {
 /// "rm" the caller did not use.
 #[derive(Debug, Clone, Default, clap::Args)]
 struct RunOpts {
+    #[command(flatten)]
+    sources: SourceArgs,
     /// Repository to work on.
     #[arg(long)]
     repo: Option<PathBuf>,
@@ -153,8 +188,16 @@ impl RunOpts {
     /// turned out to be prose. Only one side is ever populated in practice —
     /// a flag is either before "rm" or after it — so preferring `self` is an
     /// arbitrary but harmless tie-break for the case of a flag on both sides.
-    fn merge(self, other: Self) -> Self {
-        Self {
+    fn merge(self, other: Self) -> Result<Self> {
+        anyhow::ensure!(
+            self.sources.start_from.is_none() || other.sources.start_from.is_none(),
+            "--start-from may be supplied only once"
+        );
+        Ok(Self {
+            sources: SourceArgs {
+                start_from: self.sources.start_from.or(other.sources.start_from),
+                pick_commit: [other.sources.pick_commit, self.sources.pick_commit].concat(),
+            },
             repo: self.repo.or(other.repo),
             config: self.config.or(other.config),
             implementers: self.implementers.or(other.implementers),
@@ -165,7 +208,7 @@ impl RunOpts {
             dry_run: self.dry_run || other.dry_run,
             force: self.force || other.force,
             task: self.task.or(other.task),
-        }
+        })
     }
 }
 
@@ -638,6 +681,8 @@ enum TalkCmd {
 enum TaskCmd {
     /// File a task. Text as arguments, or --file, or --issue, or on stdin.
     Add {
+        #[command(flatten)]
+        sources: SourceArgs,
         /// The task text.
         #[arg(value_name = "TASK", trailing_var_arg = true)]
         instruction: Vec<String>,
@@ -693,6 +738,15 @@ enum TaskCmd {
         /// Print the filed task as JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Replace source inputs on a queued/held task before implementation starts.
+    Sources {
+        id: String,
+        #[command(flatten)]
+        sources: SourceArgs,
+        /// Explicitly select no source imports (also disables legacy inferred imports).
+        #[arg(long, conflicts_with_all = ["start_from", "pick_commit"])]
+        clear: bool,
     },
     /// List the queue.
     List {
@@ -1269,13 +1323,17 @@ async fn dispatch(command: Command) -> Result<()> {
             // taking along whatever flags clap parsed after "rm" merged with
             // whatever it parsed before.
             let (instruction, opts) = match command {
-                Some(RunCmd::Rm { id, .. }) if id.len() == 1 => {
+                Some(RunCmd::Rm { id, opts: rm_opts }) if id.len() == 1 => {
+                    anyhow::ensure!(
+                        !opts.sources.supplied() && !rm_opts.sources.supplied(),
+                        "source options cannot be used with run rm"
+                    );
                     return run_rm_cmd(&id[0]);
                 }
                 Some(RunCmd::Rm { id, opts: rm_opts }) => {
                     let mut full = vec!["rm".to_owned()];
                     full.extend(id);
-                    (full, rm_opts.merge(opts))
+                    (full, rm_opts.merge(opts)?)
                 }
                 None => (instruction, opts),
             };
@@ -1288,6 +1346,11 @@ async fn dispatch(command: Command) -> Result<()> {
                 bail!(why);
             }
             let repo = opts.repo.clone().unwrap_or_else(|| PathBuf::from("."));
+            if (resume.is_some() || opts.task.is_some()) && opts.sources.supplied() {
+                bail!(
+                    "source options only apply to new tasks; use `magi task sources` for an existing task"
+                );
+            }
             if let Some(id) = resume {
                 return resume_run(&id, opts.dry_run).await;
             }
@@ -1332,6 +1395,7 @@ async fn dispatch(command: Command) -> Result<()> {
             let (mut cfg, from) =
                 Config::discover_fetched(&repo, overrides.config.as_deref()).await?;
             overrides.apply(&mut cfg);
+            let sources = opts.sources.resolve(&repo, &cfg).await?;
             println!("config: {}", describe_layers(&from));
             if !opts.force {
                 refuse_duplicates(
@@ -1358,6 +1422,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 solo: false,
                 overrides,
                 review_of: None,
+                sources,
             };
             run_as_task(&queue, filing, opts.dry_run).await
         }
@@ -1430,6 +1495,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 source: task_source(None).await,
                 solo: false,
                 overrides,
+                sources: Default::default(),
                 review_of: Some(branch),
             };
             run_as_task(&queue, filing, false).await
@@ -3082,6 +3148,7 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
     }
     match command {
         TaskCmd::Add {
+            sources,
             instruction,
             file,
             issue,
@@ -3108,6 +3175,7 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                     || !attach.is_empty()
                     || force
                     || implementers.is_some()
+                    || sources.supplied()
                     || std::fs::canonicalize(&repo)? != std::fs::canonicalize(&t.repo)?
                 {
                     bail!(
@@ -3188,7 +3256,14 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
             } else {
                 None
             };
+            let selected = if sources.supplied() {
+                let (cfg, _) = Config::discover(&repo, None)?;
+                sources.resolve(&repo, &cfg).await?
+            } else {
+                Default::default()
+            };
             let mut task = Task::new(title, text, repo, source);
+            task.sources = selected;
             if let Some(reason) = hold {
                 task.hold_manual(Some(reason));
             }
@@ -3218,6 +3293,50 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                     task.title
                 );
             }
+            Ok(())
+        }
+
+        TaskCmd::Sources { id, sources, clear } => {
+            anyhow::ensure!(
+                clear || sources.supplied(),
+                "specify --clear, --start-from or --pick-commit"
+            );
+            let id = q.resolve_id(&id)?;
+            let _claim = q
+                .claim(&id)
+                .context("task is claimed by a running process")?;
+            let mut task = q.get(&id)?;
+            anyhow::ensure!(
+                matches!(task.status, TaskStatus::Queued | TaskStatus::Held),
+                "hold the task before changing sources"
+            );
+            anyhow::ensure!(
+                task.review_of.is_none()
+                    && task.review_branch.is_none()
+                    && task.pr_recovery.is_none()
+                    && task.replacement.is_none(),
+                "use the existing review/recover-pr workflow for this task"
+            );
+            // Inspect every attempt: no source edit may silently replace useful work.
+            for run in &task.runs {
+                let state = RunState::load(run)?;
+                anyhow::ensure!(
+                    state.prep_complete == Some(false) && state.candidates.is_empty(),
+                    "run {run} may contain useful work; use explicit review/recover-pr instead"
+                );
+            }
+            let selected = if clear {
+                Default::default()
+            } else {
+                let (cfg, _) = Config::discover(&task.repo, None)?;
+                sources.resolve(&task.repo, &cfg).await?
+            };
+            task.sources = selected;
+            q.put(&mut task)?;
+            println!(
+                "updated sources for {}; release the held task to retry preparation",
+                task.short()
+            );
             Ok(())
         }
 
@@ -3286,6 +3405,12 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
             println!("source    {}", t.source.label());
             println!("repo      {}", t.repo.display());
             println!("priority  {}", t.priority);
+            if let Some(start) = &t.sources.start_from {
+                println!("start from  {} ({})", start.token, start.sha);
+            }
+            for pick in &t.sources.pick_commits {
+                println!("pick commit {} ({})", pick.token, pick.sha);
+            }
             println!(
                 "urgent    {}",
                 if t.urgent { "enabled" } else { "disabled" }
@@ -4085,7 +4210,7 @@ async fn run_as_task(queue: &Queue, filing: magi::direct::Filing, dry_run: bool)
             if dry_run {
                 let cfg = magi::direct::config_for(&task, &task.repo)?;
                 let origin = magi::run::Origin::queue(&task.id);
-                let runner = Runner::start_naming(
+                let mut runner = Runner::start_naming(
                     &task.repo,
                     task.instruction.clone(),
                     &task.title,
@@ -4093,6 +4218,8 @@ async fn run_as_task(queue: &Queue, filing: magi::direct::Filing, dry_run: bool)
                     origin,
                 )
                 .await?;
+                runner.state.sources = task.sources.clone();
+                runner.state.save()?;
                 print!("{}", report::run(&runner.state));
                 println!("\ndry run: stopping before the first agent call");
                 // Link the prepared run (not `start`: no attempt was spent) so
@@ -4338,6 +4465,12 @@ async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
         task.short(),
         task.short()
     );
+    if claim.is_some()
+        && runner.state.prep_complete == Some(false)
+        && runner.state.candidates.is_empty()
+    {
+        runner.state.sources = task.sources.clone();
+    }
     if runner.state.prep_failure.is_some() && claim.is_some() {
         runner.retry_preparation(jiff::Timestamp::now())?;
     }
@@ -4667,6 +4800,108 @@ async fn probe(program: &str, args: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rm_fallback_rejects_two_starts_and_keeps_cli_pick_order() {
+        let mut before = RunOpts::default();
+        before.sources.pick_commit = vec!["abc1234".into()];
+        let mut after = RunOpts::default();
+        after.sources.pick_commit = vec!["def5678".into()];
+        assert_eq!(
+            after.merge(before).unwrap().sources.pick_commit,
+            ["abc1234", "def5678"]
+        );
+        let mut before = RunOpts::default();
+        before.sources.start_from = Some("one".into());
+        let mut after = RunOpts::default();
+        after.sources.start_from = Some("two".into());
+        assert!(after.merge(before).is_err());
+    }
+
+    #[tokio::test]
+    async fn source_clear_preserves_instruction_and_requires_the_task_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let mut task = Task::new(
+            "historical example".into(),
+            "Do not import abc1234".into(),
+            dir.path().to_path_buf(),
+            queue::Source::Human,
+        );
+        task.sources.start_from = Some(magi::refs::Input {
+            token: "selected".into(),
+            sha: "1".repeat(40),
+            provenance: magi::refs::Provenance::ExplicitCli,
+        });
+        task.hold_manual(Some("inspect sources".into()));
+        queue.put(&mut task).unwrap();
+        let command = || TaskCmd::Sources {
+            id: task.id.clone(),
+            sources: SourceArgs::default(),
+            clear: true,
+        };
+        let claim = queue.claim(&task.id).unwrap();
+        assert!(task_cmd_on(command(), queue.clone()).await.is_err());
+        drop(claim);
+        task_cmd_on(command(), queue.clone()).await.unwrap();
+        let cleared = queue.get(&task.id).unwrap();
+        assert_eq!(cleared.sources, magi::refs::Sources::default());
+        assert_eq!(cleared.instruction, task.instruction);
+        assert_eq!(cleared.status, TaskStatus::Held);
+    }
+
+    #[test]
+    fn source_options_are_structured_and_preserve_pick_order() {
+        for args in [
+            vec![
+                "magi",
+                "run",
+                "--start-from",
+                "feature/work",
+                "--pick-commit",
+                "abc1234",
+                "--pick-commit",
+                "def5678",
+                "fix it",
+            ],
+            vec![
+                "magi",
+                "task",
+                "add",
+                "--start-from",
+                "feature/work",
+                "--pick-commit",
+                "abc1234",
+                "--pick-commit",
+                "def5678",
+                "fix it",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            let sources = match cli.command.unwrap() {
+                Command::Run { opts, .. } => opts.sources,
+                Command::Task {
+                    command: TaskCmd::Add { sources, .. },
+                    ..
+                } => sources,
+                other => panic!("unexpected command: {other:?}"),
+            };
+            assert_eq!(sources.start_from.as_deref(), Some("feature/work"));
+            assert_eq!(sources.pick_commit, ["abc1234", "def5678"]);
+        }
+        assert!(
+            Cli::try_parse_from([
+                "magi",
+                "task",
+                "sources",
+                "id",
+                "--clear",
+                "--start-from",
+                "branch"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn clap_color_reads_no_color_before_the_terminator() {
@@ -5615,6 +5850,7 @@ mod tests {
         std::fs::write(&shot, "pixels").unwrap();
         task_cmd_on(
             TaskCmd::Add {
+                sources: Default::default(),
                 instruction: vec!["make".to_owned(), "it".to_owned(), "pretty".to_owned()],
                 file: None,
                 issue: None,
@@ -5761,6 +5997,7 @@ mod tests {
 
         task_cmd_on(
             TaskCmd::Add {
+                sources: Default::default(),
                 instruction: vec!["do".to_owned(), "the".to_owned(), "thing".to_owned()],
                 file: None,
                 issue: None,
@@ -5782,6 +6019,7 @@ mod tests {
 
         task_cmd_on(
             TaskCmd::Add {
+                sources: Default::default(),
                 instruction: vec!["do".to_owned(), "another".to_owned(), "thing".to_owned()],
                 file: None,
                 issue: None,
@@ -5820,6 +6058,7 @@ mod tests {
 
         task_cmd_on(
             TaskCmd::Add {
+                sources: Default::default(),
                 instruction: vec!["do".to_owned(), "the".to_owned(), "thing".to_owned()],
                 file: None,
                 issue: None,
@@ -5841,6 +6080,7 @@ mod tests {
 
         task_cmd_on(
             TaskCmd::Add {
+                sources: Default::default(),
                 instruction: vec!["do".to_owned(), "another".to_owned(), "thing".to_owned()],
                 file: None,
                 issue: None,
@@ -5883,6 +6123,7 @@ mod tests {
 
         let err = task_cmd_on(
             TaskCmd::Add {
+                sources: Default::default(),
                 instruction: vec!["list".to_owned()],
                 file: None,
                 issue: None,
@@ -5906,6 +6147,7 @@ mod tests {
 
         let err = task_cmd_on(
             TaskCmd::Add {
+                sources: Default::default(),
                 instruction: vec!["info".to_owned(), "20260912-114326-d3b8".to_owned()],
                 file: None,
                 issue: None,
@@ -5945,6 +6187,7 @@ mod tests {
 
         task_cmd_on(
             TaskCmd::Add {
+                sources: Default::default(),
                 instruction: vec![],
                 file: Some(path),
                 issue: None,
@@ -6279,6 +6522,7 @@ mod tests {
 
         let err = task_cmd_on(
             TaskCmd::Add {
+                sources: Default::default(),
                 instruction: vec!["do".to_owned(), "it".to_owned()],
                 file: None,
                 issue: None,
@@ -6309,6 +6553,7 @@ mod tests {
 
         task_cmd_on(
             TaskCmd::Add {
+                sources: Default::default(),
                 instruction: vec!["do".to_owned(), "it".to_owned()],
                 file: None,
                 issue: None,
@@ -6375,6 +6620,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
         owner.review_branch = Some("magi/ab12/A".to_owned());
         q.put(&mut owner).unwrap();
         let add = |force| TaskCmd::Add {
+            sources: Default::default(),
             instruction: vec!["land".to_owned(), "magi/ab12/A".to_owned()],
             file: None,
             issue: None,
@@ -6996,7 +7242,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
                 assert_eq!(id, vec!["the", "dead", "code"]);
                 assert_eq!(opts.implementers, Some(3));
                 assert_eq!(rm_opts.seed, Some(7));
-                let merged = rm_opts.merge(opts);
+                let merged = rm_opts.merge(opts).unwrap();
                 assert_eq!(merged.implementers, Some(3));
                 assert_eq!(merged.seed, Some(7));
             }

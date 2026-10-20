@@ -44,6 +44,7 @@ use crate::prompt::{
     self, CandidateView, Lens, ReviewPatch, ReviewReconsiderCtx, ReviewSeatReport, Turn,
 };
 use crate::queue;
+#[cfg(test)]
 use crate::refs;
 use crate::run::{
     BaseSync, Candidate, CommandOutcome, ContinuationOutcome, ContinuationRecord,
@@ -620,13 +621,12 @@ impl Runner {
         Self::start_naming(repo, instruction, "", config, origin).await
     }
 
-    /// [`Runner::start`] for a queued task: `also_scan` (the task's title) is
-    /// searched for branch and commit references along with the instruction,
-    /// since a task may name the work it is about only in its title.
+    /// [`Runner::start`] for a queued task. Titles and instructions never
+    /// select implementation sources. The title argument is retained for callers.
     pub async fn start_naming(
         repo: &Path,
         instruction: String,
-        also_scan: &str,
+        _also_scan: &str,
         config: Config,
         origin: Origin,
     ) -> Result<Self> {
@@ -652,29 +652,12 @@ impl Runner {
         let base_commit = fetched_base.commit.clone();
         let roles = config.resolve_roles()?;
         let max_parallel = config.graph.max_parallel.max(1);
-        // A task that points at work already in the repository starts from
-        // it; what the repository says about each reference is recorded.
-        let seeds = refs::resolve(
-            &repo,
-            &base_commit,
-            &config.merge.remote,
-            &format!("{also_scan}\n{instruction}"),
-        )
-        .await;
-        refs::plan(&repo, &seeds).await?;
         let mut state = RunState::new(repo, base_branch, base_commit, instruction, config);
         // Recorded before the first save, so a crash right after minting
         // cannot leave a run with no origin. Legibility only: nothing reads it
         // to decide anything.
         state.fetched_base = Some(fetched_base);
         state.origin = Some(origin);
-        for seed in &seeds {
-            state.event(
-                "seed",
-                refs::describe(std::slice::from_ref(seed)).unwrap_or_default(),
-            );
-        }
-        state.seeds = seeds;
         state.event("start", format!("run {} created", state.id));
         state.save()?;
         Ok(Self {
@@ -1726,6 +1709,8 @@ impl Runner {
         // Includes rollback, config, refs, checkout creation and setup. No
         // repository mutation may precede the real shared lock acquisition.
         let _coordination = self.coordinate(&repo).await?;
+        let base = self.state.base_commit.clone();
+        let plan = self.state.sources.plan(&repo, &base).await?;
         self.rollback_prep(&repo).await;
         if !self.state.candidates.is_empty() {
             bail!(
@@ -1736,8 +1721,6 @@ impl Runner {
         self.state.status = RunStatus::Prep;
         self.state.save()?;
         let repo = self.state.repo.clone();
-        let base = self.state.base_commit.clone();
-        let plan = refs::plan(&repo, &self.state.seeds).await?;
         let start = plan.start.clone().unwrap_or_else(|| base.clone());
         let root = self.state.worktree_root();
         let labels = blind::assign_labels(self.roles.implementers.len(), self.state.seed);
@@ -11065,20 +11048,30 @@ fn pr_preview(
     PrMessage { title, body }
 }
 
-/// The task with what the repository says about the existing work it names
-/// appended, so an implementer knows what it started from and what it must
-/// not redo. Unchanged when the task names nothing.
+/// Source imports have already been prepared from structured inputs. Legacy
+/// inferred references must never instruct a seat to reconstruct those imports.
 fn seeded_instruction(state: &RunState) -> String {
-    match refs::describe(&state.seeds) {
-        Some(facts) => format!(
-            "{}\n\n# Existing work the task refers to\n\n{facts}\n\n\
-             Candidates start from the unmerged branch named above, when there \
-             is one, and carry any unmerged commit named by sha as a \
-             cherry-pick. Check that this is what the task meant before \
-             building on it.",
-            state.instruction
-        ),
-        None => state.instruction.clone(),
+    let mut inputs = Vec::new();
+    if let Some(start) = &state.sources.start_from {
+        inputs.push(format!(
+            "Start from `{}` at `{}` (including ancestry).",
+            start.token, start.sha
+        ));
+    }
+    for pick in &state.sources.pick_commits {
+        inputs.push(format!(
+            "Pick `{}` at `{}` (single commit).",
+            pick.token, pick.sha
+        ));
+    }
+    if inputs.is_empty() {
+        state.instruction.clone()
+    } else {
+        format!(
+            "{}\n\n# Explicit source inputs already prepared\n\n{}",
+            state.instruction,
+            inputs.join("\n")
+        )
     }
 }
 
@@ -11111,13 +11104,9 @@ fn empty_candidate_detail(state: &RunState, base: &str) -> String {
         "empty candidate: the winning branch has 0 commits ahead of {base}, so there is \
          nothing to open a pull request for"
     );
-    match refs::describe(&state.seeds) {
-        Some(facts) => detail.push_str(&format!("\nReferences in the task:\n{facts}")),
-        None => detail.push_str(
-            "\nThe task names no existing branch or commit; if it means to land work \
-             that lives elsewhere, name the branch (magi/<run>/<label>) or the sha.",
-        ),
-    }
+    detail.push_str(
+        "\nSource imports require explicit --start-from or --pick-commit options on a new task.",
+    );
     detail
 }
 
@@ -13139,6 +13128,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_pinned_sources_create_no_partial_worktrees() {
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let mut runner = runner_at(RunStatus::Prep);
+        runner.state.repo = repo.clone();
+        runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
+        runner.state.config.graph.worktree_root = Some(tmp.path().join("worktrees"));
+        runner.state.sources.pick_commits.push(refs::Input {
+            token: "missing".into(),
+            sha: "0".repeat(40),
+            provenance: refs::Provenance::ExplicitCli,
+        });
+        assert!(runner.prep().await.is_err());
+        assert!(runner.state.candidates.is_empty());
+        assert!(!runner.state.worktree_root().exists());
+    }
+
+    #[tokio::test]
+    async fn prose_and_legacy_inference_never_import_into_candidates() {
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let base = git::rev_parse(&repo, "HEAD").await.unwrap();
+        git::git(&repo, &["checkout", "-b", "magi/history/A"])
+            .await
+            .unwrap();
+        std::fs::write(repo.join("unwanted"), "do not import").unwrap();
+        git::git(&repo, &["add", "."]).await.unwrap();
+        git::git(&repo, &["commit", "-m", "historical implementation"])
+            .await
+            .unwrap();
+        let source = git::rev_parse(&repo, "HEAD").await.unwrap();
+        git::git(&repo, &["checkout", "main"]).await.unwrap();
+        for instruction in [
+            format!("Example: magi/history/A at {source}"),
+            format!("Quoted failure: cannot apply referenced commit {source} from magi/history/A"),
+            format!("Never import magi/history/A or {source}"),
+            format!("Conversation answer: I mentioned {source} only as background"),
+        ] {
+            let mut runner = runner_at(RunStatus::Prep);
+            runner.state.repo = repo.clone();
+            runner.state.base_commit = base.clone();
+            runner.state.instruction = instruction.clone();
+            runner.state.config.graph.worktree_root = Some(tmp.path().join(&runner.state.id));
+            runner.state.config.blind.commit_msg_hook = false;
+            runner.state.seeds = vec![refs::Seed {
+                token: "magi/history/A".into(),
+                sha: source.clone(),
+                kind: refs::SeedKind::Unmerged,
+                branch: true,
+                detail: String::new(),
+            }];
+            runner.roles.implementers = vec![spec("one")];
+            assert_eq!(seeded_instruction(&runner.state), instruction);
+            // Model an old record with inferred seeds but no structured input field.
+            let mut legacy = serde_json::to_value(&runner.state).unwrap();
+            legacy.as_object_mut().unwrap().remove("sources");
+            runner.state = serde_json::from_value(legacy).unwrap();
+            assert_eq!(runner.state.sources, refs::Sources::default());
+            runner.state.save().unwrap();
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            runner.prep().await.unwrap();
+            for candidate in &runner.state.candidates {
+                assert_eq!(
+                    git::rev_parse(&candidate.worktree, "HEAD").await.unwrap(),
+                    base
+                );
+                assert!(!candidate.worktree.join("unwanted").exists());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn preparation_retries_after_explicit_release_and_rebuilds_partial_candidates() {
         ask_test_home();
         let tmp = tempfile::tempdir().unwrap();
@@ -13160,13 +13227,10 @@ mod tests {
         runner.state.config.graph.worktree_root = Some(tmp.path().join("wt"));
         runner.state.config.graph.advise = false;
         runner.state.config.blind.commit_msg_hook = false;
-        runner.state.seeds = vec![refs::Seed {
-            token: seed.clone(),
-            sha: seed.clone(),
-            kind: refs::SeedKind::Unmerged,
-            branch: false,
-            detail: String::new(),
-        }];
+        runner.state.sources =
+            refs::Sources::resolve(&repo, "origin", None, std::slice::from_ref(&seed))
+                .await
+                .unwrap();
         runner.roles.implementers = vec![spec("one"), spec("two")];
         runner.roles.judges = vec![spec("judge")];
         let label = blind::assign_labels(2, runner.state.seed)[0];
@@ -14634,7 +14698,8 @@ mod tests {
         assert!(!merge_is_empty(&repo, &state, "magi/x/B", MergeMode::Pr).await);
         let detail = empty_candidate_detail(&state, "main");
         assert!(detail.starts_with("empty candidate"), "{detail}");
-        assert!(detail.contains("magi/27b2/A"), "{detail}");
+        assert!(!detail.contains("magi/27b2/A"), "{detail}");
+        assert!(detail.contains("--start-from"), "{detail}");
     }
 
     /// `status == Ready` used to be read as "this is the harmless

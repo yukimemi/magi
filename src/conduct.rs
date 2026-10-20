@@ -641,7 +641,7 @@ async fn outcome_for(task: &Task, repo: &Path) -> prompt::ConductOutcome {
         rounds,
         branch,
         branch_head,
-        references: crate::refs::describe(&state.seeds),
+        references: None,
         empty_candidate: state.merge.as_ref().is_some_and(|m| m.empty),
     }
 }
@@ -676,73 +676,18 @@ async fn open_pr_fact(task: &Task, repo: &Path) -> Option<String> {
 /// in code, rather than trusted to the model: a question the model wrote
 /// without checking still reaches the operator with the answer attached.
 /// When it cannot be checked the question says so instead of guessing.
-async fn attach_facts(cfg: &Config, repo: &Path, queue: &Queue, verdict: &mut Verdict) {
+async fn attach_facts(_cfg: &Config, repo: &Path, queue: &Queue, verdict: &mut Verdict) {
     for d in verdict
         .decisions
         .iter_mut()
         .filter(|d| d.question.is_some())
     {
-        let Ok(task) = queue.get(&d.id) else {
-            continue;
-        };
-        let text = format!("{}\n{}", task.title, task.instruction);
-        let pr_fact = open_pr_fact(&task, repo_for(&task, repo).as_path()).await;
-        if crate::refs::scan(&text).is_empty() {
-            if let (Some(fact), Some(q)) = (pr_fact, d.question.as_mut()) {
-                q.push_str(&format!(
-                    "\n\nChecked against the repository (magi did this, not the model):\n{fact}"
-                ));
-            }
-            continue;
-        }
-        let repo = repo_for(&task, repo);
-        let remote = &cfg.merge.remote;
-        let base = crate::git::merge_base_branch(&repo, remote, cfg.merge.base.as_deref())
-            .await
-            .ok();
-        let facts = match base {
-            Some(base) => {
-                let base_name = base.clone();
-                let tracking = format!("{remote}/{base}");
-                // Best effort: a stale tracking ref would report work that
-                // has since landed as still missing from the base.
-                let refreshed = crate::git::fetch(&repo, remote, &base)
-                    .await
-                    .is_ok_and(|o| o.ok());
-                // Only the remote's tip counts: a local branch of the same
-                // name is whatever the checkout happens to hold.
-                let against = tracking;
-                match crate::git::rev_parse(&repo, &against).await {
-                    Ok(tip) => crate::refs::describe(
-                        &crate::refs::resolve(&repo, &tip, remote, &text).await,
-                    )
-                    .map(|facts| {
-                        if refreshed {
-                            facts
-                        } else {
-                            format!(
-                                "{facts}\n(could not fetch {remote}/{base_name}: this is \
-                                 against the last fetched `{against}`, which may be behind \
-                                 the remote)"
-                            )
-                        }
-                    }),
-                    Err(_) => Some(format!(
-                        "could NOT be checked against the repository: {against} is not \
-                         available here, so whether the work is in the base is unknown"
-                    )),
-                }
-            }
-            None => Some("could not check the repository: no base branch known".to_owned()),
-        };
-        let facts = match (facts, pr_fact) {
-            (Some(f), Some(p)) => Some(format!("{f}\n{p}")),
-            (f, p) => f.or(p),
-        };
-        if let (Some(facts), Some(q)) = (facts, d.question.as_mut()) {
-            q.push_str(&format!(
-                "\n\nChecked against the repository (magi did this, not the model):\n{facts}"
-            ));
+        let Ok(task) = queue.get(&d.id) else { continue };
+        if let (Some(fact), Some(q)) = (
+            open_pr_fact(&task, &repo_for(&task, repo)).await,
+            d.question.as_mut(),
+        ) {
+            q.push_str(&format!("\n\nChecked against the repository: {fact}"));
         }
     }
 }

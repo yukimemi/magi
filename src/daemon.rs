@@ -3797,6 +3797,9 @@ async fn attempt(
                     r.state.status = RunStatus::Implementing;
                     r.state.event("implement", "owner released the held selected implementer; retrying the same attempt without fallback");
                 }
+                if r.state.prep_complete == Some(false) && r.state.candidates.is_empty() {
+                    r.state.sources = task.sources.clone();
+                }
                 if r.state.prep_failure.is_some() {
                     let approval = task
                         .resumption
@@ -3848,6 +3851,7 @@ async fn attempt(
             .await
             .map(|mut r| {
                 r.state.attachments = attachments.clone();
+                r.state.sources = task.sources.clone();
                 r
             })
         }

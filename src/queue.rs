@@ -290,6 +290,9 @@ pub struct Task {
     pub title: String,
     /// The task itself, handed to the graph verbatim.
     pub instruction: String,
+    /// Explicit, SHA-pinned implementation imports; separate from instruction text.
+    #[serde(default)]
+    pub sources: crate::refs::Sources,
     /// Repository to work in.
     pub repo: PathBuf,
     /// Who asked.
@@ -799,6 +802,7 @@ impl Task {
             id: new_id(),
             title,
             instruction,
+            sources: crate::refs::Sources::default(),
             repo,
             source,
             priority: 0,
