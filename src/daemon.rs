@@ -3868,7 +3868,9 @@ async fn attempt(
         Duration::from_secs(config.graph.timeout_resource_wait),
         move || startup_pause.parked() || startup_interrupt.parked(),
     );
-    let started = wait.scope(async { match &starter {
+    // Startup includes review takeover and recovery. Do not embed its large
+    // future in both the wait scope and the surrounding attempt stack frame.
+    let started = wait.scope(Box::pin(async { match &starter {
         Starter::Review(_) if task.pr_recovery.is_some() => {
             let selected = task.pr_recovery.clone().expect("selected recovery");
             match selected.check_task(&task.id, &task.instruction) {
@@ -3971,7 +3973,7 @@ async fn attempt(
                 r
             })
         }
-    }}).await;
+    }})).await;
     let mut runner = match started {
         Ok(r) => r,
         Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => {
@@ -4300,14 +4302,16 @@ pub fn foreign_loop(
 pub async fn run_claimed(opts: &Opts, queue: &Queue, task: &mut Task) {
     let status = Arc::new(Mutex::new(Status::new()));
     let stop = Stop::new();
-    attempt(
+    // An attempt embeds startup and graph futures. Keep it off the standalone
+    // caller's stack, on both the initial execution and withheld-text resume.
+    Box::pin(attempt(
         opts,
         queue,
         &status,
         &stop,
         crate::graph::Pause::new(),
         task,
-    )
+    ))
     .await;
     // A run parked on the owner's word about a withheld PR title/body has no
     // daemon to finish it. Nobody else will enforce `answer_timeout`, so wait
@@ -4342,14 +4346,14 @@ pub async fn run_claimed(opts: &Opts, queue: &Queue, task: &mut Task) {
             break;
         }
         resumes += 1;
-        attempt(
+        Box::pin(attempt(
             opts,
             queue,
             &status,
             &stop,
             crate::graph::Pause::new(),
             task,
-        )
+        ))
         .await;
     }
     hold_if_runnable(queue, task);
