@@ -109,6 +109,11 @@ pub enum Sender {
 
 /// Resolve old records conservatively; operator prose is never classified by text.
 pub fn sender(turn: &Turn, message: Option<&Message>) -> Sender {
+    if turn.who == Who::Agent
+        && legacy_investigation_state(message.map_or(&turn.body, |m| &m.body)).is_some()
+    {
+        return Sender::Magi;
+    }
     message
         .and_then(|m| m.sender)
         .or(turn.sender)
@@ -197,6 +202,11 @@ pub(crate) fn notice_display(
         return Some(display.clone());
     }
     let body = message.map_or(turn.body.as_str(), |m| m.body.as_str());
+    if turn.who == Who::Agent
+        && let Some(state) = legacy_investigation_state(body)
+    {
+        return investigation_note(state).messages.remove(0).display;
+    }
     if sender(turn, message) == Sender::Magi
         || talk.completion_notices.iter().any(|r| r.notice == body)
     {
@@ -521,6 +531,9 @@ pub struct Talk {
     pub status: TalkStatus,
     /// Everything said, oldest first.
     pub turns: Vec<Turn>,
+    /// Last investigation result, replayed once to a resumed CLI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub investigation_state: Option<InvestigationState>,
     /// Recommendation-time question snapshots keyed by persona turn position.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub recommendations: std::collections::BTreeMap<usize, crate::consult::RecommendationManifest>,
@@ -1591,6 +1604,7 @@ pub fn begin_with(
         repo,
         agent: spec.id.clone(),
         status: TalkStatus::Open,
+        investigation_state: None,
         turns: Vec::new(),
         pending: String::new(),
         pending_attachments: Vec::new(),
@@ -2336,6 +2350,176 @@ fn pending_matches(talk: &Talk, expected_text: &str, expected_attachments: &[Str
             .eq(expected_attachments.iter())
 }
 
+/// Persisted independently of the CLI session: a successful control reply is
+/// not evidence that the requested repository investigation actually ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvestigationState {
+    /// The final launch check passed; process launch is next.
+    Started,
+    /// The investigation returned a usable evidence response.
+    Completed,
+    /// Repository coordination refused an immediate reader.
+    Busy,
+    /// The question belongs to another repository.
+    RepositoryMismatch,
+    /// Persisted metadata could not establish the repository.
+    RepositoryUnknown,
+    /// The consultation, conversation or turn ownership changed.
+    Cancelled,
+    /// The investigation could not produce evidence.
+    Failed,
+    /// The investigation exceeded its process deadline.
+    TimedOut,
+    /// The investigation exhausted the configured seat quota.
+    Quota,
+    /// A control-shaped response was not eligible for execution.
+    InvalidControl,
+}
+
+impl InvestigationState {
+    fn display(self) -> &'static str {
+        match self {
+            Self::Started => "読み取り専用の調査を開始します。承認や実行状態は変更しません。",
+            Self::Completed => "調査が完了しました。承認判断はまだ行っていません。",
+            Self::Busy => {
+                "リポジトリが使用中のため、調査は開始せず保留しました。自動再開はしません。利用可能になったら、この会話でもう一度調査を依頼してください。関連タスクがロック所有者とは限りません。"
+            }
+            Self::RepositoryMismatch => {
+                "相談対象が別のリポジトリのため、調査は開始せず保留しました。magi task show で対象と調整設定を確認し、対象リポジトリの会話で再度依頼してください。"
+            }
+            Self::RepositoryUnknown => {
+                "相談対象のリポジトリを確認できないため、調査は開始せず保留しました。タスク・実行記録を復元してから再度依頼してください。"
+            }
+            Self::Cancelled => {
+                "相談または会話の状態が変わったため、調査を中止しました。承認や実行状態は変更していません。"
+            }
+            Self::Failed => {
+                "調査に失敗しました。調査済みとは扱いません。診断ログを確認し、この会話で再度依頼してください。"
+            }
+            Self::TimedOut => {
+                "調査が時間制限を超えました。調査済みとは扱いません。この会話で再度依頼してください。"
+            }
+            Self::Quota => {
+                "利用上限に達したため、調査を完了できませんでした。利用可能になってから、この会話で再度依頼してください。"
+            }
+            Self::InvalidControl => {
+                "調査要求を受け付けられませんでした。有効な相談中に、この会話でもう一度調査を依頼してください。承認や実行状態は変更していません。"
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for InvestigationState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "investigation state: {self:?}")
+    }
+}
+impl std::error::Error for InvestigationState {}
+
+/// Display classification is deliberately broader than execution permission.
+/// Only standalone control-shaped responses are hidden; prose quoting the
+/// protocol remains ordinary text. Fences and malformed objects cannot execute.
+#[derive(Debug, PartialEq, Eq)]
+enum InvestigationResponse {
+    Prose,
+    Request(String),
+    Invalid,
+}
+
+fn investigation_response(text: &str) -> InvestigationResponse {
+    let text = text.trim();
+    let candidate = if let Some(fenced) = text.strip_prefix("```") {
+        fenced
+            .split_once('\n')
+            .map(|(_, body)| body.strip_suffix("```").unwrap_or(body))
+            .map(str::trim)
+            .unwrap_or(text)
+    } else {
+        text
+    };
+    if !candidate.starts_with('{') {
+        return InvestigationResponse::Prose;
+    }
+    match serde_json::from_str::<serde_json::Value>(candidate) {
+        Ok(value)
+            if value
+                .as_object()
+                .is_some_and(|o| o.contains_key("investigate_question")) =>
+        {
+            if candidate == text
+                && let Ok(request) = serde_json::from_str::<InvestigationRequest>(text)
+                && !request.investigate_question.is_empty()
+            {
+                return InvestigationResponse::Request(request.investigate_question);
+            }
+            InvestigationResponse::Invalid
+        }
+        Err(_)
+            if candidate
+                .trim_start_matches('{')
+                .trim_start()
+                .starts_with("\"investigate_question\"") =>
+        {
+            InvestigationResponse::Invalid
+        }
+        _ => InvestigationResponse::Prose,
+    }
+}
+
+fn legacy_investigation_state(body: &str) -> Option<InvestigationState> {
+    if investigation_response(body) != InvestigationResponse::Prose {
+        Some(InvestigationState::InvalidControl)
+    } else if body.starts_with("Investigation pending for question ") {
+        // Old untyped notes mixed holds, cancellation and failures. Do not
+        // infer their cause from embedded English exception strings.
+        Some(InvestigationState::Failed)
+    } else {
+        None
+    }
+}
+
+fn investigation_note(state: InvestigationState) -> Turn {
+    let body = format!(
+        "{MAGI_NOTE}Investigation status: {state:?}. Do not assume evidence was inspected unless Completed. No answer or execution transition was authorized. Retry only on a new request."
+    );
+    Turn {
+        sender: Some(Sender::Magi),
+        who: Who::Agent,
+        body: body.clone(),
+        messages: vec![Message {
+            sender: Some(Sender::Magi),
+            body,
+            display: Some(crate::prompt::NoticeDisplay {
+                facts: state.display().to_owned(),
+                output: None,
+                task: None,
+                run: None,
+            }),
+            attachments: Vec::new(),
+            reply: None,
+        }],
+        at: Timestamp::now(),
+        attachments: Vec::new(),
+        usage: None,
+        breaks: None,
+        posted_by: None,
+    }
+}
+
+fn persist_investigation_start(store: &Talks, id: &str, lease: &TurnLease) -> Result<()> {
+    let _guard = store.guard()?;
+    let mut fresh = store.get(id).map_err(|_| InvestigationState::Cancelled)?;
+    if !lease.holds() || !fresh.status.open() {
+        return Err(InvestigationState::Cancelled.into());
+    }
+    fresh.investigation_state = Some(InvestigationState::Started);
+    fresh
+        .turns
+        .push(investigation_note(InvestigationState::Started));
+    store.put(&mut fresh)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InvestigationRequest {
@@ -2348,8 +2532,10 @@ fn investigation_request(out: &agent::AgentOutput) -> Option<String> {
     }
     // Parse only an entire successful final response, never quoted snippets,
     // tool output, fenced examples or a failed attempt's stdout.
-    let request: InvestigationRequest = serde_json::from_str(out.text.trim()).ok()?;
-    (!request.investigate_question.is_empty()).then_some(request.investigate_question)
+    match investigation_response(&out.text) {
+        InvestigationResponse::Request(id) => Some(id),
+        _ => None,
+    }
 }
 
 fn validate_investigation(
@@ -2359,11 +2545,13 @@ fn validate_investigation(
     question: &str,
 ) -> Result<crate::ask::ChatConsult> {
     if !talks.get(talk)?.status.open() {
-        bail!("conversation closed; investigation cancelled");
+        return Err(InvestigationState::Cancelled.into());
     }
-    let q = questions.get(question)?;
+    let q = questions
+        .get(question)
+        .map_err(|_| InvestigationState::Cancelled)?;
     if q.id != question || !crate::consult::active_consult(&q, talk) {
-        bail!("question is no longer open for consultation in this conversation");
+        return Err(InvestigationState::Cancelled.into());
     }
     Ok(q.consult.expect("validated consultation"))
 }
@@ -2372,6 +2560,20 @@ fn validate_investigation(
 /// policy when persisted task/run metadata identifies that same repository.
 /// Question.cwd names an agent worktree, not the repository's policy source.
 fn validate_investigation_repository(
+    questions: &crate::ask::Questions,
+    question: &str,
+    repo: &Path,
+) -> std::result::Result<(), InvestigationState> {
+    investigation_repository_metadata(questions, question, repo).map_err(|error| {
+        tracing::warn!("investigation repository validation: {error:#}");
+        error
+            .downcast_ref::<InvestigationState>()
+            .copied()
+            .unwrap_or(InvestigationState::RepositoryUnknown)
+    })
+}
+
+fn investigation_repository_metadata(
     questions: &crate::ask::Questions,
     question: &str,
     repo: &Path,
@@ -2392,16 +2594,12 @@ fn validate_investigation_repository(
     {
         let target = std::fs::canonicalize(target).context("resolve consulted task repository")?;
         if target != standing {
-            bail!(
-                "consulted task repository differs from the standing conversation; investigation is held because its coordination policy cannot safely be reused across repositories. Use magi task show to inspect the task's repository and coordination before retrying"
-            );
+            return Err(InvestigationState::RepositoryMismatch.into());
         }
         resolved = true;
     }
     if !resolved {
-        bail!(
-            "cannot resolve consulted task repository from task or run metadata; restore that metadata before retrying investigation. Read-only magi diagnostics remain available"
-        );
+        return Err(InvestigationState::RepositoryUnknown.into());
     }
     Ok(())
 }
@@ -2534,6 +2732,7 @@ async fn turn(
 
     let mut outcome = None;
     let mut continuation_requested = false;
+    let mut investigation_notice = None;
     let mut fell_back_from: Option<String> = None;
     // What the conversation looked like after the first agent's failed try,
     // so an exhausted chain leaves exactly what a single failed seat would.
@@ -2603,6 +2802,17 @@ async fn turn(
             }
             format!("{}\n\n{standing}{text}{last_note}", transcript(talk, store))
         };
+        // Failed/held results already occur in a full transcript. Completion
+        // has a persona evidence reply instead, so explicitly include its state.
+        let body = if (resuming || talk.investigation_state == Some(InvestigationState::Completed))
+            && let Some(state) = talk.investigation_state
+        {
+            format!(
+                "Investigation result from the previous turn: {state:?}. Only Completed means evidence was inspected. This is status, not a request to retry.\n\n{body}"
+            )
+        } else {
+            body
+        };
         // A resumed conversation may remember a legacy merge/hold-only card.
         // Re-send current persisted choices, without altering the owner's words.
         let current_approvals = questions
@@ -2668,12 +2878,12 @@ async fn turn(
             && let Some(id) = investigation_request(out)
         {
             continuation_requested = true;
-            // An internal continuation is not an operator send: do not append
-            // a turn or move exact-answer authorization's evidence boundary.
+            // An internal continuation is not an operator send. Status notes
+            // never move exact-answer authorization's evidence boundary.
             let continuation = async {
                 let questions = questions.as_ref().context("question store unavailable")?;
                 if !lease.holds() {
-                    bail!("conversation turn ownership lost; investigation cancelled");
+                    return Err(InvestigationState::Cancelled.into());
                 }
                 let consultation = validate_investigation(questions, store, &talk.id, &id)?;
                 validate_investigation_repository(questions, &id, &talk.repo)?;
@@ -2683,10 +2893,10 @@ async fn turn(
                 // Acquisition resolves Git asynchronously. Recheck close,
                 // deletion, answer and consultation withdrawal before spawn.
                 if !lease.holds() {
-                    bail!("conversation turn ownership lost; investigation cancelled");
+                    return Err(InvestigationState::Cancelled.into());
                 }
                 if validate_investigation(questions, store, &talk.id, &id)? != consultation {
-                    bail!("consultation changed; request investigation again");
+                    return Err(InvestigationState::Cancelled.into());
                 }
                 validate_investigation_repository(questions, &id, &talk.repo)?;
                 let body = format!(
@@ -2709,13 +2919,14 @@ async fn turn(
                     repository_lease,
                     || {
                         if !lease.holds() {
-                            bail!("conversation turn ownership lost; investigation cancelled");
+                            return Err(InvestigationState::Cancelled.into());
                         }
                         if validate_investigation(questions, store, &talk.id, &id)? != consultation
                         {
-                            bail!("consultation changed; request investigation again");
+                            return Err(InvestigationState::Cancelled.into());
                         }
                         validate_investigation_repository(questions, &id, &talk.repo)?;
+                        persist_investigation_start(store, &talk.id, lease)?;
                         Ok(())
                     },
                 )
@@ -2723,32 +2934,58 @@ async fn turn(
             };
             let investigation_result = wait.scope(continuation).await;
             if !lease.holds() {
-                bail!("conversation turn ownership lost; investigation cancelled");
+                return Err(InvestigationState::Cancelled.into());
             }
             result = match investigation_result {
-                Ok(out) => Ok(out),
-                Err(error) => {
-                    // Keep the successful control reply's session and report
-                    // a hold, rather than falling back into another seat.
-                    let mut out = result.expect("successful control response");
-                    let holder_hint = if error.is::<crate::repo_lock::ResourceBlocked>() {
-                        questions
-                            .as_ref()
-                            .and_then(|questions| questions.get(&id).ok())
-                            .zip(crate::run::try_home())
-                            .map(|(q, home)| {
-                                crate::consult::investigation_holder_hint(
-                                    &q,
-                                    &crate::queue::Queue::at(home.join("queue")).list(),
-                                )
-                            })
-                            .unwrap_or_default()
-                    } else {
-                        String::new()
+                Ok(out)
+                    if out.usable()
+                        && !out.quota_exhausted()
+                        && out.dropped.is_none()
+                        && investigation_response(&out.text) == InvestigationResponse::Prose =>
+                {
+                    talk.investigation_state = Some(InvestigationState::Completed);
+                    Ok(out)
+                }
+                other => {
+                    let state = match other {
+                        Err(error) => {
+                            tracing::warn!("consultation investigation failed: {error:#}");
+                            if error.is::<crate::repo_lock::ResourceBlocked>()
+                                && let Some(questions) = questions.as_ref()
+                                && let Ok(q) = questions.get(&id)
+                                && let Some(home) = crate::run::try_home()
+                            {
+                                tracing::debug!(
+                                    "{}",
+                                    crate::consult::investigation_holder_hint(
+                                        &q,
+                                        &crate::queue::Queue::at(home.join("queue")).list()
+                                    )
+                                );
+                            }
+                            error
+                                .downcast_ref::<InvestigationState>()
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    if error.is::<crate::repo_lock::ResourceBlocked>() {
+                                        InvestigationState::Busy
+                                    } else {
+                                        InvestigationState::Failed
+                                    }
+                                })
+                        }
+                        Ok(out) if out.quota_exhausted() => InvestigationState::Quota,
+                        Ok(out) if out.timed_out => InvestigationState::TimedOut,
+                        Ok(out) if !out.usable() || out.dropped.is_some() => {
+                            InvestigationState::Failed
+                        }
+                        Ok(_) => InvestigationState::InvalidControl,
                     };
-                    out.text = format!(
-                        "Investigation pending for question {id}: {error}. {holder_hint}This investigation request made no answer or execution transition. Ask to investigate again in this conversation when repository coordination is available. The task awaiting this question may hold the lock; do not release another seat's lock. Supported read-only control-plane diagnostics remain available to decide the next step."
-                    );
+                    investigation_notice = Some(state);
+                    talk.investigation_state = Some(state);
+                    // Preserve the successful control session without presenting it.
+                    let mut out = result.expect("successful control response");
+                    out.text = state.display().to_owned();
                     Ok(out)
                 }
             };
@@ -2774,6 +3011,13 @@ async fn turn(
         }
     }
     let outcome = outcome.expect("a chain holds at least one agent");
+    if !continuation_requested
+        && let Ok(out) = &outcome
+        && investigation_response(&out.text) != InvestigationResponse::Prose
+    {
+        investigation_notice = Some(InvestigationState::InvalidControl);
+        talk.investigation_state = investigation_notice;
+    }
     let note = |why: String| Turn {
         sender: Some(Sender::Magi),
         breaks: None,
@@ -2785,7 +3029,7 @@ async fn turn(
         attachments: Vec::new(),
         usage: None,
     };
-    let (reply, failure) = match outcome {
+    let (mut reply, failure) = match outcome {
         Err(e) => (
             note(format!("could not run agent `{}`: {e}", talk.agent)),
             Some(format!("could not run agent `{}`: {e}", talk.agent)),
@@ -2846,6 +3090,13 @@ async fn turn(
         ),
     };
 
+    if let Some(state) = investigation_notice {
+        reply = investigation_note(state);
+    } else if !continuation_requested && failure.is_none() {
+        // The successful prompt consumed the previous result (or full transcript).
+        talk.investigation_state = None;
+    }
+
     // A close landed on disk while this turn was in flight is read back here
     // rather than trusted from the snapshot this call started with. `store`
     // holds nothing else this function does not itself own - the turn guard
@@ -2875,13 +3126,9 @@ async fn turn(
     talk.pending_messages = fresh.pending_messages;
     talk.pending_attachments = fresh.pending_attachments;
     talk.notified = fresh.notified;
-    // A `magi talk post` landed while the CLI ran: this handle predates it.
+    // Preserve posts and the durable launch notice saved while the CLI ran.
     if fresh.turns.len() > talk.turns.len() {
-        let posted: Vec<Turn> = fresh.turns[talk.turns.len()..]
-            .iter()
-            .filter(|t| t.posted_by.is_some())
-            .cloned()
-            .collect();
+        let posted = fresh.turns[talk.turns.len()..].to_vec();
         talk.turns.extend(posted);
     }
     if let Some(from) = fell_back_from.filter(|_| failure.is_none()) {
@@ -3348,6 +3595,21 @@ fn read_path(path: &Path) -> Result<Talk> {
     let mut talk: Talk =
         serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
     for turn in &mut talk.turns {
+        if turn.who == Who::Agent {
+            if let Some(state) = legacy_investigation_state(&turn.body) {
+                turn.sender = Some(Sender::Magi);
+                if turn.messages.is_empty() {
+                    turn.messages = investigation_note(state).messages;
+                    turn.messages[0].body = turn.body.clone();
+                }
+            }
+            for message in &mut turn.messages {
+                if let Some(state) = legacy_investigation_state(&message.body) {
+                    message.sender = Some(Sender::Magi);
+                    message.display = investigation_note(state).messages.remove(0).display;
+                }
+            }
+        }
         if turn.who == Who::Operator && turn.messages.is_empty() && turn.attachments.is_empty() {
             turn.messages = plain_messages(&turn.body, turn.breaks.as_deref());
         }
@@ -3531,6 +3793,88 @@ fn new_attachment_id() -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn investigation_start_preserves_posts_and_never_reopens_or_recreates_talks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Talks::at(dir.path().join("talks"));
+        let mut talk = ctx_talk("a", Vec::new());
+        store.put(&mut talk).unwrap();
+        let lease = store.claim_turn(&talk.id).unwrap().unwrap();
+        post(&store, &talk.id, "concurrent post", "run").unwrap();
+        persist_investigation_start(&store, &talk.id, &lease).unwrap();
+        let mut fresh = store.get(&talk.id).unwrap();
+        assert_eq!(fresh.turns.len(), 2);
+        assert_eq!(fresh.turns[0].body, "concurrent post");
+        assert_eq!(fresh.investigation_state, Some(InvestigationState::Started));
+        fresh.status = TalkStatus::Closed;
+        store.put(&mut fresh).unwrap();
+        assert!(persist_investigation_start(&store, &talk.id, &lease).is_err());
+        assert_eq!(store.get(&talk.id).unwrap().turns.len(), 2);
+        std::fs::remove_file(store.path_of(&talk.id)).unwrap();
+        assert!(persist_investigation_start(&store, &talk.id, &lease).is_err());
+        assert!(!store.path_of(&talk.id).exists());
+    }
+
+    #[test]
+    fn investigation_classification_separates_execution_from_display() {
+        let request = r#"{"investigate_question":"question"}"#;
+        assert_eq!(
+            investigation_response(request),
+            InvestigationResponse::Request("question".into())
+        );
+        for text in [
+            format!("```json\n{request}\n```"),
+            r#"{"investigate_question":false}"#.into(),
+            r#"{"investigate_question":"q","extra":true}"#.into(),
+            r#"{"investigate_question":"q""#.into(),
+        ] {
+            assert_eq!(
+                investigation_response(&text),
+                InvestigationResponse::Invalid,
+                "{text}"
+            );
+        }
+        for text in [
+            format!("The protocol uses {request}."),
+            format!("Example:\n```json\n{request}\n```"),
+            r#"{"example":{"investigate_question":"q"}}"#.into(),
+        ] {
+            assert_eq!(investigation_response(&text), InvestigationResponse::Prose);
+        }
+    }
+
+    #[test]
+    fn legacy_investigation_display_does_not_become_persona_or_quote() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Talks::at(dir.path().join("talks"));
+        for body in [
+            r#"{"investigate_question":"old"}"#,
+            "```json\n{\"investigate_question\":\"old\"}\n```",
+            "Investigation pending for question old: arbitrary internal exception",
+        ] {
+            let mut old = ctx_talk("a", vec![reply(body, None)]);
+            old.turns[0].sender = Some(Sender::Persona);
+            assert_eq!(sender(&old.turns[0], None), Sender::Magi);
+            store.put(&mut old).unwrap();
+            let loaded = store.get(&old.id).unwrap();
+            let message = &loaded.turns[0].messages[0];
+            let facts = &message.display.as_ref().unwrap().facts;
+            assert!(!facts.contains("investigate_question"));
+            assert!(!facts.contains("exception"));
+            let reply = resolve_reply(
+                &loaded,
+                Some(ReplyTarget {
+                    turn: 0,
+                    message: 0,
+                }),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(reply.sender, Some(Sender::Magi));
+            assert_eq!(&reply.excerpt, facts);
+        }
+    }
+
+    #[test]
     fn turn_access_lifts_the_sandbox_only_for_the_talk_opt_in() {
         use super::turn_access;
         assert_eq!(turn_access(false, false), (false, false));
@@ -3576,6 +3920,7 @@ mod tests {
             repo: PathBuf::from("."),
             agent: agent.to_owned(),
             status: TalkStatus::Open,
+            investigation_state: None,
             turns,
             pending: String::new(),
             pending_attachments: Vec::new(),
@@ -3832,6 +4177,7 @@ mod tests {
             repo: tmp.path().to_owned(),
             agent: "sonnet".to_owned(),
             status: TalkStatus::Open,
+            investigation_state: None,
             turns: Vec::new(),
             pending: String::new(),
             pending_attachments: Vec::new(),
@@ -6160,6 +6506,7 @@ mod tests {
                 repo: tmp.path().to_owned(),
                 agent: "mock".to_owned(),
                 status,
+                investigation_state: None,
                 turns: Vec::new(),
                 pending: String::new(),
                 pending_attachments: Vec::new(),

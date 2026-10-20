@@ -3250,3 +3250,21 @@ files and 64 MiB per run; a limit or write failure retains all remaining trees.
 Run metadata, review records and existing artifacts survive. Unfinished-run,
 ownership, recovery-source, output-lease and Git-checkpoint protections still
 apply; fold never authorizes deletion of another run's source.
+
+### Consultation investigation status and display
+
+`talk::investigation_response` classifies standalone control-shaped replies for
+presentation independently of `investigation_request`'s successful, strict
+execution admission. Prose quoting the protocol remains literal. Never promote
+these replies or investigation status notes to persona recommendations or owner
+evidence. Old saved control replies receive display-only compatibility metadata.
+
+`Talk::investigation_state` defaults to absent for older records. A new attempt
+replaces it; a successful subsequent ordinary prompt consumes it, while a failed
+prompt retains it. Resumed sessions receive the saved result explicitly. Full
+transcripts already carry failed/held notes; completion additionally needs the
+state because its final turn is the persona's evidence response. `Started` alone
+never proves completion. Launch notices are saved under the talk store guard
+from the latest record after coordination and final validation, immediately
+before process launch. Preserve these notices alongside concurrent posts when
+merging the final reply, and never recreate a deleted or reopen a closed talk.
