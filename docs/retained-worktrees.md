@@ -74,6 +74,9 @@ remain subject to the ordinary free-space gate. A zero floor disables monitoring
 Post-spawn interruption carries a typed resource error and durably marks the
 implementation for snapshot/rescue before entering the hold. A failed rescue
 keeps that barrier on disk; resume retries persistence before dispatching seats.
+An interrupted turn with no source change remains pending, rather than becoming
+a completed empty candidate. Its durable `interrupted_implementations` checkpoint
+survives rescue failures and reloads; resumption dispatches the same seat again.
 Admission waits that never started a process do not mark candidates completed.
 The reserve and cadence are safeguards, not a filesystem quota: unrelated
 writers and sudden allocations can still exhaust a volume between measurements.
@@ -143,16 +146,27 @@ The existing `Superseded` status is not used to retire unfinished work because
 it has separate settlement and publication effects. Historical recovery sources
 retained by an earlier explicit recovery stay retained, even if that means a
 backlog needs a later owner decision rather than automatic deletion.
-The task write lock remains exclusive throughout history inspection and
-retirement: age alone cannot revoke a live writer, and unknown process liveness
-also retains ownership. A concurrent owner selection must wait until retirement
-has finished. Old locks with valid writer identities are recovered only after
-confirmed process death.
+History inspection and Git proof run without holding the task write lock, so
+owner updates and run links can be saved during slow inspection. Immediately
+before committing retirement, a short write critical section re-reads the task
+and requires the entire snapshot to be unchanged, rechecks owner pins and open
+questions, and persists the lineage and retirement flag. Any intervening update
+retains the worktrees for a fresh pass. Deletion happens after that lock is
+released, under the run/driver/output leases and the durable retirement fence.
+Age alone still cannot revoke a live task writer; unknown process liveness
+retains its lock. Old identified locks require confirmed process death.
 
 Ordinary folding of a confirmed `Merged` run with a successful merge record
-does not wait for an unfinished queue task to settle. Explicit recovery-source
-retention and pending candidate preservation still refuse folding. Other terminal
-labels and successful PR publication alone do not establish a confirmed merge.
+does not wait for an unfinished queue task to settle, but its merge label is only
+admission to proof. Before deleting anything, every targeted candidate branch,
+worktree HEAD, HEAD/branch reflog and ORIG_HEAD must be incorporated in a single
+pinned fetched base. Independent losing candidates and detached reviewers retain
+the entire run. Git operation checkpoints, source changes and unknown ignored
+files also retain it; a target directory needs the existing Cargo residue proof.
+Missing base information or unproven squash/rebase ancestry retains sources for
+inspection. Explicit recovery-source retention and pending implementation
+preservation still refuse folding. Other terminal labels and successful PR
+publication alone do not establish a confirmed merge.
 
 ## Observability and incident evidence
 

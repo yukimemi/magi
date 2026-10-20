@@ -1383,6 +1383,7 @@ impl Runner {
             && self.state.status == RunStatus::Blocked
             && self.state.tally.is_none()
             && self.state.candidate_preservation.is_empty()
+            && self.state.interrupted_implementations.is_empty()
         {
             bail!(
                 "selected implementation is held; explicitly release the owning task to retry it"
@@ -2289,7 +2290,11 @@ impl Runner {
             .candidates
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.commits == 0 && c.failed.is_none() && !c.empty)
+            .filter(|(_, c)| {
+                (c.commits == 0 || self.state.interrupted_implementations.contains(&c.label))
+                    && c.failed.is_none()
+                    && !c.empty
+            })
             .map(|(i, _)| i)
             .collect();
         if todo.is_empty() {
@@ -2406,6 +2411,7 @@ impl Runner {
             let exhausted_the_fallback_chain = FailClass::of(&out).is_some();
             self.state.seats.insert(seat.key.clone(), seat);
             let label = self.state.candidates[i].label;
+            self.state.interrupted_implementations.remove(&label);
 
             let (summary, duration, failed, verified_claim) = match out {
                 AgentOutcome::Ok(o) => {
@@ -2502,6 +2508,7 @@ impl Runner {
                 .position(|c| c.label == label)
                 .context("pending candidate is missing")?;
             let c = self.state.candidates[i].clone();
+            let interrupted = self.state.interrupted_implementations.contains(&label);
             let result = async {
                 let wait = crate::repo_lock::WaitPolicy::new(
                     Duration::from_secs(self.state.config.graph.timeout_resource_wait),
@@ -2552,7 +2559,12 @@ impl Runner {
                 c.commits = commits;
                 c.stat = stat;
                 c.files = files;
-                c.empty = commits == 0 || patch.trim().is_empty();
+                let no_changes = commits == 0 || patch.trim().is_empty();
+                c.empty = no_changes && !interrupted;
+                if interrupted && no_changes {
+                    c.failed = None;
+                    c.verified_noop = None;
+                }
                 if !c.empty {
                     c.failed = None;
                     c.verified_noop = None;
@@ -2567,6 +2579,9 @@ impl Runner {
             match result {
                 Ok(()) => {
                     self.state.candidate_preservation.remove(&label);
+                    if !interrupted || self.state.candidates[i].files > 0 {
+                        self.state.interrupted_implementations.remove(&label);
+                    }
                 }
                 Err(e) => {
                     let reason = format!("candidate {label} preservation failed: {e:#}");
@@ -9517,6 +9532,7 @@ async fn wave(
                 label,
                 "interrupted implementation awaiting persistence".into(),
             );
+            state.interrupted_implementations.insert(label);
         }
         if let AgentOutcome::ResourceBlocked(why) = &out
             && state.resource_block.is_none()
@@ -11356,7 +11372,7 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> R
     if let Some(reason) = crate::pr_recovery::source_retention_reason(home, state) {
         bail!("refusing fold: {reason}");
     }
-    if !state.candidate_preservation.is_empty() {
+    if !state.candidate_preservation.is_empty() || !state.interrupted_implementations.is_empty() {
         bail!("candidate preservation incomplete; refusing cleanup");
     }
     // Serialize ordinary folding with the same starts/resumes as target-only
@@ -11385,6 +11401,16 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> R
             state.save_under(home)?;
             return Err(e);
         }
+    };
+    // A merged PR proves only its published change. Preflight every source
+    // before removing anything; a losing candidate or detached reviewer can
+    // still retain independent commits or Git recovery checkpoints.
+    let _source_outputs = if state.status == RunStatus::Merged
+        && state.merge.as_ref().is_some_and(|merge| merge.ok)
+    {
+        verify_merged_fold_sources(state, drop_winner, home).await?
+    } else {
+        Vec::new()
     };
     let root = state.worktree_root();
     let winner = state.tally.as_ref().map(|t| t.winner);
@@ -11448,6 +11474,158 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> R
     }
     state.save_under(home)?;
     Ok(removed)
+}
+
+async fn verify_merged_fold_sources(
+    state: &RunState,
+    drop_winner: bool,
+    home: &Path,
+) -> Result<Vec<std::fs::File>> {
+    let winner = state.tally.as_ref().map(|t| t.winner);
+    let mut heads = BTreeSet::new();
+    for candidate in &state.candidates {
+        if Some(candidate.label) == winner && !drop_winner {
+            continue;
+        }
+        match std::fs::symlink_metadata(&candidate.worktree) {
+            Ok(_) => anyhow::ensure!(
+                candidate.worktree.parent() == Some(state.worktree_root().as_path()),
+                "candidate recovery source is outside the inventoried run root: {}",
+                candidate.worktree.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && candidate.folded => {}
+            Err(error) => {
+                return Err(error).context(format!(
+                    "cannot inspect candidate recovery source: {}",
+                    candidate.worktree.display()
+                ));
+            }
+        }
+        if git::branch_exists(&state.repo, &candidate.branch).await? {
+            heads.insert(git::rev_parse(&state.repo, &candidate.branch).await?);
+            heads.extend(
+                git::git(
+                    &state.repo,
+                    &["reflog", "show", "--format=%H", &candidate.branch],
+                )
+                .await?
+                .lines()
+                .map(str::to_owned),
+            );
+        }
+    }
+    let mut cargo_guards = Vec::new();
+    let entries = match std::fs::read_dir(state.worktree_root()) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries.into_iter().flatten() {
+        let path = entry?.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "non-directory or symlink recovery source retained: {}",
+            path.display()
+        );
+        if !drop_winner
+            && winner.is_some_and(|w| {
+                path.file_name()
+                    .is_some_and(|name| name == format!("cand-{w}").as_str())
+            })
+        {
+            continue;
+        }
+        anyhow::ensure!(
+            path.join(".git").is_file(),
+            "unregistered recovery source retained: {}",
+            path.display()
+        );
+        anyhow::ensure!(
+            git::git(
+                &path,
+                &[
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                    "--ignored",
+                    "--",
+                    ".",
+                    ":(exclude)target"
+                ]
+            )
+            .await?
+            .is_empty(),
+            "source changes or ignored recovery files retained: {}",
+            path.display()
+        );
+        match std::fs::symlink_metadata(path.join("target")) {
+            Ok(_) => {
+                cargo_guards.extend(crate::retention::verify_residue(home, &state.id, &path).await?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        for checkpoint in [
+            "rebase-merge",
+            "rebase-apply",
+            "sequencer",
+            "CHERRY_PICK_HEAD",
+            "MERGE_HEAD",
+            "REBASE_HEAD",
+            "REVERT_HEAD",
+            "BISECT_LOG",
+            "AUTO_MERGE",
+            "MERGE_MSG",
+        ] {
+            let location = git::git(
+                &path,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    checkpoint,
+                ],
+            )
+            .await?;
+            anyhow::ensure!(
+                matches!(std::fs::symlink_metadata(location.trim()), Err(ref e)
+                if e.kind() == std::io::ErrorKind::NotFound),
+                "Git recovery checkpoint retained: {checkpoint}"
+            );
+        }
+        heads.insert(git::rev_parse(&path, "HEAD").await?);
+        heads.extend(
+            git::git(&path, &["reflog", "show", "--format=%H", "HEAD"])
+                .await?
+                .lines()
+                .map(str::to_owned),
+        );
+        if let Ok(original) = git::rev_parse(&path, "ORIG_HEAD").await {
+            heads.insert(original);
+        }
+    }
+    if !heads.is_empty() {
+        // Never trust a run-wide merge label or the local checkout's branch.
+        // Pin the fetched base once; missing ancestry (including an unproven
+        // squash/rebase) keeps all sources and reports why.
+        let reference = format!(
+            "refs/remotes/{}/{}",
+            state.config.merge.remote, state.base_branch
+        );
+        let base = git::rev_parse(&state.repo, &reference)
+            .await
+            .context("cannot prove merged sources against the fetched base")?;
+        for head in heads {
+            anyhow::ensure!(
+                git::git_raw(&state.repo, &["merge-base", "--is-ancestor", &head, &base])
+                    .await?
+                    .ok(),
+                "recovery source {head} is not proven incorporated in {reference}; retaining the entire run"
+            );
+        }
+    }
+    Ok(cargo_guards)
 }
 
 /// Remove `dir` if it exists and has nothing in it.
@@ -13535,6 +13713,64 @@ mod tests {
         });
         runner.state.save().unwrap();
         (tmp, runner)
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn disk_interrupted_empty_implementation_retries_after_reload_and_failed_checkpoint() {
+        for (solo, failed_checkpoint) in
+            [(true, false), (false, false), (true, true), (false, true)]
+        {
+            let (_tmp, mut runner) = preservation_resume_fixture().await;
+            if solo {
+                runner.state.candidates.retain(|c| c.label == 'A');
+            }
+            runner.state.candidates[0].empty = false;
+            runner.state.candidates[0].summary.clear();
+            runner.state.tally = None;
+            runner.state.judge_skipped = false;
+            runner.state.status = RunStatus::Implementing;
+            runner.state.config.disk.min_free_bytes = u64::MAX;
+            let mut implementer = spec("alpha");
+            implementer.command = vec!["sh".into(), "-c".into(), "exec sleep 30".into()];
+            runner.roles.implementers = vec![implementer];
+            let patch = runner.state.dir().join("artifacts/cand-A.patch");
+            if failed_checkpoint {
+                std::fs::create_dir_all(&patch).unwrap();
+            }
+            runner.state.save().unwrap();
+            assert_eq!(runner.implement().await.is_err(), failed_checkpoint);
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            assert_eq!(runner.state.status, RunStatus::Blocked);
+            assert!(runner.state.interrupted_implementations.contains(&'A'));
+            assert_eq!(runner.state.candidates[0].commits, 0);
+            assert!(!runner.state.candidates[0].empty);
+            assert!(runner.state.candidates[0].failed.is_none());
+            if failed_checkpoint {
+                assert!(runner.state.candidate_preservation.contains_key(&'A'));
+                std::fs::remove_dir(patch).unwrap();
+            }
+            runner.state.resource_block = None;
+            runner.state.config.disk.min_free_bytes = 0;
+            runner.roles.implementers[0].command = vec![
+                "sh".into(),
+                "-c".into(),
+                "printf 'retried empty interrupted seat\\n' > retry-source; echo completed".into(),
+            ];
+            runner.implement().await.unwrap();
+            assert!(runner.state.interrupted_implementations.is_empty());
+            assert!(runner.state.candidate_preservation.is_empty());
+            assert_eq!(runner.state.candidates[0].commits, 1);
+            assert!(!runner.state.candidates[0].empty);
+            assert!(
+                std::fs::read_to_string(runner.state.candidates[0].worktree.join("retry-source"))
+                    .unwrap()
+                    .contains("retried empty interrupted seat")
+            );
+            if !solo {
+                assert_eq!(runner.state.candidates[1].commits, 1);
+            }
+        }
     }
 
     #[tokio::test]

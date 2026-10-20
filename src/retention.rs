@@ -416,7 +416,7 @@ fn record_residue(home: &Path, id: &str, target: &Path, outputs: &[PathBuf]) -> 
     Ok(())
 }
 
-async fn verify_residue(home: &Path, id: &str, worktree: &Path) -> Result<Vec<File>> {
+pub(crate) async fn verify_residue(home: &Path, id: &str, worktree: &Path) -> Result<Vec<File>> {
     let target = cargo_target(worktree).await?;
     let locks = cargo_locks(&target)?;
     let proof: CargoResidue =
@@ -689,9 +689,6 @@ async fn retire_empty(
         let Ok(_claim) = queue.claim(&listed.id) else {
             continue;
         };
-        let Ok(_task_write) = queue.lock_task(&listed.id) else {
-            continue;
-        };
         let Ok(task) = queue.get(&listed.id) else {
             continue;
         };
@@ -757,26 +754,6 @@ async fn retire_empty(
             continue;
         }
         let latest = &authority.id;
-        // Durable recovery inventory precedes retirement. This retains every
-        // historical input; selecting authority never licenses deletion of a
-        // different candidate or of an unfinished preparation.
-        let lineage = serde_json::json!({"task":task.id,"authority":latest,"sources":sources,
-            "selection":task.pr_recovery,"at":now});
-        let dir = home.join("recovery-lineages");
-        let written = std::fs::create_dir_all(&dir).and_then(|()| {
-            let tmp = dir.join(format!("{}.tmp", task.id));
-            std::fs::write(
-                &tmp,
-                serde_json::to_vec_pretty(&lineage).unwrap_or_default(),
-            )?;
-            std::fs::rename(tmp, dir.join(format!("{}.json", task.id)))
-        });
-        if let Err(e) = written {
-            report
-                .failures
-                .push(format!("{}: lineage not durable: {e}", task.id));
-            continue;
-        }
         for id in &sources {
             if id == latest || report.retired >= 5 {
                 continue;
@@ -832,6 +809,7 @@ async fn retire_empty(
                         && state.reviews.is_empty()
                         && state.recovery.is_none()
                         && state.candidate_preservation.is_empty()
+                        && state.interrupted_implementations.is_empty()
                         && !state.released(),
                     "PR ownership or recovery checkpoint"
                 );
@@ -956,22 +934,7 @@ async fn retire_empty(
                     branches.lines().all(|head| head == state.base_commit),
                     "unrecorded candidate branch changes"
                 );
-                ensure!(
-                    !questions.list().iter().any(|q| q.status.open()
-                        && (q.run == *id || q.run == task.id || task.blocked_by.contains(&q.id))),
-                    "owner decision arrived during retirement proof"
-                );
-                // Keep the entire source set in every retirement record, so no
-                // historical candidate is silently replaced by the latest one.
-                state.retired_to = Some(latest.clone());
-                state.event(
-                    "retention",
-                    format!(
-                        "empty attempt retired to {latest}; recovery sources: {}",
-                        sources.join(", ")
-                    ),
-                );
-                state.save_under(home)?;
+                commit_retirement(home, &queue, &task, &mut state, latest, &sources, now)?;
                 // Durable retirement precedes removal. A crash retries removal
                 // using the same proof; it cannot make this attempt resumable.
                 for path in paths {
@@ -989,6 +952,70 @@ async fn retire_empty(
             }
         }
     }
+}
+
+/// The only task-write critical section in retirement. All Git proof and
+/// deletion happens outside it, under the run's owner/driver/output leases.
+/// Atomic task writes make the earlier snapshot consistent; this final compare
+/// rejects every intervening owner selection, hold, edit or history update.
+fn commit_retirement(
+    home: &Path,
+    queue: &crate::queue::Queue,
+    expected: &crate::queue::Task,
+    state: &mut RunState,
+    authority: &str,
+    sources: &[String],
+    now: Timestamp,
+) -> Result<()> {
+    let _write = queue.lock_task(&expected.id)?;
+    let current = queue.get(&expected.id)?;
+    ensure!(
+        serde_json::to_value(&current)? == serde_json::to_value(expected)?,
+        "task changed during retirement proof; retaining worktrees for the current owner decision"
+    );
+    ensure!(
+        !current
+            .resume_override
+            .as_ref()
+            .is_some_and(|pin| pin.pinned_run.as_ref() == Some(&state.id))
+            && !current
+                .replacement
+                .as_ref()
+                .is_some_and(|pin| pin.run == state.id),
+        "current owner selected this recovery source"
+    );
+    ensure!(
+        !crate::pr_recovery::explicit_sources_retained(home, &state.id),
+        "explicitly retained recovery source"
+    );
+    ensure!(
+        !crate::ask::Questions::at(home.join("questions"))
+            .list()
+            .iter()
+            .any(|q| q.status.open()
+                && (q.run == state.id
+                    || q.run == current.id
+                    || current.blocked_by.contains(&q.id))),
+        "owner decision arrived during retirement proof"
+    );
+    let dir = home.join("recovery-lineages");
+    std::fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!("{}.tmp", current.id));
+    let lineage = serde_json::json!({"task":current.id,"authority":authority,"sources":sources,
+        "selection":current.pr_recovery,"task_updated_at":current.updated_at,"at":now});
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&lineage)?)?;
+    std::fs::rename(tmp, dir.join(format!("{}.json", current.id)))?;
+    state.retired_to = Some(authority.to_owned());
+    state.event(
+        "retention",
+        format!(
+            "empty attempt retired to {authority}; recovery sources: {}",
+            sources.join(", ")
+        ),
+    );
+    state.save_under(home)?;
+    // No Git command or worktree removal may be added before this guard drops.
+    Ok(())
 }
 
 /// Wait for the emergency reserve to be exhausted. The normal floor requests
@@ -1336,6 +1363,9 @@ mod tests {
         )
         .await
         .unwrap();
+        git::git(&f.repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])
+            .await
+            .unwrap();
         source.status = RunStatus::Merged;
         source.save_under(&f.home).unwrap();
         assert!(crate::pr_recovery::source_retention_reason(&f.home, &source).is_none());
@@ -1370,6 +1400,274 @@ mod tests {
         assert_eq!(
             queue.get(&task.id).unwrap().status,
             crate::queue::TaskStatus::Held
+        );
+    }
+
+    #[tokio::test]
+    async fn merged_fold_preserves_independent_candidate_and_reviewer_commits_before_any_removal() {
+        let f = Fx::new().await;
+        let mut state = f.run("cc05", true).await;
+        let b_path = state.worktree_root().join("cand-B");
+        let b_branch = "magi/cc05/B";
+        git::worktree_add_branch(&f.repo, &b_path, b_branch, &f.base)
+            .await
+            .unwrap();
+        std::fs::write(b_path.join("unique-B"), "independent implementation").unwrap();
+        git::rescue_commit(&b_path, "independent candidate")
+            .await
+            .unwrap();
+        let b_head = git::rev_parse(&b_path, "HEAD").await.unwrap();
+        let mut candidate = state.candidates[0].clone();
+        candidate.label = 'B';
+        candidate.index = 1;
+        candidate.branch = b_branch.into();
+        candidate.worktree = b_path.clone();
+        state.candidates.push(candidate);
+        let mut task = f.task(&[state.clone()]);
+        task.hold_manual(Some("retain recovery sources".into()));
+        let queue = crate::queue::Queue::at(f.home.join("queue"));
+        queue.put(&mut task).unwrap();
+        git::git(
+            &f.repo,
+            &["merge", "--ff-only", &state.candidates[0].branch],
+        )
+        .await
+        .unwrap();
+        git::git(&f.repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])
+            .await
+            .unwrap();
+        state.status = RunStatus::Merged;
+        state.merge = Some(crate::run::MergeOutcome {
+            mode: crate::config::MergeMode::Pr,
+            ok: true,
+            detail: "candidate A merged".into(),
+            empty: false,
+        });
+        state.save_under(&f.home).unwrap();
+        let error = crate::graph::fold_run(&mut state, true, &f.home)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("not proven incorporated"));
+        assert!(state.candidates[0].worktree.exists());
+        assert!(b_path.exists());
+        assert_eq!(git::rev_parse(&f.repo, b_branch).await.unwrap(), b_head);
+        // Even after both candidate changes land, an unrecorded detached
+        // review worktree can retain a third independent source.
+        git::git(&f.repo, &["merge", "--no-edit", b_branch])
+            .await
+            .unwrap();
+        let reviewer = state.worktree_root().join("review-1");
+        git::worktree_add_detached(&f.repo, &reviewer, &f.base)
+            .await
+            .unwrap();
+        std::fs::write(reviewer.join("reviewer-source"), "retain reviewer commit").unwrap();
+        git::rescue_commit(&reviewer, "reviewer checkpoint")
+            .await
+            .unwrap();
+        let review_head = git::rev_parse(&reviewer, "HEAD").await.unwrap();
+        git::git(&f.repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])
+            .await
+            .unwrap();
+        assert!(
+            crate::graph::fold_run(&mut state, true, &f.home)
+                .await
+                .is_err()
+        );
+        assert!(state.candidates[0].worktree.exists() && b_path.exists() && reviewer.exists());
+        assert_eq!(
+            git::rev_parse(&reviewer, "HEAD").await.unwrap(),
+            review_head
+        );
+        git::git(&f.repo, &["merge", "--no-edit", &review_head])
+            .await
+            .unwrap();
+        git::git(&f.repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])
+            .await
+            .unwrap();
+        // Unexpected or missing candidate paths cannot escape the inventory,
+        // even though their recorded branch is now incorporated in the base.
+        state.candidates[1].worktree = f.repo.clone();
+        assert!(
+            crate::graph::fold_run(&mut state, true, &f.home)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("outside the inventoried")
+        );
+        assert!(state.candidates[0].worktree.exists() && b_path.exists());
+        state.candidates[1].worktree = state.worktree_root().join("missing-candidate");
+        assert!(
+            crate::graph::fold_run(&mut state, true, &f.home)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("cannot inspect candidate")
+        );
+        state.candidates[1].worktree = b_path.clone();
+        crate::graph::fold_run(&mut state, true, &f.home)
+            .await
+            .unwrap();
+        assert!(!b_path.exists() && !reviewer.exists());
+        assert_eq!(
+            std::fs::read_to_string(f.repo.join("unique-B")).unwrap(),
+            "independent implementation"
+        );
+        assert_eq!(
+            queue.get(&task.id).unwrap().status,
+            crate::queue::TaskStatus::Held
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_retirement_proof_allows_task_updates_and_aborts_on_new_owner_pin() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let f = Fx::new().await;
+        let source = f.run("dd03", true).await;
+        let empty = f.run("dd04", false).await;
+        let task = f.task(&[source, empty.clone()]);
+        let entered = f.repo.join("proof-entered");
+        let release = f.repo.join("proof-release");
+        let hook = f.repo.join("proof-monitor");
+        std::fs::write(&hook, format!(
+            "#!/bin/sh\n: > '{}'\nwhile ! test -f '{}'; do sleep 0.01; done\nprintf 'probe\\0'\n",
+            entered.display(), release.display())).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        git::git(
+            &f.repo,
+            &["config", "core.fsmonitor", hook.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        struct ReleaseProof(PathBuf);
+        impl Drop for ReleaseProof {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.0, "continue");
+            }
+        }
+        let _release_on_panic = ReleaseProof(release.clone());
+        let home = f.home.clone();
+        let sweep = tokio::spawn(async move {
+            let mut report = Report::default();
+            retire_empty(&home, &Fx::disk(), Fx::now(), &mut report).await;
+            report
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !entered.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let queue = crate::queue::Queue::at(f.home.join("queue"));
+        let mut selected = queue.get(&task.id).unwrap();
+        selected.resume_override = Some(crate::queue::OperatorResume {
+            question_id: "during-slow-proof".into(),
+            at: Fx::now(),
+            conductor_rehold: None,
+            forced: false,
+            pinned_run: Some(empty.id.clone()),
+        });
+        let mut update = tokio::task::spawn_blocking(move || queue.put(&mut selected));
+        let quick = match tokio::time::timeout(std::time::Duration::from_secs(2), &mut update).await
+        {
+            Ok(result) => {
+                result.unwrap().unwrap();
+                true
+            }
+            Err(_) => {
+                std::fs::write(&release, "continue").unwrap();
+                update.await.unwrap().unwrap();
+                false
+            }
+        };
+        std::fs::write(release, "continue").unwrap();
+        let report = tokio::time::timeout(std::time::Duration::from_secs(8), sweep)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            quick,
+            "task writers must not wait behind Git retirement proof"
+        );
+        assert_eq!(report.retired, 0);
+        assert!(report.retained.iter().any(|r| r.contains("task changed")));
+        assert!(empty.candidates[0].worktree.exists());
+        assert!(
+            RunState::load_under(&empty.id, &f.home)
+                .unwrap()
+                .retired_to
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn retirement_commit_rechecks_task_after_unlocked_proof_and_preserves_new_pin() {
+        let f = Fx::new().await;
+        let source = f.run("dd01", true).await;
+        let mut empty = f.run("dd02", false).await;
+        let expected = f.task(&[source.clone(), empty.clone()]);
+        let queue = crate::queue::Queue::at(f.home.join("queue"));
+        let _claim = queue.claim(&expected.id).unwrap();
+        // The proof holds run/output leases, never the task write lock.
+        let _owner = crate::pr_head::owner_lock(&f.home, &empty.id).unwrap();
+        let _driver = crate::driver::maintenance(&f.home, &empty.id).unwrap();
+        let _outputs = OutputLease::take(&empty.candidates[0].worktree, true).unwrap();
+        let mut selected = queue.get(&expected.id).unwrap();
+        selected.resume_override = Some(crate::queue::OperatorResume {
+            question_id: "new-owner-decision".into(),
+            at: Fx::now(),
+            conductor_rehold: None,
+            forced: false,
+            pinned_run: Some(empty.id.clone()),
+        });
+        queue.put(&mut selected).unwrap();
+        let error = commit_retirement(
+            &f.home,
+            &queue,
+            &expected,
+            &mut empty,
+            &source.id,
+            &expected.runs,
+            Fx::now(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("task changed"));
+        assert!(
+            RunState::load_under(&empty.id, &f.home)
+                .unwrap()
+                .retired_to
+                .is_none()
+        );
+        assert!(empty.candidates[0].worktree.exists());
+        assert_eq!(
+            queue
+                .get(&expected.id)
+                .unwrap()
+                .resume_override
+                .unwrap()
+                .pinned_run,
+            Some(empty.id.clone())
+        );
+        assert!(
+            !f.home
+                .join("recovery-lineages")
+                .join(format!("{}.json", expected.id))
+                .exists()
+        );
+        // Re-reading the new snapshot must not bypass its explicit pin either.
+        assert!(
+            commit_retirement(
+                &f.home,
+                &queue,
+                &selected,
+                &mut empty,
+                &source.id,
+                &selected.runs,
+                Fx::now()
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("selected this recovery source")
         );
     }
 

@@ -2270,10 +2270,15 @@ pub struct RunState {
     /// fold must leave them alone.
     #[serde(default)]
     pub released_branches: Vec<String>,
-    /// Completed implementation turns whose Git/artifact preservation is not confirmed.
-    /// A resume retries persistence, never dispatches these turns again.
+    /// Turns whose Git/artifact preservation is not confirmed. A resume retries
+    /// persistence before deciding whether an interrupted turn needs execution.
     #[serde(default)]
     pub candidate_preservation: BTreeMap<char, String>,
+    /// Interrupted turns whose empty trees must remain eligible for execution.
+    /// Kept separately from preservation errors so failed rescue retries retain
+    /// the distinction between an unfinished turn and a completed empty reply.
+    #[serde(default)]
+    pub interrupted_implementations: BTreeSet<char>,
     /// Existing branches and commits the task text names, and what the
     /// repository says about each (`crate::refs`). Unmerged ones seed the
     /// candidates; `base_commit` stays the comparison point.
@@ -2522,6 +2527,7 @@ impl RunState {
             released_to: None,
             released_branches: Vec::new(),
             candidate_preservation: BTreeMap::new(),
+            interrupted_implementations: BTreeSet::new(),
             seeds: Vec::new(),
             prep_failure: None,
             prep_complete: Some(false),

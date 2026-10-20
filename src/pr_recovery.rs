@@ -87,8 +87,9 @@ pub(crate) fn source_retention_reason(home: &Path, state: &crate::run::RunState)
     if explicit_sources_retained(home, &state.id) {
         return Some("explicitly retained recovery source".into());
     }
-    // A confirmed merge settles publication even while the queue is still
-    // held. Ready/Failed/Superseded and successful PR creation alone do not.
+    // A confirmed merge admits fold preflight even while the queue is held.
+    // fold_run must still prove each deletion target under its ownership and
+    // output locks. Ready/Failed/Superseded and PR creation alone do not qualify.
     if state.status == crate::run::RunStatus::Merged
         && state.merge.as_ref().is_some_and(|merged| merged.ok)
     {
