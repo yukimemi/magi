@@ -19,11 +19,30 @@ Completed tasks can also be selected again through this command.
 
 `--head` is the public update lease. Optional `--source-head <full-SHA>` is the
 immutable implementation to adopt, including a previously reviewed fix. It must
-exist locally and descend from the public lease. Full ancestry is preserved;
-old competing candidates are not implementation inputs. Fetch the intended
+exist locally. A descendant of the public lease follows the ancestry path.
+For a retained source rebased by the launcher, also pass
+`--source-run <full-retained-run-id>`. The command verifies the saved run's
+repository, task, PR, original public lease, successful base-sync, retained
+candidate ref and final recorded review head. Its recorded rebase base must be
+an ancestor of the fetched landing base. It replays every selected public
+commit against that base in a private bare object database and requires exact
+tree equality at every corresponding source commit. The complete source,
+including all later recorded review fixes, is adopted unchanged. Old competing
+candidates are not implementation inputs. Fetch the intended
 source into the target repository first if necessary. Source retention sidecars
 protect historical runs from cleanup; recovery does not move their branches.
 A changed public head requires a new selection rather than an unconditional push.
+
+The selection and new run retain full public/source/base SHAs, the ordered
+commit/tree correspondence and every later fix SHA. Startup and execution on
+resume recompute this proof and reject changes rather than silently updating it.
+Older run records may supply the necessary selection, base-sync, retained ref,
+rebase event and review evidence without having a new proof field. Missing
+records/objects, empty or merge commits, conflicts and modified replays fail
+closed with the missing evidence or differing paths. Patch similarity alone
+never authorizes adoption. Restore the retained evidence, or explicitly
+reconstruct and review a descendant source; do not weaken the lease or overwrite
+files from old main to make the check pass.
 
 Delivery requires nonempty `verify.gate` and `verify.e2e` commands and at least
 one reviewer/round. Blank commands are rejected. `pre_gate` is optional, not
@@ -70,12 +89,36 @@ The inspected target repository tracking base was
 machine layer has neither verification commands nor configuration includes. The old run
 saved empty e2e/gate/pre-gate arrays and two clean reviewer responses at
 `57cace1b9160fe340b2b4757b6153aa7d76e35e9`. That source remains available as
-`magi/f0ee/A` in the target repository and descends from the selected public
-implementation. These are local observations; public PR status must be
-queried again before recovery, and source retention must remain enabled.
+`magi/f0ee/A` in the target repository. It is **not** a descendant of the public
+lease. Local Git shows five commits from shared base `0a10a898` to public tip
+`3cb6ba20`, replayed onto `0ba31158e9f16c75e142982dc12e8b440ca71cfa`
+through `ebac36a384c766fc7402a5855ecb991a89265483`, followed by reviewed fix
+`57cace1b9160fe340b2b4757b6153aa7d76e35e9`. Run
+`20261018-200357-f0ee` records that successful base-sync and both review heads.
+A local isolated replay of all five original commits reproduced every rebased
+tree exactly, in order:
 
-Prepare a complete target-specific configuration in operator-owned storage,
-including the existing machine roster/settings with `include = ["machine.toml"]`
+| Public history | Rebased history |
+| --- | --- |
+| `e3c2f51e` | `12f8c46f` |
+| `67f5298e` | `787c9e38` |
+| `078b8639` | `c5a000ef` |
+| `bf0992ac` | `f67327e4` |
+| `3cb6ba20` | `ebac36a3` |
+
+The subsequent fix changes three files (43 insertions, 9 deletions): it
+consolidates the duplicate features table, replaces the deprecated atomic update
+with a saturating compare-exchange loop, and records the accepted measurements
+and their limits. The selected source retains that whole fix and newer main;
+copying the old public tree would lose both. Use the rebase proof path below;
+passing only `--source-head` correctly refuses this history. These are local
+observations; public PR status must be queried again before recovery, and source
+retention must remain enabled.
+
+For future recoveries, prepare a complete target-specific configuration in
+operator-owned storage. The preserved recovery's configuration is already
+prepared: reuse it unchanged. The example below includes the existing machine
+roster/settings with `include = ["machine.toml"]`
 (the include is relative to this file). Verify the included file does not
 already define these arrays. The target's `Makefile.toml` defines
 `cargo make check`; `.github/workflows/integration.yml` defines the broker
@@ -115,7 +158,9 @@ repository's files; this change does not claim that target validation ran.
 
 Install the updated CLI and restart any existing queue daemon before selecting
 the recovery. An older daemon does not understand the new source/disposition
-contract. Then inspect the existing public PR read-only:
+contract. The command below uses the already prepared operator-owned
+configuration under the cache directory; do not rewrite it. Then inspect the
+existing public PR read-only:
 
 ```sh
 gh pr view 1598 --repo kanadehq/kanade --json state,headRefName,headRefOid,baseRefName
@@ -128,13 +173,15 @@ magi task recover-pr 20261011-214217-9462 \
   --pr https://github.com/kanadehq/kanade/pull/1598 \
   --head 3cb6ba206bc4f4d15b3b2b4d91e85012fbd1e659 \
   --source-head 57cace1b9160fe340b2b4757b6153aa7d76e35e9 \
-  --disposition land --config ./kanade-recovery.toml
+  --source-run 20261018-200357-f0ee \
+  --disposition land \
+  --config "$HOME/.cache/kanade-work/kanade-recovery.toml"
 ```
 
 This command queues real work, so it was not run for the preserved task during
 this fix. The command and new options are exercised against a fake forge and
-real local Git transport in `tests/graph_task_pr.rs`. The real forge lookup was
-unavailable in the implementation environment; do not assume its old head is
-still current. Inspect the new run's actual commands, results and final head,
+real local Git transport in `tests/graph_task_pr.rs`. No live forge mutation was
+attempted; do not assume its old head is still current. Inspect the new run's
+actual commands, results and final head,
 then answer its fresh approval question only after its exact-head CI is green.
 Do not resume the obsolete candidates or hand-edit queue/question records.

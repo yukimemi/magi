@@ -739,6 +739,9 @@ enum TaskCmd {
         /// Full source commit containing the selected public implementation and reviewed fixes.
         #[arg(long)]
         source_head: Option<String>,
+        /// Retained run proving the selected source's launcher-generated rebase.
+        #[arg(long, requires = "source_head")]
+        source_run: Option<String>,
         /// Complete configuration replacement, following the usual --config semantics.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -3546,6 +3549,7 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
             head,
             disposition,
             source_head,
+            source_run,
             config: config_path,
         } => {
             let resolved = q.resolve_id(&id)?;
@@ -3557,11 +3561,13 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                 t.status != TaskStatus::Running,
                 "park the running task before selecting a public head"
             );
-            let selected = magi::pr_recovery::Selection {
+            let mut selected = magi::pr_recovery::Selection {
                 url: pr,
                 branch: format!("magi/task-{}", t.id),
                 head,
                 source_head,
+                source_run,
+                source_proof: None,
                 disposition: Some(disposition),
                 instruction: t.instruction.clone(),
                 approved_at: jiff::Timestamp::now(),
@@ -3599,7 +3605,20 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
             selected
                 .verify(&t.repo, &config.merge.remote, &base, &selected.head)
                 .await?;
-            selected.verify_source(&t.repo).await?;
+            if let Some(id) = &selected.source_run {
+                anyhow::ensure!(
+                    t.runs.contains(id),
+                    "source-run is not part of this task's history"
+                );
+            }
+            let current_base = magi::git::rev_parse(
+                &t.repo,
+                &format!("refs/remotes/{}/{}", config.merge.remote, base),
+            )
+            .await?;
+            selected
+                .prepare_source(&t.repo, &magi::run::home(), &current_base)
+                .await?;
             refuse_duplicates(
                 &q,
                 &magi::run::home().join("runs"),
@@ -5413,6 +5432,10 @@ mod tests {
             "https://example.test/team/project/pull/1",
             "--head",
             "aabb",
+            "--source-head",
+            "source",
+            "--source-run",
+            "20261018-200357-abcd",
             "--disposition",
             "review",
         ])

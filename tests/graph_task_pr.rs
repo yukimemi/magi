@@ -419,6 +419,8 @@ async fn selected_fixture() -> (
         branch: "magi/task-abcd-1234".into(),
         head: public,
         source_head: Some(source),
+        source_run: None,
+        source_proof: None,
         disposition: Some(magi::pr_recovery::Disposition::Land),
         instruction: task.instruction.clone(),
         approved_at: jiff::Timestamp::now(),
@@ -724,4 +726,89 @@ fn legacy_recovery_with_public_pr_and_approval_resumes_saved_delivery() {
         "legacy_recovery_with_public_pr_and_approval_resumes_saved_delivery",
         true,
     );
+}
+
+common::e2e! {
+async fn rebased_retained_source_keeps_review_fixes_and_public_lease() {
+    let (fx, mut task, mut selected, _bin) = selected_fixture().await;
+    let queue = magi::queue::Queue::open();
+    queue.put(&mut task).unwrap();
+    let mut retained = RunState::load(&task.runs[0]).unwrap();
+    let wt = retained.winner().unwrap().worktree.clone();
+    std::fs::write(fx.repo.join("new-main.txt"), "current main must survive\n").unwrap();
+    git::git(&fx.repo, &["add", "."]).await.unwrap();
+    git::git(&fx.repo, &["commit", "-m", "feat: advance main"]).await.unwrap();
+    let base = git::rev_parse(&fx.repo, "HEAD").await.unwrap();
+    git::git(&fx.repo, &["push", "origin", "HEAD:main"]).await.unwrap();
+    let old_base = git::merge_base(&fx.repo, &selected.head, &base).await.unwrap();
+    git::git(&wt, &["rebase", "--onto", &base, &old_base]).await.unwrap();
+    std::fs::write(wt.join("later-review.txt"), "later reviewer fix\n").unwrap();
+    git::git(&wt, &["add", "."]).await.unwrap();
+    git::git(&wt, &["commit", "-m", "fix: retain later review changes"]).await.unwrap();
+    let source = git::rev_parse(&wt, "HEAD").await.unwrap();
+    assert!(!git::is_ancestor(&fx.repo, &selected.head, &source).await);
+    let mut original = selected.clone();
+    original.source_head = None;
+    original.disposition = None;
+    retained.pr_recovery = Some(original);
+    retained.origin = Some(Origin::queue(&task.id));
+    retained.base_sync = Some(magi::run::BaseSync {
+        tip: base.clone(), behind: 0, attempts: 1, conflict: None, already_in: None,
+    });
+    retained.reviews.last_mut().unwrap().head = source.clone();
+    let branch = retained.winner().unwrap().branch.clone();
+    retained.event("land", format!("rebased {branch} onto origin/main"));
+    retained.save().unwrap();
+    selected.source_head = Some(source.clone());
+    selected.source_run = Some(retained.id.clone());
+    // Main can advance again after the retained review; the new run must sync and review anew.
+    std::fs::write(fx.repo.join("latest-main.txt"), "latest main must survive\n").unwrap();
+    git::git(&fx.repo, &["add", "."]).await.unwrap();
+    git::git(&fx.repo, &["commit", "-m", "feat: advance main after retained review"]).await.unwrap();
+    git::git(&fx.repo, &["push", "origin", "HEAD:main"]).await.unwrap();
+    let latest = git::rev_parse(&fx.repo, "HEAD").await.unwrap();
+    let config_path = fx.tmp.path().join("recovery.toml");
+    std::fs::write(&config_path, toml::to_string(&fx.config).unwrap()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
+        .args(["task", "recover-pr", &task.id, "--pr", &selected.url,
+            "--head", &selected.head, "--source-head", &source,
+            "--source-run", &retained.id, "--disposition", "land", "--config"])
+        .arg(&config_path).env("MAGI_HOME", magi::run::home()).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    task = queue.get(&task.id).unwrap();
+    selected = task.pr_recovery.clone().unwrap();
+    let proof = selected.source_proof.clone().unwrap();
+    assert_eq!(proof.new_base, base);
+    assert_eq!(proof.current_base, latest);
+    let mut runner = Runner::recover_pr(&fx.repo, &task.id, selected.clone(), fx.config.clone()).await.unwrap();
+    task.pr_recovery = Some(selected.clone());
+    task.runs.push(runner.state.id.clone());
+    queue.put(&mut task).unwrap();
+    runner.execute().await.unwrap();
+    let recovered = &runner.state.winner().unwrap().worktree;
+    for (file, expected) in [("new-main.txt", "current main must survive\n"),
+        ("reviewed-fix.txt", "preserved fix"), ("later-review.txt", "later reviewer fix\n"),
+        ("latest-main.txt", "latest main must survive\n")] {
+        assert_eq!(std::fs::read_to_string(recovered.join(file)).unwrap(), expected);
+    }
+    assert_eq!(runner.state.pr_recovery.as_ref().unwrap().source_proof.as_ref(), Some(&proof));
+    assert!(runner.state.parked);
+    let final_head = git::rev_parse(recovered, "HEAD").await.unwrap();
+    assert_ne!(final_head, source);
+    assert!(git::is_ancestor(&fx.repo, &latest, &final_head).await);
+    assert_eq!(runner.state.land_approval.as_ref().unwrap().head, final_head);
+    runner.state.check_delivery_evidence(&final_head).unwrap();
+    assert!(runner.state.check_delivery_evidence(&source).is_err());
+    // The original public lease cannot authorize another recovery after publication.
+    let error = selected.verify(&fx.repo, "origin", "main", &selected.head).await.unwrap_err().to_string();
+    assert!(error.contains("moved"), "{error}");
+    // Resuming must reproduce the saved proof, even after publication changed the public head.
+    let mut resumed = Runner::resume(&runner.state.id).unwrap();
+    resumed.execute().await.unwrap();
+    assert!(resumed.state.parked, "{:?}: {:?}", resumed.state.status, resumed.state.events);
+    assert_eq!(resumed.state.pr_recovery, Some(selected));
+    resumed.state.pr_recovery.as_mut().unwrap().source_proof.as_mut().unwrap().commits[0].2 = "0".repeat(40);
+    assert!(resumed.execute().await.unwrap_err().to_string().contains("proof changed"));
+    assert_eq!(git::remote_head(&fx.repo, "origin", "magi/task-abcd-1234").await.unwrap(), Some(final_head));
+}
 }

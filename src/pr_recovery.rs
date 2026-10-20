@@ -43,6 +43,12 @@ pub struct Selection {
     /// Full immutable source commit; older selections used the public lease.
     #[serde(default)]
     pub source_head: Option<String>,
+    /// Historical run explicitly selected to prove a launcher rebase.
+    #[serde(default)]
+    pub source_run: Option<String>,
+    /// Immutable proof, recomputed before starting or resuming work.
+    #[serde(default)]
+    pub source_proof: Option<Box<SourceProof>>,
     /// Missing on old records: requires an explicit new selection before work.
     #[serde(default)]
     pub disposition: Option<Disposition>,
@@ -51,6 +57,9 @@ pub struct Selection {
     /// Approval generation: a later selection does not resume an earlier run.
     pub approved_at: jiff::Timestamp,
 }
+
+mod lineage;
+pub use lineage::SourceProof;
 
 const RETAIN_SOURCES: &str = "retain-recovery-sources";
 
@@ -140,16 +149,58 @@ impl Selection {
 
     /// Prove the adopted fix contains the selected public implementation.
     pub async fn verify_source(&self, repo: &Path) -> Result<()> {
+        if self.source_proof.is_some() {
+            self.verify_source_under(repo, &crate::run::home()).await
+        } else {
+            self.verify_source_under(repo, Path::new("")).await
+        }
+    }
+
+    async fn verify_source_under(&self, repo: &Path, home: &Path) -> Result<()> {
         let source = git::rev_parse(repo, &format!("{}^{{commit}}", self.source())).await?;
         ensure!(
             source == self.source(),
             "source-head must resolve to its full commit SHA"
         );
-        ensure!(
-            git::is_ancestor(repo, &self.head, &source).await,
-            "source-head does not preserve the selected public implementation; select a descendant commit"
-        );
+        if let Some(proof) = &self.source_proof {
+            // Historical state is large; keep replay out of the caller's future storage.
+            let actual = Box::pin(lineage::prove(self, repo, home, &proof.current_base)).await?;
+            ensure!(
+                &actual == proof.as_ref(),
+                "saved source proof changed; select the source again"
+            );
+        } else {
+            ensure!(
+                git::is_ancestor(repo, &self.head, &source).await,
+                "source-head does not preserve the selected public implementation by ancestry; supply --source-run <retained-run-id> for a recorded launcher rebase"
+            );
+            ensure!(
+                self.source_run.is_none(),
+                "source-run requires a saved source proof; select again"
+            );
+        }
         Ok(())
+    }
+
+    /// Select and persist evidence without changing the implementation or public lease.
+    pub async fn prepare_source(
+        &mut self,
+        repo: &Path,
+        home: &Path,
+        current_base: &str,
+    ) -> Result<()> {
+        ensure!(
+            self.source_proof.is_none(),
+            "source proof is already selected; refusing to replace saved evidence"
+        );
+        if self.source_run.is_some() {
+            self.source_proof = Some(Box::new(
+                Box::pin(lineage::prove(self, repo, home, current_base)).await?,
+            ));
+            Ok(())
+        } else {
+            self.verify_source(repo).await
+        }
     }
 
     /// Confirm task identity and immutable criteria before starting work.
@@ -306,6 +357,8 @@ mod tests {
             branch: "magi/task-t".into(),
             head: "a".repeat(40),
             source_head: None,
+            source_run: None,
+            source_proof: None,
             disposition: Some(Disposition::Land),
             instruction: "criteria".into(),
             approved_at: jiff::Timestamp::now(),
@@ -387,6 +440,8 @@ mod tests {
             branch: "magi/task-t".into(),
             head: "a".repeat(40),
             source_head: None,
+            source_run: None,
+            source_proof: None,
             disposition: Some(Disposition::Review),
             instruction: "approved".into(),
             approved_at: jiff::Timestamp::now(),
