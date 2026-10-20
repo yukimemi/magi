@@ -1850,6 +1850,110 @@ async fn settings_gear_is_reachable_on_a_phone_and_never_doubles_the_rail_link()
         .wait_for(&page, "!!document.getElementById('settings-btn')", w)
         .await
         .expect("gear in the DOM");
+    browser
+        .wait_for(
+            &page,
+            "document.getElementById('runs-count').textContent !== 'Loading…'",
+            w,
+        )
+        .await
+        .expect("client ready");
+    // Glow assertions require motion regardless of the runner's OS settings.
+    // The real press below separately exercises reduced motion, then restores
+    // the OS preference after both modes have been checked.
+    browser
+        .call(
+            Some(&page.session),
+            "Emulation.setEmulatedMedia",
+            serde_json::json!({"features": [{"name": "prefers-reduced-motion", "value": "no-preference"}]}),
+        )
+        .await
+        .expect("enable motion for glow assertions");
+    let feedback = browser.eval(&page, r##"(() => {
+      const fails = [];
+      const host = document.createElement('div');
+      host.style.cssText = 'position:fixed;left:20px;top:200px;z-index:999';
+      host.innerHTML = '<button class="btn">Dynamic <span>button</span></button><fieldset disabled><button>Disabled</button></fieldset><div inert><button>Inert</button></div><div aria-disabled="true"><button>Unavailable</button></div><div data-press><input></div><button disabled>Disabled</button>';
+      document.body.append(host);
+      const button = host.firstElementChild;
+      const down = (node) => {
+        const r = node.getBoundingClientRect();
+        node.dispatchEvent(new PointerEvent('pointerdown', {bubbles:true, isPrimary:true, button:0, clientX:r.x+r.width/2, clientY:r.y+r.height/2}));
+      };
+      const clear = () => document.dispatchEvent(new PointerEvent('pointercancel'));
+      down(button.firstElementChild);
+      if (!button.hasAttribute('data-pressed')) fails.push('dynamic nested target did not press');
+      if (document.querySelectorAll('.press-glow').length !== 1) fails.push('missing glow');
+      if (getComputedStyle(document.querySelector('#press-feedback')).pointerEvents !== 'none') fails.push('overlay intercepts input');
+      down(button);
+      if (document.querySelectorAll('.press-glow').length !== 1) fails.push('glows accumulate');
+      clear();
+      if (button.hasAttribute('data-pressed') || document.querySelector('.press-glow')) fails.push('cancel did not clear');
+      for (const node of host.querySelectorAll('fieldset button, [inert] button, [aria-disabled] button, input, button:disabled')) {
+        down(node);
+        if (host.querySelector('[data-pressed]') || document.querySelector('.press-glow')) fails.push('unavailable or input target reacted');
+        clear();
+      }
+      down(button);
+      document.dispatchEvent(new Event('scroll'));
+      if (button.hasAttribute('data-pressed') || document.querySelector('.press-glow')) fails.push('scroll did not clear');
+      button.focus();
+      if (getComputedStyle(button).outlineStyle === 'none') fails.push('missing focus outline');
+      host.setAttribute('data-press', '');
+      host.setAttribute('data-pressed', '');
+      button.setAttribute('data-pressed', '');
+      if (getComputedStyle(host).opacity !== '1') fails.push('nested control also pressed its parent');
+      if (getComputedStyle(button).opacity !== '0.78') fails.push('nested control lost feedback');
+      host.remove();
+      return fails;
+    })()"##).await.expect("press feedback");
+    assert_eq!(
+        feedback,
+        serde_json::json!([]),
+        "press feedback regressions"
+    );
+
+    let pending = browser.eval(&page, r##"(async () => {
+      const source = await (await fetch('/app.js')).text();
+      let settle;
+      const client = new Function('fetch', source.replace(/\nboot\(\);\s*$/, `
+        return { request, press(target, age = 0) { pressedControl = target; pressedAt = performance.now() - age; } };
+      `))(() => new Promise((resolve, reject) => { settle = { resolve, reject }; }));
+      const button = document.createElement('button');
+      document.body.append(button);
+      const fails = [];
+      for (const [method, age, expected] of [['GET', 0, false], ['POST', 601, false], ['POST', 0, true], ['PATCH', 0, true]]) {
+        client.press(button, age);
+        const promise = client.request('/test', { method });
+        if ((button.getAttribute('aria-busy') === 'true') !== expected) fails.push(`${method}/${age}: pending state`);
+        settle.resolve(new Response('{}'));
+        await promise;
+        if (button.hasAttribute('aria-busy')) fails.push(`${method}: pending not cleared`);
+      }
+      for (const outcome of ['http', 'network']) {
+        button.setAttribute('aria-busy', 'false');
+        client.press(button);
+        const promise = client.request('/test', { method: 'POST' });
+        if (outcome === 'network') settle.reject(new Error('offline'));
+        else settle.resolve(new Response('{}', { status: 500 }));
+        try { await promise; fails.push('failure swallowed'); } catch {}
+        if (button.getAttribute('aria-busy') !== 'false') fails.push(`${outcome}: previous state lost`);
+      }
+      button.setAttribute('aria-busy', 'true');
+      client.press(button);
+      const promise = client.request('/test', { method: 'POST' });
+      settle.resolve(new Response('{}'));
+      await promise;
+      if (button.getAttribute('aria-busy') !== 'true') fails.push('explicit pending scope cleared');
+      button.remove();
+      return fails;
+    })()"##).await.expect("generic pending feedback");
+    assert_eq!(
+        pending,
+        serde_json::json!([]),
+        "pending feedback regressions"
+    );
+
     let geometry = browser
         .eval(
             &page,
@@ -1876,6 +1980,15 @@ async fn settings_gear_is_reachable_on_a_phone_and_never_doubles_the_rail_link()
         .expect("measure gear");
     assert_eq!(geometry, serde_json::json!([]), "phone header: {geometry}");
 
+    // Motion-free feedback must survive an active decorative SVG descendant.
+    browser
+        .call(
+            Some(&page.session),
+            "Emulation.setEmulatedMedia",
+            serde_json::json!({"features": [{"name": "prefers-reduced-motion", "value": "reduce"}]}),
+        )
+        .await
+        .expect("reduce motion");
     // Tap it for real, at its centre.
     let point = browser
         .eval(
@@ -1897,7 +2010,40 @@ async fn settings_gear_is_reachable_on_a_phone_and_never_doubles_the_rail_link()
             )
             .await
             .expect("mouse");
+        if kind == "mousePressed" {
+            let pressed = browser
+                .eval(
+                    &page,
+                    r##"(() => {
+                      const gear = document.getElementById('settings-btn');
+                      return {
+                        childActive: !!gear.querySelector('svg:active'),
+                        opacity: getComputedStyle(gear).opacity,
+                        glow: !!document.querySelector('.press-glow'),
+                      };
+                    })()"##,
+                )
+                .await
+                .expect("measure reduced-motion press");
+            assert_eq!(
+                pressed["childActive"], true,
+                "SVG must be active: {pressed}"
+            );
+            assert_eq!(pressed["opacity"], "0.78", "link must react: {pressed}");
+            assert_eq!(
+                pressed["glow"], false,
+                "motion must be suppressed: {pressed}"
+            );
+        }
     }
+    browser
+        .call(
+            Some(&page.session),
+            "Emulation.setEmulatedMedia",
+            serde_json::json!({"features": []}),
+        )
+        .await
+        .expect("restore motion preference");
     browser
         .wait_for(
             &page,

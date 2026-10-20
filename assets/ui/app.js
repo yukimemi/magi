@@ -830,7 +830,13 @@ let nextTalkWaitGeneration = 1;
 
 /* ---- transport --------------------------------------------------------- */
 async function request(url, init) {
-  const res = await fetch(url, init);
+  const unbusy = pendingForRequest(init);
+  let res;
+  try {
+    res = await fetch(url, init);
+  } finally {
+    unbusy();
+  }
   if (!res.ok) {
     let details = {};
     let message = `${res.status} ${res.statusText || "request failed"}`;
@@ -1484,7 +1490,7 @@ async function setLoop(running, park = false) {
     setText(button, running ? "Starting\u2026" : "Stopping\u2026");
   }
   try {
-    const view = await postJson(API.loop, { running, park });
+    const view = await withPending([park ? parkBtn : button], () => postJson(API.loop, { running, park }));
     /* Set before applyLoop, so the render that follows already knows this
        page asked \u2014 that is what puts an idle loop into `stopping`. */
     state.stopAskedAt = running ? 0 : Date.now();
@@ -2496,7 +2502,7 @@ function createTaskCard() {
   const actions = el("div", { class: "card-actions task-card-actions" },
     priorityBox, editBtn, actionMenu);
 
-  const card = el("li", { class: "card task-card" },
+  const card = el("li", { class: "card task-card", "data-press": "" },
     el("div", { class: "card-top" }, chipSlot, urgent, priority, solo, followup, permalink, whenSlot),
     title, meta, note, snippet, error, instruction, answers, actions,
   );
@@ -3000,7 +3006,7 @@ async function mutateTask(id, action, button, host) {
   button.disabled = true;
   setText(button, "…");
   try {
-    await postJson(action === "hold" ? API.hold(id) : API.release(id));
+    await withPending([button], () => postJson(action === "hold" ? API.hold(id) : API.release(id)));
     ok();
     announce(`Task ${shortId(id)} ${action === "hold" ? "held" : "released"}.`);
     await host.refresh(id);
@@ -3511,7 +3517,7 @@ function renderStatsVerdictBar(t) {
     const bucket = STATS_VERDICT_BUCKETS[arc.index];
     const n = counts[arc.index];
     const props = {
-      class: "donut-slice", "data-verdict": bucket.key,
+      class: "donut-slice", "data-verdict": bucket.key, "data-press": "",
     };
     let node;
     if (arc.deg >= 359.99) {
@@ -5329,7 +5335,7 @@ async function answerQuestion(id, body, row) {
   for (const button of buttons) button.disabled = true;
 
   try {
-    reflectQuestion(await postJson(API.answer(id), body));
+    reflectQuestion(await withPending(buttons, () => postJson(API.answer(id), body)));
     announce(`Answered: ${value.trim()}`);
     ok();
   } catch (error) {
@@ -11455,7 +11461,132 @@ function wire() {
   window.addEventListener("pageshow", onPageShow);
 }
 
+/* ---- shared press feedback -------------------------------------------- */
+let pressedControl = null;
+let pressedAt = 0;
+const PRESS_TARGET = 'button, a[href], summary, [role="button"], [role="link"], [role="tab"], [role="radio"], [role="checkbox"], [role="switch"], [role="menuitem"], [data-press]';
+
+function wirePressFeedback() {
+  const layer = $("press-feedback");
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)");
+  let current = null;
+  const clear = () => {
+    if (!current) return;
+    current.target.removeAttribute("data-pressed");
+    current.glow?.remove();
+    clearTimeout(current.timer);
+    current = null;
+  };
+  document.addEventListener("pointerdown", (event) => {
+    if (!event.isPrimary || event.button !== 0 || !(event.target instanceof Element)) return;
+    clear();
+    pressedControl = null;
+    const target = event.target.closest(PRESS_TARGET);
+    if (!target || target.matches(":disabled") || target.closest('[inert], [aria-disabled="true"]')) return;
+    if (target.matches('.task-card') && !splitMedia?.matches) return;
+    // Inputs and selectable content inside a clickable card keep their own interaction.
+    const inner = event.target.closest('input, textarea, select, label, pre, [contenteditable], details');
+    if (inner && inner !== target && target.contains(inner)) return;
+
+    pressedControl = target;
+    pressedAt = performance.now();
+    let glow = null;
+    // Read geometry before adding decorations. Multiline text, SVG and modal
+    // top-layer content use colour feedback only; never paint above a dialog.
+    if (!reduced.matches && target instanceof HTMLElement && target.getClientRects().length === 1 &&
+        !target.closest('dialog[open]') && !document.querySelector('dialog[open]')) {
+      const rect = target.getBoundingClientRect();
+      const style = getComputedStyle(target);
+      let left = Math.max(0, rect.left), top = Math.max(0, rect.top);
+      let right = Math.min(innerWidth, rect.right), bottom = Math.min(innerHeight, rect.bottom);
+      for (let parent = target.parentElement; parent; parent = parent.parentElement) {
+        const css = getComputedStyle(parent);
+        if (/(hidden|clip|auto|scroll)/.test(css.overflowX + css.overflowY)) {
+          const box = parent.getBoundingClientRect();
+          if (css.overflowX !== "visible") { left = Math.max(left, box.left); right = Math.min(right, box.right); }
+          if (css.overflowY !== "visible") { top = Math.max(top, box.top); bottom = Math.min(bottom, box.bottom); }
+        }
+      }
+      // Conservatively reject occlusion by sticky headers, floating controls,
+      // or siblings. Rounded corners are sampled just inside the visible box.
+      const pad = Math.min(12, (right - left) / 2, (bottom - top) / 2);
+      const visible = right > left && bottom > top &&
+        [[left + pad, top + pad], [right - pad, top + pad],
+          [left + pad, bottom - pad], [right - pad, bottom - pad], [event.clientX, event.clientY]]
+          .every(([x, y]) => target.contains(document.elementFromPoint(x, y)));
+      if (visible) {
+        glow = document.createElement("span");
+        glow.className = "press-glow";
+        const wave = document.createElement("span");
+        const size = Math.min(240, Math.hypot(rect.width, rect.height) * 2);
+        for (const [key, value] of Object.entries({
+          left: `${rect.left}px`, top: `${rect.top}px`, width: `${rect.width}px`, height: `${rect.height}px`,
+          'border-radius': style.borderRadius,
+          'clip-path': `inset(${top - rect.top}px ${rect.right - right}px ${rect.bottom - bottom}px ${left - rect.left}px)`,
+          '--press-x': `${event.clientX - rect.left}px`, '--press-y': `${event.clientY - rect.top}px`, '--press-size': `${size}px`,
+        })) glow.style.setProperty(key, value);
+        glow.append(wave);
+      }
+    }
+    target.setAttribute("data-pressed", "");
+    if (glow) layer.append(glow);
+    current = { target, glow, pointerId: event.pointerId, timer: setTimeout(clear, 800) };
+  }, { passive: true });
+  document.addEventListener("pointerup", (event) => {
+    if (!current || event.pointerId !== current.pointerId) return;
+    current.target.removeAttribute("data-pressed");
+    current.glow?.classList.add("is-released");
+    clearTimeout(current.timer);
+    if (!current.glow) { clear(); return; }
+    current.glow.addEventListener("animationend", (event) => {
+      if (event.target === current?.glow && event.animationName === "press-fade") clear();
+    });
+    current.timer = setTimeout(clear, 1200);
+  }, { passive: true });
+  for (const type of ["pointercancel", "scroll", "visibilitychange"]) {
+    document.addEventListener(type, (event) => {
+      if (event instanceof PointerEvent && current && event.pointerId !== current.pointerId) return;
+      pressedControl = null;
+      clear();
+    }, { capture: true, passive: true });
+  }
+  window.addEventListener("blur", () => { pressedControl = null; clear(); });
+  window.addEventListener("resize", clear, { passive: true });
+  reduced.addEventListener("change", clear);
+}
+
+// Consume a recent press only for a mutation; GET polling never marks a control.
+// Explicit pending scopes keep ownership of their existing accessibility state.
+function pendingForRequest(init) {
+  const target = pressedControl;
+  if ((init?.method || "GET").toUpperCase() === "GET" || !target ||
+      !target.isConnected || performance.now() - pressedAt > 600) return () => {};
+  pressedControl = null;
+  if (target.getAttribute("aria-busy") === "true") return () => {};
+  const previous = target.getAttribute("aria-busy");
+  target.setAttribute("aria-busy", "true");
+  return () => {
+    if (previous === null) target.removeAttribute("aria-busy");
+    else target.setAttribute("aria-busy", previous);
+  };
+}
+
+// Explicit operation scopes also cover keyboard activation and grouped controls.
+async function withPending(buttons, action) {
+  const previous = buttons.map(button => button.getAttribute("aria-busy"));
+  buttons.forEach(button => button.setAttribute("aria-busy", "true"));
+  try {
+    return await action();
+  } finally {
+    buttons.forEach((button, index) => {
+      if (previous[index] === null) button.removeAttribute("aria-busy");
+      else button.setAttribute("aria-busy", previous[index]);
+    });
+  }
+}
+
 async function boot() {
+  wirePressFeedback();
   applyTheme(currentTheme());
   wire();
   applyRoute();
