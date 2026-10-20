@@ -342,7 +342,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        let duplicate = Sources::resolve(&repo, "origin", Some(&fix), &[fix])
+        let duplicate = Sources::resolve(&repo, "origin", Some(&fix), std::slice::from_ref(&fix))
             .await
             .unwrap();
         assert!(duplicate.plan(&repo, &base).await.is_err());

@@ -11099,7 +11099,7 @@ async fn merge_is_empty(repo: &Path, state: &RunState, branch: &str, mode: Merge
 
 /// Why nothing was opened for an empty winner, with what the task's own
 /// references resolved to.
-fn empty_candidate_detail(state: &RunState, base: &str) -> String {
+fn empty_candidate_detail(_state: &RunState, base: &str) -> String {
     let mut detail = format!(
         "empty candidate: the winning branch has 0 commits ahead of {base}, so there is \
          nothing to open a pull request for"

@@ -8411,6 +8411,7 @@ mod tests {
                 solo: false,
                 overrides,
                 review_of: None,
+                sources: Default::default(),
             };
             let filed =
                 crate::direct::file(&q, dir.path(), Timestamp::now(), 1, filing, true).unwrap();
