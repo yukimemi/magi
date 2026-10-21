@@ -15,7 +15,8 @@ use tokio::net::windows::named_pipe::{NamedPipeClient, NamedPipeServer, ServerOp
 use super::{MAX_FRAME, Operation, Request, Response};
 
 pub const CHANNEL_ENV: &str = "MAGI_CHAT_CONTROL_PIPE";
-const TOKEN_ENV: &str = "MAGI_CHAT_CONTROL_TOKEN";
+// Avoid KEY/SECRET/TOKEN: shell environment policies may strip those names.
+const CAP_ENV: &str = "MAGI_CHAT_CONTROL_CAP";
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[link(name = "bcrypt")]
@@ -189,7 +190,7 @@ impl Bridge {
     pub fn attach(&self, command: &mut tokio::process::Command) {
         command
             .env(CHANNEL_ENV, &self.name)
-            .env(TOKEN_ENV, &self.token);
+            .env(CAP_ENV, &self.token);
     }
 }
 
@@ -203,7 +204,7 @@ impl Drop for Bridge {
 pub(crate) fn clear_environment(command: &mut tokio::process::Command) {
     for name in [
         CHANNEL_ENV,
-        TOKEN_ENV,
+        CAP_ENV,
         "MAGI_CHAT_CONTROL_FD",
         "MAGI_CHAT_CONTROL_RESPONSE_FD",
         "MAGI_CHAT_CONTROL_LOCK_FD",
@@ -218,7 +219,7 @@ pub async fn request(operation: &Operation) -> Result<String> {
         name.starts_with(r"\\.\pipe\magi-chat-"),
         "invalid control pipe"
     );
-    let token = std::env::var(TOKEN_ENV).context("missing control capability")?;
+    let token = std::env::var(CAP_ENV).context("missing control capability")?;
     ensure!(token.len() == 64, "invalid control capability");
     request_at(&name, &token, operation).await
 }
@@ -287,6 +288,29 @@ mod tests {
             tasks.push(task);
         }
         let bridge = Bridge::start(tmp.path(), &talk.id, tmp.path()).unwrap();
+        let mut command = tokio::process::Command::new("unused");
+        bridge.attach(&mut command);
+        let environment: Vec<_> = command.as_std().get_envs().collect();
+        // The capability must survive automatic credential-name exclusions.
+        for (name, value) in &environment {
+            let name = name.to_str().unwrap().to_ascii_uppercase();
+            assert!(
+                !["KEY", "SECRET", "TOKEN"]
+                    .iter()
+                    .any(|word| name.contains(*word))
+            );
+            assert!(value.is_some());
+        }
+        assert!(environment.iter().any(|(name, value)| {
+            *name == CAP_ENV && *value == Some(std::ffi::OsStr::new(&bridge.token))
+        }));
+        clear_environment(&mut command);
+        assert!(
+            command
+                .as_std()
+                .get_envs()
+                .all(|(_, value)| value.is_none())
+        );
         let hold = |index: usize| Operation::Hold {
             task: tasks[index].id.clone(),
             reason: "wait".into(),

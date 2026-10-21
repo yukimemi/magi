@@ -678,6 +678,13 @@ fn windows_sandboxed_chat_controls_without_direct_store_writes() {
             spec.env.insert("MAGI_CONFIG_DIR".into(), String::new());
             spec.kind = AgentKind::Codex;
             spec.command.clear();
+            // Exercise environments that automatically exclude credential names.
+            spec.extra_args.extend([
+                "-c".into(),
+                "shell_environment_policy.ignore_default_excludes=false".into(),
+                "-c".into(),
+                "shell_environment_policy.inherit=all".into(),
+            ]);
             spec.env
                 .insert("MAGI_TEST_BINARY".into(), env!("CARGO_BIN_EXE_magi").into());
             spec.env.insert("MAGI_TEST_TASK".into(), f.task.id.clone());

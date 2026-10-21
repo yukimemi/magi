@@ -115,7 +115,7 @@ pub(crate) fn clear_environment(command: &mut tokio::process::Command) {
         .env_remove(RESPONSE_ENV)
         .env_remove(LOCK_ENV)
         .env_remove("MAGI_CHAT_CONTROL_PIPE")
-        .env_remove("MAGI_CHAT_CONTROL_TOKEN");
+        .env_remove("MAGI_CHAT_CONTROL_CAP");
 }
 
 fn duplicate(name: &str) -> Result<RawFd> {
