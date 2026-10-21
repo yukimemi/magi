@@ -2596,7 +2596,13 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_handles_literal_conflict_paths_with_whitespace() {
-        for path in [" spaced file ", "tab\tand\nnewline", "日本語.txt"] {
+        // Win32 rejects trailing spaces and control characters in file names.
+        // Exercise literal pathspecs there with valid whitespace and brackets;
+        // retain trailing whitespace and control-character coverage on Unix.
+        let paths = [" spaced file name", "日本語 [literal].txt", "日本語.txt"].into_iter();
+        #[cfg(not(windows))]
+        let paths = paths.chain([" spaced file ", "tab\tand\nnewline"]);
+        for path in paths {
             let mut f = fixture_with(true, path, 2).await;
             assert_eq!(git::unmerged_paths(&f.scratch).await.unwrap(), [path]);
             std::fs::write(f.scratch.join(path), BOTH).unwrap();
