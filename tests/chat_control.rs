@@ -477,12 +477,13 @@ async fn rerun_checks_binds_head_request_and_workflow_and_never_retries_uncertai
     std::fs::write(
         &gh,
         r#"#!/bin/sh
-if [ "$1" = pr ]; then
-  cat "$MAGI_HOME/snapshot.json"
-else
-  echo "$3" >> "$MAGI_HOME/sent"
-  if [ -f "$MAGI_HOME/fail" ]; then exit 1; fi
-fi
+case "$1 $2" in
+  'pr view') cat "$MAGI_HOME/snapshot.json" ;;
+  'run rerun')
+    echo "$3" >> "$MAGI_HOME/sent"
+    if [ -f "$MAGI_HOME/fail" ]; then exit 1; fi ;;
+  *) echo "unexpected gh command: $*" >&2; exit 64 ;;
+esac
 "#,
     )
     .unwrap();
@@ -514,6 +515,7 @@ fi
             ])
             .env("MAGI_HOME", f.tmp.path())
             .env("MAGI_CONFIG_DIR", "")
+            .env(magi::updater::NO_AUTOUPDATE_ENV, "1")
             .env("MAGI_RUN", &f.talk)
             .env("MAGI_NODE", CHAT_NODE)
             .env("MAGI_TURN_SCOPE", "repository")
