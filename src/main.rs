@@ -3448,7 +3448,8 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
             let selected = if clear {
                 Default::default()
             } else {
-                let (cfg, _) = Config::discover(&task.repo, None)?;
+                let explicit = task.overrides.as_ref().and_then(|o| o.config.as_deref());
+                let (cfg, _) = Config::discover(&task.repo, explicit)?;
                 sources.resolve(&task.repo, &cfg).await?
             };
             task.sources = selected;
@@ -5059,6 +5060,89 @@ mod tests {
         let mut after = RunOpts::default();
         after.sources.start_from = Some("two".into());
         assert!(after.merge(before).is_err());
+    }
+
+    #[tokio::test]
+    async fn source_replacement_uses_the_tasks_explicit_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .quiet()
+                .current_dir(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-b", "main"]);
+        std::fs::write(
+            repo.join("magi.toml"),
+            "[merge]\nremote = 'origin'\nbase = 'main'\n",
+        )
+        .unwrap();
+        git(&["add", "magi.toml"]);
+        for message in ["base", "origin feature", "upstream feature"] {
+            git(&[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                message,
+            ]);
+            let sha = git(&["rev-parse", "HEAD"]);
+            let refs: &[&str] = match message {
+                "base" => &["refs/remotes/origin/main", "refs/remotes/upstream/main"],
+                "origin feature" => &["refs/remotes/origin/feature"],
+                _ => &["refs/remotes/upstream/feature"],
+            };
+            for reference in refs {
+                git(&["update-ref", reference, &sha]);
+            }
+        }
+        let expected = git(&["rev-parse", "refs/remotes/upstream/feature"]);
+        let config = dir.path().join("custom.toml");
+        std::fs::write(&config, "[merge]\nremote = 'upstream'\nbase = 'main'\n").unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let mut task = Task::new(
+            "retry".into(),
+            "implement".into(),
+            repo,
+            queue::Source::Human,
+        );
+        task.overrides = Some(queue::RunOverrides {
+            config: Some(config),
+            ..Default::default()
+        });
+        task.hold_manual(Some("preparation failed".into()));
+        queue.put(&mut task).unwrap();
+        task_cmd_on(
+            TaskCmd::Sources {
+                id: task.id.clone(),
+                sources: SourceArgs {
+                    start_from: Some("feature".into()),
+                    ..Default::default()
+                },
+                clear: false,
+            },
+            queue.clone(),
+        )
+        .await
+        .unwrap();
+        let updated = queue.get(&task.id).unwrap();
+        assert_eq!(updated.sources.start_from.unwrap().sha, expected);
+        assert_eq!(updated.status, TaskStatus::Held);
     }
 
     #[tokio::test]
