@@ -18,8 +18,8 @@
 //!   that contains no base at all). Whether the tree *builds* is left to the
 //!   review and gate that follow, which already know how to fix a breakage.
 //! - **The budget is `graph.review_rounds`, counted in
-//!   `RunState::rebase_fixes`** and saved before the fixer is called, shared
-//!   by both callers, so a park or a crash cannot hand a round back. It
+//!   `RunState::rebase_fixes` per sequencer stop** and saved before the fixer
+//!   is called, shared by both callers, so a park or crash cannot hand a round back. It
 //!   touches neither the task's attempts nor land's own rebase budget.
 //! - **A failure restores the branch.** Whatever the fixer left, the branch
 //!   ref goes back to where it was and the throwaway worktree is removed, so
@@ -80,14 +80,23 @@ pub async fn rebase_with_fixer(
             git::RebaseStart::Conflicted(why) => said = why,
         }
     }
-    let onto_sha = git::rev_parse(&repo, onto).await?;
+    // A tracking ref may have advanced while this rebase was parked. Finish
+    // the saved operation against its own target, then start an ordinary
+    // base sync if the requested target has moved.
+    let onto_sha = rebase_target(scratch).await?;
     // Every path that was ever unmerged: the marker check on the finished
     // tree looks at exactly these.
     let mut touched: Vec<String> = Vec::new();
 
     loop {
         if !git::rebase_in_progress(scratch).await {
-            return finish(state, scratch, branch, &orig, &onto_sha, &touched, &said).await;
+            let result = finish(state, scratch, branch, &orig, &onto_sha, &touched, &said).await?;
+            if result == Rebased::Applied && git::rev_parse(&repo, onto).await? != onto_sha {
+                state.event("rebase", "saved rebase completed; syncing the newer base");
+                state.save()?;
+                return Box::pin(rebase_with_fixer(state, scratch, branch, onto)).await;
+            }
+            return Ok(result);
         }
         let paths = git::unmerged_paths(scratch).await.unwrap_or_default();
         for p in &paths {
@@ -103,7 +112,7 @@ pub async fn rebase_with_fixer(
         if let Launch::Advanced = launcher_stage(state, scratch, &orig, &onto_sha).await? {
             continue;
         }
-        let spent = state.rebase_fixes.len();
+        let spent = stop_rounds(state, scratch).await;
         if spent >= cap {
             let why = reason(spent, cap, &paths, &said, "the rounds are spent");
             abandon(&repo, scratch, branch, &orig).await;
@@ -123,6 +132,7 @@ pub async fn rebase_with_fixer(
         let ids: Vec<String> = attempts.iter().map(|(s, _)| s.id.clone()).collect();
 
         let round = spent + 1;
+        let artifact_round = state.rebase_fixes.len() + 1;
         let branch_subjects = subjects(scratch, &format!("{onto}..{branch}")).await;
         let onto_subjects = subjects(scratch, &format!("{branch}..{onto}")).await;
         let hunks = hunks(scratch, &paths);
@@ -149,7 +159,7 @@ pub async fn rebase_with_fixer(
         // Spent before the call, on disk: a run killed mid-round must not
         // get the round back.
         let stop = rebase_head(scratch).await;
-        let index_outside = index_outside(scratch, &paths).await.ok();
+        let index_outside = Some(round_baseline(state, scratch, &paths).await?);
         state.rebase_fixes.push(RebaseFixRecord {
             agent: ids[0].clone(),
             paths: paths.clone(),
@@ -185,9 +195,9 @@ pub async fn rebase_with_fixer(
             }
             let mut seat = seat_of(state, &seat_key, &spec.id);
             let stem = if i == 0 {
-                format!("rebase-fix-{round}")
+                format!("rebase-fix-{artifact_round}")
             } else {
-                format!("rebase-fix-{round}-{}", spec.id)
+                format!("rebase-fix-{artifact_round}-{}", spec.id)
             };
             let out = agent::invoke(
                 &spec,
@@ -392,6 +402,47 @@ async fn same_stop(state: &RunState, scratch: &Path) -> bool {
     }
 }
 
+/// Records for the current stop form a contiguous suffix. Always retain the
+/// first record's paths and index baseline, even after a rejected seat edit.
+fn stop_records(state: &RunState) -> &[RebaseFixRecord] {
+    let Some(last) = state.rebase_fixes.last() else {
+        return &[];
+    };
+    let start = state
+        .rebase_fixes
+        .iter()
+        .rposition(|r| r.stop != last.stop || (r.stop.is_none() && r.paths != last.paths))
+        .map_or(0, |i| i + 1);
+    &state.rebase_fixes[start..]
+}
+
+async fn stop_rounds(state: &RunState, scratch: &Path) -> usize {
+    if same_stop(state, scratch).await {
+        stop_records(state).len()
+    } else {
+        0
+    }
+}
+
+async fn round_baseline(state: &mut RunState, scratch: &Path, paths: &[String]) -> Result<String> {
+    if same_stop(state, scratch).await {
+        if let Some(before) = &stop_records(state)[0].index_outside {
+            return Ok(before.clone());
+        }
+        return Err(infra_stop(state,
+            "the saved stop has no original outside-index baseline; keep the resolution and have the original owner establish a verified baseline before continuation".into()));
+    }
+    index_outside(scratch, paths)
+        .await
+        .map_err(|e| infra_stop(state, format!("cannot capture index baseline: {e:#}")))
+}
+
+async fn rebase_target(scratch: &Path) -> Result<String> {
+    let path = git::git(scratch, &["rev-parse", "--git-path", "rebase-merge/onto"]).await?;
+    let target = std::fs::read_to_string(scratch.join(path))?;
+    git::rev_parse(scratch, &format!("{}^{{commit}}", target.trim())).await
+}
+
 async fn stop_identity(scratch: &Path, original: &str, onto: &str) -> Result<()> {
     for (name, expected) in [("orig-head", original), ("onto", onto)] {
         let path = git::git(
@@ -528,7 +579,8 @@ async fn launcher_stage(
     if let Err(e) = stop_identity(scratch, original, onto).await {
         return Err(infra_stop(state, format!("{e:#}")));
     }
-    let last = state.rebase_fixes.last().cloned().expect("same_stop");
+    let last = stop_records(state)[0].clone();
+    let baseline = round_baseline(state, scratch, &last.paths).await?;
     let unmerged = match git::unmerged_paths(scratch).await {
         Ok(u) => u,
         Err(e) => return Err(infra_stop(state, format!("cannot read the index: {e:#}"))),
@@ -538,7 +590,7 @@ async fn launcher_stage(
             "`{p}` is unmerged but was not part of the recorded conflict"
         )));
     }
-    for p in &unmerged {
+    for p in &last.paths {
         match std::fs::symlink_metadata(scratch.join(p)) {
             Ok(m) if m.is_dir() => {
                 return Ok(Launch::Nothing(format!("`{p}` is a directory")));
@@ -577,16 +629,14 @@ async fn launcher_stage(
             stray.join(", ")
         )));
     }
-    if let Some(before) = &last.index_outside {
-        match index_outside(scratch, &last.paths).await {
-            Ok(now) if &now == before => {}
-            Ok(_) => {
-                return Ok(Launch::Nothing(
-                    "the staged changes outside the conflicted paths changed".into(),
-                ));
-            }
-            Err(e) => return Err(infra_stop(state, format!("{e:#}"))),
+    match index_outside(scratch, &last.paths).await {
+        Ok(now) if now == baseline => {}
+        Ok(_) => {
+            return Ok(Launch::Nothing(
+                "the staged changes outside the conflicted paths changed".into(),
+            ));
         }
+        Err(e) => return Err(infra_stop(state, format!("{e:#}"))),
     }
 
     let set = |state: &mut RunState, step| {
@@ -1014,7 +1064,12 @@ async fn subjects(worktree: &Path, range: &str) -> Vec<String> {
 
 fn has_markers(worktree: &Path, path: &str) -> bool {
     std::fs::read_to_string(worktree.join(path)).is_ok_and(|t| {
-        t.lines().any(|l| l.starts_with("<<<<<<< ")) && t.lines().any(|l| l.starts_with(">>>>>>> "))
+        t.lines().any(|l| {
+            l.starts_with("<<<<<<<")
+                || l == "======="
+                || l.starts_with(">>>>>>>")
+                || l.starts_with("|||||||")
+        })
     })
 }
 
@@ -1747,6 +1802,15 @@ mod tests {
     }
 
     async fn fixture_with(stop_recorded: bool, conflict: &str, commits: usize) -> Fixture {
+        fixture_stops(stop_recorded, conflict, commits, false).await
+    }
+
+    async fn fixture_stops(
+        stop_recorded: bool,
+        conflict: &str,
+        commits: usize,
+        second: bool,
+    ) -> Fixture {
         crate::run::pin_test_home();
         let t = tempfile::tempdir().unwrap();
         let d = t.path().join("repo");
@@ -1774,6 +1838,10 @@ mod tests {
         }
         sh(&d, &["checkout", "-q", "main"]);
         std::fs::write(d.join(conflict), UPSTREAM).unwrap();
+        if second {
+            std::fs::write(d.join("g.txt"), "upstream g\n").unwrap();
+            sh(&d, &["add", "g.txt"]);
+        }
         sh(&d, &["commit", "-qam", "upstream test"]);
         let scratch = t.path().join("scratch");
         let started = git::rebase_start(&d, &scratch, "topic", "main")
@@ -1868,6 +1936,149 @@ mod tests {
         assert!(git::rebase_in_progress(&f.scratch).await);
         assert_eq!(git::unmerged_paths(&f.scratch).await.unwrap(), ["f.txt"]);
         assert!(f.state.resource_block.is_none());
+        std::fs::remove_dir_all(f.state.dir()).ok();
+    }
+
+    #[tokio::test]
+    async fn partial_markers_are_rejected_even_after_staging() {
+        for marker in ["<<<<<<< HEAD", "=======", ">>>>>>> topic", "||||||| base"] {
+            for staged in [false, true] {
+                let mut f = fixture(true).await;
+                std::fs::write(f.scratch.join("f.txt"), format!("{BOTH}{marker}\n")).unwrap();
+                if staged {
+                    sh(&f.scratch, &["add", "f.txt"]);
+                }
+                assert!(has_markers(&f.scratch, "f.txt"));
+                let out = stage(&mut f).await.unwrap();
+                assert!(matches!(&out, Launch::Nothing(why) if why.contains("markers")));
+                assert!(git::rebase_in_progress(&f.scratch).await);
+                std::fs::remove_dir_all(f.state.dir()).ok();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_keep_the_first_index_baseline() {
+        let mut f = fixture(true).await;
+        std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
+        std::fs::write(f.scratch.join("automatic"), "unrelated staged edit\n").unwrap();
+        sh(&f.scratch, &["add", "automatic"]);
+        let out = stage(&mut f).await.unwrap();
+        assert!(matches!(&out, Launch::Nothing(why) if why.contains("staged changes")));
+        let paths = f.state.rebase_fixes[0].paths.clone();
+        let baseline = round_baseline(&mut f.state, &f.scratch, &paths)
+            .await
+            .unwrap();
+        assert_eq!(
+            Some(&baseline),
+            f.state.rebase_fixes[0].index_outside.as_ref()
+        );
+        assert_ne!(baseline, index_outside(&f.scratch, &paths).await.unwrap());
+        let mut retry = f.state.rebase_fixes[0].clone();
+        // Even a polluted later record cannot replace the first baseline.
+        retry.index_outside = index_outside(&f.scratch, &paths).await.ok();
+        f.state.rebase_fixes.push(retry);
+        let out = stage(&mut f).await.unwrap();
+        assert!(matches!(&out, Launch::Nothing(why) if why.contains("staged changes")));
+        assert_eq!(git::unmerged_paths(&f.scratch).await.unwrap(), ["f.txt"]);
+        std::fs::remove_dir_all(f.state.dir()).ok();
+    }
+
+    #[tokio::test]
+    async fn legacy_records_without_a_baseline_block_without_adopting_the_index() {
+        let mut f = fixture(false).await;
+        f.state.rebase_fixes[0].index_outside = None;
+        std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
+        std::fs::write(f.scratch.join("automatic"), "unrelated staged edit\n").unwrap();
+        sh(&f.scratch, &["add", "automatic"]);
+        let error = stage(&mut f).await.unwrap_err();
+        assert!(error.is::<crate::repo_lock::ResourceBlocked>());
+        assert!(error.to_string().contains("baseline"));
+        assert_eq!(f.state.rebase_fixes.len(), 1);
+        assert!(f.state.rebase_fixes[0].index_outside.is_none());
+        assert_eq!(f.read("f.txt"), BOTH);
+        assert_eq!(git::unmerged_paths(&f.scratch).await.unwrap(), ["f.txt"]);
+        std::fs::remove_dir_all(f.state.dir()).ok();
+    }
+
+    #[tokio::test]
+    async fn successful_progression_gets_a_budget_for_the_next_conflicting_commit() {
+        let mut f = fixture_stops(true, "f.txt", 2, true).await;
+        f.state.config.graph.review_rounds = 1;
+        assert_eq!(stop_rounds(&f.state, &f.scratch).await, 1);
+        std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
+        assert!(matches!(stage(&mut f).await.unwrap(), Launch::Advanced));
+        assert_eq!(git::unmerged_paths(&f.scratch).await.unwrap(), ["g.txt"]);
+        assert_eq!(stop_rounds(&f.state, &f.scratch).await, 0);
+        let paths = git::unmerged_paths(&f.scratch).await.unwrap();
+        let mut round = f.state.rebase_fixes[0].clone();
+        round.index_outside = Some(
+            round_baseline(&mut f.state, &f.scratch, &paths)
+                .await
+                .unwrap(),
+        );
+        round.paths = paths;
+        round.stop = rebase_head(&f.scratch).await;
+        f.state.rebase_fixes.push(round);
+        assert_eq!(stop_rounds(&f.state, &f.scratch).await, 1);
+        std::fs::write(f.scratch.join("g.txt"), "upstream g\ng\n").unwrap();
+        assert_eq!(
+            rebase_with_fixer(&mut f.state, &f.scratch, "topic", "main")
+                .await
+                .unwrap(),
+            Rebased::Applied
+        );
+        assert_eq!(
+            git::git(&f.state.repo, &["show", "topic:f.txt"])
+                .await
+                .unwrap(),
+            BOTH.trim_end()
+        );
+        assert_eq!(
+            git::git(&f.state.repo, &["show", "topic:g.txt"])
+                .await
+                .unwrap(),
+            "upstream g\ng"
+        );
+        std::fs::remove_dir_all(f.state.dir()).ok();
+    }
+
+    #[tokio::test]
+    async fn resume_after_staging_denial_uses_the_saved_target_when_upstream_moves() {
+        let mut f = fixture(true).await;
+        std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
+        let saved = rebase_target(&f.scratch).await.unwrap();
+        let lock = git::git(&f.scratch, &["rev-parse", "--git-path", "index.lock"])
+            .await
+            .unwrap();
+        let lock = f.scratch.join(lock);
+        std::fs::write(&lock, "").unwrap();
+        assert!(
+            stage(&mut f)
+                .await
+                .unwrap_err()
+                .is::<crate::repo_lock::ResourceBlocked>()
+        );
+        std::fs::remove_file(lock).unwrap();
+        std::fs::write(f.state.repo.join("new-upstream"), "new base\n").unwrap();
+        sh(&f.state.repo, &["add", "new-upstream"]);
+        sh(&f.state.repo, &["commit", "-qm", "new upstream"]);
+        assert_ne!(saved, git::rev_parse(&f.state.repo, "main").await.unwrap());
+        assert_eq!(
+            rebase_with_fixer(&mut f.state, &f.scratch, "topic", "main")
+                .await
+                .unwrap(),
+            Rebased::Applied
+        );
+        assert!(git::is_ancestor(&f.state.repo, &saved, "topic").await);
+        assert!(git::is_ancestor(&f.state.repo, "main", "topic").await);
+        assert_eq!(
+            git::git(&f.state.repo, &["show", "topic:f.txt"])
+                .await
+                .unwrap(),
+            BOTH.trim_end()
+        );
+        assert_eq!(f.state.rebase_fixes.len(), 1);
         std::fs::remove_dir_all(f.state.dir()).ok();
     }
 

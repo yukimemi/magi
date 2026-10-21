@@ -898,7 +898,7 @@ pub struct GateFixRecord {
 /// One fixer round spent on a rebase that stopped on a conflict: which fixer,
 /// what it was shown and whether git says the rebase then finished.
 ///
-/// The number of these is the budget spent (`graph.review_rounds` is the cap),
+/// The records at each sequencer stop count against `graph.review_rounds`,
 /// written to disk *before* the fixer runs so a park or crash cannot hand the
 /// round back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -923,7 +923,9 @@ pub struct RebaseFixRecord {
     #[serde(default)]
     pub stop: Option<String>,
     /// Staged changes outside `paths` when the round started (Git's own
-    /// clean applications), so edits made behind them can be told apart.
+    /// clean applications), so edits made behind them can be told apart. Retries
+    /// retain the first baseline for the stop; missing legacy baselines block
+    /// automatic staging rather than trusting the current index.
     #[serde(default)]
     pub index_outside: Option<String>,
     /// How far the launcher got with staging and continuing this stop point.
