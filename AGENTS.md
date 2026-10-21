@@ -2627,15 +2627,29 @@ from `prompt::chat_consult`) as a draft of that talk; the chat agent answers it
 with `magi answer` or puts the decision points to the owner in the chat.
 
 - **One judge.** `consult::origin_talk` is the only place that decides a
-  question has a chat to ask (open question, task from a chat, talk still
-  open, and never `bump::NOTICE_NODE`). Merge approvals can be consulted,
+  question has a chat to ask (open question, task from a chat, existing
+  talk, and never `bump::NOTICE_NODE`). Closed talks can be reopened. Merge
+  approvals can be consulted,
   but the chat must wait for explicit owner confirmation. `magi answer` from
   a chat supports independent current owner evidence through
   `consult::authorize_answer`; consultation delivery is not authority.
   `--quote` must bind the latest persisted owner send and exact question/choice.
   The README decision matrix documents individual and batch consent, manifests,
   retained legacy same-chat answers and downstream execution restrictions.
-  `QuestionView::origin_chat` is its result; `app.js` shows "Ask the chat agent" only when it is set.
+  `QuestionView::can_consult_chat` records eligibility. Navigation uses
+  `consult::associated_talk` / `associated_talk_with_watches` separately:
+  `Question::run_names_task()` distinguishes exact task ids from run ids;
+  association also treats `reconcile::NODE` + `reconcile::SEAT` questions
+  as task references (review-start divergence is filed under the task id);
+  release-watch records naming the question supply typed `run` / `held_task`
+  links only when exactly one record matches; ambiguous watch links are ignored.
+  Conflicting resolved owners suppress navigation. Follow-up ancestry
+  uses `chat_talk_of`. Both web origin paths preload the same links once per
+  request, skipping watch-store reads unless a `bump::NOTICE_NODE` question
+  with seat `release-watch` is present. `origin_chat` enables "Open chat"
+  ("Open chat (closed)" for a closed talk); a physically missing talk has no
+  button. These extra links
+  never expand consultation eligibility or change `daemon::task_of_question`.
 - **Never a choice.** Nothing is added to `Question::choices` and
   `Question::answer` is untouched. The question stays `Open`; `Question::consult`
   (`ask::SCHEMA` 6, `#[serde(default)]`) only records that the chat was asked, so

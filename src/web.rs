@@ -7208,11 +7208,16 @@ impl QuestionView {
     }
 
     /// Fill `origin_chat` from the queue and the talks.
-    fn with_origin(mut self, tasks: &[crate::queue::Task], talks: &[Talk]) -> Self {
+    fn with_origin(
+        mut self,
+        tasks: &[crate::queue::Task],
+        talks: &[Talk],
+        watches: &[crate::release_watch::WatchState],
+    ) -> Self {
         let consult = crate::consult::origin_talk(tasks, talks, &self.question);
         self.can_consult_chat = consult.is_some();
         let talk =
-            consult.or_else(|| crate::consult::associated_talk(tasks, talks, &self.question));
+            crate::consult::associated_talk_with_watches(tasks, talks, &self.question, watches);
         self.origin_chat_closed = talk.as_ref().is_some_and(|t| !t.status.open());
         self.origin_chat = talk.map(|t| t.id);
         self
@@ -7282,11 +7287,11 @@ fn holder_of(q: &Question, lease: Option<&ask::Lease>) -> Option<&'static str> {
 async fn questions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<QuestionView>>> {
     blocking(move || {
         let questions = ui.questions.list();
-        let (tasks, talks) = question_origin_inputs(&ui, &questions)?;
+        let (tasks, talks, watches) = question_origin_inputs(&ui, &questions)?;
         Ok(Json(
             question_views(questions, &ui.questions, || deputy_config(&ui.repo))
                 .into_iter()
-                .map(|view| view.with_origin(&tasks, &talks))
+                .map(|view| view.with_origin(&tasks, &talks, &watches))
                 .collect(),
         ))
     })
@@ -7326,15 +7331,16 @@ struct QuestionOriginView {
 async fn question_origins(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<QuestionOriginView>>> {
     blocking(move || {
         let questions = ui.questions.list();
-        let (tasks, talks) = question_origin_inputs(&ui, &questions)?;
+        let (tasks, talks, watches) = question_origin_inputs(&ui, &questions)?;
         Ok(Json(
             questions
                 .into_iter()
                 .map(|question| {
                     let consult = crate::consult::origin_talk(&tasks, &talks, &question);
                     let can_consult_chat = consult.is_some();
-                    let talk = consult
-                        .or_else(|| crate::consult::associated_talk(&tasks, &talks, &question));
+                    let talk = crate::consult::associated_talk_with_watches(
+                        &tasks, &talks, &question, &watches,
+                    );
                     QuestionOriginView {
                         record_revision: question_record_revision(&question),
                         id: question.id,
@@ -7349,10 +7355,12 @@ async fn question_origins(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<Quest
     .await
 }
 
+type QuestionOriginInputs = (Vec<Task>, Vec<Talk>, Vec<crate::release_watch::WatchState>);
+
 /// Only the task ancestry and chats these questions actually reference. Run
 /// mappings share the reconciled queue index; exact task references bypass it.
 /// No question means no task/chat I/O, including no index reconciliation.
-fn question_origin_inputs(ui: &Ui, questions: &[Question]) -> ApiResult<(Vec<Task>, Vec<Talk>)> {
+fn question_origin_inputs(ui: &Ui, questions: &[Question]) -> ApiResult<QuestionOriginInputs> {
     fn task_for_run(
         ui: &Ui,
         index: &mut Option<Vec<Arc<TaskRelation>>>,
@@ -7384,47 +7392,51 @@ fn question_origin_inputs(ui: &Ui, questions: &[Question]) -> ApiResult<(Vec<Tas
             .flatten()
             .filter(|task| task.id == id)
     };
+    let watches = crate::release_watch::states_for_questions(&ui.home, questions);
     let mut index = None;
     let mut tasks = HashMap::new();
     let mut talks = HashMap::new();
     for question in questions {
-        let mut current = if question.node == crate::conduct::NODE {
-            direct_task(&question.run, &tasks)
-        } else {
-            task_for_run(ui, &mut index, &question.run, &tasks)?
-        };
-        let mut seen = HashSet::new();
-        for _ in 0..=crate::followup::MAX_FOLLOWUP_GENERATION {
-            let Some(task) = current.take() else {
-                break;
-            };
-            if !seen.insert(task.id.clone()) {
-                break;
-            }
-            let chat = task.chat_talk().map(str::to_owned);
-            let followup = task.followup.clone();
-            tasks.insert(task.id.clone(), task);
-            if let Some(chat) = chat {
-                if plain_record_id(&chat)
-                    && !talks.contains_key(&chat)
-                    && let Ok(talk) = ui.talks.get(&chat)
-                {
-                    talks.insert(chat, talk);
+        for reference in crate::consult::question_task_refs(question, &watches) {
+            let mut current = match reference {
+                crate::consult::QuestionTaskRef::Task(id) => direct_task(id, &tasks),
+                crate::consult::QuestionTaskRef::Run(id) => {
+                    task_for_run(ui, &mut index, id, &tasks)?
                 }
-                break;
+            };
+            let mut seen = HashSet::new();
+            for _ in 0..=crate::followup::MAX_FOLLOWUP_GENERATION {
+                let Some(task) = current.take() else {
+                    break;
+                };
+                if !seen.insert(task.id.clone()) {
+                    break;
+                }
+                let chat = task.chat_talk().map(str::to_owned);
+                let followup = task.followup.clone();
+                tasks.insert(task.id.clone(), task);
+                if let Some(chat) = chat {
+                    if plain_record_id(&chat)
+                        && !talks.contains_key(&chat)
+                        && let Ok(talk) = ui.talks.get(&chat)
+                    {
+                        talks.insert(chat, talk);
+                    }
+                    break;
+                }
+                let Some(followup) = followup else {
+                    break;
+                };
+                current = match followup.origin_task {
+                    Some(id) => direct_task(&id, &tasks),
+                    None => task_for_run(ui, &mut index, &followup.run, &tasks)?,
+                };
             }
-            let Some(followup) = followup else {
-                break;
-            };
-            current = match followup.origin_task {
-                Some(id) => direct_task(&id, &tasks),
-                None => task_for_run(ui, &mut index, &followup.run, &tasks)?,
-            };
         }
     }
     let mut tasks: Vec<Task> = tasks.into_values().collect();
     tasks.sort_unstable_by(|a, b| b.priority.cmp(&a.priority).then_with(|| b.id.cmp(&a.id)));
-    Ok((tasks, talks.into_values().collect()))
+    Ok((tasks, talks.into_values().collect(), watches))
 }
 
 /// `GET /api/notifications`: not dismissed, newest first, with the unread
@@ -7535,10 +7547,10 @@ async fn question_answer(
             .questions
             .update(&q.id, |r| r.answer(answer))
             .map_err(ApiError::bad_request_from)?;
-        let (tasks, talks) =
+        let (tasks, talks, watches) =
             question_origin_inputs(&ui, std::slice::from_ref(&q)).unwrap_or_default();
         Ok(Json(
-            QuestionView::of(q, &ui.questions, cfg.as_ref()).with_origin(&tasks, &talks),
+            QuestionView::of(q, &ui.questions, cfg.as_ref()).with_origin(&tasks, &talks, &watches),
         ))
     })
     .await
@@ -7611,10 +7623,10 @@ async fn question_say(
                 r.say(body.body)
             })
             .map_err(question_text_error)?;
-        let (tasks, talks) =
+        let (tasks, talks, watches) =
             question_origin_inputs(&ui, std::slice::from_ref(&q)).unwrap_or_default();
         Ok(Json(
-            QuestionView::of(q, &ui.questions, cfg.as_ref()).with_origin(&tasks, &talks),
+            QuestionView::of(q, &ui.questions, cfg.as_ref()).with_origin(&tasks, &talks, &watches),
         ))
     })
     .await
@@ -7647,7 +7659,7 @@ async fn question_consult(
                     q.status.as_str()
                 )));
             }
-            let (tasks, talks) = question_origin_inputs(&ui, std::slice::from_ref(&q))?;
+            let (tasks, talks, watches) = question_origin_inputs(&ui, std::slice::from_ref(&q))?;
             let Some(talk) = crate::consult::origin_talk(&tasks, &talks, &q) else {
                 return Err(ApiError::conflict(format!(
                     "question {} has no chat to ask",
@@ -7680,7 +7692,8 @@ async fn question_consult(
             };
             let q = ui.questions.get(&q.id)?;
             let cfg = deputy_config(&ui.repo);
-            let view = QuestionView::of(q, &ui.questions, cfg.as_ref()).with_origin(&tasks, &talks);
+            let view = QuestionView::of(q, &ui.questions, cfg.as_ref())
+                .with_origin(&tasks, &talks, &watches);
             Ok((view, claim))
         }
     })
@@ -23467,6 +23480,209 @@ mod tests {
         assert_eq!(ui.monitor.queue_index.lock().unwrap().reparsed, 0);
     }
 
+    #[tokio::test]
+    async fn question_origins_resolve_typed_links_without_expanding_consultation() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let chat = seed_talk_at(&ui.talks, "origin-chat", "closed");
+        let mut parent = Task::new(
+            "parent".into(),
+            "body".into(),
+            PathBuf::from("/repo"),
+            Source::Agent {
+                run: chat.clone(),
+                node: crate::queue::CHAT_NODE.into(),
+            },
+        );
+        parent.id = "parent-task".into();
+        parent.runs = vec!["parent-run".into()];
+        ui.queue.put(&mut parent).unwrap();
+        let mut previous = parent;
+        for generation in 1..=2 {
+            let mut child = Task::new(
+                "child".into(),
+                "body".into(),
+                PathBuf::from("/repo"),
+                Source::Human,
+            );
+            child.id = format!("child-task-{generation}");
+            child.runs = vec![format!("child-run-{generation}")];
+            child.followup = Some(crate::queue::FollowUp {
+                origin_task: Some(previous.id.clone()),
+                run: previous.runs[0].clone(),
+                pr: String::new(),
+                findings: vec![],
+                generation,
+            });
+            ui.queue.put(&mut child).unwrap();
+            previous = child;
+        }
+        // A run may have the same spelling as another task's id; its owner
+        // must not override a typed task reference.
+        let mut collision = Task::new(
+            "collision".into(),
+            String::new(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        collision.id = "collision-task".into();
+        collision.runs = vec![previous.id.clone()];
+        ui.queue.put(&mut collision).unwrap();
+        let mut questions = Vec::new();
+        for (node, reference, expected, eligible) in [
+            (crate::triage::NODE, previous.id.as_str(), true, false),
+            (crate::triage::DEPS_NODE, previous.id.as_str(), true, false),
+            ("review", previous.runs[0].as_str(), true, true),
+            (
+                crate::bump::NOTICE_NODE,
+                previous.runs[0].as_str(),
+                true,
+                false,
+            ),
+            // Identical text in the wrong reference namespace is not evidence.
+            ("review", previous.id.as_str(), false, false),
+            (crate::triage::NODE, previous.runs[0].as_str(), false, true),
+            ("review", "unrelated", false, false),
+        ] {
+            let mut q = Question::new(
+                reference.into(),
+                node.into(),
+                "seat".into(),
+                "Question".into(),
+                String::new(),
+                vec![],
+            );
+            ui.questions.put(&mut q).unwrap();
+            questions.push((q, expected, eligible));
+        }
+        for (node, reference, associated, eligible) in [
+            (crate::reconcile::NODE, previous.id.as_str(), true, false),
+            (
+                crate::reconcile::NODE,
+                previous.runs[0].as_str(),
+                false,
+                true,
+            ),
+            ("implement", previous.id.as_str(), false, false),
+        ] {
+            let mut q = Question::new(
+                reference.into(),
+                node.into(),
+                crate::reconcile::SEAT.into(),
+                "Reconcile".into(),
+                String::new(),
+                vec![],
+            );
+            ui.questions.put(&mut q).unwrap();
+            questions.push((q, associated, eligible));
+        }
+        let mut release = Question::new(
+            "release-record".into(),
+            crate::bump::NOTICE_NODE.into(),
+            "release-watch".into(),
+            "Release".into(),
+            String::new(),
+            vec![],
+        );
+        ui.questions.put(&mut release).unwrap();
+        let watch = crate::release_watch::WatchState {
+            question: Some(release.id.clone()),
+            run: Some(previous.runs[0].clone()),
+            held_task: Some(previous.id.clone()),
+            ..Default::default()
+        };
+        let watch_dir = home.path().join("release-watch");
+        std::fs::create_dir_all(&watch_dir).unwrap();
+        let watch_path = watch_dir.join("watch.json");
+        std::fs::write(&watch_path, serde_json::to_vec(&watch).unwrap()).unwrap();
+        // Ordinary questions and bump notices do not need watch-store I/O.
+        for batch in [
+            Vec::new(),
+            questions.iter().map(|(q, _, _)| q.clone()).collect(),
+        ] {
+            let (_, _, watches) = question_origin_inputs(&ui, &batch).unwrap();
+            assert!(watches.is_empty());
+        }
+        questions.push((release.clone(), true, false));
+
+        let views = questions_list(State(ui.clone())).await.unwrap().0;
+        let origins = question_origins(State(ui.clone())).await.unwrap().0;
+        for (q, associated, eligible) in &questions {
+            let view = views.iter().find(|view| view.question.id == q.id).unwrap();
+            let origin = origins.iter().find(|view| view.id == q.id).unwrap();
+            let expected = associated.then_some(chat.as_str());
+            assert_eq!(
+                view.origin_chat.as_deref(),
+                expected,
+                "{} {}",
+                q.node,
+                q.run
+            );
+            assert_eq!(origin.origin_chat.as_deref(), expected);
+            assert_eq!(view.origin_chat_closed, *associated);
+            assert_eq!(origin.origin_chat_closed, *associated);
+            assert_eq!(view.can_consult_chat, *eligible, "{} {}", q.node, q.run);
+            assert_eq!(origin.can_consult_chat, *eligible);
+        }
+        // Either saved link independently recovers a release question's owner.
+        for (run, held_task) in [(watch.run.clone(), None), (None, watch.held_task.clone())] {
+            let link = crate::release_watch::WatchState {
+                run,
+                held_task,
+                ..watch.clone()
+            };
+            std::fs::write(&watch_path, serde_json::to_vec(&link).unwrap()).unwrap();
+            let (tasks, talks, watches) =
+                question_origin_inputs(&ui, std::slice::from_ref(&release)).unwrap();
+            assert_eq!(
+                crate::consult::associated_talk_with_watches(&tasks, &talks, &release, &watches)
+                    .unwrap()
+                    .id,
+                chat,
+            );
+            assert!(crate::consult::origin_talk(&tasks, &talks, &release).is_none());
+        }
+        std::fs::write(&watch_path, serde_json::to_vec(&watch).unwrap()).unwrap();
+        // Even identical duplicate records are ambiguous: ignore their links.
+        let duplicate_path = watch_dir.join("duplicate.json");
+        std::fs::write(&duplicate_path, serde_json::to_vec(&watch).unwrap()).unwrap();
+        let (tasks, talks, watches) =
+            question_origin_inputs(&ui, std::slice::from_ref(&release)).unwrap();
+        assert!(
+            crate::consult::associated_talk_with_watches(&tasks, &talks, &release, &watches)
+                .is_none()
+        );
+        std::fs::remove_file(duplicate_path).unwrap();
+        // Another explicit owner is a conflict even if it has no chat.
+        let mut unrelated = Task::new(
+            "other".into(),
+            String::new(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        unrelated.id = "unrelated-task".into();
+        ui.queue.put(&mut unrelated).unwrap();
+        let mut conflicting = watch.clone();
+        conflicting.held_task = Some(unrelated.id);
+        std::fs::write(
+            watch_dir.join("conflict.json"),
+            serde_json::to_vec(&conflicting).unwrap(),
+        )
+        .unwrap();
+        let (tasks, talks, watches) =
+            question_origin_inputs(&ui, std::slice::from_ref(&release)).unwrap();
+        assert!(
+            crate::consult::associated_talk_with_watches(&tasks, &talks, &release, &watches)
+                .is_none()
+        );
+        std::fs::remove_file(watch_dir.join("conflict.json")).unwrap();
+        std::fs::remove_file(ui.talks.path_of(&chat)).unwrap();
+        for origin in question_origins(State(ui.clone())).await.unwrap().0 {
+            assert!(origin.origin_chat.is_none());
+            assert!(!origin.origin_chat_closed);
+        }
+    }
+
     #[test]
     fn question_origin_lookup_matches_legacy_with_large_and_changing_histories() {
         let home = tempfile::tempdir().unwrap();
@@ -23522,7 +23738,8 @@ mod tests {
             String::new(),
             vec![],
         );
-        let (tasks, talks) = question_origin_inputs(&ui, std::slice::from_ref(&question)).unwrap();
+        let (tasks, talks, _watches) =
+            question_origin_inputs(&ui, std::slice::from_ref(&question)).unwrap();
         assert_eq!(tasks.len(), 2);
         assert_eq!(talks.len(), 1);
         assert_eq!(
@@ -23541,7 +23758,7 @@ mod tests {
         for origin_task in [Some(parent.id.clone()), None] {
             child.followup.as_mut().unwrap().origin_task = origin_task;
             ui.queue.put(&mut child).unwrap();
-            let (tasks, talks) =
+            let (tasks, talks, _watches) =
                 question_origin_inputs(&ui, std::slice::from_ref(&question)).unwrap();
             let actual = crate::consult::associated_talk(&tasks, &talks, &question).unwrap();
             let expected =
@@ -23559,11 +23776,13 @@ mod tests {
         child.followup.as_mut().unwrap().origin_task = Some(parent.id.clone());
         ui.queue.put(&mut child).unwrap();
         std::fs::remove_file(ui.queue.path_of(&parent.id)).unwrap();
-        let (tasks, talks) = question_origin_inputs(&ui, std::slice::from_ref(&question)).unwrap();
+        let (tasks, talks, _watches) =
+            question_origin_inputs(&ui, std::slice::from_ref(&question)).unwrap();
         assert!(crate::consult::origin_talk(&tasks, &talks, &question).is_none());
         child.origin_chat = Some(chat_id.clone());
         ui.queue.put(&mut child).unwrap();
-        let (tasks, talks) = question_origin_inputs(&ui, std::slice::from_ref(&question)).unwrap();
+        let (tasks, talks, _watches) =
+            question_origin_inputs(&ui, std::slice::from_ref(&question)).unwrap();
         assert_eq!(
             crate::consult::origin_talk(&tasks, &talks, &question)
                 .unwrap()
@@ -23576,7 +23795,8 @@ mod tests {
         assert!(crate::consult::origin_talk(&tasks, &talks, &question).is_none());
         assert!(crate::consult::associated_talk(&tasks, &talks, &question).is_some());
         std::fs::remove_file(ui.talks.path_of(&chat_id)).unwrap();
-        let (tasks, talks) = question_origin_inputs(&ui, std::slice::from_ref(&question)).unwrap();
+        let (tasks, talks, _watches) =
+            question_origin_inputs(&ui, std::slice::from_ref(&question)).unwrap();
         assert!(crate::consult::associated_talk(&tasks, &talks, &question).is_none());
     }
 

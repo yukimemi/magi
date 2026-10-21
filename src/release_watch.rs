@@ -400,6 +400,17 @@ pub(crate) fn register(home: &Path, repo: &Path, url: &str, run: &str) {
     w.save(&pr, &st);
 }
 
+/// Saved explicit ownership links, loaded only for batches with watch questions.
+pub(crate) fn states_for_questions(home: &Path, questions: &[Question]) -> Vec<WatchState> {
+    if !questions
+        .iter()
+        .any(|q| q.node == crate::bump::NOTICE_NODE && q.seat == "release-watch")
+    {
+        return Vec::new();
+    }
+    Watcher::new(Box::new(GhForge), home.to_path_buf()).stored()
+}
+
 /// The watch record whose open question is `question_id`, read from the magi
 /// `home`. `None` when no record names it (never guessed from the text).
 pub(crate) fn state_for_question(home: &Path, question_id: &str) -> Option<WatchState> {
