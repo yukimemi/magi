@@ -1019,6 +1019,10 @@ fn run() -> Result<()> {
         .context("build the tokio runtime")?;
     let result = runtime.block_on(async_main());
     if !IS_WEB.load(std::sync::atomic::Ordering::Relaxed) {
+        // `finalize` bounds the async wait, but the release check may still be
+        // blocked in synchronous authentication or blocking-pool DNS. Runtime
+        // Drop would wait forever; bound shutdown too (this kills no children).
+        runtime.shutdown_timeout(std::time::Duration::from_millis(100));
         return result;
     }
     // `magi web` hands itself over by returning from `serve` and exiting.
@@ -1065,7 +1069,7 @@ async fn async_main() -> Result<()> {
 
     // Overlap the release check with the command: a run spends minutes waiting
     // on agent latency, so this is free, and it is drained with a bounded wait
-    // so a slow network cannot delay the exit.
+    // before runtime shutdown imposes its own bound on lingering work.
     let pending = if consultation_scope() {
         None
     } else {

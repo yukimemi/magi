@@ -976,8 +976,8 @@ pub fn spawn(cfg: &Update, rt: &tokio::runtime::Handle) -> Option<Pending> {
 
 /// Drain a pending check and print at most one line.
 ///
-/// Bounded on purpose: a slow network must never hold up the exit of a command
-/// that already did its work.
+/// Bounds only this async wait. The caller must also bound runtime shutdown:
+/// synchronous or blocking-pool work can outlive the timeout.
 pub async fn finalize(pending: Option<Pending>, budget: Duration) {
     let Some(pending) = pending else {
         return;
