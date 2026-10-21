@@ -26,15 +26,34 @@ impl Running {
     }
 
     pub(crate) fn spawn(
+        command: tokio::process::Command,
+        lease: Option<SeatLease>,
+        outputs: Vec<crate::retention::OutputLease>,
+    ) -> std::io::Result<Self> {
+        Self::spawn_inner(command, lease, outputs, false)
+    }
+
+    /// Launcher Git operations need descendant cleanup even without a registered repository.
+    pub(crate) fn spawn_operation(
+        command: tokio::process::Command,
+        lease: Option<SeatLease>,
+        outputs: Vec<crate::retention::OutputLease>,
+    ) -> std::io::Result<Self> {
+        // SeatLease enforces registered-repository platform limits before spawn.
+        Self::spawn_inner(command, lease, outputs, true)
+    }
+
+    fn spawn_inner(
         mut command: tokio::process::Command,
         lease: Option<SeatLease>,
         outputs: Vec<crate::retention::OutputLease>,
+        supervised: bool,
     ) -> std::io::Result<Self> {
         #[cfg(unix)]
         let mut witness = None;
         #[cfg(not(unix))]
         let witness = None;
-        let owner = (lease.is_some() || !outputs.is_empty()).then(|| {
+        let owner = (supervised || lease.is_some() || !outputs.is_empty()).then(|| {
             use std::sync::atomic::{AtomicU64, Ordering};
             static NEXT_OWNER: AtomicU64 = AtomicU64::new(0);
             let token = format!(
@@ -47,7 +66,7 @@ impl Running {
             std::ffi::OsString::from(format!("MAGI_PROCESS_OWNER={token}"))
         });
         #[cfg(unix)]
-        let _writer = if lease.is_some() || !outputs.is_empty() {
+        let _writer = if supervised || lease.is_some() || !outputs.is_empty() {
             use std::os::fd::{AsRawFd, OwnedFd};
             // Create before spawning: even a tool that forks, setsid()s and
             // outlives its CLI without ever appearing in a process snapshot
@@ -83,7 +102,7 @@ impl Running {
         };
         let child = command.spawn()?;
         let mut running = Self::new(child, lease);
-        if !outputs.is_empty() {
+        if supervised || !outputs.is_empty() {
             running.group = running.child.as_ref().and_then(Child::id);
         }
         running.outputs = outputs;
@@ -97,7 +116,7 @@ impl Running {
     }
 
     pub(crate) fn coordinated(&self) -> bool {
-        self.lease.is_some() || !self.outputs.is_empty()
+        self.group.is_some() || self.lease.is_some() || !self.outputs.is_empty()
     }
 
     pub(crate) async fn finish(&mut self) {

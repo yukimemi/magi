@@ -1664,6 +1664,9 @@ impl Runner {
         // a second time, and the gate is the one node whose "green" gets
         // acted on.
         self.sync_to_base().await?;
+        if self.resource_halt()? {
+            return Ok(());
+        }
         if self.state.status == RunStatus::AlreadyInBase {
             return Ok(());
         }
@@ -1672,6 +1675,9 @@ impl Runner {
             return Ok(());
         }
         self.sync_to_base().await?;
+        if self.resource_halt()? {
+            return Ok(());
+        }
         if self.state.status == RunStatus::AlreadyInBase {
             return Ok(());
         }
@@ -4809,6 +4815,13 @@ impl Runner {
                     already_in: None,
                 });
                 self.state.event("land", why);
+            }
+            // A refused Git write or a busy repository: nothing is wrong with
+            // the branch. The scratch rebase stays standing and the run
+            // resumes into it (`base_sync` must not claim a conflict).
+            Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => {
+                self.state.save()?;
+                return Ok(());
             }
             Err(e) => {
                 let why = format!("could not rebase {} onto {tracking}: {e:#}", winner.branch);

@@ -1216,10 +1216,9 @@ pub async fn rebase_in_progress(worktree: &Path) -> bool {
 
 /// Paths git reports as unmerged in `worktree`.
 pub async fn unmerged_paths(worktree: &Path) -> Result<Vec<String>> {
-    let out = git(worktree, &["diff", "--name-only", "--diff-filter=U"]).await?;
+    let out = git(worktree, &["diff", "--name-only", "--diff-filter=U", "-z"]).await?;
     Ok(out
-        .lines()
-        .map(str::trim)
+        .split('\0')
         .filter(|l| !l.is_empty())
         .map(str::to_owned)
         .collect())

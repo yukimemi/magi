@@ -4501,6 +4501,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                         stop(state, &repo, &pr, &why).await?;
                         return Ok(pr);
                     }
+                    Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => return Err(e),
                     Err(e) => {
                         let why = format!("could not rebase {branch} onto {base}: {e:#}");
                         stop(state, &repo, &pr, &why).await?;

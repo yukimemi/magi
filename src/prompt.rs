@@ -1570,17 +1570,21 @@ pub fn rebase_conflict(c: &RebaseConflict<'_>) -> String {
             the branch **and** what the base gained. Keeping both sides is \
             often right; pick one side only when the other is truly \
             superseded.\n\
-         2. Stage the resolved files with `git add`, then complete the rebase \
-            with `GIT_EDITOR=true git rebase --continue`. If git stops again on \
-            the next commit, resolve that too and continue until the rebase \
-            has finished.\n\
+         2. Only edit the conflicted paths listed above, and leave the result in \
+            the working tree. Staging and continuing are **not your job**: the \
+            sandbox may forbid writing Git's metadata, so after you finish, \
+            magi validates the paths, stages them and runs `git rebase \
+            --continue` itself. Do not run `git add` or `git rebase \
+            --continue`; if git stops again on the next commit, you will be \
+            asked about that one in a later round.\n\
          3. Do not run `git rebase --abort` or `--skip`, do not reset or move \
             the branch, and do not push. Leave no conflict markers behind. Keep \
             the recording exec commands and pick order in the rebase todo: \
             Git's recorded picks are checked for lost commits.\n\
          4. Aim for a tree that builds and passes the project's checks against \
             the new base; if the base added a rule the branch's code now \
-            violates, fix that too.\n\
+            violates, fix that too - inside the conflicted paths only; an edit \
+            to any other file stops the launcher from staging your result.\n\
          5. Never name yourself, your vendor, or your model, anywhere.\n\
          6. If you start something in the background (a test run, a build), do \
             not end your reply while it is still pending.\n\n",

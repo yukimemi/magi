@@ -342,6 +342,10 @@ async fn the_conflict_round_bound_is_counted_in_state_and_survives_a_resume() {
             from: None,
             finished: false,
             error: None,
+            stop: None,
+            index_outside: Some(String::new()),
+            launcher: None,
+            infra: None,
         });
     }
     runner.state.save().expect("save");
@@ -358,6 +362,91 @@ async fn the_conflict_round_bound_is_counted_in_state_and_survives_a_resume() {
     // What was counted is what is on disk.
     let loaded = magi::run::RunState::load(&runner.state.id).expect("load");
     assert_eq!(loaded.rebase_fixes.len(), 3);
+}
+}
+
+common::e2e! {
+async fn legacy_conflict_records_recover_the_baseline_and_retain_the_resume_budget() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    fx.config.graph.implementers = 1;
+    set_agent_env(&mut fx, "MOCK_REBASE_FIX_NOOP");
+    let origin = wire_origin(&fx);
+
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
+        .await
+        .expect("start");
+    land_on_origin(&origin.sideline, "note.txt", "upstream\n");
+
+    // Two rounds were already spent by an earlier process of this run.
+    for _ in 0..2 {
+        runner.state.rebase_fixes.push(magi::run::RebaseFixRecord {
+            agent: "mock".to_owned(),
+            paths: vec!["note.txt".to_owned()],
+            from: None,
+            finished: false,
+            error: None,
+            stop: None,
+            index_outside: None,
+            launcher: None,
+            infra: None,
+        });
+    }
+    runner.state.save().expect("save");
+
+    runner.execute().await.expect("execute");
+    assert_eq!(
+        rebase_fix_calls(&runner.state),
+        1,
+        "only the one round left may be spent"
+    );
+    assert_eq!(runner.state.rebase_fixes.len(), 3);
+    assert_eq!(runner.state.status, RunStatus::Blocked);
+
+    // What was counted is what is on disk.
+    let loaded = magi::run::RunState::load(&runner.state.id).expect("load");
+    assert_eq!(loaded.rebase_fixes.len(), 3);
+    assert!(loaded.rebase_fixes[0].index_outside.is_some());
+    assert!(loaded.rebase_fixes.iter().all(|r| r.stop.is_some()));
+}
+}
+
+common::e2e! {
+async fn legacy_baseline_mismatch_blocks_without_spending_a_conflict_round() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    fx.config.graph.implementers = 1;
+    set_agent_env(&mut fx, "MOCK_REBASE_FIX_NOOP");
+    let origin = wire_origin(&fx);
+
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
+        .await
+        .expect("start");
+    land_on_origin(&origin.sideline, "note.txt", "upstream\n");
+
+    // Two rounds were already spent by an earlier process of this run.
+    for _ in 0..2 {
+        runner.state.rebase_fixes.push(magi::run::RebaseFixRecord {
+            agent: "mock".to_owned(),
+            paths: vec!["unexpected.txt".to_owned()],
+            from: None,
+            finished: false,
+            error: None,
+            stop: None,
+            index_outside: None,
+            launcher: None,
+            infra: None,
+        });
+    }
+    runner.state.save().expect("save");
+
+    runner.execute().await.expect("execute");
+    assert_eq!(rebase_fix_calls(&runner.state), 0);
+    assert_eq!(runner.state.rebase_fixes.len(), 2);
+    assert!(runner.state.resource_block.as_ref().unwrap().detail.contains("baseline"));
+    assert!(runner.state.rebase_fixes[0].index_outside.is_none());
+    let scratch = runner.state.dir().join("base-sync");
+    assert!(magi::git::rebase_in_progress(&scratch).await);
 }
 }
 

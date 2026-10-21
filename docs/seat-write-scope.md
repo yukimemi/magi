@@ -531,3 +531,20 @@ tracking ref から取得成功を捏造しない。既存の base-sync 処理�
 
 今回のホスト検証は成功したが、production バイナリの配備・daemon 再起動と
 新しい production 席の確認は実施していない。全体 gate とレビューは親グラフの担当。
+
+### 旧形式の rebase 停止記録の移行
+
+配備後は元の owner / run の既存 continuation を使う。`index_outside` がない記録は、
+launcher が保存済み `REBASE_HEAD` の親、現在の `HEAD`、`REBASE_HEAD` から
+`git merge-tree` で三者マージを再計算する。競合パスが保存記録と一致し、競合外の
+index が再計算結果と一致した場合だけ、基準と停止点を同じ run に保存する。
+既存の修正記録や消費済み予算は残す。元の index、解消済みファイル、ブランチ、
+sequencer はこの計算では更新しない。検証後の staging / continuation は通常の
+launcher 経路で行い、新しい fixer round を要求しない。
+
+計算は調停 lease とキャンセル時のプロセス回収を通す。再取得した lease 内で
+停止点と index を再検証してから記録を保存する。不一致、未対応のマージ形状、
+Git 書込み拒否はインフラ停止とし、保持中の内容を削除せずに理由を記録する。
+現在の index を手作業で基準として書き込んだり、別 driver で元の run を進めたり
+しない。移行不能時は元の所有者が不一致の原因を確認し、保持された内容の修復を
+判断する必要がある。

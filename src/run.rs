@@ -898,7 +898,7 @@ pub struct GateFixRecord {
 /// One fixer round spent on a rebase that stopped on a conflict: which fixer,
 /// what it was shown and whether git says the rebase then finished.
 ///
-/// The number of these is the budget spent (`graph.review_rounds` is the cap),
+/// The records at each sequencer stop count against `graph.review_rounds`,
 /// written to disk *before* the fixer runs so a park or crash cannot hand the
 /// round back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -917,6 +917,36 @@ pub struct RebaseFixRecord {
     /// Why the round produced nothing (agent failure, quota).
     #[serde(default)]
     pub error: Option<String>,
+    /// The commit the sequencer was replaying (`REBASE_HEAD`) when the round
+    /// started: which stop point the round belongs to. A record without it
+    /// predates launcher staging.
+    #[serde(default)]
+    pub stop: Option<String>,
+    /// Staged changes outside `paths` when the round started (Git's own
+    /// clean applications), so edits made behind them can be told apart. Retries
+    /// retain the first baseline for the stop; legacy baselines are rebuilt
+    /// from the original three-way merge and verified before being saved.
+    #[serde(default)]
+    pub index_outside: Option<String>,
+    /// How far the launcher got with staging and continuing this stop point.
+    #[serde(default)]
+    pub launcher: Option<LauncherStep>,
+    /// A denied or failed Git metadata write: infrastructure, not a conflict.
+    /// The rebase is kept standing and no further round is spent.
+    #[serde(default)]
+    pub infra: Option<String>,
+}
+
+/// Where launcher-owned staging of a resolved conflict stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LauncherStep {
+    /// About to stage the validated paths (or doing it).
+    Staging,
+    /// Every conflicted path is staged; the sequencer was not continued yet.
+    Staged,
+    /// `rebase --continue` was started.
+    Continuing,
 }
 
 /// How the graft phase ended (see `graph::Runner::graft`).
