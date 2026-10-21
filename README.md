@@ -670,11 +670,15 @@ not count) and only for the runs those tasks recorded. It is unavailable while
 a consultation is open.
 
 通常のチャットの sandbox・ネットワーク設定・作業ディレクトリは変更しない。
-Unix のチャット席では、継承した専用通信路からランチャーへ操作要求を渡す。
+Unix のチャット席では継承 FD、Windows ではローカル名前付きパイプを使い、
+専用通信路からランチャーへ操作要求を渡す。Windows のパイプは接続先だけに
+必要なデータ通信権限を与え、OS の暗号学的乱数で生成したターン固有の秘密で
+要求を認証する。追加のパイプインスタンスを作る権限は所有者だけに与える。
 ランチャーは起動時の会話に対象を固定し、操作ごとに認可・所有権・確認文と既存の
 実行条件を検証する。queue・questions・run などのストアを書き込む権限は追加しない。
 通信路の準備に失敗しても会話は続き、そのターンの操作機能だけが利用できなくなる。
-通信路はターンの完了・中断時に閉じる。Unix 以外の席ではこの通信路を提供しない。
+通信路はターンの完了・中断時に閉じる。Windows の接続は要求ごとに分離し、
+通信待ちは 30 秒で打ち切る。応答が失われた場合は結果不明として自動再送しない。
 
 | command | effect |
 |---|---|
@@ -683,6 +687,12 @@ Unix のチャット席では、継承した専用通信路からランチャー
 | `magi task control retry <task> <instruction>` | replaces a queued or held task's instruction and queues it in one save; attempts restart as for any release, runs and history are kept |
 | `magi task control rerun-checks <full run id> --request <id> --head <sha> --workflow <id>` | 指定した head と失敗 workflow を再確認し、リクエスト単位で再実行する。同じ操作の再送には同じ request ID を使う。`chat-controls/<talk>/<request>.json` に受付を記録し、結果不明の再送は拒否する |
 | `magi task control abandon <full run id> --quote "<message>"` | destructive: the owner's latest persisted message must be exactly `abandon-run: <run id>` and `--quote` must repeat it; the shared liveness judge then runs under the owner lock and a Live or Unknown driver is refused |
+
+Windows の実 sandbox の限定チェックは認証済み CLI が必要。PowerShell で
+`$env:RUSTUP_TOOLCHAIN = "stable"` を設定し、
+`cargo test --locked --test chat_control windows_sandboxed_chat_controls_without_direct_store_writes -- --ignored` を実行する。
+自身の task の保留が成功し、queue 内の検証用ファイルへの直接書込みが拒否されることを確認する。
+通常の子プロセス往復は `windows_chat_controls_through_real_cli_child` が検証する。
 
 Merging stays behind the approval gate. The Question system works unchanged
 alongside these commands.
