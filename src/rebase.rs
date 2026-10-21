@@ -537,6 +537,7 @@ async fn mutate(
     args: &[&str],
     lease: Option<crate::repo_lock::SeatLease>,
 ) -> Result<git::GitOut> {
+    use crate::proc::Quiet as _;
     use std::process::Stdio;
     use tokio::io::AsyncReadExt as _;
     let wait = crate::repo_lock::WaitPolicy::current();
@@ -546,6 +547,7 @@ async fn mutate(
     );
     let mut command = tokio::process::Command::new("git");
     command
+        .quiet()
         .args(args)
         .current_dir(scratch)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -769,10 +771,24 @@ async fn launcher_stage(
         }
         state.save()
     };
-    if !unmerged.is_empty() {
+    // A previous pass may have staged the resolution before being interrupted.
+    // Include later worktree edits to those recorded paths as well, while
+    // leaving already-staged deletions (which have no path to add) alone.
+    let to_stage: Vec<&str> = last
+        .paths
+        .iter()
+        .filter(|p| {
+            unmerged.contains(p)
+                || entries
+                    .iter()
+                    .any(|(xy, path)| path == *p && !xy.ends_with(' '))
+        })
+        .map(String::as_str)
+        .collect();
+    if !to_stage.is_empty() {
         set(state, crate::run::LauncherStep::Staging)?;
         let mut args = vec!["--literal-pathspecs", "add", "-A", "--"];
-        args.extend(unmerged.iter().map(String::as_str));
+        args.extend(to_stage);
         match mutate(scratch, &args, lease).await {
             Ok(o) if o.ok() => {}
             Ok(o) => {
@@ -2386,6 +2402,45 @@ mod tests {
         let out = stage(&mut f).await.unwrap();
         assert!(matches!(out, Launch::Nothing(_)));
         std::fs::remove_dir_all(f.state.dir()).ok();
+    }
+
+    #[tokio::test]
+    async fn recorded_conflict_edits_after_interrupted_staging_are_restaged() {
+        for deleted in [false, true] {
+            let mut f = fixture(true).await;
+            std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
+            sh(&f.scratch, &["add", "f.txt"]);
+            f.state.rebase_fixes[0].launcher = Some(crate::run::LauncherStep::Staged);
+            assert!(git::unmerged_paths(&f.scratch).await.unwrap().is_empty());
+
+            let revised = format!("{BOTH}additional test\n");
+            if deleted {
+                std::fs::remove_file(f.scratch.join("f.txt")).unwrap();
+            } else {
+                std::fs::write(f.scratch.join("f.txt"), &revised).unwrap();
+            }
+            let out = stage(&mut f).await.unwrap();
+            assert!(matches!(out, Launch::Advanced));
+            assert!(!git::rebase_in_progress(&f.scratch).await);
+            assert_eq!(topic_subjects(&f).await, vec!["topic g", "topic test"]);
+            if deleted {
+                assert!(
+                    git::git(&f.scratch, &["ls-tree", "HEAD", "--", "f.txt"])
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            } else {
+                assert_eq!(f.read("f.txt"), revised);
+                assert_eq!(
+                    git::git(&f.scratch, &["show", "HEAD:f.txt"]).await.unwrap(),
+                    revised.trim_end()
+                );
+            }
+            assert!(status_entries(&f.scratch).await.unwrap().is_empty());
+            assert_eq!(f.state.rebase_fixes.len(), 1, "no further round was spent");
+            std::fs::remove_dir_all(f.state.dir()).ok();
+        }
     }
 
     #[tokio::test]
