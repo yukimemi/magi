@@ -30,9 +30,6 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::queue::{Queue, Task, TaskStatus};
 use crate::talk::{Talk, Talks};
 
-/// The ledger identity of a chat-requested rerun. It is not a question id.
-pub const RERUN_REQUEST: &str = "chat-control";
-
 /// The exact owner instruction that confirms abandoning `run`.
 pub fn abandon_instruction(run: &str) -> String {
     format!("abandon-run: {run}")
@@ -141,58 +138,76 @@ pub fn resume(queue: &Queue, home: &Path, talk: &str, run: &str) -> Result<Task>
         "only the task's latest run can be resumed"
     );
     crate::resume::validate(home, run)?;
-    let token = format!("chat:{talk}");
     ensure!(
-        crate::resume::pin_queued(queue, run, &token, None, None)?,
+        crate::resume::pin_queued(queue, run, None, None)?,
         "no queued task owns run {run}"
     );
     queue.get(&task.id)
 }
 
-/// Rerun the failed checks of the pull request a run of this conversation's
-/// task opened, once per head and workflow run. Returns the workflow run ids
-/// that were requested.
+/// チャットのリクエスト単位で受付記録を残し、共通遷移でチェックを再実行する。
 pub async fn rerun_checks(
     queue: &Queue,
     home: &Path,
     talk: &str,
     run: &str,
+    request: &str,
+    head: &str,
+    workflows: &[String],
 ) -> Result<Vec<String>> {
-    use crate::release_watch::{GhForge, ReleaseForge};
     owned_run_task(queue, talk, run)?;
     let state = crate::run::RunState::load_under(run, home)?;
-    let pr = state
+    let pr = &state
         .pr
         .as_ref()
-        .map(|p| p.url.clone())
-        .context("the run recorded no pull request")?;
-    let snap = GhForge.snapshot(&state.repo, &pr).await?;
+        .context("the run recorded no pull request")?
+        .url;
     ensure!(
-        snap.state == crate::land::PrLifecycle::Open,
-        "the pull request is no longer open"
+        crate::ask::valid_asset_name(request),
+        "request must be a safe filename of at most 64 bytes"
     );
-    let mut failed: Vec<String> = Vec::new();
-    for check in &snap.checks {
-        if let Some(id) = &check.run
-            && crate::release_watch::is_failed(check.verdict)
-            && !failed.contains(id)
-        {
-            failed.push(id.clone());
-        }
+    let dir = home.join("chat-controls").join(talk);
+    std::fs::create_dir_all(&dir)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(format!("{request}.lock")))?;
+    crate::pr_head::try_lock_file(&lock)?;
+    let path = dir.join(format!("{request}.json"));
+    let action = serde_json::json!({
+        "run": run, "repo": state.repo, "pr": pr, "head": head, "runs": workflows
+    });
+    if path.exists() {
+        let prior: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+        ensure!(
+            prior["action"] == action,
+            "request ID already binds a different operation"
+        );
+        ensure!(
+            prior["status"] == "applied",
+            "previous request has an uncertain result; inspect its receipt before a new request"
+        );
+        return Ok(workflows.to_vec());
     }
-    ensure!(!failed.is_empty(), "no failed workflow run to rerun");
-    ensure!(failed.len() <= 20, "too many failed workflow runs (max 20)");
-    crate::daemon::rerun_checks_once(
-        home,
-        RERUN_REQUEST,
-        &state.repo,
-        &pr,
-        &snap.head,
-        &failed,
-        || Ok(()),
-    )
+    let record = |status: &str| -> Result<()> {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(
+            &tmp,
+            serde_json::to_vec(&serde_json::json!({
+                "action": action, "status": status
+            }))?,
+        )?;
+        std::fs::rename(tmp, &path)?;
+        Ok(())
+    };
+    let operation = format!("chat:{talk}:{request}");
+    crate::daemon::rerun_checks_once(home, &operation, &state.repo, pr, head, workflows, || {
+        record("started")
+    })
     .await?;
-    Ok(failed)
+    record("applied")?;
+    Ok(workflows.to_vec())
 }
 
 /// Abandon a run of this conversation's task whose driver is proven gone.

@@ -65,7 +65,6 @@ pub(crate) fn start(id: String) {
 pub(crate) fn pin_queued(
     queue: &crate::queue::Queue,
     run: &str,
-    token: &str,
     decided_before: Option<jiff::Timestamp>,
     applied: Option<&str>,
 ) -> Result<bool> {
@@ -92,9 +91,18 @@ pub(crate) fn pin_queued(
             },
         "resume was superseded by an operator hold or newer operator decision"
     );
-    task.release_operator("choice", Some(token));
+    if applied.is_none()
+        && task.status == TaskStatus::Queued
+        && task
+            .resume_override
+            .as_ref()
+            .is_some_and(|pin| pin.pinned_run.as_deref() == Some(run))
+    {
+        return Ok(true);
+    }
+    task.release_operator(if applied.is_some() { "choice" } else { "chat" }, applied);
     task.resume_override = Some(crate::queue::OperatorResume {
-        question_id: token.to_owned(),
+        question_id: applied.unwrap_or_default().to_owned(),
         at: jiff::Timestamp::now(),
         conductor_rehold: None,
         forced: true,

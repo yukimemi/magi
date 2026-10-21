@@ -2587,14 +2587,17 @@ existing transition (`resume::pin_queued`, extracted from the daemon's
   out. Execution commands need a full run id. The relation is re-checked under
   the task's claim. Not in `consultation_command_allowed`, so a consultation
   excludes it.
-- **Resume queues, never starts.** It pins the task (`OperatorResume`, token
-  `chat:<talk>`, no question) and the loop resumes under the execution lease.
+- **Resume queues, never starts.** It pins the task (`OperatorResume`, no question) and the loop resumes under the execution lease.
+  Question なしの再送では同じ run の既存 pin を維持し、履歴を増やさない。
+  `resume_override.question_id` は空文字列とし、架空の Question ID を記録しない。
   Only the task's latest run can be resumed.
 - **Retry** is `Task::edit` plus `release_operator("chat")` in one save; the
   accounting is `release`'s (attempts restart, runs/passes/resumption history
   stay). Only queued or held tasks, as `edit` allows.
-- **Rerun** uses ledger identity `chat-control`, keyed with head and workflow
-  run id; the forge is re-read first; an unconfirmed call is never retried.
+- **Rerun** は `--request <id> --head <sha> --workflow <id>` を受け取り、
+  `chat-controls/<talk>/<request>.json` に受付を記録する。ledger の識別子は
+  `chat:<talk>:<request>`。同一 ID の別操作への使い回しと結果不明時の再送を拒否し、
+  共通遷移で head・workflow の一致を再確認する。
 - **Abandon** requires the owner's latest persisted send to be exactly
   `abandon-run: <run>` and `--quote` of it, under the talk evidence guard,
   then the shared Dead-only judge. The grammar is the same idea as

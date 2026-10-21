@@ -674,7 +674,7 @@ a consultation is open.
 | `magi task control resume <full run id>` | pins the owning task to that run and queues it; the loop resumes it under the graph's execution lease (same checks as the Web resume). It starts no driver itself, so it needs `magi serve` |
 | `magi task control hold <task> [reason]` / `release <task>` | the same transitions as `magi task hold` / `release` |
 | `magi task control retry <task> <instruction>` | replaces a queued or held task's instruction and queues it in one save; attempts restart as for any release, runs and history are kept |
-| `magi task control rerun-checks <full run id>` | re-reads the run's pull request, then reruns its failed workflow runs once per head and run (a ledger entry is written first, so an uncertain result is never repeated) |
+| `magi task control rerun-checks <full run id> --request <id> --head <sha> --workflow <id>` | 指定した head と失敗 workflow を再確認し、リクエスト単位で再実行する。同じ操作の再送には同じ request ID を使う。`chat-controls/<talk>/<request>.json` に受付を記録し、結果不明の再送は拒否する |
 | `magi task control abandon <full run id> --quote "<message>"` | destructive: the owner's latest persisted message must be exactly `abandon-run: <run id>` and `--quote` must repeat it; the shared liveness judge then runs under the owner lock and a Live or Unknown driver is refused |
 
 Merging stays behind the approval gate. The Question system works unchanged

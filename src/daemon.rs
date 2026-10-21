@@ -1246,13 +1246,7 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                     ask::ChoiceAction::ResumeRun { run } => {
                         crate::resume::validate(home, run)?;
                         record("started")?;
-                        if !crate::resume::pin_queued(
-                            queue,
-                            run,
-                            &q.id,
-                            Some(q.asked_at),
-                            Some(&q.id),
-                        )? {
+                        if !crate::resume::pin_queued(queue, run, Some(q.asked_at), Some(&q.id))? {
                             crate::resume::validate_unqueued(home, run)?;
                             crate::resume::start(run.clone());
                         }
@@ -1304,16 +1298,8 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                         head,
                         runs,
                     } => {
-                        rerun_checks_once(
-                            home,
-                            &q.id,
-                            repo,
-                            pr,
-                            head,
-                            runs,
-                            || record("started"),
-                        )
-                        .await?;
+                        rerun_checks_once(home, &q.id, repo, pr, head, runs, || record("started"))
+                            .await?;
                     }
                     _ => unreachable!(),
                 }

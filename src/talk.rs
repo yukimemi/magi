@@ -3256,8 +3256,9 @@ pub fn briefing_for(
          hold <task id> [reason]`, `magi task control release <task id>`, \
          `magi task control retry <task id> <new instruction>` (replaces a \
          queued or held task's instruction and queues it again; its runs stay \
-         on record) and `magi task control rerun-checks <full run id>` (reruns \
-         the failed checks of that run's pull request once). Do these when the \
+         on record) and `magi task control rerun-checks <full run id> --request <id> --head <sha> --workflow <id>` (reruns \
+         the named failed workflows of that run's pull request; reuse the request id \
+         for the same operation. An uncertain result requires receipt inspection). Do these when the \
          operator asks or the situation clearly calls for it, and say what you \
          did. `magi task control abandon <full run id> --quote \"<message>\"` \
          is destructive: only after the operator's latest message is exactly \

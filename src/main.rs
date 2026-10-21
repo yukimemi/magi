@@ -668,10 +668,19 @@ enum ControlCmd {
         #[arg(trailing_var_arg = true)]
         instruction: Vec<String>,
     },
-    /// Rerun the failed checks of the pull request a run opened, once.
+    /// Rerun the failed checks of the pull request a run opened, once per request.
     RerunChecks {
         /// Full run id.
         run: String,
+        /// Unique request id; reuse it when delivery is uncertain.
+        #[arg(long)]
+        request: String,
+        /// Observed pull request head commit.
+        #[arg(long)]
+        head: String,
+        /// Failed workflow run ids (repeatable, at most twenty).
+        #[arg(long = "workflow", required = true)]
+        workflows: Vec<String>,
     },
     /// Abandon a run whose driver is proven gone. Needs the owner's exact
     /// message `abandon-run: <run id>` as the latest send, and `--quote` of it.
@@ -3485,8 +3494,15 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                     let t = cc::retry(&q, talk_id, &id, title, &text)?;
                     println!("{}", cc::describe(&t, "retry queued for"));
                 }
-                ControlCmd::RerunChecks { run } => {
-                    let ids = cc::rerun_checks(&q, &home, talk_id, &run).await?;
+                ControlCmd::RerunChecks {
+                    run,
+                    request,
+                    head,
+                    workflows,
+                } => {
+                    let ids =
+                        cc::rerun_checks(&q, &home, talk_id, &run, &request, &head, &workflows)
+                            .await?;
                     println!("requested a rerun of workflow run(s) {}", ids.join(", "));
                 }
                 ControlCmd::Abandon { run } => {
