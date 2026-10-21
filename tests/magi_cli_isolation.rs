@@ -11,7 +11,7 @@ fn real_cli_spawns_use_the_shared_helper() {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")));
     let tests = manifest.join("tests");
-    let helper = tests.join("common/mod.rs");
+    let helper = tests.join("common/cli.rs");
     let needle = ["CARGO_BIN_EXE_", "magi"].concat();
     let mut dirs = vec![tests];
     let mut references = Vec::new();
@@ -65,6 +65,36 @@ fn cli_defaults_isolate_state_cwd_and_seat_identity_and_allow_overrides() {
     assert_eq!(command.get_current_dir(), Some(cwd.as_path()));
     assert_eq!(
         command
+            .get_envs()
+            .find(|(key, _)| *key == "MAGI_RUN")
+            .unwrap()
+            .1,
+        Some(std::ffi::OsStr::new("fixture-run"))
+    );
+}
+
+#[test]
+fn outer_commands_receive_cli_cwd_environment_and_removals() {
+    let home = tempfile::tempdir().unwrap();
+    let cli = common::magi_cli(home.path());
+    let mut outer = std::process::Command::new("unused-shell");
+    outer
+        .current_dir("old-cwd")
+        .env("MAGI_RUN", "inherited-run");
+
+    common::magi_cli_environment(&cli, &mut outer);
+
+    assert_eq!(outer.get_current_dir(), cli.get_current_dir());
+    assert_eq!(
+        outer.get_envs().collect::<Vec<_>>(),
+        cli.get_envs().collect::<Vec<_>>()
+    );
+
+    let cwd = home.path().join("repo");
+    outer.current_dir(&cwd).env("MAGI_RUN", "fixture-run");
+    assert_eq!(outer.get_current_dir(), Some(cwd.as_path()));
+    assert_eq!(
+        outer
             .get_envs()
             .find(|(key, _)| *key == "MAGI_RUN")
             .unwrap()

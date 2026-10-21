@@ -15,40 +15,10 @@ use magi::config::{
     UpdateMode, Verify,
 };
 
-const SEAT_ENV: [&str; 4] = ["MAGI_RUN", "MAGI_NODE", "MAGI_SEAT", "MAGI_TURN_SCOPE"];
-
-/// Start the real CLI in a caller-owned temporary home. Keep that directory
-/// alive until the child exits. Callers may override the cwd and environment.
-pub fn magi_cli(home: &Path) -> std::process::Command {
-    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_magi"));
-    command
-        .current_dir(home)
-        .env("MAGI_HOME", home)
-        .env("MAGI_CONFIG_DIR", home.join("config"))
-        .env("MAGI_NO_AUTOUPDATE", "1");
-    for key in SEAT_ENV {
-        command.env_remove(key);
-    }
-    command
-}
-
-/// Pass the CLI's isolation settings through an agent launcher or shell mock.
-/// The launcher supplies the fixture cwd and fresh seat metadata. Copy only
-/// positive defaults here so nested calls retain the identity it just assigned.
-pub fn magi_cli_env(home: &Path, binary_key: &str) -> BTreeMap<String, String> {
-    let command = magi_cli(home);
-    let mut env: BTreeMap<_, _> = command
-        .get_envs()
-        .filter_map(|(key, value)| {
-            value.map(|value| (key.to_str().unwrap().into(), value.to_str().unwrap().into()))
-        })
-        .collect();
-    env.insert(
-        binary_key.into(),
-        command.get_program().to_str().unwrap().into(),
-    );
-    env
-}
+mod cli;
+use cli::SEAT_ENV;
+#[allow(unused_imports)]
+pub use cli::{magi_cli, magi_cli_env, magi_cli_environment};
 
 /// `set_home` is a process-wide global, so scenes that share one test binary
 /// (multiple runs, includes a `--resume`) must not run concurrently or they

@@ -1242,13 +1242,7 @@ try {{
             .arg("pwsh");
     }
     let cli = common::magi_cli(&fx.home);
-    for (key, value) in cli.get_envs() {
-        if let Some(value) = value {
-            cmd.env(key, value);
-        } else {
-            cmd.env_remove(key);
-        }
-    }
+    common::magi_cli_environment(&cli, &mut cmd);
     cmd.current_dir(&fx.seat)
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .env("MAGI_TEST_BINARY", cli.get_program())
