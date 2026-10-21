@@ -64,6 +64,9 @@ fn slow_release_auth_does_not_delay_cli_exit() {
             .env("HOME", root.join("home"))
             .env("XDG_CACHE_HOME", root.join("cache"))
             .env("GH_CALL_LOG", &calls)
+            // A synchronous auth lookup can occupy the sole runtime worker,
+            // including the worker responsible for driving Tokio timers.
+            .env("TOKIO_WORKER_THREADS", "1")
             .env_remove("GH_TOKEN")
             .env_remove("GITHUB_TOKEN")
             .env_remove("MAGI_NO_AUTOUPDATE")
