@@ -3177,3 +3177,18 @@ persona choices after edits. Orphaned saved persona IDs remain editable.
   accept a clear owner instruction through the existing latest-message quote
   gate. Abandon is a terminal consequence requiring individual confirmation;
   merge, discard and posting retain their stricter confirmation rules.
+
+### Rebase conflicts: the seat resolves contents, the launcher stages
+
+`rebase::launcher_stage` runs after every fixer round and at the head of the
+`rebase_with_fixer` loop, before the budget check. A sandboxed seat may be
+unable to write Git metadata (the index lock), so it only edits the conflicted
+paths. Under the repository coordination lease the launcher re-validates the
+unmerged set against the round's recorded paths (`RebaseFixRecord::paths`,
+stop point `stop` = `REBASE_HEAD`), refuses remaining markers and any edit or
+index change outside those paths, stages exactly them with literal pathspecs
+and runs `git rebase --continue` (recording exec and todo untouched). A
+denied or failed Git write is a `ResourceBlocked` stop (`infra` on the record):
+no round is spent, nothing is aborted, scratch and resolved files are kept and
+a resume repeats the same step. A record from before `stop` existed matches
+only when every recorded round saw the same conflict set.

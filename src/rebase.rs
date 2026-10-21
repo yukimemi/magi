@@ -95,6 +95,14 @@ pub async fn rebase_with_fixer(
                 touched.push(p.clone());
             }
         }
+        // A fixer that already worked on *this* stop point may have left the
+        // contents resolved with only the staging undone (a sandbox refusing
+        // Git's metadata, a run killed between the steps). Finish that before
+        // the budget is looked at: re-confirming resolved files is not a
+        // conflict round.
+        if let Launch::Advanced = launcher_stage(state, scratch).await? {
+            continue;
+        }
         let spent = state.rebase_fixes.len();
         if spent >= cap {
             let why = reason(spent, cap, &paths, &said, "the rounds are spent");
@@ -140,12 +148,18 @@ pub async fn rebase_with_fixer(
 
         // Spent before the call, on disk: a run killed mid-round must not
         // get the round back.
+        let stop = rebase_head(scratch).await;
+        let index_outside = index_outside(scratch, &paths).await.ok();
         state.rebase_fixes.push(RebaseFixRecord {
             agent: ids[0].clone(),
             paths: paths.clone(),
             from: Some(orig.clone()),
             finished: false,
             error: None,
+            stop,
+            index_outside,
+            launcher: None,
+            infra: None,
         });
         state.event(
             "rebase",
@@ -237,10 +251,19 @@ pub async fn rebase_with_fixer(
             Err(e) => error = Some(format!("{e:#}")),
         }
 
+        if let Some(r) = state.rebase_fixes.last_mut() {
+            r.error = error.clone();
+        }
+        if !quota {
+            // The seat resolved contents; the launcher owns Git's metadata.
+            // A denied write is `Err` (a resumable stop, no further round).
+            if let Launch::Nothing(why) = launcher_stage(state, scratch).await? {
+                state.event("rebase", format!("launcher staging skipped: {why}"));
+            }
+        }
         let finished = !git::rebase_in_progress(scratch).await;
         if let Some(r) = state.rebase_fixes.last_mut() {
             r.finished = finished;
-            r.error = error.clone();
         }
         state.save()?;
 
@@ -258,6 +281,280 @@ pub async fn rebase_with_fixer(
             return Ok(Rebased::Stopped(why));
         }
     }
+}
+
+/// What [`launcher_stage`] did.
+#[derive(Debug)]
+enum Launch {
+    /// Nothing was staged or continued; why, for the event log.
+    Nothing(String),
+    /// The sequencer moved (continued to the end or to the next stop).
+    Advanced,
+}
+
+/// The commit the sequencer is replaying right now.
+async fn rebase_head(scratch: &Path) -> Option<String> {
+    git::git(scratch, &["rev-parse", "-q", "--verify", "REBASE_HEAD"])
+        .await
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// A denied or failed Git write is infrastructure: record it on the round,
+/// keep the worktree, branch and resolved contents, and stop resumably.
+fn infra_stop(state: &mut RunState, detail: String) -> anyhow::Error {
+    if let Some(r) = state.rebase_fixes.last_mut() {
+        r.infra = Some(detail.clone());
+    }
+    block(state, "git metadata write", detail)
+}
+
+fn block(state: &mut RunState, kind: &str, detail: String) -> anyhow::Error {
+    let detail = format!("rebase recovery: {detail}");
+    state.resource_block = Some(crate::run::ResourceBlock {
+        node: "rebase".into(),
+        kind: kind.into(),
+        detail: detail.clone(),
+        at: Timestamp::now(),
+    });
+    state.event("resource", detail.clone());
+    state.save().ok();
+    crate::repo_lock::ResourceBlocked(detail).into()
+}
+
+/// Status entries `(XY, path)` of the worktree, renames split.
+async fn status_entries(scratch: &Path) -> Result<Vec<(String, String)>> {
+    let out = git::git_raw(
+        scratch,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--no-renames",
+        ],
+    )
+    .await?;
+    anyhow::ensure!(out.ok(), "git status failed: {}", out.stderr);
+    Ok(out
+        .stdout
+        .split('\0')
+        .filter(|e| e.len() > 3)
+        .map(|e| (e[..2].to_owned(), e[3..].to_owned()))
+        .collect())
+}
+
+/// Index-side changes against HEAD outside `expected` (what Git applied
+/// cleanly), as a comparable string.
+async fn index_outside(scratch: &Path, expected: &[String]) -> Result<String> {
+    let out = git::git_raw(
+        scratch,
+        &["diff", "--cached", "--raw", "-z", "--no-renames", "--no-abbrev"],
+    )
+    .await?;
+    anyhow::ensure!(out.ok(), "git diff --cached failed: {}", out.stderr);
+    let mut parts = out.stdout.split('\0').filter(|p| !p.is_empty());
+    let mut lines = Vec::new();
+    while let (Some(meta), Some(path)) = (parts.next(), parts.next()) {
+        if !expected.iter().any(|e| e == path) {
+            lines.push(format!("{meta}\t{path}"));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+/// Does `last` belong to the stop point the sequencer is at now?
+///
+/// A record carries the replayed commit. A record from before that was kept
+/// can only be matched by what it says about itself, so it counts only when
+/// every recorded round saw the same non-empty conflict set and none knows
+/// its stop: a different pick would not have repeated the same paths.
+async fn same_stop(state: &RunState, scratch: &Path) -> bool {
+    let Some(last) = state.rebase_fixes.last() else {
+        return false;
+    };
+    match &last.stop {
+        Some(stop) => rebase_head(scratch).await.as_deref() == Some(stop.as_str()),
+        None => {
+            !last.paths.is_empty()
+                && state
+                    .rebase_fixes
+                    .iter()
+                    .all(|r| r.stop.is_none() && r.paths == last.paths)
+        }
+    }
+}
+
+/// Stage what the fixer resolved and continue the sequencer, as the launcher.
+///
+/// The seat only edits contents (its sandbox may refuse Git's metadata, e.g.
+/// the index lock). Everything here is re-derived from Git inside the
+/// repository's coordination lease, so an interrupted pass is simply run
+/// again: the current unmerged set must lie inside the round's recorded
+/// paths, none may still hold markers, nothing outside them may have been
+/// edited, and only then are exactly those paths staged (literal pathspecs)
+/// and `rebase --continue` run with the recording exec untouched. Content
+/// problems are `Nothing` (the ordinary round machinery goes on); a refused
+/// Git write is an `Err` resource block that spends nothing and keeps the
+/// worktree, the branch and the resolved files.
+async fn launcher_stage(state: &mut RunState, scratch: &Path) -> Result<Launch> {
+    if !git::rebase_in_progress(scratch).await {
+        return Ok(Launch::Nothing("no rebase in progress".into()));
+    }
+    if !same_stop(state, scratch).await {
+        return Ok(Launch::Nothing(
+            "no fixer round is recorded for this stop point".into(),
+        ));
+    }
+    let wait = {
+        let inherited = crate::repo_lock::WaitPolicy::current();
+        crate::repo_lock::WaitPolicy::new(
+            Duration::from_secs(state.config.graph.timeout_resource_wait),
+            move || inherited.cancelled(),
+        )
+    };
+    if wait.cancelled() {
+        return Err(block(
+            state,
+            "repository coordination",
+            "cancelled before staging; the resolved files are kept".into(),
+        ));
+    }
+    let lease = crate::repo_lock::SeatLease::operation_with(
+        scratch,
+        state.config.coordination.as_ref(),
+        &wait,
+    )
+    .await;
+    let _lease = match lease {
+        Ok(l) => l,
+        Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => {
+            return Err(block(state, "repository coordination", e.to_string()));
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Re-validated under the lease: the seat is gone, but an external
+    // updater is not.
+    if !git::rebase_in_progress(scratch).await || !same_stop(state, scratch).await {
+        return Ok(Launch::Nothing("the stop point changed".into()));
+    }
+    let last = state.rebase_fixes.last().cloned().expect("same_stop");
+    let unmerged = match git::unmerged_paths(scratch).await {
+        Ok(u) => u,
+        Err(e) => return Err(infra_stop(state, format!("cannot read the index: {e:#}"))),
+    };
+    if let Some(p) = unmerged.iter().find(|p| !last.paths.contains(p)) {
+        return Ok(Launch::Nothing(format!(
+            "`{p}` is unmerged but was not part of the recorded conflict"
+        )));
+    }
+    for p in &unmerged {
+        match std::fs::symlink_metadata(scratch.join(p)) {
+            Ok(m) if m.is_dir() => {
+                return Ok(Launch::Nothing(format!("`{p}` is a directory")));
+            }
+            Ok(m) if m.is_file() => {
+                if let Err(e) = std::fs::read(scratch.join(p)) {
+                    return Err(infra_stop(state, format!("cannot read `{p}`: {e}")));
+                }
+                if has_markers(scratch, p) {
+                    return Ok(Launch::Nothing(format!("`{p}` still holds conflict markers")));
+                }
+            }
+            Ok(_) => {}
+            // Resolved by deleting the file.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(infra_stop(state, format!("cannot inspect `{p}`: {e}"))),
+        }
+    }
+    let entries = match status_entries(scratch).await {
+        Ok(e) => e,
+        Err(e) => return Err(infra_stop(state, format!("{e:#}"))),
+    };
+    // Whatever Git applied cleanly is staged and identical to the worktree;
+    // anything else outside the conflict is an edit nobody asked for.
+    let stray: Vec<&str> = entries
+        .iter()
+        .filter(|(_, p)| !last.paths.contains(p))
+        .filter(|(xy, _)| xy == "??" || !xy.ends_with(' '))
+        .map(|(_, p)| p.as_str())
+        .collect();
+    if !stray.is_empty() {
+        return Ok(Launch::Nothing(format!(
+            "changes outside the conflicted paths: {}",
+            stray.join(", ")
+        )));
+    }
+    if let Some(before) = &last.index_outside {
+        match index_outside(scratch, &last.paths).await {
+            Ok(now) if &now == before => {}
+            Ok(_) => {
+                return Ok(Launch::Nothing(
+                    "the staged changes outside the conflicted paths changed".into(),
+                ));
+            }
+            Err(e) => return Err(infra_stop(state, format!("{e:#}"))),
+        }
+    }
+
+    let set = |state: &mut RunState, step| {
+        if let Some(r) = state.rebase_fixes.last_mut() {
+            r.launcher = Some(step);
+        }
+        state.save()
+    };
+    if !unmerged.is_empty() {
+        set(state, crate::run::LauncherStep::Staging)?;
+        let mut args = vec!["--literal-pathspecs", "add", "-A", "--"];
+        args.extend(unmerged.iter().map(String::as_str));
+        match git::git_raw(scratch, &args).await {
+            Ok(o) if o.ok() => {}
+            Ok(o) => {
+                let said = if o.stderr.is_empty() { o.stdout } else { o.stderr };
+                return Err(infra_stop(state, format!("staging was refused: {said}")));
+            }
+            Err(e) => return Err(infra_stop(state, format!("{e:#}"))),
+        }
+        match git::unmerged_paths(scratch).await {
+            Ok(left) if left.is_empty() => {}
+            Ok(left) => {
+                return Err(infra_stop(
+                    state,
+                    format!("paths stayed unmerged after staging: {}", left.join(", ")),
+                ));
+            }
+            Err(e) => return Err(infra_stop(state, format!("{e:#}"))),
+        }
+    }
+    set(state, crate::run::LauncherStep::Staged)?;
+    let before = rebase_head(scratch).await;
+    set(state, crate::run::LauncherStep::Continuing)?;
+    let out = match git::git_raw(scratch, &["rebase", "--continue"]).await {
+        Ok(o) => o,
+        Err(e) => return Err(infra_stop(state, format!("{e:#}"))),
+    };
+    if !out.ok() && git::rebase_in_progress(scratch).await {
+        let again = git::unmerged_paths(scratch).await.unwrap_or_default();
+        // A new conflict is the next stop point, not a failure; the same
+        // stop with nothing unmerged is git unable to write.
+        if again.is_empty() || rebase_head(scratch).await == before {
+            let said = git::rebase_said(&if out.stderr.is_empty() {
+                out.stdout
+            } else {
+                out.stderr
+            });
+            return Err(infra_stop(state, format!("continue failed: {said}")));
+        }
+    }
+    state.event(
+        "rebase",
+        format!(
+            "launcher staged {} path(s) and continued the rebase",
+            unmerged.len()
+        ),
+    );
+    Ok(Launch::Advanced)
 }
 
 /// Judge a rebase that is no longer in progress by what git says.
@@ -664,6 +961,7 @@ fn hunks(worktree: &Path, paths: &[String]) -> String {
 mod tests {
     use super::*;
     use crate::proc::Quiet as _;
+    use std::path::PathBuf;
 
     fn sh(dir: &Path, args: &[&str]) {
         let o = std::process::Command::new("git")
@@ -1323,5 +1621,218 @@ mod tests {
             dropped_commits(d, d, &onto, &orig, &head).await.unwrap(),
             vec!["c1"]
         );
+    }
+
+    // ---- launcher-owned staging -------------------------------------------
+
+    const UPSTREAM: &str = "a\nupstream test\nz\n";
+    const TOPIC: &str = "a\ntopic test\nz\n";
+    const BOTH: &str = "a\nupstream test\ntopic test\nz\n";
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        scratch: PathBuf,
+        state: RunState,
+    }
+
+    impl Fixture {
+        fn read(&self, name: &str) -> String {
+            std::fs::read_to_string(self.scratch.join(name)).unwrap()
+        }
+    }
+
+    /// `topic` has two commits on `main`'s fork point: the first conflicts on
+    /// `f.txt`, the second adds `g.txt`. The rebase stands on the first and
+    /// one fixer round is recorded, as `rebase_with_fixer` would have.
+    async fn fixture(stop_recorded: bool) -> Fixture {
+        crate::run::pin_test_home();
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("repo");
+        std::fs::create_dir(&d).unwrap();
+        sh(&d, &["init", "-q", "-b", "main"]);
+        sh(&d, &["config", "user.name", "t"]);
+        sh(&d, &["config", "user.email", "t@example.com"]);
+        sh(&d, &["config", "core.autocrlf", "false"]);
+        std::fs::write(d.join("f.txt"), "a\nbase\nz\n").unwrap();
+        sh(&d, &["add", "."]);
+        sh(&d, &["commit", "-qm", "base"]);
+        let base = git::rev_parse(&d, "HEAD").await.unwrap();
+        sh(&d, &["checkout", "-qb", "topic"]);
+        std::fs::write(d.join("f.txt"), TOPIC).unwrap();
+        sh(&d, &["commit", "-qam", "topic test"]);
+        std::fs::write(d.join("g.txt"), "g\n").unwrap();
+        sh(&d, &["add", "g.txt"]);
+        sh(&d, &["commit", "-qm", "topic g"]);
+        sh(&d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("f.txt"), UPSTREAM).unwrap();
+        sh(&d, &["commit", "-qam", "upstream test"]);
+        let scratch = t.path().join("scratch");
+        let started = git::rebase_start(&d, &scratch, "topic", "main")
+            .await
+            .unwrap();
+        assert!(matches!(started, git::RebaseStart::Conflicted(_)));
+        let mut state = RunState::new(
+            d.clone(),
+            "main".into(),
+            base,
+            "rebase".into(),
+            crate::config::Config::default(),
+        );
+        let paths = git::unmerged_paths(&scratch).await.unwrap();
+        assert_eq!(paths, vec!["f.txt"]);
+        state.rebase_fixes.push(RebaseFixRecord {
+            agent: "mock".into(),
+            index_outside: index_outside(&scratch, &paths).await.ok(),
+            stop: if stop_recorded {
+                rebase_head(&scratch).await
+            } else {
+                None
+            },
+            paths,
+            from: None,
+            finished: false,
+            error: None,
+            launcher: None,
+            infra: None,
+        });
+        Fixture {
+            _dir: t,
+            scratch,
+            state,
+        }
+    }
+
+    async fn topic_subjects(f: &Fixture) -> Vec<String> {
+        subjects(&f.scratch, "main..HEAD").await
+    }
+
+    #[tokio::test]
+    async fn resolved_contents_with_an_unmerged_index_are_staged_and_continued() {
+        let mut f = fixture(true).await;
+        std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
+        let out = launcher_stage(&mut f.state, &f.scratch).await.unwrap();
+        assert!(matches!(out, Launch::Advanced));
+        assert!(!git::rebase_in_progress(&f.scratch).await);
+        // Both sides' tests survive and the later commit was replayed too.
+        assert_eq!(f.read("f.txt"), BOTH);
+        assert_eq!(f.read("g.txt"), "g\n");
+        assert_eq!(topic_subjects(&f).await, vec!["topic g", "topic test"]);
+        let rec = git::rebase_record(&f.scratch).await.unwrap();
+        assert_eq!(rec.picks.len(), 2);
+        assert_eq!(f.state.rebase_fixes.len(), 1, "no further round was spent");
+        std::fs::remove_dir_all(f.state.dir()).ok();
+    }
+
+    #[tokio::test]
+    async fn a_pre_staging_record_is_matched_by_its_repeated_conflict_set() {
+        let mut f = fixture(false).await;
+        std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
+        let again = f.state.rebase_fixes[0].clone();
+        f.state.rebase_fixes.push(again);
+        let out = launcher_stage(&mut f.state, &f.scratch).await.unwrap();
+        assert!(matches!(out, Launch::Advanced));
+        assert!(!git::rebase_in_progress(&f.scratch).await);
+
+        // Records that disagree about the conflict identify nothing.
+        let mut f = fixture(false).await;
+        std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
+        let mut other = f.state.rebase_fixes[0].clone();
+        other.paths = vec!["elsewhere.txt".into()];
+        f.state.rebase_fixes.insert(0, other);
+        let out = launcher_stage(&mut f.state, &f.scratch).await.unwrap();
+        assert!(matches!(out, Launch::Nothing(_)));
+        assert_eq!(git::unmerged_paths(&f.scratch).await.unwrap(), ["f.txt"]);
+        std::fs::remove_dir_all(f.state.dir()).ok();
+    }
+
+    #[tokio::test]
+    async fn remaining_markers_stage_nothing() {
+        let mut f = fixture(true).await;
+        let out = launcher_stage(&mut f.state, &f.scratch).await.unwrap();
+        assert!(matches!(&out, Launch::Nothing(why) if why.contains("markers")));
+        assert!(git::rebase_in_progress(&f.scratch).await);
+        assert_eq!(git::unmerged_paths(&f.scratch).await.unwrap(), ["f.txt"]);
+        assert!(f.state.resource_block.is_none());
+        std::fs::remove_dir_all(f.state.dir()).ok();
+    }
+
+    #[tokio::test]
+    async fn unrelated_edits_and_unexpected_unmerged_paths_stage_nothing() {
+        let mut f = fixture(true).await;
+        std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
+        std::fs::write(f.scratch.join("stray.txt"), "x\n").unwrap();
+        let out = launcher_stage(&mut f.state, &f.scratch).await.unwrap();
+        assert!(matches!(&out, Launch::Nothing(why) if why.contains("stray.txt")));
+        assert_eq!(git::unmerged_paths(&f.scratch).await.unwrap(), ["f.txt"]);
+        std::fs::remove_file(f.scratch.join("stray.txt")).unwrap();
+
+        // The round only ever covered some other path.
+        f.state.rebase_fixes[0].paths = vec!["other.txt".into()];
+        let out = launcher_stage(&mut f.state, &f.scratch).await.unwrap();
+        assert!(matches!(&out, Launch::Nothing(why) if why.contains("not part of")));
+        assert!(git::rebase_in_progress(&f.scratch).await);
+        std::fs::remove_dir_all(f.state.dir()).ok();
+    }
+
+    #[tokio::test]
+    async fn a_denied_index_write_is_an_infrastructure_stop_that_keeps_everything() {
+        let mut f = fixture(true).await;
+        std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
+        let lock = git::git(&f.scratch, &["rev-parse", "--git-path", "index.lock"])
+            .await
+            .unwrap();
+        let lock = f.scratch.join(lock);
+        std::fs::write(&lock, "").unwrap();
+
+        let err = launcher_stage(&mut f.state, &f.scratch).await.unwrap_err();
+        assert!(err.is::<crate::repo_lock::ResourceBlocked>(), "{err:#}");
+        let block = f.state.resource_block.clone().expect("a resource block");
+        assert_eq!(block.kind, "git metadata write");
+        assert!(f.state.rebase_fixes[0].infra.is_some());
+        assert_eq!(f.state.rebase_fixes.len(), 1, "no round was spent");
+        assert!(git::rebase_in_progress(&f.scratch).await);
+        assert_eq!(f.read("f.txt"), BOTH);
+
+        // A later pass (the lock gone) finishes the same stop point.
+        std::fs::remove_file(&lock).unwrap();
+        f.state.resource_block = None;
+        let out = launcher_stage(&mut f.state, &f.scratch).await.unwrap();
+        assert!(matches!(out, Launch::Advanced));
+        assert!(!git::rebase_in_progress(&f.scratch).await);
+        assert_eq!(f.read("f.txt"), BOTH);
+        std::fs::remove_dir_all(f.state.dir()).ok();
+    }
+
+    #[tokio::test]
+    async fn a_pass_interrupted_after_staging_is_continued_not_repeated() {
+        let mut f = fixture(true).await;
+        std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
+        sh(&f.scratch, &["add", "f.txt"]);
+        f.state.rebase_fixes[0].launcher = Some(crate::run::LauncherStep::Staged);
+        assert!(git::unmerged_paths(&f.scratch).await.unwrap().is_empty());
+        let out = launcher_stage(&mut f.state, &f.scratch).await.unwrap();
+        assert!(matches!(out, Launch::Advanced));
+        assert!(!git::rebase_in_progress(&f.scratch).await);
+        assert_eq!(topic_subjects(&f).await, vec!["topic g", "topic test"]);
+        // Nothing is left to do on a second pass.
+        let out = launcher_stage(&mut f.state, &f.scratch).await.unwrap();
+        assert!(matches!(out, Launch::Nothing(_)));
+        std::fs::remove_dir_all(f.state.dir()).ok();
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_stages_nothing_and_keeps_the_resolved_files() {
+        let mut f = fixture(true).await;
+        std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
+        let cancelled = crate::repo_lock::WaitPolicy::new(Duration::from_secs(5), || true);
+        let err = cancelled
+            .scope(launcher_stage(&mut f.state, &f.scratch))
+            .await
+            .unwrap_err();
+        assert!(err.is::<crate::repo_lock::ResourceBlocked>());
+        assert!(git::rebase_in_progress(&f.scratch).await);
+        assert_eq!(git::unmerged_paths(&f.scratch).await.unwrap(), ["f.txt"]);
+        assert_eq!(f.read("f.txt"), BOTH);
+        std::fs::remove_dir_all(f.state.dir()).ok();
     }
 }

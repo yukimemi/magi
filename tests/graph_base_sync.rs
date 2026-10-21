@@ -342,6 +342,10 @@ async fn the_conflict_round_bound_is_counted_in_state_and_survives_a_resume() {
             from: None,
             finished: false,
             error: None,
+            stop: None,
+            index_outside: None,
+            launcher: None,
+            infra: None,
         });
     }
     runner.state.save().expect("save");
