@@ -660,6 +660,26 @@ Unlike a one-shot interview, Chat does not end when a task is filed: the agent
 runs `magi task add --solo` from inside the conversation, tells you the task
 id, and the conversation stays open for whatever comes up next.
 
+### Controlling its own tasks and runs
+
+The chat agent can act on the work it filed by command, with no question or
+offered choice in between. `magi task control` works only for the standing chat
+seat (`MAGI_NODE=chat`, `MAGI_RUN` the exact id of an open conversation), only
+for tasks that conversation filed itself (a follow-up's inherited origin does
+not count) and only for the runs those tasks recorded. It is unavailable while
+a consultation is open.
+
+| command | effect |
+|---|---|
+| `magi task control resume <full run id>` | pins the owning task to that run and queues it; the loop resumes it under the graph's execution lease (same checks as the Web resume). It starts no driver itself, so it needs `magi serve` |
+| `magi task control hold <task> [reason]` / `release <task>` | the same transitions as `magi task hold` / `release` |
+| `magi task control retry <task> <instruction>` | replaces a queued or held task's instruction and queues it in one save; attempts restart as for any release, runs and history are kept |
+| `magi task control rerun-checks <full run id>` | re-reads the run's pull request, then reruns its failed workflow runs once per head and run (a ledger entry is written first, so an uncertain result is never repeated) |
+| `magi task control abandon <full run id> --quote "<message>"` | destructive: the owner's latest persisted message must be exactly `abandon-run: <run id>` and `--quote` must repeat it; the shared liveness judge then runs under the owner lock and a Live or Unknown driver is refused |
+
+Merging stays behind the approval gate. The Question system works unchanged
+alongside these commands.
+
 ## When an agent needs you
 
 ```sh

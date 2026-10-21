@@ -2572,6 +2572,37 @@ own turn machinery runs it. No new seat, no new waiter, never a fresh agent.
   that filed tasks and registered watches report back; `Talk::notified` and
   `Turn::posted_by` are `#[serde(default)]`, `talk::SCHEMA` is unchanged.
 
+### The chat controls its own tasks and runs directly
+
+`src/chat_control.rs`, `magi task control resume|hold|release|retry|rerun-checks|abandon`.
+It adds who-may-ask and what-about, nothing else: every effect reuses an
+existing transition (`resume::pin_queued`, extracted from the daemon's
+`ResumeRun` branch; `Task::hold_manual`; `Task::release_operator`;
+`Task::edit`; `daemon::rerun_checks_once`, extracted from `RerunChecks`;
+`driver::abandon_proven_dead`). Do not reimplement them here.
+
+- **Authorization.** `MAGI_NODE=chat` and `MAGI_RUN` equal to an open talk id
+  (`chat_watch::authorize`). **Scope** is `Task::filed_by_chat() == talk` and
+  the runs in that task's `runs`; an inherited `origin_chat` or follow-up is
+  out. Execution commands need a full run id. The relation is re-checked under
+  the task's claim. Not in `consultation_command_allowed`, so a consultation
+  excludes it.
+- **Resume queues, never starts.** It pins the task (`OperatorResume`, token
+  `chat:<talk>`, no question) and the loop resumes under the execution lease.
+  Only the task's latest run can be resumed.
+- **Retry** is `Task::edit` plus `release_operator("chat")` in one save; the
+  accounting is `release`'s (attempts restart, runs/passes/resumption history
+  stay). Only queued or held tasks, as `edit` allows.
+- **Rerun** uses ledger identity `chat-control`, keyed with head and workflow
+  run id; the forge is re-read first; an unconfirmed call is never retried.
+- **Abandon** requires the owner's latest persisted send to be exactly
+  `abandon-run: <run>` and `--quote` of it, under the talk evidence guard,
+  then the shared Dead-only judge. The grammar is the same idea as
+  `consult::TaskOperation`.
+- **Out of scope:** merging. Sandbox grants are unchanged: a seat that cannot
+  reach the talks store (abandon) or the run store gets an error, not a bypass.
+- The Question system is untouched and keeps working in parallel.
+
 ### Telling the chat how a command it watched ended
 
 `src/chat_watch.rs` implements `magi talk watch [--timeout <seconds>] --

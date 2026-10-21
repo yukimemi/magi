@@ -633,9 +633,66 @@ enum TalkCmd {
     },
 }
 
+/// Direct control of this chat's own tasks and runs (standing chat seat only).
+#[derive(Debug, Subcommand)]
+enum ControlCmd {
+    /// Queue a stopped, blocked or parked run to be resumed by the loop.
+    Resume {
+        /// Full run id.
+        run: String,
+    },
+    /// Hold a task for the owner.
+    Hold {
+        /// Task id or unambiguous prefix.
+        id: String,
+        /// Why.
+        #[arg(trailing_var_arg = true)]
+        reason: Vec<String>,
+    },
+    /// Release a held task back into the queue.
+    Release {
+        /// Task id or unambiguous prefix.
+        id: String,
+    },
+    /// Replace a queued or held task's instruction and queue it again.
+    Retry {
+        /// Task id or unambiguous prefix.
+        id: String,
+        /// New one-line title. Defaults to the first line of the instruction.
+        #[arg(long)]
+        title: Option<String>,
+        /// Read the new instruction from a file instead of the arguments.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// The new instruction.
+        #[arg(trailing_var_arg = true)]
+        instruction: Vec<String>,
+    },
+    /// Rerun the failed checks of the pull request a run opened, once.
+    RerunChecks {
+        /// Full run id.
+        run: String,
+    },
+    /// Abandon a run whose driver is proven gone. Needs the owner's exact
+    /// message `abandon-run: <run id>` as the latest send, and `--quote` of it.
+    Abandon {
+        /// Full run id.
+        run: String,
+    },
+}
+
 /// Operations on the queue.
 #[derive(Debug, Subcommand)]
 enum TaskCmd {
+    /// Resume, hold, release, retry, rerun checks or abandon, for the tasks
+    /// and runs this chat filed. Only the standing chat seat
+    /// (`MAGI_NODE=chat`, `MAGI_RUN` = an open conversation) may use it.
+    /// Merging is not available here.
+    Control {
+        /// What to do.
+        #[command(subcommand)]
+        op: ControlCmd,
+    },
     /// File a task. Text as arguments, or --file, or --issue, or on stdin.
     Add {
         /// The task text.
@@ -3389,6 +3446,54 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                 println!("\ndiagnostic\n{d}");
             }
             println!("\n{}", t.instruction.trim_end());
+            Ok(())
+        }
+
+        TaskCmd::Control { op } => {
+            let home = magi::run::home();
+            let talks = magi::talk::Talks::open();
+            let talk = magi::chat_control::authorize(
+                &talks,
+                &std::env::var("MAGI_RUN").unwrap_or_default(),
+                &std::env::var("MAGI_NODE").unwrap_or_default(),
+            )?;
+            let talk_id = talk.id.as_str();
+            use magi::chat_control as cc;
+            match op {
+                ControlCmd::Resume { run } => {
+                    let t = cc::resume(&q, &home, talk_id, &run)?;
+                    println!(
+                        "{}; the loop (`magi serve`) resumes the run under its execution lease",
+                        cc::describe(&t, "resume queued for")
+                    );
+                }
+                ControlCmd::Hold { id, reason } => {
+                    let t = cc::hold(&q, talk_id, &id, &reason.join(" "))?;
+                    println!("{}", cc::describe(&t, "held"));
+                }
+                ControlCmd::Release { id } => {
+                    let t = cc::release(&q, talk_id, &id)?;
+                    println!("{}", cc::describe(&t, "released"));
+                }
+                ControlCmd::Retry {
+                    id,
+                    title,
+                    file,
+                    instruction,
+                } => {
+                    let text = task_text(&instruction, file.as_deref(), None).await?;
+                    let t = cc::retry(&q, talk_id, &id, title, &text)?;
+                    println!("{}", cc::describe(&t, "retry queued for"));
+                }
+                ControlCmd::RerunChecks { run } => {
+                    let ids = cc::rerun_checks(&q, &home, talk_id, &run).await?;
+                    println!("requested a rerun of workflow run(s) {}", ids.join(", "));
+                }
+                ControlCmd::Abandon { run } => {
+                    cc::abandon(&q, &talks, &home, talk_id, &run, quote)?;
+                    println!("abandoned run {run}");
+                }
+            }
             Ok(())
         }
 
