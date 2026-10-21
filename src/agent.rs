@@ -630,6 +630,10 @@ pub(crate) async fn invoke_leased(
             None
         };
         if let Some(bridge) = &bridge {
+            // Read-only chat CLIs also authorize against the launcher's talk
+            // store before dispatching through the bridge. Match its home
+            // without granting the child filesystem write access.
+            cmd.env("MAGI_HOME", std::fs::canonicalize(crate::run::home())?);
             bridge.attach(&mut cmd);
         }
         bridge

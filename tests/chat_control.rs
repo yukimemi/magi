@@ -612,15 +612,25 @@ async fn typed_question_resume_still_uses_shared_queue_transition_once() {
     assert!(f.saved().operator_held());
 }
 
-#[cfg(windows)]
+#[cfg(any(unix, windows))]
 #[test]
-fn windows_chat_controls_through_real_cli_child() {
-    common::isolated("windows_chat_controls_through_real_cli_child", || async {
+fn chat_controls_through_real_cli_child() {
+    common::isolated("chat_controls_through_real_cli_child", || async {
         let f = Fixture::new();
         magi::run::set_home(f.tmp.path().to_owned());
         let artifacts = f.talks.artifacts_of(&f.talk);
         let mut spec = f.run.config.agents[0].clone();
         spec.env.insert("MAGI_CONFIG_DIR".into(), String::new());
+        // The launcher must override a stale per-agent store path, even for
+        // read-only turns: CLI authorization reads the same talk as the bridge.
+        spec.env.insert(
+            "MAGI_HOME".into(),
+            f.tmp
+                .path()
+                .join("wrong-home")
+                .to_string_lossy()
+                .into_owned(),
+        );
         spec.command = vec![
             env!("CARGO_BIN_EXE_magi").into(),
             "task".into(),
