@@ -3051,7 +3051,7 @@ mod tests {
         let mut run = f.run("1234", false).await;
         run.prep_failure = Some("cherry-pick conflict".into());
         let mut task = f.task(std::slice::from_ref(&run));
-        let inputs = crate::queue::recovery_inputs(&run.seeds);
+        let inputs = crate::queue::recovery_inputs(&run.sources);
         for _ in 0..108 {
             task.recovery_failed(&run);
             task.requeue();

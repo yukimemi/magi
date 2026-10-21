@@ -3714,23 +3714,17 @@ async fn attempt(
     }
     let p = phrases(&config.graph.language);
     let start_failed = p.could_not_start;
-    // Resolve once for both admission and settlement. Review-only runs do not
-    // have seed records, and may rebase later; neither fact can refund a failed
-    // automatic generation. Include an explicit review source's current head.
+    // Resolve once for both admission and settlement. The inputs are the
+    // task's explicit sources (never prose), plus an explicit review source's
+    // current head; review-only runs may rebase later, and neither fact can
+    // refund a failed automatic generation.
     if let Ok(base) =
         crate::git::merge_base_branch(&repo, &config.merge.remote, config.merge.base.as_deref())
             .await
         && let Ok(head) =
             crate::git::rev_parse(&repo, &format!("{}/{}", config.merge.remote, base)).await
     {
-        let seeds = crate::refs::resolve(
-            &repo,
-            &head,
-            &config.merge.remote,
-            &format!("{}\n{}", task.title, instruction_for(task)),
-        )
-        .await;
-        let mut inputs = crate::queue::recovery_inputs(&seeds);
+        let mut inputs = crate::queue::recovery_inputs(&task.sources);
         if let Some(branch) = task.review_of.as_ref().or(task.review_branch.as_ref()) {
             let source = crate::git::rev_parse(&repo, branch)
                 .await
@@ -3969,6 +3963,9 @@ async fn attempt(
                     r.state.status = RunStatus::Implementing;
                     r.state.event("implement", "owner released the held selected implementer; retrying the same attempt without fallback");
                 }
+                if r.state.prep_complete == Some(false) && r.state.candidates.is_empty() {
+                    r.state.sources = task.sources.clone();
+                }
                 if r.state.prep_failure.is_some() {
                     let approval = task
                         .resumption
@@ -4020,6 +4017,7 @@ async fn attempt(
             .await
             .map(|mut r| {
                 r.state.attachments = attachments.clone();
+                r.state.sources = task.sources.clone();
                 r
             })
         }
@@ -4263,7 +4261,8 @@ pub fn finish_attempt(
     settle_and_diagnose(task, verdict, &detail, max_attempts, state);
     if state.status == RunStatus::Blocked && state.prep_failure.is_some() {
         task.hold_unrequested_retry(Some(format!(
-            "Candidate setup failed: {detail}. Select a complete implementation with `magi task recover-pr`, or correct the referenced source before explicitly releasing the task."
+            "Candidate setup failed: {detail}. Correct the explicit sources with `magi task sources {}` (README, \"Use\": implementation imports), or select a complete implementation with `magi task recover-pr`, then explicitly release the task.",
+            task.short()
         )));
     }
     if task.status == TaskStatus::Done {
@@ -8681,6 +8680,7 @@ mod tests {
                 solo: false,
                 overrides,
                 review_of: None,
+                sources: Default::default(),
             };
             let filed =
                 crate::direct::file(&q, dir.path(), Timestamp::now(), 1, filing, true).unwrap();

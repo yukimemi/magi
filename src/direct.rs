@@ -43,11 +43,14 @@ pub struct Filing {
     pub overrides: RunOverrides,
     /// `magi review <branch>`: the branch to review.
     pub review_of: Option<String>,
+    /// Explicit source inputs, pinned when the CLI files the task.
+    pub sources: crate::refs::Sources,
 }
 
 impl Filing {
     fn into_task(self) -> Task {
         let mut task = Task::new(self.title, self.instruction, self.repo, self.source);
+        task.sources = self.sources;
         task.solo = self.solo;
         task.review_of = self.review_of;
         let mut overrides = self.overrides;
@@ -362,6 +365,7 @@ mod tests {
                 merge: Some("none".to_owned()),
                 ..RunOverrides::default()
             },
+            sources: Default::default(),
             review_of: Some("feat/x".to_owned()),
         }
     }
@@ -373,6 +377,37 @@ mod tests {
             .checked_sub(jiff::SignedDuration::from_secs(age_secs))
             .unwrap();
         crate::daemon::write_status_to(&home.join("daemon.json"), &status).unwrap();
+    }
+
+    #[test]
+    fn explicit_sources_survive_filing_queue_storage_and_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let mut direct = filing(dir.path());
+        direct.review_of = None;
+        direct.instruction = "Do not import the historical example abc1234".into();
+        direct.sources = crate::refs::Sources {
+            start_from: Some(crate::refs::Input {
+                token: "feature/selected".into(),
+                sha: "1".repeat(40),
+                provenance: crate::refs::Provenance::ExplicitCli,
+            }),
+            pick_commits: vec![crate::refs::Input {
+                token: "abc5678".into(),
+                sha: "2".repeat(40),
+                provenance: crate::refs::Provenance::ExplicitCli,
+            }],
+        };
+        let selected = direct.sources.clone();
+        let mut task = direct.into_task();
+        queue.put(&mut task).unwrap();
+        let mut restored = queue.get(&task.id).unwrap();
+        assert_eq!(restored.sources, selected);
+        restored.hold_manual(Some("retry preparation".into()));
+        restored.release_operator("test", None);
+        queue.put(&mut restored).unwrap();
+        assert_eq!(queue.get(&task.id).unwrap().sources, selected);
+        assert_eq!(restored.instruction, task.instruction);
     }
 
     #[test]

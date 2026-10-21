@@ -430,7 +430,7 @@ async fn selected_fixture() -> (
 
 common::e2e! {
 async fn selected_delivery_reconciles_review_override_preserves_fix_and_waits_for_fresh_approval() {
-    let (fx, mut task, selected, bin) = selected_fixture().await;
+    let (fx, mut task, selected, bin) = Box::pin(selected_fixture()).await;
     let queue = magi::queue::Queue::open();
     queue.put(&mut task).unwrap();
     let config_path = fx.tmp.path().join("recovery.toml");

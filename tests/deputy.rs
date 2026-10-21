@@ -642,6 +642,44 @@ async fn an_operator_held_task_refuses_a_verbatim_merge_settle() {
 }
 
 common::e2e! {
+async fn an_unreadable_task_file_refuses_a_settle_instead_of_skipping_the_hold_check() {
+    let s = scene(home_lock().await);
+    let land = file_land(&s.store, "Merge #7?");
+    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    s.store.update(&land.id, |q| q.say("マージしていいよ")).unwrap();
+    let queue = magi::queue::Queue::at(s.home.join("queue"));
+    let mut task = magi::queue::Task::new(
+        "held by the operator, written by a newer build".to_owned(),
+        "instruction".to_owned(),
+        s.fx.repo.clone(),
+        magi::queue::Source::Human,
+    );
+    task.runs.push(land.run.clone());
+    task.hold_manual(Some("operator says wait".to_owned()));
+    queue.put(&mut task).unwrap();
+    // A field this build does not know: `Task` rejects it, so the record
+    // cannot be read here, and the hold on it cannot be seen either.
+    let path = queue.path_of(&task.id);
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record["from_a_newer_build"] = serde_json::json!(true);
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    assert!(queue.get(&task.id).is_err());
+    script(&s, &["MAGI ask --settle \"$qid\" --choice merge --quote 'マージしていいよ'"]);
+
+    turn(&mut deputies(&s, 2)).await;
+
+    let statuses = std::fs::read_to_string(s.fx.repo.join("deputy-action-status")).unwrap();
+    let output = std::fs::read_to_string(s.fx.repo.join("deputy-action-output")).unwrap();
+    assert_ne!(statuses.lines().next(), Some("0"), "the CLI must refuse settlement: {output}");
+    assert!(output.contains("cannot be read"), "{output}");
+    let q = s.store.get(&land.id).unwrap();
+    assert_eq!(q.status, QuestionStatus::Open, "{:?}", q.thread);
+    assert!(q.answer.is_none());
+}
+}
+
+common::e2e! {
 async fn a_follow_up_request_alone_files_the_tasks_without_merging() {
     let s = scene(home_lock().await);
     let land = file_land(&s.store, "Merge #7?");

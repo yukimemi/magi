@@ -2737,10 +2737,8 @@ pub struct ConductOutcome {
     pub branch: Option<String>,
     /// Short hash of `branch`'s head, when it could be read.
     pub branch_head: Option<String>,
-    /// What the repository says about the branches and commits the task
-    /// names (`crate::refs::describe`): already on the base, or not, and
-    /// which branches hold them. Facts git could answer, so the conductor
-    /// never has to ask the operator for them.
+    /// Retained for prompt compatibility. Prose-derived source facts are
+    /// no longer supplied: instruction text cannot authorize source selection.
     pub references: Option<String>,
     /// The run ended with an empty winner: no pull request was tried.
     pub empty_candidate: bool,
