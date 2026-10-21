@@ -2639,6 +2639,8 @@ with `magi answer` or puts the decision points to the owner in the chat.
   `QuestionView::can_consult_chat` records eligibility. Navigation uses
   `consult::associated_talk` / `associated_talk_with_watches` separately:
   `Question::run_names_task()` distinguishes exact task ids from run ids;
+  association also treats `reconcile::NODE` + `reconcile::SEAT` questions
+  as task references (review-start divergence is filed under the task id);
   release-watch records naming the question supply typed `run` / `held_task`
   links only when exactly one record matches; ambiguous watch links are ignored.
   Conflicting resolved owners suppress navigation. Follow-up ancestry

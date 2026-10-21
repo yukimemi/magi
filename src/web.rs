@@ -23555,6 +23555,27 @@ mod tests {
             ui.questions.put(&mut q).unwrap();
             questions.push((q, expected, eligible));
         }
+        for (node, reference, associated, eligible) in [
+            (crate::reconcile::NODE, previous.id.as_str(), true, false),
+            (
+                crate::reconcile::NODE,
+                previous.runs[0].as_str(),
+                false,
+                true,
+            ),
+            ("implement", previous.id.as_str(), false, false),
+        ] {
+            let mut q = Question::new(
+                reference.into(),
+                node.into(),
+                crate::reconcile::SEAT.into(),
+                "Reconcile".into(),
+                String::new(),
+                vec![],
+            );
+            ui.questions.put(&mut q).unwrap();
+            questions.push((q, associated, eligible));
+        }
         let mut release = Question::new(
             "release-record".into(),
             crate::bump::NOTICE_NODE.into(),

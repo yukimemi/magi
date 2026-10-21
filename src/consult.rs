@@ -58,7 +58,11 @@ pub(crate) fn question_task_refs<'a>(
     q: &'a Question,
     watches: &'a [crate::release_watch::WatchState],
 ) -> Vec<QuestionTaskRef<'a>> {
-    let mut refs = vec![if q.run_names_task() {
+    // Review-start reconciliation is filed under a task id, unlike normal
+    // review questions; both the node and seat identify that producer.
+    let names_task = q.run_names_task()
+        || (q.node == crate::reconcile::NODE && q.seat == crate::reconcile::SEAT);
+    let mut refs = vec![if names_task {
         QuestionTaskRef::Task(&q.run)
     } else {
         QuestionTaskRef::Run(&q.run)
