@@ -205,10 +205,29 @@ fn claimed(queue: &Queue, id: &str, talk: &str) -> Result<(crate::queue::Claim, 
     Ok((claim, task))
 }
 
+fn check_hold_release(task: &Task, operation: &str) -> Result<()> {
+    match task.status {
+        TaskStatus::Queued
+        | TaskStatus::Held
+        | TaskStatus::Failed
+        | TaskStatus::Blocked
+        | TaskStatus::Parked => Ok(()),
+        TaskStatus::Done => bail!(
+            "cannot {operation} task {} (done): completed work must not be restarted; create a new task instead",
+            task.id
+        ),
+        TaskStatus::Running => bail!(
+            "cannot {operation} task {} (running): its run may still be active; use resume or abandon for the existing run instead",
+            task.id
+        ),
+    }
+}
+
 /// Hold a task of this conversation for the owner.
 pub fn hold(queue: &Queue, talk: &str, reference: &str, reason: &str) -> Result<Task> {
     let id = owned_task(queue, talk, reference)?.id;
     let (_claim, mut task) = claimed(queue, &id, talk)?;
+    check_hold_release(&task, "hold")?;
     let reason = reason.trim();
     task.hold_manual((!reason.is_empty()).then(|| reason.to_owned()));
     queue.put(&mut task)?;
@@ -220,6 +239,7 @@ pub fn hold(queue: &Queue, talk: &str, reference: &str, reason: &str) -> Result<
 pub fn release(queue: &Queue, talk: &str, reference: &str) -> Result<Task> {
     let id = owned_task(queue, talk, reference)?.id;
     let (_claim, mut task) = claimed(queue, &id, talk)?;
+    check_hold_release(&task, "release")?;
     task.release_operator("chat", None);
     queue.put(&mut task)?;
     Ok(task)
@@ -441,6 +461,77 @@ mod tests {
         assert_eq!(back.attempts, 0);
         assert_eq!(back.runs, t.runs);
         assert!(back.resumption.is_some());
+    }
+
+    #[test]
+    fn hold_and_release_refuse_done_and_running_without_saving() {
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = Queue::at(tmp.path().join("queue"));
+        for status in [TaskStatus::Done, TaskStatus::Running] {
+            let mut t = filed(&queue, "talk-a", "work");
+            t.start("20260101-000000-aaaa".into());
+            if status == TaskStatus::Done {
+                t.succeed();
+            }
+            queue.put(&mut t).unwrap();
+            let before = std::fs::read(queue.path_of(&t.id)).unwrap();
+            for operation in ["hold", "release"] {
+                let error = if operation == "hold" {
+                    hold(&queue, "talk-a", &t.id, "owner asked")
+                } else {
+                    release(&queue, "talk-a", &t.id)
+                }
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains(operation), "{error}");
+                assert!(error.contains(&t.id), "{error}");
+                assert!(error.contains(status.as_str()), "{error}");
+                let guidance = if status == TaskStatus::Done {
+                    "create a new task"
+                } else {
+                    "use resume or abandon"
+                };
+                assert!(error.contains(guidance), "{error}");
+                assert_eq!(std::fs::read(queue.path_of(&t.id)).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn hold_and_release_allow_unfinished_inactive_tasks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = Queue::at(tmp.path().join("queue"));
+        for status in [
+            TaskStatus::Queued,
+            TaskStatus::Held,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Parked,
+        ] {
+            for operation in ["hold", "release"] {
+                let mut t = filed(&queue, "talk-a", "work");
+                t.status = status;
+                t.hold_reason = Some("old reason".into());
+                t.attempts = 3;
+                t.runs.push("20260101-000000-aaaa".into());
+                queue.put(&mut t).unwrap();
+                let changed = if operation == "hold" {
+                    let held = hold(&queue, "talk-a", &t.id, " new reason ").unwrap();
+                    assert_eq!(held.status, TaskStatus::Held);
+                    assert_eq!(held.hold_reason.as_deref(), Some("new reason"));
+                    assert_eq!(held.attempts, t.attempts);
+                    held
+                } else {
+                    let released = release(&queue, "talk-a", &t.id).unwrap();
+                    assert_eq!(released.status, TaskStatus::Queued);
+                    assert_eq!(released.attempts, 0);
+                    assert_eq!(released.resumption.as_ref().unwrap().source, "chat");
+                    released
+                };
+                assert_eq!(changed.runs, t.runs);
+                assert_eq!(queue.get(&t.id).unwrap().status, changed.status);
+            }
+        }
     }
 
     #[test]
