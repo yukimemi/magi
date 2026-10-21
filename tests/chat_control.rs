@@ -611,3 +611,110 @@ async fn typed_question_resume_still_uses_shared_queue_transition_once() {
     magi::daemon::apply_choice_actions(&f.queue(), &questions, f.tmp.path()).await;
     assert!(f.saved().operator_held());
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_chat_controls_through_real_cli_child() {
+    common::isolated("windows_chat_controls_through_real_cli_child", || async {
+        let f = Fixture::new();
+        magi::run::set_home(f.tmp.path().to_owned());
+        let artifacts = f.talks.artifacts_of(&f.talk);
+        let mut spec = f.run.config.agents[0].clone();
+        spec.env.insert("MAGI_CONFIG_DIR".into(), String::new());
+        spec.command = vec![
+            env!("CARGO_BIN_EXE_magi").into(),
+            "task".into(),
+            "control".into(),
+            "hold".into(),
+            f.task.id.clone(),
+            "via launcher".into(),
+        ];
+        spec.env
+            .insert(magi::updater::NO_AUTOUPDATE_ENV.into(), "1".into());
+        let mut seat = magi::agent::SeatState::new("chat", "mock", 1);
+        let output = magi::agent::invoke(
+            &spec,
+            &mut seat,
+            &magi::agent::Invocation {
+                scope: magi::agent::InvocationScope::Repository,
+                coordination: None,
+                fetched_base: None,
+                cwd: f.tmp.path(),
+                prompt: "",
+                timeout: std::time::Duration::from_secs(30),
+                allow_write: false,
+                unsandboxed: false,
+                sessions: false,
+                artifacts: &artifacts,
+                stem: "pipe",
+                run: &f.talk,
+                node: CHAT_NODE,
+                cache_dir: None,
+                attachments: &[],
+                writable: &[],
+            },
+        )
+        .await
+        .unwrap();
+        assert!(output.usable(), "{output:?}");
+        assert_eq!(f.saved().status, TaskStatus::Held);
+        assert_eq!(f.saved().hold_reason.as_deref(), Some("via launcher"));
+    });
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires an installed, authenticated CLI and the Windows read-only sandbox"]
+fn windows_sandboxed_chat_controls_without_direct_store_writes() {
+    common::isolated(
+        "windows_sandboxed_chat_controls_without_direct_store_writes",
+        || async {
+            let f = Fixture::new();
+            magi::run::set_home(f.tmp.path().to_owned());
+            let artifacts = f.talks.artifacts_of(&f.talk);
+            let sentinel = f.tmp.path().join("queue/protected.txt");
+            std::fs::write(&sentinel, "unchanged").unwrap();
+            let mut spec = f.run.config.agents[0].clone();
+            spec.env.insert("MAGI_CONFIG_DIR".into(), String::new());
+            spec.kind = AgentKind::Codex;
+            spec.command.clear();
+            spec.env
+                .insert("MAGI_TEST_BINARY".into(), env!("CARGO_BIN_EXE_magi").into());
+            spec.env.insert("MAGI_TEST_TASK".into(), f.task.id.clone());
+            let prompt = r#"Run these two PowerShell operations using your shell tool, without asking for approval:
+1. try { [IO.File]::WriteAllText((Join-Path $env:MAGI_HOME 'queue/protected.txt'), 'changed'); Write-Output 'STORE_WRITE_ALLOWED' } catch { Write-Output 'STORE_WRITE_DENIED' }
+2. & $env:MAGI_TEST_BINARY task control hold $env:MAGI_TEST_TASK 'sandbox control'
+Do both even if one fails. Include the exact STORE_WRITE result and control result in your final response."#;
+            let mut seat = magi::agent::SeatState::new("chat", "mock", 1);
+            let output = magi::agent::invoke(
+                &spec,
+                &mut seat,
+                &magi::agent::Invocation {
+                    scope: magi::agent::InvocationScope::Repository,
+                    coordination: None,
+                    fetched_base: None,
+                    cwd: f.tmp.path(),
+                    prompt,
+                    timeout: std::time::Duration::from_secs(120),
+                    allow_write: false,
+                    unsandboxed: false,
+                    sessions: false,
+                    artifacts: &artifacts,
+                    stem: "sandbox-pipe",
+                    run: &f.talk,
+                    node: CHAT_NODE,
+                    cache_dir: None,
+                    attachments: &[],
+                    writable: &[],
+                },
+            )
+            .await
+            .unwrap();
+            assert!(output.usable(), "{output:?}");
+            assert!(output.text.contains("STORE_WRITE_DENIED"), "{output:?}");
+            assert_eq!(std::fs::read_to_string(sentinel).unwrap(), "unchanged");
+            assert_eq!(f.saved().status, TaskStatus::Held);
+            assert_eq!(f.saved().hold_reason.as_deref(), Some("sandbox control"));
+        },
+    );
+}

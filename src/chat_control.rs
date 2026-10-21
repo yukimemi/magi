@@ -30,7 +30,7 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::queue::{Queue, Task, TaskStatus};
 use crate::talk::{Talk, Talks};
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) mod bridge;
 
 /// Only these operations cross the standing turn's inherited capability.
@@ -96,6 +96,10 @@ pub async fn dispatch(
     #[cfg(unix)]
     if std::env::var_os(bridge::CHANNEL_ENV).is_some() {
         return bridge::request(&operation);
+    }
+    #[cfg(windows)]
+    if std::env::var_os(bridge::CHANNEL_ENV).is_some() {
+        return bridge::request(&operation).await;
     }
     execute(queue, home, talks, talk, operation).await
 }

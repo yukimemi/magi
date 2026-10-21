@@ -610,7 +610,7 @@ pub(crate) async fn invoke_leased(
         cmd.env_remove("CARGO_TARGET_DIR");
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let _chat_controls = {
         use crate::chat_control::bridge::{self, Bridge};
         bridge::clear_environment(&mut cmd);
