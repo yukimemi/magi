@@ -30,6 +30,38 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::queue::{Queue, Task, TaskStatus};
 use crate::talk::{Talk, Talks};
 
+/// Explicit control-plane grants for an ordinary standing turn. Transcripts
+/// remain read-only; only their separate evidence lock is writable. Runs are
+/// a snapshot of this talk's filed tasks, refreshed on every turn. The command
+/// still rechecks authorization, ownership, claims and liveness at execution.
+pub fn write_roots(home: &Path, talks: &Talks, talk: &Talk) -> Result<Vec<std::path::PathBuf>> {
+    authorize(talks, &talk.id, crate::queue::CHAT_NODE)?;
+    let mut roots = std::collections::BTreeSet::from([
+        home.join("queue"),
+        home.join("questions"), // abandon settles the run's outstanding questions
+        home.join("choice-actions"), // shared rerun ledger
+        home.join("chat-controls").join(&talk.id),
+        talks.answer_lock_root(),
+    ]);
+    for task in Queue::at(home.join("queue")).list() {
+        if owned(&task, &talk.id) {
+            for run in task.runs.iter().filter(|id| crate::run::is_run_id(id)) {
+                let path = home.join("runs").join(run);
+                if path.is_dir() {
+                    roots.insert(path);
+                }
+            }
+        }
+    }
+    roots
+        .into_iter()
+        .map(|path| {
+            std::fs::create_dir_all(&path)?;
+            Ok(path.canonicalize()?)
+        })
+        .collect()
+}
+
 /// The exact owner instruction that confirms abandoning `run`.
 pub fn abandon_instruction(run: &str) -> String {
     format!("abandon-run: {run}")

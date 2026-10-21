@@ -113,6 +113,203 @@ fn refused(out: Output) -> String {
     String::from_utf8(out.stderr).unwrap()
 }
 
+#[cfg(unix)]
+#[test]
+fn ordinary_chat_turn_launches_controls_with_limited_store_grants() {
+    common::isolated(
+        "ordinary_chat_turn_launches_controls_with_limited_store_grants",
+        || chat_turn_controls(false),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the installed CLI sandbox and permission to launch it"]
+fn sandboxed_chat_turn_controls_own_work_and_refuses_unrelated_writes() {
+    common::isolated(
+        "sandboxed_chat_turn_controls_own_work_and_refuses_unrelated_writes",
+        || chat_turn_controls(true),
+    );
+}
+
+#[cfg(unix)]
+async fn chat_turn_controls(sandbox: bool) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let _home = common::home_lock().await;
+    let f = Fixture::new();
+    magi::run::set_home(f.tmp.path().to_owned());
+    let repo = f.tmp.path().join("repository");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join("protected"), "repository evidence").unwrap();
+    let other = f.tmp.path().join("runs/unrelated");
+    std::fs::create_dir(&other).unwrap();
+    std::fs::write(other.join("protected"), "other run").unwrap();
+    let artifacts = f.talks.artifacts_of(&f.talk);
+    std::fs::create_dir_all(&artifacts).unwrap();
+    std::fs::write(artifacts.join("protected"), "earlier attachment").unwrap();
+    let questions = magi::ask::Questions::at(f.tmp.path().join("questions"));
+    let mut question = magi::ask::Question::new(
+        f.run.id.clone(),
+        "implement".into(),
+        "worker".into(),
+        "Waiting?".into(),
+        String::new(),
+        vec!["continue".into()],
+    );
+    questions.put(&mut question).unwrap();
+    let mut t = f.talks.get(&f.talk).unwrap();
+    t.repo = repo.clone();
+    f.talks.put(&mut t).unwrap();
+    let words = format!("abandon-run: {}", f.run.id);
+    let mut cfg = f.run.config.clone();
+    assert!(!cfg.talk.allow_write);
+    let bin = f.tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let real_cli = magi::config::find_program("codex");
+    if sandbox {
+        assert!(real_cli.is_some(), "installed CLI sandbox required");
+    }
+    let script = bin.join("codex");
+    // Exercise talk::turn and agent::invoke, including the actual cwd and
+    // generated flags. The host regression validates the launch contract;
+    // the explicit sandbox regression also proves filesystem enforcement.
+    std::fs::write(&script, r#"#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys
+sys.stdin.read()
+args = sys.argv[1:]
+cwd = args[args.index('-C') + 1]
+assert pathlib.Path(cwd).resolve() == pathlib.Path.cwd().resolve()
+assert pathlib.Path(cwd).resolve() != pathlib.Path(os.environ['REPO']).resolve()
+assert args[args.index('--sandbox') + 1] == 'workspace-write'
+assert not any('bypass' in a for a in args)
+assert os.environ['MAGI_ALLOW_WRITE'] == '0'
+settings = [args[i+1] for i, a in enumerate(args) if a == '-c']
+roots = json.loads(next(s.split('=', 1)[1] for s in settings if 'writable_roots=' in s))
+home = pathlib.Path(os.environ['MAGI_HOME']).resolve()
+run = os.environ['TEST_RUN']
+talk = os.environ['MAGI_RUN']
+expected = [home/'queue', home/'questions', home/'choice-actions',
+            home/'chat-controls'/talk, home/'talks/.answer-lock', home/'runs'/run]
+assert set(roots) == set(str(p) for p in expected), roots
+for s in ['approval_policy="never"', 'sandbox_workspace_write.exclude_slash_tmp=true',
+          'sandbox_workspace_write.exclude_tmpdir_env_var=true',
+          'sandbox_workspace_write.network_access=true']:
+    assert s in settings, settings
+payload = r'''
+import os, pathlib, subprocess
+binary = os.environ['MAGI_TEST_BINARY']
+task, run = os.environ['TEST_TASK'], os.environ['TEST_RUN']
+def control(*args):
+    p = subprocess.run([binary, 'task', *args], capture_output=True, text=True)
+    assert p.returncode == 0, (args, p.stdout, p.stderr)
+control('control', 'hold', task, 'wait')
+control('control', 'release', task)
+control('control', 'retry', task, 'revised instruction')
+control('control', 'resume', run)
+control('control', 'rerun-checks', run, '--request', 'sandbox-check', '--head', 'current', '--workflow', '42')
+control('--quote', 'abandon-run: '+run, 'control', 'abandon', run)
+if os.environ['TEST_SANDBOX'] == '1':
+    home = pathlib.Path(os.environ['MAGI_HOME'])
+    for p in [pathlib.Path(os.environ['REPO'])/'protected', home/'runs/unrelated/protected',
+              home/'talks'/(os.environ['MAGI_RUN']+'.json'), home/'unrelated',
+              home/'talks'/(os.environ['MAGI_RUN']+'.artifacts')/'protected']:
+        try:
+            p.write_text('forbidden')
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError('unrelated write permitted: '+str(p))
+'''
+command = [sys.executable, '-c', payload]
+if os.environ['TEST_SANDBOX'] == '1':
+    command = [os.environ['REAL_CLI'], 'sandbox', '-c', 'sandbox_mode="workspace-write"',
+               *[a for setting in settings for a in ['-c', setting]], *command]
+p = subprocess.run(command, capture_output=True, text=True)
+assert p.returncode == 0, (p.stdout, p.stderr)
+print(json.dumps({'type':'thread.started', 'thread_id':'controls-session'}))
+print(json.dumps({'type':'item.completed', 'item':{'type':'agent_message','text':'Controls completed.'}}))
+"#).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(&gh, r#"#!/bin/sh
+if [ "$1" = pr ]; then
+  printf '%s\n' '{"url":"https://github.com/example/project/pull/1","number":1,"state":"OPEN","headRefOid":"current","statusCheckRollup":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"FAILURE","detailsUrl":"https://github.com/example/project/actions/runs/42/job/1"}]}'
+fi
+"#).unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut run = f.run.clone();
+    run.repo = repo.clone();
+    run.pr = Some(magi::run::PrRecord {
+        url: "https://github.com/example/project/pull/1".into(),
+        number: 1,
+        state: "open".into(),
+        checks: "red".into(),
+        round: 0,
+        rounds: 1,
+        red_at_merge: vec![],
+    });
+    run.save_under(f.tmp.path()).unwrap();
+    let cli_path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    // SAFETY: common::isolated runs this test in a dedicated child process;
+    // no agent or blocking task exists yet.
+    unsafe { std::env::set_var("PATH", &cli_path) };
+    cfg.agents[0].kind = AgentKind::Codex;
+    cfg.agents[0].command.clear();
+    cfg.agents[0].env = BTreeMap::from([
+        ("PATH".into(), cli_path),
+        ("MAGI_HOME".into(), f.tmp.path().to_str().unwrap().into()),
+        ("MAGI_CONFIG_DIR".into(), String::new()),
+        ("MAGI_TEST_BINARY".into(), env!("CARGO_BIN_EXE_magi").into()),
+        ("TEST_TASK".into(), f.task.id.clone()),
+        ("TEST_RUN".into(), f.run.id.clone()),
+        (
+            "TEST_SANDBOX".into(),
+            if sandbox { "1" } else { "0" }.into(),
+        ),
+        (
+            "REAL_CLI".into(),
+            real_cli.unwrap_or_default().to_string_lossy().into(),
+        ),
+        ("REPO".into(), repo.to_str().unwrap().into()),
+    ]);
+    let lease = f.talks.claim_turn(&f.talk).unwrap().unwrap();
+    talk::say(&lease, &mut t, &f.talks, &cfg, &words, vec![])
+        .await
+        .unwrap();
+    assert_eq!(f.saved().instruction, "revised instruction");
+    assert_eq!(f.saved().status, TaskStatus::Queued);
+    assert_eq!(
+        RunState::load_under(&f.run.id, f.tmp.path())
+            .unwrap()
+            .status,
+        RunStatus::Failed
+    );
+    assert!(
+        f.tmp
+            .path()
+            .join("chat-controls")
+            .join(&f.talk)
+            .join("sandbox-check.json")
+            .exists()
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("protected")).unwrap(),
+        "repository evidence"
+    );
+    assert_eq!(
+        std::fs::read_to_string(other.join("protected")).unwrap(),
+        "other run"
+    );
+    assert_eq!(
+        questions.get(&question.id).unwrap().status,
+        magi::ask::QuestionStatus::Abandoned
+    );
+    assert_eq!(
+        std::fs::read_to_string(artifacts.join("protected")).unwrap(),
+        "earlier attachment"
+    );
+}
+
 #[tokio::test]
 async fn resume_is_pinned_idempotent_and_does_not_start_a_driver() {
     let _home = common::home_lock().await;

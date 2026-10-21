@@ -458,7 +458,7 @@ real exclusive lock through `repo_lock::SeatLease` without widening their
 sandbox. All chat turns (`queue::CHAT_NODE`), including consultation delivery
 and waiter-style continuations through `talk::turn`, bypass `SeatLease` and the
 per-repository gate: conversation must not wait behind repository work sessions.
-Their filesystem grants and sandbox policy stay unchanged. A fair per-repository
+This bypass does not change their filesystem grants or sandbox policy. A fair per-repository
 gate admits concurrent readers or one editor;
 editors take their own OS lock after readers have released theirs. External
 reader-lock contention waits before starting the CLI or its budget, never as
@@ -860,6 +860,11 @@ outside the repository and reach the network, and what limits it is the prompt
 and the briefing's "small explicit edits only, everything else to the queue".
 `codex_talk_turn_bypasses_sandbox_only_when_opted_in` pins the shape (the flag
 sits before `resume`).
+
+通常の読み取り専用チャットに限り、操作用ストアへの限定 grant がある場合は
+ターン専用 artifacts サブディレクトリを cwd とした `workspace-write` を使う。
+`allow_write` は false のまま、repository / transcript / attachment は grant に
+加えない。暗黙の一時ディレクトリ許可は無効にする。詳細は下の chat controls 節。
 
 Unattended seats also pass `-c approval_policy="never"`: a seat that stops to
 ask blocks until its node timeout kills it, and there is nobody at the
@@ -2602,8 +2607,14 @@ existing transition (`resume::pin_queued`, extracted from the daemon's
   `abandon-run: <run>` and `--quote` of it, under the talk evidence guard,
   then the shared Dead-only judge. The grammar is the same idea as
   `consult::TaskOperation`.
-- **Out of scope:** merging. Sandbox grants are unchanged: a seat that cannot
-  reach the talks store (abandon) or the run store gets an error, not a bypass.
+- **Out of scope:** merging. 通常のチャットには `chat_control::write_roots` から
+  queue、questions（abandon 時の終結）、共通 rerun ledger、自分の受付記録、
+  evidence lock と、自分が起票した task の run ディレクトリだけを許可する。
+  run の一覧はターン開始時の snapshot で、次のターンに更新する。
+  リポジトリ編集不可の席は turn の artifacts を cwd とする sandbox で実行し、
+  暗黙の一時ディレクトリ許可を無効にする。PR チェック再実行用の network は許可する。
+  transcript、他の run、リポジトリ、state root 全体は書き込み対象に加えない。
+  consultation / investigation の既存制限はそのまま維持する。
 - The Question system is untouched and keeps working in parallel.
 
 ### Telling the chat how a command it watched ended

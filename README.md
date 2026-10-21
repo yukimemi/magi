@@ -669,6 +669,13 @@ for tasks that conversation filed itself (a follow-up's inherited origin does
 not count) and only for the runs those tasks recorded. It is unavailable while
 a consultation is open.
 
+通常の読み取り専用チャットでも利用できる。操作用ストアと、自分が起票した task の
+run ディレクトリだけを書き込み対象に追加し、リポジトリと会話の記録は読み取り専用に保つ。
+run の許可一覧は毎ターン更新するため、そのターン中に新しく作られた run の操作は次の
+ターンで行う。書き込みを sandbox で制限する席では、作業ディレクトリをターン専用の
+artifacts サブディレクトリにし、リポジトリの参照には絶対パスを使う。
+PR チェックの再実行にはネットワークを許可する。
+
 | command | effect |
 |---|---|
 | `magi task control resume <full run id>` | pins the owning task to that run and queues it; the loop resumes it under the graph's execution lease (same checks as the Web resume). It starts no driver itself, so it needs `magi serve` |
