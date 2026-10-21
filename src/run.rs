@@ -924,8 +924,8 @@ pub struct RebaseFixRecord {
     pub stop: Option<String>,
     /// Staged changes outside `paths` when the round started (Git's own
     /// clean applications), so edits made behind them can be told apart. Retries
-    /// retain the first baseline for the stop; missing legacy baselines block
-    /// automatic staging rather than trusting the current index.
+    /// retain the first baseline for the stop; legacy baselines are rebuilt
+    /// from the original three-way merge and verified before being saved.
     #[serde(default)]
     pub index_outside: Option<String>,
     /// How far the launcher got with staging and continuing this stop point.

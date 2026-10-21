@@ -370,14 +370,18 @@ async fn index_outside(scratch: &Path, expected: &[String]) -> Result<String> {
     )
     .await?;
     anyhow::ensure!(out.ok(), "git diff --cached failed: {}", out.stderr);
-    let mut parts = out.stdout.split('\0').filter(|p| !p.is_empty());
+    Ok(outside_diff(&out.stdout, expected))
+}
+
+fn outside_diff(raw: &str, expected: &[String]) -> String {
+    let mut parts = raw.split('\0').filter(|p| !p.is_empty());
     let mut lines = Vec::new();
     while let (Some(meta), Some(path)) = (parts.next(), parts.next()) {
         if !expected.iter().any(|e| e == path) {
             lines.push(format!("{meta}\t{path}"));
         }
     }
-    Ok(lines.join("\n"))
+    lines.join("\n")
 }
 
 /// Does `last` belong to the stop point the sequencer is at now?
@@ -435,6 +439,68 @@ async fn round_baseline(state: &mut RunState, scratch: &Path, paths: &[String]) 
     index_outside(scratch, paths)
         .await
         .map_err(|e| infra_stop(state, format!("cannot capture index baseline: {e:#}")))
+}
+
+/// Recompute the clean part of this pick without reading the fixer's index
+/// as a baseline. Only object data is written; the retained index, contents,
+/// branch and sequencer are untouched. Unsupported merge shapes fail closed.
+async fn legacy_baseline(
+    scratch: &Path,
+    paths: &[String],
+    lease: Option<crate::repo_lock::SeatLease>,
+) -> Result<(String, String, String)> {
+    let head = git::rev_parse(scratch, "HEAD").await?;
+    let pick = git::rev_parse(scratch, "REBASE_HEAD").await?;
+    let parent = git::rev_parse(scratch, "REBASE_HEAD^").await?;
+    let out = mutate(
+        scratch,
+        &[
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--no-messages",
+            "-z",
+            &format!("--merge-base={parent}"),
+            &head,
+            &pick,
+        ],
+        lease,
+    )
+    .await?;
+    anyhow::ensure!(
+        out.code == Some(1),
+        "cannot reconstruct legacy conflict baseline: {}",
+        out.stderr
+    );
+    let mut fields = out.stdout.split('\0').filter(|p| !p.is_empty());
+    let tree = fields.next().context("merge-tree returned no tree")?;
+    let mut conflicts: Vec<&str> = fields.collect();
+    conflicts.sort_unstable();
+    let mut expected: Vec<&str> = paths.iter().map(String::as_str).collect();
+    expected.sort_unstable();
+    anyhow::ensure!(
+        conflicts == expected,
+        "reconstructed conflict paths differ from the saved stop"
+    );
+    let out = git::git_raw(
+        scratch,
+        &[
+            "diff",
+            "--raw",
+            "-z",
+            "--no-renames",
+            "--no-abbrev",
+            &head,
+            tree,
+        ],
+    )
+    .await?;
+    anyhow::ensure!(
+        out.ok(),
+        "cannot read reconstructed baseline: {}",
+        out.stderr
+    );
+    Ok((outside_diff(&out.stdout, paths), head, pick))
 }
 
 async fn rebase_target(scratch: &Path) -> Result<String> {
@@ -580,6 +646,64 @@ async fn launcher_stage(
         return Err(infra_stop(state, format!("{e:#}")));
     }
     let last = stop_records(state)[0].clone();
+    let lease = if last.index_outside.is_none() {
+        let (baseline, head, pick) = legacy_baseline(scratch, &last.paths, lease)
+            .await
+            .map_err(|e| infra_stop(state, format!("legacy baseline recovery: {e:#}")))?;
+        // The mutation's cleanup owner held the previous lease. Reacquire
+        // before accepting the result, then revalidate the exact stop/index.
+        let lease = crate::repo_lock::SeatLease::operation_with(
+            scratch,
+            state.config.coordination.as_ref(),
+            &wait,
+        )
+        .await
+        .map_err(|e| block(state, "repository coordination", e.to_string()))?;
+        let validation = async {
+            stop_identity(scratch, original, onto).await?;
+            anyhow::ensure!(
+                same_stop(state, scratch).await
+                    && git::rev_parse(scratch, "HEAD").await? == head
+                    && rebase_head(scratch).await.as_deref() == Some(&pick),
+                "the stop changed during legacy baseline recovery"
+            );
+            anyhow::ensure!(
+                index_outside(scratch, &last.paths).await? == baseline,
+                "the legacy index differs from the reconstructed clean baseline"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(e) = validation {
+            return Err(infra_stop(
+                state,
+                format!("legacy baseline recovery: {e:#}"),
+            ));
+        }
+        let first = state.rebase_fixes.len() - stop_records(state).len();
+        state.rebase_fixes[first].index_outside = Some(baseline);
+        for record in &mut state.rebase_fixes[first..] {
+            record.stop = Some(pick.clone());
+        }
+        state.event(
+            "rebase",
+            "verified and saved the legacy stop baseline from the original three-way merge",
+        );
+        state.save()?;
+        lease
+    } else {
+        lease
+    };
+    if last.stop.is_none() {
+        let pick = rebase_head(scratch)
+            .await
+            .context("legacy stop has no REBASE_HEAD")?;
+        let first = state.rebase_fixes.len() - stop_records(state).len();
+        for record in &mut state.rebase_fixes[first..] {
+            record.stop = Some(pick.clone());
+        }
+        state.save()?;
+    }
     let baseline = round_baseline(state, scratch, &last.paths).await?;
     let unmerged = match git::unmerged_paths(scratch).await {
         Ok(u) => u,
@@ -599,7 +723,7 @@ async fn launcher_stage(
                 if let Err(e) = std::fs::read(scratch.join(p)) {
                     return Err(infra_stop(state, format!("cannot read `{p}`: {e}")));
                 }
-                if has_markers(scratch, p) {
+                if has_markers(scratch, p, &["HEAD", "REBASE_HEAD"]).await? {
                     return Ok(Launch::Nothing(format!(
                         "`{p}` still holds conflict markers"
                     )));
@@ -732,10 +856,12 @@ async fn finish(
             }
         }
     }
-    let marked: Vec<String> = candidates
-        .into_iter()
-        .filter(|p| has_markers(scratch, p))
-        .collect();
+    let mut marked = Vec::new();
+    for p in candidates {
+        if has_markers(scratch, &p, &[orig, onto_sha]).await? {
+            marked.push(p);
+        }
+    }
 
     // Skipping every conflicting commit leaves the branch equal to the base:
     // the ancestry test below passes and the branch's work is gone. Empty is
@@ -1062,15 +1188,54 @@ async fn subjects(worktree: &Path, range: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn has_markers(worktree: &Path, path: &str) -> bool {
-    std::fs::read_to_string(worktree.join(path)).is_ok_and(|t| {
-        t.lines().any(|l| {
-            l.starts_with("<<<<<<<")
-                || l == "======="
-                || l.starts_with(">>>>>>>")
-                || l.starts_with("|||||||")
-        })
-    })
+/// A separator alone is ambiguous (for example a Setext heading). Allow
+/// separators already present under the same heading on either side, while
+/// rejecting new ones left by a resolution. Opening, closing and diff3 markers stand on their own.
+async fn has_markers(worktree: &Path, path: &str, sides: &[&str]) -> Result<bool> {
+    let Ok(text) = std::fs::read_to_string(worktree.join(path)) else {
+        return Ok(false);
+    };
+    if text
+        .lines()
+        .any(|l| l.starts_with("<<<<<<<") || l.starts_with(">>>>>>>") || l.starts_with("|||||||"))
+    {
+        return Ok(true);
+    }
+    fn separators(text: &str) -> std::collections::BTreeMap<String, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        let mut previous = "";
+        for line in text.lines() {
+            if line == "=======" {
+                *counts.entry(previous.to_owned()).or_default() += 1;
+            }
+            previous = line;
+        }
+        counts
+    }
+    let current = separators(&text);
+    if current.is_empty() {
+        return Ok(false);
+    }
+    let mut existing = std::collections::BTreeMap::<String, usize>::new();
+    for side in sides {
+        // A missing file is expected for add/add conflicts. Other failures
+        // must not be interpreted as an empty baseline.
+        let spec = format!("{side}:{path}");
+        let exists = git::git_raw(worktree, &["cat-file", "-e", &spec]).await?;
+        if exists.ok() {
+            for (heading, count) in separators(&git::git(worktree, &["show", &spec]).await?) {
+                let before = existing.entry(heading).or_default();
+                *before = (*before).max(count);
+            }
+        } else {
+            // Verify the tree itself remains readable before treating a
+            // missing entry as an empty side.
+            git::rev_parse(worktree, &format!("{side}^{{tree}}")).await?;
+        }
+    }
+    Ok(current
+        .into_iter()
+        .any(|(heading, count)| count > existing.get(&heading).copied().unwrap_or(0)))
 }
 
 /// The conflicted regions of `paths`, marker lines included, truncated. This
@@ -1826,6 +1991,8 @@ mod tests {
         let base = git::rev_parse(&d, "HEAD").await.unwrap();
         sh(&d, &["checkout", "-qb", "topic"]);
         std::fs::write(d.join(conflict), TOPIC).unwrap();
+        std::fs::write(d.join("README.md"), "Heading\n=======\n").unwrap();
+        sh(&d, &["add", "README.md"]);
         std::fs::write(d.join("automatic"), "topic applied cleanly\n").unwrap();
         sh(&d, &["commit", "-qam", "topic test"]);
         std::fs::write(d.join("g.txt"), "g\n").unwrap();
@@ -1948,13 +2115,44 @@ mod tests {
                 if staged {
                     sh(&f.scratch, &["add", "f.txt"]);
                 }
-                assert!(has_markers(&f.scratch, "f.txt"));
+                assert!(
+                    has_markers(&f.scratch, "f.txt", &["HEAD", "REBASE_HEAD"])
+                        .await
+                        .unwrap()
+                );
                 let out = stage(&mut f).await.unwrap();
                 assert!(matches!(&out, Launch::Nothing(why) if why.contains("markers")));
                 assert!(git::rebase_in_progress(&f.scratch).await);
                 std::fs::remove_dir_all(f.state.dir()).ok();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn existing_markdown_headings_are_not_conflict_markers() {
+        let f = fixture(true).await;
+        assert!(
+            !has_markers(&f.scratch, "README.md", &["HEAD", "REBASE_HEAD"])
+                .await
+                .unwrap()
+        );
+        std::fs::write(
+            f.scratch.join("README.md"),
+            "Heading\n=======\nextra separator\n=======\n",
+        )
+        .unwrap();
+        assert!(
+            has_markers(&f.scratch, "README.md", &["HEAD", "REBASE_HEAD"])
+                .await
+                .unwrap()
+        );
+        std::fs::write(f.scratch.join("README.md"), "resolved code\n=======\n").unwrap();
+        assert!(
+            has_markers(&f.scratch, "README.md", &["HEAD", "REBASE_HEAD"])
+                .await
+                .unwrap()
+        );
+        std::fs::remove_dir_all(f.state.dir()).ok();
     }
 
     #[tokio::test]
@@ -1999,6 +2197,50 @@ mod tests {
         assert_eq!(f.read("f.txt"), BOTH);
         assert_eq!(git::unmerged_paths(&f.scratch).await.unwrap(), ["f.txt"]);
         std::fs::remove_dir_all(f.state.dir()).ok();
+    }
+
+    #[tokio::test]
+    async fn legacy_baseline_is_reconstructed_and_saved_without_another_fixer() {
+        for staged in [false, true] {
+            let mut f = fixture_with(false, "f.txt", 16).await;
+            f.state.rebase_fixes[0].index_outside = None;
+            let again = f.state.rebase_fixes[0].clone();
+            f.state.rebase_fixes.push(again);
+            f.state.config.graph.review_rounds = 1;
+            std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
+            if staged {
+                sh(&f.scratch, &["add", "f.txt"]);
+            }
+            let original = git::rev_parse(&f.state.repo, "topic").await.unwrap();
+            assert!(matches!(stage(&mut f).await.unwrap(), Launch::Advanced));
+            assert_eq!(f.state.rebase_fixes.len(), 2);
+            assert!(f.state.rebase_fixes[0].index_outside.is_some());
+            assert!(f.state.rebase_fixes.iter().all(|r| r.stop.is_some()));
+            let saved = RunState::load(&f.state.id).unwrap();
+            assert_eq!(
+                saved.rebase_fixes[0].index_outside,
+                f.state.rebase_fixes[0].index_outside
+            );
+            assert_eq!(f.read("f.txt"), BOTH);
+            assert_eq!(topic_subjects(&f).await.len(), 16);
+            assert_eq!(f.read("automatic"), "topic applied cleanly\n");
+            let onto = git::rev_parse(&f.state.repo, "main").await.unwrap();
+            assert_eq!(
+                finish(
+                    &mut f.state,
+                    &f.scratch,
+                    "topic",
+                    &original,
+                    &onto,
+                    &["f.txt".into()],
+                    ""
+                )
+                .await
+                .unwrap(),
+                Rebased::Applied
+            );
+            std::fs::remove_dir_all(f.state.dir()).ok();
+        }
     }
 
     #[tokio::test]
