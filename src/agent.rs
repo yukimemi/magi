@@ -610,6 +610,31 @@ pub(crate) async fn invoke_leased(
         cmd.env_remove("CARGO_TARGET_DIR");
     }
 
+    #[cfg(unix)]
+    let _chat_controls = {
+        use crate::chat_control::bridge::{self, Bridge};
+        bridge::clear_environment(&mut cmd);
+        let bridge = if inv.node == crate::queue::CHAT_NODE
+            && inv.scope == InvocationScope::Repository
+        {
+            crate::run::try_home().and_then(|home| {
+                match Bridge::start(&home, inv.run, inv.artifacts) {
+                    Ok(bridge) => Some(bridge),
+                    Err(error) => {
+                        tracing::warn!(%error, "chat controls unavailable; continuing conversation");
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
+        if let Some(bridge) = &bridge {
+            bridge.attach(&mut cmd);
+        }
+        bridge
+    };
+
     // The final consultation/turn check is synchronous: no await separates
     // it from spawning and transferring the lease to Running.
     start_check()?;

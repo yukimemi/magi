@@ -54,3 +54,63 @@ pub(crate) async fn execute(id: &str) {
 pub(crate) fn start(id: String) {
     tokio::spawn(async move { execute(&id).await });
 }
+
+/// Hand a resumable run back to the queue task that owns it, pinned to that
+/// exact run, so the loop's ordinary start logic resumes it under the graph's
+/// execution lease. Never starts a driver itself. `Ok(false)` means no task
+/// has this run as its latest, and the caller falls back to
+/// [`validate_unqueued`]. `decided_before` refuses when the owner held or
+/// decided something newer than the request; `applied` marks a question's
+/// action as applied in the same write.
+pub(crate) fn pin_queued(
+    queue: &crate::queue::Queue,
+    run: &str,
+    decided_before: Option<jiff::Timestamp>,
+    applied: Option<&str>,
+) -> Result<bool> {
+    use crate::queue::TaskStatus;
+    let Some(listed) = queue
+        .list()
+        .into_iter()
+        .find(|t| t.runs.last().map(String::as_str) == Some(run))
+    else {
+        return Ok(false);
+    };
+    let _claim = queue.claim(&listed.id)?;
+    let mut task = queue.get(&listed.id)?;
+    ensure!(
+        task.runs.last().map(String::as_str) == Some(run)
+            && !matches!(task.status, TaskStatus::Running | TaskStatus::Done),
+        "run queue owner changed"
+    );
+    ensure!(
+        !task.operator_held()
+            && match decided_before {
+                Some(asked) => task.operator_decided_at.is_none_or(|at| at <= asked),
+                None => true,
+            },
+        "resume was superseded by an operator hold or newer operator decision"
+    );
+    if applied.is_none()
+        && task.status == TaskStatus::Queued
+        && task
+            .resume_override
+            .as_ref()
+            .is_some_and(|pin| pin.pinned_run.as_deref() == Some(run))
+    {
+        return Ok(true);
+    }
+    task.release_operator(if applied.is_some() { "choice" } else { "chat" }, applied);
+    task.resume_override = Some(crate::queue::OperatorResume {
+        question_id: applied.unwrap_or_default().to_owned(),
+        at: jiff::Timestamp::now(),
+        conductor_rehold: None,
+        forced: true,
+        pinned_run: Some(run.to_owned()),
+    });
+    if let Some(id) = applied {
+        task.mark_action_applied(id);
+    }
+    queue.put(&mut task)?;
+    Ok(true)
+}

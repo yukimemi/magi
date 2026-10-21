@@ -660,6 +660,33 @@ Unlike a one-shot interview, Chat does not end when a task is filed: the agent
 runs `magi task add --solo` from inside the conversation, tells you the task
 id, and the conversation stays open for whatever comes up next.
 
+### Controlling its own tasks and runs
+
+The chat agent can act on the work it filed by command, with no question or
+offered choice in between. `magi task control` works only for the standing chat
+seat (`MAGI_NODE=chat`, `MAGI_RUN` the exact id of an open conversation), only
+for tasks that conversation filed itself (a follow-up's inherited origin does
+not count) and only for the runs those tasks recorded. It is unavailable while
+a consultation is open.
+
+通常のチャットの sandbox・ネットワーク設定・作業ディレクトリは変更しない。
+Unix のチャット席では、継承した専用通信路からランチャーへ操作要求を渡す。
+ランチャーは起動時の会話に対象を固定し、操作ごとに認可・所有権・確認文と既存の
+実行条件を検証する。queue・questions・run などのストアを書き込む権限は追加しない。
+通信路の準備に失敗しても会話は続き、そのターンの操作機能だけが利用できなくなる。
+通信路はターンの完了・中断時に閉じる。Unix 以外の席ではこの通信路を提供しない。
+
+| command | effect |
+|---|---|
+| `magi task control resume <full run id>` | pins the owning task to that run and queues it; the loop resumes it under the graph's execution lease (same checks as the Web resume). It starts no driver itself, so it needs `magi serve` |
+| `magi task control hold <task> [reason]` / `release <task>` | the same transitions as `magi task hold` / `release` |
+| `magi task control retry <task> <instruction>` | replaces a queued or held task's instruction and queues it in one save; attempts restart as for any release, runs and history are kept |
+| `magi task control rerun-checks <full run id> --request <id> --head <sha> --workflow <id>` | 指定した head と失敗 workflow を再確認し、リクエスト単位で再実行する。同じ操作の再送には同じ request ID を使う。`chat-controls/<talk>/<request>.json` に受付を記録し、結果不明の再送は拒否する |
+| `magi task control abandon <full run id> --quote "<message>"` | destructive: the owner's latest persisted message must be exactly `abandon-run: <run id>` and `--quote` must repeat it; the shared liveness judge then runs under the owner lock and a Live or Unknown driver is refused |
+
+Merging stays behind the approval gate. The Question system works unchanged
+alongside these commands.
+
 ## When an agent needs you
 
 ```sh

@@ -827,7 +827,7 @@ pub struct Resumption {
 /// [`Task::resume_override`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorResume {
-    /// The triage question the operator answered.
+    /// 回答された Question の ID。Question を伴わない再開では空文字列。
     pub question_id: String,
     /// When the answer was applied.
     pub at: Timestamp,

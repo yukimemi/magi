@@ -1017,6 +1017,11 @@ pub(crate) fn validate_effect(
     Ok(())
 }
 
+/// The entire latest persisted owner send, when it is a usable instruction.
+pub(crate) fn latest_owner_instruction(talk: &Talk) -> Option<&str> {
+    current_instruction(talk).map(|(_, _, words)| words)
+}
+
 fn current_instruction(talk: &Talk) -> Option<(usize, usize, &str)> {
     // A newer queued send can retract the instruction. Wait until it is
     // drained rather than letting the running seat use older words. Explicitly

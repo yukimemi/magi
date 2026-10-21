@@ -633,9 +633,75 @@ enum TalkCmd {
     },
 }
 
+/// Direct control of this chat's own tasks and runs (standing chat seat only).
+#[derive(Debug, Subcommand)]
+enum ControlCmd {
+    /// Queue a stopped, blocked or parked run to be resumed by the loop.
+    Resume {
+        /// Full run id.
+        run: String,
+    },
+    /// Hold a task for the owner.
+    Hold {
+        /// Task id or unambiguous prefix.
+        id: String,
+        /// Why.
+        #[arg(trailing_var_arg = true)]
+        reason: Vec<String>,
+    },
+    /// Release a held task back into the queue.
+    Release {
+        /// Task id or unambiguous prefix.
+        id: String,
+    },
+    /// Replace a queued or held task's instruction and queue it again.
+    Retry {
+        /// Task id or unambiguous prefix.
+        id: String,
+        /// New one-line title. Defaults to the first line of the instruction.
+        #[arg(long)]
+        title: Option<String>,
+        /// Read the new instruction from a file instead of the arguments.
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// The new instruction.
+        #[arg(trailing_var_arg = true)]
+        instruction: Vec<String>,
+    },
+    /// Rerun the failed checks of the pull request a run opened, once per request.
+    RerunChecks {
+        /// Full run id.
+        run: String,
+        /// Unique request id; reuse it when delivery is uncertain.
+        #[arg(long)]
+        request: String,
+        /// Observed pull request head commit.
+        #[arg(long)]
+        head: String,
+        /// Failed workflow run ids (repeatable, at most twenty).
+        #[arg(long = "workflow", required = true)]
+        workflows: Vec<String>,
+    },
+    /// Abandon a run whose driver is proven gone. Needs the owner's exact
+    /// message `abandon-run: <run id>` as the latest send, and `--quote` of it.
+    Abandon {
+        /// Full run id.
+        run: String,
+    },
+}
+
 /// Operations on the queue.
 #[derive(Debug, Subcommand)]
 enum TaskCmd {
+    /// Resume, hold, release, retry, rerun checks or abandon, for the tasks
+    /// and runs this chat filed. Only the standing chat seat
+    /// (`MAGI_NODE=chat`, `MAGI_RUN` = an open conversation) may use it.
+    /// Merging is not available here.
+    Control {
+        /// What to do.
+        #[command(subcommand)]
+        op: ControlCmd,
+    },
     /// File a task. Text as arguments, or --file, or --issue, or on stdin.
     Add {
         /// The task text.
@@ -3389,6 +3455,59 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                 println!("\ndiagnostic\n{d}");
             }
             println!("\n{}", t.instruction.trim_end());
+            Ok(())
+        }
+
+        TaskCmd::Control { op } => {
+            let home = magi::run::home();
+            let talks = magi::talk::Talks::open();
+            let talk = magi::chat_control::authorize(
+                &talks,
+                &std::env::var("MAGI_RUN").unwrap_or_default(),
+                &std::env::var("MAGI_NODE").unwrap_or_default(),
+            )?;
+            let talk_id = talk.id.as_str();
+            use magi::chat_control as cc;
+            let operation = match op {
+                ControlCmd::Resume { run } => cc::Operation::Resume { run },
+                ControlCmd::Hold { id, reason } => cc::Operation::Hold {
+                    task: id,
+                    reason: reason.join(" "),
+                },
+                ControlCmd::Release { id } => cc::Operation::Release { task: id },
+                ControlCmd::Retry {
+                    id,
+                    title,
+                    file,
+                    instruction,
+                } => {
+                    let instruction = task_text(&instruction, file.as_deref(), None).await?;
+                    cc::Operation::Retry {
+                        task: id,
+                        title,
+                        instruction,
+                    }
+                }
+                ControlCmd::RerunChecks {
+                    run,
+                    request,
+                    head,
+                    workflows,
+                } => cc::Operation::RerunChecks {
+                    run,
+                    request,
+                    head,
+                    workflows,
+                },
+                ControlCmd::Abandon { run } => cc::Operation::Abandon {
+                    run,
+                    quote: quote.map(str::to_owned),
+                },
+            };
+            println!(
+                "{}",
+                cc::dispatch(&q, &home, &talks, talk_id, operation).await?
+            );
             Ok(())
         }
 

@@ -1190,7 +1190,6 @@ pub async fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &P
 /// Apply bounded maintenance effects independently of question ownership: a
 /// release watcher need not have a queue task, and a predecessor is another run.
 async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &Path) {
-    use crate::release_watch::{GhForge, ReleaseForge};
     for q in questions.list() {
         let Some(action) = q.chosen_action().filter(|a| a.maintenance()) else {
             continue;
@@ -1247,37 +1246,7 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                     ask::ChoiceAction::ResumeRun { run } => {
                         crate::resume::validate(home, run)?;
                         record("started")?;
-                        if let Some(listed) = queue
-                            .list()
-                            .into_iter()
-                            .find(|t| t.runs.last() == Some(run))
-                        {
-                            let _claim = queue.claim(&listed.id)?;
-                            let mut task = queue.get(&listed.id)?;
-                            anyhow::ensure!(
-                                task.runs.last() == Some(run)
-                                    && !matches!(
-                                        task.status,
-                                        TaskStatus::Running | TaskStatus::Done
-                                    ),
-                                "run queue owner changed"
-                            );
-                            anyhow::ensure!(
-                                !task.operator_held()
-                                    && task.operator_decided_at.is_none_or(|at| at <= q.asked_at),
-                                "resume was superseded by an operator hold or newer operator decision"
-                            );
-                            task.release_operator("choice", Some(&q.id));
-                            task.resume_override = Some(crate::queue::OperatorResume {
-                                question_id: q.id.clone(),
-                                at: Timestamp::now(),
-                                conductor_rehold: None,
-                                forced: true,
-                                pinned_run: Some(run.clone()),
-                            });
-                            task.mark_action_applied(&q.id);
-                            queue.put(&mut task)?;
-                        } else {
+                        if !crate::resume::pin_queued(queue, run, Some(q.asked_at), Some(&q.id))? {
                             crate::resume::validate_unqueued(home, run)?;
                             crate::resume::start(run.clone());
                         }
@@ -1329,51 +1298,8 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                         head,
                         runs,
                     } => {
-                        anyhow::ensure!(
-                            !runs.is_empty()
-                                && runs.len() <= 20
-                                && runs
-                                    .iter()
-                                    .all(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
-                                && !pr.starts_with('-'),
-                            "invalid rerun targets"
-                        );
-                        let snap = GhForge.snapshot(repo, pr).await?;
-                        anyhow::ensure!(
-                            snap.head == *head && snap.state == crate::land::PrLifecycle::Open,
-                            "pull request head or lifecycle changed"
-                        );
-                        anyhow::ensure!(
-                            runs.iter().all(|r| snap
-                                .checks
-                                .iter()
-                                .any(|c| c.run.as_ref() == Some(r)
-                                    && crate::release_watch::is_failed(c.verdict))),
-                            "named workflow is no longer failed on this pull request"
-                        );
-                        record("started")?;
-                        let rerun_lock = std::fs::OpenOptions::new()
-                            .create(true)
-                            .truncate(false)
-                            .write(true)
-                            .open(dir.join("reruns.lock"))?;
-                        crate::pr_head::try_lock_file(&rerun_lock)?;
-                        let ledger = dir.join("reruns.json");
-                        let mut recorded: std::collections::BTreeSet<String> = if ledger.exists() {
-                            serde_json::from_slice(&std::fs::read(&ledger)?)?
-                        } else {
-                            Default::default()
-                        };
-                        for run in runs {
-                            let key = serde_json::to_string(&(&q.id, repo, pr, head, run))?;
-                            if !recorded.insert(key) {
-                                continue;
-                            }
-                            let tmp = ledger.with_extension("tmp");
-                            std::fs::write(&tmp, serde_json::to_vec(&recorded)?)?;
-                            std::fs::rename(tmp, &ledger)?;
-                            GhForge.rerun(repo, run).await?;
-                        }
+                        rerun_checks_once(home, &q.id, repo, pr, head, runs, || record("started"))
+                            .await?;
                     }
                     _ => unreachable!(),
                 }
@@ -1430,6 +1356,71 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
             );
         }
     }
+}
+
+/// Rerun the named failed workflow runs of a pull request, each at most once
+/// per `request` (a question id, or a chat operation identity). The head,
+/// lifecycle and failed state are re-read from the forge first; `started` is
+/// called once those checks pass and before the first external call, and the
+/// ledger entry is written before every `gh` call, so an uncertain result is
+/// never repeated automatically.
+pub(crate) async fn rerun_checks_once(
+    home: &Path,
+    request: &str,
+    repo: &Path,
+    pr: &str,
+    head: &str,
+    runs: &[String],
+    started: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    use crate::release_watch::{GhForge, ReleaseForge};
+    anyhow::ensure!(
+        !runs.is_empty()
+            && runs.len() <= 20
+            && runs
+                .iter()
+                .all(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+            && !pr.starts_with('-'),
+        "invalid rerun targets"
+    );
+    let snap = GhForge.snapshot(repo, pr).await?;
+    anyhow::ensure!(
+        snap.head == head && snap.state == crate::land::PrLifecycle::Open,
+        "pull request head or lifecycle changed"
+    );
+    anyhow::ensure!(
+        runs.iter().all(|r| snap
+            .checks
+            .iter()
+            .any(|c| c.run.as_ref() == Some(r) && crate::release_watch::is_failed(c.verdict))),
+        "named workflow is no longer failed on this pull request"
+    );
+    started()?;
+    let dir = home.join("choice-actions");
+    std::fs::create_dir_all(&dir)?;
+    let rerun_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("reruns.lock"))?;
+    crate::pr_head::try_lock_file(&rerun_lock)?;
+    let ledger = dir.join("reruns.json");
+    let mut recorded: std::collections::BTreeSet<String> = if ledger.exists() {
+        serde_json::from_slice(&std::fs::read(&ledger)?)?
+    } else {
+        Default::default()
+    };
+    for run in runs {
+        let key = serde_json::to_string(&(request, repo, pr, head, run))?;
+        if !recorded.insert(key) {
+            continue;
+        }
+        let tmp = ledger.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_vec(&recorded)?)?;
+        std::fs::rename(tmp, &ledger)?;
+        GhForge.rerun(repo, run).await?;
+    }
+    Ok(())
 }
 
 /// Carry out the [`ask::ChoiceAction`] attached to each answered choice, once.

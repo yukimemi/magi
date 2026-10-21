@@ -3250,6 +3250,25 @@ pub fn briefing_for(
          automatic reports resume this conversation through its own turn. \
          Never promise to report back on work that is neither a filed task \
          nor a successfully registered watch.\n\n\
+         For the tasks this conversation filed, and only those, you can act \
+         directly: `magi task control resume <full run id>` (queues the run \
+         for the loop to resume; it starts nothing itself), `magi task control \
+         hold <task id> [reason]`, `magi task control release <task id>`, \
+         `magi task control retry <task id> <new instruction>` (replaces a \
+         queued or held task's instruction and queues it again; its runs stay \
+         on record) and `magi task control rerun-checks <full run id> --request <id> --head <sha> --workflow <id>` (reruns \
+         the named failed workflows of that run's pull request; reuse the request id \
+         for the same operation. An uncertain result requires receipt inspection). Do these when the \
+         operator asks or the situation clearly calls for it, and say what you \
+         did. `magi task control abandon <full run id> --quote \"<message>\"` \
+         is destructive: only after the operator's latest message is exactly \
+         `abandon-run: <full run id>` (ask them to send that line, once, after \
+         you have named the run and what abandoning does), passing that whole \
+         message as --quote; a run that might still be driven is refused. \
+         Merging a pull request is not available to you. These commands use the \
+         turn's inherited control channel without changing repository permissions, \
+         network policy or working directory. If that channel is unavailable, \
+         report the command error; never edit store files to apply an operation.\n\n\
          The current state of the code is whatever origin/main holds, not \
          whatever a working tree shows: a primary checkout often lags \
          upstream, sits on a detached HEAD and carries uncommitted changes. \
@@ -6255,6 +6274,8 @@ mod tests {
         assert!(b.contains(crate::prompt::CHAT_TASK_NOTICE_HEADING));
         assert!(b.contains("magi talk watch --timeout 900"));
         assert!(b.contains("nor a successfully registered watch"));
+        assert!(b.contains("magi task control resume <full run id>"));
+        assert!(b.contains("abandon-run: <full run id>"));
     }
 
     #[test]

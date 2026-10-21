@@ -458,7 +458,7 @@ real exclusive lock through `repo_lock::SeatLease` without widening their
 sandbox. All chat turns (`queue::CHAT_NODE`), including consultation delivery
 and waiter-style continuations through `talk::turn`, bypass `SeatLease` and the
 per-repository gate: conversation must not wait behind repository work sessions.
-Their filesystem grants and sandbox policy stay unchanged. A fair per-repository
+This bypass does not change their filesystem grants or sandbox policy. A fair per-repository
 gate admits concurrent readers or one editor;
 editors take their own OS lock after readers have released theirs. External
 reader-lock contention waits before starting the CLI or its budget, never as
@@ -2571,6 +2571,47 @@ own turn machinery runs it. No new seat, no new waiter, never a fresh agent.
 - The briefing (`talk::briefing_for`) tells the chat it cannot wait or push and
   that filed tasks and registered watches report back; `Talk::notified` and
   `Turn::posted_by` are `#[serde(default)]`, `talk::SCHEMA` is unchanged.
+
+### The chat controls its own tasks and runs directly
+
+`src/chat_control.rs`, `magi task control resume|hold|release|retry|rerun-checks|abandon`.
+It adds who-may-ask and what-about, nothing else: every effect reuses an
+existing transition (`resume::pin_queued`, extracted from the daemon's
+`ResumeRun` branch; `Task::hold_manual`; `Task::release_operator`;
+`Task::edit`; `daemon::rerun_checks_once`, extracted from `RerunChecks`;
+`driver::abandon_proven_dead`). Do not reimplement them here.
+
+- **Authorization.** `MAGI_NODE=chat` and `MAGI_RUN` equal to an open talk id
+  (`chat_watch::authorize`). **Scope** is `Task::filed_by_chat() == talk` and
+  the runs in that task's `runs`; an inherited `origin_chat` or follow-up is
+  out. Execution commands need a full run id. The relation is re-checked under
+  the task's claim. Not in `consultation_command_allowed`, so a consultation
+  excludes it.
+- **Resume queues, never starts.** It pins the task (`OperatorResume`, no question) and the loop resumes under the execution lease.
+  Question なしの再送では同じ run の既存 pin を維持し、履歴を増やさない。
+  `resume_override.question_id` は空文字列とし、架空の Question ID を記録しない。
+  Only the task's latest run can be resumed.
+- **Retry** is `Task::edit` plus `release_operator("chat")` in one save; the
+  accounting is `release`'s (attempts restart, runs/passes/resumption history
+  stay). Only queued or held tasks, as `edit` allows.
+- **Rerun** は `--request <id> --head <sha> --workflow <id>` を受け取り、
+  `chat-controls/<talk>/<request>.json` に受付を記録する。ledger の識別子は
+  `chat:<talk>:<request>`。同一 ID の別操作への使い回しと結果不明時の再送を拒否し、
+  共通遷移で head・workflow の一致を再確認する。
+- **Abandon** requires the owner's latest persisted send to be exactly
+  `abandon-run: <run>` and `--quote` of it, under the talk evidence guard,
+  then the shared Dead-only judge. The grammar is the same idea as
+  `consult::TaskOperation`.
+- **Out of scope:** merging。通常のチャットは既存の sandbox・network・cwd を維持し、
+  queue / questions / choice-actions / run / transcript への書き込み権限を追加しない。
+  `chat_control::bridge` が Unix の継承済み通信路で型付き操作だけをランチャーへ渡す。
+  ランチャーは起動時の talk を固定し、要求ごとに open・非 consultation・所属・確認文・
+  既存遷移の条件を検証する。任意コマンド、パス、別の talk、merge は要求できない。
+  同時 CLI は継承した未リンクの lock FD の POSIX process lock で直列化し、
+  request ID で応答を照合する。通信路の準備失敗は警告のみで会話を継続する。
+  完了・中断・fallback は通信路を破棄する。非 Unix には通信路を提供しない。
+  CLI を席の外から実行する場合も、従来どおり chat / open talk / 所属の認可が必要。
+- The Question system is untouched and keeps working in parallel.
 
 ### Telling the chat how a command it watched ended
 
