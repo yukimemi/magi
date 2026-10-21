@@ -2,9 +2,11 @@
 
 #![cfg(unix)]
 
+mod common;
+
 use std::fs::{self, File};
 use std::os::unix::{fs::PermissionsExt, process::CommandExt};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 struct ProcessGroup(Child);
@@ -54,11 +56,10 @@ fn slow_release_auth_does_not_delay_cli_exit() {
     let output = File::create(&output_path).unwrap();
     let start = Instant::now();
     let mut process = ProcessGroup(
-        Command::new(env!("CARGO_BIN_EXE_magi"))
+        common::magi_cli(&root.join("magi-home"))
             .args(["task", "list"])
             .current_dir(root)
             .env("PATH", std::env::join_paths(paths).unwrap())
-            .env("MAGI_HOME", root.join("magi-home"))
             .env("MAGI_CONFIG_DIR", root.join("cfg"))
             // dirs uses HOME/Library/Caches on macOS and XDG_CACHE_HOME on Linux.
             .env("HOME", root.join("home"))
@@ -69,6 +70,7 @@ fn slow_release_auth_does_not_delay_cli_exit() {
             .env("TOKIO_WORKER_THREADS", "1")
             .env_remove("GH_TOKEN")
             .env_remove("GITHUB_TOKEN")
+            // This test alone exercises updates, through fake gh and a private cache.
             .env_remove("MAGI_NO_AUTOUPDATE")
             .env_remove("MAGI_TURN_SCOPE")
             .env_remove("MAGI_RUN")

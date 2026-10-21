@@ -435,7 +435,7 @@ async fn selected_delivery_reconciles_review_override_preserves_fix_and_waits_fo
     queue.put(&mut task).unwrap();
     let config_path = fx.tmp.path().join("recovery.toml");
     std::fs::write(&config_path, toml::to_string(&fx.config).unwrap()).unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
+    let output = common::magi_cli(&magi::run::home())
         .args(["task", "recover-pr", &task.id, "--pr", &selected.url, "--head", &selected.head,
             "--source-head", selected.source(), "--disposition", "land", "--config"])
         .arg(&config_path).env("MAGI_HOME", magi::run::home()).output().unwrap();
@@ -769,7 +769,7 @@ async fn rebased_retained_source_keeps_review_fixes_and_public_lease() {
     let latest = git::rev_parse(&fx.repo, "HEAD").await.unwrap();
     let config_path = fx.tmp.path().join("recovery.toml");
     std::fs::write(&config_path, toml::to_string(&fx.config).unwrap()).unwrap();
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
+    let output = common::magi_cli(&magi::run::home())
         .args(["task", "recover-pr", &task.id, "--pr", &selected.url,
             "--head", &selected.head, "--source-head", &source,
             "--source-run", &retained.id, "--disposition", "land", "--config"])

@@ -27,7 +27,7 @@ case "$1 $2" in
  'pr merge') case "$*" in *--disable-auto*)
    if test -f "$REPAIR_FORGE/late-answer"; then
      rm "$REPAIR_FORGE/late-answer"
-     (unset MAGI_RUN MAGI_NODE; MAGI_HOME="$REPAIR_HOME" "$REPAIR_CLI" answer "$REPAIR_LATE_QUESTION" --reply "$REPAIR_LATE_CHOICE") > "$REPAIR_FORGE/late-answer-result" 2>&1 || exit 97
+     (unset MAGI_RUN MAGI_NODE MAGI_SEAT MAGI_TURN_SCOPE; cd "$REPAIR_HOME" || exit; "$REPAIR_CLI" answer "$REPAIR_LATE_QUESTION" --reply "$REPAIR_LATE_CHOICE") > "$REPAIR_FORGE/late-answer-result" 2>&1 || exit 97
    fi
    exit 0 ;; *) exit 99 ;; esac ;;
  'pr comment') exit 0 ;;
@@ -38,12 +38,20 @@ esac
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut paths = vec![bin.clone()];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let cli = common::magi_cli(&magi::run::home());
     // SAFETY: each e2e test runs in an isolated child, before its driver starts.
     unsafe {
         std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
         std::env::set_var("REPAIR_FORGE", &bin);
         std::env::set_var("REPAIR_BRANCH", branch);
-        std::env::set_var("REPAIR_CLI", env!("CARGO_BIN_EXE_magi"));
+        for (key, value) in cli.get_envs() {
+            if let Some(value) = value {
+                std::env::set_var(key, value);
+            } else {
+                std::env::remove_var(key);
+            }
+        }
+        std::env::set_var("REPAIR_CLI", cli.get_program());
         std::env::set_var("REPAIR_HOME", magi::run::home());
     }
     let agent = dir.join("mock-agent.sh");
@@ -141,9 +149,8 @@ async fn held_pr_choice(
             .iter()
             .any(|c| c == REPAIR)
     );
-    let answer = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
+    let answer = common::magi_cli(&magi::run::home())
         .args(["answer", &id, "--reply", choice])
-        .env("MAGI_HOME", magi::run::home())
         .env_remove("MAGI_RUN")
         .env_remove("MAGI_NODE")
         .output()
@@ -167,9 +174,8 @@ async fn held_pr_choice(
         Questions::open().get(&id).unwrap().resolution().as_deref(),
         Some(choice)
     );
-    let duplicate = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
+    let duplicate = common::magi_cli(&magi::run::home())
         .args(["answer", &id, "--reply", choice])
-        .env("MAGI_HOME", magi::run::home())
         .env_remove("MAGI_RUN")
         .env_remove("MAGI_NODE")
         .output()
@@ -300,9 +306,8 @@ async fn merge_repair_legacy_cli_answer_dispatches_through_parked_task_owner() {
     }).unwrap();
     task.hold_manual(Some("Pause this PR".into()));
     queue.put(&mut task).unwrap();
-    let answer = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
+    let answer = common::magi_cli(&magi::run::home())
         .args(["answer", &old_question, "--reply", REPAIR])
-        .env("MAGI_HOME", magi::run::home())
         .env_remove("MAGI_RUN").env_remove("MAGI_NODE")
         .output().unwrap();
     assert!(answer.status.success(), "{}", String::from_utf8_lossy(&answer.stderr));
@@ -674,9 +679,9 @@ async fn decision_withdraw_answer_resumes_a_manually_held_owner_only_to_close() 
     task.hold_manual(Some("Decision deferred".into()));
     task.set_implementers(2, &runner.state.config).unwrap();
     magi::queue::Queue::open().put(&mut task).unwrap();
-    let answer = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
+    let answer = common::magi_cli(&magi::run::home())
         .args(["answer", &question, "--reply", magi::merge_decision::WITHDRAW])
-        .env("MAGI_HOME", magi::run::home()).env_remove("MAGI_RUN").env_remove("MAGI_NODE")
+        .env_remove("MAGI_RUN").env_remove("MAGI_NODE")
         .output().unwrap();
     assert!(answer.status.success(), "{}", String::from_utf8_lossy(&answer.stderr));
     serve_decision(&fx, &runner.state).await;
@@ -708,10 +713,9 @@ async fn decision_replacement_crash_checkpoint_does_not_start_a_second_attempt()
 }
 
 fn run_cli(fx: &common::Fixture, args: &[&str]) {
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
+    let output = common::magi_cli(&magi::run::home())
         .args(args)
         .current_dir(&fx.repo)
-        .env("MAGI_HOME", magi::run::home())
         .env_remove("MAGI_RUN")
         .env_remove("MAGI_NODE")
         .output()

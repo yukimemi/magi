@@ -1,5 +1,6 @@
+mod common;
+
 use std::path::PathBuf;
-use std::process::Command;
 
 use magi::queue::{AnsweredQuestion, Queue, Source, Task, TaskStatus};
 
@@ -33,9 +34,8 @@ fn explicit_resumption_cli_release_persists_revised_instruction_and_history() {
     )
     .unwrap();
     queue.put(&mut task).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_magi"))
+    let output = common::magi_cli(dir.path())
         .args(["task", "release", &task.id])
-        .env("MAGI_HOME", dir.path())
         .current_dir(dir.path())
         .output()
         .unwrap();

@@ -244,9 +244,9 @@ async fn consultation_investigates_on_delivery_and_natural_followup_then_returns
     assert_eq!(f.talk.turns.len(), 4);
     assert_eq!(f.seat().turns, 4);
     // Investigation's internal request never becomes authentic owner authority.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
+    let out = common::magi_cli(f._tmp.path())
         .args(["answer", &f.question.id, "--reply", magi::land::APPROVE, "--quote", "Please investigate why this failed before I choose an answer."])
-        .env("MAGI_HOME", f._tmp.path()).env("MAGI_CONFIG_DIR", "")
+        .env("MAGI_CONFIG_DIR", "")
         .env("MAGI_RUN", &f.talk.id).env("MAGI_NODE", "chat").output().unwrap();
     assert!(!out.status.success());
     f.unchanged();
@@ -258,9 +258,9 @@ async fn consultation_investigates_on_delivery_and_natural_followup_then_returns
     assert!(!prompt.contains("launcher holds the exclusive repository lock"));
     let instruction = "hold".to_string();
     f.say(&instruction).await;
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
+    let out = common::magi_cli(f._tmp.path())
         .args(["answer", &f.question.id, "--reply", "hold", "--quote", &instruction])
-        .env("MAGI_HOME", f._tmp.path()).env("MAGI_CONFIG_DIR", "")
+        .env("MAGI_CONFIG_DIR", "")
         .env("MAGI_RUN", &f.talk.id).env("MAGI_NODE", "chat").output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let answered = f.questions.get(&f.question.id).unwrap();

@@ -6,7 +6,7 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use magi::chat_notify;
 use magi::config::{AgentKind, AgentSpec, Config};
@@ -249,7 +249,7 @@ async fn an_operators_own_draft_is_not_started_by_the_daemon() {
 }
 
 fn post(w: &World, talk: &str, env: &[(&str, &str)]) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_magi"));
+    let mut cmd = common::magi_cli(w.tmp.path());
     cmd.args(["talk", "post", talk, "found it"])
         .env("MAGI_HOME", w.tmp.path())
         .env("MAGI_CONFIG_DIR", w.tmp.path().join("config"))
@@ -425,12 +425,10 @@ async fn legacy_notices_resume_after_new_task_or_watch_notices_arrive() {
 
 #[cfg(unix)]
 fn watch(w: &World, timeout: u64, command: &[&str], node: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_magi"))
+    common::magi_cli(w.tmp.path())
         .args(["talk", "watch", "--timeout", &timeout.to_string(), "--"])
         .args(command)
         .current_dir(w.tmp.path())
-        .env("MAGI_HOME", w.tmp.path())
-        .env("MAGI_CONFIG_DIR", w.tmp.path().join("config"))
         .env("MAGI_RUN", &w.talk_id)
         .env("MAGI_NODE", node)
         .output()

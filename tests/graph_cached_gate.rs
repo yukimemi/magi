@@ -61,10 +61,9 @@ async fn a_cached_failed_gate_stays_blocked_and_does_not_run_again() {
     // Exercise the public resume path using the home actually pinned by the
     // parent process, not the later fixture directory whose `set_home` call
     // was ignored by the OnceLock.
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_magi"))
+    let output = common::magi_cli(&pinned_home)
         .args(["run", "--resume", &id])
         .current_dir(&fx.repo)
-        .env("MAGI_HOME", &pinned_home)
         .output()
         .expect("run magi --resume");
     assert!(

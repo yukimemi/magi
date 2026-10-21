@@ -15,6 +15,41 @@ use magi::config::{
     UpdateMode, Verify,
 };
 
+const SEAT_ENV: [&str; 4] = ["MAGI_RUN", "MAGI_NODE", "MAGI_SEAT", "MAGI_TURN_SCOPE"];
+
+/// Start the real CLI in a caller-owned temporary home. Keep that directory
+/// alive until the child exits. Callers may override the cwd and environment.
+pub fn magi_cli(home: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_magi"));
+    command
+        .current_dir(home)
+        .env("MAGI_HOME", home)
+        .env("MAGI_CONFIG_DIR", home.join("config"))
+        .env("MAGI_NO_AUTOUPDATE", "1");
+    for key in SEAT_ENV {
+        command.env_remove(key);
+    }
+    command
+}
+
+/// Pass the CLI's isolation settings through an agent launcher or shell mock.
+/// The launcher supplies the fixture cwd and fresh seat metadata. Copy only
+/// positive defaults here so nested calls retain the identity it just assigned.
+pub fn magi_cli_env(home: &Path, binary_key: &str) -> BTreeMap<String, String> {
+    let command = magi_cli(home);
+    let mut env: BTreeMap<_, _> = command
+        .get_envs()
+        .filter_map(|(key, value)| {
+            value.map(|value| (key.to_str().unwrap().into(), value.to_str().unwrap().into()))
+        })
+        .collect();
+    env.insert(
+        binary_key.into(),
+        command.get_program().to_str().unwrap().into(),
+    );
+    env
+}
+
 /// `set_home` is a process-wide global, so scenes that share one test binary
 /// (multiple runs, includes a `--resume`) must not run concurrently or they
 /// will clobber each other's run directory. Take one of these for the life of
@@ -87,7 +122,12 @@ where
             // exactly this one test and no runtime exists yet, so nothing else
             // reads the environment concurrently.
             // SAFETY: single test per process, set before any runtime or task.
-            unsafe { std::env::set_var(magi::config::Config::CONFIG_DIR_ENV, "") };
+            unsafe {
+                std::env::set_var(magi::config::Config::CONFIG_DIR_ENV, "");
+                for key in SEAT_ENV {
+                    std::env::remove_var(key);
+                }
+            };
         }
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -106,6 +146,10 @@ where
     let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
         .args([name, "--exact", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, "1")
+        .env_remove("MAGI_RUN")
+        .env_remove("MAGI_NODE")
+        .env_remove("MAGI_SEAT")
+        .env_remove("MAGI_TURN_SCOPE")
         // Named and empty: no machine layer. `Config::discover` in an
         // integration binary links the non-test library, so the operator's own
         // `config.toml` would otherwise merge with a fixture's `magi.toml` and
@@ -126,6 +170,7 @@ where
 
 /// Declares `async fn name() { .. }` as a `#[test]` that runs through
 /// [`isolated`]. The body is written exactly as a `#[tokio::test]` body was.
+#[allow(unused_macros)]
 macro_rules! e2e {
     ($(#[$m:meta])* async fn $name:ident() $body:block) => {
         $(#[$m])*
@@ -135,6 +180,7 @@ macro_rules! e2e {
         }
     };
 }
+#[allow(unused_imports)]
 pub(crate) use e2e;
 
 /// Judge behaviour for a scenario.

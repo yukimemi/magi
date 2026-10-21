@@ -3,7 +3,7 @@
 mod common;
 
 use std::collections::BTreeMap;
-use std::process::{Command, Output};
+use std::process::Output;
 
 use magi::config::{AgentKind, AgentSpec, Config};
 use magi::queue::{CHAT_NODE, Queue, Source, Task, TaskStatus};
@@ -74,10 +74,9 @@ impl Fixture {
         self.queue().get(&self.task.id).unwrap()
     }
     fn cli(&self, args: &[&str], node: &str, scope: &str) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_magi"))
+        common::magi_cli(self.tmp.path())
             .args(["task"])
             .args(args)
-            .env("MAGI_HOME", self.tmp.path())
             .env("MAGI_CONFIG_DIR", "")
             .env("MAGI_RUN", &self.talk)
             .env("MAGI_NODE", node)
@@ -305,7 +304,6 @@ fi
         ("PATH".into(), cli_path),
         ("MAGI_HOME".into(), f.tmp.path().to_str().unwrap().into()),
         ("MAGI_CONFIG_DIR".into(), String::new()),
-        ("MAGI_TEST_BINARY".into(), env!("CARGO_BIN_EXE_magi").into()),
         ("TEST_TASK".into(), f.task.id.clone()),
         ("FOREIGN_TASK".into(), foreign.id.clone()),
         ("FOREIGN_TALK".into(), foreign_talk.id.clone()),
@@ -329,6 +327,9 @@ fi
         ),
         ("REPO".into(), repo.to_str().unwrap().into()),
     ]);
+    cfg.agents[0]
+        .env
+        .extend(common::magi_cli_env(f.tmp.path(), "MAGI_TEST_BINARY"));
     let lease = f.talks.claim_turn(&f.talk).unwrap().unwrap();
     talk::say(&lease, &mut t, &f.talks, &cfg, &words, vec![])
         .await
@@ -500,7 +501,7 @@ esac
     )
     .unwrap();
     let invoke = |request: &str, head: &str, workflow: &str| {
-        Command::new(env!("CARGO_BIN_EXE_magi"))
+        common::magi_cli(f.tmp.path())
             .args([
                 "task",
                 "control",
@@ -513,9 +514,7 @@ esac
                 "--workflow",
                 workflow,
             ])
-            .env("MAGI_HOME", f.tmp.path())
             .env("MAGI_CONFIG_DIR", "")
-            .env(magi::updater::NO_AUTOUPDATE_ENV, "1")
             .env("MAGI_RUN", &f.talk)
             .env("MAGI_NODE", CHAT_NODE)
             .env("MAGI_TURN_SCOPE", "repository")
@@ -620,7 +619,8 @@ fn chat_controls_through_real_cli_child() {
         magi::run::set_home(f.tmp.path().to_owned());
         let artifacts = f.talks.artifacts_of(&f.talk);
         let mut spec = f.run.config.agents[0].clone();
-        spec.env.insert("MAGI_CONFIG_DIR".into(), String::new());
+        spec.env
+            .extend(common::magi_cli_env(f.tmp.path(), "MAGI_TEST_BINARY"));
         // The launcher must override a stale per-agent store path, even for
         // read-only turns: CLI authorization reads the same talk as the bridge.
         spec.env.insert(
@@ -632,15 +632,17 @@ fn chat_controls_through_real_cli_child() {
                 .into_owned(),
         );
         spec.command = vec![
-            env!("CARGO_BIN_EXE_magi").into(),
+            common::magi_cli(f.tmp.path())
+                .get_program()
+                .to_str()
+                .unwrap()
+                .into(),
             "task".into(),
             "control".into(),
             "hold".into(),
             f.task.id.clone(),
             "via launcher".into(),
         ];
-        spec.env
-            .insert(magi::updater::NO_AUTOUPDATE_ENV.into(), "1".into());
         let mut seat = magi::agent::SeatState::new("chat", "mock", 1);
         let output = magi::agent::invoke(
             &spec,
@@ -685,7 +687,8 @@ fn windows_sandboxed_chat_controls_without_direct_store_writes() {
             let sentinel = f.tmp.path().join("queue/protected.txt");
             std::fs::write(&sentinel, "unchanged").unwrap();
             let mut spec = f.run.config.agents[0].clone();
-            spec.env.insert("MAGI_CONFIG_DIR".into(), String::new());
+            spec.env
+                .extend(common::magi_cli_env(f.tmp.path(), "MAGI_TEST_BINARY"));
             spec.kind = AgentKind::Codex;
             spec.command.clear();
             // Exercise environments that automatically exclude credential names.
@@ -695,8 +698,6 @@ fn windows_sandboxed_chat_controls_without_direct_store_writes() {
                 "-c".into(),
                 "shell_environment_policy.inherit=all".into(),
             ]);
-            spec.env
-                .insert("MAGI_TEST_BINARY".into(), env!("CARGO_BIN_EXE_magi").into());
             spec.env.insert("MAGI_TEST_TASK".into(), f.task.id.clone());
             let prompt = r#"Run these two PowerShell operations using your shell tool, without asking for approval:
 1. try { [IO.File]::WriteAllText((Join-Path $env:MAGI_HOME 'queue/protected.txt'), 'changed'); Write-Output 'STORE_WRITE_ALLOWED' } catch { Write-Output 'STORE_WRITE_DENIED' }

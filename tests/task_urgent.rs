@@ -1,6 +1,6 @@
 //! The CLI reports the persisted urgent setting in both mutation and show.
 
-use std::process::Command;
+mod common;
 
 use magi::queue::{Queue, Source, Task};
 
@@ -16,9 +16,8 @@ fn urgent_command_and_show_report_saved_state() {
     );
     queue.put(&mut task).unwrap();
     let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_magi"))
+        common::magi_cli(home.path())
             .args(args)
-            .env("MAGI_HOME", home.path())
             .env("NO_COLOR", "1")
             .output()
             .unwrap()

@@ -1241,10 +1241,17 @@ try {{
             ])
             .arg("pwsh");
     }
+    let cli = common::magi_cli(&fx.home);
+    for (key, value) in cli.get_envs() {
+        if let Some(value) = value {
+            cmd.env(key, value);
+        } else {
+            cmd.env_remove(key);
+        }
+    }
     cmd.current_dir(&fx.seat)
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .env("MAGI_HOME", &fx.home)
-        .env("MAGI_TEST_BINARY", env!("CARGO_BIN_EXE_magi"))
+        .env("MAGI_TEST_BINARY", cli.get_program())
         .env("UNRELATED", unrelated.join("denied"))
         .env_remove("MAGI_RUN")
         .env_remove("MAGI_NODE")
@@ -1279,9 +1286,8 @@ try {{
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     checked(
-        Command::new(env!("CARGO_BIN_EXE_magi"))
+        common::magi_cli(&fx.home)
             .current_dir(&fx.seat)
-            .env("MAGI_HOME", &fx.home)
             .env_remove("MAGI_RUN")
             .env_remove("MAGI_NODE")
             .env_remove("MAGI_SEAT")
