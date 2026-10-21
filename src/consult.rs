@@ -10,8 +10,8 @@
 //!
 //! - **One place decides.** [`origin_talk`] is the only judge of "does this
 //!   question have a chat to ask"; the web view and both entry points use it.
-//!   [`associated_talk`] resolves the same association for navigation even
-//!   when the question can no longer be consulted.
+//!   [`associated_talk`] resolves typed ownership links for navigation,
+//!   independently of consultation eligibility.
 //! - **Not a choice.** The hand-over never goes into `Question::choices` and
 //!   never touches `Question::answer`: the question stays `Open`, its
 //!   validation and the choice actions stay as they were.
@@ -36,15 +36,65 @@ pub fn origin_talk(tasks: &[Task], talks: &[Talk], q: &Question) -> Option<Talk>
     if !q.status.open() || q.node == crate::bump::NOTICE_NODE {
         return None;
     }
-    associated_talk(tasks, talks, q)
+    let task = crate::daemon::task_of_question(tasks, q)?;
+    let chat = chat_talk_of(tasks, task)?;
+    talks.iter().find(|talk| talk.id == chat).cloned()
 }
 
 /// The existing conversation associated with a question, regardless of whether
 /// the question is still eligible for consultation.
 pub fn associated_talk(tasks: &[Task], talks: &[Talk], q: &Question) -> Option<Talk> {
-    let task = crate::daemon::task_of_question(tasks, q)?;
-    let run = chat_talk_of(tasks, task)?;
-    talks.iter().find(|t| t.id == run).cloned()
+    associated_talk_with_watches(tasks, talks, q, &[])
+}
+
+/// A typed ownership link, shared by association and the web's selective loader.
+#[derive(Clone, Copy)]
+pub(crate) enum QuestionTaskRef<'a> {
+    Task(&'a str),
+    Run(&'a str),
+}
+
+pub(crate) fn question_task_refs<'a>(
+    q: &'a Question,
+    watches: &'a [crate::release_watch::WatchState],
+) -> Vec<QuestionTaskRef<'a>> {
+    let mut refs = vec![if q.run_names_task() {
+        QuestionTaskRef::Task(&q.run)
+    } else {
+        QuestionTaskRef::Run(&q.run)
+    }];
+    for watch in watches
+        .iter()
+        .filter(|w| w.question.as_deref() == Some(&q.id))
+    {
+        refs.extend(watch.run.as_deref().map(QuestionTaskRef::Run));
+        refs.extend(watch.held_task.as_deref().map(QuestionTaskRef::Task));
+    }
+    refs
+}
+
+/// Explicit links may fill a missing owner, but conflicting owners fail closed.
+/// This navigation-only resolution never changes consultation eligibility.
+pub(crate) fn associated_talk_with_watches(
+    tasks: &[Task],
+    talks: &[Talk],
+    q: &Question,
+    watches: &[crate::release_watch::WatchState],
+) -> Option<Talk> {
+    let mut owner: Option<&Task> = None;
+    for reference in question_task_refs(q, watches) {
+        for task in tasks.iter().filter(|task| match reference {
+            QuestionTaskRef::Task(id) => task.id == id,
+            QuestionTaskRef::Run(id) => task.runs.iter().any(|run| run == id),
+        }) {
+            if owner.is_some_and(|previous| previous.id != task.id) {
+                return None;
+            }
+            owner = Some(task);
+        }
+    }
+    let chat = chat_talk_of(tasks, owner?)?;
+    talks.iter().find(|talk| talk.id == chat).cloned()
 }
 
 /// The talk `start` descends from: the id recorded on a task
