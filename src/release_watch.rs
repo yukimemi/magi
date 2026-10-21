@@ -400,8 +400,14 @@ pub(crate) fn register(home: &Path, repo: &Path, url: &str, run: &str) {
     w.save(&pr, &st);
 }
 
-/// Saved explicit ownership links for a batch of question associations.
-pub(crate) fn states_for_questions(home: &Path) -> Vec<WatchState> {
+/// Saved explicit ownership links, loaded only for batches with watch questions.
+pub(crate) fn states_for_questions(home: &Path, questions: &[Question]) -> Vec<WatchState> {
+    if !questions
+        .iter()
+        .any(|q| q.node == crate::bump::NOTICE_NODE && q.seat == "release-watch")
+    {
+        return Vec::new();
+    }
     Watcher::new(Box::new(GhForge), home.to_path_buf()).stored()
 }
 

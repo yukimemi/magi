@@ -63,9 +63,12 @@ pub(crate) fn question_task_refs<'a>(
     } else {
         QuestionTaskRef::Run(&q.run)
     }];
-    for watch in watches
+    let mut matches = watches
         .iter()
-        .filter(|w| w.question.as_deref() == Some(&q.id))
+        .filter(|w| w.question.as_deref() == Some(&q.id));
+    // Duplicate records are ambiguous even if they currently name one owner.
+    if let Some(watch) = matches.next()
+        && matches.next().is_none()
     {
         refs.extend(watch.run.as_deref().map(QuestionTaskRef::Run));
         refs.extend(watch.held_task.as_deref().map(QuestionTaskRef::Task));

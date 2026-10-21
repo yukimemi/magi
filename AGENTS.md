@@ -2640,10 +2640,13 @@ with `magi answer` or puts the decision points to the owner in the chat.
   `consult::associated_talk` / `associated_talk_with_watches` separately:
   `Question::run_names_task()` distinguishes exact task ids from run ids;
   release-watch records naming the question supply typed `run` / `held_task`
-  links. Conflicting resolved owners suppress navigation. Follow-up ancestry
+  links only when exactly one record matches; ambiguous watch links are ignored.
+  Conflicting resolved owners suppress navigation. Follow-up ancestry
   uses `chat_talk_of`. Both web origin paths preload the same links once per
-  request. `origin_chat` enables "Open chat" ("Open chat (closed)" for a
-  closed talk); a physically missing talk has no button. These extra links
+  request, skipping watch-store reads unless a `bump::NOTICE_NODE` question
+  with seat `release-watch` is present. `origin_chat` enables "Open chat"
+  ("Open chat (closed)" for a closed talk); a physically missing talk has no
+  button. These extra links
   never expand consultation eligibility or change `daemon::task_of_question`.
 - **Never a choice.** Nothing is added to `Question::choices` and
   `Question::answer` is untouched. The question stays `Open`; `Question::consult`

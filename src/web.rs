@@ -7392,11 +7392,7 @@ fn question_origin_inputs(ui: &Ui, questions: &[Question]) -> ApiResult<Question
             .flatten()
             .filter(|task| task.id == id)
     };
-    let watches = if questions.is_empty() {
-        Vec::new()
-    } else {
-        crate::release_watch::states_for_questions(&ui.home)
-    };
+    let watches = crate::release_watch::states_for_questions(&ui.home, questions);
     let mut index = None;
     let mut tasks = HashMap::new();
     let mut talks = HashMap::new();
@@ -23562,7 +23558,7 @@ mod tests {
         let mut release = Question::new(
             "release-record".into(),
             crate::bump::NOTICE_NODE.into(),
-            "seat".into(),
+            "release-watch".into(),
             "Release".into(),
             String::new(),
             vec![],
@@ -23578,6 +23574,14 @@ mod tests {
         std::fs::create_dir_all(&watch_dir).unwrap();
         let watch_path = watch_dir.join("watch.json");
         std::fs::write(&watch_path, serde_json::to_vec(&watch).unwrap()).unwrap();
+        // Ordinary questions and bump notices do not need watch-store I/O.
+        for batch in [
+            Vec::new(),
+            questions.iter().map(|(q, _, _)| q.clone()).collect(),
+        ] {
+            let (_, _, watches) = question_origin_inputs(&ui, &batch).unwrap();
+            assert!(watches.is_empty());
+        }
         questions.push((release.clone(), true, false));
 
         let views = questions_list(State(ui.clone())).await.unwrap().0;
@@ -23618,6 +23622,16 @@ mod tests {
             assert!(crate::consult::origin_talk(&tasks, &talks, &release).is_none());
         }
         std::fs::write(&watch_path, serde_json::to_vec(&watch).unwrap()).unwrap();
+        // Even identical duplicate records are ambiguous: ignore their links.
+        let duplicate_path = watch_dir.join("duplicate.json");
+        std::fs::write(&duplicate_path, serde_json::to_vec(&watch).unwrap()).unwrap();
+        let (tasks, talks, watches) =
+            question_origin_inputs(&ui, std::slice::from_ref(&release)).unwrap();
+        assert!(
+            crate::consult::associated_talk_with_watches(&tasks, &talks, &release, &watches)
+                .is_none()
+        );
+        std::fs::remove_file(duplicate_path).unwrap();
         // Another explicit owner is a conflict even if it has no chat.
         let mut unrelated = Task::new(
             "other".into(),
