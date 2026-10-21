@@ -1,5 +1,7 @@
 //! Bounded reclamation of retained attempts and Cargo outputs. Source recovery
 //! and build eviction have separate authority: evicting a target never retires a run.
+pub mod reconcile;
+
 use crate::{
     git,
     proc::Quiet as _,
@@ -813,133 +815,13 @@ async fn retire_empty(
                         && !state.released(),
                     "PR ownership or recovery checkpoint"
                 );
-                let paths = worktrees(&state).await?;
-                let mut guards = Vec::new();
-                let mut cargo_guards = Vec::new();
-                for path in &paths {
-                    guards.push(OutputLease::take(path, true)?);
-                    ensure!(
-                        git::rev_parse(path, "HEAD").await? == state.base_commit,
-                        "unique or unrecorded commits"
-                    );
-                    ensure!(
-                        git::git(path, &["status", "--porcelain", "--untracked-files=all"])
-                            .await?
-                            .is_empty(),
-                        "tracked or untracked source changes"
-                    );
-                    ensure!(
-                        git::git(
-                            path,
-                            &[
-                                "status",
-                                "--porcelain",
-                                "--untracked-files=all",
-                                "--ignored",
-                                "--",
-                                ".",
-                                ":(exclude)target"
-                            ]
-                        )
-                        .await?
-                        .is_empty(),
-                        "source changes, ignored files or build outputs"
-                    );
-                    match std::fs::symlink_metadata(path.join("target")) {
-                        Ok(_) => cargo_guards.extend(verify_residue(home, id, path).await?),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error.into()),
-                    }
-                    for checkpoint in [
-                        "rebase-merge",
-                        "rebase-apply",
-                        "sequencer",
-                        "BISECT_LOG",
-                        "REVERT_HEAD",
-                        "AUTO_MERGE",
-                        "MERGE_MSG",
-                    ] {
-                        let location = git::git(
-                            path,
-                            &[
-                                "rev-parse",
-                                "--path-format=absolute",
-                                "--git-path",
-                                checkpoint,
-                            ],
-                        )
-                        .await?;
-                        ensure!(
-                            !Path::new(location.trim()).exists(),
-                            "retained Git recovery metadata: {checkpoint}"
-                        );
-                    }
-                    // Git also initializes ORIG_HEAD when creating a worktree.
-                    // Only an origin outside the base is a recovery source.
-                    if let Ok(original) = git::rev_parse(path, "ORIG_HEAD").await {
-                        ensure!(
-                            git::git_raw(
-                                path,
-                                &["merge-base", "--is-ancestor", &original, &state.base_commit]
-                            )
-                            .await?
-                            .ok(),
-                            "ORIG_HEAD retains commits outside the original base"
-                        );
-                    }
-                    let heads = git::git(path, &["reflog", "show", "--format=%H", "HEAD"]).await?;
-                    for head in heads.lines().collect::<std::collections::BTreeSet<_>>() {
-                        ensure!(
-                            git::git_raw(
-                                path,
-                                &["merge-base", "--is-ancestor", head, &state.base_commit]
-                            )
-                            .await?
-                            .ok(),
-                            "worktree reflog retains commits outside the original base"
-                        );
-                    }
-                    for checkpoint in ["CHERRY_PICK_HEAD", "MERGE_HEAD", "REBASE_HEAD"] {
-                        ensure!(
-                            !git::git_raw(path, &["rev-parse", "--verify", checkpoint])
-                                .await?
-                                .ok(),
-                            "unfinished Git operation"
-                        );
-                    }
-                }
-                // Missing worktrees cannot establish that unrecorded prep edits
-                // were empty. Recorded candidates must also point at the base.
-                if paths.is_empty() && state.retired_to.as_ref() == Some(latest) {
-                    return Ok(());
-                }
-                ensure!(!paths.is_empty(), "no worktrees to prove empty");
-                for candidate in &state.candidates {
-                    ensure!(
-                        (paths.contains(&candidate.worktree)
-                            || state.retired_to.as_ref() == Some(latest)
-                                && !candidate.worktree.exists())
-                            && git::rev_parse(&state.repo, &candidate.branch).await?
-                                == state.base_commit,
-                        "candidate recovery source"
-                    );
-                }
-                let pattern = format!("refs/heads/magi/{}/", state.short());
-                let branches = git::git(
-                    &state.repo,
-                    &["for-each-ref", "--format=%(objectname)", &pattern],
-                )
-                .await?;
-                ensure!(
-                    branches.lines().all(|head| head == state.base_commit),
-                    "unrecorded candidate branch changes"
-                );
+                let proof = prove_empty(home, &state, latest).await?;
                 commit_retirement(home, &queue, &task, &mut state, latest, &sources, now)?;
                 // Durable retirement precedes removal. A crash retries removal
                 // using the same proof; it cannot make this attempt resumable.
-                for path in paths {
+                for path in &proof.paths {
                     ensure!(
-                        git::worktree_remove_clean(&state.repo, &path).await?,
+                        git::worktree_remove_clean(&state.repo, path).await?,
                         "Git refused clean worktree removal"
                     );
                 }
@@ -952,6 +834,222 @@ async fn retire_empty(
             }
         }
     }
+}
+
+struct EmptyProof {
+    paths: Vec<PathBuf>,
+    _outputs: Vec<OutputLease>,
+    _cargo: Vec<File>,
+}
+
+// Compare actual source bytes with the original tree independently of index
+// stat caches, assume-unchanged flags, sparse checkout and fsmonitor hints.
+async fn tracked_base(worktree: &Path, base: &str) -> Result<()> {
+    let tree = git::git(worktree, &["ls-tree", "-r", "--full-tree", "-z", base]).await?;
+    let mut files = Vec::new();
+    let mut blobs = Vec::new();
+    for record in tree.split('\0').filter(|s| !s.is_empty()) {
+        let (header, name) = record.split_once('\t').context("unknown tree record")?;
+        let parts: Vec<_> = header.split_whitespace().collect();
+        ensure!(
+            parts.len() == 3 && matches!(parts[0], "100644" | "100755") && parts[1] == "blob",
+            "unsupported tracked source kind"
+        );
+        let path = worktree.join(name);
+        let meta = std::fs::symlink_metadata(&path)?;
+        ensure!(
+            meta.is_file() && !meta.file_type().is_symlink() && path.canonicalize()? == path,
+            "noncanonical tracked source"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            ensure!(
+                (meta.permissions().mode() & 0o111 != 0) == (parts[0] == "100755"),
+                "tracked executable mode differs from original base"
+            );
+        }
+        files.push(path.to_str().context("non UTF-8 source")?.to_owned());
+        blobs.push(parts[2].to_owned());
+    }
+    for (paths, expected) in files.chunks(64).zip(blobs.chunks(64)) {
+        let mut args = vec!["hash-object", "--no-filters", "--"];
+        args.extend(paths.iter().map(String::as_str));
+        let actual = git::git(worktree, &args).await?;
+        ensure!(
+            actual.lines().eq(expected.iter().map(String::as_str)),
+            "tracked bytes differ from original base"
+        );
+    }
+    Ok(())
+}
+
+async fn prove_empty(home: &Path, state: &RunState, authority: &str) -> Result<EmptyProof> {
+    let id = &state.id;
+    let paths = worktrees(state).await?;
+    let mut guards = Vec::new();
+    let mut cargo_guards = Vec::new();
+    for path in &paths {
+        guards.push(OutputLease::take(path, true)?);
+        ensure!(
+            git::rev_parse(path, "HEAD").await? == state.base_commit,
+            "unique or unrecorded commits"
+        );
+        ensure!(
+            git::git(
+                path,
+                &[
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all"
+                ]
+            )
+            .await?
+            .is_empty(),
+            "tracked or untracked source changes"
+        );
+        ensure!(
+            git::git(
+                path,
+                &[
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=all",
+                    "--ignored",
+                    "--",
+                    ".",
+                    ":(exclude)target"
+                ]
+            )
+            .await?
+            .is_empty(),
+            "source changes, ignored files or build outputs"
+        );
+        tracked_base(path, &state.base_commit).await?;
+        match std::fs::symlink_metadata(path.join("target")) {
+            Ok(_) => cargo_guards.extend(verify_residue(home, id, path).await?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        for checkpoint in [
+            "rebase-merge",
+            "rebase-apply",
+            "sequencer",
+            "BISECT_LOG",
+            "REVERT_HEAD",
+            "AUTO_MERGE",
+            "MERGE_MSG",
+            "CHERRY_PICK_HEAD",
+            "MERGE_HEAD",
+            "REBASE_HEAD",
+        ] {
+            let location = git::git(
+                path,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    checkpoint,
+                ],
+            )
+            .await?;
+            ensure!(
+                matches!(std::fs::symlink_metadata(location.trim()), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+                "retained Git recovery metadata: {checkpoint}"
+            );
+        }
+        // Git also initializes ORIG_HEAD when creating a worktree.
+        // Only an origin outside the base is a recovery source.
+        let origin_path = git::git(
+            path,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "ORIG_HEAD",
+            ],
+        )
+        .await?;
+        match std::fs::symlink_metadata(origin_path.trim()) {
+            Ok(meta) => {
+                ensure!(
+                    meta.is_file() && !meta.file_type().is_symlink(),
+                    "unknown ORIG_HEAD artifact"
+                );
+                git::rev_parse(path, "ORIG_HEAD")
+                    .await
+                    .context("unreadable ORIG_HEAD")?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        if let Ok(original) = git::rev_parse(path, "ORIG_HEAD").await {
+            ensure!(
+                git::git_raw(
+                    path,
+                    &["merge-base", "--is-ancestor", &original, &state.base_commit]
+                )
+                .await?
+                .ok(),
+                "ORIG_HEAD retains commits outside the original base"
+            );
+        }
+        let heads = git::git(path, &["reflog", "show", "--format=%H", "HEAD"]).await?;
+        for head in heads.lines().collect::<std::collections::BTreeSet<_>>() {
+            ensure!(
+                git::git_raw(
+                    path,
+                    &["merge-base", "--is-ancestor", head, &state.base_commit]
+                )
+                .await?
+                .ok(),
+                "worktree reflog retains commits outside the original base"
+            );
+        }
+        for checkpoint in ["CHERRY_PICK_HEAD", "MERGE_HEAD", "REBASE_HEAD"] {
+            ensure!(
+                !git::git_raw(path, &["rev-parse", "--verify", checkpoint])
+                    .await?
+                    .ok(),
+                "unfinished Git operation"
+            );
+        }
+    }
+    // Missing worktrees cannot establish that unrecorded prep edits
+    // were empty. Recorded candidates must also point at the base.
+    if paths.is_empty() && state.retired_to.as_deref() == Some(authority) {
+        return Ok(EmptyProof {
+            paths,
+            _outputs: guards,
+            _cargo: cargo_guards,
+        });
+    }
+    ensure!(!paths.is_empty(), "no worktrees to prove empty");
+    for candidate in &state.candidates {
+        ensure!(
+            (paths.contains(&candidate.worktree)
+                || state.retired_to.as_deref() == Some(authority) && !candidate.worktree.exists())
+                && git::rev_parse(&state.repo, &candidate.branch).await? == state.base_commit,
+            "candidate recovery source"
+        );
+    }
+    let pattern = format!("refs/heads/magi/{}/", state.short());
+    let branches = git::git(
+        &state.repo,
+        &["for-each-ref", "--format=%(objectname)", &pattern],
+    )
+    .await?;
+    ensure!(
+        branches.lines().all(|head| head == state.base_commit),
+        "unrecorded candidate branch changes"
+    );
+    Ok(EmptyProof {
+        paths,
+        _outputs: guards,
+        _cargo: cargo_guards,
+    })
 }
 
 /// The only task-write critical section in retirement. All Git proof and
@@ -1184,6 +1282,325 @@ mod tests {
                 .unwrap();
             task
         }
+    }
+
+    async fn reconciliation_plan(f: &Fx, task: &Task, source: &RunState) -> serde_json::Value {
+        let path = reconcile::run(&f.home, &task.id, &source.id, None)
+            .await
+            .unwrap();
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn reconciliation_blanket_retention_selected_source_and_repeated_batches() {
+        let f = Fx::new().await;
+        let mut source = f.run("aa00", true).await;
+        let alternative = f.run("aa01", true).await;
+        let head = git::rev_parse(&f.repo, &source.candidates[0].branch)
+            .await
+            .unwrap();
+        source.reviewed_commits = Some(vec![head.clone()]);
+        source.save_under(&f.home).unwrap();
+        let mut runs = vec![source.clone(), alternative.clone()];
+        for i in 2..14 {
+            runs.push(f.run(&format!("aa{i:02}"), false).await);
+        }
+        let mut task = f.task(&runs);
+        task.pr_recovery = Some(crate::pr_recovery::Selection {
+            url: "https://example.invalid/pull/1".into(),
+            branch: "selected".into(),
+            head: head.clone(),
+            source_head: Some(head.clone()),
+            source_run: Some(source.id.clone()),
+            source_proof: None,
+            disposition: Some(crate::pr_recovery::Disposition::Land),
+            instruction: task.instruction.clone(),
+            approved_at: Timestamp::now(),
+        });
+        source.pr_recovery = task.pr_recovery.clone();
+        source.save_under(&f.home).unwrap();
+        runs[0] = source.clone();
+        crate::queue::Queue::at(f.home.join("queue"))
+            .put(&mut task)
+            .unwrap();
+        crate::pr_recovery::retain_sources(&task, &f.home).unwrap();
+        let task_before = serde_json::to_value(&task).unwrap();
+        let mut report = Report::default();
+        retire_empty(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+        assert_eq!(
+            report.retired, 0,
+            "automatic cleanup must still refuse blanket markers"
+        );
+        assert!(
+            report
+                .retained
+                .iter()
+                .any(|reason| reason.contains("explicitly retained"))
+        );
+        let mut total = 0;
+        for expected in [5, 5, 2, 0] {
+            let plan = reconciliation_plan(&f, &task, &source).await;
+            let selected: Vec<_> = plan["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["selected"] == true)
+                .collect();
+            assert_eq!(selected.len(), expected, "{plan:#}");
+            for e in &selected {
+                assert!(
+                    RunState::load_under(e["run"].as_str().unwrap(), &f.home)
+                        .unwrap()
+                        .retired_to
+                        .is_none()
+                );
+            }
+            let operation = plan["id"].as_str().unwrap();
+            for _ in 0..2 {
+                reconcile::run(&f.home, &task.id, &source.id, Some(operation))
+                    .await
+                    .unwrap();
+            }
+            total += expected;
+        }
+        assert_eq!(total, 12);
+        for run in &runs {
+            let dir = f.home.join("runs").join(&run.id);
+            assert!(dir.join("run.json").exists());
+            assert!(dir.join("retain-recovery-sources").exists());
+            assert!(
+                git::branch_exists(&f.repo, &run.candidates[0].branch)
+                    .await
+                    .unwrap()
+            );
+        }
+        assert!(source.candidates[0].worktree.exists());
+        assert!(alternative.candidates[0].worktree.exists());
+        assert_eq!(
+            git::rev_parse(&f.repo, &source.candidates[0].branch)
+                .await
+                .unwrap(),
+            head
+        );
+        assert_eq!(
+            serde_json::to_value(
+                crate::queue::Queue::at(f.home.join("queue"))
+                    .get(&task.id)
+                    .unwrap()
+            )
+            .unwrap(),
+            task_before
+        );
+        assert_eq!(
+            runs.iter()
+                .filter(|r| RunState::load_under(&r.id, &f.home)
+                    .unwrap()
+                    .retired_to
+                    .is_none())
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_refuses_live_dirty_ignored_unknown_and_git_checkpoints() {
+        let f = Fx::new().await;
+        let source = f.run("ab00", true).await;
+        let mut runs = vec![source.clone()];
+        for i in 1..9 {
+            runs.push(f.run(&format!("ab{i:02}"), false).await);
+        }
+        std::fs::write(runs[1].candidates[0].worktree.join("source"), "dirty").unwrap();
+        std::fs::write(runs[2].candidates[0].worktree.join("untracked"), "source").unwrap();
+        std::fs::create_dir(runs[3].candidates[0].worktree.join("scratch")).unwrap();
+        std::fs::write(
+            runs[3].candidates[0].worktree.join("scratch/source"),
+            "ignored source",
+        )
+        .unwrap();
+        std::fs::write(
+            runs[4].worktree_root().join("unknown"),
+            "unregistered source",
+        )
+        .unwrap();
+        let checkpoint = git::git(
+            &runs[5].candidates[0].worktree,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "sequencer",
+            ],
+        )
+        .await
+        .unwrap();
+        std::fs::create_dir(checkpoint.trim()).unwrap();
+        runs[6].driver_exited = false;
+        runs[6].driver_pid = Some(std::process::id());
+        runs[6].driver_started_at = crate::proc::process_started_at(std::process::id());
+        runs[6].save_under(&f.home).unwrap();
+        runs[7].driver_exited = false;
+        runs[7].driver_pid = None;
+        runs[7].save_under(&f.home).unwrap();
+        let hidden = &runs[8].candidates[0].worktree;
+        git::git(hidden, &["update-index", "--assume-unchanged", "source"])
+            .await
+            .unwrap();
+        std::fs::write(hidden.join("source"), "hidden dirty implementation").unwrap();
+        assert!(
+            git::git(hidden, &["status", "--porcelain"])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let task = f.task(&runs);
+        crate::pr_recovery::retain_sources(&task, &f.home).unwrap();
+        let plan = reconciliation_plan(&f, &task, &source).await;
+        assert!(
+            plan["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["selected"] == false),
+            "{plan:#}"
+        );
+        for run in &runs {
+            assert!(run.candidates[0].worktree.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_stale_plans_and_changed_markers_fail_closed() {
+        let f = Fx::new().await;
+        let source = f.run("ac00", true).await;
+        let empty = f.run("ac01", false).await;
+        let task = f.task(&[source.clone(), empty.clone()]);
+        crate::pr_recovery::retain_sources(&task, &f.home).unwrap();
+        let plan = reconciliation_plan(&f, &task, &source).await;
+        std::fs::write(
+            f.home.join("runs").join(&source.id).join("new-report"),
+            "new review checkpoint",
+        )
+        .unwrap();
+        assert!(
+            reconcile::run(&f.home, &task.id, &source.id, plan["id"].as_str())
+                .await
+                .is_err()
+        );
+        assert!(empty.candidates[0].worktree.exists());
+        assert!(
+            RunState::load_under(&empty.id, &f.home)
+                .unwrap()
+                .retired_to
+                .is_none()
+        );
+        let marker = f
+            .home
+            .join("runs")
+            .join(&empty.id)
+            .join("retain-recovery-sources");
+        std::fs::write(&marker, "different owner").unwrap();
+        let plan = reconciliation_plan(&f, &task, &source).await;
+        assert!(
+            plan["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["selected"] == false)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_resumes_only_its_exact_durable_fence() {
+        let f = Fx::new().await;
+        let source = f.run("ad00", true).await;
+        let empty = f.run("ad01", false).await;
+        let task = f.task(&[source.clone(), empty.clone()]);
+        crate::pr_recovery::retain_sources(&task, &f.home).unwrap();
+        let plan = reconciliation_plan(&f, &task, &source).await;
+        let id = plan["id"].as_str().unwrap();
+        assert!(
+            reconcile::interrupt_after_fence(&f.home, &task, id)
+                .await
+                .is_err()
+        );
+        assert!(empty.candidates[0].worktree.exists());
+        assert_eq!(
+            RunState::load_under(&empty.id, &f.home)
+                .unwrap()
+                .retired_to
+                .as_ref(),
+            Some(&source.id)
+        );
+        reconcile::run(&f.home, &task.id, &source.id, Some(id))
+            .await
+            .unwrap();
+        assert!(!empty.candidates[0].worktree.exists());
+        // Model an interrupted removal: restore precisely the approved base worktree.
+        git::worktree_add_branch(
+            &f.repo,
+            &empty.candidates[0].worktree,
+            "restore-empty",
+            &f.base,
+        )
+        .await
+        .unwrap();
+        // Recreated Git administration differs from approval and is refused.
+        assert!(
+            reconcile::run(&f.home, &task.id, &source.id, Some(id))
+                .await
+                .is_err()
+        );
+        assert!(empty.candidates[0].worktree.exists());
+        let mut changed = RunState::load_under(&empty.id, &f.home).unwrap();
+        changed.prep_failure = Some("new owner edit".into());
+        changed.save_under(&f.home).unwrap();
+        assert!(
+            reconcile::run(&f.home, &task.id, &source.id, Some(id))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_checks_prep_intent_reflogs_and_unknown_run_fields() {
+        let f = Fx::new().await;
+        let source = f.run("ae00", true).await;
+        let mut prep = f.run("ae01", false).await;
+        let candidate = prep.candidates.pop().unwrap();
+        prep.event("prep-intent", serde_json::json!({"branch":candidate.branch,"worktree":candidate.worktree,"start":f.base,"picks":[]}).to_string());
+        prep.save_under(&f.home).unwrap();
+        let reset = f.run("ae02", false).await;
+        let wt = &reset.candidates[0].worktree;
+        std::fs::write(wt.join("source"), "unique hidden in reflog").unwrap();
+        git::git(wt, &["add", "."]).await.unwrap();
+        git::git(wt, &["commit", "-m", "unique implementation"])
+            .await
+            .unwrap();
+        git::git(wt, &["reset", "--hard", &f.base]).await.unwrap();
+        let unknown = f.run("ae03", false).await;
+        let unknown_path = f.home.join("runs").join(&unknown.id).join("run.json");
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&unknown_path).unwrap()).unwrap();
+        raw["unknown_checkpoint"] = serde_json::json!({"source":"retain"});
+        std::fs::write(unknown_path, serde_json::to_vec_pretty(&raw).unwrap()).unwrap();
+        let task = f.task(&[source.clone(), prep.clone(), reset.clone(), unknown.clone()]);
+        crate::pr_recovery::retain_sources(&task, &f.home).unwrap();
+        let plan = reconciliation_plan(&f, &task, &source).await;
+        let selected: Vec<_> = plan["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["selected"] == true)
+            .collect();
+        assert_eq!(selected.len(), 1, "{plan:#}");
+        assert_eq!(selected[0]["run"], prep.id);
+        reconcile::run(&f.home, &task.id, &source.id, plan["id"].as_str())
+            .await
+            .unwrap();
+        assert!(!candidate.worktree.exists());
+        assert!(reset.candidates[0].worktree.exists());
+        assert!(unknown.candidates[0].worktree.exists());
     }
 
     #[tokio::test]

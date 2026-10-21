@@ -74,7 +74,7 @@ mod repo_lock;
 pub mod report;
 pub mod report_view;
 pub mod repos;
-mod retention;
+pub mod retention;
 pub mod review_repair;
 pub mod rng;
 pub mod run;

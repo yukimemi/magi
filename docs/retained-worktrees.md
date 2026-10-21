@@ -225,3 +225,107 @@ RUSTUP_TOOLCHAIN=stable cargo test --locked --lib preparation_records_creation_i
 
 Full review and verification remain owned by the enclosing run, including
 `cargo test --locked --all-targets` and `cargo make check`.
+
+## Operator reconciliation of blanket retention
+
+`magi task reconcile-retention <task> --authority-run <full-run-id>` saves a
+versioned `retention-reconciliations/<plan-id>/plan.json` under the state store.
+It does not retire anything. Inspect this file before approving it: it records
+all historical source states (including selections and rebase provenance), the
+explicit retained implementation authority, artifact fingerprints, every
+candidate's proof or refusal, and the worktree removal paths. The plan ID is
+content-derived; editing the saved approval inputs invalidates it. At most five
+provably empty startup attempts are selected per plan. Other implementations
+may coexist; their uniqueness is never resolved by choosing the newest run.
+
+Approval is a separate direct operator invocation of the same command with
+`--apply <plan-id>`. The full history must still be readable and unchanged.
+Task claims, public-owner locks, driver maintenance leases, worktree-output
+leases and Cargo residue locks protect the transition. A short task-write lock
+checks the task and filesystem witnesses again before recording retirement.
+A changed selection, report, marker, question, source ref, reflog or Git
+administration file invalidates the plan. Ordinary folding and automatic
+cleanup continue to refuse retention markers. Only this approval path accepts
+a plain, canonical historical blanket marker whose complete contents equal the
+task ID; the marker stays in place.
+
+Only registered, canonical worktrees with recorded candidate/preparation
+identity can establish emptiness. Every entry in the run's worktree root must
+match that inventory. HEAD and candidate/preparation branches must equal the
+original base; ORIG_HEAD and reflogs must contain no commits outside that base.
+Tracked source bytes are hashed against the original tree independently of index
+stat caches and assume-unchanged flags. Unsupported tracked symlinks, submodules
+or checkout transformations refuse this proof. Dirty tracked files, untracked or
+ignored source, unregistered preparation artifacts, unfinished Git operations, unique implementations, unknown/live
+ownership, pins, questions, review/publication/recovery checkpoints and unknown
+run fields all refuse retirement. A missing worktree or failed startup status
+alone supplies no proof. Cargo residue requires the existing exact residue
+proof; an ignored `target` directory alone never qualifies. Keep unmanaged
+writers stopped during maintenance; managed writers must honor the leases.
+
+Approval is persisted and synced in `approved.json`, followed by an immutable
+per-run `*-fence.json` containing the exact next state. The run's durable
+`retired_to` fence precedes worktree removal. Reports, all history entries,
+commits, refs and retention markers remain available; the operation records
+all sources and the authority as auditable lineage. Repeat the **same** apply
+command after interruption to reprove and finish remaining removals. Already
+removed paths are accepted only with this operation's exact fence; changed or
+recreated artifacts refuse continuation. No queue hold is released, attempt
+limit changed, question answered or PR mutated. Completed applies can also be
+repeated safely. Create a fresh plan for the next batch.
+
+For the retained recovery task, perform maintenance only after installing the
+updated CLI and parking its work. Do not edit queue/run JSON or remove markers.
+The following commands are an operator procedure; this change does not run
+them against the target repository:
+
+```sh
+magi task show 20261011-214217-9462 --json
+magi task reconcile-retention 20261011-214217-9462 \
+  --authority-run 20261018-200357-f0ee
+# Read the printed plan.json, including every protected source and refusal.
+magi task reconcile-retention 20261011-214217-9462 \
+  --authority-run 20261018-200357-f0ee --apply <plan-id>
+magi task show 20261011-214217-9462 --json
+```
+
+Inspect each historical run with `magi show <full-run-id> --json` and count runs
+with neither `retired_to` nor `released_to` (deduplicating task history IDs).
+Replan, inspect and approve further batches until this count is **below** the
+configured limit (fewer than eight at the default), leaving room for the next
+recovery. The existing admission check still refuses a count at or above the
+limit.
+If proof refuses all remaining attempts, retain them and investigate; do not
+raise the limit or force-release the backlog hold. Preserve the public source
+`3cb6ba206bc4f4d15b3b2b4d91e85012fbd1e659`, reviewed source
+`57cace1b9160fe340b2b4757b6153aa7d76e35e9`, authority run
+`20261018-200357-f0ee`, every distinct alternative and all rebase provenance.
+Unavailable protected sources require investigation, never a substitute SHA.
+
+After cleanup, use the [existing-PR recovery procedure](existing-pr-recovery.md)
+with the existing `kanade-recovery.toml`. Read the public PR first:
+
+```sh
+gh pr view 1598 --repo kanadehq/kanade \
+  --json state,headRefName,headRefOid,baseRefName
+```
+
+Only when it remains open on the expected task branch with the approved public
+head, select the retained reviewed implementation:
+
+```sh
+magi task recover-pr 20261011-214217-9462 \
+  --pr https://github.com/kanadehq/kanade/pull/1598 \
+  --head 3cb6ba206bc4f4d15b3b2b4d91e85012fbd1e659 \
+  --source-head 57cace1b9160fe340b2b4757b6153aa7d76e35e9 \
+  --source-run 20261018-200357-f0ee \
+  --disposition land \
+  --config "$HOME/.cache/kanade-work/kanade-recovery.toml"
+```
+
+This queues recovery, fresh review, configured verification and a fresh landing
+approval for the exact final head. It does not authorize deployment, credential
+or service changes, or merging/closing unrelated PRs. Do not run it while the
+backlog still exceeds the configured bound, and do not use `release` to bypass
+that bound. If the public head moved, inspect its ownership and source lineage
+before making a new explicit selection.
