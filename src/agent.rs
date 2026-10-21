@@ -168,22 +168,6 @@ fn repository_writer(inv: &Invocation<'_>) -> bool {
         ) || inv.node == crate::queue::CHAT_NODE)
 }
 
-// Keep the repository read-only while allowing the standing chat's commands
-// to reach their explicitly granted stores. Workspace-write includes the cwd,
-// so these turns run in their own artifacts directory, never the repository.
-fn codex_chat_controls(spec: &AgentSpec, inv: &Invocation<'_>) -> bool {
-    spec.kind == AgentKind::Codex
-        && inv.node == crate::queue::CHAT_NODE
-        && inv.scope == InvocationScope::Repository
-        && !inv.allow_write
-        && !inv.writable.is_empty()
-}
-
-fn chat_control_cwd(inv: &Invocation<'_>) -> PathBuf {
-    // Keep attachments and earlier prompts outside the implicit cwd grant.
-    inv.artifacts.join(format!("{}-controls", inv.stem))
-}
-
 fn repository_seat(inv: &Invocation<'_>) -> bool {
     // These roles consume supplied state, prompts and conversation history.
     // In particular, they must be able to deliver an answer or make queue
@@ -499,12 +483,6 @@ pub(crate) async fn invoke_leased(
         InvocationScope::Repository => None,
     };
     let mut prompt = inv.prompt.to_owned();
-    if codex_chat_controls(spec, inv) {
-        prompt.push_str(&format!(
-            "\n\nThe process working directory is this turn's artifacts directory. The repository is {} and remains read-only. Use absolute paths for repository inspection. The explicit writable stores are only for supported magi commands; never edit store files directly.",
-            inv.cwd.display()
-        ));
-    }
     if let Some(scope) = scope {
         prompt.push_str("\n\n");
         prompt.push_str(scope);
@@ -518,11 +496,9 @@ pub(crate) async fn invoke_leased(
     }
     // Apply once for initial, resumed, fallback and waiter invocations alike.
     // Deputies/chat retain their explicit grants; read-only stays read-only.
-    let home = (repository_writer(inv) || codex_chat_controls(spec, inv)).then(crate::run::home);
+    let home = repository_writer(inv).then(crate::run::home);
     let mut writable = inv.writable.to_vec();
-    if repository_writer(inv)
-        && let Some(home) = &home
-    {
+    if let Some(home) = &home {
         for root in worktree_writable_roots(inv.cwd, home).await? {
             if !writable.contains(&root) {
                 writable.push(root);
@@ -545,10 +521,6 @@ pub(crate) async fn invoke_leased(
     tokio::fs::create_dir_all(inv.artifacts)
         .await
         .with_context(|| format!("create {}", inv.artifacts.display()))?;
-    let control_cwd = codex_chat_controls(spec, inv).then(|| chat_control_cwd(inv));
-    if let Some(cwd) = &control_cwd {
-        tokio::fs::create_dir_all(cwd).await?;
-    }
     let prompt_path = inv.artifacts.join(format!("{}.prompt.md", inv.stem));
     tokio::fs::write(&prompt_path, inv.prompt)
         .await
@@ -566,8 +538,6 @@ pub(crate) async fn invoke_leased(
             "unsandboxed": inv.unsandboxed,
             "requested_network_access": if spec.kind == AgentKind::Codex && repository_writer(inv) && !inv.unsandboxed {
                 Some(false)
-            } else if codex_chat_controls(spec, inv) {
-                Some(true)
             } else { None },
             "writable_roots": inv.writable,
             "fetched_base": inv.fetched_base,
@@ -592,7 +562,7 @@ pub(crate) async fn invoke_leased(
     );
     let mut cmd = Command::new(program);
     cmd.args(&plan.argv[1..])
-        .current_dir(control_cwd.as_deref().unwrap_or(inv.cwd))
+        .current_dir(inv.cwd)
         .envs(&spec.env)
         .env("MAGI_SEAT", &seat.key)
         .env("MAGI_TURN", seat.turns.to_string())
@@ -639,6 +609,31 @@ pub(crate) async fn invoke_leased(
         // place. Strip it explicitly.
         cmd.env_remove("CARGO_TARGET_DIR");
     }
+
+    #[cfg(unix)]
+    let _chat_controls = {
+        use crate::chat_control::bridge::{self, Bridge};
+        bridge::clear_environment(&mut cmd);
+        let bridge = if inv.node == crate::queue::CHAT_NODE
+            && inv.scope == InvocationScope::Repository
+        {
+            crate::run::try_home().and_then(|home| {
+                match Bridge::start(&home, inv.run, inv.artifacts) {
+                    Ok(bridge) => Some(bridge),
+                    Err(error) => {
+                        tracing::warn!(%error, "chat controls unavailable; continuing conversation");
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
+        if let Some(bridge) = &bridge {
+            bridge.attach(&mut cmd);
+        }
+        bridge
+    };
 
     // The final consultation/turn check is synchronous: no await separates
     // it from spawning and transferring the lease to Running.
@@ -968,7 +963,6 @@ fn build_command(
             }
         }
         AgentKind::Codex => {
-            let controls = codex_chat_controls(spec, inv);
             // `--sandbox` below governs writes, not reads (see the module
             // doc: it is what makes codex the one kind whose *read-only*
             // mode is enforced, by refusing edits) - both presets can read
@@ -981,11 +975,7 @@ fn build_command(
             // is detached and a fixture's may be no repository at all.
             argv.push("--skip-git-repo-check".to_owned());
             argv.push("-C".to_owned());
-            argv.push(if controls {
-                chat_control_cwd(inv).to_string_lossy().into_owned()
-            } else {
-                inv.cwd.to_string_lossy().into_owned()
-            });
+            argv.push(inv.cwd.to_string_lossy().into_owned());
             // Codex is the only kind whose read-only-ness is enforced by the
             // CLI rather than by the prompt: a judge or reviewer seat cannot
             // write even if it decides to try. Implementers get the workspace.
@@ -999,7 +989,7 @@ fn build_command(
             } else {
                 argv.push("--sandbox".to_owned());
                 argv.push(
-                    if inv.allow_write || controls {
+                    if inv.allow_write {
                         "workspace-write"
                     } else {
                         "read-only"
@@ -1010,23 +1000,11 @@ fn build_command(
                 // that asks blocks until its timeout kills it.
                 argv.push("-c".to_owned());
                 argv.push("approval_policy=\"never\"".to_owned());
-                if controls {
-                    // Otherwise the implicit temporary-directory grants can
-                    // include a repository or unrelated state on that volume.
-                    for setting in [
-                        "sandbox_workspace_write.exclude_slash_tmp=true",
-                        "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-                        "sandbox_workspace_write.network_access=true",
-                    ] {
-                        argv.push("-c".to_owned());
-                        argv.push(setting.to_owned());
-                    }
-                }
                 if repository_writer(inv) {
                     argv.push("-c".to_owned());
                     argv.push("sandbox_workspace_write.network_access=false".to_owned());
                 }
-                if (inv.allow_write || controls) && !inv.writable.is_empty() {
+                if inv.allow_write && !inv.writable.is_empty() {
                     let roots: Vec<String> = inv
                         .writable
                         .iter()
@@ -2185,47 +2163,6 @@ mod tests {
         let want = "sandbox_workspace_write.writable_roots=[\"/data/questions\"]";
         assert!(mk(true).argv.windows(2).any(|w| w == ["-c", want]));
         assert!(!mk(false).argv.iter().any(|a| a.contains("writable_roots")));
-    }
-
-    #[test]
-    fn chat_controls_use_store_grants_without_a_repository_write_grant() {
-        let roots = [PathBuf::from("/state/queue")];
-        for resumed in [false, true] {
-            let mut seat = SeatState::new("talk", "a", 7);
-            if resumed {
-                seat.turns = 1;
-                seat.captured_session = Some("standing-session".into());
-            }
-            let mut i = inv(Path::new("/repo"), Path::new("/turn"), false);
-            i.node = crate::queue::CHAT_NODE;
-            i.writable = &roots;
-            let p = build_command(
-                &spec(AgentKind::Codex, None),
-                &seat,
-                &i,
-                Path::new("/turn/p.md"),
-            )
-            .unwrap();
-            assert!(p.argv.windows(2).any(|w| w == ["-C", "/turn/t-controls"]));
-            assert!(
-                p.argv
-                    .windows(2)
-                    .any(|w| w == ["--sandbox", "workspace-write"])
-            );
-            for setting in [
-                "approval_policy=\"never\"",
-                "sandbox_workspace_write.exclude_slash_tmp=true",
-                "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-                "sandbox_workspace_write.network_access=true",
-                "sandbox_workspace_write.writable_roots=[\"/state/queue\"]",
-            ] {
-                assert!(p.argv.iter().any(|a| a == setting), "{p:?}");
-            }
-            assert!(!p.argv.iter().any(|a| a.contains("bypass")));
-            assert!(!repository_writer(&i));
-            i.scope = InvocationScope::ConsultationInvestigation;
-            assert!(!codex_chat_controls(&spec(AgentKind::Codex, None), &i));
-        }
     }
 
     #[tokio::test]

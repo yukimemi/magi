@@ -3468,48 +3468,46 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
             )?;
             let talk_id = talk.id.as_str();
             use magi::chat_control as cc;
-            match op {
-                ControlCmd::Resume { run } => {
-                    let t = cc::resume(&q, &home, talk_id, &run)?;
-                    println!(
-                        "{}; the loop (`magi serve`) resumes the run under its execution lease",
-                        cc::describe(&t, "resume queued for")
-                    );
-                }
-                ControlCmd::Hold { id, reason } => {
-                    let t = cc::hold(&q, talk_id, &id, &reason.join(" "))?;
-                    println!("{}", cc::describe(&t, "held"));
-                }
-                ControlCmd::Release { id } => {
-                    let t = cc::release(&q, talk_id, &id)?;
-                    println!("{}", cc::describe(&t, "released"));
-                }
+            let operation = match op {
+                ControlCmd::Resume { run } => cc::Operation::Resume { run },
+                ControlCmd::Hold { id, reason } => cc::Operation::Hold {
+                    task: id,
+                    reason: reason.join(" "),
+                },
+                ControlCmd::Release { id } => cc::Operation::Release { task: id },
                 ControlCmd::Retry {
                     id,
                     title,
                     file,
                     instruction,
                 } => {
-                    let text = task_text(&instruction, file.as_deref(), None).await?;
-                    let t = cc::retry(&q, talk_id, &id, title, &text)?;
-                    println!("{}", cc::describe(&t, "retry queued for"));
+                    let instruction = task_text(&instruction, file.as_deref(), None).await?;
+                    cc::Operation::Retry {
+                        task: id,
+                        title,
+                        instruction,
+                    }
                 }
                 ControlCmd::RerunChecks {
                     run,
                     request,
                     head,
                     workflows,
-                } => {
-                    let ids =
-                        cc::rerun_checks(&q, &home, talk_id, &run, &request, &head, &workflows)
-                            .await?;
-                    println!("requested a rerun of workflow run(s) {}", ids.join(", "));
-                }
-                ControlCmd::Abandon { run } => {
-                    cc::abandon(&q, &talks, &home, talk_id, &run, quote)?;
-                    println!("abandoned run {run}");
-                }
-            }
+                } => cc::Operation::RerunChecks {
+                    run,
+                    request,
+                    head,
+                    workflows,
+                },
+                ControlCmd::Abandon { run } => cc::Operation::Abandon {
+                    run,
+                    quote: quote.map(str::to_owned),
+                },
+            };
+            println!(
+                "{}",
+                cc::dispatch(&q, &home, &talks, talk_id, operation).await?
+            );
             Ok(())
         }
 

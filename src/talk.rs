@@ -2459,16 +2459,13 @@ async fn turn(
     // has no store to consult, and must not abort the turn on `run::home()`.
     let questions =
         crate::run::try_home().map(|home| crate::ask::Questions::at(home.join("questions")));
-    let mut consult_roots = questions.as_ref().map_or_else(Vec::new, |questions| {
+    let consult_roots = questions.as_ref().map_or_else(Vec::new, |questions| {
         crate::consult::answer_write_roots(questions, store, talk)
     });
     let consulted = questions.as_ref().is_some_and(|questions| {
         crate::consult::pending_consults(questions, &talk.id)
             || crate::consult::authorized_answers(questions, talk)
     });
-    if !consulted && let Some(home) = crate::run::try_home() {
-        consult_roots.extend(crate::chat_control::write_roots(&home, store, talk)?);
-    }
 
     let (allow_write, unsandboxed) = turn_access(cfg.talk.allow_write, consulted);
 
@@ -3268,12 +3265,10 @@ pub fn briefing_for(
          `abandon-run: <full run id>` (ask them to send that line, once, after \
          you have named the run and what abandoning does), passing that whole \
          message as --quote; a run that might still be driven is refused. \
-         Merging a pull request is not available to you. These controls work \
-         with repository editing disabled: only their explicit stores are \
-         writable. Run directory grants refresh each turn; operate on a run \
-         created during this turn on the next turn. Follow the current turn's \
-         working-directory note and use absolute repository paths. Never \
-         edit control-plane files directly.\n\n\
+         Merging a pull request is not available to you. These commands use the \
+         turn's inherited control channel without changing repository permissions, \
+         network policy or working directory. If that channel is unavailable, \
+         report the command error; never edit store files to apply an operation.\n\n\
          The current state of the code is whatever origin/main holds, not \
          whatever a working tree shows: a primary checkout often lags \
          upstream, sits on a detached HEAD and carries uncommitted changes. \

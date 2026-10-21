@@ -30,36 +30,120 @@ use anyhow::{Context, Result, bail, ensure};
 use crate::queue::{Queue, Task, TaskStatus};
 use crate::talk::{Talk, Talks};
 
-/// Explicit control-plane grants for an ordinary standing turn. Transcripts
-/// remain read-only; only their separate evidence lock is writable. Runs are
-/// a snapshot of this talk's filed tasks, refreshed on every turn. The command
-/// still rechecks authorization, ownership, claims and liveness at execution.
-pub fn write_roots(home: &Path, talks: &Talks, talk: &Talk) -> Result<Vec<std::path::PathBuf>> {
-    authorize(talks, &talk.id, crate::queue::CHAT_NODE)?;
-    let mut roots = std::collections::BTreeSet::from([
-        home.join("queue"),
-        home.join("questions"), // abandon settles the run's outstanding questions
-        home.join("choice-actions"), // shared rerun ledger
-        home.join("chat-controls").join(&talk.id),
-        talks.answer_lock_root(),
-    ]);
-    for task in Queue::at(home.join("queue")).list() {
-        if owned(&task, &talk.id) {
-            for run in task.runs.iter().filter(|id| crate::run::is_run_id(id)) {
-                let path = home.join("runs").join(run);
-                if path.is_dir() {
-                    roots.insert(path);
-                }
-            }
-        }
+#[cfg(unix)]
+pub(crate) mod bridge;
+
+/// Only these operations cross the standing turn's inherited capability.
+/// Paths, commands, merge decisions and conversation identities are not input.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "operation", deny_unknown_fields)]
+pub enum Operation {
+    /// 既存 run の再開を queue に登録する。
+    Resume {
+        /// 完全な run ID。
+        run: String,
+    },
+    /// task を手動保留する。
+    Hold {
+        /// task ID または一意な接頭辞。
+        task: String,
+        /// 保留理由。
+        reason: String,
+    },
+    /// task を保留から解放する。
+    Release {
+        /// task ID または一意な接頭辞。
+        task: String,
+    },
+    /// 指示を変更して再試行する。
+    Retry {
+        /// task ID または一意な接頭辞。
+        task: String,
+        /// 新しいタイトル、省略時は指示から生成する。
+        title: Option<String>,
+        /// 新しい指示全文。
+        instruction: String,
+    },
+    /// PR の失敗した workflow を再実行する。
+    RerunChecks {
+        /// 完全な run ID。
+        run: String,
+        /// 冪等性を保証するリクエスト ID。
+        request: String,
+        /// 観測した PR head。
+        head: String,
+        /// 再実行対象の workflow run ID。
+        workflows: Vec<String>,
+    },
+    /// 個別確認後、生存が否定された run を破棄する。
+    Abandon {
+        /// 完全な run ID。
+        run: String,
+        /// 最新の所有者メッセージ全文。
+        quote: Option<String>,
+    },
+}
+
+/// The CLI sends only a typed operation when it inherited a turn capability.
+/// Outside a launched turn the existing, authorized local route remains usable.
+pub async fn dispatch(
+    queue: &Queue,
+    home: &Path,
+    talks: &Talks,
+    talk: &str,
+    operation: Operation,
+) -> Result<String> {
+    #[cfg(unix)]
+    if std::env::var_os(bridge::CHANNEL_ENV).is_some() {
+        return bridge::request(&operation);
     }
-    roots
-        .into_iter()
-        .map(|path| {
-            std::fs::create_dir_all(&path)?;
-            Ok(path.canonicalize()?)
-        })
-        .collect()
+    execute(queue, home, talks, talk, operation).await
+}
+
+async fn execute(
+    queue: &Queue,
+    home: &Path,
+    talks: &Talks,
+    talk: &str,
+    operation: Operation,
+) -> Result<String> {
+    authorize(talks, talk, crate::queue::CHAT_NODE)?;
+    ensure!(
+        !crate::consult::pending_consults(&crate::ask::Questions::at(home.join("questions")), talk),
+        "task control is excluded during consultation"
+    );
+    Ok(match operation {
+        Operation::Resume { run } => {
+            let t = resume(queue, home, talk, &run)?;
+            format!(
+                "{}; the loop (`magi serve`) resumes the run under its execution lease",
+                describe(&t, "resume queued for")
+            )
+        }
+        Operation::Hold { task, reason } => describe(&hold(queue, talk, &task, &reason)?, "held"),
+        Operation::Release { task } => describe(&release(queue, talk, &task)?, "released"),
+        Operation::Retry {
+            task,
+            title,
+            instruction,
+        } => describe(
+            &retry(queue, talk, &task, title, &instruction)?,
+            "retry queued for",
+        ),
+        Operation::RerunChecks {
+            run,
+            request,
+            head,
+            workflows,
+        } => {
+            let ids = rerun_checks(queue, home, talk, &run, &request, &head, &workflows).await?;
+            format!("requested a rerun of workflow run(s) {}", ids.join(", "))
+        }
+        Operation::Abandon { run, quote } => {
+            abandon(queue, talks, home, talk, &run, quote.as_deref())?;
+            format!("abandoned run {run}")
+        }
+    })
 }
 
 /// The exact owner instruction that confirms abandoning `run`.

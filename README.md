@@ -669,12 +669,12 @@ for tasks that conversation filed itself (a follow-up's inherited origin does
 not count) and only for the runs those tasks recorded. It is unavailable while
 a consultation is open.
 
-通常の読み取り専用チャットでも利用できる。操作用ストアと、自分が起票した task の
-run ディレクトリだけを書き込み対象に追加し、リポジトリと会話の記録は読み取り専用に保つ。
-run の許可一覧は毎ターン更新するため、そのターン中に新しく作られた run の操作は次の
-ターンで行う。書き込みを sandbox で制限する席では、作業ディレクトリをターン専用の
-artifacts サブディレクトリにし、リポジトリの参照には絶対パスを使う。
-PR チェックの再実行にはネットワークを許可する。
+通常のチャットの sandbox・ネットワーク設定・作業ディレクトリは変更しない。
+Unix のチャット席では、継承した専用通信路からランチャーへ操作要求を渡す。
+ランチャーは起動時の会話に対象を固定し、操作ごとに認可・所有権・確認文と既存の
+実行条件を検証する。queue・questions・run などのストアを書き込む権限は追加しない。
+通信路の準備に失敗しても会話は続き、そのターンの操作機能だけが利用できなくなる。
+通信路はターンの完了・中断時に閉じる。Unix 以外の席ではこの通信路を提供しない。
 
 | command | effect |
 |---|---|

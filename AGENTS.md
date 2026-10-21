@@ -861,11 +861,6 @@ and the briefing's "small explicit edits only, everything else to the queue".
 `codex_talk_turn_bypasses_sandbox_only_when_opted_in` pins the shape (the flag
 sits before `resume`).
 
-通常の読み取り専用チャットに限り、操作用ストアへの限定 grant がある場合は
-ターン専用 artifacts サブディレクトリを cwd とした `workspace-write` を使う。
-`allow_write` は false のまま、repository / transcript / attachment は grant に
-加えない。暗黙の一時ディレクトリ許可は無効にする。詳細は下の chat controls 節。
-
 Unattended seats also pass `-c approval_policy="never"`: a seat that stops to
 ask blocks until its node timeout kills it, and there is nobody at the
 terminal during a run.
@@ -2607,14 +2602,15 @@ existing transition (`resume::pin_queued`, extracted from the daemon's
   `abandon-run: <run>` and `--quote` of it, under the talk evidence guard,
   then the shared Dead-only judge. The grammar is the same idea as
   `consult::TaskOperation`.
-- **Out of scope:** merging. 通常のチャットには `chat_control::write_roots` から
-  queue、questions（abandon 時の終結）、共通 rerun ledger、自分の受付記録、
-  evidence lock と、自分が起票した task の run ディレクトリだけを許可する。
-  run の一覧はターン開始時の snapshot で、次のターンに更新する。
-  リポジトリ編集不可の席は turn の artifacts を cwd とする sandbox で実行し、
-  暗黙の一時ディレクトリ許可を無効にする。PR チェック再実行用の network は許可する。
-  transcript、他の run、リポジトリ、state root 全体は書き込み対象に加えない。
-  consultation / investigation の既存制限はそのまま維持する。
+- **Out of scope:** merging。通常のチャットは既存の sandbox・network・cwd を維持し、
+  queue / questions / choice-actions / run / transcript への書き込み権限を追加しない。
+  `chat_control::bridge` が Unix の継承済み通信路で型付き操作だけをランチャーへ渡す。
+  ランチャーは起動時の talk を固定し、要求ごとに open・非 consultation・所属・確認文・
+  既存遷移の条件を検証する。任意コマンド、パス、別の talk、merge は要求できない。
+  同時 CLI は継承した未リンクの lock FD の POSIX process lock で直列化し、
+  request ID で応答を照合する。通信路の準備失敗は警告のみで会話を継続する。
+  完了・中断・fallback は通信路を破棄する。非 Unix には通信路を提供しない。
+  CLI を席の外から実行する場合も、従来どおり chat / open talk / 所属の認可が必要。
 - The Question system is untouched and keeps working in parallel.
 
 ### Telling the chat how a command it watched ended

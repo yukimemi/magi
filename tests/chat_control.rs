@@ -115,10 +115,10 @@ fn refused(out: Output) -> String {
 
 #[cfg(unix)]
 #[test]
-fn ordinary_chat_turn_launches_controls_with_limited_store_grants() {
+fn ordinary_chat_turn_uses_inherited_controls_without_store_grants() {
     common::isolated(
-        "ordinary_chat_turn_launches_controls_with_limited_store_grants",
-        || chat_turn_controls(false),
+        "ordinary_chat_turn_uses_inherited_controls_without_store_grants",
+        || chat_turn_controls(false, false, false),
     );
 }
 
@@ -128,16 +128,37 @@ fn ordinary_chat_turn_launches_controls_with_limited_store_grants() {
 fn sandboxed_chat_turn_controls_own_work_and_refuses_unrelated_writes() {
     common::isolated(
         "sandboxed_chat_turn_controls_own_work_and_refuses_unrelated_writes",
-        || chat_turn_controls(true),
+        || chat_turn_controls(true, false, false),
     );
 }
 
 #[cfg(unix)]
-async fn chat_turn_controls(sandbox: bool) {
+#[test]
+fn ordinary_chat_survives_unavailable_control_storage() {
+    common::isolated("ordinary_chat_survives_unavailable_control_storage", || {
+        chat_turn_controls(false, true, false)
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn ordinary_chat_survives_control_channel_setup_failure() {
+    common::isolated(
+        "ordinary_chat_survives_control_channel_setup_failure",
+        || chat_turn_controls(false, true, true),
+    );
+}
+
+#[cfg(unix)]
+async fn chat_turn_controls(sandbox: bool, broken_store: bool, missing_channel: bool) {
     use std::os::unix::fs::PermissionsExt as _;
     let _home = common::home_lock().await;
     let f = Fixture::new();
-    magi::run::set_home(f.tmp.path().to_owned());
+    magi::run::set_home(if missing_channel {
+        f.tmp.path().join("unavailable-home")
+    } else {
+        f.tmp.path().to_owned()
+    });
     let repo = f.tmp.path().join("repository");
     std::fs::create_dir(&repo).unwrap();
     std::fs::write(repo.join("protected"), "repository evidence").unwrap();
@@ -157,6 +178,20 @@ async fn chat_turn_controls(sandbox: bool) {
         vec!["continue".into()],
     );
     questions.put(&mut question).unwrap();
+    let foreign_talk = talk::begin(&f.talks, &f.run.config, repo.clone(), Some("mock")).unwrap();
+    let mut foreign = Task::new(
+        "foreign".into(),
+        "foreign".into(),
+        repo.clone(),
+        Source::Agent {
+            run: foreign_talk.id.clone(),
+            node: CHAT_NODE.into(),
+        },
+    );
+    f.queue().put(&mut foreign).unwrap();
+    if broken_store {
+        std::fs::write(f.tmp.path().join("choice-actions"), "unwritable directory").unwrap();
+    }
     let mut t = f.talks.get(&f.talk).unwrap();
     t.repo = repo.clone();
     f.talks.put(&mut t).unwrap();
@@ -179,32 +214,41 @@ sys.stdin.read()
 args = sys.argv[1:]
 cwd = args[args.index('-C') + 1]
 assert pathlib.Path(cwd).resolve() == pathlib.Path.cwd().resolve()
-assert pathlib.Path(cwd).resolve() != pathlib.Path(os.environ['REPO']).resolve()
-assert args[args.index('--sandbox') + 1] == 'workspace-write'
+assert pathlib.Path(cwd).resolve() == pathlib.Path(os.environ['REPO']).resolve()
+assert args[args.index('--sandbox') + 1] == 'read-only'
 assert not any('bypass' in a for a in args)
 assert os.environ['MAGI_ALLOW_WRITE'] == '0'
 settings = [args[i+1] for i, a in enumerate(args) if a == '-c']
-roots = json.loads(next(s.split('=', 1)[1] for s in settings if 'writable_roots=' in s))
-home = pathlib.Path(os.environ['MAGI_HOME']).resolve()
-run = os.environ['TEST_RUN']
-talk = os.environ['MAGI_RUN']
-expected = [home/'queue', home/'questions', home/'choice-actions',
-            home/'chat-controls'/talk, home/'talks/.answer-lock', home/'runs'/run]
-assert set(roots) == set(str(p) for p in expected), roots
-for s in ['approval_policy="never"', 'sandbox_workspace_write.exclude_slash_tmp=true',
-          'sandbox_workspace_write.exclude_tmpdir_env_var=true',
-          'sandbox_workspace_write.network_access=true']:
-    assert s in settings, settings
+assert 'approval_policy="never"' in settings
+assert not any('writable_roots' in s or 'network_access=true' in s for s in settings)
+fds = tuple(int(os.environ[n]) for n in ['MAGI_CHAT_CONTROL_FD', 'MAGI_CHAT_CONTROL_RESPONSE_FD', 'MAGI_CHAT_CONTROL_LOCK_FD']) if 'MAGI_CHAT_CONTROL_FD' in os.environ else ()
+assert bool(fds) == (os.environ['TEST_NO_CHANNEL'] == '0')
 payload = r'''
 import os, pathlib, subprocess
 binary = os.environ['MAGI_TEST_BINARY']
 task, run = os.environ['TEST_TASK'], os.environ['TEST_RUN']
+fds = tuple(int(os.environ[n]) for n in ['MAGI_CHAT_CONTROL_FD', 'MAGI_CHAT_CONTROL_RESPONSE_FD', 'MAGI_CHAT_CONTROL_LOCK_FD'])
 def control(*args):
-    p = subprocess.run([binary, 'task', *args], capture_output=True, text=True)
+    p = subprocess.run([binary, 'task', *args], capture_output=True, text=True, pass_fds=fds)
     assert p.returncode == 0, (args, p.stdout, p.stderr)
+# The server binds the capability to this talk even if the child spoofs env.
+other = subprocess.run([binary, 'task', 'control', 'hold', os.environ['FOREIGN_TASK']],
+                       capture_output=True, text=True, pass_fds=fds, env={**os.environ, 'MAGI_RUN':os.environ['FOREIGN_TALK']})
+assert other.returncode != 0
+assert 'not filed by this conversation' in other.stderr, other.stderr
+bad = subprocess.run([binary, 'task', '--quote', 'invented', 'control', 'abandon', run],
+                     capture_output=True, text=True, pass_fds=fds)
+assert bad.returncode != 0
+assert 'individual owner confirmation' in bad.stderr, bad.stderr
+# Serialize concurrent processes and a frame larger than PIPE_BUF.
+jobs = [subprocess.Popen([binary, 'task', 'control', 'hold', task, str(i)],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=fds) for i in range(3)]
+for job in jobs:
+    out, err = job.communicate()
+    assert job.returncode == 0, (out, err)
 control('control', 'hold', task, 'wait')
 control('control', 'release', task)
-control('control', 'retry', task, 'revised instruction')
+control('control', 'retry', task, 'revised instruction'+' '*8192)
 control('control', 'resume', run)
 control('control', 'rerun-checks', run, '--request', 'sandbox-check', '--head', 'current', '--workflow', '42')
 control('--quote', 'abandon-run: '+run, 'control', 'abandon', run)
@@ -212,7 +256,9 @@ if os.environ['TEST_SANDBOX'] == '1':
     home = pathlib.Path(os.environ['MAGI_HOME'])
     for p in [pathlib.Path(os.environ['REPO'])/'protected', home/'runs/unrelated/protected',
               home/'talks'/(os.environ['MAGI_RUN']+'.json'), home/'unrelated',
-              home/'talks'/(os.environ['MAGI_RUN']+'.artifacts')/'protected']:
+              home/'talks'/(os.environ['MAGI_RUN']+'.artifacts')/'protected',
+              home/'queue'/(task+'.json'), home/'questions'/(os.environ['TEST_QUESTION']+'.json'),
+              home/'choice-actions/reruns.json', home/'runs'/run/'run.json']:
         try:
             p.write_text('forbidden')
         except PermissionError:
@@ -222,9 +268,9 @@ if os.environ['TEST_SANDBOX'] == '1':
 '''
 command = [sys.executable, '-c', payload]
 if os.environ['TEST_SANDBOX'] == '1':
-    command = [os.environ['REAL_CLI'], 'sandbox', '-c', 'sandbox_mode="workspace-write"',
+    command = [os.environ['REAL_CLI'], 'sandbox', '-c', 'sandbox_mode="read-only"',
                *[a for setting in settings for a in ['-c', setting]], *command]
-p = subprocess.run(command, capture_output=True, text=True)
+p = subprocess.run(command, capture_output=True, text=True, pass_fds=fds) if os.environ['TEST_PASSIVE'] == '0' else subprocess.CompletedProcess(command, 0, '', '')
 assert p.returncode == 0, (p.stdout, p.stderr)
 print(json.dumps({'type':'thread.started', 'thread_id':'controls-session'}))
 print(json.dumps({'type':'item.completed', 'item':{'type':'agent_message','text':'Controls completed.'}}))
@@ -261,6 +307,17 @@ fi
         ("MAGI_CONFIG_DIR".into(), String::new()),
         ("MAGI_TEST_BINARY".into(), env!("CARGO_BIN_EXE_magi").into()),
         ("TEST_TASK".into(), f.task.id.clone()),
+        ("FOREIGN_TASK".into(), foreign.id.clone()),
+        ("FOREIGN_TALK".into(), foreign_talk.id.clone()),
+        (
+            "TEST_NO_CHANNEL".into(),
+            if missing_channel { "1" } else { "0" }.into(),
+        ),
+        ("TEST_QUESTION".into(), question.id.clone()),
+        (
+            "TEST_PASSIVE".into(),
+            if broken_store { "1" } else { "0" }.into(),
+        ),
         ("TEST_RUN".into(), f.run.id.clone()),
         (
             "TEST_SANDBOX".into(),
@@ -276,7 +333,15 @@ fi
     talk::say(&lease, &mut t, &f.talks, &cfg, &words, vec![])
         .await
         .unwrap();
-    assert_eq!(f.saved().instruction, "revised instruction");
+    if broken_store {
+        assert_eq!(f.saved().instruction, "old");
+        return;
+    }
+    cfg.agents[0].env.insert("TEST_PASSIVE".into(), "1".into());
+    talk::say(&lease, &mut t, &f.talks, &cfg, "show status", vec![])
+        .await
+        .unwrap();
+    assert_eq!(f.saved().instruction.trim_end(), "revised instruction");
     assert_eq!(f.saved().status, TaskStatus::Queued);
     assert_eq!(
         RunState::load_under(&f.run.id, f.tmp.path())
