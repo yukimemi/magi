@@ -976,8 +976,8 @@ pub fn spawn(cfg: &Update, rt: &tokio::runtime::Handle) -> Option<Pending> {
 
 /// Drain a pending check and print at most one line.
 ///
-/// Bounded on purpose: a slow network must never hold up the exit of a command
-/// that already did its work.
+/// Bounds only this async wait. The caller must also bound runtime shutdown:
+/// synchronous or blocking-pool work can outlive the timeout.
 pub async fn finalize(pending: Option<Pending>, budget: Duration) {
     let Some(pending) = pending else {
         return;
@@ -987,15 +987,36 @@ pub async fn finalize(pending: Option<Pending>, budget: Duration) {
             eprintln!("{}", checker.format_banner(&latest));
         }
         Pending::Notify { checker, handle } => {
-            if let Ok(Ok(Ok(Some(latest)))) = tokio::time::timeout(budget, handle).await {
+            if let Some(Ok(Some(latest))) = finalize_task(handle, budget).await {
                 eprintln!("{}", checker.format_banner(&latest));
             }
         }
         Pending::Install { handle } => {
-            if let Ok(Ok(Ok(Some(latest)))) = tokio::time::timeout(budget, handle).await {
+            if let Some(Ok(Some(latest))) = finalize_task(handle, budget).await {
                 eprintln!("magi updated itself to {}", latest.tag_name);
             }
         }
+    }
+}
+
+/// The check can block the only runtime worker in synchronous authentication,
+/// starving Tokio's timer driver. Deliver the deadline from an OS thread so
+/// the thread polling `async_main` can reach bounded runtime shutdown anyway.
+async fn finalize_task<T>(handle: tokio::task::JoinHandle<T>, budget: Duration) -> Option<T> {
+    let (send, deadline) = tokio::sync::oneshot::channel();
+    if let Err(error) = std::thread::Builder::new()
+        .name("update-finalize-deadline".to_owned())
+        .spawn(move || {
+            std::thread::sleep(budget);
+            let _ = send.send(());
+        })
+    {
+        tracing::warn!("could not start release-check deadline: {error}");
+        return None;
+    }
+    tokio::select! {
+        result = handle => result.ok(),
+        _ = deadline => None,
     }
 }
 
@@ -1090,6 +1111,15 @@ mod tests {
     #[tokio::test]
     async fn finalize_of_nothing_is_a_no_op() {
         finalize(None, Duration::from_millis(1)).await;
+    }
+
+    #[tokio::test]
+    async fn finalize_task_preserves_a_timely_result() {
+        let handle = tokio::spawn(async { 42 });
+        assert_eq!(
+            finalize_task(handle, Duration::from_secs(1)).await,
+            Some(42)
+        );
     }
 
     /// `mode = "off"` means no checker, for every caller.
