@@ -7160,6 +7160,14 @@ impl Runner {
         );
         let before = git::rev_parse(&winner.worktree, "HEAD").await?;
         let patch = git::diff(&winner.worktree, &base, "HEAD").await?;
+        // Persist before invoking the fixer: it may commit and then be
+        // interrupted before its result (or the following e2e) is saved.
+        self.state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
+            head: before.clone(),
+            passed: false,
+            outcomes: Vec::new(),
+        });
+        self.state.save()?;
         let (_, seat, out) = self
             .ask_fixer(winner, "gate-fix", None, |spec, seat| SeatJob {
                 prompt: fix_prompt.clone(),
@@ -7240,47 +7248,8 @@ impl Runner {
         );
 
         drop(coordination);
-        let commands = self.state.config.verify.e2e.clone();
-        if !commands.is_empty() {
-            let shell = self.state.config.shell();
-            let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
-            let cache_dir = self.state.config.cache_dir();
-            let context = format!("gate-fix round {attempt}");
-            let wait = self.repository_wait();
-            let (e2e, _) = with_cache_lease(
-                &mut self.state,
-                cache_dir.as_deref(),
-                "e2e",
-                "e2e",
-                &winner.worktree,
-                &after,
-                timeout,
-                &context,
-                &wait,
-                |state, budget| {
-                    let shell = shell.clone();
-                    let commands = commands.clone();
-                    let context = context.clone();
-                    let worktree = winner.worktree.clone();
-                    async move {
-                        run_e2e_with_retry(state, &shell, &commands, &worktree, budget, &context)
-                            .await
-                    }
-                },
-            )
-            .await?;
-            if verify_inconclusive(&e2e) {
-                return Ok(GateFix::Defer);
-            }
-            if e2e.iter().any(|o| !o.ok()) {
-                self.state.event(
-                    "gate",
-                    format!("gate-fix round {attempt}: verify.e2e failed after the fix"),
-                );
-                return Ok(GateFix::Stop);
-            }
-        }
-        Ok(GateFix::Retry)
+        let wait = self.repository_wait();
+        check_gate_repair_e2e(&mut self.state, winner, &wait).await
     }
 
     // ---------------------------------------------------------------- merge
@@ -8604,6 +8573,7 @@ impl Runner {
         self.state.gate_ran = false;
         self.state.gate_head = None;
         self.state.gate_fixes.clear();
+        self.state.gate_repair_e2e = None;
         self.state.pre_gate.clear();
         self.state.pre_gate_commit = None;
         self.state.contested_handoff = None;
@@ -10910,6 +10880,84 @@ pub(crate) async fn repair_landing_gate(
     let result = runner.gate_fix_round(winner, outcomes).await;
     *state = runner.state;
     result
+}
+
+/// Recheck a repair's e2e requirement across failures, resource deferrals and
+/// process interruptions. A successful result only applies to its exact SHA.
+pub(crate) async fn check_gate_repair_e2e(
+    state: &mut RunState,
+    winner: &Candidate,
+    wait: &crate::repo_lock::WaitPolicy,
+) -> Result<GateFix> {
+    if state.gate_repair_e2e.is_none() && state.gate_fixes.is_empty() {
+        return Ok(GateFix::Retry);
+    }
+    let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+    if state
+        .gate_repair_e2e
+        .as_ref()
+        .is_some_and(|r| r.head == head && r.passed)
+    {
+        return Ok(GateFix::Retry);
+    }
+    state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
+        head: head.clone(),
+        passed: false,
+        outcomes: Vec::new(),
+    });
+    state.save()?;
+    let commands = state.config.verify.e2e.clone();
+    let outcomes = if commands.is_empty() {
+        Vec::new()
+    } else {
+        let shell = state.config.shell();
+        let timeout = Duration::from_secs(state.config.graph.verify_timeout());
+        let cache_dir = state.config.cache_dir();
+        let (outcomes, _) = with_cache_lease(
+            state,
+            cache_dir.as_deref(),
+            "e2e",
+            "e2e",
+            &winner.worktree,
+            &head,
+            timeout,
+            "gate repair e2e",
+            wait,
+            |state, budget| async move {
+                run_e2e_with_retry(
+                    state,
+                    &shell,
+                    &commands,
+                    &winner.worktree,
+                    budget,
+                    "gate repair e2e",
+                )
+                .await
+            },
+        )
+        .await?;
+        outcomes
+    };
+    let deferred = verify_inconclusive(&outcomes);
+    let passed = outcomes.iter().all(CommandOutcome::ok)
+        && git::rev_parse(&winner.worktree, "HEAD").await? == head;
+    state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
+        head,
+        passed,
+        outcomes,
+    });
+    state.save()?;
+    if deferred {
+        Ok(GateFix::Defer)
+    } else if !passed {
+        state.event(
+            "gate",
+            "verify.e2e failed after gate repair; nothing published",
+        );
+        Ok(GateFix::Stop)
+    } else {
+        Ok(GateFix::Retry)
+    }
 }
 
 /// Run the same configured gate for a landing head and a fresh graph.

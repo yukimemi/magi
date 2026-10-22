@@ -3864,6 +3864,22 @@ async fn publish_landing_head<F: Forge>(
             && git::is_clean(&winner.worktree).await?,
         "landing tree changed after gate"
     );
+    let wait = crate::repo_lock::WaitPolicy::new(
+        Duration::from_secs(state.config.graph.timeout_resource_wait),
+        || false,
+    );
+    anyhow::ensure!(
+        matches!(
+            crate::graph::check_gate_repair_e2e(state, &winner, &wait).await?,
+            crate::graph::GateFix::Retry
+        ),
+        "post-repair e2e has not passed on the landing head; nothing published"
+    );
+    anyhow::ensure!(
+        git::rev_parse(&winner.worktree, "HEAD").await? == checked
+            && git::is_clean(&winner.worktree).await?,
+        "landing tree changed during post-repair e2e"
+    );
     crate::pr_head::ensure_owner(state)?;
     if owner_requested_stop(state)? {
         bail!("owner requested stop before publication");
@@ -6825,6 +6841,104 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                     .unwrap(),
                 Some(old.clone())
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn landing_gate_repair_cannot_publish_failed_e2e_on_repeated_resumes() {
+        let (_tmp, mut state, old) = landing_git_fixture().await;
+        advance_landing_base(&state).await;
+        landing_gate_fixer(
+            &mut state,
+            "cat >/dev/null; printf fixed > change; printf '{\"addressed\":[],\"rejected\":[],\"notes\":\"fixed\"}'",
+        );
+        state.config.verify.gate =
+            vec!["grep -q fixed change || { echo 'change needs repair'; exit 1; }".into()];
+        // The repair makes the gate green while breaking an e2e invariant.
+        state.config.verify.e2e = vec!["grep -q '^change$' change".into()];
+        for resume in 0..3 {
+            assert!(resume_observed_head(&mut state, &old).await.is_err());
+            state = RunState::load(&state.id).unwrap();
+            let evidence = state.gate_repair_e2e.as_ref().unwrap();
+            let head = git::rev_parse(&state.repo, "HEAD").await.unwrap();
+            assert_eq!(evidence.head, head);
+            assert!(!evidence.passed);
+            assert!(evidence.outcomes.iter().any(|o| !o.ok()));
+            assert_eq!(state.gate_fixes.len(), 1);
+            assert_eq!(
+                git::remote_head(&state.repo, "origin", "task-head")
+                    .await
+                    .unwrap(),
+                Some(old.clone())
+            );
+            if resume > 0 {
+                assert!(
+                    state.gate_allows_progress(),
+                    "a green gate must not bypass red e2e"
+                );
+            }
+        }
+        // Once e2e genuinely succeeds on the same SHA, the saved requirement
+        // can be satisfied without another fixer or approval bypass.
+        state.config.verify.e2e = vec!["grep -q fixed change".into()];
+        let head = resume_observed_head(&mut state, &old).await.unwrap();
+        assert!(state.gate_repair_e2e.as_ref().unwrap().passed);
+        assert_eq!(state.gate_repair_e2e.as_ref().unwrap().head, head);
+        assert_eq!(state.gate_fixes.len(), 1);
+        let forge = Scripted::new(vec![seen(&head, Checks::Green, "CLEAN", false)], vec![]);
+        land_with(&mut state, &green_pr().url, &forge)
+            .await
+            .unwrap();
+        assert!(state.parked);
+        assert_eq!(state.land_approval.as_ref().unwrap().head, head);
+        assert!(forge.argvs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn landing_resumes_recheck_pending_deferred_and_stale_repair_e2e() {
+        for phase in 0..3 {
+            let (_tmp, mut state, old) = landing_git_fixture().await;
+            advance_landing_base(&state).await;
+            let head = resume_observed_head(&mut state, &old).await.unwrap();
+            // Persist the shapes left by interruption, resource deferral,
+            // and a successful check for a different (older) SHA.
+            state.land_sync_pending = true;
+            state.config.verify.e2e = vec!["echo e2e is red; exit 1".into()];
+            state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
+                head: if phase == 2 {
+                    old.clone()
+                } else {
+                    head.clone()
+                },
+                passed: phase == 2,
+                outcomes: if phase == 1 {
+                    vec![crate::run::CommandOutcome {
+                        command: state.config.verify.e2e[0].clone(),
+                        code: None,
+                        output_tail: "verification resource unavailable".into(),
+                        duration_ms: 0,
+                        resource_blocked: true,
+                    }]
+                } else {
+                    Vec::new()
+                },
+            });
+            state.save().unwrap();
+            for _ in 0..2 {
+                state = RunState::load(&state.id).unwrap();
+                assert!(resume_observed_head(&mut state, &head).await.is_err());
+                let evidence = state.gate_repair_e2e.as_ref().unwrap();
+                assert_eq!(evidence.head, head);
+                assert!(!evidence.passed);
+                assert!(!evidence.outcomes.is_empty());
+                assert_eq!(
+                    git::remote_head(&state.repo, "origin", "task-head")
+                        .await
+                        .unwrap(),
+                    Some(head.clone())
+                );
+                assert!(state.land_sync_pending);
+            }
         }
     }
 
