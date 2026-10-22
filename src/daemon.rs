@@ -1540,7 +1540,7 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
             ActionDecision::Stale => {}
             ActionDecision::Review { branch, note } => {
                 task.release_operator("choice-review", Some(&q.id));
-                task.request_review(branch);
+                task.request_approved_review(branch);
                 notices::raise(
                     Notice::info(&format!("action:{}", q.id), &note).link(Link::Task {
                         id: task.id.clone(),
@@ -3850,6 +3850,7 @@ async fn attempt(
     // review-only pass rather than resuming or competing again. Consumed
     // (cleared) here whichever way this goes, so it never outlives this one
     // attempt - see `queue::Task::review_branch`.
+    let approved_review = std::mem::take(&mut task.approved_review);
     let review_branch = take_review_branch(task, previous.as_ref());
     let branch_exists = match &review_branch {
         Some(branch) => crate::git::branch_exists(&repo, branch)
@@ -3857,6 +3858,19 @@ async fn attempt(
             .unwrap_or(false),
         None => false,
     };
+    if approved_review && !branch_exists {
+        // The owner approved carrying on from this branch. Starting a new
+        // competition instead would discard it; say what is missing.
+        let why = match &review_branch {
+            Some(branch) => format!(
+                "the approved continuation reviews branch `{branch}`, which could not be found or verified; no new competition was started. Restore the branch (or tell magi which branch holds the work), then release the task"
+            ),
+            None => "the approved continuation no longer matches the task's instruction; no new competition was started. Release the task to review the existing work again".to_owned(),
+        };
+        task.hold_machine(Some(why));
+        record(queue, task);
+        return Vec::new();
+    }
     // An explicit `magi review <branch>` is reviewed whatever happens to the
     // branch unless an explicit implementer change requires fresh work. An
     // unfinished run of the same task still wins, so a retry resumes.
@@ -4574,6 +4588,12 @@ fn apply_options(config: &mut Config, opts: &Opts, task: &Task) -> Result<()> {
     }
     if let Some(o) = &task.overrides {
         o.apply(config);
+    }
+    if task.approved_review && config.graph.review_rounds > 0 {
+        // The last review round never calls the fixer, so a one-round budget
+        // could only re-detect the findings. Two rounds are the minimum that
+        // review, repair and review again: bounded, and only for this attempt.
+        config.graph.review_rounds = config.graph.review_rounds.max(2);
     }
     Ok(())
 }

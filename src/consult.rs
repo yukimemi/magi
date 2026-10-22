@@ -217,6 +217,52 @@ impl TaskOperation {
     }
 }
 
+/// Does `words` unambiguously ask for `operation`, without JSON? Only release,
+/// hold, priority and add have a natural form; completing a task (`done`) stays
+/// an explicit typed instruction. The whole message must be unhedged and must
+/// name the task (its full id or a prefix of at least four characters) with
+/// exactly one verb class, so nothing is inferred from a stray word.
+pub fn natural_matches(words: &str, operation: &TaskOperation) -> bool {
+    // "hold" is itself a hedge word for merges; for a hold request it is the
+    // verb, so it is removed before the doubt check (other doubt still voids).
+    let neutral = if matches!(operation, TaskOperation::Hold { .. }) {
+        words.replace("hold", "").replace("保留", "").replace("止め", "")
+    } else {
+        words.to_owned()
+    };
+    if !crate::land::unhedged(&neutral, &neutral) {
+        return false;
+    }
+    let lower = words.to_lowercase();
+    let release = ["release", "resume", "continue", "再開", "解放", "リリース"];
+    let hold = ["hold", "pause", "保留", "止め"];
+    let verbs = |list: &[&str]| list.iter().any(|w| lower.contains(w));
+    let names = |task: &str| {
+        words
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|t| t.len() >= 4 && task.starts_with(t) && !t.is_empty())
+    };
+    match operation {
+        TaskOperation::Release { task } => names(task) && verbs(&release) && !verbs(&hold),
+        TaskOperation::Hold { task, reason } => {
+            names(task) && verbs(&hold) && !verbs(&release) && !reason.trim().is_empty()
+        }
+        TaskOperation::Priority { task, priority } => {
+            names(task)
+                && (lower.contains("priority") || lower.contains("優先"))
+                && words
+                    .split(|c: char| !(c.is_ascii_digit() || c == '-'))
+                    .any(|t| t.parse::<i32>().ok() == Some(*priority))
+        }
+        TaskOperation::Add { instruction, .. } => {
+            !instruction.trim().is_empty()
+                && words.contains(instruction.trim())
+                && (lower.contains("add") || lower.contains("file") || words.contains("追加"))
+        }
+        TaskOperation::Done { .. } => false,
+    }
+}
+
 fn delivered_instruction<'a>(
     q: &Question,
     talk: &'a Talk,
@@ -267,10 +313,11 @@ pub fn authorize_task_operation(
                 .and_then(|json| serde_json::from_str::<TaskOperation>(json).ok())
                 .as_ref()
                 == Some(operation)
+                || natural_matches(words, operation)
         })
     }) {
         bail!(
-            "task operation requires individual post-delivery owner evidence and --quote of the entire latest send; required instruction: {expected}"
+            "task operation requires individual post-delivery owner evidence and --quote of the entire latest send that clearly names the task and the action (or the exact form: {expected})"
         );
     }
     Ok(())
@@ -1909,6 +1956,31 @@ pub async fn drain_turns(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn natural_language_task_operations_need_a_clear_unhedged_instruction() {
+        use super::{natural_matches, TaskOperation};
+        let release = TaskOperation::Release {
+            task: "6af7c0de1234".into(),
+        };
+        assert!(natural_matches("タスク6af7を再開してよい", &release) || natural_matches("Please release task 6af7c0de1234", &release));
+        assert!(natural_matches("Please release task 6af7 now", &release));
+        // Hedged, wrong task, or mixed verbs are never enough.
+        assert!(!natural_matches("Maybe release task 6af7", &release));
+        assert!(!natural_matches("release task 9999", &release));
+        assert!(!natural_matches("release or hold task 6af7", &release));
+        // Completing a task keeps its explicit typed form.
+        let done = TaskOperation::Done {
+            task: "6af7c0de1234".into(),
+        };
+        assert!(!natural_matches("mark task 6af7 done", &done));
+        let hold = TaskOperation::Hold {
+            task: "6af7c0de1234".into(),
+            reason: "owner asked".into(),
+        };
+        assert!(natural_matches("hold task 6af7", &hold));
+        assert!(!natural_matches("hold task 6af7", &release));
+    }
+
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 

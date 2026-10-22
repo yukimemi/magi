@@ -136,6 +136,29 @@ pub fn classify(state: &RunState) -> Continuation {
     }
 }
 
+/// Offer-time revalidation: drop every `resume` choice whose run `classify`
+/// says nothing can continue (or whose record cannot be read), so an action
+/// the daemon's admission would reject is never offered. A resume that maps to
+/// a bounded repair-and-review stays offered. The caller supplies the safe
+/// fallback when no choice is left.
+pub fn revalidate_offer(q: &mut crate::ask::Question) {
+    let stale: Vec<String> = q
+        .actions
+        .iter()
+        .filter_map(|(label, action)| match action {
+            crate::ask::ChoiceAction::Resume { run } => match RunState::load(run) {
+                Ok(s) if !matches!(classify(&s), Continuation::Blocked { .. }) => None,
+                _ => Some(label.clone()),
+            },
+            _ => None,
+        })
+        .collect();
+    for label in stale {
+        q.actions.remove(&label);
+        q.choices.retain(|c| c != &label);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +264,27 @@ mod tests {
             panic!("expected blocked");
         };
         assert!(precondition.contains("no surviving branch"));
+    }
+
+    #[test]
+    fn offer_drops_a_resume_that_admission_would_reject() {
+        let mut q = crate::ask::Question::new(
+            "t".into(),
+            "conduct".into(),
+            "conductor".into(),
+            "s".into(),
+            "d".into(),
+            vec!["resume".into(), "hold".into()],
+        );
+        q.actions.insert(
+            "resume".into(),
+            crate::ask::ChoiceAction::Resume {
+                run: "no-such-run".into(),
+            },
+        );
+        q.actions.insert("hold".into(), crate::ask::ChoiceAction::Hold);
+        revalidate_offer(&mut q);
+        assert_eq!(q.choices, ["hold"]);
+        assert!(!q.actions.contains_key("resume"));
     }
 }

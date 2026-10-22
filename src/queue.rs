@@ -465,6 +465,11 @@ pub struct Task {
     /// Authored criteria when the retained recovery review was selected.
     #[serde(default)]
     pub review_instruction: Option<String>,
+    /// The retained review was chosen to carry out an owner-approved
+    /// continuation. If its branch cannot be found at start the task is held
+    /// with the reason; it must never degrade into a fresh competition.
+    #[serde(default)]
+    pub approved_review: bool,
     /// Explicit public implementation selected by the operator; never inferred from prose.
     #[serde(default)]
     pub pr_recovery: Option<crate::pr_recovery::Selection>,
@@ -936,6 +941,7 @@ impl Task {
             operator_decided_at: None,
             review_branch: None,
             review_instruction: None,
+            approved_review: false,
             pr_recovery: None,
             fresh_start: false,
             replacement: None,
@@ -1632,6 +1638,14 @@ impl Task {
         self.answers.push(AnsweredQuestion { question, answer });
     }
 
+    /// [`Task::request_review`] for an owner-approved continuation: a missing
+    /// branch holds the task instead of starting a fresh competition. See
+    /// [`Task::approved_review`].
+    pub fn request_approved_review(&mut self, branch: String) {
+        self.request_review(branch);
+        self.approved_review = true;
+    }
+
     /// Requeue this task to reopen its last run as a review-only pass against
     /// `branch` (`crate::graph::Runner::review`) rather than competing from
     /// scratch. See [`Task::review_branch`].
@@ -1648,6 +1662,7 @@ impl Task {
         // A fresh competition is the opposite of a review of the old branch.
         self.review_branch = None;
         self.review_instruction = None;
+        self.approved_review = false;
         self.fresh_start = true;
     }
 

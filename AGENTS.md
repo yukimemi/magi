@@ -3261,6 +3261,15 @@ budget apart: `ReviewFailed` (a seat never answered), `VerificationComplete`
 - Every other rejection keeps the owner's intent and holds the task with the
   specific precondition and a viable continuation appended to the generic
   message (`Continuation::explain`), never a bare "cannot make progress".
-- Known follow-up: offer-time filtering in the conductor/triage builders and
-  natural-language task operations in `consult::TaskOperation` are not covered
-  by this change.
+- The mapped review is an *approved* review (`Task::approved_review`): a branch
+  that cannot be found at start holds the task with that reason instead of
+  falling back to a fresh competition, and its review budget is at least two
+  rounds (`daemon::apply_options`) so a fixer round precedes the final review.
+- Offers are revalidated: `continuation::revalidate_offer` drops conductor
+  `resume` choices whose run `classify` calls blocked or unreadable.
+- Consultation task operations accept unambiguous natural language
+  (`consult::natural_matches`: release, hold, priority, add; the whole message
+  unhedged and naming the task) in addition to the typed JSON. `done` stays typed.
+  The quote must still equal the entire latest persisted owner message.
+- Known follow-up: approval-reason rendering and the triage/land builders'
+  offer-time filtering are not covered by this change.
