@@ -196,7 +196,7 @@ pub fn start(
     };
     save(&staging, &job)?;
     std::fs::rename(&staging, &dir)?;
-    let mut cmd = Command::new(std::env::current_exe()?);
+    let mut cmd = Command::new(crate::updater::current_exe()?);
     cmd.arg("talk")
         .arg("watch-run")
         .arg(home)
@@ -342,7 +342,7 @@ pub fn supervise(home: &Path, id: &str) -> Result<()> {
     }
     job.supervisor = Some(identity(std::process::id())?);
     save(&dir, &job)?;
-    let mut cmd = Command::new(std::env::current_exe()?);
+    let mut cmd = Command::new(crate::updater::current_exe()?);
     cmd.arg("talk")
         .arg("watch-exec")
         .arg(home)

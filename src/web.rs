@@ -1606,7 +1606,7 @@ fn resume_requested(value: Option<std::ffi::OsString>) -> bool {
 /// generation's descriptors, so every later generation logged nowhere. The
 /// pid of the child is returned so the handover log can name it.
 fn spawn_successor(home: &FsPath, resume: bool) -> Result<u32> {
-    let exe = std::env::current_exe().context("find this binary")?;
+    let exe = updater::current_exe().context("find this binary")?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     updater::log_step(
         home,
