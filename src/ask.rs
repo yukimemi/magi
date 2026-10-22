@@ -2413,6 +2413,8 @@ mod tests {
                 "merge_target",
                 "node",
                 "panel",
+                "routed_chat",
+                "routed_task",
                 "run",
                 "schema",
                 "seat",
