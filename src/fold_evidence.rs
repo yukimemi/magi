@@ -39,8 +39,8 @@ pub(crate) async fn preserve(
     // Persist newly created directory links before later deleting the only
     // source. Syncing files alone does not persist their parent directories.
     let artifacts = dir.parent().context("artifacts directory")?;
-    std::fs::File::open(artifacts)?.sync_all()?;
-    std::fs::File::open(artifacts.parent().context("run directory")?)?.sync_all()?;
+    sync_directory(artifacts)?;
+    sync_directory(artifacts.parent().context("run directory")?)?;
     let mut bytes = 0;
     let mut files = 0;
     for entry in std::fs::read_dir(&dir)? {
@@ -325,11 +325,41 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
         file.write_all(data)?;
         file.sync_all()?;
         std::fs::rename(&tmp, path)?;
-        std::fs::File::open(path.parent().context("artifact parent")?)?.sync_all()?;
+        sync_directory(path.parent().context("artifact parent")?)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     result
+}
+
+fn sync_directory(_path: &Path) -> Result<()> {
+    // Normal directory handles cannot be opened/synced this way on Windows.
+    // Keep file syncing and atomic publication on every platform, and persist
+    // directory entries on Unix, as in retention::reconcile::durable_new_with.
+    #[cfg(unix)]
+    std::fs::File::open(_path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evidence_publication_syncs_supported_directories() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let artifacts = dir.path().join("artifacts");
+        let evidence = artifacts.join("fold-evidence");
+        std::fs::create_dir_all(&evidence)?;
+        sync_directory(&artifacts)?;
+        sync_directory(dir.path())?;
+
+        let path = evidence.join("manifest.json");
+        atomic_write(&path, b"{}")?;
+        assert_eq!(std::fs::read(&path)?, b"{}");
+        assert!(!evidence.join("manifest.json.pending").exists());
+        Ok(())
+    }
 }
