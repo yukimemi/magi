@@ -43,6 +43,7 @@ pub mod disk;
 mod driver;
 pub mod dupes;
 pub mod fixer;
+mod fold_evidence;
 pub mod followup;
 pub mod git;
 pub mod github_text;

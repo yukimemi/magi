@@ -101,8 +101,8 @@ pub(crate) fn source_retention_reason(home: &Path, state: &crate::run::RunState)
         // Queue completion does not prove that every historical candidate
         // landed. In particular, Superseded and Failed-without-tally runs
         // may still own independent implementations. Keep those sources
-        // until recovery transfers them or the merged-source preflight above
-        // can prove incorporation; Done is not deletion authority.
+        // until recovery transfers them or confirmed-merge preflight captures
+        // durable source evidence; Done is not deletion authority.
         .find(|task| task.runs.contains(&state.id))
         .map(|task| {
             format!(
