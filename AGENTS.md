@@ -3242,3 +3242,25 @@ files and 64 MiB per run; a limit or write failure retains all remaining trees.
 Run metadata, review records and existing artifacts survive. Unfinished-run,
 ownership, recovery-source, output-lease and Git-checkpoint protections still
 apply; fold never authorizes deletion of another run's source.
+
+### One judge for "continue": `continuation::classify`
+
+`src/continuation.rs` answers what an approved *resume* can do for a run, so the
+offer and the admission cannot disagree. `Resume` is defined as
+`handover::can_resume`; nothing re-implements it. `budget` tells a spent review
+budget apart: `ReviewFailed` (a seat never answered), `VerificationComplete`
+(clean/disabled/handed off: the remaining failure is verification, not review),
+`LandingCheckpoint`, and `UnresolvedFindings`.
+
+- `daemon::decide_action` maps a `Resume` that admission would reject, on a
+  Blocked run with a spent budget and a surviving winner branch, to
+  `ActionDecision::Review`: `Task::request_review(branch)` through the existing
+  takeover path (same task, same public PR head, history kept). It never merges,
+  discards, folds or starts a competition, and the event/notice says which
+  transition was chosen. Merge approval stays head-bound.
+- Every other rejection keeps the owner's intent and holds the task with the
+  specific precondition and a viable continuation appended to the generic
+  message (`Continuation::explain`), never a bare "cannot make progress".
+- Known follow-up: offer-time filtering in the conductor/triage builders and
+  natural-language task operations in `consult::TaskOperation` are not covered
+  by this change.

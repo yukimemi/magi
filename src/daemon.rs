@@ -851,6 +851,9 @@ enum ActionDecision {
     Resume(String),
     /// Requeue as a fresh competition.
     Requeue,
+    /// The run cannot resume, but its branch can be reviewed again with a
+    /// bounded repair pass ([`crate::continuation`]); keeps task, PR and work.
+    Review { branch: String, note: String },
     /// Hold the task by explicit operator choice.
     Hold,
     /// Close the task as done.
@@ -985,10 +988,23 @@ where
                     ActionDecision::Refuse("run already has a live driver".into())
                 }
                 Ok(s) if crate::handover::can_resume(&s) => ActionDecision::Resume(run.clone()),
-                Ok(_) => ActionDecision::Refuse((p.resume_cannot_progress)(
-                    q.short(),
-                    ask::short_id(run),
-                )),
+                Ok(s) => match crate::continuation::classify(&s) {
+                    crate::continuation::Continuation::RepairAndReview { branch } => {
+                        let note = crate::continuation::Continuation::RepairAndReview {
+                            branch: branch.clone(),
+                        }
+                        .explain()
+                        .unwrap_or_default();
+                        ActionDecision::Review { branch, note }
+                    }
+                    other => {
+                        let generic = (p.resume_cannot_progress)(q.short(), ask::short_id(run));
+                        ActionDecision::Refuse(match other.explain() {
+                            Some(why) => format!("{generic}: {why}"),
+                            None => generic,
+                        })
+                    }
+                },
                 Err(e) => ActionDecision::Refuse((p.resume_unreadable)(
                     q.short(),
                     ask::short_id(run),
@@ -1492,6 +1508,7 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
         let ran = matches!(
             decision,
             ActionDecision::Resume(_)
+                | ActionDecision::Review { .. }
                 | ActionDecision::Requeue
                 | ActionDecision::Hold
                 | ActionDecision::Done
@@ -1521,6 +1538,15 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
                 });
             }
             ActionDecision::Stale => {}
+            ActionDecision::Review { branch, note } => {
+                task.release_operator("choice-review", Some(&q.id));
+                task.request_review(branch);
+                notices::raise(
+                    Notice::info(&format!("action:{}", q.id), &note).link(Link::Task {
+                        id: task.id.clone(),
+                    }),
+                );
+            }
             ActionDecision::Requeue => {
                 task.release_operator("choice-requeue", Some(&q.id));
                 task.requeue();
@@ -10620,6 +10646,47 @@ mod tests {
                 Some(state.id)
             );
         }
+    }
+
+    #[test]
+    fn approved_resume_of_an_exhausted_review_becomes_a_bounded_branch_review() {
+        let mut state = run_state(RunStatus::Blocked);
+        state.driver_exited = true;
+        state.config.graph.review_rounds = 1;
+        let mut round = review_round(1);
+        round.blocking = 2;
+        round.progressed = false;
+        state.reviews = vec![round];
+        state.candidates = vec![candidate('A', "work", false, None)];
+        state.tally = Some(
+            serde_json::from_value(serde_json::json!({
+                "first_choice": {}, "borda": {}, "winner": "A",
+                "unanimous_initial": true, "deliberated": false,
+                "changed_votes": 0, "unanimous_final": true, "met_quorum": true
+            }))
+            .unwrap(),
+        );
+        assert!(!crate::handover::can_resume(&state));
+        let mut task = held_task_with(&state.id);
+        task.release();
+        let question = action_question(&state.id, resume_action(&state.id));
+        let ActionDecision::Review { branch, note } =
+            decide_action(&task, &question, &PHRASES_EN, |_| Ok(state.clone()))
+        else {
+            panic!("a spent review with findings must not be refused as unable to progress");
+        };
+        assert_eq!(branch, state.candidates[0].branch);
+        assert!(note.contains("nothing is merged"));
+
+        // Without a surviving branch the refusal names the precondition.
+        state.candidates.clear();
+        state.tally = None;
+        let ActionDecision::Refuse(why) =
+            decide_action(&task, &question, &PHRASES_EN, |_| Ok(state.clone()))
+        else {
+            panic!("expected a refusal");
+        };
+        assert!(why.contains("no surviving branch"), "{why}");
     }
 
     #[test]

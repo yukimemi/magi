@@ -34,6 +34,7 @@ pub mod chat_notify;
 pub mod chat_watch;
 pub mod clean;
 pub mod conduct;
+pub mod continuation;
 pub mod config;
 pub mod consult;
 pub mod daemon;
