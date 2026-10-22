@@ -3794,6 +3794,27 @@ async fn owner_stop<F: Forge>(state: &mut RunState, pr: &mut PrState, forge: &F)
     Ok(true)
 }
 
+/// Keep an unstarted verification resumable without charging a task attempt.
+fn check_landing_resources(
+    state: &mut RunState,
+    node: &str,
+    outcomes: &[crate::run::CommandOutcome],
+) -> Result<()> {
+    if let Some(blocked) = outcomes.iter().find(|outcome| outcome.resource_blocked) {
+        let detail = format!("{}: {}", blocked.command, blocked.output_tail);
+        state.resource_block = Some(crate::run::ResourceBlock {
+            node: node.into(),
+            kind: "shared build cache".into(),
+            detail: detail.clone(),
+            at: jiff::Timestamp::now(),
+        });
+        state.event("resource", &detail);
+        state.save()?;
+        bail!("landing verification could not start: {detail}");
+    }
+    Ok(())
+}
+
 /// Gate the local winner and publish that exact SHA, retaining the saved lease.
 /// A push completed before a crash is recoverable only when its SHA was gated.
 async fn publish_landing_head<F: Forge>(
@@ -3832,10 +3853,10 @@ async fn publish_landing_head<F: Forge>(
         );
         let mut outcomes = crate::graph::run_landing_gate(state, &winner, &wait).await?;
         loop {
-            anyhow::ensure!(
-                !outcomes.iter().any(|o| o.resource_blocked),
-                "landing gate could not acquire verification resources"
-            );
+            if outcomes.iter().any(|outcome| outcome.resource_blocked) {
+                state.gate = outcomes.clone();
+                check_landing_resources(state, "gate", &outcomes)?;
+            }
             if outcomes.iter().all(|o| o.ok()) {
                 break;
             }
@@ -3870,11 +3891,18 @@ async fn publish_landing_head<F: Forge>(
         Duration::from_secs(state.config.graph.timeout_resource_wait),
         move || inherited.cancelled(),
     );
+    let e2e = crate::graph::check_gate_repair_e2e(state, &winner, &wait).await?;
+    if matches!(e2e, crate::graph::GateFix::Defer) {
+        let outcomes = state
+            .gate_repair_e2e
+            .as_ref()
+            .context("deferred landing e2e has no outcomes")?
+            .outcomes
+            .clone();
+        check_landing_resources(state, "e2e", &outcomes)?;
+    }
     anyhow::ensure!(
-        matches!(
-            crate::graph::check_gate_repair_e2e(state, &winner, &wait).await?,
-            crate::graph::GateFix::Retry
-        ),
+        matches!(e2e, crate::graph::GateFix::Retry),
         "post-repair e2e has not passed on the landing head; nothing published"
     );
     anyhow::ensure!(

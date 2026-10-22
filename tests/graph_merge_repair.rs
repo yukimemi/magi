@@ -511,6 +511,148 @@ async fn serve_decision(fx: &common::Fixture, state: &RunState) {
     .unwrap();
 }
 
+// Re-executed by the contention tests so the lease belongs to a different
+// live process. Closing stdin releases it and lets the child exit normally.
+#[test]
+fn landing_verification_cache_holder() {
+    use std::io::BufRead as _;
+    let Some(home) = std::env::var_os("LANDING_CACHE_TEST_HOME") else {
+        return;
+    };
+    magi::run::set_home(home.into());
+    let cache = std::path::PathBuf::from(std::env::var_os("LANDING_CACHE_TEST_DIR").unwrap());
+    let owner = magi::cache::Owner::here("other-run", "gate", "gate", &cache, "other-head");
+    let guard = match magi::cache::try_acquire(&magi::run::home(), &cache, &owner).unwrap() {
+        magi::cache::AcquireOutcome::Acquired(guard) => guard,
+        magi::cache::AcquireOutcome::Busy(_) => panic!("test cache was already busy"),
+    };
+    std::fs::write(cache.join("holder-ready"), "").unwrap();
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).unwrap();
+    guard.release();
+}
+
+async fn landing_cache_contention_refunds_attempt(e2e: bool) {
+    let (fx, mut runner, question) = held_pr_choice(false, false, "merge").await;
+    Questions::open()
+        .update(&question, |q| {
+            q.status = magi::ask::QuestionStatus::Open;
+            q.answer = None;
+            q.answered_at = None;
+            Ok(())
+        })
+        .unwrap();
+    let cache = fx.tmp.path().join("verification-cache");
+    std::fs::create_dir(&cache).unwrap();
+    let started = fx.tmp.path().join("verification-started");
+    let command = format!(
+        "CARGO_TARGET_DIR={} touch {}",
+        cache.display(),
+        started.display()
+    );
+    runner.state.config.graph.timeout_resource_wait = 1;
+    runner.state.parked = false;
+    runner.state.status = RunStatus::Blocked;
+    runner.state.merge.as_mut().unwrap().ok = false;
+    if e2e {
+        runner.state.config.verify.e2e = vec![command];
+        runner.state.gate_repair_e2e = Some(magi::run::GateRepairE2e {
+            head: runner.state.land_approval.as_ref().unwrap().head.clone(),
+            passed: false,
+            outcomes: Vec::new(),
+        });
+    } else {
+        runner.state.config.verify.gate = vec![command];
+        runner.state.gate_ran = false;
+        runner.state.gate_head = None;
+    }
+    let mut task = decision_owner(&mut runner, &fx).await;
+    task.release_operator("test", None);
+    magi::queue::Queue::open().put(&mut task).unwrap();
+    let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "landing_verification_cache_holder",
+            "--nocapture",
+        ])
+        .env("LANDING_CACHE_TEST_HOME", magi::run::home())
+        .env("LANDING_CACHE_TEST_DIR", &cache)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while !cache.join("holder-ready").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if ready.is_ok() {
+        serve_decision(&fx, &runner.state).await;
+    }
+    drop(holder.stdin.take());
+    let output = holder.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ready.expect("cache holder did not become ready");
+
+    let owner = magi::queue::Queue::open().get(&task.id).unwrap();
+    let disk = RunState::load(&runner.state.id).unwrap();
+    assert_eq!(
+        owner.attempts, task.attempts,
+        "resource waits must refund the attempt"
+    );
+    assert_eq!(owner.status, magi::queue::TaskStatus::Held);
+    assert_eq!(owner.hold_source, Some(magi::queue::HoldSource::Machine));
+    assert_eq!(owner.runs, task.runs);
+    assert_eq!(
+        disk.resource_block.as_ref().unwrap().node,
+        if e2e { "e2e" } else { "gate" }
+    );
+    let outcomes = if e2e {
+        &disk.gate_repair_e2e.as_ref().unwrap().outcomes
+    } else {
+        &disk.gate
+    };
+    assert!(outcomes.iter().any(|outcome| outcome.resource_blocked));
+    let worktree = &disk.winner().unwrap().worktree;
+    assert!(!started.exists());
+    assert_eq!(
+        magi::git::rev_parse(worktree, "HEAD").await.unwrap(),
+        disk.pr_pushed_head.as_ref().unwrap().as_str()
+    );
+
+    // Once the real lease is free, releasing the task retries the same run.
+    let mut released = owner;
+    released.release_operator("test", None);
+    magi::queue::Queue::open().put(&mut released).unwrap();
+    serve_decision(&fx, &disk).await;
+    let resumed = RunState::load(&disk.id).unwrap();
+    assert!(resumed.resource_block.is_none(), "{:?}", resumed.events);
+    assert!(resumed.parked, "{:?}", resumed.events);
+    assert!(started.exists());
+    assert_eq!(
+        magi::queue::Queue::open().get(&task.id).unwrap().runs,
+        task.runs
+    );
+}
+
+common::e2e! {
+async fn landing_gate_cache_contention_spends_no_attempt() {
+    landing_cache_contention_refunds_attempt(false).await;
+}
+}
+
+common::e2e! {
+async fn landing_post_repair_e2e_cache_contention_spends_no_attempt() {
+    landing_cache_contention_refunds_attempt(true).await;
+}
+}
+
 common::e2e! {
 async fn decision_cli_hold_survives_head_change_and_daemon_settles_manual_hold() {
     let (fx, mut runner, question) = held_pr_choice(false, false, "hold").await;
