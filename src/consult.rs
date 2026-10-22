@@ -147,7 +147,8 @@ pub fn pending_consults(questions: &Questions, talk_id: &str) -> bool {
 
 /// Consultation activity is separate from the question's waiting state.
 pub fn active_consult(q: &Question, talk_id: &str) -> bool {
-    q.status.open()
+    q.routed_task.is_none()
+        && q.status.open()
         && q.consult_outcome.is_none()
         && q.consult.as_ref().is_some_and(|c| c.talk == talk_id)
 }
@@ -307,6 +308,10 @@ pub fn record_other(q: &mut Question, talk: &Talk, text: &str, quote: Option<&st
 /// When queueing fails the record is withdrawn, so the owner can try again.
 pub fn begin(questions: &Questions, talks: &Talks, q: &Question, talk: &Talk) -> Result<bool> {
     let (q, fresh) = questions.update(&q.id, |r| {
+        anyhow::ensure!(
+            r.routed_task.is_none(),
+            "task decision is delivered by its own chat turn"
+        );
         if !r.status.open() {
             bail!("question {} is already {}", r.short(), r.status.as_str());
         }
@@ -1413,6 +1418,9 @@ pub fn validate_answer(
     reply: &str,
     quote: Option<&str>,
 ) -> Result<()> {
+    if q.routed_task.is_some() && consent(q, reply) == Consent::Merge {
+        bail!("task-chat merge consent requires the owner's head-bound button");
+    }
     let kind = QuestionKind::of(q);
     if node != CHAT_NODE || kind == QuestionKind::Ordinary {
         return Ok(());

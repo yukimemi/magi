@@ -609,6 +609,12 @@ pub struct Question {
     /// Exact PR and head displayed to the owner. Absent on legacy questions.
     #[serde(default)]
     pub merge_target: Option<crate::merge_decision::Target>,
+    /// Task decision outbox; retained until task-chat delivery is durable.
+    #[serde(default)]
+    pub routed_task: Option<String>,
+    /// Set after delivery; merge consent remains in this record.
+    #[serde(default)]
+    pub routed_chat: Option<String>,
     /// What the daemon does when a given choice is answered, keyed by the
     /// choice's exact text. Empty for an ordinary question. A key is always
     /// one of [`Question::choices`]; `#[serde(default)]` so older files read.
@@ -747,6 +753,8 @@ impl Question {
             posting_comparison: None,
             choices,
             merge_target: None,
+            routed_task: None,
+            routed_chat: None,
             actions: std::collections::BTreeMap::new(),
             panel: false,
             assets: Vec::new(),
@@ -828,6 +836,34 @@ impl Question {
     /// and "that is not one of the choices" and "this question is multiple
     /// choice" are different mistakes with different fixes.
     pub fn answer(&mut self, answer: Answer) -> Result<()> {
+        self.answer_inner(answer, false)
+    }
+
+    /// Only the owner HTTP button endpoint supplies this head-bound evidence.
+    pub(crate) fn answer_chat_button(
+        &mut self,
+        answer: Answer,
+        talk: &str,
+        head: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.routed_chat.as_deref() == Some(talk),
+            "wrong approval chat"
+        );
+        anyhow::ensure!(
+            self.merge_target.as_ref().is_some_and(|t| t.head == head),
+            "stale approval head"
+        );
+        self.answer_inner(answer, true)
+    }
+
+    fn answer_inner(&mut self, answer: Answer, owner_button: bool) -> Result<()> {
+        if self.routed_task.is_some()
+            && matches!(&answer, Answer::Choice(c) if crate::consult::consent(self, c) == crate::consult::Consent::Merge)
+            && !owner_button
+        {
+            bail!("task-chat merge approval requires the owner's head-bound chat button");
+        }
         match self.status {
             QuestionStatus::Answered => bail!(
                 "question {} was already answered; the run has moved on and a \
@@ -938,6 +974,9 @@ impl Question {
         quote: &str,
         note: Option<&str>,
     ) -> Result<()> {
+        if self.routed_task.is_some() {
+            bail!("task decisions are handled by the task chat, not a deputy");
+        }
         let Some(deputy) = &self.deputy else {
             bail!("question {} has no deputy", self.short());
         };
@@ -1508,6 +1547,13 @@ impl Questions {
     /// previous state readable rather than a truncated file that would strand
     /// the run waiting on it.
     pub fn put(&self, q: &mut Question) -> Result<()> {
+        if q.status.open()
+            && q.routed_task.is_none()
+            && let Some(home) = self.root.parent()
+        {
+            q.routed_task =
+                crate::task_chat::task_of(q, &crate::queue::Queue::at(home.join("queue")).list());
+        }
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
         let body = serde_json::to_string_pretty(q).context("serialize question")?;
@@ -2017,6 +2063,9 @@ async fn wait_loop(
 /// An error here is reported, not swallowed, so `magi notify --test` can show
 /// the operator why nothing arrives. The waiting path logs it and carries on.
 pub async fn notify(cmd: &config::Notify, q: &Question) -> Result<()> {
+    if q.routed_task.is_some() {
+        return Ok(());
+    }
     let mut summary = format!("Question {}: {}", q.short(), q.summary.trim());
     if q.status.open() {
         summary.push_str(&format!(

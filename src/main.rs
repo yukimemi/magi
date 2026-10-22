@@ -482,7 +482,8 @@ enum Command {
         #[arg(long)]
         refresh: bool,
     },
-    /// Ask the owner something and wait. Meant for agents inside a run.
+    /// Post a task decision as free text to its chat, without waiting.
+    /// Legacy non-task questions retain the wait/thread/choice workflow.
     ///
     /// The owner may talk back instead of answering, in which case this
     /// returns with their words on stdout and exit code 0 rather than
@@ -2414,8 +2415,8 @@ async fn task_text(words: &[String], file: Option<&Path>, issue: Option<u64>) ->
     bail!("give a task: as arguments, --file, --issue, or on stdin");
 }
 
-/// `magi ask`: file a question and block until the owner answers, or reply to
-/// one already open and wait again.
+/// `magi ask`: task decisions post to the chat outbox and exit successfully.
+/// Non-task questions retain the legacy foreground wait and thread workflow.
 ///
 /// This is the command an agent runs, so its exit status carries the outcome:
 /// zero whenever a run can go on (an answer, or the owner talking back rather
@@ -2569,7 +2570,9 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
                 }
                 Ok(())
             })?;
-            eprintln!("replied on {} — waiting for the owner again", q.short());
+            if q.routed_task.is_none() {
+                eprintln!("replied on {} — waiting for the owner again", q.short());
+            }
             q
         }
         None => {
@@ -2593,10 +2596,20 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
                 store.put_panel(&mut q, &html, &assets)?;
             }
             store.put(&mut q)?;
-            eprintln!("asked {} — waiting for the owner", q.short());
+            if q.routed_task.is_none() {
+                eprintln!("asked {} — waiting for the owner", q.short());
+            }
             q
         }
     };
+
+    if q.routed_task.is_some() {
+        println!(
+            "Posted decision {} to the task chat outbox; finish this turn without waiting.",
+            q.id
+        );
+        return Ok(());
+    }
 
     // A merge approval's or release-watch question's deadline is fixed at
     // `asked_at + answer_timeout` (the instant land / the watcher abandons it),
@@ -2754,6 +2767,13 @@ async fn ask_wait_cmd(
     let resolved = store.resolve_id(id)?;
     let mut q = store.get(&resolved)?;
     question_belongs_to_this_run(&q, &run, "wait on")?;
+    if q.routed_task.is_some() {
+        println!(
+            "Decision {} is routed to the task chat; finish without waiting.",
+            q.id
+        );
+        return Ok(());
+    }
     // The owner may have answered - or the question may have been abandoned
     // out from under it - in the gap between an earlier call reporting
     // `Wait::Pending` and this one being run. Either is a real outcome, not
@@ -3031,6 +3051,10 @@ async fn answer_cmd(args: AnswerArgs) -> Result<()> {
     } else {
         ask::Answer::Choice(reply)
     };
+    anyhow::ensure!(
+        q.routed_task.is_none() || q.merge_target.is_some(),
+        "task decisions are free text in the task chat; use magi task control"
+    );
     let tasks = magi::queue::Queue::open().list();
     let talks = magi::talk::Talks::open();
     let seat = agent_env();

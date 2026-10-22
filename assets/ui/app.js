@@ -6379,6 +6379,29 @@ function renderTalk() {
   }
   state.prevTalkTurnCount = turnCount;
 
+  let approvals = $("talk-merge-approvals");
+  if (!approvals) {
+    approvals = el("div", { id: "talk-merge-approvals" });
+    $("talk-turns").after(approvals);
+  }
+  clear(approvals);
+  for (const approval of talk.merge_approvals || []) {
+    const row = el("div", { class: "talk-pending" },
+      el("p", { text: `Merge decision: ${approval.target.pr} at ${approval.target.head}` }));
+    for (const choice of ["merge", "hold"]) {
+      row.append(el("button", { class: "btn", type: "button", text: choice === "merge" ? "Merge this head" : "Hold", onclick: async (event) => {
+        event.currentTarget.disabled = true;
+        try {
+          await postJson(API.answer(approval.question), { choice, talk: talk.id, head: approval.target.head });
+          await loadTalk(talk.id);
+        } catch (error) {
+          row.append(el("p", { text: error.message }));
+        }
+      } }));
+    }
+    approvals.append(row);
+  }
+
   renderTalkTasks(talk);
 
   const canSay = status === "open";

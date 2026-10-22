@@ -11,9 +11,9 @@
 //!
 //! - **Authorization.** `MAGI_NODE=chat` and `MAGI_RUN` equal to the exact id
 //!   of an open conversation ([`crate::chat_watch::authorize`]).
-//! - **Scope.** Only tasks that conversation filed itself
-//!   ([`Task::filed_by_chat`]) and the runs recorded in their `runs`. A
-//!   follow-up's inherited `origin_chat` does not count. Task ids and run ids
+//! - **Scope.** Tasks that conversation filed itself ([`Task::filed_by_chat`])
+//!   or whose decision destination is its persisted [`Task::chat`], and their
+//!   recorded runs. An inherited `origin_chat` alone does not count. Task ids and run ids
 //!   are checked against the queue under the task's claim, not trusted.
 //! - **Resume starts nothing here.** It pins the owning task to the run and
 //!   queues it; the loop's ordinary start logic resumes it under the graph's
@@ -173,7 +173,7 @@ pub fn authorize(talks: &Talks, run: &str, node: &str) -> Result<Talk> {
 
 /// Whether `task` was filed by exactly this conversation.
 fn owned(task: &Task, talk: &str) -> bool {
-    task.filed_by_chat() == Some(talk)
+    task.filed_by_chat() == Some(talk) || task.chat.as_deref() == Some(talk)
 }
 
 /// A task of this conversation, from a full or unambiguous-prefix id.

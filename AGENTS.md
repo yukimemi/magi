@@ -2695,7 +2695,8 @@ inherits `MAGI_RUN` / `MAGI_NODE`.
   talk's own session and lease. Atomic result records and
   `talk::queue_once` with `watch:<id>:finished` tolerate a restart between
   saving the draft and marking delivery. Transient I/O failures retry; closed
-  or deleted talks are skipped and never reopened. Delivery waits until the
+  or deleted talks are skipped and never reopened by this passive watch path.
+  Task decision delivery (`task_chat`) deliberately reopens closed talks. Delivery waits until the
   next serve startup if serve is stopped; the job continues independently.
 - **Automatic text stays automatic.** `prompt::chat_watch_notice` creates a
   fixed English report with scrubbed, clipped, defused output quoted as
@@ -3274,3 +3275,26 @@ files and 64 MiB per run; a limit or write failure retains all remaining trees.
 Run metadata, review records and existing artifacts survive. Unfinished-run,
 ownership, recovery-source, output-lease and Git-checkpoint protections still
 apply; fold never authorizes deletion of another run's source.
+
+### Task decision delivery
+
+This section supersedes earlier task-question waiting, choice and deputy rules;
+those rules now apply only to the retained non-task legacy workflow.
+
+Task-scoped Questions are a durable outbox for `task_chat::sweep`, not a
+conversation with their asker. `magi ask` posts and finishes; do not wait or
+start a deputy/waiter for these records. Decisions go as free text to the task's
+persisted `chat`, its own source chat, or its inherited origin chat. A missing
+chat is created with the chatter-chain head, default persona and one
+implementer. This decision path deliberately **reopens closed chats**; the
+passive completion/watch path still skips them. Keep those rules distinct.
+
+Use `magi task control` to apply chat decisions, retaining its existing state,
+ownership, liveness and confirmation checks. Automatic messages permit only
+investigation and reporting. Merge approval records stay open with their
+existing PR/head binding and deadlines. A persona reply containing the full
+approval ID presents Merge/Hold buttons; only the owner's head-bound button
+request can approve a routed merge. Free text, agent answers, deputy settlement
+and quoted consent cannot approve it. Silence is a hold; `land_approval` stays
+on by default. Keep the Question store and non-task legacy workflow until the
+next migration step.

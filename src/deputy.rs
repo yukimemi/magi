@@ -169,6 +169,9 @@ pub enum Kind {
 /// (a reviewer's `review` is also the divergence question's node). A question
 /// with no choices cannot be settled and is a notice, not something to answer.
 pub fn kind_of(q: &Question) -> Option<Kind> {
+    if q.routed_task.is_some() {
+        return None;
+    }
     match q.node.as_str() {
         crate::conduct::NODE => Some(Kind::Conduct),
         crate::land::APPROVAL_NODE => Some(Kind::Land),
@@ -261,7 +264,9 @@ pub fn merge_gated(q: &Question) -> bool {
 /// questions that something other than the waiter retires: a merge approval
 /// (land) and a release-watch question (the watcher, by silence being a hold).
 pub fn fixed_clock(q: &Question) -> bool {
-    matches!(kind_of(q), Some(Kind::Land | Kind::Release)) || q.node == crate::github_text::ASK_NODE
+    q.node == crate::land::APPROVAL_NODE
+        || (q.node == crate::bump::NOTICE_NODE && q.seat == "release-watch")
+        || q.node == crate::github_text::ASK_NODE
 }
 
 /// Second after which nobody is to be started or kept on `q`.
@@ -443,6 +448,9 @@ impl Deputies {
         for q in self.store.list() {
             if (self.halt)() {
                 return;
+            }
+            if crate::task_chat::routes(&q, &self.home) {
+                continue;
             }
             let Some(kind) = kind_of(&q) else {
                 continue;

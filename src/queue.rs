@@ -129,7 +129,8 @@ use crate::ask::Questions;
 ///
 /// 19: persist settled pass start times for upgrade-resume scheduling.
 /// Old passes default to unknown and use settlement order as an approximation.
-pub const SCHEMA: u32 = 19;
+/// 20: persist the task decision chat destination, defaulting to absent.
+pub const SCHEMA: u32 = 20;
 
 /// Candidate order only: all claims, lanes and eligibility gates still apply.
 /// Upgrade-parked runs retain their pass-start order ahead of ordinary work,
@@ -314,6 +315,9 @@ pub struct Task {
     pub repo: PathBuf,
     /// Who asked.
     pub source: Source,
+    /// Durable destination for task decision messages (including tasks filed outside chat).
+    #[serde(default)]
+    pub chat: Option<String>,
     /// Higher runs first; ties break oldest-first so nothing starves.
     #[serde(default)]
     pub priority: i32,
@@ -919,6 +923,7 @@ impl Task {
             sources: crate::refs::Sources::default(),
             repo,
             source,
+            chat: None,
             priority: 0,
             solo: false,
             status: TaskStatus::Queued,

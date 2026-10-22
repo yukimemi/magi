@@ -3247,6 +3247,12 @@ async fn poll(
 
         // Deterministic: no model, run before the conductor sees anything so
         // its input reflects the queue's current, already-resolved state.
+        crate::task_chat::sweep(
+            queue,
+            &crate::talk::Talks::at(home.join("talks")),
+            &questions,
+            home,
+        );
         repair_choice_offers(&questions);
         resolve_blockers(queue, &questions);
         apply_choice_actions(queue, &questions, home).await;

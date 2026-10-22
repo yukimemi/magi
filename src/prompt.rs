@@ -280,83 +280,17 @@ fn truncate_patch(patch: &str, branch: &str) -> String {
 /// two designs on a phone with no evidence will either guess or ignore it.
 fn ask_the_owner(language: &str) -> String {
     let mut s = String::from(
-        "\
-# Asking the owner\n\n\
-If a decision is genuinely the owner's - a product choice, a tradeoff with no \
-technically correct answer, something that would be expensive to undo - stop \
-and ask instead of guessing:\n\n\
-```sh\n\
-magi ask --summary \"Which storage backend?\" --choice SQLite --choice Redis\n\
-```\n\n\
-It blocks and prints the owner's answer on stdout. Omit `--choice` for a \
-free-text reply.\n\n\
-**An answer is an instruction to you.** Every question presumes that once \
-the owner answers, you carry the answer out yourself: the process blocked \
-in `magi ask` continues with it. So never ask permission for something you \
-can and should just do - resuming a parked run, which the project \
-instructions already tell you to do, is done, not asked about. Only when a \
-part genuinely cannot be done by you, say in the question WHO will do it \
-(agent, operator or daemon) for each choice, and start each `--choice` label \
-with that actor, so the owner knows whether picking it leads to action or to \
-waiting on someone:\n\n\
-```sh\n\
-magi ask --summary \"Token expired: who rotates it?\" --choice \"agent: switch to the read-only mirror\" --choice \"operator: rotate the token, then I continue\"\n\
-```\n\n\
-Keep the actor word in English (`agent:`, `operator:`, `daemon:`) whatever \
-language the question is written in.\n\n\
-When a choice should make the daemon act on the task behind your run once it \
-is picked, attach a structured action to that exact choice with `--action \
-\"<choice>=<verb>\"`: `resume` (continue this run, or `resume:<run-id>`), \
-`requeue` (a fresh competition) or `done`. The daemon never infers an action \
-from a label's wording, so a choice without `--action` only records the \
-answer.\n\n\
-```sh\n\
-magi ask --summary \"Continue this run?\" --choice \"daemon: resume the run\" --action \"daemon: resume the run=resume\" --choice \"operator: I will decide later\"\n\
-```\n\n\
-**Never put this in the background.** The process blocked inside `magi ask` \
-*is* the conversation with the owner - it is the only thing that will ever \
-read their answer. Backgrounding it, or letting your own process exit while \
-it is still running, does not free you to keep working and pick the answer \
-up later: it throws the answer away. The owner still sees the question, \
-still replies, and nothing is left listening. A single call cannot block \
-forever, so instead of hanging until something kills it, it stops on its own \
-after a while and prints that nothing has happened yet - not a failure, just \
-this call's own turn running out. When you see that, call it again, in the \
-foreground, exactly as told:\n\n\
-```sh\n\
-magi ask --wait <question-id>\n\
-```\n\n\
-Keep calling `--wait` in the foreground - one blocking call after another - \
-until an answer or a reply comes back. It resumes the same wait; it does not \
-ask anything new and takes no `--summary`. Backgrounding *this* call throws \
-the answer away exactly as backgrounding the first one would.\n\n\
-You can attach a page you format yourself, which is how the owner actually \
-judges: a diff, a table of what changes, a rendered before and after.\n\n\
-```sh\n\
-magi ask --summary \"...\" --choice A --choice B --panel panel.html --asset shot.png\n\
-```\n\n\
-The panel is your own HTML and CSS, rendered in a sandbox: **no JavaScript \
-runs and nothing may load from the network**. External links must carry \
-`target=\"_blank\"` to work: a link that navigates the frame itself is refused. \
-Inline your styles, reference \
-attached assets by their bare filename, and use `data:` URIs for anything \
-small. A `<script>`, a remote font or an external image is silently blocked, \
-so do not spend effort on them.\n\n\
-The owner may answer back with a question of their own instead of deciding - \
-`magi ask` then exits 0 and prints what they said, because that is not a \
-failure, it is the conversation continuing. Read it, and reply on the same \
-question with `--thread`:\n\n\
-```sh\n\
-magi ask --thread <question-id> --summary \"...\" --choice A --choice B\n\
-```\n\n\
-This appends your reply and waits again; it does not start a new question, so \
-say only what is new. Restate `--choice` if the right answers changed because \
-of what the owner asked - the previous choices are gone otherwise, not kept. \
-Keep replying on the same thread until an answer comes back.\n\n\
-Ask sparingly. A question stops the run until a human notices it, and asking \
-about something you could have decided yourself is how that channel becomes \
-noise the owner learns to ignore. Asking permission for something you were \
-already meant to do is the same noise.",
+        "# Asking the owner\n\nWhen a task needs an owner decision, post the context as free text:\n\n\
+         ```sh\nmagi ask --summary \"Decision needed\" --detail \"Context and recommendation\"\n```\n\n\
+         Task questions are delivered to the task's chat. The command posts and exits; finish your turn. \
+         Do not wait, poll --wait, offer choices, or start a deputy/waiter. \
+         The chat discusses the decision with the owner and uses `magi task control` to apply it. \
+         Merge approval requires the owner's explicit PR-head-bound chat button; silence is a hold. \
+         Questions without an associated task retain the legacy foreground question workflow. \
+         Only for those legacy questions, `magi ask --thread <id>` replies and waits again. \
+         Legacy evidence panels use `--panel panel.html --asset shot.png`: no JavaScript runs and \
+         nothing may load from the network; external links require `target=\"_blank\"`. \
+         Ask sparingly; post decisions only when owner judgement is needed.",
     );
     if !is_english(language) {
         // Load-bearing, and separate from `lang()` on purpose: the summary,
@@ -1838,9 +1772,10 @@ pub struct DeputyPrompt<'a> {
     pub language: &'a str,
 }
 
-/// Heading of the automatic turn that reports a chat-filed task's final state
-/// to the conversation. The briefing names it, and `consult` leaves it out of
-/// the owner's words.
+/// Heading of automatic task decisions, excluded from owner consent evidence.
+pub const TASK_MESSAGE_HEADING: &str = "Task decision message";
+
+/// Heading for passive completion reports.
 pub const CHAT_TASK_NOTICE_HEADING: &str = "Update on a task you filed";
 
 /// Heading shared by watch draft detection and owner-message filtering.
@@ -1848,9 +1783,13 @@ pub const CHAT_WATCH_NOTICE_HEADING: &str = "Update on a job you watched";
 
 /// Recognize automatic completion reports in a conversation message.
 pub fn is_completion_notice(message: &str) -> bool {
-    [CHAT_TASK_NOTICE_HEADING, CHAT_WATCH_NOTICE_HEADING]
-        .iter()
-        .any(|heading| message.trim_start().starts_with(&format!("# {heading}\n")))
+    [
+        CHAT_TASK_NOTICE_HEADING,
+        CHAT_WATCH_NOTICE_HEADING,
+        TASK_MESSAGE_HEADING,
+    ]
+    .iter()
+    .any(|heading| message.trim_start().starts_with(&format!("# {heading}\n")))
 }
 
 /// Display-only snapshot of an automatic event, separate from agent instructions.
@@ -2096,6 +2035,7 @@ pub const CHAT_CONSULT_END: &str = "edit the repository.";
 pub fn defuse(text: &str) -> String {
     let mut out = text.to_owned();
     for marker in [
+        TASK_MESSAGE_HEADING,
         CHAT_CONSULT_HEADING,
         CHAT_CONSULT_END,
         CHAT_TASK_NOTICE_HEADING,
@@ -3840,45 +3780,13 @@ mod tests {
     }
 
     #[test]
-    fn an_implementer_is_told_how_to_reply_when_the_owner_asks_back() {
+    fn task_ask_posts_free_text_and_finishes_without_waiting() {
         let p = implement("do it", "/tmp/wt", "en", None, &[]);
-        assert!(p.contains("--thread"), "{p}");
-        assert!(
-            p.contains("exits 0"),
-            "the agent must not read being asked back as a failed command: {p}"
-        );
-        assert!(
-            p.contains("Restate `--choice`"),
-            "the old choices are not kept across a reply: {p}"
-        );
-    }
-    #[test]
-    fn an_implementer_is_told_never_to_background_the_wait_and_how_to_resume_it() {
-        // A seat backgrounded a blocking `magi ask`, reported it would
-        // "continue once the owner replies", and exited `completed` - the
-        // child that would have read the reply died with it, and the owner's
-        // eventual answer had nobody left listening. The prompt has to rule
-        // this out explicitly rather than trust it is obvious.
-        let p = implement("do it", "/tmp/wt", "en", None, &[]);
-        assert!(
-            p.contains("Never put this in the background"),
-            "the exact failure mode has to be named, not implied: {p}"
-        );
-        assert!(p.contains("magi ask --wait"), "{p}");
-        assert!(
-            p.contains("foreground"),
-            "the fix is a foreground call, not a background one: {p}"
-        );
-    }
-    #[test]
-    fn a_question_presumes_the_asker_acts_on_the_answer_and_names_who_acts() {
-        let p = implement("do it", "/tmp/wt", "en", None, &[]);
-        assert!(p.contains("never ask permission"), "{p}");
-        assert!(p.contains("resuming a parked run"), "{p}");
-        assert!(p.contains("agent: switch to the read-only mirror"), "{p}");
-        assert!(p.contains("operator: rotate the token"), "{p}");
-        let c = conduct(&[conduct_task("t1")], &[], &[], "en");
-        assert!(c.contains("never `agent:`"), "{c}");
+        assert!(p.contains("command posts and exits"));
+        assert!(p.contains("Do not wait"));
+        assert!(p.contains("magi task control"));
+        assert!(p.contains("PR-head-bound chat button"));
+        assert!(!p.contains("--choice SQLite"));
     }
 
     #[test]

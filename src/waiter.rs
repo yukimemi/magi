@@ -124,7 +124,7 @@ pub fn decide_owned(
     now: Timestamp,
     daemon_owns_action: bool,
 ) -> Action {
-    if q.cwd.is_none() || lease.is_some_and(|l| l.fresh(now)) {
+    if q.routed_task.is_some() || q.cwd.is_none() || lease.is_some_and(|l| l.fresh(now)) {
         return Action::Idle;
     }
     match q.status {
@@ -233,6 +233,9 @@ impl Waiter {
         for q in self.store.list() {
             if halt() {
                 return;
+            }
+            if crate::task_chat::routes(&q, &self.home) {
+                continue;
             }
             let lease = self.store.read_lease(&q.id);
             let owned = self.daemon_owns_action(&q);
@@ -427,6 +430,9 @@ impl Waiter {
         // Re-read under the claim: the asker may have come back, or the owner
         // may have said more, since the tick's copy was taken.
         let q = self.store.get(&q.id)?;
+        if crate::task_chat::routes(&q, &self.home) {
+            return Ok(());
+        }
         let now = Timestamp::now();
         let lease = self.store.read_lease(&q.id);
         let owned = self.daemon_owns_action(&q);

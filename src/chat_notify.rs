@@ -744,7 +744,7 @@ pub fn authorize_post(tasks: &[Task], run: &str, node: &str, talk_id: &str) -> R
         .iter()
         .find(|t| t.runs.iter().any(|r| r == run))
         .ok_or_else(|| anyhow::anyhow!("run {run} belongs to no task"))?;
-    match task.filed_by_chat() {
+    match task.chat.as_deref().or_else(|| task.filed_by_chat()) {
         Some(id) if id == talk_id => Ok(()),
         _ => bail!("run {run} does not belong to a task filed from chat {talk_id}"),
     }
