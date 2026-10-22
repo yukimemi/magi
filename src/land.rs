@@ -7195,24 +7195,33 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         advance_landing_base(&state).await;
         landing_setup(&mut state).await;
         interrupt_landing_rebase(&mut state).await;
-        // Include a newline to exercise NUL-delimited path handling.
-        let local = "local\nnotes";
+        // Exercise unusual names without asking Windows to create an invalid
+        // control-character filename. Unix also covers embedded newlines.
+        let locals = [
+            "local notes",
+            #[cfg(unix)]
+            "local\nnotes",
+        ];
         let excludes = git::git(&state.repo, &["rev-parse", "--git-path", "info/exclude"])
             .await
             .unwrap();
         std::fs::write(state.repo.join(excludes), "local*\n").unwrap();
-        std::fs::write(state.repo.join(local), "keep these notes").unwrap();
-        assert!(
-            git::git_raw(&state.repo, &["check-ignore", "--quiet", local])
-                .await
-                .unwrap()
-                .ok()
-        );
+        for local in locals {
+            std::fs::write(state.repo.join(local), "keep these notes").unwrap();
+            assert!(
+                git::git_raw(&state.repo, &["check-ignore", "--quiet", local])
+                    .await
+                    .unwrap()
+                    .ok()
+            );
+        }
         restore_landing_worktree(&mut state).await.unwrap();
-        assert_eq!(
-            std::fs::read_to_string(state.repo.join(local)).unwrap(),
-            "keep these notes"
-        );
+        for local in locals {
+            assert_eq!(
+                std::fs::read_to_string(state.repo.join(local)).unwrap(),
+                "keep these notes"
+            );
+        }
         assert_eq!(
             std::fs::read_to_string(state.repo.join(".env")).unwrap(),
             "secret"
