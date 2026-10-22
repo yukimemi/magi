@@ -2236,6 +2236,37 @@ impl std::fmt::Debug for IdSource {
     }
 }
 
+/// Does `path` exist (a broken symlink counts)? Only `NotFound` is "no":
+/// any other failure is an error rather than a free slot.
+fn path_exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
+    }
+}
+
+fn validate_attachments(sources: &[PathBuf]) -> Result<Vec<(&PathBuf, &str)>> {
+    let mut wanted = Vec::new();
+    for src in sources {
+        let name = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .with_context(|| format!("`{}` has no usable file name", src.display()))?;
+        if !crate::ask::valid_asset_name(name) {
+            bail!(
+                "attachment name `{name}` must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,63}}$ \
+                 with no `..`; rename the file and try again"
+            );
+        }
+        if !src.is_file() {
+            bail!("attachment `{}` is not a file", src.display());
+        }
+        wanted.push((src, name));
+    }
+    Ok(wanted)
+}
+
 /// How many candidate ids a new task may try before filing gives up.
 const FILE_ATTEMPTS: usize = 256;
 
@@ -2282,32 +2313,66 @@ impl Queue {
     fn file_with(
         &self,
         task: &mut Task,
+        hook: impl FnMut(&mut Task) -> Result<bool>,
+        undo: impl FnMut(&mut Task),
+    ) -> Result<()> {
+        self.reserve_id(task, hook, undo, true)
+    }
+
+    /// The reservation loop behind [`Queue::file_with`]. With `store` false
+    /// the id is only reserved through whatever `hook` leaves on disk (an
+    /// attachment directory) and no record is written; the task stays unfiled.
+    ///
+    /// An injected id source supplies the first candidate too, unless the
+    /// task already holds an id through an earlier reservation (attachments);
+    /// production keeps the id [`Task::new`] minted.
+    fn reserve_id(
+        &self,
+        task: &mut Task,
         mut hook: impl FnMut(&mut Task) -> Result<bool>,
         mut undo: impl FnMut(&mut Task),
+        store: bool,
     ) -> Result<()> {
+        let redraw_first = self.ids.0.is_some() && task.attachments.is_empty();
         for attempt in 0..FILE_ATTEMPTS {
-            if attempt > 0 {
+            if attempt > 0 || redraw_first {
                 task.id = self.mint_id();
             }
             let _lock = self.lock_task(&task.id)?;
-            let path = self.path_of(&task.id);
-            if path
-                .try_exists()
-                .with_context(|| format!("check {}", path.display()))?
-            {
+            if path_exists(&self.path_of(&task.id))? {
                 continue;
             }
             if !hook(task)? {
                 continue;
             }
-            if let Err(e) = self.write_record(task) {
-                undo(task);
-                return Err(e);
+            if store {
+                if let Err(e) = self.write_record(task) {
+                    undo(task);
+                    return Err(e);
+                }
+                task.unfiled = false;
             }
-            task.unfiled = false;
             return Ok(());
         }
         bail!("no free task id after {FILE_ATTEMPTS} attempts")
+    }
+
+    /// Is `id` used by anything but a stored record: a claim file, or an
+    /// attachment directory (`check_attachments`) left by an earlier
+    /// reservation or an interrupted filing? Only a definite "not found" is
+    /// free; any other answer is an error, never "free".
+    fn id_in_use(&self, id: &str, check_attachments: bool) -> Result<bool> {
+        if path_exists(&self.lock_path(id))? {
+            return Ok(true);
+        }
+        Ok(check_attachments && path_exists(&self.attachments_dir(id))?)
+    }
+
+    /// The `hook` of a plain [`Queue::put`] of a new task. Attachments
+    /// already copied by [`Queue::attach`] sit in this id's own directory,
+    /// which is then not a sign of someone else's use.
+    fn plain_filing_hook(&self, task: &Task) -> Result<bool> {
+        Ok(!self.id_in_use(&task.id, task.attachments.is_empty())?)
     }
 
     /// File a new task and take its claim in one step, on the id that ends up
@@ -2317,7 +2382,7 @@ impl Queue {
         self.file_with(
             task,
             |t| {
-                if self.lock_path(&t.id).exists() {
+                if self.id_in_use(&t.id, true)? {
                     return Ok(false);
                 }
                 claim = Some(self.claim(&t.id)?);
@@ -2355,30 +2420,41 @@ impl Queue {
     /// `stem-3.ext`, ... A name that does not validate is refused rather than
     /// sanitised - the operator renames the file.
     pub fn attach(&self, task: &mut Task, sources: &[PathBuf]) -> Result<Vec<String>> {
-        let mut wanted = Vec::new();
-        for src in sources {
-            let name = src
-                .file_name()
-                .and_then(|n| n.to_str())
-                .with_context(|| format!("`{}` has no usable file name", src.display()))?;
-            if !crate::ask::valid_asset_name(name) {
-                bail!(
-                    "attachment name `{name}` must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,63}}$ \
-                     with no `..`; rename the file and try again"
-                );
-            }
-            if !src.is_file() {
-                bail!("attachment `{}` is not a file", src.display());
-            }
-            wanted.push((src, name));
+        let wanted = validate_attachments(sources)?;
+        if task.unfiled && task.attachments.is_empty() {
+            // Not stored yet: the directory is created under the id's
+            // reservation and keeps the id taken until the record lands.
+            let names = std::cell::RefCell::new(Vec::new());
+            self.reserve_id(
+                task,
+                |t| {
+                    if self.id_in_use(&t.id, true)? {
+                        return Ok(false);
+                    }
+                    *names.borrow_mut() = self.copy_attachments(t, &wanted)?;
+                    Ok(true)
+                },
+                |_| {},
+                false,
+            )?;
+            return Ok(names.into_inner());
         }
+        self.copy_attachments(task, &wanted)
+    }
+
+    /// Copy `wanted` into `task`'s attachment directory (see [`Queue::attach`]).
+    fn copy_attachments(
+        &self,
+        task: &mut Task,
+        wanted: &[(&PathBuf, &str)],
+    ) -> Result<Vec<String>> {
         let dir = self.attachments_dir(&task.id);
         let existed = dir.is_dir();
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         let mut created: Vec<PathBuf> = Vec::new();
         let mut names = Vec::new();
         let mut copy_all = || -> Result<()> {
-            for (src, name) in &wanted {
+            for (src, name) in wanted {
                 let (stored, path) = copy_new(&dir, src, name)?;
                 created.push(path);
                 names.push(stored);
@@ -2409,7 +2485,7 @@ impl Queue {
     /// a failed `put` leaving the stored record untouched, which its
     /// write-then-rename guarantees.
     pub fn attach_and_put(&self, task: &mut Task, sources: &[PathBuf]) -> Result<Vec<String>> {
-        if task.unfiled {
+        if task.unfiled && task.attachments.is_empty() {
             return self.attach_and_file(task, sources);
         }
         let dir = self.attachments_dir(&task.id);
@@ -2433,16 +2509,16 @@ impl Queue {
     /// directory is created under the id's reservation, and a candidate whose
     /// directory already exists is taken.
     fn attach_and_file(&self, task: &mut Task, sources: &[PathBuf]) -> Result<Vec<String>> {
+        let wanted = validate_attachments(sources)?;
         let before = task.attachments.len();
         let names = std::cell::RefCell::new(Vec::new());
         let result = self.file_with(
             task,
             |t| {
-                let dir = self.attachments_dir(&t.id);
-                if dir.exists() {
+                if self.id_in_use(&t.id, true)? {
                     return Ok(false);
                 }
-                *names.borrow_mut() = self.attach(t, sources)?;
+                *names.borrow_mut() = self.copy_attachments(t, &wanted)?;
                 Ok(true)
             },
             |t| {
@@ -2483,7 +2559,7 @@ impl Queue {
     pub fn put(&self, task: &mut Task) -> Result<()> {
         if task.unfiled {
             // A new task never merges into a record that has its id.
-            return self.file_with(task, |_| Ok(true), |_| {});
+            return self.file_with(task, |t| self.plain_filing_hook(t), |_| {});
         }
         let _lock = self.lock_task(&task.id)?;
         self.put_unlocked(task)
@@ -2495,7 +2571,7 @@ impl Queue {
     /// started running or finished.
     pub fn create_new(&self, task: &mut Task) -> Result<bool> {
         let _lock = self.lock_task(&task.id)?;
-        if self.path_of(&task.id).exists() {
+        if path_exists(&self.path_of(&task.id))? {
             return Ok(false);
         }
         self.write_record(task)?;
@@ -5988,44 +6064,53 @@ mod tests {
         assert_eq!(restored.sources, t.sources);
     }
 
-    fn colliding_queue(dir: &Path) -> Queue {
+    /// A queue whose id source yields `ids` in order, then fresh ones.
+    fn queue_with_ids(dir: &Path, ids: &[&str]) -> Queue {
+        let ids: Vec<String> = ids.iter().map(|s| (*s).to_owned()).collect();
         let n = std::sync::atomic::AtomicUsize::new(0);
         Queue::at(dir.join("queue")).with_id_source(move || {
-            format!(
-                "20260101-000000-f{:03x}",
-                n.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            )
+            let i = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ids.get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("20260101-000000-f{i:03x}"))
         })
     }
+
+    const TAKEN: &str = "20260101-000000-aaaa";
 
     #[test]
     fn a_new_task_never_merges_into_a_record_with_its_candidate_id() {
         let dir = tempfile::tempdir().unwrap();
-        let q = colliding_queue(dir.path());
+        let q = queue_with_ids(dir.path(), &[TAKEN, TAKEN]);
         let mut first = task("first");
-        first.id = "20260101-000000-aaaa".into();
         first.start("run-1".into());
         first.succeed();
         q.put(&mut first).unwrap();
-        assert_eq!(first.id, "20260101-000000-aaaa");
+        assert_eq!(first.id, TAKEN);
         let stored_before = q.get(&first.id).unwrap();
         assert!(!stored_before.runs.is_empty());
 
         let mut second = task("second");
-        second.id = first.id.clone();
         q.put(&mut second).unwrap();
 
         assert_ne!(second.id, first.id);
         assert!(second.runs.is_empty());
+        assert!(second.passes.is_empty());
         assert!(second.chat_notices.is_empty());
         assert!(second.chat_notice.is_none());
+        assert_eq!(second.chat_notice_due(), task("fresh").chat_notice_due());
         let a = q.get(&first.id).unwrap();
         let b = q.get(&second.id).unwrap();
         assert_eq!(a.title, "first");
         assert_eq!(a.runs, stored_before.runs);
+        assert_eq!(a.passes, stored_before.passes);
         assert_eq!(a.chat_notices, stored_before.chat_notices);
+        assert_eq!(a.chat_notice, stored_before.chat_notice);
+        assert_eq!(a.chat_notice_due(), stored_before.chat_notice_due());
         assert_eq!(b.title, "second");
         assert!(b.runs.is_empty());
+        assert!(b.passes.is_empty());
+        assert!(b.chat_notice.is_none());
 
         // A later save is an update: it still merges.
         let mut again = q.get(&second.id).unwrap();
@@ -6036,14 +6121,24 @@ mod tests {
     }
 
     #[test]
+    fn a_new_task_skips_an_id_with_an_orphaned_claim_or_attachments() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = queue_with_ids(dir.path(), &["orphan-lock", "orphan-dir", "free"]);
+        std::fs::create_dir_all(q.root()).unwrap();
+        std::fs::write(q.root().join("orphan-lock.lock"), "x").unwrap();
+        std::fs::create_dir_all(q.attachments_dir("orphan-dir")).unwrap();
+        let mut t = task("t");
+        q.put(&mut t).unwrap();
+        assert_eq!(t.id, "free");
+    }
+
+    #[test]
     fn a_claimed_new_task_holds_the_claim_on_the_reserved_id() {
         let dir = tempfile::tempdir().unwrap();
-        let q = colliding_queue(dir.path());
+        let q = queue_with_ids(dir.path(), &[TAKEN, TAKEN]);
         let mut first = task("first");
-        first.id = "20260101-000000-aaaa".into();
         q.put(&mut first).unwrap();
         let mut second = task("second");
-        second.id = first.id.clone();
         let claim = q.file_claimed(&mut second).unwrap();
         assert_ne!(second.id, first.id);
         assert!(q.claim(&second.id).is_err());
@@ -6054,13 +6149,11 @@ mod tests {
     #[test]
     fn an_attached_new_task_skips_a_taken_id() {
         let dir = tempfile::tempdir().unwrap();
-        let q = colliding_queue(dir.path());
+        let q = queue_with_ids(dir.path(), &[TAKEN, TAKEN]);
         let mut first = task("first");
-        first.id = "20260101-000000-aaaa".into();
         q.put(&mut first).unwrap();
         let src = source_file(dir.path(), "shot.png", "x");
         let mut second = task("second");
-        second.id = first.id.clone();
         q.attach_and_put(&mut second, &[src]).unwrap();
         assert_ne!(second.id, first.id);
         assert!(!q.attachments_dir(&first.id).exists());
@@ -6069,9 +6162,26 @@ mod tests {
     }
 
     #[test]
+    fn attaching_before_putting_a_new_task_reserves_the_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = queue_with_ids(dir.path(), &[TAKEN, TAKEN]);
+        let mut first = task("first");
+        q.put(&mut first).unwrap();
+        let src = source_file(dir.path(), "shot.png", "x");
+        let mut second = task("second");
+        q.attach(&mut second, &[src]).unwrap();
+        assert_ne!(second.id, first.id);
+        assert!(q.attachments_dir(&second.id).is_dir());
+        q.put(&mut second).unwrap();
+        assert_eq!(q.get(&second.id).unwrap().attachments.len(), 1);
+        assert_eq!(q.get(&first.id).unwrap().title, "first");
+        assert!(q.get(&first.id).unwrap().attachments.is_empty());
+    }
+
+    #[test]
     fn create_new_keeps_its_already_exists_meaning() {
         let dir = tempfile::tempdir().unwrap();
-        let q = colliding_queue(dir.path());
+        let q = Queue::at(dir.path().join("queue"));
         let mut a = task("a");
         a.id = "fixed-id".into();
         assert!(q.create_new(&mut a).unwrap());
@@ -6084,13 +6194,10 @@ mod tests {
     #[test]
     fn filing_gives_up_when_no_id_is_ever_free() {
         let dir = tempfile::tempdir().unwrap();
-        let q = Queue::at(dir.path().join("queue"))
-            .with_id_source(|| "20260101-000000-aaaa".to_owned());
+        let q = Queue::at(dir.path().join("queue")).with_id_source(|| TAKEN.to_owned());
         let mut first = task("first");
-        first.id = "20260101-000000-aaaa".into();
         q.put(&mut first).unwrap();
         let mut second = task("second");
-        second.id = first.id.clone();
         assert!(q.put(&mut second).is_err());
         assert_eq!(q.get(&first.id).unwrap().title, "first");
     }
