@@ -989,8 +989,9 @@ impl Talks {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
         let path = self.turn_path(id);
+        let retry = crate::lock_file::Retry::new(None);
         let token = fresh_token();
-        if create_turn(&path, &token, now)? {
+        if create_turn(&path, &token, now, retry)? {
             return Ok(Some(TurnLease {
                 talk: id.to_owned(),
                 path,
@@ -1004,18 +1005,20 @@ impl Talks {
         // exclusive lock file, so two takers cannot each delete the other's
         // fresh lease. A taker that finds the lock held simply loses; the lock
         // itself ages out, so a taker that died inside it cannot wedge the talk.
-        let Some(_lock) = TurnLock::take(&path)? else {
+        let Some(_lock) = TurnLock::take_with(&path, retry)? else {
             return Ok(None);
         };
         if lease_blocks(&path, now) {
             return Ok(None);
         }
         let _ = std::fs::remove_file(&path);
-        Ok(create_turn(&path, &token, now)?.then_some(TurnLease {
-            talk: id.to_owned(),
-            path,
-            token,
-        }))
+        Ok(
+            create_turn(&path, &token, now, retry)?.then_some(TurnLease {
+                talk: id.to_owned(),
+                path,
+                token,
+            }),
+        )
     }
 
     /// Is a turn running in `id` anywhere, by a fresh lease?
@@ -1106,13 +1109,14 @@ const TICKET_GENERATIONS: u32 = 16;
 const TICKET_SWEEP_AGE: Duration = Duration::from_secs(3600);
 
 /// Create `path` exclusively with `body`; `false` when it already exists.
+#[cfg(test)]
 fn create_exclusive(path: &Path, body: &str) -> Result<bool> {
+    create_exclusive_with(path, body, crate::lock_file::Retry::new(None))
+}
+
+fn create_exclusive_with(path: &Path, body: &str, retry: crate::lock_file::Retry) -> Result<bool> {
     use std::io::Write as _;
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
+    match retry.create(path) {
         Ok(mut f) => {
             if let Err(e) = f.write_all(body.as_bytes()) {
                 drop(f);
@@ -1126,7 +1130,12 @@ fn create_exclusive(path: &Path, body: &str) -> Result<bool> {
     }
 }
 
-fn create_turn(path: &Path, token: &str, now: Timestamp) -> Result<bool> {
+fn create_turn(
+    path: &Path,
+    token: &str,
+    now: Timestamp,
+    retry: crate::lock_file::Retry,
+) -> Result<bool> {
     let record = TurnRecord {
         token: token.to_owned(),
         pid: std::process::id(),
@@ -1136,7 +1145,7 @@ fn create_turn(path: &Path, token: &str, now: Timestamp) -> Result<bool> {
     // Written in full under a private name, then published exclusively: a
     // reader never sees a half-written lease.
     let tmp = path.with_extension(format!("turn.{token}.new"));
-    publish_exclusive(path, &tmp, &body)
+    publish_exclusive_with(path, &tmp, &body, retry)
 }
 
 /// Is there a lease at `path` that must not be taken over? A fresh beat, or
@@ -1178,13 +1187,9 @@ fn link_unsupported(e: &std::io::Error) -> bool {
 /// The no-hard-link path of [`publish_exclusive`]. A failed write never
 /// removes `path`: by then it may belong to a successor, so the half-made file
 /// is left to expire (a young empty one blocks, an unreadable one is stale).
-fn create_in_place(path: &Path, body: &str) -> Result<bool> {
+fn create_in_place(path: &Path, body: &str, retry: crate::lock_file::Retry) -> Result<bool> {
     use std::io::Write as _;
-    let mut f = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
+    let mut f = match retry.create(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
         Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
@@ -1197,19 +1202,28 @@ fn create_in_place(path: &Path, body: &str) -> Result<bool> {
 }
 
 fn publish_exclusive(path: &Path, tmp: &Path, body: &str) -> Result<bool> {
+    publish_exclusive_with(path, tmp, body, crate::lock_file::Retry::new(None))
+}
+
+fn publish_exclusive_with(
+    path: &Path,
+    tmp: &Path,
+    body: &str,
+    retry: crate::lock_file::Retry,
+) -> Result<bool> {
     std::fs::write(tmp, body).with_context(|| format!("write {}", tmp.display()))?;
     #[cfg(test)]
     let linked = if failpoint::no_link_forced() {
         Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     } else {
-        std::fs::hard_link(tmp, path)
+        retry.run(|| std::fs::hard_link(tmp, path))
     };
     #[cfg(not(test))]
-    let linked = std::fs::hard_link(tmp, path);
+    let linked = retry.run(|| std::fs::hard_link(tmp, path));
     let out = match linked {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(e) if link_unsupported(&e) => create_in_place(path, body),
+        Err(e) if link_unsupported(&e) => create_in_place(path, body, retry),
         Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
     };
     let _ = std::fs::remove_file(tmp);
@@ -1267,15 +1281,19 @@ impl TurnLock {
     /// Publish `token` at `path` complete (written privately, then published
     /// exclusively), so nobody reads a half-written token; `false` if `path`
     /// exists.
-    fn publish(path: &Path, token: &str) -> Result<bool> {
+    fn publish(path: &Path, token: &str, retry: crate::lock_file::Retry) -> Result<bool> {
         let tmp = path.with_extension(format!("lock.{token}.new"));
-        publish_exclusive(path, &tmp, token)
+        publish_exclusive_with(path, &tmp, token, retry)
     }
 
     fn take(lease: &Path) -> Result<Option<Self>> {
+        Self::take_with(lease, crate::lock_file::Retry::new(None))
+    }
+
+    fn take_with(lease: &Path, retry: crate::lock_file::Retry) -> Result<Option<Self>> {
         let path = lease.with_extension("turn.lock");
         let token = Self::token();
-        if Self::publish(&path, &token)? {
+        if Self::publish(&path, &token, retry)? {
             return Ok(Some(Self { path, token }));
         }
         let Ok(seen) = std::fs::read_to_string(&path) else {
@@ -1311,7 +1329,7 @@ impl TurnLock {
         let mut won = false;
         for n in 0..TICKET_GENERATIONS {
             let ticket = path.with_extension(format!("lock.{key}.break.{n}"));
-            if create_exclusive(&ticket, "")? {
+            if create_exclusive_with(&ticket, "", retry)? {
                 won = true;
                 break;
             }
@@ -1341,7 +1359,7 @@ impl TurnLock {
         if !remove_if_carries(&path, &seen) {
             return Ok(None);
         }
-        if Self::publish(&path, &token)? {
+        if Self::publish(&path, &token, retry)? {
             return Ok(Some(Self { path, token }));
         }
         Ok(None)

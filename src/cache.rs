@@ -336,12 +336,14 @@ fn classify_with<F: Fn(u32) -> bool>(path: &Path, alive: F) -> Status {
 /// overwrite an existing one, exactly like [`crate::queue::Queue::claim`]'s
 /// task lock, which this mirrors on purpose rather than inventing a second
 /// exclusion primitive in the same codebase.
-fn write_new(path: &Path, cache_dir: &Path, owner: &Owner) -> std::io::Result<()> {
+fn write_new(
+    path: &Path,
+    cache_dir: &Path,
+    owner: &Owner,
+    retry: crate::lock_file::Retry,
+) -> std::io::Result<()> {
     use std::io::Write as _;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
+    let mut f = retry.create(path)?;
     let lease = LeaseFile {
         cache_dir: cache_dir.display().to_string(),
         owner: owner.clone(),
@@ -397,6 +399,22 @@ fn try_acquire_with<F: Fn(u32) -> bool + Copy>(
     owner: &Owner,
     alive: F,
 ) -> Result<AcquireOutcome> {
+    try_acquire_before(
+        home,
+        cache_dir,
+        owner,
+        alive,
+        crate::lock_file::Retry::new(None),
+    )
+}
+
+fn try_acquire_before<F: Fn(u32) -> bool + Copy>(
+    home: &Path,
+    cache_dir: &Path,
+    owner: &Owner,
+    alive: F,
+    retry: crate::lock_file::Retry,
+) -> Result<AcquireOutcome> {
     let dir = leases_dir(home);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join(format!("{}.json", slug(cache_dir)));
@@ -407,7 +425,7 @@ fn try_acquire_with<F: Fn(u32) -> bool + Copy>(
     // losing the race to genuinely live contenders is exactly what `Busy`
     // reports back, not something this function spins on.
     for _ in 0..2 {
-        match write_new(&path, cache_dir, owner) {
+        match write_new(&path, cache_dir, owner, retry) {
             Ok(()) => {
                 record_catalog(home, cache_dir, owner);
                 return Ok(AcquireOutcome::Acquired(Guard::new(path)));
@@ -477,8 +495,23 @@ pub async fn wait_for_unless(
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<Option<Guard>> {
     let start = std::time::Instant::now();
+    // Include hand-off waits in the existing resource budget and keep them
+    // within the cancellation polling interval, on the blocking pool.
+    let retry = crate::lock_file::Retry::new(Some(start + budget.min(poll)));
     loop {
-        match try_acquire(home, cache_dir, owner)? {
+        let acquired = {
+            let (home, cache_dir, owner) = (home.to_owned(), cache_dir.to_owned(), owner.clone());
+            tokio::task::spawn_blocking(move || {
+                let Ok(_outputs) = crate::retention::OutputLease::cache(&home, &cache_dir, true)
+                else {
+                    return Ok(AcquireOutcome::Busy(Busy::Outputs));
+                };
+                try_acquire_before(&home, &cache_dir, &owner, proc::pid_alive, retry)
+            })
+            .await
+            .context("join cache lock acquisition")??
+        };
+        match acquired {
             AcquireOutcome::Acquired(g) => return Ok(Some(g)),
             AcquireOutcome::Busy(busy) => {
                 if cancel() {
@@ -1093,7 +1126,13 @@ mod tests {
         let dead_owner = owner(999_999);
         let path = lease_path(home.path(), &cache);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        write_new(&path, &cache, &dead_owner).expect("seed a stale lease");
+        write_new(
+            &path,
+            &cache,
+            &dead_owner,
+            crate::lock_file::Retry::new(None),
+        )
+        .expect("seed a stale lease");
         assert_eq!(
             classify_with(&path, |_| false),
             Status::Stale(dead_owner.clone())
@@ -1188,7 +1227,13 @@ mod tests {
             try_acquire(home.path(), &active_cache, &owner(std::process::id())).expect("acquire");
         let stale_path = lease_path(home.path(), &stale_cache);
         std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
-        write_new(&stale_path, &stale_cache, &owner(999_999)).unwrap();
+        write_new(
+            &stale_path,
+            &stale_cache,
+            &owner(999_999),
+            crate::lock_file::Retry::new(None),
+        )
+        .unwrap();
         let unknown_path = lease_path(home.path(), &unknown_cache);
         std::fs::write(&unknown_path, b"garbage").unwrap();
 

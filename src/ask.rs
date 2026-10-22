@@ -1448,12 +1448,9 @@ impl Questions {
             .with_context(|| format!("create {}", self.root.display()))?;
         let lock = self.root.join(format!("{id}.lock"));
         let started = std::time::Instant::now();
+        let retry = crate::lock_file::Retry::new(Some(started + LOCK_STALE));
         loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock)
-            {
+            match retry.create(&lock) {
                 Ok(_) => break,
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     let stale = std::fs::metadata(&lock)

@@ -632,13 +632,8 @@ impl Waiter {
 /// second daemon) cannot resume the same seat at once. A claim older than a
 /// whole delivery plus slack was left by a process that died.
 pub(crate) fn take_claim(path: &std::path::Path, stale_after: Duration) -> bool {
-    let attempt = || {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .is_ok()
-    };
+    let retry = crate::lock_file::Retry::new(None);
+    let attempt = || retry.create(path).is_ok();
     if attempt() {
         return true;
     }
