@@ -5062,6 +5062,25 @@ async fn run_refresh_keeps_question_focus_and_blocks_stale_actions() {
         fx.config.clone(),
     );
     run.save_under(&home).unwrap();
+    let mut merged = RunState::new(
+        fx.repo.clone(),
+        "main".into(),
+        "0000000".into(),
+        "Merged run with identical core and evidence payloads".into(),
+        fx.config.clone(),
+    );
+    merged.id = "20260901-000009-cc09".into();
+    merged.status = RunStatus::Merged;
+    merged.pr = Some(magi::run::PrRecord {
+        url: "https://github.com/example/repo/pull/7".into(),
+        number: 7,
+        state: "merged".into(),
+        checks: "green".into(),
+        round: 0,
+        rounds: 3,
+        red_at_merge: Vec::new(),
+    });
+    merged.save_under(&home).unwrap();
     let questions = magi::ask::Questions::at(home.join("questions"));
     let mut q = magi::ask::Question::new(
         run.id.clone(),
@@ -5120,12 +5139,54 @@ async fn run_refresh_keeps_question_focus_and_blocks_stale_actions() {
       button.click();
       const failure = document.activeElement === box && !panel.hidden
         && box.value === 'An unfinished answer' && clicked === 0;
+      let markCoreReady;
+      const coreReady = new Promise(r => markCoreReady = r);
+      let releaseEvidence;
+      const evidenceBarrier = new Promise(r => releaseEvidence = r);
+      window.fetch = async (...args) => {
+        const url = String(args[0]);
+        if (url.endsWith('/api/runs/20260901-000009-cc09/core')) {
+          const res = await originalFetch(...args);
+          const body = await res.json();
+          return {
+            ok: res.ok,
+            status: res.status,
+            headers: res.headers,
+            json: () => {
+              Promise.resolve().then(() => Promise.resolve()).then(markCoreReady);
+              return Promise.resolve(body);
+            },
+          };
+        }
+        if (url.endsWith('/api/runs/20260901-000009-cc09')) {
+          await evidenceBarrier;
+        }
+        return originalFetch(...args);
+      };
+      const loadMerged = deck.loadRun('20260901-000009-cc09');
+      await coreReady;
+      const coreBeforeEvidence = deck.state.detail.core !== null
+        && deck.state.detail.evidence === null
+        && deck.state.detail.evidenceError === true
+        && !document.querySelector('#run-land .land-top');
+      releaseEvidence();
+      await loadMerged;
+      const identicalPayloads = JSON.stringify(deck.state.detail.core) === JSON.stringify(deck.state.detail.evidence);
+      const landRendered = deck.state.detail.evidenceError === false
+        && !!document.querySelector('#run-land .land-top');
       window.fetch = originalFetch;
-      return {pending, success, failure};
+      return {pending, success, failure, coreBeforeEvidence, identicalPayloads, landRendered};
     })()"#).await.unwrap();
     assert_eq!(
         out,
-        serde_json::json!({"pending": true, "success": true, "failure": true})
+        serde_json::json!({
+            "pending": true,
+            "success": true,
+            "failure": true,
+            "coreBeforeEvidence": true,
+            "identicalPayloads": true,
+            "landRendered": true,
+        })
     );
     browser.close_page(&page).await;
 }
