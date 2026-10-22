@@ -49,6 +49,53 @@ impl Retry {
         self.run_with(operation, Instant::now, std::thread::sleep)
     }
 
+    fn pause(self, error: &io::Error, now: Instant) -> Option<Duration> {
+        if !self.permission_denied || error.kind() != io::ErrorKind::PermissionDenied {
+            return None;
+        }
+        let remaining = self.deadline.saturating_duration_since(now);
+        (!remaining.is_zero()).then_some(POLL.min(remaining))
+    }
+
+    /// Check cancellation before and after each delete-pending wait.
+    pub(crate) async fn run_async_unless<T>(
+        self,
+        operation: impl FnMut() -> io::Result<T>,
+        cancel: &(dyn Fn() -> bool + Sync),
+    ) -> io::Result<Option<T>> {
+        self.run_async_with(operation, cancel, Instant::now, tokio::time::sleep)
+            .await
+    }
+
+    async fn run_async_with<T, F: std::future::Future<Output = ()>>(
+        self,
+        mut operation: impl FnMut() -> io::Result<T>,
+        cancel: &(impl Fn() -> bool + ?Sized),
+        now: impl Fn() -> Instant,
+        mut sleep: impl FnMut(Duration) -> F,
+    ) -> io::Result<Option<T>> {
+        loop {
+            match operation() {
+                Err(error) => {
+                    let Some(delay) = self.pause(&error, now()) else {
+                        return Err(error);
+                    };
+                    if cancel() {
+                        return Ok(None);
+                    }
+                    sleep(delay).await;
+                    if cancel() {
+                        return Ok(None);
+                    }
+                    if now() >= self.deadline {
+                        return Err(error);
+                    }
+                }
+                Ok(value) => return Ok(Some(value)),
+            }
+        }
+    }
+
     fn run_with<T>(
         self,
         mut operation: impl FnMut() -> io::Result<T>,
@@ -57,14 +104,12 @@ impl Retry {
     ) -> io::Result<T> {
         loop {
             match operation() {
-                Err(e) if self.permission_denied && e.kind() == io::ErrorKind::PermissionDenied => {
-                    let remaining = self.deadline.saturating_duration_since(now());
-                    if remaining.is_zero() {
+                Err(e) => {
+                    let Some(delay) = self.pause(&e, now()) else {
                         return Err(e);
-                    }
-                    sleep(POLL.min(remaining));
-                    // Do not attempt a successful acquisition after expiry or
-                    // discard the actual OS error when the budget is exhausted.
+                    };
+                    sleep(delay);
+                    // Do not acquire after expiry or discard the actual OS error.
                     if now() >= self.deadline {
                         return Err(e);
                     }
@@ -102,6 +147,108 @@ mod tests {
             |wait| elapsed.set(elapsed.get() + wait),
         );
         (result, calls, elapsed.get())
+    }
+
+    #[tokio::test]
+    async fn async_retry_checks_cancellation_before_sleep() {
+        let start = Instant::now();
+        let retry = Retry {
+            deadline: start + HANDOFF,
+            permission_denied: true,
+        };
+        let mut calls = 0;
+        let result = retry
+            .run_async_with(
+                || {
+                    calls += 1;
+                    Err::<(), _>(io::ErrorKind::PermissionDenied.into())
+                },
+                &|| true,
+                || start,
+                |_| async { panic!("cancelled acquisition must not sleep") },
+            )
+            .await
+            .unwrap();
+        assert!(result.is_none());
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn async_retry_checks_cancellation_after_sleep() {
+        let start = Instant::now();
+        let cancelled = Cell::new(false);
+        let mut calls = 0;
+        let mut sleeps = 0;
+        let result = Retry {
+            deadline: start + HANDOFF,
+            permission_denied: true,
+        }
+        .run_async_with(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(io::ErrorKind::PermissionDenied.into())
+                } else {
+                    Ok(())
+                }
+            },
+            &|| cancelled.get(),
+            || start,
+            |_| {
+                sleeps += 1;
+                cancelled.set(true);
+                std::future::ready(())
+            },
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+        assert_eq!(calls, 1, "must not acquire after cancellation");
+        assert_eq!(sleeps, 1);
+    }
+
+    #[tokio::test]
+    async fn async_retry_preserves_success_conflict_and_expiry() {
+        for terminal in [None, Some(io::ErrorKind::AlreadyExists)] {
+            for budget in [HANDOFF, Duration::from_millis(7)] {
+                let start = Instant::now();
+                let elapsed = Cell::new(Duration::ZERO);
+                let mut calls = 0;
+                let result = Retry {
+                    deadline: start + budget,
+                    permission_denied: true,
+                }
+                .run_async_with(
+                    || {
+                        calls += 1;
+                        let kind = if calls == 1 {
+                            Some(io::ErrorKind::PermissionDenied)
+                        } else {
+                            terminal
+                        };
+                        kind.map_or(Ok(()), |kind| Err(kind.into()))
+                    },
+                    &|| false,
+                    || start + elapsed.get(),
+                    |delay| {
+                        elapsed.set(elapsed.get() + delay);
+                        std::future::ready(())
+                    },
+                )
+                .await;
+                if budget < POLL {
+                    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+                    assert_eq!(calls, 1);
+                    assert_eq!(elapsed.get(), budget);
+                } else {
+                    match terminal {
+                        None => assert_eq!(result.unwrap(), Some(())),
+                        Some(kind) => assert_eq!(result.unwrap_err().kind(), kind),
+                    }
+                    assert_eq!(calls, 2);
+                }
+            }
+        }
     }
 
     #[test]
