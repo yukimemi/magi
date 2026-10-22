@@ -3057,6 +3057,17 @@ fn claim_dispatch(
         PermitKind::Urgent => Some(Arc::clone(urgent).try_acquire_owned().ok()?),
         PermitKind::Ordinary => Some(Arc::clone(ordinary).try_acquire_owned().ok()?),
     };
+    // Persist the dispatch order under the claim, before config discovery or
+    // coordination waits can reorder concurrent starts.
+    let stamp = Timestamp::now();
+    let mut task = task;
+    task.dispatched_at = Some(stamp);
+    if let Err(e) = queue.modify(&task.id, |t| {
+        t.dispatched_at = Some(stamp);
+        true
+    }) {
+        tracing::warn!("could not record dispatch order of {}: {e:#}", task.short());
+    }
     Some(DispatchClaim {
         task,
         claim,

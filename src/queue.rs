@@ -574,6 +574,11 @@ pub struct Task {
     /// which pass cost what. Kept across a release.
     #[serde(default)]
     pub passes: Vec<TaskPass>,
+    /// When the loop claimed this task for its latest dispatch. Stamped under
+    /// the claim, before any slow start-up work, so it is the real dispatch
+    /// order; `record_pass_at` prefers it over the graph's own pass start.
+    #[serde(default)]
+    pub dispatched_at: Option<Timestamp>,
     /// Durable failed-input budget, unaffected by automatic release/requeue.
     #[serde(default)]
     pub recovery_budget: Option<RecoveryBudget>,
@@ -947,6 +952,7 @@ impl Task {
             chat_notices: Vec::new(),
             hold_notice_cause: None,
             passes: Vec::new(),
+            dispatched_at: None,
             recovery_budget: None,
             recovery_admission: None,
             recovery_generations: Vec::new(),
@@ -1445,7 +1451,7 @@ impl Task {
         self.passes.push(TaskPass {
             run: run.to_owned(),
             pass_index,
-            started_at,
+            started_at: self.dispatched_at.or(started_at),
             cost,
             attempts_after: self.attempts,
             settled_at: Timestamp::now(),
@@ -5176,6 +5182,32 @@ mod tests {
             }),
         );
         t
+    }
+
+    #[test]
+    fn upgrade_resume_order_follows_dispatch_claim_not_graph_start() {
+        // A was claimed first but its graph pass started later (slow start-up).
+        let stamp = |id: &str, dispatched: &str, started: &str| {
+            let mut t = task(id);
+            t.id = id.into();
+            t.start(format!("run-{id}"));
+            t.park("upgrade");
+            t.dispatched_at = Some(dispatched.parse().unwrap());
+            t.record_pass_at(
+                &format!("run-{id}"),
+                0,
+                Some(started.parse().unwrap()),
+                1,
+                Some(crate::run::ParkCause::Upgrade {
+                    from: "old".into(),
+                    to: None,
+                }),
+            );
+            t
+        };
+        let a = stamp("a", "2026-10-22T00:00:01Z", "2026-10-22T00:00:09Z");
+        let b = stamp("b", "2026-10-22T00:00:02Z", "2026-10-22T00:00:03Z");
+        assert!(dispatch_order(&a, &b).is_lt());
     }
 
     #[test]
