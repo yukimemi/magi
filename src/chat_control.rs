@@ -95,7 +95,14 @@ pub async fn dispatch(
 ) -> Result<String> {
     #[cfg(unix)]
     if std::env::var_os(bridge::CHANNEL_ENV).is_some() {
-        return bridge::request(&operation);
+        // The launcher sets this flag for writable seats, including effective
+        // unsandboxed chat turns. execute() still enforces talk authorization.
+        match bridge::request(&operation) {
+            Err(error)
+                if error.is::<bridge::Unavailable>()
+                    && std::env::var("MAGI_ALLOW_WRITE").as_deref() == Ok("1") => {}
+            result => return result,
+        }
     }
     #[cfg(windows)]
     if std::env::var_os(bridge::CHANNEL_ENV).is_some() {

@@ -230,6 +230,7 @@ fds = tuple(int(os.environ[n]) for n in ['MAGI_CHAT_CONTROL_FD', 'MAGI_CHAT_CONT
 def control(*args):
     p = subprocess.run([binary, 'task', *args], capture_output=True, text=True, pass_fds=fds)
     assert p.returncode == 0, (args, p.stdout, p.stderr)
+    return p.stdout
 # The server binds the capability to this talk even if the child spoofs env.
 other = subprocess.run([binary, 'task', 'control', 'hold', os.environ['FOREIGN_TASK']],
                        capture_output=True, text=True, pass_fds=fds, env={**os.environ, 'MAGI_RUN':os.environ['FOREIGN_TALK']})
@@ -239,6 +240,63 @@ bad = subprocess.run([binary, 'task', '--quote', 'invented', 'control', 'abandon
                      capture_output=True, text=True, pass_fds=fds)
 assert bad.returncode != 0
 assert 'individual owner confirmation' in bad.stderr, bad.stderr
+# Kill requesters only after a complete write and before any response read.
+# The stopped child holds the process lock; waitpid confirms the exact point.
+import signal
+orphan = r"""
+import fcntl, json, os, signal, struct
+request, response, lock = (int(os.environ[n]) for n in ['MAGI_CHAT_CONTROL_FD', 'MAGI_CHAT_CONTROL_RESPONSE_FD', 'MAGI_CHAT_CONTROL_LOCK_FD'])
+fcntl.lockf(lock, fcntl.LOCK_EX)
+operation = {'operation':'Hold', 'task':os.environ['TEST_TASK'], 'reason':'orphan'}
+if os.environ['ORPHAN_ID'] == '2':
+    operation['task'] = os.environ['FOREIGN_TASK']
+body = json.dumps({'id':int(os.environ['ORPHAN_ID']), 'operation':operation}).encode()
+frame = struct.pack('>I', len(body)) + body
+while frame:
+    frame = frame[os.write(request, frame):]
+os.kill(os.getpid(), signal.SIGSTOP)
+raise AssertionError('requester must be killed before reading')
+"""
+for orphan_id in ['1', '2']:
+    child = subprocess.Popen([os.environ.get('PYTHON', 'python3'), '-c', orphan], pass_fds=fds,
+                             env={**os.environ, 'ORPHAN_ID':orphan_id})
+    pid, status = os.waitpid(child.pid, os.WUNTRACED)
+    assert pid == child.pid and os.WIFSTOPPED(status), status
+    child.kill()
+    assert child.wait() == -signal.SIGKILL
+assert 'held' in control('control', 'hold', task, 'after orphan')
+import json
+saved = json.loads((pathlib.Path(os.environ['MAGI_HOME'])/'queue'/(task+'.json')).read_text())
+assert saved['hold_reason'] == 'after orphan', saved
+assert 'released' in control('control', 'release', task)
+# Preparation may fall back only with local write permission. Exercise failure
+# at each duplicate, including cleanup of the preceding successful copies.
+if os.environ['TEST_SANDBOX'] == '0':
+    import json
+    for name in ['MAGI_CHAT_CONTROL_LOCK_FD', 'MAGI_CHAT_CONTROL_FD', 'MAGI_CHAT_CONTROL_RESPONSE_FD']:
+        for allowed in ['0', '1']:
+            p = subprocess.run([binary, 'task', 'control', 'hold', task, 'local fallback'],
+                               capture_output=True, text=True, pass_fds=fds,
+                               env={**os.environ, name:'999999', 'MAGI_ALLOW_WRITE':allowed})
+            assert (p.returncode == 0) == (allowed == '1'), (p.stdout, p.stderr)
+    denied = subprocess.run([binary, 'task', 'control', 'hold', os.environ['FOREIGN_TASK']],
+                            capture_output=True, text=True, pass_fds=fds,
+                            env={**os.environ, 'MAGI_CHAT_CONTROL_FD':'999999', 'MAGI_ALLOW_WRITE':'1'})
+    assert denied.returncode != 0 and 'not filed by this conversation' in denied.stderr, denied.stderr
+    # A usable descriptor that disconnects after transmission must never fall
+    # back locally, even when write permission is available.
+    read, write = os.pipe()
+    os.close(write)
+    p = subprocess.run([binary, 'task', 'control', 'hold', task, 'must not execute locally'],
+                       capture_output=True, text=True, pass_fds=(*fds, read),
+                       env={**os.environ, 'MAGI_CHAT_CONTROL_RESPONSE_FD':str(read), 'MAGI_ALLOW_WRITE':'1'})
+    os.close(read)
+    assert p.returncode != 0 and 'outcome is unknown' in p.stderr, p.stderr
+    # The sent operation is allowed to execute at the launcher; drain its
+    # response and prove subsequent requests still select their own results.
+    control('control', 'hold', task, 'after disconnect')
+    saved = json.loads((pathlib.Path(os.environ['MAGI_HOME'])/'queue'/(task+'.json')).read_text())
+    assert saved['hold_reason'] == 'after disconnect', saved
 # Serialize concurrent processes and a frame larger than PIPE_BUF.
 jobs = [subprocess.Popen([binary, 'task', 'control', 'hold', task, str(i)],
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=fds) for i in range(3)]
