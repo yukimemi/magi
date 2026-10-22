@@ -370,17 +370,47 @@ fn find_magi_owner(
     }
 }
 
+/// A structured PR record survives both stop messages replacing `merge.detail`
+/// and older resumes accidentally resetting the graph status to Gating.
+pub(crate) fn landing_checkpoint(state: &RunState) -> bool {
+    state.status.resumable()
+        && state.config.graph.land
+        && state.pr.as_ref().is_some_and(|pr| pr.state == "open")
+        && state
+            .merge
+            .as_ref()
+            .is_some_and(|m| m.mode == crate::config::MergeMode::Pr && !m.empty)
+}
+
+/// Shared admission policy for queue retries, typed actions and control resume.
+/// Review exhaustion does not spend a publication or landing checkpoint.
+pub(crate) fn can_resume(state: &RunState) -> bool {
+    state.status.resumable()
+        && !state.released()
+        && state.retired_to.is_none()
+        && state.pr_taken_over_by.is_none()
+        && (resume_checkpoint(state)
+            || crate::run::try_home().is_some_and(|home| has_resume_checkpoint(state, &home))
+            || !(state.status == RunStatus::Blocked
+                && state.reviews.len() >= state.config.graph.review_rounds))
+}
+
+fn resume_checkpoint(state: &RunState) -> bool {
+    state.status == RunStatus::Landing
+        || landing_checkpoint(state)
+        || state.pr_publication_pending
+        || state.land_approval.is_some()
+        || state.merge_decision.is_some()
+        || state.land_armed_head.is_some()
+        || !state.merge_repairs.is_empty()
+}
+
 /// A resumable publication, landing or owner decision must keep its existing
 /// graph and worktree. Call under the owner lock before releasing or retiring
 /// a predecessor; completed runs may retain these fields as historical evidence.
 pub(crate) fn has_resume_checkpoint(state: &RunState, home: &Path) -> bool {
     state.status.resumable()
-        && (state.status == RunStatus::Landing
-            || state.pr_publication_pending
-            || state.land_approval.is_some()
-            || state.merge_decision.is_some()
-            || state.land_armed_head.is_some()
-            || !state.merge_repairs.is_empty()
+        && (resume_checkpoint(state)
             || crate::ask::Questions::at(home.join("questions"))
                 .list()
                 .iter()

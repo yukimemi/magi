@@ -1845,10 +1845,11 @@ async fn approval_gate(
             .into_iter()
             .find(|q| q.id == a.question)
             .filter(|q| {
-                a.head.eq_ignore_ascii_case(head)
-                    || q.resolution()
-                        .as_deref()
-                        .is_some_and(crate::merge_decision::stops)
+                q.status != ask::QuestionStatus::Abandoned
+                    && (a.head.eq_ignore_ascii_case(head)
+                        || q.resolution()
+                            .as_deref()
+                            .is_some_and(crate::merge_decision::stops))
             })
     });
     let reusable = match reusable {
@@ -3793,6 +3794,149 @@ async fn owner_stop<F: Forge>(state: &mut RunState, pr: &mut PrState, forge: &F)
     Ok(true)
 }
 
+/// Gate the local winner and publish that exact SHA, retaining the saved lease.
+/// A push completed before a crash is recoverable only when its SHA was gated.
+async fn publish_landing_head<F: Forge>(
+    state: &mut RunState,
+    observed: &str,
+    pr_url: &str,
+    forge: &F,
+) -> Result<String> {
+    crate::pr_head::ensure_owner(state)?;
+    let winner = state.winner().cloned().context("landing has no winner")?;
+    let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+    let expected = state.pr_pushed_head.as_deref().unwrap_or(observed);
+    anyhow::ensure!(
+        observed == expected
+            || (observed == head
+                && state.gate_head.as_deref() == Some(&head)
+                && state.gate_allows_progress()),
+        "public head moved outside this run; refusing to overwrite it"
+    );
+    anyhow::ensure!(
+        git::is_clean(&winner.worktree).await?,
+        "landing worktree is dirty"
+    );
+    if state.gate_head.as_deref() != Some(&head) || !state.gate_ran {
+        state.gate.clear();
+        state.gate_head = None;
+        state.gate_ran = false;
+        state.pre_gate.clear();
+        state.pre_gate_commit = None;
+        state.save()?;
+        let wait = crate::repo_lock::WaitPolicy::new(
+            Duration::from_secs(state.config.graph.timeout_resource_wait),
+            || false,
+        );
+        let outcomes = crate::graph::run_landing_gate(state, &winner, &wait).await?;
+        // An unavailable verification resource is not a completed gate.
+        anyhow::ensure!(
+            !outcomes.iter().any(|o| o.resource_blocked),
+            "landing gate could not acquire verification resources"
+        );
+        state.gate = outcomes;
+        state.gate_ran = true;
+        state.gate_head = Some(git::rev_parse(&winner.worktree, "HEAD").await?);
+        state.save()?;
+    }
+    anyhow::ensure!(
+        state.gate_allows_progress(),
+        "landing gate failed; nothing published"
+    );
+    let checked = state
+        .gate_head
+        .clone()
+        .context("landing gate has no checked SHA")?;
+    anyhow::ensure!(
+        git::rev_parse(&winner.worktree, "HEAD").await? == checked
+            && git::is_clean(&winner.worktree).await?,
+        "landing tree changed after gate"
+    );
+    crate::pr_head::ensure_owner(state)?;
+    if owner_requested_stop(state)? {
+        bail!("owner requested stop before publication");
+    }
+    let current = forge.view(&state.repo, pr_url).await?;
+    anyhow::ensure!(
+        current.pr.state == PrLifecycle::Open,
+        "PR closed or merged while gating; nothing published"
+    );
+    anyhow::ensure!(
+        current.head == observed || current.head == checked,
+        "PR head changed while gating; nothing published"
+    );
+    let public = state.pr_branch().unwrap_or(&winner.branch).to_owned();
+    let lease = format!("--force-with-lease=refs/heads/{public}:{observed}");
+    let refspec = format!("{checked}:refs/heads/{public}");
+    let lock = repo_merge_lock(&state.repo);
+    let _slot = lock.lock().await;
+    let pushed = git::git_raw(
+        &winner.worktree,
+        &["push", &lease, &state.config.merge.remote, &refspec],
+    )
+    .await?;
+    anyhow::ensure!(
+        pushed.ok(),
+        "publishing gated landing head failed: {}",
+        pushed.stderr
+    );
+    state.pr_pushed_head = Some(checked.clone());
+    state.land_sync_pending = false;
+    state.save()?;
+    Ok(checked)
+}
+
+/// Reconcile a stopped landing before changing its branch. This also handles
+/// old records whose graph status or merge detail no longer identifies land.
+async fn resume_landing_head<F: Forge>(
+    state: &mut RunState,
+    observed: &str,
+    pr_url: &str,
+    forge: &F,
+) -> Result<String> {
+    crate::pr_head::ensure_owner(state)?;
+    let winner = state.winner().cloned().context("landing has no winner")?;
+    let local = git::rev_parse(&winner.worktree, "HEAD").await?;
+    let expected = state
+        .pr_pushed_head
+        .as_deref()
+        .or(state.gate_head.as_deref())
+        .context("missing public head lease")?;
+    anyhow::ensure!(
+        observed == expected
+            || (observed == local
+                && state.gate_head.as_deref() == Some(&local)
+                && state.gate_allows_progress()),
+        "public head moved outside this run; refusing to sync"
+    );
+    // Save reconciliation before rebasing again; a prior push may have reached
+    // the remote immediately before the previous driver's last save.
+    state.pr_pushed_head = Some(observed.to_owned());
+    state.save()?;
+    anyhow::ensure!(
+        git::is_clean(&winner.worktree).await?,
+        "landing worktree is dirty"
+    );
+    let remote = state.config.merge.remote.clone();
+    let base = state.base_branch.clone();
+    let fetched = git::fetch(&state.repo, &remote, &base).await?;
+    anyhow::ensure!(
+        fetched.ok(),
+        "cannot fetch landing base: {}",
+        fetched.stderr
+    );
+    let onto = format!("{remote}/{base}");
+    let tip = git::rev_parse(&state.repo, &onto).await?;
+    if !git::is_ancestor(&state.repo, &tip, &local).await {
+        let scratch = state.dir().join("rebase");
+        match crate::rebase::rebase_with_fixer(state, &scratch, &winner.branch, &onto).await? {
+            crate::rebase::Rebased::Applied => git::sync_to_head(&winner.worktree).await?,
+            crate::rebase::Rebased::Stopped(why) => bail!("landing rebase stopped: {why}"),
+        }
+    }
+    publish_landing_head(state, observed, pr_url, forge).await
+}
+
 async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> Result<PrState> {
     crate::pr_head::ensure_owner(state)?;
     let reopening_hold = crate::merge_decision::resumable_hold(state);
@@ -3913,6 +4057,15 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 stop(state, &repo, &pr, &why).await?;
                 return Ok(pr);
             }
+        }
+
+        if state.land_sync_pending && pr.state == PrLifecycle::Open {
+            let head = resume_landing_head(state, &seen.head, pr_url, forge).await?;
+            awaiting_head = Some(head);
+            waited = Duration::ZERO;
+            rechecked = false;
+            // Read CI and approvals afresh, never from the pre-push observation.
+            continue;
         }
 
         if pr.state == PrLifecycle::Open {
@@ -4432,53 +4585,9 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 }
                 match rebased {
                     Ok(None) => {
-                        let pushed = {
-                            let merge_lock = repo_merge_lock(&repo);
-                            let _merge_slot = merge_lock.lock().await;
-                            if let Some(head) = &state.pr_head {
-                                git::push_as(
-                                    &repo,
-                                    &state.config.merge.remote,
-                                    &branch,
-                                    head,
-                                    state
-                                        .pr_pushed_head
-                                        .as_deref()
-                                        .context("missing public head lease")?,
-                                )
-                                .await?
-                            } else {
-                                git::push_pinned(
-                                    &repo,
-                                    &state.config.merge.remote,
-                                    &branch,
-                                    &seen.head,
-                                )
-                                .await?
-                            }
-                        };
-                        if !pushed.ok() {
-                            let why = format!(
-                                "rebased {branch} but could not push it: {}",
-                                pushed.stderr.trim()
-                            );
-                            stop(state, &repo, &pr, &why).await?;
-                            return Ok(pr);
-                        }
-                        // Bind to what was pushed: until the pull request is
-                        // seen on it, the rollup is the old head's.
-                        let head =
-                            match git::rev_parse(&repo, &format!("refs/heads/{branch}")).await {
-                                Ok(head) => head,
-                                Err(e) => {
-                                    let why = format!(
-                                        "rebased and pushed {branch} but could not read the pushed \
-                                     commit: {e:#}"
-                                    );
-                                    stop(state, &repo, &pr, &why).await?;
-                                    return Ok(pr);
-                                }
-                            };
+                        let winner = state.winner().cloned().context("landing has no winner")?;
+                        git::sync_to_head(&winner.worktree).await?;
+                        let head = publish_landing_head(state, &seen.head, pr_url, forge).await?;
                         crate::graph::refresh_reviewed_commits(state, &branch).await;
                         state.pr_pushed_head = Some(head.clone());
                         awaiting_head = Some(head);
@@ -6487,8 +6596,204 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         }
     }
 
-    /// A candidate whose label is `A` and has won, so [`RunState::winner`]
-    /// resolves to it.
+    async fn landing_git_fixture() -> (tempfile::TempDir, RunState, String) {
+        crate::run::pin_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let remote = tmp.path().join("remote.git");
+        std::fs::create_dir(&repo).unwrap();
+        git::git(tmp.path(), &["init", "--bare", remote.to_str().unwrap()])
+            .await
+            .unwrap();
+        git::git(&repo, &["init", "-b", "main"]).await.unwrap();
+        git::git(&repo, &["config", "user.name", "Test"])
+            .await
+            .unwrap();
+        git::git(&repo, &["config", "user.email", "test@example.test"])
+            .await
+            .unwrap();
+        std::fs::write(repo.join("base"), "base").unwrap();
+        git::git(&repo, &["add", "."]).await.unwrap();
+        git::git(&repo, &["commit", "-m", "base"]).await.unwrap();
+        git::git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        git::git(&repo, &["push", "origin", "main"]).await.unwrap();
+        git::git(&repo, &["checkout", "-b", "winner"])
+            .await
+            .unwrap();
+        std::fs::write(repo.join("change"), "change").unwrap();
+        git::git(&repo, &["add", "."]).await.unwrap();
+        git::git(&repo, &["commit", "-m", "change"]).await.unwrap();
+        let head = git::rev_parse(&repo, "HEAD").await.unwrap();
+        git::git(&repo, &["push", "origin", "HEAD:refs/heads/task-head"])
+            .await
+            .unwrap();
+        let mut state = run_state();
+        state.repo = repo.clone();
+        state.config.graph.land = true;
+        state.config.graph.land_approval = true;
+        state.pr_head = Some("task-head".into());
+        state.pr_pushed_head = Some(head.clone());
+        state.candidates = vec![winning_candidate("change")];
+        state.candidates[0].worktree = repo;
+        state.candidates[0].branch = "winner".into();
+        state.tally = Some(uncontested_tally());
+        state.gate_ran = true;
+        state.gate_head = Some(head.clone());
+        state.land_sync_pending = true;
+        state.save().unwrap();
+        (tmp, state, head)
+    }
+
+    async fn resume_observed_head(state: &mut RunState, head: &str) -> Result<String> {
+        let forge = Scripted::new(vec![seen(head, Checks::Green, "CLEAN", false)], vec![]);
+        resume_landing_head(state, head, &green_pr().url, &forge).await
+    }
+
+    async fn advance_landing_base(state: &RunState) {
+        git::git(&state.repo, &["checkout", "main"]).await.unwrap();
+        std::fs::write(state.repo.join("advance"), "advance").unwrap();
+        git::git(&state.repo, &["add", "."]).await.unwrap();
+        git::git(&state.repo, &["commit", "-m", "advance base"])
+            .await
+            .unwrap();
+        git::git(&state.repo, &["push", "origin", "main"])
+            .await
+            .unwrap();
+        git::git(&state.repo, &["checkout", "winner"])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn landing_resume_gates_rebased_sha_and_publishes_it_to_the_existing_head() {
+        let (_tmp, mut state, old) = landing_git_fixture().await;
+        advance_landing_base(&state).await;
+        state.config.verify.gate = vec!["test -f advance".into()];
+        let head = resume_observed_head(&mut state, &old).await.unwrap();
+        assert_ne!(head, old);
+        assert_eq!(state.gate_head.as_deref(), Some(head.as_str()));
+        assert!(state.gate_allows_progress());
+        assert_eq!(
+            git::remote_head(&state.repo, "origin", "task-head")
+                .await
+                .unwrap(),
+            Some(head.clone())
+        );
+        assert_eq!(state.pr_pushed_head, Some(head));
+        assert!(!state.land_sync_pending);
+        assert!(state.config.graph.land_approval);
+    }
+
+    #[tokio::test]
+    async fn landing_resume_returns_to_approval_wait_and_closed_pr_skips_sync() {
+        let (_tmp, mut state, head) = landing_git_fixture().await;
+        let forge = Scripted::new(vec![seen(&head, Checks::Green, "CLEAN", false)], vec![]);
+        let id = state.id.clone();
+        let pr = land_with(&mut state, &green_pr().url, &forge)
+            .await
+            .unwrap();
+        assert_eq!(pr.state, PrLifecycle::Open);
+        assert_eq!(state.id, id);
+        assert!(state.parked);
+        assert_eq!(state.status, RunStatus::Landing);
+        assert_eq!(state.land_approval.as_ref().unwrap().head, head);
+        assert!(forge.argvs().is_empty());
+
+        state.land_sync_pending = true;
+        std::fs::write(state.repo.join("dirty"), "do not touch").unwrap();
+        let mut closed = seen("foreign", Checks::Green, "CLEAN", false);
+        closed.pr.state = PrLifecycle::Closed;
+        let forge = Scripted::new(vec![closed], vec![]);
+        assert_eq!(
+            land_with(&mut state, &green_pr().url, &forge)
+                .await
+                .unwrap()
+                .state,
+            PrLifecycle::Closed
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.repo.join("dirty")).unwrap(),
+            "do not touch"
+        );
+        assert!(forge.argvs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn landing_resume_does_not_publish_a_failed_rebased_gate() {
+        let (_tmp, mut state, old) = landing_git_fixture().await;
+        advance_landing_base(&state).await;
+        state.config.verify.gate = vec!["exit 1".into()];
+        assert!(resume_observed_head(&mut state, &old).await.is_err());
+        assert_ne!(state.gate_head.as_deref(), Some(old.as_str()));
+        assert!(!state.gate_allows_progress());
+        assert_eq!(
+            git::remote_head(&state.repo, "origin", "task-head")
+                .await
+                .unwrap(),
+            Some(old)
+        );
+        assert!(state.land_sync_pending);
+    }
+
+    #[tokio::test]
+    async fn landing_publication_recovers_a_push_before_save_and_refuses_a_lease_conflict() {
+        let (_tmp, mut state, old) = landing_git_fixture().await;
+        advance_landing_base(&state).await;
+        let pushed = resume_observed_head(&mut state, &old).await.unwrap();
+        // Model a crash after the push but before saving its published SHA.
+        state.pr_pushed_head = Some(old.clone());
+        state.land_sync_pending = true;
+        assert_eq!(
+            resume_observed_head(&mut state, &pushed).await.unwrap(),
+            pushed
+        );
+        // A writer races the observed PR snapshot: the explicit remote lease
+        // must reject the push even though preflight saw our expected head.
+        git::git(
+            &state.repo,
+            &["push", "--force", "origin", "main:refs/heads/task-head"],
+        )
+        .await
+        .unwrap();
+        assert!(
+            publish_landing_head(
+                &mut state,
+                &pushed,
+                &green_pr().url,
+                &Scripted::new(vec![seen(&pushed, Checks::Green, "CLEAN", false)], vec![])
+            )
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("publishing gated")
+        );
+        assert!(
+            resume_observed_head(&mut state, "foreign-head")
+                .await
+                .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn landing_publication_refuses_a_pr_closed_during_gate() {
+        let (_tmp, mut state, head) = landing_git_fixture().await;
+        let mut closed = seen(&head, Checks::Green, "CLEAN", false);
+        closed.pr.state = PrLifecycle::Closed;
+        let forge = Scripted::new(vec![closed], vec![]);
+        assert!(
+            publish_landing_head(&mut state, &head, &green_pr().url, &forge)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("PR closed or merged")
+        );
+    }
+
+    /// A candidate selected by the uncontested tally.
     fn winning_candidate(summary: &str) -> Candidate {
         Candidate {
             index: 0,
@@ -7430,7 +7735,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     }
 
     #[tokio::test]
-    async fn holding_or_abandoning_the_existing_question_is_read_back_as_held() {
+    async fn explicit_hold_stays_held_but_expired_approval_is_reasked() {
         crate::run::pin_test_home();
         let store = ask::Questions::open();
 
@@ -7470,8 +7775,16 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             approval_gate(&mut abandoned_state, &pr, "feat: x", None, "abc")
                 .await
                 .unwrap(),
-            ApprovalGate::Held,
-            "silence must never merge"
+            ApprovalGate::Pending,
+            "an expired approval must ask again without merging"
+        );
+        assert_eq!(
+            store.get(&q.id).unwrap().status,
+            ask::QuestionStatus::Abandoned
+        );
+        assert_ne!(
+            abandoned_state.land_approval.as_ref().unwrap().question,
+            q.id
         );
     }
 

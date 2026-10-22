@@ -9,7 +9,7 @@ pub(crate) fn validate(home: &Path, id: &str) -> Result<crate::run::RunState> {
     let _owner = crate::pr_head::owner_lock(home, id)?;
     let state = crate::run::RunState::load_under(id, home)?;
     ensure!(
-        state.status.resumable() && !state.released(),
+        crate::handover::can_resume(&state),
         "run {} is `{}`, and only a stalled or blocked run can be resumed",
         state.short(),
         state.status.as_str()

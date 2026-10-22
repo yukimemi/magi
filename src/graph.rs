@@ -1445,7 +1445,11 @@ impl Runner {
         // clean round as reason to set `status` to `Gating`, which would
         // clobber this marker before `merge` ever ran, and this run would
         // never find its way back into `land` at all.
-        if self.state.status == RunStatus::Landing {
+        if self.state.status == RunStatus::Landing
+            || crate::handover::landing_checkpoint(&self.state)
+        {
+            self.state.land_sync_pending = true;
+            self.state.save()?;
             self.run_land().await?;
             // `run_land` may have settled the run right here - CI came back
             // green and the PR merged, say - without ever passing back
@@ -7071,77 +7075,8 @@ impl Runner {
     /// Run `verify.gate` once against the winner's current tree, logging one
     /// event per command. Empty when nothing is configured.
     async fn run_gate(&mut self, winner: &Candidate) -> Result<Vec<CommandOutcome>> {
-        let shell = self.state.config.shell();
-        let gate_commands = self.state.config.verify.gate.clone();
-        let has_pre_gate = !self.state.config.verify.pre_gate.is_empty();
-        let outcomes = if gate_commands.is_empty() && !has_pre_gate {
-            Vec::new()
-        } else {
-            let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
-            let cache_dir = self.state.config.cache_dir();
-            let wait = self.repository_wait();
-            let head = git::rev_parse(&winner.worktree, "HEAD").await?;
-            let (outcomes, _) = with_cache_lease(
-                &mut self.state,
-                cache_dir.as_deref(),
-                "gate",
-                "gate",
-                &winner.worktree,
-                &head,
-                timeout,
-                "final gate",
-                &wait,
-                |state, budget| {
-                    let shell = shell.clone();
-                    let gate_commands = gate_commands.clone();
-                    let winner = winner.clone();
-                    async move {
-                        Self::run_pre_gate(state, &winner).await;
-                        let (outcomes, timed_out_pids) = run_commands(
-                            state,
-                            "gate",
-                            "gate",
-                            0,
-                            &shell,
-                            &gate_commands,
-                            &winner.worktree,
-                            budget,
-                        )
-                        .await;
-                        (outcomes, false, timed_out_pids)
-                    }
-                },
-            )
-            .await?;
-            outcomes
-        };
-        if outcomes.is_empty() {
-            // Nothing configured to check — distinct from every other
-            // silence in this run's event log, since an empty `gate` alone
-            // no longer says whether the gate ran at all (see
-            // `RunState::gate_ran`'s own doc).
-            self.state
-                .event("gate", "no gate commands configured; not tested");
-        }
-        for o in &outcomes {
-            self.state.event(
-                "gate",
-                format!(
-                    "`{}` -> {}",
-                    o.command,
-                    if o.ok() {
-                        "pass".to_owned()
-                    } else {
-                        format!(
-                            "FAIL ({:?})\n{}",
-                            o.code,
-                            tail(&o.output_tail, EVENT_OUTPUT_TAIL)
-                        )
-                    }
-                ),
-            );
-        }
-        Ok(outcomes)
+        let wait = self.repository_wait();
+        run_landing_gate(&mut self.state, winner, &wait).await
     }
 
     /// One bounded fix round for a failing gate.
@@ -8433,9 +8368,10 @@ impl Runner {
         crate::pr_head::ensure_owner(&self.state)?;
         let url = self
             .state
-            .merge
+            .pr
             .as_ref()
-            .map(|m| m.detail.clone())
+            .map(|pr| pr.url.clone())
+            .or_else(|| self.state.merge.as_ref().map(|m| m.detail.clone()))
             .unwrap_or_default();
         let url = url.lines().next().unwrap_or("").trim().to_owned();
         if !url.starts_with("http") {
@@ -10952,6 +10888,83 @@ fn neutral_title(state: &RunState, winner: char) -> String {
         winner.to_ascii_uppercase(),
         state.id
     )
+}
+
+/// Run the same configured gate for a landing head and a fresh graph.
+pub(crate) async fn run_landing_gate(
+    state: &mut RunState,
+    winner: &Candidate,
+    wait: &crate::repo_lock::WaitPolicy,
+) -> Result<Vec<CommandOutcome>> {
+    let shell = state.config.shell();
+    let gate_commands = state.config.verify.gate.clone();
+    let has_pre_gate = !state.config.verify.pre_gate.is_empty();
+    let outcomes = if gate_commands.is_empty() && !has_pre_gate {
+        Vec::new()
+    } else {
+        let timeout = Duration::from_secs(state.config.graph.verify_timeout());
+        let cache_dir = state.config.cache_dir();
+        let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+        let (outcomes, _) = with_cache_lease(
+            state,
+            cache_dir.as_deref(),
+            "gate",
+            "gate",
+            &winner.worktree,
+            &head,
+            timeout,
+            "final gate",
+            wait,
+            |state, budget| {
+                let shell = shell.clone();
+                let gate_commands = gate_commands.clone();
+                let winner = winner.clone();
+                async move {
+                    Runner::run_pre_gate(state, &winner).await;
+                    let (outcomes, timed_out_pids) = run_commands(
+                        state,
+                        "gate",
+                        "gate",
+                        0,
+                        &shell,
+                        &gate_commands,
+                        &winner.worktree,
+                        budget,
+                    )
+                    .await;
+                    (outcomes, false, timed_out_pids)
+                }
+            },
+        )
+        .await?;
+        outcomes
+    };
+    if outcomes.is_empty() {
+        // Nothing configured to check — distinct from every other
+        // silence in this run's event log, since an empty `gate` alone
+        // no longer says whether the gate ran at all (see
+        // `RunState::gate_ran`'s own doc).
+        state.event("gate", "no gate commands configured; not tested");
+    }
+    for o in &outcomes {
+        state.event(
+            "gate",
+            format!(
+                "`{}` -> {}",
+                o.command,
+                if o.ok() {
+                    "pass".to_owned()
+                } else {
+                    format!(
+                        "FAIL ({:?})\n{}",
+                        o.code,
+                        tail(&o.output_tail, EVENT_OUTPUT_TAIL)
+                    )
+                }
+            ),
+        );
+    }
+    Ok(outcomes)
 }
 
 /// The pull request title to hand to `land::merge_subject`. A review-only run
@@ -16380,6 +16393,45 @@ mod tests {
         );
 
         held.release();
+    }
+
+    #[tokio::test]
+    async fn stopped_landing_resumes_from_structured_pr_even_with_legacy_gating_status() {
+        crate::run::pin_test_home();
+        for status in [RunStatus::Blocked, RunStatus::Gating] {
+            let mut runner = runner_at(status);
+            runner.state.config.graph.land = true;
+            runner.state.gate_ran = true;
+            runner.state.merge = Some(MergeOutcome {
+                mode: MergeMode::Pr,
+                ok: false,
+                detail: "the fixer produced no commit".into(),
+                empty: false,
+            });
+            let url = "https://example.invalid/o/r/pull/1";
+            runner.state.pr = Some(crate::run::PrRecord {
+                url: url.into(),
+                number: 1,
+                state: "open".into(),
+                checks: "red".into(),
+                round: 1,
+                rounds: 1,
+                red_at_merge: Vec::new(),
+            });
+            runner.state.save().unwrap();
+            // The nonexistent repository makes observation fail before a forge
+            // command can run. We still must reach land, rather than silently
+            // return from the graph with its old gate and merge records.
+            runner.execute_graph().await.unwrap();
+            assert_eq!(runner.state.status, RunStatus::Blocked);
+            assert!(runner.state.land_sync_pending);
+            assert!(runner.state.events.iter().any(|event|
+                event.node == "land" && event.message == format!("watching {url}")));
+            assert_eq!(
+                runner.state.merge.as_ref().unwrap().detail,
+                "the fixer produced no commit"
+            );
+        }
     }
 
     #[tokio::test]

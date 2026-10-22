@@ -984,14 +984,7 @@ where
                 Ok(s) if s.liveness(false) == Liveness::Live => {
                     ActionDecision::Refuse("run already has a live driver".into())
                 }
-                Ok(s)
-                    if s.status.resumable()
-                        && !s.released()
-                        && s.retired_to.is_none()
-                        && !exhausted_review_budget(&s) =>
-                {
-                    ActionDecision::Resume(run.clone())
-                }
+                Ok(s) if crate::handover::can_resume(&s) => ActionDecision::Resume(run.clone()),
                 Ok(_) => ActionDecision::Refuse((p.resume_cannot_progress)(
                     q.short(),
                     ask::short_id(run),
@@ -3453,6 +3446,43 @@ async fn poll(
     Ok(())
 }
 
+/// Historical successors do not revoke a still-resumable public owner. Scan
+/// under the same lock as publication/driver claims, and fail closed on unknown
+/// history before spending another attempt.
+fn public_resume_owner(home: &Path, runs: &[String], repo: &Path) -> Result<Option<RunState>> {
+    let mut owner = None;
+    for id in runs.iter().collect::<std::collections::BTreeSet<_>>() {
+        let _lock = crate::pr_head::owner_lock(home, id)?;
+        let state = RunState::load_under(id, home)?;
+        if state.released()
+            || state.retired_to.is_some()
+            || state.pr_taken_over_by.is_some()
+            || !crate::handover::landing_checkpoint(&state)
+        {
+            continue;
+        }
+        anyhow::ensure!(
+            state.repo == repo,
+            "public owner repository differs; inspect run lineage"
+        );
+        anyhow::ensure!(
+            owner.is_none(),
+            "multiple retained public owners; inspect run lineage"
+        );
+        anyhow::ensure!(
+            crate::handover::can_resume(&state),
+            "public owner cannot resume"
+        );
+        let claimed = is_working_on(home, id, Timestamp::now());
+        anyhow::ensure!(
+            state.liveness_under(home, claimed) == crate::run::Liveness::Dead,
+            "public owner's driver is live or unknown; wait before retrying"
+        );
+        owner = Some(state);
+    }
+    Ok(owner)
+}
+
 /// Run one claimed task to a terminal status and record the outcome.
 ///
 /// Every transition is flushed to the queue as it happens, so the state on disk
@@ -3474,10 +3504,25 @@ async fn attempt(
         repo.display()
     );
 
+    let public_owner = match public_resume_owner(&crate::run::home(), &task.runs, &repo) {
+        Ok(owner) => owner,
+        Err(e) => {
+            task.hold_machine(Some(format!(
+                "Cannot verify existing public owner: {e:#}; no attempt started."
+            )));
+            record(queue, task);
+            return Vec::new();
+        }
+    };
+    let resume_runs = public_owner
+        .as_ref()
+        .map(|s| vec![s.id.clone()])
+        .unwrap_or_else(|| task.runs.clone());
+
     // A stop spends no agent resources and uses the saved landing owner.
     // Current roster edits, missing attachments or a failed config fetch must
     // never turn it into a new implementation, or prevent a PR from closing.
-    if let Some(previous) = task.runs.last().and_then(|id| RunState::load(id).ok())
+    if let Some(previous) = resume_runs.last().and_then(|id| RunState::load(id).ok())
         && previous
             .merge_decision
             .as_ref()
@@ -3489,8 +3534,7 @@ async fn attempt(
         record(queue, task);
         return Vec::new();
     }
-    let stop_owner = task
-        .runs
+    let stop_owner = resume_runs
         .last()
         .and_then(|id| RunState::load(id).ok())
         .filter(|state| {
@@ -3535,11 +3579,19 @@ async fn attempt(
         );
     }
 
+    if let Some(owner) = &public_owner
+        && (task.fresh_start || !may_resume_run(owner, task))
+    {
+        task.hold_machine(Some(format!("Existing PR belongs to run {}; resume its authorized instructions or explicitly resolve its owner decision before starting a successor. No attempt started.", owner.id)));
+        record(queue, task);
+        return Vec::new();
+    }
+
     let unfinished = (!task.fresh_start)
-        .then(|| unfinished_run(&task.runs, task.short()))
+        .then(|| unfinished_run(&resume_runs, task.short()))
         .flatten()
         .filter(|id| RunState::load(id).is_ok_and(|run| may_resume_run(&run, task)));
-    let previous = task.runs.last().and_then(|id| RunState::load(id).ok());
+    let previous = resume_runs.last().and_then(|id| RunState::load(id).ok());
     if !task.fresh_start
         && task.pr_recovery.is_none()
         && task.review_branch.is_none()
@@ -3782,7 +3834,9 @@ async fn attempt(
             })
         })
         .and_then(|pin| pin.pinned_run.clone());
-    let starter = if let Some(run) = stop_pin {
+    let starter = if let Some(owner) = &public_owner {
+        Starter::Resume(owner.id.clone())
+    } else if let Some(run) = stop_pin {
         // Stop actions resume their exact owner even after seat-count edits;
         // they must never fall through to implementation or a takeover.
         Starter::Resume(run)
@@ -4928,23 +4982,15 @@ fn month_number(name: &str) -> Option<i8> {
         .map(|i| i as i8 + 1)
 }
 
-/// Resuming a `Blocked` run that already spent every review round its own
-/// config allowed cannot make progress: `graph::Runner`'s review loop walks
-/// `(reviews.len()+1)..=max_rounds`, which is empty once `reviews.len()` has
-/// reached `max_rounds`, so `execute` would settle straight back to
-/// `Blocked` without asking anyone anything. Read-only against a state this
-/// build never mutates — `src/graph.rs` stays untouched — but without this
-/// check, [`unfinished_run`] would keep reporting such a run as still
-/// "unfinished", and `crate::conduct::Recovery::Requeue` (whose whole
-/// promise is a fresh competition when a design needs to change) would
-/// silently resume the exhausted run instead, spending an attempt on a
-/// cycle that cannot change anything.
+/// Test probe for the shared resume policy's review-budget exclusion.
+#[cfg(test)]
 fn exhausted_review_budget(state: &RunState) -> bool {
     // A run whose task-head publication failed has nothing left to review:
     // resuming it only retries the publication, so it is never "exhausted".
-    state.status == RunStatus::Blocked
-        && !state.pr_publication_pending
-        && state.reviews.len() >= state.config.graph.review_rounds
+    !crate::handover::can_resume(state)
+        && state.status == RunStatus::Blocked
+        && !state.released()
+        && state.retired_to.is_none()
 }
 
 /// This task's *most recent* run, if resuming it would actually make
@@ -4972,7 +5018,7 @@ fn exhausted_review_budget(state: &RunState) -> bool {
 /// **one second** later, buying three fresh implementations to reach the
 /// same panel. `RunStatus::resumable` rather than `!done()` is what catches
 /// the second case: a stall is terminal, and its cheap recovery re-asks only
-/// the absent seats. [`exhausted_review_budget`] is the other half: a run
+/// the absent seats. [`crate::handover::can_resume`] supplies the other half: a run
 /// that is technically `resumable()` but provably cannot progress must not
 /// count as "unfinished" either, or `Recovery::Requeue` becomes a silent
 /// no-op instead of the fresh competition it promises.
@@ -5017,9 +5063,7 @@ where
             id = authority;
             continue;
         }
-        return (state.status.resumable()
-            && !state.released()
-            && !exhausted_review_budget(&state)
+        return (crate::handover::can_resume(&state)
             && state.liveness(false) != crate::run::Liveness::Live)
             .then_some(id);
     }
@@ -5046,13 +5090,7 @@ where
     let Some(id) = task.runs.last() else {
         return false;
     };
-    load(id).is_ok_and(|s| {
-        s.parked
-            && s.status.resumable()
-            && !s.released()
-            && s.retired_to.is_none()
-            && !exhausted_review_budget(&s)
-    })
+    load(id).is_ok_and(|s| s.parked && crate::handover::can_resume(&s))
 }
 
 /// Which of the three ways [`attempt`] can mint or continue a run this task
@@ -10377,6 +10415,109 @@ mod tests {
             "release keeps run history but must not resume it"
         );
         assert_eq!(released.runs, ["stalled-run"]);
+    }
+
+    fn stopped_public_run(status: RunStatus) -> RunState {
+        let mut state = run_state(status);
+        state.driver_exited = true;
+        state.config.graph.land = true;
+        state.config.graph.review_rounds = 1;
+        state.reviews = vec![review_round(1)];
+        state.merge = Some(crate::run::MergeOutcome {
+            mode: MergeMode::Pr,
+            ok: false,
+            detail: "landing stopped".into(),
+            empty: false,
+        });
+        state.pr = Some(crate::run::PrRecord {
+            url: "https://example.test/pull/1".into(),
+            number: 1,
+            state: "open".into(),
+            checks: "red".into(),
+            round: 1,
+            rounds: 1,
+            red_at_merge: Vec::new(),
+        });
+        state
+    }
+
+    #[test]
+    fn stopped_public_owner_resumes_on_release_choice_and_control_after_review_exhaustion() {
+        for status in [RunStatus::Blocked, RunStatus::Gating] {
+            let home = tempfile::tempdir().unwrap();
+            let mut state = stopped_public_run(status);
+            state.save_under(home.path()).unwrap();
+            assert!(crate::handover::has_resume_checkpoint(&state, home.path()));
+            assert!(!exhausted_review_budget(&state));
+            let mut task = held_task_with(&state.id);
+            task.release();
+            let unfinished = unfinished_run_with(&task.runs, task.short(), |_| Ok(state.clone()));
+            assert_eq!(
+                choose_starter(None, false, unfinished.as_deref()),
+                Starter::Resume(state.id.clone())
+            );
+            let question = action_question(&state.id, resume_action(&state.id));
+            assert_eq!(
+                decide_action(&task, &question, &PHRASES_EN, |_| Ok(state.clone())),
+                ActionDecision::Resume(state.id.clone())
+            );
+            // The control-plane command uses this same preflight before pinning.
+            assert_eq!(
+                crate::resume::validate(home.path(), &state.id).unwrap().id,
+                state.id
+            );
+            let queue = Queue::at(home.path().join("queue"));
+            let mut controlled = Task::new(
+                "resume land".into(),
+                state.instruction.clone(),
+                state.repo.clone(),
+                Source::Agent {
+                    run: "talk".into(),
+                    node: crate::queue::CHAT_NODE.into(),
+                },
+            );
+            controlled.runs.push(state.id.clone());
+            controlled.hold_machine(Some("land stopped".into()));
+            queue.put(&mut controlled).unwrap();
+            let resumed =
+                crate::chat_control::resume(&queue, home.path(), "talk", &state.id).unwrap();
+            assert_eq!(resumed.status, TaskStatus::Queued);
+            assert_eq!(
+                resumed.resume_override.unwrap().pinned_run,
+                Some(state.id.clone())
+            );
+            assert_eq!(resumed.attempts, 0);
+        }
+    }
+
+    #[test]
+    fn retained_public_owner_wins_over_an_existing_successor_and_unknown_history_holds() {
+        let home = tempfile::tempdir().unwrap();
+        let mut owner = stopped_public_run(RunStatus::Blocked);
+        owner.id = "20260101-000000-aaaa".into();
+        owner.save_under(home.path()).unwrap();
+        let mut successor = run_state(RunStatus::Blocked);
+        successor.id = "20260101-000001-bbbb".into();
+        successor.save_under(home.path()).unwrap();
+        let runs = vec![owner.id.clone(), successor.id.clone()];
+        assert_eq!(
+            public_resume_owner(home.path(), &runs, &owner.repo)
+                .unwrap()
+                .unwrap()
+                .id,
+            owner.id
+        );
+        let lock = crate::pr_head::owner_lock(home.path(), &owner.id).unwrap();
+        assert!(public_resume_owner(home.path(), &runs, &owner.repo).is_err());
+        drop(lock);
+        std::fs::remove_file(
+            home.path()
+                .join("runs")
+                .join(&successor.id)
+                .join("run.json"),
+        )
+        .unwrap();
+        assert!(public_resume_owner(home.path(), &runs, &owner.repo).is_err());
     }
 
     #[test]
