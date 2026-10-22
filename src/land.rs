@@ -3817,7 +3817,8 @@ async fn publish_landing_head<F: Forge>(
         git::is_clean(&winner.worktree).await?,
         "landing worktree is dirty"
     );
-    if state.gate_head.as_deref() != Some(&head) || !state.gate_ran {
+    if state.gate_head.as_deref() != Some(&head) || !state.gate_ran || !state.gate_allows_progress()
+    {
         state.gate.clear();
         state.gate_head = None;
         state.gate_ran = false;
@@ -3828,12 +3829,23 @@ async fn publish_landing_head<F: Forge>(
             Duration::from_secs(state.config.graph.timeout_resource_wait),
             || false,
         );
-        let outcomes = crate::graph::run_landing_gate(state, &winner, &wait).await?;
-        // An unavailable verification resource is not a completed gate.
-        anyhow::ensure!(
-            !outcomes.iter().any(|o| o.resource_blocked),
-            "landing gate could not acquire verification resources"
-        );
+        let mut outcomes = crate::graph::run_landing_gate(state, &winner, &wait).await?;
+        loop {
+            anyhow::ensure!(
+                !outcomes.iter().any(|o| o.resource_blocked),
+                "landing gate could not acquire verification resources"
+            );
+            if outcomes.iter().all(|o| o.ok()) {
+                break;
+            }
+            match Box::pin(crate::graph::repair_landing_gate(state, &winner, &outcomes)).await? {
+                crate::graph::GateFix::Retry => {
+                    outcomes = crate::graph::run_landing_gate(state, &winner, &wait).await?;
+                }
+                crate::graph::GateFix::Stop => break,
+                crate::graph::GateFix::Defer => bail!("landing gate repair deferred"),
+            }
+        }
         state.gate = outcomes;
         state.gate_ran = true;
         state.gate_head = Some(git::rev_parse(&winner.worktree, "HEAD").await?);
@@ -3886,6 +3898,62 @@ async fn publish_landing_head<F: Forge>(
     Ok(checked)
 }
 
+/// A scratch rebase moves the winner ref before its index and files. Recover
+/// only a tree proven unchanged since the saved start; never discard edits.
+async fn restore_landing_worktree(state: &mut RunState) -> Result<()> {
+    let winner = state.winner().cloned().context("landing has no winner")?;
+    if !git::is_clean(&winner.worktree).await? {
+        let from = state
+            .land_rebase_from
+            .as_deref()
+            .context("landing worktree is dirty")?;
+        let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+        anyhow::ensure!(head != from, "landing worktree is dirty");
+        for args in [
+            vec!["diff", "--cached", "--quiet", from],
+            vec!["diff", "--quiet"],
+        ] {
+            anyhow::ensure!(
+                git::git_raw(&winner.worktree, &args).await?.ok(),
+                "landing worktree has edits beyond the interrupted rebase"
+            );
+        }
+        anyhow::ensure!(
+            git::git(
+                &winner.worktree,
+                &["ls-files", "--others", "--exclude-standard"]
+            )
+            .await?
+            .trim()
+            .is_empty(),
+            "landing worktree has untracked edits"
+        );
+        git::sync_to_head(&winner.worktree).await?;
+    }
+    crate::worktree_setup::prepare(&state.config, &state.repo, &winner.worktree).await?;
+    state.land_rebase_from = None;
+    state.save()?;
+    Ok(())
+}
+
+async fn rebase_landing_worktree(
+    state: &mut RunState,
+    onto: &str,
+) -> Result<crate::rebase::Rebased> {
+    restore_landing_worktree(state).await?;
+    let winner = state.winner().cloned().context("landing has no winner")?;
+    state.land_sync_pending = true;
+    state.land_rebase_from = Some(git::rev_parse(&winner.worktree, "HEAD").await?);
+    state.save()?;
+    let scratch = state.dir().join("rebase");
+    let result = crate::rebase::rebase_with_fixer(state, &scratch, &winner.branch, onto).await?;
+    if result == crate::rebase::Rebased::Applied {
+        git::sync_to_head(&winner.worktree).await?;
+        restore_landing_worktree(state).await?;
+    }
+    Ok(result)
+}
+
 /// Reconcile a stopped landing before changing its branch. This also handles
 /// old records whose graph status or merge detail no longer identifies land.
 async fn resume_landing_head<F: Forge>(
@@ -3913,10 +3981,7 @@ async fn resume_landing_head<F: Forge>(
     // the remote immediately before the previous driver's last save.
     state.pr_pushed_head = Some(observed.to_owned());
     state.save()?;
-    anyhow::ensure!(
-        git::is_clean(&winner.worktree).await?,
-        "landing worktree is dirty"
-    );
+    restore_landing_worktree(state).await?;
     let remote = state.config.merge.remote.clone();
     let base = state.base_branch.clone();
     let fetched = git::fetch(&state.repo, &remote, &base).await?;
@@ -3928,9 +3993,8 @@ async fn resume_landing_head<F: Forge>(
     let onto = format!("{remote}/{base}");
     let tip = git::rev_parse(&state.repo, &onto).await?;
     if !git::is_ancestor(&state.repo, &tip, &local).await {
-        let scratch = state.dir().join("rebase");
-        match crate::rebase::rebase_with_fixer(state, &scratch, &winner.branch, &onto).await? {
-            crate::rebase::Rebased::Applied => git::sync_to_head(&winner.worktree).await?,
+        match rebase_landing_worktree(state, &onto).await? {
+            crate::rebase::Rebased::Applied => {}
             crate::rebase::Rebased::Stopped(why) => bail!("landing rebase stopped: {why}"),
         }
     }
@@ -4572,21 +4636,17 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 if owner_stop(state, &mut pr, forge).await? {
                     return Ok(pr);
                 }
-                let scratch = state.dir().join("rebase");
                 let onto = format!("{remote}/{base}");
-                let rebased =
-                    match crate::rebase::rebase_with_fixer(state, &scratch, &branch, &onto).await {
-                        Ok(crate::rebase::Rebased::Applied) => Ok(None),
-                        Ok(crate::rebase::Rebased::Stopped(why)) => Ok(Some(why)),
-                        Err(e) => Err(e),
-                    };
+                let rebased = match rebase_landing_worktree(state, &onto).await {
+                    Ok(crate::rebase::Rebased::Applied) => Ok(None),
+                    Ok(crate::rebase::Rebased::Stopped(why)) => Ok(Some(why)),
+                    Err(e) => Err(e),
+                };
                 if owner_stop(state, &mut pr, forge).await? {
                     return Ok(pr);
                 }
                 match rebased {
                     Ok(None) => {
-                        let winner = state.winner().cloned().context("landing has no winner")?;
-                        git::sync_to_head(&winner.worktree).await?;
                         let head = publish_landing_head(state, &seen.head, pr_url, forge).await?;
                         crate::graph::refresh_reviewed_commits(state, &branch).await;
                         state.pr_pushed_head = Some(head.clone());
@@ -6634,6 +6694,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             .unwrap();
         let mut state = run_state();
         state.repo = repo.clone();
+        state.base_commit = git::rev_parse(&repo, "origin/main").await.unwrap();
         state.config.graph.land = true;
         state.config.graph.land_approval = true;
         state.pr_head = Some("task-head".into());
@@ -6687,6 +6748,169 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(state.pr_pushed_head, Some(head));
         assert!(!state.land_sync_pending);
         assert!(state.config.graph.land_approval);
+    }
+
+    fn landing_gate_fixer(state: &mut RunState, script: &str) {
+        state.config.disk.min_free_bytes = 0;
+        state.config.graph.gate_fix_rounds = 1;
+        state.config.agents = vec![crate::config::AgentSpec {
+            id: "mock".into(),
+            kind: crate::config::AgentKind::Command,
+            model: None,
+            command: vec!["sh".into(), "-c".into(), script.into()],
+            extra_args: Vec::new(),
+            env: Default::default(),
+            prompt_delivery: None,
+        }];
+        state.candidates[0].agent = "mock".into();
+    }
+
+    #[tokio::test]
+    async fn landing_resume_repairs_a_failed_rebased_gate_before_publication() {
+        let (_tmp, mut state, old) = landing_git_fixture().await;
+        advance_landing_base(&state).await;
+        landing_gate_fixer(
+            &mut state,
+            "cat >/dev/null; printf fixed > change; printf '{\"addressed\":[],\"rejected\":[],\"notes\":\"fixed\"}'",
+        );
+        state.config.verify.gate =
+            vec!["grep -q fixed change || { echo 'change needs repair'; exit 1; }".into()];
+        state.config.verify.e2e = vec!["test -f advance".into()];
+        // First save a red gate without spending a fixer round. Resume must
+        // still offer the remaining budget for this exact same failed head.
+        state.config.graph.gate_fix_rounds = 0;
+        assert!(resume_observed_head(&mut state, &old).await.is_err());
+        assert_eq!(
+            git::remote_head(&state.repo, "origin", "task-head")
+                .await
+                .unwrap(),
+            Some(old.clone())
+        );
+        state.config.graph.gate_fix_rounds = 1;
+        let head = resume_observed_head(&mut state, &old).await.unwrap();
+        assert_eq!(state.gate_fixes.len(), 1);
+        assert!(state.gate_fixes[0].committed);
+        assert!(state.gate_allows_progress());
+        assert_eq!(state.gate_head.as_ref(), Some(&head));
+        assert_eq!(
+            git::remote_head(&state.repo, "origin", "task-head")
+                .await
+                .unwrap(),
+            Some(head.clone())
+        );
+        let forge = Scripted::new(vec![seen(&head, Checks::Green, "CLEAN", false)], vec![]);
+        land_with(&mut state, &green_pr().url, &forge)
+            .await
+            .unwrap();
+        assert!(state.parked);
+        assert_eq!(state.land_approval.as_ref().unwrap().head, head);
+        assert!(forge.argvs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn landing_gate_repairs_stop_at_the_saved_budget_without_publishing() {
+        let (_tmp, mut state, old) = landing_git_fixture().await;
+        advance_landing_base(&state).await;
+        landing_gate_fixer(
+            &mut state,
+            "cat >/dev/null; printf fixed > change; printf '{\"addressed\":[],\"rejected\":[],\"notes\":\"fixed\"}'",
+        );
+        state.config.verify.gate = vec!["echo still red; exit 1".into()];
+        for _ in 0..2 {
+            assert!(resume_observed_head(&mut state, &old).await.is_err());
+            assert_eq!(state.gate_fixes.len(), 1);
+            assert_eq!(
+                git::remote_head(&state.repo, "origin", "task-head")
+                    .await
+                    .unwrap(),
+                Some(old.clone())
+            );
+        }
+    }
+
+    async fn interrupt_landing_rebase(state: &mut RunState) {
+        state.land_rebase_from = Some(git::rev_parse(&state.repo, "HEAD").await.unwrap());
+        state.save().unwrap();
+        let scratch = state.dir().join("rebase");
+        assert_eq!(
+            crate::rebase::rebase_with_fixer(state, &scratch, "winner", "origin/main")
+                .await
+                .unwrap(),
+            crate::rebase::Rebased::Applied
+        );
+        assert!(!git::is_clean(&state.repo).await.unwrap());
+    }
+
+    async fn landing_setup(state: &mut RunState) {
+        git::git(
+            &state.repo,
+            &["config", "extensions.worktreeConfig", "true"],
+        )
+        .await
+        .unwrap();
+        state.config.worktree.setup =
+            vec![toml::from_str("run = \"printf secret > .env\"").unwrap()];
+        crate::worktree_setup::prepare(&state.config, &state.repo, &state.repo)
+            .await
+            .unwrap();
+        state.config.verify.gate = vec!["test -f advance && test -f .env".into()];
+    }
+
+    #[tokio::test]
+    async fn landing_resume_restores_setup_after_both_fresh_and_interrupted_rebases() {
+        for phase in 0..3 {
+            let (_tmp, mut state, old) = landing_git_fixture().await;
+            advance_landing_base(&state).await;
+            landing_setup(&mut state).await;
+            if phase > 0 {
+                interrupt_landing_rebase(&mut state).await;
+                if phase == 2 {
+                    // Crash after clean removed setup products, before setup.
+                    git::sync_to_head(&state.repo).await.unwrap();
+                    assert!(!state.repo.join(".env").exists());
+                }
+                state = RunState::load(&state.id).unwrap();
+            }
+            let head = resume_observed_head(&mut state, &old).await.unwrap();
+            assert_ne!(head, old);
+            assert!(state.gate_allows_progress());
+            assert!(state.land_rebase_from.is_none());
+            assert_eq!(
+                std::fs::read_to_string(state.repo.join(".env")).unwrap(),
+                "secret"
+            );
+            assert!(git::is_clean(&state.repo).await.unwrap());
+            assert!(
+                !git::git(&state.repo, &["ls-tree", "--name-only", "HEAD"])
+                    .await
+                    .unwrap()
+                    .contains(".env")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn landing_resume_preserves_user_edits_after_an_interrupted_rebase() {
+        for staged in [false, true] {
+            let (_tmp, mut state, old) = landing_git_fixture().await;
+            advance_landing_base(&state).await;
+            interrupt_landing_rebase(&mut state).await;
+            std::fs::write(state.repo.join("change"), "user edit").unwrap();
+            if staged {
+                git::git(&state.repo, &["add", "change"]).await.unwrap();
+            }
+            assert!(resume_observed_head(&mut state, &old).await.is_err());
+            assert_eq!(
+                std::fs::read_to_string(state.repo.join("change")).unwrap(),
+                "user edit"
+            );
+            assert_eq!(
+                git::remote_head(&state.repo, "origin", "task-head")
+                    .await
+                    .unwrap(),
+                Some(old)
+            );
+        }
     }
 
     #[tokio::test]

@@ -10358,7 +10358,7 @@ fn verify_inconclusive(outcomes: &[CommandOutcome]) -> bool {
 }
 
 /// What [`Runner::gate_fix_round`] decided.
-enum GateFix {
+pub(crate) enum GateFix {
     /// The tree changed and `verify.e2e` is still green: run the gate again.
     Retry,
     /// No more rounds, nothing to fix, or the fix did not hold: the gate's
@@ -10888,6 +10888,28 @@ fn neutral_title(state: &RunState, winner: char) -> String {
         winner.to_ascii_uppercase(),
         state.id
     )
+}
+
+/// Reuse the graph's bounded fixer without starting another graph or driver.
+/// Copy the working state back even on errors so spent rounds remain visible.
+pub(crate) async fn repair_landing_gate(
+    state: &mut RunState,
+    winner: &Candidate,
+    outcomes: &[CommandOutcome],
+) -> Result<GateFix> {
+    if state.gate_fixes.len() >= state.config.graph.gate_fix_rounds || !gate_fixable(outcomes) {
+        return Ok(GateFix::Stop);
+    }
+    let mut runner = Runner {
+        roles: state.config.resolve_roles()?,
+        sem: Arc::new(Semaphore::new(state.config.graph.max_parallel.max(1))),
+        state: state.clone(),
+        pause: Pause::new(),
+        interrupt: Pause::new(),
+    };
+    let result = runner.gate_fix_round(winner, outcomes).await;
+    *state = runner.state;
+    result
 }
 
 /// Run the same configured gate for a landing head and a fresh graph.

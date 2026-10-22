@@ -2169,6 +2169,9 @@ pub struct RunState {
     /// Resume must reconcile, sync, gate and publish the existing PR head before CI.
     #[serde(default)]
     pub land_sync_pending: bool,
+    /// Winner tip before a landing rebase, retained until worktree setup finishes.
+    #[serde(default)]
+    pub land_rebase_from: Option<String>,
     /// Fix rounds a failing gate has already spent, oldest first. Persisted
     /// right after each fixer call so a resumed run spends only what is left
     /// of `graph.gate_fix_rounds` instead of starting the budget over.
@@ -2531,6 +2534,7 @@ impl RunState {
             gate_ran: false,
             gate_head: None,
             land_sync_pending: false,
+            land_rebase_from: None,
             gate_fixes: Vec::new(),
             rebase_fixes: Vec::new(),
             graft: None,
