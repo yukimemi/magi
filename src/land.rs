@@ -3825,9 +3825,10 @@ async fn publish_landing_head<F: Forge>(
         state.pre_gate.clear();
         state.pre_gate_commit = None;
         state.save()?;
+        let inherited = crate::repo_lock::WaitPolicy::current();
         let wait = crate::repo_lock::WaitPolicy::new(
             Duration::from_secs(state.config.graph.timeout_resource_wait),
-            || false,
+            move || inherited.cancelled(),
         );
         let mut outcomes = crate::graph::run_landing_gate(state, &winner, &wait).await?;
         loop {
@@ -3864,9 +3865,10 @@ async fn publish_landing_head<F: Forge>(
             && git::is_clean(&winner.worktree).await?,
         "landing tree changed after gate"
     );
+    let inherited = crate::repo_lock::WaitPolicy::current();
     let wait = crate::repo_lock::WaitPolicy::new(
         Duration::from_secs(state.config.graph.timeout_resource_wait),
-        || false,
+        move || inherited.cancelled(),
     );
     anyhow::ensure!(
         matches!(
@@ -7128,6 +7130,77 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         restore_landing_worktree(&mut state).await.unwrap();
         assert!(state.land_rebase_from.is_none());
         assert!(git::is_clean(&state.repo).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn landing_verification_inherits_cancellation_while_waiting_for_a_local_seat() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for e2e in [false, true] {
+            let (_tmp, mut state, head) = landing_git_fixture().await;
+            let common = crate::repo_lock::common_dir(&state.repo)
+                .await
+                .unwrap()
+                .unwrap();
+            std::fs::write(common.join("updater.contract"), "test-protocol-v1\n").unwrap();
+            state.config.coordination = crate::config::test_coordination();
+            if e2e {
+                state.config.verify.e2e = vec!["true".into()];
+                state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
+                    head: head.clone(),
+                    passed: false,
+                    outcomes: Vec::new(),
+                });
+            } else {
+                state.config.verify.gate = vec!["true".into()];
+                state.gate_ran = false;
+            }
+            let holder = crate::repo_lock::SeatLease::for_checkout(
+                &state.repo,
+                true,
+                state.config.coordination.as_ref(),
+            )
+            .await
+            .unwrap();
+            assert!(holder.is_some());
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let signal = cancelled.clone();
+            let wait = crate::repo_lock::WaitPolicy::new(Duration::from_secs(30), move || {
+                signal.load(Ordering::SeqCst)
+            });
+            let forge = Scripted::new(vec![seen(&head, Checks::Green, "CLEAN", false)], vec![]);
+            let url = green_pr().url;
+            let (result, ()) = tokio::join!(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    wait.scope(publish_landing_head(&mut state, &head, &url, &forge)),
+                ),
+                async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    cancelled.store(true, Ordering::SeqCst);
+                }
+            );
+            let error = result
+                .expect("cancellation must release the verification waiter")
+                .unwrap_err();
+            assert!(error.is::<crate::repo_lock::ResourceBlocked>(), "{error:#}");
+            assert!(forge.argvs().is_empty());
+            assert_eq!(
+                git::remote_head(&state.repo, "origin", "task-head")
+                    .await
+                    .unwrap(),
+                Some(head.clone())
+            );
+            drop(holder);
+            // Cancellation must release its reservation so another attempt can verify.
+            assert_eq!(
+                publish_landing_head(&mut state, &head, &url, &forge)
+                    .await
+                    .unwrap(),
+                head
+            );
+        }
     }
 
     #[tokio::test]

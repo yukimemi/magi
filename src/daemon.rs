@@ -10491,6 +10491,45 @@ mod tests {
     }
 
     #[test]
+    fn exhausted_gate_failure_after_clean_review_is_not_resumable() {
+        let home = tempfile::tempdir().unwrap();
+        let mut state = run_state(RunStatus::Blocked);
+        state.config.graph.review_rounds = 1;
+        let mut review = review_round(1);
+        review.clean = true;
+        state.reviews = vec![review];
+        state.gate_ran = true;
+        state.gate = vec![crate::run::CommandOutcome {
+            command: "verify".into(),
+            code: Some(1),
+            output_tail: "gate failed after repair budget exhausted".into(),
+            duration_ms: 0,
+            resource_blocked: false,
+        }];
+        state.save_under(home.path()).unwrap();
+        assert!(!crate::handover::has_resume_checkpoint(&state, home.path()));
+        assert!(exhausted_review_budget(&state));
+        let mut task = held_task_with(&state.id);
+        task.release();
+        assert!(unfinished_run_with(&task.runs, task.short(), |_| Ok(state.clone())).is_none());
+        let question = action_question(&state.id, resume_action(&state.id));
+        assert_ne!(
+            decide_action(&task, &question, &PHRASES_EN, |_| Ok(state.clone())),
+            ActionDecision::Resume(state.id.clone())
+        );
+        assert!(crate::resume::validate(home.path(), &state.id).is_err());
+
+        // A clean review that has not reached the gate still has work to do.
+        state.gate_ran = false;
+        state.gate.clear();
+        assert!(!exhausted_review_budget(&state));
+        assert_eq!(
+            unfinished_run_with(&task.runs, task.short(), |_| Ok(state.clone())),
+            Some(state.id)
+        );
+    }
+
+    #[test]
     fn resource_blocked_verification_resumes_the_same_run() {
         for (kind, stage) in [
             ("cache", "clean"),
