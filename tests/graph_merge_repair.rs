@@ -728,7 +728,7 @@ fn run_cli(fx: &common::Fixture, args: &[&str]) {
     );
 }
 
-async fn approval_gate_late_stop(choice: &str) {
+async fn approval_gate_late_stop(choice: &str, during_gate: bool) {
     let (fx, mut runner, question) = held_pr_choice(false, false, choice).await;
     let task = decision_owner(&mut runner, &fx).await;
     Questions::open()
@@ -741,7 +741,14 @@ async fn approval_gate_late_stop(choice: &str) {
         .unwrap();
     // The first owner_stop sees an open card. Disarming this saved arm is
     // the await between that read and approval_gate reading the card again.
-    runner.state.land_armed_head = Some(runner.state.land_approval.as_ref().unwrap().head.clone());
+    if during_gate {
+        runner.state.gate_ran = false;
+        runner.state.gate_head = None;
+        runner.state.config.verify.gate = vec![r#"rm "$REPAIR_FORGE/late-answer" && (unset MAGI_RUN MAGI_NODE MAGI_SEAT MAGI_TURN_SCOPE; cd "$REPAIR_HOME" && "$REPAIR_CLI" answer "$REPAIR_LATE_QUESTION" --reply "$REPAIR_LATE_CHOICE")"#.into()];
+    } else {
+        runner.state.land_armed_head =
+            Some(runner.state.land_approval.as_ref().unwrap().head.clone());
+    }
     runner.state.save().unwrap();
     std::fs::write(fx.tmp.path().join("forge/late-answer"), "").unwrap();
     // SAFETY: this test owns an isolated child; the callback runs after these writes.
@@ -794,13 +801,53 @@ async fn approval_gate_late_stop(choice: &str) {
 
 common::e2e! {
 async fn decision_review_late_withdraw_at_approval_gate_closes_the_pr() {
-    approval_gate_late_stop(magi::merge_decision::WITHDRAW).await;
+    approval_gate_late_stop(magi::merge_decision::WITHDRAW, false).await;
 }
 }
 
 common::e2e! {
 async fn decision_review_late_reimplementation_at_approval_gate_requeues_the_owner() {
-    approval_gate_late_stop("reimplement:beta").await;
+    approval_gate_late_stop("reimplement:beta", false).await;
+}
+}
+
+common::e2e! {
+async fn decision_review_late_withdraw_during_landing_gate_closes_the_pr() {
+    approval_gate_late_stop(magi::merge_decision::WITHDRAW, true).await;
+}
+}
+
+common::e2e! {
+async fn decision_review_late_reimplementation_during_landing_gate_requeues_the_owner() {
+    approval_gate_late_stop("reimplement:beta", true).await;
+}
+}
+
+common::e2e! {
+async fn decision_repair_answer_survives_a_landing_base_advance() {
+    let (fx, runner, question) = held_pr(false, false).await;
+    let old_head = runner.state.land_approval.as_ref().unwrap().head.clone();
+    magi::git::git(&fx.repo, &["checkout", "main"]).await.unwrap();
+    std::fs::write(fx.repo.join("base-advance.txt"), "new base").unwrap();
+    magi::git::commit_all(&fx.repo, "test: advance base").await.unwrap();
+    assert!(magi::git::push(&fx.repo, "origin", "main").await.unwrap().ok());
+
+    let mut resumed = Runner::resume(&runner.state.id).unwrap();
+    resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.id, runner.state.id);
+    assert_eq!(resumed.state.merge_repairs.len(), 1, "{:?}", resumed.state.events);
+    let repair = &resumed.state.merge_repairs[0];
+    assert_eq!(repair.question, question);
+    assert_eq!(repair.head, old_head);
+    assert_eq!(repair.phase, MergeRepairPhase::Complete);
+    assert!(fx.tmp.path().join("forge/fixes").exists());
+    assert!(resumed.state.parked);
+    let next = resumed.state.land_approval.as_ref().unwrap();
+    assert_ne!(next.question, question);
+    assert_ne!(next.head, old_head);
+    assert!(Questions::open().get(&next.question).unwrap().status.open());
+    let calls = std::fs::read_to_string(fx.tmp.path().join("forge/calls")).unwrap();
+    assert!(calls.lines().filter(|line| line.starts_with("pr merge")).all(|line| line.contains("--disable-auto")));
 }
 }
 

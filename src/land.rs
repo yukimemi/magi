@@ -4165,7 +4165,46 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
         }
 
         if state.land_sync_pending && pr.state == PrLifecycle::Open {
-            let head = resume_landing_head(state, &seen.head, pr_url, forge).await?;
+            // Disarming can outlive an owner answer. Consume it before our
+            // own rebase invalidates the head shown on the decision card.
+            if owner_stop(state, &mut pr, forge).await? {
+                return Ok(pr);
+            }
+            let repair_answer = state.land_approval.as_ref().is_some_and(|binding| {
+                binding.head.eq_ignore_ascii_case(&seen.head)
+                    && ask::Questions::open()
+                        .get(&binding.question)
+                        .is_ok_and(|q| {
+                            q.run == state.id
+                                && q.node == APPROVAL_NODE
+                                && q.status == ask::QuestionStatus::Answered
+                                && matches!(approval(q.resolution().as_deref()), Approval::Repair)
+                        })
+            });
+            if repair_answer {
+                let subject = merge_subject(
+                    crate::graph::landing_title(state, &seen.title),
+                    &crate::graph::landing_subject_source(state),
+                );
+                let contested = contested_to_ask(state);
+                if matches!(
+                    approval_gate(state, &pr, &subject, contested.as_ref(), &seen.head).await?,
+                    ApprovalGate::Repair
+                ) {
+                    if let Err(why) = disarm(forge, state, &repo, pr.number).await {
+                        state.event("repair", format!("auto-merge could not be disabled: {why}; repair preflight will retry"));
+                        state.save()?;
+                    }
+                    return Ok(pr);
+                }
+            }
+            let synced = resume_landing_head(state, &seen.head, pr_url, forge).await;
+            // A stop detected before publication must apply its durable
+            // decision, even when verification returned an error meanwhile.
+            if owner_stop(state, &mut pr, forge).await? {
+                return Ok(pr);
+            }
+            let head = synced?;
             awaiting_head = Some(head);
             waited = Duration::ZERO;
             rechecked = false;
@@ -4688,7 +4727,12 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 }
                 match rebased {
                     Ok(None) => {
-                        let head = publish_landing_head(state, &seen.head, pr_url, forge).await?;
+                        let published =
+                            publish_landing_head(state, &seen.head, pr_url, forge).await;
+                        if owner_stop(state, &mut pr, forge).await? {
+                            return Ok(pr);
+                        }
+                        let head = published?;
                         crate::graph::refresh_reviewed_commits(state, &branch).await;
                         state.pr_pushed_head = Some(head.clone());
                         awaiting_head = Some(head);
