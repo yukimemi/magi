@@ -9621,7 +9621,7 @@ fn round_is_clean(
 /// remain", so a reentry retries the check (see `Runner::review_loop`'s own
 /// handling of that shape) instead of this cheap recomputation guessing a
 /// verdict a real attempt never produced.
-fn review_conclusion(reviews: &[ReviewRound], max_rounds: usize) -> Option<RunStatus> {
+pub(crate) fn review_conclusion(reviews: &[ReviewRound], max_rounds: usize) -> Option<RunStatus> {
     if max_rounds == 0 || reviews.iter().any(|r| r.clean) {
         return Some(RunStatus::Gating);
     }

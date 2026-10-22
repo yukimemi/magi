@@ -3918,9 +3918,10 @@ async fn publish_landing_head<F: Forge>(
 /// only a tree proven unchanged since the saved start; never discard edits.
 async fn restore_landing_worktree(state: &mut RunState) -> Result<()> {
     let winner = state.winner().cloned().context("landing has no winner")?;
+    let inherited = crate::repo_lock::WaitPolicy::current();
     let wait = crate::repo_lock::WaitPolicy::new(
         Duration::from_secs(state.config.graph.timeout_resource_wait),
-        || false,
+        move || inherited.cancelled(),
     );
     let _coordination = crate::repo_lock::SeatLease::operation_with(
         &winner.worktree,
@@ -7068,6 +7069,65 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 "restored"
             );
         }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn landing_restoration_inherits_cancellation_while_waiting_for_a_local_seat() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_tmp, mut state, _) = landing_git_fixture().await;
+        advance_landing_base(&state).await;
+        landing_setup(&mut state).await;
+        interrupt_landing_rebase(&mut state).await;
+        let common = crate::repo_lock::common_dir(&state.repo)
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(common.join("updater.contract"), "test-protocol-v1\n").unwrap();
+        state.config.coordination = crate::config::test_coordination();
+        let holder = crate::repo_lock::SeatLease::for_checkout(
+            &state.repo,
+            true,
+            state.config.coordination.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert!(holder.is_some());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let signal = cancelled.clone();
+        let wait = crate::repo_lock::WaitPolicy::new(Duration::from_secs(30), move || {
+            signal.load(Ordering::SeqCst)
+        });
+        let before = git::git(&state.repo, &["diff", "HEAD"]).await.unwrap();
+        let checkpoint = state.land_rebase_from.clone();
+        let (result, ()) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                wait.scope(restore_landing_worktree(&mut state)),
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                cancelled.store(true, Ordering::SeqCst);
+            }
+        );
+        let error = result
+            .expect("cancellation must release the waiting driver")
+            .unwrap_err();
+        assert!(error.is::<crate::repo_lock::ResourceBlocked>(), "{error:#}");
+        assert_eq!(
+            git::git(&state.repo, &["diff", "HEAD"]).await.unwrap(),
+            before
+        );
+        assert_eq!(state.land_rebase_from, checkpoint);
+        assert_eq!(
+            std::fs::read_to_string(state.repo.join(".env")).unwrap(),
+            "secret"
+        );
+        drop(holder);
+        restore_landing_worktree(&mut state).await.unwrap();
+        assert!(state.land_rebase_from.is_none());
+        assert!(git::is_clean(&state.repo).await.unwrap());
     }
 
     #[tokio::test]

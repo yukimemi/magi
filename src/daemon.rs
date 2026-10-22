@@ -10491,17 +10491,56 @@ mod tests {
     }
 
     #[test]
-    fn resource_blocked_gate_after_clean_final_review_resumes_the_same_run() {
-        for kind in ["cache", "coordination"] {
+    fn resource_blocked_verification_resumes_the_same_run() {
+        for (kind, stage) in [
+            ("cache", "clean"),
+            ("coordination", "clean"),
+            ("cache", "review-e2e"),
+            ("coordination", "no-reviews"),
+            ("coordination", "handoff"),
+        ] {
             let home = tempfile::tempdir().unwrap();
             let mut state = run_state(RunStatus::Blocked);
             state.config.graph.review_rounds = 1;
             let mut review = review_round(1);
             review.clean = true;
             state.reviews = vec![review];
+            if stage == "review-e2e" {
+                let review = &mut state.reviews[0];
+                review.clean = false;
+                review.blocking = 1;
+                review.e2e = vec![crate::run::CommandOutcome {
+                    command: "verify".into(),
+                    code: None,
+                    output_tail: "resource wait expired".into(),
+                    duration_ms: 0,
+                    resource_blocked: true,
+                }];
+            } else if stage == "no-reviews" {
+                state.config.graph.review_rounds = 0;
+                state.reviews.clear();
+            } else if stage == "handoff" {
+                // A completed final verification can hand off to the gate
+                // even when the review still carries contested findings.
+                let review = &mut state.reviews[0];
+                review.clean = false;
+                review.blocking = 1;
+                review.e2e = vec![crate::run::CommandOutcome {
+                    command: "verify".into(),
+                    code: Some(0),
+                    output_tail: String::new(),
+                    duration_ms: 0,
+                    resource_blocked: false,
+                }];
+            }
             state.gate_ran = false;
             state.resource_block = Some(crate::run::ResourceBlock {
-                node: "gate".into(),
+                node: if stage == "review-e2e" {
+                    "review"
+                } else {
+                    "gate"
+                }
+                .into(),
                 kind: kind.into(),
                 detail: "resource wait expired".into(),
                 at: jiff::Timestamp::now(),
@@ -10525,10 +10564,33 @@ mod tests {
                 crate::resume::validate(home.path(), &state.id).unwrap().id,
                 state.id
             );
+            let queue = Queue::at(home.path().join("queue"));
+            let mut controlled = Task::new(
+                "resume verification".into(),
+                state.instruction.clone(),
+                state.repo.clone(),
+                Source::Agent {
+                    run: "talk".into(),
+                    node: crate::queue::CHAT_NODE.into(),
+                },
+            );
+            controlled.runs.push(state.id.clone());
+            controlled.hold_machine(Some("verification resource unavailable".into()));
+            queue.put(&mut controlled).unwrap();
+            let resumed =
+                crate::chat_control::resume(&queue, home.path(), "talk", &state.id).unwrap();
+            assert_eq!(resumed.status, TaskStatus::Queued);
+            assert_eq!(
+                resumed.resume_override.unwrap().pinned_run,
+                Some(state.id.clone())
+            );
+            assert_eq!(resumed.attempts, 0);
 
             // A genuinely unresolved final review still exhausts the budget.
-            state.reviews[0].clean = false;
-            state.reviews[0].blocking = 1;
+            state.config.graph.review_rounds = 1;
+            let mut unresolved = review_round(1);
+            unresolved.blocking = 1;
+            state.reviews = vec![unresolved];
             state.resource_block = None;
             state.save_under(home.path()).unwrap();
             assert!(exhausted_review_budget(&state));
