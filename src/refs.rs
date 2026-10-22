@@ -128,10 +128,12 @@ impl Sources {
                 parents.ok() && parents.stdout.split_whitespace().count() <= 2,
                 "--pick-commit does not support merge commits"
             );
+            // Contained in the history the candidates actually start from
+            // (`onto`: `--start-from` when given, else the base). A base-only
+            // commit picked onto an explicit start that lacks it is a real
+            // import, not a duplicate.
             anyhow::ensure!(
-                !picks.contains(&input.sha)
-                    && !git::ancestry(repo, &input.sha, onto).await?
-                    && !git::ancestry(repo, &input.sha, base).await?,
+                !picks.contains(&input.sha) && !git::ancestry(repo, &input.sha, onto).await?,
                 "duplicate or already contained --pick-commit {}",
                 input.token
             );
@@ -348,6 +350,41 @@ mod tests {
             .await
             .unwrap();
         assert!(picks.plan(&repo, &base).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_base_only_commit_can_be_picked_onto_an_explicit_start() {
+        let (_g, repo, _, fix, _) = repo_with_side_branch();
+        // main moves on after the side branch forked: B is in the base, not in F.
+        let b = commit_file(&repo, "b.txt", "b\n");
+        let base = b.clone();
+        let onto_start = Sources::resolve(
+            &repo,
+            "origin",
+            Some("magi/27b2/A"),
+            std::slice::from_ref(&b),
+        )
+        .await
+        .unwrap();
+        let plan = onto_start.plan(&repo, &base).await.unwrap();
+        assert_eq!(plan.start.as_deref(), Some(fix.as_str()));
+        assert_eq!(plan.picks, vec![b.clone()]);
+        // Without an explicit start the candidates begin at the base, which
+        // already contains B: picking it again is a duplicate.
+        let onto_base = Sources::resolve(&repo, "origin", None, std::slice::from_ref(&b))
+            .await
+            .unwrap();
+        assert!(onto_base.plan(&repo, &base).await.is_err());
+        // A start that already contains the picked commit rejects it too.
+        let contained = Sources::resolve(
+            &repo,
+            "origin",
+            Some("magi/27b2/A"),
+            std::slice::from_ref(&fix),
+        )
+        .await
+        .unwrap();
+        assert!(contained.plan(&repo, &base).await.is_err());
     }
 
     #[tokio::test]
