@@ -129,6 +129,19 @@ fn plain_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
 }
 
+/// Old run records outlive their checkout and output directories. Only an
+/// absent path means nothing to reclaim; inaccessible paths remain errors.
+fn run_paths_missing(state: &RunState) -> Result<bool> {
+    for path in [state.worktree_root(), state.repo.clone()] {
+        match std::fs::metadata(&path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(e) => return Err(e).with_context(|| format!("inspect {}", path.display())),
+        }
+    }
+    Ok(false)
+}
+
 /// Enumerate actual registered worktrees, not just candidates in run.json.
 async fn worktrees(state: &RunState) -> Result<Vec<PathBuf>> {
     let root = state.worktree_root();
@@ -516,12 +529,25 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
         if disk.worktree_limit_bytes == 0 {
             continue;
         }
+        match run_paths_missing(&state) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                report.failures.push(format!("{id}: {e:#}"));
+                continue;
+            }
+        }
         let list = match registrations.entry(state.repo.clone()) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => {
                 match git::git(&state.repo, &["worktree", "list", "--porcelain"]).await {
                     Ok(list) => entry.insert(list),
                     Err(e) => {
+                        // The checkout may disappear after the inventory check.
+                        // Do not confuse a missing Git executable with that case.
+                        if matches!(run_paths_missing(&state), Ok(true)) {
+                            continue;
+                        }
                         report.failures.push(format!("{id}: {e:#}"));
                         continue;
                     }
@@ -1282,6 +1308,100 @@ mod tests {
                 .unwrap();
             task
         }
+    }
+
+    #[tokio::test]
+    async fn sweep_skips_missing_run_paths_and_reclaims_other_runs() {
+        for remove_root in [true, false] {
+            let f = Fx::new().await;
+            let stale = Fx::new().await;
+            let mut missing = stale.run("aa00", false).await;
+            Fx::target(&missing.candidates[0].worktree);
+            missing.save_under(&f.home).unwrap();
+            if remove_root {
+                std::fs::remove_dir_all(missing.worktree_root()).unwrap();
+                // An existing non-repository proves the absent root is checked
+                // before querying Git, even when no registrations are cached.
+                std::fs::remove_dir_all(stale.repo.join(".git")).unwrap();
+            } else {
+                std::fs::remove_dir_all(&stale.repo).unwrap();
+            }
+            let healthy = f.run("aa01", false).await;
+            Fx::target(&healthy.candidates[0].worktree);
+
+            let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+            assert!(report.failures.is_empty(), "{report:?}");
+            assert_eq!(report.freed_bytes, 200, "{report:?}");
+            assert!(
+                !healthy.candidates[0]
+                    .worktree
+                    .join("target/debug/output")
+                    .exists()
+            );
+            if !remove_root {
+                // Without the repository, ownership cannot be validated.
+                assert!(
+                    missing.candidates[0]
+                        .worktree
+                        .join("target/debug/output")
+                        .exists()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_skips_missing_candidate_checkout_and_reclaims_later_runs() {
+        let f = Fx::new().await;
+        let mut missing = f.run("aa00", false).await;
+        Fx::target(&missing.candidates[0].worktree);
+        missing.repo = missing.candidates[0].worktree.clone();
+        missing.save_under(&f.home).unwrap();
+        std::fs::remove_dir_all(&missing.repo).unwrap();
+        assert!(missing.worktree_root().is_dir());
+        assert!(f.repo.is_dir());
+
+        let healthy = f.run("aa01", false).await;
+        Fx::target(&healthy.candidates[0].worktree);
+
+        let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+        assert!(report.failures.is_empty(), "{report:?}");
+        assert_eq!(report.freed_bytes, 200, "{report:?}");
+        assert!(
+            !healthy.candidates[0]
+                .worktree
+                .join("target/debug/output")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_reports_invalid_repository_and_still_reclaims_later_runs() {
+        let f = Fx::new().await;
+        let broken = Fx::new().await;
+        let mut invalid = broken.run("aa00", false).await;
+        Fx::target(&invalid.candidates[0].worktree);
+        invalid.save_under(&f.home).unwrap();
+        std::fs::remove_dir_all(broken.repo.join(".git")).unwrap();
+        let healthy = f.run("aa01", false).await;
+        Fx::target(&healthy.candidates[0].worktree);
+
+        let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+        assert_eq!(report.failures.len(), 1, "{report:?}");
+        assert!(report.failures[0].starts_with(&format!("{}:", invalid.id)));
+        assert_eq!(report.freed_bytes, 200, "{report:?}");
+        assert!(
+            !healthy.candidates[0]
+                .worktree
+                .join("target/debug/output")
+                .exists()
+        );
+        assert!(
+            invalid.candidates[0]
+                .worktree
+                .join("target/debug/output")
+                .exists()
+        );
     }
 
     async fn reconciliation_plan(f: &Fx, task: &Task, source: &RunState) -> serde_json::Value {
