@@ -2330,11 +2330,13 @@ pub struct RunState {
     /// the distinction between an unfinished turn and a completed empty reply.
     #[serde(default)]
     pub interrupted_implementations: BTreeSet<char>,
-    /// Existing branches and commits the task text names, and what the
-    /// repository says about each (`crate::refs`). Unmerged ones seed the
-    /// candidates; `base_commit` stays the comparison point.
+    /// Legacy automatically inferred references, retained only for audit.
+    /// These are never explicit authorization and never seed preparation.
     #[serde(default)]
     pub seeds: Vec<crate::refs::Seed>,
+    /// Explicit, SHA-pinned implementation imports; separate from instruction text.
+    #[serde(default, skip_serializing_if = "crate::refs::Sources::is_empty")]
+    pub sources: crate::refs::Sources,
     /// Candidate preparation stopped before agents ran; requires an explicit source correction.
     #[serde(default)]
     pub prep_failure: Option<String>,
@@ -2583,6 +2585,7 @@ impl RunState {
             candidate_preservation: BTreeMap::new(),
             interrupted_implementations: BTreeSet::new(),
             seeds: Vec::new(),
+            sources: crate::refs::Sources::default(),
             prep_failure: None,
             prep_complete: Some(false),
             seats: BTreeMap::new(),

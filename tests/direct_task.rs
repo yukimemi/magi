@@ -36,6 +36,7 @@ fn review_filing(fx: &common::Fixture, branch: &str, config: std::path::PathBuf)
             config: Some(config),
             ..RunOverrides::default()
         },
+        sources: Default::default(),
         review_of: Some(branch.to_owned()),
     }
 }

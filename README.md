@@ -208,6 +208,56 @@ starts meanwhile cannot take it. `--merge`, `-c`, `-j`, `--review-rounds`,
 `--seed` and `--config` ride on the task, so they hold either way. A run that
 fails standalone leaves its task `held` (`magi task release` retries it).
 
+Implementation imports are opt-in on both `magi task add` and `magi run`:
+
+```sh
+magi task add --start-from feature/fix --pick-commit abc1234 --pick-commit def5678 -- "Finish the implementation"
+magi run --start-from feature/fix -- "Finish the implementation"
+```
+
+`--start-from <BRANCH|COMMIT>` selects one starting commit **including its
+ancestry**. `--pick-commit <COMMIT>` accepts a commit SHA and applies only that
+commit, in the exact order supplied; repeat it for multiple commits. Merge
+commits cannot be picked. Inputs are resolved to full SHAs before filing and
+stored separately from the instruction. Branch movement does not change a
+queued task or retry. A branch whose local and remote-tracking tips differ
+resolves to the newer tip when one contains the other (a fetch that left the
+local branch behind); diverged tips, unknown/ambiguous inputs, duplicate picks
+and picks already in the selected starting history are rejected before
+candidate worktrees are created. Resolution uses locally available objects and
+tracking refs; it never guesses from prose.
+
+Titles, task descriptions, examples, quoted logs and conversation answers never
+select imports or recovery sources. Old automatically inferred run `seeds` are
+kept for audit only; they are not converted to explicit inputs. Existing explicit
+review and `recover-pr` selections retain their own ownership and approval checks.
+Already prepared runs keep their work; this upgrade does not rebuild them.
+
+For a task stopped by accidental historical prose imports, inspect `magi task
+show <id> --json` and its runs first, then hold it if necessary. Use `magi task
+sources <id> --clear` to select no imports, or supply `--start-from` and/or
+`--pick-commit` to replace the entire selection. This operation requires an
+unclaimed queued/held task and refuses review/recovery tasks or any attempt that
+may contain useful candidate work. It preserves the instruction and run history.
+Then `magi task release <id>` explicitly authorizes preparation to retry with the
+new selection. When the operation refuses because work may exist, preserve it
+and use the explicit review or `recover-pr` workflow instead; do not delete runs
+or close PRs merely to clear a preparation error. Source options on `run --task`
+or `run --resume` are rejected rather than silently ignored.
+
+A run created before this change whose prose-derived cherry-pick failed *after*
+its candidate worktree was created is the one case `task sources` cannot help:
+it has no structured sources, it keeps its registered candidates (so the
+command refuses it), and it never opened a PR for `recover-pr`. Preparation
+stops before any agent runs, so those candidate worktrees hold only the base
+commit plus the unintended imports; the imported commits still exist on their
+own branches. To resume the original task without them, take each candidate
+worktree listed by `magi show <run>`, check `git -C <worktree> status` for
+anything of your own (commit it to a branch of yours first if so), run
+`git -C <worktree> cherry-pick --abort`, then `magi task release <id>`. The
+retry removes the now clean candidates and recreates them from the base commit
+with no imports, continuing the same run and its history.
+
 To recover an existing task PR from an implementation the operator has chosen,
 use `magi task recover-pr <task-id> --pr <PR-URL> --head <full-public-SHA> --disposition land`
 (or `--disposition review` for local review only). Optional `--source-head <full-SHA>`
@@ -215,7 +265,7 @@ preserves a reviewed fix independently of the public-head lease. See
 [the recovery contract and validation setup](docs/existing-pr-recovery.md).
 This queues a single review candidate from the fetched public commit with its
 complete ancestry, preserving the task's instructions. The selection overrides
-historical review branches, resume pins and references extracted from prose.
+historical review branches and resume pins.
 The PR must be the unique open PR for `magi/task-<task-id>` in the task's
 repository, targeting the configured base. Active or unknown previous
 publishers prevent takeover; historical source branches and worktrees remain.

@@ -290,6 +290,9 @@ pub struct Task {
     pub title: String,
     /// The task itself, handed to the graph verbatim.
     pub instruction: String,
+    /// Explicit, SHA-pinned implementation imports; separate from instruction text.
+    #[serde(default, skip_serializing_if = "crate::refs::Sources::is_empty")]
+    pub sources: crate::refs::Sources,
     /// Repository to work in.
     pub repo: PathBuf,
     /// Who asked.
@@ -623,11 +626,21 @@ fn recovery_progress(state: &crate::run::RunState) -> Option<String> {
     Some(format!("{:x}", hash.finish()))
 }
 
-pub(crate) fn recovery_inputs(seeds: &[crate::refs::Seed]) -> String {
+/// The implementation inputs a recovery budget is keyed on: the explicit,
+/// SHA-pinned sources only, never references parsed from instruction prose.
+/// No sources is `[]`, the key an input-free task always had.
+pub(crate) fn recovery_inputs(sources: &crate::refs::Sources) -> String {
     serde_json::to_string(
-        &seeds
+        &sources
+            .start_from
             .iter()
-            .map(|s| (&s.token, &s.sha, s.kind))
+            .map(|i| ("start", &i.token, &i.sha))
+            .chain(
+                sources
+                    .pick_commits
+                    .iter()
+                    .map(|i| ("pick", &i.token, &i.sha)),
+            )
             .collect::<Vec<_>>(),
     )
     .unwrap_or_default()
@@ -872,6 +885,7 @@ impl Task {
             id: new_id(),
             title,
             instruction,
+            sources: crate::refs::Sources::default(),
             repo,
             source,
             priority: 0,
@@ -1831,7 +1845,7 @@ impl Task {
     /// Record a failed graph pass without allowing automatic requeues to refund it.
     pub(crate) fn recovery_failed(&mut self, state: &crate::run::RunState) {
         let (base, inputs) = self.recovery_admission.as_ref().map_or_else(
-            || (state.base_commit.clone(), recovery_inputs(&state.seeds)),
+            || (state.base_commit.clone(), recovery_inputs(&state.sources)),
             |a| (a.base.clone(), a.inputs.clone()),
         );
         let progress = recovery_progress(state);
@@ -2745,6 +2759,20 @@ impl Queue {
             .collect();
         tasks.sort_unstable_by(|a, b| b.priority.cmp(&a.priority).then_with(|| b.id.cmp(&a.id)));
         tasks
+    }
+
+    /// Task files [`Queue::list`] skips because they cannot be parsed (a
+    /// newer schema, a torn write). A guard that looks a task up by scanning
+    /// the list must treat any of these as "the task might be there".
+    pub fn unreadable(&self) -> Vec<PathBuf> {
+        std::fs::read_dir(&self.root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .filter(|p| read_path(p).is_err())
+            .collect()
     }
 
     /// Runs that a later attempt at the same task replaced, mapped to the id
@@ -5616,5 +5644,23 @@ mod tests {
         .expect("modify");
         q.put(&mut stale).expect("stale put");
         assert_eq!(q.get(&t.id).expect("get").chat_notice_due(), None);
+    }
+
+    #[test]
+    fn empty_sources_are_omitted_so_older_builds_still_read_the_task() {
+        // `Task` rejects unknown fields, so a build without `sources` cannot
+        // read a record that carries the key, even an empty one.
+        let mut t = task("plain");
+        let value = serde_json::to_value(&t).unwrap();
+        assert!(value.get("sources").is_none(), "{value}");
+        t.sources.pick_commits.push(crate::refs::Input {
+            token: "abc1234".into(),
+            sha: "a".repeat(40),
+            provenance: crate::refs::Provenance::ExplicitCli,
+        });
+        let value = serde_json::to_value(&t).unwrap();
+        assert_eq!(value["sources"]["pick_commits"][0]["sha"], "a".repeat(40));
+        let restored: Task = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.sources, t.sources);
     }
 }

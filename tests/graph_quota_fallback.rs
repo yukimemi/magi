@@ -322,7 +322,11 @@ async fn selected_implementer_quota_cannot_publish_a_seeded_partial_patch() {
     let winner = old.state.winner().unwrap();
     let head = magi::git::rev_parse(&winner.worktree, "HEAD").await.unwrap();
     fx.config.graph.selected_implementer = Some("alpha".into());
-    let mut replacement = Runner::start(&fx.repo, format!("Reimplement {head}; create note.txt"), fx.config.clone(), magi::run::Origin::operator()).await.unwrap();
+    let mut replacement = Runner::start(&fx.repo, "create note.txt".into(), fx.config.clone(), magi::run::Origin::operator()).await.unwrap();
+    // Import the inherited patch explicitly; prose references never select sources.
+    replacement.state.sources = magi::refs::Sources::resolve(
+        &fx.repo, &fx.config.merge.remote, None, &[head],
+    ).await.unwrap();
     assert!(replacement.execute().await.is_err());
     assert_eq!(replacement.state.status, magi::run::RunStatus::Blocked);
     assert!(replacement.state.candidates[0].commits > 0, "the inherited patch alone cannot stand in for the selected implementer");
