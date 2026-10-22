@@ -3224,3 +3224,21 @@ This is candidate ordering only. Explicit interrupts, urgent slots, concurrency,
 claims, coordination, approval waits, cooldowns and resource gates retain their
 existing checks. A resume that cannot run must not stop the daemon from trying
 unrelated eligible candidates. Other park causes receive no promotion.
+
+### Confirmed-merge folding
+
+Confirmed merged runs (`Merged` plus `merge.ok`) reclaim their owned candidate
+and reviewer worktrees through `graph::fold_run`, including the normal
+`clean::fold_due` retry path for historical leftovers. Missing owned trees and
+obsolete reflog/ORIG_HEAD history do not block this cleanup. Before any deletion,
+`artifacts/fold-evidence/` stores unincorporated source-tip binary patches, raw change
+indexes (NUL-delimited metadata/path pairs), and changed files' original blobs.
+Tips proven incorporated in the fetched base (including exact squash-patch proof)
+need no patch archive. The index supplies original paths/modes and blob IDs;
+`blob-<id>` supplies their bytes, so reconstruct those files and apply the corresponding `<head>.patch`
+without depending on surviving Git objects. This intentionally discards obsolete
+intermediate history. Evidence is bounded to 128 source tips per pass, 4,096
+files and 64 MiB per run; a limit or write failure retains all remaining trees.
+Run metadata, review records and existing artifacts survive. Unfinished-run,
+ownership, recovery-source, output-lease and Git-checkpoint protections still
+apply; fold never authorizes deletion of another run's source.

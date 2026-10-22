@@ -11485,9 +11485,8 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> R
             return Err(e);
         }
     };
-    // A merged PR proves only its published change. Preflight every source
-    // before removing anything; a losing candidate or detached reviewer can
-    // still retain independent commits or Git recovery checkpoints.
+    // Confirmed merges dispose of their owned sources after durable evidence
+    // capture. Preflight every source before removing anything.
     let _source_outputs = if state.status == RunStatus::Merged
         && state.merge.as_ref().is_some_and(|merge| merge.ok)
     {
@@ -11570,31 +11569,20 @@ async fn verify_merged_fold_sources(
         if Some(candidate.label) == winner && !drop_winner {
             continue;
         }
+        anyhow::ensure!(
+            candidate.worktree.parent() == Some(state.worktree_root().as_path()),
+            "candidate recovery source is outside the inventoried run root: {}",
+            candidate.worktree.display()
+        );
         match std::fs::symlink_metadata(&candidate.worktree) {
-            Ok(_) => anyhow::ensure!(
-                candidate.worktree.parent() == Some(state.worktree_root().as_path()),
-                "candidate recovery source is outside the inventoried run root: {}",
-                candidate.worktree.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && candidate.folded => {}
-            Err(error) => {
-                return Err(error).context(format!(
-                    "cannot inspect candidate recovery source: {}",
-                    candidate.worktree.display()
-                ));
-            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-        if git::branch_exists(&state.repo, &candidate.branch).await? {
+        if !state.released_branches.contains(&candidate.branch)
+            && git::branch_exists(&state.repo, &candidate.branch).await?
+        {
             heads.insert(git::rev_parse(&state.repo, &candidate.branch).await?);
-            heads.extend(
-                git::git(
-                    &state.repo,
-                    &["reflog", "show", "--format=%H", &candidate.branch],
-                )
-                .await?
-                .lines()
-                .map(str::to_owned),
-            );
         }
     }
     let mut cargo_guards = Vec::new();
@@ -11678,111 +11666,10 @@ async fn verify_merged_fold_sources(
             );
         }
         heads.insert(git::rev_parse(&path, "HEAD").await?);
-        heads.extend(
-            git::git(&path, &["reflog", "show", "--format=%H", "HEAD"])
-                .await?
-                .lines()
-                .map(str::to_owned),
-        );
-        if let Ok(original) = git::rev_parse(&path, "ORIG_HEAD").await {
-            heads.insert(original);
-        }
     }
-    if !heads.is_empty() {
-        // Never trust a run-wide merge label or the local checkout's branch.
-        // Pin the fetched base once. A squash does not preserve commit IDs:
-        // prove the winner's cumulative patch before accepting its ancestors.
-        let reference = format!(
-            "refs/remotes/{}/{}",
-            state.config.merge.remote, state.base_branch
-        );
-        let base = git::rev_parse(&state.repo, &reference)
-            .await
-            .context("cannot prove merged sources against the fetched base")?;
-        let mut squash_winner = None;
-        let mut checked_squash = false;
-        for head in heads {
-            if git::git_raw(&state.repo, &["merge-base", "--is-ancestor", &head, &base])
-                .await?
-                .ok()
-            {
-                continue;
-            }
-            if !checked_squash {
-                squash_winner = proven_squash_winner(state, &base).await?;
-                checked_squash = true;
-            }
-            let incorporated = if let Some(winner) = &squash_winner {
-                git::git_raw(&state.repo, &["merge-base", "--is-ancestor", &head, winner])
-                    .await?
-                    .ok()
-            } else {
-                false
-            };
-            anyhow::ensure!(
-                incorporated,
-                "recovery source {head} is not proven incorporated in {reference}; retaining the entire run"
-            );
-        }
-    }
+    crate::fold_evidence::preserve(state, home, &heads).await?;
+
     Ok(cargo_guards)
-}
-
-/// Called only for a confirmed merged run. Its label admits proof, but does
-/// not prove that any particular local branch or recovery checkpoint landed.
-/// Match the complete binary patch, including modes and blob IDs, against a
-/// single-parent commit in the pinned fetched history. This works after later
-/// base commits too, without trusting the current base tree to still match.
-async fn proven_squash_winner(state: &RunState, base: &str) -> Result<Option<String>> {
-    let Some(winner) = state.winner() else {
-        return Ok(None);
-    };
-    let head = git::rev_parse(&state.repo, &winner.branch).await?;
-    if !git::git_raw(
-        &state.repo,
-        &["merge-base", "--is-ancestor", &state.base_commit, &head],
-    )
-    .await?
-    .ok()
-    {
-        return Ok(None);
-    }
-    let patch = fold_source_patch(&state.repo, &state.base_commit, &head).await?;
-    if patch.is_empty() {
-        return Ok(None);
-    }
-    let range = format!("{}..{base}", state.base_commit);
-    let commits = git::git(&state.repo, &["log", "--no-merges", "--format=%H", &range]).await?;
-    for commit in commits.lines() {
-        let parent = format!("{commit}^");
-        if fold_source_patch(&state.repo, &parent, commit).await? == patch {
-            return Ok(Some(head));
-        }
-    }
-    Ok(None)
-}
-
-async fn fold_source_patch(repo: &Path, from: &str, to: &str) -> Result<String> {
-    git::git(
-        repo,
-        &[
-            "-c",
-            "core.quotePath=true",
-            "diff",
-            "--binary",
-            "--full-index",
-            "--no-renames",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--no-color",
-            "--ignore-submodules=none",
-            "--submodule=short",
-            from,
-            to,
-            "--",
-        ],
-    )
-    .await
 }
 
 /// Remove `dir` if it exists and has nothing in it.
@@ -15333,6 +15220,17 @@ mod tests {
         state.released_branches = vec!["magi/x/A".to_owned()];
 
         fold_run(&mut state, true, &home).await.expect("fold_run");
+        state.status = RunStatus::Merged;
+        state.base_commit = git::rev_parse(&repo, "main").await.unwrap();
+        state.merge = Some(crate::run::MergeOutcome {
+            mode: MergeMode::Pr,
+            ok: true,
+            detail: "confirmed merged".into(),
+            empty: false,
+        });
+        fold_run(&mut state, true, &home)
+            .await
+            .expect("merged fold");
 
         assert!(
             git::branch_exists(&repo, "magi/x/A").await.unwrap(),

@@ -2041,6 +2041,16 @@ mod tests {
         .unwrap();
         assert_eq!((folded, unreadable), (1, 0));
         assert!(!source.candidates[0].worktree.exists());
+        let evidence = f
+            .home
+            .join("runs")
+            .join(&source.id)
+            .join("artifacts/fold-evidence");
+        let names: Vec<_> = std::fs::read_dir(evidence)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("manifest.json")]);
         assert_eq!(
             queue.get(&task.id).unwrap().status,
             crate::queue::TaskStatus::Held
@@ -2048,8 +2058,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merged_fold_proves_multi_commit_squash_and_retains_unpublished_sources() {
-        for variant in ["exact", "partial", "checkpoint", "loser"] {
+    async fn merged_fold_skips_proven_squash_and_archives_unpublished_sources() {
+        for variant in ["exact", "partial", "checkpoint", "loser", "reviewer"] {
             let f = Fx::new().await;
             let mut state = f.run("cc06", true).await;
             let candidate = state.candidates[0].clone();
@@ -2112,15 +2122,17 @@ mod tests {
             git::git(&f.repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])
                 .await
                 .unwrap();
-            if variant == "checkpoint" {
+            if matches!(variant, "checkpoint" | "reviewer") {
                 // A reset hides unique work from HEAD, but not its reflog.
                 std::fs::write(reviewer.join("unpublished"), "reviewer checkpoint").unwrap();
                 git::rescue_commit(&reviewer, "unpublished checkpoint")
                     .await
                     .unwrap();
-                git::git(&reviewer, &["reset", "--hard", &intermediate])
-                    .await
-                    .unwrap();
+                if variant == "checkpoint" {
+                    git::git(&reviewer, &["reset", "--hard", &intermediate])
+                        .await
+                        .unwrap();
+                }
             }
             if variant == "loser" {
                 let mut loser = candidate.clone();
@@ -2144,156 +2156,285 @@ mod tests {
                 empty: false,
             });
             state.save_under(&f.home).unwrap();
+            let review_head = git::rev_parse(&reviewer, "HEAD").await.unwrap();
             let result = crate::graph::fold_run(&mut state, true, &f.home).await;
-            if variant == "exact" {
-                result.unwrap();
-                assert!(!candidate.worktree.exists() && !reviewer.exists());
+            result.unwrap();
+            assert!(
+                !candidate.worktree.exists() && !reviewer.exists(),
+                "{variant}"
+            );
+            assert!(
+                !git::branch_exists(&f.repo, &candidate.branch)
+                    .await
+                    .unwrap()
+            );
+            let artifacts = f
+                .home
+                .join("runs")
+                .join(&state.id)
+                .join("artifacts/fold-evidence");
+            assert_eq!(
+                artifacts.join(format!("{head}.patch")).exists(),
+                variant == "partial",
+                "only a partially published winner needs evidence: {variant}"
+            );
+            assert_eq!(
+                artifacts.join(format!("{intermediate}.patch")).exists(),
+                variant == "partial",
+                "squash proof also covers intermediate reviewer tips: {variant}"
+            );
+            let patches: Vec<_> = std::fs::read_dir(&artifacts)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "patch"))
+                .collect();
+            let expected = match variant {
+                "partial" => 2,
+                "loser" | "reviewer" => 1,
+                _ => 0,
+            };
+            assert_eq!(patches.len(), expected, "{variant}");
+            if variant == "loser" {
                 assert!(
-                    !git::branch_exists(&f.repo, &candidate.branch)
-                        .await
+                    std::fs::read_to_string(&patches[0])
                         .unwrap()
-                );
-                assert!(
-                    f.home
-                        .join("runs")
-                        .join(&state.id)
-                        .join("run.json")
-                        .exists()
-                );
-            } else {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .to_string()
-                        .contains("not proven incorporated"),
-                    "{variant}"
-                );
-                assert!(
-                    candidate.worktree.exists() && reviewer.exists(),
-                    "{variant}"
-                );
-                assert!(
-                    git::branch_exists(&f.repo, &candidate.branch)
-                        .await
-                        .unwrap()
+                        .contains("losing candidate")
                 );
             }
+            assert!(artifacts.join("manifest.json").exists());
+            if variant == "reviewer" {
+                assert!(
+                    std::fs::read_to_string(artifacts.join(format!("{review_head}.patch")))
+                        .unwrap()
+                        .contains("reviewer checkpoint")
+                );
+            }
+            crate::graph::fold_run(&mut state, true, &f.home)
+                .await
+                .unwrap();
         }
     }
 
     #[tokio::test]
-    async fn merged_fold_preserves_independent_candidate_and_reviewer_commits_before_any_removal() {
-        let f = Fx::new().await;
-        let mut state = f.run("cc05", true).await;
-        let b_path = state.worktree_root().join("cand-B");
-        let b_branch = "magi/cc05/B";
-        git::worktree_add_branch(&f.repo, &b_path, b_branch, &f.base)
+    async fn merged_fold_missing_review_source_preserves_artifacts_and_retries() {
+        for missing in [true, false] {
+            let f = Fx::new().await;
+            let mut state = f.run("cc05", true).await;
+            // A fetched base exists, but these local review changes were not
+            // incorporated by ancestry, so their recovery evidence is required.
+            git::git(
+                &f.repo,
+                &["update-ref", "refs/remotes/origin/main", &f.base],
+            )
             .await
             .unwrap();
-        std::fs::write(b_path.join("unique-B"), "independent implementation").unwrap();
-        git::rescue_commit(&b_path, "independent candidate")
+            let candidate = state.candidates[0].clone();
+            if !missing {
+                std::fs::write(f.repo.join("base-advance"), "new base").unwrap();
+                git::rescue_commit(&f.repo, "advance base before rebase")
+                    .await
+                    .unwrap();
+                git::git(&candidate.worktree, &["rebase", "main"])
+                    .await
+                    .unwrap();
+                // Match the runner's post-rebase synchronization, which
+                // clears the merge backend's transient AUTO_MERGE checkpoint.
+                git::sync_to_head(&candidate.worktree).await.unwrap();
+            }
+            let head = git::rev_parse(&candidate.worktree, "HEAD").await.unwrap();
+            // Model review-only state: no implementation-time snapshot exists.
+            state.reviewed_commits = Some(Vec::new());
+            state.candidates[0].worktree = state.worktree_root().join("under-review");
+            git::git(
+                &f.repo,
+                &[
+                    "worktree",
+                    "move",
+                    candidate.worktree.to_str().unwrap(),
+                    state.candidates[0].worktree.to_str().unwrap(),
+                ],
+            )
             .await
             .unwrap();
-        let b_head = git::rev_parse(&b_path, "HEAD").await.unwrap();
-        let mut candidate = state.candidates[0].clone();
-        candidate.label = 'B';
-        candidate.index = 1;
-        candidate.branch = b_branch.into();
-        candidate.worktree = b_path.clone();
-        state.candidates.push(candidate);
-        let mut task = f.task(&[state.clone()]);
-        task.hold_manual(Some("retain recovery sources".into()));
-        let queue = crate::queue::Queue::at(f.home.join("queue"));
-        queue.put(&mut task).unwrap();
-        git::git(
-            &f.repo,
-            &["merge", "--ff-only", &state.candidates[0].branch],
-        )
-        .await
-        .unwrap();
-        git::git(&f.repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])
+            let reviewer = state.worktree_root().join("review-1");
+            git::worktree_add_detached(&f.repo, &reviewer, &head)
+                .await
+                .unwrap();
+            // A reset/rebase can leave unpublished recovery history. It must
+            // not keep any remaining owned worktree alive indefinitely.
+            std::fs::write(reviewer.join("obsolete"), "old history").unwrap();
+            git::rescue_commit(&reviewer, "old review history")
+                .await
+                .unwrap();
+            git::git(&reviewer, &["reset", "--hard", &head])
+                .await
+                .unwrap();
+            if missing {
+                std::fs::remove_dir_all(&state.candidates[0].worktree).unwrap();
+            }
+            let run_dir = f.home.join("runs").join(&state.id);
+            let artifacts = run_dir.join("artifacts");
+            std::fs::create_dir_all(&artifacts).unwrap();
+            std::fs::write(artifacts.join("review.json"), "review findings").unwrap();
+            if missing {
+                std::fs::write(artifacts.join("cand-A.patch"), "original snapshot").unwrap();
+            }
+            state.status = RunStatus::Merged;
+            state.merge = Some(crate::run::MergeOutcome {
+                mode: crate::config::MergeMode::Pr,
+                ok: true,
+                detail: "confirmed squash merge".into(),
+                empty: false,
+            });
+            state.save_under(&f.home).unwrap();
+            // Unexpected external paths remain protected, even if absent.
+            let owned = state.candidates[0].worktree.clone();
+            state.candidates[0].worktree = f.home.join("missing-external");
+            assert!(
+                crate::graph::fold_run(&mut state, true, &f.home)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("outside the inventoried")
+            );
+            state.candidates[0].worktree = owned;
+            // A live output borrower blocks the entire preflight.
+            let guard = OutputLease::borrow(&reviewer).unwrap().unwrap();
+            assert!(
+                crate::graph::fold_run(&mut state, true, &f.home)
+                    .await
+                    .is_err()
+            );
+            assert!(reviewer.exists());
+            drop(guard);
+            // Failure to persist evidence must not cause partial removal.
+            let evidence = artifacts.join("fold-evidence");
+            std::fs::write(&evidence, "blocked").unwrap();
+            assert!(
+                crate::graph::fold_run(&mut state, true, &f.home)
+                    .await
+                    .is_err()
+            );
+            assert!(reviewer.exists());
+            std::fs::remove_file(&evidence).unwrap();
+            std::fs::create_dir_all(&evidence).unwrap();
+            let oversized = evidence.join("capacity-fixture");
+            std::fs::File::create(&oversized)
+                .unwrap()
+                .set_len(64 * 1024 * 1024)
+                .unwrap();
+            assert!(
+                crate::graph::fold_run(&mut state, true, &f.home)
+                    .await
+                    .is_err()
+            );
+            assert!(reviewer.exists());
+            std::fs::remove_file(oversized).unwrap();
+            // Ignored recovery files and unfinished Git operations still hold
+            // all sources, even for a confirmed merge.
+            std::fs::create_dir_all(reviewer.join("scratch")).unwrap();
+            std::fs::write(reviewer.join("scratch/recovery"), "keep").unwrap();
+            assert!(
+                crate::graph::fold_run(&mut state, true, &f.home)
+                    .await
+                    .is_err()
+            );
+            std::fs::remove_dir_all(reviewer.join("scratch")).unwrap();
+            let checkpoint = git::git(&reviewer, &["rev-parse", "--git-path", "CHERRY_PICK_HEAD"])
+                .await
+                .unwrap();
+            std::fs::write(&checkpoint, &head).unwrap();
+            assert!(
+                crate::graph::fold_run(&mut state, true, &f.home)
+                    .await
+                    .is_err()
+            );
+            std::fs::remove_file(checkpoint).unwrap();
+            let (folded, unreadable) = crate::clean::fold_due(
+                &f.home.join("runs"),
+                &f.home,
+                &f.bay,
+                &Fx::disk(),
+                Fx::now(),
+            )
             .await
             .unwrap();
-        state.status = RunStatus::Merged;
-        state.merge = Some(crate::run::MergeOutcome {
-            mode: crate::config::MergeMode::Pr,
-            ok: true,
-            detail: "candidate A merged".into(),
-            empty: false,
-        });
-        state.save_under(&f.home).unwrap();
-        let error = crate::graph::fold_run(&mut state, true, &f.home)
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("not proven incorporated"));
-        assert!(state.candidates[0].worktree.exists());
-        assert!(b_path.exists());
-        assert_eq!(git::rev_parse(&f.repo, b_branch).await.unwrap(), b_head);
-        // Even after both candidate changes land, an unrecorded detached
-        // review worktree can retain a third independent source.
-        git::git(&f.repo, &["merge", "--no-edit", b_branch])
-            .await
-            .unwrap();
-        let reviewer = state.worktree_root().join("review-1");
-        git::worktree_add_detached(&f.repo, &reviewer, &f.base)
-            .await
-            .unwrap();
-        std::fs::write(reviewer.join("reviewer-source"), "retain reviewer commit").unwrap();
-        git::rescue_commit(&reviewer, "reviewer checkpoint")
-            .await
-            .unwrap();
-        let review_head = git::rev_parse(&reviewer, "HEAD").await.unwrap();
-        git::git(&f.repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])
-            .await
-            .unwrap();
-        assert!(
+            if folded != 1 {
+                panic!(
+                    "normal cleanup failed: {:#}",
+                    crate::graph::fold_run(&mut state, true, &f.home)
+                        .await
+                        .unwrap_err()
+                );
+            }
+            assert_eq!((folded, unreadable), (1, 0));
+            assert!(!reviewer.exists() && !state.candidates[0].worktree.exists());
+            state = RunState::load_under(&state.id, &f.home).unwrap();
+            assert!(state.candidates[0].folded);
+            let manifest = std::fs::read(evidence.join("manifest.json")).unwrap();
             crate::graph::fold_run(&mut state, true, &f.home)
                 .await
-                .is_err()
-        );
-        assert!(state.candidates[0].worktree.exists() && b_path.exists() && reviewer.exists());
-        assert_eq!(
-            git::rev_parse(&reviewer, "HEAD").await.unwrap(),
-            review_head
-        );
-        git::git(&f.repo, &["merge", "--no-edit", &review_head])
-            .await
-            .unwrap();
-        git::git(&f.repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])
-            .await
-            .unwrap();
-        // Unexpected or missing candidate paths cannot escape the inventory,
-        // even though their recorded branch is now incorporated in the base.
-        state.candidates[1].worktree = f.repo.clone();
-        assert!(
-            crate::graph::fold_run(&mut state, true, &f.home)
+                .unwrap();
+            assert_eq!(
+                std::fs::read(evidence.join("manifest.json")).unwrap(),
+                manifest
+            );
+            git::git(&f.repo, &["reflog", "expire", "--expire=now", "--all"])
                 .await
-                .unwrap_err()
-                .to_string()
-                .contains("outside the inventoried")
-        );
-        assert!(state.candidates[0].worktree.exists() && b_path.exists());
-        state.candidates[1].worktree = state.worktree_root().join("missing-candidate");
-        assert!(
-            crate::graph::fold_run(&mut state, true, &f.home)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("cannot inspect candidate")
-        );
-        state.candidates[1].worktree = b_path.clone();
-        crate::graph::fold_run(&mut state, true, &f.home)
+                .unwrap();
+            git::git(&f.repo, &["gc", "--prune=now"]).await.unwrap();
+            assert!(
+                !git::git_raw(&f.repo, &["cat-file", "-e", &head])
+                    .await
+                    .unwrap()
+                    .ok()
+            );
+            // Restore the modified file into a fresh repository from artifact
+            // bytes alone; no original commit or blob is consulted.
+            let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+            let old_blob = manifest[format!("head-{head}")]["base_blobs"][0]
+                .as_str()
+                .unwrap();
+            let recovered = f.home.join("recovered");
+            std::fs::create_dir_all(&recovered).unwrap();
+            git::git(&recovered, &["init"]).await.unwrap();
+            std::fs::write(
+                recovered.join("source"),
+                std::fs::read(evidence.join(format!("blob-{old_blob}"))).unwrap(),
+            )
+            .unwrap();
+            git::git(
+                &recovered,
+                &[
+                    "apply",
+                    evidence.join(format!("{head}.patch")).to_str().unwrap(),
+                ],
+            )
             .await
             .unwrap();
-        assert!(!b_path.exists() && !reviewer.exists());
-        assert_eq!(
-            std::fs::read_to_string(f.repo.join("unique-B")).unwrap(),
-            "independent implementation"
-        );
-        assert_eq!(
-            queue.get(&task.id).unwrap().status,
-            crate::queue::TaskStatus::Held
-        );
+            assert_eq!(
+                std::fs::read_to_string(recovered.join("source")).unwrap(),
+                "cc05"
+            );
+            assert!(
+                !std::fs::read(evidence.join(format!("{head}.patch")))
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                std::fs::read_to_string(artifacts.join("review.json")).unwrap(),
+                "review findings"
+            );
+            if missing {
+                assert_eq!(
+                    std::fs::read_to_string(artifacts.join("cand-A.patch")).unwrap(),
+                    "original snapshot"
+                );
+            } else {
+                assert!(!artifacts.join("cand-A.patch").exists());
+            }
+            assert!(run_dir.join("run.json").exists());
+        }
     }
 
     #[tokio::test]
