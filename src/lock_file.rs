@@ -12,6 +12,8 @@ const HANDOFF: Duration = Duration::from_millis(100);
 const POLL: Duration = Duration::from_millis(15);
 
 /// Construct once per acquisition and pass through stale recovery and fallback.
+/// Preserve an explicit caller deadline across ordinary contention; only an
+/// acquisition without one uses the short hand-off budget.
 /// A real `AlreadyExists` is returned immediately for the caller to interpret.
 #[derive(Clone, Copy)]
 pub(crate) struct Retry {
@@ -21,9 +23,8 @@ pub(crate) struct Retry {
 
 impl Retry {
     pub(crate) fn new(deadline: Option<Instant>) -> Self {
-        let cap = Instant::now() + HANDOFF;
         Self {
-            deadline: deadline.map_or(cap, |d| d.min(cap)),
+            deadline: deadline.unwrap_or_else(|| Instant::now() + HANDOFF),
             permission_denied: cfg!(windows),
         }
     }
@@ -302,9 +303,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         let retry = Retry::task_write(deadline);
         assert!(retry.permission_denied);
-        if !cfg!(windows) {
-            assert_eq!(retry.deadline, deadline);
-        }
+        assert_eq!(retry.deadline, deadline);
     }
 
     #[test]
@@ -357,11 +356,91 @@ mod tests {
     }
 
     #[test]
-    fn caller_deadline_and_handoff_cap_both_apply() {
+    fn delete_pending_after_ordinary_contention_uses_remaining_caller_budget() {
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let retry = Retry {
+            permission_denied: true,
+            ..Retry::new(Some(start + Duration::from_secs(10)))
+        };
+        let conflict = retry.run_with::<()>(
+            || Err(io::ErrorKind::AlreadyExists.into()),
+            || start + elapsed.get(),
+            |_| panic!("real conflict must return immediately"),
+        );
+        assert_eq!(conflict.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        elapsed.set(Duration::from_millis(150));
+        let mut calls = 0;
+        let result = retry.run_with(
+            || {
+                calls += 1;
+                if calls == 1 {
+                    Err(io::ErrorKind::PermissionDenied.into())
+                } else {
+                    Ok(())
+                }
+            },
+            || start + elapsed.get(),
+            |delay| elapsed.set(elapsed.get() + delay),
+        );
+        assert!(result.is_ok());
+        assert_eq!(calls, 2);
+        assert_eq!(elapsed.get(), Duration::from_millis(150) + POLL);
+    }
+
+    #[tokio::test]
+    async fn async_delete_pending_after_poll_uses_remaining_caller_budget() {
+        let start = Instant::now();
+        let budget = Duration::from_secs(10);
+        let poll = Duration::from_millis(50);
+        let elapsed = Cell::new(Duration::ZERO);
+        let retry = Retry {
+            permission_denied: true,
+            ..Retry::new(Some(start + budget))
+        };
+        let conflict = retry
+            .run_async_with::<(), _>(
+                || Err(io::ErrorKind::AlreadyExists.into()),
+                &|| false,
+                || start + elapsed.get(),
+                |_| async { panic!("real conflict must return immediately") },
+            )
+            .await;
+        assert_eq!(conflict.unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        elapsed.set(poll * 3);
+        let mut calls = 0;
+        let result = retry
+            .run_async_with(
+                || {
+                    calls += 1;
+                    if calls == 1 {
+                        Err(io::ErrorKind::PermissionDenied.into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                &|| false,
+                || start + elapsed.get(),
+                |delay| {
+                    elapsed.set(elapsed.get() + delay);
+                    std::future::ready(())
+                },
+            )
+            .await;
+        assert_eq!(result.unwrap(), Some(()));
+        assert_eq!(calls, 2);
+        assert_eq!(elapsed.get(), poll * 3 + POLL);
+        assert_eq!(retry.deadline, start + budget);
+    }
+
+    #[test]
+    fn caller_deadline_is_preserved_and_only_unspecified_waits_are_capped() {
         let deadline = Instant::now();
         assert_eq!(Retry::new(Some(deadline)).deadline, deadline);
         let before = Instant::now();
-        let retry = Retry::new(Some(before + Duration::from_secs(10)));
+        let deadline = before + Duration::from_secs(10);
+        assert_eq!(Retry::new(Some(deadline)).deadline, deadline);
+        let retry = Retry::new(None);
         assert!(retry.deadline <= Instant::now() + HANDOFF);
         assert!(retry.deadline >= before + HANDOFF);
     }

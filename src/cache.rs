@@ -553,8 +553,9 @@ pub async fn wait_for_unless(
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<Option<Guard>> {
     let start = std::time::Instant::now();
-    // Keep the existing resource deadline and cancellation polling interval.
-    let retry = crate::lock_file::Retry::new(Some(start + budget.min(poll)));
+    // Delete-pending retries share the whole resource wait budget; the helper
+    // checks cancellation before and after each retry sleep.
+    let retry = crate::lock_file::Retry::new(Some(start + budget));
     loop {
         let Some(acquired) = try_acquire_async(home, cache_dir, owner, retry, cancel).await? else {
             return Ok(None);
