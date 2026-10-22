@@ -491,6 +491,10 @@ fn durable_new_with(
         // Publish a complete, synced inode atomically without replacing an
         // existing approval. No in-place fallback is safe for these records.
         std::fs::hard_link(&staging, path)?;
+        // Directory handles cannot be opened/synced this way on Windows.
+        // The publication primitive remains atomic there; reconciliation
+        // itself requires Unix leases and refuses other platforms in run().
+        #[cfg(unix)]
         std::fs::File::open(parent)?.sync_all()?;
         Ok(())
     })();
@@ -992,7 +996,7 @@ async fn apply_plan(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) async fn interrupt_after_fence(home: &Path, task: &Task, operation: &str) -> Result<()> {
     let queue = Queue::at(home.join("queue"));
     let _claim = queue.claim(&task.id)?;
@@ -1010,7 +1014,7 @@ pub(super) async fn interrupt_after_fence(home: &Path, task: &Task, operation: &
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) async fn interrupt_during_state_save(
     home: &Path,
     task: &Task,

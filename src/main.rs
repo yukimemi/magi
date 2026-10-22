@@ -3705,12 +3705,14 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                 std::env::var_os("MAGI_RUN").is_none(),
                 "retention reconciliation requires a direct operator command"
             );
-            let path = magi::retention::reconcile::run(
+            // Keep the reconciliation proof future off every task command's
+            // stack, including simple queue edits that never use this branch.
+            let path = Box::pin(magi::retention::reconcile::run(
                 &magi::run::home(),
                 &id,
                 &authority_run,
                 apply.as_deref(),
-            )
+            ))
             .await?;
             println!("{}", path.display());
             if apply.is_none() {
