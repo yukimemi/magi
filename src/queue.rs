@@ -511,6 +511,12 @@ pub struct Task {
     /// to, exactly as before.
     #[serde(default)]
     pub urgent: bool,
+    /// Set by [`Task::new`], cleared once a queue has stored the task. Never
+    /// persisted: a task read from disk is always an existing one. While set,
+    /// [`Queue::put`] reserves the id (see [`Queue::file_with`]) instead of
+    /// merging into whatever record already carries it.
+    #[serde(skip)]
+    pub(crate) unfiled: bool,
     /// Files (typically screenshots) copied into `<id>.attachments/` beside
     /// this task's file by [`Queue::attach`], as bare validated names. The
     /// copy is what makes them reach the implementer: the original may be
@@ -941,6 +947,7 @@ impl Task {
             replacement: None,
             interrupt: false,
             urgent: false,
+            unfiled: true,
             attachments: Vec::new(),
             followup: None,
             origin_chat,
@@ -2211,7 +2218,26 @@ impl Drop for TaskLock {
 #[derive(Debug, Clone)]
 pub struct Queue {
     root: PathBuf,
+    ids: IdSource,
 }
+
+/// Where candidate ids for new tasks come from. Injectable so a test can
+/// force a collision; production uses [`new_id`].
+#[derive(Clone)]
+struct IdSource(Option<std::sync::Arc<dyn Fn() -> String + Send + Sync>>);
+
+impl std::fmt::Debug for IdSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "IdSource(custom)"
+        } else {
+            "IdSource"
+        })
+    }
+}
+
+/// How many candidate ids a new task may try before filing gives up.
+const FILE_ATTEMPTS: usize = 256;
 
 impl Queue {
     /// The operator's queue, `<home>/queue`.
@@ -2222,7 +2248,84 @@ impl Queue {
     /// A queue at an explicit root. Tests use this; so could an operator who
     /// wants a queue per project.
     pub fn at(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            ids: IdSource(None),
+        }
+    }
+
+    /// Replace the source of candidate ids for new tasks. For tests that need
+    /// a deterministic collision.
+    #[doc(hidden)]
+    pub fn with_id_source(mut self, f: impl Fn() -> String + Send + Sync + 'static) -> Self {
+        self.ids = IdSource(Some(std::sync::Arc::new(f)));
+        self
+    }
+
+    fn mint_id(&self) -> String {
+        match &self.ids.0 {
+            Some(f) => f(),
+            None => new_id(),
+        }
+    }
+
+    /// File a new task: reserve its id atomically and write it without ever
+    /// reading, merging into or replacing an existing record.
+    ///
+    /// The candidate is `task.id`. Under that id's write lock, a record that
+    /// already exists makes the candidate taken and another id is minted; a
+    /// failure to find out is an error, never "free". `hook` runs under the
+    /// lock once the id looks free and may veto it with `Ok(false)` (an
+    /// orphaned claim or attachment directory also marks an id as used). The
+    /// first `Err` ends the attempt. `undo` runs if the record then fails to
+    /// write. `task.id` is the reserved id on success.
+    fn file_with(
+        &self,
+        task: &mut Task,
+        mut hook: impl FnMut(&mut Task) -> Result<bool>,
+        mut undo: impl FnMut(&mut Task),
+    ) -> Result<()> {
+        for attempt in 0..FILE_ATTEMPTS {
+            if attempt > 0 {
+                task.id = self.mint_id();
+            }
+            let _lock = self.lock_task(&task.id)?;
+            let path = self.path_of(&task.id);
+            if path
+                .try_exists()
+                .with_context(|| format!("check {}", path.display()))?
+            {
+                continue;
+            }
+            if !hook(task)? {
+                continue;
+            }
+            if let Err(e) = self.write_record(task) {
+                undo(task);
+                return Err(e);
+            }
+            task.unfiled = false;
+            return Ok(());
+        }
+        bail!("no free task id after {FILE_ATTEMPTS} attempts")
+    }
+
+    /// File a new task and take its claim in one step, on the id that ends up
+    /// reserved. An id whose claim file already exists is taken.
+    pub fn file_claimed(&self, task: &mut Task) -> Result<Claim> {
+        let mut claim = None;
+        self.file_with(
+            task,
+            |t| {
+                if self.lock_path(&t.id).exists() {
+                    return Ok(false);
+                }
+                claim = Some(self.claim(&t.id)?);
+                Ok(true)
+            },
+            |_| {},
+        )?;
+        claim.context("claim missing after filing")
     }
 
     /// Directory holding the task files.
@@ -2306,6 +2409,9 @@ impl Queue {
     /// a failed `put` leaving the stored record untouched, which its
     /// write-then-rename guarantees.
     pub fn attach_and_put(&self, task: &mut Task, sources: &[PathBuf]) -> Result<Vec<String>> {
+        if task.unfiled {
+            return self.attach_and_file(task, sources);
+        }
         let dir = self.attachments_dir(&task.id);
         let existed = dir.is_dir();
         let before = task.attachments.len();
@@ -2321,6 +2427,35 @@ impl Queue {
             return Err(e);
         }
         Ok(names)
+    }
+
+    /// [`Queue::attach_and_put`] for a task not yet stored: the attachment
+    /// directory is created under the id's reservation, and a candidate whose
+    /// directory already exists is taken.
+    fn attach_and_file(&self, task: &mut Task, sources: &[PathBuf]) -> Result<Vec<String>> {
+        let before = task.attachments.len();
+        let names = std::cell::RefCell::new(Vec::new());
+        let result = self.file_with(
+            task,
+            |t| {
+                let dir = self.attachments_dir(&t.id);
+                if dir.exists() {
+                    return Ok(false);
+                }
+                *names.borrow_mut() = self.attach(t, sources)?;
+                Ok(true)
+            },
+            |t| {
+                let dir = self.attachments_dir(&t.id);
+                for name in names.borrow().iter() {
+                    let _ = std::fs::remove_file(dir.join(name));
+                }
+                // The directory did not exist when the id was reserved.
+                let _ = std::fs::remove_dir(&dir);
+                t.attachments.truncate(before);
+            },
+        );
+        result.map(|()| names.into_inner())
     }
 
     /// Absolute paths of `task`'s attachments, whatever shape this queue's
@@ -2346,6 +2481,10 @@ impl Queue {
     /// before it, and writing that snapshot back whole would erase the link.
     /// Nothing ever removes a run from a task, so the union loses nothing.
     pub fn put(&self, task: &mut Task) -> Result<()> {
+        if task.unfiled {
+            // A new task never merges into a record that has its id.
+            return self.file_with(task, |_| Ok(true), |_| {});
+        }
         let _lock = self.lock_task(&task.id)?;
         self.put_unlocked(task)
     }
@@ -2359,12 +2498,19 @@ impl Queue {
         if self.path_of(&task.id).exists() {
             return Ok(false);
         }
-        self.put_unlocked(task)?;
+        self.write_record(task)?;
+        task.unfiled = false;
         Ok(true)
     }
 
     /// [`Queue::put`] for a caller already holding [`Queue::lock_task`].
     fn put_unlocked(&self, task: &mut Task) -> Result<()> {
+        self.merge_stored(task);
+        self.write_record(task)
+    }
+
+    /// Fold the stored record of `task`'s id into `task` (updates only).
+    fn merge_stored(&self, task: &mut Task) {
         if let Ok(mut stored) = read_path(&self.path_of(&task.id)) {
             stored.import_chat_notice();
             for key in stored.chat_notices {
@@ -2394,6 +2540,10 @@ impl Queue {
                 task.chat_notice = Some(n);
             }
         }
+    }
+
+    /// Stamp and write `task` atomically; the caller holds the id's lock.
+    fn write_record(&self, task: &mut Task) -> Result<()> {
         task.import_chat_notice();
         task.updated_at = Timestamp::now();
         std::fs::create_dir_all(&self.root)
@@ -5836,5 +5986,112 @@ mod tests {
         assert_eq!(value["sources"]["pick_commits"][0]["sha"], "a".repeat(40));
         let restored: Task = serde_json::from_value(value).unwrap();
         assert_eq!(restored.sources, t.sources);
+    }
+
+    fn colliding_queue(dir: &Path) -> Queue {
+        let n = std::sync::atomic::AtomicUsize::new(0);
+        Queue::at(dir.join("queue")).with_id_source(move || {
+            format!(
+                "20260101-000000-f{:03x}",
+                n.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            )
+        })
+    }
+
+    #[test]
+    fn a_new_task_never_merges_into_a_record_with_its_candidate_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = colliding_queue(dir.path());
+        let mut first = task("first");
+        first.id = "20260101-000000-aaaa".into();
+        first.start("run-1".into());
+        first.succeed();
+        q.put(&mut first).unwrap();
+        assert_eq!(first.id, "20260101-000000-aaaa");
+        let stored_before = q.get(&first.id).unwrap();
+        assert!(!stored_before.runs.is_empty());
+
+        let mut second = task("second");
+        second.id = first.id.clone();
+        q.put(&mut second).unwrap();
+
+        assert_ne!(second.id, first.id);
+        assert!(second.runs.is_empty());
+        assert!(second.chat_notices.is_empty());
+        assert!(second.chat_notice.is_none());
+        let a = q.get(&first.id).unwrap();
+        let b = q.get(&second.id).unwrap();
+        assert_eq!(a.title, "first");
+        assert_eq!(a.runs, stored_before.runs);
+        assert_eq!(a.chat_notices, stored_before.chat_notices);
+        assert_eq!(b.title, "second");
+        assert!(b.runs.is_empty());
+
+        // A later save is an update: it still merges.
+        let mut again = q.get(&second.id).unwrap();
+        again.title = "second, edited".into();
+        q.put(&mut again).unwrap();
+        assert_eq!(q.get(&second.id).unwrap().title, "second, edited");
+        assert_eq!(q.list().len(), 2);
+    }
+
+    #[test]
+    fn a_claimed_new_task_holds_the_claim_on_the_reserved_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = colliding_queue(dir.path());
+        let mut first = task("first");
+        first.id = "20260101-000000-aaaa".into();
+        q.put(&mut first).unwrap();
+        let mut second = task("second");
+        second.id = first.id.clone();
+        let claim = q.file_claimed(&mut second).unwrap();
+        assert_ne!(second.id, first.id);
+        assert!(q.claim(&second.id).is_err());
+        assert!(q.claim(&first.id).is_ok(), "the first task was not claimed");
+        drop(claim);
+    }
+
+    #[test]
+    fn an_attached_new_task_skips_a_taken_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = colliding_queue(dir.path());
+        let mut first = task("first");
+        first.id = "20260101-000000-aaaa".into();
+        q.put(&mut first).unwrap();
+        let src = source_file(dir.path(), "shot.png", "x");
+        let mut second = task("second");
+        second.id = first.id.clone();
+        q.attach_and_put(&mut second, &[src]).unwrap();
+        assert_ne!(second.id, first.id);
+        assert!(!q.attachments_dir(&first.id).exists());
+        assert_eq!(q.attachment_paths(&second).len(), 1);
+        assert!(q.attachment_paths(&second)[0].is_file());
+    }
+
+    #[test]
+    fn create_new_keeps_its_already_exists_meaning() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = colliding_queue(dir.path());
+        let mut a = task("a");
+        a.id = "fixed-id".into();
+        assert!(q.create_new(&mut a).unwrap());
+        let mut b = task("b");
+        b.id = "fixed-id".into();
+        assert!(!q.create_new(&mut b).unwrap());
+        assert_eq!(q.get("fixed-id").unwrap().title, "a");
+    }
+
+    #[test]
+    fn filing_gives_up_when_no_id_is_ever_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"))
+            .with_id_source(|| "20260101-000000-aaaa".to_owned());
+        let mut first = task("first");
+        first.id = "20260101-000000-aaaa".into();
+        q.put(&mut first).unwrap();
+        let mut second = task("second");
+        second.id = first.id.clone();
+        assert!(q.put(&mut second).is_err());
+        assert_eq!(q.get(&first.id).unwrap().title, "first");
     }
 }
