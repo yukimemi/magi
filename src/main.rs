@@ -792,6 +792,15 @@ enum TaskCmd {
         /// Task id or unambiguous prefix/suffix.
         id: String,
     },
+    /// Plan or explicitly approve bounded retirement of provably empty retained attempts.
+    ReconcileRetention {
+        id: String,
+        #[arg(long)]
+        authority_run: String,
+        /// Apply exactly this saved plan; omit to save a plan without retiring anything.
+        #[arg(long)]
+        apply: Option<String>,
+    },
     /// Recover an existing task PR with an explicit source and delivery disposition.
     RecoverPr {
         id: String,
@@ -3687,6 +3696,33 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
             Ok(())
         }
 
+        TaskCmd::ReconcileRetention {
+            id,
+            authority_run,
+            apply,
+        } => {
+            anyhow::ensure!(
+                std::env::var_os("MAGI_RUN").is_none(),
+                "retention reconciliation requires a direct operator command"
+            );
+            // Keep the reconciliation proof future off every task command's
+            // stack, including simple queue edits that never use this branch.
+            let path = Box::pin(magi::retention::reconcile::run(
+                &magi::run::home(),
+                &id,
+                &authority_run,
+                apply.as_deref(),
+            ))
+            .await?;
+            println!("{}", path.display());
+            if apply.is_none() {
+                println!(
+                    "Inspect plan.json; approve with --apply <plan-id>. At most five attempts are selected."
+                );
+            }
+            Ok(())
+        }
+
         TaskCmd::RecoverPr {
             id,
             pr,
@@ -4830,6 +4866,29 @@ async fn probe(program: &str, args: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconciliation_cli_requires_explicit_authority_and_separate_apply() {
+        assert!(Cli::try_parse_from(["magi", "task", "reconcile-retention", "task"]).is_err());
+        let parsed = Cli::try_parse_from([
+            "magi",
+            "task",
+            "reconcile-retention",
+            "task",
+            "--authority-run",
+            "run",
+            "--apply",
+            "plan",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Task {
+                command: TaskCmd::ReconcileRetention { apply: Some(_), .. },
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn clap_color_reads_no_color_before_the_terminator() {

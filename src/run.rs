@@ -3135,7 +3135,11 @@ impl RunState {
     /// back through whichever directory some *other* process or test pinned
     /// into that `OnceLock` first, not the one this call was actually handed.
     pub fn save_under(&mut self, home: &Path) -> Result<()> {
-        self.updated_at = Timestamp::now();
+        self.save_under_at(home, Timestamp::now())
+    }
+
+    pub(crate) fn save_under_at(&mut self, home: &Path, at: Timestamp) -> Result<()> {
+        self.updated_at = at;
         let dir = home.join("runs").join(&self.id);
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         let body = serde_json::to_string_pretty(self).context("serialize run state")?;
