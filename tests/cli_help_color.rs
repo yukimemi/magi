@@ -1,10 +1,11 @@
 //! `--help` is coloured by the Evangelion theme, and every way of asking for
 //! plain text still gets plain text.
 
-use std::process::Command;
+mod common;
 
 fn help(args: &[&str], envs: &[(&str, &str)]) -> String {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_magi"));
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = common::magi_cli(home.path());
     cmd.args(args)
         .env_remove("NO_COLOR")
         .env_remove("CLICOLOR_FORCE")

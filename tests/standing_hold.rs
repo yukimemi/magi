@@ -1,7 +1,7 @@
 //! A real standing-chat turn grants question-store access and invokes the
 //! actual answer CLI, including when no consultation was sent to this chat.
 
-use std::collections::BTreeMap;
+mod common;
 
 use magi::ask::{Question, Questions};
 use magi::config::{AgentKind, AgentSpec, Config};
@@ -58,17 +58,7 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
             model: None,
             command: vec!["sh".into(), script.to_string_lossy().into_owned()],
             extra_args: vec![],
-            env: BTreeMap::from([
-                ("ANSWER_BIN".into(), env!("CARGO_BIN_EXE_magi").into()),
-                (
-                    "MAGI_HOME".into(),
-                    tmp.path().to_string_lossy().into_owned(),
-                ),
-                (
-                    "MAGI_CONFIG_DIR".into(),
-                    tmp.path().join("config").to_string_lossy().into_owned(),
-                ),
-            ]),
+            env: common::magi_cli_env(tmp.path(), "ANSWER_BIN"),
             prompt_delivery: None,
         }],
         ..Config::default()

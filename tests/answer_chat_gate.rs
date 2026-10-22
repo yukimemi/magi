@@ -6,6 +6,8 @@
 //! dropping the env lookup, the node check, the `--quote` hand-over or the
 //! validate call fails here and not only in review.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::process::{Command, Output};
 
@@ -82,12 +84,10 @@ fn fixture() -> Fixture {
 }
 
 fn answer(f: &Fixture, run: &str, quote: Option<&str>) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_magi"));
+    let mut cmd = common::magi_cli(f.tmp.path());
     cmd.arg("answer")
         .arg(&f.qid)
         .args(["--reply", magi::land::APPROVE])
-        .env("MAGI_HOME", f.tmp.path())
-        .env("MAGI_CONFIG_DIR", f.tmp.path().join("config"))
         .env_remove("MAGI_RUN")
         .env_remove("MAGI_NODE")
         .env("MAGI_RUN", run)
@@ -134,7 +134,7 @@ fn legacy_consult_repair_requires_exact_owner_choice_and_keeps_original_handoff(
     let old_handoff = t.turns[0].body.clone();
     assert!(!old_handoff.contains(magi::land::REPAIR));
     let submit = || {
-        Command::new(env!("CARGO_BIN_EXE_magi"))
+        common::magi_cli(f.tmp.path())
             .args([
                 "answer",
                 &f.qid,
@@ -143,8 +143,6 @@ fn legacy_consult_repair_requires_exact_owner_choice_and_keeps_original_handoff(
                 "--quote",
                 magi::land::REPAIR,
             ])
-            .env("MAGI_HOME", f.tmp.path())
-            .env("MAGI_CONFIG_DIR", f.tmp.path().join("config"))
             .env("MAGI_RUN", &f.talk_id)
             .env("MAGI_NODE", magi::queue::CHAT_NODE)
             .output()
@@ -241,10 +239,8 @@ fn ask_chat_busy_exits_unsuccessfully_without_changing_state() {
         .claim_turn(&f.talk_id)
         .unwrap()
         .expect("held elsewhere");
-    let out = Command::new(env!("CARGO_BIN_EXE_magi"))
+    let out = common::magi_cli(f.tmp.path())
         .args(["answer", &q.id, "--ask-chat"])
-        .env("MAGI_HOME", f.tmp.path())
-        .env("MAGI_CONFIG_DIR", f.tmp.path().join("config"))
         .env_remove("MAGI_RUN")
         .env_remove("MAGI_NODE")
         .output()
@@ -283,10 +279,8 @@ fn standing_owner(f: &Fixture, words: &str, recommendations: Option<&str>) -> St
 }
 
 fn hold(f: &Fixture, run: &str, words: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_magi"))
+    common::magi_cli(f.tmp.path())
         .args(["answer", &f.qid, "--reply", "hold", "--quote", words])
-        .env("MAGI_HOME", f.tmp.path())
-        .env("MAGI_CONFIG_DIR", f.tmp.path().join("config"))
         .env("MAGI_RUN", run)
         .env("MAGI_NODE", magi::queue::CHAT_NODE)
         .output()
@@ -750,10 +744,8 @@ fn consultation_waiting_for_evidence_cannot_undo_a_manual_cli_hold() {
         // Direct operator answers require no chat evidence. Dispatch must let
         // this command settle without waiting for a question lock to expire.
         let started = std::time::Instant::now();
-        let out = Command::new(env!("CARGO_BIN_EXE_magi"))
+        let out = common::magi_cli(f.tmp.path())
             .args(["answer", &f.qid, "--reply", "hold"])
-            .env("MAGI_HOME", f.tmp.path())
-            .env("MAGI_CONFIG_DIR", f.tmp.path().join("config"))
             .env_remove("MAGI_RUN")
             .env_remove("MAGI_NODE")
             .output()
@@ -897,10 +889,8 @@ fn chat_merge_preserves_the_recorded_head_confirmation_requirement() {
 }
 
 fn choose(f: &Fixture, run: &str, choice: &str, words: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_magi"))
+    common::magi_cli(f.tmp.path())
         .args(["answer", &f.qid, "--reply", choice, "--quote", words])
-        .env("MAGI_HOME", f.tmp.path())
-        .env("MAGI_CONFIG_DIR", f.tmp.path().join("config"))
         .env("MAGI_RUN", run)
         .env("MAGI_NODE", magi::queue::CHAT_NODE)
         .output()
@@ -1410,7 +1400,7 @@ fn same_chat_replacement_title_uses_bound_current_owner_text_and_retains_evidenc
 }
 
 fn title_deputy(f: &Fixture, words: &str) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_magi"))
+    common::magi_cli(f.tmp.path())
         .args([
             "ask",
             "--settle",
@@ -1420,8 +1410,6 @@ fn title_deputy(f: &Fixture, words: &str) -> Output {
             "--quote",
             words,
         ])
-        .env("MAGI_HOME", f.tmp.path())
-        .env("MAGI_CONFIG_DIR", f.tmp.path().join("config"))
         .env("MAGI_NODE", magi::deputy::NODE)
         .env("MAGI_RUN", &f.questions.get(&f.qid).unwrap().run)
         .env("MAGI_SEAT", "title-deputy")
@@ -1673,10 +1661,8 @@ fn recovery_answer(
     words: Option<&str>,
     interpreted: bool,
 ) -> Output {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_magi"));
+    let mut cmd = common::magi_cli(f.tmp.path());
     cmd.args(["answer", id, "--reply", reply])
-        .env("MAGI_HOME", f.tmp.path())
-        .env("MAGI_CONFIG_DIR", f.tmp.path().join("config"))
         .env("MAGI_RUN", run)
         .env("MAGI_NODE", magi::queue::CHAT_NODE);
     if let Some(words) = words {
@@ -2260,11 +2246,9 @@ fn consult_owner(f: &Fixture, words: &str) {
 }
 
 fn consult_command(f: &Fixture, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_magi"))
+    common::magi_cli(f.tmp.path())
         .args(args)
         .current_dir(f.tmp.path())
-        .env("MAGI_HOME", f.tmp.path())
-        .env("MAGI_CONFIG_DIR", f.tmp.path().join("config"))
         .env("MAGI_RUN", &f.talk_id)
         .env("MAGI_NODE", magi::queue::CHAT_NODE)
         .env("MAGI_TURN_SCOPE", "consultation-control")
@@ -2570,10 +2554,9 @@ fn ordinary_chat_task_add_does_not_require_an_existing_talk_record() {
             .status
             .success()
     );
-    let out = Command::new(env!("CARGO_BIN_EXE_magi"))
+    let out = common::magi_cli(f.tmp.path())
         .args(["task", "add", "Independent work"])
         .current_dir(f.tmp.path())
-        .env("MAGI_HOME", f.tmp.path())
         .env("MAGI_CONFIG_DIR", "")
         .env("MAGI_RUN", "missing-standing-chat")
         .env("MAGI_NODE", magi::queue::CHAT_NODE)
@@ -2637,7 +2620,7 @@ exec "$REAL_GIT" "$@"
         std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
     )
     .unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_magi"))
+    let child = common::magi_cli(f.tmp.path())
         .args([
             "task",
             "--quote",
@@ -2647,7 +2630,6 @@ exec "$REAL_GIT" "$@"
             "Reimplement from scratch",
         ])
         .current_dir(f.tmp.path())
-        .env("MAGI_HOME", f.tmp.path())
         .env("MAGI_CONFIG_DIR", "")
         .env("MAGI_RUN", &f.talk_id)
         .env("MAGI_NODE", magi::queue::CHAT_NODE)

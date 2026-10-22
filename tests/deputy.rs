@@ -456,8 +456,16 @@ async fn a_say_on_a_merge_approval_gets_a_deputy_and_never_the_waiter() {
 /// What the mock deputy runs on its real turn: the actual CLI, as the seat
 /// would, against this scene's home.
 fn script(s: &Scene, lines: &[&str]) {
-    let bin = env!("CARGO_BIN_EXE_magi");
-    let mut body = format!("export MAGI_HOME='{}'\n", s.home.display());
+    let cli = common::magi_cli(&s.home);
+    let bin = cli.get_program().to_str().unwrap();
+    let mut body = String::new();
+    for (key, value) in cli.get_envs() {
+        // Preserve the deputy identity the launcher just assigned.
+        if let Some(value) = value {
+            let quoted = value.to_str().unwrap().replace('\'', "'\"'\"'");
+            body.push_str(&format!("export {}='{quoted}'\n", key.to_str().unwrap()));
+        }
+    }
     body.push_str(": > deputy-action-status\n: > deputy-action-output\n");
     for l in lines {
         body.push_str("if {\n");

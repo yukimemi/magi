@@ -1,5 +1,5 @@
 //! Operator ingress preserves text only when there is a delivery route.
-use std::process::Command;
+mod common;
 
 use magi::ask::{Deputy, Question, Questions, WaiterKind};
 use magi::config::Config;
@@ -151,9 +151,8 @@ fn terminal_say_and_operator_thread_refuse_without_saving_or_forging_agent_turns
         vec!["answer", &q.id, "--say", "close the PR"],
         vec!["ask", "--thread", &q.id, "--summary", "close the PR"],
     ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_magi"))
+        let output = common::magi_cli(home.path())
             .args(args)
-            .env("MAGI_HOME", home.path())
             .env_remove("MAGI_RUN")
             .env_remove("MAGI_NODE")
             .env_remove("MAGI_SEAT")
@@ -311,9 +310,8 @@ fn terminal_text_answer_remains_a_decision_without_a_recipient() {
         vec![],
     );
     store.put(&mut q).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_magi"))
+    let output = common::magi_cli(home.path())
         .args(["answer", &q.id, "--reply", "chosen name"])
-        .env("MAGI_HOME", home.path())
         .env_remove("MAGI_RUN")
         .env_remove("MAGI_NODE")
         .env_remove("MAGI_SEAT")
@@ -352,7 +350,7 @@ fn release_watch_deputy_thread_with_empty_run_is_an_agent_reply() {
         if live_lease {
             store.beat(&q.id, WaiterKind::Deputy);
         }
-        let mut child = Command::new(env!("CARGO_BIN_EXE_magi"))
+        let mut child = common::magi_cli(home.path())
             .args([
                 "ask",
                 "--thread",
@@ -363,7 +361,6 @@ fn release_watch_deputy_thread_with_empty_run_is_an_agent_reply() {
                 "hold",
             ])
             .current_dir(home.path())
-            .env("MAGI_HOME", home.path())
             .env(Config::CONFIG_DIR_ENV, "")
             .env("MAGI_RUN", "")
             .env("MAGI_NODE", magi::deputy::NODE)

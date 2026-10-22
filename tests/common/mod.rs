@@ -15,6 +15,11 @@ use magi::config::{
     UpdateMode, Verify,
 };
 
+mod cli;
+use cli::SEAT_ENV;
+#[allow(unused_imports)]
+pub use cli::{magi_cli, magi_cli_env, magi_cli_environment};
+
 /// `set_home` is a process-wide global, so scenes that share one test binary
 /// (multiple runs, includes a `--resume`) must not run concurrently or they
 /// will clobber each other's run directory. Take one of these for the life of
@@ -87,7 +92,12 @@ where
             // exactly this one test and no runtime exists yet, so nothing else
             // reads the environment concurrently.
             // SAFETY: single test per process, set before any runtime or task.
-            unsafe { std::env::set_var(magi::config::Config::CONFIG_DIR_ENV, "") };
+            unsafe {
+                std::env::set_var(magi::config::Config::CONFIG_DIR_ENV, "");
+                for key in SEAT_ENV {
+                    std::env::remove_var(key);
+                }
+            };
         }
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -106,6 +116,10 @@ where
     let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
         .args([name, "--exact", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, "1")
+        .env_remove("MAGI_RUN")
+        .env_remove("MAGI_NODE")
+        .env_remove("MAGI_SEAT")
+        .env_remove("MAGI_TURN_SCOPE")
         // Named and empty: no machine layer. `Config::discover` in an
         // integration binary links the non-test library, so the operator's own
         // `config.toml` would otherwise merge with a fixture's `magi.toml` and
@@ -126,6 +140,7 @@ where
 
 /// Declares `async fn name() { .. }` as a `#[test]` that runs through
 /// [`isolated`]. The body is written exactly as a `#[tokio::test]` body was.
+#[allow(unused_macros)]
 macro_rules! e2e {
     ($(#[$m:meta])* async fn $name:ident() $body:block) => {
         $(#[$m])*
@@ -135,6 +150,7 @@ macro_rules! e2e {
         }
     };
 }
+#[allow(unused_imports)]
 pub(crate) use e2e;
 
 /// Judge behaviour for a scenario.
