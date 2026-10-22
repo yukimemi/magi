@@ -1070,30 +1070,31 @@ impl MarkerLock {
     /// Try to take the lock for `marker`, stealing a stale one first if it is
     /// old enough to mean its owner is gone rather than merely slow.
     /// `Ok(None)` means someone else genuinely holds it right now.
+    #[cfg(test)]
     fn acquire(marker: &Path) -> Result<Option<Self>> {
+        Self::acquire_with(marker, crate::lock_file::Retry::new(None))
+    }
+
+    fn acquire_with(marker: &Path, retry: crate::lock_file::Retry) -> Result<Option<Self>> {
         let path = marker.with_extension("lock");
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create {}", parent.display()))?;
         }
-        if Self::try_create(&path)? {
+        if Self::try_create(&path, retry)? {
             return Ok(Some(Self { path }));
         }
         if Self::is_stale(&path) {
             let _ = std::fs::remove_file(&path);
-            if Self::try_create(&path)? {
+            if Self::try_create(&path, retry)? {
                 return Ok(Some(Self { path }));
             }
         }
         Ok(None)
     }
 
-    fn try_create(path: &Path) -> Result<bool> {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
+    fn try_create(path: &Path, retry: crate::lock_file::Retry) -> Result<bool> {
+        match retry.create(path) {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
             Err(e) => Err(e).with_context(|| format!("create {}", path.display())),
@@ -1146,16 +1147,23 @@ async fn wait_for_marker_lock_with(
     poll: Duration,
     ceiling: Duration,
 ) -> Result<Option<MarkerLock>> {
-    let mut waited = Duration::ZERO;
+    let deadline = std::time::Instant::now() + ceiling;
+    let retry = crate::lock_file::Retry::new(Some(deadline));
     loop {
-        if let Some(lock) = MarkerLock::acquire(marker)? {
+        // Delete-pending retries must not block the async executor.
+        let marker = marker.to_owned();
+        let acquired =
+            tokio::task::spawn_blocking(move || MarkerLock::acquire_with(&marker, retry))
+                .await
+                .context("join marker lock acquisition")??;
+        if let Some(lock) = acquired {
             return Ok(Some(lock));
         }
-        if waited >= ceiling {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
             return Ok(None);
         }
-        tokio::time::sleep(poll).await;
-        waited += poll;
+        tokio::time::sleep(poll.min(remaining)).await;
     }
 }
 

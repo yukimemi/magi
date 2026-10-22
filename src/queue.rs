@@ -2050,15 +2050,16 @@ const MAX_MARKER_DEPTH: u8 = 3;
 /// was left by a remover that died; it is cleared by the same compare-and-
 /// remove discipline as a lock, guarded by a marker of its own, so a recoverer
 /// that judged it stale cannot delete a fresh marker that replaced it.
-fn take_marker(path: &Path, token: &str, depth: u8) -> Option<(PathBuf, String)> {
+fn take_marker(
+    path: &Path,
+    token: &str,
+    depth: u8,
+    retry: crate::lock_file::Retry,
+) -> Option<(PathBuf, String)> {
     use std::io::Write;
     let marker = break_marker(path, token);
     for _ in 0..2 {
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&marker)
-        {
+        match retry.create(&marker) {
             Ok(mut f) => {
                 let mine = owner_token();
                 if f.write_all(mine.as_bytes()).is_err() {
@@ -2072,7 +2073,7 @@ fn take_marker(path: &Path, token: &str, depth: u8) -> Option<(PathBuf, String)>
                 let judged = std::fs::read_to_string(&marker).ok();
                 match judged.filter(|_| older_than_stale(&marker)) {
                     Some(judged) if depth < MAX_MARKER_DEPTH => {
-                        remove_lock_if(&marker, &judged, true, depth + 1)?;
+                        remove_lock_if(&marker, &judged, true, depth + 1, retry)?;
                     }
                     _ => return None,
                 }
@@ -2087,8 +2088,14 @@ fn take_marker(path: &Path, token: &str, depth: u8) -> Option<(PathBuf, String)>
 /// `require_stale`, is still stale). Removal is serialized per token by the
 /// break marker, so a remover that judged an old lock cannot delete the fresh
 /// one that replaced it. `None` means the marker was busy: try again.
-fn remove_lock_if(path: &Path, token: &str, require_stale: bool, depth: u8) -> Option<bool> {
-    let (marker, mine) = take_marker(path, token, depth)?;
+fn remove_lock_if(
+    path: &Path,
+    token: &str,
+    require_stale: bool,
+    depth: u8,
+    retry: crate::lock_file::Retry,
+) -> Option<bool> {
+    let (marker, mine) = take_marker(path, token, depth, retry)?;
     let still = std::fs::read_to_string(path).is_ok_and(|c| c == token)
         && (!require_stale || older_than_stale(path) && writer_may_be_gone(token));
     if still {
@@ -2100,22 +2107,28 @@ fn remove_lock_if(path: &Path, token: &str, require_stale: bool, depth: u8) -> O
             let _ = std::fs::remove_file(&marker);
         }
     } else {
-        let _ = remove_lock_if(&marker, &mine, false, depth + 1);
+        let _ = remove_lock_if(&marker, &mine, false, depth + 1, retry);
     }
     Some(still)
 }
 
 /// Break the lock judged stale while it held `judged`. Returns whether it was
 /// removed; a lock that has since been replaced is left alone.
+#[cfg(test)]
 fn break_stale(path: &Path, judged: &str) -> bool {
-    remove_lock_if(path, judged, true, 0).unwrap_or(false)
+    break_stale_with(path, judged, crate::lock_file::Retry::new(None))
+}
+
+fn break_stale_with(path: &Path, judged: &str, retry: crate::lock_file::Retry) -> bool {
+    remove_lock_if(path, judged, true, 0, retry).unwrap_or(false)
 }
 
 impl Drop for TaskLock {
     fn drop(&mut self) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let retry = crate::lock_file::Retry::new(Some(deadline));
         loop {
-            match remove_lock_if(&self.path, &self.token, false, 0) {
+            match remove_lock_if(&self.path, &self.token, false, 0, retry) {
                 Some(_) => return,
                 None if std::time::Instant::now() > deadline => return,
                 None => std::thread::sleep(std::time::Duration::from_millis(5)),
@@ -2376,12 +2389,10 @@ impl Queue {
             .with_context(|| format!("create {}", self.root.display()))?;
         let path = self.root.join(format!("{id}.write-lock"));
         let started = std::time::Instant::now();
+        let retry = crate::lock_file::Retry::task_write(started + TASK_LOCK_STALE);
+        let marker_retry = crate::lock_file::Retry::new(Some(started + TASK_LOCK_STALE));
         loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
+            match retry.create(&path) {
                 Ok(mut file) => {
                     use std::io::Write;
                     let token = owner_token();
@@ -2398,7 +2409,7 @@ impl Queue {
                     let judged = std::fs::read_to_string(&path).ok();
                     let broken = judged
                         .filter(|_| older_than_stale(&path))
-                        .is_some_and(|judged| break_stale(&path, &judged));
+                        .is_some_and(|judged| break_stale_with(&path, &judged, marker_retry));
                     // A break that does not happen (marker busy, recovery
                     // exhausted) is a wait like any other, so it meets the
                     // same deadline instead of spinning forever.
@@ -2408,15 +2419,6 @@ impl Queue {
                         }
                         std::thread::sleep(std::time::Duration::from_millis(15));
                     }
-                }
-                // On Windows, `create_new` on a file whose delete is still
-                // pending fails with ERROR_ACCESS_DENIED, not `AlreadyExists`.
-                // Treat it as a race and retry until the deadline.
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::PermissionDenied
-                        && started.elapsed() <= TASK_LOCK_STALE =>
-                {
-                    std::thread::sleep(std::time::Duration::from_millis(15));
                 }
                 Err(e) => return Err(e).with_context(|| format!("lock {}", path.display())),
             }
@@ -2828,11 +2830,8 @@ impl Queue {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
         let path = self.lock_path(id);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
+        let retry = crate::lock_file::Retry::new(None);
+        match retry.create(&path) {
             Ok(mut f) => {
                 use std::io::Write as _;
                 // Best effort: the pid is for the human looking at a stale lock.

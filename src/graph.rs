@@ -550,11 +550,12 @@ impl FixClaim {
     fn acquire(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let path = dir.join("fix.lock");
-        match Self::create(&path) {
+        let retry = crate::lock_file::Retry::new(None);
+        match Self::create(&path, retry) {
             Ok(claim) => Ok(claim),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 if Self::reclaim_if_dead(&path) {
-                    Self::create(&path).with_context(|| format!("lock {}", path.display()))
+                    Self::create(&path, retry).with_context(|| format!("lock {}", path.display()))
                 } else {
                     bail!(
                         "another repair or `magi fix` is already running for this run ({} exists)",
@@ -566,11 +567,8 @@ impl FixClaim {
         }
     }
 
-    fn create(path: &Path) -> std::io::Result<Self> {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+    fn create(path: &Path, retry: crate::lock_file::Retry) -> std::io::Result<Self> {
+        let mut f = retry.create(path)?;
         use std::io::Write as _;
         // Read back by `reclaim_if_dead` on a later, stuck invocation.
         writeln!(f, "{}", std::process::id())?;

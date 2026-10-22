@@ -397,13 +397,10 @@ impl Notices {
             .with_context(|| format!("create {}", self.root.display()))?;
         let lock = self.root.join(format!("{id}.lock"));
         let start = std::time::Instant::now();
+        let retry = crate::lock_file::Retry::new(Some(start + LOCK_WAIT));
         let mut held = false;
         while start.elapsed() < LOCK_WAIT {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock)
-            {
+            match retry.create(&lock) {
                 Ok(_) => {
                     held = true;
                     break;

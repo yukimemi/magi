@@ -336,12 +336,17 @@ fn classify_with<F: Fn(u32) -> bool>(path: &Path, alive: F) -> Status {
 /// overwrite an existing one, exactly like [`crate::queue::Queue::claim`]'s
 /// task lock, which this mirrors on purpose rather than inventing a second
 /// exclusion primitive in the same codebase.
-fn write_new(path: &Path, cache_dir: &Path, owner: &Owner) -> std::io::Result<()> {
+fn write_new(
+    path: &Path,
+    cache_dir: &Path,
+    owner: &Owner,
+    retry: crate::lock_file::Retry,
+) -> std::io::Result<()> {
+    write_lease(retry.create(path)?, cache_dir, owner)
+}
+
+fn write_lease(mut f: std::fs::File, cache_dir: &Path, owner: &Owner) -> std::io::Result<()> {
     use std::io::Write as _;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)?;
     let lease = LeaseFile {
         cache_dir: cache_dir.display().to_string(),
         owner: owner.clone(),
@@ -397,6 +402,22 @@ fn try_acquire_with<F: Fn(u32) -> bool + Copy>(
     owner: &Owner,
     alive: F,
 ) -> Result<AcquireOutcome> {
+    try_acquire_before(
+        home,
+        cache_dir,
+        owner,
+        alive,
+        crate::lock_file::Retry::new(None),
+    )
+}
+
+fn try_acquire_before<F: Fn(u32) -> bool + Copy>(
+    home: &Path,
+    cache_dir: &Path,
+    owner: &Owner,
+    alive: F,
+    retry: crate::lock_file::Retry,
+) -> Result<AcquireOutcome> {
     let dir = leases_dir(home);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join(format!("{}.json", slug(cache_dir)));
@@ -407,24 +428,79 @@ fn try_acquire_with<F: Fn(u32) -> bool + Copy>(
     // losing the race to genuinely live contenders is exactly what `Busy`
     // reports back, not something this function spins on.
     for _ in 0..2 {
-        match write_new(&path, cache_dir, owner) {
-            Ok(()) => {
-                record_catalog(home, cache_dir, owner);
-                return Ok(AcquireOutcome::Acquired(Guard::new(path)));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
-        }
-        match classify_with(&path, alive) {
-            Status::Free => {} // reclaimed between the write and the read; loop once more
-            Status::Stale(_) => {
-                let _ = std::fs::remove_file(&path);
-            }
-            Status::Active(o) => return Ok(AcquireOutcome::Busy(Busy::Active(o))),
-            Status::Unknown => return Ok(AcquireOutcome::Busy(Busy::Unknown)),
+        let result = write_new(&path, cache_dir, owner, retry);
+        if let Some(outcome) = acquire_result(home, &path, cache_dir, owner, alive, result)? {
+            return Ok(outcome);
         }
     }
     Ok(AcquireOutcome::Busy(Busy::Contended))
+}
+
+// Shared stale/conflict handling; only opening the file is retried.
+fn acquire_result(
+    home: &Path,
+    path: &Path,
+    cache_dir: &Path,
+    owner: &Owner,
+    alive: impl Fn(u32) -> bool + Copy,
+    result: std::io::Result<()>,
+) -> Result<Option<AcquireOutcome>> {
+    match result {
+        Ok(()) => {
+            record_catalog(home, cache_dir, owner);
+            return Ok(Some(AcquireOutcome::Acquired(Guard::new(path.to_owned()))));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("create {}", path.display())),
+    }
+    match classify_with(path, alive) {
+        Status::Free => {}
+        Status::Stale(_) => {
+            let _ = std::fs::remove_file(path);
+        }
+        Status::Active(o) => return Ok(Some(AcquireOutcome::Busy(Busy::Active(o)))),
+        Status::Unknown => return Ok(Some(AcquireOutcome::Busy(Busy::Unknown))),
+    }
+    Ok(None)
+}
+
+async fn try_acquire_async(
+    home: &Path,
+    cache_dir: &Path,
+    owner: &Owner,
+    retry: crate::lock_file::Retry,
+    cancel: &(dyn Fn() -> bool + Sync),
+) -> Result<Option<AcquireOutcome>> {
+    let Ok(_outputs) = crate::retention::OutputLease::cache(home, cache_dir, true) else {
+        return Ok(Some(AcquireOutcome::Busy(Busy::Outputs)));
+    };
+    let dir = leases_dir(home);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let path = dir.join(format!("{}.json", slug(cache_dir)));
+    for _ in 0..2 {
+        let opened = retry
+            .run_async_unless(
+                || {
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                },
+                cancel,
+            )
+            .await;
+        let result = match opened {
+            Ok(Some(file)) => write_lease(file, cache_dir, owner),
+            Ok(None) => return Ok(None),
+            Err(error) => Err(error),
+        };
+        if let Some(outcome) =
+            acquire_result(home, &path, cache_dir, owner, proc::pid_alive, result)?
+        {
+            return Ok(Some(outcome));
+        }
+    }
+    Ok(Some(AcquireOutcome::Busy(Busy::Contended)))
 }
 
 /// Is `cache_dir` in use right now — held by a live owner, or in a state
@@ -465,8 +541,8 @@ pub async fn wait_for(
 }
 
 /// [`wait_for`] that also gives up, with `Ok(None)`, as soon as `cancel`
-/// returns true. `cancel` is looked at once per `poll`, so a park request is
-/// honoured within a poll interval instead of after the whole budget. The
+/// returns true. `cancel` is checked at each contention poll and before and
+/// after delete-pending sleeps, so a park request does not wait out the budget. The
 /// lease is never held on that path: nothing was acquired.
 pub async fn wait_for_unless(
     home: &Path,
@@ -477,8 +553,14 @@ pub async fn wait_for_unless(
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<Option<Guard>> {
     let start = std::time::Instant::now();
+    // Delete-pending retries share the whole resource wait budget; the helper
+    // checks cancellation before and after each retry sleep.
+    let retry = crate::lock_file::Retry::new(Some(start + budget));
     loop {
-        match try_acquire(home, cache_dir, owner)? {
+        let Some(acquired) = try_acquire_async(home, cache_dir, owner, retry, cancel).await? else {
+            return Ok(None);
+        };
+        match acquired {
             AcquireOutcome::Acquired(g) => return Ok(Some(g)),
             AcquireOutcome::Busy(busy) => {
                 if cancel() {
@@ -1093,7 +1175,13 @@ mod tests {
         let dead_owner = owner(999_999);
         let path = lease_path(home.path(), &cache);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        write_new(&path, &cache, &dead_owner).expect("seed a stale lease");
+        write_new(
+            &path,
+            &cache,
+            &dead_owner,
+            crate::lock_file::Retry::new(None),
+        )
+        .expect("seed a stale lease");
         assert_eq!(
             classify_with(&path, |_| false),
             Status::Stale(dead_owner.clone())
@@ -1188,7 +1276,13 @@ mod tests {
             try_acquire(home.path(), &active_cache, &owner(std::process::id())).expect("acquire");
         let stale_path = lease_path(home.path(), &stale_cache);
         std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
-        write_new(&stale_path, &stale_cache, &owner(999_999)).unwrap();
+        write_new(
+            &stale_path,
+            &stale_cache,
+            &owner(999_999),
+            crate::lock_file::Retry::new(None),
+        )
+        .unwrap();
         let unknown_path = lease_path(home.path(), &unknown_cache);
         std::fs::write(&unknown_path, b"garbage").unwrap();
 
