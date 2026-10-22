@@ -3298,3 +3298,9 @@ request can approve a routed merge. Free text, agent answers, deputy settlement
 and quoted consent cannot approve it. Silence is a hold; `land_approval` stays
 on by default. Keep the Question store and non-task legacy workflow until the
 next migration step.
+
+`[graph] question_routing` (default on) is the per-repository switch for task
+decision routing (`task_chat::enabled_for`, consulted by `Questions::put`,
+`task_chat::routes` and `task_chat::sweep`). Off restores the question/deputy/
+waiter path. `Queue::put_unlocked` keeps a stored `Task::chat` against stale
+writes, so the one chat per task is never lost.

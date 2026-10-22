@@ -19,6 +19,14 @@ pub fn task_of(q: &Question, tasks: &[Task]) -> Option<String> {
     matching.next().is_none().then(|| task.id.clone())
 }
 
+/// `[graph] question_routing` of the task's repository. An unreadable
+/// config keeps the default (on), like every other default-on graph switch.
+pub(crate) fn enabled_for(tasks: &[Task], task_id: &str) -> bool {
+    tasks.iter().find(|t| t.id == task_id).is_none_or(|t| {
+        Config::discover(&t.repo, None).map_or(true, |(cfg, _)| cfg.graph.question_routing)
+    })
+}
+
 /// Also recognize legacy and watch-linked records before the first sweep.
 pub(crate) fn routes(q: &Question, home: &Path) -> bool {
     if q.routed_task.is_some() {
@@ -29,7 +37,7 @@ pub(crate) fn routes(q: &Question, home: &Path) -> bool {
     }
     let tasks = Queue::at(home.join("queue")).list();
     let watches = crate::release_watch::states_for_questions(home, std::slice::from_ref(q));
-    task_of_with_watches(q, &tasks, &watches).is_some()
+    task_of_with_watches(q, &tasks, &watches).is_some_and(|id| enabled_for(&tasks, &id))
 }
 
 /// Resolve and persist one destination while holding the task lock. A stable
@@ -114,6 +122,9 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
         else {
             continue;
         };
+        if !enabled_for(&tasks, &task_id) {
+            continue;
+        }
         let result = (|| -> Result<()> {
             let (q, ()) = questions.update(&q.id, |r| {
                 r.routed_task = Some(task_id.clone());

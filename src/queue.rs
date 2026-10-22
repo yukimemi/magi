@@ -2594,6 +2594,11 @@ impl Queue {
     fn merge_stored(&self, task: &mut Task) {
         if let Ok(mut stored) = read_path(&self.path_of(&task.id)) {
             stored.import_chat_notice();
+            // The task's message chat is recorded once and never rewound or
+            // dropped by a writer holding an older snapshot.
+            if task.chat.is_none() {
+                task.chat = stored.chat.clone();
+            }
             for key in stored.chat_notices {
                 if !task.chat_notices.contains(&key) {
                     task.chat_notices.push(key);
@@ -3732,6 +3737,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let q = Queue::at(dir.path().join("queue"));
         (dir, q)
+    }
+
+    #[test]
+    fn a_stale_write_does_not_drop_the_recorded_task_chat() {
+        let (_dir, q) = queue();
+        let mut stale = task("chat");
+        q.put(&mut stale).unwrap();
+        let mut fresh = q.get(&stale.id).unwrap();
+        fresh.chat = Some("talk-1".to_owned());
+        q.put(&mut fresh).unwrap();
+        q.put(&mut stale).unwrap();
+        assert_eq!(q.get(&stale.id).unwrap().chat.as_deref(), Some("talk-1"));
     }
 
     #[test]

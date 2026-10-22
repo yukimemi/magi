@@ -637,6 +637,10 @@ than a consultation-destination error. For chat answers, operator-held refusal
 is specific to approval questions; ordinary triage, dependency and recovery questions remain
 answerable, and recording their answers does not itself lift the task's hold.
 
+`[graph] question_routing` (default `true`) sends what used to be a question
+about a task to that task's chat as free text. Setting it to `false` for a
+repository keeps the question store, deputies and waiter as they were there.
+
 Merge approval uses two independent controls: `land_approval=true` asks for
 every merge; `hold_contested_merge=true` asks for unresolved Major-or-above
 internal findings **or** a final rejecting reviewer vote, even with zero Major
