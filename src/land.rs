@@ -3865,7 +3865,16 @@ async fn publish_landing_head<F: Forge>(
                     outcomes = crate::graph::run_landing_gate(state, &winner, &wait).await?;
                 }
                 crate::graph::GateFix::Stop => break,
-                crate::graph::GateFix::Defer => bail!("landing gate repair deferred"),
+                crate::graph::GateFix::Defer => {
+                    // The repair checks e2e immediately, before the next gate.
+                    // Preserve a cache wait here as well as below; otherwise
+                    // the daemon charges an attempt for unstarted verification.
+                    if let Some(e2e) = &state.gate_repair_e2e {
+                        let outcomes = e2e.outcomes.clone();
+                        check_landing_resources(state, "e2e", &outcomes)?;
+                    }
+                    bail!("landing gate repair deferred");
+                }
             }
         }
         state.gate = outcomes;
@@ -4042,10 +4051,14 @@ async fn resume_landing_head<F: Forge>(
     anyhow::ensure!(
         observed == expected
             || (observed == local
-                && state.gate_head.as_deref() == Some(&local)
-                && state.gate_allows_progress()),
+                && ((state.gate_head.as_deref() == Some(&local) && state.gate_allows_progress())
+                    || git::is_ancestor(&winner.worktree, expected, &local).await)),
         "public head moved outside this run; refusing to sync"
     );
+    // An operator may have extended and published the winner while approval
+    // was pending. Matching local/public history can be adopted as the lease,
+    // but publish_landing_head must gate its new SHA before proceeding. A
+    // remote-only or divergent update still cannot be overwritten.
     // Save reconciliation before rebasing again; a prior push may have reached
     // the remote immediately before the previous driver's last save.
     state.pr_pushed_head = Some(observed.to_owned());
@@ -6876,6 +6889,82 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             prompt_delivery: None,
         }];
         state.candidates[0].agent = "mock".into();
+    }
+
+    #[tokio::test]
+    async fn landing_resume_revalidates_an_operator_published_winner_extension() {
+        let (_tmp, mut state, old) = landing_git_fixture().await;
+        std::fs::write(state.repo.join("change"), "operator update").unwrap();
+        git::commit_all(&state.repo, "extend winner").await.unwrap();
+        let updated = git::rev_parse(&state.repo, "HEAD").await.unwrap();
+        git::git(
+            &state.repo,
+            &["push", "origin", "HEAD:refs/heads/task-head"],
+        )
+        .await
+        .unwrap();
+        state.config.verify.gate = vec!["exit 1".into()];
+        state.config.graph.gate_fix_rounds = 0;
+        assert!(resume_observed_head(&mut state, &updated).await.is_err());
+        assert_ne!(old, updated);
+        assert_eq!(state.gate_head.as_ref(), Some(&updated));
+        assert!(!state.gate_allows_progress());
+        assert!(state.land_sync_pending);
+        state.config.verify.gate = vec!["grep -q 'operator update' change".into()];
+        let head = resume_observed_head(&mut state, &updated).await.unwrap();
+        assert_eq!(head, updated);
+        assert!(state.gate_allows_progress());
+        assert!(!state.land_sync_pending);
+        let forge = Scripted::new(vec![seen(&head, Checks::Green, "CLEAN", false)], vec![]);
+        land_with(&mut state, &green_pr().url, &forge)
+            .await
+            .unwrap();
+        assert!(state.parked);
+        assert_eq!(state.land_approval.as_ref().unwrap().head, head);
+        assert!(forge.argvs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn landing_resume_refuses_remote_only_and_divergent_operator_updates() {
+        for divergent in [false, true] {
+            let (_tmp, mut state, old) = landing_git_fixture().await;
+            if divergent {
+                git::git(&state.repo, &["reset", "--hard", "origin/main"])
+                    .await
+                    .unwrap();
+            }
+            std::fs::write(state.repo.join("external"), "external").unwrap();
+            git::commit_all(&state.repo, "external update")
+                .await
+                .unwrap();
+            let external = git::rev_parse(&state.repo, "HEAD").await.unwrap();
+            git::git(
+                &state.repo,
+                &["push", "--force", "origin", "HEAD:refs/heads/task-head"],
+            )
+            .await
+            .unwrap();
+            if !divergent {
+                git::git(&state.repo, &["reset", "--hard", &old])
+                    .await
+                    .unwrap();
+            }
+            let error = resume_observed_head(&mut state, &external)
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("public head moved outside this run")
+            );
+            assert_eq!(state.pr_pushed_head.as_ref(), Some(&old));
+            assert_eq!(
+                git::remote_head(&state.repo, "origin", "task-head")
+                    .await
+                    .unwrap(),
+                Some(external)
+            );
+        }
     }
 
     #[tokio::test]

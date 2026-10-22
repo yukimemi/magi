@@ -387,12 +387,16 @@ async fn merge_repair_obsolete_head_answer_is_not_consumed() {
     let (fx, runner, old_question) = held_pr(false, false).await;
     let winner = runner.state.winner().unwrap();
     magi::git::git(&winner.worktree, &["commit", "--allow-empty", "-m", "fix: newer head"]).await.unwrap();
+    let updated = magi::git::rev_parse(&winner.worktree, "HEAD").await.unwrap();
     assert!(magi::git::push(&winner.worktree, "origin", &winner.branch).await.unwrap().ok());
     let mut resumed = Runner::resume(&runner.state.id).unwrap();
     resumed.execute().await.unwrap();
     assert!(resumed.state.parked);
     assert!(resumed.state.merge_repairs.is_empty());
     assert_ne!(resumed.state.land_approval.as_ref().unwrap().question, old_question);
+    assert_eq!(resumed.state.land_approval.as_ref().unwrap().head, updated);
+    assert_eq!(resumed.state.gate_head.as_ref(), Some(&updated));
+    assert_eq!(resumed.state.pr_pushed_head.as_ref(), Some(&updated));
     assert!(!fx.tmp.path().join("forge/fixes").exists());
 }
 }
@@ -521,10 +525,29 @@ fn landing_verification_cache_holder() {
     };
     magi::run::set_home(home.into());
     let cache = std::path::PathBuf::from(std::env::var_os("LANDING_CACHE_TEST_DIR").unwrap());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    if let Some(trigger) = std::env::var_os("LANDING_CACHE_TEST_TRIGGER") {
+        std::fs::write(cache.join("holder-started"), "").unwrap();
+        while !std::path::Path::new(&trigger).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixer did not signal cache holder"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
     let owner = magi::cache::Owner::here("other-run", "gate", "gate", &cache, "other-head");
-    let guard = match magi::cache::try_acquire(&magi::run::home(), &cache, &owner).unwrap() {
-        magi::cache::AcquireOutcome::Acquired(guard) => guard,
-        magi::cache::AcquireOutcome::Busy(_) => panic!("test cache was already busy"),
+    let guard = loop {
+        match magi::cache::try_acquire(&magi::run::home(), &cache, &owner).unwrap() {
+            magi::cache::AcquireOutcome::Acquired(guard) => break guard,
+            magi::cache::AcquireOutcome::Busy(_) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixer did not release cache"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
     };
     std::fs::write(cache.join("holder-ready"), "").unwrap();
     let mut line = String::new();
@@ -532,7 +555,7 @@ fn landing_verification_cache_holder() {
     guard.release();
 }
 
-async fn landing_cache_contention_refunds_attempt(e2e: bool) {
+async fn landing_cache_contention_refunds_attempt(e2e: bool, immediate_repair: bool) {
     let (fx, mut runner, question) = held_pr_choice(false, false, "merge").await;
     Questions::open()
         .update(&question, |q| {
@@ -544,6 +567,19 @@ async fn landing_cache_contention_refunds_attempt(e2e: bool) {
         .unwrap();
     let cache = fx.tmp.path().join("verification-cache");
     std::fs::create_dir(&cache).unwrap();
+    let trigger = cache.join("repair-started");
+    if immediate_repair {
+        // Acquire only after the initial gate has failed and released its
+        // cache lease. The holder then waits for the fixer wave to release
+        // its own lease, before the subsequent repair verification starts.
+        let agent = fx.tmp.path().join("mock-agent.sh");
+        let script = std::fs::read_to_string(&agent).unwrap();
+        let prefix = format!(
+            "#!/bin/sh\nif grep -q 'failed the verification gate' \"$MAGI_PROMPT_FILE\"; then\n  touch {}\nfi",
+            trigger.display(),
+        );
+        std::fs::write(agent, script.replacen("#!/bin/sh", &prefix, 1)).unwrap();
+    }
     let started = fx.tmp.path().join("verification-started");
     let command = format!(
         "CARGO_TARGET_DIR={} touch {}",
@@ -556,11 +592,21 @@ async fn landing_cache_contention_refunds_attempt(e2e: bool) {
     runner.state.merge.as_mut().unwrap().ok = false;
     if e2e {
         runner.state.config.verify.e2e = vec![command];
-        runner.state.gate_repair_e2e = Some(magi::run::GateRepairE2e {
-            head: runner.state.land_approval.as_ref().unwrap().head.clone(),
-            passed: false,
-            outcomes: Vec::new(),
-        });
+        if immediate_repair {
+            // Fail the real landing gate and let the fixture's gate fixer
+            // commit gatefix.txt before e2e tries to acquire the busy cache.
+            runner.state.config.verify.gate =
+                vec!["test -f gatefix.txt || { echo 'gatefix.txt needs repair'; exit 1; }".into()];
+            runner.state.config.graph.gate_fix_rounds = 1;
+            runner.state.gate_ran = false;
+            runner.state.gate_head = None;
+        } else {
+            runner.state.gate_repair_e2e = Some(magi::run::GateRepairE2e {
+                head: runner.state.land_approval.as_ref().unwrap().head.clone(),
+                passed: false,
+                outcomes: Vec::new(),
+            });
+        }
     } else {
         runner.state.config.verify.gate = vec![command];
         runner.state.gate_ran = false;
@@ -569,7 +615,11 @@ async fn landing_cache_contention_refunds_attempt(e2e: bool) {
     let mut task = decision_owner(&mut runner, &fx).await;
     task.release_operator("test", None);
     magi::queue::Queue::open().put(&mut task).unwrap();
-    let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+    let mut holder_command = std::process::Command::new(std::env::current_exe().unwrap());
+    if immediate_repair {
+        holder_command.env("LANDING_CACHE_TEST_TRIGGER", &trigger);
+    }
+    let mut holder = holder_command
         .args([
             "--exact",
             "landing_verification_cache_holder",
@@ -583,7 +633,12 @@ async fn landing_cache_contention_refunds_attempt(e2e: bool) {
         .spawn()
         .unwrap();
     let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        while !cache.join("holder-ready").exists() {
+        let ready_file = if immediate_repair {
+            "holder-started"
+        } else {
+            "holder-ready"
+        };
+        while !cache.join(ready_file).exists() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
@@ -621,9 +676,20 @@ async fn landing_cache_contention_refunds_attempt(e2e: bool) {
     assert!(outcomes.iter().any(|outcome| outcome.resource_blocked));
     let worktree = &disk.winner().unwrap().worktree;
     assert!(!started.exists());
+    let local = magi::git::rev_parse(worktree, "HEAD").await.unwrap();
+    if immediate_repair {
+        assert_eq!(disk.gate_fixes.len(), 1);
+        assert!(disk.gate_fixes[0].committed);
+        assert_ne!(&local, disk.pr_pushed_head.as_ref().unwrap());
+        assert_eq!(disk.gate_repair_e2e.as_ref().unwrap().head, local);
+    } else {
+        assert_eq!(&local, disk.pr_pushed_head.as_ref().unwrap());
+    }
     assert_eq!(
-        magi::git::rev_parse(worktree, "HEAD").await.unwrap(),
-        disk.pr_pushed_head.as_ref().unwrap().as_str()
+        magi::git::remote_head(worktree, "origin", disk.pr_branch().unwrap())
+            .await
+            .unwrap(),
+        disk.pr_pushed_head
     );
 
     // Once the real lease is free, releasing the task retries the same run.
@@ -635,6 +701,12 @@ async fn landing_cache_contention_refunds_attempt(e2e: bool) {
     assert!(resumed.resource_block.is_none(), "{:?}", resumed.events);
     assert!(resumed.parked, "{:?}", resumed.events);
     assert!(started.exists());
+    if immediate_repair {
+        assert_eq!(resumed.gate_fixes.len(), 1);
+        assert!(resumed.gate_repair_e2e.as_ref().unwrap().passed);
+        assert_eq!(resumed.gate_head, resumed.pr_pushed_head);
+        assert_eq!(resumed.land_approval.as_ref().unwrap().head, local);
+    }
     assert_eq!(
         magi::queue::Queue::open().get(&task.id).unwrap().runs,
         task.runs
@@ -643,13 +715,19 @@ async fn landing_cache_contention_refunds_attempt(e2e: bool) {
 
 common::e2e! {
 async fn landing_gate_cache_contention_spends_no_attempt() {
-    landing_cache_contention_refunds_attempt(false).await;
+    landing_cache_contention_refunds_attempt(false, false).await;
 }
 }
 
 common::e2e! {
 async fn landing_post_repair_e2e_cache_contention_spends_no_attempt() {
-    landing_cache_contention_refunds_attempt(true).await;
+    landing_cache_contention_refunds_attempt(true, false).await;
+}
+}
+
+common::e2e! {
+async fn landing_immediate_repair_e2e_cache_contention_spends_no_attempt() {
+    landing_cache_contention_refunds_attempt(true, true).await;
 }
 }
 
@@ -796,11 +874,15 @@ async fn decision_cli_stale_merge_answer_never_authorizes_a_changed_head() {
     let w = runner.state.winner().unwrap();
     std::fs::write(w.worktree.join("after-approval.txt"), "new head").unwrap();
     magi::git::commit_all(&w.worktree, "fix: move head after approval").await.unwrap();
+    let updated = magi::git::rev_parse(&w.worktree, "HEAD").await.unwrap();
     assert!(magi::git::push(&w.worktree, "origin", &w.branch).await.unwrap().ok());
     serve_decision(&fx, &runner.state).await;
     let disk = RunState::load(&runner.state.id).unwrap();
     assert!(disk.parked);
     assert_ne!(disk.land_approval.as_ref().unwrap().question, question);
+    assert_eq!(disk.land_approval.as_ref().unwrap().head, updated);
+    assert_eq!(disk.gate_head.as_ref(), Some(&updated));
+    assert_eq!(disk.pr_pushed_head.as_ref(), Some(&updated));
     assert_ne!(disk.status, RunStatus::Merged);
     assert_eq!(magi::queue::Queue::open().get(&task.id).unwrap().runs, task.runs);
     let calls = std::fs::read_to_string(fx.tmp.path().join("forge/calls")).unwrap();
