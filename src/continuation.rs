@@ -114,7 +114,10 @@ pub fn classify(state: &RunState) -> Continuation {
             continuation: "Continue on that newer run; this one is kept as history.".into(),
         };
     }
-    let branch = state.winner().filter(|c| !c.folded).map(|c| c.branch.clone());
+    let branch = state
+        .winner()
+        .filter(|c| !c.folded)
+        .map(|c| c.branch.clone());
     match (budget(state), branch) {
         (Budget::UnresolvedFindings | Budget::ReviewFailed, Some(branch))
             if state.status == RunStatus::Blocked =>
@@ -197,11 +200,14 @@ mod tests {
         .unwrap();
         c.folded = false;
         s.candidates = vec![c];
-        s.tally = Some(serde_json::from_value(serde_json::json!({
-            "first_choice": {}, "borda": {}, "winner": "A", "unanimous_initial": true,
-            "deliberated": false, "changed_votes": 0, "unanimous_final": true,
-            "met_quorum": true
-        })).unwrap());
+        s.tally = Some(
+            serde_json::from_value(serde_json::json!({
+                "first_choice": {}, "borda": {}, "winner": "A", "unanimous_initial": true,
+                "deliberated": false, "changed_votes": 0, "unanimous_final": true,
+                "met_quorum": true
+            }))
+            .unwrap(),
+        );
     }
 
     #[test]
@@ -282,7 +288,8 @@ mod tests {
                 run: "no-such-run".into(),
             },
         );
-        q.actions.insert("hold".into(), crate::ask::ChoiceAction::Hold);
+        q.actions
+            .insert("hold".into(), crate::ask::ChoiceAction::Hold);
         revalidate_offer(&mut q);
         assert_eq!(q.choices, ["hold"]);
         assert!(!q.actions.contains_key("resume"));

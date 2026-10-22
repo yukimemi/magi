@@ -226,7 +226,10 @@ pub fn natural_matches(words: &str, operation: &TaskOperation) -> bool {
     // "hold" is itself a hedge word for merges; for a hold request it is the
     // verb, so it is removed before the doubt check (other doubt still voids).
     let neutral = if matches!(operation, TaskOperation::Hold { .. }) {
-        words.replace("hold", "").replace("保留", "").replace("止め", "")
+        words
+            .replace("hold", "")
+            .replace("保留", "")
+            .replace("止め", "")
     } else {
         words.to_owned()
     };
@@ -255,9 +258,9 @@ pub fn natural_matches(words: &str, operation: &TaskOperation) -> bool {
     // additional content ("review the release notes for task ...") is not an
     // instruction to run exactly this operation.
     let fillers = [
-        "please", "task", "the", "it", "to", "now", "ok", "okay", "yes", "go", "ahead", "and",
-        "a", "this", "that", "you", "can", "may", "set", "change", "make", "of", "priority",
-        "add", "file", "new", "work", "again", "is", "fine", "good",
+        "please", "task", "the", "it", "to", "now", "ok", "okay", "yes", "go", "ahead", "and", "a",
+        "this", "that", "you", "can", "may", "set", "change", "make", "of", "priority", "add",
+        "file", "new", "work", "again", "is", "fine", "good",
     ];
     let clean = |skip: &[usize], extra: &[&str]| {
         tokens.iter().enumerate().all(|(i, t)| {
@@ -275,7 +278,9 @@ pub fn natural_matches(words: &str, operation: &TaskOperation) -> bool {
             };
             has(&release_words, &release_ja)
                 && !has(&hold_words, &hold_ja)
-                && !tokens.iter().any(|t| *t == "add" || *t == "set" || *t == "priority")
+                && !tokens
+                    .iter()
+                    .any(|t| *t == "add" || *t == "set" || *t == "priority")
                 && clean(&[at], &[])
         }
         TaskOperation::Hold { task, reason } => {
@@ -315,7 +320,9 @@ pub fn natural_matches(words: &str, operation: &TaskOperation) -> bool {
                 .split(|c: char| !c.is_ascii_alphanumeric())
                 .filter(|t| !t.is_empty())
                 .collect();
-            (rest_tokens.contains(&"add") || rest_tokens.contains(&"file") || words.contains("追加"))
+            (rest_tokens.contains(&"add")
+                || rest_tokens.contains(&"file")
+                || words.contains("追加"))
                 && rest_tokens.iter().all(|t| fillers.contains(t))
         }
         TaskOperation::Done { .. } => false,
@@ -2017,11 +2024,14 @@ pub async fn drain_turns(
 mod tests {
     #[test]
     fn natural_language_task_operations_need_a_clear_unhedged_instruction() {
-        use super::{natural_matches, TaskOperation};
+        use super::{TaskOperation, natural_matches};
         let release = TaskOperation::Release {
             task: "6af7c0de1234".into(),
         };
-        assert!(natural_matches("タスク6af7を再開してよい", &release) || natural_matches("Please release task 6af7c0de1234", &release));
+        assert!(
+            natural_matches("タスク6af7を再開してよい", &release)
+                || natural_matches("Please release task 6af7c0de1234", &release)
+        );
         assert!(natural_matches("Please release task 6af7 now", &release));
         // Hedged, wrong task, or mixed verbs are never enough.
         assert!(!natural_matches("Maybe release task 6af7", &release));
@@ -2039,7 +2049,10 @@ mod tests {
         assert!(natural_matches("hold task 6af7", &hold));
         assert!(!natural_matches("hold task 6af7", &release));
         // Mentioning the task is not an instruction to release it.
-        assert!(!natural_matches("Review the release notes for task 6af7", &release));
+        assert!(!natural_matches(
+            "Review the release notes for task 6af7",
+            &release
+        ));
         // Priority binds the stated value, never a digit of the id.
         let prio = |n| TaskOperation::Priority {
             task: "6af7c0de1234".into(),
@@ -2048,8 +2061,14 @@ mod tests {
         assert!(natural_matches("Set task 6af7 priority to 9", &prio(9)));
         assert!(!natural_matches("Set task 6af7 priority to 9", &prio(6)));
         assert!(!natural_matches("Set task 6af7 priority to 9", &prio(7)));
-        assert!(!natural_matches("set priority of task 6af7 to 10", &prio(7)));
-        assert!(natural_matches("set priority of task 6af7 to 10", &prio(10)));
+        assert!(!natural_matches(
+            "set priority of task 6af7 to 10",
+            &prio(7)
+        ));
+        assert!(natural_matches(
+            "set priority of task 6af7 to 10",
+            &prio(10)
+        ));
     }
 
     use std::collections::BTreeMap;
