@@ -1548,6 +1548,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconciliation_recovers_interrupted_state_staging_in_a_batch() {
+        for partial in [false, true] {
+            let f = Fx::new().await;
+            let source = f.run("ab10", true).await;
+            let first = f.run("ab11", false).await;
+            let second = f.run("ab12", false).await;
+            let task = f.task(&[source.clone(), first.clone(), second.clone()]);
+            crate::pr_recovery::retain_sources(&task, &f.home).unwrap();
+            let plan = reconciliation_plan(&f, &task, &source).await;
+            let id = plan["id"].as_str().unwrap();
+            let staging = f.home.join("runs").join(&second.id).join("run.json.tmp");
+            // Matching bytes without this operation's fence are not trusted.
+            std::fs::write(&staging, b"").unwrap();
+            assert!(
+                reconcile::run(&f.home, &task.id, &source.id, Some(id))
+                    .await
+                    .is_err()
+            );
+            assert!(staging.exists());
+            std::fs::remove_file(&staging).unwrap();
+            let error = reconcile::interrupt_during_state_save(&f.home, &task, id, partial)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("before run state rename"),
+                "{error:#}"
+            );
+            assert!(
+                RunState::load_under(&first.id, &f.home)
+                    .unwrap()
+                    .retired_to
+                    .is_some()
+            );
+            assert!(
+                RunState::load_under(&second.id, &f.home)
+                    .unwrap()
+                    .retired_to
+                    .is_none()
+            );
+            assert!(first.candidates[0].worktree.exists());
+            assert!(second.candidates[0].worktree.exists());
+            let interrupted = std::fs::read(&staging).unwrap();
+            // An unrelated file must survive a refused retry unchanged.
+            std::fs::write(&staging, b"unrelated recovery source").unwrap();
+            assert!(
+                reconcile::run(&f.home, &task.id, &source.id, Some(id))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read(&staging).unwrap(),
+                b"unrelated recovery source"
+            );
+            std::fs::write(&staging, interrupted).unwrap();
+            reconcile::run(&f.home, &task.id, &source.id, Some(id))
+                .await
+                .unwrap();
+            assert!(!staging.exists());
+            assert!(!first.candidates[0].worktree.exists());
+            assert!(!second.candidates[0].worktree.exists());
+            assert_eq!(
+                RunState::load_under(&second.id, &f.home)
+                    .unwrap()
+                    .retired_to,
+                Some(source.id)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn reconciliation_resumes_only_its_exact_durable_fence() {
         let f = Fx::new().await;
         let source = f.run("ad00", true).await;

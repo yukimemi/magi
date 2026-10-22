@@ -640,7 +640,16 @@ pub async fn run(
                 && plan.authority == authority,
             "plan identity mismatch"
         );
-        apply_plan(home, &queue, &task, &plan, &dir, || Ok(())).await?;
+        apply_plan(
+            home,
+            &queue,
+            &task,
+            &plan,
+            &dir,
+            |state| state.save_under_at(home, plan.at),
+            || Ok(()),
+        )
+        .await?;
         return Ok(dir);
     }
     let mut plan = Plan {
@@ -772,6 +781,7 @@ async fn apply_plan(
     task: &Task,
     plan: &Plan,
     dir: &Path,
+    mut save_state: impl FnMut(&mut RunState) -> Result<()>,
     before_removal: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     ensure!(
@@ -850,6 +860,22 @@ async fn apply_plan(
             let state_path = home.join("runs").join(&e.run).join("run.json");
             if current == serde_json::to_value(&approved)? {
                 expected.insert(state_path, fingerprint(&task.repo, &fence).await?);
+            }
+            let staging = home.join("runs").join(&e.run).join("run.json.tmp");
+            if staging.try_exists()? {
+                // save_under_at can stop after any prefix of its write. Only
+                // accept a new staging file whose bytes match this exact
+                // approved state; never ignore arbitrary recovery artifacts.
+                ensure!(
+                    !plan.snapshot.contains_key(&staging),
+                    "run staging file predates approval"
+                );
+                plain_file(&staging)?;
+                ensure!(
+                    serde_json::to_vec_pretty(&approved)?.starts_with(&std::fs::read(&staging)?),
+                    "run staging file differs from approved retirement fence"
+                );
+                expected.insert(staging.clone(), fingerprint(&task.repo, &staging).await?);
             }
         }
         eligible(home, task, &state, &plan.authority)?;
@@ -942,7 +968,7 @@ async fn apply_plan(
             if !fence.try_exists()? {
                 durable_new(&fence, state)?;
             }
-            state.save_under_at(home, plan.at)?;
+            save_state(state)?;
             // Persist the fence before any source-directory removal.
             std::fs::File::open(home.join("runs").join(&state.id).join("run.json"))?.sync_all()?;
             std::fs::File::open(home.join("runs").join(&state.id))?.sync_all()?;
@@ -972,9 +998,55 @@ pub(super) async fn interrupt_after_fence(home: &Path, task: &Task, operation: &
     let _claim = queue.claim(&task.id)?;
     let dir = home.join("retention-reconciliations").join(operation);
     let plan: Plan = read(&dir.join("plan.json"))?;
-    apply_plan(home, &queue, task, &plan, &dir, || {
-        anyhow::bail!("simulated interruption after durable fence")
-    })
+    apply_plan(
+        home,
+        &queue,
+        task,
+        &plan,
+        &dir,
+        |state| state.save_under_at(home, plan.at),
+        || anyhow::bail!("simulated interruption after durable fence"),
+    )
+    .await
+}
+
+#[cfg(test)]
+pub(super) async fn interrupt_during_state_save(
+    home: &Path,
+    task: &Task,
+    operation: &str,
+    partial: bool,
+) -> Result<()> {
+    let queue = Queue::at(home.join("queue"));
+    let _claim = queue.claim(&task.id)?;
+    let dir = home.join("retention-reconciliations").join(operation);
+    let plan: Plan = read(&dir.join("plan.json"))?;
+    let mut saved = 0;
+    apply_plan(
+        home,
+        &queue,
+        task,
+        &plan,
+        &dir,
+        |state| {
+            saved += 1;
+            if saved == 2 {
+                let bytes = serde_json::to_vec_pretty(state)?;
+                let bytes = if partial {
+                    &bytes[..bytes.len() / 2]
+                } else {
+                    &bytes
+                };
+                std::fs::write(
+                    home.join("runs").join(&state.id).join("run.json.tmp"),
+                    bytes,
+                )?;
+                anyhow::bail!("simulated interruption before run state rename");
+            }
+            state.save_under_at(home, plan.at)
+        },
+        || Ok(()),
+    )
     .await
 }
 
