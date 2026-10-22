@@ -10491,6 +10491,52 @@ mod tests {
     }
 
     #[test]
+    fn resource_blocked_gate_after_clean_final_review_resumes_the_same_run() {
+        for kind in ["cache", "coordination"] {
+            let home = tempfile::tempdir().unwrap();
+            let mut state = run_state(RunStatus::Blocked);
+            state.config.graph.review_rounds = 1;
+            let mut review = review_round(1);
+            review.clean = true;
+            state.reviews = vec![review];
+            state.gate_ran = false;
+            state.resource_block = Some(crate::run::ResourceBlock {
+                node: "gate".into(),
+                kind: kind.into(),
+                detail: "resource wait expired".into(),
+                at: jiff::Timestamp::now(),
+            });
+            state.save_under(home.path()).unwrap();
+            assert!(!crate::handover::has_resume_checkpoint(&state, home.path()));
+            assert!(!exhausted_review_budget(&state));
+            let mut task = held_task_with(&state.id);
+            task.release();
+            let unfinished = unfinished_run_with(&task.runs, task.short(), |_| Ok(state.clone()));
+            assert_eq!(
+                choose_starter(None, false, unfinished.as_deref()),
+                Starter::Resume(state.id.clone())
+            );
+            let question = action_question(&state.id, resume_action(&state.id));
+            assert_eq!(
+                decide_action(&task, &question, &PHRASES_EN, |_| Ok(state.clone())),
+                ActionDecision::Resume(state.id.clone())
+            );
+            assert_eq!(
+                crate::resume::validate(home.path(), &state.id).unwrap().id,
+                state.id
+            );
+
+            // A genuinely unresolved final review still exhausts the budget.
+            state.reviews[0].clean = false;
+            state.reviews[0].blocking = 1;
+            state.resource_block = None;
+            state.save_under(home.path()).unwrap();
+            assert!(exhausted_review_budget(&state));
+            assert!(crate::resume::validate(home.path(), &state.id).is_err());
+        }
+    }
+
+    #[test]
     fn retained_public_owner_wins_over_an_existing_successor_and_unknown_history_holds() {
         let home = tempfile::tempdir().unwrap();
         let mut owner = stopped_public_run(RunStatus::Blocked);

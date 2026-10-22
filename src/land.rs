@@ -3918,6 +3918,16 @@ async fn publish_landing_head<F: Forge>(
 /// only a tree proven unchanged since the saved start; never discard edits.
 async fn restore_landing_worktree(state: &mut RunState) -> Result<()> {
     let winner = state.winner().cloned().context("landing has no winner")?;
+    let wait = crate::repo_lock::WaitPolicy::new(
+        Duration::from_secs(state.config.graph.timeout_resource_wait),
+        || false,
+    );
+    let _coordination = crate::repo_lock::SeatLease::operation_with(
+        &winner.worktree,
+        state.config.coordination.as_ref(),
+        &wait,
+    )
+    .await?;
     if !git::is_clean(&winner.worktree).await? {
         let from = state
             .land_rebase_from
@@ -3964,7 +3974,6 @@ async fn rebase_landing_worktree(
     let scratch = state.dir().join("rebase");
     let result = crate::rebase::rebase_with_fixer(state, &scratch, &winner.branch, onto).await?;
     if result == crate::rebase::Rebased::Applied {
-        git::sync_to_head(&winner.worktree).await?;
         restore_landing_worktree(state).await?;
     }
     Ok(result)
@@ -6999,6 +7008,64 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                     .await
                     .unwrap()
                     .contains(".env")
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn landing_restoration_waits_for_external_coordination_before_changing_files() {
+        use std::os::fd::AsRawFd as _;
+
+        for interrupted in [false, true] {
+            let (_tmp, mut state, _) = landing_git_fixture().await;
+            advance_landing_base(&state).await;
+            landing_setup(&mut state).await;
+            if interrupted {
+                interrupt_landing_rebase(&mut state).await;
+            }
+            state.config.worktree.setup =
+                vec![toml::from_str("run = \"printf restored > .env\"").unwrap()];
+            let common = crate::repo_lock::common_dir(&state.repo)
+                .await
+                .unwrap()
+                .unwrap();
+            std::fs::write(common.join("updater.contract"), "test-protocol-v1\n").unwrap();
+            state.config.coordination = crate::config::test_coordination();
+            state.config.graph.timeout_resource_wait = 0;
+            let external = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(common.join("updater.lock"))
+                .unwrap();
+            // SAFETY: the descriptor belongs to `external` and remains open.
+            let locked =
+                unsafe { libc::flock(external.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            assert_eq!(locked, 0);
+            let before = git::git(&state.repo, &["diff", "HEAD"]).await.unwrap();
+            let checkpoint = state.land_rebase_from.clone();
+            let error = restore_landing_worktree(&mut state).await.unwrap_err();
+            assert!(error.is::<crate::repo_lock::ResourceBlocked>(), "{error:#}");
+            assert_eq!(
+                git::git(&state.repo, &["diff", "HEAD"]).await.unwrap(),
+                before
+            );
+            assert_eq!(state.land_rebase_from, checkpoint);
+            assert_eq!(
+                std::fs::read_to_string(state.repo.join(".env")).unwrap(),
+                "secret"
+            );
+
+            drop(external);
+            state.config.graph.timeout_resource_wait = 2;
+            restore_landing_worktree(&mut state).await.unwrap();
+            assert!(git::is_clean(&state.repo).await.unwrap());
+            assert!(state.land_rebase_from.is_none());
+            assert_eq!(
+                std::fs::read_to_string(state.repo.join(".env")).unwrap(),
+                "restored"
             );
         }
     }

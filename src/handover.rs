@@ -383,7 +383,8 @@ pub(crate) fn landing_checkpoint(state: &RunState) -> bool {
 }
 
 /// Shared admission policy for queue retries, typed actions and control resume.
-/// Review exhaustion does not spend a publication or landing checkpoint.
+/// Review exhaustion does not spend a publication or landing checkpoint, or
+/// prevent work after a clean review from retrying an infrastructure wait.
 pub(crate) fn can_resume(state: &RunState) -> bool {
     state.status.resumable()
         && !state.released()
@@ -391,6 +392,7 @@ pub(crate) fn can_resume(state: &RunState) -> bool {
         && state.pr_taken_over_by.is_none()
         && (resume_checkpoint(state)
             || crate::run::try_home().is_some_and(|home| has_resume_checkpoint(state, &home))
+            || state.reviews.iter().any(|round| round.clean)
             || !(state.status == RunStatus::Blocked
                 && state.reviews.len() >= state.config.graph.review_rounds))
 }
