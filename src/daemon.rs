@@ -1913,7 +1913,13 @@ fn settle_and_diagnose(
         }
         task.mark_action_applied(&d.question);
         if let Some(pass) = state.passes.last() {
-            task.record_pass(&state.id, pass.index, task.attempts, None);
+            task.record_pass_at(
+                &state.id,
+                pass.index,
+                Some(pass.started_at),
+                task.attempts,
+                None,
+            );
         }
         return;
     }
@@ -1957,7 +1963,13 @@ fn settle_and_diagnose(
             )));
         }
         if let Some(pass) = state.passes.last() {
-            task.record_pass(&state.id, pass.index, attempts_before, None);
+            task.record_pass_at(
+                &state.id,
+                pass.index,
+                Some(pass.started_at),
+                attempts_before,
+                None,
+            );
         }
         return;
     }
@@ -2011,7 +2023,13 @@ fn settle_and_diagnose(
             Some(crate::run::PassEnd::Parked { cause }) => Some(cause.clone()),
             _ => None,
         };
-        task.record_pass(&state.id, pass.index, attempts_before, parked);
+        task.record_pass_at(
+            &state.id,
+            pass.index,
+            Some(pass.started_at),
+            attempts_before,
+            parked,
+        );
     }
     if task.status == TaskStatus::Held {
         if state.prep_failure.is_none() {
@@ -3039,6 +3057,17 @@ fn claim_dispatch(
         PermitKind::Urgent => Some(Arc::clone(urgent).try_acquire_owned().ok()?),
         PermitKind::Ordinary => Some(Arc::clone(ordinary).try_acquire_owned().ok()?),
     };
+    // Persist the dispatch order under the claim, before config discovery or
+    // coordination waits can reorder concurrent starts.
+    let stamp = Timestamp::now();
+    let mut task = task;
+    task.dispatched_at = Some(stamp);
+    if let Err(e) = queue.modify(&task.id, |t| {
+        t.dispatched_at = Some(stamp);
+        true
+    }) {
+        tracing::warn!("could not record dispatch order of {}: {e:#}", task.short());
+    }
     Some(DispatchClaim {
         task,
         claim,
@@ -5447,7 +5476,7 @@ fn runnable(queue: &Queue) -> Vec<Task> {
         .into_iter()
         .filter(|t| t.status.runnable())
         .collect();
-    tasks.sort_unstable_by(|a, b| b.priority.cmp(&a.priority).then(a.id.cmp(&b.id)));
+    tasks.sort_unstable_by(crate::queue::dispatch_order);
     tasks
 }
 
@@ -6070,6 +6099,49 @@ mod tests {
         t.id = id.to_owned();
         t.urgent = true;
         t
+    }
+
+    #[test]
+    fn upgrade_resume_dispatch_keeps_claim_and_lane_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let mut parked = task_with_id("parked");
+        parked.start("run".into());
+        parked.park("upgrade");
+        parked.record_pass_at(
+            "run",
+            0,
+            Some(Timestamp::now()),
+            1,
+            Some(crate::run::ParkCause::Upgrade {
+                from: "old".into(),
+                to: None,
+            }),
+        );
+        let mut fresh = task_with_id("fresh");
+        fresh.priority = 100;
+        let mut urgent_task = urgent_task("urgent");
+        for t in [&mut parked, &mut fresh, &mut urgent_task] {
+            queue.put(t).unwrap();
+        }
+        let ordinary = Arc::new(tokio::sync::Semaphore::new(1));
+        let urgent = Arc::new(tokio::sync::Semaphore::new(1));
+        let candidates = runnable(&queue);
+        assert_eq!(candidates[0].id, parked.id);
+        let first = claim_dispatch(&queue, &candidates[0], false, &ordinary, &urgent).unwrap();
+        assert!(claim_dispatch(&queue, &fresh, false, &ordinary, &urgent).is_none());
+        assert!(claim_dispatch(&queue, &urgent_task, false, &ordinary, &urgent).is_some());
+        drop(first);
+        let claimed_elsewhere = queue.claim(&parked.id).unwrap();
+        let next = runnable(&queue)
+            .into_iter()
+            .find_map(|t| claim_dispatch(&queue, &t, false, &ordinary, &urgent))
+            .unwrap();
+        assert_eq!(next.task.id, fresh.id);
+        assert_eq!(queue.get(&parked.id).unwrap().attempts, 0);
+        drop(claimed_elsewhere);
+        drop(next);
+        assert!(claim_dispatch(&queue, &parked, true, &ordinary, &urgent).is_none());
     }
 
     #[test]
@@ -8138,12 +8210,24 @@ mod tests {
             parked: true,
             no_viable_candidates: false,
         };
+        // A crash after the checkpoint but before queue settlement must
+        // recover exactly the same scheduling evidence and refund.
+        let mut orphan = t.clone();
+        reclaim(&mut orphan, Some(run.clone()), 2, "en");
+        assert_eq!(orphan.status, TaskStatus::Parked);
+        assert_eq!(orphan.attempts, 0);
+        assert_eq!(
+            orphan.upgrade_resume_key(),
+            Some((run.passes[0].started_at, orphan.id.as_str()))
+        );
         settle_and_diagnose(&mut t, verdict, "parked", 2, &run);
         assert_eq!(t.attempts, 0);
         assert_eq!(t.passes.len(), 1);
         assert_eq!(t.passes[0].cost, crate::queue::PassCost::Refunded);
         assert_eq!(t.passes[0].parked, Some(cause));
         assert_eq!(t.passes[0].pass_index, 0);
+        assert_eq!(t.passes[0].started_at, Some(run.passes[0].started_at));
+        assert!(t.upgrade_resume_key().is_some());
 
         // A resumed pass that then fails spends its attempt, and the earlier
         // pass's entry is untouched.

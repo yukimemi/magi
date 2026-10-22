@@ -15840,6 +15840,7 @@ mod tests {
         crate::queue::TaskPass {
             run: run.to_owned(),
             pass_index: index,
+            started_at: None,
             cost,
             attempts_after: 1,
             settled_at: Timestamp::now(),
