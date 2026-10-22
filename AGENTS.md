@@ -1144,6 +1144,10 @@ rebase) uses an explicit `--force-with-lease=refs/heads/<head>:<sha>` measured
 against `pr_pushed_head`, the last successful push, never a fetched tracking
 ref. An absent remote requires an empty lease; an existing remote with an
 unknown or different SHA is refused, preserving human pushes.
+Landing resume may adopt an operator-published extension when the public head
+equals the local winner and descends from the saved public head. It gates the
+updated SHA before proceeding and requires fresh approval for the changed head;
+remote-only and divergent updates remain protected.
 
 On reuse, the guarded body replaces the body in full. The title refreshes only
 if it equals the recorded `pr_posted_title` or `should_retitle` identifies a

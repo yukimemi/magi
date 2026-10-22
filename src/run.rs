@@ -876,6 +876,18 @@ pub struct ReviewRevoteRecord {
     pub failed: Option<String>,
 }
 
+/// Post-repair e2e evidence. An empty, unsuccessful record is a durable
+/// requirement saved before the fixer can change the winner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GateRepairE2e {
+    /// Exact winner SHA requiring or receiving post-repair verification.
+    pub head: String,
+    /// All configured commands completed successfully on this SHA.
+    pub passed: bool,
+    /// Last command results; empty before verification starts.
+    pub outcomes: Vec<CommandOutcome>,
+}
+
 /// One fix round spent on a failing `verify.gate`: which fixer, what it did to
 /// the tree, and the gate output it was shown.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2166,11 +2178,20 @@ pub struct RunState {
     /// from before this existed, which reads as "commit unknown".
     #[serde(default)]
     pub gate_head: Option<String>,
+    /// Resume must reconcile, sync, gate and publish the existing PR head before CI.
+    #[serde(default)]
+    pub land_sync_pending: bool,
+    /// Winner tip before a landing rebase, retained until worktree setup finishes.
+    #[serde(default)]
+    pub land_rebase_from: Option<String>,
     /// Fix rounds a failing gate has already spent, oldest first. Persisted
     /// right after each fixer call so a resumed run spends only what is left
     /// of `graph.gate_fix_rounds` instead of starting the budget over.
     #[serde(default)]
     pub gate_fixes: Vec<GateFixRecord>,
+    /// Publication after gate repair requires successful e2e on the final SHA.
+    #[serde(default)]
+    pub gate_repair_e2e: Option<GateRepairE2e>,
     /// Fixer rounds spent on a rebase conflict (base sync and land share one
     /// budget, `graph.review_rounds`), oldest first. Persisted right before
     /// each fixer call, so a resumed run spends only what is left.
@@ -2527,7 +2548,10 @@ impl RunState {
             gate: Vec::new(),
             gate_ran: false,
             gate_head: None,
+            land_sync_pending: false,
+            land_rebase_from: None,
             gate_fixes: Vec::new(),
+            gate_repair_e2e: None,
             rebase_fixes: Vec::new(),
             graft: None,
             recovery: None,

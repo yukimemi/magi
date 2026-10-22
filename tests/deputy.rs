@@ -1425,16 +1425,34 @@ async fn maintenance_named_resume_never_replaces_an_exhausted_run() {
             ChoiceAction::ResumeRun { run: run.id.clone() });
         q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
         s.store.put(&mut q).unwrap();
+        let path = s.home.join("runs").join(&run.id).join("run.json");
+        let before = std::fs::read(&path).unwrap();
+        let runs_before = std::fs::read_dir(s.home.join("runs")).unwrap()
+            .map(|entry| entry.unwrap().file_name()).collect::<std::collections::BTreeSet<_>>();
         magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
         task = queue.get(&task.id).unwrap();
+        if exhausted_before_answer {
+            // Admission refuses exhausted work before a queue pin is written.
+            assert_eq!(task.status, TaskStatus::Held);
+            assert!(task.resume_override.is_none());
+            assert_eq!(task.runs, vec![run.id.clone()]);
+            assert_eq!(task.attempts, 0);
+            let receipt = std::fs::read_to_string(s.home.join("choice-actions")
+                .join(format!("{}.json", q.id))).unwrap();
+            assert!(receipt.contains("refused or failed"), "{receipt}");
+            assert!(receipt.contains("can be resumed"), "{receipt}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            let runs_after = std::fs::read_dir(s.home.join("runs")).unwrap()
+                .map(|entry| entry.unwrap().file_name()).collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(runs_after, runs_before, "no replacement run was minted");
+            continue;
+        }
         assert_eq!(task.status, TaskStatus::Queued);
         assert_eq!(task.resume_override.as_ref().unwrap().pinned_run.as_deref(), Some(run.id.as_str()));
         // Also protect a pin that was accepted while budget remained but is
         // no longer resumable by the time the daemon dispatches the attempt.
-        if !exhausted_before_answer {
-            run.reviews.push(round);
-            run.save_under(&s.home).unwrap();
-        }
+        run.reviews.push(round);
+        run.save_under(&s.home).unwrap();
         let path = s.home.join("runs").join(&run.id).join("run.json");
         let before = std::fs::read(&path).unwrap();
         let runs_before = std::fs::read_dir(s.home.join("runs")).unwrap()

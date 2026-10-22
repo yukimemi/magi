@@ -387,12 +387,16 @@ async fn merge_repair_obsolete_head_answer_is_not_consumed() {
     let (fx, runner, old_question) = held_pr(false, false).await;
     let winner = runner.state.winner().unwrap();
     magi::git::git(&winner.worktree, &["commit", "--allow-empty", "-m", "fix: newer head"]).await.unwrap();
+    let updated = magi::git::rev_parse(&winner.worktree, "HEAD").await.unwrap();
     assert!(magi::git::push(&winner.worktree, "origin", &winner.branch).await.unwrap().ok());
     let mut resumed = Runner::resume(&runner.state.id).unwrap();
     resumed.execute().await.unwrap();
     assert!(resumed.state.parked);
     assert!(resumed.state.merge_repairs.is_empty());
     assert_ne!(resumed.state.land_approval.as_ref().unwrap().question, old_question);
+    assert_eq!(resumed.state.land_approval.as_ref().unwrap().head, updated);
+    assert_eq!(resumed.state.gate_head.as_ref(), Some(&updated));
+    assert_eq!(resumed.state.pr_pushed_head.as_ref(), Some(&updated));
     assert!(!fx.tmp.path().join("forge/fixes").exists());
 }
 }
@@ -509,6 +513,222 @@ async fn serve_decision(fx: &common::Fixture, state: &RunState) {
     )
     .await
     .unwrap();
+}
+
+// Re-executed by the contention tests so the lease belongs to a different
+// live process. Closing stdin releases it and lets the child exit normally.
+#[test]
+fn landing_verification_cache_holder() {
+    use std::io::BufRead as _;
+    let Some(home) = std::env::var_os("LANDING_CACHE_TEST_HOME") else {
+        return;
+    };
+    magi::run::set_home(home.into());
+    let cache = std::path::PathBuf::from(std::env::var_os("LANDING_CACHE_TEST_DIR").unwrap());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    if let Some(trigger) = std::env::var_os("LANDING_CACHE_TEST_TRIGGER") {
+        std::fs::write(cache.join("holder-started"), "").unwrap();
+        while !std::path::Path::new(&trigger).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "fixer did not signal cache holder"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    let owner = magi::cache::Owner::here("other-run", "gate", "gate", &cache, "other-head");
+    let guard = loop {
+        match magi::cache::try_acquire(&magi::run::home(), &cache, &owner).unwrap() {
+            magi::cache::AcquireOutcome::Acquired(guard) => break guard,
+            magi::cache::AcquireOutcome::Busy(_) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixer did not release cache"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    };
+    std::fs::write(cache.join("holder-ready"), "").unwrap();
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).unwrap();
+    guard.release();
+}
+
+async fn landing_cache_contention_refunds_attempt(e2e: bool, immediate_repair: bool) {
+    let (fx, mut runner, question) = held_pr_choice(false, false, "merge").await;
+    Questions::open()
+        .update(&question, |q| {
+            q.status = magi::ask::QuestionStatus::Open;
+            q.answer = None;
+            q.answered_at = None;
+            Ok(())
+        })
+        .unwrap();
+    let cache = fx.tmp.path().join("verification-cache");
+    std::fs::create_dir(&cache).unwrap();
+    let trigger = cache.join("repair-started");
+    if immediate_repair {
+        // Acquire only after the initial gate has failed and released its
+        // cache lease. The holder then waits for the fixer wave to release
+        // its own lease, before the subsequent repair verification starts.
+        let agent = fx.tmp.path().join("mock-agent.sh");
+        let script = std::fs::read_to_string(&agent).unwrap();
+        let prefix = format!(
+            "#!/bin/sh\nif grep -q 'failed the verification gate' \"$MAGI_PROMPT_FILE\"; then\n  touch {}\nfi",
+            trigger.display(),
+        );
+        std::fs::write(agent, script.replacen("#!/bin/sh", &prefix, 1)).unwrap();
+    }
+    let started = fx.tmp.path().join("verification-started");
+    let command = format!(
+        "CARGO_TARGET_DIR={} touch {}",
+        cache.display(),
+        started.display()
+    );
+    runner.state.config.graph.timeout_resource_wait = 1;
+    runner.state.parked = false;
+    runner.state.status = RunStatus::Blocked;
+    runner.state.merge.as_mut().unwrap().ok = false;
+    if e2e {
+        runner.state.config.verify.e2e = vec![command];
+        if immediate_repair {
+            // Fail the real landing gate and let the fixture's gate fixer
+            // commit gatefix.txt before e2e tries to acquire the busy cache.
+            runner.state.config.verify.gate =
+                vec!["test -f gatefix.txt || { echo 'gatefix.txt needs repair'; exit 1; }".into()];
+            runner.state.config.graph.gate_fix_rounds = 1;
+            runner.state.gate_ran = false;
+            runner.state.gate_head = None;
+        } else {
+            runner.state.gate_repair_e2e = Some(magi::run::GateRepairE2e {
+                head: runner.state.land_approval.as_ref().unwrap().head.clone(),
+                passed: false,
+                outcomes: Vec::new(),
+            });
+        }
+    } else {
+        runner.state.config.verify.gate = vec![command];
+        runner.state.gate_ran = false;
+        runner.state.gate_head = None;
+    }
+    let mut task = decision_owner(&mut runner, &fx).await;
+    task.release_operator("test", None);
+    magi::queue::Queue::open().put(&mut task).unwrap();
+    let mut holder_command = std::process::Command::new(std::env::current_exe().unwrap());
+    if immediate_repair {
+        holder_command.env("LANDING_CACHE_TEST_TRIGGER", &trigger);
+    }
+    let mut holder = holder_command
+        .args([
+            "--exact",
+            "landing_verification_cache_holder",
+            "--nocapture",
+        ])
+        .env("LANDING_CACHE_TEST_HOME", magi::run::home())
+        .env("LANDING_CACHE_TEST_DIR", &cache)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let ready_file = if immediate_repair {
+            "holder-started"
+        } else {
+            "holder-ready"
+        };
+        while !cache.join(ready_file).exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    if ready.is_ok() {
+        serve_decision(&fx, &runner.state).await;
+    }
+    drop(holder.stdin.take());
+    let output = holder.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ready.expect("cache holder did not become ready");
+
+    let owner = magi::queue::Queue::open().get(&task.id).unwrap();
+    let disk = RunState::load(&runner.state.id).unwrap();
+    assert_eq!(
+        owner.attempts, task.attempts,
+        "resource waits must refund the attempt"
+    );
+    assert_eq!(owner.status, magi::queue::TaskStatus::Held);
+    assert_eq!(owner.hold_source, Some(magi::queue::HoldSource::Machine));
+    assert_eq!(owner.runs, task.runs);
+    assert_eq!(
+        disk.resource_block.as_ref().unwrap().node,
+        if e2e { "e2e" } else { "gate" }
+    );
+    let outcomes = if e2e {
+        &disk.gate_repair_e2e.as_ref().unwrap().outcomes
+    } else {
+        &disk.gate
+    };
+    assert!(outcomes.iter().any(|outcome| outcome.resource_blocked));
+    let worktree = &disk.winner().unwrap().worktree;
+    assert!(!started.exists());
+    let local = magi::git::rev_parse(worktree, "HEAD").await.unwrap();
+    if immediate_repair {
+        assert_eq!(disk.gate_fixes.len(), 1);
+        assert!(disk.gate_fixes[0].committed);
+        assert_ne!(&local, disk.pr_pushed_head.as_ref().unwrap());
+        assert_eq!(disk.gate_repair_e2e.as_ref().unwrap().head, local);
+    } else {
+        assert_eq!(&local, disk.pr_pushed_head.as_ref().unwrap());
+    }
+    assert_eq!(
+        magi::git::remote_head(worktree, "origin", disk.pr_branch().unwrap())
+            .await
+            .unwrap(),
+        disk.pr_pushed_head
+    );
+
+    // Once the real lease is free, releasing the task retries the same run.
+    let mut released = owner;
+    released.release_operator("test", None);
+    magi::queue::Queue::open().put(&mut released).unwrap();
+    serve_decision(&fx, &disk).await;
+    let resumed = RunState::load(&disk.id).unwrap();
+    assert!(resumed.resource_block.is_none(), "{:?}", resumed.events);
+    assert!(resumed.parked, "{:?}", resumed.events);
+    assert!(started.exists());
+    if immediate_repair {
+        assert_eq!(resumed.gate_fixes.len(), 1);
+        assert!(resumed.gate_repair_e2e.as_ref().unwrap().passed);
+        assert_eq!(resumed.gate_head, resumed.pr_pushed_head);
+        assert_eq!(resumed.land_approval.as_ref().unwrap().head, local);
+    }
+    assert_eq!(
+        magi::queue::Queue::open().get(&task.id).unwrap().runs,
+        task.runs
+    );
+}
+
+common::e2e! {
+async fn landing_gate_cache_contention_spends_no_attempt() {
+    landing_cache_contention_refunds_attempt(false, false).await;
+}
+}
+
+common::e2e! {
+async fn landing_post_repair_e2e_cache_contention_spends_no_attempt() {
+    landing_cache_contention_refunds_attempt(true, false).await;
+}
+}
+
+common::e2e! {
+async fn landing_immediate_repair_e2e_cache_contention_spends_no_attempt() {
+    landing_cache_contention_refunds_attempt(true, true).await;
+}
 }
 
 common::e2e! {
@@ -654,11 +874,15 @@ async fn decision_cli_stale_merge_answer_never_authorizes_a_changed_head() {
     let w = runner.state.winner().unwrap();
     std::fs::write(w.worktree.join("after-approval.txt"), "new head").unwrap();
     magi::git::commit_all(&w.worktree, "fix: move head after approval").await.unwrap();
+    let updated = magi::git::rev_parse(&w.worktree, "HEAD").await.unwrap();
     assert!(magi::git::push(&w.worktree, "origin", &w.branch).await.unwrap().ok());
     serve_decision(&fx, &runner.state).await;
     let disk = RunState::load(&runner.state.id).unwrap();
     assert!(disk.parked);
     assert_ne!(disk.land_approval.as_ref().unwrap().question, question);
+    assert_eq!(disk.land_approval.as_ref().unwrap().head, updated);
+    assert_eq!(disk.gate_head.as_ref(), Some(&updated));
+    assert_eq!(disk.pr_pushed_head.as_ref(), Some(&updated));
     assert_ne!(disk.status, RunStatus::Merged);
     assert_eq!(magi::queue::Queue::open().get(&task.id).unwrap().runs, task.runs);
     let calls = std::fs::read_to_string(fx.tmp.path().join("forge/calls")).unwrap();
@@ -728,7 +952,7 @@ fn run_cli(fx: &common::Fixture, args: &[&str]) {
     );
 }
 
-async fn approval_gate_late_stop(choice: &str) {
+async fn approval_gate_late_stop(choice: &str, during_gate: bool) {
     let (fx, mut runner, question) = held_pr_choice(false, false, choice).await;
     let task = decision_owner(&mut runner, &fx).await;
     Questions::open()
@@ -741,7 +965,14 @@ async fn approval_gate_late_stop(choice: &str) {
         .unwrap();
     // The first owner_stop sees an open card. Disarming this saved arm is
     // the await between that read and approval_gate reading the card again.
-    runner.state.land_armed_head = Some(runner.state.land_approval.as_ref().unwrap().head.clone());
+    if during_gate {
+        runner.state.gate_ran = false;
+        runner.state.gate_head = None;
+        runner.state.config.verify.gate = vec![r#"rm "$REPAIR_FORGE/late-answer" && (unset MAGI_RUN MAGI_NODE MAGI_SEAT MAGI_TURN_SCOPE; cd "$REPAIR_HOME" && "$REPAIR_CLI" answer "$REPAIR_LATE_QUESTION" --reply "$REPAIR_LATE_CHOICE")"#.into()];
+    } else {
+        runner.state.land_armed_head =
+            Some(runner.state.land_approval.as_ref().unwrap().head.clone());
+    }
     runner.state.save().unwrap();
     std::fs::write(fx.tmp.path().join("forge/late-answer"), "").unwrap();
     // SAFETY: this test owns an isolated child; the callback runs after these writes.
@@ -794,13 +1025,53 @@ async fn approval_gate_late_stop(choice: &str) {
 
 common::e2e! {
 async fn decision_review_late_withdraw_at_approval_gate_closes_the_pr() {
-    approval_gate_late_stop(magi::merge_decision::WITHDRAW).await;
+    approval_gate_late_stop(magi::merge_decision::WITHDRAW, false).await;
 }
 }
 
 common::e2e! {
 async fn decision_review_late_reimplementation_at_approval_gate_requeues_the_owner() {
-    approval_gate_late_stop("reimplement:beta").await;
+    approval_gate_late_stop("reimplement:beta", false).await;
+}
+}
+
+common::e2e! {
+async fn decision_review_late_withdraw_during_landing_gate_closes_the_pr() {
+    approval_gate_late_stop(magi::merge_decision::WITHDRAW, true).await;
+}
+}
+
+common::e2e! {
+async fn decision_review_late_reimplementation_during_landing_gate_requeues_the_owner() {
+    approval_gate_late_stop("reimplement:beta", true).await;
+}
+}
+
+common::e2e! {
+async fn decision_repair_answer_survives_a_landing_base_advance() {
+    let (fx, runner, question) = held_pr(false, false).await;
+    let old_head = runner.state.land_approval.as_ref().unwrap().head.clone();
+    magi::git::git(&fx.repo, &["checkout", "main"]).await.unwrap();
+    std::fs::write(fx.repo.join("base-advance.txt"), "new base").unwrap();
+    magi::git::commit_all(&fx.repo, "test: advance base").await.unwrap();
+    assert!(magi::git::push(&fx.repo, "origin", "main").await.unwrap().ok());
+
+    let mut resumed = Runner::resume(&runner.state.id).unwrap();
+    resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.id, runner.state.id);
+    assert_eq!(resumed.state.merge_repairs.len(), 1, "{:?}", resumed.state.events);
+    let repair = &resumed.state.merge_repairs[0];
+    assert_eq!(repair.question, question);
+    assert_eq!(repair.head, old_head);
+    assert_eq!(repair.phase, MergeRepairPhase::Complete);
+    assert!(fx.tmp.path().join("forge/fixes").exists());
+    assert!(resumed.state.parked);
+    let next = resumed.state.land_approval.as_ref().unwrap();
+    assert_ne!(next.question, question);
+    assert_ne!(next.head, old_head);
+    assert!(Questions::open().get(&next.question).unwrap().status.open());
+    let calls = std::fs::read_to_string(fx.tmp.path().join("forge/calls")).unwrap();
+    assert!(calls.lines().filter(|line| line.starts_with("pr merge")).all(|line| line.contains("--disable-auto")));
 }
 }
 
