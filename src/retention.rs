@@ -1351,6 +1351,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sweep_skips_missing_candidate_checkout_and_reclaims_later_runs() {
+        let f = Fx::new().await;
+        let mut missing = f.run("aa00", false).await;
+        Fx::target(&missing.candidates[0].worktree);
+        missing.repo = missing.candidates[0].worktree.clone();
+        missing.save_under(&f.home).unwrap();
+        std::fs::remove_dir_all(&missing.repo).unwrap();
+        assert!(missing.worktree_root().is_dir());
+        assert!(f.repo.is_dir());
+
+        let healthy = f.run("aa01", false).await;
+        Fx::target(&healthy.candidates[0].worktree);
+
+        let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+        assert!(report.failures.is_empty(), "{report:?}");
+        assert_eq!(report.freed_bytes, 200, "{report:?}");
+        assert!(
+            !healthy.candidates[0]
+                .worktree
+                .join("target/debug/output")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
     async fn sweep_reports_invalid_repository_and_still_reclaims_later_runs() {
         let f = Fx::new().await;
         let broken = Fx::new().await;
