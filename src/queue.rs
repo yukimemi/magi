@@ -1409,9 +1409,20 @@ impl Task {
         self.schema = self.schema.max(SCHEMA);
     }
 
+    /// Record a settled pass whose start time is unknown (see [`Self::record_pass_at`]).
+    pub fn record_pass(
+        &mut self,
+        run: &str,
+        pass_index: usize,
+        attempts_before: usize,
+        parked: Option<crate::run::ParkCause>,
+    ) {
+        self.record_pass_at(run, pass_index, None, attempts_before, parked);
+    }
+
     /// Record a settled pass. `attempts_before` is the count just before the
     /// settle, so a refund is read off what actually changed, not inferred.
-    pub fn record_pass(
+    pub fn record_pass_at(
         &mut self,
         run: &str,
         pass_index: usize,
@@ -5154,7 +5165,7 @@ mod tests {
         t.id = id.into();
         t.start(format!("run-{id}"));
         t.park("upgrade");
-        t.record_pass(
+        t.record_pass_at(
             &format!("run-{id}"),
             0,
             Some(started.parse().unwrap()),
@@ -5247,12 +5258,12 @@ mod tests {
         let q = Queue::at(dir.path().join("queue"));
         let mut t = task("resume");
         t.start("A".into());
-        t.record_pass("A", 0, None, 1, None);
+        t.record_pass("A", 0, 1, None);
         t.start("B".into());
         q.put(&mut t).unwrap();
         assert_eq!(t.runs, vec!["A", "B"]);
         t.start("A".into());
-        t.record_pass("A", 1, None, 3, None);
+        t.record_pass("A", 1, 3, None);
         q.put(&mut t).unwrap();
         let saved = q.get(&t.id).unwrap();
         assert_eq!(saved.runs, vec!["B", "A"]);
@@ -5267,9 +5278,9 @@ mod tests {
     fn repeated_start_records_one_run_and_separate_passes() {
         let mut t = task("resume");
         t.start("same-run".into());
-        t.record_pass("same-run", 0, None, 1, None);
+        t.record_pass("same-run", 0, 1, None);
         t.start("same-run".into());
-        t.record_pass("same-run", 1, None, 2, None);
+        t.record_pass("same-run", 1, 2, None);
         assert_eq!(t.runs, vec!["same-run"]);
         assert_eq!(t.attempts, 2);
         assert_eq!(t.passes.len(), 2);

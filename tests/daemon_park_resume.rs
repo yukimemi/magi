@@ -122,7 +122,7 @@ async fn park_resume(upgrade: bool) {
             Some(magi::run::PassEnd::Parked { cause }) => cause,
             _ => panic!("upgrade must leave a parked pass"),
         };
-        task.record_pass(&run_id, pass.index, Some(pass.started_at), 1, Some(cause));
+        task.record_pass_at(&run_id, pass.index, Some(pass.started_at), 1, Some(cause));
     } else {
         task.stall("parked after `judging` - resume to carry on from here");
     }

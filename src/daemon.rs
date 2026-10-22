@@ -1913,7 +1913,7 @@ fn settle_and_diagnose(
         }
         task.mark_action_applied(&d.question);
         if let Some(pass) = state.passes.last() {
-            task.record_pass(
+            task.record_pass_at(
                 &state.id,
                 pass.index,
                 Some(pass.started_at),
@@ -1963,7 +1963,7 @@ fn settle_and_diagnose(
             )));
         }
         if let Some(pass) = state.passes.last() {
-            task.record_pass(
+            task.record_pass_at(
                 &state.id,
                 pass.index,
                 Some(pass.started_at),
@@ -2023,7 +2023,7 @@ fn settle_and_diagnose(
             Some(crate::run::PassEnd::Parked { cause }) => Some(cause.clone()),
             _ => None,
         };
-        task.record_pass(
+        task.record_pass_at(
             &state.id,
             pass.index,
             Some(pass.started_at),
@@ -4063,7 +4063,7 @@ async fn attempt(
             task.attempts += 1;
             if let Some(partial) = e.downcast_ref::<crate::pr_recovery::StartupFailed>() {
                 task.link_run(&partial.run);
-                task.record_pass(&partial.run, 0, None, task.attempts, None);
+                task.record_pass(&partial.run, 0, task.attempts, None);
             }
             task.last_error = Some(format!("{start_failed}{e:#}"));
             task.hold_unrequested_retry(Some(format!(
@@ -6097,7 +6097,7 @@ mod tests {
         let mut parked = task_with_id("parked");
         parked.start("run".into());
         parked.park("upgrade");
-        parked.record_pass(
+        parked.record_pass_at(
             "run",
             0,
             Some(Timestamp::now()),
