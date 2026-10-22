@@ -3850,7 +3850,7 @@ async fn attempt(
     // review-only pass rather than resuming or competing again. Consumed
     // (cleared) here whichever way this goes, so it never outlives this one
     // attempt - see `queue::Task::review_branch`.
-    let approved_review = std::mem::take(&mut task.approved_review);
+    let approved_review = task.approved_review;
     let review_branch = take_review_branch(task, previous.as_ref());
     let branch_exists = match &review_branch {
         Some(branch) => crate::git::branch_exists(&repo, branch)
@@ -3867,7 +3867,9 @@ async fn attempt(
             ),
             None => "the approved continuation no longer matches the task's instruction; no new competition was started. Release the task to review the existing work again".to_owned(),
         };
-        task.hold_machine(Some(why));
+        // Keep the target and the approval: releasing after the branch is
+        // restored must resume this review, not compete afresh.
+        task.hold_for_handover(review_branch.clone(), why);
         record(queue, task);
         return Vec::new();
     }
@@ -5306,7 +5308,7 @@ fn may_resume_run(run: &RunState, task: &Task) -> bool {
 }
 
 /// Review scaffolding is execution context, not evidence of an operator edit.
-pub(crate) fn compatible_run_instruction(run: &RunState, task: &Task) -> bool {
+pub fn compatible_run_instruction(run: &RunState, task: &Task) -> bool {
     if let Some(authored) = &run.task_instruction {
         return compatible_instruction(authored, task);
     }

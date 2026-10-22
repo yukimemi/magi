@@ -234,30 +234,89 @@ pub fn natural_matches(words: &str, operation: &TaskOperation) -> bool {
         return false;
     }
     let lower = words.to_lowercase();
-    let release = ["release", "resume", "continue", "再開", "解放", "リリース"];
-    let hold = ["hold", "pause", "保留", "止め"];
-    let verbs = |list: &[&str]| list.iter().any(|w| lower.contains(w));
-    let names = |task: &str| {
-        words
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .any(|t| t.len() >= 4 && task.starts_with(t) && !t.is_empty())
+    let release_words = ["release", "resume", "continue"];
+    let release_ja = ["再開", "解放", "リリース"];
+    let hold_words = ["hold", "pause"];
+    let hold_ja = ["保留", "止め"];
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let has = |ws: &[&str], ja: &[&str]| {
+        tokens.iter().any(|t| ws.contains(t)) || ja.iter().any(|w| lower.contains(w))
+    };
+    // The task reference: one token that is the id or a prefix of it.
+    let task_token = |task: &str| {
+        tokens
+            .iter()
+            .position(|t| t.len() >= 4 && task.to_lowercase().starts_with(t))
+    };
+    // Every other ASCII word must be a plain filler: a message that carries
+    // additional content ("review the release notes for task ...") is not an
+    // instruction to run exactly this operation.
+    let fillers = [
+        "please", "task", "the", "it", "to", "now", "ok", "okay", "yes", "go", "ahead", "and",
+        "a", "this", "that", "you", "can", "may", "set", "change", "make", "of", "priority",
+        "add", "file", "new", "work", "again", "is", "fine", "good",
+    ];
+    let clean = |skip: &[usize], extra: &[&str]| {
+        tokens.iter().enumerate().all(|(i, t)| {
+            skip.contains(&i)
+                || fillers.contains(t)
+                || release_words.contains(t)
+                || hold_words.contains(t)
+                || extra.contains(t)
+        })
     };
     match operation {
-        TaskOperation::Release { task } => names(task) && verbs(&release) && !verbs(&hold),
+        TaskOperation::Release { task } => {
+            let Some(at) = task_token(task) else {
+                return false;
+            };
+            has(&release_words, &release_ja)
+                && !has(&hold_words, &hold_ja)
+                && !tokens.iter().any(|t| *t == "add" || *t == "set" || *t == "priority")
+                && clean(&[at], &[])
+        }
         TaskOperation::Hold { task, reason } => {
-            names(task) && verbs(&hold) && !verbs(&release) && !reason.trim().is_empty()
+            let Some(at) = task_token(task) else {
+                return false;
+            };
+            has(&hold_words, &hold_ja)
+                && !has(&release_words, &release_ja)
+                && !reason.trim().is_empty()
+                && clean(&[at], &[])
         }
         TaskOperation::Priority { task, priority } => {
-            names(task)
-                && (lower.contains("priority") || lower.contains("優先"))
-                && words
-                    .split(|c: char| !(c.is_ascii_digit() || c == '-'))
-                    .any(|t| t.parse::<i32>().ok() == Some(*priority))
+            let Some(at) = task_token(task) else {
+                return false;
+            };
+            if *priority < 0 || !(tokens.contains(&"priority") || lower.contains("優先")) {
+                return false;
+            }
+            // The stated value is a token of its own, never a digit of the id.
+            let numbers: Vec<usize> = tokens
+                .iter()
+                .enumerate()
+                .filter(|(i, t)| *i != at && t.chars().all(|c| c.is_ascii_digit()))
+                .map(|(i, _)| i)
+                .collect();
+            numbers.len() == 1
+                && tokens[numbers[0]].parse::<i32>().ok() == Some(*priority)
+                && clean(&[at, numbers[0]], &[])
         }
         TaskOperation::Add { instruction, .. } => {
-            !instruction.trim().is_empty()
-                && words.contains(instruction.trim())
-                && (lower.contains("add") || lower.contains("file") || words.contains("追加"))
+            let text = instruction.trim();
+            if text.is_empty() || !words.contains(text) {
+                return false;
+            }
+            let rest = words.replacen(text, " ", 1).to_lowercase();
+            let rest_tokens: Vec<&str> = rest
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|t| !t.is_empty())
+                .collect();
+            (rest_tokens.contains(&"add") || rest_tokens.contains(&"file") || words.contains("追加"))
+                && rest_tokens.iter().all(|t| fillers.contains(t))
         }
         TaskOperation::Done { .. } => false,
     }
@@ -1979,6 +2038,18 @@ mod tests {
         };
         assert!(natural_matches("hold task 6af7", &hold));
         assert!(!natural_matches("hold task 6af7", &release));
+        // Mentioning the task is not an instruction to release it.
+        assert!(!natural_matches("Review the release notes for task 6af7", &release));
+        // Priority binds the stated value, never a digit of the id.
+        let prio = |n| TaskOperation::Priority {
+            task: "6af7c0de1234".into(),
+            priority: n,
+        };
+        assert!(natural_matches("Set task 6af7 priority to 9", &prio(9)));
+        assert!(!natural_matches("Set task 6af7 priority to 9", &prio(6)));
+        assert!(!natural_matches("Set task 6af7 priority to 9", &prio(7)));
+        assert!(!natural_matches("set priority of task 6af7 to 10", &prio(7)));
+        assert!(natural_matches("set priority of task 6af7 to 10", &prio(10)));
     }
 
     use std::collections::BTreeMap;

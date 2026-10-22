@@ -3834,6 +3834,18 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                 .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
             let mut t = q.get(&resolved)?;
             t.release_operator("cli", None);
+            // A run whose review budget is spent cannot resume as it is; the
+            // shared continuation judge picks the bounded repair-and-review
+            // of its surviving branch instead of a fresh competition.
+            if let Some(last) = t.runs.last()
+                && let Ok(state) = magi::run::RunState::load(last)
+                && let magi::continuation::Continuation::RepairAndReview { branch } =
+                    magi::continuation::classify(&state)
+                && magi::daemon::compatible_run_instruction(&state, &t)
+            {
+                t.request_approved_review(branch);
+                println!("continuing by reviewing the existing branch (bounded repair)");
+            }
             q.put(&mut t)?;
             println!("queued {} {}", t.short(), t.title);
             Ok(())

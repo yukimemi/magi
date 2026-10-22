@@ -1224,6 +1224,8 @@ impl Task {
         self.park_reason = None;
         self.fresh_start = false;
         self.interrupt = false;
+        // The approved continuation has now been carried out.
+        self.approved_review = false;
         // The answer has been honoured: the task got its turn.
         self.resume_override = None;
     }
@@ -2019,6 +2021,7 @@ impl Task {
         if !refused_handover {
             self.review_branch = None;
             self.review_instruction = None;
+            self.approved_review = false;
         }
         self.fresh_start = false;
     }
