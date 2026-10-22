@@ -3449,7 +3449,11 @@ async fn poll(
 /// Historical successors do not revoke a still-resumable public owner. Scan
 /// under the same lock as publication/driver claims, and fail closed on unknown
 /// history before spending another attempt.
-fn public_resume_owner(home: &Path, runs: &[String], repo: &Path) -> Result<Option<RunState>> {
+async fn public_resume_owner(
+    home: &Path,
+    runs: &[String],
+    repo: &Path,
+) -> Result<Option<RunState>> {
     let mut owner = None;
     for id in runs.iter().collect::<std::collections::BTreeSet<_>>() {
         let _lock = crate::pr_head::owner_lock(home, id)?;
@@ -3462,7 +3466,8 @@ fn public_resume_owner(home: &Path, runs: &[String], repo: &Path) -> Result<Opti
             continue;
         }
         anyhow::ensure!(
-            state.repo == repo,
+            crate::git::toplevel(&state.repo).await?.canonicalize()?
+                == crate::git::toplevel(repo).await?.canonicalize()?,
             "public owner repository differs; inspect run lineage"
         );
         anyhow::ensure!(
@@ -3504,7 +3509,7 @@ async fn attempt(
         repo.display()
     );
 
-    let public_owner = match public_resume_owner(&crate::run::home(), &task.runs, &repo) {
+    let public_owner = match public_resume_owner(&crate::run::home(), &task.runs, &repo).await {
         Ok(owner) => owner,
         Err(e) => {
             task.hold_machine(Some(format!(
@@ -10641,10 +10646,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn retained_public_owner_wins_over_an_existing_successor_and_unknown_history_holds() {
+    #[tokio::test]
+    async fn retained_public_owner_wins_over_an_existing_successor_and_unknown_history_holds() {
         let home = tempfile::tempdir().unwrap();
         let mut owner = stopped_public_run(RunStatus::Blocked);
+        let repo = tempfile::tempdir().unwrap();
+        crate::git::git(repo.path(), &["init"]).await.unwrap();
+        owner.repo = crate::git::toplevel(repo.path()).await.unwrap();
         owner.id = "20260101-000000-aaaa".into();
         owner.save_under(home.path()).unwrap();
         let mut successor = run_state(RunStatus::Blocked);
@@ -10653,13 +10661,48 @@ mod tests {
         let runs = vec![owner.id.clone(), successor.id.clone()];
         assert_eq!(
             public_resume_owner(home.path(), &runs, &owner.repo)
+                .await
                 .unwrap()
                 .unwrap()
                 .id,
             owner.id
         );
+        let subdir = owner.repo.join("nested");
+        std::fs::create_dir(&subdir).unwrap();
+        assert_eq!(
+            public_resume_owner(home.path(), &runs, &subdir)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            owner.id
+        );
+        #[cfg(unix)]
+        {
+            let alias = home.path().join("repo-alias");
+            std::os::unix::fs::symlink(&owner.repo, &alias).unwrap();
+            assert_eq!(
+                public_resume_owner(home.path(), &runs, &alias.join("nested"))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                owner.id
+            );
+        }
+        let different = tempfile::tempdir().unwrap();
+        crate::git::git(different.path(), &["init"]).await.unwrap();
+        assert!(
+            public_resume_owner(home.path(), &runs, different.path())
+                .await
+                .is_err()
+        );
         let lock = crate::pr_head::owner_lock(home.path(), &owner.id).unwrap();
-        assert!(public_resume_owner(home.path(), &runs, &owner.repo).is_err());
+        assert!(
+            public_resume_owner(home.path(), &runs, &owner.repo)
+                .await
+                .is_err()
+        );
         drop(lock);
         std::fs::remove_file(
             home.path()
@@ -10668,7 +10711,11 @@ mod tests {
                 .join("run.json"),
         )
         .unwrap();
-        assert!(public_resume_owner(home.path(), &runs, &owner.repo).is_err());
+        assert!(
+            public_resume_owner(home.path(), &runs, &owner.repo)
+                .await
+                .is_err()
+        );
     }
 
     #[test]

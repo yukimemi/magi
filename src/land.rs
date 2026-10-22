@@ -3947,15 +3947,16 @@ async fn restore_landing_worktree(state: &mut RunState) -> Result<()> {
                 "landing worktree has edits beyond the interrupted rebase"
             );
         }
+        // `sync_to_head` also cleans ignored files. Only recorded setup
+        // products may be discarded; local ignored files are still user work.
+        let products = crate::worktree_setup::withheld_paths(&winner.worktree).await;
+        let untracked = git::git(&winner.worktree, &["ls-files", "--others", "-z"]).await?;
         anyhow::ensure!(
-            git::git(
-                &winner.worktree,
-                &["ls-files", "--others", "--exclude-standard"]
-            )
-            .await?
-            .trim()
-            .is_empty(),
-            "landing worktree has untracked edits"
+            untracked
+                .split('\0')
+                .filter(|p| !p.is_empty())
+                .all(|p| products.iter().any(|product| product == p)),
+            "landing worktree has untracked or ignored edits outside setup products"
         );
         git::sync_to_head(&winner.worktree).await?;
     }
@@ -7013,6 +7014,48 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                     .contains(".env")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn landing_restoration_protects_ignored_files_outside_setup_products() {
+        let (_tmp, mut state, _) = landing_git_fixture().await;
+        advance_landing_base(&state).await;
+        landing_setup(&mut state).await;
+        interrupt_landing_rebase(&mut state).await;
+        // Include a newline to exercise NUL-delimited path handling.
+        let local = "local\nnotes";
+        let excludes = git::git(&state.repo, &["rev-parse", "--git-path", "info/exclude"])
+            .await
+            .unwrap();
+        std::fs::write(state.repo.join(excludes), "local*\n").unwrap();
+        std::fs::write(state.repo.join(local), "keep these notes").unwrap();
+        assert!(
+            git::git_raw(&state.repo, &["check-ignore", "--quiet", local])
+                .await
+                .unwrap()
+                .ok()
+        );
+        let before = git::git(&state.repo, &["diff", "HEAD"]).await.unwrap();
+        let checkpoint = state.land_rebase_from.clone();
+        let error = restore_landing_worktree(&mut state).await.unwrap_err();
+        assert!(error.to_string().contains("ignored edits"), "{error:#}");
+        assert_eq!(
+            std::fs::read_to_string(state.repo.join(local)).unwrap(),
+            "keep these notes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.repo.join(".env")).unwrap(),
+            "secret"
+        );
+        assert_eq!(
+            git::git(&state.repo, &["diff", "HEAD"]).await.unwrap(),
+            before
+        );
+        assert_eq!(state.land_rebase_from, checkpoint);
+        std::fs::remove_file(state.repo.join(local)).unwrap();
+        restore_landing_worktree(&mut state).await.unwrap();
+        assert!(git::is_clean(&state.repo).await.unwrap());
+        assert!(state.land_rebase_from.is_none());
     }
 
     #[tokio::test]
