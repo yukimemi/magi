@@ -394,8 +394,8 @@ pub(crate) fn can_resume(state: &RunState) -> bool {
         && state.pr_taken_over_by.is_none()
         && (resume_checkpoint(state)
             || crate::run::try_home().is_some_and(|home| has_resume_checkpoint(state, &home))
-            || state.config.graph.review_rounds == 0
-            || (state.reviews.iter().any(|round| round.clean)
+            || ((state.config.graph.review_rounds == 0
+                || state.reviews.iter().any(|round| round.clean))
                 && (!state.gate_ran || state.resource_block.is_some()))
             || (state.resource_block.is_some() && review == Some(RunStatus::Gating))
             || (review.is_none()
