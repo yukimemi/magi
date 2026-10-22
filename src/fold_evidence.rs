@@ -1,6 +1,6 @@
 //! Durable, bounded source evidence for confirmed-merge cleanup.
 //!
-//! Each current source HEAD gets a binary patch against the run base, a raw
+//! Each unincorporated source HEAD gets a binary patch against the run base, a raw
 //! change index (including paths/modes), and the old blobs needed to read or
 //! reconstruct that change after Git garbage collection. Reflogs and ORIG_HEAD
 //! are obsolete execution history, not additional retention obligations.
@@ -66,28 +66,10 @@ pub(crate) async fn preserve(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(error) => return Err(error.into()),
         };
-    for head in heads {
+    let unincorporated = unincorporated_heads(state, heads).await?;
+    for head in &unincorporated {
         let key = format!("head-{head}");
-        let patch = capture(
-            &state.repo,
-            &[
-                "-c",
-                "core.quotePath=true",
-                "diff",
-                "--binary",
-                "--full-index",
-                "--no-renames",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-color",
-                "--ignore-submodules=none",
-                "--submodule=short",
-                &state.base_commit,
-                head,
-                "--",
-            ],
-        )
-        .await?;
+        let patch = source_patch(&state.repo, &state.base_commit, head).await?;
         let index = capture(
             &state.repo,
             &[
@@ -170,7 +152,7 @@ pub(crate) async fn preserve(
         manifest.insert("sources".into(), json!(sources));
         manifest.insert(
             "history_policy".into(),
-            json!("Current source tips preserved; obsolete reflog/ORIG_HEAD history discarded."),
+            json!("Unincorporated current source tips preserved; obsolete reflog/ORIG_HEAD history discarded."),
         );
     }
     let data = serde_json::to_vec_pretty(&manifest)?;
@@ -187,6 +169,103 @@ pub(crate) async fn preserve(
     );
     atomic_write(&dir.join("manifest.json"), &data)?;
     Ok(())
+}
+
+/// Pin the fetched base once. A confirmed merge permits proof, but does not
+/// establish that every losing candidate or reviewer tip was incorporated.
+async fn unincorporated_heads(
+    state: &RunState,
+    heads: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    if heads.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let reference = format!(
+        "refs/remotes/{}/{}",
+        state.config.merge.remote, state.base_branch
+    );
+    let base = git::rev_parse(&state.repo, &reference)
+        .await
+        .context("cannot prove merged sources against the fetched base")?;
+    let mut squash_winner = None;
+    let mut checked_squash = false;
+    let mut remaining = BTreeSet::new();
+    for head in heads {
+        if is_ancestor(&state.repo, head, &base).await? {
+            continue;
+        }
+        if !checked_squash {
+            squash_winner = proven_squash_winner(state, &base).await?;
+            checked_squash = true;
+        }
+        if let Some(winner) = &squash_winner
+            && is_ancestor(&state.repo, head, winner).await?
+        {
+            continue;
+        }
+        remaining.insert(head.clone());
+    }
+    Ok(remaining)
+}
+
+async fn is_ancestor(repo: &Path, head: &str, base: &str) -> Result<bool> {
+    Ok(
+        git::git_raw(repo, &["merge-base", "--is-ancestor", head, base])
+            .await?
+            .ok(),
+    )
+}
+
+/// Match the complete binary patch against a single-parent commit in fetched
+/// history, including modes and blob IDs. Later base changes do not invalidate
+/// this proof. Missing winner branches on cleanup retries provide no proof.
+async fn proven_squash_winner(state: &RunState, base: &str) -> Result<Option<String>> {
+    let Some(winner) = state.winner() else {
+        return Ok(None);
+    };
+    if !git::branch_exists(&state.repo, &winner.branch).await? {
+        return Ok(None);
+    }
+    let head = git::rev_parse(&state.repo, &winner.branch).await?;
+    if !is_ancestor(&state.repo, &state.base_commit, &head).await? {
+        return Ok(None);
+    }
+    let patch = source_patch(&state.repo, &state.base_commit, &head).await?;
+    if patch.is_empty() {
+        return Ok(None);
+    }
+    let range = format!("{}..{base}", state.base_commit);
+    let commits = capture(&state.repo, &["log", "--no-merges", "--format=%H", &range]).await?;
+    for commit in std::str::from_utf8(&commits)?.lines() {
+        let parent = format!("{commit}^");
+        if source_patch(&state.repo, &parent, commit).await? == patch {
+            return Ok(Some(head));
+        }
+    }
+    Ok(None)
+}
+
+async fn source_patch(repo: &Path, from: &str, to: &str) -> Result<Vec<u8>> {
+    capture(
+        repo,
+        &[
+            "-c",
+            "core.quotePath=true",
+            "diff",
+            "--binary",
+            "--full-index",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--ignore-submodules=none",
+            "--submodule=short",
+            from,
+            to,
+            "--",
+        ],
+    )
+    .await
 }
 
 async fn capture(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {

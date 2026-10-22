@@ -2041,6 +2041,16 @@ mod tests {
         .unwrap();
         assert_eq!((folded, unreadable), (1, 0));
         assert!(!source.candidates[0].worktree.exists());
+        let evidence = f
+            .home
+            .join("runs")
+            .join(&source.id)
+            .join("artifacts/fold-evidence");
+        let names: Vec<_> = std::fs::read_dir(evidence)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from("manifest.json")]);
         assert_eq!(
             queue.get(&task.id).unwrap().status,
             crate::queue::TaskStatus::Held
@@ -2048,7 +2058,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merged_fold_archives_multi_commit_squash_and_unpublished_sources() {
+    async fn merged_fold_skips_proven_squash_and_archives_unpublished_sources() {
         for variant in ["exact", "partial", "checkpoint", "loser", "reviewer"] {
             let f = Fx::new().await;
             let mut state = f.run("cc06", true).await;
@@ -2163,7 +2173,34 @@ mod tests {
                 .join("runs")
                 .join(&state.id)
                 .join("artifacts/fold-evidence");
-            assert!(artifacts.join(format!("{head}.patch")).exists());
+            assert_eq!(
+                artifacts.join(format!("{head}.patch")).exists(),
+                variant == "partial",
+                "only a partially published winner needs evidence: {variant}"
+            );
+            assert_eq!(
+                artifacts.join(format!("{intermediate}.patch")).exists(),
+                variant == "partial",
+                "squash proof also covers intermediate reviewer tips: {variant}"
+            );
+            let patches: Vec<_> = std::fs::read_dir(&artifacts)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "patch"))
+                .collect();
+            let expected = match variant {
+                "partial" => 2,
+                "loser" | "reviewer" => 1,
+                _ => 0,
+            };
+            assert_eq!(patches.len(), expected, "{variant}");
+            if variant == "loser" {
+                assert!(
+                    std::fs::read_to_string(&patches[0])
+                        .unwrap()
+                        .contains("losing candidate")
+                );
+            }
             assert!(artifacts.join("manifest.json").exists());
             if variant == "reviewer" {
                 assert!(
@@ -2183,6 +2220,14 @@ mod tests {
         for missing in [true, false] {
             let f = Fx::new().await;
             let mut state = f.run("cc05", true).await;
+            // A fetched base exists, but these local review changes were not
+            // incorporated by ancestry, so their recovery evidence is required.
+            git::git(
+                &f.repo,
+                &["update-ref", "refs/remotes/origin/main", &f.base],
+            )
+            .await
+            .unwrap();
             let candidate = state.candidates[0].clone();
             if !missing {
                 std::fs::write(f.repo.join("base-advance"), "new base").unwrap();
