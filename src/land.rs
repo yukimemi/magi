@@ -3947,18 +3947,30 @@ async fn restore_landing_worktree(state: &mut RunState) -> Result<()> {
                 "landing worktree has edits beyond the interrupted rebase"
             );
         }
-        // `sync_to_head` also cleans ignored files. Only recorded setup
-        // products may be discarded; local ignored files are still user work.
-        let products = crate::worktree_setup::withheld_paths(&winner.worktree).await;
+        // Preserve build artifacts and local files, including ignored ones.
+        // read-tree can overwrite ignored paths, so reject collisions with
+        // the new tree (including file/directory conflicts) before updating.
         let untracked = git::git(&winner.worktree, &["ls-files", "--others", "-z"]).await?;
-        anyhow::ensure!(
-            untracked
-                .split('\0')
-                .filter(|p| !p.is_empty())
-                .all(|p| products.iter().any(|product| product == p)),
-            "landing worktree has untracked or ignored edits outside setup products"
-        );
-        git::sync_to_head(&winner.worktree).await?;
+        let tracked = git::git(
+            &winner.worktree,
+            &["ls-tree", "-r", "--name-only", "-z", "HEAD"],
+        )
+        .await?;
+        for local in untracked.split('\0').filter(|p| !p.is_empty()) {
+            anyhow::ensure!(
+                !tracked.split('\0').filter(|p| !p.is_empty()).any(|path| {
+                    path == local
+                        || path
+                            .strip_prefix(local)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                        || local
+                            .strip_prefix(path)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                }),
+                "landing worktree has an untracked or ignored path conflicting with HEAD: {local}"
+            );
+        }
+        git::git(&winner.worktree, &["read-tree", "-m", "-u", "HEAD"]).await?;
     }
     crate::worktree_setup::prepare(&state.config, &state.repo, &winner.worktree).await?;
     state.land_rebase_from = None;
@@ -7035,10 +7047,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 .unwrap()
                 .ok()
         );
-        let before = git::git(&state.repo, &["diff", "HEAD"]).await.unwrap();
-        let checkpoint = state.land_rebase_from.clone();
-        let error = restore_landing_worktree(&mut state).await.unwrap_err();
-        assert!(error.to_string().contains("ignored edits"), "{error:#}");
+        restore_landing_worktree(&mut state).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(state.repo.join(local)).unwrap(),
             "keep these notes"
@@ -7047,15 +7056,101 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             std::fs::read_to_string(state.repo.join(".env")).unwrap(),
             "secret"
         );
-        assert_eq!(
-            git::git(&state.repo, &["diff", "HEAD"]).await.unwrap(),
-            before
-        );
-        assert_eq!(state.land_rebase_from, checkpoint);
-        std::fs::remove_file(state.repo.join(local)).unwrap();
-        restore_landing_worktree(&mut state).await.unwrap();
         assert!(git::is_clean(&state.repo).await.unwrap());
         assert!(state.land_rebase_from.is_none());
+    }
+
+    #[tokio::test]
+    async fn landing_restoration_rejects_ignored_paths_conflicting_with_the_new_tree() {
+        for local in ["advance", "advance/notes", "new-directory"] {
+            let (_tmp, mut state, _) = landing_git_fixture().await;
+            advance_landing_base(&state).await;
+            // Also cover a local file blocking a new tracked directory.
+            git::git(&state.repo, &["checkout", "main"]).await.unwrap();
+            std::fs::create_dir(state.repo.join("new-directory")).unwrap();
+            std::fs::write(state.repo.join("new-directory/tracked"), "new").unwrap();
+            git::git(&state.repo, &["add", "."]).await.unwrap();
+            git::git(&state.repo, &["commit", "-m", "add directory"])
+                .await
+                .unwrap();
+            git::git(&state.repo, &["push", "origin", "main"])
+                .await
+                .unwrap();
+            git::git(&state.repo, &["checkout", "winner"])
+                .await
+                .unwrap();
+            let excludes = git::git(&state.repo, &["rev-parse", "--git-path", "info/exclude"])
+                .await
+                .unwrap();
+            std::fs::write(state.repo.join(excludes), "advance\nnew-directory\n").unwrap();
+            let path = state.repo.join(local);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "local notes").unwrap();
+            interrupt_landing_rebase(&mut state).await;
+            let before = git::git(&state.repo, &["diff", "HEAD"]).await.unwrap();
+            let checkpoint = state.land_rebase_from.clone();
+            let error = restore_landing_worktree(&mut state).await.unwrap_err();
+            assert!(
+                error.to_string().contains("conflicting with HEAD"),
+                "{error:#}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "local notes");
+            assert_eq!(
+                git::git(&state.repo, &["diff", "HEAD"]).await.unwrap(),
+                before
+            );
+            assert_eq!(state.land_rebase_from, checkpoint);
+        }
+    }
+
+    #[tokio::test]
+    async fn landing_resume_preserves_ignored_gate_artifacts_without_setup() {
+        for interrupted in [false, true] {
+            let (_tmp, mut state, old) = landing_git_fixture().await;
+            assert!(state.config.worktree.setup.is_empty());
+            // A gate product exists before the base moves, without setup metadata.
+            let excludes = git::git(&state.repo, &["rev-parse", "--git-path", "info/exclude"])
+                .await
+                .unwrap();
+            std::fs::write(state.repo.join(excludes), "target/\n").unwrap();
+            state.config.verify.gate =
+                vec!["mkdir -p target && printf artifact > target/probe".into()];
+            state.gate_ran = false;
+            resume_observed_head(&mut state, &old).await.unwrap();
+            assert_eq!(
+                std::fs::read_to_string(state.repo.join("target/probe")).unwrap(),
+                "artifact"
+            );
+            advance_landing_base(&state).await;
+            if interrupted {
+                interrupt_landing_rebase(&mut state).await;
+                state = RunState::load(&state.id).unwrap();
+            }
+            state.config.verify.gate =
+                vec!["test -f advance && test \"$(cat target/probe)\" = artifact".into()];
+            let head = resume_observed_head(&mut state, &old).await.unwrap();
+            assert_ne!(head, old);
+            assert!(state.gate_allows_progress());
+            assert_eq!(state.gate_head.as_deref(), Some(head.as_str()));
+            assert_eq!(
+                std::fs::read_to_string(state.repo.join("target/probe")).unwrap(),
+                "artifact"
+            );
+            assert!(state.land_rebase_from.is_none());
+            assert_eq!(
+                git::remote_head(&state.repo, "origin", "task-head")
+                    .await
+                    .unwrap(),
+                Some(head.clone())
+            );
+            let forge = Scripted::new(vec![seen(&head, Checks::Green, "CLEAN", false)], vec![]);
+            land_with(&mut state, &green_pr().url, &forge)
+                .await
+                .unwrap();
+            assert!(state.parked);
+            assert_eq!(state.land_approval.as_ref().unwrap().head, head);
+            assert!(forge.argvs().is_empty());
+        }
     }
 
     #[tokio::test]
