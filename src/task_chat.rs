@@ -27,12 +27,15 @@ pub(crate) fn enabled_for(tasks: &[Task], task_id: &str) -> bool {
     })
 }
 
-/// Questions whose answer is consumed by machinery with no chat command
-/// (the posting gate's text choice, a release job's retry / rerun offers)
-/// stay on the question path: delivering and retiring them would resolve
-/// them without a decision. Merge approvals are routed (button, head-bound).
+/// Questions whose answer is consumed by machinery that has no step-1 control
+/// command yet (the posting gate's text choice, a release job's retry / rerun
+/// offers, the branch-divergence choice) stay authoritative on the question
+/// path: retiring them on delivery would resolve them without a decision. The
+/// task chat is still told (see `sweep`), as a notice only. Merge approvals are
+/// routed (button, head-bound). Step 3 adds the control operations.
 pub(crate) fn chat_routable(q: &Question) -> bool {
     q.node != crate::github_text::ASK_NODE
+        && !(q.node == crate::reconcile::NODE && q.seat == crate::reconcile::SEAT)
         && (q.node != crate::bump::NOTICE_NODE || q.merge_target.is_some())
 }
 
@@ -66,7 +69,6 @@ pub fn post(
                 .or_else(|| task.filed_by_chat().map(str::to_owned))
                 .or_else(|| crate::consult::chat_talk_of(&queue.list(), task));
             let repo = task.repo.clone();
-            let want = repo.canonicalize().unwrap_or_else(|_| repo.clone());
             let load = |id: &str| -> Result<talk::Talk> {
                 if talks.path_of(id).exists() {
                     talks.get(id)
@@ -78,16 +80,10 @@ pub fn post(
                 }
             };
             let own = format!("task-{}", task.id);
-            // An associated chat for another repository cannot carry this
-            // task's decisions; fall back to the task's own chat.
-            let (id, mut chat) = match associated {
-                Some(a) => {
-                    let c = load(&a)?;
-                    if c.repo == want { (a, c) } else { (own.clone(), load(&own)?) }
-                }
-                None => (own.clone(), load(&own)?),
-            };
-            anyhow::ensure!(chat.repo == want, "task chat belongs to a different repository");
+            // The associated chat is reused whatever its repository: the
+            // owner's conversation is where the decision belongs.
+            let id = associated.unwrap_or(own);
+            let mut chat = load(&id)?;
             // Unlike passive completion/watch notifications, decisions reopen.
             if !chat.status.open() {
                 talk::reopen(&mut chat, talks)?;
@@ -103,7 +99,9 @@ pub fn post(
             let body = format!("# {}\n\n{}\n\n{}\n\nTask: {}\nRun: {}\nPR: {}\nState: {}\n",
                 crate::prompt::TASK_MESSAGE_HEADING, clean(&q.summary), clean(&q.detail),
                 task.id, run, clean(pr), task.status.as_str());
-            let instructions = if let Some(target) = &q.merge_target {
+            let instructions = if !chat_routable(q) {
+                "\nThis decision is still pending as a question in the owner's Questions list and is answered there. Tell the owner it is waiting; do not answer it yourself and do not start a deputy.\n".into()
+            } else if let Some(target) = &q.merge_target {
                 format!("\nMerge decision {} for PR {} at head {}: explain the decision and include this full question ID in your reply to offer the chat buttons. Only the owner can click Merge or Hold. Never approve from text or an agent command. Silence is a hold.\n", q.id, target.pr, target.head)
             } else {
                 "\nDiscuss this free-text decision with the owner. Apply decisions only through `magi task control`. Do not answer the legacy question or start a deputy/waiter.\n".into()
@@ -145,12 +143,14 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
         };
         // A record routed at filing time stays routed even if the switch was
         // turned off since: `routes` already hides it from the legacy path.
-        if q.routed_task.is_none() && (!chat_routable(&q) || !enabled_for(&tasks, &task_id)) {
+        if q.routed_task.is_none() && !enabled_for(&tasks, &task_id) {
             continue;
         }
         let result = (|| -> Result<()> {
             let (q, ()) = questions.update(&q.id, |r| {
-                r.routed_task = Some(task_id.clone());
+                if chat_routable(r) {
+                    r.routed_task = Some(task_id.clone());
+                }
                 Ok(())
             })?;
             // Already queued approvals must not reopen a chat on every poll.
@@ -160,7 +160,7 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
             let chat = post(queue, talks, home, &task_id, &q)?;
             questions.update(&q.id, |r| {
                 r.routed_chat = Some(chat.clone());
-                if r.merge_target.is_none() {
+                if chat_routable(r) && r.merge_target.is_none() {
                     r.abandon(format!("forwarded to task chat {chat}"));
                 }
                 Ok(())
