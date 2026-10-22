@@ -13,6 +13,7 @@ use anyhow::{Context as _, Result, ensure};
 use serde_json::json;
 use tokio::io::AsyncReadExt as _;
 
+use crate::proc::Quiet as _;
 use crate::{git, run::RunState};
 
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -270,6 +271,7 @@ async fn source_patch(repo: &Path, from: &str, to: &str) -> Result<Vec<u8>> {
 
 async fn capture(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let mut child = tokio::process::Command::new("git")
+        .quiet()
         .args(args)
         .current_dir(repo)
         .stdin(Stdio::null())
