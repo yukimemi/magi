@@ -27,12 +27,21 @@ pub(crate) fn enabled_for(tasks: &[Task], task_id: &str) -> bool {
     })
 }
 
+/// Questions whose answer is consumed by machinery with no chat command
+/// (the posting gate's text choice, a release job's retry / rerun offers)
+/// stay on the question path: delivering and retiring them would resolve
+/// them without a decision. Merge approvals are routed (button, head-bound).
+pub(crate) fn chat_routable(q: &Question) -> bool {
+    q.node != crate::github_text::ASK_NODE
+        && (q.node != crate::bump::NOTICE_NODE || q.merge_target.is_some())
+}
+
 /// Also recognize legacy and watch-linked records before the first sweep.
 pub(crate) fn routes(q: &Question, home: &Path) -> bool {
     if q.routed_task.is_some() {
         return true;
     }
-    if !q.status.open() {
+    if !q.status.open() || !chat_routable(q) {
         return false;
     }
     let tasks = Queue::at(home.join("queue")).list();
@@ -56,17 +65,29 @@ pub fn post(
             let associated = task.chat.clone()
                 .or_else(|| task.filed_by_chat().map(str::to_owned))
                 .or_else(|| crate::consult::chat_talk_of(&queue.list(), task));
-            let id = associated.unwrap_or_else(|| format!("task-{}", task.id));
-            let mut chat = if talks.path_of(&id).exists() {
-                talks.get(&id)?
-            } else {
-                let (cfg, _) = Config::discover(&task.repo, None)?;
-                talk::begin_with_id(talks, &cfg, task.repo.clone(), None,
-                    &talk::Preferred { agent: None, persona: None, implementers: Some(1) },
-                    Some(id.clone()))?
+            let repo = task.repo.clone();
+            let want = repo.canonicalize().unwrap_or_else(|_| repo.clone());
+            let load = |id: &str| -> Result<talk::Talk> {
+                if talks.path_of(id).exists() {
+                    talks.get(id)
+                } else {
+                    let (cfg, _) = Config::discover(&repo, None)?;
+                    talk::begin_with_id(talks, &cfg, repo.clone(), None,
+                        &talk::Preferred { agent: None, persona: None, implementers: Some(1) },
+                        Some(id.to_owned()))
+                }
             };
-            anyhow::ensure!(chat.repo == task.repo.canonicalize().unwrap_or_else(|_| task.repo.clone()),
-                "task chat belongs to a different repository");
+            let own = format!("task-{}", task.id);
+            // An associated chat for another repository cannot carry this
+            // task's decisions; fall back to the task's own chat.
+            let (id, mut chat) = match associated {
+                Some(a) => {
+                    let c = load(&a)?;
+                    if c.repo == want { (a, c) } else { (own.clone(), load(&own)?) }
+                }
+                None => (own.clone(), load(&own)?),
+            };
+            anyhow::ensure!(chat.repo == want, "task chat belongs to a different repository");
             // Unlike passive completion/watch notifications, decisions reopen.
             if !chat.status.open() {
                 talk::reopen(&mut chat, talks)?;
@@ -122,7 +143,9 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
         else {
             continue;
         };
-        if !enabled_for(&tasks, &task_id) {
+        // A record routed at filing time stays routed even if the switch was
+        // turned off since: `routes` already hides it from the legacy path.
+        if q.routed_task.is_none() && (!chat_routable(&q) || !enabled_for(&tasks, &task_id)) {
             continue;
         }
         let result = (|| -> Result<()> {
@@ -234,5 +257,22 @@ mod tests {
             q.answer_chat_button(Answer::Choice("merge".into()), "chat", "head-a")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn gate_and_release_job_questions_stay_on_the_question_path() {
+        let q = |node: &str| {
+            Question::new("run".into(), node.into(), "seat".into(), "s".into(), String::new(), vec![])
+        };
+        assert!(!chat_routable(&q(crate::github_text::ASK_NODE)));
+        assert!(!chat_routable(&q(crate::bump::NOTICE_NODE)));
+        assert!(chat_routable(&q("conduct")));
+        let mut m = q(crate::bump::NOTICE_NODE);
+        m.merge_target = Some(crate::merge_decision::Target {
+            pr: "https://example.test/pull/1".into(),
+            head: "h".into(),
+            language: "en".into(),
+        });
+        assert!(chat_routable(&m));
     }
 }

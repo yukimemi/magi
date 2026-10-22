@@ -1553,7 +1553,10 @@ impl Questions {
         {
             let tasks = crate::queue::Queue::at(home.join("queue")).list();
             q.routed_task = crate::task_chat::task_of(q, &tasks)
-                .filter(|id| crate::task_chat::enabled_for(&tasks, id));
+                .filter(|id| {
+                    crate::task_chat::chat_routable(q)
+                        && crate::task_chat::enabled_for(&tasks, id)
+                });
         }
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
