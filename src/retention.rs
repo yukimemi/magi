@@ -1292,6 +1292,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconciliation_proves_unmeasured_startup_candidates_empty() {
+        let f = Fx::new().await;
+        let source = f.run("af00", true).await;
+        let mut clean = f.run("af01", false).await;
+        let mut dirty = f.run("af02", false).await;
+        for state in [&mut clean, &mut dirty] {
+            state.status = RunStatus::Prep;
+            state.prep_complete = Some(false);
+            state.candidates[0].empty = false;
+            state.save_under(&f.home).unwrap();
+        }
+        std::fs::write(dirty.candidates[0].worktree.join("source"), "unsaved work").unwrap();
+        let task = f.task(&[source.clone(), clean.clone(), dirty.clone()]);
+        crate::pr_recovery::retain_sources(&task, &f.home).unwrap();
+        let plan = reconciliation_plan(&f, &task, &source).await;
+        let selected: Vec<_> = plan["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["selected"] == true)
+            .collect();
+        assert_eq!(selected.len(), 1, "{plan:#}");
+        assert_eq!(selected[0]["run"], clean.id);
+        reconcile::run(&f.home, &task.id, &source.id, plan["id"].as_str())
+            .await
+            .unwrap();
+        assert!(!clean.candidates[0].worktree.exists());
+        assert!(dirty.candidates[0].worktree.exists());
+        assert!(
+            RunState::load_under(&dirty.id, &f.home)
+                .unwrap()
+                .retired_to
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
     async fn reconciliation_blanket_retention_selected_source_and_repeated_batches() {
         let f = Fx::new().await;
         let mut source = f.run("aa00", true).await;

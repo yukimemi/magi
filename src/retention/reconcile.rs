@@ -268,7 +268,10 @@ fn eligible(home: &Path, task: &Task, state: &RunState, authority: &str) -> Resu
         state
             .candidates
             .iter()
-            .all(|c| c.commits == 0 && c.empty && c.files == 0 && !c.folded),
+            // Startup registers candidates with empty=false before measuring
+            // them. Zero counters permit proof, but do not themselves prove
+            // emptiness: strict_proof checks the actual source and reflogs.
+            .all(|c| c.commits == 0 && c.files == 0 && !c.folded),
         "recorded implementation"
     );
     marker(home, task, &state.id)?;
@@ -462,14 +465,38 @@ async fn evidence(state: &RunState, paths: &[PathBuf]) -> Result<BTreeMap<PathBu
 }
 
 fn durable_new(path: &Path, value: &impl Serialize) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(value)?;
+    durable_new_with(path, |file| Ok(file.write_all(&bytes)?))
+}
+
+fn durable_new_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> Result<()>,
+) -> Result<()> {
+    let parent = path.parent().context("missing audit parent")?;
+    // A stopped writer may leave this private staging file behind. A fresh
+    // name lets the same apply retry without trusting or reusing its contents.
+    let staging = parent.join(format!(
+        ".audit-{}-{}.tmp",
+        std::process::id(),
+        jiff::Timestamp::now().as_nanosecond()
+    ));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(path)?;
-    file.write_all(&serde_json::to_vec_pretty(value)?)?;
-    file.sync_all()?;
-    std::fs::File::open(path.parent().context("missing audit parent")?)?.sync_all()?;
-    Ok(())
+        .open(&staging)?;
+    let result = (|| {
+        write(&mut file)?;
+        file.sync_all()?;
+        // Publish a complete, synced inode atomically without replacing an
+        // existing approval. No in-place fallback is safe for these records.
+        std::fs::hard_link(&staging, path)?;
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    let _ = std::fs::remove_file(staging);
+    result
 }
 
 fn read<T: serde::de::DeserializeOwned + Serialize>(path: &Path) -> Result<T> {
@@ -949,4 +976,34 @@ pub(super) async fn interrupt_after_fence(home: &Path, task: &Task, operation: &
         anyhow::bail!("simulated interruption after durable fence")
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_publication_hides_partial_writes_and_retries_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for name in ["approved.json", "startup-fence.json"] {
+            let path = root.join(name);
+            let failed = durable_new_with(&path, |file| {
+                file.write_all(b"{\"partial\":")?;
+                assert!(!path.exists(), "partial JSON must never be published");
+                anyhow::bail!("simulated disk-full or interrupted write")
+            });
+            assert!(failed.is_err());
+            assert!(!path.exists());
+            // A killed process can leave a staging file, even a partial one.
+            // Neither it nor a staging link left after publication is read.
+            let orphan = root.join(".audit-stopped-writer.tmp");
+            std::fs::write(&orphan, b"{").unwrap();
+            let approved = serde_json::json!({"complete": true});
+            durable_new(&path, &approved).unwrap();
+            assert_eq!(read::<serde_json::Value>(&path).unwrap(), approved);
+            assert!(durable_new(&path, &serde_json::json!({"other": true})).is_err());
+            assert_eq!(read::<serde_json::Value>(&path).unwrap(), approved);
+        }
+    }
 }
