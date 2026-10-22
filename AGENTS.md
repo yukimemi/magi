@@ -3207,3 +3207,20 @@ denied or failed Git write is a `ResourceBlocked` stop (`infra` on the record):
 no round is spent, nothing is aborted, scratch and resolved files are kept and
 a resume repeats the same step. A record from before `stop` existed matches
 only when every recorded round saw the same conflict set.
+
+### Upgrade resume scheduling
+
+Only tasks parked by `ParkCause::Upgrade` retain their place ahead of ordinary
+runnable work, including newer tasks with higher ordinary priority. The latest
+settled pass must belong to the current run and the task must still be parked
+without a fresh-start request. `queue::dispatch_order` orders these resumes by
+the persisted pass start time, then task id, before ordinary priority/id order.
+Legacy pass records without a start time use settlement time and id as an
+approximation. Parking refunds the attempt; dispatch resumes the existing run
+and checkpoint rather than creating a competition. Startup parks with no run
+or recorded upgrade pass do not receive this ordering.
+
+This is candidate ordering only. Explicit interrupts, urgent slots, concurrency,
+claims, coordination, approval waits, cooldowns and resource gates retain their
+existing checks. A resume that cannot run must not stop the daemon from trying
+unrelated eligible candidates. Other park causes receive no promotion.

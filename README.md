@@ -972,6 +972,16 @@ skips what is already recorded. The run comes back as parked-and-resumable,
 the process exits, the binary can be replaced, and the next loop **resumes
 that run** rather than competing again — or you tap Resume yourself.
 
+Runs parked for a binary upgrade resume ahead of ordinary queued work,
+including newer tasks with higher ordinary priority, after the daemon restarts.
+Multiple upgrade resumes keep their persisted pass-start order (task id breaks
+ties); older records without a start time approximate it using settlement time.
+They continue the same run and checkpoint. Interrupts, urgent slots, concurrency,
+claims, coordination, approval waits and resource gates still apply: a blocked
+resume does not prevent unrelated eligible work from progressing. Other park
+causes, and startup parks without a run and recorded upgrade pass, keep ordinary
+scheduling order.
+
 A park spends no attempt. It is the operator asking for the process back, not
 a run that failed, and a few upgrades must not exhaust a budget meant for
 agents that actually misbehaved.

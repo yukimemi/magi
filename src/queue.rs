@@ -126,7 +126,24 @@ use crate::ask::Questions;
 ///
 /// 16: added [`Task::attempt_limit`], an optional task-specific retry budget.
 /// Field-only, `#[serde(default)]`; old records inherit the daemon limit.
-pub const SCHEMA: u32 = 18;
+///
+/// 19: persist settled pass start times for upgrade-resume scheduling.
+/// Old passes default to unknown and use settlement order as an approximation.
+pub const SCHEMA: u32 = 19;
+
+/// Candidate order only: all claims, lanes and eligibility gates still apply.
+/// Upgrade-parked runs retain their pass-start order ahead of ordinary work,
+/// regardless of ordinary priority. Old records without a start time use
+/// settlement time and task id as an approximation. Other parks are ordinary.
+/// Urgent slots and explicit interrupts are handled separately by the daemon.
+pub(crate) fn dispatch_order(a: &Task, b: &Task) -> std::cmp::Ordering {
+    match (a.upgrade_resume_key(), b.upgrade_resume_key()) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => b.priority.cmp(&a.priority).then(a.id.cmp(&b.id)),
+    }
+}
 
 /// Who placed the current hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -690,6 +707,9 @@ pub struct TaskPass {
     pub cost: PassCost,
     /// `attempts` once this pass was settled.
     pub attempts_after: usize,
+    /// When this pass began, retained across daemon upgrades.
+    #[serde(default)]
+    pub started_at: Option<Timestamp>,
     /// When the loop settled it.
     pub settled_at: Timestamp,
     /// Why the pass parked, when it did.
@@ -1395,6 +1415,7 @@ impl Task {
         &mut self,
         run: &str,
         pass_index: usize,
+        started_at: Option<Timestamp>,
         attempts_before: usize,
         parked: Option<crate::run::ParkCause>,
     ) {
@@ -1413,12 +1434,30 @@ impl Task {
         self.passes.push(TaskPass {
             run: run.to_owned(),
             pass_index,
+            started_at,
             cost,
             attempts_after: self.attempts,
             settled_at: Timestamp::now(),
             parked,
         });
         self.schema = self.schema.max(SCHEMA);
+    }
+
+    /// Only the latest pass of the current, resumable upgrade-parked run
+    /// retains its place. Explicit fresh starts and other park causes do not.
+    pub(crate) fn upgrade_resume_key(&self) -> Option<(Timestamp, &str)> {
+        if self.status != TaskStatus::Parked || self.fresh_start {
+            return None;
+        }
+        let pass = self.passes.last()?;
+        if self.runs.last() != Some(&pass.run)
+            || !matches!(pass.parked, Some(crate::run::ParkCause::Upgrade { .. }))
+        {
+            return None;
+        }
+        // Before schema 19 the dispatch start was not copied to the task.
+        // Settlement time is only an approximation for those old records.
+        Some((pass.started_at.unwrap_or(pass.settled_at), &self.id))
     }
 
     /// Whether this held task may only be released by an operator.
@@ -2836,15 +2875,15 @@ impl Queue {
 
     /// The task a daemon should run next, or `None` when the queue is idle.
     ///
-    /// Highest priority first, oldest first within a priority, so a burst of
-    /// agent-filed work cannot starve the task a human filed this morning.
+    /// Upgrade resumes first, then highest priority and oldest id first.
+    /// See [`dispatch_order`] for the durable ordering rule.
     pub fn next_runnable(&self) -> Option<Task> {
         let mut runnable: Vec<Task> = self
             .list()
             .into_iter()
             .filter(|t| t.status.runnable())
             .collect();
-        runnable.sort_unstable_by(|a, b| b.priority.cmp(&a.priority).then(a.id.cmp(&b.id)));
+        runnable.sort_unstable_by(dispatch_order);
         runnable.into_iter().next()
     }
 
@@ -5110,18 +5149,110 @@ mod tests {
         assert!(paths[0].ends_with(format!("{}.attachments/shot.png", t.id)));
     }
 
+    fn upgrade_parked(id: &str, started: &str) -> Task {
+        let mut t = task(id);
+        t.id = id.into();
+        t.start(format!("run-{id}"));
+        t.park("upgrade");
+        t.record_pass(
+            &format!("run-{id}"),
+            0,
+            Some(started.parse().unwrap()),
+            1,
+            Some(crate::run::ParkCause::Upgrade {
+                from: "old".into(),
+                to: None,
+            }),
+        );
+        t
+    }
+
+    #[test]
+    fn upgrade_resume_order_survives_queue_reload_and_reversed_settlement() {
+        let (_dir, q) = queue();
+        let mut later = upgrade_parked("later", "2026-10-22T00:00:02Z");
+        let mut earlier = upgrade_parked("earlier", "2026-10-22T00:00:01Z");
+        earlier.priority = -10;
+        let mut fresh = task("fresh");
+        fresh.id = "newer".into();
+        fresh.priority = 100;
+        for t in [&mut fresh, &mut later, &mut earlier] {
+            q.put(t).unwrap();
+        }
+        let reloaded = Queue::at(q.root().to_owned());
+        let mut tasks = reloaded.list();
+        tasks.sort_unstable_by(dispatch_order);
+        assert_eq!(
+            tasks.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["earlier", "later", "newer"]
+        );
+        assert_eq!(reloaded.next_runnable().unwrap().id, "earlier");
+        assert_eq!(reloaded.get("earlier").unwrap().attempts, 0);
+    }
+
+    #[test]
+    fn upgrade_resume_legacy_order_uses_settlement_and_id() {
+        let mut a = upgrade_parked("a", "2026-10-22T00:00:02Z");
+        let mut b = upgrade_parked("b", "2026-10-22T00:00:01Z");
+        for t in [&mut a, &mut b] {
+            let mut value = serde_json::to_value(&*t).unwrap();
+            value["passes"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("started_at");
+            *t = serde_json::from_value(value).unwrap();
+        }
+        assert!(dispatch_order(&a, &b).is_lt());
+        b.passes[0].settled_at = a.passes[0].settled_at;
+        assert!(dispatch_order(&a, &b).is_lt());
+    }
+
+    #[test]
+    fn upgrade_resume_key_excludes_other_parks_and_explicit_task_changes() {
+        let original = upgrade_parked("a", "2026-10-22T00:00:01Z");
+        assert!(original.upgrade_resume_key().is_some());
+        for cause in [
+            crate::run::ParkCause::Operator,
+            crate::run::ParkCause::Question,
+            crate::run::ParkCause::Interrupt {
+                reason: "interrupt".into(),
+            },
+            crate::run::ParkCause::Unspecified,
+        ] {
+            let mut t = original.clone();
+            t.passes[0].parked = Some(cause);
+            assert!(t.upgrade_resume_key().is_none());
+            let mut fresh = task("fresh");
+            fresh.priority = 1;
+            assert!(dispatch_order(&fresh, &t).is_lt());
+        }
+        let mut t = original.clone();
+        t.release();
+        assert!(t.upgrade_resume_key().is_none());
+        t.edit("edited".into(), "new instruction".into()).unwrap();
+        assert!(t.upgrade_resume_key().is_none());
+        let mut t = original.clone();
+        t.requeue();
+        t.status = TaskStatus::Parked;
+        assert!(t.upgrade_resume_key().is_none());
+        let mut t = original.clone();
+        t.start("different-run".into());
+        t.park("no upgrade");
+        assert!(t.upgrade_resume_key().is_none());
+    }
+
     #[test]
     fn explicitly_resumed_older_run_becomes_current_without_duplicate_history() {
         let dir = tempfile::tempdir().unwrap();
         let q = Queue::at(dir.path().join("queue"));
         let mut t = task("resume");
         t.start("A".into());
-        t.record_pass("A", 0, 1, None);
+        t.record_pass("A", 0, None, 1, None);
         t.start("B".into());
         q.put(&mut t).unwrap();
         assert_eq!(t.runs, vec!["A", "B"]);
         t.start("A".into());
-        t.record_pass("A", 1, 3, None);
+        t.record_pass("A", 1, None, 3, None);
         q.put(&mut t).unwrap();
         let saved = q.get(&t.id).unwrap();
         assert_eq!(saved.runs, vec!["B", "A"]);
@@ -5136,9 +5267,9 @@ mod tests {
     fn repeated_start_records_one_run_and_separate_passes() {
         let mut t = task("resume");
         t.start("same-run".into());
-        t.record_pass("same-run", 0, 1, None);
+        t.record_pass("same-run", 0, None, 1, None);
         t.start("same-run".into());
-        t.record_pass("same-run", 1, 2, None);
+        t.record_pass("same-run", 1, None, 2, None);
         assert_eq!(t.runs, vec!["same-run"]);
         assert_eq!(t.attempts, 2);
         assert_eq!(t.passes.len(), 2);
