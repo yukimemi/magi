@@ -106,9 +106,9 @@ pub fn file(
             Ok(Filed::Daemon { task, pid })
         }
         None => {
-            // Claimed first: between `put` and the claim a loop could take it.
-            let claim = queue.claim(&task.id)?;
-            queue.put(&mut task).context("file the task")?;
+            // Claimed as the task is filed, on the id that was reserved:
+            // between `put` and the claim a loop could take it.
+            let claim = queue.file_claimed(&mut task).context("file the task")?;
             Ok(Filed::Standalone { task, claim })
         }
     }
@@ -316,12 +316,9 @@ fn adopt_in(
         state.repo.clone(),
         Source::Human,
     );
-    let claim = queue
-        .claim(&task.id)
-        .with_context(|| format!("could not claim a new task for run {}", state.id))?;
     task.start(state.id.clone());
-    queue
-        .put(&mut task)
+    let claim = queue
+        .file_claimed(&mut task)
         .with_context(|| format!("could not file a new task for run {}", state.id))?;
     Ok(Some(Adopted {
         queue,
