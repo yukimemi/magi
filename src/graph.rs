@@ -879,9 +879,19 @@ impl Runner {
         let mut state = state;
         let branch = state.branch_for('A');
         let wait = repository_wait(&state, None);
-        let coordination = coordinate_operation(&mut state, repo, &wait).await?;
-        git::git(repo, &["branch", &branch, selection.source()]).await?;
-        drop(coordination);
+        let prepared = async {
+            let coordination = coordinate_operation(&mut state, repo, &wait).await?;
+            git::git(repo, &["branch", &branch, selection.source()]).await?;
+            drop(coordination);
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(e) = prepared {
+            // Nothing was exposed yet: do not leave a reserved record as a
+            // phantom owner of the public head.
+            state.discard_reserved();
+            return Err(e);
+        }
         state.event(
             "recovery",
             format!(
