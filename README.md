@@ -1226,6 +1226,7 @@ setup = [
 
 [merge]
 mode = "none"            # none | local | pr
+# ci = "expected"       # expected | none
 
 [update]
 mode = "notify"          # off | notify | install
@@ -1248,6 +1249,17 @@ fetch_interval = 600            # seconds between `git fetch origin` in every ch
 
 `mode = "none"` is the default on purpose: magi prints the merge command and
 stops. It does not touch your base branch unless you ask it to.
+
+For a repository without CI, set `[merge] ci = "none"` in its repository
+config. This explicitly ignores every check status, including third-party
+statuses, and skips waiting for an empty rollup. Conflicts, unresolved review
+comments, head verification, and the configured approval gates still apply.
+The default `"expected"` waits for readable checks and refuses to merge when
+they remain unreadable. Local release mode does not change this default.
+Repository config is read from the remote base branch, so land the setting
+there before using it. Avoid putting `ci = "none"` in machine config: it would
+ignore CI across repositories inheriting that setting. Restore `"expected"`
+when CI is introduced.
 
 `[update] auto_restart = true` opts `magi web` into the same update-and-restart
 handover as the UI's **Update & restart** button. It defaults to `false`.
