@@ -44,6 +44,63 @@ fn question(run: &str) -> Question {
 }
 
 common::e2e! {
+async fn delivery_waiting_for_chat_does_not_block_task_writes() {
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("outbox");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let mut task = task(&fx.repo, Source::Human);
+    task.origin_chat = Some(chat.id.clone());
+    queue.put(&mut task).unwrap();
+    let q = question("run-a");
+    // This is the guard a chat decision holds while its side effects update
+    // the task. Delivery must never hold the task lock while waiting for it.
+    let answer = talks.answer_guard().unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let delivery = scope.spawn(|| {
+            let result = magi::task_chat::post(&queue, &talks, &home, &task.id, &q);
+            done_tx.send(()).unwrap();
+            result
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reserved = loop {
+            if queue.get(&task.id).unwrap().chat.as_deref() == Some(chat.id.as_str()) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline { break false; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let (written_tx, written_rx) = std::sync::mpsc::channel();
+        let queue = &queue;
+        let task = &task;
+        let writer = scope.spawn(move || {
+            let result = queue.modify(&task.id, |t| {
+                t.title = "Concurrent decision update".into();
+                true
+            });
+            written_tx.send(result).unwrap();
+        });
+        let written = written_rx.recv_timeout(std::time::Duration::from_secs(5));
+        let waiting = done_rx.try_recv().is_err();
+        // Release before asserting so even a regression joins both workers.
+        drop(answer);
+        writer.join().unwrap();
+        let delivered = delivery.join().unwrap().unwrap();
+        assert!(reserved, "destination must be persisted before waiting for the chat");
+        assert!(waiting, "delivery must wait for the held chat guard");
+        assert!(written.unwrap().unwrap(), "task writes must finish while the chat is locked");
+        assert_eq!(delivered, chat.id);
+    });
+    assert_eq!(queue.get(&task.id).unwrap().title, "Concurrent decision update");
+    // A restart/retry uses the reservation and the existing dedup key.
+    magi::task_chat::post(&queue, &talks, &home, &task.id, &q).unwrap();
+    assert_eq!(talks.get(&chat.id).unwrap().pending_messages.len(), 1);
+}
+}
+
+common::e2e! {
 async fn existing_closed_chat_reopens_and_delivery_is_durable_once() {
     let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
     let home = fx.tmp.path().join("outbox");
@@ -100,10 +157,32 @@ async fn new_chat_is_solo_default_and_recovers_an_unrecorded_creation() {
     assert_eq!(chat.implementers, 1);
     assert!(chat.persona.is_empty());
     assert_eq!(chat.agent, "alpha");
+    // Reserving the task link no longer serializes talk creation. Two
+    // simultaneous first deliveries must retain both drafts in the same talk.
+    let mut other = self::task(&fx.repo, Source::Human);
+    queue.put(&mut other).unwrap();
+    let first = question("run-a");
+    let second = question("run-a");
+    let barrier = std::sync::Barrier::new(2);
+    let deliver = |q: &Question| {
+        barrier.wait();
+        magi::task_chat::post(&queue, &talks, &home, &other.id, q).unwrap()
+    };
+    let (one, two) = std::thread::scope(|scope| {
+        let one = scope.spawn(|| deliver(&first));
+        let two = scope.spawn(|| deliver(&second));
+        (one.join().unwrap(), two.join().unwrap())
+    });
+    assert_eq!(one, two);
+    let concurrent = talks.get(&one).unwrap();
+    assert_eq!(concurrent.pending_messages.len(), 2);
+    for q in [&first, &second] {
+        assert!(concurrent.notified.contains(&format!("question:{}", q.id)));
+    }
     // Simulate creation/draft committed but the task link not committed.
     queue.modify(&task.id, |t| { t.chat = None; true }).unwrap();
     assert_eq!(magi::task_chat::post(&queue, &talks, &home, &task.id, &q).unwrap(), id);
-    assert_eq!(talks.list().len(), 1);
+    assert_eq!(talks.list().len(), 2);
     assert_eq!(talks.get(&id).unwrap().pending_messages.len(), 1);
 }
 }

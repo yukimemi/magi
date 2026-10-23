@@ -1544,6 +1544,19 @@ pub(crate) fn begin_with_id(
     preferred: &Preferred,
     id: Option<String>,
 ) -> Result<Talk> {
+    // Task delivery reserves its ID before taking any talk lock. Concurrent
+    // deliveries may both see the reserved talk missing; serialize creation
+    // with draft writes so the second creator cannot overwrite an owner draft
+    // or a notice already accepted by the first.
+    let _creation = if let Some(id) = &id {
+        let guard = store.guard()?;
+        if store.path_of(id).exists() {
+            return store.get(id);
+        }
+        Some(guard)
+    } else {
+        None
+    };
     // Absolute: a relative path means the wrong repository once anything
     // other than this process reads it back.
     let repo = repo.canonicalize().unwrap_or(repo);

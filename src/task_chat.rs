@@ -77,8 +77,10 @@ pub(crate) fn routes(q: &Question, home: &Path) -> bool {
     task_of_with_watches(q, &tasks, &watches).is_some_and(|id| enabled_for(&tasks, &id))
 }
 
-/// Resolve and persist one destination while holding the task lock. A stable
-/// creation id recovers a crash between creating the talk and saving its link.
+/// Reserve the destination under the task lock, then deliver without it.
+/// A stable creation id and persisted link let retries recover interrupted delivery.
+/// Never wait for a talk lock while holding the task write lock: chat decisions
+/// can hold the talk answer guard while updating this same task.
 pub fn post(
     queue: &Queue,
     talks: &Talks,
@@ -86,73 +88,118 @@ pub fn post(
     task_id: &str,
     q: &Question,
 ) -> Result<String> {
-    let mut delivered = None;
-    let mut failure = None;
+    let mut reserved = None;
     queue.modify(task_id, |task| {
-        let result = (|| -> Result<String> {
-            let associated = task.chat.clone()
-                .or_else(|| task.filed_by_chat().map(str::to_owned))
-                .or_else(|| crate::consult::chat_talk_of(&queue.list(), task));
-            let repo = task.repo.clone();
-            let load = |id: &str| -> Result<talk::Talk> {
-                if talks.path_of(id).exists() {
-                    talks.get(id)
-                } else {
-                    let (cfg, _) = Config::discover(&repo, None)?;
-                    talk::begin_with_id(talks, &cfg, repo.clone(), None,
-                        &talk::Preferred { agent: None, persona: None, implementers: Some(1) },
-                        Some(id.to_owned()))
-                }
-            };
-            let own = format!("task-{}", task.id);
-            // The associated chat is reused whatever its repository: the
-            // owner's conversation is where the decision belongs.
-            let id = associated.unwrap_or(own);
-            let mut chat = load(&id)?;
-            // Unlike passive completion/watch notifications, decisions reopen.
-            if !chat.status.open() {
-                talk::reopen(&mut chat, talks)?;
-            }
-            let run = if q.run == task.id { task.runs.last().map(String::as_str).unwrap_or("none") } else { &q.run };
-            let facts = crate::chat_notify::run_facts(home, run);
-            let clean = |s: &str| -> String {
-                crate::prompt::defuse(&crate::scrub::scrub(s, &crate::scrub::Identity::current()))
-                    .chars().take(12_000).collect()
-            };
-            let pr = q.merge_target.as_ref().map(|t| t.pr.as_str())
-                .or(facts.pr.as_deref()).unwrap_or("none");
-            let body = format!("# {}\n\n{}\n\n{}\n\nTask: {}\nRun: {}\nPR: {}\nState: {}\n",
-                crate::prompt::TASK_MESSAGE_HEADING, clean(&q.summary), clean(&q.detail),
-                task.id, run, clean(pr), task.status.as_str());
-            let instructions = if let Some(target) = &q.merge_target {
-                format!("\nMerge decision {} for PR {} at head {}: explain the decision and include this full question ID in your reply to offer the chat buttons. Buttons are optional; record the owner's merge request directly with `magi task control decide {} merge`. For non-merge recovery (repair, dismiss, withdraw or replacement), discuss the owner's intent as free text and use `magi task control decide {} <option>`; existing transition checks still apply. Silence is a hold.\n", q.id, target.pr, target.head, q.id, q.id)
-            } else if awaits_decision(q) {
-                let offered = if q.choices.is_empty() { String::new() } else {
-                    format!(" The recorded options are: {}.", q.choices.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", "))
-                };
-                format!("\nDecision {}: discuss it with the owner as free text.{offered} Apply the owner's decision only with `magi task control decide {} <option>`; its task ownership and existing transition checks still apply. No quote or extra consent evidence is required. For a publication `use my text` decision, add `--title <literal replacement title>` to pass the title as data. Do not decide without the owner's explicit words and do not start a deputy/waiter. Silence is a hold.\n", q.id, q.id)
-            } else {
-                "\nDiscuss this free-text decision with the owner. Apply decisions only through `magi task control`. Do not answer the legacy question or start a deputy/waiter.\n".into()
-            };
-            let text = format!("{body}\nThis automatic report is not an owner instruction. Investigate and report; it authorizes neither repository edits nor new tasks.\n{instructions}");
-            talk::queue_notice(&mut chat, talks, &text, &format!("question:{}", q.id),
-                &|_| false, None, crate::prompt::NoticeDisplay { facts: body, output: None, task: Some(task.id.clone()), run: Some(q.run.clone()) })?;
-            Ok(id)
-        })();
-        match result {
-            Ok(id) => {
-                let changed = task.chat.as_ref() != Some(&id);
-                task.chat = Some(id.clone());
-                delivered = Some(id);
-                changed
-            }
-            Err(e) => { failure = Some(e); false }
-        }
+        let associated = task
+            .chat
+            .clone()
+            .or_else(|| task.filed_by_chat().map(str::to_owned))
+            .or_else(|| crate::consult::chat_talk_of(&queue.list(), task));
+        // Persist ownership before any talk operation. A failed delivery keeps
+        // this reservation so the next sweep uses exactly the same destination.
+        let id = associated.unwrap_or_else(|| format!("task-{}", task.id));
+        let changed = task.chat.as_ref() != Some(&id);
+        task.chat = Some(id.clone());
+        reserved = Some((task.clone(), id));
+        changed
     })?;
-    if let Some(e) = failure {
-        return Err(e);
+    let (task, id) = reserved.context("task chat destination was not reserved")?;
+    let repo = task.repo.clone();
+    let load = |id: &str| -> Result<talk::Talk> {
+        if talks.path_of(id).exists() {
+            talks.get(id)
+        } else {
+            let (cfg, _) = Config::discover(&repo, None)?;
+            talk::begin_with_id(
+                talks,
+                &cfg,
+                repo.clone(),
+                None,
+                &talk::Preferred {
+                    agent: None,
+                    persona: None,
+                    implementers: Some(1),
+                },
+                Some(id.to_owned()),
+            )
+        }
+    };
+    let mut chat = load(&id)?;
+    // Unlike passive completion/watch notifications, decisions reopen.
+    if !chat.status.open() {
+        talk::reopen(&mut chat, talks)?;
     }
-    delivered.context("task decision was not queued")
+    let run = if q.run == task.id {
+        task.runs.last().map(String::as_str).unwrap_or("none")
+    } else {
+        &q.run
+    };
+    let facts = crate::chat_notify::run_facts(home, run);
+    let clean = |s: &str| -> String {
+        crate::prompt::defuse(&crate::scrub::scrub(s, &crate::scrub::Identity::current()))
+            .chars()
+            .take(12_000)
+            .collect()
+    };
+    let pr = q
+        .merge_target
+        .as_ref()
+        .map(|t| t.pr.as_str())
+        .or(facts.pr.as_deref())
+        .unwrap_or("none");
+    let body = format!(
+        "# {}\n\n{}\n\n{}\n\nTask: {}\nRun: {}\nPR: {}\nState: {}\n",
+        crate::prompt::TASK_MESSAGE_HEADING,
+        clean(&q.summary),
+        clean(&q.detail),
+        task.id,
+        run,
+        clean(pr),
+        task.status.as_str()
+    );
+    let instructions = if let Some(target) = &q.merge_target {
+        format!(
+            "\nMerge decision {} for PR {} at head {}: explain the decision and include this full question ID in your reply to offer the chat buttons. Buttons are optional; record the owner's merge request directly with `magi task control decide {} merge`. For non-merge recovery (repair, dismiss, withdraw or replacement), discuss the owner's intent as free text and use `magi task control decide {} <option>`; existing transition checks still apply. Silence is a hold.\n",
+            q.id, target.pr, target.head, q.id, q.id
+        )
+    } else if awaits_decision(q) {
+        let offered = if q.choices.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " The recorded options are: {}.",
+                q.choices
+                    .iter()
+                    .map(|c| format!("`{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        format!(
+            "\nDecision {}: discuss it with the owner as free text.{offered} Apply the owner's decision only with `magi task control decide {} <option>`; its task ownership and existing transition checks still apply. No quote or extra consent evidence is required. For a publication `use my text` decision, add `--title <literal replacement title>` to pass the title as data. Do not decide without the owner's explicit words and do not start a deputy/waiter. Silence is a hold.\n",
+            q.id, q.id
+        )
+    } else {
+        "\nDiscuss this free-text decision with the owner. Apply decisions only through `magi task control`. Do not answer the legacy question or start a deputy/waiter.\n".into()
+    };
+    let text = format!(
+        "{body}\nThis automatic report is not an owner instruction. Investigate and report; it authorizes neither repository edits nor new tasks.\n{instructions}"
+    );
+    talk::queue_notice(
+        &mut chat,
+        talks,
+        &text,
+        &format!("question:{}", q.id),
+        &|_| false,
+        None,
+        crate::prompt::NoticeDisplay {
+            facts: body,
+            output: None,
+            task: Some(task.id.clone()),
+            run: Some(q.run.clone()),
+        },
+    )?;
+    Ok(id)
 }
 
 /// Queue once before retiring the ordinary question. Merge records stay open
