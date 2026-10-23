@@ -556,3 +556,112 @@ test('late reference decoration never changes a replaced conversation', async ()
   await current;
   assert.equal(h.walk(h.root).find(node => node.tag === 'a').href, '#/tasks/current');
 });
+
+test('conversation detail preempts health/list connections until its sections finish', async () => {
+  const requests = [];
+  const transport = source.slice(source.indexOf('const conversationPriority ='), source.indexOf('const getText ='));
+  const state = { talkDetail: { id: 'a' }, talkWaits: new Map() };
+  const api = runInNewContext(`${transport}\n${sections}\n${talks}\n({getJson, loadTalk})`, {
+    AbortController, state, API: { talk: id => `/api/talks/${id}` },
+    pendingForRequest: () => () => {},
+    fetch: (url, options = {}) => new Promise((resolve, reject) => {
+      const entry = { url, options, resolve: value => resolve({ ok: true, json: async () => value }) };
+      requests.push(entry);
+      options.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+    }),
+    sectionNotice() {}, trackTalkThinking() {}, renderTalk() {}, ok() {}, rememberTalkChoices() {},
+    shortId: id => id, failFor: () => assert.fail('unexpected detail failure'),
+  });
+  const health = api.getJson('/api/health');
+  const list = api.getJson('/api/talks/page');
+  await flush();
+  assert.equal(requests.length, 2);
+  const detail = api.loadTalk('a');
+  await flush();
+  assert.ok(requests[0].options.signal.aborted);
+  assert.ok(requests[1].options.signal.aborted);
+  assert.equal(requests.length, 4, 'bulk requests must wait, not retry alongside detail');
+  requests.find(r => r.url.endsWith('/core')).resolve({ id: 'a' });
+  await flush();
+  assert.equal(state.talkDetail.talk.id, 'a');
+  assert.equal(requests.length, 4);
+  requests.find(r => r.url.endsWith('/sections')).resolve({ roster: [], personas: [] });
+  await detail;
+  await flush();
+  assert.equal(requests.length, 6);
+  requests[4].resolve({});
+  requests[5].resolve({ rows: [], next: null });
+  await Promise.all([health, list]);
+});
+
+for (const expired of [false, true]) test(`chat paging is on demand and recovers expired cursors (expired=${expired})`, async () => {
+  const requests = [];
+  let recovered = false;
+  const state = { talks: null, talkReads: {}, talkWaits: new Map(), rev: {} };
+  const loaders = source.slice(source.indexOf('const storeReads ='), source.indexOf('function loadRuns('));
+  const chatLoaders = source.slice(source.indexOf('let talksNext ='), source.indexOf('/* Refresh one conversation.'));
+  const api = runInNewContext(`${loaders}\n${chatLoaders}\n({ loadTalks, loadOlderTalks, markAllTalksRead: undefined })`, {
+    state, API: { talks: '/api/talks' },
+    getJson: async url => {
+      requests.push(url);
+      if (expired && url.includes('before=') && !recovered) {
+        recovered = true;
+        throw Object.assign(new Error('cursor expired'), { status: 409 });
+      }
+      return url.includes('before=') ? { rows: [{ id: 'old', turns: [] }], next: null }
+        : { rows: [{ id: 'new', turns: [] }], next: 'cursor' };
+    },
+    $: () => null, sectionNotice() {}, renderTalks() {}, refreshSearch() {}, trackTalkThinking() {},
+    sortTalks: list => list, ok() {}, setTimeout, clearTimeout, incrementalListRender: false,
+  });
+  await api.loadTalks();
+  assert.equal(requests.length, 1);
+  assert.equal(state.talks.length, 1);
+  await api.loadOlderTalks();
+  assert.equal(requests.length, expired ? 4 : 2);
+  assert.equal(state.talks.length, 2);
+});
+
+test('mark all read includes unloaded pages and uses captured turn timestamps', async () => {
+  const saved = [];
+  const state = { talks: [{ id: 'new', turns: [{ who: 'agent', at: '2026-10-20T00:00:00Z' }] }], talkReads: {} };
+  const unread = source.slice(source.indexOf('const talkTurns ='), source.indexOf('/* Open first, then newest first'));
+  const complete = runInNewContext(`let talksNext = 'older';
+    async function loadOlderTalks() {
+      state.talks.push({ id: 'old', turns: [{ who: 'agent', at: '2026-10-19T00:00:00Z' }] });
+      talksNext = null;
+    }
+    ${unread}\n({ markAllTalksRead, talkUnreadCount })`, {
+    state, TALK_READS_KEY: 'reads', saveCollapsed: (_, data) => saved.push({ ...data }), renderTalks() {}, announce() {},
+  });
+  await complete.markAllTalksRead();
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].old, '2026-10-19T00:00:00Z');
+  assert.equal(saved[0].new, '2026-10-20T00:00:00Z');
+  assert.equal(complete.talkUnreadCount({ id: 'old', unread_count: 7, turns: [{ at: saved[0].old }] }), 0);
+  assert.equal(complete.talkUnreadCount(null), 0);
+});
+
+test('chat search hydrates matches outside the loaded page in bounded batches', async () => {
+  const requests = [];
+  const state = { talks: [{ id: 'loaded' }], talkReads: {}, search: { chats: { seq: 0 } } };
+  const search = source.slice(source.indexOf('async function runSearch('), source.indexOf('/* After the list behind a search'));
+  const rows = source.slice(source.indexOf('function talkReadOptions('), source.indexOf('function showOlderTalks('));
+  const api = runInNewContext(`${rows}\n${search}\n({ runSearch })`, {
+    state, API: { search: () => '/api/search', talks: '/api/talks' },
+    searchText: () => 'needle', renderSearchScope() {},
+    mergeStore: (_, rows) => [...state.talks, ...rows],
+    getJson: async url => {
+      requests.push(url);
+      if (url === '/api/search') return { hits: Array.from({ length: 73 }, (_, i) => ({ id: `older-${i}` })), total: 73 };
+      const ids = new URL(url, 'http://localhost').searchParams.get('ids').split(',');
+      assert.ok(ids.length <= 50);
+      return ids.map(id => ({ id }));
+    },
+  });
+  await api.runSearch('chats');
+  assert.equal(requests.length, 3);
+  assert.equal(state.talks.length, 74);
+  assert.equal(state.search.chats.status, 'ok');
+  assert.equal(state.search.chats.hits.size, 73);
+});

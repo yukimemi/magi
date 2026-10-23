@@ -44,7 +44,7 @@ Unchanged task histories and run timelines retain their DOM nodes.
   task outcome. This eliminates three independent queue parses.
 - A single worker scans revision metadata for all SSE clients and health reads.
   Cold SSE clients wait for that worker instead of starting duplicate scans.
-  Health shares revisions and reads questions once for its two counts. Transient
+  Health shares revisions and caches parsed questions by store identity. Transient
   scan failures preserve the last successful snapshot and are retried. Revision
   tokens include file identity and deletion, including question/notice stores.
   Question stores include lease and panel entries, not just JSON records.
@@ -56,8 +56,28 @@ Unchanged task histories and run timelines retain their DOM nodes.
   from the old scope. Cold/unavailable `runs_bytes` and `worktrees_bytes` are
   `null`; optional free/cache values are omitted until known. A fully measured
   empty tree is still `0`. Admission and cleanup use their existing authority.
-- No config or process-liveness cache was introduced. Mutation handlers retain
-  their existing authoritative validation.
+- Health caches run readability by file identity, including parse failures.
+  Every request reconciles metadata so replacements, repairs and deletions affect
+  `runs_unreadable` immediately. Question lease freshness is checked even when
+  question files have not changed; notification revisions remain fresh between
+  monitor ticks.
+- Display configuration discovery runs in a background thread, at most once per
+  minute. Capacity sizing keeps its independent single flight described above.
+  Health returns `disk: null` until configuration is first observed, then returns
+  the per-field capacity observations even while measurements are pending.
+  Cold readability indexing still parses each run once; warm requests only
+  parse changed runs. Mutation handlers retain authoritative validation.
+- Both conversation list routes return at most 50 summaries. Each contains at
+  most two 240-character previews, total turn count and exact unread count;
+  transcripts, Markdown trees, context calculation and references stay in detail.
+  The server retains agent timestamps internally. `x-talk-reads` accepts a JSON
+  map of conversation IDs to last-read timestamps; the UI sends it only for rows
+  in the current page, keeping headers bounded.
+- Chat loads one page, with an explicit button for older conversations. Search
+  hydrates matching summaries from the whole store; marking all read explicitly
+  walks remaining pages. Health/list reads use a separate two-slot execution
+  lane, and the browser aborts and retries those reads around conversation core
+  and sections requests, including when a response body is still downloading.
 
 The `health_disk_*` unit regressions hold a capacity walk open while concurrent
 health responses complete, then exercise single-flight refresh, failure recovery
@@ -219,9 +239,11 @@ Related conversation tasks and roster still share one secondary response.
 タスク履歴、Run の関係情報、Stats の履歴集計には一括処理が残る。
 Queue / Chat 一覧はページ単位で表示し、Stats のキュー集計は独立して表示する。 Report/detail routes still
 read run state and check liveness separately; lazy text fallback removes one
-normal read but does not eliminate the other two. Health still does config,
-disk and unreadable-run work. Further section splitting and measured shared run
-projections remain follow-up work. There is no claim that every route is O(1).
+normal read but does not eliminate the other two. Health metadata reconciliation
+and cold readability indexing remain proportional to history size; disk metrics
+and update configuration can lag by a minute plus measurement time. Further
+section splitting and measured shared run projections remain follow-up work.
+There is no claim that every route is O(1).
 
 This environment denies process inspection, so no CPU/profile comparison against
 the running web process was collected. Production accumulated-history browser
