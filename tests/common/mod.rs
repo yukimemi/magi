@@ -370,11 +370,15 @@ if [ -n "$MOCK_HANG_SEAT" ] && { case ",$MOCK_HANG_SEAT," in *",$seat,"*) true ;
   # Prove the real process reached the hang before its deadline. Sleep's
   # handles are detached: killing the MSYS shell must not leave a child
   # holding stdout. Any orphan lives at most one second, with one spawn per
-  # second rather than ten. Only magi's timeout ends this hang.
+  # second rather than ten. The 600-iteration safety cap is far above
+  # HANG_TURN_SECS, but prevents an endless hang if killing the shell fails.
   printf '%s %s %s\n' "$MAGI_NODE" "$seat" "$MOCK_AGENT_ID" >> "$(dirname "$p")/hangs.log"
-  while :; do
+  hang=0
+  while [ "$hang" -lt 600 ]; do
     sleep 1 </dev/null >/dev/null 2>&1
+    hang=$((hang + 1))
   done
+  exit 1
 fi
 
 # Rate-limit simulation: a matching seat reports the same error shape a real
