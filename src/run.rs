@@ -3253,6 +3253,16 @@ impl RunState {
         Ok(())
     }
 
+    /// Withdraw a run that was reserved but never exposed (a pre-start check
+    /// failed), so its record cannot be mistaken for an owner of anything.
+    /// Removes only this run's own freshly reserved directory.
+    pub fn discard_reserved(&self) {
+        let dir = self.dir();
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!("discard reserved run {}: {e:#}", self.id);
+        }
+    }
+
     /// Flush to `run.json`, atomically, under the process-global [`home`].
     pub fn save(&mut self) -> Result<()> {
         let home = home();

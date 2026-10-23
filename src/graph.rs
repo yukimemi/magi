@@ -860,7 +860,11 @@ impl Runner {
         state.pr_head = Some(selection.branch.clone());
         state.pr_recovery = Some(selection.clone());
         state.reserve()?;
-        crate::pr_head::check_predecessors(&state, &selection.branch).await?;
+        if let Err(e) = crate::pr_head::check_predecessors(&state, &selection.branch).await {
+            // Never leave a reserved record behind as a phantom owner of the head.
+            state.discard_reserved();
+            return Err(e);
+        }
         Self::open_selected(repo, state, roles, max_parallel, base_commit, selection).await
     }
 
