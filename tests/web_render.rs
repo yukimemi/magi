@@ -17,6 +17,8 @@
 
 #[path = "web_render/cdp.rs"]
 mod cdp;
+#[path = "web_render/diag.rs"]
+mod diag;
 // This binary uses the home lock and the fixture, not the `e2e!` wrapper.
 #[allow(unused_macros, unused_imports)]
 mod common;
@@ -273,6 +275,10 @@ async fn serve_with_client_probe(
             next.run(request).await
         },
     ));
+    let requests = diag::Requests::register(&base);
+    let router = router.layer(axum::middleware::from_fn(move |request, next| {
+        requests.clone().record(request, next)
+    }));
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });

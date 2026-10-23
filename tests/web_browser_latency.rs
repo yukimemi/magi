@@ -4,6 +4,9 @@
 mod cdp;
 #[allow(unused_macros, unused_imports)]
 mod common;
+#[allow(dead_code)]
+#[path = "web_render/diag.rs"]
+mod diag;
 
 use magi::{
     ask::{Question, Questions},

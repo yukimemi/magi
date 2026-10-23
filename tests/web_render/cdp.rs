@@ -7,12 +7,18 @@
 //! instead of hanging CI.
 
 use std::path::{Path, PathBuf};
+
+use super::diag;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
+
+#[path = "process.rs"]
+mod process;
+use process::Chrome;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
@@ -69,13 +75,17 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// One running headless Chrome and its browser-level DevTools connection.
 ///
-/// Dropping it kills the process (`kill_on_drop`), so a failed assertion cannot
-/// leave a browser behind.
-pub struct Browser {
-    child: Child,
+/// Dropping it terminates and reaps the owned Chrome process tree before
+/// removing the profile, including on failed assertions and failed launches.
+pub struct Browser<S = MaybeTlsStream<TcpStream>> {
+    child: Chrome,
     profile: tempfile::TempDir,
-    ws: Socket,
+    ws: WebSocketStream<S>,
     next_id: u64,
+    test: String,
+    requests: Option<diag::Requests>,
+    heartbeat: diag::Heartbeat,
+    event_trace: std::collections::VecDeque<Value>,
     /// Events that arrived while a command was waiting for its answer, as
     /// `(sessionId, message)`.
     events: Vec<(Option<String>, Value)>,
@@ -107,6 +117,12 @@ impl Browser {
             .arg("--no-default-browser-check")
             .arg("--disable-extensions")
             .arg("--hide-scrollbars")
+            // Pages only come from the loopback server; a proxy can never
+            // serve them, so skip proxy auto-detection (WPAD) at navigation.
+            .arg("--no-proxy-server")
+            .arg("--enable-logging")
+            .arg(format!("--log-file={}", profile.path().join("chrome-debug.log").display()))
+            .arg("--vmodule=render_process_host_impl=1,child_process_launcher_helper=1,navigation_request=1")
             // Port 0: the OS picks, Chrome reports it in DevToolsActivePort.
             .arg("--remote-debugging-port=0")
             .arg(format!("--user-data-dir={}", profile.path().display()))
@@ -115,9 +131,8 @@ impl Browser {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(log))
             .kill_on_drop(true);
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("start {}: {e}", chrome.display()))?;
+        let mut child =
+            Chrome::spawn(&mut cmd).map_err(|e| format!("start {}: {e}", chrome.display()))?;
         // `cmd` still holds the log handle; drop it so the file can be removed
         // with the profile on Windows once Chrome is gone.
         drop(cmd);
@@ -129,16 +144,19 @@ impl Browser {
                 profile,
                 ws,
                 next_id: 0,
+                test: std::thread::current()
+                    .name()
+                    .unwrap_or("unnamed")
+                    .to_owned(),
+                requests: None,
+                heartbeat: diag::Heartbeat::start(),
+                event_trace: Default::default(),
                 events: Vec::new(),
             }),
             Err(why) => {
-                let _ = child.start_kill();
-                let reaped = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
+                drop(child);
                 let stderr = std::fs::read_to_string(&log_path).unwrap_or_default();
                 let mut msg = why;
-                if reaped.is_err() {
-                    msg.push_str(" (the failed Chrome could not be reaped)");
-                }
                 let tail = tail_lines(&stderr, STDERR_LINES);
                 if tail.trim().is_empty() {
                     msg.push_str("; Chrome wrote nothing to stderr");
@@ -146,7 +164,6 @@ impl Browser {
                     msg.push_str("; Chrome stderr tail: ");
                     msg.push_str(&tail);
                 }
-                drop(child);
                 drop(profile);
                 Err(msg)
             }
@@ -154,7 +171,7 @@ impl Browser {
     }
 
     /// Wait for the debugging port and open the browser-level connection.
-    async fn connect(child: &mut Child, profile: &Path) -> Result<Socket, String> {
+    async fn connect(child: &mut Chrome, profile: &Path) -> Result<Socket, String> {
         let marker = profile.join("DevToolsActivePort");
         let deadline = Instant::now() + LAUNCH_TIMEOUT;
         let url = loop {
@@ -182,10 +199,43 @@ impl Browser {
             .map_err(|e| format!("DevTools connect: {e}"))?;
         Ok(ws)
     }
+}
 
+impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Browser<S> {
     /// Send one command and wait for its answer, keeping any events that
     /// arrive meanwhile. `session` addresses a page target.
     pub async fn call(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, String> {
+        self.call_within(session, method, params, CALL_TIMEOUT)
+            .await
+    }
+
+    async fn call_within(
+        &mut self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+        within: Duration,
+    ) -> Result<Value, String> {
+        let started_ms = diag::now();
+        match tokio::time::timeout(within, self.call_inner(session, method, params)).await {
+            Ok(result) => result,
+            Err(_) => {
+                let evidence = self.diagnostics(session).await;
+                Err(format!(
+                    "{method}: no answer within {within:?}; started_ms={started_ms}; {evidence}"
+                ))
+            }
+        }
+    }
+
+    // Also bound socket writes. Diagnostic probes use this directly so they
+    // cannot recursively diagnose themselves or extend the failed command.
+    async fn call_inner(
         &mut self,
         session: Option<&str>,
         method: &str,
@@ -201,14 +251,9 @@ impl Browser {
             .send(Message::text(msg.to_string()))
             .await
             .map_err(|e| format!("{method}: send: {e}"))?;
-        let deadline = Instant::now() + CALL_TIMEOUT;
         loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let Some(v) = self.read(left).await? else {
-                return Err(format!(
-                    "{method}: no answer within {CALL_TIMEOUT:?}; {}",
-                    self.diagnostics(session)
-                ));
+            let Some(v) = self.read(CALL_TIMEOUT).await? else {
+                continue;
             };
             if v.get("id").and_then(Value::as_u64) == Some(id) {
                 if let Some(err) = v.get("error") {
@@ -219,29 +264,70 @@ impl Browser {
         }
     }
 
-    // A renderer can stop answering while the browser's socket stays open.
-    // Preserve the evidence before Drop kills Chrome and deletes its profile;
-    // the method name alone cannot distinguish a crash from a startup hang.
-    fn diagnostics(&mut self, session: Option<&str>) -> String {
+    // Preserve evidence before cleanup deletes the profile. Probes address the
+    // browser, not the unresponsive page, and share one six-second deadline.
+    async fn diagnostics(&mut self, session: Option<&str>) -> String {
+        let at = diag::now();
         let process = match self.child.try_wait() {
             Ok(Some(status)) => format!("exited: {status}"),
             Ok(None) => "running".to_owned(),
             Err(error) => format!("status unavailable: {error}"),
         };
-        let events = self
-            .events
-            .iter()
-            .filter(|(s, _)| s.is_none() || s.as_deref() == session)
-            .rev()
-            .take(10)
-            .map(|(_, event)| event.to_string())
-            .collect::<Vec<_>>();
-        let stderr = std::fs::read_to_string(self.profile.path().join("chrome-stderr.log"))
-            .unwrap_or_else(|error| format!("stderr unavailable: {error}"));
+        let pid = self.child.id();
+        let before = json!({"at_ms": at, "test": self.test, "browser_pid": pid,
+            "Chrome": process, "heartbeat": self.heartbeat.snapshot(),
+            "requests": self.requests.as_ref().map(diag::Requests::snapshot),
+            "events": self.event_trace.iter().filter(|event|
+                event["event"]["sessionId"].as_str().is_none_or(|s| Some(s) == session))
+                .cloned().collect::<Vec<_>>()});
+        // An OS query cannot be cancelled. Keep it off Tokio's blocking pool:
+        // runtime shutdown otherwise waits forever for a stuck diagnostic query.
+        let (sender, os) = tokio::sync::oneshot::channel();
+        let sampler = std::thread::Builder::new()
+            .name("chrome-diagnostics".to_owned())
+            .spawn(move || {
+                let _ = sender.send(diag::os_samples(pid.unwrap_or(0)));
+            });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        let mut probes = Vec::new();
+        for method in [
+            "SystemInfo.getProcessInfo",
+            "Browser.getVersion",
+            "Target.getTargets",
+            "SystemInfo.getProcessInfo",
+        ] {
+            if method == "SystemInfo.getProcessInfo" && !probes.is_empty() {
+                tokio::time::sleep_until(
+                    (tokio::time::Instant::now() + Duration::from_secs(1)).min(deadline),
+                )
+                .await;
+            }
+            let end = (tokio::time::Instant::now() + Duration::from_secs(1)).min(deadline);
+            let result =
+                tokio::time::timeout_at(end, self.call_inner(None, method, json!({}))).await;
+            probes.push(json!({"at_ms": diag::now(), "method": method,
+            "result": match result {
+                Ok(Ok(value)) => value,
+                Ok(Err(error)) => json!({"error": error}),
+                Err(_) => json!({"error": "diagnostic probe timed out"}),
+            }}));
+        }
+        let os = match tokio::time::timeout_at(deadline, os).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(error)) => {
+                json!({"error": format!("OS sampler disconnected: {error}; spawn: {sampler:?}")})
+            }
+            Err(_) => json!({"error": "OS sampling exceeded diagnostic deadline"}),
+        };
         format!(
-            "Chrome {process}; recent events (newest first): {}; Chrome stderr tail: {}",
-            tail_lines(&events.join("\n"), 10),
-            tail_lines(&stderr, STDERR_LINES),
+            "{before}\n browser probes: {}\n OS samples: {os}\n HTTP after probes: {}\n Chrome stderr tail: {}\n Chrome debug tail: {}",
+            json!(probes),
+            self.requests
+                .as_ref()
+                .map(diag::Requests::snapshot)
+                .unwrap_or(Value::Null),
+            file_tail(&self.profile.path().join("chrome-stderr.log")),
+            file_tail(&self.profile.path().join("chrome-debug.log"))
         )
     }
 
@@ -266,6 +352,11 @@ impl Browser {
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
+            if self.event_trace.len() == 40 {
+                self.event_trace.pop_front();
+            }
+            self.event_trace
+                .push_back(json!({"at_ms": diag::now(), "event": v}));
             self.events.push((session, v));
             return Ok(Some(Value::Null));
         }
@@ -301,6 +392,7 @@ impl Browser {
         height: u32,
         mobile: bool,
     ) -> Result<Page, String> {
+        self.requests = diag::Requests::for_url(url);
         let t = self
             .call(None, "Target.createTarget", json!({ "url": "about:blank" }))
             .await?;
@@ -404,6 +496,20 @@ where
     Err(failures.join("; "))
 }
 
+// Read only a bounded tail, even if verbose Chrome logging grew a large file.
+fn file_tail(path: &Path) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let read = || -> std::io::Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        file.seek(SeekFrom::Start(len.saturating_sub(16 * 1024)))?;
+        let mut bytes = Vec::new();
+        file.take(16 * 1024).read_to_end(&mut bytes)?;
+        Ok(tail_lines(&String::from_utf8_lossy(&bytes), 80))
+    };
+    read().unwrap_or_else(|error| format!("unavailable: {error}"))
+}
+
 /// The last `n` lines of `text`, also capped to `STDERR_BYTES` from the end.
 fn tail_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
@@ -421,6 +527,101 @@ fn tail_lines(text: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn exercise_timeout(respond: bool) -> String {
+        use tokio_tungstenite::tungstenite::protocol::Role;
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let server = tokio::spawn(async move {
+            let mut ws = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+            let mut methods = Vec::new();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let command: Value = serde_json::from_str(&text).unwrap();
+                let method = command["method"].as_str().unwrap().to_owned();
+                methods.push(method.clone());
+                if method == "Page.navigate" {
+                    continue;
+                }
+                if !respond {
+                    if methods.len() == 5 {
+                        // Keep the socket open through the final probe timeout.
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        break;
+                    }
+                    continue;
+                }
+                // Include the original late answer: it must not satisfy a probe.
+                ws.send(Message::text(
+                    json!({"id": 1, "result": {"late": true}}).to_string(),
+                ))
+                .await
+                .unwrap();
+                ws.send(Message::text(
+                    json!({"id": command["id"], "result": {"probe": method}}).to_string(),
+                ))
+                .await
+                .unwrap();
+                if methods.len() == 5 {
+                    break;
+                }
+            }
+            methods
+        });
+        let ws = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let profile = tempfile::tempdir().unwrap();
+        let child = Chrome::spawn(&mut process::tests::helper_command(
+            &profile.path().join("leaf"),
+        ))
+        .unwrap();
+        let mut browser = Browser {
+            child,
+            profile,
+            ws,
+            next_id: 0,
+            test: "fake-CDP".to_owned(),
+            requests: None,
+            heartbeat: diag::Heartbeat::start(),
+            event_trace: Default::default(),
+            events: Vec::new(),
+        };
+        let started = Instant::now();
+        let error = browser
+            .call_within(
+                Some("page"),
+                "Page.navigate",
+                json!({}),
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert!(error.starts_with("Page.navigate: no answer within 20ms"));
+        assert!(error.contains("fake-CDP"));
+        assert!(error.contains("cpu_ms"));
+        assert_eq!(
+            server.await.unwrap(),
+            [
+                "Page.navigate",
+                "SystemInfo.getProcessInfo",
+                "Browser.getVersion",
+                "Target.getTargets",
+                "SystemInfo.getProcessInfo"
+            ]
+        );
+        error
+    }
+
+    #[tokio::test]
+    async fn timeout_probes_browser_without_retrying_page_command() {
+        let error = exercise_timeout(true).await;
+        assert!(error.contains("\"probe\":\"SystemInfo.getProcessInfo\""));
+    }
+
+    #[tokio::test]
+    async fn unresponsive_browser_probes_are_bounded_and_do_not_recurse() {
+        let error = exercise_timeout(false).await;
+        assert_eq!(error.matches("diagnostic probe timed out").count(), 4);
+        assert_eq!(error.matches("browser probes:").count(), 1);
+    }
 
     #[tokio::test]
     async fn retry_stops_at_the_first_success() {
