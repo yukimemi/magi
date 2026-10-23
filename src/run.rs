@@ -3240,9 +3240,13 @@ impl RunState {
                     }
                 }
                 self.id = id.to_owned();
-                // Keep a failed initial write visible as an unreadable reservation;
-                // a later creator must not reuse it after a crash or I/O failure.
-                self.save_under(home)?;
+                // A failed first write rolls back only our own directory:
+                // `remove_dir` refuses anything with contents, so a partial
+                // record or another run's data is never deleted.
+                if let Err(e) = self.save_under(home) {
+                    let _ = std::fs::remove_dir(&dir);
+                    return Err(e);
+                }
                 Ok(true)
             },
         )?;

@@ -653,17 +653,8 @@ impl Talks {
                 talk.id = id.to_owned();
                 let body = serde_json::to_string_pretty(talk).context("serialize new talk")?;
                 let path = self.path_of(id);
-                // Reserve private staging too: even identical temporary tokens
-                // must not let competing creators write through the same inode.
-                let staging = crate::id_reserve::IdSource::new(fresh_token).reserve(
-                    None,
-                    "talk staging",
-                    |token| crate::id_reserve::create_dir(&self.root.join(format!(".new-{token}"))),
-                )?;
-                let staging = self.root.join(format!(".new-{staging}"));
-                let result = publish_exclusive(&path, &staging.join("record"), &body);
-                let _ = std::fs::remove_dir(&staging);
-                result
+                let tmp = path.with_extension(format!("json.new.{}", fresh_token()));
+                publish_exclusive(&path, &tmp, &body)
             },
         )?;
         Ok(())
