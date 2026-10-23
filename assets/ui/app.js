@@ -727,6 +727,7 @@ const state = {
      disk, and a phone that never opens the tab should not pay for that on
      every revision tick. */
   stats: null,
+  statsQueue: null,
   /* The repository `/api/stats` is currently narrowed to (the raw path from
      `repos[].repo`, matched against `?repo=` exactly), or null for the
      all-repositories aggregate - the default. In-memory only, same as
@@ -4754,6 +4755,7 @@ function mountPanel(row, question) {
     "aria-label": `Open the panel full screen: ${question.summary || shortId(question.id)}`,
     onclick: () => openPanel(question),
   });
+  // This panel is newly opened by the operator and has no snapshot yet.
   const pending = el("p", { class: "frame-note", text: "Loading the panel\u2026" });
   r.panelBox.append(
     el("div", { class: "ask-panel-bar" },
@@ -6069,9 +6071,18 @@ function sectionRequest(key, url, accept, reject, text = false, refresh = false)
     });
   return job.promise;
 }
-function sectionNotice(anchorId, key, message, retry) {
+const sectionNoticePending = new WeakMap();
+function sectionNotice(anchorId, key, message, retry, { pending = false, snapshot = false } = {}) {
   const anchor = $(anchorId);
   if (!anchor) return;
+  let active = sectionNoticePending.get(anchor);
+  if (!active) sectionNoticePending.set(anchor, active = new Set());
+  if (pending) active.add(key);
+  else active.delete(key);
+  if (active.size) anchor.setAttribute("aria-busy", "true");
+  else anchor.removeAttribute("aria-busy");
+  // Keep both the snapshot and any error/Retry in place until this read settles.
+  if (pending && snapshot) return;
   let box = $(key);
   if (!box) {
     box = el("div", { id: key, role: "status", class: "view-sub" });
@@ -6115,7 +6126,7 @@ async function loadTalk(id, { background = false } = {}) {
   const observed = wait && { generation: wait.generation, startedAt: Date.now() };
   const current = () => state.talkDetail === detail && state.talkDetail.id === id;
   const retry = () => loadTalk(id, { background: true });
-  sectionNotice("talk-meta", "talk-core-state", detail.talk ? "" : "Loading conversation…");
+  sectionNotice("talk-meta", "talk-core-state", "Loading conversation…", null, { pending: true, snapshot: Boolean(detail.talk) });
   const core = sectionRequest(`talk:${id}:core`, `${API.talk(id)}/core`, talk => {
     trackTalkThinking(talk, observed);
     if (!current()) return;
@@ -6139,7 +6150,7 @@ async function loadTalk(id, { background = false } = {}) {
   }, false, background);
   // Waiting conversations outside the visible detail need only liveness.
   if (!current()) return core;
-  sectionNotice("talk-task-progress", "talk-sections-state", detail.sections ? "" : "Loading related tasks and choices…");
+  sectionNotice("talk-task-progress", "talk-sections-state", "Loading related tasks and choices…", null, { pending: true, snapshot: Boolean(detail.sections) });
   const sections = sectionRequest(`talk:${id}:sections`, `${API.talk(id)}/sections`, data => {
     if (!current()) return;
     detail.sections = data;
@@ -7298,6 +7309,7 @@ function renderGraft(runId, g) {
     diff.addEventListener("toggle", () => {
       if (!diff.open || loaded) return;
       loaded = true;
+      // The loaded guard makes this a first-expansion placeholder only.
       diffBox.textContent = "loading…";
       request(API.graftDiff(runId)).then((r) => r.text())
         .then((t) => { diffBox.textContent = t || "(empty diff)"; })
@@ -7526,7 +7538,7 @@ function renderReportCards() {
   const toggle = $("report-raw-toggle");
   let reason = null;
   if (!view) {
-    if (state.detail.reportLoading) {
+    if (state.detail.reportLoading && state.detail.report == null) {
       setText(raw, "Loading report…");
       show(box, false);
       show(raw, true);
@@ -7551,7 +7563,7 @@ function renderReportCards() {
   show(raw, !cards);
   show($("wrap-toggle"), !cards);
   if (!cards) {
-    setText(raw, state.detail.report || "Loading text report…");
+    setText(raw, state.detail.report ?? "Loading text report…");
     return;
   }
   /* Rebuild only when the data moved, so a refresh does not disturb a card
@@ -9367,6 +9379,7 @@ function loadStore(name, url, change, apply) {
         const partial = Boolean(!request.whole && delta && delta.base === state.rev[name] && state[name] !== null
           // Replenish the 50-row window after deletion or an unreadable row.
           && (name !== "runs" || delta.removed.length === 0));
+        const snapshot = state[name] !== null;
         const observedAt = Date.now();
         const observed = new Map([...state.talkWaits].map(([id, wait]) => [id, {
           generation: wait.generation, startedAt: observedAt,
@@ -9388,7 +9401,7 @@ function loadStore(name, url, change, apply) {
               for (const row of collected.values()) visible.set(row.id, row);
               apply(mergeStore(name, [...visible.values()], { changed: [], removed: [] }), true, observed, page.rows);
               cursor = page.next;
-              sectionNotice(`${name}-h`, `${name}-load-state`, cursor ? "Loading older entries…" : "");
+              sectionNotice(`${name}-h`, `${name}-load-state`, cursor ? "Loading older entries…" : "", null, { pending: Boolean(cursor), snapshot });
               // Finish the frozen membership walk even under continuous
               // writes. Queued deltas reconcile it after every page is shown.
             } while (cursor);
@@ -9456,10 +9469,11 @@ async function loadStats({ background = false, queueOnly = false } = {}) {
       detailSections.delete(name);
     }
   }
-  if (!queueOnly) sectionNotice("stats-h", "stats-load-state", state.stats ? "Updating statistics…" : "Loading statistics…");
+  if (!queueOnly) sectionNotice("stats-h", "stats-load-state", "Loading statistics…", null, { pending: true, snapshot: state.stats !== null });
   show($("stats-queue-scope-note"), !!state.statsRepo);
-  sectionNotice("stats-queue-tiles", "stats-queue-state", state.stats ? "Updating queue…" : "Loading queue…");
+  sectionNotice("stats-queue-tiles", "stats-queue-state", "Loading queue…", null, { pending: true, snapshot: state.statsQueue != null });
   const queue = sectionRequest("stats:queue", `${API.stats}/queue`, counts => {
+    state.statsQueue = counts;
     renderStatsQueue(counts);
     sectionNotice("stats-queue-tiles", "stats-queue-state", "");
     ok();
@@ -9507,7 +9521,7 @@ function loadQuestionOrigins() {
   questionOriginController = controller;
   if (!questionOriginsStarted) {
     questionOriginsStarted = true;
-    sectionNotice("questions-h", "questions-origin-state", "Loading question origins…");
+    sectionNotice("questions-h", "questions-origin-state", "Loading question origins…", null, { pending: true });
   }
   return getJson(`${API.questions}/origins`, { signal: controller.signal }).then(origins => {
     if (generation !== questionOriginGeneration) return;
@@ -9857,18 +9871,18 @@ async function loadRun(id, { background = false } = {}) {
   }
   const detail = state.detail;
   const retry = () => loadRun(id, { background: true });
-  sectionNotice("run-meta", "run-core-state", detail.run && !detail.run.isShell ? "" : "Loading run…");
+  sectionNotice("run-meta", "run-core-state", "Loading run…", null, { pending: true, snapshot: Boolean(detail.run && !detail.run.isShell) });
   // Stage the two new responses without discarding the displayed snapshot.
   // Shared staging also supports sectionRequest's coalesced trailing refresh.
   detail.core = null;
   detail.evidence = null;
-  const retain = background && detail.run && !detail.run.isShell;
+  const retain = Boolean(detail.run && !detail.run.isShell);
   if (!retain) {
     detail.evidenceError = true;
     renderRunDetail();
   }
   setRunEvidencePending(true);
-  sectionNotice("run-meta", "run-evidence-state", "Loading related status…");
+  sectionNotice("run-meta", "run-evidence-state", "Loading related status…", null, { pending: true, snapshot: retain });
   const applyEvidence = () => {
     if (!detail.core || !detail.evidence) return;
     if (!detail.core.updated_at || detail.core.updated_at !== detail.evidence.updated_at) {
@@ -10719,6 +10733,11 @@ function renderSettings() {
   renderSettingsContext();
   const d = settingsState.data;
   const body = $("settings-body");
+  // Retain the rendered settings during refresh; Loading is only for first use.
+  // The retained controls hold stale closures, so they are inert until the
+  // refresh lands and renderSettings rebuilds them.
+  body.toggleAttribute("inert", !!(d && settingsState.loading));
+  if (d && settingsState.loading) return;
   clear(body);
   const banner = $("settings-error");
   const msg = settingsState.message;
@@ -10730,7 +10749,6 @@ function renderSettings() {
     return;
   }
   setText($("settings-sub"), `As seen from ${d.repo}`);
-  if (settingsState.loading) return;
   if (d.error) {
     body.append(renderMagiIconSettings(), renderAvatarSettings());
     setText($("settings-error-text"),
@@ -10789,7 +10807,7 @@ async function loadTask(id, { background = false } = {}) {
   const detail = state.taskDetail;
   const retry = () => loadTask(id, { background: true });
   renderTask();
-  sectionNotice("task-meta", "task-core-state", detail.task && !detail.task.isShell ? "" : "Loading task…");
+  sectionNotice("task-meta", "task-core-state", "Loading task…", null, { pending: true, snapshot: Boolean(detail.task && !detail.task.isShell) });
   const core = sectionRequest(`task:${id}:core`, `${API.task(id)}/core`, task => {
     if (state.taskDetail !== detail) return;
     if (!detail.task || detail.task.isShell || detail.task.coreOnly) detail.task = { ...task, coreOnly: true };
@@ -10798,7 +10816,7 @@ async function loadTask(id, { background = false } = {}) {
   }, error => {
     if (state.taskDetail === detail) sectionNotice("task-meta", "task-core-state", `Task: ${error.message}`, retry);
   }, false, background);
-  sectionNotice("task-attempts-count", "task-history-state", detail.task && !detail.task.coreOnly && !detail.task.isShell ? "" : "Loading history and dependencies…");
+  sectionNotice("task-attempts-count", "task-history-state", "Loading history and dependencies…", null, { pending: true, snapshot: Boolean(detail.task && !detail.task.coreOnly && !detail.task.isShell) });
   const history = sectionRequest(`task:${id}:history`, API.task(id), task => {
     if (state.taskDetail !== detail) return;
     detail.task = task;

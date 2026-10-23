@@ -215,6 +215,7 @@ for (const failure of [false, true]) {
     assert.equal(h.state.detail.run, saved);
     assert.equal(h.state.detail.evidenceError, false);
     assert.equal(h.state.detail.evidencePending, true);
+    assert.equal(h.notices.filter(n => n[1] === 'run-evidence-state' && n[4]?.pending).at(-1)[4].snapshot, true);
     assert.equal(h.renders.length, rendered);
     h.requests[3].resolve({ ...saved, updated_at: 'after' });
     await flush();
@@ -324,4 +325,94 @@ test('ordinary duplicate dashboard loads join pending requests without trailing 
   await Promise.all([first, second]);
   assert.equal(h.requests.length, 2);
   assert.equal(h.state.stats.version, 1);
+});
+
+test('pending notices preserve snapshots and Retry controls, and settle busy state per section', () => {
+  const nodes = new Map();
+  const anchor = {
+    attrs: {}, after: box => nodes.set(box.id, box),
+    setAttribute(key, value) { this.attrs[key] = value; },
+    removeAttribute(key) { delete this.attrs[key]; },
+  };
+  nodes.set('anchor', anchor);
+  const noticeSource = source.slice(source.indexOf('const sectionNoticePending ='), source.indexOf('const talkDetailRequests ='));
+  const notice = runInNewContext(`${noticeSource}\nsectionNotice`, {
+    $: key => nodes.get(key),
+    el: (tag, props) => ({ tag, ...props, dataset: {}, children: [], append(child) { this.children.push(child); } }),
+    clear: box => { box.children = []; }, show: (box, visible) => { box.hidden = !visible; },
+  });
+  notice('anchor', 'core', 'Loading…', null, { pending: true });
+  assert.equal(nodes.get('core').hidden, false, 'first load is visible');
+  notice('anchor', 'core', '');
+  const signature = nodes.get('core').dataset.signature;
+  notice('anchor', 'core', 'Loading…', null, { pending: true, snapshot: true });
+  notice('anchor', 'evidence', 'Loading…', null, { pending: true, snapshot: true });
+  assert.equal(nodes.get('core').hidden, true);
+  assert.equal(nodes.get('core').dataset.signature, signature);
+  assert.equal(nodes.has('evidence'), false);
+  notice('anchor', 'core', ''); // Same signature must still settle its busy state.
+  assert.equal(anchor.attrs['aria-busy'], 'true', 'evidence is still pending');
+  const retry = () => {};
+  notice('anchor', 'evidence', 'Unavailable', retry);
+  assert.equal(anchor.attrs['aria-busy'], undefined);
+  const error = nodes.get('evidence');
+  const button = error.children[1];
+  notice('anchor', 'evidence', 'Loading…', null, { pending: true, snapshot: true });
+  assert.equal(error.hidden, false);
+  assert.equal(error.children[1], button, 'Retry stays in place during refresh');
+  notice('anchor', 'evidence', '');
+  assert.equal(error.hidden, true);
+  assert.equal(anchor.attrs['aria-busy'], undefined);
+});
+
+test('dashboard queue snapshot is independent of history, including empty results', async () => {
+  const h = harness();
+  const first = h.api.loadStats({ queueOnly: true });
+  assert.equal(h.notices.at(-1)[4].snapshot, false);
+  h.requests[0].resolve({});
+  await first;
+  const refresh = h.api.loadStats({ queueOnly: true, background: true });
+  assert.equal(h.state.stats, null);
+  assert.equal(h.notices.at(-1)[4].snapshot, true);
+  h.requests[1].resolve({});
+  await refresh;
+});
+
+for (const report of ['', 'Saved text']) {
+  test(`report refresh retains loaded text (${JSON.stringify(report)})`, () => {
+    const nodes = new Map();
+    const get = key => {
+      if (!nodes.has(key)) nodes.set(key, {});
+      return nodes.get(key);
+    };
+    const reportSource = source.slice(source.indexOf('function renderReportCards()'), source.indexOf('function renderRunDetail()'));
+    const render = runInNewContext(`${reportSource}\nrenderReportCards`, {
+      state: { detail: { id: 'a', reportView: null, reportLoading: true, report } },
+      $: get, setText: (node, text) => { node.textContent = text; },
+      show: (node, visible) => { node.hidden = !visible; }, setAttr() {},
+    });
+    render();
+    assert.equal(get('run-report').textContent, report);
+    assert.equal(get('run-report').hidden, false);
+  });
+}
+
+test('settings refresh keeps the existing body intact and inert', () => {
+  const body = {
+    content: 'Saved settings', inert: false,
+    toggleAttribute(name, on) { if (name === 'inert') this.inert = on; },
+  };
+  const settingsState = { data: {}, loading: true };
+  const settingsSource = source.slice(source.indexOf('function renderSettings()'), source.indexOf('/* ---- task detail'));
+  const render = runInNewContext(`${settingsSource}\nrenderSettings`, {
+    settingsState, renderSettingsContext() {},
+    $: () => body, clear: () => { body.content = ''; },
+  });
+  render();
+  assert.equal(body.content, 'Saved settings');
+  assert.equal(body.inert, true);
+  settingsState.data = null;
+  settingsState.loading = false;
+  try { render(); } catch { /* later rendering needs the full DOM; only inert matters */ }
+  assert.equal(body.inert, false);
 });
