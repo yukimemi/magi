@@ -1517,6 +1517,13 @@ pub fn read_reply(q: &crate::ask::Question) -> Reply {
     if chose != USE_MY_TEXT {
         return Reply::Fallback;
     }
+    if q.node == ASK_NODE
+        && q.routed_task.is_some()
+        && q.routed_chat.is_some()
+        && let Some(title) = &q.publication_title
+    {
+        return Reply::Title(title.clone());
+    }
     if let Some(authority) = &q.answer_authority {
         return if authority.question == q.id && authority.choice == USE_MY_TEXT {
             crate::consult::owner_title(q, &authority.instruction)

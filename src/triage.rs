@@ -1192,6 +1192,7 @@ pub fn pending_for(questions: &Questions, task: &Task) -> bool {
 
 fn awaiting_task_chat(q: &Question, task: &Task) -> bool {
     q.routed_chat.is_some()
+        && !already_applied(task, q)
         && task.resumption.as_ref().map_or(0, |r| r.generation) == q.triage_generation.unwrap_or(0)
         && task.operator_decided_at.is_none_or(|at| at <= q.asked_at)
 }

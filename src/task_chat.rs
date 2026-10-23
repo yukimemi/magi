@@ -130,7 +130,7 @@ pub fn post(
                 let offered = if q.choices.is_empty() { String::new() } else {
                     format!(" The recorded options are: {}.", q.choices.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", "))
                 };
-                format!("\nDecision {}: discuss it with the owner as free text.{offered} Apply the owner's decision only with `magi task control decide {} <option>`; its task ownership and existing transition checks still apply. No quote or extra consent evidence is required. Do not decide without the owner's explicit words and do not start a deputy/waiter. Silence is a hold.\n", q.id, q.id)
+                format!("\nDecision {}: discuss it with the owner as free text.{offered} Apply the owner's decision only with `magi task control decide {} <option>`; its task ownership and existing transition checks still apply. No quote or extra consent evidence is required. For a publication `use my text` decision, add `--title <literal replacement title>` to pass the title as data. Do not decide without the owner's explicit words and do not start a deputy/waiter. Silence is a hold.\n", q.id, q.id)
             } else {
                 "\nDiscuss this free-text decision with the owner. Apply decisions only through `magi task control`. Do not answer the legacy question or start a deputy/waiter.\n".into()
             };

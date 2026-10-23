@@ -726,13 +726,15 @@ enum ControlCmd {
         #[arg(long = "workflow", required = true)]
         workflows: Vec<String>,
     },
-    /// Record the owner's decision on publication, divergence, release or approval recovery
-    /// question routed to this chat. Needs `--quote` of the owner's latest message.
+    /// Record a decision routed to this chat, without quote evidence.
     Decide {
         /// Question id from the automatic message.
         question: String,
         /// One of the recorded options, exactly.
         choice: String,
+        /// Literal replacement title for a publication decision's `use my text` choice.
+        #[arg(long)]
+        title: Option<String>,
     },
     /// Abandon a run whose driver is proven gone. Needs the owner's exact
     /// message `abandon-run: <run id>` as the latest send, and `--quote` of it.
@@ -3692,9 +3694,14 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                     head,
                     workflows,
                 },
-                ControlCmd::Decide { question, choice } => cc::Operation::Decide {
+                ControlCmd::Decide {
                     question,
                     choice,
+                    title,
+                } => cc::Operation::Decide {
+                    question,
+                    choice,
+                    title,
                     quote: quote.map(str::to_owned),
                 },
                 ControlCmd::Abandon { run } => cc::Operation::Abandon {

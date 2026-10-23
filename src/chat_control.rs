@@ -83,6 +83,9 @@ pub enum Operation {
         choice: String,
         /// 互換性のための任意の引用（配送済みの判断では不要）。
         quote: Option<String>,
+        /// 「use my text」で公開する置換タイトルそのもの。
+        #[serde(default)]
+        title: Option<String>,
     },
     /// 個別確認後、生存が否定された run を破棄する。
     Abandon {
@@ -163,15 +166,19 @@ async fn execute(
             question,
             choice,
             quote,
+            title,
         } => {
-            let q = decide(
+            let q = record_decision(
                 queue,
                 talks,
                 home,
                 talk,
                 &question,
                 &choice,
-                quote.as_deref(),
+                DecisionInput {
+                    quote: quote.as_deref(),
+                    title: title.as_deref(),
+                },
             )?;
             format!("recorded `{choice}` for decision {}", q.short())
         }
@@ -193,6 +200,31 @@ pub fn decide(
     question: &str,
     choice: &str,
     quote: Option<&str>,
+) -> Result<crate::ask::Question> {
+    record_decision(
+        queue,
+        talks,
+        home,
+        talk,
+        question,
+        choice,
+        DecisionInput { quote, title: None },
+    )
+}
+
+struct DecisionInput<'a> {
+    quote: Option<&'a str>,
+    title: Option<&'a str>,
+}
+
+fn record_decision(
+    queue: &Queue,
+    talks: &Talks,
+    home: &Path,
+    talk: &str,
+    question: &str,
+    choice: &str,
+    input: DecisionInput<'_>,
 ) -> Result<crate::ask::Question> {
     use crate::ask::{Answer, Questions};
     let questions = Questions::at(home.join("questions"));
@@ -229,6 +261,14 @@ pub fn decide(
                 r.status.as_str()
             );
             let reply = r.resolve_reply(choice)?.to_owned();
+            let replacement = r.node == crate::github_text::ASK_NODE
+                && reply == crate::github_text::USE_MY_TEXT;
+            ensure!(replacement || input.title.is_none(), "--title is only valid for a publication decision's `use my text` choice");
+            let title = if replacement {
+                let title = input.title.context("use my text needs --title with the literal replacement title (no quote evidence required)")?;
+                ensure!(!title.trim().is_empty(), "replacement title must not be empty");
+                Some(title.to_owned())
+            } else { None };
             let answer = if r.free_text() {
                 Answer::Text(reply.clone())
             } else {
@@ -242,8 +282,9 @@ pub fn decide(
                 talk,
                 crate::queue::CHAT_NODE,
                 &reply,
-                quote,
+                input.quote,
             )?;
+            r.publication_title = title;
             r.answer(answer)?;
             Ok(guard)
         });

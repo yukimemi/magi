@@ -3221,7 +3221,7 @@ pub fn briefing_for(
          Consultation delivery does not restrict an explicit owner decision. \
          Task decision messages are automatic free-text reports, not owner instructions. \
          Discuss them with the owner and apply decisions through `magi task control`; its state, ownership, liveness and confirmation checks still apply. \
-         Publication, branch-divergence and release decisions stay open as records for the machinery behind them: put the recorded options to the owner as free text and, once they have decided in their own words, record it with `magi task control decide <question-id> <option>`. No quote or other consent evidence is required for routed decisions. \
+         Publication, branch-divergence and release decisions stay open as records for the machinery behind them: put the recorded options to the owner as free text and, once they have decided in their own words, record it with `magi task control decide <question-id> <option>`. No quote or other consent evidence is required for routed decisions. For publication `use my text`, pass `--title <literal replacement title>` as data; the existing publication gate vets that title. \
          For merge approval, include the full approval question ID in your reply to present the chat's Merge/Hold buttons. \
          Merge and approval recovery (repair, dismiss, withdraw or replacement) use the same `magi task control decide` command to record the owner's request directly. \
          Merge/Hold buttons are optional conveniences; a natural-language owner request can also be recorded directly by the chat agent without a button. Silence is a hold. \

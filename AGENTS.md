@@ -3328,3 +3328,12 @@ validates is the optional chat binding and displayed head binding. A direct
 answer requires neither a prior persona offer nor a button. Open routed
 questions are filtered out of the Questions list client-side, not dropped
 from the API.
+
+Routed publication replacements use `magi task control decide <id> 'use my text'
+--title '<literal title>'`. `Question::publication_title` stores the replacement
+as data without quote evidence or a fabricated owner thread entry;
+`github_text::read_reply` passes it through the existing title vetting and
+publication path. Missing/empty title data cannot settle that choice.
+Applied triage decisions must not remain pending chat decisions:
+`triage::awaiting_task_chat` excludes `already_applied`, including dependency
+detachment, which does not change the root's operator generation.

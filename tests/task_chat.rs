@@ -367,3 +367,43 @@ async fn publication_divergence_and_release_decisions_route_and_wait_for_the_cha
     }
 }
 }
+
+common::e2e! {
+async fn applied_routed_dependency_detach_stops_waiting_and_allows_a_new_decision() {
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("outbox");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let questions = Questions::at(home.join("questions"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let mut root = task(&fx.repo, Source::Agent { run: chat.id.clone(), node: magi::queue::CHAT_NODE.into() });
+    root.hold_manual(Some("Waiting for owner".into()));
+    queue.put(&mut root).unwrap();
+    let mut dependant = task(&fx.repo, Source::Human);
+    dependant.block(vec![root.id.clone()], None);
+    queue.put(&mut dependant).unwrap();
+    magi::triage::run_once(&queue, &questions, None, jiff::Timestamp::now());
+    let q = questions.list().into_iter().find(|q| q.node == magi::triage::DEPS_NODE).unwrap();
+    magi::task_chat::sweep(&queue, &talks, &questions, &home);
+    assert!(magi::triage::pending_for(&questions, &root));
+    magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, &q.choices[2], None).unwrap();
+    assert!(magi::triage::pending_for(&questions, &queue.get(&root.id).unwrap()), "answered but not yet applied");
+    assert_eq!(magi::triage::apply_answers(&queue, &questions), [root.id.clone()]);
+    let after = queue.get(&root.id).unwrap();
+    assert!(after.triage_applied(&q.id));
+    assert_eq!(after.resumption, root.resumption);
+    assert_eq!(after.operator_decided_at, root.operator_decided_at);
+    assert!(!magi::triage::pending_for(&questions, &after));
+    assert!(queue.get(&dependant.id).unwrap().blocked_by.is_empty());
+    assert!(magi::triage::apply_answers(&queue, &questions).is_empty(), "application is idempotent");
+    let mut later = task(&fx.repo, Source::Human);
+    later.block(vec![root.id.clone()], None);
+    queue.put(&mut later).unwrap();
+    let report = magi::triage::run_once(&queue, &questions, None, jiff::Timestamp::now());
+    assert_eq!(report.asked, [root.id.clone()]);
+    let open = questions.list().into_iter().filter(|q| q.node == magi::triage::DEPS_NODE && q.status.open()).collect::<Vec<_>>();
+    assert_eq!(open.len(), 1);
+    assert_ne!(open[0].id, q.id);
+    assert!(magi::triage::pending_for(&questions, &queue.get(&root.id).unwrap()));
+}
+}

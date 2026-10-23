@@ -615,6 +615,10 @@ pub struct Question {
     /// Set after delivery; merge consent remains in this record.
     #[serde(default)]
     pub routed_chat: Option<String>,
+    /// Literal replacement title supplied with a routed publication decision.
+    /// This is publication data, not owner-consent evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_title: Option<String>,
     /// What the daemon does when a given choice is answered, keyed by the
     /// choice's exact text. Empty for an ordinary question. A key is always
     /// one of [`Question::choices`]; `#[serde(default)]` so older files read.
@@ -755,6 +759,7 @@ impl Question {
             merge_target: None,
             routed_task: None,
             routed_chat: None,
+            publication_title: None,
             actions: std::collections::BTreeMap::new(),
             panel: false,
             assets: Vec::new(),
