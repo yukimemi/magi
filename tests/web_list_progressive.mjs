@@ -91,3 +91,16 @@ test('a skipped delta base still finishes enumeration before starting a fresh sn
   await done;
   assert.equal(h.state.rev.queue, 5);
 });
+
+for (const existing of [null, [], [row('saved')]]) {
+  test(`older-entry notice uses the snapshot from before paging (${JSON.stringify(existing)})`, async () => {
+    const h = harness(existing);
+    const done = h.load();
+    h.requests[0].resolve({ rows: [row('first')], next: 'older' });
+    await flush();
+    assert.equal(h.notices.at(-1)[4].pending, true);
+    assert.equal(h.notices.at(-1)[4].snapshot, existing !== null);
+    h.requests[1].resolve({ rows: [], next: null });
+    await done;
+  });
+}

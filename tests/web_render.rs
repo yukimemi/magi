@@ -5088,55 +5088,79 @@ async fn run_refresh_keeps_question_focus_and_blocks_stale_actions() {
     )
     .await;
     let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
-    let page = browser
-        .open_page(&format!("{base}#/runs/{}", run.id), 1280, 900, false)
-        .await
-        .unwrap();
-    browser.wait_for(&page,
-        "window.deck && deck.state.detail.evidenceError === false && !!document.querySelector('#run-asks textarea')",
-        Duration::from_secs(30)).await.unwrap();
-    let out = browser.eval(&page, r#"(async () => {
-      const box = document.querySelector('#run-asks textarea');
-      const panel = document.querySelector('#run-ask-panel');
-      box.value = 'An unfinished answer'; box.focus(); box.setSelectionRange(3, 8);
-      const originalFetch = window.fetch;
-      let release;
-      const barrier = new Promise(r => release = r);
-      let fail = false;
-      window.fetch = async (...args) => {
-        if (String(args[0]).match(/\/api\/runs\/[^/]+(?:\/core)?$/)) {
-          await barrier;
-          if (fail) throw new Error('deliberate failure');
-        }
-        return originalFetch(...args);
-      };
-      const refresh = deck.loadRun(deck.state.detail.id, {background: true});
-      const button = [...document.querySelectorAll('#run-asks button')].find(b => b.textContent === 'Send answer');
-      let clicked = 0;
-      button.addEventListener('click', () => clicked++);
-      button.click();
-      const pending = document.activeElement === box && !panel.hidden
-        && box.value === 'An unfinished answer' && clicked === 0
-        && button.getAttribute('aria-disabled') === 'true';
-      release(); await refresh;
-      const success = document.activeElement === box && box.selectionStart === 3 && box.selectionEnd === 8;
-      // A failed secondary refresh must leave the same editable DOM present.
-      fail = true;
-      await deck.loadRun(deck.state.detail.id, {background: true});
-      button.click();
-      const failure = document.activeElement === box && !panel.hidden
-        && box.value === 'An unfinished answer' && clicked === 0;
-      return {pending, success, failure};
-    })()"#).await.unwrap();
-    assert_eq!(
-        out,
-        serde_json::json!({
-            "pending": true,
-            "success": true,
-            "failure": true,
-        })
-    );
-    browser.close_page(&page).await;
+    for width in [390, 1280] {
+        let page = browser
+            .open_page(&format!("{base}#/runs/{}", run.id), width, 900, false)
+            .await
+            .unwrap();
+        browser.wait_for(&page,
+            "window.deck && deck.state.detail.evidenceError === false && !!document.querySelector('#run-asks textarea')",
+            Duration::from_secs(30)).await.unwrap();
+        let out = browser.eval(&page, r#"(async () => {
+          const box = document.querySelector('#run-asks textarea');
+          const panel = document.querySelector('#run-ask-panel');
+          box.value = 'An unfinished answer'; box.focus(); box.setSelectionRange(3, 8);
+          const originalFetch = window.fetch;
+          const tabs = document.querySelector('.run-tabs');
+          const top = () => tabs.getBoundingClientRect().top + window.scrollY;
+          const before = top();
+          const visible = tabs.getClientRects().length > 0 && tabs.getBoundingClientRect().height > 0;
+          let releaseCore, releaseEvidence;
+          const coreBarrier = new Promise(r => releaseCore = r);
+          const evidenceBarrier = new Promise(r => releaseEvidence = r);
+          let fail = false;
+          window.fetch = async (...args) => {
+            if (String(args[0]).match(/\/api\/runs\/[^/]+(?:\/core)?$/)) {
+              await (String(args[0]).endsWith('/core') ? coreBarrier : evidenceBarrier);
+              if (fail) throw new Error('deliberate failure');
+            }
+            return originalFetch(...args);
+          };
+          const refresh = deck.loadRun(deck.state.detail.id, {background: true});
+          const notice = document.querySelector('#run-evidence-state');
+          const pendingLayout = visible && top() === before && (!notice || notice.hidden)
+            && document.querySelector('#run-meta').getAttribute('aria-busy') === 'true';
+          const button = [...document.querySelectorAll('#run-asks button')].find(b => b.textContent === 'Send answer');
+          let clicked = 0;
+          button.addEventListener('click', () => clicked++);
+          button.click();
+          const pending = document.activeElement === box && !panel.hidden
+            && box.value === 'An unfinished answer' && clicked === 0
+            && button.getAttribute('aria-disabled') === 'true';
+          releaseCore();
+          while (!deck.state.detail.core) await new Promise(requestAnimationFrame);
+          const coreLayout = top() === before
+            && document.querySelector('#run-meta').getAttribute('aria-busy') === 'true';
+          releaseEvidence(); await refresh;
+          const completedLayout = top() === before
+            && !document.querySelector('#run-meta').hasAttribute('aria-busy');
+          const success = document.activeElement === box && box.selectionStart === 3 && box.selectionEnd === 8;
+          // A failed secondary refresh must leave the same editable DOM present.
+          fail = true;
+          await deck.loadRun(deck.state.detail.id, {background: true});
+          button.click();
+          const failure = document.activeElement === box && !panel.hidden
+            && box.value === 'An unfinished answer' && clicked === 0;
+          const error = document.querySelector('#run-evidence-state');
+          const retry = !error.hidden && error.textContent.includes('deliberate failure')
+            && !!error.querySelector('button');
+          window.fetch = originalFetch;
+          return {pending, success, failure, pendingLayout, coreLayout, completedLayout, retry};
+        })()"#).await.unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "pending": true,
+                "success": true,
+                "failure": true,
+                "pendingLayout": true,
+                "coreLayout": true,
+                "completedLayout": true,
+                "retry": true,
+            })
+        );
+        browser.close_page(&page).await;
+    }
 }
 
 /// The evidence-ready transition must render the sections gated on it even
