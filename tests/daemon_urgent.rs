@@ -15,7 +15,9 @@ mod common;
 
 use std::time::Duration;
 
-use common::seat_block::{SeatBlock, task_ended, task_failed, wait_while_running};
+use common::seat_block::{
+    SeatBlock, task_ended, task_failed, wait_for_completion, wait_while_running,
+};
 use common::{Judges, fixture, home_lock};
 use magi::daemon::{self, Opts, Stop};
 use magi::queue::{Queue, Source, Task, TaskStatus};
@@ -120,7 +122,7 @@ async fn an_urgent_task_starts_alongside_an_already_running_task() {
 
     block.release();
 
-    wait_while_running(
+    wait_for_completion(
         &mut serve,
         || {
             queue
@@ -229,7 +231,7 @@ async fn an_ordinary_task_still_waits_for_the_ordinary_slot_to_free() {
 
     block.release();
 
-    wait_while_running(
+    wait_for_completion(
         &mut serve,
         || {
             queue
@@ -243,7 +245,7 @@ async fn an_ordinary_task_still_waits_for_the_ordinary_slot_to_free() {
 
     // Only now, with the ordinary slot free, does the second task get its
     // turn.
-    wait_while_running(
+    wait_for_completion(
         &mut serve,
         || {
             queue

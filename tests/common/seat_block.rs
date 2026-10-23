@@ -140,6 +140,33 @@ where
     }
 }
 
+/// Overall guard for waits on work that must finish once released.
+///
+/// Unlike the "seat started" wait, completion has a bounded cost once the seat
+/// is released, so a scheduler that leaves a task `Queued` must fail here
+/// instead of hanging `cargo test` (the daemon loop never exits on its own).
+pub const COMPLETION_GUARD: Duration = Duration::from_secs(60);
+
+/// [`wait_while_running`] for a post-release completion, bounded by
+/// [`COMPLETION_GUARD`].
+pub async fn wait_for_completion<F, D, R, E>(run: &mut F, ready: R, ended: E, what: &str)
+where
+    F: Future<Output = D> + Unpin,
+    D: std::fmt::Debug,
+    R: FnMut() -> bool,
+    E: FnMut() -> Option<String>,
+{
+    if tokio::time::timeout(
+        COMPLETION_GUARD,
+        wait_while_running(run, ready, ended, what),
+    )
+    .await
+    .is_err()
+    {
+        panic!("{what}: not finished within {COMPLETION_GUARD:?}");
+    }
+}
+
 /// Format a diagnostic if `task_id` has already settled out of its active run.
 ///
 /// Transient `TaskStatus::Queued` (before the daemon claims the task) and an
