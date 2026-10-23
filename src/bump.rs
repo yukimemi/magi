@@ -1559,14 +1559,23 @@ async fn after_merge_inner(
             return Ok(());
         }
     };
-    if custom {
+    // Local mode has no auto-tag to hand the release to: the bump PR and the
+    // watcher's approval are the release path, so it always proceeds.
+    if custom && !state.config.release.is_local() {
         // The change itself may already have raised the version; the
         // repository's own auto-tag then releases it, and a second bump
-        // would publish a duplicate.
-        let mb = git::git(&winner.worktree, &["merge-base", &base, &winner.branch])
+        // would publish a duplicate. Measured against the remote base the
+        // branch was cut from, never a possibly stale local branch; a branch
+        // already contained in it (merged without squashing) is unknown.
+        let tracking = format!("{remote}/{base}");
+        let tip = git::rev_parse(&winner.worktree, &winner.branch)
+            .await
+            .unwrap_or_default();
+        let mb = git::git(&winner.worktree, &["merge-base", &tracking, &winner.branch])
             .await
             .map(|s| s.trim().to_owned())
             .unwrap_or_default();
+        let mb = if mb == tip { String::new() } else { mb };
         if !mb.is_empty()
             && let (Some(before), Some(after)) = (
                 primary_version_at(&winner.worktree, &mb, &primary).await,
@@ -4446,5 +4455,49 @@ version = \"0.45.18\"\n";
         );
         assert!(rec.pr_url.is_none() && rec.action_required.is_none());
         assert!(store.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_stale_local_base_does_not_make_an_inherited_version_look_like_this_changes() {
+        let (_d, repo) = shun_origin("1.0.0").await;
+        let old = git::rev_parse(&repo, "HEAD").await.unwrap();
+        tokio::fs::write(
+            repo.join("src-tauri/Cargo.toml"),
+            SHUN_TOML.replace("1.0.0", "1.0.1"),
+        )
+        .await
+        .unwrap();
+        git::git(&repo, &["commit", "-am", "bump upstream"])
+            .await
+            .unwrap();
+        git::git(&repo, &["push", "origin", "main"]).await.unwrap();
+        git::git(&repo, &["checkout", "-b", "feat"]).await.unwrap();
+        tokio::fs::write(repo.join("app.ts"), "x\n").await.unwrap();
+        git::git(&repo, &["add", "-A"]).await.unwrap();
+        git::git(&repo, &["commit", "-m", "fix"]).await.unwrap();
+        // The local main lags origin/main, which already carries 1.0.1.
+        git::git(&repo, &["update-ref", "refs/heads/main", &old])
+            .await
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let store = Notices::at(home.path().join("notifications"));
+        let mut state = winner_state(&repo, "main");
+        state.candidates[0].branch = "feat".to_owned();
+        state.config.release.version_files = shun_files();
+        let _ = after_merge_at(
+            &mut state,
+            "https://example.invalid/pull/1",
+            Some(home.path()),
+            Some(&store),
+        )
+        .await;
+        assert!(
+            !state
+                .events
+                .iter()
+                .any(|e| e.message.contains("already moved")),
+            "{:?}",
+            state.events
+        );
     }
 }
