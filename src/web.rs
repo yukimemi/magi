@@ -453,10 +453,28 @@ pub(crate) struct SharedMonitor {
 #[derive(Debug, Default)]
 struct HealthIndex {
     runs: HashMap<String, (FileIdentity, bool)>,
-    questions: Option<(u64, Vec<Question>)>,
+    questions: Option<QuestionCounts>,
     notices: Option<(u64, usize)>,
     #[cfg(test)]
     run_parses: usize,
+}
+
+/// Live stamps invalidate counts immediately; the TTL also refreshes lease state.
+const QUESTION_COUNTS_TTL: Duration = Duration::from_secs(10);
+
+#[derive(Debug)]
+struct QuestionCounts {
+    revision: u64,
+    measured: std::time::Instant,
+    open: usize,
+    owner: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DiskSizes {
+    runs: u64,
+    worktrees: u64,
+    cache: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -464,6 +482,7 @@ struct DiskCache {
     measured: Option<std::time::Instant>,
     loading: bool,
     config: Option<Config>,
+    disk: Option<DiskSizes>,
     update: Option<UpdateView>,
 }
 
@@ -2816,7 +2835,9 @@ impl DiskView {
 
     fn with_capacity(ui: &Ui, capacity: DiskCapacity) -> Self {
         Self {
-            free_bytes: capacity.free_bytes,
+            free_bytes: crate::disk::free_bytes(&ui.runs)
+                .ok()
+                .or(capacity.free_bytes),
             runs_bytes: capacity.runs_bytes,
             worktrees_bytes: capacity.worktrees_bytes,
             cache_bytes: capacity.cache_bytes,
@@ -2904,7 +2925,10 @@ fn refresh_health_config(ui: &Arc<Ui>) {
     });
 }
 
-fn health_counts(ui: &Ui) -> ApiResult<(usize, usize, usize, u64, usize)> {
+fn health_counts(
+    ui: &Ui,
+    fallback_questions_rev: u64,
+) -> ApiResult<(usize, usize, usize, u64, usize)> {
     let mut index = ui
         .monitor
         .health_index
@@ -2934,15 +2958,24 @@ fn health_counts(ui: &Ui) -> ApiResult<(usize, usize, usize, u64, usize)> {
         };
         unreadable += usize::from(bad);
     }
-    let questions_rev = stamps_revision(
-        &try_stamps(ui.questions.root(), false, true).map_err(anyhow::Error::from)?,
-    );
-    if index
-        .questions
-        .as_ref()
-        .is_none_or(|(rev, _)| *rev != questions_rev)
-    {
-        index.questions = Some((questions_rev, ui.questions.list()));
+    let questions_rev = try_stamps(ui.questions.root(), false, true)
+        .map(|stamps| stamps_revision(&stamps))
+        .unwrap_or(fallback_questions_rev);
+    if index.questions.as_ref().is_none_or(|counts| {
+        counts.revision != questions_rev || counts.measured.elapsed() >= QUESTION_COUNTS_TTL
+    }) {
+        let questions = ui.questions.list();
+        index.questions = Some(QuestionCounts {
+            revision: questions_rev,
+            measured: std::time::Instant::now(),
+            open: questions.iter().filter(|q| q.status.open()).count(),
+            owner: questions
+                .iter()
+                .filter(|q| {
+                    q.status.open() && (!q.waiting_on_agent() || ui.questions.deputy_exhausted(q))
+                })
+                .count(),
+        });
     }
     let notifications_rev =
         stamps_revision(&try_stamps(ui.notices.root(), false, true).map_err(anyhow::Error::from)?);
@@ -2952,17 +2985,11 @@ fn health_counts(ui: &Ui) -> ApiResult<(usize, usize, usize, u64, usize)> {
     {
         index.notices = Some((notifications_rev, ui.notices.count_unread()));
     }
-    let questions = &index.questions.as_ref().unwrap().1;
-    let open = questions.iter().filter(|q| q.status.open()).count();
-    // Lease freshness changes with time even if no file changes.
-    let owner = questions
-        .iter()
-        .filter(|q| q.status.open() && (!q.waiting_on_agent() || ui.questions.deputy_exhausted(q)))
-        .count();
+    let questions = index.questions.as_ref().unwrap();
     Ok((
         unreadable,
-        open,
-        owner,
+        questions.open,
+        questions.owner,
         notifications_rev,
         index.notices.unwrap().1,
     ))
@@ -2986,15 +3013,20 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
             questions_needs_owner,
             notifications_rev,
             notifications_unread,
-        ) = health_counts(&ui)?;
-        let ((cfg, config_observed), update) = {
+        ) = health_counts(&ui, revisions.2)?;
+        let ((cfg, config_observed, sizes, measured), update) = {
             let cache = ui
                 .monitor
                 .disk_cache
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             (
-                (cache.config.clone(), cache.measured.is_some()),
+                (
+                    cache.config.clone(),
+                    cache.measured.is_some(),
+                    cache.disk.clone(),
+                    cache.measured,
+                ),
                 cache.update.clone().unwrap_or(UpdateView {
                     available: false,
                     to: None,
@@ -3005,19 +3037,35 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
         // refreshes. A cold config read may still be pending; an existing
         // capacity flight must remain visible to concurrent health requests.
         let prior_capacity = {
-            let observation = ui
+            let mut observation = ui
                 .monitor
                 .disk
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            // Adopt a completed size snapshot only before the scoped capacity
+            // observer has started. Later scope changes remain its authority.
+            if observation.scope.is_none()
+                && let Some(sizes) = sizes
+            {
+                observation.scope = Some(DiskScope::of(&ui, cfg.as_ref()));
+                observation.capacity = DiskCapacity {
+                    runs_bytes: Some(sizes.runs),
+                    worktrees_bytes: Some(sizes.worktrees),
+                    cache_bytes: sizes.cache,
+                    free_bytes: None,
+                };
+                observation.finished = measured;
+            }
             observation.scope.as_ref().map(|_| observation.capacity)
         };
         let disk = if config_observed {
             serde_json::to_value(DiskView::of(&ui, cfg.as_ref())).ok()
         } else {
-            prior_capacity.and_then(|capacity| {
-                serde_json::to_value(DiskView::with_capacity(&ui, capacity)).ok()
-            })
+            serde_json::to_value(DiskView::with_capacity(
+                &ui,
+                prior_capacity.unwrap_or_default(),
+            ))
+            .ok()
         };
         let upgrade = updater::read_progress(&ui.home).map(|p| upgrade_progress_view(&ui, p));
         let jobs = crate::worker::active(&ui.home).map_err(ApiError::from)?;
@@ -5110,6 +5158,7 @@ struct TalkListView {
     turns: Vec<TalkListTurn>,
     turn_count: usize,
     unread_count: usize,
+    context: talk::ContextUsage,
     #[serde(skip)]
     agent_times: Vec<Timestamp>,
     thinking: bool,
@@ -5178,6 +5227,7 @@ fn talk_rows(ui: &Ui, ids: Vec<String>, headers: &header::HeaderMap) -> Vec<Talk
                         .collect(),
                     turn_count: talk.turns.len(),
                     unread_count: 0,
+                    context: talk::context_usage(&talk, None),
                     turns,
                     thinking: false,
                     id: talk.id,
@@ -5202,6 +5252,7 @@ fn talk_rows(ui: &Ui, ids: Vec<String>, headers: &header::HeaderMap) -> Vec<Talk
                 repo: row.repo.clone(),
                 agent: row.agent.clone(),
                 status: row.status,
+                context: row.context.clone(),
                 turns: row.turns.clone(),
                 turn_count: row.turn_count,
                 thinking: false,
@@ -22738,7 +22789,9 @@ mod tests {
                 let disk = serde_json::to_value(view.disk).unwrap();
                 assert!(disk["runs_bytes"].is_null());
                 assert!(disk["worktrees_bytes"].is_null());
-                assert!(disk.get("free_bytes").is_none());
+                // Free space is a cheap live observation even while the
+                // recursive capacity measurement remains blocked.
+                assert!(disk["free_bytes"].is_u64());
             }
         })
         .await

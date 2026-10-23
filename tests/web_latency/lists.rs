@@ -249,7 +249,7 @@ async fn large_home_health_and_talks_bound_request_work() {
     ui.monitor.disk_cache.lock().unwrap().loading = true;
     let before = health(State(ui.clone())).await.unwrap().0;
     assert_eq!(before.runs_unreadable, 0);
-    assert!(before.disk.is_none());
+    assert!(before.disk.as_ref().unwrap()["runs_bytes"].is_null());
     assert_eq!(ui.monitor.health_index.lock().unwrap().run_parses, 925);
     let rows = talks_list(
         State(ui.clone()),
@@ -339,6 +339,8 @@ async fn talk_summary_unread_counts_and_external_changes_are_exact() {
     ui.talks.put(&mut talk).unwrap();
     let rows = talk_rows(&ui, vec![id.clone()], &header::HeaderMap::new());
     assert_eq!(rows[0].unread_count, 1);
+    assert_eq!(rows[0].context, talk::context_usage(&talk, None));
+    assert!(rows[0].context.tokens.is_some());
     let mut headers = header::HeaderMap::new();
     headers.insert(
         "x-talk-reads",
@@ -392,4 +394,110 @@ async fn conversation_core_does_not_queue_behind_bulk_readers() {
         .unwrap();
     stalled.abort();
     assert!(stalled.await.err().unwrap().is_cancelled());
+}
+
+#[tokio::test]
+async fn graft_health_question_counts_use_live_stamps_ttl_and_fallback() {
+    let home = tempfile::tempdir().unwrap();
+    let ui = delta_test_ui(home.path());
+    ui.monitor.disk_cache.lock().unwrap().loading = true;
+    let before = health(State(ui.clone())).await.unwrap().0;
+    assert_eq!(before.questions_open, 0);
+    let first_measurement = ui
+        .monitor
+        .health_index
+        .lock()
+        .unwrap()
+        .questions
+        .as_ref()
+        .unwrap()
+        .measured;
+    let _ = health(State(ui.clone())).await.unwrap();
+    assert_eq!(
+        ui.monitor
+            .health_index
+            .lock()
+            .unwrap()
+            .questions
+            .as_ref()
+            .unwrap()
+            .measured,
+        first_measurement
+    );
+
+    let mut q = Question::new(
+        "run".into(),
+        "implement".into(),
+        "impl-A".into(),
+        "Needs an answer".into(),
+        "Details".into(),
+        vec![],
+    );
+    ui.questions.put(&mut q).unwrap();
+    // The monitor has not polled, but live stamps must invalidate the cache.
+    assert_eq!(health(State(ui.clone())).await.unwrap().0.questions_open, 1);
+    let revision = ui
+        .monitor
+        .health_index
+        .lock()
+        .unwrap()
+        .questions
+        .as_ref()
+        .unwrap()
+        .revision;
+    {
+        let mut index = ui.monitor.health_index.lock().unwrap();
+        let counts = index.questions.as_mut().unwrap();
+        counts.measured = std::time::Instant::now() - QUESTION_COUNTS_TTL;
+    }
+    let _ = health(State(ui.clone())).await.unwrap();
+    assert!(
+        ui.monitor
+            .health_index
+            .lock()
+            .unwrap()
+            .questions
+            .as_ref()
+            .unwrap()
+            .measured
+            .elapsed()
+            < QUESTION_COUNTS_TTL
+    );
+
+    // An unavailable stamp source keeps the last known revision and counts.
+    std::fs::rename(ui.questions.root(), home.path().join("saved-questions")).unwrap();
+    std::fs::write(ui.questions.root(), "unavailable").unwrap();
+    assert_eq!(health_counts(&ui, revision).unwrap().1, 1);
+    // Even a cold count with an unreadable store must not fail all of health.
+    ui.monitor.health_index.lock().unwrap().questions = None;
+    assert!(health(State(ui.clone())).await.is_ok());
+}
+
+#[tokio::test]
+async fn graft_health_refreshes_free_space_and_retention_without_resizing() {
+    let home = tempfile::tempdir().unwrap();
+    let ui = delta_test_ui(home.path());
+    {
+        let mut cache = ui.monitor.disk_cache.lock().unwrap();
+        cache.measured = Some(std::time::Instant::now());
+        cache.disk = Some(DiskSizes {
+            runs: 123,
+            worktrees: 456,
+            cache: Some(789),
+        });
+    }
+    let path = ui.runs.parent().unwrap().join("retention.json");
+    std::fs::write(&path, r#"{"retired":1}"#).unwrap();
+    let first = health(State(ui.clone())).await.unwrap().0.disk.unwrap();
+    assert_eq!(first["runs_bytes"], 123);
+    assert_eq!(first["retention"]["retired"], 1);
+    std::fs::write(&path, r#"{"retired":2}"#).unwrap();
+    std::fs::write(home.path().join("new-data"), "new bytes").unwrap();
+    let second = health(State(ui.clone())).await.unwrap().0.disk.unwrap();
+    assert_eq!(second["retention"]["retired"], 2);
+    assert_eq!(second["runs_bytes"], 123);
+    assert_eq!(second["worktrees_bytes"], 456);
+    assert_eq!(second["cache_bytes"], 789);
+    assert!(second["free_bytes"].is_u64());
+    assert!(!ui.monitor.disk_cache.lock().unwrap().loading);
 }
