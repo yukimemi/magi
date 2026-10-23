@@ -643,6 +643,13 @@ initial vote otherwise. With both controls off, ordinary new approvals are
 skipped. Existing questions and owner decisions, and fresh approval after
 merge repair, cannot be bypassed by disabling these controls.
 
+For existing-branch reviews, literal `true` values for either control in the
+reviewed commit's `magi.toml` or `.magi/config.toml` also require the hold. These
+values can only strengthen base policy, persist across later removal and resume,
+and are checked again at the landing head. Questions record the source file and
+commit. Branch includes and templates are not evaluated; all other settings,
+including verification commands, still come from the base configuration.
+
 The question and phone panel show all applicable approval reasons, each final
 vote and its reason, and last-round internal findings (including Minor) with
 available adoption evidence. A fixer claiming a finding was addressed, or a

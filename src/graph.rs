@@ -1027,6 +1027,33 @@ impl Runner {
                 .unwrap_or_default(),
         );
 
+        // A takeover must not forget a hold that a previous review observed,
+        // even if repairs have since removed it from the branch.
+        for id in &takeover.earlier {
+            if let Ok(old) = RunState::load_under(id, &takeover.home)
+                && old.repo == state.repo
+                && (old.pr_head.as_deref() == Some(branch)
+                    || old.winner().is_some_and(|w| w.branch == branch))
+            {
+                for hold in old.branch_owner_holds {
+                    if !state.branch_owner_holds.contains(&hold) {
+                        state.event(
+                            "approval-policy",
+                            format!(
+                                "inherited {}=true from the reviewed branch's {} at {} (run {id})",
+                                hold.control.key(),
+                                hold.file,
+                                hold.head
+                            ),
+                        );
+                        state.branch_owner_holds.push(hold);
+                    }
+                }
+            }
+        }
+        let reviewed_head = git::rev_parse(repo, branch).await?;
+        state.observe_branch_owner_holds(&reviewed_head).await;
+
         // An attached worktree, so the fixer's commits land on the branch under
         // review rather than on a detached head nobody will look at again.
         let worktree = state.worktree_root().join("under-review");
@@ -10753,7 +10780,7 @@ pub(crate) const EXISTING_BRANCH: &str = "(existing branch)";
 /// Does this run review work that already existed, rather than implement a
 /// task? Runs recorded before `reviewed_commits` existed carry only the
 /// candidate marker.
-fn is_review_run(state: &RunState) -> bool {
+pub(crate) fn is_review_run(state: &RunState) -> bool {
     state.reviewed_commits.is_some() || state.candidates.iter().any(|c| c.agent == EXISTING_BRANCH)
 }
 
