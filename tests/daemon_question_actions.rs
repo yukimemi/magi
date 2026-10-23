@@ -13,7 +13,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{Judges, fixture, home_lock};
+use common::{Judges, SeatBlock, fixture, home_lock};
 use magi::ask::{Answer, ChoiceAction, Question, Questions};
 use magi::daemon::{self, Opts};
 use magi::graph::{Pause, Runner};
@@ -28,18 +28,9 @@ async fn answered_resume_action_is_executed(label: &str) {
     fx.config.disk.auto_fold = false;
     fx.config.disk.cache_limit_bytes = 0;
 
-    let block_dir = fx.tmp.path().join("block");
-    std::fs::create_dir_all(&block_dir).expect("block dir");
+    let block = SeatBlock::install(&mut fx, "judge-1", "judge");
     let conduct_log = fx.tmp.path().join("conduct.log");
     for a in &mut fx.config.agents {
-        a.env
-            .insert("MOCK_BLOCK_SEAT".to_owned(), "judge-1".to_owned());
-        a.env
-            .insert("MOCK_BLOCK_NODE".to_owned(), "judge".to_owned());
-        a.env.insert(
-            "MOCK_BLOCK_DIR".to_owned(),
-            block_dir.to_string_lossy().into_owned(),
-        );
         a.env.insert(
             "MOCK_CONDUCT_LOG".to_owned(),
             conduct_log.to_string_lossy().into_owned(),
@@ -57,26 +48,11 @@ async fn answered_resume_action_is_executed(label: &str) {
     .await
     .expect("start");
     runner.on_pause(pause.clone());
-    let started = block_dir.join("started-judge-1");
-    let release = block_dir.join("release-judge-1");
-    let interrupter = tokio::spawn({
-        let pause = pause.clone();
-        async move {
-            let mut seen = false;
-            for _ in 0..1500 {
-                if started.exists() {
-                    seen = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            assert!(seen, "the mock never signalled that judge-1 had started");
-            pause.park();
-            std::fs::write(&release, b"go").expect("release judge-1");
-        }
-    });
-    runner.execute().await.expect("execute parks after judge");
-    interrupter.await.expect("interrupter");
+    let mut exec = Box::pin(runner.execute());
+    block.started(&mut exec, || None).await;
+    pause.park();
+    block.release();
+    exec.await.expect("execute parks after judge");
     let run_id = runner.state.id.clone();
     let judged = runner.state.judgements.len();
     assert!(runner.state.parked);
