@@ -740,13 +740,23 @@ fn approval_evidence(state: &RunState) -> String {
             .filter(|c| !c.base_value(&state.config.graph))
             .and_then(|c| state.branch_owner_holds.iter().find(|h| h.control == c));
         if let Some(source) = source {
-            let _ = writeln!(
-                s,
-                "- {}=true from the reviewed branch's {} ({})",
-                source.control.key(),
-                source.file,
-                source.head
-            );
+            if ja {
+                let _ = writeln!(
+                    s,
+                    "- {}=true（レビュー対象ブランチの {} 由来, {}）",
+                    source.control.key(),
+                    source.file,
+                    source.head
+                );
+            } else {
+                let _ = writeln!(
+                    s,
+                    "- {}=true from the reviewed branch's {} ({})",
+                    source.control.key(),
+                    source.file,
+                    source.head
+                );
+            }
         }
         let _ = writeln!(s, "- {label}");
     }

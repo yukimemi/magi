@@ -4203,6 +4203,8 @@ lock_file = "{{ vars.bad }}"
                 ("[graph]\nland_approval = false\n", false),
                 ("[graph]\nland = true\n", false),
                 ("[graph\n", false),
+                ("[graph]\nland_approval = \"yes\"\n", false),
+                ("[graph]\nland_approval = 1\n", false),
             ] {
                 let (_tmp, repo) = fixture(text, "[graph]\nland_approval = false\n");
                 let head = crate::git::rev_parse(&repo, "HEAD").await.unwrap();
@@ -4261,6 +4263,9 @@ lock_file = "{{ vars.bad }}"
             );
             let (holds, diagnostics) =
                 branch_owner_holds(&repo, "0000000000000000000000000000000000000000").await;
+            assert!(holds.is_empty());
+            assert!(!diagnostics.is_empty());
+            let (holds, diagnostics) = branch_owner_holds(&repo, "").await;
             assert!(holds.is_empty());
             assert!(!diagnostics.is_empty());
             for base in [false, true] {
