@@ -3960,7 +3960,7 @@ fn seed_questions(home: &std::path::Path, seeds: &[QuestionSeed<'_>]) {
         );
         q.id = seed.id.to_owned();
         q.asked_at = seed.asked_at.parse().expect("valid question timestamp");
-        store.put_executable(&mut q).expect("seed question");
+        store.put(&mut q).expect("seed question");
     }
 }
 
