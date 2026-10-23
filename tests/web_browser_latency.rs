@@ -2,11 +2,11 @@
 //! revisions with tests/web_latency/compare.py. No production stores are read.
 #[path = "web_render/cdp.rs"]
 mod cdp;
+#[allow(unused_macros, unused_imports)]
+mod common;
 #[allow(dead_code)]
 #[path = "web_render/diag.rs"]
 mod diag;
-#[allow(unused_macros, unused_imports)]
-mod common;
 
 use magi::{
     ask::{Question, Questions},

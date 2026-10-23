@@ -276,9 +276,9 @@ async fn serve_with_client_probe(
         },
     ));
     let requests = diag::Requests::register(&base);
-    let router = router.layer(axum::middleware::from_fn(
-        move |request, next| requests.clone().record(request, next),
-    ));
+    let router = router.layer(axum::middleware::from_fn(move |request, next| {
+        requests.clone().record(request, next)
+    }));
     tokio::spawn(async move {
         let _ = axum::serve(listener, router).await;
     });

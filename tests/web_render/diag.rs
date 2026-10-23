@@ -246,10 +246,14 @@ pub fn os_samples(root: u32) -> Value {
         let load = System::load_average();
         // MSYS mock agents spawn ~10 sh/bash per second; a large count here
         // points at a process-spawn storm rather than at Chrome.
-        let shells = system.processes().values().filter(|p| {
-            let name = p.name().to_string_lossy().to_ascii_lowercase();
-            name.starts_with("sh") || name.starts_with("bash")
-        }).count();
+        let shells = system
+            .processes()
+            .values()
+            .filter(|p| {
+                let name = p.name().to_string_lossy().to_ascii_lowercase();
+                name.starts_with("sh") || name.starts_with("bash")
+            })
+            .count();
         samples.push(json!({"at_ms": now(), "process_count": system.processes().len(),
             "shell_processes": shells,
             "cpu_percent": system.global_cpu_usage(), "available_memory": system.available_memory(),
