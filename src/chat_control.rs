@@ -75,6 +75,15 @@ pub enum Operation {
         /// 再実行対象の workflow run ID。
         workflows: Vec<String>,
     },
+    /// 公開テキスト・分岐・リリース監視の判断を、所有者の言葉を引用して記録する。
+    Decide {
+        /// 質問 ID（完全または一意な接頭辞）。
+        question: String,
+        /// 記録された選択肢のラベル。
+        choice: String,
+        /// 最新の所有者メッセージ全文。
+        quote: Option<String>,
+    },
     /// 個別確認後、生存が否定された run を破棄する。
     Abandon {
         /// 完全な run ID。
@@ -150,11 +159,97 @@ async fn execute(
             let ids = rerun_checks(queue, home, talk, &run, &request, &head, &workflows).await?;
             format!("requested a rerun of workflow run(s) {}", ids.join(", "))
         }
+        Operation::Decide {
+            question,
+            choice,
+            quote,
+        } => {
+            let q = decide(
+                queue,
+                talks,
+                home,
+                talk,
+                &question,
+                &choice,
+                quote.as_deref(),
+            )?;
+            format!("recorded `{choice}` for decision {}", q.short())
+        }
         Operation::Abandon { run, quote } => {
             abandon(queue, talks, home, talk, &run, quote.as_deref())?;
             format!("abandoned run {run}")
         }
     })
+}
+
+/// Record the owner's decision on a routed publication / divergence / release
+/// question. The record stays the authority the machinery behind it reads; the
+/// chat only supplies the answer, under the same evidence rules `magi answer`
+/// applies to a chat seat (offered label, owner quote, exact-content binding
+/// and irreversible-choice confirmation). Merge is never decided here.
+pub fn decide(
+    queue: &Queue,
+    talks: &Talks,
+    home: &Path,
+    talk: &str,
+    question: &str,
+    choice: &str,
+    quote: Option<&str>,
+) -> Result<crate::ask::Question> {
+    use crate::ask::{Answer, Questions};
+    let questions = Questions::at(home.join("questions"));
+    let id = questions.resolve_id(question)?;
+    let q = questions.get(&id)?;
+    ensure!(
+        q.routed_chat.as_deref() == Some(talk) && crate::task_chat::awaits_decision(&q),
+        "question {} is not a decision routed to this conversation; merge approvals use the owner's chat button",
+        q.short()
+    );
+    let task_id = q
+        .routed_task
+        .clone()
+        .context("question is not routed to a task")?;
+    ensure!(
+        owned(&queue.get(&task_id)?, talk),
+        "the task behind this decision is not owned by this conversation"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let (q, guard) = loop {
+        let mut busy = false;
+        let updated = questions.update(&q.id, |r| {
+            let guard = match talks.try_answer_guard()? {
+                Some(g) => g,
+                None => {
+                    busy = true;
+                    bail!("conversation evidence is locked by another process");
+                }
+            };
+            ensure!(r.status.open(), "question {} is already {}", r.short(), r.status.as_str());
+            // Whatever the choice, a routed decision is the owner's: the quote
+            // must be their entire latest persisted send in this conversation.
+            let latest = talks.get(talk)?;
+            ensure!(
+                quote.is_some_and(|w| !w.trim().is_empty()
+                    && crate::consult::latest_owner_instruction(&latest) == Some(w)),
+                "a routed decision needs --quote of the owner's entire latest message in this conversation"
+            );
+            let reply = r.resolve_reply(choice)?.to_owned();
+            let answer = if r.free_text() { Answer::Text(reply.clone()) } else { Answer::Choice(reply.clone()) };
+            crate::consult::refuse_operator_held(r, crate::queue::CHAT_NODE, &queue.list())?;
+            r.answer_authority = crate::consult::authorize_answer(
+                r, talks, &questions, talk, crate::queue::CHAT_NODE, &reply, quote,
+            )?;
+            r.answer(answer)?;
+            Ok(guard)
+        });
+        if busy && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        break updated?;
+    };
+    drop(guard);
+    Ok(q)
 }
 
 /// The exact owner instruction that confirms abandoning `run`.

@@ -1552,11 +1552,9 @@ impl Questions {
             && let Some(home) = self.root.parent()
         {
             let tasks = crate::queue::Queue::at(home.join("queue")).list();
-            q.routed_task = crate::task_chat::task_of(q, &tasks)
-                .filter(|id| {
-                    crate::task_chat::chat_routable(q)
-                        && crate::task_chat::enabled_for(&tasks, id)
-                });
+            q.routed_task = crate::task_chat::task_of(q, &tasks).filter(|id| {
+                crate::task_chat::chat_routable(q) && crate::task_chat::enabled_for(&tasks, id)
+            });
         }
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
@@ -2364,7 +2362,12 @@ mod tests {
         assert!(store.get(&q.id).unwrap().status.open());
 
         // Once the chat has it, the ordinary settlement applies again.
-        store.update(&q.id, |r| { r.routed_chat = Some("chat".into()); Ok(()) }).unwrap();
+        store
+            .update(&q.id, |r| {
+                r.routed_chat = Some("chat".into());
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(store.settle_run(&q.run, RunStatus::Failed).unwrap(), 1);
     }
 

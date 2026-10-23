@@ -3304,3 +3304,21 @@ decision routing (`task_chat::enabled_for`, consulted by `Questions::put`,
 `task_chat::routes` and `task_chat::sweep`). Off restores the question/deputy/
 waiter path. `Queue::put_unlocked` keeps a stored `Task::chat` against stale
 writes, so the one chat per task is never lost.
+
+Update (step 2 scope): every task-scoped producer routes, including the posting
+gate, the branch-divergence question and non-merge release-watch questions
+(`task_chat::chat_routable`). Those three (`task_chat::awaits_decision`) are not
+abandoned on delivery: the record stays open for the machinery that reads its
+answer, and the chat settles it with `magi task control decide`
+(`chat_control::decide`: routed to that chat, owned task, `--quote` of the
+owner's entire latest send, then `consult::authorize_answer`). Merge approvals
+and a local release approval keep the owner's head-bound button; only the
+merge-consent answer needs it, so hold, dismiss and repair keep their ordinary
+answers. An approval or local-release card with no `merge_target` is an old
+card and is never routed. `task_chat::enabled_for` treats an unreadable
+repository config as "off", because `routed_task` is persisted and cannot be
+undone when the config returns. The button endpoint has no stronger caller
+identity than every other owner route (the tailnet is the boundary); what it
+adds over the old Questions-list button is the persona offer, the chat binding
+and the head binding. Open routed questions are filtered out of the Questions
+list client-side, not dropped from the API.

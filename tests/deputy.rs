@@ -1378,6 +1378,15 @@ async fn maintenance_resume_preserves_operator_decisions_after_deputy_settle() {
     use magi::{ask::ChoiceAction, queue::{Queue, Source, Task, TaskStatus}, run::{RunState, RunStatus}};
     let s = scene(home_lock().await);
     s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
+    // This is the retained legacy deputy workflow: the repository opts out of
+    // task-chat routing (`question_routing = false`) in its committed layer.
+    let mut legacy = s.fx.config.clone();
+    legacy.graph.question_routing = false;
+    std::fs::write(s.fx.repo.join("magi.toml"), toml::to_string(&legacy).unwrap()).unwrap();
+    for args in [vec!["add", "magi.toml"], vec!["commit", "-m", "test: legacy question path"], vec!["push", "origin", "main"]] {
+        let out = std::process::Command::new("git").args(&args).current_dir(&s.fx.repo).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
     let queue = Queue::at(s.home.join("queue"));
     for manual_hold in [true, false] {
         let mut run = RunState::new(s.fx.repo.clone(), "main".into(), "base".into(),

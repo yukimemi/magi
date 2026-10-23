@@ -19,24 +19,40 @@ pub fn task_of(q: &Question, tasks: &[Task]) -> Option<String> {
     matching.next().is_none().then(|| task.id.clone())
 }
 
-/// `[graph] question_routing` of the task's repository. An unreadable
-/// config keeps the default (on), like every other default-on graph switch.
+/// `[graph] question_routing` of the task's repository. An unreadable config
+/// is "unknown", never "on": routing is persisted on the record and cannot be
+/// undone when the config comes back, so a read failure keeps the legacy path.
 pub(crate) fn enabled_for(tasks: &[Task], task_id: &str) -> bool {
-    tasks.iter().find(|t| t.id == task_id).is_none_or(|t| {
-        Config::discover(&t.repo, None).map_or(true, |(cfg, _)| cfg.graph.question_routing)
+    tasks.iter().find(|t| t.id == task_id).is_some_and(|t| {
+        Config::discover(&t.repo, None).is_ok_and(|(cfg, _)| cfg.graph.question_routing)
     })
 }
 
-/// Questions whose answer is consumed by machinery that has no step-1 control
-/// command yet (the posting gate's text choice, a release job's retry / rerun
-/// offers, the branch-divergence choice) stay authoritative on the question
-/// path: retiring them on delivery would resolve them without a decision. The
-/// task chat is still told (see `sweep`), as a notice only. Merge approvals are
-/// routed (button, head-bound). Step 3 adds the control operations.
+/// Every question about a task is routed to its chat. Two shapes need a
+/// head-bound merge target to be routable at all (a merge approval and a
+/// local release approval): without one they are old cards whose dismiss /
+/// repair recovery lives on the question path. A choice-less bump notice is a
+/// notice, not a decision.
 pub(crate) fn chat_routable(q: &Question) -> bool {
-    q.node != crate::github_text::ASK_NODE
-        && !(q.node == crate::reconcile::NODE && q.seat == crate::reconcile::SEAT)
-        && (q.node != crate::bump::NOTICE_NODE || q.merge_target.is_some())
+    if q.node == crate::land::APPROVAL_NODE {
+        return q.merge_target.is_some();
+    }
+    if q.node == crate::bump::NOTICE_NODE {
+        return q.merge_target.is_some() || (q.seat == "release-watch" && !q.choices.is_empty());
+    }
+    true
+}
+
+/// Routed questions whose answer is consumed by machinery (the posting gate,
+/// the branch-divergence reconcile, the release watcher) rather than by a
+/// step-1 control command. They stay open after delivery and the chat settles
+/// them with `magi task control decide`, under the evidence rules `magi
+/// answer` applies from a chat. A merge target means the owner's button.
+pub fn awaits_decision(q: &Question) -> bool {
+    q.merge_target.is_none()
+        && (q.node == crate::github_text::ASK_NODE
+            || (q.node == crate::reconcile::NODE && q.seat == crate::reconcile::SEAT)
+            || (q.node == crate::bump::NOTICE_NODE && q.seat == "release-watch"))
 }
 
 /// Also recognize legacy and watch-linked records before the first sweep.
@@ -99,8 +115,11 @@ pub fn post(
             let body = format!("# {}\n\n{}\n\n{}\n\nTask: {}\nRun: {}\nPR: {}\nState: {}\n",
                 crate::prompt::TASK_MESSAGE_HEADING, clean(&q.summary), clean(&q.detail),
                 task.id, run, clean(pr), task.status.as_str());
-            let instructions = if !chat_routable(q) {
-                "\nThis decision is still pending as a question in the owner's Questions list and is answered there. Tell the owner it is waiting; do not answer it yourself and do not start a deputy.\n".into()
+            let instructions = if awaits_decision(q) {
+                let offered = if q.choices.is_empty() { String::new() } else {
+                    format!(" The recorded options are: {}.", q.choices.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", "))
+                };
+                format!("\nDecision {}: discuss it with the owner as free text.{offered} Apply the owner's decision only with `magi task control decide {} <option> --quote <entire latest owner message>`; its authorization, exact-content and consequence checks still apply. Do not decide without the owner's explicit words and do not start a deputy/waiter. Silence is a hold.\n", q.id, q.id)
             } else if let Some(target) = &q.merge_target {
                 format!("\nMerge decision {} for PR {} at head {}: explain the decision and include this full question ID in your reply to offer the chat buttons. Only the owner can click Merge or Hold. Never approve from text or an agent command. Silence is a hold.\n", q.id, target.pr, target.head)
             } else {
@@ -160,7 +179,15 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
             let chat = post(queue, talks, home, &task_id, &q)?;
             questions.update(&q.id, |r| {
                 r.routed_chat = Some(chat.clone());
-                if chat_routable(r) && r.merge_target.is_none() {
+                if awaits_decision(r) {
+                    // Its answer is still read by the machinery behind it; the
+                    // chat's own consultation record is what the evidence
+                    // rules bind the decision to.
+                    r.consult.get_or_insert_with(|| crate::ask::ChatConsult {
+                        talk: chat.clone(),
+                        at: jiff::Timestamp::now(),
+                    });
+                } else if chat_routable(r) && r.merge_target.is_none() {
                     r.abandon(format!("forwarded to task chat {chat}"));
                 }
                 Ok(())
@@ -260,13 +287,45 @@ mod tests {
     }
 
     #[test]
-    fn gate_and_release_job_questions_stay_on_the_question_path() {
-        let q = |node: &str| {
-            Question::new("run".into(), node.into(), "seat".into(), "s".into(), String::new(), vec![])
+    fn gate_divergence_and_release_questions_route_and_await_a_decision() {
+        let q = |node: &str, seat: &str, choices: Vec<String>| {
+            Question::new(
+                "run".into(),
+                node.into(),
+                seat.into(),
+                "s".into(),
+                String::new(),
+                choices,
+            )
         };
-        assert!(!chat_routable(&q(crate::github_text::ASK_NODE)));
-        assert!(!chat_routable(&q(crate::bump::NOTICE_NODE)));
-        assert!(chat_routable(&q("conduct")));
+        let gate = q(
+            crate::github_text::ASK_NODE,
+            "posting-gate",
+            vec!["use fallback".into()],
+        );
+        assert!(chat_routable(&gate) && awaits_decision(&gate));
+        let diverged = q(
+            crate::reconcile::NODE,
+            crate::reconcile::SEAT,
+            vec!["a".into()],
+        );
+        assert!(chat_routable(&diverged) && awaits_decision(&diverged));
+        let release = q(
+            crate::bump::NOTICE_NODE,
+            "release-watch",
+            vec!["hold".into()],
+        );
+        assert!(chat_routable(&release) && awaits_decision(&release));
+        // A choice-less bump notice and an old approval card without a target
+        // are not decisions to route.
+        assert!(!chat_routable(&q(crate::bump::NOTICE_NODE, "bump", vec![])));
+        assert!(!chat_routable(&q(
+            crate::land::APPROVAL_NODE,
+            "land",
+            vec!["merge".into()]
+        )));
+        let q = |node: &str| q(node, "seat", vec![]);
+        assert!(chat_routable(&q("conduct")) && !awaits_decision(&q("conduct")));
         let mut m = q(crate::bump::NOTICE_NODE);
         m.merge_target = Some(crate::merge_decision::Target {
             pr: "https://example.test/pull/1".into(),
@@ -274,5 +333,31 @@ mod tests {
             language: "en".into(),
         });
         assert!(chat_routable(&m));
+    }
+
+    #[test]
+    fn an_unreadable_repository_config_never_routes_a_question() {
+        let home = tempfile::tempdir().unwrap();
+        let queue = Queue::at(home.path().join("queue"));
+        let repo = home.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        std::fs::write(repo.join("magi.toml"), "this is = [not toml").unwrap();
+        let mut task = Task::new("t".into(), "i".into(), repo, crate::queue::Source::Human);
+        queue.put(&mut task).unwrap();
+        assert!(!enabled_for(&queue.list(), &task.id));
+        let questions = Questions::at(home.path().join("questions"));
+        let mut q = Question::new(
+            task.id.clone(),
+            "conduct".into(),
+            "seat".into(),
+            "s".into(),
+            String::new(),
+            vec![],
+        );
+        questions.put(&mut q).unwrap();
+        // Routing is persisted and cannot be undone when the config returns,
+        // so a read failure keeps the legacy question path.
+        assert!(q.routed_task.is_none());
+        assert!(questions.get(&q.id).unwrap().routed_task.is_none());
     }
 }

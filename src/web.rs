@@ -7255,7 +7255,6 @@ fn question_views(
     }
     let cfg = load();
     qs.into_iter()
-        .filter(|q| q.routed_task.is_none())
         .map(|q| QuestionView::of(q, store, cfg.as_ref()))
         .collect()
 }
@@ -7558,9 +7557,13 @@ async fn question_answer(
             .update(&q.id, |r| {
                 anyhow::ensure!(
                     r.routed_task.is_none() || r.merge_target.is_some(),
-                    "task decisions are free text in the task chat; use magi task control"
+                    "task decisions are free text in the task chat; its agent records them with `magi task control decide`"
                 );
-                if r.routed_task.is_some() && r.merge_target.is_some() {
+                let merge = matches!(&answer, ask::Answer::Choice(c)
+                    if crate::consult::consent(r, c) == crate::consult::Consent::Merge);
+                // Only a merge needs the owner's chat button. Hold, dismiss and
+                // repair keep their ordinary, individually guarded answers.
+                if r.routed_task.is_some() && r.merge_target.is_some() && merge {
                     let talk_id = body
                         .talk
                         .as_deref()
@@ -11830,6 +11833,89 @@ mod tests {
             Some("merge")
         );
         assert!(send(button).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_routed_approval_keeps_hold_without_the_chat_button() {
+        let home = TempDir::new().unwrap();
+        let ui = Arc::new(Ui::new(
+            Queue::at(home.path().join("queue")),
+            Questions::at(home.path().join("questions")),
+            Talks::at(home.path().join("talks")),
+            home.path().join("runs"),
+            home.path().to_owned(),
+            home.path().to_owned(),
+        ));
+        for choice in [crate::land::HOLD] {
+            let mut q = Question::new(
+                "run".into(),
+                crate::land::APPROVAL_NODE.into(),
+                "land".into(),
+                "Merge?".into(),
+                String::new(),
+                vec!["merge".into(), choice.into()],
+            );
+            q.routed_task = Some("task".into());
+            q.merge_target = Some(crate::merge_decision::Target {
+                pr: "https://example.test/pull/1".into(),
+                head: "head-a".into(),
+                language: "en".into(),
+            });
+            ui.questions.put(&mut q).unwrap();
+            let answer = |c: &str| {
+                question_answer(
+                    State(ui.clone()),
+                    Path(q.id.clone()),
+                    Ok(Json(
+                        serde_json::from_value::<NewAnswer>(serde_json::json!({ "choice": c }))
+                            .unwrap(),
+                    )),
+                )
+            };
+            // Merge still needs the button; hold keeps its ordinary answer (dismiss and
+            // repair are covered by the obsolete_approval / legacy_merge_repair tests).
+            assert!(answer("merge").await.is_err());
+            assert!(ui.questions.get(&q.id).unwrap().status.open());
+            let _ = answer(choice).await.unwrap();
+            assert_eq!(
+                ui.questions.get(&q.id).unwrap().resolution().as_deref(),
+                Some(choice)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_routed_decision_is_refused_on_the_question_route() {
+        let home = TempDir::new().unwrap();
+        let ui = Arc::new(Ui::new(
+            Queue::at(home.path().join("queue")),
+            Questions::at(home.path().join("questions")),
+            Talks::at(home.path().join("talks")),
+            home.path().join("runs"),
+            home.path().to_owned(),
+            home.path().to_owned(),
+        ));
+        let mut q = Question::new(
+            "run".into(),
+            crate::github_text::ASK_NODE.into(),
+            "posting-gate".into(),
+            "Post?".into(),
+            String::new(),
+            vec!["use fallback".into()],
+        );
+        q.routed_task = Some("task".into());
+        ui.questions.put(&mut q).unwrap();
+        let sent = question_answer(
+            State(ui.clone()),
+            Path(q.id.clone()),
+            Ok(Json(
+                serde_json::from_value::<NewAnswer>(serde_json::json!({"choice":"use fallback"}))
+                    .unwrap(),
+            )),
+        )
+        .await;
+        assert!(sent.is_err());
+        assert!(ui.questions.get(&q.id).unwrap().status.open());
     }
 
     #[tokio::test]

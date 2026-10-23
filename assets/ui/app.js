@@ -9573,7 +9573,9 @@ function loadQuestions() {
   if (questionOriginController) questionOriginController.abort();
   return loadStore("questions", `${API.questions}/core`, null, list => {
     const previousById = new Map((state.questions || []).map(question => [question.id, question]));
-    state.questions = sortQuestions((Array.isArray(list) ? list : []).map(question => {
+    /* An open question routed to a task chat is decided there (a merge by the
+       owner's button, the rest through the chat agent), so it is not a card. */
+    state.questions = sortQuestions((Array.isArray(list) ? list : []).filter(question => !(question.routed_task && question.status === "open")).map(question => {
       const previous = previousById.get(question.id);
       if (!previous || previous.record_revision !== question.record_revision) return question;
       // Core rows omit origins; retain them until the fresh lookup completes.

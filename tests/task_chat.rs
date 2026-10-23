@@ -67,7 +67,7 @@ async fn existing_closed_chat_reopens_and_delivery_is_durable_once() {
     assert!(!chat.pending.contains("old choice"));
     for text in [&task.id, "run-a", "State:", "PR:"] { assert!(chat.pending.contains(text)); }
     assert!(chat.pending_messages[0].display.is_some());
-    assert_eq!(magi::chat_notify::talks_to_start(&talks), [chat.id.clone()]);
+    assert_eq!(magi::chat_notify::talks_to_start(&talks), std::slice::from_ref(&chat.id));
     assert_eq!(queue.get(&task.id).unwrap().chat, Some(chat.id.clone()));
     assert!(!questions.get(&q.id).unwrap().status.open());
     assert!(magi::chat_control::owned_task(&queue, &chat.id, &task.id).is_ok());
@@ -196,5 +196,56 @@ async fn forwarded_triage_does_not_file_another_question_while_chat_decides() {
     }
     assert_eq!(questions.list().len(), 1);
     assert_eq!(talks.get(&chat.id).unwrap().pending_messages.len(), 1);
+}
+}
+
+common::e2e! {
+async fn publication_divergence_and_release_decisions_route_and_wait_for_the_chat_control() {
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("outbox");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let questions = Questions::at(home.join("questions"));
+    let mut chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let other = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let mut task = task(&fx.repo, Source::Agent { run: chat.id.clone(), node: magi::queue::CHAT_NODE.into() });
+    queue.put(&mut task).unwrap();
+    let mut ids = Vec::new();
+    for (node, seat, choice) in [
+        (magi::github_text::ASK_NODE, "posting-gate", "use fallback"),
+        (magi::reconcile::NODE, magi::reconcile::SEAT, "keep"),
+        (magi::bump::NOTICE_NODE, "release-watch", "leave it"),
+    ] {
+        let mut q = question("run-a");
+        q.node = node.into();
+        q.seat = seat.into();
+        q.choices = vec![choice.into()];
+        questions.put(&mut q).unwrap();
+        assert_eq!(q.routed_task.as_deref(), Some(task.id.as_str()), "{node}");
+        ids.push(q.id);
+    }
+    magi::task_chat::sweep(&queue, &talks, &questions, &home);
+    let delivered = talks.get(&chat.id).unwrap();
+    assert_eq!(delivered.pending_messages.len(), 3);
+    assert!(delivered.pending.contains("magi task control decide"));
+    for id in &ids {
+        let q = questions.get(id).unwrap();
+        // Still the record the machinery reads, but nobody waits or deputizes.
+        assert!(q.status.open());
+        assert_eq!(q.routed_chat.as_deref(), Some(chat.id.as_str()));
+        assert!(magi::deputy::kind_of(&q).is_none());
+        // Another conversation, or no owner evidence, records nothing.
+        assert!(magi::chat_control::decide(&queue, &talks, &home, &other.id, id, &q.choices[0], None).is_err());
+        assert!(magi::chat_control::decide(&queue, &talks, &home, &chat.id, id, &q.choices[0], None).is_err());
+        assert!(questions.get(id).unwrap().status.open());
+        assert!(magi::chat_control::decide(&queue, &talks, &home, &chat.id, id, "not offered", Some("x")).is_err());
+    }
+    // The owner's own latest words, quoted whole, settle it; the record then
+    // carries the answer the release watcher applies on its next lap.
+    let release = ids[2].clone();
+    talk::record(&mut chat, &talks, "leave it", vec![]).unwrap();
+    let q = magi::chat_control::decide(&queue, &talks, &home, &chat.id, &release, "leave it", Some("leave it")).unwrap();
+    assert_eq!(q.resolution().as_deref(), Some("leave it"));
+    assert!(questions.get(&ids[0]).unwrap().status.open());
 }
 }

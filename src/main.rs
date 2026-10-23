@@ -726,6 +726,14 @@ enum ControlCmd {
         #[arg(long = "workflow", required = true)]
         workflows: Vec<String>,
     },
+    /// Record the owner's decision on a publication, divergence or release
+    /// question routed to this chat. Needs `--quote` of the owner's latest message.
+    Decide {
+        /// Question id from the automatic message.
+        question: String,
+        /// One of the recorded options, exactly.
+        choice: String,
+    },
     /// Abandon a run whose driver is proven gone. Needs the owner's exact
     /// message `abandon-run: <run id>` as the latest send, and `--quote` of it.
     Abandon {
@@ -3053,7 +3061,7 @@ async fn answer_cmd(args: AnswerArgs) -> Result<()> {
     };
     anyhow::ensure!(
         q.routed_task.is_none() || q.merge_target.is_some(),
-        "task decisions are free text in the task chat; use magi task control"
+        "task decisions are free text in the task chat; its agent records them with `magi task control decide`"
     );
     let tasks = magi::queue::Queue::open().list();
     let talks = magi::talk::Talks::open();
@@ -3678,6 +3686,11 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                     request,
                     head,
                     workflows,
+                },
+                ControlCmd::Decide { question, choice } => cc::Operation::Decide {
+                    question,
+                    choice,
+                    quote: quote.map(str::to_owned),
                 },
                 ControlCmd::Abandon { run } => cc::Operation::Abandon {
                     run,
