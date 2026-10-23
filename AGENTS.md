@@ -1343,6 +1343,30 @@ again.
   and `Task::release` keeps it only for a machine hold; releasing without
   cleaning the old worktree re-holds the task without spending an attempt.
 
+### Release bumps outside a root `Cargo.toml` (`[release] version_files`)
+
+`src/release_manifest.rs` (pure, plus `apply`) resolves, reads, checks and
+rewrites the declared files; `bump`, `release_local` (`bumped_by`, the version
+check in `drive`) and `branch_version` all take the version-of-record path from
+`release_manifest::primary_path`. Unset means the root `Cargo.toml` and the old
+`cargo build` lock sync, unchanged.
+
+- **Declared, never detected.** The first entry must be a `Cargo.toml` with
+  kind `cargo` and be the file the repository's `auto-tag.yml` reads; JSON
+  files get one string replaced. With declared files the lock beside the first
+  entry is edited as text (no `cargo build`: a Tauri crate may not build here)
+  and exactly one entry must match. `package-lock.json` is out of scope. shun's
+  own `magi.toml` needs the list from the README; that is a change in its repo.
+- **A skip is state, not prose.** `ReleaseBump::skipped` (`#[serde(default)]`,
+  `run::SCHEMA` unchanged) records no-manifest, disagreeing files, a change that
+  already raised the version, and release-only changes. `Skip::action` also
+  sets `action_required` and raises a `release-bump:<run>` notice (no manifest
+  with an `auto-tag.yml` present, disagreeing files). Unreadable versions are
+  unknown, never "unchanged". The already-raised check applies only with
+  declared files; the legacy default path is untouched.
+- Approval gates, automerge, local-mode approval and the no-manual-tag rule are
+  not changed by any of this.
+
 ### Releasing without GitHub Actions (`[release] mode = "local"`)
 
 For repositories whose Actions never run (private, no minutes): the release

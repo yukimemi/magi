@@ -33,6 +33,7 @@ use crate::git;
 use crate::land;
 use crate::notices::{Link, Notice, Notices};
 use crate::proc::Quiet as _;
+use crate::release_manifest;
 use crate::run::{self, RunState, RunStatus};
 use crate::verdict;
 
@@ -793,7 +794,7 @@ pub(crate) fn current_version(toml: &str) -> Result<String> {
 /// The version a release pull request really carries: the manifest on its head
 /// branch (an escalation rewrites it but keeps the branch name), falling back
 /// to the branch name only when the manifest cannot be read.
-async fn branch_version(repo: &Path, remote: &str, branch: &str) -> Option<String> {
+async fn branch_version(repo: &Path, remote: &str, branch: &str, primary: &str) -> Option<String> {
     let from_name = branch.strip_prefix("chore/release-v").map(str::to_owned);
     // A tracking ref of its own: FETCH_HEAD is shared with every other fetch in
     // this repository (the release watcher runs them concurrently).
@@ -801,7 +802,7 @@ async fn branch_version(repo: &Path, remote: &str, branch: &str) -> Option<Strin
     let spec = format!("+refs/heads/{branch}:{tracking}");
     let fetched = git::git_raw(repo, &["fetch", "--quiet", remote, &spec]).await;
     if fetched.is_ok_and(|o| o.code == Some(0))
-        && let Ok(out) = git::git_raw(repo, &["show", &format!("{tracking}:Cargo.toml")]).await
+        && let Ok(out) = git::git_raw(repo, &["show", &format!("{tracking}:{primary}")]).await
         && out.code == Some(0)
         && let Ok(v) = current_version(&out.stdout)
     {
@@ -1312,6 +1313,44 @@ struct Progress {
     version: Option<String>,
     /// A release pull request already pending when this attempt started.
     pending_pr: Option<String>,
+    /// Why the bump was deliberately not made.
+    skip: Option<Skip>,
+}
+
+/// A bump that was deliberately not made. Recorded on the run so it can never
+/// read as a completed release.
+#[derive(Debug)]
+struct Skip {
+    /// Why, in one line.
+    reason: String,
+    /// What the owner has to do, when the skip needs them (this also raises a
+    /// notice).
+    action: Option<String>,
+}
+
+/// Record a skip on the run, and page the owner when it needs them.
+fn record_skip(state: &mut RunState, store: Option<&Notices>, skip: &Skip) {
+    let record = state.release_bump.get_or_insert_with(Default::default);
+    record.skipped = Some(skip.reason.clone());
+    let Some(action) = &skip.action else {
+        return;
+    };
+    record.action_required = Some(action.clone());
+    let notice = Notice::error(
+        &format!("release-bump:{}", state.id),
+        format!(
+            "Run {} merged, but its release bump was skipped: {action}.",
+            state.id
+        ),
+    )
+    .link(Link::Run {
+        id: state.id.clone(),
+    });
+    let store = store.cloned().unwrap_or_else(Notices::open);
+    if let Err(e) = store.raise(notice) {
+        state.event("bump", format!("could not raise a notice: {e:#}"));
+    }
+    state.event("bump", format!("needs attention: {action}"));
 }
 
 /// The `(version, reason)` to notify with for a failed attempt. The reason is
@@ -1330,7 +1369,13 @@ fn notice_for_failure(progress: &Progress, err: &anyhow::Error) -> (Option<Strin
 /// is not a fault. `ls-tree` rather than `cat-file -e`, so an unresolvable
 /// ref (a failed fetch, a misconfigured base) stays an error instead of being
 /// reported as a non-Rust repository.
+#[cfg(test)]
 async fn base_has_cargo_toml(repo: &Path, remote: &str, base: &str) -> Result<bool> {
+    base_has_file(repo, remote, base, release_manifest::DEFAULT_PRIMARY).await
+}
+
+/// [`base_has_cargo_toml`] for any repository-relative path.
+async fn base_has_file(repo: &Path, remote: &str, base: &str, path: &str) -> Result<bool> {
     let out = git::git(
         repo,
         &[
@@ -1338,12 +1383,24 @@ async fn base_has_cargo_toml(repo: &Path, remote: &str, base: &str) -> Result<bo
             "--name-only",
             &format!("{remote}/{base}"),
             "--",
-            "Cargo.toml",
+            path,
         ],
     )
     .await
-    .context("look for Cargo.toml on the base branch")?;
+    .with_context(|| format!("look for {path} on the base branch"))?;
     Ok(!out.trim().is_empty())
+}
+
+/// The version of record's version at `rev`, read in `dir`. `None` when it
+/// cannot be read (unknown, never "unchanged").
+async fn primary_version_at(dir: &Path, rev: &str, path: &str) -> Option<String> {
+    let out = git::git_raw(dir, &["show", &format!("{rev}:{path}")])
+        .await
+        .ok()?;
+    if out.code != Some(0) {
+        return None;
+    }
+    current_version(&out.stdout).ok()
 }
 
 /// [`after_merge`] with an optional magi home, so tests can point the
@@ -1357,6 +1414,9 @@ async fn after_merge_at(
 ) -> Result<()> {
     let mut progress = Progress::default();
     let result = after_merge_inner(state, pr_url, home, &mut progress).await;
+    if let Some(skip) = &progress.skip {
+        record_skip(state, store, skip);
+    }
     if let Err(e) = &result {
         let (version, reason) = notice_for_failure(&progress, e);
         let pending = progress.pending_pr.as_deref();
@@ -1393,22 +1453,72 @@ async fn after_merge_inner(
     let files = git::changed_files(&winner.worktree, &base, &winner.branch)
         .await
         .unwrap_or_default();
-    if is_release_only(&files) {
-        state.event(
-            "bump",
-            "the merged change touches only the release manifest; not treating it as a trigger",
-        );
-        return Ok(());
+    let declared = state.config.release.version_files.clone();
+    let custom = release_manifest::is_custom(&declared);
+    let primary = release_manifest::primary_path(&declared).to_owned();
+    if release_manifest::release_only(&files, &declared) {
+        // With declared files the file names alone are not enough (a
+        // dependency update touches `package.json` too): the version of
+        // record must not be provably unchanged.
+        let unchanged = custom
+            && match (
+                primary_version_at(&winner.worktree, &base, &primary).await,
+                primary_version_at(&winner.worktree, &winner.branch, &primary).await,
+            ) {
+                (Some(before), Some(after)) => before == after,
+                _ => false,
+            };
+        if !unchanged {
+            state.event(
+                "bump",
+                "the merged change touches only the release manifest; not treating it as a trigger",
+            );
+            progress.skip = Some(Skip {
+                reason: "the merged change touches only the release files; not a trigger"
+                    .to_owned(),
+                action: None,
+            });
+            return Ok(());
+        }
     }
 
     // Outside the lock, and before anything that assumes a Rust manifest.
     // Fetch first so a stale remote-tracking ref cannot misjudge the base.
     git::fetch(&repo, &remote, &base).await.ok();
-    if !base_has_cargo_toml(&repo, &remote, &base).await? {
+    if !base_has_file(&repo, &remote, &base, &primary).await? {
         state.event(
             "bump",
-            "release bump: no Cargo.toml on the base branch; release bumps are Rust-only, skipping",
+            if custom {
+                format!(
+                    "release bump: no {primary} on the base branch (from [release] version_files); skipping"
+                )
+            } else {
+                "release bump: no Cargo.toml on the base branch; release bumps are Rust-only, skipping"
+                    .to_owned()
+            },
         );
+        // A repository that releases from a workflow but has no manifest magi
+        // can read is one whose release silently never happens: say so.
+        let releases_by_workflow =
+            base_has_file(&repo, &remote, &base, ".github/workflows/auto-tag.yml")
+                .await
+                .unwrap_or(false);
+        let ja = crate::lang::is_japanese(&state.config.graph.language);
+        let action = releases_by_workflow.then(|| {
+            if ja {
+                format!(
+                    "base ブランチに {primary} がありません。auto-tag.yml があるリポジトリです。magi.toml の [release] version_files に版の正本 (auto-tag.yml が読む Cargo.toml) を指定するか、リリースを手で行ってください"
+                )
+            } else {
+                format!(
+                    "the base branch has no {primary} but does have .github/workflows/auto-tag.yml; set [release] version_files in magi.toml to the version of record auto-tag.yml reads, or release by hand"
+                )
+            }
+        });
+        progress.skip = Some(Skip {
+            reason: format!("no {primary} on the base branch; no release bump was made"),
+            action,
+        });
         return Ok(());
     }
 
@@ -1428,10 +1538,57 @@ async fn after_merge_inner(
     };
 
     git::fetch(&repo, &remote, &base).await.ok();
-    let cargo_toml = git::git(&repo, &["show", &format!("{remote}/{base}:Cargo.toml")])
-        .await
-        .context("read Cargo.toml from the base branch")?;
-    let base_version = current_version(&cargo_toml)?;
+    let mut versions = Vec::new();
+    for f in release_manifest::effective(&declared) {
+        let text = git::git(&repo, &["show", &format!("{remote}/{base}:{}", f.path)])
+            .await
+            .with_context(|| format!("read {} from the base branch", f.path))?;
+        let v = release_manifest::read_version(f.kind, &text)
+            .with_context(|| format!("read the version of {}", f.path))?;
+        versions.push((f.path, v));
+    }
+    let base_version = match release_manifest::agree(&versions) {
+        Ok(v) => v,
+        Err(e) => {
+            let reason = format!("{e:#}");
+            state.event("bump", format!("release bump skipped: {reason}"));
+            progress.skip = Some(Skip {
+                action: Some(format!("{reason}; align them by hand, then release")),
+                reason,
+            });
+            return Ok(());
+        }
+    };
+    if custom {
+        // The change itself may already have raised the version; the
+        // repository's own auto-tag then releases it, and a second bump
+        // would publish a duplicate.
+        let mb = git::git(&winner.worktree, &["merge-base", &base, &winner.branch])
+            .await
+            .map(|s| s.trim().to_owned())
+            .unwrap_or_default();
+        if !mb.is_empty()
+            && let (Some(before), Some(after)) = (
+                primary_version_at(&winner.worktree, &mb, &primary).await,
+                primary_version_at(&winner.worktree, &winner.branch, &primary).await,
+            )
+            && before != after
+        {
+            state.event(
+                "bump",
+                format!(
+                    "the merged change already moved {primary} from v{before} to v{after}; leaving the release to the repository's auto-tag"
+                ),
+            );
+            progress.skip = Some(Skip {
+                reason: format!(
+                    "the change itself raised {primary} from v{before} to v{after}; the repository's auto-tag releases it"
+                ),
+                action: None,
+            });
+            return Ok(());
+        }
+    }
 
     let mut pending = read_marker(&marker);
     if let Some(p) = &pending {
@@ -1469,7 +1626,7 @@ async fn after_merge_inner(
         // See `find_open_release_pr`'s own doc for what this does and does
         // not close.
         if let Ok(Some((branch, url))) = find_open_release_pr(&repo).await
-            && let Some(target) = branch_version(&repo, &remote, &branch)
+            && let Some(target) = branch_version(&repo, &remote, &branch, &primary)
                 .await
                 .and_then(|v| Version::parse(&v).ok())
         {
@@ -1874,15 +2031,7 @@ async fn escalate_pending(
     // after the push is a follow-up, not a precondition: the branch already
     // carries the new version whether or not it succeeds.
     let pushed: Result<()> = async {
-        let cargo_toml_path = worktree.join("Cargo.toml");
-        let toml = tokio::fs::read_to_string(&cargo_toml_path)
-            .await
-            .with_context(|| format!("read {}", cargo_toml_path.display()))?;
-        let rewritten = rewrite_cargo_version(&toml, &next)?;
-        tokio::fs::write(&cargo_toml_path, rewritten)
-            .await
-            .with_context(|| format!("write {}", cargo_toml_path.display()))?;
-        sync_lockfile(&worktree, state.config.cache_dir().as_deref()).await?;
+        write_release_files(state, &worktree, &next).await?;
         let committed = git::commit_all(
             &worktree,
             &format!(
@@ -2159,16 +2308,7 @@ async fn open_bump_pr(
     decision: &BumpDecision,
     source_pr_url: &str,
 ) -> Result<(String, AutomergeOutcome)> {
-    let cargo_toml_path = worktree.join("Cargo.toml");
-    let toml = tokio::fs::read_to_string(&cargo_toml_path)
-        .await
-        .with_context(|| format!("read {}", cargo_toml_path.display()))?;
-    let rewritten = rewrite_cargo_version(&toml, next_version)?;
-    tokio::fs::write(&cargo_toml_path, rewritten)
-        .await
-        .with_context(|| format!("write {}", cargo_toml_path.display()))?;
-
-    sync_lockfile(worktree, state.config.cache_dir().as_deref()).await?;
+    write_release_files(state, worktree, next_version).await?;
 
     let committed = git::commit_all(worktree, &format!("chore: release v{next_version}"))
         .await
@@ -2311,6 +2451,25 @@ async fn gh_merge_directly(
         land::lifecycle(cwd, pr_url).await.ok()
     };
     resolve_direct_merge(&refusal, &argv, out.status.success(), &stderr, after)
+}
+
+/// Put `version` into the repository's release files in `worktree`: the
+/// configured `version_files` (the lock beside the first one is edited as text),
+/// else the root `Cargo.toml` with `cargo build` moving `Cargo.lock`.
+async fn write_release_files(state: &RunState, worktree: &Path, version: &str) -> Result<()> {
+    let declared = &state.config.release.version_files;
+    if release_manifest::is_custom(declared) {
+        return release_manifest::apply(worktree, declared, version);
+    }
+    let cargo_toml_path = worktree.join("Cargo.toml");
+    let toml = tokio::fs::read_to_string(&cargo_toml_path)
+        .await
+        .with_context(|| format!("read {}", cargo_toml_path.display()))?;
+    let rewritten = rewrite_cargo_version(&toml, version)?;
+    tokio::fs::write(&cargo_toml_path, rewritten)
+        .await
+        .with_context(|| format!("write {}", cargo_toml_path.display()))?;
+    sync_lockfile(worktree, state.config.cache_dir().as_deref()).await
 }
 
 /// Run `cargo build` so `Cargo.lock` follows the version bump, the same step
@@ -2969,6 +3128,7 @@ mod tests {
         let with_pr = Progress {
             version: Some("0.2.0".into()),
             pending_pr: Some("https://example.invalid/pull/9".into()),
+            skip: None,
         };
         let (v, reason) = notice_for_failure(&with_pr, &err);
         assert_eq!(v.as_deref(), Some("0.2.0"));
@@ -4108,5 +4268,183 @@ version = \"0.45.18\"\n";
             land::Step::Done { merged: false }
         );
         assert!(!should_release_bump(RunStatus::Blocked));
+    }
+
+    fn shun_files() -> Vec<crate::config::VersionFile> {
+        use crate::config::{VersionFile, VersionKind};
+        vec![
+            VersionFile {
+                path: "src-tauri/Cargo.toml".to_owned(),
+                kind: VersionKind::Cargo,
+            },
+            VersionFile {
+                path: "package.json".to_owned(),
+                kind: VersionKind::Json,
+            },
+            VersionFile {
+                path: "src-tauri/tauri.conf.json".to_owned(),
+                kind: VersionKind::Json,
+            },
+        ]
+    }
+
+    const SHUN_TOML: &str = "[package]\nname = \"shun\"\nversion = \"1.0.0\"\n";
+    const SHUN_LOCK: &str = "[[package]]\nname = \"shun\"\nversion = \"1.0.0\"\n";
+
+    async fn shun_origin(package_version: &str) -> (tempfile::TempDir, PathBuf) {
+        let pkg = format!("{{\n  \"version\": \"{package_version}\"\n}}\n");
+        let origin = origin_with(&[("README.md", "x\n")]).await;
+        for (name, body) in [
+            ("src-tauri/Cargo.toml", SHUN_TOML),
+            ("src-tauri/Cargo.lock", SHUN_LOCK),
+            ("package.json", pkg.as_str()),
+            ("src-tauri/tauri.conf.json", "{ \"version\": \"1.0.0\" }\n"),
+        ] {
+            let path = origin.1.join(name);
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+            tokio::fs::write(path, body).await.unwrap();
+        }
+        git::git(&origin.1, &["add", "-A"]).await.unwrap();
+        git::git(&origin.1, &["commit", "-m", "shun"])
+            .await
+            .unwrap();
+        git::git(&origin.1, &["push", "origin", "main"])
+            .await
+            .unwrap();
+        origin
+    }
+
+    #[tokio::test]
+    async fn a_shun_layout_bump_changes_only_the_declared_files_and_the_adjacent_lock() {
+        let (_d, repo) = shun_origin("1.0.0").await;
+        let mut state = winner_state(&repo, "main");
+        state.config.release.version_files = shun_files();
+        write_release_files(&state, &repo, "1.1.0").await.unwrap();
+        let status = git::git(&repo, &["status", "--porcelain"]).await.unwrap();
+        let mut paths: Vec<_> = status.lines().map(|l| l[3..].to_owned()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            [
+                "package.json",
+                "src-tauri/Cargo.lock",
+                "src-tauri/Cargo.toml",
+                "src-tauri/tauri.conf.json"
+            ]
+        );
+        let lock = std::fs::read_to_string(repo.join("src-tauri/Cargo.lock")).unwrap();
+        assert!(lock.contains("version = \"1.1.0\""));
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_repo_with_auto_tag_but_no_root_manifest_is_skipped_visibly() {
+        let (_d, repo) = origin_with(&[("README.md", "x\n")]).await;
+        let wf = repo.join(".github/workflows");
+        tokio::fs::create_dir_all(&wf).await.unwrap();
+        tokio::fs::write(wf.join("auto-tag.yml"), "name: t\n")
+            .await
+            .unwrap();
+        git::git(&repo, &["add", "-A"]).await.unwrap();
+        git::git(&repo, &["commit", "-m", "wf"]).await.unwrap();
+        git::git(&repo, &["push", "origin", "main"]).await.unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let store = Notices::at(home.path().join("notifications"));
+        let mut state = winner_state(&repo, "main");
+        after_merge_at(
+            &mut state,
+            "https://example.invalid/pull/1",
+            Some(home.path()),
+            Some(&store),
+        )
+        .await
+        .unwrap();
+        let rec = state.release_bump.clone().expect("a skip is recorded");
+        assert!(rec.skipped.is_some_and(|s| s.contains("Cargo.toml")));
+        assert!(
+            rec.action_required
+                .is_some_and(|a| a.contains("version_files"))
+        );
+        assert!(rec.pr_url.is_none() && !rec.automerge_enabled);
+        assert_eq!(store.list().len(), 1);
+        assert!(crate::report::run(&state).contains("SKIPPED"));
+    }
+
+    #[tokio::test]
+    async fn a_non_rust_repo_without_auto_tag_records_a_skip_without_paging() {
+        let (_d, repo) = origin_with(&[("README.md", "hi\n")]).await;
+        let home = tempfile::tempdir().unwrap();
+        let store = Notices::at(home.path().join("notifications"));
+        let mut state = winner_state(&repo, "main");
+        after_merge_at(
+            &mut state,
+            "https://example.invalid/pull/1",
+            Some(home.path()),
+            Some(&store),
+        )
+        .await
+        .unwrap();
+        let rec = state.release_bump.clone().unwrap();
+        assert!(rec.skipped.is_some());
+        assert!(rec.action_required.is_none());
+        assert!(store.list().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disagreeing_version_files_stop_the_bump_and_ask_the_owner() {
+        let (_d, repo) = shun_origin("0.9.0").await;
+        let home = tempfile::tempdir().unwrap();
+        let store = Notices::at(home.path().join("notifications"));
+        let mut state = winner_state(&repo, "main");
+        state.config.release.version_files = shun_files();
+        after_merge_at(
+            &mut state,
+            "https://example.invalid/pull/1",
+            Some(home.path()),
+            Some(&store),
+        )
+        .await
+        .unwrap();
+        let rec = state.release_bump.clone().unwrap();
+        assert!(rec.skipped.is_some_and(|s| s.contains("disagree")));
+        assert!(rec.action_required.is_some());
+        assert_eq!(store.list().len(), 1);
+        assert!(rec.pr_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_change_that_already_raised_the_version_is_left_to_the_repos_auto_tag() {
+        let (_d, repo) = shun_origin("1.0.0").await;
+        git::git(&repo, &["checkout", "-b", "feat"]).await.unwrap();
+        let toml = SHUN_TOML.replace("1.0.0", "1.0.1");
+        tokio::fs::write(repo.join("src-tauri/Cargo.toml"), toml)
+            .await
+            .unwrap();
+        tokio::fs::write(repo.join("app.ts"), "x\n").await.unwrap();
+        git::git(&repo, &["add", "-A"]).await.unwrap();
+        git::git(&repo, &["commit", "-m", "fix and bump"])
+            .await
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let store = Notices::at(home.path().join("notifications"));
+        let mut state = winner_state(&repo, "main");
+        state.candidates[0].branch = "feat".to_owned();
+        state.config.release.version_files = shun_files();
+        after_merge_at(
+            &mut state,
+            "https://example.invalid/pull/1",
+            Some(home.path()),
+            Some(&store),
+        )
+        .await
+        .unwrap();
+        let rec = state.release_bump.clone().unwrap();
+        assert!(
+            rec.skipped
+                .is_some_and(|s| s.contains("already") || s.contains("raised"))
+        );
+        assert!(rec.pr_url.is_none() && rec.action_required.is_none());
+        assert!(store.list().is_empty());
     }
 }

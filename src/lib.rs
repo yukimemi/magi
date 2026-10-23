@@ -71,6 +71,7 @@ pub mod reconcile;
 pub mod recovery;
 pub mod refs;
 pub mod release_local;
+pub mod release_manifest;
 pub mod release_watch;
 mod repo_lock;
 pub mod report;

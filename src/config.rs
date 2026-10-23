@@ -1071,6 +1071,34 @@ pub struct Release {
     pub commands: Vec<String>,
     /// Minutes each command may run before it is killed and counted as failed.
     pub timeout_minutes: u64,
+    /// Files whose version a release bump rewrites, for repositories whose
+    /// manifest is not a root `Cargo.toml` (a Tauri app keeps it under
+    /// `src-tauri/`, with the app version repeated in `package.json` and
+    /// `tauri.conf.json`). Empty (default) means the root `Cargo.toml` and
+    /// nothing else. The first entry is the version of record - the file the
+    /// repository's own `auto-tag.yml` reads - and must be `kind = "cargo"`.
+    /// Never detected: see [`crate::release_manifest`].
+    pub version_files: Vec<VersionFile>,
+}
+
+/// How a [`VersionFile`] is read and rewritten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VersionKind {
+    /// A `Cargo.toml` (`[package]` or `[workspace.package]` `version`).
+    Cargo,
+    /// A JSON file with a top-level `"version"` string.
+    Json,
+}
+
+/// One entry of [`Release::version_files`].
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VersionFile {
+    /// Path relative to the repository root, `/`-separated.
+    pub path: String,
+    /// How to read and rewrite it.
+    pub kind: VersionKind,
 }
 
 impl Default for Release {
@@ -1079,11 +1107,17 @@ impl Default for Release {
             mode: ReleaseMode::Actions,
             commands: Vec::new(),
             timeout_minutes: 30,
+            version_files: Vec::new(),
         }
     }
 }
 
 impl Release {
+    /// Refuse a malformed `version_files` at load time.
+    pub fn validate(&self) -> Result<()> {
+        crate::release_manifest::validate(&self.version_files).context("[release] version_files")
+    }
+
     /// Is this repository released by magi rather than by its workflows?
     pub fn is_local(&self) -> bool {
         self.mode == ReleaseMode::Local
@@ -1698,6 +1732,7 @@ impl Config {
             .context(ConfigFailure::layers("config-deserialize", paths))?;
         crate::persona::validate(&cfg.talk.personas)?;
         cfg.worktree.validate()?;
+        cfg.release.validate()?;
         if let Some(name) = cfg.talk.operator_name() {
             if name.chars().count() > OPERATOR_NAME_MAX || name.chars().any(char::is_control) {
                 bail!(
@@ -2451,7 +2486,18 @@ impl Config {
              # MAGI_RELEASE_TAG, MAGI_RELEASE_COMMIT and MAGI_RELEASE_PR. Make them\n\
              # safe to repeat: a crash mid-command is treated as unfinished.\n\
              # commands = [\"cargo build --release\", \"gh release create \\\"$MAGI_RELEASE_TAG\\\" --generate-notes\"]\n\
-             # timeout_minutes = 30\n",
+             # timeout_minutes = 30\n\
+             # Repositories whose Cargo.toml is not at the root (e.g. a Tauri app).\n\
+             # The first entry is the version of record and must be the file the\n\
+             # repository's auto-tag.yml reads (kind \"cargo\"); the others are\n\
+             # rewritten to the same version. Paths are relative to the repository\n\
+             # root. Cargo.lock beside the first entry follows; package-lock.json\n\
+             # is not touched.\n\
+             # version_files = [\n\
+             #   { path = \"src-tauri/Cargo.toml\", kind = \"cargo\" },\n\
+             #   { path = \"package.json\", kind = \"json\" },\n\
+             #   { path = \"src-tauri/tauri.conf.json\", kind = \"json\" },\n\
+             # ]\n",
         );
         s
     }
@@ -3590,6 +3636,38 @@ lock_file = "{{ vars.bad }}"
         std::fs::write(&path, Config::starter_toml()).unwrap();
         assert!(Config::load(&path).unwrap().verify.pre_gate.is_empty());
         assert!(Config::starter_toml().contains("# pre_gate = []"));
+    }
+
+    #[test]
+    fn release_version_files_parse_default_empty_and_are_validated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magi.toml");
+        std::fs::write(&path, "").unwrap();
+        assert!(
+            Config::load(&path)
+                .unwrap()
+                .release
+                .version_files
+                .is_empty()
+        );
+        std::fs::write(
+            &path,
+            "[release]\nversion_files = [\n{ path = \"src-tauri/Cargo.toml\", kind = \"cargo\" },\n{ path = \"package.json\", kind = \"json\" },\n]\n",
+        )
+        .unwrap();
+        let files = Config::load(&path).unwrap().release.version_files;
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[1].kind, VersionKind::Json);
+        for bad in [
+            "{ path = \"package.json\", kind = \"json\" }",
+            "{ path = \"../Cargo.toml\", kind = \"cargo\" }",
+            "{ path = \"Cargo.toml\", kind = \"cargo\", extra = 1 }",
+            "{ path = \"Cargo.toml\", kind = \"yaml\" }",
+        ] {
+            std::fs::write(&path, format!("[release]\nversion_files = [{bad}]\n")).unwrap();
+            assert!(Config::load(&path).is_err(), "{bad}");
+        }
+        assert!(Config::starter_toml().contains("# version_files = ["));
     }
 
     #[test]

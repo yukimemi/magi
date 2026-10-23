@@ -2032,6 +2032,10 @@ pub struct ReleaseBump {
     /// read as needing attention.
     #[serde(default)]
     pub action_required: Option<String>,
+    /// Why no release bump was made. A skipped bump is not a completed
+    /// release: the report and the web page say SKIPPED with this reason.
+    #[serde(default)]
+    pub skipped: Option<String>,
 }
 
 /// The workflow runs `land` reran on one head, with when (unix seconds).

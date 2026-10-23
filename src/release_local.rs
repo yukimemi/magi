@@ -156,9 +156,9 @@ pub fn reconcile_version(manifest: &str, bumped: bool, job: &mut Job) -> bool {
 /// since the commit is the one the pull request merged as. A shallow boundary
 /// hides its parent from every revision lookup, so existence is read from the
 /// commit object's own `parent` header, which no graft rewrites.
-async fn bumped_by(wt: &Path, commit: &str, version: &str) -> bool {
+async fn bumped_by(wt: &Path, commit: &str, version: &str, manifest: &str) -> bool {
     let parent = format!("{commit}^1");
-    let shown = git::git_raw(wt, &["show", &format!("{parent}:Cargo.toml")]).await;
+    let shown = git::git_raw(wt, &["show", &format!("{parent}:{manifest}")]).await;
     if let Ok(out) = &shown
         && out.code == Some(0)
         && let Ok(v) = crate::bump::current_version(&out.stdout)
@@ -387,11 +387,12 @@ async fn drive(env: &Env<'_>, dir: &Path, wt: &Path, job: &mut Job, save: Save<'
             bail!("the release checkout is not clean");
         }
     }
-    if let Ok(toml) = std::fs::read_to_string(wt.join("Cargo.toml")) {
+    let manifest = crate::release_manifest::primary_path(&env.release.version_files);
+    if let Ok(toml) = std::fs::read_to_string(wt.join(manifest)) {
         let before = job.version.clone();
         match crate::bump::current_version(&toml) {
             Ok(v) if v != job.version && !job.tag_done && job.done == 0 => {
-                let bumped = bumped_by(wt, &job.commit, &v).await;
+                let bumped = bumped_by(wt, &job.commit, &v, manifest).await;
                 if !reconcile_version(&v, bumped, job) {
                     bail!(
                         "{VERSION_MISMATCH_PREFIX}{v}, but the release is {}; not tagging",
@@ -716,6 +717,7 @@ mod tests {
             mode: crate::config::ReleaseMode::Local,
             commands: commands.iter().map(|s| (*s).to_owned()).collect(),
             timeout_minutes: 1,
+            version_files: Vec::new(),
         }
     }
 
