@@ -10220,6 +10220,7 @@ mod tests {
                 extra_args: Vec::new(),
                 env: Default::default(),
                 prompt_delivery: None,
+                max_turn_secs: None,
             }],
             ..Config::default()
         }
@@ -12202,6 +12203,7 @@ mod tests {
                 extra_args: Vec::new(),
                 env: Default::default(),
                 prompt_delivery: None,
+                max_turn_secs: None,
             }],
             ..Config::default()
         };
@@ -12272,6 +12274,7 @@ mod tests {
                 extra_args: Vec::new(),
                 env: Default::default(),
                 prompt_delivery: None,
+                max_turn_secs: None,
             }],
             ..Config::default()
         };

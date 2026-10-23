@@ -94,8 +94,10 @@ async fn a_judge_that_times_out_voting_is_handed_over_with_full_context() {
     let _home = common::home_lock().await;
     let mut fx = common::fixture(_home, Judges::Split, false);
     fx.config.graph.timeout_judge = common::HANDOVER_BUDGET;
+    fx.config.agents.iter_mut().find(|a| a.id == "beta").unwrap().max_turn_secs = Some(common::HANG_TURN_SECS);
     set_env(&mut fx, "beta", &[("MOCK_HANG_SEAT", "judge-1"), ("MOCK_ONLY_NODE", "vote")]);
     let runner = run(&fx).await;
+    common::assert_hung(&runner.state, "vote", "judge-1", "beta");
     assert_full_vote_handover(&runner.state);
     assert_eq!(handover(&runner.state, "vote", "judge-1")[0].reason, "timed out");
 }

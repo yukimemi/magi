@@ -83,6 +83,7 @@ esac
             command: Vec::new(),
             extra_args: Vec::new(),
             prompt_delivery: None,
+            max_turn_secs: None,
             env: BTreeMap::from([
                 ("PATH".into(), cli_path),
                 ("TRACE".into(), trace.to_str().unwrap().into()),

@@ -2564,6 +2564,7 @@ mod tests {
             extra_args: Vec::new(),
             env: BTreeMap::new(),
             prompt_delivery: None,
+            max_turn_secs: None,
         });
         let text = run(&s);
         assert!(

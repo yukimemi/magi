@@ -73,6 +73,8 @@ async fn a_timeout_hands_the_seat_over() {
     let state = &runner.state;
 
     assert_eq!(state.handovers.len(), 1, "{:?}", state.handovers);
+    common::assert_hung(state, "implement", "impl-A", "alpha");
+    assert_eq!(asked(state, "implement", "impl-A"), 2);
     assert_eq!(state.handovers[0].reason, "timed out");
     assert_eq!(state.handovers[0].to, "beta");
     let a = state.candidates.iter().find(|c| c.label == 'A').expect("A");
@@ -117,6 +119,8 @@ async fn a_roster_that_runs_out_ends_the_seat_with_each_agent_tried_once() {
         .iter()
         .map(|h| (h.from.as_str(), h.to.as_str()))
         .collect();
+    common::assert_hung(state, "implement", "impl-A", "beta");
+    assert_eq!(state.handovers[1].reason, "timed out");
     assert_eq!(moves, [("alpha", "beta"), ("beta", "gamma")]);
     assert_eq!(asked(state, "implement", "impl-A"), 3);
 }

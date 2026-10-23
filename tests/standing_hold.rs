@@ -60,6 +60,7 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
             extra_args: vec![],
             env: common::magi_cli_env(tmp.path(), "ANSWER_BIN"),
             prompt_delivery: None,
+            max_turn_secs: None,
         }],
         ..Config::default()
     };

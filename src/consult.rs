@@ -1931,6 +1931,7 @@ mod tests {
                 extra_args: Vec::new(),
                 env: BTreeMap::new(),
                 prompt_delivery: None,
+                max_turn_secs: None,
             }],
             ..Config::default()
         };
@@ -2095,6 +2096,7 @@ mod tests {
                 extra_args: Vec::new(),
                 env: BTreeMap::from([("LEASE".to_owned(), lease.to_string_lossy().into_owned())]),
                 prompt_delivery: None,
+                max_turn_secs: None,
             }],
             ..Config::default()
         }

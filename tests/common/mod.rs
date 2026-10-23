@@ -360,24 +360,21 @@ fi
 # Ordinary-failure / hang simulation, scoped by the agent's own env so one
 # roster entry can fail a seat that the next one answers. `MOCK_FAIL_SEAT`
 # exits non-zero with nothing usable on every prompt for that seat;
-# `MOCK_HANG_SEAT` outlives any sane node timeout (the test shortens it), so
+# `MOCK_HANG_SEAT` outlives its agent turn cap, so
 # the CLI is killed and the turn reads as timed out.
 if [ -n "$MOCK_FAIL_SEAT" ] && { case ",$MOCK_FAIL_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && only; then
   echo "mock failure" >&2
   exit 1
 fi
 if [ -n "$MOCK_HANG_SEAT" ] && { case ",$MOCK_HANG_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && only; then
-  # A polling loop in this shell, never `exec sleep 60`: on Windows (MSYS)
-  # `exec` spawns a child, so killing the shell leaves the sleeper alive and
-  # holding the inherited stdout. Here the shell is the only long-lived
-  # process; once it is killed an orphan lives at most one 0.1s sleep. The cap
-  # is far above `HANDOVER_BUDGET`, so only the kill ends the hang.
-  hang=0
-  while [ "$hang" -lt 600 ]; do
-    sleep 0.1
-    hang=$((hang + 1))
+  # Prove the real process reached the hang before its deadline. Sleep's
+  # handles are detached: killing the MSYS shell must not leave a child
+  # holding stdout. Any orphan lives at most one second, with one spawn per
+  # second rather than ten. Only magi's timeout ends this hang.
+  printf '%s %s %s\n' "$MAGI_NODE" "$seat" "$MOCK_AGENT_ID" >> "$(dirname "$p")/hangs.log"
+  while :; do
+    sleep 1 </dev/null >/dev/null 2>&1
   done
-  exit 1
 fi
 
 # Rate-limit simulation: a matching seat reports the same error shape a real
@@ -764,8 +761,13 @@ pub fn fixture(home: HomeGuard, judges: Judges, require_fix: bool) -> Fixture {
         model: None,
         command: vec!["sh".to_owned(), script.to_string_lossy().into_owned()],
         extra_args: Vec::new(),
-        env: env.clone(),
+        env: {
+            let mut env = env.clone();
+            env.insert("MOCK_AGENT_ID".to_owned(), id.to_owned());
+            env
+        },
         prompt_delivery: None,
+        max_turn_secs: None,
     };
 
     let config = Config {
@@ -906,18 +908,27 @@ pub fn fixture_with_failure(home: HomeGuard, failed_seats: &[&str]) -> Fixture {
     fx
 }
 
-/// Node budget, in seconds, for tests whose mock hangs until killed. The node
-/// budget is shared by the whole seat chain, so the agent that takes over after
-/// the hang must also finish inside it: a one-second budget made a slow runner
-/// time the successor out too and hand over once more than the test expects.
-/// The hang only ends by being killed, so a generous value costs wall-clock
-/// time, never correctness.
+/// Generous caller budget retained for the successor after a short agent turn.
 pub const HANDOVER_BUDGET: u64 = 20;
+/// Only the hanging roster agent gets this per-turn cap.
+pub const HANG_TURN_SECS: u64 = 2;
 
-/// Solo-run fixture where each named agent fails (`fail_agents`) or hangs past
-/// the [`HANDOVER_BUDGET`] implement budget (`hang_agents`) on the given seats, and every
-/// other roster agent answers normally — the shape the seat handover needs: the
-/// same seat key must fail on one agent's turn and succeed on another's.
+/// Assert that the real child entered the hang, rather than timing out during
+/// startup. Include the node so a later-turn test proves the intended turn hung.
+pub fn assert_hung(state: &magi::run::RunState, node: &str, seat: &str, agent: &str) {
+    let log = magi::agent::artifacts_dir(&state.dir()).join("hangs.log");
+    let seen = std::fs::read_to_string(log).expect("real process reached hang");
+    assert_eq!(
+        seen.lines()
+            .filter(|line| *line == format!("{node} {seat} {agent}"))
+            .count(),
+        1,
+        "{seen}"
+    );
+}
+
+/// Solo-run fixture where named agents fail or hang on the given seats.
+/// The hanging agent's short turn cap leaves the successor a generous budget.
 pub fn fixture_with_handover_failures(
     home: HomeGuard,
     fail_agents: &[&str],
@@ -933,6 +944,7 @@ pub fn fixture_with_handover_failures(
         }
         if hang_agents.contains(&a.id.as_str()) {
             a.env.insert("MOCK_HANG_SEAT".to_owned(), value.clone());
+            a.max_turn_secs = Some(HANG_TURN_SECS);
             fx.config.graph.timeout_implement = HANDOVER_BUDGET;
         }
     }

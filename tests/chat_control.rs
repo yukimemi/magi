@@ -31,6 +31,7 @@ impl Fixture {
                 extra_args: vec![],
                 env: BTreeMap::new(),
                 prompt_delivery: None,
+                max_turn_secs: None,
             }],
             ..Config::default()
         };

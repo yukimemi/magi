@@ -449,6 +449,7 @@ pub(crate) async fn invoke_leased(
 ) -> Result<AgentOutput> {
     let readonly = inv.scope == InvocationScope::ConsultationInvestigation;
     let inv = &Invocation {
+        timeout: spec.turn_timeout(inv.timeout),
         allow_write: inv.allow_write && !readonly,
         unsandboxed: inv.unsandboxed && inv.scope == InvocationScope::Repository,
         writable: if readonly { &[] } else { inv.writable },
@@ -1900,6 +1901,7 @@ mod tests {
             extra_args: Vec::new(),
             env: BTreeMap::from([(COMMAND_HELPER_MODE.to_owned(), mode.to_owned())]),
             prompt_delivery: None,
+            max_turn_secs: None,
         }
     }
 
@@ -1932,6 +1934,7 @@ mod tests {
             extra_args: Vec::new(),
             env: BTreeMap::new(),
             prompt_delivery: None,
+            max_turn_secs: None,
         }
     }
 
@@ -3316,6 +3319,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_turn_cap_limits_a_direct_invocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = dir.path().join("artifacts");
+        let mut seat = SeatState::new("impl-A", "helper", 7);
+        let mut s = command_helper("sleep");
+        s.max_turn_secs = Some(2);
+        let out = invoke(&s, &mut seat, &inv(dir.path(), &artifacts, false))
+            .await
+            .unwrap();
+        assert!(out.timed_out, "{out:?}");
+        // The caller supplies 900 seconds and the helper sleeps for 30:
+        // neither may override the short per-agent cap.
+        assert!(out.duration_ms < 20_000, "{out:?}");
+    }
+
+    #[tokio::test]
     async fn timeout_is_reported_not_hung() {
         let dir = tempfile::tempdir().unwrap();
         let mut seat = SeatState::new("impl-A", "a", 7);
@@ -3421,6 +3440,7 @@ mod tests {
             extra_args: Vec::new(),
             env: BTreeMap::new(),
             prompt_delivery: None,
+            max_turn_secs: None,
         }
     }
 
