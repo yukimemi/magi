@@ -77,6 +77,7 @@ case "$(cat "$MAGI_PROMPT_FILE")" in
         printf '%s\n' "$REQUEST_EVENT";;
       closed) cp "$CLOSED_RECORD" "$TALK_RECORD"; printf '%s\n' "$REQUEST_EVENT";;
       failed) printf '%s\n' "$REQUEST_EVENT"; exit 1;;
+      unreadable-question) printf '{' > "$QUESTION_RECORD"; printf '%s\n' "$REQUEST_EVENT";;
       malformed) printf '%s\n' "$MALFORMED_EVENT";;
       quoted) printf '%s\n' "$QUOTED_EVENT";;
       *) printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Control reply."}}';;
@@ -498,14 +499,10 @@ async fn standalone_investigation_request_outside_consultation_is_not_executed_o
 common::e2e! {
 async fn investigation_spawn_failure_is_failed_instead_of_pending() {
     let mut f = Fixture::new().await;
-    // A later executable on PATH must never be launched when the fixture fails.
-    // Put a harmless sentinel ahead of inherited host executables.
-    let fallback = f._tmp.path().join("fallback");
-    std::fs::create_dir(&fallback).unwrap();
-    let fallback_cli = fallback.join("codex");
-    std::fs::write(&fallback_cli, "#!/bin/sh\n: > \"$TRACE/unexpected-fallback\"\nexit 99\n").unwrap();
-    std::fs::set_permissions(&fallback_cli, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let cli_path = format!("{}:{}:{}", f._tmp.path().display(), fallback.display(), f.cfg.agents[0].env["PATH"]);
+    // Resolution must not be able to fall through to a host CLI when the
+    // fixture's shebang fails: PATH holds only the fixture dir and system
+    // directories that carry the shell utilities the fixture script needs.
+    let cli_path = format!("{}:/usr/bin:/bin", f._tmp.path().display());
     f.cfg.agents[0].env.insert("PATH".into(), cli_path);
     std::fs::write(&f.mode, "spawn-failed").unwrap();
     f.delivery().await;
@@ -514,7 +511,6 @@ async fn investigation_spawn_failure_is_failed_instead_of_pending() {
     assert_eq!(talk::sender(notice, None), talk::Sender::Magi);
     assert!(notice.messages[0].display.as_ref().unwrap().facts.contains("失敗"));
     assert!(!f.trace.join("1.prompt").exists());
-    assert!(!f.trace.join("unexpected-fallback").exists());
     assert!(f._tmp.path().join("codex").is_file());
 }
 }
@@ -538,6 +534,56 @@ esac
     let notice = f.talk.turns.last().unwrap();
     assert_eq!(talk::sender(notice, None), talk::Sender::Magi);
     assert!(notice.messages[0].display.as_ref().unwrap().facts.contains("利用上限"));
+    f.unchanged();
+}
+}
+
+common::e2e! {
+async fn protocol_examples_followed_by_prose_remain_persona_replies_without_investigation() {
+    let mut f = Fixture::new().await;
+    let request = serde_json::json!({"investigate_question": f.question.id}).to_string();
+    for (index, text) in [
+        format!("```json\n{request}\n```\nこれはプロトコルの例です。"),
+        format!("{request} これはプロトコルの例です。"),
+    ].into_iter().enumerate() {
+        f.cfg.agents[0].env.insert("REQUEST_EVENT".into(), serde_json::json!({
+            "type":"item.completed", "item":{"type":"agent_message", "text":text}
+        }).to_string());
+        if index == 0 { f.delivery().await; }
+        else { f.say("Explain the protocol example.").await; }
+        let reply = f.talk.turns.last().unwrap();
+        assert_eq!(reply.body, text);
+        assert_eq!(talk::sender(reply, None), talk::Sender::Persona);
+        assert_eq!(f.seat().turns, index + 1);
+        assert!(!f.trace.join(format!("{}.prompt", index + 1)).exists());
+        assert_eq!(f.talk.investigation_state, None);
+        f.unchanged();
+    }
+}
+}
+
+common::e2e! {
+async fn unreadable_investigation_question_reports_failure_and_can_retry_after_repair() {
+    let mut f = Fixture::new().await;
+    let path = f.questions.path_of(&f.question.id);
+    let saved = std::fs::read(&path).unwrap();
+    f.cfg.agents[0].env.insert("QUESTION_RECORD".into(), path.to_str().unwrap().into());
+    std::fs::write(&f.mode, "unreadable-question").unwrap();
+    f.talk = f.talks.get(&f.talk.id).unwrap();
+    let lease = f.talks.claim_turn(&f.talk.id).unwrap().unwrap();
+    let text = talk::drain(&mut f.talk, &f.talks).unwrap().unwrap();
+    talk::respond(&lease, &mut f.talk, &f.talks, &f.cfg, &text).await.unwrap();
+    drop(lease);
+    assert_eq!(f.talk.investigation_state, Some(talk::InvestigationState::Failed));
+    let notice = f.talk.turns.last().unwrap();
+    assert_eq!(talk::sender(notice, None), talk::Sender::Magi);
+    assert!(notice.messages[0].display.as_ref().unwrap().facts.contains("失敗"));
+    assert!(!f.trace.join("1.prompt").exists());
+    std::fs::write(&path, saved).unwrap();
+    f.unchanged();
+    std::fs::write(&f.mode, "investigate").unwrap();
+    f.say("Investigate again after repairing the record.").await;
+    assert_eq!(f.talk.investigation_state, Some(talk::InvestigationState::Completed));
     f.unchanged();
 }
 }

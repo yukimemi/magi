@@ -2430,19 +2430,37 @@ enum InvestigationResponse {
 fn investigation_response(text: &str) -> InvestigationResponse {
     let text = text.trim();
     let candidate = if let Some(fenced) = text.strip_prefix("```") {
-        fenced
-            .split_once('\n')
-            .map(|(_, body)| body.strip_suffix("```").unwrap_or(body))
-            .map(str::trim)
-            .unwrap_or(text)
+        let Some((_, body)) = fenced.split_once('\n') else {
+            return InvestigationResponse::Prose;
+        };
+        let mut candidate = body;
+        let mut offset = 0;
+        for line in body.split_inclusive('\n') {
+            if line.trim() == "```" {
+                if !body[offset + line.len()..].trim().is_empty() {
+                    // A fenced example followed by explanation is quoted prose.
+                    return InvestigationResponse::Prose;
+                }
+                candidate = &body[..offset];
+                break;
+            }
+            offset += line.len();
+        }
+        candidate.trim()
     } else {
         text
     };
     if !candidate.starts_with('{') {
         return InvestigationResponse::Prose;
     }
-    match serde_json::from_str::<serde_json::Value>(candidate) {
-        Ok(value)
+    let mut objects =
+        serde_json::Deserializer::from_str(candidate).into_iter::<serde_json::Value>();
+    match objects.next() {
+        Some(Ok(_)) if !candidate[objects.byte_offset()..].trim().is_empty() => {
+            // An object followed by explanation is not a standalone request.
+            InvestigationResponse::Prose
+        }
+        Some(Ok(value))
             if value
                 .as_object()
                 .is_some_and(|o| o.contains_key("investigate_question")) =>
@@ -2455,7 +2473,7 @@ fn investigation_response(text: &str) -> InvestigationResponse {
             }
             InvestigationResponse::Invalid
         }
-        Err(_) if has_investigation_key(candidate) => InvestigationResponse::Invalid,
+        Some(Err(_)) if has_investigation_key(candidate) => InvestigationResponse::Invalid,
         _ => InvestigationResponse::Prose,
     }
 }
@@ -2570,9 +2588,19 @@ fn validate_investigation(
     if !talks.get(talk)?.status.open() {
         return Err(InvestigationState::Cancelled.into());
     }
-    let q = questions
-        .get(question)
-        .map_err(|_| InvestigationState::Cancelled)?;
+    let q = questions.get(question).map_err(|error| {
+        tracing::warn!(question, "investigation question read failed: {error:#}");
+        // A strict request names one complete id. Inspect only safe filenames;
+        // never turn an untrusted request into a diagnostic path traversal.
+        let missing = Path::new(question).file_name() == Some(std::ffi::OsStr::new(question))
+            && matches!(std::fs::symlink_metadata(questions.path_of(question)),
+                Err(ref cause) if cause.kind() == std::io::ErrorKind::NotFound);
+        error.context(if missing {
+            InvestigationState::Cancelled
+        } else {
+            InvestigationState::Failed
+        })
+    })?;
     if q.id != question || !crate::consult::active_consult(&q, talk) {
         return Err(InvestigationState::Cancelled.into());
     }
@@ -3864,6 +3892,11 @@ mod tests {
         for text in [
             format!("The protocol uses {request}."),
             format!("Example:\n```json\n{request}\n```"),
+            format!("```json\n{request}\n```\nこれはプロトコルの例です。"),
+            format!("```json\n{request}\n   ```\nこれはプロトコルの例です。"),
+            "```json\n{\"extra\":true,\"investigate_question\":\"q\"\n```\nこれは不完全な例です。"
+                .into(),
+            format!("{request} これはプロトコルの例です。"),
             r#"{"example":{"investigate_question":"q"}}"#.into(),
             r#"{"example":{"investigate_question":"q"}"#.into(),
             r#"{"example":"investigate_question","extra":true"#.into(),
@@ -6191,6 +6224,32 @@ mod tests {
         let validate = || validate_investigation(&questions, &talks, &talk.id, &q.id);
         assert_eq!(validate().unwrap(), q.consult.clone().unwrap());
         assert!(validate_investigation(&questions, &talks, &talk.id, q.short()).is_err());
+        let path = questions.path_of(&q.id);
+        let saved = std::fs::read(&path).unwrap();
+        std::fs::write(&path, "{").unwrap();
+        let error = validate().unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<InvestigationState>(),
+            Some(&InvestigationState::Failed)
+        );
+        assert!(error.downcast_ref::<serde_json::Error>().is_some());
+        assert!(InvestigationState::Failed.display().contains("失敗"));
+        std::fs::remove_file(&path).unwrap();
+        let error = validate().unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<InvestigationState>(),
+            Some(&InvestigationState::Cancelled)
+        );
+        std::fs::create_dir(&path).unwrap();
+        let error = validate().unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<InvestigationState>(),
+            Some(&InvestigationState::Failed)
+        );
+        assert!(error.downcast_ref::<std::io::Error>().is_some());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, saved).unwrap();
+        assert_eq!(validate().unwrap(), q.consult.clone().unwrap());
         for change in [0, 1, 2] {
             let mut changed = q.clone();
             match change {
