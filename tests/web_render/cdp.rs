@@ -117,6 +117,9 @@ impl Browser {
             .arg("--no-default-browser-check")
             .arg("--disable-extensions")
             .arg("--hide-scrollbars")
+            // Pages only come from the loopback server; a proxy can never
+            // serve them, so skip proxy auto-detection (WPAD) at navigation.
+            .arg("--no-proxy-server")
             .arg("--enable-logging")
             .arg(format!("--log-file={}", profile.path().join("chrome-debug.log").display()))
             .arg("--vmodule=render_process_host_impl=1,child_process_launcher_helper=1,navigation_request=1")

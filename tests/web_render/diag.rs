@@ -12,6 +12,19 @@
 //! supply the remaining context. Body EOF means the HTTP server consumed the
 //! application stream, not that Chrome acknowledged the bytes. No probe answer
 //! is evidence too, not a retry.
+//!
+//! | what the report shows | layer |
+//! |---|---|
+//! | heartbeat gaps of seconds | the test process itself was frozen, not Chrome |
+//! | no request arrival for the page | the browser never asked the server (proxy resolution, network stack) |
+//! | arrival without response headers | the server accepted but did not answer |
+//! | document completed, command still unanswered | Chrome got the document and did not commit it (renderer start-up or browser-process wait) |
+//! | no renderer in CDP and OS snapshots | the renderer was never started |
+//! | renderer present, CPU delta 0 between samples | the renderer is blocked waiting |
+//! | renderer present, CPU delta growing | the renderer is busy (runaway script or layout) |
+//! | probe commands time out too | the browser process is wedged |
+//! | high `shell_processes` or load | host contention (a process-spawn storm) |
+//! | Chrome log lines about launching or navigating | what the browser last did |
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
@@ -231,7 +244,14 @@ pub fn os_samples(root: u32) -> Value {
                 "status": format!("{:?}", p.status()), "cpu_ms": p.accumulated_cpu_time(),
                 "cpu_percent": p.cpu_usage(), "memory_bytes": p.memory()})).collect();
         let load = System::load_average();
+        // MSYS mock agents spawn ~10 sh/bash per second; a large count here
+        // points at a process-spawn storm rather than at Chrome.
+        let shells = system.processes().values().filter(|p| {
+            let name = p.name().to_string_lossy().to_ascii_lowercase();
+            name.starts_with("sh") || name.starts_with("bash")
+        }).count();
         samples.push(json!({"at_ms": now(), "process_count": system.processes().len(),
+            "shell_processes": shells,
             "cpu_percent": system.global_cpu_usage(), "available_memory": system.available_memory(),
             "total_memory": system.total_memory(), "load_average": [load.one, load.five, load.fifteen],
             "processes": processes}));
