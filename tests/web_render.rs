@@ -5163,6 +5163,113 @@ async fn run_refresh_keeps_question_focus_and_blocks_stale_actions() {
     }
 }
 
+/// A background refresh of a displayed run must not insert a "Loading ..."
+/// line under the run meta: everything below it would jump down and back up.
+#[tokio::test]
+async fn run_background_refresh_does_not_shift_content_below_notices() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP run refresh layout: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let mut run = RunState::new(
+        fx.repo.clone(),
+        "main".into(),
+        "0000000".into(),
+        "Check layout".into(),
+        fx.config.clone(),
+    );
+    run.save_under(&home).unwrap();
+    let base = serve_with_client_probe(
+        &home,
+        Queue::at(home.join("queue")),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Run,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    for (w, h, mobile) in [(1280, 900, false), (390, 844, true)] {
+        let page = browser
+            .open_page(&format!("{base}#/runs/{}", run.id), w, h, mobile)
+            .await
+            .unwrap();
+        browser
+            .wait_for(
+                &page,
+                "window.deck && deck.state.detail.evidenceError === false",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        let out = browser
+            .eval(
+                &page,
+                r#"(async () => {
+      const below = () => {
+        // Measured from the notice anchor: only what the notices insert
+        // between the two may move, not unrelated page chrome above them.
+        const el = document.getElementById('run-tabs');
+        const r = el.getBoundingClientRect();
+        const m = document.getElementById('run-meta').getBoundingClientRect();
+        return { top: r.top - m.top, visible: r.height > 0 && m.height > 0 };
+      };
+      const notice = () => ['run-core-state', 'run-evidence-state'].some(id => {
+        const n = document.getElementById(id);
+        return n && !n.hidden && n.getBoundingClientRect().height > 0;
+      });
+      // Settle once so the baseline is the steady layout, not first paint.
+      await deck.loadRun(deck.state.detail.id, {background: true});
+      const before = below();
+      const originalFetch = window.fetch;
+      let releaseCore, releaseAll;
+      const coreGate = new Promise(r => releaseCore = r);
+      const allGate = new Promise(r => releaseAll = r);
+      window.fetch = async (...args) => {
+        const url = String(args[0]);
+        if (/\/api\/runs\/[^/]+\/core$/.test(url)) await coreGate;
+        else if (/\/api\/runs\/[^/]+$/.test(url)) await allGate;
+        return originalFetch(...args);
+      };
+      const refresh = deck.loadRun(deck.state.detail.id, {background: true});
+      const pending = below();
+      const pendingNotice = notice();
+      const busy = document.getElementById('run-meta').getAttribute('aria-busy');
+      releaseCore();
+      await new Promise(r => setTimeout(r, 100));
+      const coreOnly = below();
+      releaseAll(); await refresh;
+      const after = below();
+      window.fetch = originalFetch;
+      return {
+        visible: [before, pending, coreOnly, after].every(p => p.visible),
+        same: [pending, coreOnly, after].every(p => Math.abs(p.top - before.top) < 0.5),
+        pendingNotice, busy,
+        busyCleared: document.getElementById('run-meta').getAttribute('aria-busy'),
+      };
+    })()"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "visible": true,
+                "same": true,
+                "pendingNotice": false,
+                "busy": "true",
+                "busyCleared": null,
+            }),
+            "at {w}px"
+        );
+        browser.close_page(&page).await;
+    }
+}
+
 /// The evidence-ready transition must render the sections gated on it even
 /// when the evidence payload equals what core already put on screen.
 #[tokio::test]
