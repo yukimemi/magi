@@ -13,6 +13,7 @@ const node = (tag, attrs = {}, ...children) => ({ tag, ...attrs, children: child
 const markdown = source.slice(source.indexOf('function buildMd('), source.indexOf('/* Keep the legacy path'));
 const display = runInNewContext(`${links}\n${markdown}\n${render}\nrenderNoticeDisplay`, {
   el: node, clear: n => { n.children = []; }, append: (n, kids) => n.append(...kids), URL, document: { createTextNode: text => node('#text', { text }) },
+  setTimeout() {},
 });
 
 test('facts link safely and watched output stays collapsed literal text', () => {
@@ -60,9 +61,10 @@ test('notification facts share Markdown DOM rendering while output stays literal
 
 
 const rows = source.slice(source.indexOf('function updateTurnRow('), source.indexOf('/* Full size,'));
-const updateRow = runInNewContext(`${markdown}\n${render}\n${rows}\nupdateTurnRow`, {
+const updateRow = runInNewContext(`${links}\n${markdown}\n${render}\n${rows}\nupdateTurnRow`, {
   el: node, clear: n => { n.children = []; }, append: (n, kids) => n.append(...kids),
   document: { createTextNode: text => node('#text', { text }) },
+  URL, setTimeout() {},
   turnWho: turn => turn.sender === 'magi' ? 'system' : 'operator',
   setAttr: () => {}, setAvatar: () => {}, setText: () => {},
   when: () => ({}), MAGI_PREFIX: 'magi: ', magiIconState: {},
@@ -87,9 +89,10 @@ test('history rows use per-message AST and refresh when display metadata arrives
 const pending = source.slice(source.indexOf('function renderTalkPending('), source.indexOf('async function resumeTalkPending('));
 test('queued notices use the same facts AST and keep operator sends literal', () => {
   const box = node('div');
-  const renderPending = runInNewContext(`${markdown}\n${render}\n${pending}\nrenderTalkPending`, {
+  const renderPending = runInNewContext(`${links}\n${markdown}\n${render}\n${pending}\nrenderTalkPending`, {
     el: node, clear: n => { n.children = []; }, append: (n, kids) => n.append(...kids),
     document: { createTextNode: text => node('#text', { text }) },
+    URL, setTimeout() {},
     $: () => box, show: () => {}, state: { talkWaits: new Map() },
     avatarImg: () => node('img'), setAvatar: () => {}, magiIconState: {},
     resumeTalkPending: () => {}, clearTalkPending: () => {}, editTalkPending: () => {},
@@ -103,5 +106,7 @@ test('queued notices use the same facts AST and keep operator sends literal', ()
   assert.equal(messages[0].children[3].children[0].children[0].tag, 'h1');
   assert.equal(messages[1].children[3].tag, 'p');
   assert.equal(messages[1].children[3].text, '# Update');
-  assert.equal(JSON.stringify(box).includes('Internal directives'), false);
+  const displayedText = n => typeof n === 'string'
+    ? n : [n?.text || '', ...(n?.children || []).map(displayedText)].join('');
+  assert.equal(displayedText(box).includes('Internal directives'), false);
 });

@@ -353,15 +353,14 @@ a { color: inherit; text-decoration: none; }
   align-items: center;
   gap: var(--s2);
 }
-.daemon-controls:has([data-armed="yes"]) { grid-column: 1 / -1; grid-row: 3; flex-wrap: wrap; }
+.daemon-controls:has([data-armed="yes"]),
+.daemon-controls:has(.daemon-version:not([hidden])) { grid-column: 1 / -1; grid-row: 3; flex-wrap: wrap; }
 .daemon-version {
   font-family: var(--mono);
   font-size: .6875rem;
   color: var(--ink-3);
-  white-space: nowrap;
+  white-space: normal;
 }
-.daemon:has(#loop-park:not([hidden])) .daemon-version,
-.daemon:has(#loop-upgrade:not([hidden])) .daemon-version { display: none; }
 .daemon .daemon-btn {
   flex: none;
   font-size: var(--t1);

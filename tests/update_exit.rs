@@ -104,3 +104,74 @@ fn slow_release_auth_does_not_delay_cli_exit() {
     );
     assert_eq!(fs::read_to_string(calls).unwrap(), "auth token\n");
 }
+
+#[test]
+fn pinned_worker_helpers_never_replace_their_executable() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    fs::create_dir_all(root.join("bin")).unwrap();
+    fs::create_dir_all(root.join("home/Library/Caches")).unwrap();
+    fs::create_dir_all(root.join("cache")).unwrap();
+    fs::create_dir_all(root.join("cfg/magi")).unwrap();
+    fs::write(
+        root.join("cfg/magi/config.toml"),
+        "[update]\nmode = \"install\"\ninterval = \"1s\"\n",
+    )
+    .unwrap();
+    let gh = root.join("bin/gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\nprintf called > \"$GH_CALL_LOG\"\nsleep 20\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![root.join("bin")];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    for args in [vec!["task", "list"], vec!["self-update", "--yes"]] {
+        let output_path = root.join("output");
+        let output = File::create(&output_path).unwrap();
+        let mut process = ProcessGroup(
+            common::magi_cli(&root.join("magi-home"))
+                .args(&args)
+                .current_dir(root)
+                .env("PATH", std::env::join_paths(&paths).unwrap())
+                .env("MAGI_CONFIG_DIR", root.join("cfg"))
+                .env("MAGI_WORKER_GENERATION", "pinned-test-generation")
+                .env("GH_CALL_LOG", root.join("gh-calls"))
+                .env("HOME", root.join("home"))
+                .env("XDG_CACHE_HOME", root.join("cache"))
+                .env_remove("GH_TOKEN")
+                .env_remove("GITHUB_TOKEN")
+                .env_remove("MAGI_NO_AUTOUPDATE")
+                .stdin(Stdio::null())
+                .stdout(output.try_clone().unwrap())
+                .stderr(output)
+                .process_group(0)
+                .spawn()
+                .unwrap(),
+        );
+        let started = Instant::now();
+        let status = loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(8),
+                "pinned helper attempted release work"
+            );
+            if let Some(status) = process.0.try_wait().unwrap() {
+                break status;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let output = fs::read_to_string(&output_path).unwrap();
+        if args[0] == "self-update" {
+            assert!(!status.success());
+        } else {
+            assert!(status.success(), "{output}");
+        }
+        assert!(
+            !root.join("gh-calls").exists(),
+            "pinned helper contacted the forge"
+        );
+    }
+}

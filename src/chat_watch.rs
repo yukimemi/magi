@@ -626,7 +626,7 @@ impl<T: Read + std::os::windows::io::AsRawHandle> Pipe for T {
 // Native job objects close the whole Windows process tree when a supervisor
 // exits, even involuntarily. The launch gate stays closed until assignment.
 #[cfg(windows)]
-mod windows {
+pub(crate) mod windows {
     use std::ffi::c_void;
     use std::os::windows::io::AsRawHandle;
     type Handle = *mut c_void;
@@ -683,6 +683,15 @@ mod windows {
         fn SetInformationJobObject(job: Handle, class: i32, info: *const c_void, size: u32) -> i32;
         fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
         fn CloseHandle(handle: Handle) -> i32;
+        fn GetCurrentProcess() -> Handle;
+        fn IsProcessInJob(process: Handle, job: Handle, result: *mut i32) -> i32;
+        fn QueryInformationJobObject(
+            job: Handle,
+            class: i32,
+            info: *mut c_void,
+            size: u32,
+            returned: *mut u32,
+        ) -> i32;
         fn PeekNamedPipe(
             pipe: Handle,
             buffer: Handle,
@@ -707,6 +716,67 @@ mod windows {
         let mut overlapped = Overlapped::default();
         unsafe {
             UnlockFileEx(file, 0, 1, 0, &mut overlapped);
+        }
+    }
+    /// Detach without inheriting a parent-owned kill-on-close job. Ordinary
+    /// ancestor jobs (for example a CI runner) need not permit explicit breakaway.
+    pub(crate) fn detached_flags() -> std::io::Result<u32> {
+        let mut in_job = 0;
+        if unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if in_job == 0 {
+            return Ok(0x0000_0008 | 0x0000_0200);
+        }
+        let mut limits = BasicLimits::default();
+        if unsafe {
+            QueryInformationJobObject(
+                std::ptr::null_mut(),
+                2,
+                std::ptr::from_mut(&mut limits).cast(),
+                std::mem::size_of::<BasicLimits>() as u32,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        detached_flags_for_limits(limits.flags)
+    }
+
+    fn detached_flags_for_limits(limits: u32) -> std::io::Result<u32> {
+        let detached = 0x0000_0008 | 0x0000_0200;
+        if limits & 0x1000 != 0 {
+            return Ok(detached);
+        } // SILENT_BREAKAWAY_OK
+        if limits & 0x0800 != 0 {
+            return Ok(detached | 0x0100_0000);
+        } // BREAKAWAY_OK
+        if limits & 0x2000 != 0 {
+            // KILL_ON_JOB_CLOSE
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "cannot detach worker: containing kill-on-close Windows job forbids breakaway",
+            ));
+        }
+        Ok(detached)
+    }
+
+    #[cfg(test)]
+    mod worker_detach_tests {
+        use super::detached_flags_for_limits;
+        #[test]
+        fn ordinary_ancestor_job_does_not_require_breakaway_permission() {
+            assert_eq!(detached_flags_for_limits(0).unwrap(), 0x208);
+            assert_eq!(
+                detached_flags_for_limits(0x2000 | 0x0800).unwrap(),
+                0x0100_0208
+            );
+            assert_eq!(detached_flags_for_limits(0x2000 | 0x1000).unwrap(), 0x208);
+            assert_eq!(
+                detached_flags_for_limits(0x2000).unwrap_err().kind(),
+                std::io::ErrorKind::Unsupported
+            );
         }
     }
     pub struct Containment(Handle);

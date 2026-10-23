@@ -16,6 +16,7 @@ function harness(saved = null) {
     upgrade: { stage: 'done', to: 'v0.1.0' }, upgrade_request_error: saved };
   const context = { $, state: { health }, API: { upgrade: '/api/upgrade' }, Response,
     fetch: async () => new Response('{}'), Date, setTimeout() {},
+    pendingForRequest: () => () => {},
     show: (node, visible) => { node.hidden = !visible; },
     setText: (node, text) => { node.textContent = text; },
     setAttr: (node, name, value) => { node[name] = value; }, clear() {}, el() {},
@@ -25,8 +26,8 @@ function harness(saved = null) {
   };
   const client = runInNewContext([
     slice('async function request(', 'const deleteReq ='),
-    slice('let upgradeSending =', '/* Start or stop the loop in this server.'),
-    slice('function quietNote(', 'async function setLoop('),
+    slice('function upgradeOverdue(', 'function initLoopDetail('),
+    slice('let upgradeSending =', 'async function setLoop('),
     '({upgrade, renderLoop, renderUpgradeError})',
   ].join('\n'), context);
   client.renderLoop();
@@ -143,4 +144,14 @@ test('accepted response only dismisses failures known before the request began',
       assert.match(h.$('upgrade-error-text').textContent, /New .* failure/);
     }
   }
+});
+
+test('standalone workers are not included in queue-wide park controls', () => {
+  const h = harness();
+  h.health.jobs = [{kind: 'task', queue_owned: false, version: '0.1.0'}];
+  h.renderLoop();
+  assert.equal(h.$('loop-park').hidden, true);
+  h.health.jobs = [{kind: 'task', queue_owned: true, version: '0.1.0'}];
+  h.renderLoop();
+  assert.equal(h.$('loop-park').hidden, false, 'queue-owned work remains controllable after the scheduler stops');
 });

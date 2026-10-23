@@ -84,10 +84,9 @@
 
 <!-- The loop strip is the difference between "nothing is queued" and
      "nothing is going to happen", so it sits above the content on every view
-     instead of inside one of them. The loop runs inside this server, so the
-     strip also carries the control that starts and stops it: a task filed
-     from a phone that sat in the queue until somebody reached a keyboard was
-     the last thing in this product that needed a terminal.
+     instead of inside one of them. Its controls operate an independent
+     scheduler, while execution workers survive both web and scheduler
+     replacement. Stopping dispatch does not mean active work has stopped.
 
      Starting is one tap: it is cheap and repeatable. Stopping takes two
      (the same confirmed() helper the upgrade uses), because a stray tap from
@@ -113,9 +112,8 @@
          serving them. -->
     <span class="daemon-version" id="loop-version" hidden></span>
     <button class="btn daemon-btn" type="button" id="loop-toggle" aria-describedby="loop-why" hidden></button>
-    <!-- The escalation, shown only while a stop is waiting out a run: parking
-         stops at the run's next step instead, which is what an operator waiting
-         to replace the binary actually wants. -->
+    <!-- Explicit park is separate from scheduler stop and update/restart:
+         task workers stop at their next node boundary only when requested. -->
     <button class="btn btn-quiet daemon-btn" type="button" id="loop-park" aria-describedby="loop-why" hidden></button>
     <!-- Replacing the binary ends this process, so it lives with the other
          controls that do, and it arms on the first tap. -->

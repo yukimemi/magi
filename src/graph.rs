@@ -1240,7 +1240,7 @@ impl Runner {
         } else {
             None
         };
-        let mut execution = self.claim_driver()?;
+        let mut execution = self.claim_driver().await?;
         let runner = &mut *execution.runner;
         let wait = runner.repository_wait();
         // Keep the graph's large future off the callers' stack, including
@@ -1254,7 +1254,7 @@ impl Runner {
             }
             other => other,
         };
-        execution.driver.finish(&mut runner.state)?;
+        execution.driver.finish(&mut runner.state).await?;
         let ended = if result.is_err() {
             Some(crate::notices::run_stopped(&runner.state.id, &runner.state))
         } else {
@@ -1276,8 +1276,14 @@ impl Runner {
     }
 
     /// Validate ownership and persist the driver claim in one critical section.
-    fn claim_driver(&mut self) -> Result<DriverExecution<'_>> {
-        let owner = match crate::pr_head::owner_lock(&crate::run::home(), &self.state.id) {
+    async fn claim_driver(&mut self) -> Result<DriverExecution<'_>> {
+        let owner = match crate::pr_head::owner_lock_wait(
+            &crate::run::home(),
+            &self.state.id,
+            Duration::from_secs(self.state.config.graph.timeout_resource_wait),
+        )
+        .await
+        {
             Ok(owner) => owner,
             Err(error) => {
                 let detail = format!("worktree maintenance or ownership update: {error:#}");
@@ -14553,15 +14559,45 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_failed_driver_lease_record_releases_the_claim_and_retained_state() {
+    #[tokio::test]
+    async fn driver_claim_waits_for_maintenance_before_starting_a_pass() {
+        crate::run::pin_test_home();
+        let mut runner = runner_at(RunStatus::Gating);
+        runner.state.save().unwrap();
+        let id = runner.state.id.clone();
+        let passes = runner.state.passes.len();
+        let owner = crate::pr_head::owner_lock(&crate::run::home(), &id).unwrap();
+        let mut claiming = Box::pin(runner.claim_driver());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(claiming.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(RunState::load(&id).unwrap().passes.len(), passes);
+        drop(owner);
+        let execution = tokio::time::timeout(Duration::from_secs(2), claiming)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.runner.state.passes.len(), passes + 1);
+        assert!(execution.runner.state.resource_block.is_none());
+        assert_eq!(
+            execution.runner.state.liveness(false),
+            crate::run::Liveness::Live
+        );
+        drop(execution);
+        assert!(RunState::load(&id).unwrap().driver_exited);
+    }
+
+    #[tokio::test]
+    async fn a_failed_driver_lease_record_releases_the_claim_and_retained_state() {
         crate::run::pin_test_home();
         let mut runner = runner_at(RunStatus::Gating);
         runner.state.save().unwrap();
         // run.json can commit, but the subsequent lease metadata write fails.
         // Cleanup must run after releasing the short ownership lock.
         std::fs::create_dir(runner.state.dir().join("driver.json.tmp")).unwrap();
-        assert!(runner.claim_driver().is_err());
+        assert!(runner.claim_driver().await.is_err());
         assert!(runner.state.driver_exited);
         assert_eq!(runner.state.driver_pid, None);
         let disk = RunState::load(&runner.state.id).unwrap();

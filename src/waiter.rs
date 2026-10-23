@@ -68,6 +68,23 @@ const DELIVERY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// short enough that a fixed problem does not wait a day.
 const RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Retry {
+    key: String,
+    until: i64,
+}
+
+fn retry_path(store: &Questions, id: &str) -> PathBuf {
+    store.root().join(format!("{id}.waiter-retry.json"))
+}
+
+fn retry_blocked(store: &Questions, id: &str, key: &str, now: Timestamp) -> bool {
+    std::fs::read(retry_path(store, id))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Retry>(&bytes).ok())
+        .is_some_and(|retry| retry.key == key && now.as_second() < retry.until)
+}
+
 /// What the agent has not read yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Word {
@@ -203,6 +220,34 @@ impl Waiter {
         }
     }
 
+    /// Admission check without starting a process for an idle question store.
+    pub fn has_work(&self, now: Timestamp) -> bool {
+        self.store.list().iter().any(|q| {
+            let lease = self.store.read_lease(&q.id);
+            match decide_owned(
+                q,
+                lease.as_ref(),
+                false,
+                self.default_timeout,
+                now,
+                self.daemon_owns_action(q),
+            ) {
+                Action::Idle => false,
+                Action::Expire => true,
+                Action::Deliver(_) if q.deputy.is_some() => crate::deputy::exhausted_past_deadline(
+                    q,
+                    crate::deputy::can_start(self.conduct_cfg.as_ref(), crate::deputy::agent_of(q)),
+                    self.default_timeout,
+                    now,
+                ),
+                Action::Deliver(word) => {
+                    let key = format!("{}:{:?}", q.thread.len(), word);
+                    !self.seat_busy(q, now) && !retry_blocked(&self.store, &q.id, &key, now)
+                }
+            }
+        })
+    }
+
     /// Is this question's asking seat still mid-turn?
     fn seat_busy(&self, q: &Question, now: Timestamp) -> bool {
         if q.run == crate::conduct::NODE {
@@ -267,7 +312,8 @@ impl Waiter {
                         continue;
                     }
                     let key = format!("{}:{:?}", q.thread.len(), word);
-                    if matches!(self.memo.get(&q.id), Some((k, until)) if *k == key && Instant::now() < *until)
+                    if retry_blocked(&self.store, &q.id, &key, now)
+                        || matches!(self.memo.get(&q.id), Some((k, until)) if *k == key && Instant::now() < *until)
                     {
                         continue;
                     }
@@ -401,6 +447,23 @@ impl Waiter {
             r.waiter = None;
             Ok(())
         });
+        let retry = Retry {
+            key: key.clone(),
+            until: Timestamp::now()
+                .as_second()
+                .saturating_add(RETRY_AFTER.as_secs() as i64),
+        };
+        let written = serde_json::to_vec(&retry)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| {
+                std::fs::write(retry_path(&self.store, &q.id), bytes).map_err(Into::into)
+            });
+        if let Err(error) = written {
+            tracing::warn!(
+                "question {} retry cooldown could not be saved: {error:#}",
+                q.short()
+            );
+        }
         self.memo
             .insert(q.id.clone(), (key, Instant::now() + RETRY_AFTER));
     }
@@ -630,6 +693,7 @@ impl Waiter {
             Ok(())
         })?;
         self.memo.remove(&q.id);
+        let _ = std::fs::remove_file(retry_path(&self.store, &q.id));
         Ok(())
     }
 }
@@ -664,25 +728,34 @@ impl Drop for Release {
     }
 }
 
-/// The waiter's loop, until `stop` is asked for.
-///
-/// A stop ends the loop between ticks; a park also drops a delivery in flight.
-/// Neither writes anything to a question: the lease just ages out and the next
-/// waiter - this daemon restarted, or another - reads the same state off disk.
-pub async fn run(mut waiter: Waiter, stop: crate::daemon::Stop) {
-    let halt = {
-        let stop = stop.clone();
-        move || stop.parking()
-    };
-    while !stop.stopped() {
-        waiter.tick(Timestamp::now(), &halt).await;
-        tokio::time::sleep(TICK).await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_backoff_survives_a_new_finite_waiter() {
+        let home = tempfile::tempdir().expect("home");
+        let store = Questions::at(home.path().join("questions"));
+        std::fs::create_dir_all(store.root()).expect("questions");
+        let retry = Retry {
+            key: "input".to_owned(),
+            until: 700,
+        };
+        std::fs::write(
+            retry_path(&store, "question"),
+            serde_json::to_vec(&retry).expect("retry"),
+        )
+        .expect("save retry");
+        let reopened = Questions::at(home.path().join("questions"));
+        assert!(retry_blocked(&reopened, "question", "input", ts(699)));
+        assert!(!retry_blocked(
+            &reopened,
+            "question",
+            "different input",
+            ts(699)
+        ));
+        assert!(!retry_blocked(&reopened, "question", "input", ts(700)));
+    }
 
     fn ts(secs: i64) -> Timestamp {
         Timestamp::from_second(secs).unwrap()

@@ -3,6 +3,7 @@
 //! the same conversation, and stops when the question's time runs out.
 mod common;
 
+use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -46,8 +47,21 @@ fn file(store: &Questions, fx: &Fixture, summary: &str) -> Question {
 }
 
 fn scene(home: HomeGuard) -> Scene {
-    let fx = fixture(home, Judges::Unanimous, false);
+    let mut fx = fixture(home, Judges::Unanimous, false);
     let home = fx.tmp.path().join("magi-home");
+    let user_home = fx.tmp.path().join("user-home");
+    std::fs::create_dir_all(&user_home).unwrap();
+    for agent in &mut fx.config.agents {
+        for (key, path) in [
+            ("HOME", &user_home),
+            ("USERPROFILE", &user_home),
+            ("MAGI_HOME", &home),
+        ] {
+            agent
+                .env
+                .insert(key.to_owned(), path.to_string_lossy().into_owned());
+        }
+    }
     let store = Questions::at(home.join("questions"));
     let q = file(&store, &fx, "Is the setup done?");
     Scene { fx, home, store, q }
@@ -73,6 +87,61 @@ fn log(s: &Scene) -> Vec<String> {
 async fn turn(d: &mut Deputies) {
     d.tick(Timestamp::now());
     d.drain().await;
+}
+
+fn restart_deadline(s: &Scene, id: &str) -> Timestamp {
+    let path = s.store.root().join(format!("{id}.deputy/next-start"));
+    let seconds = std::fs::read_to_string(path).unwrap().parse().unwrap();
+    Timestamp::from_second(seconds).unwrap()
+}
+
+/// Model a prior invocation whose durable restart deadline has already passed.
+/// Opening the existing file ensures the turn really persisted its cooldown.
+fn elapse_restart_cooldown(s: &Scene, id: &str) {
+    let path = s.store.root().join(format!("{id}.deputy/next-start"));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .expect("the prior deputy persisted its cooldown")
+        .write_all((Timestamp::now().as_second() - 1).to_string().as_bytes())
+        .unwrap();
+}
+
+common::e2e! {
+async fn finite_runners_preserve_the_unchanged_input_restart_gap() {
+    let s = scene(home_lock().await);
+    turn(&mut deputies(&s, 1)).await;
+    let first = s.store.get(&s.q.id).unwrap().deputy.unwrap();
+    let next = restart_deadline(&s, &s.q.id);
+    let before = Timestamp::from_second(next.as_second() - 1).unwrap();
+
+    // Recreating the dispatcher every finite service lap must not rebill the
+    // same idle conversation or spend its lifetime starts.
+    for _ in 0..3 {
+        let mut finite = deputies(&s, 1);
+        assert!(!finite.has_work(before), "not before the persisted deadline");
+        assert!(finite.has_work(next), "eligible exactly at the deadline");
+        finite.tick(before);
+        finite.drain().await;
+    }
+    assert_eq!(log(&s).len(), 1, "no duplicate invocation during the gap");
+    assert_eq!(s.store.get(&s.q.id).unwrap().deputy.unwrap().starts, first.starts);
+
+    // After the gap an unchanged question can retry, but still resumes its
+    // existing seat rather than allocating a duplicate CLI conversation.
+    elapse_restart_cooldown(&s, &s.q.id);
+    turn(&mut deputies(&s, 1)).await;
+    let after = s.store.get(&s.q.id).unwrap().deputy.unwrap();
+    let (a, b) = (first.seat.unwrap(), after.seat.unwrap());
+    assert_eq!(log(&s), [
+        format!("{} started", a.key),
+        format!("{} resumed", a.key),
+    ]);
+    assert_eq!(b.claude_session, a.claude_session);
+    assert_eq!(b.turns, a.turns + 1);
+    assert_eq!(after.starts, first.starts + 1);
+}
 }
 
 common::e2e! {
@@ -181,10 +250,22 @@ async fn a_restart_resumes_the_same_deputy_seat() {
     let first = s.store.get(&s.q.id).unwrap().deputy.unwrap();
     assert_eq!(log(&s), [format!("{} started", first.seat.as_ref().unwrap().key)]);
 
-    // A new process: nothing in memory, only what is on the question.
-    s.store.drop_lease(&s.q.id);
+    // A new process still observes the durable start gap, even with new input.
     s.store.update(&s.q.id, |q| q.say("are you there?")).unwrap();
+    let mut waiting = deputies(&s, 2);
+    let before = Timestamp::from_second(
+        restart_deadline(&s, &s.q.id).as_second() - 1
+    ).unwrap();
+    assert!(!waiting.has_work(before));
+    waiting.tick(before);
+    waiting.drain().await;
+    assert_eq!(log(&s).len(), 1, "a restart must not erase the start gap");
+
+    // Once the prior start is old enough, only persisted conversation state
+    // is needed to deliver the owner's new word to the same seat.
+    elapse_restart_cooldown(&s, &s.q.id);
     let mut restarted = deputies(&s, 2);
+    assert!(restarted.has_work(Timestamp::now()));
     turn(&mut restarted).await;
 
     let after = s.store.get(&s.q.id).unwrap().deputy.unwrap();
@@ -194,6 +275,10 @@ async fn a_restart_resumes_the_same_deputy_seat() {
     assert_eq!(b.turns, 3, "resumed, not handed over again");
     assert_eq!(after.starts, 2);
     assert_eq!(log(&s)[1], format!("{} resumed", a.key));
+    let q = s.store.get(&s.q.id).unwrap();
+    assert_eq!(q.delivered_turns, q.thread.len(), "the new word was read");
+    assert_eq!(q.thread.last().unwrap().who, Who::Agent);
+    assert!(!q.waiting_on_agent(), "the resumed seat answered back");
 }
 }
 
@@ -201,18 +286,44 @@ common::e2e! {
 async fn a_seat_that_lost_its_session_starts_over_with_the_whole_context() {
     let s = scene(home_lock().await);
     let mut d = deputies(&s, 2);
+    s.store.update(&s.q.id, |q| q.say("the setup is still blocked")).unwrap();
     turn(&mut d).await;
-    s.store.drop_lease(&s.q.id);
-    // Turns recorded but the CLI conversation gone: never assume memory.
+    let first = s.store.get(&s.q.id).unwrap().deputy.unwrap().seat.unwrap();
+    // The prior turn's history survives, but its CLI conversation is gone.
     s.store
         .update(&s.q.id, |q| {
             q.deputy.as_mut().unwrap().seat.as_mut().unwrap().turns = 0;
-            Ok(())
+            q.say("the setup now needs a token")
         })
         .unwrap();
+    elapse_restart_cooldown(&s, &s.q.id);
     let mut restarted = deputies(&s, 2);
     turn(&mut restarted).await;
-    assert!(log(&s)[1].ends_with("started"), "{:?}", log(&s));
+    let after = s.store.get(&s.q.id).unwrap();
+    let dep = after.deputy.as_ref().unwrap();
+    let seat = dep.seat.as_ref().unwrap();
+    assert_eq!(log(&s), [
+        format!("{} started", first.key),
+        format!("{} started", first.key),
+    ]);
+    assert_eq!(seat.key, first.key, "the question keeps its own seat");
+    assert_ne!(seat.claude_session, first.claude_session, "a fresh CLI conversation");
+    assert_eq!(seat.turns, 2, "a new handover, then a real turn");
+    assert_eq!(dep.starts, 2);
+    assert_eq!(after.delivered_turns, after.thread.len());
+    let prompt = std::fs::read_to_string(
+        s.store.root().join(format!("{}.deputy/turn-2.prompt.md", s.q.id))
+    ).unwrap();
+    for context in [
+        "Is the setup done?",
+        "the conductor's reasoning",
+        "the build needs a manual setup step",
+        "operator: skip it",
+        "the setup is still blocked",
+        "the setup now needs a token",
+    ] {
+        assert!(prompt.contains(context), "missing {context:?} in {prompt}");
+    }
 }
 }
 
@@ -267,6 +378,10 @@ async fn a_live_lease_the_cap_and_the_start_bound_all_hold_a_deputy_back() {
     one.drain().await;
     assert_eq!(log(&s).len(), 2, "{:?}", log(&s));
 
+    // Remove the unrelated retry gap so these assertions exercise ownership
+    // and the lifetime start bound rather than just the durable cooldown.
+    elapse_restart_cooldown(&s, &s.q.id);
+    elapse_restart_cooldown(&s, &other.id);
     // A fresh lease means somebody is already on it.
     let mut d = deputies(&s, 2);
     s.store.beat(&s.q.id, WaiterKind::Asker);

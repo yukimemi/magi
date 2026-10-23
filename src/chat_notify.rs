@@ -24,7 +24,6 @@ use std::path::Path;
 use anyhow::{Result, bail};
 use jiff::Timestamp;
 
-use crate::config::Config;
 use crate::prompt::{ChatTaskNotice, NoticeDisplay, chat_task_report};
 use crate::queue::{ChatNotice, ChatNoticeOutcome, Queue, Task, TaskStatus};
 use crate::talk::{self, Talks};
@@ -661,7 +660,7 @@ pub fn talks_to_start(talks: &Talks) -> Vec<String> {
 
 /// Is the draft made of completion notices alone? A notice appended to an
 /// operator's unsent draft must not start that draft on the daemon's initiative.
-fn pending_is_only_notices(t: &talk::Talk) -> bool {
+pub(crate) fn pending_is_only_notices(t: &talk::Talk) -> bool {
     if t.pending_messages.iter().any(|m| m.sender.is_some()) {
         if !t.pending_messages.iter().all(|m| {
             matches!(m.sender, None | Some(talk::Sender::Magi))
@@ -693,35 +692,22 @@ fn pending_is_only_notices(t: &talk::Talk) -> bool {
     })
 }
 
-/// Start the chat's turn for every talk owed a notice, under the talk's own
-/// lease, each spawned into `turns` (the daemon's in-flight set, which its exit
-/// waits for). `parking` (an upgrade is parking) starts
-/// nothing. Returns how many turns were started; a talk whose lease is held
-/// elsewhere is left to its holder, who drains the draft before letting go.
+/// Submit automatic notices to detached workers. Never submit operator drafts,
+/// including a notice appended to an unsent draft.
 pub fn start_turns(talks: &Talks, parking: bool, turns: &mut tokio::task::JoinSet<()>) -> usize {
     if parking {
         return 0;
     }
     let mut started = 0;
     for id in talks_to_start(talks) {
-        let lease = match talks.claim_turn(&id) {
-            Ok(Some(lease)) => lease,
-            Ok(None) => continue,
-            Err(e) => {
-                tracing::warn!("chat {id}: turn lease: {e:#}");
-                continue;
-            }
-        };
+        if talks.turn_held(&id) || crate::consult::turn_worker_active(talks, &id) {
+            continue;
+        }
         started += 1;
         let talks = talks.clone();
         turns.spawn(async move {
-            let run = async {
-                let talk = talks.get(&id)?;
-                let (cfg, _) = Config::discover(&talk.repo, None)?;
-                crate::consult::drain_turns(&talks, &id, lease, &cfg).await
-            };
-            if let Err(e) = run.await {
-                tracing::warn!("chat {id}: notice turn failed: {e:#}");
+            if let Err(e) = crate::consult::spawn_notice_turn(&talks, &id).await {
+                tracing::warn!("chat {id}: notice worker failed to start: {e:#}");
             }
         });
     }

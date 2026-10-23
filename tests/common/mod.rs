@@ -16,7 +16,7 @@ use magi::config::{
 };
 
 mod cli;
-use cli::SEAT_ENV;
+use cli::{SEAT_ENV, WORKER_ENV};
 #[allow(unused_imports)]
 pub use cli::{magi_cli, magi_cli_env, magi_cli_environment};
 pub mod seat_block;
@@ -97,9 +97,10 @@ where
             // SAFETY: single test per process, set before any runtime or task.
             unsafe {
                 std::env::set_var(magi::config::Config::CONFIG_DIR_ENV, "");
-                for key in SEAT_ENV {
+                for key in SEAT_ENV.into_iter().chain(WORKER_ENV) {
                     std::env::remove_var(key);
                 }
+                std::env::set_var("MAGI_WORKER_EXE", env!("CARGO_BIN_EXE_magi"));
             };
         }
         tokio::runtime::Builder::new_current_thread()
@@ -123,11 +124,15 @@ where
         .env_remove("MAGI_NODE")
         .env_remove("MAGI_SEAT")
         .env_remove("MAGI_TURN_SCOPE")
+        .env_remove("MAGI_WORKER_ID")
+        .env_remove("MAGI_WORKER_GENERATION")
+        .env_remove("MAGI_WORKER_HOME")
         // Named and empty: no machine layer. `Config::discover` in an
         // integration binary links the non-test library, so the operator's own
         // `config.toml` would otherwise merge with a fixture's `magi.toml` and
         // trip the "array declared in two layers" refusal on that machine only.
         .env(magi::config::Config::CONFIG_DIR_ENV, "")
+        .env("MAGI_WORKER_EXE", env!("CARGO_BIN_EXE_magi"))
         .output();
     *lock.lock().unwrap() += 1;
     cv.notify_one();

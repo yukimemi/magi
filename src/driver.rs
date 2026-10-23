@@ -146,8 +146,13 @@ impl DriverGuard {
     }
 
     /// Save the final graph state and its released ownership together.
-    pub(crate) fn finish(&mut self, state: &mut RunState) -> Result<()> {
-        let _owner = crate::pr_head::owner_lock(&self.home, &self.id)?;
+    pub(crate) async fn finish(&mut self, state: &mut RunState) -> Result<()> {
+        let _owner = crate::pr_head::owner_lock_wait(
+            &self.home,
+            &self.id,
+            std::time::Duration::from_secs(state.config.graph.timeout_resource_wait),
+        )
+        .await?;
         let disk = RunState::load_under(&self.id, &self.home)?;
         if Identity::of(&disk) != self.identity || disk.released_to.is_some() {
             bail!("run driver ownership changed before execution finished");
@@ -273,8 +278,35 @@ mod tests {
         guard
     }
 
-    #[test]
-    fn every_graph_outcome_releases_ownership_with_its_final_state() {
+    #[tokio::test]
+    async fn finishing_waits_for_maintenance_without_releasing_execution() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = state(home.path());
+        let id = s.id.clone();
+        let mut guard = claim(home.path(), &s);
+        let owner = crate::pr_head::owner_lock(home.path(), &id).unwrap();
+        let mut finishing = Box::pin(guard.finish(&mut s));
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(finishing.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let disk = RunState::load_under(&id, home.path()).unwrap();
+        assert!(!disk.driver_exited);
+        assert_eq!(disk.liveness_under(home.path(), false), Liveness::Live);
+        assert!(DriverGuard::acquire(home.path(), &disk).is_err());
+        drop(owner);
+        tokio::time::timeout(std::time::Duration::from_secs(2), finishing)
+            .await
+            .unwrap()
+            .unwrap();
+        let disk = RunState::load_under(&id, home.path()).unwrap();
+        assert!(disk.driver_exited);
+        assert_eq!(disk.driver_pid, None);
+    }
+
+    #[tokio::test]
+    async fn every_graph_outcome_releases_ownership_with_its_final_state() {
         for status in [
             RunStatus::Gating,
             RunStatus::Blocked,
@@ -292,7 +324,7 @@ mod tests {
                 assert!(DriverGuard::acquire(home.path(), &s).is_err());
                 s.status = status;
                 s.parked = parked;
-                guard.finish(&mut s).unwrap();
+                guard.finish(&mut s).await.unwrap();
                 let disk = RunState::load_under(&s.id, home.path()).unwrap();
                 assert_eq!(disk.status, status);
                 assert_eq!(disk.parked, parked);
@@ -331,9 +363,9 @@ mod tests {
         );
     }
 
-    #[test]
     #[cfg(unix)]
-    fn driver_drop_unlocks_even_with_an_inherited_descriptor() {
+    #[tokio::test]
+    async fn driver_drop_unlocks_even_with_an_inherited_descriptor() {
         for finished in [false, true] {
             let home = tempfile::tempdir().unwrap();
             let mut s = state(home.path());
@@ -342,7 +374,7 @@ mod tests {
             let inherited = guard._lease._file.try_clone().unwrap();
             assert!(DriverGuard::acquire(home.path(), &s).is_err());
             if finished {
-                guard.finish(&mut s).unwrap();
+                guard.finish(&mut s).await.unwrap();
             }
             assert!(DriverGuard::acquire(home.path(), &s).is_err());
             drop(guard);
@@ -465,9 +497,9 @@ mod tests {
         assert_eq!(disk.liveness_under(home.path(), false), Liveness::Dead);
     }
 
-    #[test]
     #[cfg(unix)]
-    fn execution_lease_releases_even_with_an_inherited_descriptor() {
+    #[tokio::test]
+    async fn execution_lease_releases_even_with_an_inherited_descriptor() {
         for finished in [false, true] {
             let home = tempfile::tempdir().unwrap();
             let mut s = state(home.path());
@@ -475,7 +507,7 @@ mod tests {
             let inherited = guard._lease._file.try_clone().unwrap();
             assert!(DriverGuard::acquire(home.path(), &s).is_err());
             if finished {
-                guard.finish(&mut s).unwrap();
+                guard.finish(&mut s).await.unwrap();
             }
             drop(guard);
             let next = DriverGuard::acquire(home.path(), &s)

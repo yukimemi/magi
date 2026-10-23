@@ -53,7 +53,7 @@ use crate::release_local::{self, Job};
 use crate::run::RunState;
 
 /// Pause between laps.
-const LAP: Duration = Duration::from_secs(300);
+pub(crate) const LAP: Duration = Duration::from_secs(300);
 
 /// How long after a rerun the forge may still report the old failure before
 /// that is read as "still red". `gh run rerun` returns before the checks flip
@@ -1432,34 +1432,6 @@ impl Watcher {
             });
         }
         let _ = std::fs::remove_file(self.state_path(pr));
-    }
-}
-
-/// The task `magi serve` spawns. `settings` returns the checkouts to cover and
-/// `[daemon] release_stall_minutes`; it is re-read every lap so a config
-/// change is picked up, and `0` minutes switches the lap off.
-pub(crate) async fn run(
-    watcher: Watcher,
-    settings: impl Fn() -> (Vec<PathBuf>, u64),
-    stop: crate::daemon::Stop,
-) {
-    let halt = {
-        let stop = stop.clone();
-        move || stop.stopped()
-    };
-    while !stop.stopped() {
-        let (repos, minutes) = settings();
-        if minutes > 0 {
-            let now = jiff::Timestamp::now().as_second();
-            watcher
-                .lap(&repos, (minutes as i64).saturating_mul(60), now, &halt)
-                .await;
-        }
-        let mut slept = Duration::ZERO;
-        while slept < LAP && !stop.stopped() {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            slept += Duration::from_secs(1);
-        }
     }
 }
 

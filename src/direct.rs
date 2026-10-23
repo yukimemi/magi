@@ -160,10 +160,10 @@ impl Followed {
 /// line whenever the newest run's status changes.
 ///
 /// Finished is `done`, `held` or `blocked`: a `failed` or `queued` task is the
-/// loop's to retry. A task that stays unfinished while no loop is alive, or
-/// past `max_wait`, is an error - never taken over here, because the loop may
-/// merely be slow to heartbeat and a second driver would race it. Recovery is
-/// the loop's own claim reclaim and `Runner::resume`. Running out of
+/// loop's to retry. A task that stays unfinished while neither a scheduler nor
+/// its independently leased task worker is alive is an error, never taken over
+/// here. Scheduler replacement does not end a worker's ownership or this wait.
+/// Recovery remains the scheduler's own claim reclaim and `Runner::resume`.
 /// `max_wait` is not an error: it returns with `finished: false`.
 pub async fn follow(
     queue: &Queue,
@@ -205,6 +205,7 @@ pub async fn follow(
         let reading = crate::daemon::read_status(home);
         if crate::daemon::foreign_loop(reading.as_ref(), Timestamp::now(), std::process::id())
             .is_none()
+            && !crate::daemon::is_working_on_task(home, id, Timestamp::now())
         {
             bail!(
                 "no magi loop is serving the queue any more, and task {} is still {}; it was \
@@ -223,6 +224,47 @@ pub async fn follow(
         }
         tokio::time::sleep(poll).await;
     }
+}
+
+/// Read-only lookup of the task already owning a run.
+#[must_use]
+pub fn resume_owner(queue: &Queue, run: &str) -> Option<Task> {
+    queue
+        .list()
+        .into_iter()
+        .find(|task| task.runs.iter().any(|id| id == run))
+}
+
+/// Find and claim an existing owner, or file a new owner while already claimed.
+/// The caller serializes find-or-create with the run's `resume-<id>` claim and
+/// retains this returned claim until its pinned request is handed to a worker.
+pub fn claim_resume_owner(
+    queue: &Queue,
+    run: &str,
+    instruction: &str,
+    repo: &Path,
+    source: Source,
+    sources: &crate::refs::Sources,
+) -> Result<(Task, Claim)> {
+    if let Some(listed) = resume_owner(queue, run) {
+        let claim = queue.claim(&listed.id)?;
+        let task = queue.get(&listed.id)?;
+        anyhow::ensure!(
+            task.runs.iter().any(|id| id == run),
+            "run queue owner changed"
+        );
+        return Ok((task, claim));
+    }
+    let mut task = Task::new(
+        crate::queue::title_from(instruction, 72),
+        instruction.to_owned(),
+        repo.to_path_buf(),
+        source,
+    );
+    task.sources = sources.clone();
+    task.link_run(run);
+    let claim = queue.file_claimed(&mut task)?;
+    Ok((task, claim))
 }
 
 /// A run opened inside this process (the follow-up review of `magi fix`) and

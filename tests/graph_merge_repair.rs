@@ -38,20 +38,17 @@ esac
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut paths = vec![bin.clone()];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
-    let cli = common::magi_cli(&magi::run::home());
+    let cli_env = common::magi_cli_env(&magi::run::home(), "REPAIR_CLI");
     // SAFETY: each e2e test runs in an isolated child, before its driver starts.
     unsafe {
         std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
         std::env::set_var("REPAIR_FORGE", &bin);
         std::env::set_var("REPAIR_BRANCH", branch);
-        for (key, value) in cli.get_envs() {
-            if let Some(value) = value {
-                std::env::set_var(key, value);
-            } else {
-                std::env::remove_var(key);
-            }
+        // These defaults configure the embedded library process, not a CLI
+        // child. Keep its explicit worker executable and embedding identity.
+        for (key, value) in cli_env {
+            std::env::set_var(key, value);
         }
-        std::env::set_var("REPAIR_CLI", cli.get_program());
         std::env::set_var("REPAIR_HOME", magi::run::home());
     }
     let agent = dir.join("mock-agent.sh");
@@ -836,6 +833,12 @@ async fn decision_reimplementation_retires_owner_before_requeue_and_preserves_se
     for agent in &mut recovered.config.agents { agent.env.remove("MOCK_QUOTA_SEAT"); }
     recovered.config.merge.mode = MergeMode::None;
     recovered.save().unwrap();
+    // Subscription recovery includes expiry of the machine-wide cooldown,
+    // which now survives scheduler replacement instead of resetting in memory.
+    let expired = magi::run::home().join("task-quota-cooldown.json");
+    std::fs::write(expired, serde_json::to_vec(
+        &(jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1)),
+    ).unwrap()).unwrap();
     let mut released = after.clone();
     released.release_operator("quota-restored", None);
     magi::queue::Queue::open().put(&mut released).unwrap();
@@ -1181,5 +1184,84 @@ async fn decision_cli_hold_release_invalidates_prior_merge_consent_on_daemon_res
     assert!(!fx.tmp.path().join("forge/closed").exists());
     let calls = std::fs::read_to_string(fx.tmp.path().join("forge/calls")).unwrap();
     assert!(calls.lines().filter(|line| line.starts_with("pr merge")).all(|line| line.contains("--disable-auto")));
+}
+}
+
+common::e2e! {
+async fn an_invalid_embedded_worker_executable_stops_the_scheduler_without_retrying() {
+    let guard = common::home_lock().await;
+    let mut fx = common::fixture(guard, common::Judges::Unanimous, false);
+    fx.config.disk.min_free_bytes = 0;
+    fx.config.disk.auto_fold = false;
+    fx.config.disk.cache_limit_bytes = 0;
+    fx.config.daemon.max_deputies = 0;
+    fx.config.daemon.release_stall_minutes = 0;
+    fx.config.repos.fetch_interval = 0;
+    let config = fx.tmp.path().join("startup.toml");
+    std::fs::write(&config, toml::to_string(&fx.config).unwrap()).unwrap();
+    let home = magi::run::home();
+    let host_home = fx.tmp.path().join("host-home");
+    std::fs::create_dir_all(&host_home).unwrap();
+    let starts = fx.tmp.path().join("worker-starts");
+    let broken = fx.tmp.path().join("not-a-worker");
+    std::fs::write(
+        &broken,
+        "#!/bin/sh\nprintf 'started\\n' >> \"$MAGI_STARTUP_PROBE\"\necho 'worker executable rejected hidden arguments' >&2\nexit 2\n",
+    ).unwrap();
+    std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // SAFETY: this scene owns its process and no workers have been started.
+    unsafe {
+        std::env::set_var("HOME", &host_home);
+        std::env::set_var("USERPROFILE", &host_home);
+        std::env::set_var("MAGI_HOME", &home);
+        std::env::set_var("MAGI_WORKER_EXE", &broken);
+        std::env::set_var("MAGI_STARTUP_PROBE", &starts);
+    }
+    let queue = magi::queue::Queue::open();
+    let mut task = magi::queue::Task::new(
+        "Worker startup failure".into(),
+        "create note.txt".into(),
+        fx.repo.clone(),
+        magi::queue::Source::Human,
+    );
+    queue.put(&mut task).unwrap();
+    // Suppress only unrelated periodic work, as the daemon unit fixtures do.
+    // The task still goes through the real dispatcher and detached OS spawn.
+    let ticks = home.join("service-ticks");
+    std::fs::create_dir_all(&ticks).unwrap();
+    std::fs::write(
+        ticks.join("daemon-conductor"),
+        serde_json::to_vec(&jiff::Timestamp::now()).unwrap(),
+    ).unwrap();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        magi::daemon::serve_until(
+            magi::daemon::Opts {
+                repo: fx.repo.clone(),
+                config: Some(config),
+                once: true,
+                poll: std::time::Duration::from_secs(3600),
+                worktrees_root: Some(fx.tmp.path().join("worktrees")),
+                ..Default::default()
+            },
+            magi::daemon::Stop::new(),
+        ),
+    ).await.expect("startup failure must stop dispatch, not wait and reserve again");
+    outcome.expect_err("an invalid worker must not report successful dispatch");
+    assert_eq!(std::fs::read_to_string(starts).unwrap(), "started\n");
+    let active = magi::worker::active(&home).unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].key, format!("task:{}", task.id));
+    assert_eq!(active[0].status, magi::worker::Status::Starting);
+    let notices = magi::notices::Notices::open().list();
+    notices.iter().find(|n| n.key == "loop:worker-startup")
+        .expect("startup must leave a phone-visible notification after the scheduler stops");
+    let worker_log = home.join("workers/jobs").join(&active[0].id).join("worker.log");
+    assert!(std::fs::read_to_string(worker_log).unwrap()
+        .contains("worker executable rejected hidden arguments"));
+    let saved = queue.get(&task.id).unwrap();
+    assert_eq!(saved.attempts, 0);
+    assert!(saved.runs.is_empty());
+    assert!(queue.claim(&task.id).is_ok(), "the stopped dispatcher releases its queue claim");
 }
 }

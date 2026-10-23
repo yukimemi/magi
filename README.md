@@ -203,10 +203,11 @@ queue (the same path as `magi task add`) and print its id - open it with
 `magi task show <id>`. If a `magi serve` / `magi web` loop is alive on this
 machine the task is filed `urgent` (its own one-slot lane, other runs are not
 paused) and the command follows the loop's run and exits with its outcome;
-otherwise the command runs the task itself, holding its claim so a loop that
-starts meanwhile cannot take it. `--merge`, `-c`, `-j`, `--review-rounds`,
-`--seed` and `--config` ride on the task, so they hold either way. A run that
-fails standalone leaves its task `held` (`magi task release` retries it).
+otherwise an independent worker runs the task, holding its claim so a scheduler
+that starts meanwhile cannot take it. The CLI only follows: closing that CLI
+does not terminate the worker. `--merge`, `-c`, `-j`, `--review-rounds`, `--seed`
+and `--config` ride on the task, so they hold either way. A run that fails
+standalone leaves its task `held` (`magi task release` retries it).
 
 Implementation imports are opt-in on both `magi task add` and `magi run`:
 
@@ -707,12 +708,15 @@ draft instead of starting a second CLI turn. The web composer shows that draft;
 use **Resume queued draft** to run it unchanged, **Edit text** to replace only
 its text while keeping its attachments, or **Clear** to discard the exact draft
 you are viewing. Clear and Edit use a snapshot check, so they refuse rather
-than overwrite a draft changed by another action. A server restart cannot
-resume an in-flight CLI process, but the recorded transcript and pending draft
-remain on disk and are visible after reopening Chat. Use **Resume queued
-draft** for either text-only or image-only recovery; do not resend the stored
-message. Editing an idle recovered draft starts its drain, but unchanged drafts
-have their own Resume action.
+than overwrite a draft changed by another action. Restarting the web or scheduler
+does not terminate an in-flight Chat invocation: its independent worker retains
+the same conversation and CLI session, and the replacement web process displays
+its busy state and eventual reply. Submissions accepted after an update use the
+new executable; queued sends remain serialized behind the running turn.
+Use **Resume queued draft** for text-only or image-only recovery after an actual
+execution failure, rather than resending the stored message. A launch failure
+proven to have started no execution restores the recorded send to that draft;
+an uncertain startup is never automatically replayed.
 
 The conversation runs with writes disabled by default: an agent that had
 already edited the repository mid-conversation would make a later
@@ -997,62 +1001,71 @@ Before this the delete button greyed itself out and said "Run `magi fold`
 first" — a phone being told to open a terminal, in the one product whose point
 is that it does not need one.
 
-**Update & restart, from the phone.** One tap arms it, the second replaces
-this binary with the newest release and brings the deck back on it:
+**Update & restart, from the phone.** One tap arms it, the second installs the
+newest release and replaces the web and scheduler processes. **Running work does
+not park, restart, or wait for a graph node to finish.**
 
-1. a run in flight **parks** at its next node boundary and stays resumable, so
-   this costs at most the step it is on rather than the competition;
-2. `kaishin` puts the new binary in place — it *renames* the running image
-   aside, so the swap itself needs no downtime;
-3. the server drops its listener, spawns a detached successor, and exits; the
-   successor waits out the address and binds it;
-4. the loop resumes the parked run rather than competing again.
+The same binary has three process roles:
 
-Measured end to end on a 0.1.0 deck upgrading itself to the 0.2.0 release:
-**eleven seconds** from the request to the successor answering on the same
-address, with no terminal involved. Refused when the loop belongs to another
-process, because replacing this binary would leave that one running an old
-binary against the same queue.
+- `magi web` serves the screen and API. Its Start/Stop controls operate an
+  independent scheduler, including one started by an earlier web process.
+- `magi serve` dispatches the queue and manages ordinary, urgent and
+  decision-only lanes. On restart it reconstructs occupied slots from live
+  worker reservations, rather than starting those tasks again.
+- Independent workers own task claims, graph execution leases, Chat sessions,
+  deputy turns and finite maintenance operations until their outcomes are saved.
+  A worker survives its launching web, scheduler or following CLI exiting.
 
-**Stop, replace the binary, resume.** A plain stop never abandons a run: it
-finishes the competition it is on, which can be an hour. That is right when
-you only want the queue to drain, and useless when you have fixes to install —
-and killing the process instead loses whatever the seats in flight had not
-written.
+During an upgrade:
 
-So a stop that is waiting out a run offers **Park at the next step**. The run
-stops at its next node boundary, which costs at most the node in progress
-because every node writes its state before the next one starts and every node
-skips what is already recorded. The run comes back as parked-and-resumable,
-the process exits, the binary can be replaced, and the next loop **resumes
-that run** rather than competing again — or you tap Resume yourself.
+1. `kaishin` replaces the installed executable.
+2. The scheduler stops claiming work and is replaced. Existing task, Chat and
+   maintenance workers continue on their immutable executable generations.
+3. The web closes admission briefly and finishes only outstanding
+   persistence-to-reservation handoffs, not agent invocations.
+4. The listener is released before the successor web starts on the same address.
+   The browser reconnects; new work uses the new executable.
 
-Runs parked for a binary upgrade resume ahead of ordinary queued work,
-including newer tasks with higher ordinary priority, after the daemon restarts.
-Multiple upgrade resumes keep their persisted pass-start order (task id breaks
-ties); older records without a start time approximate it using settlement time.
-They continue the same run and checkpoint. Interrupts, urgent slots, concurrency,
-claims, coordination, approval waits and resource gates still apply: a blocked
-resume does not prevent unrelated eligible work from progressing. Other park
-causes, and startup parks without a run and recorded upgrade pass, keep ordinary
-scheduling order.
+Finishing an old worker needs no ownership transfer, new run, extra pass or
+attempt refund. Its existing owner saves the result normally. Ordinary
+concurrency and the separate urgent lane remain bounded across scheduler
+replacement. Standalone CLI executions remain outside the scheduler's lanes.
 
-A park spends no attempt. It is the operator asking for the process back, not
-a run that failed, and a few upgrades must not exhaust a budget meant for
-agents that actually misbehaved.
+Short ownership-maintenance transactions are awaited at execution boundaries
+using the run's existing resource-wait budget, not an agent's runtime budget.
+An ordinary maintenance pass must not turn a live task into an immediate hold.
 
-**The loop runs inside `magi web`.** `GET /api/loop` reports whether it is
-running and who owns it; `POST /api/loop {"running": true|false}` starts and
-stops it. Only the process serving the page can control its own loop — a loop
-started elsewhere is reported with the owning pid and both calls are refused,
-because a button that silently did nothing would be worse than a refusal, and
-two loops on one queue race for the same claims and bill the agent quota twice.
+**Stop and park are different.** Stop promptly stops the scheduler from claiming
+new work; active workers continue. **Park at the next step** explicitly asks
+queue-owned task workers to checkpoint at a graph boundary and leave their runs
+resumable. A park refunds its attempt, but an update does not need one.
+Historical runs already parked by an older binary upgrade keep their existing
+resume ordering.
 
-Answering an interview turn returns **202** immediately and runs the agent in
-the background: a turn takes twenty to ninety seconds, and a phone that walks
-behind a wall while the request is open loses the answer the server had already
-produced. The operator's turn is persisted before the response returns, so the
-transcript is never missing what you actually said.
+**First migration:** an older embedded scheduler cannot be extracted from its
+process while running. Finish or park that legacy scheduler once before starting
+the independent scheduler. A live legacy process is protected even when its
+heartbeat is stale. This limitation does not apply to later worker-based updates.
+
+**Local execution evidence:** `<magi-home>/workers/jobs/<id>/` contains active
+reservations and `worker.log`; finished records move to `workers/results/<id>/`.
+The most recent 256 finished records are retained. Content-addressed executables
+live under `workers/generations/<sha256>/` and are deliberately retained, so an
+old worker's later helper commands cannot switch to a newly installed binary.
+Do not remove a generation while its workers are running. Health and the loop
+strip show active worker versions separately from the web version; worker
+configuration payloads and command output are not exposed by Health.
+
+If a worker cannot start or acknowledge startup, dispatch stops and a notification
+records the failure. An uncertain startup reservation stays protected and may
+still complete; the scheduler does not repeatedly reserve the same task or spend
+agent attempts retrying it. Already-running workers are not cancelled.
+
+`GET /api/loop` reports scheduler ownership; `POST /api/loop
+{"running": true|false}` starts or stops it, and `"park": true` requests an
+explicit queue-worker park. Accepted Chat submissions return **202** after their
+durable handoff, before the agent answers. Conversation transcripts and queued
+drafts remain readable throughout process replacement.
 
 Every list is ordered by creation, never by last activity. A list that reorders
 itself while you are reading it moves the row out from under your thumb.

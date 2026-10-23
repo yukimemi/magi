@@ -240,8 +240,8 @@ enum Command {
     /// and prints its id; open it with `magi task show <id>`. When a `magi
     /// serve` / `magi web` loop is alive the task is filed urgent and that
     /// loop runs it - this command follows it and exits with its outcome.
-    /// Otherwise this process runs it, holding the task's claim so a loop
-    /// started meanwhile leaves it alone.
+    /// Otherwise an independent worker runs it and this command follows its
+    /// outcome. Exiting this command does not terminate the execution.
     Run {
         #[command(subcommand)]
         command: Option<RunCmd>,
@@ -264,8 +264,8 @@ enum Command {
     /// vote. This is the cheap half of the graph, for hand-written changes.
     ///
     /// Like `magi run`, this files a task first (its id is printed; open it
-    /// with `magi task show <id>`), then runs it here or - when a loop is
-    /// alive - hands it over as an urgent task and follows it.
+    /// with `magi task show <id>`), then follows an independent worker. A live
+    /// scheduler receives it as urgent; otherwise a standalone worker owns it.
     Review {
         /// Branch holding the work to review.
         branch: String,
@@ -424,11 +424,11 @@ enum Command {
         #[command(subcommand)]
         command: TalkCmd,
     },
-    /// Drain the queue unattended: take the next task, run the graph, repeat.
+    /// Dispatch queued work to independent execution workers.
     ///
-    /// One competition at a time on purpose. The graph is already parallel
-    /// inside (candidates times judges), and two at once doubles the burn on
-    /// the agent-CLI quota that is the real constraint.
+    /// Restarting the scheduler does not stop workers already running. Ordinary
+    /// execution slots follow `[daemon] max_concurrent_runs`; urgent work keeps
+    /// its separate bounded slot.
     Serve {
         /// Repository used by tasks that name none.
         #[arg(long, default_value = ".")]
@@ -464,12 +464,9 @@ enum Command {
         /// Repository used by tasks filed without one.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
-        /// What the loop this server runs should do with each winning branch.
+        /// What each winning branch should become.
         ///
-        /// `magi web` runs the loop itself now, so the override `magi serve`
-        /// accepts has to be expressible here too - otherwise starting the
-        /// loop from a phone would mean accepting whatever the repository's
-        /// config says, and the terminal would still be required to change it.
+        /// Passed to the independent queue scheduler started from the phone.
         #[arg(long, value_enum)]
         merge: Option<MergeArg>,
     },
@@ -636,6 +633,15 @@ enum Command {
     Completion {
         /// Target shell.
         shell: Shell,
+    },
+    /// Run one durable internal worker reservation.
+    #[command(name = "__worker", hide = true)]
+    Worker {
+        /// State directory containing the reservation.
+        #[arg(long)]
+        home: PathBuf,
+        /// Full worker reservation identifier.
+        id: String,
     },
     /// Update the magi binary from GitHub releases.
     SelfUpdate {
@@ -1157,9 +1163,16 @@ async fn async_main() -> Result<()> {
 /// Start the background release check, unless this command is about updating,
 /// printing static text, or holding the whole screen.
 fn spawn_update_check(command: &Command) -> Option<updater::Pending> {
+    // Helpers launched by a worker must stay on its immutable generation.
+    if std::env::var_os("MAGI_WORKER_GENERATION").is_some() {
+        return None;
+    }
     if matches!(
         command,
-        Command::SelfUpdate { .. } | Command::Completion { .. } | Command::Tui
+        Command::SelfUpdate { .. }
+            | Command::Completion { .. }
+            | Command::Tui
+            | Command::Worker { .. }
     ) {
         return None;
     }
@@ -1400,6 +1413,7 @@ async fn dispatch(command: Command) -> Result<()> {
         );
     }
     match command {
+        Command::Worker { home, id } => magi::worker::run(&home, &id).await,
         Command::Run {
             command,
             instruction,
@@ -4444,9 +4458,9 @@ fn standalone_opts(task: &magi::queue::Task) -> magi::daemon::Opts {
     }
 }
 
-/// Every run is a task: file `filing`, then either hand it to the live loop
-/// that owns the queue and follow it, or run it here against the claimed task
-/// record. See [`magi::direct`].
+/// Every run is a task: file `filing`, then follow either the live scheduler's
+/// urgent worker or a standalone worker with an acknowledged claim handoff.
+/// See [`magi::direct`].
 async fn run_as_task(queue: &Queue, filing: magi::direct::Filing, dry_run: bool) -> Result<()> {
     let home = magi::run::home();
     let filed = magi::direct::file(
@@ -4469,7 +4483,7 @@ async fn run_as_task(queue: &Queue, filing: magi::direct::Filing, dry_run: bool)
         }
         magi::direct::Filed::Standalone { mut task, claim } => {
             println!(
-                "task {} filed; this process runs it (open it with `magi task show {}`)",
+                "task {} filed; an independent worker will run it (open it with `magi task show {}`)",
                 task.short(),
                 task.short()
             );
@@ -4499,8 +4513,7 @@ async fn run_as_task(queue: &Queue, filing: magi::direct::Filing, dry_run: bool)
                 return Ok(());
             }
             let opts = standalone_opts(&task);
-            magi::daemon::run_claimed(&opts, queue, &mut task).await;
-            drop(claim);
+            magi::daemon::run_detached_claimed(&opts, queue, &mut task, claim).await?;
             report_task_outcome(&task)
         }
     }
@@ -4518,7 +4531,14 @@ fn report_task_outcome(task: &magi::queue::Task) -> Result<()> {
     };
     let state = RunState::load(run)?;
     print!("{}", report::run(&state));
-    let result = if state.status.done() && state.status != RunStatus::Failed {
+    // A created PR waiting for its owner is a delivered handoff, not a failed
+    // execution and not a claim that the PR merged.
+    let result = if state.status.done() && state.status != RunStatus::Failed
+        || task.status == TaskStatus::Parked
+            && state.status == RunStatus::Landing
+            && state.parked
+            && state.pr.is_some()
+    {
         Ok(())
     } else {
         Err(anyhow::anyhow!(
@@ -4616,51 +4636,23 @@ async fn run_existing_task(
         return follow_task(queue, &home, &id).await;
     }
     queue.put(&mut task)?;
-    println!("task {} is run by this process", task.short());
+    println!("task {} is run by an independent worker", task.short());
     let opts = standalone_opts(&task);
-    magi::daemon::run_claimed(&opts, queue, &mut task).await;
-    drop(claim);
+    magi::daemon::run_detached_claimed(
+        &opts,
+        queue,
+        &mut task,
+        claim.context("standalone task claim")?,
+    )
+    .await?;
     report_task_outcome(&task)
-}
-
-/// The task owning `run`, if any. With none, `file` decides: `true` files and
-/// links a new Queued task, `false` returns `None` and touches nothing.
-fn resume_owner(
-    queue: &Queue,
-    run_id: &str,
-    instruction: &str,
-    repo: &Path,
-    source: Source,
-    sources: &magi::refs::Sources,
-    file: bool,
-) -> Result<Option<Task>> {
-    if let Some(t) = queue
-        .list()
-        .into_iter()
-        .find(|t| t.runs.iter().any(|r| r == run_id))
-    {
-        return Ok(Some(t));
-    }
-    if !file {
-        return Ok(None);
-    }
-    let mut t = Task::new(
-        queue::title_from(instruction, 72),
-        instruction.to_owned(),
-        repo.to_path_buf(),
-        source,
-    );
-    t.sources = sources.clone();
-    t.link_run(run_id);
-    queue.put(&mut t)?;
-    Ok(Some(t))
 }
 
 /// `magi run --resume <run>`: the run's owning task is claimed for the
 /// duration (so no loop resumes it too), and filed first when the run never
 /// had one. A live loop that would resume the run itself is handed the task.
 async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
-    let mut runner = Runner::resume(id)?;
+    let runner = Runner::resume(id)?;
     println!(
         "{}",
         format_args!("resuming {} ({:?})", runner.state.id, runner.state.status)
@@ -4674,15 +4666,7 @@ async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
         // filed-then-held or filed-then-removed task would still race that
         // loop. (`run_as_task`'s dry run does file a Held task; this path
         // adopts an existing run, so it only reports what a real resume does.)
-        match resume_owner(
-            &queue,
-            &run_id,
-            &runner.state.instruction,
-            &runner.state.repo,
-            Source::Human,
-            &runner.state.sources,
-            false,
-        )? {
+        match magi::direct::resume_owner(&queue, &run_id) {
             Some(t) => println!(
                 "task {} owns this run ({})",
                 t.short(),
@@ -4702,86 +4686,54 @@ async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
             runner.state.short()
         )
     })?;
-    let mut task = resume_owner(
+    let (mut task, claim) = magi::direct::claim_resume_owner(
         &queue,
         &run_id,
         &runner.state.instruction,
         &runner.state.repo,
         task_source(None).await,
         &runner.state.sources,
-        true,
-    )?
-    .expect("file = true always yields an owner");
+    )?;
     // The loop picks `task.runs.last()`, so it only resumes *this* run when it
     // is that one and nothing else steers the attempt elsewhere.
     let loop_resumes = task.runs.last() == Some(&run_id)
         && !task.fresh_start
         && task.review_branch.is_none()
         && magi::daemon::loop_would_resume(&run_id);
-    let claim = if live_loop(&home) && loop_resumes {
-        None
-    } else {
-        Some(queue.claim(&task.id).with_context(|| {
-            format!(
-                "task {} owns run {}, and something else is already running it",
-                task.short(),
-                runner.state.short()
-            )
-        })?)
-    };
-    drop(guard);
+    let hand_to_loop = live_loop(&home) && loop_resumes;
     println!(
         "task {} (open it with `magi task show {}`)",
         task.short(),
         task.short()
     );
-    if claim.is_some()
-        && runner.state.prep_complete == Some(false)
-        && runner.state.candidates.is_empty()
-    {
-        runner.state.sources = task.sources.clone();
-    }
-    if runner.state.prep_failure.is_some() && claim.is_some() {
-        runner.retry_preparation(jiff::Timestamp::now())?;
-    }
-    if claim.is_none() {
+    task.release_operator("cli-run-resume", None);
+    task.resume_override = Some(queue::OperatorResume {
+        question_id: String::new(),
+        at: jiff::Timestamp::now(),
+        conductor_rehold: None,
+        forced: true,
+        pinned_run: Some(run_id.clone()),
+    });
+    if hand_to_loop {
         // The loop resumes it: an attempt at a task whose newest run is
         // unfinished resumes that run (`Runner::resume`), never competes again.
-        task.release_operator("cli-run-resume", None);
-        task.resume_override = Some(queue::OperatorResume {
-            question_id: String::new(),
-            at: jiff::Timestamp::now(),
-            conductor_rehold: None,
-            forced: true,
-            pinned_run: Some(run_id.clone()),
-        });
+        // The same pinned request is used by the standalone worker below.
         task.urgent = true;
         queue.put(&mut task)?;
+        drop(guard);
+        drop(claim);
         println!(
             "task {} marked urgent for the running magi loop",
             task.short()
         );
         return follow_task(&queue, &home, &task.id).await;
     }
-    task.start(run_id);
     queue.put(&mut task)?;
-    let quota_before = runner.state.quota.clone();
-    runner.state.next_pass_task_entry = true;
-    let result = runner.execute().await;
-    print!("{}", report::run(&runner.state));
-    let (status, left_pr) = (runner.state.status, runner.state.pr.is_some());
-    let outcome = result.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"));
-    let outcome = outcome.map(|_| ());
-    magi::daemon::finish_attempt(
-        magi::daemon::Opts::default().max_attempts,
-        &queue,
-        &mut task,
-        &runner.state,
-        &quota_before,
-        result,
-    );
-    drop(claim);
-    exit_status(outcome, status, left_pr)
+    drop(guard);
+    let opts = standalone_opts(&task);
+    drop(runner);
+    magi::daemon::run_detached_claimed(&opts, &queue, &mut task, claim).await?;
+    report_task_outcome(&task)
 }
 
 async fn doctor(repo: &Path, config: Option<&Path>) -> Result<()> {
@@ -5302,7 +5254,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_owner_files_only_when_asked_and_never_twice() {
+    fn resume_owner_creation_is_claimed_and_preserves_later_owner_edits() {
         let dir = tempfile::tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
         let repo = Path::new("/repo");
@@ -5312,47 +5264,33 @@ mod tests {
                 sha: "1".repeat(40),
                 provenance: magi::refs::Provenance::ExplicitCli,
             }),
-            pick_commits: vec![magi::refs::Input {
-                token: "abc1234".into(),
-                sha: "2".repeat(40),
-                provenance: magi::refs::Provenance::ExplicitCli,
-            }],
+            ..Default::default()
         };
-        // The saved run supplies structured inputs, never references in prose.
-        let sources: magi::refs::Sources =
-            serde_json::from_str(&serde_json::to_string(&sources).unwrap()).unwrap();
-        let own = |file| {
-            resume_owner(
+        let claim_owner = || {
+            magi::direct::claim_resume_owner(
                 &queue,
                 "run-1",
                 "do it",
                 repo,
                 Source::Human,
                 &sources,
-                file,
             )
         };
+        assert!(magi::direct::resume_owner(&queue, "run-1").is_none());
+        let (mut filed, claim) = claim_owner().unwrap();
+        assert!(queue.claim(&filed.id).is_err());
+        assert!(
+            claim_owner().is_err(),
+            "a second resume cannot claim the same owner"
+        );
+        drop(claim);
 
-        assert!(own(false).unwrap().is_none());
-        assert!(queue.list().is_empty());
-
-        let filed = own(true).unwrap().expect("filed");
-        assert_eq!(filed.status, TaskStatus::Queued);
-        assert_eq!(filed.runs, vec!["run-1".to_owned()]);
-        assert_eq!(filed.sources, sources);
-        assert_eq!(queue.get(&filed.id).unwrap().sources, sources);
-        assert_eq!(queue.list().len(), 1);
-
-        for file in [false, true] {
-            assert_eq!(own(file).unwrap().expect("owner").id, filed.id);
-            assert_eq!(queue.list().len(), 1);
-        }
-        // An existing owner's explicit edit (including clearing imports) wins
-        // over the run checkpoint, for both foreground and daemon resumes.
-        let mut edited = queue.get(&filed.id).unwrap();
-        edited.sources = magi::refs::Sources::default();
-        queue.put(&mut edited).unwrap();
-        assert_eq!(own(true).unwrap().unwrap().sources, edited.sources);
+        // A later explicit edit wins over the older checkpoint's imports.
+        filed.sources = magi::refs::Sources::default();
+        queue.put(&mut filed).unwrap();
+        let (reopened, _claim) = claim_owner().unwrap();
+        assert_eq!(reopened.id, filed.id, "resume must not file a second owner");
+        assert_eq!(reopened.sources, magi::refs::Sources::default());
     }
 
     #[test]
@@ -5875,6 +5813,15 @@ mod tests {
         let text = doctor_queue_and_loop(dir.path());
 
         assert!(text.contains("unreadable 1"), "{text}");
+    }
+
+    #[test]
+    fn worker_task_prose_is_not_an_internal_control_command() {
+        let instruction =
+            ["worker", "processes", "must", "survive", "web", "restart"].map(str::to_owned);
+        assert!(
+            mistyped_command("magi task add", &instruction, false, &subcommand_words(),).is_none()
+        );
     }
 
     #[test]

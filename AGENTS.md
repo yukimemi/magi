@@ -1578,28 +1578,59 @@ re-sends the policy whenever it is not Solo. Enforcement is the prompt only;
 repo config (`talk::check_implementers`), so `--repo` pointing elsewhere is
 checked only when the task runs.
 
-### Handing the address over: release, then spawn
+### Web and scheduler restart independently of execution workers
 
-`POST /api/upgrade` ends the process it is serving from, and the order of the
-last two steps is the whole thing:
+`src/worker.rs` owns durable detached reservations, execution leases and immutable
+SHA-256 executable generations. `magi web` serves HTTP; `magi serve` dispatches;
+task workers run the existing attempt and settlement. Updating replaces web and
+scheduler, never parks or cancels paid work. A scheduler restart reconstructs
+ordinary/urgent/decision-only capacity from reservations. Standalone CLI workers
+remain outside those lanes and global queue-worker park requests.
 
-1. `upgrade_and_restart` replaces the binary and signals `HANDOVER`.
-2. `serve`'s `select!` wakes on it, parks and drains the loop, **drops the
-   listener by returning**, and only then calls `spawn_successor`.
+- **The worker owns the claim.** Keep task claims and run execution leases until
+  settlement. A missing scheduler heartbeat is not a dead worker. Unknown worker
+  storage is an error, never an empty active set or permission to reclaim.
+  `daemon::resume_owner_lock` waits asynchronously for transient ownership updates
+  within the saved `timeout_resource_wait` before an attempt starts, then re-reads
+  ownership under the lock; maintenance contention must not hold a resumable task.
+  A worker must exclude only its own verified reservation from public-owner
+  preflight liveness; that reservation still protects cleanup, and the prior
+  driver's execution lease/process evidence must still be checked.
+  Sandboxed liveness checks use `worker::observe_active` with read-only lease
+  handles; only authorized writers use `worker::active` to reconcile and retire
+  records. Never widen a chat's write scope merely to observe worker ownership.
+- **Pin helpers too.** Worker PATH and `MAGI_WORKER_EXE` name its retained
+  executable. `MAGI_WORKER_ID` identifies the reservation; `Job.sequence` orders
+  publications under the store lock. Pinned helpers never self-update.
+  The hidden `__worker` spelling appears in `main.rs` and
+  `worker::detached_command`; change both together. Do not use the ordinary task
+  word `worker` as this internal command: the typo guard would reject real prose.
+- **Finite services, independent deputies.** Waiter/release/maintenance work
+  outlives a scheduler in finite jobs. Each deputy question has its own job;
+  global capacity counts both reservations and fresh question leases. An active
+  service key is retained across config changes, not re-spawned with a new payload.
+- **Admission is short.** Web handover closes new admission and waits only for
+  persistence-to-reservation transactions, never Chat or graph execution.
+  A per-talk publication lease covers draft writes through startup acknowledgement;
+  a worker uses it for generation selection and draft promotion, then releases it
+  before invoking the CLI. UI TurnLease acquisition remains nonblocking.
+- **Never replay uncertain starts.** Only `worker::not_started` proof permits
+  restoring a recorded operator send to a manual draft. Preserve attachments,
+  reply metadata, later drafts and task posts. A posted task turn is not proof
+  that the chat answered an operator send.
+- **Release, then spawn.** Remember the installed executable path before update,
+  replace the scheduler, release the listener, then start the successor web.
+  Answer 202 before process exit. A live legacy embedded scheduler requires one
+  finish/park migration; a stale heartbeat alone does not permit overlap.
+- **Evidence stays local.** Active jobs and logs live in `workers/jobs`, terminal
+  records retire lazily to `workers/results` after execution handles close
+  (Windows cannot rename live directories). Keep the latest 256 terminal records;
+  generation executables remain retained. Health projects public metadata only,
+  never payload/configuration or output.
 
-The first attempt did it the other way round — spawn, sleep 200 ms, `exit(0)`
-— and the successor died on "address already in use" with its stdio sent to
-null, so the deck never came back and there was no terminal to say why. Note
-that the successor is whatever binary was just installed, so it cannot be
-assumed to carry `bind_waiting`: correctness has to come from the ordering,
-and the retry is only belt to that braces.
-
-Two more rules here:
-
-- **Refuse when the loop is foreign.** Replacing this binary would leave
-  somebody else's `magi serve` running an old one against the same claims.
-- **Answer 202 before restarting.** The reply has to leave while this process
-  can still send one; the phone learns the deck is back by reconnecting.
+Real restart tests kill one parent PID, not its descendant tree. They use private
+host homes as well as `MAGI_HOME` so default worktree measurement and housekeeping
+never visit the operator's directories.
 
 ### A run is interrupted at a node boundary, never mid-node
 
@@ -1616,9 +1647,8 @@ of paid calls.
 Two rules follow, and neither is optional:
 
 - **A parked run is not a failed one.** `Verdict::parked` refunds the attempt.
-  It is the operator asking for the process back — to replace the binary,
-  usually — and a few upgrades must not exhaust a budget meant for agents that
-  misbehaved.
+  It is an explicit owner or scheduling/resource checkpoint request, not an
+  agent failure. Worker-based upgrades do not request a park or alter attempts.
 - **An unfinished run is resumed, never re-competed.** `attempt` looks for a
   non-terminal run of the task and calls `Runner::resume` on it. When it did
   not, run 01c2 was blocked and the loop immediately started 3cbf on the same
@@ -2240,11 +2270,11 @@ something to answer, so it does not reuse `ask::Questions`.
 
 ### A release PR is watched until it lands
 
-`src/release_watch.rs` runs inside `magi serve` as its own task (like the
-waiter and the deputies; not a queue step, not tied to a run), because a
-pending bump is coalesced across runs and outlives the run that opened it.
-Before it, a `chore/release-v*` pull request whose required check went red
-sat for hours with auto-merge waiting and nobody told.
+`src/release_watch.rs` is scheduled by `magi serve` through independent finite
+service workers, like waiter recovery. It is not a queue step or tied to a run:
+a pending bump is coalesced across runs and outlives the run that opened it.
+Its in-flight release work survives scheduler replacement; later laps use the
+new generation and retain the explicit `serve --config` layer.
 
 - **The forge is the truth.** Every open pull request whose head branch starts
   with `chore/release-v`, in the checkouts under `[repos] roots` plus the
@@ -2482,82 +2512,35 @@ MAGI_CHROME=/path/to/chrome cargo test --test web_render   # name a binary expli
 ### Every run belongs to a task
 
 `magi run` / `magi review` file a task first (`direct::file`), then either hand
-it to a live foreign loop as `urgent` and follow it (`direct::follow`; it never
-takes the task over if the loop dies), or claim it *before writing it* and run
-it in-process through `daemon::run_claimed` - the daemon's own `attempt`, so
-attempts, quota refunds and parking are counted one way. Liveness is
-`daemon::foreign_loop` (fresh heartbeat, pid not ours), shared with the web UI;
-a claim's success says nothing about whether a loop lives. CLI choices
-(`--merge`, `-c`, ...) live in `Task::overrides`; `Task::review_of` is an
-explicit review that fails on a missing branch instead of falling back to a
-competition (unlike the conductor's `review_branch`). A standalone run that
-leaves its task runnable **holds** it: nobody asked for an automatic retry.
-`--dry-run` never hands over. There is no run without a task: `--resume` files
-one when the run has none.
+it to a live scheduler as `urgent` or reserve a standalone task worker while
+holding the filing claim. `direct::follow` follows live workers even while the
+scheduler is being replaced; it never takes the work over. Workers reuse the
+daemon's existing attempt and settlement, so accounting has one implementation.
+CLI choices live in `Task::overrides`; an explicit review fails on a missing
+branch rather than competing. Standalone failures hold instead of auto-retrying.
+`--dry-run` never dispatches. CLI, Web and owner-choice resumes share atomic
+`direct::claim_resume_owner`, a forced run pin and the same task-worker handoff;
+an ownerless legacy run is filed under its claim before it becomes runnable.
 
 ### A stuck handover must be diagnosable from files alone
 
-An upgrade that stalled once left only `upgrade.json` at `replaced` and no
-log from the old process. Three files now carry the evidence, none of them
-depending on a supervisor's redirection:
+`<home>/upgrade.log` records replacement, scheduler restart, admission drain,
+listener release, successor PID/error and runtime shutdown through
+`updater::log_step`. It rotates at `LOG_MAX_BYTES` (256 KiB).
+`<home>/web.log` contains successor stdout/stderr; supervisor redirection alone
+only follows the first generation's descriptors.
 
-- **`<home>/upgrade.log`** - every handover step (`upgrade_and_restart`
-  signalling `HANDOVER`, `serve`'s `select!` waking, `hand_over` entering,
-  `finish_loop` and how long it waited, the listener release, the successor's
-  pid or error, `serve` returning, the runtime shutting down) with a UTC
-  timestamp and pid, through `updater::log_step`. Open-append-close each time;
-  rotated to `upgrade.log.1` past `updater::LOG_MAX_BYTES` (256 KiB), one
-  generation. Last line seen is where it stuck.
-- **`<home>/web.log`** - the successor's stdout and stderr (`spawn_successor`
-  used to send them to null, so every generation after the first logged
-  nowhere). `magi web` stderr lines now carry a timestamp.
-- **`upgrade.note.json`** (surfaced as `upgrade.detail`) - the watchdog thread (`updater::spawn_watchdog`,
-  every 30 s, off the runtime) warns and records what a non-terminal stage
-  waits on. `/api/health` reports the same as `upgrade.stuck_for_secs` /
-  `upgrade.stuck_kind`; the deck banner says "Handover stuck in <stage>". The
-  watchdog never rewrites `upgrade.json` (that read-modify-write could revert a
-  stage the handover or the successor saved in between); its note lives in its
-  own file and is shown only while stage and `updated_at` still match.
-- **`upgrade.handover.json`** - the lease `hand_over` holds while it is alive
-  (`updater::LeaseGuard`: `entered_at`, `beat_at`, `parked_run`). Written
-  before the `parking` stage, beaten every 20 s (`web::LEASE_BEAT`) from
-  `finish_loop`'s wait, removed on drop and by `reconcile_after_restart`. Fresh
-  means a beat within `updater::LEASE_TTL_SECS` (90 s), no pid checks, and
-  `entered_at >= Progress::started_at` so an older upgrade's lease proves
-  nothing. `updater::stall` is the one judge: a fresh lease is **never** stuck
-  however long the run's node takes (there is no `parking` ceiling any more);
-  `replaced` / `restarting` past 120 s with no lease is stuck, `replaced` is
-  `never_entered` (the only kind the banner tells the operator to restart by
-  hand for), anything with a lease that stopped beating is `stopped_beating`.
-- **Stages never go backwards.** `updater::write_progress` compares against the
-  record under a process-wide lock (`updater::monotonic`): a non-terminal
-  candidate not past the recorded stage keeps the recorded stage and
-  timestamps and refreshes only `to`; terminal records start fresh. A second
-  `POST /api/upgrade` on a live handover once wrote `replaced` over `parking`
-  and the watchdog blamed the wrong component for 46 minutes.
+`upgrade.json` and the separate `upgrade.note.json` carry monotonic progress and
+watchdog evidence. The watchdog must never rewrite the progress record.
+Legacy `parking`, `parked_run` and `parked_talks` fields remain readable as history,
+not instructions to pause independent workers. New handovers report restarting
+and wait only for the short admission boundary.
 
-**The park also waits for chat turns, but only after the loop is done.**
-`hand_over` first awaits `finish_loop` (chat stays open meanwhile: a park can
-last as long as a node and nothing restarts yet), then sets `TalkTurns::parking`
-(`ParkingTurns`) and `finish_talks` waits, beating the lease, until
-`TalkTurns::live` is empty. While parking, `claim_talk_turn` refuses a direct
-start ("upgrade in progress, try again in a moment"), a queued claim and
-`begin_talk_turn_unless_pending` read as busy so `/say` and consult leave a
-durable draft, and `drain_loop` gives its slot up instead of draining the next
-draft (the draft stays for a manual resume after the restart). The wait is
-bounded by `talk_wait_bound`: web's `[graph] timeout_talk` plus `TALK_PARK_GRACE`;
-past it the talk ids go to `upgrade.log` and the `restarting` stage's `detail`
-and the hand-over proceeds. `Progress::parked_talks` carries the ids for
-`/api/health`'s `waiting_on`. The run wait itself is unchanged and unbounded.
+Worker startup, panic and execution output goes to the reservation's `worker.log`
+from before exec. Terminal results are saved before lazy archival, so a Windows
+sharing violation cannot turn a completed execution into scheduler failure.
+An unavailable result or execution lease never authorizes an automatic replay.
 
-Supervisor redirection (launchd, NSSM, systemd...) only ever holds the first
-generation's descriptors, and a rename of its log files at start does not
-change what an already-running process writes to. So `magi-web.err.log` can
-legitimately lack a long-running process's output; read `upgrade.log` and
-`web.log` instead, and restart the supervised process to reattach its
-redirection. These values (256 KiB, 120 s, 90 s lease, 20 s beat, 30 s poll, 10 s runtime
-shutdown bound in `main::run`) live in `updater.rs` / `main.rs`; keep this
-section aligned with them.
 
 ### Telling the chat how a task it filed ended
 
@@ -2593,14 +2576,13 @@ own turn machinery runs it. No new seat, no new waiter, never a fresh agent.
 - **Closed or deleted is skipped** (`ChatNoticeOutcome::Skipped`, recorded so
   it is not retried), never reopened - unlike `consult::begin`. A transient I/O
   error records nothing and the next tick retries.
-- **Starting the turn.** `chat_notify::start_turns` takes the talk's own
-  cross-process lease and runs `consult::drain_turns` (shared with
-  `consult::start_turn`) in a spawned task. Only a draft that contains the
-  notice heading is started on the daemon's initiative; an operator's unsent
-  draft is not. If the lease is held elsewhere the holder drains the draft
-  before letting go, and the next tick looks again.
-- **A parking upgrade starts nothing** (`start_turns(.., stop.parking())`):
-  the draft stays durable for a manual resume, as for a consult.
+- **Starting the turn.** `chat_notify::start_turns` reserves a detached Chat
+  worker for notification-only pending input. The worker takes the talk's
+  cross-process turn lease and retains its existing seat/session. An operator's
+  unsent or recovered draft is never started by an automatic notice.
+- **Scheduler replacement cancels nothing.** Already-reserved Chat jobs continue;
+  later service ticks use the replacement generation. Explicit parking still
+  suppresses new automatic starts.
 - **The notice is not the owner's word.** `consult::latest_message` skips
   messages that are a task notice, so a merge approval's `--quote` can never
   be taken from one.
@@ -3337,3 +3319,14 @@ publication path. Missing/empty title data cannot settle that choice.
 Applied triage decisions must not remain pending chat decisions:
 `triage::awaiting_task_chat` excludes `already_applied`, including dependency
 detachment, which does not change the root's operator generation.
+
+### Execution-boundary ownership waits
+
+`pr_head::owner_lock_wait` is the shared asynchronous acquisition path for
+driver claim/finalization and scheduler resume preflight. Use the saved run's
+`graph.timeout_resource_wait`, then re-read ownership under the acquired lock;
+never turn a short maintenance transaction into an immediate task hold.
+Finalization retains its execution lease throughout the wait. Only lock
+contention is retried; permission and other I/O errors still fail closed.
+The synchronous `owner_lock` remains non-blocking for administrative operations
+and drop cleanup.

@@ -622,6 +622,11 @@ impl Talks {
         }
     }
 
+    /// State home containing this conversation store and its detached workers.
+    pub fn home(&self) -> &Path {
+        self.root.parent().unwrap_or(&self.root)
+    }
+
     /// Claim the right to read-modify-write a talk's `status`. A plain
     /// `std::sync::Mutex`, not an async one: every caller holds it across a
     /// handful of small file operations and never across an `.await`, so
@@ -1714,6 +1719,113 @@ pub fn record_reply(
     Ok(text.to_owned())
 }
 
+/// Undo only an exact admission whose execution is proven never started.
+/// Caller owns publication and TurnLease, and has a worker-core startup fence
+/// proving non-execution. Unknown/started workers must never use this recovery.
+pub(crate) fn restore_recorded_draft(
+    store: &Talks,
+    talk_id: &str,
+    index: usize,
+    expected: &Turn,
+) -> Result<bool> {
+    let _guard = store.guard()?;
+    let mut fresh = store.get(talk_id)?;
+    if expected.who != Who::Operator
+        || fresh.turns.get(index) != Some(expected)
+        || fresh.turns[index + 1..]
+            .iter()
+            .any(|turn| turn.posted_by.is_none())
+        || fresh.recommendations.range(index..).next().is_some()
+    {
+        return Ok(false);
+    }
+    // A concurrently accepted quote of this transcript location prevents its
+    // removal. Publication excludes normal UI admissions; this also protects
+    // a CLI writer that did not participate in that fence.
+    if fresh
+        .pending_messages
+        .iter()
+        .chain(
+            fresh.turns[index + 1..]
+                .iter()
+                .flat_map(|turn| &turn.messages),
+        )
+        .any(|message| {
+            message
+                .reply
+                .as_ref()
+                .is_some_and(|reply| reply.target.turn == index)
+        })
+    {
+        return Ok(false);
+    }
+    let recorded = fresh.turns.remove(index);
+    if fresh.pending_messages.is_empty()
+        && (!fresh.pending.is_empty() || !fresh.pending_attachments.is_empty())
+    {
+        fresh.pending_messages.push(Message {
+            display: None,
+            sender: None,
+            body: fresh.pending.clone(),
+            attachments: fresh.pending_attachments.clone(),
+            reply: None,
+        });
+    }
+    let mut messages = recorded.messages;
+    if messages.is_empty() {
+        messages.push(Message {
+            display: None,
+            sender: Some(Sender::Operator),
+            body: recorded.body,
+            attachments: recorded.attachments,
+            reply: None,
+        });
+    }
+    messages.append(&mut fresh.pending_messages);
+    fresh.pending_messages = messages;
+    for message in fresh
+        .pending_messages
+        .iter_mut()
+        .chain(fresh.turns.iter_mut().flat_map(|turn| &mut turn.messages))
+    {
+        if let Some(reply) = message.reply.as_mut() {
+            if reply.target.turn > index {
+                reply.target.turn -= 1;
+            }
+        }
+    }
+    if let Some(boundary) = fresh.posts_read_through.as_mut() {
+        if *boundary > index {
+            *boundary -= 1;
+        }
+    }
+    rebuild_pending(&mut fresh);
+    store.put(&mut fresh)?;
+    Ok(true)
+}
+
+fn rebuild_pending(fresh: &mut Talk) {
+    fresh.pending.clear();
+    fresh.pending_breaks = Some(Vec::new());
+    fresh.pending_attachments.clear();
+    for message in &fresh.pending_messages {
+        if !message.body.is_empty() {
+            if !fresh.pending.is_empty() {
+                fresh.pending.push_str("\n\n");
+                fresh
+                    .pending_breaks
+                    .as_mut()
+                    .expect("initialized")
+                    .push(fresh.pending.len());
+            }
+            fresh.pending.push_str(&message.body);
+        }
+        fresh
+            .pending_attachments
+            .extend(message.attachments.clone());
+    }
+}
+
 /// Add an unrecorded message to the durable draft while another turn runs.
 pub fn queue(
     talk: &mut Talk,
@@ -2311,25 +2423,7 @@ pub fn edit_pending_message(
         } else {
             edited.body = text.to_owned();
         }
-        fresh.pending.clear();
-        fresh.pending_breaks = Some(Vec::new());
-        fresh.pending_attachments.clear();
-        for message in &fresh.pending_messages {
-            if !message.body.is_empty() {
-                if !fresh.pending.is_empty() {
-                    fresh.pending.push_str("\n\n");
-                    fresh
-                        .pending_breaks
-                        .as_mut()
-                        .expect("initialized")
-                        .push(fresh.pending.len());
-                }
-                fresh.pending.push_str(&message.body);
-            }
-            fresh
-                .pending_attachments
-                .extend(message.attachments.clone());
-        }
+        rebuild_pending(&mut fresh);
     } else {
         if fresh.pending_messages.len() > 1
             && fresh.pending_messages.iter().any(|m| m.reply.is_some())
