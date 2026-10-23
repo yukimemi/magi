@@ -89,6 +89,13 @@ jobs:
           name: junit-${{ matrix.os }}
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
+        # The junit report is a diagnostic aid, not a gate. A transient
+        # GitHub artifact-service failure (CreateArtifact twirp timeout,
+        # run 39338929309 / job 118355342719) after every test passed
+        # turned a green job red. Keep the failure in the log but never
+        # let the upload decide the job result; a failing test step
+        # still fails the job.
+        continue-on-error: true
 
   test-windows-unit:
     name: test windows unit
@@ -137,6 +144,9 @@ jobs:
           name: junit-windows-${{ matrix.shard }}
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
+        # Non-fatal for the same reason as the junit upload in the
+        # test job above (transient artifact-service failure).
+        continue-on-error: true
 
   test-windows:
     # The required status check `test (windows-latest)`. It must fail when any
