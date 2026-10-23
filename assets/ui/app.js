@@ -10734,6 +10734,9 @@ function renderSettings() {
   const d = settingsState.data;
   const body = $("settings-body");
   // Retain the rendered settings during refresh; Loading is only for first use.
+  // The retained controls hold stale closures, so they are inert until the
+  // refresh lands and renderSettings rebuilds them.
+  body.toggleAttribute("inert", !!(d && settingsState.loading));
   if (d && settingsState.loading) return;
   clear(body);
   const banner = $("settings-error");
