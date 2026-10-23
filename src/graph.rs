@@ -907,7 +907,10 @@ impl Runner {
             choice: None,
             task_instruction: Some(selection.instruction.clone()),
         };
-        state.save()?;
+        if let Err(e) = state.save() {
+            state.discard_reserved();
+            return Err(e);
+        }
         let id = state.id.clone();
         let opened = Self::open_review(
             repo,
