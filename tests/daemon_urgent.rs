@@ -13,8 +13,11 @@
 
 mod common;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use common::seat_block::{
+    SeatBlock, task_ended, task_failed, wait_for_completion, wait_while_running,
+};
 use common::{Judges, fixture, home_lock};
 use magi::daemon::{self, Opts, Stop};
 use magi::queue::{Queue, Source, Task, TaskStatus};
@@ -42,42 +45,11 @@ fn daemon_config(fx: &common::Fixture) -> magi::config::Config {
     config
 }
 
-/// Block the sole implementer seat (`impl-A`, regardless of candidate count
-/// — see `graph_park.rs`) on a file marker until released.
-fn block_impl_a(fx: &mut common::Fixture, block_dir: &std::path::Path) {
-    std::fs::create_dir_all(block_dir).expect("block dir");
-    for a in &mut fx.config.agents {
-        a.env
-            .insert("MOCK_BLOCK_SEAT".to_owned(), "impl-A".to_owned());
-        a.env.insert(
-            "MOCK_BLOCK_DIR".to_owned(),
-            block_dir.to_string_lossy().into_owned(),
-        );
-    }
-}
-
-/// Poll `cond` until it is true, or panic naming `what` — bounded so a
-/// regression fails this test fast instead of hanging the suite.
-async fn wait_until(mut cond: impl FnMut() -> bool, timeout: Duration, what: &str) {
-    let start = Instant::now();
-    while !cond() {
-        if start.elapsed() > timeout {
-            panic!("timed out after {:?} waiting for: {what}", start.elapsed());
-        }
-        tokio::time::sleep(Duration::from_millis(15)).await;
-    }
-}
-
-const MARKER_WAIT: Duration = Duration::from_secs(60);
-
 common::e2e! {
 async fn an_urgent_task_starts_alongside_an_already_running_task() {
     let home = home_lock().await;
     let mut fx = fixture(home, Judges::Unanimous, false);
-    let block_dir = fx.tmp.path().join("block");
-    block_impl_a(&mut fx, &block_dir);
-    let started_marker = block_dir.join("started-impl-A");
-    let release_marker = block_dir.join("release-impl-A");
+    let block = SeatBlock::install(&mut fx, "impl-A", "implement");
 
     let config = daemon_config(&fx);
     let config_path = write_config(fx.tmp.path(), &config);
@@ -100,17 +72,14 @@ async fn an_urgent_task_starts_alongside_an_already_running_task() {
         worktrees_root: Some(fx.tmp.path().join("wt")),
         ..Opts::default()
     };
-    let serve = tokio::spawn(daemon::serve_until(opts, stop.clone()));
+    let mut serve = tokio::spawn(daemon::serve_until(opts, stop.clone()));
 
     // The ordinary run's implement call is genuinely in flight, not merely
     // claimed - proven by the mock's own marker, the same proof
     // `graph_park.rs` uses.
-    wait_until(
-        || started_marker.exists(),
-        MARKER_WAIT,
-        "the ordinary task's implement seat never signalled it started",
-    )
-    .await;
+    block
+        .started(&mut serve, || task_ended(&queue, &ordinary.id))
+        .await;
     assert_eq!(
         queue.get(&ordinary.id).unwrap().status,
         TaskStatus::Running,
@@ -133,13 +102,14 @@ async fn an_urgent_task_starts_alongside_an_already_running_task() {
     // execute` is even called) - unlike the daemon's own status file, which
     // is only refreshed on a multi-second heartbeat and so is not a fast or
     // reliable signal for a test to poll.
-    wait_until(
+    wait_while_running(
+        &mut serve,
         || {
             queue
                 .get(&urgent.id)
                 .is_ok_and(|t| t.status == TaskStatus::Running)
         },
-        MARKER_WAIT,
+        || task_ended(&queue, &ordinary.id).or_else(|| task_ended(&queue, &urgent.id)),
         "the urgent task never joined the blocked ordinary run in flight",
     )
     .await;
@@ -150,9 +120,10 @@ async fn an_urgent_task_starts_alongside_an_already_running_task() {
     );
     assert_eq!(queue.get(&ordinary.id).unwrap().runs.len(), 1);
 
-    std::fs::write(&release_marker, b"go").expect("release impl-A");
+    block.release();
 
-    wait_until(
+    wait_for_completion(
+        &mut serve,
         || {
             queue
                 .get(&ordinary.id)
@@ -161,13 +132,13 @@ async fn an_urgent_task_starts_alongside_an_already_running_task() {
                     .get(&urgent.id)
                     .is_ok_and(|t| t.status == TaskStatus::Done)
         },
-        MARKER_WAIT,
+        || task_failed(&queue, &ordinary.id).or_else(|| task_failed(&queue, &urgent.id)),
         "both tasks never reached a terminal status",
     )
     .await;
 
     stop.stop();
-    tokio::time::timeout(MARKER_WAIT, serve)
+    tokio::time::timeout(Duration::from_secs(60), serve)
         .await
         .expect("the daemon loop did not stop in time")
         .expect("the daemon task panicked")
@@ -195,10 +166,7 @@ common::e2e! {
 async fn an_ordinary_task_still_waits_for_the_ordinary_slot_to_free() {
     let home = home_lock().await;
     let mut fx = fixture(home, Judges::Unanimous, false);
-    let block_dir = fx.tmp.path().join("block");
-    block_impl_a(&mut fx, &block_dir);
-    let started_marker = block_dir.join("started-impl-A");
-    let release_marker = block_dir.join("release-impl-A");
+    let block = SeatBlock::install(&mut fx, "impl-A", "implement");
 
     let config = daemon_config(&fx);
     let config_path = write_config(fx.tmp.path(), &config);
@@ -221,14 +189,11 @@ async fn an_ordinary_task_still_waits_for_the_ordinary_slot_to_free() {
         worktrees_root: Some(fx.tmp.path().join("wt")),
         ..Opts::default()
     };
-    let serve = tokio::spawn(daemon::serve_until(opts, stop.clone()));
+    let mut serve = tokio::spawn(daemon::serve_until(opts, stop.clone()));
 
-    wait_until(
-        || started_marker.exists(),
-        MARKER_WAIT,
-        "the ordinary task's implement seat never signalled it started",
-    )
-    .await;
+    block
+        .started(&mut serve, || task_ended(&queue, &ordinary.id))
+        .await;
 
     // No `--urgent` this time: this task must sit `Queued` behind the
     // ordinary pool exactly as it always has, unaffected by the urgent slot
@@ -244,7 +209,18 @@ async fn an_ordinary_task_still_waits_for_the_ordinary_slot_to_free() {
     // Give the loop several ordinary poll intervals to prove it is *not*
     // starting the second task, not merely that it has not started it yet.
     for _ in 0..10 {
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::select! {
+            biased;
+            out = &mut serve => {
+                panic!("daemon exited while checking plain task stays queued: {out:?}");
+            }
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        if let Some(reason) =
+            task_ended(&queue, &ordinary.id).or_else(|| task_ended(&queue, &plain.id))
+        {
+            panic!("task settled while ordinary run was still blocked: {reason}");
+        }
         assert_eq!(
             queue.get(&plain.id).unwrap().status,
             TaskStatus::Queued,
@@ -253,34 +229,36 @@ async fn an_ordinary_task_still_waits_for_the_ordinary_slot_to_free() {
         );
     }
 
-    std::fs::write(&release_marker, b"go").expect("release impl-A");
+    block.release();
 
-    wait_until(
+    wait_for_completion(
+        &mut serve,
         || {
             queue
                 .get(&ordinary.id)
                 .is_ok_and(|t| t.status == TaskStatus::Done)
         },
-        MARKER_WAIT,
+        || task_failed(&queue, &ordinary.id).or_else(|| task_failed(&queue, &plain.id)),
         "the ordinary task never finished",
     )
     .await;
 
     // Only now, with the ordinary slot free, does the second task get its
     // turn.
-    wait_until(
+    wait_for_completion(
+        &mut serve,
         || {
             queue
                 .get(&plain.id)
                 .is_ok_and(|t| t.status == TaskStatus::Done)
         },
-        MARKER_WAIT,
+        || task_failed(&queue, &plain.id),
         "the second ordinary task never started once the slot freed",
     )
     .await;
 
     stop.stop();
-    tokio::time::timeout(MARKER_WAIT, serve)
+    tokio::time::timeout(Duration::from_secs(60), serve)
         .await
         .expect("the daemon loop did not stop in time")
         .expect("the daemon task panicked")

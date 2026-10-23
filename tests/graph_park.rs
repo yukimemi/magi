@@ -5,7 +5,7 @@
 //! the process loses whatever the seats in flight had not written.
 mod common;
 
-use common::{Judges, fixture, home_lock};
+use common::{Judges, SeatBlock, fixture, home_lock};
 use magi::graph::{Pause, Runner};
 use magi::run::RunStatus;
 
@@ -211,17 +211,7 @@ common::e2e! {
 async fn a_park_requested_while_a_seat_is_mid_call_does_not_cut_it_short() {
     let _home = home_lock().await;
     let mut fx = fixture(_home, Judges::Unanimous, false);
-
-    let block_dir = fx.tmp.path().join("block");
-    std::fs::create_dir_all(&block_dir).expect("block dir");
-    for a in &mut fx.config.agents {
-        a.env
-            .insert("MOCK_BLOCK_SEAT".to_owned(), "impl-A".to_owned());
-        a.env.insert(
-            "MOCK_BLOCK_DIR".to_owned(),
-            block_dir.to_string_lossy().into_owned(),
-        );
-    }
+    let block = SeatBlock::install(&mut fx, "impl-A", "implement");
 
     let pause = Pause::new();
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
@@ -229,39 +219,16 @@ async fn a_park_requested_while_a_seat_is_mid_call_does_not_cut_it_short() {
         .expect("start");
     runner.on_pause(pause.clone());
 
-    let started_marker = block_dir.join("started-impl-A");
-    let release_marker = block_dir.join("release-impl-A");
-    let interrupter = tokio::spawn({
-        let pause = pause.clone();
-        async move {
-            // A real signal that `impl-A`'s call has begun, not a guessed
-            // duration - bounded so a regression that never reaches it fails
-            // fast instead of hanging the suite.
-            let mut seen = false;
-            for _ in 0..500 {
-                if started_marker.exists() {
-                    seen = true;
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-            assert!(seen, "the mock never signalled that impl-A had started");
-
-            // The call is now genuinely in flight. Ask it to park.
-            pause.park();
-            // Nothing inside the call can observe that - only `execute`'s
-            // own boundary check, after `implement` returns, can - so
-            // letting it finish on its own is what proves the point rather
-            // than merely being lucky about timing.
-            std::fs::write(&release_marker, b"go").expect("release impl-A");
-        }
-    });
-
-    runner
-        .execute()
-        .await
-        .expect("execute parks after implement");
-    interrupter.await.expect("interrupter");
+    let mut exec = Box::pin(runner.execute());
+    block.started(&mut exec, || None).await;
+    // The call is now genuinely in flight. Ask it to park.
+    pause.park();
+    // Nothing inside the call can observe that - only `execute`'s own
+    // boundary check, after `implement` returns, can - so letting it finish
+    // on its own is what proves the point rather than merely being lucky
+    // about timing.
+    block.release();
+    exec.await.expect("execute parks after implement");
 
     assert_eq!(
         runner.state.candidates.len(),
@@ -284,5 +251,107 @@ async fn a_park_requested_while_a_seat_is_mid_call_does_not_cut_it_short() {
          before `judge` ever started"
     );
     assert!(runner.state.parked);
+}
+}
+
+#[test]
+fn seat_block_reports_early_run_completion_even_when_marker_exists() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+
+    // 1. Run finishes before marker ever appears.
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(async {
+            let mut run = Box::pin(async { Err::<(), &str>("prep exploded") });
+            common::seat_block::wait_while_running(
+                &mut run,
+                || false,
+                || None,
+                "impl-A never started",
+            )
+            .await;
+        });
+    }))
+    .expect_err("must panic when run finishes before marker");
+    let msg = err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        msg.contains("prep exploded"),
+        "panic carries the run's outcome: {msg}"
+    );
+
+    // 2. Both the marker and the `ended` condition are present on the same tick:
+    // termination takes precedence over the marker.
+    let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(async {
+            let mut run = Box::pin(std::future::pending::<()>());
+            common::seat_block::wait_while_running(
+                &mut run,
+                || true,
+                || Some("task settled as Held".to_owned()),
+                "impl-A never started",
+            )
+            .await;
+        });
+    }))
+    .expect_err("must panic when ended and ready are observed together");
+    let msg = err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        msg.contains("task settled as Held"),
+        "panic carries the ended diagnostic: {msg}"
+    );
+}
+
+common::e2e! {
+async fn seat_block_drop_without_release_fails_the_blocked_mock_seat() {
+    let _home = home_lock().await;
+    let mut fx = fixture(_home, Judges::Unanimous, false);
+    let block = SeatBlock::install(&mut fx, "impl-A", "implement");
+    let started_path = block.started_path().to_path_buf();
+    let abandon_path = block.abandon_path().to_path_buf();
+
+    let prompt_file = fx.tmp.path().join("prompt.md");
+    std::fs::write(&prompt_file, "implement note.txt\n").expect("write prompt");
+    let agent = &fx.config.agents[0];
+    let mut cmd = tokio::process::Command::new(&agent.command[0]);
+    cmd.args(&agent.command[1..])
+        .current_dir(&fx.repo)
+        .envs(&agent.env)
+        .env("MAGI_PROMPT_FILE", &prompt_file)
+        .env("MAGI_RUN", "20261023-000000-test")
+        .env("MAGI_NODE", "implement")
+        .env("MAGI_SEAT", "impl-A")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd.spawn().expect("spawn mock");
+    let mut wait = Box::pin(child.wait_with_output());
+
+    block.started(&mut wait, || None).await;
+    assert!(started_path.exists());
+
+    // Dropping without calling `release()` writes `abandon-impl-A`, which makes
+    // the blocked mock exit non-zero rather than silently continuing.
+    drop(block);
+    assert!(abandon_path.exists());
+
+    let out = wait.await.expect("mock output");
+    assert!(
+        !out.status.success(),
+        "abandoned mock block must fail, not continue silently"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("mock: block on impl-A abandoned without release"),
+        "unexpected stderr: {stderr}"
+    );
 }
 }

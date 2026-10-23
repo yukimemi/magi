@@ -19,6 +19,9 @@ mod cli;
 use cli::SEAT_ENV;
 #[allow(unused_imports)]
 pub use cli::{magi_cli, magi_cli_env, magi_cli_environment};
+pub mod seat_block;
+#[allow(unused_imports)]
+pub use seat_block::SeatBlock;
 
 /// `set_home` is a process-wide global, so scenes that share one test binary
 /// (multiple runs, includes a `--resume`) must not run concurrently or they
@@ -334,15 +337,23 @@ fi
 # proof the caller can wait on that this process has actually begun, then
 # blocks until a `release-<seat>` marker appears before falling through to
 # the ordinary implementation branch below. `MOCK_BLOCK_NODE` names another
-# node (say `judge`) to block instead of `implement`. Bounded to five seconds of
-# polling so a test bug fails fast instead of hanging the suite; an ordinary
-# test releases it within milliseconds of seeing the marker.
+# node (say `judge`) to block instead of `implement`.
+#
+# A polling loop in this shell, never `exec sleep`: on Windows (MSYS) `exec`
+# spawns a child, so killing the shell leaves the sleeper alive and holding
+# the inherited stdout. Here the shell is the only long-lived process; once it
+# is killed an orphan lives at most one 0.01s sleep. Never cap the poll count
+# and fall through silently: a missing release must surface as a failure (via
+# `abandon-<seat>` when `SeatBlock` drops, or the node timeout), never as a
+# passing call.
 if [ -n "$MOCK_BLOCK_SEAT" ] && [ "$MAGI_NODE" = "${MOCK_BLOCK_NODE:-implement}" ] && { case ",$MOCK_BLOCK_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
-  : > "$MOCK_BLOCK_DIR/started-$seat"
-  i=0
-  while [ ! -f "$MOCK_BLOCK_DIR/release-$seat" ] && [ "$i" -lt 500 ]; do
-    sleep 0.01
-    i=$((i + 1))
+  : > "$MOCK_BLOCK_DIR/started-$seat" || exit 1
+  while [ ! -f "$MOCK_BLOCK_DIR/release-$seat" ]; do
+    if [ -f "$MOCK_BLOCK_DIR/abandon-$seat" ]; then
+      echo "mock: block on $seat abandoned without release" >&2
+      exit 1
+    fi
+    sleep 0.01 || exit 1
   done
 fi
 
