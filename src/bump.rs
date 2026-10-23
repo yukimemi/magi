@@ -1391,6 +1391,18 @@ async fn base_has_file(repo: &Path, remote: &str, base: &str, path: &str) -> Res
     Ok(!out.trim().is_empty())
 }
 
+/// The commit a change was cut from: the merge-base of `<remote>/<base>` and
+/// the branch, never a possibly stale local branch. `None` when it cannot be
+/// found or the branch is already contained in the remote base (unknown).
+async fn change_base(dir: &Path, remote: &str, base: &str, branch: &str) -> Option<String> {
+    let tip = git::rev_parse(dir, branch).await.ok()?;
+    let mb = git::git(dir, &["merge-base", &format!("{remote}/{base}"), branch])
+        .await
+        .ok()?;
+    let mb = mb.trim().to_owned();
+    (!mb.is_empty() && mb != tip).then_some(mb)
+}
+
 /// The version of record's version at `rev`, read in `dir`. `None` when it
 /// cannot be read (unknown, never "unchanged").
 async fn primary_version_at(dir: &Path, rev: &str, path: &str) -> Option<String> {
@@ -1460,13 +1472,17 @@ async fn after_merge_inner(
         // With declared files the file names alone are not enough (a
         // dependency update touches `package.json` too): the version of
         // record must not be provably unchanged.
+        let mb = change_base(&winner.worktree, &remote, &base, &winner.branch).await;
         let unchanged = custom
-            && match (
-                primary_version_at(&winner.worktree, &base, &primary).await,
-                primary_version_at(&winner.worktree, &winner.branch, &primary).await,
-            ) {
-                (Some(before), Some(after)) => before == after,
-                _ => false,
+            && match mb {
+                Some(mb) => matches!(
+                    (
+                        primary_version_at(&winner.worktree, &mb, &primary).await,
+                        primary_version_at(&winner.worktree, &winner.branch, &primary).await,
+                    ),
+                    (Some(before), Some(after)) if before == after
+                ),
+                None => false,
             };
         if !unchanged {
             state.event(
@@ -1567,15 +1583,9 @@ async fn after_merge_inner(
         // would publish a duplicate. Measured against the remote base the
         // branch was cut from, never a possibly stale local branch; a branch
         // already contained in it (merged without squashing) is unknown.
-        let tracking = format!("{remote}/{base}");
-        let tip = git::rev_parse(&winner.worktree, &winner.branch)
+        let mb = change_base(&winner.worktree, &remote, &base, &winner.branch)
             .await
             .unwrap_or_default();
-        let mb = git::git(&winner.worktree, &["merge-base", &tracking, &winner.branch])
-            .await
-            .map(|s| s.trim().to_owned())
-            .unwrap_or_default();
-        let mb = if mb == tip { String::new() } else { mb };
         if !mb.is_empty()
             && let (Some(before), Some(after)) = (
                 primary_version_at(&winner.worktree, &mb, &primary).await,
@@ -4498,6 +4508,68 @@ version = \"0.45.18\"\n";
                 .any(|e| e.message.contains("already moved")),
             "{:?}",
             state.events
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dependency_only_change_on_a_stale_local_base_is_not_release_only() {
+        let (_d, repo) = shun_origin("1.0.0").await;
+        let old = git::rev_parse(&repo, "HEAD").await.unwrap();
+        for (p, from) in [
+            ("src-tauri/Cargo.toml", SHUN_TOML),
+            ("package.json", "{\n  \"version\": \"1.0.0\"\n}\n"),
+            ("src-tauri/tauri.conf.json", "{ \"version\": \"1.0.0\" }\n"),
+        ] {
+            tokio::fs::write(repo.join(p), from.replace("1.0.0", "1.0.1"))
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(
+            repo.join("src-tauri/Cargo.lock"),
+            SHUN_LOCK.replace("1.0.0", "1.0.1"),
+        )
+        .await
+        .unwrap();
+        git::git(&repo, &["commit", "-am", "bump upstream"])
+            .await
+            .unwrap();
+        git::git(&repo, &["push", "origin", "main"]).await.unwrap();
+        git::git(&repo, &["checkout", "-b", "feat"]).await.unwrap();
+        tokio::fs::write(
+            repo.join("package.json"),
+            "{\n  \"version\": \"1.0.1\",\n  \"dependencies\": {}\n}\n",
+        )
+        .await
+        .unwrap();
+        git::git(&repo, &["commit", "-am", "deps"]).await.unwrap();
+        git::git(&repo, &["update-ref", "refs/heads/main", &old])
+            .await
+            .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let store = Notices::at(home.path().join("notifications"));
+        let mut state = winner_state(&repo, "main");
+        state.candidates[0].branch = "feat".to_owned();
+        state.config.release.version_files = shun_files();
+        let _ = after_merge_at(
+            &mut state,
+            "https://example.invalid/pull/1",
+            Some(home.path()),
+            Some(&store),
+        )
+        .await;
+        assert!(
+            !state
+                .events
+                .iter()
+                .any(|e| e.message.contains("only the release manifest")),
+            "{:?}",
+            state.events
+        );
+        assert!(
+            state
+                .release_bump
+                .as_ref()
+                .is_none_or(|b| b.skipped.is_none())
         );
     }
 }
