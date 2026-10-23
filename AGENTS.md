@@ -2821,7 +2821,7 @@ reply that is not `{"title_english": bool, "body_english": bool}` all yield
 `None`, and the built-in heuristics decide as before. No API key and no HTTP
 dependency, so offline tests and CI are unaffected.
 
-- The same role also writes the one description rewrite when no resumable implementer conversation exists (review-only runs, or a seat with no session): `graph::Runner::rewrite_pr_text` resolves it with `agent::pick_chain` (unset = default pick), in a separate `github-text-rewrite` seat, advancing on error, quota, unusable output or a reply with no `TITLE:` line. A classification-only wrapper therefore ends in the owner question. No handover is recorded; the result is re-checked by the gate.
+- The same role also writes the one description rewrite: `graph::Runner::rewrite_pr_text` first resumes the winning implementer's conversation when one exists, then falls back to `agent::pick_chain` over this role (unset = default pick), skipping the implementer's agent, in a separate `github-text-rewrite` seat created only when its turn comes. It advances on error, quota, unusable output or a reply with no `TITLE:` line, so an implementer that is out of quota (runs 7861 / 344a: agy, a week from its reset) does not end the rewrite. A classification-only wrapper therefore ends in the owner question. No handover is recorded; the result is re-checked by the gate.
 - The wrapper receives the prompt through `{prompt_file}` and prints the JSON
   object on stdout (a code fence or earlier log lines are tolerated).
 - Only prose goes out (code, quotes and `<details>` are dropped) and only after
@@ -3063,6 +3063,16 @@ code. `pr_outcome::summary_evidence` supplies structured review/verification
 facts, open findings and decline reasons for independent paraphrasing; fixer
 notes and candidate reports are never public body material. Their originals
 remain in RunState and local artifacts in the operator's language.
+
+**GitHub-bound seats override the operator's CLI answer language.** The
+change summary, the description rewrite and the release-bump decision run
+with `agent::for_github_text`, which for claude adds
+`--settings {"language":"<github_language>"}`. claude applies the operator's
+user-level `language` setting (`"language": "Japanese"` in
+`~/.claude/settings.json`) over the prompt's "Write ... in English": the change
+summary came back in Japanese on every replay without the override and in
+English with it. The other CLI kinds are passed through unchanged. Any new seat
+whose answer is posted to GitHub must go through the same function.
 
 `ChangeSummary` is reusable only for the same HEAD, merge-base and evidence
 fingerprint (generation specification, GitHub language, verification and

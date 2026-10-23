@@ -1805,6 +1805,29 @@ pub fn pick(
         })
 }
 
+/// `spec` for a seat whose answer is posted to GitHub (a pull request title or
+/// description, a release reason), so the answer comes back in
+/// `github_language` whatever language the operator set for their own CLI.
+///
+/// claude applies the user-level `language` setting (`"language": "Japanese"`
+/// in `~/.claude/settings.json`) over a sentence in the prompt: the change
+/// summary prompt said "Write ... in English" and the description came back in
+/// Japanese, three times out of three when replayed, and in English every time
+/// with this override. A per-invocation `--settings` outranks the user file, so
+/// it is the CLI's own mechanism rather than more prompt wording. The other
+/// CLIs have no operator-level answer-language preference magi knows of and
+/// are returned unchanged.
+pub fn for_github_text(spec: &AgentSpec, github_language: &str) -> AgentSpec {
+    let mut spec = spec.clone();
+    if spec.kind == AgentKind::Claude {
+        spec.extra_args.push("--settings".to_owned());
+        spec.extra_args.push(
+            serde_json::json!({ "language": crate::lang::name(github_language) }).to_string(),
+        );
+    }
+    spec
+}
+
 /// Resolve a standalone seat's agent choice into the ordered chain to try.
 ///
 /// Unset (or empty) is [`pick`]'s default order, one entry. Otherwise each
@@ -2082,6 +2105,45 @@ mod tests {
         let second = plan_for(AgentKind::Claude, &seat, true);
         assert!(second.argv.windows(2).any(|w| w == ["--resume", &uuid]));
         assert!(!second.argv.iter().any(|a| a == "--session-id"));
+    }
+
+    #[test]
+    fn github_bound_claude_seats_override_the_operators_answer_language() {
+        let seat = SeatState::new("change-summary", "a", 7);
+        let art = Path::new("/art");
+        for (language, name) in [("en", "English"), ("", "English"), ("ja", "Japanese")] {
+            let claude = for_github_text(&spec(AgentKind::Claude, None), language);
+            let plan = build_command(
+                &claude,
+                &seat,
+                &inv(Path::new("."), art, false),
+                Path::new("/art/p.md"),
+            )
+            .unwrap();
+            let settings = format!(r#"{{"language":"{name}"}}"#);
+            assert!(
+                plan.argv
+                    .windows(2)
+                    .any(|w| w == ["--settings", settings.as_str()]),
+                "{:?}",
+                plan.argv
+            );
+            // The prompt still arrives on stdin, not as an argument a
+            // variadic flag could swallow.
+            assert_eq!(plan.stdin.as_deref(), Some("do the thing"));
+        }
+        for kind in [
+            AgentKind::Codex,
+            AgentKind::Opencode,
+            AgentKind::Antigravity,
+            AgentKind::Omp,
+        ] {
+            assert!(
+                for_github_text(&spec(kind, None), "en")
+                    .extra_args
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

@@ -76,8 +76,9 @@ async fn ask_decision(
             "bump",
             format!("decision attempt {attempt}: trying {} ({stem})", spec.id),
         );
+        // The reason is posted in the release pull request.
         let outcome = agent::invoke(
-            spec,
+            &agent::for_github_text(spec, &state.config.graph.github_language),
             &mut seat,
             &Invocation {
                 scope: crate::agent::InvocationScope::Repository,
@@ -192,7 +193,7 @@ async fn guard_reason(
             decision.reason
         );
         let retry = agent::invoke(
-            spec,
+            &agent::for_github_text(spec, &state.config.graph.github_language),
             seat,
             &Invocation {
                 scope: crate::agent::InvocationScope::Repository,

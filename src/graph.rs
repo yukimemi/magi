@@ -7549,7 +7549,7 @@ impl Runner {
         for (i, spec) in chain.into_iter().enumerate() {
             let seat = crate::fixer::seat_for(&mut self.state, "change-summary", &spec.id);
             let job = SeatJob {
-                spec: spec.clone(),
+                spec: agent::for_github_text(&spec, &self.state.config.graph.github_language),
                 seat,
                 cwd: winner.worktree.clone(),
                 prompt: prompt.clone(),
@@ -7653,12 +7653,14 @@ impl Runner {
     }
 
     /// One read-only rewrite request for a withheld description. The
-    /// implementer's own conversation is reused only when it exists and can be
-    /// resumed; otherwise the `[roles] language_judge` chain (or the default
-    /// pick) writes it in a separate conversation. The prompt carries the whole
-    /// text, so no agent needs any memory. Each agent is asked at most once and
-    /// the chain advances on an error, quota, unusable answer or a reply with
-    /// no `TITLE:` line. Nothing is recorded as a handover.
+    /// implementer's own conversation is tried first when it exists and can be
+    /// resumed; then the `[roles] language_judge` chain (or the default pick)
+    /// writes it in a separate conversation, skipping the implementer's agent.
+    /// The prompt carries the whole text, so no agent needs any memory. Each
+    /// agent is asked at most once and the chain advances on an error, quota,
+    /// unusable answer or a reply with no `TITLE:` line: a resumed implementer
+    /// that has run out of quota must not end the rewrite. Nothing is recorded
+    /// as a handover.
     async fn rewrite_pr_text(
         &mut self,
         winner: &Candidate,
@@ -7671,8 +7673,9 @@ impl Runner {
         );
         let sessions = self.state.config.graph.sessions;
         let timeout_full = Duration::from_secs(self.state.config.graph.timeout_implement);
-        // (spec, seat, resumed)
-        let mut attempts: Vec<(AgentSpec, SeatState, bool)> = Vec::new();
+        // (spec, the resumed implementer's seat). A fallback seat is created
+        // only when its turn comes, so an unused fallback leaves no record.
+        let mut attempts: Vec<(AgentSpec, Option<SeatState>)> = Vec::new();
         let key = format!("impl-{}", winner.label);
         if let Some(spec) = self
             .state
@@ -7685,39 +7688,40 @@ impl Runner {
             && existing.agent == spec.id
             && agent::has_session(spec.kind, existing, sessions)
         {
-            attempts.push((spec, existing.clone(), true));
-        } else {
-            let chain = agent::pick_chain(
-                &self.state.config.agents,
-                self.state.config.roles.language_judge.as_ref(),
-                &agent::installed,
-                "language_judge",
-            );
-            match chain {
-                Ok(chain) => {
-                    for spec in chain {
-                        let seat = crate::fixer::seat_for(
-                            &mut self.state,
-                            "github-text-rewrite",
-                            &spec.id,
-                        );
-                        attempts.push((spec, seat, false));
+            attempts.push((spec, Some(existing.clone())));
+        }
+        match agent::pick_chain(
+            &self.state.config.agents,
+            self.state.config.roles.language_judge.as_ref(),
+            &agent::installed,
+            "language_judge",
+        ) {
+            Ok(chain) => {
+                for spec in chain {
+                    if attempts.iter().any(|(tried, _)| tried.id == spec.id) {
+                        continue;
                     }
-                }
-                Err(e) => {
-                    tracing::warn!("no agent for the description rewrite: {e:#}");
-                    self.state
-                        .event("github-text", "no rewrite agent available");
-                    return None;
+                    attempts.push((spec, None));
                 }
             }
+            Err(e) if attempts.is_empty() => {
+                tracing::warn!("no agent for the description rewrite: {e:#}");
+                self.state
+                    .event("github-text", "no rewrite agent available");
+                return None;
+            }
+            Err(e) => tracing::warn!("no fallback agent for the description rewrite: {e:#}"),
         }
         let prompts = self.state.config.prompts.clone();
         let cache = self.state.config.cache_dir();
         let run = self.state.id.clone();
-        for (i, (spec, seat, resumed)) in attempts.into_iter().enumerate() {
+        for (i, (spec, resumed_seat)) in attempts.into_iter().enumerate() {
+            let resumed = resumed_seat.is_some();
+            let seat = resumed_seat.unwrap_or_else(|| {
+                crate::fixer::seat_for(&mut self.state, "github-text-rewrite", &spec.id)
+            });
             let job = SeatJob {
-                spec: spec.clone(),
+                spec: agent::for_github_text(&spec, &self.state.config.graph.github_language),
                 seat,
                 cwd: winner.worktree.clone(),
                 prompt: prompt.clone(),
@@ -18214,6 +18218,42 @@ mod tests {
             .expect("rewritten");
         assert_eq!(runner.state.seats["impl-A"].turns, 2);
         assert!(!runner.state.seats.contains_key("github-text-rewrite"));
+    }
+
+    #[tokio::test]
+    async fn a_failing_resumed_implementer_falls_back_to_the_language_judge_role() {
+        // Runs 7861 / 344a: the winning implementer (agy) had a resumable
+        // session, was out of quota, and nothing else was asked.
+        crate::run::pin_test_home();
+        let dir = tempfile::tempdir().unwrap();
+        let mut exhausted = spec("alpha");
+        exhausted.command = vec!["false".into()];
+        let mut runner = rewrite_runner(
+            dir.path(),
+            false,
+            vec![exhausted, scripted("beta", EN_REWRITE)],
+        );
+        // The implementer's own agent is in the role too: it is not asked twice.
+        runner.state.config.roles.language_judge = Some(crate::config::AgentChoice::Chain(vec![
+            "alpha".into(),
+            "beta".into(),
+        ]));
+        let mut seat = SeatState::new("impl-A", "alpha", runner.state.seed);
+        seat.turns = 1;
+        runner.state.seats.insert("impl-A".into(), seat);
+        let winner = runner.state.candidates[0].clone();
+        let msg = runner
+            .guarded_pr_message(&winner, None, true)
+            .await
+            .unwrap()
+            .expect("the role rewrites after the implementer fails");
+        assert!(msg.body.contains("`src/net.rs`"));
+        assert_eq!(
+            runner.state.seats["impl-A"].turns, 2,
+            "the implementer was tried once"
+        );
+        assert_eq!(runner.state.seats["github-text-rewrite"].agent, "beta");
+        assert_eq!(runner.state.seats["github-text-rewrite"].turns, 1);
     }
 
     #[tokio::test]
