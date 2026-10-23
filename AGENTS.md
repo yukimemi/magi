@@ -552,6 +552,14 @@ checkout is often stale or detached: nagi's run ce6e failed its gate on a step
 - Tests that start a run need a remote: `tests/common::fixture` pushes `main` to
   a local bare `origin`.
 
+Approval policy has one additive exception: existing-branch reviews read literal
+`graph.land_approval=true` and `graph.hold_contested_merge=true` from the pinned
+reviewed commit's `magi.toml` and `.magi/config.toml`, again at the landing head.
+Effective values are ORed with base policy and retained across resumes and later
+removals. Only these allowlisted switches are read; includes and templates are
+not evaluated. Gate, e2e, roster and prompts still come from the base layers.
+Question evidence and run events retain the source file and commit.
+
 ### `[worktree] setup` products are hidden, not committed
 
 `src/worktree_setup.rs` runs after every worktree magi creates (candidates,

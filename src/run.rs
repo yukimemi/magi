@@ -2087,6 +2087,9 @@ pub struct RunState {
     pub seed: u64,
     /// Config snapshot, so a resumed run behaves like the original.
     pub config: Config,
+    /// Additive approval policy; retained even if a later head removes it.
+    #[serde(default)]
+    pub branch_owner_holds: Vec<BranchOwnerHold>,
     /// Did this run take a reference on `extensions.worktreeConfig` being on
     /// (see [`crate::git::acquire_worktree_config`])? If so, cleanup releases
     /// it - which only actually turns the setting back off once every other
@@ -2505,7 +2508,56 @@ pub struct FollowupRecord {
     pub findings: Vec<String>,
 }
 
+/// A monotonic owner hold observed in a reviewed commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchOwnerHold {
+    /// Approval switch enabled by the branch.
+    pub control: crate::config::OwnerHold,
+    /// Repository-relative configuration file.
+    pub file: String,
+    /// Pinned commit where the hold was first observed.
+    pub head: String,
+}
+
 impl RunState {
+    /// Effective policy is the OR of trusted config and observed branch holds.
+    pub fn owner_hold(&self, control: crate::config::OwnerHold) -> bool {
+        control.base_value(&self.config.graph)
+            || self.branch_owner_holds.iter().any(|h| h.control == control)
+    }
+
+    /// Read only pinned commits of existing-branch reviews, never candidates.
+    pub async fn observe_branch_owner_holds(&mut self, head: &str) {
+        if !crate::graph::is_review_run(self) {
+            return;
+        }
+        let (holds, diagnostics) = crate::config::branch_owner_holds(&self.repo, head).await;
+        for message in diagnostics {
+            tracing::warn!("{message}");
+            self.event("approval-policy", message);
+        }
+        for (control, file) in holds {
+            if self
+                .branch_owner_holds
+                .iter()
+                .any(|h| h.control == control && h.file == file)
+            {
+                continue;
+            }
+            let message = format!(
+                "{}=true from the reviewed branch's {file} at {head}",
+                control.key()
+            );
+            tracing::info!("{message}");
+            self.event("approval-policy", message);
+            self.branch_owner_holds.push(BranchOwnerHold {
+                control,
+                file,
+                head: head.to_owned(),
+            });
+        }
+    }
+
     /// A fresh run.
     pub fn new(
         repo: PathBuf,
@@ -2530,6 +2582,7 @@ impl RunState {
             status: RunStatus::Prep,
             seed,
             config,
+            branch_owner_holds: Vec::new(),
             enabled_worktree_config: false,
             pr_head: None,
             pr_recovery: None,

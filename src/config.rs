@@ -13,7 +13,9 @@
 //! dropped). `git show <sha>:magi.toml` of the remote-tracking ref's commit is
 //! written to a content-addressed directory under the git common dir
 //! (`<common>/magi/config/<sha>-<hash of repo>/`, temp dir when that is not
-//! writable) and loaded from there.
+//! writable) and loaded from there. Reviewed branches may additionally enable
+//! literal owner-hold switches; these never weaken base policy or load other
+//! branch settings, includes or templates.
 //!
 //! `remote` and `base` are themselves in the file, so they are resolved in a
 //! fixed order, first hit wins:
@@ -2528,6 +2530,96 @@ fn is_git_worktree(repo: &Path) -> bool {
     git_out(repo, &["rev-parse", "--git-dir"]).is_some()
 }
 
+/// Approval switches whose reviewed-branch values can only add owner holds.
+/// Keep the allowlist and base-value lookup together when adding a switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OwnerHold {
+    /// Ask before every merge.
+    LandApproval,
+    /// Ask when internal review remains contested.
+    HoldContestedMerge,
+}
+
+impl OwnerHold {
+    /// Complete allowlist of additive approval switches.
+    pub const ALL: [Self; 2] = [Self::LandApproval, Self::HoldContestedMerge];
+
+    /// TOML key in the graph table.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::LandApproval => "land_approval",
+            Self::HoldContestedMerge => "hold_contested_merge",
+        }
+    }
+
+    /// Value from the trusted configuration snapshot.
+    pub fn base_value(self, graph: &Graph) -> bool {
+        match self {
+            Self::LandApproval => graph.land_approval,
+            Self::HoldContestedMerge => graph.hold_contested_merge,
+        }
+    }
+}
+
+/// Literal true values only: no defaults, includes, rendering or other config.
+/// Both repository files contribute monotonically, independent of precedence.
+pub async fn branch_owner_holds(
+    repo: &Path,
+    head: &str,
+) -> (Vec<(OwnerHold, String)>, Vec<String>) {
+    let mut holds = Vec::new();
+    let mut diagnostics = Vec::new();
+    // Git can report a missing path even when the commit itself is absent.
+    // Distinguish that read failure before treating missing files as normal.
+    if let Err(error) =
+        crate::git::git(repo, &["cat-file", "-e", &format!("{head}^{{commit}}")]).await
+    {
+        diagnostics.push(format!("cannot read reviewed commit {head}: {error:#}"));
+        return (holds, diagnostics);
+    }
+    for file in ["magi.toml", ".magi/config.toml"] {
+        let object = format!("{head}:{file}");
+        let text = match crate::git::git(repo, &["show", &object]).await {
+            Ok(text) => text,
+            Err(error) => {
+                // Absence is normal; other read failures remain auditable.
+                let error = format!("{error:#}");
+                if !error.contains("does not exist in")
+                    && !error.contains("exists on disk, but not in")
+                {
+                    diagnostics.push(format!(
+                        "cannot read reviewed branch {file} at {head}: {error}"
+                    ));
+                }
+                continue;
+            }
+        };
+        let value = match toml::from_str::<toml::Value>(&text) {
+            Ok(value) => value,
+            Err(error) => {
+                diagnostics.push(format!(
+                    "cannot parse reviewed branch {file} at {head}: {error}"
+                ));
+                continue;
+            }
+        };
+        if value.get("include").is_some() || text.contains("{{") || text.contains("{%") {
+            diagnostics.push(format!("reviewed branch {file} at {head}: only literal owner holds are read; includes and templates are ignored"));
+        }
+        for hold in OwnerHold::ALL {
+            if value
+                .get("graph")
+                .and_then(|g| g.get(hold.key()))
+                .and_then(toml::Value::as_bool)
+                == Some(true)
+            {
+                holds.push((hold, file.to_owned()));
+            }
+        }
+    }
+    (holds, diagnostics)
+}
+
 #[derive(Deserialize, Default)]
 struct ProbeMerge {
     base: Option<String>,
@@ -4102,6 +4194,93 @@ lock_file = "{{ vars.bad }}"
             git(&repo, &["remote", "set-head", "origin", "trunk"]);
             std::fs::write(repo.join("magi.toml"), disk).unwrap();
             (tmp, repo)
+        }
+
+        #[tokio::test]
+        async fn branch_owner_holds_only_add_literal_true_values() {
+            for (text, expected) in [
+                ("[graph]\nland_approval = true\n", true),
+                ("[graph]\nland_approval = false\n", false),
+                ("[graph]\nland = true\n", false),
+                ("[graph\n", false),
+            ] {
+                let (_tmp, repo) = fixture(text, "[graph]\nland_approval = false\n");
+                let head = crate::git::rev_parse(&repo, "HEAD").await.unwrap();
+                let (holds, _) = branch_owner_holds(&repo, &head).await;
+                assert_eq!(
+                    holds.contains(&(OwnerHold::LandApproval, "magi.toml".into())),
+                    expected
+                );
+                assert!(
+                    !holds
+                        .iter()
+                        .any(|(h, _)| *h == OwnerHold::HoldContestedMerge)
+                );
+                for base in [false, true] {
+                    let mut cfg = Config::default();
+                    cfg.graph.land_approval = base;
+                    let mut state = crate::run::RunState::new(
+                        repo.clone(),
+                        "trunk".into(),
+                        head.clone(),
+                        "review".into(),
+                        cfg,
+                    );
+                    state.observe_branch_owner_holds(&head).await;
+                    assert!(
+                        state.branch_owner_holds.is_empty(),
+                        "competition candidates are excluded"
+                    );
+                    state.reviewed_commits = Some(Vec::new());
+                    state.observe_branch_owner_holds(&head).await;
+                    assert_eq!(state.owner_hold(OwnerHold::LandApproval), base || expected);
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn branch_owner_holds_missing_and_unreadable_preserve_base() {
+            let (_tmp, repo) = fixture(
+                "[graph]\nland_approval = true\n",
+                "[graph]\nland_approval = true\n",
+            );
+            git(&repo, &["rm", "magi.toml"]);
+            std::fs::create_dir(repo.join(".magi")).unwrap();
+            std::fs::write(
+                repo.join(".magi/config.toml"),
+                "[graph]\nhold_contested_merge = true\n",
+            )
+            .unwrap();
+            git(&repo, &["add", "."]);
+            git(&repo, &["commit", "-m", "nested hold"]);
+            let head = crate::git::rev_parse(&repo, "HEAD").await.unwrap();
+            let (holds, _) = branch_owner_holds(&repo, &head).await;
+            assert_eq!(
+                holds,
+                [(OwnerHold::HoldContestedMerge, ".magi/config.toml".into())]
+            );
+            let (holds, diagnostics) =
+                branch_owner_holds(&repo, "0000000000000000000000000000000000000000").await;
+            assert!(holds.is_empty());
+            assert!(!diagnostics.is_empty());
+            for base in [false, true] {
+                let mut cfg = Config::default();
+                cfg.graph.land_approval = base;
+                let mut state = crate::run::RunState::new(
+                    repo.clone(),
+                    "trunk".into(),
+                    head.clone(),
+                    "review".into(),
+                    cfg,
+                );
+                state.reviewed_commits = Some(Vec::new());
+                state.observe_branch_owner_holds(&head).await;
+                assert_eq!(state.owner_hold(OwnerHold::LandApproval), base);
+                state
+                    .observe_branch_owner_holds("0000000000000000000000000000000000000000")
+                    .await;
+                assert_eq!(state.owner_hold(OwnerHold::LandApproval), base);
+            }
         }
 
         #[test]
