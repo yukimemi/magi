@@ -389,6 +389,8 @@ struct RunView {
     #[serde(default)]
     candidates: Vec<CandView>,
     #[serde(default)]
+    foreign_checkout: Option<CandView>,
+    #[serde(default)]
     pr: Option<PrView>,
     /// The run that took this one's worktree (and pull request) over.
     #[serde(default)]
@@ -876,6 +878,7 @@ fn run_claims(
     let mut out: Vec<Claim> = view
         .candidates
         .iter()
+        .chain(view.foreign_checkout.iter())
         .filter(|c| !c.branch.is_empty())
         .map(|c| Claim {
             owner: owner.clone(),

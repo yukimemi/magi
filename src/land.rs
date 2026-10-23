@@ -3860,6 +3860,10 @@ async fn publish_landing_head<F: Forge>(
         current.head == observed || current.head == checked,
         "PR head changed while gating; nothing published"
     );
+    anyhow::ensure!(
+        crate::foreign_checkout::write_back(state, &checked).await?,
+        "foreign checkout delivery is blocked; see the run events"
+    );
     let public = state.pr_branch().unwrap_or(&winner.branch).to_owned();
     let lease = format!("--force-with-lease=refs/heads/{public}:{observed}");
     let refspec = format!("{checked}:refs/heads/{public}");
@@ -5626,6 +5630,10 @@ pub async fn fix_round(
     }
     crate::pr_head::ensure_owner(state)?;
     let remote = state.config.merge.remote.clone();
+    anyhow::ensure!(
+        crate::foreign_checkout::write_back(state, &after).await?,
+        "foreign checkout delivery is blocked; see the run events"
+    );
     let public_head = state.pr_branch().unwrap_or(&winner.branch).to_owned();
     let push = if state.pr_head.is_some() {
         let expected = state

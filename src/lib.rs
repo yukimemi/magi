@@ -47,6 +47,7 @@ pub mod dupes;
 pub mod fixer;
 mod fold_evidence;
 pub mod followup;
+pub mod foreign_checkout;
 pub mod git;
 pub mod github_text;
 pub mod graft;

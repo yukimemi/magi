@@ -396,6 +396,10 @@ pub(crate) async fn publish(
         }
     }
     let tip = git::rev_parse(&winner.worktree, &format!("refs/heads/{}", winner.branch)).await?;
+    anyhow::ensure!(
+        crate::foreign_checkout::write_back(state, &tip).await?,
+        "foreign checkout delivery is blocked; see the run events"
+    );
     let push = git::push_as(&winner.worktree, &remote, &winner.branch, &head, &expected).await?;
     if !push.ok() {
         bail!("public head push refused: {}", push.stderr);

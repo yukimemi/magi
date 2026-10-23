@@ -3361,3 +3361,15 @@ count-pruned. Conductor resumption concerns with no verified new blocker or
 state change remain notice history without waking a chat. These receipts never
 resolve questions, change holds or authorize work. Owner input and explicitly
 requested updates/watches bypass semantic suppression.
+
+### Reviews of foreign worktrees
+
+A clean hand-written checkout remains operator-owned. Review-only runs record
+`RunState::foreign_checkout` and edit a `magi/<run>/review` shadow branch in their
+own worktree. Never run setup, reset, clean, rescue commits or fold against the
+foreign path. Before filing a review, and again at execution, reject dirty or
+locked foreign holders. Completion and every publication path must pass through
+`foreign_checkout::write_back`: revalidate the canonical Git directory, attached
+branch, clean status (including untracked files) and saved head, then fast-forward
+only. A moved checkout or rewritten review history blocks delivery and retains
+the isolated fixes; never force-move the operator's branch to recover.

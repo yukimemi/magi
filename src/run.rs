@@ -2153,6 +2153,9 @@ pub struct RunState {
     /// Absent in older runs; never infer fetch evidence from a tracking ref.
     #[serde(default)]
     pub fetched_base: Option<FetchedBase>,
+    /// Guarded destination for an isolated review of a foreign checkout.
+    #[serde(default)]
+    pub foreign_checkout: Option<crate::foreign_checkout::ForeignCheckout>,
     /// The task, verbatim.
     pub instruction: String,
     /// Authored task criteria before review scaffolding was generated.
@@ -2687,6 +2690,7 @@ impl RunState {
             config,
             branch_owner_holds: Vec::new(),
             enabled_worktree_config: false,
+            foreign_checkout: None,
             pr_head: None,
             pr_recovery: None,
             recovery_config: None,
