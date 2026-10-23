@@ -2617,6 +2617,9 @@ fn read_cooldown(home: &Path) -> Result<Option<Timestamp>> {
 /// sets, so there is one loop body rather than two that drift apart the first
 /// time the retry policy changes on only one of them.
 pub async fn serve(opts: Opts) -> Result<()> {
+    tracing::info!(
+        "automatic update and restart requires magi web; standalone serve does not restart"
+    );
     serve_until(opts, Stop::new()).await
 }
 

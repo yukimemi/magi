@@ -3330,3 +3330,13 @@ Finalization retains its execution lease throughout the wait. Only lock
 contention is retried; permission and other I/O errors still fail closed.
 The synchronous `owner_lock` remains non-blocking for administrative operations
 and drop cleanup.
+
+### Automatic web upgrades
+
+`[update] auto_restart` is opt-in and uses the manual upgrade gate, progress,
+installer and successor handover in `src/web.rs`. Keep those paths shared.
+Automatic requests wait for idle task and chat workers and never park active
+runs. Workers racing the idle snapshot retain their executable and continue
+through handover; neither manual nor automatic restarts wait for execution
+leases. The handover drains only admission transactions. Failed-tag suppression
+is process-local, not run state; do not persist it or change `run::SCHEMA` for update bookkeeping.

@@ -1209,6 +1209,7 @@ mode = "none"            # none | local | pr
 [update]
 mode = "notify"          # off | notify | install
 # interval = "24h"
+# auto_restart = false     # magi web only: update and restart when idle
 
 [repos]
 # Where `magi repos` (and `GET /api/repos`) look for other local checkouts.
@@ -1226,6 +1227,27 @@ fetch_interval = 600            # seconds between `git fetch origin` in every ch
 
 `mode = "none"` is the default on purpose: magi prints the merge command and
 stops. It does not touch your base branch unless you ask it to.
+
+`[update] auto_restart = true` opts `magi web` into the same update-and-restart
+handover as the UI's **Update & restart** button. It defaults to `false`.
+Checks use `interval` (default `24h`, minimum `1m`); configuration is reloaded
+on each poll (every 30 seconds to 15 minutes). Cached releases can trigger an
+update without another network check. `mode = "off"` and `MAGI_NO_AUTOUPDATE`
+disable it. `mode = "install"` keeps its existing CLI startup behavior.
+
+Automatic requests wait indefinitely for no active runs, resumes, in-process
+chat turns, or on-disk chat leases. They do not park active runs. If work races
+the idle check, the handover waits for the run to finish and for chats without
+a timeout before releasing the listener and starting the successor. A loop
+owned by another process prevents the update. Standalone `magi serve` cannot
+perform this restart; run `magi web` and start its loop from the UI instead.
+
+Deferrals and automatic triggers appear as `auto-upgrade:` entries in the
+upgrade log; `/api/health` includes the progress `trigger` (`manual` or `auto`).
+A failed automatic release tag is skipped for this process's lifetime; a
+different tag or a process restart allows another attempt. Failed-tag memory
+is not persisted. Config errors defer automatic updates. Older binaries reject
+the new `auto_restart` key, so upgrade them before adding it to shared config.
 
 An arbitrary agent, or a deterministic stub for testing:
 
