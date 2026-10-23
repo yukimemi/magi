@@ -58,12 +58,27 @@ printf '%s\n' "$MAGI_ALLOW_WRITE" > "$TRACE/$MAGI_TURN.write"
 printf '%s\n' '{"type":"thread.started","thread_id":"standing-session"}'
 case "$(cat "$MAGI_PROMPT_FILE")" in
   *'Current turn scope: consultation investigation'*)
-    printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Evidence inspected; owner decision still needed."}}';;
+    cp "$TALK_RECORD" "$TRACE/start-record.json"
+    case "$(cat "$MODE")" in
+      nested) printf '%s\n' "$REQUEST_EVENT";;
+      investigation-failed) exit 1;;
+      investigation-timeout) sleep 3;;
+      *) printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Evidence inspected; owner decision still needed."}}';;
+    esac;;
   *)
     case "$(cat "$MODE")" in
-      investigate) printf '%s\n' "$REQUEST_EVENT";;
+      investigate|nested|investigation-failed|investigation-timeout) printf '%s\n' "$REQUEST_EVENT";;
+      spawn-failed)
+        # Keep this PATH entry executable so resolution cannot reach a host CLI.
+        # Replace the inode so the current shell can finish reading its script.
+        rm "$0"
+        printf '#!%s/missing-interpreter\n' "$TRACE" > "$0"
+        chmod +x "$0"
+        printf '%s\n' "$REQUEST_EVENT";;
       closed) cp "$CLOSED_RECORD" "$TALK_RECORD"; printf '%s\n' "$REQUEST_EVENT";;
       failed) printf '%s\n' "$REQUEST_EVENT"; exit 1;;
+      unreadable-question) printf '{' > "$QUESTION_RECORD"; printf '%s\n' "$REQUEST_EVENT";;
+      malformed) printf '%s\n' "$MALFORMED_EVENT";;
       quoted) printf '%s\n' "$QUOTED_EVENT";;
       *) printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Control reply."}}';;
     esac;;
@@ -92,6 +107,10 @@ esac
         let talks = Talks::at(tmp.path().join("talks"));
         let questions = Questions::at(tmp.path().join("questions"));
         let talk = talk::begin(&talks, &cfg, repo, Some("fixture")).unwrap();
+        cfg.agents[0].env.insert(
+            "TALK_RECORD".into(),
+            talks.path_of(&talk.id).to_str().unwrap().into(),
+        );
         let task_repo = if other {
             let repo = tmp.path().join("other-repo");
             std::fs::create_dir(&repo).unwrap();
@@ -172,6 +191,13 @@ esac
             "QUOTED_EVENT".into(),
             event(format!("```json\n{request}\n```")),
         );
+        cfg.agents[0].env.insert(
+            "MALFORMED_EVENT".into(),
+            event(format!(
+                "{{\"extra\":true,\"investigate_question\":\"{}\"",
+                question.id
+            )),
+        );
         Self {
             _tmp: tmp,
             talks,
@@ -230,7 +256,7 @@ common::e2e! {
 async fn consultation_investigates_on_delivery_and_natural_followup_then_returns_to_control() {
     let mut f = Fixture::new().await;
     f.delivery().await;
-    assert_eq!(f.talk.turns.len(), 2, "internal request is not an operator send");
+    assert_eq!(f.talk.turns.len(), 3, "internal request is replaced by a start notice");
     assert_eq!(f.seat().turns, 2);
     assert_eq!(f.seat().captured_session.as_deref(), Some("standing-session"));
     assert!(f.talk.turns.last().unwrap().body.contains("Evidence inspected"));
@@ -241,7 +267,7 @@ async fn consultation_investigates_on_delivery_and_natural_followup_then_returns
     assert_eq!(std::fs::read_to_string(f.trace.join("1.write")).unwrap().trim(), "0");
     assert!(std::fs::read_to_string(f.trace.join("1.prompt")).unwrap().contains("launcher holds the exclusive repository lock"));
     f.say("Please investigate why this failed before I choose an answer.").await;
-    assert_eq!(f.talk.turns.len(), 4);
+    assert_eq!(f.talk.turns.len(), 6);
     assert_eq!(f.seat().turns, 4);
     // Investigation's internal request never becomes authentic owner authority.
     let out = common::magi_cli(f._tmp.path())
@@ -287,12 +313,19 @@ async fn busy_consultation_investigation_stays_open_and_can_retry_in_same_conver
     tokio::time::timeout(std::time::Duration::from_secs(10), f.delivery()).await.unwrap();
     assert_eq!(f.seat().turns, 1);
     assert!(!f.trace.join("1.prompt").exists());
-    assert!(f.talk.turns.last().unwrap().body.contains("Investigation pending"));
-    assert!(f.talk.turns.last().unwrap().body.contains("owner unknown"));
+    assert_eq!(f.talk.investigation_state, Some(talk::InvestigationState::Busy));
+    let notice = f.talk.turns.last().unwrap();
+    assert_eq!(talk::sender(notice, None), talk::Sender::Magi);
+    assert!(notice.messages[0].display.as_ref().unwrap().facts.contains("開始せず保留"));
+    assert!(!f.trace.join("start-record.json").exists());
     // SAFETY: this test owns the external descriptor, never another seat's lock.
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
     f.say("Investigate again now.").await;
     assert_eq!(f.seat().turns, 3);
+    assert!(std::fs::read_to_string(f.trace.join("1.prompt")).unwrap().contains("previous turn: Busy"));
+    let at_start: Talk = serde_json::from_slice(&std::fs::read(f.trace.join("start-record.json")).unwrap()).unwrap();
+    assert_eq!(at_start.investigation_state, Some(talk::InvestigationState::Started));
+    assert_eq!(talk::sender(at_start.turns.last().unwrap(), None), talk::Sender::Magi);
     assert!(f.talk.turns.last().unwrap().body.contains("Evidence inspected"));
 }
 }
@@ -325,7 +358,7 @@ async fn closing_during_control_response_cancels_investigation_before_repository
     assert_eq!(f.seat().turns, 1);
     assert!(!f.trace.join("1.prompt").exists());
     assert_eq!(f.talks.get(&f.talk.id).unwrap().status, talk::TalkStatus::Closed);
-    assert!(f.talk.turns.last().unwrap().body.contains("investigation cancelled"));
+    assert_eq!(f.talk.investigation_state, Some(talk::InvestigationState::Cancelled));
 }
 }
 
@@ -341,10 +374,8 @@ async fn foreign_repository_consultation_stays_pending_even_when_standing_reposi
     tokio::time::timeout(std::time::Duration::from_secs(10), f.delivery()).await.unwrap();
     assert_eq!(f.seat().turns, 1);
     assert!(!f.trace.join("1.prompt").exists());
-    let reply = &f.talk.turns.last().unwrap().body;
-    assert!(reply.contains("Investigation pending"));
-    assert!(reply.contains("repository differs"));
-    assert!(reply.contains("magi task show"));
+    assert_eq!(f.talk.investigation_state, Some(talk::InvestigationState::RepositoryMismatch));
+    assert!(f.talk.turns.last().unwrap().messages[0].display.as_ref().unwrap().facts.contains("magi task show"));
     // SAFETY: release only this test's descriptor, never another seat's lock.
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
     // An idle foreign repository still cannot borrow the standing policy.
@@ -354,7 +385,7 @@ async fn foreign_repository_consultation_stays_pending_even_when_standing_reposi
     f.say("Investigate again without changing or answering the question.").await;
     assert_eq!(f.seat().turns, 2);
     assert!(!f.trace.join("2.prompt").exists());
-    assert!(f.talk.turns.last().unwrap().body.contains("repository differs"));
+    assert_eq!(f.talk.investigation_state, Some(talk::InvestigationState::RepositoryMismatch));
 }
 }
 
@@ -376,10 +407,7 @@ async fn unresolved_consultation_repository_does_not_fall_back_to_question_cwd()
     f.delivery().await;
     assert_eq!(f.seat().turns, 1);
     assert!(!f.trace.join("1.prompt").exists());
-    let reply = &f.talk.turns.last().unwrap().body;
-    assert!(reply.contains("Investigation pending"));
-    assert!(reply.contains("cannot resolve consulted task repository"));
-    assert!(reply.contains("restore that metadata"));
+    assert_eq!(f.talk.investigation_state, Some(talk::InvestigationState::RepositoryUnknown));
 }
 }
 
@@ -418,5 +446,144 @@ async fn ending_one_consultation_keeps_other_consults_then_restores_the_next_tur
     let prompt = std::fs::read_to_string(f.trace.join("2.prompt")).unwrap();
     assert!(prompt.contains("Current turn scope: ordinary repository conversation"));
     assert!(!prompt.contains("Current turn scope: consultation control"));
+}
+}
+
+common::e2e! {
+async fn invalid_nested_and_failed_investigations_are_magi_not_persona_replies() {
+    let mut f = Fixture::new().await;
+    std::fs::write(&f.mode, "control").unwrap();
+    f.delivery().await;
+    for (mode, expected) in [
+        ("quoted", talk::InvestigationState::InvalidControl),
+        ("malformed", talk::InvestigationState::InvalidControl),
+        ("nested", talk::InvestigationState::InvalidControl),
+        ("investigation-failed", talk::InvestigationState::Failed),
+        ("investigation-timeout", talk::InvestigationState::TimedOut),
+    ] {
+        f.cfg.graph.timeout_talk = 1;
+        std::fs::write(&f.mode, mode).unwrap();
+        f.say("Investigate before deciding.").await;
+        assert_eq!(f.talk.investigation_state, Some(expected));
+        let notice = f.talk.turns.last().unwrap();
+        assert_eq!(talk::sender(notice, None), talk::Sender::Magi);
+        let facts = &notice.messages[0].display.as_ref().unwrap().facts;
+        assert!(!facts.contains("investigate_question"));
+        assert!(!facts.contains("Investigation"));
+        assert!(!f.talk.recommendations.contains_key(&(f.talk.turns.len()-1)));
+        std::fs::write(&f.mode, "control").unwrap();
+        let next = f.seat().turns;
+        f.say("What happened?").await;
+        let prompt = std::fs::read_to_string(f.trace.join(format!("{next}.prompt"))).unwrap();
+        assert!(prompt.contains(&format!("previous turn: {expected:?}")));
+        assert_eq!(f.talk.investigation_state, None);
+        f.unchanged();
+    }
+}
+}
+
+common::e2e! {
+async fn standalone_investigation_request_outside_consultation_is_not_executed_or_displayed() {
+    let mut f = Fixture::new().await;
+    f.questions.update(&f.question.id, |q| { q.consult = None; Ok(()) }).unwrap();
+    f.question = f.questions.get(&f.question.id).unwrap();
+    f.say("Investigate").await;
+    assert_eq!(f.seat().turns, 1);
+    assert!(!f.trace.join("1.prompt").exists());
+    let notice = f.talk.turns.last().unwrap();
+    assert_eq!(talk::sender(notice, None), talk::Sender::Magi);
+    assert!(!notice.messages[0].display.as_ref().unwrap().facts.contains("investigate_question"));
+}
+}
+
+common::e2e! {
+async fn investigation_spawn_failure_is_failed_instead_of_pending() {
+    let mut f = Fixture::new().await;
+    // Resolution must not be able to fall through to a host CLI when the
+    // fixture's shebang fails: PATH holds only the fixture dir and system
+    // directories that carry the shell utilities the fixture script needs.
+    let cli_path = format!("{}:/usr/bin:/bin", f._tmp.path().display());
+    f.cfg.agents[0].env.insert("PATH".into(), cli_path);
+    std::fs::write(&f.mode, "spawn-failed").unwrap();
+    f.delivery().await;
+    assert_eq!(f.talk.investigation_state, Some(talk::InvestigationState::Failed));
+    let notice = f.talk.turns.last().unwrap();
+    assert_eq!(talk::sender(notice, None), talk::Sender::Magi);
+    assert!(notice.messages[0].display.as_ref().unwrap().facts.contains("失敗"));
+    assert!(!f.trace.join("1.prompt").exists());
+    assert!(f._tmp.path().join("codex").is_file());
+}
+}
+
+common::e2e! {
+async fn investigation_quota_failure_is_not_reported_as_completed_or_lock_contention() {
+    let mut f = Fixture::new().await;
+    let script = f._tmp.path().join("quota.sh");
+    std::fs::write(&script, r#"#!/bin/sh
+case "$(cat "$MAGI_PROMPT_FILE")" in
+  *'Current turn scope: consultation investigation'*)
+    printf '%s\n' '{"is_error":true,"api_error_status":429,"api_error":"usage_limit_reached"}';;
+  *) printf '%s\n' "$RAW_REQUEST";;
+esac
+"#).unwrap();
+    f.cfg.agents[0].kind = AgentKind::Command;
+    f.cfg.agents[0].command = vec!["/bin/sh".into(), script.to_str().unwrap().into()];
+    f.cfg.agents[0].env.insert("RAW_REQUEST".into(), serde_json::json!({"investigate_question":f.question.id}).to_string());
+    f.delivery().await;
+    assert_eq!(f.talk.investigation_state, Some(talk::InvestigationState::Quota));
+    let notice = f.talk.turns.last().unwrap();
+    assert_eq!(talk::sender(notice, None), talk::Sender::Magi);
+    assert!(notice.messages[0].display.as_ref().unwrap().facts.contains("利用上限"));
+    f.unchanged();
+}
+}
+
+common::e2e! {
+async fn protocol_examples_followed_by_prose_remain_persona_replies_without_investigation() {
+    let mut f = Fixture::new().await;
+    let request = serde_json::json!({"investigate_question": f.question.id}).to_string();
+    for (index, text) in [
+        format!("```json\n{request}\n```\nこれはプロトコルの例です。"),
+        format!("{request} これはプロトコルの例です。"),
+    ].into_iter().enumerate() {
+        f.cfg.agents[0].env.insert("REQUEST_EVENT".into(), serde_json::json!({
+            "type":"item.completed", "item":{"type":"agent_message", "text":text}
+        }).to_string());
+        if index == 0 { f.delivery().await; }
+        else { f.say("Explain the protocol example.").await; }
+        let reply = f.talk.turns.last().unwrap();
+        assert_eq!(reply.body, text);
+        assert_eq!(talk::sender(reply, None), talk::Sender::Persona);
+        assert_eq!(f.seat().turns, index + 1);
+        assert!(!f.trace.join(format!("{}.prompt", index + 1)).exists());
+        assert_eq!(f.talk.investigation_state, None);
+        f.unchanged();
+    }
+}
+}
+
+common::e2e! {
+async fn unreadable_investigation_question_reports_failure_and_can_retry_after_repair() {
+    let mut f = Fixture::new().await;
+    let path = f.questions.path_of(&f.question.id);
+    let saved = std::fs::read(&path).unwrap();
+    f.cfg.agents[0].env.insert("QUESTION_RECORD".into(), path.to_str().unwrap().into());
+    std::fs::write(&f.mode, "unreadable-question").unwrap();
+    f.talk = f.talks.get(&f.talk.id).unwrap();
+    let lease = f.talks.claim_turn(&f.talk.id).unwrap().unwrap();
+    let text = talk::drain(&mut f.talk, &f.talks).unwrap().unwrap();
+    talk::respond(&lease, &mut f.talk, &f.talks, &f.cfg, &text).await.unwrap();
+    drop(lease);
+    assert_eq!(f.talk.investigation_state, Some(talk::InvestigationState::Failed));
+    let notice = f.talk.turns.last().unwrap();
+    assert_eq!(talk::sender(notice, None), talk::Sender::Magi);
+    assert!(notice.messages[0].display.as_ref().unwrap().facts.contains("失敗"));
+    assert!(!f.trace.join("1.prompt").exists());
+    std::fs::write(&path, saved).unwrap();
+    f.unchanged();
+    std::fs::write(&f.mode, "investigate").unwrap();
+    f.say("Investigate again after repairing the record.").await;
+    assert_eq!(f.talk.investigation_state, Some(talk::InvestigationState::Completed));
+    f.unchanged();
 }
 }
