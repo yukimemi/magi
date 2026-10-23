@@ -131,6 +131,9 @@ async fn merge_requires_owner_button_and_keeps_the_existing_consent_record() {
     assert!(q.answer(Answer::Choice("merge".into())).is_err());
     assert!(magi::consult::validate_answer(&q, &talks, &chat.id, magi::queue::CHAT_NODE, "merge", Some("merge reviewed-head")).is_err());
     talk::record(&mut chat, &talks, &format!("{}: merge reviewed-head", q.id), vec![]).unwrap();
+    let words = format!("{}: merge reviewed-head", q.id);
+    assert!(magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id,
+        magi::land::APPROVE, Some(&words)).is_err(), "even exact owner text cannot merge through task control");
     assert!(!magi::task_chat::approval_offered(&chat, &q), "owner text cannot offer a button");
     let mut value = serde_json::to_value(&chat).unwrap();
     let mut turn = value["turns"][0].clone();
@@ -196,6 +199,105 @@ async fn forwarded_triage_does_not_file_another_question_while_chat_decides() {
     }
     assert_eq!(questions.list().len(), 1);
     assert_eq!(talks.get(&chat.id).unwrap().pending_messages.len(), 1);
+}
+}
+
+common::e2e! {
+async fn targetless_release_approval_keeps_its_compatibility_card_and_answer() {
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("outbox");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let questions = Questions::at(home.join("questions"));
+    let mut task = task(&fx.repo, Source::Human);
+    queue.put(&mut task).unwrap();
+    let mut q = question("");
+    q.node = magi::bump::NOTICE_NODE.into();
+    q.seat = "release-watch".into();
+    q.choices = vec![magi::land::APPROVE.into(), magi::land::HOLD.into()];
+    questions.put(&mut q).unwrap();
+    // Old records can identify their task through the watcher, without any
+    // saved approval head. Never manufacture a head or strand their card.
+    std::fs::create_dir_all(home.join("release-watch")).unwrap();
+    std::fs::write(home.join("release-watch/legacy.json"), serde_json::to_vec(&serde_json::json!({
+        "question": q.id, "run": "run-a", "url": "https://example.test/pull/1",
+        "repo": fx.repo, "local": true
+    })).unwrap()).unwrap();
+    for _ in 0..2 { magi::task_chat::sweep(&queue, &talks, &questions, &home); }
+    let q = questions.get(&q.id).unwrap();
+    assert!(q.routed_task.is_none());
+    assert!(q.routed_chat.is_none());
+    assert!(q.merge_target.is_none());
+    assert!(talks.list().is_empty());
+    assert!(magi::deputy::kind_of(&q).is_some());
+    // Repair a record already misrouted by the previous implementation too.
+    let mut misrouted = q.clone();
+    misrouted.routed_task = Some(task.id.clone());
+    misrouted.routed_chat = Some("old-chat".into());
+    misrouted.consult = Some(magi::ask::ChatConsult { talk: "old-chat".into(), at: jiff::Timestamp::now() });
+    questions.put(&mut misrouted).unwrap();
+    let repaired = questions.get(&q.id).unwrap();
+    assert!(repaired.routed_task.is_none());
+    assert!(repaired.routed_chat.is_none());
+    assert!(repaired.consult.is_none());
+    magi::task_chat::sweep(&queue, &talks, &questions, &home);
+    assert!(talks.list().is_empty());
+    let (q, ()) = questions.update(&q.id, |q| q.answer(Answer::Choice(magi::land::HOLD.into()))).unwrap();
+    assert_eq!(q.resolution().as_deref(), Some(magi::land::HOLD));
+}
+}
+
+common::e2e! {
+async fn approval_recovery_uses_chat_control_with_individual_owner_confirmation() {
+    use magi::{ask::ChoiceAction, run::{RunState, RunStatus, LandApproval, PrRecord}};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("outbox");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let questions = Questions::at(home.join("questions"));
+    for choice in [magi::land::REPAIR.to_owned(), magi::merge_decision::WITHDRAW.to_owned(),
+        format!("{}alpha", magi::merge_decision::REIMPLEMENT), magi::merge_decision::DISMISS.to_owned()] {
+        let mut chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+        let other = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+        let mut run = RunState::new(fx.repo.clone(), "main".into(), "base".into(), "work".into(), fx.config.clone());
+        run.status = RunStatus::Landing;
+        run.parked = true;
+        run.driver_exited = true;
+        run.pr = Some(PrRecord { url: "https://example.test/pull/1".into(), number: 1,
+            state: "open".into(), checks: "green".into(), round: 0, rounds: 1, red_at_merge: vec![] });
+        let mut task = task(&fx.repo, Source::Agent { run: chat.id.clone(), node: magi::queue::CHAT_NODE.into() });
+        task.runs = vec![run.id.clone()];
+        task.status = magi::queue::TaskStatus::Parked;
+        queue.put(&mut task).unwrap();
+        let mut q = question(&run.id);
+        q.node = magi::land::APPROVAL_NODE.into();
+        q.merge_target = Some(magi::merge_decision::Target { pr: run.pr.as_ref().unwrap().url.clone(),
+            head: "reviewed-head".into(), language: "en".into() });
+        q.choices = vec![magi::land::APPROVE.into(), magi::land::HOLD.into(), choice.clone()];
+        run.land_approval = Some(LandApproval { question: q.id.clone(), head: "reviewed-head".into() });
+        run.save_under(&home).unwrap();
+        questions.put(&mut q).unwrap();
+        magi::task_chat::sweep(&queue, &talks, &questions, &home);
+        assert!(talks.get(&chat.id).unwrap().pending.contains("non-merge recovery"));
+        assert!(magi::chat_control::decide(&queue, &talks, &home, &other.id, &q.id, &choice, None).is_err());
+        assert!(magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, &choice, None).is_err());
+        talk::record(&mut chat, &talks, "go ahead", vec![]).unwrap();
+        assert!(magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, &choice, Some("go ahead")).is_err());
+        let words = format!("{}: {}", q.id, choice);
+        talk::record(&mut chat, &talks, &words, vec![]).unwrap();
+        let answered = magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, &choice, Some(&words)).unwrap();
+        assert_eq!(answered.resolution().as_deref(), Some(choice.as_str()));
+        assert_eq!(answered.answer_authority.as_ref().unwrap().instruction, words);
+        if choice == magi::merge_decision::DISMISS {
+            assert_eq!(RunState::load_under(&run.id, &home).unwrap().status, RunStatus::Superseded);
+            assert_eq!(queue.get(&task.id).unwrap().status, magi::queue::TaskStatus::Done);
+        } else {
+            // Dispatch stays on the existing Resume action and its owner /
+            // liveness checks; this command only records the authorized choice.
+            assert!(matches!(answered.chosen_action(), Some(ChoiceAction::Resume { run: id }) if id == &run.id));
+            assert_eq!(RunState::load_under(&run.id, &home).unwrap().status, RunStatus::Landing);
+        }
+    }
 }
 }
 

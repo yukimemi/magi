@@ -38,7 +38,10 @@ pub(crate) fn chat_routable(q: &Question) -> bool {
         return q.merge_target.is_some();
     }
     if q.node == crate::bump::NOTICE_NODE {
-        return q.merge_target.is_some() || (q.seat == "release-watch" && !q.choices.is_empty());
+        return q.merge_target.is_some()
+            || (q.seat == "release-watch"
+                && !q.choices.is_empty()
+                && !q.choices.iter().any(|c| c == crate::land::APPROVE));
     }
     true
 }
@@ -47,12 +50,14 @@ pub(crate) fn chat_routable(q: &Question) -> bool {
 /// the branch-divergence reconcile, the release watcher) rather than by a
 /// step-1 control command. They stay open after delivery and the chat settles
 /// them with `magi task control decide`, under the evidence rules `magi
-/// answer` applies from a chat. A merge target means the owner's button.
+/// answer` applies from a chat. Approvals also accept recovery decisions here;
+/// merge consent itself always requires the owner's button.
 pub fn awaits_decision(q: &Question) -> bool {
-    q.merge_target.is_none()
-        && (q.node == crate::github_text::ASK_NODE
-            || (q.node == crate::reconcile::NODE && q.seat == crate::reconcile::SEAT)
-            || (q.node == crate::bump::NOTICE_NODE && q.seat == "release-watch"))
+    q.merge_target.is_some()
+        || (chat_routable(q)
+            && (q.node == crate::github_text::ASK_NODE
+                || (q.node == crate::reconcile::NODE && q.seat == crate::reconcile::SEAT)
+                || (q.node == crate::bump::NOTICE_NODE && q.seat == "release-watch")))
 }
 
 /// Also recognize legacy and watch-linked records before the first sweep.
@@ -115,13 +120,13 @@ pub fn post(
             let body = format!("# {}\n\n{}\n\n{}\n\nTask: {}\nRun: {}\nPR: {}\nState: {}\n",
                 crate::prompt::TASK_MESSAGE_HEADING, clean(&q.summary), clean(&q.detail),
                 task.id, run, clean(pr), task.status.as_str());
-            let instructions = if awaits_decision(q) {
+            let instructions = if let Some(target) = &q.merge_target {
+                format!("\nMerge decision {} for PR {} at head {}: explain the decision and include this full question ID in your reply to offer the chat buttons. Only the owner can click Merge or Hold. Never approve from text or an agent command. For non-merge recovery (repair, dismiss, withdraw or replacement), discuss the owner's intent as free text and use `magi task control decide {} <option> --quote <entire latest owner message>`; exact consequence confirmation and all existing transition checks still apply. Silence is a hold.\n", q.id, target.pr, target.head, q.id)
+            } else if awaits_decision(q) {
                 let offered = if q.choices.is_empty() { String::new() } else {
                     format!(" The recorded options are: {}.", q.choices.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", "))
                 };
                 format!("\nDecision {}: discuss it with the owner as free text.{offered} Apply the owner's decision only with `magi task control decide {} <option> --quote <entire latest owner message>`; its authorization, exact-content and consequence checks still apply. Do not decide without the owner's explicit words and do not start a deputy/waiter. Silence is a hold.\n", q.id, q.id)
-            } else if let Some(target) = &q.merge_target {
-                format!("\nMerge decision {} for PR {} at head {}: explain the decision and include this full question ID in your reply to offer the chat buttons. Only the owner can click Merge or Hold. Never approve from text or an agent command. Silence is a hold.\n", q.id, target.pr, target.head)
             } else {
                 "\nDiscuss this free-text decision with the owner. Apply decisions only through `magi task control`. Do not answer the legacy question or start a deputy/waiter.\n".into()
             };
@@ -153,6 +158,11 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
     let all = questions.list();
     let watches = crate::release_watch::states_for_questions(home, &all);
     for q in all.into_iter().filter(|q| q.status.open()) {
+        // Targetless legacy approvals retain their compatibility card. Do not
+        // send even a draft that would imply this chat can decide that record.
+        if q.routed_task.is_none() && !chat_routable(&q) {
+            continue;
+        }
         let Some(task_id) = q
             .routed_task
             .clone()
@@ -316,6 +326,13 @@ mod tests {
             vec!["hold".into()],
         );
         assert!(chat_routable(&release) && awaits_decision(&release));
+        let legacy_release = q(
+            crate::bump::NOTICE_NODE,
+            "release-watch",
+            vec![crate::land::APPROVE.into(), crate::land::HOLD.into()],
+        );
+        assert!(!chat_routable(&legacy_release));
+        assert!(!awaits_decision(&legacy_release));
         // A choice-less bump notice and an old approval card without a target
         // are not decisions to route.
         assert!(!chat_routable(&q(crate::bump::NOTICE_NODE, "bump", vec![])));

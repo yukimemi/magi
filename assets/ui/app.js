@@ -6388,6 +6388,7 @@ function renderTalk() {
   for (const approval of talk.merge_approvals || []) {
     const row = el("div", { class: "talk-pending" },
       el("p", { text: `Merge decision: ${approval.target.pr} at ${approval.target.head}` }));
+    row.append(el("p", { text: "You can also ask in this chat to repair findings, dismiss an obsolete approval, withdraw the PR, or replace its implementation. The agent checks which recovery operations are available and asks for any required confirmation." }));
     for (const choice of ["merge", "hold"]) {
       row.append(el("button", { class: "btn", type: "button", text: choice === "merge" ? "Merge this head" : "Hold", onclick: async (event) => {
         event.currentTarget.disabled = true;

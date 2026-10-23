@@ -3223,6 +3223,7 @@ pub fn briefing_for(
          Discuss them with the owner and apply decisions through `magi task control`; its state, ownership, liveness and confirmation checks still apply. \
          Publication, branch-divergence and release decisions stay open as records for the machinery behind them: put the recorded options to the owner as free text and, once they have decided in their own words, record it with `magi task control decide <question-id> <option> --quote <entire latest owner message>`. \
          For merge approval, include the full approval question ID in your reply to present the chat's Merge/Hold buttons. \
+         Non-merge approval recovery (repair, dismiss, withdraw or replacement) uses `magi task control decide` with the owner's entire latest message; preserve individual confirmation of the exact consequence. Never use that command to approve merging. \
          Only the owner's button click on the recorded PR head can approve merging; free text, quoted consent and agent commands cannot. Silence is a hold. \
          Automatic messages authorize investigation and reporting only, not new tasks or repository edits. \
          Legacy non-task questions still use `magi answer <full-question-id> --reply <exact offered choice> --quote <entire latest owner message>`. \

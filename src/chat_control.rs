@@ -75,7 +75,7 @@ pub enum Operation {
         /// 再実行対象の workflow run ID。
         workflows: Vec<String>,
     },
-    /// 公開テキスト・分岐・リリース監視の判断を、所有者の言葉を引用して記録する。
+    /// 公開・分岐・リリース・承認復旧の判断を、所有者の言葉を引用して記録する。
     Decide {
         /// 質問 ID（完全または一意な接頭辞）。
         question: String,
@@ -182,7 +182,7 @@ async fn execute(
     })
 }
 
-/// Record the owner's decision on a routed publication / divergence / release
+/// Record the owner's decision on a routed publication / divergence / release / recovery
 /// question. The record stays the authority the machinery behind it reads; the
 /// chat only supplies the answer, under the same evidence rules `magi answer`
 /// applies to a chat seat (offered label, owner quote, exact-content binding
@@ -234,6 +234,10 @@ pub fn decide(
                 "a routed decision needs --quote of the owner's entire latest message in this conversation"
             );
             let reply = r.resolve_reply(choice)?.to_owned();
+            ensure!(
+                crate::consult::consent(r, &reply) != crate::consult::Consent::Merge,
+                "merge consent requires the owner's head-bound chat button"
+            );
             let answer = if r.free_text() { Answer::Text(reply.clone()) } else { Answer::Choice(reply.clone()) };
             crate::consult::refuse_operator_held(r, crate::queue::CHAT_NODE, &queue.list())?;
             r.answer_authority = crate::consult::authorize_answer(

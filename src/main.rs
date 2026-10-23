@@ -726,7 +726,7 @@ enum ControlCmd {
         #[arg(long = "workflow", required = true)]
         workflows: Vec<String>,
     },
-    /// Record the owner's decision on a publication, divergence or release
+    /// Record the owner's decision on publication, divergence, release or approval recovery
     /// question routed to this chat. Needs `--quote` of the owner's latest message.
     Decide {
         /// Question id from the automatic message.

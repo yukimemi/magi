@@ -3312,10 +3312,18 @@ abandoned on delivery: the record stays open for the machinery that reads its
 answer, and the chat settles it with `magi task control decide`
 (`chat_control::decide`: routed to that chat, owned task, `--quote` of the
 owner's entire latest send, then `consult::authorize_answer`). Merge approvals
-and a local release approval keep the owner's head-bound button; only the
-merge-consent answer needs it, so hold, dismiss and repair keep their ordinary
-answers. An approval or local-release card with no `merge_target` is an old
-card and is never routed. `task_chat::enabled_for` treats an unreadable
+and a local release approval keep the owner's head-bound button for merge
+consent. Their non-merge recovery decisions (hold, repair, dismiss, withdraw
+and replacement) use the same `task control decide` command and existing
+owner-evidence and transition checks. The chat UI explains this recovery
+surface; it does not offer ordinary decision buttons. `decide` explicitly
+rejects merge consent even when there is question-bound owner text. An
+approval or release-watch record offering `merge` with no `merge_target` is
+an old card and is never routed, even when its watch record identifies a task.
+`Questions::with_repair_choice` first attempts to recover the saved watch head;
+if none exists, it also clears any invalid routing from earlier versions so
+the compatibility card is usable again. Non-merge release recovery records
+still route. `task_chat::enabled_for` treats an unreadable
 repository config as "off", because `routed_task` is persisted and cannot be
 undone when the config returns. The button endpoint has no stronger caller
 identity than every other owner route (the tailnet is the boundary); what it

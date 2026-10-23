@@ -1599,6 +1599,29 @@ impl Questions {
         {
             q = current;
         }
+        // A previous routing version treated targetless release approvals as
+        // ordinary recovery decisions. If no saved head can be recovered,
+        // restore their compatibility card instead of leaving an approval
+        // that neither the chat button nor task control can answer.
+        if q.status.open()
+            && q.routed_task.is_some()
+            && !crate::task_chat::chat_routable(&q)
+            && let Ok((current, ())) =
+                self.update(&q.id, |current| {
+                    if current.status.open() && !crate::task_chat::chat_routable(current) {
+                        if current.consult.as_ref().is_some_and(|c| {
+                            current.routed_chat.as_deref() == Some(c.talk.as_str())
+                        }) {
+                            current.consult = None;
+                        }
+                        current.routed_task = None;
+                        current.routed_chat = None;
+                    }
+                    Ok(())
+                })
+        {
+            q = current;
+        }
         if (q.status.open() || q.resolution().as_deref() == Some(crate::land::REPAIR))
             && q.node == crate::land::APPROVAL_NODE
             && let Some(home) = self.root.parent()
