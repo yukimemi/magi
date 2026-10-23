@@ -397,13 +397,22 @@ for (const report of ['', 'Saved text']) {
   });
 }
 
-test('settings refresh keeps the existing body intact', () => {
-  const body = { content: 'Saved settings' };
+test('settings refresh keeps the existing body intact and inert', () => {
+  const body = {
+    content: 'Saved settings', inert: false,
+    toggleAttribute(name, on) { if (name === 'inert') this.inert = on; },
+  };
+  const settingsState = { data: {}, loading: true };
   const settingsSource = source.slice(source.indexOf('function renderSettings()'), source.indexOf('/* ---- task detail'));
   const render = runInNewContext(`${settingsSource}\nrenderSettings`, {
-    settingsState: { data: {}, loading: true }, renderSettingsContext() {},
+    settingsState, renderSettingsContext() {},
     $: () => body, clear: () => { body.content = ''; },
   });
   render();
   assert.equal(body.content, 'Saved settings');
+  assert.equal(body.inert, true);
+  settingsState.data = null;
+  settingsState.loading = false;
+  try { render(); } catch { /* later rendering needs the full DOM; only inert matters */ }
+  assert.equal(body.inert, false);
 });
