@@ -5190,8 +5190,19 @@ async fn run_refresh_keeps_question_focus_and_blocks_stale_actions() {
           box.value = 'An unfinished answer'; box.focus(); box.setSelectionRange(3, 8);
           const originalFetch = window.fetch;
           const tabs = document.querySelector('.run-tabs');
-          const top = () => tabs.getBoundingClientRect().top + window.scrollY;
+          const meta = document.querySelector('#run-meta');
+          // Measure the space where refresh notices are inserted. Adding
+          // scrollY to a viewport coordinate can lose precision after focus
+          // scrolls the page, and also includes unrelated chrome above meta.
+          const top = () => tabs.getBoundingClientRect().top - meta.getBoundingClientRect().top;
           const before = top();
+          // The relative measurement must still detect an inserted notice.
+          const probe = document.createElement('div');
+          probe.style.height = '10px';
+          meta.after(probe);
+          const detectsShift = top() !== before;
+          probe.remove();
+          const layoutSensitive = detectsShift && top() === before;
           const visible = tabs.getClientRects().length > 0 && tabs.getBoundingClientRect().height > 0;
           let releaseCore, releaseEvidence;
           const coreBarrier = new Promise(r => releaseCore = r);
@@ -5233,7 +5244,7 @@ async fn run_refresh_keeps_question_focus_and_blocks_stale_actions() {
           const retry = !error.hidden && error.textContent.includes('deliberate failure')
             && !!error.querySelector('button');
           window.fetch = originalFetch;
-          return {pending, success, failure, pendingLayout, coreLayout, completedLayout, retry};
+          return {pending, success, failure, pendingLayout, coreLayout, completedLayout, retry, layoutSensitive};
         })()"#).await.unwrap();
         assert_eq!(
             out,
@@ -5245,6 +5256,7 @@ async fn run_refresh_keeps_question_focus_and_blocks_stale_actions() {
                 "coreLayout": true,
                 "completedLayout": true,
                 "retry": true,
+                "layoutSensitive": true,
             })
         );
         browser.close_page(&page).await;
