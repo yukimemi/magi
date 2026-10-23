@@ -75,13 +75,13 @@ pub enum Operation {
         /// 再実行対象の workflow run ID。
         workflows: Vec<String>,
     },
-    /// 公開・分岐・リリース・承認復旧の判断を、所有者の言葉を引用して記録する。
+    /// タスクチャットで所有者の判断を記録する（マージを含む）。
     Decide {
         /// 質問 ID（完全または一意な接頭辞）。
         question: String,
         /// 記録された選択肢のラベル。
         choice: String,
-        /// 最新の所有者メッセージ全文。
+        /// 互換性のための任意の引用（配送済みの判断では不要）。
         quote: Option<String>,
     },
     /// 個別確認後、生存が否定された run を破棄する。
@@ -182,11 +182,9 @@ async fn execute(
     })
 }
 
-/// Record the owner's decision on a routed publication / divergence / release / recovery
-/// question. The record stays the authority the machinery behind it reads; the
-/// chat only supplies the answer, under the same evidence rules `magi answer`
-/// applies to a chat seat (offered label, owner quote, exact-content binding
-/// and irreversible-choice confirmation). Merge is never decided here.
+/// Record a routed decision for the task's own chat. The chat agent interprets
+/// the owner's request directly; no quote or additional consent evidence is
+/// required. Existing answer dispatch and transition checks still apply.
 pub fn decide(
     queue: &Queue,
     talks: &Talks,
@@ -202,7 +200,7 @@ pub fn decide(
     let q = questions.get(&id)?;
     ensure!(
         q.routed_chat.as_deref() == Some(talk) && crate::task_chat::awaits_decision(&q),
-        "question {} is not a decision routed to this conversation; merge approvals use the owner's chat button",
+        "question {} is not a decision routed to this conversation",
         q.short()
     );
     let task_id = q
@@ -224,24 +222,27 @@ pub fn decide(
                     bail!("conversation evidence is locked by another process");
                 }
             };
-            ensure!(r.status.open(), "question {} is already {}", r.short(), r.status.as_str());
-            // Whatever the choice, a routed decision is the owner's: the quote
-            // must be their entire latest persisted send in this conversation.
-            let latest = talks.get(talk)?;
             ensure!(
-                quote.is_some_and(|w| !w.trim().is_empty()
-                    && crate::consult::latest_owner_instruction(&latest) == Some(w)),
-                "a routed decision needs --quote of the owner's entire latest message in this conversation"
+                r.status.open(),
+                "question {} is already {}",
+                r.short(),
+                r.status.as_str()
             );
             let reply = r.resolve_reply(choice)?.to_owned();
-            ensure!(
-                crate::consult::consent(r, &reply) != crate::consult::Consent::Merge,
-                "merge consent requires the owner's head-bound chat button"
-            );
-            let answer = if r.free_text() { Answer::Text(reply.clone()) } else { Answer::Choice(reply.clone()) };
+            let answer = if r.free_text() {
+                Answer::Text(reply.clone())
+            } else {
+                Answer::Choice(reply.clone())
+            };
             crate::consult::refuse_operator_held(r, crate::queue::CHAT_NODE, &queue.list())?;
             r.answer_authority = crate::consult::authorize_answer(
-                r, talks, &questions, talk, crate::queue::CHAT_NODE, &reply, quote,
+                r,
+                talks,
+                &questions,
+                talk,
+                crate::queue::CHAT_NODE,
+                &reply,
+                quote,
             )?;
             r.answer(answer)?;
             Ok(guard)

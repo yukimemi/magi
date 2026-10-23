@@ -836,10 +836,10 @@ impl Question {
     /// and "that is not one of the choices" and "this question is multiple
     /// choice" are different mistakes with different fixes.
     pub fn answer(&mut self, answer: Answer) -> Result<()> {
-        self.answer_inner(answer, false)
+        self.answer_inner(answer)
     }
 
-    /// Only the owner HTTP button endpoint supplies this head-bound evidence.
+    /// Optional chat buttons validate the displayed conversation and PR head.
     pub(crate) fn answer_chat_button(
         &mut self,
         answer: Answer,
@@ -854,16 +854,10 @@ impl Question {
             self.merge_target.as_ref().is_some_and(|t| t.head == head),
             "stale approval head"
         );
-        self.answer_inner(answer, true)
+        self.answer_inner(answer)
     }
 
-    fn answer_inner(&mut self, answer: Answer, owner_button: bool) -> Result<()> {
-        if self.routed_task.is_some()
-            && matches!(&answer, Answer::Choice(c) if crate::consult::consent(self, c) == crate::consult::Consent::Merge)
-            && !owner_button
-        {
-            bail!("task-chat merge approval requires the owner's head-bound chat button");
-        }
+    fn answer_inner(&mut self, answer: Answer) -> Result<()> {
         match self.status {
             QuestionStatus::Answered => bail!(
                 "question {} was already answered; the run has moved on and a \

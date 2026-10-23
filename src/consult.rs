@@ -537,6 +537,11 @@ pub fn authorize_answer(
     if node != CHAT_NODE {
         return Ok(None);
     }
+    // Before delivery, preserve already-supported legacy consultation replies.
+    if q.routed_task.is_some() && q.routed_chat.is_some() {
+        validate_routed_answer(q, talks, run, reply)?;
+        return Ok(None);
+    }
     if reply == crate::land::HOLD && q.actions.contains_key(reply) {
         bail!("hold cannot execute a question action");
     }
@@ -1407,6 +1412,30 @@ impl QuestionKind {
     }
 }
 
+/// Routed decisions use the chat agent's interpretation of the owner's request,
+/// while retaining conversation ownership and open-record checks. Legacy
+/// consultation consent below is unchanged.
+fn validate_routed_answer(q: &Question, talks: &Talks, run: &str, reply: &str) -> Result<()> {
+    anyhow::ensure!(
+        q.routed_chat.as_deref() == Some(run),
+        "decision belongs to a different chat"
+    );
+    anyhow::ensure!(q.status.open(), "decision is no longer open");
+    anyhow::ensure!(talks.get(run)?.status.open(), "the task chat is closed");
+    let home = talks.root().parent().context("talk store has no home")?;
+    let queue = crate::queue::Queue::at(home.join("queue"));
+    crate::chat_control::owned_task(
+        &queue,
+        run,
+        q.routed_task.as_deref().context("decision has no task")?,
+    )?;
+    anyhow::ensure!(
+        q.free_text() || q.choices.iter().any(|c| c == reply),
+        "decision requires an offered choice"
+    );
+    Ok(())
+}
+
 /// Validate guarded decisions answered by a running chat. Terminal answers
 /// retain their existing behavior. Merge and posting policies both require
 /// evidence from the correct conversation; posting also checks the selected text.
@@ -1418,8 +1447,8 @@ pub fn validate_answer(
     reply: &str,
     quote: Option<&str>,
 ) -> Result<()> {
-    if q.routed_task.is_some() && consent(q, reply) == Consent::Merge {
-        bail!("task-chat merge consent requires the owner's head-bound button");
+    if node == CHAT_NODE && q.routed_task.is_some() && q.routed_chat.is_some() {
+        return validate_routed_answer(q, talks, run, reply);
     }
     let kind = QuestionKind::of(q);
     if node != CHAT_NODE || kind == QuestionKind::Ordinary {

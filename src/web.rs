@@ -7561,21 +7561,17 @@ async fn question_answer(
                 );
                 let merge = matches!(&answer, ask::Answer::Choice(c)
                     if crate::consult::consent(r, c) == crate::consult::Consent::Merge);
-                // Only a merge needs the owner's chat button. Hold, dismiss and
-                // repair keep their ordinary, individually guarded answers.
-                if r.routed_task.is_some() && r.merge_target.is_some() && merge {
-                    let talk_id = body
-                        .talk
-                        .as_deref()
-                        .context("approval requires its chat button")?;
-                    let head = body
-                        .head
-                        .as_deref()
-                        .context("approval requires the displayed head")?;
+                // Buttons retain their displayed chat/head binding. A direct
+                // decision does not require a button or a prior persona offer.
+                if r.routed_task.is_some() && r.merge_target.is_some() && merge
+                    && (body.talk.is_some() || body.head.is_some())
+                {
+                    let talk_id = body.talk.as_deref().context("approval button requires its chat")?;
+                    let head = body.head.as_deref().context("approval button requires the displayed head")?;
                     let talk = ui.talks.get(talk_id)?;
                     anyhow::ensure!(
-                        talk.status.open() && crate::task_chat::approval_offered(&talk, r),
-                        "approval has not been offered by this chat agent"
+                        talk.status.open(),
+                        "approval chat is closed"
                     );
                     r.answer_chat_button(answer, talk_id, head)
                 } else {
@@ -11777,7 +11773,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_chat_merge_button_rejects_text_agents_and_stale_heads() {
+    async fn task_chat_merge_accepts_direct_decisions_and_checks_optional_buttons() {
         let home = TempDir::new().unwrap();
         let ui = Arc::new(Ui::new(
             Queue::at(home.path().join("queue")),
@@ -11788,7 +11784,7 @@ mod tests {
             home.path().to_owned(),
         ));
         let talks = &ui.talks;
-        let mut chat =
+        let chat =
             talk::begin(talks, &stub_config(), home.path().to_owned(), Some("stub")).unwrap();
         let mut q = Question::new(
             "run".into(),
@@ -11815,15 +11811,8 @@ mod tests {
         };
         let button = serde_json::json!({"choice":"merge", "talk":chat.id, "head":"head-a"});
         assert!(send(serde_json::json!({"text":"merge"})).await.is_err());
-        assert!(send(serde_json::json!({"choice":"merge"})).await.is_err());
-        assert!(send(button.clone()).await.is_err(), "not offered yet");
-        talk::queue_once(&mut chat, talks, "automatic", &format!("question:{}", q.id)).unwrap();
-        let mut value = serde_json::to_value(&chat).unwrap();
-        value["turns"] = serde_json::json!([{
-            "who":"agent", "sender":"persona", "body":q.id, "at":Timestamp::now(), "attachments":[]
-        }]);
-        chat = serde_json::from_value(value).unwrap();
-        talks.put(&mut chat).unwrap();
+        let wrong_chat = serde_json::json!({"choice":"merge", "talk":"other", "head":"head-a"});
+        assert!(send(wrong_chat).await.is_err());
         let stale = serde_json::json!({"choice":"merge", "talk":chat.id, "head":"old-head"});
         assert!(send(stale).await.is_err());
         assert!(ui.questions.get(&q.id).unwrap().status.open());
@@ -11836,7 +11825,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_routed_approval_keeps_hold_without_the_chat_button() {
+    async fn routed_approvals_accept_merge_and_hold_without_chat_buttons() {
         let home = TempDir::new().unwrap();
         let ui = Arc::new(Ui::new(
             Queue::at(home.path().join("queue")),
@@ -11846,7 +11835,7 @@ mod tests {
             home.path().to_owned(),
             home.path().to_owned(),
         ));
-        for choice in [crate::land::HOLD] {
+        for choice in [crate::land::APPROVE, crate::land::HOLD] {
             let mut q = Question::new(
                 "run".into(),
                 crate::land::APPROVAL_NODE.into(),
@@ -11872,10 +11861,6 @@ mod tests {
                     )),
                 )
             };
-            // Merge still needs the button; hold keeps its ordinary answer (dismiss and
-            // repair are covered by the obsolete_approval / legacy_merge_repair tests).
-            assert!(answer("merge").await.is_err());
-            assert!(ui.questions.get(&q.id).unwrap().status.open());
             let _ = answer(choice).await.unwrap();
             assert_eq!(
                 ui.questions.get(&q.id).unwrap().resolution().as_deref(),

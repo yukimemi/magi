@@ -109,7 +109,7 @@ async fn new_chat_is_solo_default_and_recovers_an_unrecorded_creation() {
 }
 
 common::e2e! {
-async fn merge_requires_owner_button_and_keeps_the_existing_consent_record() {
+async fn routed_merge_accepts_chat_decision_without_quote_or_button() {
     let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
     let home = fx.tmp.path().join("outbox");
     let queue = Queue::at(home.join("queue"));
@@ -125,23 +125,39 @@ async fn merge_requires_owner_button_and_keeps_the_existing_consent_record() {
     q.merge_target = Some(magi::merge_decision::Target { pr: "https://example.test/pull/1".into(), head: "reviewed-head".into(), language: "en".into() });
     questions.put(&mut q).unwrap();
     magi::task_chat::sweep(&queue, &talks, &questions, &home);
-    let mut q = questions.get(&q.id).unwrap();
+    let q = questions.get(&q.id).unwrap();
     assert!(q.status.open());
     assert!(magi::deputy::fixed_clock(&q));
-    assert!(q.answer(Answer::Choice("merge".into())).is_err());
-    assert!(magi::consult::validate_answer(&q, &talks, &chat.id, magi::queue::CHAT_NODE, "merge", Some("merge reviewed-head")).is_err());
-    talk::record(&mut chat, &talks, &format!("{}: merge reviewed-head", q.id), vec![]).unwrap();
-    let words = format!("{}: merge reviewed-head", q.id);
-    assert!(magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id,
-        magi::land::APPROVE, Some(&words)).is_err(), "even exact owner text cannot merge through task control");
-    assert!(!magi::task_chat::approval_offered(&chat, &q), "owner text cannot offer a button");
-    let mut value = serde_json::to_value(&chat).unwrap();
-    let mut turn = value["turns"][0].clone();
-    turn["who"] = "agent".into();
-    turn["sender"] = "persona".into();
-    value["turns"].as_array_mut().unwrap().push(turn);
-    chat = serde_json::from_value(value).unwrap();
-    assert!(magi::task_chat::approval_offered(&chat, &q));
+    // The owner can ask naturally; neither an offered card nor a quote is required.
+    assert!(q.clone().answer(Answer::Choice("merge".into())).is_ok());
+    talk::record(&mut chat, &talks, "マージして", vec![]).unwrap();
+    assert!(magi::consult::validate_answer(&q, &talks, &chat.id, magi::queue::CHAT_NODE, "merge", None).is_ok());
+    assert!(magi::consult::authorize_answer(&q, &talks, &questions, &chat.id, magi::queue::CHAT_NODE, "merge", None).is_ok());
+    let mut unrelated = Task::new("Unrelated".into(), "Work".into(), fx.repo.clone(), Source::Human);
+    queue.put(&mut unrelated).unwrap();
+    let mut wrong_task = q.clone();
+    wrong_task.routed_task = Some(unrelated.id);
+    assert!(magi::consult::authorize_answer(&wrong_task, &talks, &questions, &chat.id, magi::queue::CHAT_NODE, "merge", None).is_err());
+    assert!(!magi::task_chat::approval_offered(&chat, &q));
+    let answered = magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, magi::land::APPROVE, None).unwrap();
+    assert_eq!(answered.resolution().as_deref(), Some("merge"));
+    assert_eq!(answered.merge_target.as_ref().unwrap().head, "reviewed-head");
+    assert!(answered.answer_authority.is_none());
+    assert!(magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, magi::land::APPROVE, None).is_err());
+    // The compatibility `magi answer` CLI uses the same routed policy from a
+    // chat seat, rather than falling back to legacy consultation evidence.
+    let mut next = question("run-a");
+    next.node = q.node.clone();
+    next.choices = q.choices.clone();
+    next.merge_target = q.merge_target.clone();
+    questions.put(&mut next).unwrap();
+    magi::task_chat::sweep(&queue, &talks, &questions, &home);
+    let output = common::magi_cli(&home)
+        .args(["answer", &next.id, "--reply", "merge"])
+        .env("MAGI_RUN", &chat.id).env("MAGI_NODE", magi::queue::CHAT_NODE)
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(questions.get(&next.id).unwrap().resolution().as_deref(), Some("merge"));
     // A delivered approval never reopens a subsequently closed conversation.
     talk::close(&mut chat, &talks).unwrap();
     magi::task_chat::sweep(&queue, &talks, &questions, &home);
@@ -248,7 +264,7 @@ async fn targetless_release_approval_keeps_its_compatibility_card_and_answer() {
 }
 
 common::e2e! {
-async fn approval_recovery_uses_chat_control_with_individual_owner_confirmation() {
+async fn approval_recovery_uses_chat_control_without_quote_evidence() {
     use magi::{ask::ChoiceAction, run::{RunState, RunStatus, LandApproval, PrRecord}};
     let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
     let home = fx.tmp.path().join("outbox");
@@ -280,14 +296,14 @@ async fn approval_recovery_uses_chat_control_with_individual_owner_confirmation(
         magi::task_chat::sweep(&queue, &talks, &questions, &home);
         assert!(talks.get(&chat.id).unwrap().pending.contains("non-merge recovery"));
         assert!(magi::chat_control::decide(&queue, &talks, &home, &other.id, &q.id, &choice, None).is_err());
+        assert!(magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, "not offered", None).is_err());
+        talk::close(&mut chat, &talks).unwrap();
         assert!(magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, &choice, None).is_err());
-        talk::record(&mut chat, &talks, "go ahead", vec![]).unwrap();
-        assert!(magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, &choice, Some("go ahead")).is_err());
-        let words = format!("{}: {}", q.id, choice);
-        talk::record(&mut chat, &talks, &words, vec![]).unwrap();
-        let answered = magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, &choice, Some(&words)).unwrap();
+        magi::talk::reopen(&mut chat, &talks).unwrap();
+        talk::record(&mut chat, &talks, "進めて", vec![]).unwrap();
+        let answered = magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, &choice, None).unwrap();
         assert_eq!(answered.resolution().as_deref(), Some(choice.as_str()));
-        assert_eq!(answered.answer_authority.as_ref().unwrap().instruction, words);
+        assert!(answered.answer_authority.is_none());
         if choice == magi::merge_decision::DISMISS {
             assert_eq!(RunState::load_under(&run.id, &home).unwrap().status, RunStatus::Superseded);
             assert_eq!(queue.get(&task.id).unwrap().status, magi::queue::TaskStatus::Done);
@@ -314,7 +330,7 @@ async fn publication_divergence_and_release_decisions_route_and_wait_for_the_cha
     queue.put(&mut task).unwrap();
     let mut ids = Vec::new();
     for (node, seat, choice) in [
-        (magi::github_text::ASK_NODE, "posting-gate", "use fallback"),
+        (magi::github_text::ASK_NODE, "posting-gate", magi::github_text::POST_ORIGINAL),
         (magi::reconcile::NODE, magi::reconcile::SEAT, "keep"),
         (magi::bump::NOTICE_NODE, "release-watch", "leave it"),
     ] {
@@ -336,18 +352,18 @@ async fn publication_divergence_and_release_decisions_route_and_wait_for_the_cha
         assert!(q.status.open());
         assert_eq!(q.routed_chat.as_deref(), Some(chat.id.as_str()));
         assert!(magi::deputy::kind_of(&q).is_none());
-        // Another conversation, or no owner evidence, records nothing.
+        // Another conversation or an invalid choice records nothing.
         assert!(magi::chat_control::decide(&queue, &talks, &home, &other.id, id, &q.choices[0], None).is_err());
-        assert!(magi::chat_control::decide(&queue, &talks, &home, &chat.id, id, &q.choices[0], None).is_err());
         assert!(questions.get(id).unwrap().status.open());
         assert!(magi::chat_control::decide(&queue, &talks, &home, &chat.id, id, "not offered", Some("x")).is_err());
     }
-    // The owner's own latest words, quoted whole, settle it; the record then
-    // carries the answer the release watcher applies on its next lap.
-    let release = ids[2].clone();
-    talk::record(&mut chat, &talks, "leave it", vec![]).unwrap();
-    let q = magi::chat_control::decide(&queue, &talks, &home, &chat.id, &release, "leave it", Some("leave it")).unwrap();
-    assert_eq!(q.resolution().as_deref(), Some("leave it"));
-    assert!(questions.get(&ids[0]).unwrap().status.open());
+    // Each producer's decision is accepted without quote evidence and remains
+    // on its existing consumer path, including exact publication choices.
+    for id in &ids {
+        let q = questions.get(id).unwrap();
+        talk::record(&mut chat, &talks, "進めて", vec![]).unwrap();
+        let answered = magi::chat_control::decide(&queue, &talks, &home, &chat.id, id, &q.choices[0], None).unwrap();
+        assert_eq!(answered.resolution().as_deref(), Some(q.choices[0].as_str()));
+    }
 }
 }

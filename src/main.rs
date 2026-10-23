@@ -3060,7 +3060,7 @@ async fn answer_cmd(args: AnswerArgs) -> Result<()> {
         ask::Answer::Choice(reply)
     };
     // A routed decision belongs to the task chat: a chat seat answers with the
-    // same evidence rules as `magi task control decide`, the owner may answer
+    // same ownership rules as `magi task control decide`, the owner may answer
     // from a terminal, but another agent seat may not.
     anyhow::ensure!(
         q.routed_task.is_none()

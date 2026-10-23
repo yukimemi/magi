@@ -510,8 +510,9 @@ in an irreversible decision.
 
 **Silence is a hold.** An unanswered approval never merges, and neither does
 anything other than explicit approval. For task chats, the agent presents
-Merge/Hold buttons bound to the displayed PR head. A free-text `merge` reply or
-an agent command cannot approve it; only the owner's button click can.
+Merge/Hold buttons bound to the displayed PR head. The chat agent may also
+record the owner's merge request directly with
+`magi task control decide`; no button or quote evidence is required.
 
 A standing conversation can answer an exact owner decision even when the
 question was consulted elsewhere or never consulted. Use
@@ -749,7 +750,7 @@ Unix のチャット席では継承 FD、Windows ではローカル名前付き�
 | `magi task control hold <task> [reason]` / `release <task>` | the same transitions as `magi task hold` / `release` |
 | `magi task control retry <task> <instruction>` | replaces a queued or held task's instruction and queues it in one save; attempts restart as for any release, runs and history are kept |
 | `magi task control rerun-checks <full run id> --request <id> --head <sha> --workflow <id>` | 指定した head と失敗 workflow を再確認し、リクエスト単位で再実行する。同じ操作の再送には同じ request ID を使う。`chat-controls/<talk>/<request>.json` に受付を記録し、結果不明の再送は拒否する |
-| `magi task control decide <question id> <option> --quote "<message>"` | records the owner's decision on publication (github-text), branch divergence, release recovery or non-merge approval recovery routed to this chat. This includes repair, dismissal, withdrawal and replacement when available. The record stays open after delivery and remains what the machinery behind it reads; `--quote` must be the owner's entire latest persisted message, and the usual `magi answer` evidence rules (offered label, exact-content binding, irreversible-choice confirmation) still apply. Merge is never decided here |
+| `magi task control decide <question id> <option>` | records the owner's decision on publication (github-text), branch divergence, release recovery or merge approval routed to this chat. This includes repair, dismissal, withdrawal and replacement when available. No quote or extra consent evidence is required. The routed chat, owned task, open record and offered choice are checked; existing consumers and transition checks apply the answer. |
 | `magi task control abandon <full run id> --quote "<message>"` | destructive: the owner's latest persisted message must be exactly `abandon-run: <run id>` and `--quote` must repeat it; the shared liveness judge then runs under the owner lock and a Live or Unknown driver is refused |
 
 Windows の実 sandbox の限定チェックは認証済み CLI が必要。PowerShell で
@@ -1496,8 +1497,9 @@ The chat discusses decisions with the owner and applies them through
 `magi task control`. Automatic reports do not authorize new tasks or repository
 edits. Merge approval remains default-on and bound to the displayed PR head:
 the chat agent presents Merge/Hold buttons by including the full approval ID in
-its reply. Only the owner's button confirms a merge; free text, quoted consent,
-and agent commands cannot do so. Silence is a hold. Existing head verification
-and merge transitions remain in charge. The Question store and legacy non-task
+its reply. At the owner's request, the chat agent may also record merge directly
+with `magi task control decide`, without quote or other consent evidence.
+Buttons remain optional and validate their displayed head. Silence is a hold.
+Existing head verification and merge transitions remain in charge. The Question store and legacy non-task
 question/deputy/waiter workflows remain available during this migration.
 Delivery requires the daemon; pending outbox records survive a restart.

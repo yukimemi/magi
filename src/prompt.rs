@@ -285,7 +285,7 @@ fn ask_the_owner(language: &str) -> String {
          Task questions are delivered to the task's chat. The command posts and exits; finish your turn. \
          Do not wait, poll --wait, offer choices, or start a deputy/waiter. \
          The chat discusses the decision with the owner and uses `magi task control` to apply it. \
-         Merge approval requires the owner's explicit PR-head-bound chat button; silence is a hold. \
+         The chat agent records the owner's decisions, including merge, with `magi task control decide` without quote evidence; silence is a hold. \
          Questions without an associated task retain the legacy foreground question workflow. \
          Only for those legacy questions, `magi ask --thread <id>` replies and waits again. \
          Legacy evidence panels use `--panel panel.html --asset shot.png`: no JavaScript runs and \
@@ -3785,7 +3785,7 @@ mod tests {
         assert!(p.contains("command posts and exits"));
         assert!(p.contains("Do not wait"));
         assert!(p.contains("magi task control"));
-        assert!(p.contains("PR-head-bound chat button"));
+        assert!(p.contains("without quote evidence; silence is a hold"));
         assert!(!p.contains("--choice SQLite"));
     }
 

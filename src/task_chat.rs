@@ -49,9 +49,8 @@ pub(crate) fn chat_routable(q: &Question) -> bool {
 /// Routed questions whose answer is consumed by machinery (the posting gate,
 /// the branch-divergence reconcile, the release watcher) rather than by a
 /// step-1 control command. They stay open after delivery and the chat settles
-/// them with `magi task control decide`, under the evidence rules `magi
-/// answer` applies from a chat. Approvals also accept recovery decisions here;
-/// merge consent itself always requires the owner's button.
+/// them with `magi task control decide`, including merge and recovery decisions.
+/// The agent records the owner's request without quote evidence.
 pub fn awaits_decision(q: &Question) -> bool {
     q.merge_target.is_some()
         || (chat_routable(q)
@@ -126,12 +125,12 @@ pub fn post(
                 crate::prompt::TASK_MESSAGE_HEADING, clean(&q.summary), clean(&q.detail),
                 task.id, run, clean(pr), task.status.as_str());
             let instructions = if let Some(target) = &q.merge_target {
-                format!("\nMerge decision {} for PR {} at head {}: explain the decision and include this full question ID in your reply to offer the chat buttons. Only the owner can click Merge or Hold. Never approve from text or an agent command. For non-merge recovery (repair, dismiss, withdraw or replacement), discuss the owner's intent as free text and use `magi task control decide {} <option> --quote <entire latest owner message>`; exact consequence confirmation and all existing transition checks still apply. Silence is a hold.\n", q.id, target.pr, target.head, q.id)
+                format!("\nMerge decision {} for PR {} at head {}: explain the decision and include this full question ID in your reply to offer the chat buttons. Buttons are optional; record the owner's merge request directly with `magi task control decide {} merge`. For non-merge recovery (repair, dismiss, withdraw or replacement), discuss the owner's intent as free text and use `magi task control decide {} <option>`; existing transition checks still apply. Silence is a hold.\n", q.id, target.pr, target.head, q.id, q.id)
             } else if awaits_decision(q) {
                 let offered = if q.choices.is_empty() { String::new() } else {
                     format!(" The recorded options are: {}.", q.choices.iter().map(|c| format!("`{c}`")).collect::<Vec<_>>().join(", "))
                 };
-                format!("\nDecision {}: discuss it with the owner as free text.{offered} Apply the owner's decision only with `magi task control decide {} <option> --quote <entire latest owner message>`; its authorization, exact-content and consequence checks still apply. Do not decide without the owner's explicit words and do not start a deputy/waiter. Silence is a hold.\n", q.id, q.id)
+                format!("\nDecision {}: discuss it with the owner as free text.{offered} Apply the owner's decision only with `magi task control decide {} <option>`; its task ownership and existing transition checks still apply. No quote or extra consent evidence is required. Do not decide without the owner's explicit words and do not start a deputy/waiter. Silence is a hold.\n", q.id, q.id)
             } else {
                 "\nDiscuss this free-text decision with the owner. Apply decisions only through `magi task control`. Do not answer the legacy question or start a deputy/waiter.\n".into()
             };
@@ -196,8 +195,8 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
                 r.routed_chat = Some(chat.clone());
                 if awaits_decision(r) {
                     // Its answer is still read by the machinery behind it; the
-                    // chat's own consultation record is what the evidence
-                    // rules bind the decision to.
+                    // consultation link keeps compatibility consumers and
+                    // conversation context associated with the decision.
                     r.consult.get_or_insert_with(|| crate::ask::ChatConsult {
                         talk: chat.clone(),
                         at: jiff::Timestamp::now(),
@@ -258,7 +257,7 @@ mod tests {
     use crate::ask::{Answer, QuestionStatus};
 
     #[test]
-    fn only_matching_owner_button_can_settle_routed_merge() {
+    fn routed_merge_accepts_direct_answers_and_checks_optional_button_binding() {
         let mut q = Question::new(
             "run".into(),
             crate::land::APPROVAL_NODE.into(),
@@ -274,7 +273,7 @@ mod tests {
             head: "head-a".into(),
             language: "en".into(),
         });
-        assert!(q.answer(Answer::Choice("merge".into())).is_err());
+        assert!(q.clone().answer(Answer::Choice("merge".into())).is_ok());
         assert!(
             q.settle_by_deputy("seat", "merge", "merge head-a", None)
                 .is_err()
@@ -326,7 +325,9 @@ mod tests {
             assert!(chat_routable(&triage) && awaits_decision(&triage));
         }
         let mut acted = q("conduct", "conductor", vec!["finish".into(), "hold".into()]);
-        acted.actions.insert("finish".into(), crate::ask::ChoiceAction::Done);
+        acted
+            .actions
+            .insert("finish".into(), crate::ask::ChoiceAction::Done);
         assert!(chat_routable(&acted) && awaits_decision(&acted));
         let diverged = q(
             crate::reconcile::NODE,
