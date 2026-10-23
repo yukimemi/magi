@@ -1718,6 +1718,12 @@ impl Questions {
             if q.node == crate::bump::NOTICE_NODE {
                 continue;
             }
+            // A routed task decision not yet delivered is a pending message
+            // for the chat, not a question the dead seat waits on; the
+            // sweep retires it once it is queued.
+            if q.routed_task.is_some() && q.routed_chat.is_none() {
+                continue;
+            }
             q.abandon(&why);
             self.put(&mut q)?;
             abandoned += 1;
@@ -2346,6 +2352,20 @@ mod tests {
 
         // A second call against the same, now-settled run finds nothing left.
         assert_eq!(store.settle_run(&q.run, RunStatus::Failed).unwrap(), 0);
+    }
+
+    #[test]
+    fn settle_run_keeps_an_undelivered_routed_decision() {
+        let (_dir, store) = store();
+        let mut q = choice_question();
+        q.routed_task = Some("task".into());
+        store.put(&mut q).unwrap();
+        assert_eq!(store.settle_run(&q.run, RunStatus::Failed).unwrap(), 0);
+        assert!(store.get(&q.id).unwrap().status.open());
+
+        // Once the chat has it, the ordinary settlement applies again.
+        store.update(&q.id, |r| { r.routed_chat = Some("chat".into()); Ok(()) }).unwrap();
+        assert_eq!(store.settle_run(&q.run, RunStatus::Failed).unwrap(), 1);
     }
 
     fn choice_question() -> Question {
