@@ -5062,25 +5062,6 @@ async fn run_refresh_keeps_question_focus_and_blocks_stale_actions() {
         fx.config.clone(),
     );
     run.save_under(&home).unwrap();
-    let mut merged = RunState::new(
-        fx.repo.clone(),
-        "main".into(),
-        "0000000".into(),
-        "Merged run with identical core and evidence payloads".into(),
-        fx.config.clone(),
-    );
-    merged.id = "20260901-000009-cc09".into();
-    merged.status = RunStatus::Merged;
-    merged.pr = Some(magi::run::PrRecord {
-        url: "https://github.com/example/repo/pull/7".into(),
-        number: 7,
-        state: "merged".into(),
-        checks: "green".into(),
-        round: 0,
-        rounds: 3,
-        red_at_merge: Vec::new(),
-    });
-    merged.save_under(&home).unwrap();
     let questions = magi::ask::Questions::at(home.join("questions"));
     let mut q = magi::ask::Question::new(
         run.id.clone(),
@@ -5139,6 +5120,67 @@ async fn run_refresh_keeps_question_focus_and_blocks_stale_actions() {
       button.click();
       const failure = document.activeElement === box && !panel.hidden
         && box.value === 'An unfinished answer' && clicked === 0;
+      return {pending, success, failure};
+    })()"#).await.unwrap();
+    assert_eq!(
+        out,
+        serde_json::json!({
+            "pending": true,
+            "success": true,
+            "failure": true,
+        })
+    );
+    browser.close_page(&page).await;
+}
+
+/// The evidence-ready transition must render the sections gated on it even
+/// when the evidence payload equals what core already put on screen.
+#[tokio::test]
+async fn run_landing_renders_when_core_precedes_identical_evidence() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP run core-before-evidence: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let mut merged = RunState::new(
+        fx.repo.clone(),
+        "main".into(),
+        "0000000".into(),
+        "Merged run with identical core and evidence payloads".into(),
+        fx.config.clone(),
+    );
+    merged.id = "20260901-000009-cc09".into();
+    merged.status = RunStatus::Merged;
+    merged.pr = Some(magi::run::PrRecord {
+        url: "https://github.com/example/repo/pull/7".into(),
+        number: 7,
+        state: "merged".into(),
+        checks: "green".into(),
+        round: 0,
+        rounds: 3,
+        red_at_merge: Vec::new(),
+    });
+    merged.save_under(&home).unwrap();
+    let base = serve_with_client_probe(
+        &home,
+        Queue::at(home.join("queue")),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Run,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    let page = browser.open_page(&base, 1280, 900, false).await.unwrap();
+    browser
+        .wait_for(&page, "!!window.deck", Duration::from_secs(30))
+        .await
+        .unwrap();
+    let out = browser.eval(&page, r#"(async () => {
+      const originalFetch = window.fetch;
       let markCoreReady;
       const coreReady = new Promise(r => markCoreReady = r);
       let releaseEvidence;
@@ -5175,14 +5217,11 @@ async fn run_refresh_keeps_question_focus_and_blocks_stale_actions() {
       const landRendered = deck.state.detail.evidenceError === false
         && !!document.querySelector('#run-land .land-top');
       window.fetch = originalFetch;
-      return {pending, success, failure, coreBeforeEvidence, identicalPayloads, landRendered};
+      return {coreBeforeEvidence, identicalPayloads, landRendered};
     })()"#).await.unwrap();
     assert_eq!(
         out,
         serde_json::json!({
-            "pending": true,
-            "success": true,
-            "failure": true,
             "coreBeforeEvidence": true,
             "identicalPayloads": true,
             "landRendered": true,
