@@ -241,7 +241,7 @@ async fn serve_with_client_probe(
         ),
         ClientProbe::Settings => Some("settingsState, renderSettings, loadSettings, saveSettings"),
         ClientProbe::Questions => Some(
-            "state, shortId, renderQuestions, renderAsks, openPanel, closePanel, focusFirstAsk",
+            "state, storeReads, loadQuestionOrigins, shortId, renderQuestions, renderAsks, openPanel, closePanel, focusFirstAsk",
         ),
         ClientProbe::Run => Some("state, loadRun"),
         ClientProbe::Upgrade => {
@@ -3937,6 +3937,33 @@ async fn dep_graph_labels_are_truncated_by_display_width() {
     assert_eq!(out["short"], true);
 }
 
+struct QuestionSeed<'a> {
+    id: &'a str,
+    run: &'a str,
+    node: &'a str,
+    seat: &'a str,
+    summary: &'a str,
+    asked_at: &'a str,
+    choices: &'a [&'a str],
+}
+
+fn seed_questions(home: &std::path::Path, seeds: &[QuestionSeed<'_>]) {
+    let store = magi::ask::Questions::at(home.join("questions"));
+    for seed in seeds {
+        let mut q = magi::ask::Question::new(
+            seed.run.to_owned(),
+            seed.node.to_owned(),
+            seed.seat.to_owned(),
+            seed.summary.to_owned(),
+            String::new(),
+            seed.choices.iter().map(|c| (*c).to_owned()).collect(),
+        );
+        q.id = seed.id.to_owned();
+        q.asked_at = seed.asked_at.parse().expect("valid question timestamp");
+        store.put_executable(&mut q).expect("seed question");
+    }
+}
+
 /// Persisted question IDs stay visible in each treatment and survive the same
 /// keyed reconciliation used by SSE, without taking focus from an answer.
 #[tokio::test]
@@ -3949,6 +3976,41 @@ async fn question_identity_disclosure_copy_and_live_updates() {
     let guard = common::home_lock().await;
     let fx = common::fixture(guard, common::Judges::Unanimous, false);
     let home = fx.tmp.path().join("magi-home");
+    seed_questions(
+        &home,
+        &[
+            QuestionSeed {
+                id: "20261012-230524-5d55",
+                run: "20261012-230500-aaaa",
+                node: magi::github_text::ASK_NODE,
+                seat: magi::github_text::ASK_SEAT,
+                summary: "Choose the posting text",
+                asked_at: "2026-10-12T23:05:26Z",
+                choices: &[
+                    magi::github_text::USE_FALLBACK,
+                    magi::github_text::POST_ORIGINAL,
+                ],
+            },
+            QuestionSeed {
+                id: "20261012-230525-bbbb",
+                run: "20261012-230500-aaaa",
+                node: "implement",
+                seat: "impl-A",
+                summary: "Choose the posting text",
+                asked_at: "2026-10-12T23:05:25Z",
+                choices: &[],
+            },
+            QuestionSeed {
+                id: "20261012-230526-cccc",
+                run: "20261012-230500-aaaa",
+                node: magi::land::APPROVAL_NODE,
+                seat: "land",
+                summary: "Choose the posting text",
+                asked_at: "2026-10-12T23:05:24Z",
+                choices: &[magi::land::APPROVE, magi::land::HOLD],
+            },
+        ],
+    );
     let base = serve_with_client_probe(
         &home,
         Queue::at(home.join("queue")),
@@ -3967,7 +4029,7 @@ async fn question_identity_disclosure_copy_and_live_updates() {
         browser
             .wait_for(
                 &page,
-                "!!window.deck && deck.state.questions !== null",
+                "!!window.deck && Array.isArray(deck.state.questions) && deck.state.questions.length === 3",
                 Duration::from_secs(30),
             )
             .await
@@ -3991,13 +4053,13 @@ async fn question_identity_disclosure_copy_and_live_updates() {
         let out = browser.eval(&page, r##"(async () => {
           const check = (ok, why) => { if (!ok) throw new Error(why); };
           await window.queueReady;
+          while (deck.storeReads.get('questions')) await deck.storeReads.get('questions').promise;
+          await deck.loadQuestionOrigins();
           await new Promise(r => requestAnimationFrame(r));
-          const q = { id: '20261012-230524-5d55', run: '20261012-230500-aaaa',
-            status: 'open', summary: 'Choose the posting text', detail: '',
-            asked_at: '2026-10-12T23:05:24Z', node: 'posting-gate', choices: ['use fallback', 'post original'] };
-          const normal = { ...q, id: '20261012-230525-bbbb', node: 'implement', choices: [] };
-          const merge = { ...q, id: '20261012-230526-cccc', node: 'land-approval', choices: ['merge', 'hold'] };
-          deck.state.questions = [q, normal, merge]; deck.renderQuestions();
+          const q = deck.state.questions.find(item => item.id === '20261012-230524-5d55');
+          const normal = deck.state.questions.find(item => item.id === '20261012-230525-bbbb');
+          const merge = deck.state.questions.find(item => item.id === '20261012-230526-cccc');
+          check(Boolean(q && normal && merge), 'seeded questions missing');
           const rows = [...document.querySelectorAll('#questions-list .ask')];
           check(rows.length === 3, 'question cards missing');
           check(rows.map(r => r.querySelector('summary').textContent).join(',') === '#5d55,#bbbb,#cccc', 'wrong short IDs');
@@ -4645,9 +4707,34 @@ async fn question_chat_link_survives_consultation_and_settlement() {
     )
     .unwrap();
     talk::record(&mut chat, &talks, "Question origin chat", Vec::new()).unwrap();
+    let queue = Queue::at(home.join("queue"));
+    let mut task = Task::new(
+        "Question origin task".into(),
+        "Instruction".into(),
+        fx.repo.clone(),
+        Source::Agent {
+            run: chat.id.clone(),
+            node: magi::queue::CHAT_NODE.into(),
+        },
+    );
+    task.status = TaskStatus::Running;
+    task.runs = vec!["run".into()];
+    queue.put(&mut task).unwrap();
+    seed_questions(
+        &home,
+        &[QuestionSeed {
+            id: "question-chat-link",
+            run: "run",
+            node: "implement",
+            seat: "impl-A",
+            summary: "Choose a backend",
+            asked_at: "2026-10-12T23:05:24Z",
+            choices: &[],
+        }],
+    );
     let base = serve_with_client_probe(
         &home,
-        Queue::at(home.join("queue")),
+        queue,
         talks,
         home.join("runs"),
         &fx.repo,
@@ -4663,7 +4750,7 @@ async fn question_chat_link_survives_consultation_and_settlement() {
         browser
             .wait_for(
                 &page,
-                "!!window.deck && deck.state.questions !== null",
+                "!!window.deck && Array.isArray(deck.state.questions) && deck.state.questions.length === 1",
                 Duration::from_secs(30),
             )
             .await
@@ -4674,10 +4761,11 @@ async fn question_chat_link_survives_consultation_and_settlement() {
             .unwrap();
         let out = browser.eval(&page, r##"(async () => {
           await window.queueReady;
+          while (deck.storeReads.get('questions')) await deck.storeReads.get('questions').promise;
+          await deck.loadQuestionOrigins();
           const check = (ok, why) => { if (!ok) throw new Error(why); };
-          const q = { id: 'question-chat-link', run: 'run', status: 'open',
-            summary: 'Choose a backend', detail: '', asked_at: '2026-10-12T23:05:24Z',
-            node: 'implement', choices: [], origin_chat: originChat, can_consult_chat: true };
+          const q = deck.state.questions.find(item => item.id === 'question-chat-link');
+          check(q && q.origin_chat === originChat && q.can_consult_chat, 'origin chat not loaded');
           const render = (patch = {}) => {
             Object.assign(q, patch); deck.state.questions = [{ ...q }]; deck.renderQuestions();
           };
