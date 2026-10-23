@@ -871,12 +871,17 @@ impl Talks {
         // Explicit provenance must remain on disk, even without attachments.
         let mut persisted = t.clone();
         for turn in &mut persisted.turns {
-            if turn.attachments.is_empty() && messages_need_no_metadata(&turn.messages) {
+            if turn.attachments.is_empty()
+                && messages_need_no_metadata(&turn.messages)
+                && plain_messages(&turn.body, turn.breaks.as_deref()) == turn.messages
+            {
                 turn.messages.clear();
             }
         }
         if persisted.pending_attachments.is_empty()
             && messages_need_no_metadata(&persisted.pending_messages)
+            && plain_messages(&persisted.pending, persisted.pending_breaks.as_deref())
+                == persisted.pending_messages
         {
             persisted.pending_messages.clear();
         }

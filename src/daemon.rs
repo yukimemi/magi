@@ -984,9 +984,7 @@ where
                         ActionDecision::Resume(run.clone())
                     }
                 }
-                Ok(s) if s.liveness(false) == Liveness::Live => {
-                    ActionDecision::Refuse("run already has a live driver".into())
-                }
+                Ok(s) if s.liveness(false) == Liveness::Live => ActionDecision::Skip,
                 Ok(s) if crate::handover::can_resume(&s) => ActionDecision::Resume(run.clone()),
                 Ok(s) => match crate::continuation::classify(&s) {
                     crate::continuation::Continuation::RepairAndReview { branch } => {
@@ -3847,9 +3845,9 @@ async fn attempt(
     // failure shows it up as `held`/`failed` with the run state unreadable.
     // `crate::conduct` chose `Review` for this task on an earlier cycle: its
     // branch survived, and this reopens exactly that branch as a
-    // review-only pass rather than resuming or competing again. Consumed
-    // (cleared) here whichever way this goes, so it never outlives this one
-    // attempt - see `queue::Task::review_branch`.
+    // review-only pass rather than resuming or competing again. Ordinary
+    // review hints are consumed here; an approved continuation keeps its
+    // target until successful startup - see `queue::Task::review_branch`.
     let approved_review = task.approved_review;
     let review_branch = take_review_branch(task, previous.as_ref());
     let branch_exists = match &review_branch {
@@ -5285,8 +5283,13 @@ fn choose_starter(
 
 /// Consume a retained review only while its authored criteria still match.
 fn take_review_branch(task: &mut Task, previous: Option<&RunState>) -> Option<String> {
-    let branch = task.review_branch.take();
-    let instruction = task.review_instruction.take();
+    // Startup can wait or fail before Task::start. Keep the approval and its
+    // target together until that successful start consumes both.
+    let (branch, instruction) = if task.approved_review {
+        (task.review_branch.clone(), task.review_instruction.clone())
+    } else {
+        (task.review_branch.take(), task.review_instruction.take())
+    };
     branch.filter(|branch| match &instruction {
         Some(authored) => *authored == task.instruction,
         // Legacy retained branches must agree with their prior run; only an
@@ -5959,6 +5962,30 @@ mod tests {
             take_review_branch(&mut t, Some(&run)).is_none(),
             "legacy retained candidate cannot replace a revised approved head"
         );
+    }
+
+    #[test]
+    fn approved_review_target_survives_startup_selection_and_resource_wait() {
+        let mut task = task();
+        task.request_approved_review("approved-head".into());
+        for parked in [false, true] {
+            assert_eq!(
+                take_review_branch(&mut task, None).as_deref(),
+                Some("approved-head")
+            );
+            if parked {
+                task.park("repository busy");
+            } else {
+                task.hold_machine(Some("repository busy".into()));
+            }
+            task = serde_json::from_str(&serde_json::to_string(&task).unwrap()).unwrap();
+            task.release_operator("triage", None);
+            assert!(task.approved_review);
+            assert_eq!(task.review_branch.as_deref(), Some("approved-head"));
+        }
+        task.start("new-review".into());
+        assert!(!task.approved_review);
+        assert!(task.review_branch.is_none());
     }
 
     #[test]

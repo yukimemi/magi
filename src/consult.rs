@@ -223,110 +223,68 @@ impl TaskOperation {
 /// name the task (its full id or a prefix of at least four characters) with
 /// exactly one verb class, so nothing is inferred from a stray word.
 pub fn natural_matches(words: &str, operation: &TaskOperation) -> bool {
-    // "hold" is itself a hedge word for merges; for a hold request it is the
-    // verb, so it is removed before the doubt check (other doubt still voids).
-    let neutral = if matches!(operation, TaskOperation::Hold { .. }) {
-        words
-            .replace("hold", "")
-            .replace("保留", "")
-            .replace("止め", "")
-    } else {
-        words.to_owned()
-    };
-    if !crate::land::unhedged(&neutral, &neutral) {
+    // Match the complete instruction. Never discard punctuation, signs or
+    // non-ASCII clauses: those can change the meaning of consent.
+    if words.starts_with("    ") || words.starts_with('\t') {
         return false;
     }
-    let lower = words.to_lowercase();
-    let release_words = ["release", "resume", "continue"];
-    let release_ja = ["再開", "解放", "リリース"];
-    let hold_words = ["hold", "pause"];
-    let hold_ja = ["保留", "止め"];
-    let tokens: Vec<&str> = lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .collect();
-    let has = |ws: &[&str], ja: &[&str]| {
-        tokens.iter().any(|t| ws.contains(t)) || ja.iter().any(|w| lower.contains(w))
-    };
-    // The task reference: one token that is the id or a prefix of it.
-    let task_token = |task: &str| {
-        tokens
-            .iter()
-            .position(|t| t.len() >= 4 && task.to_lowercase().starts_with(t))
-    };
-    // Every other ASCII word must be a plain filler: a message that carries
-    // additional content ("review the release notes for task ...") is not an
-    // instruction to run exactly this operation.
-    let fillers = [
-        "please", "task", "the", "it", "to", "now", "ok", "okay", "yes", "go", "ahead", "and", "a",
-        "this", "that", "you", "can", "may", "set", "change", "make", "of", "priority", "add",
-        "file", "new", "work", "again", "is", "fine", "good",
-    ];
-    let clean = |skip: &[usize], extra: &[&str]| {
-        tokens.iter().enumerate().all(|(i, t)| {
-            skip.contains(&i)
-                || fillers.contains(t)
-                || release_words.contains(t)
-                || hold_words.contains(t)
-                || extra.contains(t)
-        })
-    };
-    match operation {
-        TaskOperation::Release { task } => {
-            let Some(at) = task_token(task) else {
-                return false;
-            };
-            has(&release_words, &release_ja)
-                && !has(&hold_words, &hold_ja)
-                && !tokens
-                    .iter()
-                    .any(|t| *t == "add" || *t == "set" || *t == "priority")
-                && clean(&[at], &[])
-        }
-        TaskOperation::Hold { task, reason } => {
-            let Some(at) = task_token(task) else {
-                return false;
-            };
-            has(&hold_words, &hold_ja)
-                && !has(&release_words, &release_ja)
-                && !reason.trim().is_empty()
-                && clean(&[at], &[])
-        }
-        TaskOperation::Priority { task, priority } => {
-            let Some(at) = task_token(task) else {
-                return false;
-            };
-            if *priority < 0 || !(tokens.contains(&"priority") || lower.contains("優先")) {
-                return false;
-            }
-            // The stated value is a token of its own, never a digit of the id.
-            let numbers: Vec<usize> = tokens
+    let lower = words.trim().to_lowercase();
+    let text = lower.trim_end_matches(['.', '!', '。', '！']).trim();
+    let text = text.strip_prefix("please ").unwrap_or(text);
+    let text = text.strip_suffix(" now").unwrap_or(text);
+    if let TaskOperation::Add { instruction, solo } = operation {
+        let prefixes: &[&str] = if *solo {
+            &["add solo task: ", "add a solo task to "]
+        } else {
+            &["add task: ", "add a task to "]
+        };
+        return !instruction.trim().is_empty()
+            && (prefixes
                 .iter()
-                .enumerate()
-                .filter(|(i, t)| *i != at && t.chars().all(|c| c.is_ascii_digit()))
-                .map(|(i, _)| i)
-                .collect();
-            numbers.len() == 1
-                && tokens[numbers[0]].parse::<i32>().ok() == Some(*priority)
-                && clean(&[at, numbers[0]], &[])
-        }
-        TaskOperation::Add { instruction, .. } => {
-            let text = instruction.trim();
-            if text.is_empty() || !words.contains(text) {
-                return false;
-            }
-            let rest = words.replacen(text, " ", 1).to_lowercase();
-            let rest_tokens: Vec<&str> = rest
-                .split(|c: char| !c.is_ascii_alphanumeric())
-                .filter(|t| !t.is_empty())
-                .collect();
-            (rest_tokens.contains(&"add")
-                || rest_tokens.contains(&"file")
-                || words.contains("追加"))
-                && rest_tokens.iter().all(|t| fillers.contains(t))
-        }
-        TaskOperation::Done { .. } => false,
+                .any(|prefix| words.trim() == format!("{prefix}{instruction}"))
+                || (!*solo && words.trim() == format!("{instruction}をタスクに追加してください")));
     }
+    let task = match operation {
+        TaskOperation::Release { task }
+        | TaskOperation::Hold { task, .. }
+        | TaskOperation::Priority { task, .. } => task.to_lowercase(),
+        _ => return false,
+    };
+    // Queue resolution checks prefix uniqueness before this evidence check.
+    (4..=task.len())
+        .filter(|&end| task.is_char_boundary(end))
+        .any(|end| {
+            let id = &task[..end];
+            match operation {
+                TaskOperation::Release { .. } => {
+                    ["release", "resume", "continue"].iter().any(|verb| {
+                        text == format!("{verb} task {id}")
+                            || text == format!("you may {verb} task {id}")
+                    }) || ["再開", "解放", "リリース"].iter().any(|verb| {
+                        ["してよい", "してください", "して", "をお願いします"]
+                            .iter()
+                            .any(|ending| text == format!("タスク{id}を{verb}{ending}"))
+                    })
+                }
+                TaskOperation::Hold { reason, .. } => {
+                    !reason.trim().is_empty()
+                        && (["hold", "pause"]
+                            .iter()
+                            .any(|verb| text == format!("{verb} task {id}"))
+                            || ["して", "してよい", "してください"]
+                                .iter()
+                                .any(|ending| text == format!("タスク{id}を保留{ending}")))
+                }
+                TaskOperation::Priority { priority, .. } => {
+                    text == format!("set task {id} priority to {priority}")
+                        || text == format!("set priority of task {id} to {priority}")
+                        || ["して", "してください", "する"].iter().any(|ending| {
+                            text == format!("タスク{id}の優先度を{priority}に{ending}")
+                        })
+                }
+                _ => false,
+            }
+        })
 }
 
 fn delivered_instruction<'a>(
@@ -1177,6 +1135,9 @@ fn current_instruction(talk: &Talk) -> Option<(usize, usize, &str)> {
         // never from a guessed last paragraph. The whole-message grammar also
         // excludes generated legacy wrappers.
         if send.sender.is_none()
+            && !(turn.sender == Some(talk::Sender::Operator)
+                && turn.messages.len() == 1
+                && turn.body == send.body)
             && (turn.breaks.is_none()
                 || turn
                     .messages
@@ -2028,10 +1989,30 @@ mod tests {
         let release = TaskOperation::Release {
             task: "6af7c0de1234".into(),
         };
-        assert!(
-            natural_matches("タスク6af7を再開してよい", &release)
-                || natural_matches("Please release task 6af7c0de1234", &release)
-        );
+        assert!(natural_matches("タスク6af7を再開してよい", &release));
+        assert!(natural_matches(
+            "Please release task 6af7c0de1234",
+            &release
+        ));
+        // Extra Japanese content or a dropped sign is never consent.
+        assert!(!natural_matches("タスク6af7の再開手順を説明して", &release));
+        for extra in [
+            "タスク6af7を再開して別のタスクを削除して",
+            "タスク6af7を再開してよいとは言っていない",
+            "explain how to resume task 6af7",
+            "> resume task 6af7",
+            "    resume task 6af7",
+        ] {
+            assert!(!natural_matches(extra, &release), "{extra}");
+        }
+        let prio = |n| TaskOperation::Priority {
+            task: "6af7c0de1234".into(),
+            priority: n,
+        };
+        assert!(!natural_matches("Set task 6af7 priority to -9", &prio(9)));
+        assert!(natural_matches("Set task 6af7 priority to -9", &prio(-9)));
+        assert!(!natural_matches("Set task 6af7 priority to −9", &prio(9)));
+        assert!(!natural_matches("Set task 6af7 priority to 9.5", &prio(9)));
         assert!(natural_matches("Please release task 6af7 now", &release));
         // Hedged, wrong task, or mixed verbs are never enough.
         assert!(!natural_matches("Maybe release task 6af7", &release));
@@ -2047,6 +2028,23 @@ mod tests {
             reason: "owner asked".into(),
         };
         assert!(natural_matches("hold task 6af7", &hold));
+        assert!(natural_matches("タスク6af7を保留してください", &hold));
+        assert!(natural_matches(
+            "タスク6af7の優先度を-9にしてください",
+            &prio(-9)
+        ));
+        let add = TaskOperation::Add {
+            instruction: "日本語の作業内容".into(),
+            solo: false,
+        };
+        assert!(natural_matches("add task: 日本語の作業内容", &add));
+        assert!(natural_matches(
+            "日本語の作業内容をタスクに追加してください",
+            &add
+        ));
+        assert!(natural_matches("add a task to 日本語の作業内容", &add));
+        assert!(!natural_matches("add solo task: 日本語の作業内容", &add));
+        assert!(!natural_matches("add task: 別の作業内容", &add));
         assert!(!natural_matches("hold task 6af7", &release));
         // Mentioning the task is not an instruction to release it.
         assert!(!natural_matches(
@@ -2148,6 +2146,44 @@ mod tests {
             "SQLite is simpler.".to_owned(),
             vec!["SQLite".to_owned(), "Redis".to_owned()],
         )
+    }
+
+    #[test]
+    fn persisted_task_instruction_accepts_the_whole_send_and_rejects_stale_evidence() {
+        let (tmp, store, mut talk) = talks();
+        let questions = Questions::at(tmp.path().join("questions"));
+        let mut q = question("implement");
+        questions.put(&mut q).unwrap();
+        begin(&questions, &store, &q, &talk).unwrap();
+        talk = store.get(&talk.id).unwrap();
+        talk::drain(&mut talk, &store).unwrap();
+        let words = "タスク6af7を再開してよい";
+        talk::record(&mut talk, &store, words, vec![]).unwrap();
+        let op = TaskOperation::Release {
+            task: "6af7c0de1234".into(),
+        };
+        let check = |talk: &Talk, quote| authorize_task_operation(&questions, talk, &op, quote);
+        assert!(check(&store.get(&talk.id).unwrap(), Some(words)).is_ok());
+        assert!(check(&talk, Some("再開してよい")).is_err());
+        // An explicitly attributed single send remains whole even when old
+        // message metadata has no sender or paragraph-boundary field.
+        let turn = talk.turns.last_mut().unwrap();
+        turn.messages[0].sender = None;
+        turn.breaks = None;
+        store.put(&mut talk).unwrap();
+        assert!(check(&store.get(&talk.id).unwrap(), Some(words)).is_ok());
+        // Generated notices cannot retract or authorize real owner words.
+        let mut generated = talk.turns.last().unwrap().clone();
+        generated.sender = Some(talk::Sender::Magi);
+        generated.body = "release task 6af7".into();
+        generated.messages[0].body = generated.body.clone();
+        generated.messages[0].sender = Some(talk::Sender::Magi);
+        talk.turns.push(generated);
+        store.put(&mut talk).unwrap();
+        assert!(check(&talk, Some(words)).is_ok());
+        talk::record(&mut talk, &store, "待って、再開しないで", vec![]).unwrap();
+        assert!(check(&talk, Some(words)).is_err());
+        assert!(check(&talk, Some("待って、再開しないで")).is_err());
     }
 
     #[test]

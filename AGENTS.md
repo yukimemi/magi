@@ -3254,7 +3254,7 @@ budget apart: `ReviewFailed` (a seat never answered), `VerificationComplete`
 
 - `daemon::decide_action` maps a `Resume` that admission would reject, on a
   Blocked run with a spent budget and a surviving winner branch, to
-  `ActionDecision::Review`: `Task::request_review(branch)` through the existing
+  `ActionDecision::Review`: `Task::request_approved_review(branch)` through the existing
   takeover path (same task, same public PR head, history kept). It never merges,
   discards, folds or starts a competition, and the event/notice says which
   transition was chosen. Merge approval stays head-bound.
@@ -3266,10 +3266,33 @@ budget apart: `ReviewFailed` (a seat never answered), `VerificationComplete`
   falling back to a fresh competition, and its review budget is at least two
   rounds (`daemon::apply_options`) so a fixer round precedes the final review.
 - Offers are revalidated: `continuation::revalidate_offer` drops conductor
-  `resume` choices whose run `classify` calls blocked or unreadable.
+  `resume` choices whose run is permanently blocked or unreadable, retaining a
+  safe hold if all choices disappear. A live driver is a temporary wait; its
+  answer remains pending until the driver exits. Triage checks the prior run
+  before offering release, and checks again when applying the answer. Landing
+  omits repair when there is no recorded review for its consumer to snapshot.
 - Consultation task operations accept unambiguous natural language
   (`consult::natural_matches`: release, hold, priority, add; the whole message
   unhedged and naming the task) in addition to the typed JSON. `done` stays typed.
   The quote must still equal the entire latest persisted owner message.
-- Known follow-up: approval-reason rendering and the triage/land builders'
-  offer-time filtering are not covered by this change.
+- `magi task release` and triage use `continuation::release_task`: exhausted
+  reviews select an approved bounded branch review; a resumable run whose
+  admission is blocked (for example review complete, gate failed), or an
+  unreadable prior record, stays held with the specific precondition and the
+  approved intent recorded. The approved review target survives resource
+  waits, startup failures and subsequent releases until `Task::start`.
+- Natural-language consent matches the complete command, including Japanese
+  clauses and signed priority values. For example `タスク6af7を再開してよい`
+  resumes existing work; a request to explain how to resume does not execute.
+  `Set task 6af7 priority to -9` authorizes -9 only. `add task: <text>` and
+  `add solo task: <text>` bind the exact task text and execution option.
+- Persisted evidence uses the whole latest attributed owner send. A single
+  explicitly attributed send does not require legacy paragraph boundaries.
+  `Talks::put` omits plain-message metadata only when `plain_messages` can
+  reconstruct it exactly; missing boundaries must not erase valid evidence.
+  Queued retractions, generated notices and partial quotes never authorize.
+- Approval reasons already come from `land::approval_reasons`, saved in the
+  question detail and panel by `approval_evidence`. The saved snapshot includes
+  open blocking findings and final rejecting votes, independent of a green
+  gate, and remains visible through consultation. Legacy cards without that
+  snapshot report the missing evidence instead of inventing original reasons.

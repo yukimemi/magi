@@ -881,10 +881,14 @@ pub fn approval_choices(state: &RunState) -> Vec<String> {
     let mut choices = vec![
         APPROVE.to_owned(),
         HOLD.to_owned(),
-        REPAIR.to_owned(),
         crate::merge_decision::WITHDRAW.to_owned(),
         crate::merge_decision::DISMISS.to_owned(),
     ];
+    // The repair consumer needs a recorded review to snapshot. Without one
+    // it can only hold, so don't offer that unusable transition.
+    if !state.reviews.is_empty() {
+        choices.insert(2, REPAIR.to_owned());
+    }
     choices.extend(
         state
             .config
@@ -911,6 +915,10 @@ pub fn upgrade_repair_choice(q: &mut ask::Question, state: &RunState) -> bool {
         // Older cards attached Resume to hold; a hold must remain answerable
         // without dispatching a question action.
         q.actions.remove(HOLD);
+        if state.reviews.is_empty() {
+            q.choices.retain(|c| c != REPAIR);
+            q.actions.remove(REPAIR);
+        }
         for choice in approval_choices(state) {
             if !q.choices.contains(&choice) {
                 q.choices.push(choice);
@@ -8250,6 +8258,14 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             }
             state.reviews[0].reviews[0].vote = Some(crate::verdict::ReviewVote::Reject);
         }
+    }
+
+    #[test]
+    fn landing_does_not_offer_a_repair_the_consumer_cannot_start() {
+        let mut state = repair_state(true, false);
+        state.reviews.clear();
+        assert!(!approval_choices(&state).iter().any(|c| c == REPAIR));
+        assert!(approval_choices(&state).iter().any(|c| c == HOLD));
     }
 
     #[test]
