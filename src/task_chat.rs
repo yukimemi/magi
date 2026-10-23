@@ -55,7 +55,10 @@ pub(crate) fn chat_routable(q: &Question) -> bool {
 pub fn awaits_decision(q: &Question) -> bool {
     q.merge_target.is_some()
         || (chat_routable(q)
-            && (q.node == crate::github_text::ASK_NODE
+            // A structured action (done, resume, requeue ...) is applied by the
+            // daemon from the recorded answer, so the record must stay open.
+            && (!q.actions.is_empty()
+                || q.node == crate::github_text::ASK_NODE
                 || q.node == crate::triage::NODE
                 || q.node == crate::triage::DEPS_NODE
                 || (q.node == crate::reconcile::NODE && q.seat == crate::reconcile::SEAT)
@@ -322,6 +325,9 @@ mod tests {
             let triage = q(node, "triage", vec!["hold".into(), "discard".into()]);
             assert!(chat_routable(&triage) && awaits_decision(&triage));
         }
+        let mut acted = q("conduct", "conductor", vec!["finish".into(), "hold".into()]);
+        acted.actions.insert("finish".into(), crate::ask::ChoiceAction::Done);
+        assert!(chat_routable(&acted) && awaits_decision(&acted));
         let diverged = q(
             crate::reconcile::NODE,
             crate::reconcile::SEAT,
