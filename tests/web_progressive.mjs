@@ -622,6 +622,58 @@ for (const expired of [false, true]) test(`chat paging is on demand and recovers
   assert.equal(state.talks.length, 2);
 });
 
+for (const failSecondBatch of [false, true]) test(`coalesced chat deltas fetch all batches before applying (failure=${failSecondBatch})`, async () => {
+  const ids = Array.from({ length: 60 }, (_, i) => `chat-${i}`);
+  const requests = [];
+  const state = {
+    talks: ['starter', 'removed', ...ids].map(id => ({ id, version: 0 })),
+    talkReads: { 'chat-59': 'read-at' }, talkWaits: new Map(), rev: { talks: 'r0' },
+  };
+  const loaders = source.slice(source.indexOf('const storeReads ='), source.indexOf('function loadRuns('));
+  const chatLoaders = source.slice(source.indexOf('let talksNext ='), source.indexOf('/* Refresh one conversation.'));
+  const api = runInNewContext(`${loaders}\n${chatLoaders}\n({ loadTalks })`, {
+    state, API: { talks: '/api/talks' },
+    getJson: (url, options) => new Promise((resolve, reject) => {
+      const requested = new URL(url, 'http://localhost').searchParams.get('ids').split(',');
+      requests.push({ ids: requested, options, resolve, reject });
+    }),
+    $: () => null, sectionNotice() {}, renderTalks() {}, refreshSearch() {}, trackTalkThinking() {},
+    sortTalks: list => list, ok() {}, setTimeout: () => 1, clearTimeout() {}, incrementalListRender: false,
+  });
+  const done = api.loadTalks({ rev: 'r1', delta: { base: 'r0', changed: ['starter'], removed: [] } });
+  api.loadTalks({ rev: 'r2', delta: { base: 'r1', changed: ids.slice(0, 30), removed: [] } });
+  api.loadTalks({ rev: 'r3', delta: { base: 'r2', changed: ids.slice(30), removed: ['removed'] } });
+  requests[0].resolve([{ id: 'starter', version: 1 }]);
+  await flush();
+  assert.equal(requests[1].ids.length, 50);
+  requests[1].resolve(requests[1].ids.map(id => ({ id, version: 1 })));
+  await flush();
+  assert.equal(requests[2].ids.length, 10);
+  assert.equal(state.rev.talks, 'r1', 'revision waits for all batches');
+  assert.equal(state.talks.find(row => row.id === ids[0]).version, 0, 'no partial merge');
+  if (failSecondBatch) {
+    requests[2].reject(new Error('batch failed'));
+    await done;
+    assert.equal(state.rev.talks, null, 'failed batches require recovery');
+    assert.equal(state.talks.length, 62, 'failed delta retains the snapshot');
+    assert.ok(state.talks.filter(row => ids.includes(row.id)).every(row => row.version === 0));
+  } else {
+    // A changed row absent from the server must still be removed.
+    requests[2].resolve(requests[2].ids.filter(id => id !== 'chat-58').map(id => ({ id, version: 1 })));
+    await flush();
+    assert.equal(requests[3].ids.join(','), 'chat-59');
+    assert.equal(JSON.parse(requests[3].options.headers['x-talk-reads'])['chat-59'], 'read-at');
+    requests[3].resolve([{ id: 'chat-59', version: 1, unread_count: 0 }]);
+    await done;
+    assert.equal(state.rev.talks, 'r3');
+    assert.equal(state.talks.length, 60);
+    assert.ok(!state.talks.some(row => row.id === 'removed' || row.id === 'chat-58'));
+    assert.ok(state.talks.every(row => row.version === 1));
+    assert.equal(state.talks.find(row => row.id === 'chat-59').unread_count, 0);
+    assert.deepEqual(requests.slice(1, 3).flatMap(request => request.ids), ids);
+  }
+});
+
 test('mark all read includes unloaded pages and uses captured turn timestamps', async () => {
   const saved = [];
   const state = { talks: [{ id: 'new', turns: [{ who: 'agent', at: '2026-10-20T00:00:00Z' }] }], talkReads: {} };

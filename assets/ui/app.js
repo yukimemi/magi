@@ -9511,7 +9511,16 @@ function loadStore(name, url, change, apply) {
             ? `${url}${url.includes("?") ? "&" : "?"}ids=${encodeURIComponent(delta.changed.join(","))}` : url;
           let rows;
           const paged = !partial && (name === "queue" || name === "talks");
-          if (paged) {
+          if (partial && name === "talks") {
+            // Coalesced notifications can exceed the endpoint's 50-row cap.
+            // Fetch every batch before merging or acknowledging the revision.
+            rows = [];
+            for (let i = 0; i < delta.changed.length; i += 50) {
+              const ids = delta.changed.slice(i, i + 50);
+              const batch = await getTalkRows(`${url}${url.includes("?") ? "&" : "?"}ids=${encodeURIComponent(ids.join(","))}`);
+              rows.push(...batch);
+            }
+          } else if (paged) {
             let cursor = null;
             const collected = new Map();
             do {
