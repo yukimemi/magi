@@ -407,3 +407,46 @@ async fn applied_routed_dependency_detach_stops_waiting_and_allows_a_new_decisio
     assert!(magi::triage::pending_for(&questions, &queue.get(&root.id).unwrap()));
 }
 }
+
+common::e2e! {
+async fn abandoned_dependency_decision_does_not_block_a_new_dependency_question() {
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("outbox");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let questions = Questions::at(home.join("questions"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let mut root = task(&fx.repo, Source::Human);
+    root.origin_chat = Some(chat.id.clone());
+    root.hold_manual(Some("waiting".into()));
+    queue.put(&mut root).unwrap();
+    let mut dependent = Task::new("Dependent".into(), "Work".into(), fx.repo.clone(), Source::Human);
+    dependent.block(vec![root.id.clone()], None);
+    queue.put(&mut dependent).unwrap();
+    let first = magi::triage::run_once(&queue, &questions, None, jiff::Timestamp::now());
+    assert_eq!(first.asked, [root.id.clone()]);
+    magi::task_chat::sweep(&queue, &talks, &questions, &home);
+    let first = questions.list().into_iter().find(|q| q.node == magi::triage::DEPS_NODE).unwrap();
+    assert_eq!(first.routed_chat.as_deref(), Some(chat.id.as_str()));
+    assert!(magi::triage::pending_for(&questions, &queue.get(&root.id).unwrap()));
+    dependent.release_operator("test", None);
+    queue.put(&mut dependent).unwrap();
+    magi::triage::run_once(&queue, &questions, None, jiff::Timestamp::now());
+    assert_eq!(questions.get(&first.id).unwrap().status, magi::ask::QuestionStatus::Abandoned);
+    assert!(!magi::triage::pending_for(&questions, &queue.get(&root.id).unwrap()));
+    let mut next = Task::new("New dependent".into(), "Work".into(), fx.repo.clone(), Source::Human);
+    next.block(vec![root.id.clone()], None);
+    queue.put(&mut next).unwrap();
+    let report = magi::triage::run_once(&queue, &questions, None, jiff::Timestamp::now());
+    assert_eq!(report.asked, [root.id.clone()]);
+    let current = questions.list().into_iter().find(|q| q.node == magi::triage::DEPS_NODE && q.status.open()).unwrap();
+    assert_ne!(current.id, first.id);
+    assert!(current.detail.contains(next.short()));
+    assert!(!current.detail.contains(dependent.short()));
+    assert!(magi::triage::pending_for(&questions, &queue.get(&root.id).unwrap()));
+    magi::task_chat::sweep(&queue, &talks, &questions, &home);
+    assert_eq!(questions.get(&current.id).unwrap().routed_chat, first.routed_chat);
+    assert_eq!(talks.get(&chat.id).unwrap().pending_messages.len(), 2);
+    assert!(magi::triage::run_once(&queue, &questions, None, jiff::Timestamp::now()).asked.is_empty());
+}
+}
