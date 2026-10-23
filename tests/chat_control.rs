@@ -425,10 +425,12 @@ fi
         std::fs::read_to_string(other.join("protected")).unwrap(),
         "other run"
     );
-    assert_eq!(
-        questions.get(&question.id).unwrap().status,
-        magi::ask::QuestionStatus::Abandoned
-    );
+    // The question was routed to the task chat at filing time and not yet
+    // delivered, so settling its run keeps it as a pending message instead of
+    // abandoning it (see `Questions::settle_run`).
+    let left = questions.get(&question.id).unwrap();
+    assert!(left.routed_task.is_some() && left.routed_chat.is_none());
+    assert_eq!(left.status, magi::ask::QuestionStatus::Open);
     assert_eq!(
         std::fs::read_to_string(artifacts.join("protected")).unwrap(),
         "earlier attachment"

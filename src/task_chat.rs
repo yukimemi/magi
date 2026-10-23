@@ -56,6 +56,8 @@ pub fn awaits_decision(q: &Question) -> bool {
     q.merge_target.is_some()
         || (chat_routable(q)
             && (q.node == crate::github_text::ASK_NODE
+                || q.node == crate::triage::NODE
+                || q.node == crate::triage::DEPS_NODE
                 || (q.node == crate::reconcile::NODE && q.seat == crate::reconcile::SEAT)
                 || (q.node == crate::bump::NOTICE_NODE && q.seat == "release-watch")))
 }
@@ -314,6 +316,12 @@ mod tests {
             vec!["use fallback".into()],
         );
         assert!(chat_routable(&gate) && awaits_decision(&gate));
+        // Triage discard / dependency decisions are applied by the daemon from
+        // the recorded answer, so they stay open until the chat settles them.
+        for node in [crate::triage::NODE, crate::triage::DEPS_NODE] {
+            let triage = q(node, "triage", vec!["hold".into(), "discard".into()]);
+            assert!(chat_routable(&triage) && awaits_decision(&triage));
+        }
         let diverged = q(
             crate::reconcile::NODE,
             crate::reconcile::SEAT,
