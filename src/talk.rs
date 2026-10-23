@@ -596,6 +596,7 @@ impl Talk {
 #[derive(Debug, Clone)]
 pub struct Talks {
     root: PathBuf,
+    ids: crate::id_reserve::IdSource,
     /// Serializes the read-modify-write cycle that reads a talk, decides
     /// something from its `status`, and writes the whole record back.
     /// [`close`], [`record`] and the tail of [`turn`] all take this before
@@ -619,12 +620,53 @@ impl Talks {
         Self {
             root,
             lock: Arc::new(Mutex::new(())),
+            ids: crate::id_reserve::IdSource::new(new_id),
         }
     }
 
     /// State home containing this conversation store and its detached workers.
     pub fn home(&self) -> &Path {
         self.root.parent().unwrap_or(&self.root)
+    }
+
+    /// Inject candidate ids for deterministic collision tests.
+    #[doc(hidden)]
+    pub fn with_id_source(mut self, source: impl Fn() -> String + Send + Sync + 'static) -> Self {
+        self.ids = crate::id_reserve::IdSource::custom(source);
+        self
+    }
+
+    /// Create a new conversation without reading or replacing existing data.
+    /// Orphaned artifacts and turn leases also keep their identity reserved.
+    pub fn create(&self, talk: &mut Talk) -> Result<()> {
+        std::fs::create_dir_all(&self.root).context("create talks root")?;
+        let initial = talk.id.clone();
+        self.ids.reserve(
+            (!self.ids.is_custom()).then_some(initial.as_str()),
+            "talk",
+            |id| {
+                for path in [self.path_of(id), self.artifacts_of(id), self.turn_path(id)] {
+                    if crate::id_reserve::path_exists(&path)? {
+                        return Ok(false);
+                    }
+                }
+                talk.id = id.to_owned();
+                let body = serde_json::to_string_pretty(talk).context("serialize new talk")?;
+                let path = self.path_of(id);
+                // Reserve private staging too: even identical temporary tokens
+                // must not let competing creators write through the same inode.
+                let staging = crate::id_reserve::IdSource::new(fresh_token).reserve(
+                    None,
+                    "talk staging",
+                    |token| crate::id_reserve::create_dir(&self.root.join(format!(".new-{token}"))),
+                )?;
+                let staging = self.root.join(format!(".new-{staging}"));
+                let result = publish_exclusive(&path, &staging.join("record"), &body);
+                let _ = std::fs::remove_dir(&staging);
+                result
+            },
+        )?;
+        Ok(())
     }
 
     /// Claim the right to read-modify-write a talk's `status`. A plain
@@ -837,7 +879,7 @@ impl Talks {
         std::path::absolute(&path).ok()
     }
 
-    /// Write a conversation, atomically, so a process killed mid-write leaves
+    /// Update a conversation, atomically, so a process killed mid-write leaves
     /// the previous state readable rather than a truncated file.
     ///
     /// The write-then-rename itself is retried a handful of times - see
@@ -1635,7 +1677,7 @@ pub(crate) fn begin_with_id(
         updated_at: now,
         seat: SeatState::new(SEAT, &spec.id, crate::rng::entropy()),
     };
-    store.put(&mut talk)?;
+    store.create(&mut talk)?;
     Ok(talk)
 }
 
@@ -2204,7 +2246,7 @@ fn check_lease(lease: &TurnLease, talk: &Talk) -> Result<()> {
 /// silently dropping whatever turn the other call had just appended.
 ///
 /// If the re-read fails, this errors rather than falling back to the
-/// caller's stale copy: `talk::begin` always `put`s the record before handing
+/// caller's stale copy: `talk::begin` always creates the record before handing
 /// out a `Talk`, so the only way a re-read can fail is a concurrent
 /// [`Talks::remove`] having deleted it, and writing the stale copy back would
 /// resurrect exactly what that delete removed.
@@ -3738,6 +3780,110 @@ mod tests {
                 model: m.map(str::to_owned),
             }),
         }
+    }
+
+    #[test]
+    fn creating_talks_retries_collisions_without_merging_existing_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut talks = Talks::at(tmp.path().join("talks"));
+        let first_id = "20260101-000000-abcd";
+        talks.ids = crate::id_reserve::sequence(&[first_id, first_id, "20260101-000000-1234"]);
+        let mut first = ctx_talk("original", vec![reply("transcript", None)]);
+        first.pending = "unsent draft".into();
+        first.notified.push("notice-key".into());
+        talks.create(&mut first).unwrap();
+        std::fs::create_dir_all(talks.attachments_dir(&first.id)).unwrap();
+        let asset = talks.attachments_dir(&first.id).join("keep");
+        std::fs::write(&asset, "attachment").unwrap();
+        let lease = talks.claim_turn(&first.id).unwrap().expect("turn lease");
+        let lease_before = std::fs::read(talks.turn_path(&first.id)).unwrap();
+        let record_before = std::fs::read(talks.path_of(&first.id)).unwrap();
+        let mut other_store = Talks::at(talks.root.clone());
+        other_store.ids = talks.ids.clone();
+        let mut second = ctx_talk("independent", Vec::new());
+        other_store.create(&mut second).unwrap();
+        assert_eq!(second.id, "20260101-000000-1234");
+        assert_eq!(talks.list().len(), 2);
+        assert_eq!(talks.get(&second.id).unwrap().agent, "independent");
+        assert!(talks.get(&second.id).unwrap().pending.is_empty());
+        assert!(talks.get(&second.id).unwrap().notified.is_empty());
+        assert_eq!(
+            std::fs::read(talks.path_of(&first.id)).unwrap(),
+            record_before
+        );
+        assert_eq!(
+            std::fs::read(talks.turn_path(&first.id)).unwrap(),
+            lease_before
+        );
+        assert_eq!(std::fs::read(&asset).unwrap(), b"attachment");
+        drop(lease);
+    }
+
+    #[test]
+    fn creating_talks_skips_legacy_records_and_orphaned_artifacts_or_leases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut talks = Talks::at(tmp.path().join("talks"));
+        std::fs::create_dir_all(&talks.root).unwrap();
+        std::fs::write(talks.path_of("legacy"), "old record").unwrap();
+        std::fs::create_dir(talks.artifacts_of("artifacts")).unwrap();
+        std::fs::write(talks.turn_path("lease"), "old lease").unwrap();
+        talks.ids = crate::id_reserve::sequence(&["legacy", "artifacts", "lease", "free"]);
+        let mut talk = ctx_talk("new", Vec::new());
+        talks.create(&mut talk).unwrap();
+        assert_eq!(talk.id, "free");
+        assert_eq!(
+            std::fs::read(talks.path_of("legacy")).unwrap(),
+            b"old record"
+        );
+        assert_eq!(
+            std::fs::read(talks.turn_path("lease")).unwrap(),
+            b"old lease"
+        );
+        let stuck = talks.clone().with_id_source(|| "legacy".into());
+        assert!(
+            stuck
+                .create(&mut talk)
+                .unwrap_err()
+                .to_string()
+                .contains("256 attempts")
+        );
+    }
+
+    #[test]
+    fn creating_talks_without_hard_links_still_reserves_exclusively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut talks = Talks::at(tmp.path().join("talks"));
+        talks.ids = crate::id_reserve::sequence(&["first", "first", "second"]);
+        failpoint::force_no_link(true);
+        let mut first = ctx_talk("original", Vec::new());
+        talks.create(&mut first).unwrap();
+        let before = std::fs::read(talks.path_of(&first.id)).unwrap();
+        let mut second = ctx_talk("independent", Vec::new());
+        talks.create(&mut second).unwrap();
+        failpoint::force_no_link(false);
+        assert_eq!(second.id, "second");
+        assert_eq!(std::fs::read(talks.path_of(&first.id)).unwrap(), before);
+        assert_eq!(talks.list().len(), 2);
+    }
+
+    #[test]
+    fn creating_a_talk_fails_when_the_store_cannot_be_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("talks");
+        std::fs::write(&root, "not a directory").unwrap();
+        let mut talk = ctx_talk("new", Vec::new());
+        assert!(Talks::at(root).create(&mut talk).is_err());
+    }
+
+    #[test]
+    fn begin_reserves_the_talk_before_returning_it() {
+        let (tmp, talks) = store();
+        let talks = talks.with_id_source(|| "20260101-000000-abcd".into());
+        let cfg = config(mock_agent(tmp.path(), ECHO, BTreeMap::new()));
+        let first = begin(&talks, &cfg, tmp.path().to_owned(), None).unwrap();
+        let before = std::fs::read(talks.path_of(&first.id)).unwrap();
+        assert!(begin(&talks, &cfg, tmp.path().to_owned(), None).is_err());
+        assert_eq!(std::fs::read(talks.path_of(&first.id)).unwrap(), before);
     }
 
     fn ctx_config(windows: &[(&str, u64)]) -> Config {

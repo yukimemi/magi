@@ -2562,7 +2562,8 @@ impl RunState {
         }
     }
 
-    /// A fresh run.
+    /// A fresh, unreserved run. Production callers must call [`Self::reserve`]
+    /// before using its id, deriving branches, or saving it. Resumes load instead.
     pub fn new(
         repo: PathBuf,
         base_branch: String,
@@ -3203,6 +3204,51 @@ impl RunState {
         );
     }
 
+    /// Reserve a fresh run's identity and persist its initial record.
+    /// Call exactly once, before exposing the id; never call on a loaded run.
+    pub fn reserve(&mut self) -> Result<()> {
+        self.reserve_under(&home())
+    }
+
+    /// [`Self::reserve`] with an explicit store home.
+    pub fn reserve_under(&mut self, home: &Path) -> Result<()> {
+        self.reserve_with(home, &crate::id_reserve::IdSource::new(new_id))
+    }
+
+    fn reserve_with(&mut self, home: &Path, ids: &crate::id_reserve::IdSource) -> Result<()> {
+        let root = home.join("runs");
+        std::fs::create_dir_all(&root).context("create runs root")?;
+        let initial = self.id.clone();
+        ids.reserve(
+            (!ids.is_custom()).then_some(initial.as_str()),
+            "run",
+            |id| {
+                let dir = root.join(id);
+                if !crate::id_reserve::create_dir(&dir)? {
+                    return Ok(false);
+                }
+                // Branches and worktrees use only the suffix. Publish our directory
+                // before scanning: concurrent contenders either see each other and
+                // retry, or the later one sees the earlier reservation and retries.
+                for entry in std::fs::read_dir(&root).context("scan reserved run ids")? {
+                    let name = entry?.file_name();
+                    let Some(other) = name.to_str() else { continue };
+                    if other != id && is_run_id(other) && short_of(other) == short_of(id) {
+                        // Only remove our own empty directory, never existing data.
+                        std::fs::remove_dir(&dir).context("release colliding run suffix")?;
+                        return Ok(false);
+                    }
+                }
+                self.id = id.to_owned();
+                // Keep a failed initial write visible as an unreadable reservation;
+                // a later creator must not reuse it after a crash or I/O failure.
+                self.save_under(home)?;
+                Ok(true)
+            },
+        )?;
+        Ok(())
+    }
+
     /// Flush to `run.json`, atomically, under the process-global [`home`].
     pub fn save(&mut self) -> Result<()> {
         let home = home();
@@ -3756,25 +3802,10 @@ pub fn latest_id() -> Option<String> {
     list_ids().into_iter().next()
 }
 
-/// `YYYYMMDD-HHMMSS-xxxx`, sortable and short enough for a branch name.
-///
-/// The four hex digits are fresh entropy, **not** `blind.seed`. They were the
-/// seed, and a pinned seed then made the whole id a function of the second it
-/// started in: two runs a second apart were distinguishable, two in the same
-/// second were not. Everything keyed on the id collided with them - the run
-/// directory, `artifacts/`, and the candidate worktrees under
-/// `wt/magi/<short>/`.
-///
-/// `tests/common` pins the seed on purpose, so its integration tests all share
-/// one suffix. On Windows the suite is slow enough that the seconds differ and
-/// nothing showed; on Linux `graph_dropped_stream`'s three tests run inside
-/// 16s, so two of them shared a run directory and the second read an artifact
-/// the first had written (`impl-B-resume.out`) - a failure that looked like the
-/// resume logic misbehaving and was really two runs in one directory.
-///
-/// A seed exists to make the *blind* decisions reproducible: label assignment
-/// and per-judge presentation order. It was never meant to name the run, and
-/// `RunState::seed` still carries it for what it is for.
+/// An unreserved `YYYYMMDD-HHMMSS-xxxx` candidate, sortable and branch-safe.
+/// Fresh entropy is independent of the blind seed. Entropy alone cannot prevent
+/// collisions: production creation must use `RunState::reserve` before the id
+/// escapes, reserving both the full id and its branch/worktree suffix on disk.
 fn new_id() -> String {
     let stamp = Zoned::now().strftime("%Y%m%d-%H%M%S");
     let entropy = crate::rng::entropy();
@@ -3829,6 +3860,58 @@ mod tests {
             "Do it".to_owned(),
             Config::default(),
         )
+    }
+
+    #[test]
+    fn reserving_runs_retries_full_and_short_collisions_without_touching_the_first() {
+        let home = tempfile::tempdir().unwrap();
+        let first_id = "20260101-000000-abcd";
+        let ids = crate::id_reserve::sequence(&[
+            first_id,
+            first_id,
+            "20260102-000000-abcd",
+            "20260101-000000-1234",
+        ]);
+        let mut first = pass_state();
+        first.reserve_with(home.path(), &ids).unwrap();
+        let first_dir = home.path().join("runs").join(&first.id);
+        std::fs::create_dir(first_dir.join("artifacts")).unwrap();
+        std::fs::write(first_dir.join("artifacts/keep"), b"original artifact").unwrap();
+        let before = std::fs::read(first_dir.join("run.json")).unwrap();
+        let mut second = pass_state();
+        second.instruction = "independent".into();
+        second.reserve_with(home.path(), &ids).unwrap();
+        assert_eq!(first.id, first_id);
+        assert_eq!(second.id, "20260101-000000-1234");
+        assert_ne!(first.branch_for('A'), second.branch_for('A'));
+        assert_eq!(std::fs::read(first_dir.join("run.json")).unwrap(), before);
+        assert_eq!(
+            std::fs::read(first_dir.join("artifacts/keep")).unwrap(),
+            b"original artifact"
+        );
+        assert_eq!(
+            RunState::load_under(&second.id, home.path())
+                .unwrap()
+                .instruction,
+            "independent"
+        );
+        assert!(!home.path().join("runs/20260102-000000-abcd").exists());
+        let stuck = crate::id_reserve::IdSource::custom(|| "20260101-000000-abcd".into());
+        assert!(
+            pass_state()
+                .reserve_with(home.path(), &stuck)
+                .unwrap_err()
+                .to_string()
+                .contains("256 attempts")
+        );
+        assert_eq!(std::fs::read(first_dir.join("run.json")).unwrap(), before);
+    }
+
+    #[test]
+    fn reserving_a_run_fails_when_the_store_cannot_be_created() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("runs"), "not a directory").unwrap();
+        assert!(pass_state().reserve_under(home.path()).is_err());
     }
 
     #[test]

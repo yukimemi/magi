@@ -657,6 +657,7 @@ impl Runner {
         // to decide anything.
         state.fetched_base = Some(fetched_base);
         state.origin = Some(origin);
+        state.reserve()?;
         state.event("start", format!("run {} created", state.id));
         state.save()?;
         Ok(Self {
@@ -733,6 +734,7 @@ impl Runner {
         );
         state.fetched_base = Some(fetched_base);
         state.origin = Some(origin);
+        state.reserve()?;
 
         // Released before anything else touches the branch: a stale local
         // branch is moved with `git branch -f`, which git refuses while an
@@ -857,6 +859,7 @@ impl Runner {
         state.origin = Some(crate::run::Origin::queue(task));
         state.pr_head = Some(selection.branch.clone());
         state.pr_recovery = Some(selection.clone());
+        state.reserve()?;
         crate::pr_head::check_predecessors(&state, &selection.branch).await?;
         Self::open_selected(repo, state, roles, max_parallel, base_commit, selection).await
     }
