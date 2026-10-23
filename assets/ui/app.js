@@ -9875,12 +9875,15 @@ async function loadRun(id, { background = false } = {}) {
       sectionNotice("run-meta", "run-evidence-state", "Run changed while loading related status. Retry.", retry);
       return;
     }
+    // Core may have rendered first with evidence gated; leaving that state must
+    // render even when the payloads are identical, or the gated sections stay empty.
+    const wasGated = Boolean(detail.evidenceError);
     const unchanged = JSON.stringify(detail.run) === JSON.stringify(detail.evidence);
     detail.run = detail.evidence;
     detail.evidenceError = false;
     detail.evidencePending = false;
     sectionNotice("run-meta", "run-evidence-state", "");
-    if (!unchanged) renderRunDetail();
+    if (wasGated || !unchanged) renderRunDetail();
     setRunEvidencePending(false);
   };
   const core = sectionRequest(`run:${id}:core`, `${API.run(id)}/core`, run => {
