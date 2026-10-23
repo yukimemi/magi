@@ -11265,7 +11265,9 @@ mod tests {
             fx.get("/api/notifications")
         );
         assert_eq!(request_counts(&questions).0, 1);
-        assert_eq!(request_counts(&talks).0, 2);
+        // Cached summaries perform no config discovery or git work, even
+        // alongside the questions request that still discovers config.
+        assert_eq!(request_counts(&talks), (0, 0));
         assert_eq!(request_counts(&notices), (0, 0));
     }
 
