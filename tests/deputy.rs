@@ -944,6 +944,7 @@ fn unasked_questions() -> Vec<Question> {
             magi::github_text::ASK_SEAT,
             &["use fallback", "use my text"],
         ),
+        q(magi::land::CI_HOLD_NODE, "land", &["resume", "hold"]),
         q(
             magi::reconcile::NODE,
             magi::reconcile::SEAT,
