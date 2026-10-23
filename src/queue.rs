@@ -454,9 +454,9 @@ pub struct Task {
     /// `crate::graph::Runner::review` instead of competing from scratch.
     ///
     /// Requeues the task the same way [`Task::release`] does, so it is
-    /// picked up by the ordinary loop; `crate::daemon` reads this field once,
-    /// when it actually starts the run, and clears it either way — consumed
-    /// on success, dropped if the branch no longer exists by then. Never set
+    /// picked up by the ordinary loop. Ordinary review hints are consumed on
+    /// startup selection; an owner-approved review retains its target through
+    /// waits and failures until `Task::start` consumes it. Never set
     /// from the conductor's own words: `crate::daemon` derives the branch
     /// name itself from the task's last run, so a hallucinated branch can
     /// never reach here.
@@ -465,6 +465,11 @@ pub struct Task {
     /// Authored criteria when the retained recovery review was selected.
     #[serde(default)]
     pub review_instruction: Option<String>,
+    /// The retained review was chosen to carry out an owner-approved
+    /// continuation. If its branch cannot be found at start the task is held
+    /// with the reason; it must never degrade into a fresh competition.
+    #[serde(default)]
+    pub approved_review: bool,
     /// Explicit public implementation selected by the operator; never inferred from prose.
     #[serde(default)]
     pub pr_recovery: Option<crate::pr_recovery::Selection>,
@@ -942,6 +947,7 @@ impl Task {
             operator_decided_at: None,
             review_branch: None,
             review_instruction: None,
+            approved_review: false,
             pr_recovery: None,
             fresh_start: false,
             replacement: None,
@@ -1225,6 +1231,13 @@ impl Task {
         self.park_reason = None;
         self.fresh_start = false;
         self.interrupt = false;
+        // The approved continuation has now been carried out; its target is
+        // consumed with it.
+        if self.approved_review {
+            self.review_branch = None;
+            self.review_instruction = None;
+        }
+        self.approved_review = false;
         // The answer has been honoured: the task got its turn.
         self.resume_override = None;
     }
@@ -1639,6 +1652,14 @@ impl Task {
         self.answers.push(AnsweredQuestion { question, answer });
     }
 
+    /// [`Task::request_review`] for an owner-approved continuation: a missing
+    /// branch holds the task instead of starting a fresh competition. See
+    /// [`Task::approved_review`].
+    pub fn request_approved_review(&mut self, branch: String) {
+        self.request_review(branch);
+        self.approved_review = true;
+    }
+
     /// Requeue this task to reopen its last run as a review-only pass against
     /// `branch` (`crate::graph::Runner::review`) rather than competing from
     /// scratch. See [`Task::review_branch`].
@@ -1655,6 +1676,7 @@ impl Task {
         // A fresh competition is the opposite of a review of the old branch.
         self.review_branch = None;
         self.review_instruction = None;
+        self.approved_review = false;
         self.fresh_start = true;
     }
 
@@ -1663,9 +1685,9 @@ impl Task {
     /// released it, the retry is a review of the same branch rather than a
     /// resume or a fresh competition. Spends no attempt.
     ///
-    /// This is the only way a machine hold keeps a `review_branch`: the
-    /// daemon takes it at the start of every attempt, so [`Task::release`]
-    /// relies on that to tell this hold from every other.
+    /// Ordinary review hints are consumed on startup selection, so this
+    /// restores them for retry. Owner-approved targets are retained through
+    /// every startup wait or failure until the next run actually starts.
     pub fn hold_for_handover(&mut self, branch: Option<String>, reason: String) {
         if branch.is_some() {
             self.review_branch = branch;
@@ -2007,10 +2029,12 @@ impl Task {
         self.blocked_from = None;
         // A machine hold that still names a review branch is a refused
         // handover (see [`Task::hold_for_handover`]): the retry must review
-        // that same branch. Any other release drops it.
-        if !refused_handover {
+        // that same branch. Approved reviews also survive resource waits and
+        // parking until successful startup consumes the approval and target.
+        if !refused_handover && !self.approved_review {
             self.review_branch = None;
             self.review_instruction = None;
+            self.approved_review = false;
         }
         self.fresh_start = false;
     }

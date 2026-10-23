@@ -927,6 +927,7 @@ fn apply_one(
                     d.choices.clone(),
                 );
                 q.actions = d.actions.clone();
+                crate::continuation::revalidate_offer(&mut q);
                 crate::choice_effect::executable_conductor(&mut q);
                 q.decision_context = Some(context);
                 // The wait is handed to a deputy (`crate::deputy`), so a

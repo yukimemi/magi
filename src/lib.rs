@@ -36,6 +36,7 @@ pub mod clean;
 pub mod conduct;
 pub mod config;
 pub mod consult;
+pub mod continuation;
 pub mod daemon;
 pub mod deputy;
 pub mod direct;

@@ -576,7 +576,7 @@ evidence with the literal replacement title; it cannot reuse old thread text.
 | Fix findings and re-review | `<id>: fix findings and re-review` | Yes | Offered/recoverable repair, same run and PR, bounded review and fresh approval |
 | Ordinary queue/conductor/agent questions; retry, rerun, requeue, resume, release recovery | `<id>: <exact choice>` | Yes, except destructive effects | Existing claims, operator holds, task generation and recovery state |
 | Free-text questions | `<id>: <complete answer>` | No: no offered choice to bind | Existing asker/waiter dispatch |
-| Consultation task add / release / hold / done / priority | Latest whole post-delivery owner send: `task-operation: <typed JSON operation>`, quoted whole with `magi task --quote ...` | No | Full resolved task id and exact arguments; existing queue claims/state checks; add uses this conversation's repository, positional text and optional `--solo` only |
+| Consultation task add / release / hold / done / priority | Latest whole post-delivery owner send: unambiguous natural language or `task-operation: <typed JSON operation>`, quoted whole with `magi task --quote ...` | No | Full resolved task id and exact arguments; existing queue claims/state checks; add uses this conversation's repository, positional text and optional `--solo` only |
 | Outcome outside the offered choices | `magi answer <id> --reply-other <entire latest owner send> --quote <same send>` | No | Saves an evidence note and ends consultation only; question remains Open, waiter remains held, no answer or choice action |
 | Withdrawal / PR closure / `reimplement:<agent>` | `<id>: <exact consequence token>` | No | Existing closure confirmation, owner claim and replacement transitions |
 | Triage discard, dependency discard/detach, divergence overwrite, structured `done`, conductor complete/configure | `<id>: <exact consequence token>` | No | Individual explicit consequence; existing consumer checks |
@@ -585,19 +585,29 @@ evidence with the literal replacement title; it cannot reuse old thread text.
 | Guarded `use fallback` | `<id>: use fallback` | Yes | Existing safe fallback and posting gate |
 | Guarded `use my text` | `<id>: use my text <question/content fingerprint>` followed by a newline and the literal replacement title | No | Persisted owner title and final posting gate; a choice token alone supplies no title |
 
-For consultation task operations, the CLI accepts a closed typed instruction rather
-than inferring execution arguments from prose. For example, the owner's complete
-send `task-operation: {"add":{"instruction":"Reimplement from scratch","solo":true}}`
-authorizes `magi task --quote '<that entire send>' add --solo 'Reimplement from scratch'`.
-Other payloads are `{"release":{"task":"<full task id>"}}`,
-`{"hold":{"task":"<full task id>","reason":"Wait for replacement"}}`,
-`{"done":{"task":"<full task id>"}}`, and
-`{"priority":{"task":"<full task id>","priority":5}}`, each prefixed with
-`task-operation: `. JSON whitespace does not matter; every field does. A missing,
-stale, queued, pre-delivery, generated, conditional or mismatched instruction is
-refused. The chat presents the required instruction once when natural language
-does not bind it; it must not promise unsupported writes. Task operations need
-separate owner instructions and should precede `--reply-other`.
+相談中のタスク操作は、JSON を必須にせず、対象と操作が明確な自然言語を受け付けます。
+たとえば「タスク6af7を再開してよい」「Please release task 6af7」、
+「hold task 6af7」「Set task 6af7 priority to -9」が使えます。
+優先度は符号まで一致する必要があります。「再開手順を説明して」や、別の操作を含む文は
+実行承認にはなりません。追加は `add task: <作業内容>`、単独実行は
+`add solo task: <作業内容>` で内容と実行方法を指定できます。
+従来の `task-operation: <JSON>` も利用でき、完了扱いにする `done` は引き続き
+その明示形式が必要です。内部では最新の永続化済み所有者メッセージ全体を照合し、
+相談配信前の指示、未処理の新着メッセージ、撤回、生成通知、部分引用を承認として使いません。
+操作は相談を終了する `--reply-other` より前に実行します。
+
+再開は既存タスクと実行履歴を維持します。レビュー予算が尽きて未解決指摘がある場合は、
+既存ブランチへの回数制限付き修復・再レビューへ切り替えます。
+起動時のロック待ちやブランチ確認失敗でも承認済みの対象を保持します。
+検証失敗などでそのまま進められない場合や実行記録を読めない場合は、承認を記録して
+具体的な前提条件と次の対応を示し、保留を続けます。新規の実装競争は始めません。
+CLI の `magi task release` と triage の再開も同じ判定を使います。
+提示前と回答適用時に状態を確認し、無効な復旧候補しかない場合は保留を選べます。
+
+マージ承認の質問本文・パネルには、設定による全件承認、未解決の Major 以上の指摘、
+最終 reject 票など、実際に承認を要求する理由が保存されます。
+検証が成功しても未解決指摘や reject は解消扱いになりません。
+修復・再開の承認はマージ承認ではなく、マージには対象 head に対する別の承認が必要です。
 
 Only `magi answer` settles a question. `--reply-other` deliberately does not
 wake its waiter or interpret the decision as a choice action; it prints that the

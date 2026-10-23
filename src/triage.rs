@@ -502,6 +502,9 @@ enum AnswerAction {
 /// back.
 fn interpret_answer(q: &Question) -> AnswerAction {
     let resolution = q.resolution().unwrap_or_default();
+    if q.actions.get(&resolution) == Some(&crate::ask::ChoiceAction::Hold) {
+        return AnswerAction::KeepHeld;
+    }
     match q.choices.iter().position(|c| *c == resolution) {
         Some(0) => AnswerAction::Resume,
         Some(2) => AnswerAction::Discard,
@@ -576,9 +579,18 @@ fn file_question(
         w.detail(task, &why),
         choices,
     );
+    revalidate_task_offer(&mut q, task);
     q.triage_generation = Some(task.resumption.as_ref().map_or(0, |r| r.generation));
     questions.put_executable(&mut q).ok()?;
     Some(q)
+}
+
+fn revalidate_task_offer(q: &mut Question, task: &Task) {
+    if let Some(reason) = crate::continuation::task_offer_block(task) {
+        q.detail.push_str(&format!("\n\n{reason}"));
+        q.choices.clear();
+        crate::choice_effect::safe_hold(q);
+    }
 }
 
 /// What a deputy is told about a triage question: the task, why it is held and
@@ -609,7 +621,9 @@ pub(crate) fn deputy_brief(q: &Question, queue: &Queue) -> String {
     s.push_str("\n\nWhat each option does, by position (the owner taps a button; you only read their words):");
     let n = q.choices.len();
     for (i, c) in q.choices.iter().enumerate() {
-        let effect = if q.node == DEPS_NODE {
+        let effect = if q.actions.get(c) == Some(&crate::ask::ChoiceAction::Hold) {
+            "the task stays held"
+        } else if q.node == DEPS_NODE {
             match i {
                 0 => "the dependency is released so the loop runs it",
                 1 => {
@@ -713,6 +727,9 @@ enum DepsAction {
 
 fn interpret_deps_answer(q: &Question) -> DepsAction {
     let resolution = q.resolution().unwrap_or_default();
+    if q.actions.get(&resolution) == Some(&crate::ask::ChoiceAction::Hold) {
+        return DepsAction::Nothing;
+    }
     match q.choices.iter().position(|c| *c == resolution) {
         Some(0) => DepsAction::Release,
         Some(1) => DepsAction::Discard,
@@ -841,7 +858,7 @@ fn apply_deps_answer(queue: &Queue, questions: &Questions, q: &Question, now: Ti
                 question: q.summary.clone(),
                 answer: q.resolution().unwrap_or_default(),
             });
-            root.release_operator("triage-dependencies", Some(&q.id));
+            crate::continuation::release_task(&mut root, "triage-dependencies", Some(&q.id));
             root.resume_override = Some(OperatorResume {
                 question_id: q.id.clone(),
                 at: now,
@@ -955,6 +972,7 @@ fn ask_about_stuck_roots(
             detail,
             choices,
         );
+        revalidate_task_offer(&mut question, root);
         question.triage_generation = Some(root.resumption.as_ref().map_or(0, |r| r.generation));
         if questions.put_executable(&mut question).is_ok() {
             report.asked.push(root.id.clone());
@@ -1023,7 +1041,7 @@ pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
         if !newer_decision {
             match action {
                 AnswerAction::Resume => {
-                    task.release_operator("triage", Some(&q.id));
+                    crate::continuation::release_task(&mut task, "triage", Some(&q.id));
                     task.resume_override = Some(OperatorResume {
                         question_id: q.id.clone(),
                         at: Timestamp::now(),
@@ -1360,6 +1378,37 @@ mod tests {
         assert_eq!(back.status, TaskStatus::Queued);
         assert!(back.hold_source.is_none());
         assert!(questions.list().is_empty(), "nothing needed asking");
+    }
+
+    #[test]
+    fn triage_unreadable_recovery_offers_hold_and_preserves_its_meaning() {
+        crate::run::pin_test_home();
+        let (dir, queue, questions) = store();
+        let mut t = task("prior work", dir.path().join("repo"));
+        t.start("missing-triage-run".into());
+        t.hold_machine(Some("review stopped".into()));
+        queue.put(&mut t).unwrap();
+        let mut q = file_question(
+            &questions,
+            &t,
+            Bucket::MachineUnknown,
+            &JA,
+            Timestamp::now(),
+        )
+        .unwrap();
+        assert_eq!(q.choices.len(), 1);
+        assert!(q.detail.contains("cannot be read"));
+        assert_eq!(
+            q.actions.get(&q.choices[0]),
+            Some(&crate::ask::ChoiceAction::Hold)
+        );
+        q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+        assert_eq!(interpret_answer(&q), AnswerAction::KeepHeld);
+        questions.put(&mut q).unwrap();
+        apply_answers(&queue, &questions);
+        let back = queue.get(&t.id).unwrap();
+        assert_eq!(back.status, TaskStatus::Held);
+        assert_eq!(back.runs, t.runs);
     }
 
     #[test]

@@ -3833,9 +3833,12 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                 .claim(&resolved)
                 .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
             let mut t = q.get(&resolved)?;
-            t.release_operator("cli", None);
+            magi::continuation::release_task(&mut t, "cli", None);
             q.put(&mut t)?;
-            println!("queued {} {}", t.short(), t.title);
+            println!("{} {} {}", t.status.as_str(), t.short(), t.title);
+            if let Some(reason) = &t.hold_reason {
+                println!("{reason}");
+            }
             Ok(())
         }
 

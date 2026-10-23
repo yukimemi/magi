@@ -851,6 +851,9 @@ enum ActionDecision {
     Resume(String),
     /// Requeue as a fresh competition.
     Requeue,
+    /// The run cannot resume, but its branch can be reviewed again with a
+    /// bounded repair pass ([`crate::continuation`]); keeps task, PR and work.
+    Review { branch: String, note: String },
     /// Hold the task by explicit operator choice.
     Hold,
     /// Close the task as done.
@@ -981,14 +984,25 @@ where
                         ActionDecision::Resume(run.clone())
                     }
                 }
-                Ok(s) if s.liveness(false) == Liveness::Live => {
-                    ActionDecision::Refuse("run already has a live driver".into())
-                }
+                Ok(s) if s.liveness(false) == Liveness::Live => ActionDecision::Skip,
                 Ok(s) if crate::handover::can_resume(&s) => ActionDecision::Resume(run.clone()),
-                Ok(_) => ActionDecision::Refuse((p.resume_cannot_progress)(
-                    q.short(),
-                    ask::short_id(run),
-                )),
+                Ok(s) => match crate::continuation::classify(&s) {
+                    crate::continuation::Continuation::RepairAndReview { branch } => {
+                        let note = crate::continuation::Continuation::RepairAndReview {
+                            branch: branch.clone(),
+                        }
+                        .explain()
+                        .unwrap_or_default();
+                        ActionDecision::Review { branch, note }
+                    }
+                    other => {
+                        let generic = (p.resume_cannot_progress)(q.short(), ask::short_id(run));
+                        ActionDecision::Refuse(match other.explain() {
+                            Some(why) => format!("{generic}: {why}"),
+                            None => generic,
+                        })
+                    }
+                },
                 Err(e) => ActionDecision::Refuse((p.resume_unreadable)(
                     q.short(),
                     ask::short_id(run),
@@ -1492,6 +1506,7 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
         let ran = matches!(
             decision,
             ActionDecision::Resume(_)
+                | ActionDecision::Review { .. }
                 | ActionDecision::Requeue
                 | ActionDecision::Hold
                 | ActionDecision::Done
@@ -1521,6 +1536,15 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
                 });
             }
             ActionDecision::Stale => {}
+            ActionDecision::Review { branch, note } => {
+                task.release_operator("choice-review", Some(&q.id));
+                task.request_approved_review(branch);
+                notices::raise(
+                    Notice::info(&format!("action:{}", q.id), &note).link(Link::Task {
+                        id: task.id.clone(),
+                    }),
+                );
+            }
             ActionDecision::Requeue => {
                 task.release_operator("choice-requeue", Some(&q.id));
                 task.requeue();
@@ -3821,9 +3845,10 @@ async fn attempt(
     // failure shows it up as `held`/`failed` with the run state unreadable.
     // `crate::conduct` chose `Review` for this task on an earlier cycle: its
     // branch survived, and this reopens exactly that branch as a
-    // review-only pass rather than resuming or competing again. Consumed
-    // (cleared) here whichever way this goes, so it never outlives this one
-    // attempt - see `queue::Task::review_branch`.
+    // review-only pass rather than resuming or competing again. Ordinary
+    // review hints are consumed here; an approved continuation keeps its
+    // target until successful startup - see `queue::Task::review_branch`.
+    let approved_review = task.approved_review;
     let review_branch = take_review_branch(task, previous.as_ref());
     let branch_exists = match &review_branch {
         Some(branch) => crate::git::branch_exists(&repo, branch)
@@ -3831,6 +3856,21 @@ async fn attempt(
             .unwrap_or(false),
         None => false,
     };
+    if approved_review && !branch_exists {
+        // The owner approved carrying on from this branch. Starting a new
+        // competition instead would discard it; say what is missing.
+        let why = match &review_branch {
+            Some(branch) => format!(
+                "the approved continuation reviews branch `{branch}`, which could not be found or verified; no new competition was started. Restore the branch (or tell magi which branch holds the work), then release the task"
+            ),
+            None => "the approved continuation no longer matches the task's instruction; no new competition was started. Release the task to review the existing work again".to_owned(),
+        };
+        // Keep the target and the approval: releasing after the branch is
+        // restored must resume this review, not compete afresh.
+        task.hold_for_handover(review_branch.clone(), why);
+        record(queue, task);
+        return Vec::new();
+    }
     // An explicit `magi review <branch>` is reviewed whatever happens to the
     // branch unless an explicit implementer change requires fresh work. An
     // unfinished run of the same task still wins, so a retry resumes.
@@ -4549,6 +4589,12 @@ fn apply_options(config: &mut Config, opts: &Opts, task: &Task) -> Result<()> {
     if let Some(o) = &task.overrides {
         o.apply(config);
     }
+    if task.approved_review && config.graph.review_rounds > 0 {
+        // The last review round never calls the fixer, so a one-round budget
+        // could only re-detect the findings. Two rounds are the minimum that
+        // review, repair and review again: bounded, and only for this attempt.
+        config.graph.review_rounds = config.graph.review_rounds.max(2);
+    }
     Ok(())
 }
 
@@ -5237,8 +5283,13 @@ fn choose_starter(
 
 /// Consume a retained review only while its authored criteria still match.
 fn take_review_branch(task: &mut Task, previous: Option<&RunState>) -> Option<String> {
-    let branch = task.review_branch.take();
-    let instruction = task.review_instruction.take();
+    // Startup can wait or fail before Task::start. Keep the approval and its
+    // target together until that successful start consumes both.
+    let (branch, instruction) = if task.approved_review {
+        (task.review_branch.clone(), task.review_instruction.clone())
+    } else {
+        (task.review_branch.take(), task.review_instruction.take())
+    };
     branch.filter(|branch| match &instruction {
         Some(authored) => *authored == task.instruction,
         // Legacy retained branches must agree with their prior run; only an
@@ -5260,7 +5311,7 @@ fn may_resume_run(run: &RunState, task: &Task) -> bool {
 }
 
 /// Review scaffolding is execution context, not evidence of an operator edit.
-pub(crate) fn compatible_run_instruction(run: &RunState, task: &Task) -> bool {
+pub fn compatible_run_instruction(run: &RunState, task: &Task) -> bool {
     if let Some(authored) = &run.task_instruction {
         return compatible_instruction(authored, task);
     }
@@ -5911,6 +5962,30 @@ mod tests {
             take_review_branch(&mut t, Some(&run)).is_none(),
             "legacy retained candidate cannot replace a revised approved head"
         );
+    }
+
+    #[test]
+    fn approved_review_target_survives_startup_selection_and_resource_wait() {
+        let mut task = task();
+        task.request_approved_review("approved-head".into());
+        for parked in [false, true] {
+            assert_eq!(
+                take_review_branch(&mut task, None).as_deref(),
+                Some("approved-head")
+            );
+            if parked {
+                task.park("repository busy");
+            } else {
+                task.hold_machine(Some("repository busy".into()));
+            }
+            task = serde_json::from_str(&serde_json::to_string(&task).unwrap()).unwrap();
+            task.release_operator("triage", None);
+            assert!(task.approved_review);
+            assert_eq!(task.review_branch.as_deref(), Some("approved-head"));
+        }
+        task.start("new-review".into());
+        assert!(!task.approved_review);
+        assert!(task.review_branch.is_none());
     }
 
     #[test]
@@ -10620,6 +10695,47 @@ mod tests {
                 Some(state.id)
             );
         }
+    }
+
+    #[test]
+    fn approved_resume_of_an_exhausted_review_becomes_a_bounded_branch_review() {
+        let mut state = run_state(RunStatus::Blocked);
+        state.driver_exited = true;
+        state.config.graph.review_rounds = 1;
+        let mut round = review_round(1);
+        round.blocking = 2;
+        round.progressed = false;
+        state.reviews = vec![round];
+        state.candidates = vec![candidate('A', "work", false, None)];
+        state.tally = Some(
+            serde_json::from_value(serde_json::json!({
+                "first_choice": {}, "borda": {}, "winner": "A",
+                "unanimous_initial": true, "deliberated": false,
+                "changed_votes": 0, "unanimous_final": true, "met_quorum": true
+            }))
+            .unwrap(),
+        );
+        assert!(!crate::handover::can_resume(&state));
+        let mut task = held_task_with(&state.id);
+        task.release();
+        let question = action_question(&state.id, resume_action(&state.id));
+        let ActionDecision::Review { branch, note } =
+            decide_action(&task, &question, &PHRASES_EN, |_| Ok(state.clone()))
+        else {
+            panic!("a spent review with findings must not be refused as unable to progress");
+        };
+        assert_eq!(branch, state.candidates[0].branch);
+        assert!(note.contains("nothing is merged"));
+
+        // Without a surviving branch the refusal names the precondition.
+        state.candidates.clear();
+        state.tally = None;
+        let ActionDecision::Refuse(why) =
+            decide_action(&task, &question, &PHRASES_EN, |_| Ok(state.clone()))
+        else {
+            panic!("expected a refusal");
+        };
+        assert!(why.contains("no surviving branch"), "{why}");
     }
 
     #[test]

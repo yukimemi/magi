@@ -70,11 +70,16 @@ pub(crate) fn executable_conductor(q: &mut Question) {
     q.choices.retain(|c| q.actions.contains_key(c));
     q.actions.retain(|c, _| q.choices.contains(c));
     if offered_choices && q.choices.is_empty() {
-        let hold = "daemon: 保留を続ける".to_owned();
-        q.actions
-            .insert(hold.clone(), crate::ask::ChoiceAction::Hold);
-        q.choices.push(hold);
+        safe_hold(q);
     }
+}
+
+/// The one choice that is always executable: keep the task held.
+pub(crate) fn safe_hold(q: &mut Question) {
+    let hold = "daemon: 保留を続ける".to_owned();
+    q.actions
+        .insert(hold.clone(), crate::ask::ChoiceAction::Hold);
+    q.choices.push(hold);
 }
 
 /// Regenerated each turn so old deputy briefs cannot conceal new effects.

@@ -217,6 +217,76 @@ impl TaskOperation {
     }
 }
 
+/// Does `words` unambiguously ask for `operation`, without JSON? Only release,
+/// hold, priority and add have a natural form; completing a task (`done`) stays
+/// an explicit typed instruction. The whole message must be unhedged and must
+/// name the task (its full id or a prefix of at least four characters) with
+/// exactly one verb class, so nothing is inferred from a stray word.
+pub fn natural_matches(words: &str, operation: &TaskOperation) -> bool {
+    // Match the complete instruction. Never discard punctuation, signs or
+    // non-ASCII clauses: those can change the meaning of consent.
+    if words.starts_with("    ") || words.starts_with('\t') {
+        return false;
+    }
+    let lower = words.trim().to_lowercase();
+    let text = lower.trim_end_matches(['.', '!', '。', '！']).trim();
+    let text = text.strip_prefix("please ").unwrap_or(text);
+    let text = text.strip_suffix(" now").unwrap_or(text);
+    if let TaskOperation::Add { instruction, solo } = operation {
+        let prefixes: &[&str] = if *solo {
+            &["add solo task: ", "add a solo task to "]
+        } else {
+            &["add task: ", "add a task to "]
+        };
+        return !instruction.trim().is_empty()
+            && (prefixes
+                .iter()
+                .any(|prefix| words.trim() == format!("{prefix}{instruction}"))
+                || (!*solo && words.trim() == format!("{instruction}をタスクに追加してください")));
+    }
+    let task = match operation {
+        TaskOperation::Release { task }
+        | TaskOperation::Hold { task, .. }
+        | TaskOperation::Priority { task, .. } => task.to_lowercase(),
+        _ => return false,
+    };
+    // Queue resolution checks prefix uniqueness before this evidence check.
+    (4..=task.len())
+        .filter(|&end| task.is_char_boundary(end))
+        .any(|end| {
+            let id = &task[..end];
+            match operation {
+                TaskOperation::Release { .. } => {
+                    ["release", "resume", "continue"].iter().any(|verb| {
+                        text == format!("{verb} task {id}")
+                            || text == format!("you may {verb} task {id}")
+                    }) || ["再開", "解放", "リリース"].iter().any(|verb| {
+                        ["してよい", "してください", "して", "をお願いします"]
+                            .iter()
+                            .any(|ending| text == format!("タスク{id}を{verb}{ending}"))
+                    })
+                }
+                TaskOperation::Hold { reason, .. } => {
+                    !reason.trim().is_empty()
+                        && (["hold", "pause"]
+                            .iter()
+                            .any(|verb| text == format!("{verb} task {id}"))
+                            || ["して", "してよい", "してください"]
+                                .iter()
+                                .any(|ending| text == format!("タスク{id}を保留{ending}")))
+                }
+                TaskOperation::Priority { priority, .. } => {
+                    text == format!("set task {id} priority to {priority}")
+                        || text == format!("set priority of task {id} to {priority}")
+                        || ["して", "してください", "する"].iter().any(|ending| {
+                            text == format!("タスク{id}の優先度を{priority}に{ending}")
+                        })
+                }
+                _ => false,
+            }
+        })
+}
+
 fn delivered_instruction<'a>(
     q: &Question,
     talk: &'a Talk,
@@ -267,10 +337,11 @@ pub fn authorize_task_operation(
                 .and_then(|json| serde_json::from_str::<TaskOperation>(json).ok())
                 .as_ref()
                 == Some(operation)
+                || natural_matches(words, operation)
         })
     }) {
         bail!(
-            "task operation requires individual post-delivery owner evidence and --quote of the entire latest send; required instruction: {expected}"
+            "task operation requires individual post-delivery owner evidence and --quote of the entire latest send that clearly names the task and the action (or the exact form: {expected})"
         );
     }
     Ok(())
@@ -1064,6 +1135,9 @@ fn current_instruction(talk: &Talk) -> Option<(usize, usize, &str)> {
         // never from a guessed last paragraph. The whole-message grammar also
         // excludes generated legacy wrappers.
         if send.sender.is_none()
+            && !(turn.sender == Some(talk::Sender::Operator)
+                && turn.messages.len() == 1
+                && turn.body == send.body)
             && (turn.breaks.is_none()
                 || turn
                     .messages
@@ -1909,6 +1983,92 @@ pub async fn drain_turns(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn natural_language_task_operations_need_a_clear_unhedged_instruction() {
+        use super::{TaskOperation, natural_matches};
+        let release = TaskOperation::Release {
+            task: "6af7c0de1234".into(),
+        };
+        assert!(natural_matches("タスク6af7を再開してよい", &release));
+        assert!(natural_matches(
+            "Please release task 6af7c0de1234",
+            &release
+        ));
+        // Extra Japanese content or a dropped sign is never consent.
+        assert!(!natural_matches("タスク6af7の再開手順を説明して", &release));
+        for extra in [
+            "タスク6af7を再開して別のタスクを削除して",
+            "タスク6af7を再開してよいとは言っていない",
+            "explain how to resume task 6af7",
+            "> resume task 6af7",
+            "    resume task 6af7",
+        ] {
+            assert!(!natural_matches(extra, &release), "{extra}");
+        }
+        let prio = |n| TaskOperation::Priority {
+            task: "6af7c0de1234".into(),
+            priority: n,
+        };
+        assert!(!natural_matches("Set task 6af7 priority to -9", &prio(9)));
+        assert!(natural_matches("Set task 6af7 priority to -9", &prio(-9)));
+        assert!(!natural_matches("Set task 6af7 priority to −9", &prio(9)));
+        assert!(!natural_matches("Set task 6af7 priority to 9.5", &prio(9)));
+        assert!(natural_matches("Please release task 6af7 now", &release));
+        // Hedged, wrong task, or mixed verbs are never enough.
+        assert!(!natural_matches("Maybe release task 6af7", &release));
+        assert!(!natural_matches("release task 9999", &release));
+        assert!(!natural_matches("release or hold task 6af7", &release));
+        // Completing a task keeps its explicit typed form.
+        let done = TaskOperation::Done {
+            task: "6af7c0de1234".into(),
+        };
+        assert!(!natural_matches("mark task 6af7 done", &done));
+        let hold = TaskOperation::Hold {
+            task: "6af7c0de1234".into(),
+            reason: "owner asked".into(),
+        };
+        assert!(natural_matches("hold task 6af7", &hold));
+        assert!(natural_matches("タスク6af7を保留してください", &hold));
+        assert!(natural_matches(
+            "タスク6af7の優先度を-9にしてください",
+            &prio(-9)
+        ));
+        let add = TaskOperation::Add {
+            instruction: "日本語の作業内容".into(),
+            solo: false,
+        };
+        assert!(natural_matches("add task: 日本語の作業内容", &add));
+        assert!(natural_matches(
+            "日本語の作業内容をタスクに追加してください",
+            &add
+        ));
+        assert!(natural_matches("add a task to 日本語の作業内容", &add));
+        assert!(!natural_matches("add solo task: 日本語の作業内容", &add));
+        assert!(!natural_matches("add task: 別の作業内容", &add));
+        assert!(!natural_matches("hold task 6af7", &release));
+        // Mentioning the task is not an instruction to release it.
+        assert!(!natural_matches(
+            "Review the release notes for task 6af7",
+            &release
+        ));
+        // Priority binds the stated value, never a digit of the id.
+        let prio = |n| TaskOperation::Priority {
+            task: "6af7c0de1234".into(),
+            priority: n,
+        };
+        assert!(natural_matches("Set task 6af7 priority to 9", &prio(9)));
+        assert!(!natural_matches("Set task 6af7 priority to 9", &prio(6)));
+        assert!(!natural_matches("Set task 6af7 priority to 9", &prio(7)));
+        assert!(!natural_matches(
+            "set priority of task 6af7 to 10",
+            &prio(7)
+        ));
+        assert!(natural_matches(
+            "set priority of task 6af7 to 10",
+            &prio(10)
+        ));
+    }
+
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
@@ -1986,6 +2146,44 @@ mod tests {
             "SQLite is simpler.".to_owned(),
             vec!["SQLite".to_owned(), "Redis".to_owned()],
         )
+    }
+
+    #[test]
+    fn persisted_task_instruction_accepts_the_whole_send_and_rejects_stale_evidence() {
+        let (tmp, store, mut talk) = talks();
+        let questions = Questions::at(tmp.path().join("questions"));
+        let mut q = question("implement");
+        questions.put(&mut q).unwrap();
+        begin(&questions, &store, &q, &talk).unwrap();
+        talk = store.get(&talk.id).unwrap();
+        talk::drain(&mut talk, &store).unwrap();
+        let words = "タスク6af7を再開してよい";
+        talk::record(&mut talk, &store, words, vec![]).unwrap();
+        let op = TaskOperation::Release {
+            task: "6af7c0de1234".into(),
+        };
+        let check = |talk: &Talk, quote| authorize_task_operation(&questions, talk, &op, quote);
+        assert!(check(&store.get(&talk.id).unwrap(), Some(words)).is_ok());
+        assert!(check(&talk, Some("再開してよい")).is_err());
+        // An explicitly attributed single send remains whole even when old
+        // message metadata has no sender or paragraph-boundary field.
+        let turn = talk.turns.last_mut().unwrap();
+        turn.messages[0].sender = None;
+        turn.breaks = None;
+        store.put(&mut talk).unwrap();
+        assert!(check(&store.get(&talk.id).unwrap(), Some(words)).is_ok());
+        // Generated notices cannot retract or authorize real owner words.
+        let mut generated = talk.turns.last().unwrap().clone();
+        generated.sender = Some(talk::Sender::Magi);
+        generated.body = "release task 6af7".into();
+        generated.messages[0].body = generated.body.clone();
+        generated.messages[0].sender = Some(talk::Sender::Magi);
+        talk.turns.push(generated);
+        store.put(&mut talk).unwrap();
+        assert!(check(&talk, Some(words)).is_ok());
+        talk::record(&mut talk, &store, "待って、再開しないで", vec![]).unwrap();
+        assert!(check(&talk, Some(words)).is_err());
+        assert!(check(&talk, Some("待って、再開しないで")).is_err());
     }
 
     #[test]
