@@ -7506,6 +7506,7 @@ function renderSection(runId, s) {
       const b = s.bump;
       return card([rtag(`automerge ${b.automerge.replace(/_/g, " ")}`, s.tone)], rlines([
         b.version ? `version v${b.version}` : null, b.pr_url ? `pr ${b.pr_url}` : null,
+        b.skipped ? `SKIPPED (no release was made): ${b.skipped}` : null,
         b.problem, b.action_required ? `action required: ${b.action_required}` : null,
       ].filter(Boolean)));
     }

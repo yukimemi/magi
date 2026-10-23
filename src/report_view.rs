@@ -593,8 +593,10 @@ pub struct ReleaseBumpView {
     pub version: Option<String>,
     /// Pull request.
     pub pr_url: Option<String>,
-    /// `enabled`, `merged_directly`, `local`, `failed` or `not_enabled`.
+    /// `enabled`, `merged_directly`, `local`, `failed`, `skipped` or `not_enabled`.
     pub automerge: &'static str,
+    /// Why no bump was made; a skipped bump is not a release.
+    pub skipped: Option<String>,
     /// First line of the problem.
     pub problem: Option<String>,
     /// What a person must do.
@@ -1485,7 +1487,9 @@ pub fn build_with(
     }
 
     if let Some(b) = &state.release_bump {
-        let automerge = if b.automerge_enabled {
+        let automerge = if b.skipped.is_some() && b.pr_url.is_none() {
+            "skipped"
+        } else if b.automerge_enabled {
             "enabled"
         } else if b.merged_directly {
             "merged_directly"
@@ -1499,7 +1503,7 @@ pub fn build_with(
         sections.push(Section::ReleaseBump {
             head: head(
                 "release bump",
-                if automerge == "failed" || b.action_required.is_some() {
+                if automerge == "failed" || automerge == "skipped" || b.action_required.is_some() {
                     Tone::Warn
                 } else {
                     Tone::Neutral
@@ -1512,6 +1516,7 @@ pub fn build_with(
                 automerge,
                 problem: b.problem.as_deref().map(first_line),
                 action_required: b.action_required.clone(),
+                skipped: b.skipped.clone(),
             },
         });
     }

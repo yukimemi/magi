@@ -879,6 +879,40 @@ the task is **held** with the reason, because the implementation exists and is
 waiting on CI or on you. Retrying would race a second branch against your open
 pull request and spend the whole competition budget again.
 
+### Release bumps for repositories without a root `Cargo.toml`
+
+After a merge, magi opens a `chore/release-vX.Y.Z` pull request that raises the
+version; the repository's own `auto-tag.yml` then tags and `release.yml`
+publishes. By default magi reads and rewrites the root `Cargo.toml`. A Tauri
+application such as `yukimemi/shun` keeps it under `src-tauri/` and repeats the
+version in `package.json` and `tauri.conf.json`, so name the files in the
+repository's `magi.toml`:
+
+```toml
+[release]
+version_files = [
+  { path = "src-tauri/Cargo.toml", kind = "cargo" },
+  { path = "package.json", kind = "json" },
+  { path = "src-tauri/tauri.conf.json", kind = "json" },
+]
+```
+
+- **Nothing is detected.** The first entry is the version of record and must be
+  the `Cargo.toml` that `auto-tag.yml` reads. The others are rewritten to the
+  same version (one string replaced, formatting kept). The `Cargo.lock` beside
+  the first entry follows, edited as text. `package-lock.json` is not touched.
+- Paths are relative to the repository root; absolute paths, `..` and symlinks
+  that leave the repository are refused.
+- **A bump that does not happen says so.** The run records a `skipped` reason,
+  shown as `SKIPPED` in `magi show` and the web run page, and never reads as a
+  finished release. Skips: no version of record on the base branch (with an
+  `auto-tag.yml` there, you are also paged and pointed at `version_files`), the
+  declared files disagreeing on the version, the merged change already raising
+  the version itself (the repository's auto-tag releases it; no duplicate PR),
+  and a change touching only the release files.
+- The bump PR, automerge or the owner approval gate (`land_approval`, local
+  mode) and the repository's own tagging are unchanged: magi never tags by hand.
+
 ## Project conventions in the prompts
 
 ```toml

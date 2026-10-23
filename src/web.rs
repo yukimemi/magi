@@ -18040,6 +18040,7 @@ mod tests {
             release: None,
             problem: None,
             action_required: None,
+            skipped: None,
         });
 
         let mut blocked = RunState::new(
@@ -18060,6 +18061,7 @@ mod tests {
             release: None,
             problem: Some("checks red".to_owned()),
             action_required: Some("look at the PR".to_owned()),
+            skipped: None,
         });
 
         for state in [&clean, &blocked] {

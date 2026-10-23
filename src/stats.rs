@@ -1851,6 +1851,7 @@ mod tests {
             release: None,
             problem: None,
             action_required: None,
+            skipped: None,
         });
 
         // Also clean, but automerge itself was rejected by GitHub and magi
@@ -1866,6 +1867,7 @@ mod tests {
             release: None,
             problem: None,
             action_required: None,
+            skipped: None,
         });
 
         // Needs a human, PR opened.
@@ -1879,6 +1881,7 @@ mod tests {
             release: None,
             problem: Some("checks red".to_owned()),
             action_required: Some("look at the PR".to_owned()),
+            skipped: None,
         });
 
         // Needs a human, no PR ever opened.
@@ -1892,6 +1895,7 @@ mod tests {
             release: None,
             problem: Some("gh pr create failed".to_owned()),
             action_required: Some("open the PR by hand".to_owned()),
+            skipped: None,
         });
 
         let stats = collect(&[
@@ -1930,6 +1934,7 @@ mod tests {
             release: None,
             problem: None,
             action_required: None,
+            skipped: None,
         });
 
         let stats = collect(&[blocked]);
