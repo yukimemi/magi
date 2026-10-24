@@ -99,3 +99,30 @@ pub mod worktree_setup;
 
 pub mod choice_effect;
 mod resume;
+
+// Run environment-sensitive unit fixtures as ordinary standalone invocations,
+// without mutating the concurrent test harness or inheriting worker ownership.
+#[cfg(test)]
+pub(crate) fn standalone_test(name: &str) -> bool {
+    const CHILD: &str = "MAGI_STANDALONE_TEST";
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", name, "--nocapture"])
+        .env(CHILD, name)
+        .env_remove("MAGI_WORKER_ID")
+        .env_remove("MAGI_WORKER_GENERATION")
+        .env_remove("MAGI_WORKER_HOME")
+        .env_remove("MAGI_WORKER_EXE")
+        .output()
+        .expect("standalone test process");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "standalone test {name} failed: {}\n{}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}

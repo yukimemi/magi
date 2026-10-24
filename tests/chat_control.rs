@@ -20,7 +20,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let talks = Talks::at(tmp.path().join("talks"));
         let cfg = Config {
             agents: vec![AgentSpec {
@@ -241,6 +241,12 @@ bad = subprocess.run([binary, 'task', '--quote', 'invented', 'control', 'abandon
                      capture_output=True, text=True, pass_fds=fds)
 assert bad.returncode != 0
 assert 'individual owner confirmation' in bad.stderr, bad.stderr
+# Both planning spellings cross the bridge and preserve the unanswered-decision guard.
+for prefix in [[], ['control']]:
+    planned = subprocess.run([binary, 'task', *prefix, 'reconcile-retention', task,
+                              '--authority-run', run], capture_output=True, text=True, pass_fds=fds)
+    assert planned.returncode != 0
+    assert 'unanswered owner decision' in planned.stderr, planned.stderr
 # Kill requesters only after a complete write and before any response read.
 # The stopped child holds the process lock; waitpid confirms the exact point.
 import signal
@@ -796,4 +802,35 @@ Do both even if one fails. Include the exact STORE_WRITE result and control resu
             assert_eq!(f.saved().hold_reason.as_deref(), Some("sandbox control"));
         },
     );
+}
+
+#[test]
+fn reconciliation_cli_rejects_non_chat_seats_and_preserves_direct_route() {
+    let f = Fixture::new();
+    let args = [
+        "reconcile-retention",
+        &f.task.id,
+        "--authority-run",
+        &f.run.id,
+    ];
+    for node in ["implement-1", "review-1", "task", ""] {
+        let error = refused(f.cli(&args, node, "repository"));
+        assert!(error.contains("standing chat"), "{error}");
+    }
+    let error = refused(
+        common::magi_cli(f.tmp.path())
+            .args(["task"])
+            .args(args)
+            .env_remove("MAGI_RUN")
+            .env_remove("MAGI_NODE")
+            .env_remove("MAGI_TURN_SCOPE")
+            .output()
+            .unwrap(),
+    );
+    let expected = if cfg!(unix) {
+        "authority must be a retained implementation"
+    } else {
+        "retention reconciliation requires Unix leases"
+    };
+    assert!(error.contains(expected), "{error}");
 }

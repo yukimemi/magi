@@ -182,6 +182,13 @@ fn try_lock(path: &Path) -> Result<Option<Lease>> {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn execution_lease_for_test(path: &Path) -> Lease {
+    try_lock(path)
+        .expect("execution lease")
+        .expect("free execution lease")
+}
+
 /// Try to own a named cross-process singleton, without PID-based stale handling.
 /// Names are hashed, so callers may use logical keys containing paths or colons.
 pub fn try_lease(home: &Path, name: &str) -> Result<Option<Lease>> {

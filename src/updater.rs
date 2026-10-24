@@ -1120,6 +1120,24 @@ mod tests {
     /// attempt spent another request.
     #[test]
     fn checking_is_off_for_every_caller_when_the_config_says_off() {
+        if pinned_worker_generation() {
+            for mode in [UpdateMode::Notify, UpdateMode::Install] {
+                assert!(
+                    Checker::new(&Update {
+                        mode,
+                        interval: None,
+                        auto_restart: false
+                    })
+                    .is_none(),
+                    "pinned worker descendants must not check for updates"
+                );
+            }
+        }
+        if !crate::standalone_test(
+            "updater::tests::checking_is_off_for_every_caller_when_the_config_says_off",
+        ) {
+            return;
+        }
         assert!(
             Checker::new(&Update {
                 mode: UpdateMode::Off,

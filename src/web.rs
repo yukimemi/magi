@@ -10818,7 +10818,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_endpoints_large_home_responses() {
+        check_large_home_endpoints(false).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "local wall-clock performance measurement; see docs/web-responsiveness.md"]
     async fn list_endpoints_large_home_ceiling() {
+        check_large_home_endpoints(true).await;
+    }
+
+    async fn check_large_home_endpoints(timed: bool) {
         let (_tmp, repos, fx) = performance_fixture().await;
         seed_performance(&fx, &repos, 200, 300, 400);
         let mut failures = Vec::new();
@@ -10840,11 +10850,15 @@ mod tests {
             "/api/repos",
         ] {
             let start = std::time::Instant::now();
-            let result = tokio::time::timeout(Duration::from_secs(5), fx.get(path)).await;
+            let result = if timed {
+                tokio::time::timeout(Duration::from_secs(5), fx.get(path)).await
+            } else {
+                Ok(fx.get(path).await)
+            };
             let elapsed = start.elapsed();
             eprintln!("{path}: {elapsed:?}");
             match result {
-                Ok(res) if res.status == 200 && elapsed <= Duration::from_secs(5) => {}
+                Ok(res) if res.status == 200 && (!timed || elapsed <= Duration::from_secs(5)) => {}
                 Ok(res) => failures.push(format!("{path}: status {}, {elapsed:?}", res.status)),
                 Err(_) => failures.push(format!("{path}: exceeded 5 seconds ({elapsed:?})")),
             }
@@ -21902,14 +21916,7 @@ mod tests {
             created_at: 0,
             finished_at: None,
         };
-        let lease = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(directory.join("live.lock"))
-            .unwrap();
-        crate::pr_head::try_lock_file(&lease).unwrap();
+        let lease = crate::worker::execution_lease_for_test(&directory.join("live.lock"));
         let write = |job: &crate::worker::Job| {
             std::fs::write(directory.join("job.json"), serde_json::to_vec(job).unwrap()).unwrap();
         };

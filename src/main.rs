@@ -742,6 +742,14 @@ enum ControlCmd {
         #[arg(long)]
         title: Option<String>,
     },
+    /// Plan or individually authorize retention reconciliation for this chat's task.
+    ReconcileRetention {
+        id: String,
+        #[arg(long)]
+        authority_run: String,
+        #[arg(long)]
+        apply: Option<String>,
+    },
     /// Abandon a run whose driver is proven gone. Needs the owner's exact
     /// message `abandon-run: <run id>` as the latest send, and `--quote` of it.
     Abandon {
@@ -3718,6 +3726,16 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                     title,
                     quote: quote.map(str::to_owned),
                 },
+                ControlCmd::ReconcileRetention {
+                    id,
+                    authority_run,
+                    apply,
+                } => cc::Operation::ReconcileRetention {
+                    task: id,
+                    authority: authority_run,
+                    apply,
+                    quote: quote.map(str::to_owned),
+                },
                 ControlCmd::Abandon { run } => cc::Operation::Abandon {
                     run,
                     quote: quote.map(str::to_owned),
@@ -3907,10 +3925,31 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
             authority_run,
             apply,
         } => {
-            anyhow::ensure!(
-                std::env::var_os("MAGI_RUN").is_none(),
-                "retention reconciliation requires a direct operator command"
-            );
+            if std::env::var_os("MAGI_RUN").is_some() {
+                let talks = magi::talk::Talks::open();
+                let talk = magi::chat_control::authorize(
+                    &talks,
+                    &std::env::var("MAGI_RUN").unwrap_or_default(),
+                    &std::env::var("MAGI_NODE").unwrap_or_default(),
+                )?;
+                println!(
+                    "{}",
+                    magi::chat_control::dispatch(
+                        &q,
+                        &magi::run::home(),
+                        &talks,
+                        &talk.id,
+                        magi::chat_control::Operation::ReconcileRetention {
+                            task: id,
+                            authority: authority_run,
+                            apply,
+                            quote: quote.map(str::to_owned),
+                        },
+                    )
+                    .await?
+                );
+                return Ok(());
+            }
             // Keep the reconciliation proof future off every task command's
             // stack, including simple queue edits that never use this branch.
             let path = Box::pin(magi::retention::reconcile::run(

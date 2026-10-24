@@ -11266,6 +11266,11 @@ mod tests {
 
     #[tokio::test]
     async fn ownership_contention_waits_and_reads_the_settled_record_before_resuming() {
+        if !crate::standalone_test(
+            "daemon::tests::ownership_contention_waits_and_reads_the_settled_record_before_resuming",
+        ) {
+            return;
+        }
         let home = tempfile::tempdir().unwrap();
         let mut owner = stopped_public_run(RunStatus::Blocked);
         owner.save_under(home.path()).unwrap();
@@ -11294,6 +11299,11 @@ mod tests {
 
     #[tokio::test]
     async fn retained_public_owner_wins_over_an_existing_successor_and_unknown_history_holds() {
+        if !crate::standalone_test(
+            "daemon::tests::retained_public_owner_wins_over_an_existing_successor_and_unknown_history_holds",
+        ) {
+            return;
+        }
         let home = tempfile::tempdir().unwrap();
         let mut owner = stopped_public_run(RunStatus::Blocked);
         let repo = tempfile::tempdir().unwrap();

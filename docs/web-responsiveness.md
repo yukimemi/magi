@@ -124,6 +124,21 @@ Chrome 4 プロセスの同時実行によるホスト CPU 競合を含むデバ
 
 ## Reproduction and measurement boundaries
 
+`list_endpoints_large_home_responses` checks every initial-load HTTP route against
+200 questions, 300 runs and 400 tasks/conversations in the normal test suite.
+The deterministic request-cost tests also remain enabled: they bound configuration
+discoveries and Git calls at increasing record counts, including cold caches.
+
+The separate `list_endpoints_large_home_ceiling` measurement retains the five-second
+limit per route. Run it explicitly on an otherwise idle host; the parallel test
+suite competes for CPU and filesystem resources and cannot provide a stable
+wall-clock performance measurement. Like the other local latency measurements,
+this test is ignored by default:
+
+```sh
+RUSTUP_TOOLCHAIN=stable cargo test --locked --lib web::tests::list_endpoints_large_home_ceiling -- --ignored --exact --nocapture --test-threads=1
+```
+
 ```sh
 node --test tests/web_progressive.mjs
 RUSTUP_TOOLCHAIN=stable cargo test --locked --lib web_history_latency_measurement -- --ignored --nocapture

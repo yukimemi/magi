@@ -1032,6 +1032,21 @@ pub(crate) fn latest_owner_instruction(talk: &Talk) -> Option<&str> {
     current_instruction(talk).map(|(_, _, words)| words)
 }
 
+/// Exact latest owner evidence for individually confirmed destructive controls.
+pub(crate) fn exact_owner_authorization(
+    talk: &Talk,
+    expected: &str,
+    quote: Option<&str>,
+) -> Result<serde_json::Value> {
+    let (turn, message, words) = current_instruction(talk)
+        .context("no current persisted owner instruction; drain newer messages first")?;
+    anyhow::ensure!(
+        words == expected && quote == Some(expected),
+        "requires the latest individual owner message and --quote exactly `{expected}`"
+    );
+    Ok(serde_json::json!({"turn":turn,"message":message,"instruction":words}))
+}
+
 fn current_instruction(talk: &Talk) -> Option<(usize, usize, &str)> {
     // A newer queued send can retract the instruction. Wait until it is
     // drained rather than letting the running seat use older words. Explicitly

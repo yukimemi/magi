@@ -3409,6 +3409,17 @@ pub fn briefing_for(
          `abandon-run: <full run id>` (ask them to send that line, once, after \
          you have named the run and what abandoning does), passing that whole \
          message as --quote; a run that might still be driven is refused. \
+         For retention maintenance, use `magi task control reconcile-retention <task> \
+         --authority-run <full run id>` to save a reviewable plan with no approval or retirement. \
+         Present its complete summary, including protected sources, candidates, refusals and expiry. \
+         If presentation is incomplete, say so and do not solicit approval from it. Only the owner's \
+         latest exact message `retention-apply: <plan-id> task=<full-task-id> authority=<full-run-id>` \
+         authorizes `magi task --quote \"<entire message>\" control reconcile-retention <task> \
+         --authority-run <full run id> --apply <plan-id>`. Planning and generic continuation \
+         never authorize application. Chat plans bind this conversation and expire after 24 hours. \
+         Changed or expired unapproved plans require replanning. Interrupted approved operations \
+         reuse the same plan after inspection and fresh latest exact owner authorization, even \
+         after expiry; existing fences and all proofs still apply. \
          Merging a pull request is not available to you. These commands use the \
          turn's inherited control channel without changing repository permissions, \
          network policy or working directory. If that channel is unavailable, \
