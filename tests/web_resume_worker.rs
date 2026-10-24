@@ -156,8 +156,7 @@ async fn request(
     }).await.expect("HTTP request timeout")
 }
 
-common::e2e! {
-async fn manual_web_resume_keeps_its_task_worker_after_web_replacement() {
+async fn manual_web_resume_after_web_replacement(orphaned_running: bool) {
     let home = home_lock().await;
     let mut fx = fixture(home, Judges::Unanimous, false);
     let home = magi::run::home();
@@ -167,8 +166,14 @@ async fn manual_web_resume_keeps_its_task_worker_after_web_replacement() {
 
     // Create a real, resumable run with prepared worktrees, before any agent
     // invocation. Resume must carry those same worktrees into a task worker.
-    let mut runner = Runner::start(&fx.repo, "create note.txt".into(), fx.config.clone(),
-        magi::run::Origin::operator()).await.expect("start real run");
+    let mut runner = Runner::start(
+        &fx.repo,
+        "create note.txt".into(),
+        fx.config.clone(),
+        magi::run::Origin::operator(),
+    )
+    .await
+    .expect("start real run");
     let pause = Pause::new();
     pause.park();
     runner.on_pause(pause);
@@ -179,39 +184,76 @@ async fn manual_web_resume_keeps_its_task_worker_after_web_replacement() {
     drop(runner);
 
     let queue = Queue::open();
-    let mut task = Task::new("manually resumed task".into(), "create note.txt".into(),
-        fx.repo.clone(), Source::Human);
+    let mut task = Task::new(
+        "manually resumed task".into(),
+        "create note.txt".into(),
+        fx.repo.clone(),
+        Source::Human,
+    );
     task.solo = true;
     task.overrides = Some(RunOverrides {
-        config: Some(config), merge: Some("none".into()), ..Default::default()
+        config: Some(config),
+        merge: Some("none".into()),
+        ..Default::default()
     });
     task.start(run_id.clone());
-    task.stall("parked before implementation");
+    if !orphaned_running {
+        task.stall("parked before implementation");
+    }
+    // With no scheduler or live driver, Running represents a worker that
+    // exited without settling its queue task. Manual resume must recover it.
+    assert_eq!(
+        task.status,
+        if orphaned_running {
+            TaskStatus::Running
+        } else {
+            TaskStatus::Failed
+        }
+    );
     queue.put(&mut task).unwrap();
 
     let (mut predecessor, address) = web(&home, &fx.repo, &fx.tmp.path().join("old-web.log")).await;
-    let (status, body) = request(address, "POST", &format!("/api/runs/{run_id}/resume"), None).await;
+    let (status, body) =
+        request(address, "POST", &format!("/api/runs/{run_id}/resume"), None).await;
     assert_eq!(status, 202, "{body}");
-    wait_for(|| block.started_path().exists(), "resumed implementation worker").await;
+    wait_for(
+        || block.started_path().exists(),
+        "resumed implementation worker",
+    )
+    .await;
     let before_task = queue.get(&task.id).unwrap();
     let before_state = RunState::load(&run_id).unwrap();
-    let worker = magi::worker::active(&home).unwrap().into_iter()
+    let worker = magi::worker::active(&home)
+        .unwrap()
+        .into_iter()
         .find(|job| job.kind == "task" && job.key == format!("task:{}", task.id))
         .expect("manual resume published an ordinary task worker");
     assert_eq!(before_state.driver_pid, worker.pid);
     assert_ne!(worker.pid, Some(predecessor.0.id()));
     assert!(!before_state.parked);
+    let (status, body) =
+        request(address, "POST", &format!("/api/runs/{run_id}/resume"), None).await;
+    assert_eq!(
+        status, 409,
+        "a live worker still prevents a duplicate resume: {body}"
+    );
 
     predecessor.stop();
-    assert!(queue.claim(&task.id).is_err(), "web never owns the execution claim");
+    assert!(
+        queue.claim(&task.id).is_err(),
+        "web never owns the execution claim"
+    );
     let (_successor, address) = web(&home, &fx.repo, &fx.tmp.path().join("new-web.log")).await;
     let (status, health) = request(address, "GET", "/api/health", None).await;
     assert_eq!(status, 200, "{health}");
-    assert!(health["jobs"].as_array().unwrap().iter().any(|job| {
-        job["id"].as_str() == Some(worker.id.as_str())
-            && job["generation"].as_str() == Some(worker.generation.as_str())
-            && job["pid"].as_u64() == worker.pid.map(u64::from)
-    }), "replacement web sees the original task worker: {health}");
+    assert!(
+        health["jobs"].as_array().unwrap().iter().any(|job| {
+            job["id"].as_str() == Some(worker.id.as_str())
+                && job["generation"].as_str() == Some(worker.generation.as_str())
+                && job["pid"].as_u64() == worker.pid.map(u64::from)
+        }),
+        "replacement web sees the original task worker: {health}"
+    );
     let still_running = queue.get(&task.id).unwrap();
     assert_eq!(still_running.attempts, before_task.attempts);
     assert_eq!(still_running.runs, before_task.runs);
@@ -222,14 +264,28 @@ async fn manual_web_resume_keeps_its_task_worker_after_web_replacement() {
     assert!(!state.parked);
 
     block.release();
-    wait_for(|| queue.get(&task.id).unwrap().status == TaskStatus::Done,
-        "the same resumed worker to finish").await;
+    wait_for(
+        || queue.get(&task.id).unwrap().status == TaskStatus::Done,
+        "the same resumed worker to finish",
+    )
+    .await;
     let finished = queue.get(&task.id).unwrap();
     assert_eq!(finished.runs, vec![run_id.clone()]);
     assert_eq!(finished.attempts, before_task.attempts);
     let state = RunState::load(&run_id).unwrap();
     assert_eq!(state.passes.len(), before_state.passes.len());
     assert!(!state.parked);
+}
+
+common::e2e! {
+async fn manual_web_resume_keeps_its_task_worker_after_web_replacement() {
+    manual_web_resume_after_web_replacement(false).await;
+}
+}
+
+common::e2e! {
+async fn manual_web_resume_recovers_an_orphaned_running_task_without_a_scheduler() {
+    manual_web_resume_after_web_replacement(true).await;
 }
 }
 

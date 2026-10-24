@@ -59,12 +59,13 @@ pub(crate) async fn spawn_detached(home: &Path, id: &str) -> Result<crate::worke
     )?;
     ensure!(
         task.runs.last().is_some_and(|run| run == id)
-            && !matches!(
-                task.status,
-                crate::queue::TaskStatus::Running | crate::queue::TaskStatus::Done
-            ),
+            && task.status != crate::queue::TaskStatus::Done,
         "run queue owner changed"
     );
+    // A crashed worker can leave its task Running after releasing its claim
+    // and execution lease. Preflight checked run liveness, and the task claim
+    // acquired above excludes a concurrent queue driver; no scheduler reclaim
+    // is required before this explicit resume.
     task.release_operator("resume", None);
     task.resume_override = Some(crate::queue::OperatorResume {
         question_id: String::new(),
