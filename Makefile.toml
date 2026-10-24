@@ -1,3 +1,11 @@
+# Not kata-owned (kata only rewrites the listed `tasks.*` paths). CI runs the
+# integration tests under cargo-nextest (`.github/workflows/ci.yml`, profile
+# `ci` in `.config/nextest.toml`), so the local gate does too: lib / bin unit
+# tests stay on `cargo test`, integration binaries run in parallel. Without
+# cargo-nextest installed, `test-targets` warns and falls back to `cargo test`.
+[env]
+PJ_RUST_TEST_RUNNER = "nextest"
+
 [tasks.default]
 alias = "check"
 

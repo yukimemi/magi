@@ -2120,6 +2120,14 @@ every review round rebuilds this crate from scratch in the winner's worktree,
 which dwarfs the agent latency it is measuring. `magi fold --all` afterwards:
 `candidates + judges + reviewers` worktrees exist at peak.
 
+`cargo make check` runs the integration binaries under cargo-nextest
+(`PJ_RUST_TEST_RUNNER = "nextest"` in `Makefile.toml`'s `[env]`, the same split
+CI uses): lib / bin unit tests on `cargo test`, integration tests in parallel
+under `.config/nextest.toml`'s group caps. Install cargo-nextest wherever the
+gate runs; without it the task warns and falls back to the serial `cargo test`
+(measured locally: ~21 min serial against ~12 min with nextest for the same
+tests, on a loaded machine).
+
 **Never build by hand into the directory `verify` uses.** Two different source
 trees alternating through one `CARGO_TARGET_DIR` will link a test against the
 other tree's stale `libmagi`, and the compiler then reports missing fields on
