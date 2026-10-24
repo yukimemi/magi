@@ -1817,15 +1817,52 @@ pub fn pick(
 /// it is the CLI's own mechanism rather than more prompt wording. The other
 /// CLIs have no operator-level answer-language preference magi knows of and
 /// are returned unchanged.
-pub fn for_github_text(spec: &AgentSpec, github_language: &str) -> AgentSpec {
+pub fn for_github_text(spec: &AgentSpec, github_language: &str, cwd: &Path) -> Result<AgentSpec> {
     let mut spec = spec.clone();
     if spec.kind == AgentKind::Claude {
-        spec.extra_args.push("--settings".to_owned());
-        spec.extra_args.push(
-            serde_json::json!({ "language": crate::lang::name(github_language) }).to_string(),
-        );
+        // The CLI uses the last --settings value. Replace that value in
+        // place, preserving its settings and the precedence of earlier flags.
+        let mut existing = None;
+        let mut args = spec.extra_args.iter().enumerate();
+        while let Some((index, arg)) = args.next() {
+            if arg == "--settings" {
+                let (value_index, value) = args.next().context("--settings requires a value")?;
+                existing = Some((value_index, value.as_str(), false));
+            } else if let Some(value) = arg.strip_prefix("--settings=") {
+                existing = Some((index, value, true));
+            }
+        }
+        let mut settings = if let Some((_, value, _)) = existing {
+            let json = if value.trim_start().starts_with('{') {
+                value.to_owned()
+            } else {
+                std::fs::read_to_string(cwd.join(value))
+                    .context("cannot read existing seat --settings file")?
+            };
+            serde_json::from_str::<serde_json::Value>(&json)
+                .context("cannot parse existing seat --settings JSON")?
+        } else {
+            serde_json::json!({})
+        };
+        settings
+            .as_object_mut()
+            .context("seat --settings must be a JSON object")?
+            .insert(
+                "language".to_owned(),
+                serde_json::json!(crate::lang::name(github_language)),
+            );
+        let settings = settings.to_string();
+        if let Some((index, _, equals)) = existing {
+            spec.extra_args[index] = if equals {
+                format!("--settings={settings}")
+            } else {
+                settings
+            };
+        } else {
+            spec.extra_args.extend(["--settings".to_owned(), settings]);
+        }
     }
-    spec
+    Ok(spec)
 }
 
 /// Resolve a standalone seat's agent choice into the ordered chain to try.
@@ -2112,7 +2149,8 @@ mod tests {
         let seat = SeatState::new("change-summary", "a", 7);
         let art = Path::new("/art");
         for (language, name) in [("en", "English"), ("", "English"), ("ja", "Japanese")] {
-            let claude = for_github_text(&spec(AgentKind::Claude, None), language);
+            let claude =
+                for_github_text(&spec(AgentKind::Claude, None), language, Path::new(".")).unwrap();
             let plan = build_command(
                 &claude,
                 &seat,
@@ -2139,10 +2177,70 @@ mod tests {
             AgentKind::Omp,
         ] {
             assert!(
-                for_github_text(&spec(kind, None), "en")
+                for_github_text(&spec(kind, None), "en", Path::new("."))
+                    .unwrap()
                     .extra_args
                     .is_empty()
             );
+        }
+    }
+
+    #[test]
+    fn github_text_preserves_existing_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = serde_json::json!({
+            "language": "Japanese",
+            "env": { "SEAT_MODE": "configured" },
+            "apiKeyHelper": "credential-helper",
+            "hooks": { "Stop": [] }
+        });
+        std::fs::write(dir.path().join("seat-settings.json"), original.to_string()).unwrap();
+        for value in [original.to_string(), "./seat-settings.json".to_owned()] {
+            for equals in [false, true] {
+                let mut spec = spec(AgentKind::Claude, None);
+                // Earlier settings stay earlier; the CLI's last value wins.
+                spec.extra_args = vec!["--settings={\"language\":\"French\"}".to_owned()];
+                if equals {
+                    spec.extra_args.push(format!("--settings={value}"));
+                } else {
+                    spec.extra_args
+                        .extend(["--settings".to_owned(), value.clone()]);
+                }
+                spec.extra_args.push("--verbose".to_owned());
+                let updated = for_github_text(&spec, "en", dir.path()).unwrap();
+                assert_eq!(updated.extra_args.len(), spec.extra_args.len());
+                assert_eq!(updated.extra_args[0], spec.extra_args[0]);
+                assert_eq!(updated.extra_args.last(), spec.extra_args.last());
+                let value = &updated.extra_args[updated.extra_args.len() - 2];
+                let actual: serde_json::Value =
+                    serde_json::from_str(value.strip_prefix("--settings=").unwrap_or(value))
+                        .unwrap();
+                let mut expected = original.clone();
+                expected["language"] = serde_json::json!("English");
+                assert_eq!(actual, expected);
+            }
+        }
+        let on_disk: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("seat-settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(on_disk, original);
+    }
+
+    #[test]
+    fn github_text_rejects_unreadable_or_invalid_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bad.json"), "invalid json").unwrap();
+        std::fs::write(dir.path().join("array.json"), "[]").unwrap();
+        for args in [
+            vec!["--settings"],
+            vec!["--settings", "missing.json"],
+            vec!["--settings=bad.json"],
+            vec!["--settings", "array.json"],
+        ] {
+            let mut spec = spec(AgentKind::Claude, None);
+            spec.extra_args = args.into_iter().map(str::to_owned).collect();
+            assert!(for_github_text(&spec, "en", dir.path()).is_err());
         }
     }
 

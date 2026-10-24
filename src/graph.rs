@@ -7548,8 +7548,19 @@ impl Runner {
         let run = self.state.id.clone();
         for (i, spec) in chain.into_iter().enumerate() {
             let seat = crate::fixer::seat_for(&mut self.state, "change-summary", &spec.id);
+            let github_spec = match agent::for_github_text(
+                &spec,
+                &self.state.config.graph.github_language,
+                &winner.worktree,
+            ) {
+                Ok(spec) => spec,
+                Err(e) => {
+                    tracing::warn!(agent = %spec.id, "cannot prepare GitHub text settings: {e:#}");
+                    continue;
+                }
+            };
             let job = SeatJob {
-                spec: agent::for_github_text(&spec, &self.state.config.graph.github_language),
+                spec: github_spec,
                 seat,
                 cwd: winner.worktree.clone(),
                 prompt: prompt.clone(),
@@ -7720,8 +7731,19 @@ impl Runner {
             let seat = resumed_seat.unwrap_or_else(|| {
                 crate::fixer::seat_for(&mut self.state, "github-text-rewrite", &spec.id)
             });
+            let github_spec = match agent::for_github_text(
+                &spec,
+                &self.state.config.graph.github_language,
+                &winner.worktree,
+            ) {
+                Ok(spec) => spec,
+                Err(e) => {
+                    tracing::warn!(agent = %spec.id, "cannot prepare GitHub text settings: {e:#}");
+                    continue;
+                }
+            };
             let job = SeatJob {
-                spec: agent::for_github_text(&spec, &self.state.config.graph.github_language),
+                spec: github_spec,
                 seat,
                 cwd: winner.worktree.clone(),
                 prompt: prompt.clone(),

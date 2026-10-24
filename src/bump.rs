@@ -77,28 +77,32 @@ async fn ask_decision(
             format!("decision attempt {attempt}: trying {} ({stem})", spec.id),
         );
         // The reason is posted in the release pull request.
-        let outcome = agent::invoke(
-            &agent::for_github_text(spec, &state.config.graph.github_language),
-            &mut seat,
-            &Invocation {
-                scope: crate::agent::InvocationScope::Repository,
-                coordination: state.config.coordination.as_ref(),
-                fetched_base: None,
-                cwd: repo,
-                prompt,
-                timeout: attempt_timeout,
-                allow_write: false,
-                unsandboxed: false,
-                sessions: false,
-                artifacts: &artifacts,
-                stem: &stem,
-                run: &state.id,
-                node: "bump",
-                cache_dir: cache.as_deref(),
-                attachments: &[],
-                writable: &[],
-            },
-        )
+        let outcome = async {
+            let spec = agent::for_github_text(spec, &state.config.graph.github_language, repo)?;
+            agent::invoke(
+                &spec,
+                &mut seat,
+                &Invocation {
+                    scope: crate::agent::InvocationScope::Repository,
+                    coordination: state.config.coordination.as_ref(),
+                    fetched_base: None,
+                    cwd: repo,
+                    prompt,
+                    timeout: attempt_timeout,
+                    allow_write: false,
+                    unsandboxed: false,
+                    sessions: false,
+                    artifacts: &artifacts,
+                    stem: &stem,
+                    run: &state.id,
+                    node: "bump",
+                    cache_dir: cache.as_deref(),
+                    attachments: &[],
+                    writable: &[],
+                },
+            )
+            .await
+        }
         .await;
         let parsed = if agent::chain_advances(&outcome) {
             None
@@ -192,28 +196,32 @@ async fn guard_reason(
             "{prompt}\n\nYour release reason failed the GitHub text gate: {violations:?}. Return the same decision JSON with an English reason containing no local identity or secrets. Previous reason: {}",
             decision.reason
         );
-        let retry = agent::invoke(
-            &agent::for_github_text(spec, &state.config.graph.github_language),
-            seat,
-            &Invocation {
-                scope: crate::agent::InvocationScope::Repository,
-                coordination: state.config.coordination.as_ref(),
-                fetched_base: None,
-                cwd: repo,
-                prompt: &rewrite,
-                timeout: crate::graph::retry_budget(DECISION_TIMEOUT, true),
-                allow_write: false,
-                unsandboxed: false,
-                sessions: false,
-                artifacts: &artifacts,
-                stem: "bump-rewrite",
-                run: &state.id,
-                node: "bump",
-                cache_dir: state.config.cache_dir().as_deref(),
-                attachments: &[],
-                writable: &[],
-            },
-        )
+        let retry = async {
+            let spec = agent::for_github_text(spec, &state.config.graph.github_language, repo)?;
+            agent::invoke(
+                &spec,
+                seat,
+                &Invocation {
+                    scope: crate::agent::InvocationScope::Repository,
+                    coordination: state.config.coordination.as_ref(),
+                    fetched_base: None,
+                    cwd: repo,
+                    prompt: &rewrite,
+                    timeout: crate::graph::retry_budget(DECISION_TIMEOUT, true),
+                    allow_write: false,
+                    unsandboxed: false,
+                    sessions: false,
+                    artifacts: &artifacts,
+                    stem: "bump-rewrite",
+                    run: &state.id,
+                    node: "bump",
+                    cache_dir: state.config.cache_dir().as_deref(),
+                    attachments: &[],
+                    writable: &[],
+                },
+            )
+            .await
+        }
         .await;
         let reason = retry
             .ok()
