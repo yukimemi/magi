@@ -1,17 +1,23 @@
 //! Short titles from completed operator/persona exchanges, independent of chat sessions.
 use super::*;
 
+/// タイトルが自動生成か手動設定かを表す。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TitleSource {
+    /// 会話から自動生成されたタイトル。
     Generated,
+    /// 利用者が設定したタイトル。
     Manual,
 }
 
+/// 会話に保存するタイトルとその設定元。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChatTitle {
+    /// 表示するタイトル。
     pub text: String,
+    /// タイトルの設定元。
     pub source: TitleSource,
 }
 
@@ -83,7 +89,9 @@ fn parse(text: &str) -> Option<String> {
     struct Output {
         title: String,
     }
-    let out: Output = serde_json::from_str(text.trim()).ok()?;
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    let out: Output = serde_json::from_str(text.get(start..=end)?).ok()?;
     let title = out.title.trim();
     if title.is_empty() || title.chars().count() > 40 || out.title.chars().any(char::is_control) {
         return None;
@@ -92,18 +100,27 @@ fn parse(text: &str) -> Option<String> {
 }
 
 async fn generate(talk: &Talk, store: &Talks, cfg: &Config) -> Option<String> {
-    let chain = agent::pick_chain(
+    let mut chain = agent::pick_chain(
         &cfg.agents,
         cfg.roles.chatter.as_ref(),
         &agent::installed,
         "chatter",
     )
     .ok()?;
+    // Prefer the agent that just answered successfully, keeping the fallback order.
+    if let Some(at) = chain.iter().position(|spec| spec.id == talk.agent) {
+        chain[..=at].rotate_right(1);
+    }
     let identity = crate::scrub::Identity::current();
     let body = prompt(talk, &identity);
-    let artifacts = store.artifacts_of(&talk.id);
+    let artifacts = store.artifacts_of(&talk.id).join("title");
     let cache = cfg.cache_dir();
+    let started = std::time::Instant::now();
     for spec in chain {
+        let remaining = Duration::from_secs(30).saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
         let mut seat = SeatState::new("talk-title", &spec.id, crate::rng::entropy());
         let inv = Invocation {
             scope: agent::InvocationScope::Repository,
@@ -111,7 +128,7 @@ async fn generate(talk: &Talk, store: &Talks, cfg: &Config) -> Option<String> {
             fetched_base: None,
             cwd: &talk.repo,
             prompt: &body,
-            timeout: Duration::from_secs(30),
+            timeout: remaining,
             allow_write: false,
             unsandboxed: false,
             sessions: false,
@@ -141,7 +158,7 @@ fn unchanged(fresh: &Talk, snapshot: &Talk) -> bool {
     fresh.status == TalkStatus::Open
         && fresh.title == snapshot.title
         && fresh.title_attempted_at == snapshot.title_attempted_at
-        && fresh.turns == snapshot.turns
+        && exchanges(&fresh.turns).len() == exchanges(&snapshot.turns).len()
 }
 
 /// Called inside the existing turn lease/heartbeat, with no store lock during CLI I/O.
@@ -312,17 +329,23 @@ mod tests {
     }
 
     #[test]
-    fn title_output_requires_one_short_single_line_json_value() {
+    fn title_output_accepts_wrappers_but_requires_one_short_single_line_json_value() {
         assert_eq!(
             parse(r#"{"title":"最近の話題"}"#).as_deref(),
             Some("最近の話題")
         );
+        for wrapped in [
+            "```json\n{\"title\":\"名前\"}\n```",
+            "開始ログ\n{\"title\":\"名前\"}\n終了ログ",
+        ] {
+            assert_eq!(parse(wrapped).as_deref(), Some("名前"));
+        }
         for bad in [
+            "} ログ {",
             r#"{"title":""}"#,
             r#"{"title":"a\nb"}"#,
             r#"{"title":"a\n"}"#,
             r#"{"title":"ok","other":true}"#,
-            "```json\n{\"title\":\"名前\"}\n```",
             "{\"title\":\"a\"} {}",
         ] {
             assert!(parse(bad).is_none(), "{bad}");
@@ -332,7 +355,7 @@ mod tests {
     }
 
     #[test]
-    fn title_application_rejects_manual_edits_closure_or_new_transcript() {
+    fn title_application_rejects_manual_edits_closure_or_new_exchange() {
         let mut talk = chat();
         exchange(&mut talk, "話題");
         let snapshot = talk.clone();
@@ -347,6 +370,24 @@ mod tests {
             text: "手動".into(),
             source: TitleSource::Manual,
         });
+        assert!(!unchanged(&talk, &snapshot));
+    }
+
+    #[test]
+    fn title_application_allows_posts_notices_and_pending_input() {
+        let mut talk = chat();
+        exchange(&mut talk, "話題");
+        let snapshot = talk.clone();
+        let mut post = message(Who::Agent, "外部投稿", None);
+        post.posted_by = Some("task".into());
+        talk.turns.push(post);
+        talk.turns
+            .push(message(Who::Operator, "通知", Some(Sender::Magi)));
+        talk.turns
+            .push(message(Who::Agent, "通知への回答", Some(Sender::Persona)));
+        talk.turns.push(message(Who::Operator, "次の入力", None));
+        assert!(unchanged(&talk, &snapshot));
+        talk.turns.push(message(Who::Agent, "次の回答", None));
         assert!(!unchanged(&talk, &snapshot));
     }
 
@@ -462,6 +503,7 @@ mod tests {
         assert_eq!(talk.title.as_ref().unwrap().text, "最近の話題");
         assert_eq!(serde_json::to_value(&talk.seat).unwrap(), seat);
         assert_eq!(store.get(&talk.id).unwrap().title, talk.title);
+        assert!(store.artifacts_of(&talk.id).join("title").is_dir());
         std::fs::remove_file(&capture).unwrap();
         exchange(&mut talk, "次の話題");
         store.put(&mut talk).unwrap();
@@ -470,5 +512,12 @@ mod tests {
             !capture.exists(),
             "no invocation before five more exchanges"
         );
+        let mut cfg = cfg;
+        cfg.agents[0] = make("invalid", r#"{"title":"先頭の席"}"#);
+        talk.agent = "valid".into();
+        talk.title_attempted_at = None;
+        store.put_inner(&mut talk, false).unwrap();
+        refresh(&mut talk, &store, &cfg).await;
+        assert_eq!(talk.title.as_ref().unwrap().text, "最近の話題");
     }
 }
