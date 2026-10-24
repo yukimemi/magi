@@ -4913,6 +4913,7 @@ async fn queue_page(
 /// Opening a conversation obtains its full context window and controls.
 #[derive(Serialize)]
 struct TalkListView {
+    title: Option<talk::ChatTitle>,
     id: String,
     repo: PathBuf,
     agent: String,
@@ -4941,6 +4942,7 @@ async fn talks_page(
             .into_iter()
             .filter_map(|id| ui.talks.get(&id).ok())
             .map(|talk| TalkListView {
+                title: talk.title.clone(),
                 thinking: ui.is_thinking(&talk.id),
                 context: talk::context_usage(&talk, None),
                 turns: talk
@@ -5208,14 +5210,20 @@ where
 /// under `operator` / `agent` so the snippet says who spoke. Nothing else
 /// (session ids, repo paths, usage, drafts) is part of the document.
 ///
-/// The title rule mirrors `talkOpener` / `firstLine` in `app.js`: the first
-/// non-empty line of the first operator turn, trimmed and cut to 96 chars.
+/// Saved titles take precedence; otherwise mirror the opener fallback in `app.js`.
 fn talk_search_doc(talk: &Talk) -> serde_json::Value {
     let opener = talk
-        .turns
-        .iter()
-        .find(|t| t.who == crate::talk::Who::Operator)
-        .and_then(|t| t.body.lines().map(str::trim).find(|l| !l.is_empty()))
+        .title
+        .as_ref()
+        .filter(|t| !t.text.is_empty())
+        .map(|t| t.text.as_str())
+        .or_else(|| {
+            talk.turns
+                .iter()
+                .find(|t| t.who == talk::Who::Operator)
+                .map(|t| t.body.as_str())
+        })
+        .and_then(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
         .unwrap_or("");
     let title: String = if opener.chars().count() > 96 {
         opener.chars().take(95).chain(['\u{2026}']).collect()
@@ -17979,6 +17987,26 @@ mod tests {
         let dir = f.home.path().join("talks");
         std::fs::create_dir_all(&dir).expect("talks dir");
         std::fs::write(dir.join(format!("{id}.json")), doc.to_string()).expect("write talk");
+    }
+
+    #[test]
+    fn chat_search_prefers_the_saved_title_and_keeps_the_transcript() {
+        let mut talk: Talk = serde_json::from_value(serde_json::json!({
+            "schema": 1, "id": "20260908-205806-ab12", "repo": ".", "agent": "test",
+            "status": "open", "turns": [{"who":"operator", "body":"古い話題", "at":"2026-09-08T20:58:02Z"}],
+            "created_at": "2026-09-08T20:58:02Z", "updated_at": "2026-09-08T20:58:02Z",
+            "seat": crate::agent::SeatState::new("talk", "test", 1)
+        })).unwrap();
+        assert_eq!(talk_search_doc(&talk)["title"], "古い話題");
+        talk.title = Some(talk::ChatTitle {
+            text: "最近の話題".into(),
+            source: talk::TitleSource::Generated,
+        });
+        let doc = talk_search_doc(&talk);
+        assert_eq!(doc["title"], "最近の話題");
+        assert_eq!(doc["turns"][0]["operator"], "古い話題");
+        talk.title.as_mut().unwrap().source = talk::TitleSource::Manual;
+        assert_eq!(talk_search_doc(&talk)["title"], "最近の話題");
     }
 
     #[tokio::test]

@@ -5724,6 +5724,7 @@ const talkTurnsMd = (talk) => (talk && Array.isArray(talk.turn_bodies_md) ? talk
 /* What names a conversation before it has a title of its own: the first
    thing the operator said, if anything has been said yet. */
 function talkOpener(talk) {
+  if (talk && talk.title && talk.title.text) return talk.title.text;
   const first = talkTurns(talk).find((turn) => turn.who === "operator");
   return first ? String(first.body || "") : "";
 }
