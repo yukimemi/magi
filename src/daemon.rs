@@ -2469,6 +2469,11 @@ pub async fn run_task_worker(home: &Path, payload: serde_json::Value) -> Result<
     let _claim = loop {
         match queue.claim(&request.task) {
             Ok(claim) => break claim,
+            // Only contention (the claim file exists) is worth waiting out; an
+            // I/O failure must end this worker instead of pinning its lane.
+            Err(e) if e.chain().any(|c| c.is::<std::io::Error>()) => {
+                return Err(e.context("claim the task for its worker"));
+            }
             Err(_) => {
                 sweep_stale_claims(&queue, STALE_CLAIM);
                 tokio::time::sleep(Duration::from_millis(50)).await;
@@ -4710,6 +4715,10 @@ pub fn hold_if_runnable(queue: &Queue, task: &mut Task) {
     // checkpoint or owner handoff, not an unrequested retry.
     if matches!(task.status, TaskStatus::Queued | TaskStatus::Failed)
         && !awaiting_resume_with(task, RunState::load)
+        // A run parked on the owner's word about a withheld PR title/body
+        // resumes via `land_resume_state`, including review-only tasks that
+        // `awaiting_resume_with` does not consider.
+        && withheld_text_wait(task).is_none()
         && !(task.fresh_start && task.replacement.is_some())
     {
         let why = task.last_error.clone().map_or_else(
