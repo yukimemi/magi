@@ -440,6 +440,7 @@ pub(crate) struct SharedMonitor {
     pub worker_started: std::sync::atomic::AtomicBool,
     pub queue_index: Arc<Mutex<QueueIndex>>,
     list_walks: Mutex<Vec<ListWalk>>,
+    disk: Arc<Mutex<DiskObservation>>,
 }
 
 /// Keep a failed store's last observation without suppressing healthy stores.
@@ -479,6 +480,7 @@ impl SharedMonitor {
             worker_started: std::sync::atomic::AtomicBool::new(false),
             queue_index: Arc::default(),
             list_walks: Mutex::default(),
+            disk: Arc::default(),
         }
     }
 
@@ -2578,19 +2580,17 @@ fn upgrade_progress_view(ui: &Ui, progress: updater::Progress) -> UpgradeProgres
     }
 }
 
-/// The disk figures `/api/health` carries. Every number is produced by
-/// [`crate::disk`], the same code that decides a run may not start, so the
-/// health screen and the gate cannot disagree about what the machine looks
-/// like.
+/// Last successful capacity observations, independent of admission/cleanup.
+/// Cold or unavailable directory measurements are null, never invented zeros.
 #[derive(Debug, Serialize)]
 struct DiskView {
     /// Free bytes on the volume holding the runs, when measurable.
     #[serde(skip_serializing_if = "Option::is_none")]
     free_bytes: Option<u64>,
-    /// Everything the runs directory occupies, unreadable runs included.
-    runs_bytes: u64,
+    /// Everything the runs directory occupies, when fully measurable.
+    runs_bytes: Option<u64>,
     /// Everything the runs' worktrees occupy.
-    worktrees_bytes: u64,
+    worktrees_bytes: Option<u64>,
     /// The shared build cache's size, when the config names one.
     #[serde(skip_serializing_if = "Option::is_none")]
     cache_bytes: Option<u64>,
@@ -2598,17 +2598,163 @@ struct DiskView {
     retention: Option<crate::retention::Report>,
 }
 
-impl DiskView {
-    /// Measure the three directories and re-read the config's cache.
+/// Capacity walks have their own demand-driven single flight, not the revision
+/// worker: a large build cache must never delay revisions or a health response.
+const DISK_REFRESH: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiskScope {
+    runs: PathBuf,
+    worktrees: PathBuf,
+    cache: Option<PathBuf>,
+}
+
+impl DiskScope {
     fn of(ui: &Ui, cfg: Option<&Config>) -> Self {
-        let cache_bytes = cfg
-            .and_then(|cfg| cfg.cache_dir())
-            .map(|dir| crate::disk::dir_size(&dir));
         Self {
-            free_bytes: crate::disk::free_bytes(&ui.runs).ok(),
-            runs_bytes: crate::disk::dir_size(&ui.runs),
-            worktrees_bytes: crate::disk::dir_size(&ui.worktrees_root),
-            cache_bytes,
+            runs: ui.runs.clone(),
+            worktrees: ui.worktrees_root.clone(),
+            cache: cfg.and_then(Config::cache_dir),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DiskCapacity {
+    free_bytes: Option<u64>,
+    runs_bytes: Option<u64>,
+    worktrees_bytes: Option<u64>,
+    cache_bytes: Option<u64>,
+}
+
+impl DiskCapacity {
+    fn measure(scope: &DiskScope) -> Self {
+        Self {
+            free_bytes: crate::disk::free_bytes(&scope.runs).ok(),
+            runs_bytes: disk_capacity_size(&scope.runs),
+            worktrees_bytes: disk_capacity_size(&scope.worktrees),
+            cache_bytes: scope.cache.as_deref().and_then(disk_capacity_size),
+        }
+    }
+
+    fn retain_successes(&mut self, next: Self) {
+        self.free_bytes = next.free_bytes.or(self.free_bytes);
+        self.runs_bytes = next.runs_bytes.or(self.runs_bytes);
+        self.worktrees_bytes = next.worktrees_bytes.or(self.worktrees_bytes);
+        self.cache_bytes = next.cache_bytes.or(self.cache_bytes);
+    }
+}
+
+/// Like disk::dir_size, do not follow links. Unlike its admission-oriented
+/// best-effort total, an incomplete observation must not look like an empty tree.
+fn disk_capacity_size(path: &FsPath) -> Option<u64> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(0),
+        Err(_) => return None,
+    };
+    if !metadata.is_dir() {
+        return Some(if metadata.is_file() {
+            metadata.len()
+        } else {
+            0
+        });
+    }
+    let mut total = 0;
+    let mut stack = vec![path.to_owned()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(dir).ok()? {
+            let entry = entry.ok()?;
+            let metadata = entry.metadata().ok()?;
+            if metadata.is_dir() {
+                stack.push(entry.path());
+            } else if metadata.is_file() {
+                total += metadata.len();
+            }
+        }
+    }
+    Some(total)
+}
+
+#[derive(Debug, Default)]
+struct DiskObservation {
+    scope: Option<DiskScope>,
+    capacity: DiskCapacity,
+    in_flight: bool,
+    finished: Option<std::time::Instant>,
+}
+
+impl DiskObservation {
+    fn observe(
+        state: &Arc<Mutex<Self>>,
+        scope: DiskScope,
+        measure: impl FnOnce(&DiskScope) -> DiskCapacity + Send + 'static,
+    ) -> DiskCapacity {
+        let mut observation = state.lock().unwrap_or_else(PoisonError::into_inner);
+        if observation.scope.as_ref() != Some(&scope) {
+            observation.scope = Some(scope.clone());
+            observation.capacity = DiskCapacity::default();
+            observation.finished = None;
+        }
+        let capacity = observation.capacity;
+        if observation.in_flight
+            || observation
+                .finished
+                .is_some_and(|at| at.elapsed() < DISK_REFRESH)
+        {
+            return capacity;
+        }
+        observation.in_flight = true;
+        drop(observation);
+
+        let refresh = DiskRefresh {
+            state: Arc::clone(state),
+            scope,
+        };
+        tokio::task::spawn_blocking(move || {
+            let next = measure(&refresh.scope);
+            let mut observation = refresh.state.lock().unwrap_or_else(PoisonError::into_inner);
+            if observation.scope.as_ref() == Some(&refresh.scope) {
+                observation.capacity.retain_successes(next);
+            }
+            drop(observation);
+            // The guard also clears the flight on panic or a cancelled,
+            // not-yet-started blocking job. No failed scan can wedge health.
+            drop(refresh);
+        });
+        capacity
+    }
+}
+
+struct DiskRefresh {
+    state: Arc<Mutex<DiskObservation>>,
+    scope: DiskScope,
+}
+
+impl Drop for DiskRefresh {
+    fn drop(&mut self) {
+        let mut observation = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        observation.in_flight = false;
+        if observation.scope.as_ref() == Some(&self.scope) {
+            // Wait a full period after completion, including failed scans.
+            observation.finished = Some(std::time::Instant::now());
+        }
+    }
+}
+
+impl DiskView {
+    /// Return immediately, retaining known capacity while one worker refreshes.
+    fn of(ui: &Ui, cfg: Option<&Config>) -> Self {
+        let capacity = DiskObservation::observe(
+            &ui.monitor.disk,
+            DiskScope::of(ui, cfg),
+            DiskCapacity::measure,
+        );
+        Self {
+            free_bytes: capacity.free_bytes,
+            runs_bytes: capacity.runs_bytes,
+            worktrees_bytes: capacity.worktrees_bytes,
+            cache_bytes: capacity.cache_bytes,
             retention: ui
                 .runs
                 .parent()
@@ -8369,12 +8515,14 @@ async fn talk_core(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResu
         let id = resolve_talk(&ui.talks, &id)?;
         let talk = ui.talks.get(&id)?;
         let thinking = ui.is_thinking(&id);
-        Ok(Json(TalkView::with_config(
+        // The browser already resolves Markdown text/code references after
+        // rendering. A cold reference/review index must not gate the transcript.
+        Ok(Json(TalkView::with_references(
             talk,
             thinking,
             None,
             &ui.home,
-            &ui.references,
+            &id_links::IdIndex::default(),
         )))
     })
     .await
@@ -22245,6 +22393,243 @@ mod tests {
         );
     }
 
+    async fn wait_for_disk_scan(state: &Arc<Mutex<DiskObservation>>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.lock().unwrap().in_flight {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capacity scan finished");
+    }
+
+    fn disk_test_scope(home: &FsPath) -> DiskScope {
+        DiskScope {
+            runs: home.join("runs"),
+            worktrees: home.join("worktrees"),
+            cache: Some(home.join("cache")),
+        }
+    }
+
+    fn known_disk_capacity() -> DiskCapacity {
+        DiskCapacity {
+            free_bytes: Some(100),
+            runs_bytes: Some(200),
+            worktrees_bytes: Some(300),
+            cache_bytes: Some(400),
+        }
+    }
+
+    #[tokio::test]
+    async fn health_disk_cold_and_concurrent_requests_do_not_wait_for_capacity() {
+        let home = TempDir::new().unwrap();
+        std::fs::write(home.path().join("magi.toml"), "[update]\nmode = \"off\"\n").unwrap();
+        let mut ui = delta_test_ui(home.path());
+        let state = Arc::get_mut(&mut ui).unwrap();
+        state.repo = home.path().to_owned();
+        state.worktrees_root = home.path().join("worktrees");
+        *ui.monitor.latest.lock().unwrap() = Some(((0, 0, 0, 0, 0, 0), Default::default()));
+        ui.monitor
+            .worker_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let cfg = deputy_config(&ui.repo);
+        let scope = DiskScope::of(&ui, cfg.as_ref());
+        let (started, reached) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let cold = DiskObservation::observe(&ui.monitor.disk, scope, move |_| {
+            started.send(()).unwrap();
+            blocked.recv().unwrap();
+            known_disk_capacity()
+        });
+        assert!(cold.runs_bytes.is_none());
+        tokio::time::timeout(Duration::from_secs(5), reached)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let requests: Vec<_> = (0..4)
+            .map(|_| {
+                let ui = ui.clone();
+                tokio::spawn(async move { health(State(ui)).await.unwrap().0 })
+            })
+            .collect();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for request in requests {
+                let view = request.await.unwrap();
+                let disk = serde_json::to_value(view.disk).unwrap();
+                assert!(disk["runs_bytes"].is_null());
+                assert!(disk["worktrees_bytes"].is_null());
+                assert!(disk.get("free_bytes").is_none());
+            }
+        })
+        .await
+        .expect("health must return while the measurement is causally blocked");
+        assert!(ui.monitor.disk.lock().unwrap().in_flight);
+        // No competing worker can have published while the first holds flight.
+        assert!(
+            ui.monitor
+                .disk
+                .lock()
+                .unwrap()
+                .capacity
+                .runs_bytes
+                .is_none()
+        );
+        release.send(()).unwrap();
+        wait_for_disk_scan(&ui.monitor.disk).await;
+        assert_eq!(
+            ui.monitor.disk.lock().unwrap().capacity.runs_bytes,
+            Some(200)
+        );
+    }
+
+    #[tokio::test]
+    async fn health_disk_refresh_retains_successes_and_cadence_starts_at_completion() {
+        let home = TempDir::new().unwrap();
+        let scope = disk_test_scope(home.path());
+        let state = Arc::new(Mutex::new(DiskObservation {
+            scope: Some(scope.clone()),
+            capacity: known_disk_capacity(),
+            finished: Some(std::time::Instant::now() - DISK_REFRESH * 2),
+            ..Default::default()
+        }));
+        let (started, reached) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let before = DiskObservation::observe(&state, scope.clone(), move |_| {
+            started.send(()).unwrap();
+            blocked.recv().unwrap();
+            DiskCapacity {
+                runs_bytes: Some(250),
+                ..Default::default()
+            }
+        });
+        assert_eq!(before.cache_bytes, Some(400));
+        tokio::time::timeout(Duration::from_secs(5), reached)
+            .await
+            .unwrap()
+            .unwrap();
+        let duplicate_scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for _ in 0..4 {
+            let scans = duplicate_scans.clone();
+            let during = DiskObservation::observe(&state, scope.clone(), move |_| {
+                scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                DiskCapacity::default()
+            });
+            assert_eq!(during.runs_bytes, Some(200));
+            assert_eq!(during.cache_bytes, Some(400));
+        }
+        release.send(()).unwrap();
+        wait_for_disk_scan(&state).await;
+        let scans = duplicate_scans.clone();
+        let after = DiskObservation::observe(&state, scope, move |_| {
+            scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            DiskCapacity::default()
+        });
+        wait_for_disk_scan(&state).await;
+        assert_eq!(after.runs_bytes, Some(250));
+        assert_eq!(after.free_bytes, Some(100));
+        assert_eq!(after.cache_bytes, Some(400));
+        assert_eq!(duplicate_scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(state.lock().unwrap().finished.unwrap().elapsed() < DISK_REFRESH);
+    }
+
+    #[tokio::test]
+    async fn health_disk_changed_scope_never_publishes_the_previous_cache() {
+        let home = TempDir::new().unwrap();
+        let old_scope = disk_test_scope(home.path());
+        let mut new_scope = old_scope.clone();
+        new_scope.cache = Some(home.path().join("replacement-cache"));
+        let state = Arc::new(Mutex::new(DiskObservation {
+            scope: Some(old_scope.clone()),
+            capacity: known_disk_capacity(),
+            ..Default::default()
+        }));
+        let (started, reached) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        DiskObservation::observe(&state, old_scope, move |_| {
+            started.send(()).unwrap();
+            blocked.recv().unwrap();
+            known_disk_capacity()
+        });
+        tokio::time::timeout(Duration::from_secs(5), reached)
+            .await
+            .unwrap()
+            .unwrap();
+        let duplicate_scans = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scans = duplicate_scans.clone();
+        let changed = DiskObservation::observe(&state, new_scope.clone(), move |_| {
+            scans.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            DiskCapacity::default()
+        });
+        assert!(changed.cache_bytes.is_none());
+        assert!(changed.runs_bytes.is_none());
+        release.send(()).unwrap();
+        wait_for_disk_scan(&state).await;
+        {
+            let observation = state.lock().unwrap();
+            assert!(observation.capacity.cache_bytes.is_none());
+            assert!(observation.finished.is_none());
+        }
+        DiskObservation::observe(&state, new_scope.clone(), move |scope| {
+            assert_eq!(scope, &new_scope);
+            DiskCapacity {
+                cache_bytes: Some(999),
+                ..Default::default()
+            }
+        });
+        wait_for_disk_scan(&state).await;
+        assert_eq!(state.lock().unwrap().capacity.cache_bytes, Some(999));
+        assert_eq!(duplicate_scans.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn health_disk_panicked_worker_releases_flight_and_retries_after_cadence() {
+        let home = TempDir::new().unwrap();
+        let scope = disk_test_scope(home.path());
+        let state = Arc::new(Mutex::new(DiskObservation {
+            scope: Some(scope.clone()),
+            capacity: known_disk_capacity(),
+            ..Default::default()
+        }));
+        DiskObservation::observe(&state, scope.clone(), |_| panic!("capacity worker failure"));
+        wait_for_disk_scan(&state).await;
+        {
+            let mut observation = state.lock().unwrap();
+            assert_eq!(observation.capacity.cache_bytes, Some(400));
+            assert!(observation.finished.unwrap().elapsed() < DISK_REFRESH);
+            observation.finished = Some(std::time::Instant::now() - DISK_REFRESH);
+        }
+        DiskObservation::observe(&state, scope, |_| DiskCapacity {
+            cache_bytes: Some(450),
+            ..Default::default()
+        });
+        wait_for_disk_scan(&state).await;
+        assert_eq!(state.lock().unwrap().capacity.cache_bytes, Some(450));
+    }
+
+    #[test]
+    fn health_disk_capacity_counts_empty_and_missing_without_following_links() {
+        let home = TempDir::new().unwrap();
+        assert_eq!(disk_capacity_size(&home.path().join("missing")), Some(0));
+        assert_eq!(disk_capacity_size(home.path()), Some(0));
+        std::fs::create_dir(home.path().join("nested")).unwrap();
+        std::fs::write(home.path().join("nested/data"), b"12345").unwrap();
+        assert_eq!(disk_capacity_size(home.path()), Some(5));
+        #[cfg(unix)]
+        {
+            // Unix distinguishes an invalid descendant lookup from absence.
+            assert_eq!(
+                disk_capacity_size(&home.path().join("nested/data/child")),
+                None
+            );
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(home.path(), home.path().join("nested/link")).unwrap();
+            assert_eq!(disk_capacity_size(home.path()), Some(5));
+        }
+    }
+
     #[tokio::test]
     async fn health_reports_the_running_version_and_no_pending_upgrade_by_default() {
         // `mode = "off"` for the same reason as the test above: a default
@@ -23980,6 +24365,60 @@ mod tests {
             .unwrap();
         assert_eq!(core.talk.id, id);
         assert!(talk_sections(State(ui), Path(id)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn conversation_core_defers_store_links_but_preserves_markdown_and_provenance() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let id = seed_talk_at(&ui.talks, "20261019-000000-cafe", "open");
+        let mut task = Task::new(
+            "Referenced task".into(),
+            "Unrelated instruction history".repeat(1024),
+            home.path().into(),
+            Source::Human,
+        );
+        task.id = "20261019-000000-abcd".into();
+        ui.queue.put(&mut task).unwrap();
+        let mut conversation = ui.talks.get(&id).unwrap();
+        conversation.turns.push(talk::Turn {
+            sender: Some(talk::Sender::Persona),
+            who: talk::Who::Agent,
+            body: "**Useful transcript** task@abcd and R2-1-3\n\n| Reference |\n| --- |\n| `abcd` |\n\n- task@abcd\n\n```\ntask@abcd\n```".into(),
+            at: conversation.created_at,
+            attachments: Vec::new(),
+            usage: None,
+            breaks: None,
+            messages: Vec::new(),
+            posted_by: None,
+        });
+        ui.talks.put(&mut conversation).unwrap();
+
+        let Json(core) = talk_core(State(ui.clone()), Path(id)).await.unwrap();
+        let markdown = serde_json::to_value(&core.turn_bodies_md)
+            .unwrap()
+            .to_string();
+        assert!(markdown.contains("\"strong\""));
+        assert!(markdown.contains("\"table\""));
+        assert!(markdown.contains("\"bullet_list\""));
+        assert!(markdown.contains("\"code_block\""));
+        assert!(!markdown.contains("\"internal_link\""));
+        assert_eq!(core.talk.turns[0].sender, Some(talk::Sender::Persona));
+        assert_eq!(core.talk.turns[0].body, conversation.turns[0].body);
+        assert_eq!(ui.monitor.queue_index.lock().unwrap().reparsed, 0);
+
+        // Deferred decoration still resolves the same validated task, without
+        // touching opaque code blocks or changing the original transcript.
+        let references = ui.references.for_talk(home.path(), &conversation);
+        let mut decorated = core.turn_bodies_md[0].clone();
+        references.markdown(&mut decorated);
+        let decorated = serde_json::to_value(decorated).unwrap().to_string();
+        assert_eq!(decorated.matches("\"internal_link\"").count(), 3);
+        assert!(decorated.contains(&format!("#/tasks/{}", task.id)));
+        assert_eq!(
+            ui.talks.get(&conversation.id).unwrap().turns[0].body,
+            conversation.turns[0].body
+        );
     }
 
     #[tokio::test]

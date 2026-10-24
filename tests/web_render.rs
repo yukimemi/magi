@@ -3635,6 +3635,26 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
     chat.turns[0].sender = None;
     chat.turns[0].messages.clear();
     talks.put(&mut chat).unwrap();
+    // Match a long-lived conversation without copying operator history. Ordinary
+    // prose must stay readable while store-backed reference decoration is slow.
+    for i in 1..85 {
+        talk::record(
+            &mut chat,
+            &talks,
+            &format!(
+                "Synthetic message {i}.\n\n{}",
+                "Conversation details remain available before related records arrive. ".repeat(20)
+            ),
+            Vec::new(),
+        )
+        .unwrap();
+    }
+    for turn in chat.turns.iter_mut().skip(2).step_by(2) {
+        turn.who = talk::Who::Agent;
+        turn.sender = None;
+        turn.messages.clear();
+    }
+    talks.put(&mut chat).unwrap();
     target.source = Source::Agent {
         run: chat.id.clone(),
         node: magi::queue::CHAT_NODE.into(),
@@ -3655,9 +3675,71 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
     let base = serve(&home, queue.clone(), talks, home.join("runs"), &fx.repo).await;
     let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
     let page = browser
-        .open_page(&format!("{base}#/queue"), 1280, 900, false)
+        .open_page("about:blank", 1280, 900, false)
         .await
         .expect("page");
+    browser
+        .call(
+            Some(&page.session),
+            "Page.addScriptToEvaluateOnNewDocument",
+            serde_json::json!({"source": r#"(() => {
+                const original = window.fetch;
+                let release;
+                const gate = new Promise(resolve => { release = resolve; });
+                window.delayedChatReads = { references: 0, sections: 0, health: 0 };
+                window.releaseChatReads = release;
+                window.fetch = async (...args) => {
+                    const url = String(args[0]);
+                    const kind = url === '/api/references' ? 'references'
+                        : url.endsWith('/sections') ? 'sections'
+                        : url === '/api/health' ? 'health' : null;
+                    if (kind) {
+                        window.delayedChatReads[kind]++;
+                        await gate;
+                    }
+                    return original(...args);
+                };
+            })()"#}),
+        )
+        .await
+        .unwrap();
+    browser
+        .call(
+            Some(&page.session),
+            "Page.navigate",
+            serde_json::json!({"url": format!("{base}#/chat/{}", chat.id)}),
+        )
+        .await
+        .unwrap();
+    browser
+        .wait_for(
+            &page,
+            "document.querySelectorAll('#talk-turns > li').length === 85 \
+             && document.getElementById('talk-turns').textContent.includes('Synthetic message 84.') \
+             && document.querySelector('#talk-turns pre code')?.textContent.trim() === '12ba' \
+             && window.delayedChatReads.references > 0 \
+             && window.delayedChatReads.sections > 0 \
+             && window.delayedChatReads.health > 0",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("long transcript renders before health, related sections and references finish");
+    browser
+        .eval(&page, "window.releaseChatReads(); true")
+        .await
+        .unwrap();
+    browser
+        .wait_for(
+            &page,
+            "document.querySelectorAll('.turn[data-who=agent] a[href=\"#/tasks/20260908-205803-12ba\"]').length === 2",
+            Duration::from_secs(30),
+        )
+        .await
+        .expect("real deferred reference response decorates the preserved transcript");
+    browser
+        .eval(&page, "location.hash = '#/queue'; true")
+        .await
+        .unwrap();
     browser
         .wait_for(
             &page,
@@ -3726,14 +3808,14 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
     let out = browser.eval(&page, r##"(() => {
       const turn = document.querySelector('.turn[data-who=agent]');
       const links = [...turn.querySelectorAll('a')];
-      const out = { alphabetic: !!turn.querySelector('a[href="#/tasks/20260908-205804-dead"]'), code: !!turn.querySelector('a code'), blockLinks: turn.querySelectorAll('pre a').length,
+      const out = { alphabetic: !!turn.querySelector('a[href="#/tasks/20260908-205804-dead"]'), blockLinks: turn.querySelectorAll('pre a').length,
         sameTab: links.every(a => !a.target), unknown: links.some(a => a.textContent === '0000') };
       links[0].click();
       return out;
     })()"##).await.unwrap();
     assert_eq!(
         out,
-        serde_json::json!({ "alphabetic": true, "code": true, "blockLinks": 0, "sameTab": true, "unknown": false })
+        serde_json::json!({ "alphabetic": true, "blockLinks": 0, "sameTab": true, "unknown": false })
     );
     browser.wait_for(&page,
         "location.hash === '#/tasks/20260908-205803-12ba' && !!document.querySelector('#task-note a[href=\"#/tasks/20260908-205804-dead\"]') && !!document.querySelector('#task-error a')",

@@ -441,3 +441,118 @@ test('settings refresh keeps the existing body intact and inert', () => {
   try { render(); } catch { /* later rendering needs the full DOM; only inert matters */ }
   assert.equal(body.inert, false);
 });
+
+test('conversation navigation rejects old core and enrichment even on return to the same id', async () => {
+  const h = harness();
+  const old = h.api.loadTalk('a');
+  h.api.cancelDetailSections();
+  h.state.talkDetail = { id: 'a' };
+  const current = h.api.loadTalk('a');
+  assert.equal(h.requests[0].options.signal.aborted, true);
+  h.requests[2].resolve({ id: 'a', updated_at: 'new', turns: [{ body: 'Current transcript' }] });
+  await flush();
+  assert.equal(h.state.talkDetail.talk.turns[0].body, 'Current transcript');
+  h.requests[3].resolve({ context_for: 'new', roster: [], personas: [], tasks: ['current'] });
+  await current;
+  h.requests[0].resolve({ id: 'a', updated_at: 'old', turns: [{ body: 'Obsolete transcript' }] });
+  h.requests[1].resolve({ context_for: 'old', roster: [], personas: [], tasks: ['obsolete'] });
+  await old;
+  assert.equal(h.state.talkDetail.talk.turns[0].body, 'Current transcript');
+  assert.deepEqual(h.state.talkDetail.talk.tasks, ['current']);
+  assertNoFailures(h);
+});
+
+function referenceHarness() {
+  class Node {
+    constructor(tag, text = '') { this.tag = tag; this.text = text; this.children = []; this.parentNode = null; }
+    get textContent() { return this.text + this.children.map(node => node.textContent).join(''); }
+    get isConnected() { return this.connected || Boolean(this.parentNode?.isConnected); }
+    get nextSibling() { return this.parentNode?.children[this.parentNode.children.indexOf(this) + 1]; }
+    append(...nodes) {
+      for (const node of nodes.flat(Infinity).filter(Boolean)) {
+        node.remove();
+        node.parentNode = this;
+        this.children.push(node);
+      }
+    }
+    before(...nodes) {
+      const parent = this.parentNode;
+      const position = parent.children.indexOf(this);
+      for (const node of nodes) node.parentNode = parent;
+      parent.children.splice(position, 0, ...nodes);
+    }
+    remove() {
+      if (!this.parentNode) return;
+      const parent = this.parentNode;
+      parent.children.splice(parent.children.indexOf(this), 1);
+      this.parentNode = null;
+    }
+  }
+  const make = (tag, props = {}, ...children) => {
+    const { text = '', ...attrs } = props;
+    const node = Object.assign(new Node(tag, text), attrs);
+    node.append(...children);
+    return node;
+  };
+  const requests = [];
+  const referenceSource = source.slice(source.indexOf('const referenceRanges ='), source.indexOf('function setAttr('));
+  const markdownSource = source.slice(source.indexOf('function buildMd('), source.indexOf('/* Replace `container`'));
+  const api = runInNewContext(`${referenceSource}\n${markdownSource}\n({buildMd, flushReferences, refreshReferences})`, {
+    el: make, WeakRef, setTimeout: () => 1,
+    document: { createTextNode: text => new Node('#text', text), createDocumentFragment: () => new Node('#fragment') },
+    postJson: (url, body) => new Promise((resolve, reject) => requests.push({ url, body, resolve, reject })),
+  });
+  const root = make('root');
+  root.connected = true;
+  const walk = node => [node, ...node.children.flatMap(walk)];
+  return { api, root, requests, walk };
+}
+
+test('unlinked transcript Markdown is immediately useful and gains validated links after deferred resolution', async () => {
+  const h = referenceHarness();
+  const nodes = [
+    { type: 'paragraph', children: [{ type: 'strong', children: [{ type: 'text', value: 'task@abcd' }] }] },
+    { type: 'bullet_list', items: [{ type: 'list_item', children: [{ type: 'code', code: 'abcd' }] }] },
+    { type: 'table', rows: [[{ header: true, children: [{ type: 'text', value: 'R2-1-3' }] }]] },
+    { type: 'code_block', code: 'dead' },
+    { type: 'link', href: 'https://example.org', children: [{ type: 'text', value: 'beef' }] },
+    { type: 'image', src: '/attachment.png', alt: 'cafe' },
+  ];
+  h.root.append(...nodes.map(h.api.buildMd));
+  const initial = h.root.textContent;
+  assert.equal(initial, 'task@abcdabcdR2-1-3deadbeef');
+  const pending = h.api.flushReferences();
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.requests[0].url, '/api/references');
+  assert.equal(JSON.stringify(h.requests[0].body), JSON.stringify([
+    { text: 'task@abcd', code: false }, { text: 'abcd', code: true }, { text: 'R2-1-3', code: false },
+  ]));
+  assert.equal(h.walk(h.root).filter(node => node.tag === 'a').length, 1, 'only the existing external link precedes resolution');
+  h.requests[0].resolve(h.requests[0].body.map(item => ({
+    watch: true, parts: [{ text: item.text, href: item.text === 'R2-1-3' ? '#/runs/real/report' : '#/tasks/real' }],
+  })));
+  await pending;
+  assert.equal(h.root.textContent, initial);
+  const links = h.walk(h.root).filter(node => node.tag === 'a');
+  assert.equal(links.length, 4);
+  assert.equal(links.filter(node => node.href === '#/tasks/real').length, 2);
+  assert.equal(h.walk(h.root).find(node => node.tag === 'pre').textContent, 'dead');
+  assert.equal(h.walk(h.root).find(node => node.tag === 'img').src, '/attachment.png');
+});
+
+test('late reference decoration never changes a replaced conversation', async () => {
+  const h = referenceHarness();
+  const previous = h.api.buildMd({ type: 'paragraph', children: [{ type: 'text', value: 'task@abcd' }] });
+  h.root.append(previous);
+  const pending = h.api.flushReferences();
+  previous.remove();
+  h.root.append(h.api.buildMd({ type: 'paragraph', children: [{ type: 'text', value: 'task@abcd' }] }));
+  h.requests[0].resolve([{ watch: true, parts: [{ text: 'task@abcd', href: '#/tasks/obsolete' }] }]);
+  await pending;
+  assert.equal(h.root.textContent, 'task@abcd');
+  assert.equal(h.walk(h.root).filter(node => node.tag === 'a').length, 0);
+  const current = h.api.flushReferences();
+  h.requests[1].resolve([{ watch: true, parts: [{ text: 'task@abcd', href: '#/tasks/current' }] }]);
+  await current;
+  assert.equal(h.walk(h.root).find(node => node.tag === 'a').href, '#/tasks/current');
+});
