@@ -21902,14 +21902,7 @@ mod tests {
             created_at: 0,
             finished_at: None,
         };
-        let lease = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(directory.join("live.lock"))
-            .unwrap();
-        crate::pr_head::try_lock_file(&lease).unwrap();
+        let lease = crate::worker::execution_lease_for_test(&directory.join("live.lock"));
         let write = |job: &crate::worker::Job| {
             std::fs::write(directory.join("job.json"), serde_json::to_vec(job).unwrap()).unwrap();
         };
