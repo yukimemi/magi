@@ -61,6 +61,11 @@ pub fn disabled_by_env() -> bool {
     }
 }
 
+/// Worker descendants must never replace or re-exec their immutable binary.
+fn pinned_worker_generation() -> bool {
+    std::env::var_os("MAGI_WORKER_GENERATION").is_some()
+}
+
 /// GitHub owner.
 const OWNER: &str = "yukimemi";
 /// GitHub repository — *not* `CARGO_PKG_NAME`, which is the published package.
@@ -96,6 +101,12 @@ fn state_path() -> Option<PathBuf> {
 
 /// `magi self-update`.
 pub async fn run_self_update(yes: bool, check_only: bool, non_interactive: bool) -> Result<()> {
+    if !check_only && pinned_worker_generation() {
+        anyhow::bail!(
+            "this worker executable generation is immutable; run self-update \
+             from the installed magi executable outside the worker"
+        );
+    }
     let opts = kaishin::UpdateOptions::new()
         .yes(yes)
         .check_only(check_only)
@@ -147,7 +158,7 @@ impl Checker {
     /// theirs to press; what it may not do is go to the network behind a
     /// configuration that says not to.
     pub fn new(cfg: &Update) -> Option<Self> {
-        if cfg.mode == UpdateMode::Off {
+        if cfg.mode == UpdateMode::Off || pinned_worker_generation() {
             return None;
         }
         let mut inner = kaishin::Checker::new(BIN, options());
@@ -223,13 +234,11 @@ pub enum Stage {
     /// The new binary is in place and [`crate::web`]'s handover has been
     /// signalled, but has not acted yet.
     Replaced,
-    /// The handover is waiting for the run in flight, if any, to reach its
-    /// next node boundary. The deck answers throughout this - it is not the
-    /// unreachable gap, see `web::hand_over`.
+    /// Legacy progress from an embedded scheduler upgrade. Retained for
+    /// first-migration reporting only; independent workers never enter it.
     Parking,
-    /// The listener has been released and the successor is starting. This is
-    /// the one genuinely unreachable moment, and it is meant to be
-    /// sub-second - see `web::bind_waiting`.
+    /// Restarting the scheduler and web listener. Execution workers continue
+    /// on their immutable executable and are never awaited by this stage.
     Restarting,
     /// A successor came up and confirmed it is running the release this
     /// upgrade asked for.
@@ -407,24 +416,6 @@ fn store_progress(home: &Path, progress: &Progress) -> Result<()> {
     Ok(())
 }
 
-/// Record which chat turns the parked handover is still waiting on. Written
-/// only while the stage is [`Stage::Parking`], under the same lock as
-/// [`write_progress`], so a stage that moved on is never touched.
-pub fn set_parked_talks(home: &Path, talks: &[String]) {
-    let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(mut progress) = read_progress(home) else {
-        return;
-    };
-    if progress.stage != Stage::Parking || progress.parked_talks == talks {
-        return;
-    }
-    progress.parked_talks = talks.to_vec();
-    // Same stage, so `monotonic` would keep the old record: store directly.
-    if let Err(e) = store_progress(home, &progress) {
-        log_warn(home, &format!("could not write upgrade.json: {e:#}"));
-    }
-}
-
 /// The phrase naming the chat turns a park waits on, empty for none.
 #[must_use]
 pub fn talks_phrase(talks: &[String]) -> String {
@@ -435,17 +426,14 @@ pub fn talks_phrase(talks: &[String]) -> String {
     }
 }
 
-/// Record `detail` as the failure of the upgrade request that is asking,
-/// unless a handover is already in flight (`parking` / `restarting`): that
-/// handover is not this request's to fail. The check and the write happen
-/// under the same lock as [`write_progress`], so a handover that records
-/// `parking` in between cannot be overwritten. Returns whether it was written.
+/// Record an upgrade failure. A legacy embedded handover owns its own
+/// parking state; new detached restarts may fail and must report that failure.
 pub fn fail_progress(home: &Path, detail: &str) -> Result<bool> {
     let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut progress) = read_progress(home) else {
         return Ok(false);
     };
-    if matches!(progress.stage, Stage::Parking | Stage::Restarting) {
+    if progress.stage == Stage::Parking {
         return Ok(false);
     }
     progress.fail(detail);
@@ -571,6 +559,7 @@ pub fn read_lease(home: &Path) -> Option<HandoverLease> {
     serde_json::from_str(&body).ok()
 }
 
+#[cfg(test)]
 fn write_lease(home: &Path, lease: &HandoverLease) {
     let path = lease_path(home);
     let tmp = path.with_extension("json.tmp");
@@ -583,13 +572,15 @@ fn write_lease(home: &Path, lease: &HandoverLease) {
     }
 }
 
-/// Held by `hand_over` for as long as it runs; removes the lease on drop.
+/// Legacy handover fixture for compatibility tests; new handovers never park.
+#[cfg(test)]
 #[derive(Debug)]
 pub struct LeaseGuard {
     home: PathBuf,
     lease: HandoverLease,
 }
 
+#[cfg(test)]
 impl LeaseGuard {
     /// Record that `hand_over` has been entered.
     #[must_use]
@@ -607,29 +598,6 @@ impl LeaseGuard {
         }
     }
 
-    /// Enter the handover: write the lease and the `parking` stage as one step
-    /// under the progress lock, so a failing upgrade request ([`fail_progress`])
-    /// or a fresh one ([`write_progress`]) cannot land between the two and leave
-    /// a record that is newer than the lease. `None` for the stage means
-    /// `upgrade.json` was unreadable (the lease is still written).
-    #[must_use]
-    pub fn enter_parking(home: &Path) -> (Self, bool) {
-        let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let progress = read_progress(home);
-        let this = Self::enter(home, progress.as_ref().and_then(|p| p.parked_run.clone()));
-        let recorded = match progress {
-            Some(mut p) => {
-                p.advance(Stage::Parking);
-                if let Err(e) = write_progress_locked(home, &p) {
-                    log_warn(home, &format!("could not write upgrade.json: {e:#}"));
-                }
-                true
-            }
-            None => false,
-        };
-        (this, recorded)
-    }
-
     /// Say it is still alive.
     pub fn beat(&mut self) {
         self.lease.beat_at = Timestamp::now();
@@ -637,6 +605,7 @@ impl LeaseGuard {
     }
 }
 
+#[cfg(test)]
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(lease_path(&self.home));
@@ -951,7 +920,7 @@ pub fn reconcile_after_restart(home: &Path) {
 
 /// Spawn the background check for `cfg`, unless it is switched off.
 pub fn spawn(cfg: &Update, rt: &tokio::runtime::Handle) -> Option<Pending> {
-    if disabled_by_env() || cfg.mode == UpdateMode::Off {
+    if disabled_by_env() || pinned_worker_generation() || cfg.mode == UpdateMode::Off {
         return None;
     }
     let checker = Checker::new(cfg)?;
@@ -1366,17 +1335,13 @@ mod tests {
     }
 
     #[test]
-    fn entering_parking_is_one_step_that_keeps_the_lease_newer_than_the_record() {
+    fn a_failed_detached_restart_reports_the_failure() {
         let home = tempfile::tempdir().expect("temp home");
-        write_progress(home.path(), &staged(Stage::Replaced, 1000)).expect("write");
-        let (guard, recorded) = LeaseGuard::enter_parking(home.path());
-        assert!(recorded);
-        let p = read_progress(home.path()).expect("record");
-        assert_eq!(p.stage, Stage::Parking);
-        let l = read_lease(home.path()).expect("lease");
-        assert!(l.entered_at >= p.started_at);
-        assert!(!fail_progress(home.path(), "boom").expect("fail"));
-        drop(guard);
+        write_progress(home.path(), &staged(Stage::Restarting, 1000)).expect("write");
+        assert!(fail_progress(home.path(), "successor spawn failed").expect("fail"));
+        let progress = read_progress(home.path()).expect("progress");
+        assert_eq!(progress.stage, Stage::Failed);
+        assert_eq!(progress.detail.as_deref(), Some("successor spawn failed"));
     }
 
     #[test]

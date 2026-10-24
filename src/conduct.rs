@@ -1093,7 +1093,7 @@ impl Drop for Busy {
 
 /// The conductor's state across polling cycles: its own CLI-side conversation
 /// and the last (revision, stalled ∪ finished ids) pair it actually acted on.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Conductor {
     seat: Option<SeatState>,
     last_seen: Option<(u64, BTreeSet<String>)>,

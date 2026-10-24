@@ -89,8 +89,21 @@ pub const TICK: Duration = Duration::from_secs(5);
 /// the quota is gone.
 pub const MAX_STARTS: u32 = 3;
 
-/// Least gap between two starts for one question.
+/// Least gap between two starts for one question, including new owner input.
+/// Persisted independently of a runner so finite service laps cannot repeatedly
+/// bill the same conversation or exhaust its lifetime start quota.
 const RESTART_AFTER: Duration = Duration::from_secs(30);
+
+fn next_start_path(store: &Questions, id: &str) -> PathBuf {
+    store.root().join(format!("{id}.deputy")).join("next-start")
+}
+
+fn start_due(store: &Questions, id: &str, now: Timestamp) -> bool {
+    std::fs::read_to_string(next_start_path(store, id))
+        .ok()
+        .and_then(|text| text.parse::<i64>().ok())
+        .is_none_or(|next| now.as_second() >= next)
+}
 
 /// Added to the question's remaining time for the invocation's wall clock, so
 /// the deputy's own `magi ask --wait` reaches the deadline first.
@@ -333,7 +346,7 @@ pub fn exhausted_past_deadline(
         && now.as_second() > deadline(q, default_timeout)
 }
 
-/// The deputy runner: its own task inside `magi serve`, beside the waiter.
+/// Question-service dispatcher; each invocation owns an independent worker.
 pub struct Deputies {
     store: Questions,
     home: PathBuf,
@@ -369,6 +382,26 @@ impl Deputies {
             inflight: HashSet::new(),
             memo: HashMap::new(),
         }
+    }
+
+    /// Admission check for a finite tick; an idle store needs no child process.
+    pub fn has_work(&self, now: Timestamp) -> bool {
+        self.max > 0
+            && self.store.list().iter().any(|q| {
+                kind_of(q).is_some()
+                    && !crate::task_chat::routes(q, &self.home)
+                    && q.status.open()
+                    && q.deputy
+                        .as_ref()
+                        .is_none_or(|deputy| deputy.starts < MAX_STARTS)
+                    && self
+                        .store
+                        .read_lease(&q.id)
+                        .is_none_or(|lease| !lease.fresh(now))
+                    && can_start(self.cfg.as_ref(), agent_of(q))
+                    && restart_in_time(q, self.default_timeout(), now)
+                    && start_due(&self.store, &q.id, now)
+            })
     }
 
     fn default_timeout(&self) -> u64 {
@@ -441,53 +474,105 @@ impl Deputies {
             .ok()
     }
 
-    /// Look at every open conductor question once and start a deputy on each
-    /// that has none, within the limits. Returns without waiting for them.
+    fn ready(&self, q: Question, now: Timestamp) -> Option<Question> {
+        if (self.halt)() || !q.status.open() || crate::task_chat::routes(&q, &self.home) {
+            return None;
+        }
+        let kind = kind_of(&q)?;
+        let needs_cwd = kind == Kind::Conduct && q.cwd.is_none();
+        let q = if q.deputy.is_none() || needs_cwd || q.answer_timeout == 0 {
+            self.attach(&q, kind)?
+        } else {
+            q
+        };
+        let deputy = q.deputy.as_ref()?;
+        if self
+            .store
+            .read_lease(&q.id)
+            .is_some_and(|lease| lease.fresh(now))
+            || deputy.starts >= MAX_STARTS
+            || !restart_in_time(&q, self.default_timeout(), now)
+            || !can_start(self.cfg.as_ref(), &deputy.agent)
+            || !start_due(&self.store, &q.id, now)
+        {
+            return None;
+        }
+        Some(q)
+    }
+
+    /// Start independent deputy invocations up to the global live reservation
+    /// limit. Return after launch, never after a long question conversation.
+    pub async fn dispatch(&self, now: Timestamp) -> Result<()> {
+        let Some(_dispatch) = crate::worker::try_lease(&self.home, "deputy-dispatch")? else {
+            return Ok(());
+        };
+        let jobs = crate::worker::active(&self.home)?;
+        let mut occupied: HashSet<String> = jobs
+            .iter()
+            .filter(|job| job.kind == "deputy")
+            .map(|job| {
+                job.key
+                    .strip_prefix("deputy:")
+                    .unwrap_or(&job.id)
+                    .to_owned()
+            })
+            .collect();
+        let questions = self.store.list();
+        // Keep first-migration/CLI-owned deputy leases in the same capacity
+        // accounting, without double-counting a lease owned by a known job.
+        occupied.extend(
+            questions
+                .iter()
+                .filter(|q| {
+                    self.store
+                        .read_lease(&q.id)
+                        .is_some_and(|lease| lease.kind == WaiterKind::Deputy && lease.fresh(now))
+                })
+                .map(|q| q.id.clone()),
+        );
+        for q in questions {
+            if occupied.len() >= self.max || (self.halt)() {
+                break;
+            }
+            if occupied.contains(&q.id) {
+                continue;
+            }
+            let Some(q) = self.ready(q, now) else {
+                continue;
+            };
+            let request = WorkerRequest {
+                question: q.id.clone(),
+                cfg: self.cfg.clone(),
+                fallback_repo: self.fallback_repo.clone(),
+            };
+            match crate::worker::spawn(
+                &self.home,
+                "deputy",
+                &format!("deputy:{}", q.id),
+                serde_json::to_value(request)?,
+            )
+            .await
+            {
+                Ok(_) => {
+                    occupied.insert(q.id);
+                }
+                Err(error) => tracing::warn!("question {} deputy worker: {error:#}", q.short()),
+            }
+        }
+        Ok(())
+    }
+
+    /// In-process executor retained for direct runner callers and tests.
     pub fn tick(&mut self, now: Timestamp) {
         self.reap();
         for q in self.store.list() {
-            if (self.halt)() {
-                return;
-            }
-            if crate::task_chat::routes(&q, &self.home) {
-                continue;
-            }
-            let Some(kind) = kind_of(&q) else {
-                continue;
-            };
-            if !q.status.open() {
-                continue;
-            }
-            let needs_cwd = kind == Kind::Conduct && q.cwd.is_none();
-            let q = if q.deputy.is_none() || needs_cwd || q.answer_timeout == 0 {
-                match self.attach(&q, kind) {
-                    Some(q) => q,
-                    None => continue,
-                }
-            } else {
-                q
-            };
-            let Some(dep) = q.deputy.as_ref() else {
+            let Some(q) = self.ready(q, now) else {
                 continue;
             };
             if self.inflight.contains(&q.id)
-                || self.store.read_lease(&q.id).is_some_and(|l| l.fresh(now))
+                || self.inflight.len() >= self.max
+                || matches!(self.memo.get(&q.id), Some(until) if Instant::now() < *until)
             {
-                continue;
-            }
-            if dep.starts >= MAX_STARTS {
-                continue;
-            }
-            // Past the deadline the waiter retires the question; a say that
-            // arrived in time is still read first.
-            if !restart_in_time(&q, self.default_timeout(), now) {
-                continue;
-            }
-            if self.inflight.len() >= self.max || !can_start(self.cfg.as_ref(), dep.agent.as_str())
-            {
-                continue;
-            }
-            if matches!(self.memo.get(&q.id), Some(until) if Instant::now() < *until) {
                 continue;
             }
             self.memo
@@ -502,16 +587,19 @@ impl Deputies {
             };
             let id = q.id.clone();
             self.tasks.spawn(async move {
-                if let Err(e) = job.turn(&id).await {
-                    tracing::warn!("deputy for question {}: {e:#}", crate::ask::short_id(&id));
+                if let Err(error) = job.turn(&id).await {
+                    tracing::warn!(
+                        "deputy for question {}: {error:#}",
+                        crate::ask::short_id(&id)
+                    );
                 }
                 id
             });
         }
     }
 
-    /// Wait for every deputy turn in flight. The daemon never calls this; the
-    /// tests do, to look at the record once a turn is over.
+    /// Wait out invocations started by the in-process runner. The detached
+    /// service dispatcher never uses this path.
     pub async fn drain(&mut self) {
         while let Some(done) = self.tasks.join_next().await {
             if let Ok(id) = done {
@@ -520,6 +608,27 @@ impl Deputies {
         }
         self.inflight.clear();
     }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct WorkerRequest {
+    question: String,
+    cfg: Option<Config>,
+    fallback_repo: PathBuf,
+}
+
+/// Hidden detached entry point for exactly one existing question/seat.
+pub async fn run_worker(home: &Path, payload: serde_json::Value) -> Result<()> {
+    let request: WorkerRequest = serde_json::from_value(payload)?;
+    Job {
+        store: Questions::at(home.join("questions")),
+        home: home.to_path_buf(),
+        cfg: request.cfg,
+        fallback_repo: request.fallback_repo,
+        halt: Arc::new(|| false),
+    }
+    .turn(&request.question)
+    .await
 }
 
 /// Everything one deputy turn needs, owned so it can run detached.
@@ -601,8 +710,10 @@ impl Job {
             return Ok(());
         };
         if !q.status.open()
+            || crate::task_chat::routes(&q, &self.home)
             || dep.starts >= MAX_STARTS
             || self.store.read_lease(&q.id).is_some_and(|l| l.fresh(now))
+            || !start_due(&self.store, &q.id, now)
         {
             return Ok(());
         }
@@ -703,6 +814,14 @@ impl Job {
 
         // Recorded before the turn starts, so a daemon that dies mid-turn
         // leaves a start counted and the seat on the record.
+        let next_start = next_start_path(&self.store, &q.id);
+        std::fs::create_dir_all(next_start.parent().expect("deputy artifacts parent"))?;
+        std::fs::write(
+            next_start,
+            now.as_second()
+                .saturating_add(RESTART_AFTER.as_secs() as i64)
+                .to_string(),
+        )?;
         self.store.beat(&q.id, WaiterKind::Deputy);
         let starts = dep.starts + 1;
         let first = seat.clone();
@@ -887,10 +1006,27 @@ impl Job {
     }
 }
 
-/// The runner's loop, until `stop` is asked for.
-pub async fn run(mut deputies: Deputies, stop: crate::daemon::Stop) {
-    while !stop.stopped() {
-        deputies.tick(Timestamp::now());
-        tokio::time::sleep(TICK).await;
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+
+    #[test]
+    fn restart_cooldown_survives_a_new_runner() {
+        let home = tempfile::tempdir().expect("home");
+        let questions = Questions::at(home.path().join("questions"));
+        let path = next_start_path(&questions, "question");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("artifacts");
+        std::fs::write(&path, "130").expect("next start");
+        let reopened = Questions::at(home.path().join("questions"));
+        assert!(!start_due(
+            &reopened,
+            "question",
+            Timestamp::from_second(129).unwrap()
+        ));
+        assert!(start_due(
+            &reopened,
+            "question",
+            Timestamp::from_second(130).unwrap()
+        ));
     }
 }

@@ -225,8 +225,10 @@ fn cleanup(
                     }
                 }
             }
-            drop(lease);
+            // Publish repository availability last: the next owner may
+            // immediately reclaim outputs after acquiring coordination.
             drop(outputs);
+            drop(lease);
             let _ = done.send(());
         });
     if let Err(e) = started {

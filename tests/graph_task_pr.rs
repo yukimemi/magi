@@ -230,7 +230,7 @@ async fn public_head_metadata_failure_resumes_without_competing_again() {
 }
 
 common::e2e! {
-async fn driver_claim_and_publication_takeover_share_an_ownership_lock() {
+async fn a_prepublication_driver_snapshot_cannot_overwrite_a_settled_takeover() {
     let home = home_lock().await;
     let mut fx = fixture(home, Judges::Unanimous, false);
     forge(fx.tmp.path());
@@ -245,11 +245,7 @@ async fn driver_claim_and_publication_takeover_share_an_ownership_lock() {
     use std::os::fd::AsRawFd;
     // SAFETY: lock owns a live descriptor; closing it releases the lock.
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
-    // Model the takeover's critical section: a stale driver cannot claim or
-    // save while publication owns the old record.
-    let error = stale.execute().await.unwrap_err();
-    assert!(format!("{error:#}").contains("ownership is being updated"));
-    assert!(RunState::load(&first.id).unwrap().driver_exited);
+    // Keep a stale driver snapshot while publication owns the old record.
     let mut second = Runner::start(&fx.repo, "create note.txt".into(), fx.config.clone(), Origin::queue("abcd-1234")).await.unwrap();
     second.execute().await.unwrap();
     assert!(!second.state.merge.as_ref().unwrap().ok);
@@ -258,8 +254,8 @@ async fn driver_claim_and_publication_takeover_share_an_ownership_lock() {
     let mut resumed = Runner::resume(&second.state.id).unwrap();
     resumed.execute().await.unwrap();
     assert!(resumed.state.merge.as_ref().unwrap().ok);
-    // Even the runner whose first check raced publication must now reject
-    // the disk takeover without saving its old in-memory state over it.
+    // A driver loaded before publication must reject the settled takeover
+    // without saving its old in-memory state over it.
     assert!(stale.execute().await.is_err());
     assert_eq!(RunState::load(&first.id).unwrap().pr_taken_over_by.as_deref(), Some(resumed.state.id.as_str()));
 }
@@ -597,7 +593,7 @@ async fn assert_recovery_resume_uses_saved_config(legacy: bool) {
     Box::pin(magi::daemon::run_claimed(&opts, &queue, &mut task)).await;
     assert_eq!(
         task.status,
-        magi::queue::TaskStatus::Held,
+        magi::queue::TaskStatus::Parked,
         "{:?} {:?}",
         task.hold_reason,
         task.last_error
@@ -653,7 +649,7 @@ async fn assert_recovery_resume_uses_saved_config(legacy: bool) {
         Box::pin(magi::daemon::run_claimed(&opts, &queue, &mut task)).await;
         assert_eq!(
             task.status,
-            magi::queue::TaskStatus::Held,
+            magi::queue::TaskStatus::Parked,
             "{:?}",
             task.hold_reason
         );

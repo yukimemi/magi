@@ -105,7 +105,7 @@ fn restart_recovery_requires_dispatch_capacity_and_a_live_owner() {
 }
 
 #[test]
-fn deadline_and_handover_use_existing_recovery_rules() {
+fn legacy_handover_record_and_deadline_use_existing_recovery_rules() {
     let home = tempfile::tempdir().unwrap();
     let store = Questions::at(home.path().join("questions"));
     let mut q = question(&store);
@@ -121,7 +121,18 @@ fn deadline_and_handover_use_existing_recovery_rules() {
     let mut progress = magi::updater::Progress::new("old".into(), "new".into());
     progress.advance(magi::updater::Stage::Restarting);
     magi::updater::write_progress(home.path(), &progress).unwrap();
-    let lease = magi::updater::LeaseGuard::enter(home.path(), None);
+    let now = jiff::Timestamp::now();
+    let lease_path = magi::updater::lease_path(home.path());
+    std::fs::write(
+        &lease_path,
+        serde_json::to_vec(&magi::updater::HandoverLease {
+            entered_at: now,
+            beat_at: now,
+            parked_run: None,
+        })
+        .unwrap(),
+    )
+    .unwrap();
     assert_eq!(availability(&store, &q, Some(&cfg)).state, "waiting");
     let mut edited = cfg.clone();
     edited.daemon.max_deputies = 0;
@@ -129,7 +140,7 @@ fn deadline_and_handover_use_existing_recovery_rules() {
         availability(&store, &q, Some(&edited)).reason,
         "daemon_unavailable"
     );
-    drop(lease);
+    std::fs::remove_file(lease_path).unwrap();
     assert_eq!(
         availability(&store, &q, Some(&cfg)).reason,
         "daemon_unavailable"

@@ -1,40 +1,18 @@
-//! The unattended loop: take the next task, run the graph, record what
-//! happened, take the next one.
+//! The unattended scheduler and independently leased task workers.
 //!
-//! This is what turns magi from a command a human types into something an
-//! agent can hand work to. [`crate::queue`] is the mailbox; this module is the
-//! thing that empties it. Nothing here decides *how* a task is implemented —
-//! that is [`crate::graph`] — it only decides which task runs next, and what a
-//! finished run means for the task that produced it.
+//! The scheduler chooses tasks and execution lanes; a detached worker owns each
+//! queue claim, graph driver and outcome settlement. Replacing the scheduler
+//! reconstructs occupied slots from live worker jobs, without touching their
+//! attempts, passes or paid agent calls. Finite maintenance jobs follow the same
+//! lifetime rule. Explicit parking is durable control, never an upgrade step.
 //!
-//! # One run at a time, on purpose
+//! # A crashed worker is legible
 //!
-//! There is no `--jobs` flag and there will not be one. A single run is
-//! already internally parallel: candidates implement concurrently and judges
-//! rank concurrently, so the machine is not idle while one task is in flight.
-//! The real constraint is not CPU but the agent CLIs' quota, and two graphs at
-//! once doubles the burn rate on exactly the resource whose exhaustion produces
-//! [`RunStatus::Stalled`]. Serialising the loop is what keeps a full backlog
-//! from converting the whole day's quota into a pile of untrustworthy verdicts.
-//!
-//! # A crash is legible, and the loop notices on its own
-//!
-//! The task is written as [`crate::queue::TaskStatus::Running`], with its run
-//! id, *before* the graph starts, and is only rewritten once the run reaches a
-//! terminal status. A daemon killed mid-run therefore leaves the task
-//! `Running` and pointing at the run that was in flight. The alternative —
-//! reverting the task to `Queued` on the way out — would hide the abandoned
-//! run and re-spend its quota on the next poll.
-//!
-//! A task left `Running` forever is not the point, though:
-//! [`crate::queue::TaskStatus::runnable`] never offers it again, so a daemon
-//! that died mid-run would otherwise strand its task for good.
-//! [`reclaim_orphaned_running`] runs on every poll and settles exactly the
-//! tasks no live process is actually driving — proven by [`Queue::claim`]
-//! succeeding rather than by a staleness guess — against whatever their last
-//! run actually became, through the same [`settle`] a live finish uses. A run
-//! that genuinely cannot be read still holds its task for a human; the run's
-//! own report explains how far it got.
+//! A task is written `Running`, with its run id, before graph execution. The
+//! worker keeps its claim until the outcome is recorded. Recovery requires both
+//! no live worker reservation and an obtainable task claim, and settles the
+//! saved run through the same policy as a live finish. A scheduler's missing
+//! heartbeat alone is never evidence that a run died.
 //!
 //! # Retries are bounded
 //!
@@ -155,6 +133,9 @@ pub struct Status {
     /// Effective startup capabilities of the question recovery loops.
     #[serde(default)]
     pub question_recovery: Option<crate::question_delivery::Recovery>,
+    /// Independent-worker control protocol supported by this scheduler.
+    #[serde(default)]
+    pub worker_protocol: Option<u32>,
 }
 
 impl Status {
@@ -172,6 +153,7 @@ impl Status {
             completed: 0,
             polls: 0,
             question_recovery: None,
+            worker_protocol: Some(1),
         }
     }
 }
@@ -183,7 +165,8 @@ impl Default for Status {
 }
 
 /// How the loop should behave.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Opts {
     /// Repository used by tasks that name none.
     pub repo: PathBuf,
@@ -219,6 +202,24 @@ impl Default for Opts {
             merge: None,
             worktrees_root: None,
         }
+    }
+}
+
+impl Opts {
+    fn absolute(&self) -> Result<Self> {
+        let mut opts = self.clone();
+        opts.repo = std::path::absolute(&opts.repo)?;
+        opts.config = opts
+            .config
+            .as_deref()
+            .map(std::path::absolute)
+            .transpose()?;
+        opts.worktrees_root = opts
+            .worktrees_root
+            .as_deref()
+            .map(std::path::absolute)
+            .transpose()?;
+        Ok(opts)
     }
 }
 
@@ -277,21 +278,16 @@ fn clear_status_at(path: &Path) {
 /// message is "stop", it is idempotent, and a flag cannot be missed by a
 /// receiver that was not listening yet.
 ///
-/// The handle also answers the question the operator's screen asks next: a
-/// stop does not take effect until the run in flight has finished, so
-/// [`Stop::finishing`] reports "asked to stop, still working" rather than
-/// leaving a caller to infer it from a heartbeat and hope.
+/// A stop ends scheduler dispatch promptly. Its busy snapshot is observational:
+/// detached task workers keep their own lifetimes and ownership after this
+/// handle's scheduler exits.
 #[derive(Debug, Clone, Default)]
 pub struct Stop {
     /// Set once, never cleared: a stop is not something an operator takes back
     /// half way through, and a clearable flag would let a start racing a stop
     /// resurrect a loop that is already unwinding.
     stopped: Arc<AtomicBool>,
-    /// How many runs are in flight, so `finishing` can distinguish a stop
-    /// that has landed from one that is waiting on `execute`. A count, not a
-    /// flag, because more than one run can be in flight at once - see
-    /// [`crate::config::Daemon::max_concurrent_runs`] - and the last one to
-    /// finish is the one that should turn "finishing" off.
+    /// Live task workers observed by the scheduler's latest dispatch snapshot.
     busy: Arc<std::sync::atomic::AtomicUsize>,
     /// Wakes the idle wait. Without this a stop would not be seen until the
     /// poll interval elapsed, and an operator tapping stop on a phone would
@@ -325,13 +321,8 @@ impl Stop {
         self.stopped.load(Ordering::SeqCst)
     }
 
-    /// Has a stop been asked for that has not taken effect yet, because a run
-    /// is still in flight?
-    ///
-    /// This is the state a screen has to be able to show. A stop never abandons
-    /// a run — see [`serve_until`] — so between the tap and the loop's return
-    /// there is a window of tens of minutes in which "running" and "stopped"
-    /// are both misleading answers.
+    /// Whether a requested scheduler retirement still has an active snapshot.
+    /// Workers continue independently after the scheduler has retired.
     #[must_use]
     pub fn finishing(&self) -> bool {
         self.stopped() && self.busy_now()
@@ -340,13 +331,8 @@ impl Stop {
     /// Ask the loop to stop *and* the run in flight to park at its next node
     /// boundary.
     ///
-    /// The plain [`Stop::stop`] never abandons a run, which is right when the
-    /// operator only wants the queue to drain: a competition is tens of
-    /// minutes and its worktrees are paid for. But an operator who wants to
-    /// replace the binary cannot wait out a run that has an hour left, and
-    /// killing the process loses whatever the seats in flight had not written.
-    /// Parking costs at most the node in progress and leaves the run
-    /// resumable.
+    /// Unlike plain stop, explicit park asks workers to checkpoint at their
+    /// existing safe boundaries. Binary replacement never needs a park.
     pub fn park(&self, cause: crate::run::ParkCause) {
         self.pause.park_for(cause);
         self.stop();
@@ -364,25 +350,10 @@ impl Stop {
         self.pause.clone()
     }
 
-    /// Is any run in flight right now?
-    ///
-    /// `finishing` answers "a stop is waiting on a run", which is false until
-    /// someone asks to stop. An upgrade needs the plain question, because it
-    /// is about to be the one asking.
+    /// Whether the scheduler's latest snapshot contains active task workers.
     #[must_use]
     pub fn busy_now(&self) -> bool {
         self.busy.load(Ordering::SeqCst) > 0
-    }
-
-    /// Mark one more run as in flight, for [`Stop::finishing`].
-    fn enter(&self) {
-        self.busy.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Mark one run as finished. The last one out is what makes
-    /// [`Stop::busy_now`] false again.
-    fn exit(&self) {
-        self.busy.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Wait out one poll interval, returning early once a stop is asked for.
@@ -433,6 +404,8 @@ pub struct Reading {
     /// Effective startup capabilities of the question recovery loops.
     #[serde(default)]
     pub question_recovery: Option<crate::question_delivery::Recovery>,
+    /// Independent-worker control protocol, absent on legacy embedded loops.
+    pub worker_protocol: Option<u32>,
 }
 
 /// Accept the old single-`Current`-or-absent shape as well as the current
@@ -485,23 +458,71 @@ pub fn read_status(home: &Path) -> Option<Reading> {
     serde_json::from_str(&body).ok()
 }
 
-/// Every run a live daemon is working on right now.
+/// Read-only evidence of runs owned by a live daemon or independent worker.
 ///
-/// One definition of liveness, because deleting a task and deleting a run are
-/// both gated on it from both the CLI and the web UI - four callers that must
-/// never disagree about whether the same thing is in flight. A stale heartbeat
-/// reads as "no daemon": that is [`Reading::running`]'s judgement, and a task
-/// left at `running` or a run left at `implementing` by a killed daemon is a
-/// leftover record rather than work in progress. More than one entry once
-/// [`crate::config::Daemon::max_concurrent_runs`] is more than one - a caller
-/// after "the one thing in flight" wants [`is_working_on`] or
-/// [`is_working_on_task`], not this directly.
+/// CLI, sandboxed conversation controls and Web cleanup share this observation.
+/// A stale daemon heartbeat does not invalidate a worker's OS-held lease.
+/// Starting reservations and unknown worker state remain protected; observing
+/// them never creates, reconciles or archives files in the worker store.
+/// Callers interested in one identity use [`is_working_on`] or
+/// [`is_working_on_task`].
 #[must_use]
 pub fn current_work(home: &Path, now: Timestamp) -> Vec<Current> {
-    read_status(home)
+    let mut current = read_status(home)
         .filter(|reading| reading.running(now))
         .map(|reading| reading.current)
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let workers = crate::worker::observe_active(home).and_then(|jobs| {
+        jobs.into_iter()
+            .filter(|job| job.kind == "task")
+            .map(|job| {
+                let request: TaskWorker = serde_json::from_value(job.payload)?;
+                let run = Queue::at(request.queue)
+                    .get(&request.task)
+                    .ok()
+                    .and_then(|task| task.runs.last().cloned())
+                    .unwrap_or_default();
+                Ok(Current {
+                    task: request.task,
+                    run,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+    });
+    match workers {
+        Ok(workers) => {
+            for worker in workers {
+                if let Some(existing) = current.iter_mut().find(|c| c.task == worker.task) {
+                    *existing = worker;
+                } else {
+                    current.push(worker);
+                }
+            }
+        }
+        Err(error) => {
+            // This API gates destructive cleanup. Unknown worker ownership
+            // protects every known task/run instead of pretending it is idle.
+            tracing::error!("cannot determine active workers: {error:#}");
+            current.extend(
+                Queue::at(home.join("queue"))
+                    .list()
+                    .into_iter()
+                    .map(|task| Current {
+                        task: task.id,
+                        run: task.runs.last().cloned().unwrap_or_default(),
+                    }),
+            );
+            current.extend(
+                crate::run::list_ids_in(&home.join("runs"))
+                    .into_iter()
+                    .map(|run| Current {
+                        task: String::new(),
+                        run,
+                    }),
+            );
+        }
+    }
+    current
 }
 
 /// Whether a live daemon is working on this run at this moment.
@@ -553,13 +574,9 @@ pub fn is_working_on_task(home: &Path, task: &str, now: Timestamp) -> bool {
 ///   falls back to `older_than`, since there is nothing else to check.
 ///
 /// Age must never override a *positive* liveness confirmation. `sweep`
-/// [`poll`]s concurrently with every attempt this daemon itself has spawned —
-/// see [`InFlightGuard`] — not only between them the way a single sequential
-/// loop once did, so a run that legitimately runs longer than `older_than`
-/// (a multi-round review, a long land wait carried across several resumed
-/// attempts) still has this very process's own live pid sitting in its own
-/// lock file on every later sweep. Deciding by age alone in that case would
-/// delete this daemon's own still-valid claim on its own in-flight task,
+/// polls concurrently with independently running task workers. A worker may
+/// legitimately run longer than `older_than`; its live pid must still protect
+/// its claim. Age alone must never turn that claim into a second task attempt,
 /// which [`reclaim_orphaned_running`] would then read as abandoned and hand
 /// to a second attempt — two `Runner`s writing the same `run.json` and the
 /// same worktree at once. `pid_alive` answering "alive" for anything it
@@ -1241,7 +1258,7 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                         record("started")?;
                         if !crate::resume::pin_queued(queue, run, Some(q.asked_at), Some(&q.id))? {
                             crate::resume::validate_unqueued(home, run)?;
-                            crate::resume::start(run.clone());
+                            crate::resume::start(home, run.clone()).await?;
                         }
                     }
                     ask::ChoiceAction::ReleaseTask {
@@ -2138,10 +2155,14 @@ fn reclaim(task: &mut Task, last_run: Option<RunState>, max_attempts: usize, lan
 /// Called on every poll, not only at startup, for the reason
 /// [`sweep_stale_claims`] now is too: a daemon that has been up for days must
 /// keep noticing this, not only on the one morning it happened to restart.
-fn reclaim_orphaned_running(queue: &Queue, max_attempts: usize) -> Vec<String> {
+fn reclaim_orphaned_running(
+    queue: &Queue,
+    max_attempts: usize,
+    live_workers: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
     let mut reclaimed = Vec::new();
     for listed in queue.list() {
-        if listed.status != TaskStatus::Running {
+        if listed.status != TaskStatus::Running || live_workers.contains(&listed.id) {
             continue;
         }
         let Ok(_claim) = queue.claim(&listed.id) else {
@@ -2314,6 +2335,282 @@ where
     abandoned
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TaskWorker {
+    opts: Opts,
+    queue: PathBuf,
+    task: String,
+    #[serde(default)]
+    lane: PermitKind,
+    #[serde(default)]
+    standalone: bool,
+}
+
+fn task_jobs(home: &Path) -> Result<Vec<crate::worker::Job>> {
+    Ok(crate::worker::active(home)?
+        .into_iter()
+        .filter(|job| job.kind == "task")
+        .collect())
+}
+
+fn owned_task_jobs(home: &Path) -> Result<Vec<crate::worker::Job>> {
+    task_jobs(home)?
+        .into_iter()
+        .filter_map(
+            |job| match serde_json::from_value::<TaskWorker>(job.payload.clone()) {
+                Ok(request) if !request.standalone => Some(Ok(job)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error.into())),
+            },
+        )
+        .collect()
+}
+
+/// Whether an independent scheduler can be controlled without its web parent.
+#[must_use]
+pub fn managed(home: &Path) -> bool {
+    match crate::worker::active(home) {
+        Err(error) => {
+            tracing::error!("cannot determine scheduler ownership: {error:#}");
+            true
+        }
+        Ok(jobs) if jobs.iter().any(|j| j.kind == "scheduler") => true,
+        Ok(_) => {
+            read_status(home).is_some_and(|r| r.worker_protocol == Some(1))
+                && crate::worker::try_lease(home, "scheduler").map_or(true, |lease| lease.is_none())
+        }
+    }
+}
+
+/// Start a detached, singleton scheduler using this executable generation.
+pub async fn spawn_detached(home: &Path, opts: &Opts) -> Result<crate::worker::Job> {
+    anyhow::ensure!(
+        crate::worker::control(home, "scheduler")?.is_none() || !managed(home),
+        "the scheduler is stopping; wait for retirement before starting it again"
+    );
+    crate::worker::spawn(
+        home,
+        "scheduler",
+        "scheduler",
+        serde_json::to_value(opts.absolute()?)?,
+    )
+    .await
+}
+
+fn park_request_path(home: &Path, job: &crate::worker::Job) -> PathBuf {
+    home.join("worker-parks").join(format!("{}.json", job.id))
+}
+
+fn request_task_park(
+    home: &Path,
+    job: &crate::worker::Job,
+    cause: crate::run::ParkCause,
+) -> Result<()> {
+    let path = park_request_path(home, job);
+    std::fs::create_dir_all(path.parent().context("worker park directory")?)?;
+    std::fs::write(path, serde_json::to_vec(&cause)?)?;
+    crate::worker::request(home, &job.key, crate::worker::Control::Park)
+}
+
+/// Stop dispatch immediately; only an explicit park reaches existing workers.
+pub fn request_control(home: &Path, control: crate::worker::Control) -> Result<()> {
+    if control == crate::worker::Control::Park {
+        for job in owned_task_jobs(home)? {
+            request_task_park(home, &job, crate::run::ParkCause::Operator)?;
+        }
+    }
+    crate::worker::request(home, "scheduler", control)
+}
+
+/// Replace the scheduler, leaving all active task and conversation jobs alone.
+pub async fn restart_detached(home: &Path) -> Result<()> {
+    let active = crate::worker::active(home)?;
+    let prior = active.into_iter().find(|job| job.kind == "scheduler");
+    if prior.is_none() && !managed(home) {
+        return Ok(());
+    }
+    let opts: Opts = match prior {
+        Some(job) => serde_json::from_value(job.payload)?,
+        None => serde_json::from_slice(&std::fs::read(home.join("scheduler-options.json"))?)?,
+    };
+    request_control(home, crate::worker::Control::Stop)?;
+    loop {
+        let reserved = crate::worker::active(home)?
+            .iter()
+            .any(|job| job.kind == "scheduler");
+        if !reserved && crate::worker::try_lease(home, "scheduler")?.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    spawn_detached(home, &opts).await?;
+    Ok(())
+}
+
+/// Hidden worker dispatch entry. The worker infrastructure owns its job lease.
+pub async fn run_scheduler_worker(home: &Path, payload: serde_json::Value) -> Result<()> {
+    let opts: Opts = serde_json::from_value(payload)?;
+    let _ = home;
+    serve_until(opts, Stop::new()).await
+}
+
+/// Execute and settle one task with the queue claim owned by this process.
+pub async fn run_task_worker(home: &Path, payload: serde_json::Value) -> Result<()> {
+    let request: TaskWorker = serde_json::from_value(payload)?;
+    let queue = Queue::at(request.queue);
+    let key = format!("task:{}", request.task);
+    let job = task_jobs(home)?
+        .into_iter()
+        .find(|job| job.key == key)
+        .context("task worker reservation is missing")?;
+    let park_path = park_request_path(home, &job);
+    // The spawning CLI/scheduler still owns the claim until spawn acknowledges
+    // our durable reservation. Never execute before that ownership hand-off.
+    let _claim = loop {
+        match queue.claim(&request.task) {
+            Ok(claim) => break claim,
+            // Only contention (the claim file exists) is worth waiting out; an
+            // I/O failure must end this worker instead of pinning its lane.
+            Err(e) if e.chain().any(|c| c.is::<std::io::Error>()) => {
+                return Err(e.context("claim the task for its worker"));
+            }
+            Err(_) => {
+                sweep_stale_claims(&queue, STALE_CLAIM);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    let mut task = queue.get(&request.task)?;
+    if !task.status.runnable()
+        || (!request.standalone
+            && request.lane
+                != permit_kind(land_resume_state(&task) == LandResume::Ready, task.urgent))
+    {
+        return Ok(());
+    }
+    let stop = Stop::new();
+    let watcher = {
+        let home = home.to_path_buf();
+        let stop = stop.clone();
+        let park_path = park_path.clone();
+        tokio::spawn(async move {
+            loop {
+                if crate::worker::control(&home, &key).ok().flatten().is_some() {
+                    let cause = std::fs::read(&park_path)
+                        .ok()
+                        .and_then(|body| serde_json::from_slice(&body).ok())
+                        .unwrap_or(crate::run::ParkCause::Operator);
+                    stop.park(cause);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+    };
+    let quota = if request.standalone {
+        run_claimed_until(&request.opts, &queue, &mut task, &stop).await
+    } else {
+        let status = Arc::new(Mutex::new(Status::new()));
+        Box::pin(attempt(
+            &request.opts,
+            &queue,
+            &status,
+            &stop,
+            crate::graph::Pause::new(),
+            &mut task,
+        ))
+        .await
+    };
+    watcher.abort();
+    let _ = std::fs::remove_file(park_path);
+    persist_cooldown(home, &quota).await?;
+    Ok(())
+}
+
+/// Launch the standalone task worker with a claim-to-reservation handoff.
+/// Returns only after the worker owns a durable execution reservation.
+pub async fn spawn_claimed(
+    home: &Path,
+    opts: &Opts,
+    queue: &Queue,
+    task: &Task,
+    claim: crate::queue::Claim,
+) -> Result<crate::worker::Job> {
+    let request = TaskWorker {
+        opts: opts.absolute()?,
+        queue: std::path::absolute(queue.root())?,
+        task: task.id.clone(),
+        lane: permit_kind(land_resume_state(task) == LandResume::Ready, task.urgent),
+        standalone: true,
+    };
+    let job = crate::worker::spawn(
+        home,
+        "task",
+        &format!("task:{}", task.id),
+        serde_json::to_value(request)?,
+    )
+    .await?;
+    drop(claim);
+    Ok(job)
+}
+
+/// Transfer a standalone caller's claim only after the detached worker is live,
+/// then follow that worker to its final (non-automatically-retrying) outcome.
+pub async fn run_detached_claimed(
+    opts: &Opts,
+    queue: &Queue,
+    task: &mut Task,
+    claim: crate::queue::Claim,
+) -> Result<()> {
+    let home = crate::run::home();
+    let job = spawn_claimed(&home, opts, queue, task, claim).await?;
+    loop {
+        // Reconcile execution leases even without a scheduler. A dead worker
+        // must become a reported failure, never an infinite persisted wait.
+        crate::worker::active(&home)?;
+        let current = crate::worker::get(&home, &job.id)?;
+        if matches!(
+            current.status,
+            crate::worker::Status::Finished | crate::worker::Status::Failed
+        ) {
+            *task = queue.get(&task.id)?;
+            anyhow::ensure!(
+                current.status != crate::worker::Status::Failed,
+                "task worker failed: {}",
+                current.result.as_deref().unwrap_or("unknown failure")
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+async fn persist_cooldown(home: &Path, quota: &[QuotaLoss]) -> Result<()> {
+    if let Some(until) = cooldown_until(quota, Timestamp::now()) {
+        let _lease = loop {
+            if let Some(lease) = crate::worker::try_lease(home, "task-quota-cooldown")? {
+                break lease;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        if read_cooldown(home)?.is_none_or(|previous| previous < until) {
+            let path = home.join("task-quota-cooldown.json");
+            let temporary = path.with_extension("json.tmp");
+            std::fs::write(&temporary, serde_json::to_vec(&until)?)?;
+            std::fs::rename(temporary, path)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_cooldown(home: &Path) -> Result<Option<Timestamp>> {
+    match std::fs::read(home.join("task-quota-cooldown.json")) {
+        Ok(body) => Ok(Some(serde_json::from_slice(&body)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Run the loop until Ctrl-C, or until the queue drains with [`Opts::once`].
 ///
 /// A thin wrapper over [`serve_until`] with a stop nothing but Ctrl-C ever
@@ -2325,27 +2622,61 @@ pub async fn serve(opts: Opts) -> Result<()> {
 
 /// [`serve`], but stopping when `stop` is set as well as on Ctrl-C.
 ///
-/// Neither a signal nor a `stop` abandons a run in flight. Killing the graph
-/// mid-node leaves worktrees, branches and agent sessions behind, and every
-/// agent call already paid for is lost; finishing the run costs the operator a
-/// wait and saves them a cleanup. A stop therefore only sets a flag: the
-/// current `execute` runs to its terminal status, the task's outcome is
-/// recorded, and only then does the loop return. That window is what
-/// [`Stop::finishing`] is for. An operator who genuinely wants the run dead
-/// still has a second Ctrl-C, which the runtime turns into a process kill —
-/// and the task left `Running` then tells the next daemon, and the next human,
-/// where to look.
+/// A stop retires dispatch promptly, including while a worker launch is being
+/// acknowledged. Already reserved workers own their attempts independently and
+/// finish with their started executable. Explicit park additionally forwards
+/// durable park requests; neither scheduler retirement nor update does so.
 ///
 /// While the queue is empty the stop is honoured within one wakeup rather than
 /// one poll interval: the wait is a `select!` against [`Stop`]'s notify, so a
 /// caller that taps stop does not sit through the remainder of a sleep.
 pub async fn serve_until(opts: Opts, stop: Stop) -> Result<()> {
+    let opts = opts.absolute()?;
+    let home = crate::run::home();
+    let _scheduler = crate::worker::try_lease(&home, "scheduler")?
+        .context("another scheduler already owns this home")?;
+    if let Some(reading) = read_status(&home)
+        && legacy_scheduler_running(&reading, Timestamp::now(), std::process::id())
+    {
+        bail!("a legacy scheduler is still running; stop it before starting independent dispatch");
+    }
+    if !crate::worker::active(&home)?
+        .iter()
+        .any(|job| job.kind == "scheduler")
+    {
+        crate::worker::clear_control(&home, "scheduler")?;
+    }
+    std::fs::write(
+        home.join("scheduler-options.json"),
+        serde_json::to_vec(&opts)?,
+    )?;
+    let control = {
+        let home = home.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            loop {
+                match crate::worker::control(&home, "scheduler").ok().flatten() {
+                    Some(crate::worker::Control::Park) => {
+                        let _ = request_control(&home, crate::worker::Control::Park);
+                        stop.park(crate::run::ParkCause::Operator);
+                        break;
+                    }
+                    Some(crate::worker::Control::Stop) => {
+                        stop.stop();
+                        break;
+                    }
+                    None => {}
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    };
     let signal = {
         let stop = stop.clone();
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
                 stop.stop();
-                tracing::info!("shutdown requested; a run in flight will be finished first");
+                tracing::info!("scheduler shutdown requested; independent workers continue");
             }
         })
     };
@@ -2365,6 +2696,7 @@ pub async fn serve_until(opts: Opts, stop: Stop) -> Result<()> {
     .await;
 
     signal.abort();
+    control.abort();
     outcome
 }
 
@@ -2405,6 +2737,16 @@ async fn drive(
         tracing::info!(runs = ?reconciled, "reconciled stopped run drivers at startup");
     }
     let mut initial_status = Status::new();
+    let owned = owned_task_jobs(home)?;
+    initial_status.current = current_work(home, Timestamp::now())
+        .into_iter()
+        .filter(|current| {
+            owned
+                .iter()
+                .any(|job| job.key.strip_prefix("task:") == Some(current.task.as_str()))
+        })
+        .collect();
+    initial_status.idle = initial_status.current.is_empty();
     initial_status.question_recovery = Some(crate::question_delivery::Recovery::new(
         recovery_cfg.as_ref(),
         daemon_cfg.max_deputies,
@@ -2420,55 +2762,6 @@ async fn drive(
     // fact in the same sense the agent roster is.
     let concurrency = max_concurrent(daemon_cfg.max_concurrent_runs);
 
-    // Something has to be waiting on every question for as long as it is open,
-    // whether or not the agent's own `magi ask` survived. Its own task rather
-    // than a step of the poll loop: the poll loop is busy for the whole of a
-    // run, and an owner's reply must not queue behind one.
-    let waiter = tokio::spawn(crate::waiter::run(
-        crate::waiter::Waiter::new(
-            crate::ask::Questions::at(home.join("questions")),
-            home.to_path_buf(),
-            recovery_cfg.clone(),
-        ),
-        stop.clone(),
-    ));
-
-    // The follow-up seats for the conductor's questions: the conductor files a
-    // question and moves on, and each open one gets a deputy that reads the
-    // owner's reply. Its own task for the same reason the waiter's is.
-    let deputies = tokio::spawn(crate::deputy::run(
-        crate::deputy::Deputies::new(
-            crate::ask::Questions::at(home.join("questions")),
-            home.to_path_buf(),
-            recovery_cfg.clone(),
-            opts.repo.clone(),
-            daemon_cfg.max_deputies,
-            {
-                let stop = stop.clone();
-                Arc::new(move || stop.parking())
-            },
-        ),
-        stop.clone(),
-    ));
-
-    // Keeps every checkout's origin/main fresh; its own task so a slow remote
-    // never holds up the poll loop.
-    let fetcher = tokio::spawn(fetch_loop(opts.repo.clone(), opts.clone(), stop.clone()));
-
-    // Watches the release-bump pull requests until they land; its own task, not
-    // tied to any run, because a pending bump outlives the run that opened it.
-    let release_watch = tokio::spawn(crate::release_watch::run(
-        crate::release_watch::Watcher::new(
-            Box::new(crate::release_watch::GhForge),
-            home.to_path_buf(),
-        ),
-        {
-            let (repo, opts) = (opts.repo.clone(), opts.clone());
-            move || release_watch_settings(&repo, &opts)
-        },
-        stop.clone(),
-    ));
-
     tracing::info!(
         "magi serve: queue {} (poll {}s, {} attempts per task, {} run(s) at once{})",
         queue.root().display(),
@@ -2482,48 +2775,49 @@ async fn drive(
         }
     );
 
-    // `--once` drains an already-idle queue without reaching the idle wait,
-    // but must still perform the startup cleanup.
-    janitor(&opts.repo, opts, home, worktrees_root).await;
-    resweep_superseded_attempts(queue, home);
-
-    let outcome = poll(
-        opts,
-        queue,
-        &status,
-        home,
-        worktrees_root,
-        stop,
-        DispatchLimits {
+    let outcome = tokio::select! {
+        outcome = poll(opts, queue, &status, home, worktrees_root, stop, DispatchLimits {
             max_concurrent: concurrency,
             pause_for_interrupts: daemon_cfg.pause_for_interrupts,
-        },
-    )
-    .await;
+            recovery_cfg,
+        }) => outcome,
+        () = async {
+            while !stop.stopped() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        } => {
+            if stop.parking() {
+                request_control(home, crate::worker::Control::Park)?;
+            }
+            Ok(())
+        }
+    };
 
+    stop.busy.store(0, Ordering::SeqCst);
     beat.abort();
-    waiter.abort();
-    deputies.abort();
-    fetcher.abort();
-    release_watch.abort();
     clear_status_at(status_file);
     outcome
 }
 
 /// The checkouts the release watcher covers and `[daemon] release_stall_minutes`,
 /// re-read each lap. An unreadable config yields `0` minutes: the watcher idles.
-fn release_watch_settings(repo: &Path, opts: &Opts) -> (Vec<PathBuf>, u64) {
-    let Ok(cfg) = prepare(repo, opts) else {
-        return (Vec::new(), 0);
-    };
+pub(crate) fn release_watch_settings_from_config(
+    home: &Path,
+    repo: &Path,
+    cfg: &Config,
+) -> (Vec<PathBuf>, u64) {
     let mut paths: Vec<PathBuf> = crate::repos::scan(&cfg.repos.roots)
         .into_iter()
         .map(|r| r.path)
         .collect();
     // Repositories the daemon has worked in, wherever they live: a task may
     // name one outside `[repos] roots`, and its release PR must be watched too.
-    let mut known: Vec<PathBuf> = Queue::open().list().into_iter().map(|t| t.repo).collect();
-    let runs = crate::run::home().join("runs");
+    let mut known: Vec<PathBuf> = Queue::at(home.join("queue"))
+        .list()
+        .into_iter()
+        .map(|t| t.repo)
+        .collect();
+    let runs = home.join("runs");
     for id in crate::run::list_ids_in(&runs) {
         let repo = std::fs::read_to_string(runs.join(&id).join("run.json"))
             .ok()
@@ -2546,29 +2840,6 @@ fn release_watch_settings(repo: &Path, opts: &Opts) -> (Vec<PathBuf>, u64) {
 
 /// Per-repo bound on one `git fetch`, so a dead remote cannot stall the pass.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Run [`crate::clean::fetch_origins`] every `[repos] fetch_interval` seconds
-/// until `stop`. The config is re-read each lap; `0` (or an unreadable config)
-/// disables the fetch for that lap. Never fails.
-async fn fetch_loop(repo: PathBuf, opts: Opts, stop: Stop) {
-    while !stop.stopped() {
-        let (interval, roots) = match prepare(&repo, &opts) {
-            Ok(c) => (c.repos.fetch_interval, c.repos.roots),
-            Err(_) => (0, Vec::new()),
-        };
-        if interval > 0 && !roots.is_empty() {
-            let r = crate::clean::fetch_origins(&roots, FETCH_TIMEOUT, || stop.stopped()).await;
-            tracing::debug!("fetch origins: {r:?}");
-        }
-        // Sleep in slices so a stop or a config change is noticed promptly.
-        let wait = if interval > 0 { interval } else { 60 };
-        let mut slept = 0;
-        while slept < wait && !stop.stopped() {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            slept += 1;
-        }
-    }
-}
 
 /// Refresh the status file on a fixed tick.
 ///
@@ -2714,31 +2985,6 @@ const RECHECK_WHILE_BUSY: Duration = Duration::from_millis(200);
 /// backlog of short tasks does not pay for that walk on every poll.
 const CACHE_CHECK_INTERVAL_SECS: u64 = 5 * 60;
 
-/// Frees one attempt's concurrency slot - `Stop`'s busy count and its entry
-/// in `Status::current` - on drop, so both are released even if the attempt
-/// panics rather than returning.
-///
-/// A `Drop` impl rather than statements written after the `.await` it
-/// guards: a panic unwinds straight past code placed "after" a call, and
-/// `Runner::execute`'s chain reaches deep enough into agent-output parsing
-/// that ruling a panic out there is not a bet this loop can make. Without
-/// this, one panicking run would leave [`Stop::busy_now`] stuck `true`
-/// forever - the idle branch in [`poll`], and with it the janitor, would
-/// never run again - and a ghost entry in `Status::current` naming a task
-/// nothing is still working on.
-struct InFlightGuard<'a> {
-    status: &'a Arc<Mutex<Status>>,
-    stop: &'a Stop,
-    task_id: &'a str,
-}
-
-impl Drop for InFlightGuard<'_> {
-    fn drop(&mut self) {
-        lock(self.status).current.retain(|c| c.task != self.task_id);
-        self.stop.exit();
-    }
-}
-
 /// State of [`poll`]'s own interrupt-scheduling sequence - see
 /// [`crate::config::Daemon::pause_for_interrupts`]. Advanced once per tick by
 /// [`advance_interrupt`] and consulted by [`interrupt_gate`], both pure and
@@ -2749,18 +2995,9 @@ impl Drop for InFlightGuard<'_> {
 /// queue - which is exactly the coverage this feature's first two attempts
 /// were missing.
 ///
-/// Deliberately in-memory only, not written to disk anywhere: a daemon
-/// restart mid-sequence loses track of which run it had asked to park and
-/// which task was meant to run first, and simply falls back to `Idle` -
-/// see [`drive`]'s own setup. The parked run itself is not lost - it is
-/// sitting in the queue exactly like any other resumable, interrupted task,
-/// `RunStatus::resumable` and [`Task::interrupt`] both intact on disk - it
-/// just resumes on the ordinary priority order rather than guaranteed to go
-/// first. Giving that guarantee a crash-proof memory would mean a new queue
-/// field and a recovery ordering to go with it, which is exactly the
-/// complexity this feature's constraints rule out for the one property that
-/// actually matters: at most one run, ever, at once.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Persisted after every transition, so scheduler replacement preserves the
+/// interrupt's exclusive turn and the interrupted task's priority resume.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum Interrupt {
     /// No interrupt sequence in progress. Ordinary dispatch applies.
     Idle,
@@ -2974,6 +3211,7 @@ struct DispatchLimits {
     max_concurrent: usize,
     /// See [`crate::config::Daemon::pause_for_interrupts`].
     pause_for_interrupts: bool,
+    recovery_cfg: Option<Config>,
 }
 
 /// Which semaphore, if any, dispatching a candidate should draw its permit
@@ -2984,7 +3222,7 @@ struct DispatchLimits {
 /// entirely", "spend the one urgent slot" and "spend an ordinary slot" is
 /// exactly the policy this feature adds, and a policy only exercisable by
 /// running the whole loop is a policy nobody checks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 enum PermitKind {
     /// A land-merge resume (see [`LandResume::Ready`]): bypasses every slot.
     /// Checked first - a task can be both a land resume and marked
@@ -3000,6 +3238,7 @@ enum PermitKind {
     Urgent,
     /// The ordinary `max_concurrent_runs` pool - unaffected by either of the
     /// above.
+    #[default]
     Ordinary,
 }
 
@@ -3013,6 +3252,21 @@ fn permit_kind(priority: bool, urgent: bool) -> PermitKind {
     } else {
         PermitKind::Ordinary
     }
+}
+
+fn available_slots(requests: &[TaskWorker], limit: usize) -> (usize, usize) {
+    let (ordinary, urgent) = requests.iter().filter(|request| !request.standalone).fold(
+        (0usize, 0usize),
+        |(ordinary, urgent), request| match request.lane {
+            PermitKind::Ordinary => (ordinary + 1, urgent),
+            PermitKind::Urgent => (ordinary, urgent + 1),
+            PermitKind::None => (ordinary, urgent),
+        },
+    );
+    (
+        limit.saturating_sub(ordinary),
+        1usize.saturating_sub(urgent),
+    )
 }
 
 struct DispatchClaim {
@@ -3093,6 +3347,268 @@ fn claim_dispatch(
 /// while the interrupt task itself has the floor, is precisely the second
 /// run 75dd's own "at most one run, ever, at once" guarantee must never
 /// allow - see [`Interrupt`]'s own doc.
+#[derive(Serialize, Deserialize)]
+struct ServiceWorker {
+    opts: Opts,
+    queue: PathBuf,
+    worktrees_root: PathBuf,
+    operation: String,
+}
+
+fn load_conductor(home: &Path) -> Result<Conductor> {
+    match std::fs::read(home.join("conductor-state.json")) {
+        Ok(body) => serde_json::from_slice(&body).context("read conductor state"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Conductor::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn conductor_work(queue: &Queue, home: &Path) -> (Vec<Task>, Vec<Task>, Vec<Task>) {
+    let live: std::collections::BTreeSet<_> = current_work(home, Timestamp::now())
+        .into_iter()
+        .map(|c| c.task)
+        .collect();
+    let stalled = stalled_tasks(queue, home, Timestamp::now());
+    let stalled_ids: std::collections::BTreeSet<_> = stalled.iter().map(|t| t.id.clone()).collect();
+    let finished = finished_tasks(queue)
+        .into_iter()
+        .filter(|t| !live.contains(&t.id) && !stalled_ids.contains(&t.id))
+        .filter(|t| !awaiting_resume_with(t, |id| RunState::load_under(id, home)))
+        .collect();
+    let queued = queued_tasks(queue)
+        .into_iter()
+        .filter(|t| !live.contains(&t.id))
+        .collect();
+    (queued, stalled, finished)
+}
+
+async fn start_service(
+    home: &Path,
+    opts: &Opts,
+    queue: &Queue,
+    worktrees_root: &Path,
+    operation: &str,
+    cfg: Option<&Config>,
+    busy: bool,
+) -> Result<()> {
+    // Fetch policy is live configuration, unlike question recovery capacity.
+    // Reload before both cadence and eligibility, including disabled -> enabled.
+    let fetch_cfg = if operation == "fetch" {
+        match prepare(&opts.repo, opts) {
+            Ok(cfg) => Some(cfg),
+            Err(error) => {
+                tracing::warn!("could not reload periodic fetch configuration: {error:#}");
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+    let cfg = fetch_cfg.as_ref().or(cfg);
+    let ticks = home.join("service-ticks");
+    std::fs::create_dir_all(&ticks)?;
+    let receipt = ticks.join(format!("daemon-{operation}"));
+    let last = std::fs::read(&receipt)
+        .ok()
+        .and_then(|body| serde_json::from_slice::<Timestamp>(&body).ok());
+    let interval = match operation {
+        "disk-pressure" => 30,
+        "cache" => CACHE_CHECK_INTERVAL_SECS,
+        "fetch" => cfg.map_or(60, |cfg| cfg.repos.fetch_interval.max(1)),
+        _ => opts.poll.as_secs().max(1),
+    };
+    let now = Timestamp::now();
+    if !cache_check_due(last, now, interval) {
+        return Ok(());
+    }
+    let key = format!("service:daemon-{operation}");
+    if crate::worker::active(home)?
+        .iter()
+        .any(|job| job.key == key)
+    {
+        return Ok(());
+    }
+    let eligible = match operation {
+        "conductor" => {
+            let (queued, stalled, finished) = conductor_work(queue, home);
+            !(queued.is_empty() && stalled.is_empty() && finished.is_empty())
+                && load_conductor(home)?.worth_a_look(queue, &stalled, &finished)
+        }
+        "maintenance" => Questions::at(home.join("questions"))
+            .list()
+            .iter()
+            .any(|q| {
+                q.chosen_action().is_some_and(|action| action.maintenance())
+                    && !home
+                        .join("choice-actions")
+                        .join(format!("{}.json", q.id))
+                        .exists()
+            }),
+        "housekeeping" => !busy && runnable(queue).is_empty(),
+        "cache" => {
+            !busy
+                && !runnable(queue).is_empty()
+                && cfg.is_some_and(|cfg| cfg.disk.cache_limit_bytes > 0)
+        }
+        "disk-pressure" => busy,
+        "fetch" => {
+            cfg.is_some_and(|cfg| cfg.repos.fetch_interval > 0 && !cfg.repos.roots.is_empty())
+        }
+        _ => false,
+    };
+    if !eligible {
+        return Ok(());
+    }
+    let request = ServiceWorker {
+        opts: opts.absolute()?,
+        queue: std::path::absolute(queue.root())?,
+        worktrees_root: std::path::absolute(worktrees_root)?,
+        operation: operation.to_owned(),
+    };
+    if let Err(error) =
+        crate::worker::spawn(home, "daemon-service", &key, serde_json::to_value(request)?).await
+    {
+        tracing::warn!(operation, "could not launch daemon service: {error:#}");
+    }
+    std::fs::write(receipt, serde_json::to_vec(&now)?)?;
+    Ok(())
+}
+
+/// Finite maintenance jobs survive scheduler replacement without duplicating
+/// agent calls or cancelling an operation between its effect and receipt.
+pub async fn run_service_worker(home: &Path, payload: serde_json::Value) -> Result<()> {
+    let request: ServiceWorker = serde_json::from_value(payload)?;
+    let opts = &request.opts;
+    let queue = Queue::at(request.queue);
+    let questions = Questions::at(home.join("questions"));
+    match request.operation.as_str() {
+        "maintenance" => apply_maintenance_choices(&queue, &questions, home).await,
+        "conductor" => {
+            let path = home.join("conductor-state.json");
+            let mut conductor = load_conductor(home)?;
+            let (queued, stalled, finished) = conductor_work(&queue, home);
+            if !(queued.is_empty() && stalled.is_empty() && finished.is_empty())
+                && conductor.worth_a_look(&queue, &stalled, &finished)
+            {
+                let cfg = prepare(&opts.repo, opts)?;
+                conductor
+                    .maybe_run(
+                        &cfg,
+                        &opts.repo,
+                        &queue,
+                        &questions,
+                        home,
+                        &queued,
+                        &stalled,
+                        &finished,
+                        opts.max_attempts,
+                    )
+                    .await;
+                let temporary = path.with_extension("json.tmp");
+                std::fs::write(&temporary, serde_json::to_vec(&conductor)?)?;
+                std::fs::rename(temporary, path)?;
+            }
+        }
+        "fetch" => {
+            let cfg = prepare(&opts.repo, opts)?;
+            if cfg.repos.fetch_interval > 0 && !cfg.repos.roots.is_empty() {
+                let outcome = clean::fetch_origins(&cfg.repos.roots, FETCH_TIMEOUT, || false).await;
+                tracing::debug!("fetch origins: {outcome:?}");
+            }
+        }
+        "cache" => {
+            if task_jobs(home)?.is_empty() {
+                let mut checked = None;
+                maybe_prune_cache_between_runs(
+                    &opts.repo,
+                    opts,
+                    home,
+                    &Stop::new(),
+                    &mut checked,
+                    Timestamp::now(),
+                )
+                .await;
+            }
+        }
+        "disk-pressure" => {
+            if let Ok(cfg) = prepare(&opts.repo, opts) {
+                crate::retention::sweep(home, &cfg.disk, Timestamp::now()).await;
+                if let Err(e) = clean::prune_cache_if_over_limit(&cfg, home) {
+                    tracing::warn!("disk pressure cache cleanup failed: {e:#}");
+                }
+                for current in current_work(home, Timestamp::now()) {
+                    if let Ok(state) = RunState::load_under(&current.run, home)
+                        && let Some(reason) = disk_gate(&state.repo, &state.config)
+                    {
+                        for job in owned_task_jobs(home)?.into_iter().filter(|job| {
+                            job.key.strip_prefix("task:") == Some(current.task.as_str())
+                        }) {
+                            request_task_park(
+                                home,
+                                &job,
+                                crate::run::ParkCause::Interrupt {
+                                    reason: reason.clone(),
+                                },
+                            )?;
+                        }
+                        notices::raise_in(
+                            home,
+                            Notice::warn(
+                                "disk:pressure",
+                                "Disk pressure persists after cleanup; active workers were asked to checkpoint and park. New starts and resumes wait for free space.",
+                            ),
+                        );
+                    }
+                }
+            }
+        }
+        "housekeeping" => {
+            if task_jobs(home)?.is_empty() {
+                if let Ok(cfg) = prepare(&opts.repo, opts) {
+                    crate::retention::sweep(home, &cfg.disk, Timestamp::now()).await;
+                }
+                janitor(&opts.repo, opts, home, &request.worktrees_root).await;
+                resweep_superseded_attempts(&queue, home);
+                triage_held(&queue, home, opts).await;
+            }
+        }
+        operation => bail!("unknown daemon service {operation}"),
+    }
+    Ok(())
+}
+
+/// Only a different request under the same key is a dispatch handoff race.
+/// Our own unacknowledged reservation is a startup failure, not competing work:
+/// stop dispatch without fencing it, so an already detached child may still run.
+fn task_worker_spawn_error(home: &Path, request: &TaskWorker, error: anyhow::Error) -> Result<()> {
+    let key = format!("task:{}", request.task);
+    let payload = serde_json::to_value(request)?;
+    if crate::worker::active(home)?
+        .iter()
+        .any(|job| job.key == key && job.kind == "task" && job.payload != payload)
+    {
+        tracing::warn!(
+            "task {} acquired a competing worker reservation: {error:#}",
+            crate::run::short_of(&request.task)
+        );
+        return Ok(());
+    }
+    tracing::error!("task worker startup stopped dispatch: {error:#}");
+    notices::raise_in(
+        home,
+        Notice::error(
+            "loop:worker-startup",
+            "A task worker could not be started or acknowledged. Scheduler dispatch stopped; already reserved workers may still complete. Startup details are kept in the local execution log.",
+        ),
+    );
+    Err(error).with_context(|| {
+        format!(
+            "cannot start task {} worker; dispatcher stopped; any unacknowledged reservation remains occupied",
+            crate::run::short_of(&request.task)
+        )
+    })
+}
+
 async fn poll(
     opts: &Opts,
     queue: &Queue,
@@ -3102,147 +3618,63 @@ async fn poll(
     stop: &Stop,
     limits: DispatchLimits,
 ) -> Result<()> {
-    let DispatchLimits {
-        max_concurrent,
-        pause_for_interrupts,
-    } = limits;
-    // Only consulted by `once`, where a task that just failed is still
-    // `runnable` and would otherwise be picked up again inside the same drain.
-    // In the long-running mode a later poll retrying a failed task is the point,
-    // and the attempt counter is what bounds it.
-    let mut attempted: Vec<String> = Vec::new();
-    let sem = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
-    // One extra, permanent slot for `--urgent` tasks (see `Task::urgent`),
-    // entirely separate from `sem`: an urgent candidate must dispatch
-    // alongside whatever `sem` already has checked out, never by waiting for
-    // one of those ordinary slots to free up and never by growing
-    // `max_concurrent_runs` itself. Sized at one, not unbounded - see
-    // `permit_kind`'s own doc - so a second `--urgent` task queues behind the
-    // first on this same slot rather than opening a third run.
-    let urgent_sem = Arc::new(tokio::sync::Semaphore::new(1));
-    // A quota hit is a fact about the machine, not the task that happened to
-    // surface it, and every other *ordinary* candidate is no less likely to
-    // hit the same wall - see the warning below. A land-merge resume is
-    // exempt: it is a human decision finishing, not a fresh competition, and
-    // must not sit out a quota cooldown it did not cause.
-    let quota_cooldown_until: Arc<Mutex<Option<Timestamp>>> = Arc::new(Mutex::new(None));
-    let mut inflight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
-    let mut conductor = Conductor::new();
-    // See `maybe_prune_cache_between_runs`'s own doc: this is the cache check
-    // a congested queue would otherwise starve of the fully-idle branch below.
-    let mut cache_last_checked: Option<Timestamp> = None;
-    let mut disk_last_checked: Option<Timestamp> = None;
-    // See `Interrupt`'s own doc: in-memory only, advanced once per tick.
-    let mut interrupt = Interrupt::Idle;
-    // The `Pause` handed to each dispatched candidate's own `Runner` - see
-    // `attempt`'s new parameter - kept here so the tick that decides to park
-    // a run for an interrupt can reach that specific run's handle and no
-    // other's. Pruned to whatever is still in flight at the top of every
-    // tick, so a finished attempt's handle does not linger.
-    let mut interrupt_pauses: std::collections::HashMap<String, crate::graph::Pause> =
-        std::collections::HashMap::new();
-
+    let mut attempted = Vec::new();
+    let interrupt_path = home.join("scheduler-interrupt.json");
+    let mut interrupt = match std::fs::read(&interrupt_path) {
+        Ok(body) => serde_json::from_slice(&body).context("read scheduler interrupt state")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Interrupt::Idle,
+        Err(error) => return Err(error.into()),
+    };
+    let mut previous = std::collections::BTreeSet::<String>::new();
     while !stop.stopped() {
-        lock(status).polls += 1;
-
-        // Reap whatever finished since the last tick without blocking on
-        // anything still running. `InFlightGuard` already released the slot
-        // even if the spawned attempt panicked; this only surfaces that it
-        // happened, since a panic swallowed here otherwise leaves no trace.
-        while let Some(result) = inflight.try_join_next() {
-            if let Err(e) = result {
-                tracing::error!("a spawned attempt did not finish cleanly: {e}");
-                notices::raise(Notice::error(
-                    "loop:attempt",
-                    "A queued attempt ended abnormally; check the task it was running.",
-                ));
-            }
+        let jobs: Vec<_> = crate::worker::active(home)?
+            .into_iter()
+            .filter(|job| job.kind == "task")
+            .collect();
+        let requests: Vec<_> = jobs
+            .iter()
+            .map(|job| {
+                serde_json::from_value::<TaskWorker>(job.payload.clone())
+                    .with_context(|| format!("read live task worker {}", job.id))
+            })
+            .collect::<Result<_>>()?;
+        let live: std::collections::BTreeSet<_> = requests.iter().map(|r| r.task.clone()).collect();
+        let owned: std::collections::BTreeSet<_> = requests
+            .iter()
+            .filter(|r| !r.standalone)
+            .map(|r| r.task.clone())
+            .collect();
+        let current: Vec<_> = requests
+            .iter()
+            .filter(|request| !request.standalone)
+            .map(|request| Current {
+                task: request.task.clone(),
+                run: queue
+                    .get(&request.task)
+                    .ok()
+                    .and_then(|task| task.runs.last().cloned())
+                    .unwrap_or_default(),
+            })
+            .collect();
+        {
+            let mut snapshot = lock(status);
+            snapshot.polls += 1;
+            snapshot.completed += previous.difference(&owned).count();
+            snapshot.current = current;
+            snapshot.idle = owned.is_empty();
         }
+        previous = owned.clone();
+        stop.busy.store(owned.len(), Ordering::SeqCst);
 
-        let swept = sweep_stale_claims(queue, STALE_CLAIM);
-        if !swept.is_empty() {
-            tracing::warn!(
-                "swept {} stale claim(s) left behind by an earlier daemon: {}",
-                swept.len(),
-                swept.join(", ")
-            );
-        }
-        // Capture stalled work before reclaiming it. A dead daemon's ordinary
-        // lock is swept and reclaimed in this same poll, but the conductor
-        // must still see that it was stranded rather than only its mechanical
-        // terminal state.
-        let now = Timestamp::now();
-
-        // No run this daemon spawned is mid-compile right now, whether or
-        // not another candidate is about to start - see
-        // `maybe_prune_cache_between_runs`'s own doc for why this cannot
-        // wait for the queue to run dry.
-        if !stop.busy_now() {
-            maybe_prune_cache_between_runs(
-                &opts.repo,
-                opts,
-                home,
-                stop,
-                &mut cache_last_checked,
-                now,
-            )
-            .await;
-        }
-
-        if cache_check_due(disk_last_checked, now, 30) {
-            disk_last_checked = Some(now);
-            if let Ok(cfg) = prepare(&opts.repo, opts) {
-                crate::retention::sweep(home, &cfg.disk, now).await;
-                // Shared-cache ownership makes this safe even with other runs
-                // active. Reclaim idle outputs before asking writers to park.
-                if let Err(e) = clean::prune_cache_if_over_limit(&cfg, home) {
-                    tracing::warn!("disk pressure cache cleanup failed: {e:#}");
-                }
-                for current in lock(status).current.clone() {
-                    if let Ok(state) = RunState::load_under(&current.run, home)
-                        && let Some(reason) = disk_gate(&state.repo, &state.config)
-                    {
-                        if let Some(pause) = interrupt_pauses.get(&current.task) {
-                            pause.park_because(reason);
-                        }
-                        notices::raise_in(
-                            home,
-                            Notice::warn(
-                                "disk:pressure",
-                                "Disk pressure persists after cleanup; active runs were asked to checkpoint and park. New starts and resumes wait for free space.",
-                            ),
-                        );
-                    }
-                }
-            }
-        }
-
-        let stalled = stalled_tasks(queue, home, now);
-        let stalled_ids: std::collections::BTreeSet<_> =
-            stalled.iter().map(|task| task.id.clone()).collect();
-        let reclaimed = reclaim_orphaned_running(queue, opts.max_attempts);
-        if !reclaimed.is_empty() {
-            tracing::warn!(
-                "reclaimed {} task(s) left `running` by a daemon that never \
-                 recorded the outcome: {}",
-                reclaimed.len(),
-                reclaimed.join(", ")
-            );
-        }
-        let abandoned_runs = reclaim_abandoned_runs(home, now);
-        if !abandoned_runs.is_empty() {
-            tracing::warn!(
-                "failed {} run(s) left behind by a killed process, past every \
-                 active seat's own timeout: {}",
-                abandoned_runs.len(),
-                abandoned_runs.join(", ")
-            );
-        }
-
-        // `home`, not `ask::Questions::open()`'s own process-global default:
-        // `poll` is handed its home explicitly precisely so a test can point
-        // it elsewhere, the same reason `Queue::at` and the status file path
-        // are parameters rather than resolved here - see `drive`'s own doc.
+        // Slots are reconstructed from durable reservations and OS-held worker
+        // leases, not this scheduler's lifetime or mutable task urgency.
+        let (ordinary, urgent) = available_slots(&requests, limits.max_concurrent);
+        let sem = Arc::new(tokio::sync::Semaphore::new(ordinary));
+        let urgent_sem = Arc::new(tokio::sync::Semaphore::new(urgent));
+        let mut permits = Vec::new();
+        sweep_stale_claims(queue, STALE_CLAIM);
+        reclaim_orphaned_running(queue, opts.max_attempts, &live);
+        reclaim_abandoned_runs(home, Timestamp::now());
         let questions = Questions::at(home.join("questions"));
 
         // Deterministic: no model, run before the conductor sees anything so
@@ -3255,230 +3687,196 @@ async fn poll(
         );
         repair_choice_offers(&questions);
         resolve_blockers(queue, &questions);
-        apply_choice_actions(queue, &questions, home).await;
+        apply_task_choice_actions(queue, &questions, home);
         triage::apply_answers(queue, &questions);
         reconcile_task_questions(queue, &questions);
-        // Tell the chat a filed task or watched command has ended. Reconciled
-        // here regardless of how it ended, and started only when no
-        // upgrade is parking (the draft then waits for a manual resume).
-        {
-            let talks = crate::talk::Talks::at(home.join("talks"));
-            crate::chat_notify::sweep(queue, &talks, home);
-            crate::chat_watch::sweep(home, &talks);
-            crate::chat_notify::start_turns(&talks, stop.parking(), &mut inflight);
-        }
+        let talks = crate::talk::Talks::at(home.join("talks"));
+        crate::chat_notify::sweep(queue, &talks, home);
+        crate::chat_watch::sweep(home, &talks);
+        let mut turns = tokio::task::JoinSet::new();
+        crate::chat_notify::start_turns(&talks, stop.parking(), &mut turns);
+        // start_turns dispatches detached turns; no paid work lives in this set.
+        while turns.join_next().await.is_some() {}
 
-        // The conductor gets one look per cycle, right before the loop takes
-        // its next task, and only when there is something new to look at -
-        // see `Conductor::worth_a_look`'s own doc for why "stalled is
-        // non-empty" is the wrong test. Checked before `prepare` so an
-        // unchanged cycle never pays for a synchronous config load.
-        let finished: Vec<Task> = finished_tasks(queue)
-            .into_iter()
-            .filter(|task| !stalled_ids.contains(&task.id))
-            // A parked run is waiting for this loop, not for a decision: the
-            // conductor must not get to hold it or requeue it (a requeue
-            // sets `fresh_start` and re-competes) before `attempt` resumes.
-            .filter(|task| !awaiting_resume_with(task, |id| RunState::load_under(id, home)))
-            .collect();
-        let queued = queued_tasks(queue);
-        // An empty queue has nothing to arrange. In particular, do not let
-        // the conductor's initial snapshot cause synchronous config I/O
-        // between the caller's stop notification and the idle wait below.
-        if !(queued.is_empty() && stalled.is_empty() && finished.is_empty())
-            && conductor.worth_a_look(queue, &stalled, &finished)
-        {
-            match prepare(&opts.repo, opts) {
-                Ok(cfg) => {
-                    conductor
-                        .maybe_run(
-                            &cfg,
-                            &opts.repo,
-                            queue,
-                            &questions,
-                            home,
-                            &queued,
-                            &stalled,
-                            &finished,
-                            opts.max_attempts,
-                        )
-                        .await;
-                }
-                Err(e) => {
-                    tracing::warn!("conductor: no config: {e:#}");
-                    notices::raise(Notice::warn(
-                        "loop:no-config",
-                        "The loop could not read this repository's config, so held tasks are not being triaged.",
-                    ));
-                }
-            }
+        crate::consult::start_services(
+            home,
+            &opts.repo,
+            limits.recovery_cfg.as_ref(),
+            opts.config.as_deref(),
+        )
+        .await?;
+        for operation in [
+            "conductor",
+            "maintenance",
+            "housekeeping",
+            "disk-pressure",
+            "cache",
+            "fetch",
+        ] {
+            start_service(
+                home,
+                opts,
+                queue,
+                worktrees_root,
+                operation,
+                limits.recovery_cfg.as_ref(),
+                !live.is_empty(),
+            )
+            .await?;
         }
-
+        let latest = crate::worker::active(home)?;
+        if latest.iter().any(|job| job.key == "service:daemon-cache")
+            || latest
+                .iter()
+                .any(|job| job.kind == "task" && !jobs.iter().any(|known| known.id == job.id))
+        {
+            stop.idle(RECHECK_WHILE_BUSY.min(opts.poll)).await;
+            continue;
+        }
         let candidates: Vec<Task> = runnable(queue)
             .into_iter()
-            .filter(|t| !opts.once || !attempted.contains(&t.id))
+            .filter(|task| !live.contains(&task.id))
+            .filter(|task| !opts.once || !attempted.contains(&task.id))
             .collect();
-
-        // A task id only stays a key here while its attempt is genuinely in
-        // flight; `status.current` is the same liveness fact `InFlightGuard`
-        // maintains for the phone's own status file, so this piggybacks on
-        // it rather than tracking a second copy of the same thing.
-        let in_flight: Vec<String> = lock(status)
-            .current
-            .iter()
-            .map(|c| c.task.clone())
-            .collect();
-        interrupt_pauses.retain(|id, _| in_flight.contains(id));
-
-        interrupt =
-            advance_interrupt_tick(pause_for_interrupts, interrupt, &in_flight, &candidates);
+        let in_flight: Vec<_> = owned.iter().cloned().collect();
+        let prior_interrupt = std::mem::discriminant(&interrupt);
+        interrupt = advance_interrupt_tick(
+            limits.pause_for_interrupts,
+            interrupt,
+            &in_flight,
+            &candidates,
+        );
+        // Same-variant transitions preserve their identities. Only an actual
+        // transition needs a durable write, atomically before sending controls.
+        if prior_interrupt != std::mem::discriminant(&interrupt) {
+            let temporary = interrupt_path.with_extension("json.tmp");
+            std::fs::write(&temporary, serde_json::to_vec(&interrupt)?)?;
+            std::fs::rename(temporary, &interrupt_path)?;
+        }
         if let Interrupt::Parking {
             parked,
             interrupt_task,
         } = &interrupt
         {
-            let reason = format!(
-                "task {} asked to run first",
-                crate::run::short_of(interrupt_task)
-            );
-            for id in parked {
-                if let Some(pause) = interrupt_pauses.get(id) {
-                    pause.park_because(reason.clone());
+            for job in jobs.iter().filter(|job| {
+                parked
+                    .iter()
+                    .any(|id| job.key.strip_prefix("task:") == Some(id.as_str()))
+            }) {
+                if crate::worker::control(home, &job.key)?.is_none() {
+                    request_task_park(
+                        home,
+                        job,
+                        crate::run::ParkCause::Interrupt {
+                            reason: format!(
+                                "task {} asked to run first",
+                                crate::run::short_of(interrupt_task)
+                            ),
+                        },
+                    )?;
                 }
             }
         }
         let candidates = interrupt_gate(&interrupt, &in_flight, candidates);
-
-        let cooling_down =
-            lock(&quota_cooldown_until).is_some_and(|until| Timestamp::now() < until);
-
-        let mut started_any = false;
+        let cooling = read_cooldown(home)?.is_some_and(|until| Timestamp::now() < until);
+        let mut started = false;
+        let mut resync = false;
         for candidate in candidates {
             if stop.stopped() {
                 break;
             }
-
             let Some(DispatchClaim {
-                mut task,
+                task,
                 claim,
                 permit,
-            }) = claim_dispatch(queue, &candidate, cooling_down, &sem, &urgent_sem)
+            }) = claim_dispatch(queue, &candidate, cooling, &sem, &urgent_sem)
             else {
                 continue;
             };
-
-            let task_id = task.id.clone();
-            attempted.push(task_id.clone());
-            lock(status).idle = false;
-            // A stop asked for from here on is "finishing", not "stopped": the
-            // run gets to reach a terminal status before the loop returns.
-            stop.enter();
-            started_any = true;
-
-            // A fresh, unshared handle - never `stop.pause()` - so parking
-            // this run for an interrupt cannot leak into any other run this
-            // loop ever drives. See `Pause`'s own doc.
-            let run_pause = crate::graph::Pause::new();
-            interrupt_pauses.insert(task_id.clone(), run_pause.clone());
-
-            let opts = opts.clone();
-            let queue = queue.clone();
-            let status = Arc::clone(status);
-            let stop = stop.clone();
-            let quota_cooldown_until = Arc::clone(&quota_cooldown_until);
-            inflight.spawn(async move {
-                // Held for the whole attempt: dropping either at the end of
-                // this task is what releases the claim and, for an ordinary
-                // candidate, frees its concurrency slot back to the loop.
-                let _claim = claim;
-                let _permit = permit;
-                // See `InFlightGuard`: this must survive a panic inside `attempt`.
-                let _inflight = InFlightGuard {
-                    status: &status,
-                    stop: &stop,
-                    task_id: &task_id,
-                };
-                let quota = attempt(&opts, &queue, &status, &stop, run_pause, &mut task).await;
-                lock(&status).completed += 1;
-                // A quota loss is a fact about the machine, not this task, and
-                // the next ordinary candidate the loop offers is no less
-                // likely to hit the same wall: without a cooldown here a
-                // whole backlog can be run - and failed - in the seconds it
-                // takes each attempt to notice the CLI is out of quota.
-                let now = Timestamp::now();
-                if let Some(until) = cooldown_until(&quota, now) {
-                    let wait = until.as_second() - now.as_second();
-                    *lock(&quota_cooldown_until) = Some(until);
-                    let hint = quota
-                        .iter()
-                        .find(|q| q.reset.is_some())
-                        .and_then(|q| q.reset.as_deref());
-                    match hint {
-                        Some(h) => tracing::warn!(
-                            "quota hit; waiting {wait}s before taking another ordinary task \
-                             (CLI reported reset: {h})"
-                        ),
-                        None => tracing::warn!(
-                            "quota hit; waiting {wait}s before taking another ordinary task \
-                             (no reset hint reported)"
-                        ),
-                    }
+            if crate::worker::active(home)?
+                .iter()
+                .any(|job| job.kind == "task" && !jobs.iter().any(|known| known.id == job.id))
+            {
+                drop(claim);
+                resync = true;
+                break;
+            }
+            let lane = permit_kind(land_resume_state(&task) == LandResume::Ready, task.urgent);
+            let request = TaskWorker {
+                opts: opts.absolute()?,
+                queue: std::path::absolute(queue.root())?,
+                task: task.id.clone(),
+                lane,
+                standalone: false,
+            };
+            // Keep the claim until spawn acknowledges the worker's durable
+            // reservation. The worker then claims and re-reads before attempt.
+            if let Err(error) = crate::worker::spawn(
+                home,
+                "task",
+                &format!("task:{}", task.id),
+                serde_json::to_value(&request)?,
+            )
+            .await
+            {
+                task_worker_spawn_error(home, &request, error)?;
+                drop(claim);
+                resync = true;
+                break;
+            }
+            drop(claim);
+            permits.extend(permit);
+            attempted.push(task.id);
+            started = true;
+        }
+        if started || resync {
+            continue;
+        }
+        if owned.is_empty() && opts.once {
+            while crate::worker::active(home)?
+                .iter()
+                .any(|job| job.key == "service:daemon-housekeeping")
+            {
+                stop.idle(RECHECK_WHILE_BUSY).await;
+                if stop.stopped() {
+                    return Ok(());
                 }
-            });
-        }
-
-        if started_any {
-            continue;
-        }
-
-        if stop.busy_now() {
-            // Something started on an earlier tick is still running. Recheck
-            // soon rather than sleeping out the whole poll interval - a freed
-            // slot, or a land approval answered mid-run, must not sit idle
-            // for it.
-            stop.idle(RECHECK_WHILE_BUSY.min(opts.poll)).await;
-            continue;
-        }
-
-        // Truly idle: nothing new to start and nothing still running.
-        lock(status).idle = true;
-        if opts.once {
-            // A one-shot drain must perform the same post-work cleanup as a
-            // daemon that reached a normal idle interval. The startup pass
-            // cannot see runs or cache files produced by this drain.
-            janitor(&opts.repo, opts, home, worktrees_root).await;
-            resweep_superseded_attempts(queue, home);
-            triage_held(queue, home, opts).await;
+            }
             break;
         }
-        stop.idle(opts.poll).await;
-        if stop.stopped() {
-            continue;
-        }
-        // Housekeeping only after a full quiet interval. Running it before
-        // the first idle wait can block the executor while an operator's
-        // stop request is waiting to be scheduled, defeating Stop's retained
-        // wake permit. No run can start while this branch is active, so the
-        // janitor still never races an in-flight compile.
-        janitor(&opts.repo, opts, home, worktrees_root).await;
-        resweep_superseded_attempts(queue, home);
-        triage_held(queue, home, opts).await;
+        stop.idle(if live.is_empty() {
+            opts.poll
+        } else {
+            RECHECK_WHILE_BUSY.min(opts.poll)
+        })
+        .await;
     }
-
-    // Never return while a run is still in flight, whichever way the loop
-    // above exited: a stop only sets a flag - see `serve_until` - and
-    // returning here while `inflight` still holds spawned work would abandon
-    // it exactly as a mid-node kill would.
-    while let Some(result) = inflight.join_next().await {
-        if let Err(e) = result {
-            tracing::error!("a spawned attempt did not finish cleanly: {e}");
-            notices::raise(Notice::error(
-                "loop:attempt",
-                "A queued attempt ended abnormally; check the task it was running.",
-            ));
-        }
-    }
+    // Dropping a scheduler only drops dispatch bookkeeping. The workers own
+    // every queue claim and Runner driver lease through outcome settlement.
+    stop.busy.store(0, Ordering::SeqCst);
     Ok(())
+}
+
+/// A maintenance pass may briefly own the same record while a worker starts.
+/// Wait without blocking the executor or charging an agent attempt, then read
+/// ownership again under the acquired lock. Other I/O failures still fail closed.
+async fn resume_owner_lock(home: &Path, id: &str) -> Result<crate::pr_head::OwnerLock> {
+    let busy = |error: &anyhow::Error| {
+        error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            error.kind() == std::io::ErrorKind::WouldBlock
+                || cfg!(windows) && error.raw_os_error() == Some(33)
+        })
+    };
+    match crate::pr_head::owner_lock(home, id) {
+        Ok(lock) => return Ok(lock),
+        Err(error) if busy(&error) => {}
+        Err(error) => return Err(error),
+    }
+    let wait = RunState::load_under(id, home)?
+        .config
+        .graph
+        .timeout_resource_wait;
+    crate::pr_head::owner_lock_wait(home, id, Duration::from_secs(wait)).await
 }
 
 /// Historical successors do not revoke a still-resumable public owner. Scan
@@ -3489,9 +3887,16 @@ async fn public_resume_owner(
     runs: &[String],
     repo: &Path,
 ) -> Result<Option<RunState>> {
+    // This worker's reservation protects cleanup, but is not evidence that a
+    // previous driver is still executing. Keep every other claim and the run's
+    // own execution lease/process checks authoritative.
+    let current_task = crate::worker::current_job(home)?
+        .filter(|job| job.kind == "task" && job.pid == Some(std::process::id()))
+        .map(|job| serde_json::from_value::<TaskWorker>(job.payload).map(|request| request.task))
+        .transpose()?;
     let mut owner = None;
     for id in runs.iter().collect::<std::collections::BTreeSet<_>>() {
-        let _lock = crate::pr_head::owner_lock(home, id)?;
+        let _lock = resume_owner_lock(home, id).await?;
         let state = RunState::load_under(id, home)?;
         if state.released()
             || state.retired_to.is_some()
@@ -3513,7 +3918,9 @@ async fn public_resume_owner(
             crate::handover::can_resume(&state),
             "public owner cannot resume"
         );
-        let claimed = is_working_on(home, id, Timestamp::now());
+        let claimed = current_work(home, Timestamp::now())
+            .iter()
+            .any(|claim| claim.run == *id && current_task.as_deref() != Some(claim.task.as_str()));
         anyhow::ensure!(
             state.liveness_under(home, claimed) == crate::run::Liveness::Dead,
             "public owner's driver is live or unknown; wait before retrying"
@@ -4318,13 +4725,14 @@ pub fn finish_attempt(
 /// or requeued) is **held**: nobody asked for a retry, and a loop starting
 /// later must not spend agent calls on it. `magi task release` retries.
 pub fn hold_if_runnable(queue: &Queue, task: &mut Task) {
-    // A run parked on the owner's word about a withheld PR title/body is not a
-    // failure nobody asked to retry: it resumes (answer, or the neutral text on
-    // the deadline) the moment a loop serves the queue, via `land_resume_state`.
-    // Holding it would keep it from ever being a candidate.
-    let waits_on_owner = withheld_text_wait(task).is_some();
-    if task.status.runnable()
-        && !waits_on_owner
+    // Parked work (including legacy Failed records with a parked run) is a
+    // checkpoint or owner handoff, not an unrequested retry.
+    if matches!(task.status, TaskStatus::Queued | TaskStatus::Failed)
+        && !awaiting_resume_with(task, RunState::load)
+        // A run parked on the owner's word about a withheld PR title/body
+        // resumes via `land_resume_state`, including review-only tasks that
+        // `awaiting_resume_with` does not consider.
+        && withheld_text_wait(task).is_none()
         && !(task.fresh_start && task.replacement.is_some())
     {
         let why = task.last_error.clone().map_or_else(
@@ -4369,14 +4777,18 @@ pub fn foreign_loop(
     }
 }
 
-/// Run one task this process has claimed, in this process, through exactly the
-/// attempt a daemon would make: the same starter choice (start, resume,
-/// review), the same `Task::start` / `settle` transitions, attempt counting,
-/// quota refund and parking. No second dispatcher - `magi run` and `magi
-/// review` call this when no daemon is alive.
-///
-/// The caller holds the [`Queue::claim`] for the whole call, which is what
-/// keeps a daemon that starts meanwhile from taking the task.
+fn legacy_scheduler_running(reading: &Reading, now: Timestamp, own_pid: u32) -> bool {
+    reading.worker_protocol != Some(1)
+        && (foreign_loop(Some(reading), now, own_pid).is_some()
+            || reading
+                .pid
+                .is_some_and(|pid| pid != own_pid && crate::proc::pid_alive(pid)))
+}
+
+/// Low-level claimed-task execution shared by the detached standalone worker
+/// and focused lifecycle fixtures. The caller must retain the queue claim for
+/// this entire call. CLI callers transfer ownership through
+/// [`run_detached_claimed`] instead of executing inside their own runtime.
 ///
 /// The one deliberate difference from the loop: a task the attempt leaves
 /// runnable (failed with attempts to spare, or requeued) is **held** instead.
@@ -4384,15 +4796,23 @@ pub fn foreign_loop(
 /// calls re-running a hand-started task behind the operator's back;
 /// `magi task release` is the explicit retry.
 pub async fn run_claimed(opts: &Opts, queue: &Queue, task: &mut Task) {
+    run_claimed_until(opts, queue, task, &Stop::new()).await;
+}
+
+async fn run_claimed_until(
+    opts: &Opts,
+    queue: &Queue,
+    task: &mut Task,
+    stop: &Stop,
+) -> Vec<QuotaLoss> {
     let status = Arc::new(Mutex::new(Status::new()));
-    let stop = Stop::new();
     // An attempt embeds startup and graph futures. Keep it off the standalone
     // caller's stack, on both the initial execution and withheld-text resume.
-    Box::pin(attempt(
+    let mut quota = Box::pin(attempt(
         opts,
         queue,
         &status,
-        &stop,
+        stop,
         crate::graph::Pause::new(),
         task,
     ))
@@ -4406,7 +4826,7 @@ pub async fn run_claimed(opts: &Opts, queue: &Queue, task: &mut Task) {
     // limit for the new question. `resumes` bounds it even if a resume parks
     // without asking anything new.
     let mut resumes = 0;
-    while resumes < MAX_WITHHELD_RESUMES {
+    while resumes < MAX_WITHHELD_RESUMES && !stop.parking() {
         let Some(timeout) = withheld_text_wait(task) else {
             break;
         };
@@ -4419,28 +4839,33 @@ pub async fn run_claimed(opts: &Opts, queue: &Queue, task: &mut Task) {
         let limit = std::time::Instant::now() + Duration::from_secs(timeout + 60);
         let ready = loop {
             match land_resume_state(task) {
-                LandResume::StillWaiting if std::time::Instant::now() < limit => {
+                LandResume::StillWaiting
+                    if !stop.parking() && std::time::Instant::now() < limit =>
+                {
                     tokio::time::sleep(WITHHELD_POLL).await;
                 }
                 LandResume::Ready => break true,
                 _ => break false,
             }
         };
-        if !ready {
+        if !ready || stop.parking() {
             break;
         }
         resumes += 1;
-        Box::pin(attempt(
-            opts,
-            queue,
-            &status,
-            &stop,
-            crate::graph::Pause::new(),
-            task,
-        ))
-        .await;
+        quota.extend(
+            Box::pin(attempt(
+                opts,
+                queue,
+                &status,
+                stop,
+                crate::graph::Pause::new(),
+                task,
+            ))
+            .await,
+        );
     }
     hold_if_runnable(queue, task);
+    quota
 }
 
 /// Resumes an in-process run makes for withheld-text questions: the gate asks
@@ -4567,36 +4992,10 @@ fn prepare(repo: &Path, opts: &Opts) -> Result<Config> {
     Ok(config)
 }
 
-/// Prune the shared build cache back under its cap at a safe boundary
-/// between runs, so a queue that never empties - and so never reaches
-/// [`poll`]'s fully-idle branch, where the ordinary [`janitor`] pass lives -
-/// does not leave the cache to grow unchecked for as long as the backlog
-/// lasts.
-///
-/// Called from [`poll`] only when `stop.busy_now()` is already `false`: the
-/// same liveness fact the idle branch's own janitor call rests on - no run
-/// this daemon spawned is still mid-compile - so pruning here races nothing.
-/// The caller must not call this while a run is in flight; there is no
-/// second `busy_now()` check inside this function, on purpose, because there
-/// is nothing left to check that `busy_now()` has not already answered.
-///
-/// A stop that has already been asked for *is* checked here, for a different
-/// reason. [`clean::prune_cache_if_over_limit`] walks the whole cache
-/// synchronously before it decides anything, so the poll loop cannot get back
-/// to its own `stopped()` test until that walk is over — and a loop already
-/// on its way out must not make the operator wait out housekeeping it is
-/// about to stop needing. This is the same call the idle branch makes when it
-/// rechecks `stop.stopped()` after its wait before reaching [`janitor`], and
-/// it matters more here: `busy_now()` is false throughout, so
-/// [`Stop::finishing`] would report a stop as already landed while the walk
-/// still held the loop. Nothing is lost by skipping — the cap is a standing
-/// policy, and the next daemon's startup pass measures the same cache.
-///
-/// Rate-limited by [`CACHE_CHECK_INTERVAL_SECS`] rather than run on every
-/// poll: a busy loop reaches this the instant one run's `InFlightGuard` drops
-/// and the next has not yet claimed a task, which can be every few
-/// milliseconds, and re-walking a multi-gigabyte cache that often would cost
-/// more than the growth it is guarding against.
+/// Prune the shared build cache at a between-runs boundary. The detached cache
+/// service checks authoritative task jobs first; dispatch waits for that finite
+/// service, so scheduler replacement cannot turn a compile into idle cleanup.
+/// Its durable service cadence preserves [`CACHE_CHECK_INTERVAL_SECS`].
 async fn maybe_prune_cache_between_runs(
     repo: &Path,
     opts: &Opts,
@@ -5673,6 +6072,140 @@ mod tests {
             PathBuf::from("/repo"),
             Source::Human,
         )
+    }
+
+    fn starting_task_reservation(home: &Path, request: &TaskWorker) -> crate::worker::Job {
+        let job = crate::worker::Job {
+            id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
+            sequence: 1,
+            kind: "task".into(),
+            key: format!("task:{}", request.task),
+            payload: serde_json::to_value(request).unwrap(),
+            generation: "a".repeat(64),
+            version: None,
+            status: crate::worker::Status::Starting,
+            result: None,
+            pid: None,
+            created_at: u64::try_from(Timestamp::now().as_second()).unwrap(),
+            finished_at: None,
+        };
+        let dir = home.join("workers/jobs").join(&job.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("job.json"), serde_json::to_vec(&job).unwrap()).unwrap();
+        job
+    }
+
+    #[test]
+    fn an_unacknowledged_own_reservation_stops_dispatch_without_cancelling_the_child() {
+        let home = tempfile::tempdir().unwrap();
+        let request = TaskWorker {
+            opts: Opts::default(),
+            queue: home.path().join("queue"),
+            task: "startup".into(),
+            lane: PermitKind::Ordinary,
+            standalone: false,
+        };
+        let job = starting_task_reservation(home.path(), &request);
+        task_worker_spawn_error(
+            home.path(),
+            &request,
+            anyhow::anyhow!("worker startup is unacknowledged: private-error-detail"),
+        )
+        .expect_err("our own reservation must not turn a failed spawn into a resync");
+        let active = crate::worker::active(home.path()).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, job.id);
+        assert_eq!(active[0].status, crate::worker::Status::Starting);
+        assert!(
+            crate::worker::control(home.path(), &job.key)
+                .unwrap()
+                .is_none()
+        );
+        let notices = notices::Notices::at(home.path().join("notifications")).list();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].key, "loop:worker-startup");
+        assert!(!notices[0].message.contains("private-error-detail"));
+    }
+
+    #[test]
+    fn a_standalone_handoff_reservation_resyncs_dispatch_without_replacing_it() {
+        let home = tempfile::tempdir().unwrap();
+        let mut request = TaskWorker {
+            opts: Opts::default(),
+            queue: home.path().join("queue"),
+            task: "handoff".into(),
+            lane: PermitKind::Ordinary,
+            standalone: true,
+        };
+        let job = starting_task_reservation(home.path(), &request);
+        request.standalone = false;
+        task_worker_spawn_error(
+            home.path(),
+            &request,
+            anyhow::anyhow!("operation key is already reserved for a different request"),
+        )
+        .expect("a different standalone request is the handoff race, not our startup failure");
+        let active = crate::worker::active(home.path()).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, job.id);
+        assert_eq!(active[0].payload, job.payload);
+        assert!(
+            notices::Notices::at(home.path().join("notifications"))
+                .list()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_live_worker_reservation_prevents_reclaim_before_its_task_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let mut task = task();
+        task.status = TaskStatus::Running;
+        task.attempts = 1;
+        queue.put(&mut task).unwrap();
+        let live = std::collections::BTreeSet::from([task.id.clone()]);
+        assert!(reclaim_orphaned_running(&queue, 2, &live).is_empty());
+        drop(queue.claim(&task.id).unwrap());
+        let saved = queue.get(&task.id).unwrap();
+        assert_eq!(saved.status, TaskStatus::Running);
+        assert_eq!(saved.attempts, 1);
+        assert!(saved.last_error.is_none());
+    }
+
+    #[test]
+    fn standalone_workers_do_not_consume_scheduler_lanes() {
+        let request = |task: &str, lane, standalone| TaskWorker {
+            opts: Opts::default(),
+            queue: PathBuf::from("/queue"),
+            task: task.to_owned(),
+            lane,
+            standalone,
+        };
+        let mut jobs = vec![
+            request("ordinary", PermitKind::Ordinary, false),
+            request("standalone-urgent", PermitKind::Urgent, true),
+            request("standalone-ordinary", PermitKind::Ordinary, true),
+            request("decision", PermitKind::None, false),
+        ];
+        assert_eq!(available_slots(&jobs, 2), (1, 1));
+        jobs.push(request("urgent", PermitKind::Urgent, false));
+        assert_eq!(available_slots(&jobs, 2), (1, 0));
+        assert_eq!(available_slots(&jobs, 0), (0, 0));
+    }
+
+    #[test]
+    fn a_live_legacy_scheduler_blocks_migration_even_with_a_stale_heartbeat() {
+        let now = Timestamp::now();
+        let mut reading = Reading {
+            pid: Some(std::process::id()),
+            updated_at: Some(now - jiff::SignedDuration::from_secs(STALE_SECS + 1)),
+            ..Reading::default()
+        };
+        assert!(!reading.running(now));
+        assert!(legacy_scheduler_running(&reading, now, 0));
+        reading.worker_protocol = Some(1);
+        assert!(!legacy_scheduler_running(&reading, now, 0));
     }
 
     #[test]
@@ -7136,15 +7669,8 @@ mod tests {
 
     #[test]
     fn an_old_lock_whose_pid_is_still_alive_is_never_swept_by_age_alone() {
-        // The regression this guards: `sweep` now runs concurrently with
-        // every attempt this daemon itself has spawned (see
-        // `InFlightGuard`), not only between them the way a single
-        // sequential loop once did. A run that legitimately outlives
-        // `older_than` still has this very process's own live pid sitting in
-        // its own lock file on every later sweep, and deciding by age alone
-        // would delete that still-valid claim out from under the attempt
-        // that holds it - which `reclaim_orphaned_running` would then read
-        // as abandoned and hand to a second, competing attempt.
+        // A live worker's claim remains authoritative even beyond the sweep's
+        // age limit. Sweeping it would permit a second competing attempt.
         let dir = tempfile::tempdir().unwrap();
         let queue = Queue::at(dir.path().to_path_buf());
         let mut t = task();
@@ -7268,7 +7794,7 @@ mod tests {
         // the bug: a `running` task stranded behind a dead daemon's lock,
         // invisible to the claim-as-proof check because the lock outlived
         // the process that wrote it.
-        assert!(reclaim_orphaned_running(&queue, 2).is_empty());
+        assert!(reclaim_orphaned_running(&queue, 2, &Default::default()).is_empty());
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Running);
 
         let swept = sweep_stale_claims_with(&queue, Duration::from_secs(6 * 60 * 60), |pid| {
@@ -7276,7 +7802,7 @@ mod tests {
         });
         assert_eq!(swept, vec![t.id.clone()]);
 
-        let reclaimed = reclaim_orphaned_running(&queue, 2);
+        let reclaimed = reclaim_orphaned_running(&queue, 2, &Default::default());
         assert_eq!(reclaimed, vec![t.id.clone()]);
         let after = queue.get(&t.id).unwrap();
         assert_eq!(
@@ -8292,7 +8818,7 @@ mod tests {
         queued.id = "20260904-000000-wait".to_owned();
         queue.put(&mut queued).unwrap();
 
-        let reclaimed = reclaim_orphaned_running(&queue, 2);
+        let reclaimed = reclaim_orphaned_running(&queue, 2, &Default::default());
         assert_eq!(reclaimed, vec![orphaned.id.clone()]);
 
         assert_eq!(
@@ -9106,6 +9632,31 @@ mod tests {
         // which is exactly what happened before this function took the
         // parameter at all.
         let home = dir.join("home");
+        // These control-only fixtures do not launch native workers. Give the
+        // independently tested maintenance services a fresh cadence receipt.
+        let stamps = home.join("service-ticks");
+        std::fs::create_dir_all(&stamps).unwrap();
+        for service in ["waiter", "deputies", "release-watch"] {
+            std::fs::write(
+                stamps.join(service),
+                Timestamp::now().as_second().to_string(),
+            )
+            .unwrap();
+        }
+        for operation in [
+            "conductor",
+            "maintenance",
+            "housekeeping",
+            "disk-pressure",
+            "cache",
+            "fetch",
+        ] {
+            std::fs::write(
+                stamps.join(format!("daemon-{operation}")),
+                serde_json::to_vec(&Timestamp::now()).unwrap(),
+            )
+            .unwrap();
+        }
         let worktrees = dir.join("wt");
         (
             opts,
@@ -9136,7 +9687,7 @@ mod tests {
     #[test]
     fn only_a_stop_with_a_run_in_flight_reads_as_finishing() {
         let stop = Stop::new();
-        stop.enter();
+        stop.busy.store(1, Ordering::SeqCst);
         assert!(
             !stop.finishing(),
             "a busy loop nobody has asked to stop is just running"
@@ -9148,7 +9699,7 @@ mod tests {
             "a stop asked for mid-run has not landed until the run is settled"
         );
 
-        stop.exit();
+        stop.busy.store(0, Ordering::SeqCst);
         assert!(
             !stop.finishing(),
             "once the run is settled the stop has landed and there is nothing to finish"
@@ -9158,18 +9709,17 @@ mod tests {
     #[test]
     fn finishing_stays_true_until_the_last_of_several_runs_exits() {
         let stop = Stop::new();
-        stop.enter();
-        stop.enter();
+        stop.busy.store(2, Ordering::SeqCst);
         stop.stop();
         assert!(stop.finishing(), "two runs still in flight");
 
-        stop.exit();
+        stop.busy.store(1, Ordering::SeqCst);
         assert!(
             stop.finishing(),
             "one run finished, but a sibling is still working"
         );
 
-        stop.exit();
+        stop.busy.store(0, Ordering::SeqCst);
         assert!(
             !stop.finishing(),
             "the last run out is what actually lands the stop"
@@ -9260,10 +9810,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn once_runs_startup_housekeeping_before_an_empty_queue_exits() {
+    async fn housekeeping_worker_settles_questions_without_a_scheduler() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut opts, queue, status_file, home, worktrees) = idle_loop(dir.path());
-        opts.once = true;
+        let (opts, queue, _, home, worktrees) = idle_loop(dir.path());
 
         let mut settled = RunState::new(
             dir.path().join("repo"),
@@ -9291,14 +9840,23 @@ mod tests {
         );
         questions.put(&mut question).unwrap();
 
-        drive(&opts, &queue, &status_file, &home, &worktrees, &Stop::new())
-            .await
-            .unwrap();
+        run_service_worker(
+            &home,
+            serde_json::to_value(ServiceWorker {
+                opts,
+                queue: queue.root().to_path_buf(),
+                worktrees_root: worktrees,
+                operation: "housekeeping".to_owned(),
+            })
+            .unwrap(),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             questions.get(&question.id).unwrap().status,
             ask::QuestionStatus::Abandoned,
-            "an empty --once drain still performs startup question cleanup"
+            "the independent housekeeping worker settles ended-run questions"
         );
     }
 
@@ -9461,16 +10019,8 @@ mod tests {
         );
     }
 
-    /// The regression this whole change exists for: gate timeouts on runs
-    /// 52da/2f7f/5991/0915 traced back to the shared cache sitting at 81.8
-    /// GiB against a 10 GiB cap, because the operator's queue never had a
-    /// quiet moment for `poll`'s fully-idle branch to reach the ordinary
-    /// `janitor` pass.
-    ///
-    /// Reproduced with a backlog whose repository is never created:
-    /// `Runner::start` fails at `git::toplevel`, spawning no agent CLI.
-    /// Each task is held after one startup failure, but the remaining tasks
-    /// keep the queue busy until an external stop ends the loop.
+    /// A backlog must not starve cache pruning. The finite cache worker runs
+    /// independently of queue drain and must not consume any task attempts.
     #[tokio::test]
     async fn cache_prune_reaches_a_queue_that_never_goes_idle() {
         let dir = tempfile::tempdir().unwrap();
@@ -9495,52 +10045,24 @@ mod tests {
 
         let home = dir.path().join("home");
         let worktrees = dir.path().join("wt");
-        let status_file = home.join("daemon.json");
-        let stop = Stop::new();
-        let stopper = {
-            let stop = stop.clone();
-            let queue = Queue::at(dir.path().join("queue"));
-            tokio::spawn(async move {
-                // Observe completed work rather than rely on a wall-clock
-                // delay. Every startup failure holds only its own task; the
-                // backlog keeps offering work at the next boundary.
-                for _ in 0..2_000 {
-                    if queue.list().iter().filter(|t| t.attempts == 1).count() >= 2 {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
-                stop.stop();
+        run_service_worker(
+            &home,
+            serde_json::to_value(ServiceWorker {
+                opts,
+                queue: queue.root().to_path_buf(),
+                worktrees_root: worktrees,
+                operation: "cache".to_owned(),
             })
-        };
-
-        tokio::time::timeout(
-            Duration::from_secs(20),
-            drive(&opts, &queue, &status_file, &home, &worktrees, &stop),
+            .unwrap(),
         )
         .await
-        .expect("the loop must not hang on a queue that keeps producing failing work")
-        .expect("the loop's own setup and teardown must not fail");
-        stopper.await.unwrap();
-
+        .unwrap();
         let after = queue.list();
-        let completed = after.iter().filter(|t| t.attempts == 1).count();
-        assert!(
-            completed >= 2,
-            "the harness must have processed multiple tasks to exercise a busy queue \
-             (got {completed} completed task(s))"
-        );
-        assert!(
-            after.iter().any(|t| t.status.runnable()),
-            "unprocessed tasks must remain: the external stop, rather than an \
-             exhausted backlog, must end the test"
-        );
+        assert_eq!(after.len(), 128);
         assert!(
             after
                 .iter()
-                .filter(|t| t.attempts > 0)
-                .all(|t| { t.attempts == 1 && t.status == TaskStatus::Held }),
-            "a busy backlog must not retry a task's unchanged startup failure"
+                .all(|task| task.status.runnable() && task.attempts == 0)
         );
 
         assert_eq!(
@@ -9713,7 +10235,7 @@ mod tests {
 
         let now = Timestamp::now();
         assert!(
-            reclaim_orphaned_running(&queue, 2).is_empty(),
+            reclaim_orphaned_running(&queue, 2, &Default::default()).is_empty(),
             "the unparseable lock is still well within STALE_CLAIM, so the claim fails \
              and reclaim must leave the task alone"
         );
@@ -9749,7 +10271,10 @@ mod tests {
             stalled.iter().map(|task| &task.id).collect::<Vec<_>>(),
             [&t.id]
         );
-        assert_eq!(reclaim_orphaned_running(&queue, 2), [t.id.clone()]);
+        assert_eq!(
+            reclaim_orphaned_running(&queue, 2, &Default::default()),
+            [t.id.clone()]
+        );
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
 
         // Reclaim drops its guard before conductor decisions are applied, so
@@ -10737,6 +11262,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ownership_contention_waits_and_reads_the_settled_record_before_resuming() {
+        let home = tempfile::tempdir().unwrap();
+        let mut owner = stopped_public_run(RunStatus::Blocked);
+        owner.save_under(home.path()).unwrap();
+        let history = vec![owner.id.clone()];
+        let repo = owner.repo.clone();
+        let lock = crate::pr_head::owner_lock(home.path(), &owner.id).unwrap();
+        let mut lookup = Box::pin(public_resume_owner(home.path(), &history, &repo));
+        let initial =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(lookup.as_mut().poll(cx))).await;
+        assert!(
+            initial.is_pending(),
+            "a busy record must not hold or resume the task"
+        );
+        owner.retired_to = Some("20260101-000001-bbbb".into());
+        owner.save_under(home.path()).unwrap();
+        drop(lock);
+        let result = tokio::time::timeout(Duration::from_secs(10), lookup)
+            .await
+            .expect("ownership lock released")
+            .expect("read settled owner");
+        assert!(
+            result.is_none(),
+            "the retired owner must not be resumed from a stale read"
+        );
+    }
+
+    #[tokio::test]
     async fn retained_public_owner_wins_over_an_existing_successor_and_unknown_history_holds() {
         let home = tempfile::tempdir().unwrap();
         let mut owner = stopped_public_run(RunStatus::Blocked);
@@ -10787,13 +11340,6 @@ mod tests {
                 .await
                 .is_err()
         );
-        let lock = crate::pr_head::owner_lock(home.path(), &owner.id).unwrap();
-        assert!(
-            public_resume_owner(home.path(), &runs, &owner.repo)
-                .await
-                .is_err()
-        );
-        drop(lock);
         std::fs::remove_file(
             home.path()
                 .join("runs")

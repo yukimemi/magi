@@ -221,6 +221,8 @@ OS lock.
 Before spawning, the launcher also creates a liveness pipe with a writer
 inherited by the CLI and its tools. Cleanup retains repository, worktree-output
 and cache leases until EOF on that pipe, including on normal CLI completion.
+Output-protection leases are released before repository coordination is made
+available again, so the next repository owner can immediately reclaim outputs.
 Thus a tool that forks into a separate session and becomes reparented before
 cleanup can no longer release ownership merely by disappearing from the CLI's
 process tree. An undiscovered tool may finish naturally while cleanup waits;

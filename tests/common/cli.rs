@@ -4,17 +4,29 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 pub(super) const SEAT_ENV: [&str; 4] = ["MAGI_RUN", "MAGI_NODE", "MAGI_SEAT", "MAGI_TURN_SCOPE"];
+// These resets apply to spawned CLIs. Library-embedding test hosts retain their
+// explicit MAGI_WORKER_EXE when copying child isolation settings back to a host.
+pub(super) const WORKER_ENV: [&str; 4] = [
+    "MAGI_WORKER_EXE",
+    "MAGI_WORKER_ID",
+    "MAGI_WORKER_GENERATION",
+    "MAGI_WORKER_HOME",
+];
 
 /// Start the real CLI in a caller-owned temporary home. Keep that directory
 /// alive until the child exits. Callers may override the cwd and environment.
 pub fn magi_cli(home: &Path) -> std::process::Command {
+    let host_home = home.join("host-home");
+    std::fs::create_dir_all(&host_home).expect("create isolated CLI home");
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_magi"));
     command
         .current_dir(home)
         .env("MAGI_HOME", home)
         .env("MAGI_CONFIG_DIR", home.join("config"))
+        .env("HOME", &host_home)
+        .env("USERPROFILE", &host_home)
         .env("MAGI_NO_AUTOUPDATE", "1");
-    for key in SEAT_ENV {
+    for key in SEAT_ENV.into_iter().chain(WORKER_ENV) {
         command.env_remove(key);
     }
     command

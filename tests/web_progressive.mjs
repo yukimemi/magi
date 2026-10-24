@@ -86,10 +86,17 @@ test('pending refresh joins work, and failure retains useful report and run', as
   const second = h.api.loadRun('a');
   assert.equal(h.requests.length, 3);
   h.requests[0].resolve({ id: 'a', updated_at: 'now', useful: true });
+  await flush();
+  const core = h.state.detail.core;
+  assert.equal(core.useful, true);
+  const third = h.api.loadRun('a');
+  assert.equal(h.requests.length, 3, 'an ordinary join must not start or queue more reads');
+  assert.equal(h.state.detail.core, core, 'joining must preserve staged core');
   h.requests[1].resolve({ id: 'a', updated_at: 'now', useful: true });
   h.requests[2].resolve({ schema: 1, sections: ['kept'] });
-  await Promise.all([first, second]);
+  await Promise.all([first, second, third]);
   assertNoFailures(h);
+  assert.equal(h.requests.length, 3);
   const refresh = h.api.loadRun('a', { background: true });
   h.requests[3].reject(new Error('core unavailable'));
   h.requests[4].reject(new Error('evidence unavailable'));
@@ -132,25 +139,43 @@ test('dashboard filter changes discard reversed responses', async () => {
   assertNoFailures(h);
 });
 
-test('a change during a slow read schedules one trailing refresh without parallel duplicates', async () => {
-  const h = harness();
-  const first = h.api.loadRun('a');
-  h.api.loadRun('a', { background: true });
-  h.api.loadRun('a', { background: true });
-  assert.equal(h.requests.length, 3);
-  h.requests[0].resolve({ id: 'a', updated_at: 'now', version: 1 });
-  h.requests[1].resolve({ id: 'a', updated_at: 'now', version: 1 });
-  h.requests[2].resolve({ schema: 1, sections: [] });
-  await flush();
-  assert.equal(h.requests.length, 6);
-  h.requests[3].resolve({ id: 'a', updated_at: 'now', version: 2 });
-  h.requests[4].resolve({ id: 'a', updated_at: 'now', version: 2 });
-  h.requests[5].resolve({ schema: 1, sections: [] });
-  await first;
-  assert.equal(h.state.detail.run.version, 2);
-  assert.equal(h.requests.length, 6);
-  assertNoFailures(h);
-});
+for (const staleFails of [false, true]) {
+  test(`a change during a slow read keeps trailing evidence gated (staleFails=${staleFails})`, async () => {
+    const h = harness();
+    const first = h.api.loadRun('a');
+    const second = h.api.loadRun('a', { background: true });
+    const third = h.api.loadRun('a', { background: true });
+    const joined = h.api.loadRun('a');
+    assert.equal(h.requests.length, 3);
+    if (staleFails) {
+      for (const request of h.requests) request.reject(new Error('superseded read failed'));
+    } else {
+      h.requests[0].resolve({ id: 'a', updated_at: 'now', version: 1 });
+      h.requests[1].resolve({ id: 'a', updated_at: 'now', version: 1 });
+      h.requests[2].resolve({ schema: 1, sections: [] });
+    }
+    await flush();
+    assert.equal(h.requests.length, 6, 'change signals coalesce into one trailing read per section');
+    assert.equal(h.state.detail.core, null);
+    assert.equal(h.state.detail.evidence, null);
+    assert.equal(h.state.detail.evidencePending, true);
+    for (const key of ['run-core-state', 'run-evidence-state']) {
+      assert.equal(h.notices.filter(n => n[1] === key).at(-1)[4]?.pending, true);
+    }
+    h.requests[3].resolve({ id: 'a', updated_at: 'now', version: 2 });
+    await flush();
+    assert.equal(h.state.detail.core.version, 2);
+    assert.equal(h.state.detail.evidence, null);
+    assert.equal(h.state.detail.evidencePending, true, 'current core alone cannot enable stale actions');
+    h.requests[4].resolve({ id: 'a', updated_at: 'now', version: 2 });
+    h.requests[5].resolve({ schema: 1, sections: [] });
+    await Promise.all([first, second, third, joined]);
+    assert.equal(h.state.detail.run.version, 2);
+    assert.equal(h.state.detail.evidencePending, false);
+    assert.equal(h.requests.length, 6);
+    assertNoFailures(h);
+  });
+}
 
 test('task instructions are useful while history fails, without complete action evidence', async () => {
   const h = harness();

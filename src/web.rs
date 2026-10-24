@@ -68,28 +68,12 @@
 //! and no executor thread, and concurrent turns on one talk are refused rather
 //! than queued - see [`Ui::begin_talk_turn`].
 //!
-//! # The loop runs here
+//! # Independent scheduler
 //!
-//! `magi web` runs the queue loop in this process, started and stopped from
-//! `/api/loop`. That is the point of the whole surface: a task filed from a
-//! phone with nobody around to type `magi serve` is a task that sits in the
-//! queue until someone walks back to the machine.
-//!
-//! It is a tokio task holding a [`daemon::Stop`], not a child process. There
-//! is no pid file of this module's own and nothing to supervise - a child
-//! would need reaping, a second copy of the daemon's retry policy, and a
-//! story for what happens when `magi web` dies with the loop still running.
-//! `<home>/daemon.json`, which the loop itself writes, stays the only
-//! cross-process signal, and it is how this process notices that the
-//! operator's own `magi serve` already owns the loop and refuses to start a
-//! second one that would fight it for claims.
-//!
-//! Stopping is cooperative and therefore not instant. A run in flight is
-//! finished first, for the reason [`daemon::serve`] gives: killing the graph
-//! mid-node leaves worktrees, branches and agent sessions behind and throws
-//! away every agent call already paid for. `POST /api/loop` sets the flag and
-//! answers immediately rather than waiting, because the wait is measured in
-//! tens of minutes and the operator is holding a phone.
+//! `/api/loop` starts and controls a detached scheduler. Replacing or closing
+//! the web process does not stop that scheduler or its task/chat workers.
+//! Stop ends scheduling; explicit park additionally asks task workers to stop
+//! at their next node boundary. Updating never requests a park.
 
 #[cfg(test)]
 pub(crate) mod request_cost;
@@ -98,6 +82,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path as FsPath, PathBuf};
+#[cfg(test)]
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -266,13 +251,11 @@ pub struct Opts {
     /// Print the URL on its own line for a caller that wants to hand it to a
     /// browser. magi never launches one itself.
     pub open: bool,
-    /// Merge mode override for the loop this process runs (`none`, `local`,
+    /// Merge mode override for the independent scheduler (`none`, `local`,
     /// `pr`); `None` leaves it to each repository's own config.
     ///
-    /// The same override `magi serve --merge` takes, and here for the same
-    /// reason: `magi web` is now the thing that runs the loop, so an operator
-    /// who wants this session's runs to open pull requests has to be able to
-    /// say so without going back to the command they no longer type.
+    /// The same override as `magi serve --merge`, passed when the phone starts
+    /// dispatch without requiring a terminal.
     pub merge: Option<String>,
 }
 
@@ -642,6 +625,9 @@ pub struct Ui {
     /// see it, and a second `magi web` on the same home is already a
     /// misconfiguration the queue's claims would catch first.
     talk_turns: Arc<Mutex<TalkTurns>>,
+    /// Short persistence-to-worker-publication transactions only, never agent
+    /// execution. A handover closes admission before it releases the runtime.
+    admissions: Arc<tokio::sync::RwLock<bool>>,
     /// Held by `POST /api/upgrade` from its busy-stage check until the first
     /// progress record is written, so two taps cannot both start an upgrade.
     /// After that `upgrade.json` carries the exclusion.
@@ -669,19 +655,10 @@ pub struct Ui {
     machine_config: Option<PathBuf>,
     /// Merge mode override handed to the loop this process starts.
     merge: Option<String>,
-    /// The loop this process is running, if it is running one.
+    /// Local request revision and errors; execution belongs to detached workers.
     looping: Arc<Mutex<LoopState>>,
-    /// How a loop is actually started.
-    ///
-    /// A field rather than a direct call to [`daemon::serve_until`], because
-    /// the real loop resolves its queue and its status file through the
-    /// process-global magi home and claims whatever it finds there. A test
-    /// that started it would reach straight past its own temp directory into
-    /// the operator's live queue, overwrite the status file of the `magi
-    /// serve` that owns it, and spend real agent quota on a real competition.
-    /// What the routes have to get right is the bookkeeping, so the tests
-    /// drive the routes against a loop that only starts and stops; production
-    /// is [`launch_daemon`] and nothing reassigns it.
+    /// Isolated route-test scheduler; never compiled into production.
+    #[cfg(test)]
     launch: Launch,
     /// A test-only stop point inside `talk_say`'s busy branch. See
     /// [`BusyQueueGate`].
@@ -689,6 +666,8 @@ pub struct Ui {
     busy_queue_gate: Arc<Mutex<Option<BusyQueueGate>>>,
     pub(crate) monitor: Arc<SharedMonitor>,
 }
+
+type AdmissionGuard = tokio::sync::OwnedRwLockReadGuard<bool>;
 
 /// A one-shot stop point the busy branch's queued-draft write can be made to
 /// pause at, right before [`talk::queue`] runs.
@@ -746,6 +725,7 @@ impl Ui {
             // `with_merge` gives.
             worktrees_root: run::default_worktree_root(),
             talk_turns: Arc::default(),
+            admissions: Arc::default(),
             upgrade_gate: Arc::default(),
             upgrade_spawned: Arc::default(),
             upgrade_request_error: Arc::default(),
@@ -754,6 +734,7 @@ impl Ui {
             machine_config: Config::machine_layer(),
             merge: None,
             looping: Arc::default(),
+            #[cfg(test)]
             launch: launch_daemon,
             #[cfg(test)]
             busy_queue_gate: Arc::default(),
@@ -930,9 +911,63 @@ impl Ui {
             .unwrap_or_else(PoisonError::into_inner) = Some(gate);
     }
 
-    /// The loop's state, for [`serve`]'s own way out.
-    fn looping(&self) -> Arc<Mutex<LoopState>> {
-        Arc::clone(&self.looping)
+    /// Prevent a restart from ending an already accepted send between its
+    /// durable transcript write and detached worker reservation.
+    fn begin_admission(&self) -> ApiResult<AdmissionGuard> {
+        let guard = Arc::clone(&self.admissions)
+            .try_read_owned()
+            .map_err(|_| ApiError::conflict("web restart in progress; retry this message"))?;
+        if *guard {
+            return Err(ApiError::conflict(
+                "web restart in progress; retry this message",
+            ));
+        }
+        Ok(guard)
+    }
+
+    /// Start a scheduler that outlives this web process.
+    async fn start_detached_loop(&self) -> ApiResult<()> {
+        let reading = daemon::read_status(&self.home);
+        if let Some(other) = Foreign::of(reading.as_ref()) {
+            return Err(ApiError::conflict(format!(
+                "{} is still running a legacy scheduler; finish or park it before starting the independent scheduler.",
+                other.who()
+            )));
+        }
+        let jobs = crate::worker::active(&self.home).map_err(ApiError::from)?;
+        let control = crate::worker::control(&self.home, "scheduler").map_err(ApiError::from)?;
+        let scheduler_running = jobs.iter().any(|job| job.kind == "scheduler")
+            || reading.is_some_and(|reading| {
+                reading.worker_protocol == Some(1) && reading.running(Timestamp::now())
+            });
+        if control.is_some() && scheduler_running {
+            return Err(ApiError::conflict(
+                "the scheduler is still stopping; retry Start after it has stopped",
+            ));
+        }
+        if !jobs.iter().any(|job| job.kind == "scheduler") {
+            let available =
+                crate::worker::try_lease(&self.home, "scheduler").map_err(ApiError::from)?;
+            if available.is_none() {
+                return Err(ApiError::conflict(
+                    "the scheduler is still running or stopping; retry after its transition completes",
+                ));
+            }
+            drop(available);
+        }
+        let opts = daemon::Opts {
+            repo: self.repo.clone(),
+            merge: self.merge.clone(),
+            worktrees_root: Some(self.worktrees_root.clone()),
+            ..daemon::Opts::default()
+        };
+        daemon::spawn_detached(&self.home, &opts)
+            .await
+            .map_err(ApiError::from)?;
+        let mut state = self.lock_loop();
+        state.last_error = None;
+        state.rev += 1;
+        Ok(())
     }
 
     /// Start the loop in this process, or say who already has one.
@@ -941,6 +976,7 @@ impl Ui {
     /// one judgement about who owns the loop: reading the status file again
     /// inside this function could refuse a start for a daemon the same
     /// response then reports as gone.
+    #[cfg(test)]
     fn start_loop(&self, foreign: Option<Foreign>) -> ApiResult<()> {
         if let Some(other) = foreign {
             return Err(ApiError::conflict(format!(
@@ -1027,30 +1063,44 @@ impl Ui {
                 other.who()
             )));
         }
-        let mut state = self.lock_loop();
-        // An operator who stops the loop has decided it stays stopped, even
-        // across an upgrade that was already in flight.
-        if !park {
-            state.resume_after_handover = false;
+        #[cfg(not(test))]
+        {
+            daemon::request_control(
+                &self.home,
+                if park {
+                    crate::worker::Control::Park
+                } else {
+                    crate::worker::Control::Stop
+                },
+            )
+            .map_err(ApiError::from)?;
+            self.lock_loop().rev += 1;
+            Ok(())
         }
-        let Some(live) = state.live.as_ref() else {
-            return Ok(());
-        };
-        // A park upgrades a stop that has already been asked for: the
-        // operator who tapped "stop" and then realised the run has an hour
-        // left must not have to restart the loop to change their mind.
-        if live.stop.stopped() && (!park || live.stop.parking()) {
-            return Ok(());
+        #[cfg(test)]
+        {
+            let mut state = self.lock_loop();
+            let Some(live) = state.live.as_ref() else {
+                return Ok(());
+            };
+            // A park upgrades a stop that has already been asked for: the
+            // operator who tapped "stop" and then realised the run has an hour
+            // left must not have to restart the loop to change their mind.
+            if live.stop.stopped() && (!park || live.stop.parking()) {
+                return Ok(());
+            }
+            if park {
+                live.stop.park(crate::run::ParkCause::Operator);
+                tracing::info!(
+                    "the loop was asked to park; the run stops at its next node boundary"
+                );
+            } else {
+                live.stop.stop();
+                tracing::info!("the loop was asked to stop; a run in flight is finished first");
+            }
+            state.rev += 1;
+            Ok(())
         }
-        if park {
-            live.stop.park(crate::run::ParkCause::Operator);
-            tracing::info!("the loop was asked to park; the run stops at its next node boundary");
-        } else {
-            live.stop.stop();
-            tracing::info!("the loop was asked to stop; a run in flight is finished first");
-        }
-        state.rev += 1;
-        Ok(())
     }
 
     /// The loop as both `/api/loop` and `/api/health` report it.
@@ -1059,6 +1109,15 @@ impl Ui {
     /// health answers with this view *and* the daemon object beside it: one
     /// read per response is what stops a single answer naming a foreign owner
     /// in one field and calling the loop free in the other.
+    #[cfg(not(test))]
+    fn try_loop_view(&self, reading: Option<daemon::Reading>) -> ApiResult<LoopView> {
+        let jobs = crate::worker::active(&self.home).map_err(|error| {
+            ApiError::internal(format!("cannot read independent worker state: {error:#}"))
+        })?;
+        Ok(self.runtime_loop_view(reading, &jobs))
+    }
+
+    #[cfg(test)]
     fn loop_view(&self, reading: Option<daemon::Reading>) -> LoopView {
         let state = self.lock_loop();
         // A loop that panicked never recorded its own end, so the handle -
@@ -1079,29 +1138,61 @@ impl Ui {
         }
     }
 
-    /// Start the loop in a successor whose predecessor was running one.
-    ///
-    /// Goes through the same path as the UI's start-loop action. A refusal
-    /// (another process owns the loop) is logged and left in `last_error`;
-    /// the loop then simply stays stopped.
-    fn resume_after_handover(&self, resume: bool) -> bool {
-        if !resume {
-            return false;
-        }
-        let foreign = Foreign::of(daemon::read_status(&self.home).as_ref());
-        match self.start_loop(foreign) {
-            Ok(()) => true,
-            Err(e) => {
-                let why = format!(
-                    "the loop could not be resumed after the upgrade: {}",
-                    e.message
-                );
-                tracing::warn!("{why}");
-                let mut state = self.lock_loop();
-                state.last_error = Some(why);
-                state.rev += 1;
-                false
-            }
+    /// Reuse one active-job snapshot for both ownership and public health.
+    fn runtime_loop_view(
+        &self,
+        reading: Option<daemon::Reading>,
+        jobs: &[crate::worker::Job],
+    ) -> LoopView {
+        let scheduler = jobs.iter().find(|job| job.kind == "scheduler");
+        let reporting = reading
+            .as_ref()
+            .is_some_and(|r| r.running(Timestamp::now()));
+        let managed = scheduler.is_some()
+            || (reporting
+                && reading
+                    .as_ref()
+                    .is_some_and(|r| r.worker_protocol == Some(1)));
+        let control = crate::worker::control(&self.home, "scheduler")
+            .ok()
+            .flatten();
+        // Foreground serve also persists its options, so ownership never
+        // causes us to substitute the web process's repository for its own.
+        let persisted = if managed && scheduler.is_none() {
+            std::fs::read(self.home.join("scheduler-options.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<daemon::Opts>(&bytes).ok())
+        } else {
+            None
+        };
+        let repo = scheduler
+            .and_then(|job| job.payload.get("repo"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| {
+                persisted
+                    .as_ref()
+                    .map(|opts| opts.repo.display().to_string())
+            })
+            .unwrap_or_else(|| self.repo.display().to_string());
+        let merge = match scheduler {
+            Some(job) => job
+                .payload
+                .get("merge")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            None => persisted.map_or_else(|| self.merge.clone(), |opts| opts.merge),
+        };
+        LoopView {
+            running: managed || reporting,
+            stopping: managed && matches!(control, Some(crate::worker::Control::Stop)),
+            parking: matches!(control, Some(crate::worker::Control::Park))
+                && jobs.iter().any(|job| job.kind == "task"),
+            owned: managed,
+            repo,
+            merge,
+            last_error: self.lock_loop().last_error.clone(),
+            daemon: DaemonView::of(reading),
         }
     }
 
@@ -1110,11 +1201,7 @@ impl Ui {
         lock_or_recover(&self.looping)
     }
 
-    /// Whether this process currently owns the agent turn for `id`.
-    ///
-    /// This deliberately describes only the in-memory claim made by
-    /// [`Ui::begin_talk_turn`]. It is not conversation data and therefore is
-    /// never persisted with a [`Talk`].
+    /// In-flight admission, detached startup, or a cross-process turn lease.
     fn is_thinking(&self, id: &str) -> bool {
         self.talk_turns
             .lock()
@@ -1122,6 +1209,7 @@ impl Ui {
             // Another process (the CLI) can hold the turn through the
             // on-disk lease.
             || self.talks.turn_held(id)
+            || crate::consult::turn_worker_active(&self.talks, id)
     }
 
     /// Claim the right to run one turn in a talk, or report that it is busy.
@@ -1157,14 +1245,11 @@ impl Ui {
             .talk_turns
             .lock()
             .map_err(|_| ApiError::internal("the talk turn lock was poisoned"))?;
-        if live.parking {
+        if crate::consult::turn_worker_active(&self.talks, id) {
             if queued {
-                // The draft is already durable; nothing may drain it until
-                // the successor is up, so the caller sees a busy slot.
                 *live.queued.entry(id.to_owned()).or_default() += 1;
-                return Ok(None);
             }
-            return Err(ApiError::conflict(UPGRADE_IN_PROGRESS));
+            return Ok(None);
         }
         let inserted = live.live.insert(id.to_owned());
         // The on-disk lease is the cross-process half of the gate. Taken
@@ -1212,8 +1297,8 @@ impl Ui {
             .talk_turns
             .lock()
             .map_err(|_| ApiError::internal("the talk turn lock was poisoned"))?;
-        // Same answer as a running turn: the text is queued as a draft.
-        if live.parking || live.live.contains(id) {
+        // A detached worker owns its turn across web process replacement.
+        if live.live.contains(id) || crate::consult::turn_worker_active(&self.talks, id) {
             return Ok(TalkTurnStart::Busy);
         }
         let Some(lease) = self.talks.claim_turn(id).map_err(ApiError::from)? else {
@@ -1239,60 +1324,6 @@ impl Ui {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         live.queued.get(id).copied().unwrap_or(0)
-    }
-
-    /// The shared turn slots, for the upgrade hand-over to wait on.
-    fn turns(&self) -> Arc<Mutex<TalkTurns>> {
-        Arc::clone(&self.talk_turns)
-    }
-
-    /// Park the loop for an upgrade, and report the run that is parking.
-    ///
-    /// A park rather than a stop: a stop waits out the whole competition, and
-    /// not waiting is the point of upgrading from a phone. `None` means
-    /// nothing was in flight, which is worth saying so the operator is not
-    /// told a run is parking when none is.
-    fn park_for_upgrade(&self, from: &str, to: Option<&str>) -> ApiResult<Option<String>> {
-        let parking = {
-            let mut state = self.lock_loop();
-            // Decided here, before the park: by the time the handover fires
-            // an idle loop has already seen the park and ended, so `live`
-            // would read as "was never running". A loop the operator had
-            // already stopped stays stopped.
-            //
-            // Sticky: a second upgrade request finds the loop already
-            // stopping because of the first one's park, and must not read
-            // that as the operator having stopped it. Only an explicit stop
-            // or a failed update clears an earlier intent.
-            let resume = state.resume_after_handover
-                || state
-                    .live
-                    .as_ref()
-                    .is_some_and(|live| live.alive() && !live.stop.stopped());
-            state.resume_after_handover = resume;
-            let Some(live) = state.live.as_ref() else {
-                return Ok(None);
-            };
-            let busy = live.stop.busy_now();
-            live.stop.park(crate::run::ParkCause::Upgrade {
-                from: from.to_owned(),
-                to: to.map(|t| t.trim_start_matches('v').to_owned()),
-            });
-            state.rev += 1;
-            busy
-        };
-        Ok(if parking {
-            // More than one run can be in flight now (see
-            // `Config::daemon.max_concurrent_runs`); this answer names one of
-            // them so the operator sees a park actually happened, not every
-            // run a park now asks to stop at its next boundary.
-            daemon::current_work(&self.home, jiff::Timestamp::now())
-                .into_iter()
-                .next()
-                .map(|c| c.run)
-        } else {
-            None
-        })
     }
 
     /// Claim a run for a resume, on the same reasoning as
@@ -1429,10 +1460,6 @@ impl Ui {
     }
 }
 
-/// What a chat request is told while an upgrade is parking and the request
-/// cannot be queued as a draft.
-const UPGRADE_IN_PROGRESS: &str = "upgrade in progress, try again in a moment";
-
 /// One talk's turn slot, released on drop.
 ///
 /// A guard rather than a matching `remove` at the end of the handler, because
@@ -1457,10 +1484,6 @@ struct TalkTurnGuard {
 struct TalkTurns {
     live: HashSet<String>,
     queued: HashMap<String, u64>,
-    /// Set while an upgrade hand-over is parking: no turn may start, so the
-    /// set in `live` can only shrink. Cleared again if the hand-over ends
-    /// without exiting the process.
-    parking: bool,
 }
 
 /// The atomic initial-state decision made by
@@ -1475,6 +1498,7 @@ enum TalkTurnStart {
 }
 
 impl TalkTurnGuard {
+    #[cfg(test)]
     /// Does this guard still own the on-disk lease? A transient failure to
     /// check counts as owning: the next beat decides. A guard that lost it
     /// must not start another turn on the same session.
@@ -1484,6 +1508,7 @@ impl TalkTurnGuard {
             .is_none_or(|lease| !matches!(lease.beat(), Ok(false)))
     }
 
+    #[cfg(test)]
     /// `talk::respond` while renewing the on-disk lease, so a turn longer
     /// than the lease's TTL still reads as held to other processes.
     async fn respond(
@@ -1584,6 +1609,8 @@ static HANDOVER: std::sync::LazyLock<Notify> = std::sync::LazyLock::new(Notify::
 
 /// Set to `1` on the successor when the loop was running at handover.
 const RESUME_LOOP_ENV: &str = "MAGI_WEB_RESUME_LOOP";
+/// Keep a dynamically assigned listener address stable across replacement.
+const RESTART_PORT_ENV: &str = "MAGI_WEB_RESTART_PORT";
 
 /// Whether the environment value asks for the loop to be resumed.
 fn resume_requested(value: Option<std::ffi::OsString>) -> bool {
@@ -1602,18 +1629,13 @@ fn resume_requested(value: Option<std::ffi::OsString>) -> bool {
 /// Detached and without inherited stdio: the successor has to outlive this
 /// process, and must not hold open a pipe a terminal is waiting on.
 ///
-/// `resume` tells the successor to start the queue loop, through
-/// [`RESUME_LOOP_ENV`]. It is always set or removed explicitly so a value this
-/// process inherited from its own predecessor cannot leak into a generation
-/// that should not resume. The successor's own environment keeps the variable
-/// (and so do the agent CLIs it starts); `serve` reads it once at startup.
+/// The scheduler is restarted separately; execution workers are not awaited.
 ///
 /// The successor's stdout and stderr are appended to `<home>/web.log` rather
 /// than sent to null: a supervisor's redirection only ever held the first
 /// generation's descriptors, so every later generation logged nowhere. The
 /// pid of the child is returned so the handover log can name it.
-fn spawn_successor(home: &FsPath, resume: bool) -> Result<u32> {
-    let exe = std::env::current_exe().context("find this binary")?;
+fn spawn_successor(home: &FsPath, port: u16, exe: &FsPath) -> Result<u32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     updater::log_step(
         home,
@@ -1644,12 +1666,9 @@ fn spawn_successor(home: &FsPath, resume: bool) -> Result<u32> {
         }
     };
 
-    let mut cmd = std::process::Command::new(&exe);
-    if resume {
-        cmd.env(RESUME_LOOP_ENV, "1");
-    } else {
-        cmd.env_remove(RESUME_LOOP_ENV);
-    }
+    let mut cmd = std::process::Command::new(exe);
+    cmd.env_remove(RESUME_LOOP_ENV);
+    cmd.env(RESTART_PORT_ENV, port.to_string());
     cmd.args(&args)
         .stdin(std::process::Stdio::null())
         .stdout(out)
@@ -1675,31 +1694,13 @@ async fn wait_for_handover(signal: &Notify) {
     signal.notified().await;
 }
 
-/// Serve the UI until Ctrl-C, finishing a run the loop has in flight.
-///
-/// The server itself owns no state, so nothing here is graceful for the HTTP
-/// side's sake: the connections go with the dropped listener, which costs a
-/// phone one change-stream reconnection it was going to make anyway.
-///
-/// The signal branch is not optional now that the loop lives in this process.
-/// [`daemon::serve_until`] listens for Ctrl-C itself, and a registered
-/// handler is what stops the signal terminating the process - so without a
-/// branch of our own, the first Ctrl-C after the operator started the loop
-/// would stop the loop and leave `magi web` listening forever, unkillable
-/// from the terminal it was started in.
-///
-/// What it waits for is the loop, not the sockets. A run in flight is
-/// finished first, for the reason [`daemon::serve`] gives: killing the graph
-/// mid-node leaves worktrees, branches and agent sessions behind and throws
-/// away every agent call already paid for.
-///
-/// The server therefore runs on a task of its own rather than inside the
-/// `select!`: an arm that resolves *drops* the futures the other arms were
-/// polling, so serving the address from inside one would take the deck down
-/// at the instant the handover began and keep it down for the whole park -
-/// up to `timeout_implement`, an hour by default. See [`hand_over`], which
-/// owns the order.
+/// Serve the UI independently from scheduler and execution workers.
+/// A restart releases its listener before starting the successor.
 pub async fn serve(opts: Opts) -> Result<()> {
+    // Capture before self-replacement: current_exe may later name a removed
+    // image on Linux or the renamed old image on Windows.
+    crate::worker::remember_current_executable()?;
+    let executable = std::env::current_exe().context("find the installed web executable")?;
     let (addr, warning) = resolve_bind(&opts.bind);
     if let Some(warning) = warning {
         tracing::warn!("{warning}");
@@ -1720,6 +1721,7 @@ pub async fn serve(opts: Opts) -> Result<()> {
     // them from.
     let home = ui.home.clone();
     let repo = ui.repo.clone();
+    let admissions = Arc::clone(&ui.admissions);
     // Settles a progress record a predecessor left non-terminal - either this
     // *is* the successor `spawn_successor` started, or the previous process
     // died mid-handover. Before the router starts answering, so the very
@@ -1744,25 +1746,30 @@ pub async fn serve(opts: Opts) -> Result<()> {
     // going for as long as this process serves, `serve` has nothing to await
     // it for, and it exits on its own the moment the process does.
     tokio::spawn(run_update_recheck(repo, home.clone()));
-    let looping = ui.looping();
-    let turns = ui.turns();
-    let talk_store = ui.talks.clone();
-    let socket = SocketAddr::new(addr, opts.port);
+    let port = if opts.port == 0 {
+        std::env::var(RESTART_PORT_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|port| *port != 0)
+            .unwrap_or(0)
+    } else {
+        opts.port
+    };
+    let socket = SocketAddr::new(addr, port);
     let listener = bind_waiting(socket).await?;
-    let url = format!("http://{addr}:{}", opts.port);
+    let bound = listener.local_addr().context("read bound web address")?;
+    let port = bound.port();
+    let url = format!("http://{bound}");
     tracing::info!(
         "magi web UI on {url} - there is no authentication, so anyone who can \
          reach this address can file and hold tasks: the tailnet is the \
          security boundary"
     );
-    if ui.resume_after_handover(resume_requested(std::env::var_os(RESUME_LOOP_ENV))) {
-        tracing::info!("resumed the loop the predecessor was running");
-    } else {
-        tracing::info!(
-            "the queue loop is not running yet - start it from the UI, which is \
-             the whole reason this process can: nothing in the queue moves until \
-             something is running the loop"
-        );
+    // A legacy predecessor may request first-migration scheduler startup.
+    if resume_requested(std::env::var_os(RESUME_LOOP_ENV)) && !daemon::managed(&home) {
+        ui.start_detached_loop()
+            .await
+            .map_err(|e| anyhow::anyhow!(e.message))?;
     }
     if opts.open {
         // The URL alone on stdout, for a caller that wants to open it. magi
@@ -1790,18 +1797,15 @@ pub async fn serve(opts: Opts) -> Result<()> {
             Err(e) => Err(e).context("the task serving the web UI ended"),
         },
         () = interrupted => {
-            tracing::info!("shutting down the web UI");
-            finish_loop(&home, &looping, None).await;
+            tracing::info!("shutting down the web UI; detached workers continue");
+            close_admissions(&admissions).await;
+            served.abort();
+            let _ = served.await;
             Ok(())
         }
         () = handover => {
-            updater::log_step(&home, "serve: the select! woke on the handover signal");
             let successor_home = home.clone();
-            let wait_for = move |ids: &[String]| talk_wait_for(&talk_store, ids);
-            hand_over(&home, &looping, &turns, &wait_for, served, move |resume| {
-                spawn_successor(&successor_home, resume)
-            })
-            .await
+            hand_over(&home, &admissions, served, move || spawn_successor(&successor_home, port, &executable)).await
         }
     };
     updater::log_step(
@@ -1861,283 +1865,53 @@ async fn normalize_default_repo(repo: PathBuf) -> PathBuf {
     }
 }
 
-/// Park the loop, then release the address, then start the successor.
-///
-/// The order is the whole function, and each step is answerable to a failure
-/// this arrangement has already had:
-///
-/// 1. **Park.** The loop was asked to stop by the request that replaced the
-///    binary, and this waits for it, because killing the graph mid-node
-///    leaves worktrees, branches and agent sessions behind and throws away
-///    every agent call already paid for. It takes as long as the node in
-///    flight - up to `timeout_implement`, an hour by default - and the deck
-///    goes on answering for all of it, which is the reason `served` is a task
-///    rather than an arm of [`serve`]'s `select!`. It was an arm once: the
-///    first upgrade from a phone that caught a run mid-implement dropped the
-///    listener the moment it was asked to, and the operator got
-///    `Cannot reach magi: Failed to fetch` with no way to see the park it was
-///    waiting on and nothing but a process list to say the run was alive.
-/// 2. **Release.** Aborting *and awaiting* the task is what frees the socket:
-///    the join resolves only once the task's future has been dropped, so the
-///    listener is released before the next line. Connections it already
-///    accepted are served on tasks of their own and wind down asynchronously;
-///    on some platforms (macOS) they can briefly keep the address busy, and
-///    the successor's `bind_waiting` absorbs that.
-/// 3. **Start the successor**, which binds the address this process has just
-///    let go of - see [`spawn_successor`] for what the other order cost.
-///
-/// The [`updater::Progress`] bookkeeping bracketing steps 1 and 3 is
-/// reporting, not part of the design: it exists so `/api/health` can say
-/// "parking, waiting on run X" instead of leaving the phone to guess why the
-/// deck went quiet, and dropping it would not change the order above.
+/// Close new ingress and finish only transactions publishing durable work.
+/// The writer waits for owned admission guards, not task or chat turn leases.
+async fn close_admissions(admissions: &tokio::sync::RwLock<bool>) {
+    *admissions.write().await = true;
+}
+
+/// Restart only the scheduler and web listener, never their execution workers.
+/// The old listener must be fully released before the successor is started.
 async fn hand_over(
     home: &FsPath,
-    looping: &Mutex<LoopState>,
-    turns: &Arc<Mutex<TalkTurns>>,
-    talk_wait: &(dyn Fn(&[String]) -> Duration + Sync),
+    admissions: &tokio::sync::RwLock<bool>,
     served: tokio::task::JoinHandle<std::io::Result<()>>,
-    successor: impl FnOnce(bool) -> Result<u32>,
+    successor: impl FnOnce() -> Result<u32>,
 ) -> Result<()> {
-    updater::log_step(home, "hand_over: entered; writing the parking stage");
-    // The lease and the stage are written as one step, so a reader that sees
-    // `parking` also finds the proof that hand_over is alive. Dropped on
-    // every way out.
-    let (mut lease, recorded) = updater::LeaseGuard::enter_parking(home);
-    if !recorded {
-        updater::log_warn(
-            home,
-            "hand_over: upgrade.json is unreadable; no parking stage",
-        );
-    }
-    // Chat stays open while the loop parks: nothing restarts until it ends,
-    // and the park can last as long as a node. Only once it is done is the
-    // slot closed, right before the restart; a turn started earlier is in
-    // `live` by then, so `finish_talks` waits for it.
-    finish_loop(home, looping, Some(&mut lease)).await;
-    let parking = ParkingTurns::begin(turns);
-    let talks_done = finish_talks(home, turns, talk_wait);
-    tokio::pin!(talks_done);
-    let mut beat = tokio::time::interval(LEASE_BEAT);
-    let (abandoned, waited_for) = loop {
-        tokio::select! {
-            left = &mut talks_done => break left,
-            _ = beat.tick() => lease.beat(),
-        }
-    };
-    drop(lease);
-    updater::log_step(home, "hand_over: releasing the listener (abort and await)");
-    served.abort();
-    let _ = served.await;
-    updater::log_step(home, "hand_over: listener released");
-    // Read last: the deck answers for the whole park, so an operator's stop
-    // during the wait must still be honoured by the successor.
-    let resume = lock_or_recover(looping).resume_after_handover;
-    match updater::read_progress(home) {
-        Some(mut progress) => {
-            progress.advance(updater::Stage::Restarting);
-            if !abandoned.is_empty() {
-                progress.detail = Some(format!(
-                    "handed over while {} still running after {} s",
-                    updater::talks_phrase(&abandoned),
-                    waited_for.as_secs()
-                ));
-            }
-            updater::write_progress_logged(home, &progress);
-        }
-        None => updater::log_warn(
-            home,
-            "hand_over: upgrade.json is unreadable; no restarting stage",
-        ),
+    close_admissions(admissions).await;
+    if let Some(mut progress) = updater::read_progress(home) {
+        progress.advance(updater::Stage::Restarting);
+        progress.detail =
+            Some("Restarting scheduler and web; active workers continue unchanged.".to_owned());
+        updater::write_progress_logged(home, &progress);
     }
     updater::log_step(
         home,
-        &format!("hand_over: starting the successor (resume={resume})"),
+        "restarting scheduler without parking execution workers",
     );
-    drop(parking);
-    match successor(resume) {
+    let scheduler = daemon::restart_detached(home).await;
+    if let Err(error) = &scheduler {
+        let _ = updater::fail_progress(home, &format!("restart scheduler: {error:#}"));
+        updater::log_warn(
+            home,
+            &format!("scheduler restart failed; restoring the web UI: {error:#}"),
+        );
+    }
+    updater::log_step(home, "releasing the web listener");
+    served.abort();
+    let _ = served.await;
+    updater::log_step(home, "web listener released; starting the successor");
+    match successor() {
         Ok(pid) => {
-            updater::log_step(home, &format!("hand_over: successor started, pid {pid}"));
-            Ok(())
+            updater::log_step(home, &format!("successor started, pid {pid}"));
+            scheduler
         }
         Err(e) => {
-            updater::log_warn(
-                home,
-                &format!("hand_over: the successor did not start: {e:#}"),
-            );
+            let _ = updater::fail_progress(home, &format!("start web successor: {e:#}"));
             Err(e)
         }
     }
-}
-
-/// Grace added to `[graph] timeout_talk` for the upgrade's wait on chat turns:
-/// a turn that runs its full timeout still needs a moment to record its answer.
-const TALK_PARK_GRACE: Duration = Duration::from_secs(60);
-
-/// How often the park looks at the chat turns still running.
-const TALK_POLL: Duration = Duration::from_millis(250);
-
-/// The longest an upgrade waits for chat turns: one turn's timeout plus a
-/// grace. Beyond it a stuck turn must not block the hand-over.
-fn talk_wait_bound(timeout_talk_secs: u64) -> Duration {
-    Duration::from_secs(timeout_talk_secs) + TALK_PARK_GRACE
-}
-
-/// The bound for the turns of `ids`: the longest `[graph] timeout_talk` among
-/// the repositories those talks run in (each turn uses its own talk's
-/// configuration), plus the grace. A talk or config that cannot be read counts
-/// with the default timeout.
-fn talk_wait_for(talks: &Talks, ids: &[String]) -> Duration {
-    let default = Config::default().graph.timeout_talk;
-    let longest = ids
-        .iter()
-        .map(|id| {
-            talks
-                .get(id)
-                .ok()
-                .and_then(|t| Config::discover(&t.repo, None).ok())
-                .map_or(default, |(c, _)| c.graph.timeout_talk)
-        })
-        .max()
-        .unwrap_or(default);
-    talk_wait_bound(longest)
-}
-
-/// Stops new chat turns for as long as it lives, so the hand-over only ever
-/// waits on a set that cannot grow. `hand_over` takes it only after the loop
-/// has stopped, so chat stays usable while the loop parks. Dropping it reopens the slots.
-struct ParkingTurns(Arc<Mutex<TalkTurns>>);
-
-impl ParkingTurns {
-    fn begin(turns: &Arc<Mutex<TalkTurns>>) -> Self {
-        turns.lock().unwrap_or_else(PoisonError::into_inner).parking = true;
-        Self(Arc::clone(turns))
-    }
-}
-
-impl Drop for ParkingTurns {
-    fn drop(&mut self) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .parking = false;
-    }
-}
-
-/// Wait until no chat turn is running in this process, for at most the longest
-/// `bound_for` has given for the turns seen so far. Returns the talk ids still
-/// running when the bound was hit (empty when the turns finished) with the
-/// bound that applied, after saying so in the upgrade log.
-async fn finish_talks(
-    home: &FsPath,
-    turns: &Mutex<TalkTurns>,
-    bound_for: &(dyn Fn(&[String]) -> Duration + Sync),
-) -> (Vec<String>, Duration) {
-    let running = || {
-        let mut ids: Vec<String> = turns
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .live
-            .iter()
-            .cloned()
-            .collect();
-        // A turn another task of this process (the daemon's completion
-        // notice) or another process runs holds only the on-disk lease.
-        let talks = talk::Talks::at(home.join("talks"));
-        for t in talks.list() {
-            if talks.turn_held(&t.id) && !ids.contains(&t.id) {
-                ids.push(t.id);
-            }
-        }
-        ids.sort();
-        ids
-    };
-    let started = std::time::Instant::now();
-    let mut seen = Vec::new();
-    let mut bound = Duration::ZERO;
-    loop {
-        let ids = running();
-        if ids != seen {
-            bound = bound.max(bound_for(&ids));
-            if ids.is_empty() {
-                updater::log_step(home, "finish_talks: no chat turn is running");
-            } else {
-                updater::log_step(
-                    home,
-                    &format!(
-                        "finish_talks: waiting for {} to finish",
-                        updater::talks_phrase(&ids)
-                    ),
-                );
-            }
-            updater::set_parked_talks(home, &ids);
-            seen = ids;
-        }
-        if seen.is_empty() {
-            return (Vec::new(), bound);
-        }
-        if started.elapsed() >= bound {
-            updater::log_warn(
-                home,
-                &format!(
-                    "finish_talks: {} still running after {} s; handing over anyway",
-                    updater::talks_phrase(&seen),
-                    bound.as_secs()
-                ),
-            );
-            return (seen, bound);
-        }
-        tokio::time::sleep(TALK_POLL).await;
-    }
-}
-
-/// How often `finish_loop` renews the handover lease; well inside
-/// [`updater::LEASE_TTL_SECS`].
-const LEASE_BEAT: Duration = Duration::from_secs(20);
-
-/// Ask the loop to stop and wait for it, on the way out of [`serve`].
-///
-/// The wait is the whole function. Returning from `serve` while a graph is
-/// mid-node ends the process with worktrees, branches and agent sessions left
-/// behind and every agent call in that run paid for and thrown away, which is
-/// exactly what the daemon's own shutdown refuses to do.
-async fn finish_loop(
-    home: &FsPath,
-    state: &Mutex<LoopState>,
-    mut lease: Option<&mut updater::LeaseGuard>,
-) {
-    let live = lock_or_recover(state).live.take();
-    let Some(live) = live else {
-        updater::log_step(home, "finish_loop: no loop running; nothing to wait for");
-        return;
-    };
-    live.stop.stop();
-    lock_or_recover(state).rev += 1;
-    updater::log_step(
-        home,
-        "finish_loop: waiting for the loop to finish the run in flight",
-    );
-    let waited = std::time::Instant::now();
-    // The task records its own outcome and logs it, so there is nothing to do
-    // with a join error here but stop waiting.
-    let mut handle = live.handle;
-    let mut beat = tokio::time::interval(LEASE_BEAT);
-    loop {
-        tokio::select! {
-            _ = &mut handle => break,
-            _ = beat.tick() => {
-                if let Some(lease) = lease.as_deref_mut() {
-                    lease.beat();
-                }
-            }
-        }
-    }
-    updater::log_step(
-        home,
-        &format!(
-            "finish_loop: the loop ended after {:.1}s",
-            waited.elapsed().as_secs_f32()
-        ),
-    );
 }
 
 /// Resolve `--bind` to an address, plus a warning when the answer is not what
@@ -2453,7 +2227,7 @@ struct HealthView {
     /// replies, instead of sitting lit for however long the agent thinks.
     questions_needs_owner: usize,
     daemon: DaemonView,
-    /// The loop in this process, exactly what `/api/loop` answers with.
+    /// The independently controllable scheduler, as `/api/loop` reports it.
     ///
     /// Here so a phone that has just woken needs one request to know whether
     /// anything is going to happen at all: `daemon` says a loop is alive
@@ -2471,7 +2245,45 @@ struct HealthView {
     /// first one. Read off disk, so the successor can report what its
     /// predecessor started.
     upgrade: Option<UpgradeProgressView>,
+    /// Detached jobs survive replacement of this web process. Each reports
+    /// its own immutable executable generation rather than the web version.
+    jobs: Vec<WorkerView>,
     upgrade_request_error: Option<UpgradeRequestFailure>,
+}
+
+/// Public execution metadata only. Job payloads contain private configuration
+/// and must never be returned by the health endpoint.
+#[derive(Debug, Serialize)]
+struct WorkerView {
+    id: String,
+    kind: String,
+    key: String,
+    pid: Option<u32>,
+    status: crate::worker::Status,
+    generation: String,
+    version: Option<String>,
+    queue_owned: bool,
+}
+
+impl From<crate::worker::Job> for WorkerView {
+    fn from(job: crate::worker::Job) -> Self {
+        let queue_owned = job.kind == "task"
+            && job
+                .payload
+                .get("standalone")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true);
+        Self {
+            id: job.id,
+            kind: job.kind,
+            key: job.key,
+            pid: job.pid,
+            status: job.status,
+            generation: job.generation,
+            version: job.version,
+            queue_owned,
+        }
+    }
 }
 
 /// What `/api/health` knows about a release newer than this build.
@@ -2569,15 +2381,8 @@ fn recheck_poll_period(cfg: &Update) -> Duration {
 /// already does - both for whether checking is on at all and for how long
 /// the next sleep should be.
 ///
-/// Not [`updater::spawn`]'s `auto_update` path, even under `mode =
-/// "install"`: swapping the running binary out from under a task or a run
-/// mid-node is exactly what `hand_over`'s parking exists to do deliberately,
-/// not as a side effect of a timer nobody asked to fire. This only ever
-/// calls [`updater::Checker::newer_release`], which refreshes
-/// `last_update_check.json` and nothing else - so under `mode = "install"`
-/// this behaves like `notify` for as long as the deck stays up, and an
-/// actual self-install still happens exactly where it always has: once, at
-/// the next process start.
+/// Notification-only even in install mode: a timer refreshes release metadata,
+/// while the explicit update action owns executable replacement and restart.
 async fn run_update_recheck(repo: PathBuf, home: PathBuf) {
     loop {
         let (cfg, _) = Config::discover(&repo, None).unwrap_or_default();
@@ -2780,7 +2585,13 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
         let update = cached_update_view(cfg.as_ref());
         let upgrade = updater::read_progress(&ui.home).map(|p| upgrade_progress_view(&ui, p));
         let questions = ui.questions.list();
+        let jobs = crate::worker::active(&ui.home).map_err(ApiError::from)?;
+        #[cfg(not(test))]
+        let looping = ui.runtime_loop_view(reading.clone(), &jobs);
+        #[cfg(test)]
+        let looping = ui.loop_view(reading.clone());
         Ok(Json(HealthView {
+            jobs: jobs.into_iter().map(WorkerView::from).collect(),
             version: env!("CARGO_PKG_VERSION"),
             home: ui.home.display().to_string(),
             queue_rev: revisions.0,
@@ -2800,8 +2611,8 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
                     q.status.open() && (!q.waiting_on_agent() || ui.questions.deputy_exhausted(q))
                 })
                 .count(),
-            daemon: DaemonView::of(reading.clone()),
-            looping: ui.loop_view(reading),
+            daemon: DaemonView::of(reading),
+            looping,
             disk: DiskView::of(&ui, cfg.as_ref()),
             update,
             upgrade,
@@ -2818,31 +2629,13 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
 /// What `/api/loop` answers, and what `/api/health` carries as `loop`.
 #[derive(Debug, Serialize)]
 struct LoopView {
-    /// A loop is running in *this* process.
+    /// A scheduler is running, independently of this web process.
     running: bool,
-    /// It has been asked to stop and is still finishing a run.
-    ///
-    /// [`daemon::Stop::finishing`]'s answer rather than "the flag is set",
-    /// because the two differ exactly where it matters: a loop asked to stop
-    /// while idle is gone within one poll interval, and one asked to stop
-    /// mid-run keeps going for as long as the graph takes. The operator needs
-    /// to be told which of those they are waiting for.
+    /// The scheduler has been asked to stop scheduling new work.
     stopping: bool,
-    /// A park was asked for: the run in flight stops at its next node
-    /// boundary rather than finishing.
-    ///
-    /// Separate from `stopping` because the two promise different waits. A
-    /// stop is "when this competition ends", which can be an hour; a park is
-    /// "after the step it is on", which is minutes and is what an operator
-    /// waiting to replace the binary needs to see.
+    /// An explicit operator park was requested, independently from updates.
     parking: bool,
-    /// The loop is this process's own.
-    ///
-    /// Spelled separately from `running` for the front end's sake, even
-    /// though inside this process the two move together: `running: false`
-    /// with `daemon.running: true` is the case where the operator's own `magi
-    /// serve` owns the loop, and `owned` is the field that tells the UI its
-    /// buttons have to explain that rather than pretend.
+    /// This scheduler supports durable controls from any web generation.
     owned: bool,
     /// Repository the loop uses for tasks that name none - what it was
     /// started with while it runs, and what a start would use before that.
@@ -2863,14 +2656,10 @@ struct LoopView {
     daemon: DaemonView,
 }
 
-/// A loop another process already owns.
+/// A legacy embedded scheduler that this web process cannot control.
 ///
-/// `<home>/daemon.json` is the only cross-process signal there is, so this is
-/// the whole of the test: a heartbeat no older than [`daemon::STALE_SECS`],
-/// published by a pid that is not ours. Excluding our own pid is what makes
-/// stopping work at all - the loop this process runs writes that file too, so
-/// a check that ignored the pid would decide the operator's own UI was a
-/// stranger and refuse to stop the loop it had just started.
+/// Worker-protocol schedulers use durable controls regardless of which process
+/// started them. Older schedulers are identified by their foreign heartbeat.
 #[derive(Debug, Clone, Copy)]
 struct Foreign {
     /// The pid the other process published, when it published one.
@@ -2884,6 +2673,9 @@ impl Foreign {
         // A fresh heartbeat with no pid in it is still evidence of a live
         // daemon. "Some other process" is the honest answer, and refusing
         // to start beside it is the safe one.
+        if reading.is_some_and(|r| r.worker_protocol.unwrap_or_default() >= 1) {
+            return None;
+        }
         daemon::foreign_loop(reading, Timestamp::now(), std::process::id()).map(|pid| Self { pid })
     }
 
@@ -2901,9 +2693,11 @@ impl Foreign {
 ///
 /// A plain function pointer, so [`Ui`] stays `Debug` and `Clone` without a
 /// trait object or a hand-written `Debug` impl for the sake of one seam.
+#[cfg(test)]
 type Launch = fn(daemon::Opts, daemon::Stop) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
 /// The real loop: [`daemon::serve_until`], boxed to fit [`Launch`].
+#[cfg(test)]
 fn launch_daemon(
     opts: daemon::Opts,
     stop: daemon::Stop,
@@ -2911,30 +2705,22 @@ fn launch_daemon(
     Box::pin(daemon::serve_until(opts, stop))
 }
 
-/// The loop this process runs, behind one lock.
+/// Local web-control revisions and errors, plus the unit-test launch seam.
 #[derive(Debug, Default)]
 struct LoopState {
     /// The loop, while there is one.
+    #[cfg(test)]
     live: Option<Live>,
-    /// Bumped on every change to this struct, and streamed as `loop_rev`.
-    ///
-    /// The loop is in-process state rather than a file, so nothing on disk
-    /// would tell a second phone that the first one started it. Without this
-    /// counter the only way to learn about a start, a stop request or a crash
-    /// would be to poll `/api/loop`, which is the thing the change stream
-    /// exists to avoid on a mobile link.
+    /// Local control changes streamed as `loop_rev`; actual scheduler and
+    /// execution ownership comes from durable status and OS-held worker leases.
     rev: u64,
     /// Why the last loop ended, when it ended badly. See
     /// [`LoopView::last_error`].
     last_error: Option<String>,
-    /// The loop was running (and not already stopping) when the last upgrade
-    /// parked it, so the successor should start one. Set afresh by every
-    /// [`Ui::park_for_upgrade`], cleared by an explicit stop and by a failed
-    /// update.
-    resume_after_handover: bool,
 }
 
 /// A loop in flight.
+#[cfg(test)]
 #[derive(Debug)]
 struct Live {
     /// The cooperative stop, shared with the loop task.
@@ -2950,6 +2736,7 @@ struct Live {
     opts: daemon::Opts,
 }
 
+#[cfg(test)]
 impl Live {
     /// Is the task still there? See [`Live::handle`].
     fn alive(&self) -> bool {
@@ -2971,7 +2758,11 @@ fn lock_or_recover(state: &Mutex<LoopState>) -> MutexGuard<'_, LoopState> {
 async fn loop_get(State(ui): State<Arc<Ui>>) -> ApiResult<Json<LoopView>> {
     blocking(move || {
         let reading = daemon::read_status(&ui.home);
-        Ok(Json(ui.loop_view(reading)))
+        #[cfg(not(test))]
+        let view = ui.try_loop_view(reading)?;
+        #[cfg(test)]
+        let view = ui.loop_view(reading);
+        Ok(Json(view))
     })
     .await
 }
@@ -2998,13 +2789,8 @@ struct LoopCommand {
     park: bool,
 }
 
-/// `POST /api/loop` - start the loop in this process, or ask it to stop.
-///
-/// Answers with the view rather than waiting for the loop to reach the state
-/// that was asked for. Starting is immediate anyway; stopping is not, and the
-/// wait is a run's worth of minutes, which is not a thing to hold a phone's
-/// request open for. `stopping` in the answer is what the operator watches
-/// instead.
+/// Start or control the detached scheduler without waiting for execution
+/// workers. Only an explicit park asks workers to stop at a node boundary.
 async fn loop_post(
     State(ui): State<Arc<Ui>>,
     body: std::result::Result<Json<LoopCommand>, JsonRejection>,
@@ -3012,17 +2798,30 @@ async fn loop_post(
     // Taken as a `Result` so a malformed body is a 400 like every other route
     // here, rather than axum's default 422 that the UI has no branch for.
     let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
-    blocking(move || {
-        let reading = daemon::read_status(&ui.home);
-        let foreign = Foreign::of(reading.as_ref());
+    #[cfg(not(test))]
+    {
         if body.running {
-            ui.start_loop(foreign)?;
+            ui.start_detached_loop().await?;
         } else {
+            let foreign = Foreign::of(daemon::read_status(&ui.home).as_ref());
             ui.stop_loop(foreign, body.park)?;
         }
-        Ok(Json(ui.loop_view(reading)))
-    })
-    .await
+        Ok(Json(ui.try_loop_view(daemon::read_status(&ui.home))?))
+    }
+    #[cfg(test)]
+    {
+        blocking(move || {
+            let reading = daemon::read_status(&ui.home);
+            let foreign = Foreign::of(reading.as_ref());
+            if body.running {
+                ui.start_loop(foreign)?;
+            } else {
+                ui.stop_loop(foreign, body.park)?;
+            }
+            Ok(Json(ui.loop_view(reading)))
+        })
+        .await
+    }
 }
 
 /// What `POST /api/upgrade` set in motion.
@@ -3032,8 +2831,6 @@ struct UpgradeView {
     from: String,
     /// The release it is replacing itself with, when there is one.
     to: Option<String>,
-    /// A run was parked first, and this is its id.
-    parked: Option<String>,
     /// What the operator should expect to happen next.
     detail: String,
 }
@@ -3108,23 +2905,12 @@ impl UpgradeRequestFailure {
 /// `POST /api/upgrade` - replace this binary with the newest release and come
 /// back on it.
 ///
-/// The one thing the deck could not do for itself. Every fix landed today
-/// either waited for a competition to end or went in with the deck stopped,
-/// because `cargo install` cannot overwrite a running executable on Windows.
-/// `kaishin` can: `self_replace` **renames** the running image aside and puts
-/// the new one in its place, so the swap itself needs no downtime. Only the
-/// restart does, and the order is the whole design:
+/// Replace the installed binary, restart the detached scheduler, release the
+/// web listener, then start the successor. Active task and conversation
+/// workers retain their immutable executable and continue without parking.
 ///
-/// 1. **Park.** A run in flight stops at its next node boundary and stays
-///    resumable, so this costs at most the node in progress rather than the
-///    competition. Without it the honest choices were waiting an hour or
-///    discarding paid agent work.
-/// 2. **Replace.** The new binary goes into place while this one still runs.
-/// 3. **Hand over.** [`serve`] drops the listener, *then* spawns the
-///    successor - see [`spawn_successor`] for what happens in the other
-///    order.
-/// 4. **Resume.** The next loop carries the parked run on rather than
-///    competing again; see `daemon::attempt`.
+/// A legacy embedded scheduler is the only incompatible owner: its work
+/// must finish or park before the first migration replaces its process.
 ///
 /// Answers **202**: the reply has to reach the phone while this process can
 /// still send one, and the phone learns the deck is back by reconnecting.
@@ -3132,9 +2918,9 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> Response {
     let reading = daemon::read_status(&ui.home);
     if let Some(other) = Foreign::of(reading.as_ref()) {
         return ApiError::conflict(format!(
-            "the loop belongs to {}, so replacing this binary would leave \
-             that process running an old one against the same queue. Upgrade \
-             where it was started.",
+            "{} is a legacy scheduler without detached restart support. \
+             Finish or explicitly park its work in the existing UI before \
+             this first migration; independent schedulers do not need this.",
             other.who()
         ))
         .into_response();
@@ -3208,7 +2994,6 @@ async fn upgrade_prepare(ui: &Arc<Ui>) -> ApiResult<(StatusCode, Json<UpgradeVie
             Json(UpgradeView {
                 from: env!("CARGO_PKG_VERSION").to_owned(),
                 to: None,
-                parked: None,
                 detail: format!(
                     "Automatic updates are disabled by {}. Nothing was parked \
                      and nothing restarted.",
@@ -3218,10 +3003,8 @@ async fn upgrade_prepare(ui: &Arc<Ui>) -> ApiResult<(StatusCode, Json<UpgradeVie
         ));
     }
 
-    // Asked before anything is disturbed. Restarting when there is nothing
-    // to install is not a harmless no-op: it parks the run in flight and
-    // drops every connection to pay for an upgrade that did not happen. A
-    // probe against a deck already on the newest build did exactly that.
+    // Check before disturbing listeners or scheduling: no available update
+    // means there is no reason to restart anything.
     let (cfg, _) = Config::discover(&ui.repo, None).unwrap_or_default();
     let from = env!("CARGO_PKG_VERSION").to_owned();
     let latest = match crate::updater::Checker::new(&cfg.update) {
@@ -3243,7 +3026,6 @@ fn upgrade_checked(
             Json(UpgradeView {
                 from,
                 to: None,
-                parked: None,
                 detail: "Already on the newest release. Nothing was parked \
                          and nothing restarted."
                     .to_owned(),
@@ -3251,52 +3033,26 @@ fn upgrade_checked(
         ));
     };
 
-    // Parked before anything is replaced: a successor that came up while a
-    // run was mid-node would find a run nobody is driving.
-    let parked = ui.park_for_upgrade(&from, Some(latest.tag_name.as_str()))?;
-    let detail = match &parked {
-        // Honest about the wait. A park takes effect at the *next* node
-        // boundary, so a run mid-implement finishes that wave first - up to
-        // `timeout_implement`, an hour by default. Saying "restarting now"
-        // would make the deck look wedged for the rest of it.
-        Some(run) => format!(
-            "Run {} is parking at its next step, which can take as long as \
-             the step it is on - up to an hour for an implement wave. The \
-             deck replaces itself once it parks, comes back, and the loop \
-             carries that run on from where it stopped. Nothing is lost if \
-             you close this.",
-            crate::run::short_of(run)
-        ),
-        None => "The deck replaces itself and comes back. Nothing was in \
-                 flight to park."
-            .to_owned(),
-    };
+    let detail = "Downloading the release, then restarting web and scheduler. Active task and chat workers keep running on their started executable; nothing is parked.".to_owned();
 
     // Recorded before the spawn, not inside it: the phone's next `/api/health`
     // poll must see a `Downloading` stage immediately, not whenever the
     // spawned task happens to get scheduled.
-    let mut progress = updater::Progress::new(from.clone(), latest.tag_name.clone());
-    progress.parked_run = parked.clone();
-    // A failed write is logged, not returned: the loop is already parked
-    // above, and bailing out here would leave it parked with no upgrade
-    // spawned to hand over or resume it.
+    let progress = updater::Progress::new(from.clone(), latest.tag_name.clone());
     updater::write_progress_logged(&ui.home, &progress);
 
     let home = ui.home.clone();
-    let looping = ui.looping();
     ui.upgrade_spawned
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let spawned = Arc::clone(&ui.upgrade_spawned);
     tokio::spawn(async move {
         if let Err(e) = upgrade_and_restart(home.clone()).await {
             tracing::error!("the upgrade did not complete: {e:#}");
-            lock_or_recover(&looping).resume_after_handover = false;
             // A failure of this attempt says nothing about a handover an
             // earlier request already has in flight; checked and written
             // under the progress lock.
             let _ = updater::fail_progress(&home, &format!("{e:#}"));
-            // Released last: until the cleanup above is done, a retry must
-            // not be able to park and record state this would then undo.
+            // Release only after failure bookkeeping, before accepting a retry.
             spawned.store(false, std::sync::atomic::Ordering::SeqCst);
         }
     });
@@ -3306,7 +3062,6 @@ fn upgrade_checked(
         Json(UpgradeView {
             from,
             to: Some(latest.tag_name),
-            parked,
             detail,
         }),
     ))
@@ -4343,32 +4098,34 @@ async fn run_resume(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
 ) -> ApiResult<(StatusCode, Json<RunSummary>)> {
-    let (id, state) = {
-        let ui = Arc::clone(&ui);
-        blocking(move || {
-            let id = resolve_run(&ui.runs, &id)?;
-            let state = read_run(&ui.runs, &id)?;
-            Ok((id, state))
-        })
-        .await?
-    };
-    crate::resume::validate_unqueued(&ui.home, &id)
-        .map_err(|e| ApiError::conflict(e.to_string()))?;
-    let _resume = ui.begin_resume(&id)?;
+    let admission = ui.begin_admission()?;
+    admitted(admission, async move {
+        let (id, state) = {
+            let ui = Arc::clone(&ui);
+            blocking(move || {
+                let id = resolve_run(&ui.runs, &id)?;
+                let state = read_run(&ui.runs, &id)?;
+                Ok((id, state))
+            })
+            .await?
+        };
+        crate::resume::validate_unqueued(&ui.home, &id)
+            .map_err(|e| ApiError::conflict(e.to_string()))?;
+        let _resume = ui.begin_resume(&id)?;
 
-    // The same shape the list route returns, so the phone updates the card it
-    // already has rather than learning a second schema for one button.
-    let queued = RunSummary::of(
-        &state,
-        !ui.questions.open_for(&id).is_empty(),
-        state.liveness(false),
-    );
-    let run = id.clone();
-    tokio::spawn(async move {
-        let _resume = _resume;
-        crate::resume::execute(&run).await;
-    });
-    Ok((StatusCode::ACCEPTED, Json(queued)))
+        crate::resume::start(&ui.home, id.clone())
+            .await
+            .map_err(ApiError::from)?;
+        // The same shape the list route returns, so the phone updates the card it
+        // already has rather than learning a second schema for one button.
+        let queued = RunSummary::of(
+            &state,
+            !ui.questions.open_for(&id).is_empty(),
+            state.liveness(daemon::is_working_on(&ui.home, &id, Timestamp::now())),
+        );
+        Ok((StatusCode::ACCEPTED, Json(queued)))
+    })
+    .await
 }
 
 async fn run_report(
@@ -7664,6 +7421,21 @@ async fn question_say(
     .await
 }
 
+/// A disconnected request or a replacing listener cannot interrupt the short
+/// transaction between persistence and detached worker publication.
+async fn admitted<T: Send + 'static>(
+    admission: AdmissionGuard,
+    work: impl Future<Output = ApiResult<T>> + Send + 'static,
+) -> ApiResult<T> {
+    tokio::spawn(async move {
+        let result = work.await;
+        drop(admission);
+        result
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("work admission failed: {error}")))?
+}
+
 /// `POST /api/questions/{id}/consult` - hand the question to the chat its task
 /// came from. The question stays open: the chat agent answers it with `magi
 /// answer`, or puts the decision to the owner in the conversation.
@@ -7676,66 +7448,92 @@ async fn question_consult(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
 ) -> ApiResult<(StatusCode, Json<QuestionView>)> {
-    let (view, reclaimed) = blocking({
-        let ui = Arc::clone(&ui);
-        move || {
-            let id = resolve_question(&ui.questions, &id)?;
-            let q = ui
-                .questions
-                .get(&id)
-                .map_err(|e| ApiError::from(e).with_status(StatusCode::INTERNAL_SERVER_ERROR))?;
-            if !q.status.open() {
-                return Err(ApiError::conflict(format!(
-                    "question {} is already {}",
-                    q.short(),
-                    q.status.as_str()
-                )));
-            }
-            let (tasks, talks, watches) = question_origin_inputs(&ui, std::slice::from_ref(&q))?;
-            let Some(talk) = crate::consult::origin_talk(&tasks, &talks, &q) else {
-                return Err(ApiError::conflict(format!(
-                    "question {} has no chat to ask",
-                    q.short()
-                )));
-            };
-            // Read the config before `begin` saves anything: a failure here
-            // must leave no consult record or draft behind, or a retry would
-            // see `fresh == false` and never start the turn.
-            let cfg = if q.consult.is_none() {
-                Some(Config::discover(&talk.repo, None)?.0)
-            } else {
-                None
-            };
-            let fresh = crate::consult::begin(&ui.questions, &ui.talks, &q, &talk)?;
-            let claim = if fresh {
-                match ui.begin_queued_talk_turn(&talk.id)? {
-                    Some(turn_guard) => {
-                        let talk = ui.talks.get(&talk.id)?;
-                        let cfg = match cfg {
-                            Some(cfg) => cfg,
-                            None => Config::discover(&talk.repo, None)?.0,
-                        };
-                        Some((talk, cfg, turn_guard))
-                    }
-                    None => None,
+    let admission = ui.begin_admission()?;
+    admitted(admission, async move {
+        let (q, tasks, talks, watches, talk, cfg) = blocking({
+            let ui = Arc::clone(&ui);
+            move || {
+                let id = resolve_question(&ui.questions, &id)?;
+                let q = ui.questions.get(&id).map_err(|e| {
+                    ApiError::from(e).with_status(StatusCode::INTERNAL_SERVER_ERROR)
+                })?;
+                if !q.status.open() {
+                    return Err(ApiError::conflict(format!(
+                        "question {} is already {}",
+                        q.short(),
+                        q.status.as_str()
+                    )));
                 }
-            } else {
-                None
-            };
-            let q = ui.questions.get(&q.id)?;
-            let cfg = deputy_config(&ui.repo);
-            let view = QuestionView::of(q, &ui.questions, cfg.as_ref())
-                .with_origin(&tasks, &talks, &watches);
-            Ok((view, claim))
+                let (tasks, talks, watches) =
+                    question_origin_inputs(&ui, std::slice::from_ref(&q))?;
+                let Some(talk) = crate::consult::origin_talk(&tasks, &talks, &q) else {
+                    return Err(ApiError::conflict(format!(
+                        "question {} has no chat to ask",
+                        q.short()
+                    )));
+                };
+                // Read the config before `begin` saves anything: a failure here
+                // must leave no consult record or draft behind, or a retry would
+                // see `fresh == false` and never start the turn.
+                let cfg = if q.consult.is_none() {
+                    Some(Config::discover(&talk.repo, None)?.0)
+                } else {
+                    None
+                };
+                Ok((q, tasks, talks, watches, talk, cfg))
+            }
+        })
+        .await?;
+        let _publication = crate::consult::publication_guard(&ui.talks, &talk.id)
+            .await
+            .map_err(ApiError::from)?;
+        let (view, reclaimed, submitted) = blocking({
+            let ui = Arc::clone(&ui);
+            move || {
+                let fresh = crate::consult::begin(&ui.questions, &ui.talks, &q, &talk)?;
+                let claim = if fresh {
+                    match ui.begin_queued_talk_turn(&talk.id)? {
+                        Some(turn_guard) => {
+                            let talk = ui.talks.get(&talk.id)?;
+                            let cfg = match cfg {
+                                Some(cfg) => cfg,
+                                None => Config::discover(&talk.repo, None)?.0,
+                            };
+                            Some((talk, cfg, turn_guard))
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                let q = ui.questions.get(&q.id)?;
+                let cfg = deputy_config(&ui.repo);
+                let view = QuestionView::of(q, &ui.questions, cfg.as_ref())
+                    .with_origin(&tasks, &talks, &watches);
+                Ok((view, claim, fresh.then_some(talk.id)))
+            }
+        })
+        .await?;
+        #[cfg(not(test))]
+        {
+            if let Some(id) = submitted {
+                crate::consult::spawn_turn(&ui.talks, &id)
+                    .await
+                    .map_err(ApiError::from)?;
+            }
+            drop(reclaimed);
         }
+        #[cfg(test)]
+        let _ = submitted;
+        #[cfg(test)]
+        if let Some((talk, cfg, turn_guard)) = reclaimed {
+            let talks = ui.talks.clone();
+            let id = talk.id.clone();
+            tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
+        }
+        Ok((StatusCode::ACCEPTED, Json(view)))
     })
-    .await?;
-    if let Some((talk, cfg, turn_guard)) = reclaimed {
-        let talks = ui.talks.clone();
-        let id = talk.id.clone();
-        tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
-    }
-    Ok((StatusCode::ACCEPTED, Json(view)))
+    .await
 }
 
 /// Expand an id or short id to exactly one question id.
@@ -8563,6 +8361,8 @@ async fn talk_say(
     Path(id): Path<String>,
     body: std::result::Result<Json<NewTalkTurn>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<TalkView>)> {
+    let admission = ui.begin_admission()?;
+    admitted(admission, async move {
     let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
     if body.text.trim().is_empty() && body.attachments.is_empty() {
         return Err(ApiError::bad_request("say something"));
@@ -8612,6 +8412,8 @@ async fn talk_say(
         })
         .await?
     };
+    let _publication = crate::consult::publication_guard(&ui.talks, &id)
+        .await.map_err(ApiError::from)?;
 
     // Pending recovery and a new immediate turn are decided under the same
     // claim lock. Without that one critical section, a second `/say` can see
@@ -8722,6 +8524,22 @@ async fn talk_say(
                         }
                     })
                     .await;
+                    #[cfg(not(test))]
+                    {
+                        match written {
+                            Ok((view, reclaimed)) => {
+                                let launched = crate::consult::spawn_turn(&ui.talks, &id).await;
+                                drop(reclaimed);
+                                match launched {
+                                    Ok(_) => { let _ = tx.send(Ok(view)); }
+                                    Err(error) => { let _ = tx.send(Err(ApiError::from(error))); }
+                                }
+                            }
+                            Err(error) => { let _ = tx.send(Err(error)); }
+                        }
+                    }
+                    #[cfg(test)]
+                    {
                     let (view, reclaimed) = match written {
                         Ok(pair) => pair,
                         Err(e) => {
@@ -8739,6 +8557,7 @@ async fn talk_say(
                     if let Some((talk, cfg, turn_guard)) = reclaimed {
                         let talks = ui.talks.clone();
                         drain_loop(talk, talks, cfg, id, turn_guard).await;
+                    }
                     }
                 }
             });
@@ -8777,6 +8596,7 @@ async fn talk_say(
     // travels back over a `oneshot`, sent the moment `record` succeeds.
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn({
+        #[cfg(test)]
         let ui = Arc::clone(&ui);
         let talks = talks.clone();
         let id = id.clone();
@@ -8814,7 +8634,7 @@ async fn talk_say(
                 }
             })
             .await;
-            let (text, mut talk) = match recorded {
+            let (text, talk) = match recorded {
                 Ok(pair) => pair,
                 Err(e) => {
                     // Nobody is listening if the handler's own future was
@@ -8824,7 +8644,25 @@ async fn talk_say(
                     return;
                 }
             };
+            #[cfg(not(test))]
+            {
+                let _ = (&cfg, &text);
+                // The reservation becomes durable while this process still
+                // holds the talk lease. The child waits for that lease; the
+                // new UI sees its startup reservation immediately.
+                let result = crate::consult::spawn_recorded_turn(
+                    &talks, &id, talk.turns.len() - 1,
+                ).await;
+                drop(turn_guard);
+                match result {
+                    Ok(_) => { let _ = tx.send(Ok((talk, true))); }
+                    Err(error) => { let _ = tx.send(Err(ApiError::from(error))); }
+                }
+            }
+            #[cfg(test)]
+            {
             let queued = talk.clone();
+            let mut talk = talk;
             let thinking = ui.is_thinking(&id);
             // If this fails, the caller is gone; the turn still runs below
             // exactly as it would have for a caller that stayed connected.
@@ -8839,6 +8677,7 @@ async fn talk_say(
             // Anything `talk::queue` added while the turn above was running
             // is still owed an answer - see `drain_loop`.
             drain_loop(talk, talks, cfg, id, turn_guard).await;
+            }
         }
     });
 
@@ -8851,6 +8690,7 @@ async fn talk_say(
         StatusCode::ACCEPTED,
         Json(TalkView::new(queued, thinking, &ui)),
     ))
+    }).await
 }
 
 /// `POST /api/talks/{id}/pending/resume` promotes a persisted draft without
@@ -8860,57 +8700,68 @@ async fn talk_pending_resume(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
 ) -> ApiResult<(StatusCode, Json<TalkView>)> {
-    let id = {
-        let ui = Arc::clone(&ui);
-        let asked = id.clone();
-        blocking(move || resolve_talk(&ui.talks, &asked)).await?
-    };
-    let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
-        return Err(ApiError::conflict(
-            "a talk turn is already running; the queued draft will be handled by it",
-        ));
-    };
-    let (talk, cfg) = {
-        let ui = Arc::clone(&ui);
-        let id = id.clone();
-        blocking(move || {
-            let talk = ui.talks.get(&id)?;
-            if !talk.status.open() {
-                return Err(ApiError::conflict(format!(
-                    "talk {} is {} and takes no more turns",
-                    talk.short(),
-                    talk.status.as_str()
-                )));
-            }
-            if talk.pending.is_empty() && talk.pending_attachments.is_empty() {
-                return Err(ApiError::conflict("there is no queued draft to resume"));
-            }
-            let (cfg, _) = Config::discover(&talk.repo, None)?;
-            Ok((talk, cfg))
-        })
-        .await?
-    };
-    let view = TalkView::new(talk.clone(), true, &ui);
-    let talks = ui.talks.clone();
-    tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
-    Ok((StatusCode::ACCEPTED, Json(view)))
+    let admission = ui.begin_admission()?;
+    admitted(admission, async move {
+        let id = {
+            let ui = Arc::clone(&ui);
+            let asked = id.clone();
+            blocking(move || resolve_talk(&ui.talks, &asked)).await?
+        };
+        let _publication = crate::consult::publication_guard(&ui.talks, &id)
+            .await
+            .map_err(ApiError::from)?;
+        let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
+            return Err(ApiError::conflict(
+                "a talk turn is already running; the queued draft will be handled by it",
+            ));
+        };
+        let (talk, cfg) = {
+            let ui = Arc::clone(&ui);
+            let id = id.clone();
+            blocking(move || {
+                let talk = ui.talks.get(&id)?;
+                if !talk.status.open() {
+                    return Err(ApiError::conflict(format!(
+                        "talk {} is {} and takes no more turns",
+                        talk.short(),
+                        talk.status.as_str()
+                    )));
+                }
+                if talk.pending.is_empty() && talk.pending_attachments.is_empty() {
+                    return Err(ApiError::conflict("there is no queued draft to resume"));
+                }
+                let (cfg, _) = Config::discover(&talk.repo, None)?;
+                Ok((talk, cfg))
+            })
+            .await?
+        };
+        let view = TalkView::new(talk.clone(), true, &ui);
+        let talks = ui.talks.clone();
+        #[cfg(not(test))]
+        detach_talk_turn(talk, talks, cfg, id, turn_guard).await?;
+        #[cfg(test)]
+        tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
+        Ok((StatusCode::ACCEPTED, Json(view)))
+    })
+    .await
 }
 
-/// Drain [`talk::Talk::pending`] one turn at a time until nothing is left,
-/// releasing `turn` only once a check finds it truly empty. Shared by both
-/// callers that can end up owning a talk's turn slot with something already
-/// queued for it: `talk_say`'s normal path, after its own `talk::respond`
-/// call, and `talk_say`'s busy path, when it reclaims a slot the previous
-/// holder just gave up - see the comment at that call site.
-///
-/// The release is folded into the final generation check under `turn`'s own
-/// lock - the same lock [`Ui::begin_talk_turn`] takes to decide "busy or
-/// free". Before its blocking `talk::drain`, this loop observes the queued
-/// generation. A `say` that sees the turn busy writes its draft, then advances
-/// that generation. Thus, if it lands while the drain is in flight, the final
-/// check observes the advance and drains again; otherwise it releases the
-/// claim while holding the same lock. This keeps the release/arrival handoff
-/// atomic without holding the global claim mutex across filesystem I/O.
+/// Hand off an admitted draft while retaining the talk lease until its
+/// detached startup reservation is durable.
+#[cfg(not(test))]
+async fn detach_talk_turn(
+    _talk: Talk,
+    talks: Talks,
+    _cfg: Config,
+    id: String,
+    turn: TalkTurnGuard,
+) -> ApiResult<()> {
+    let launched = crate::consult::spawn_turn(&talks, &id).await;
+    drop(turn);
+    launched.map(|_| ()).map_err(ApiError::from)
+}
+
+#[cfg(test)]
 async fn drain_loop(talk: Talk, talks: Talks, cfg: Config, id: String, turn: TalkTurnGuard) {
     drain_loop_started(talk, talks, cfg, id, turn, None).await;
 }
@@ -8947,6 +8798,36 @@ async fn settle_settings_turn(
     settled.await.unwrap_or(false)
 }
 
+#[cfg(not(test))]
+async fn drain_loop_started(
+    talk: Talk,
+    talks: Talks,
+    _cfg: Config,
+    id: String,
+    turn: TalkTurnGuard,
+    started: Option<tokio::sync::oneshot::Sender<bool>>,
+) {
+    let pending = !talk.pending.is_empty() || !talk.pending_attachments.is_empty();
+    let running = if pending {
+        match crate::consult::spawn_turn(&talks, &id).await {
+            Ok(_) => true,
+            Err(error) => {
+                tracing::warn!("talk {id}: could not launch draft worker: {error:#}");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    drop(turn);
+    if let Some(started) = started {
+        let _ = started.send(running);
+    }
+}
+
+// Existing in-process conversation tests exercise transcript/arrival ordering;
+// real process-lifetime behavior is covered by the CLI integration tests.
+#[cfg(test)]
 async fn drain_loop_started(
     mut talk: Talk,
     talks: Talks,
@@ -8975,17 +8856,6 @@ async fn drain_loop_started(
             }
             break;
         }
-        {
-            // A parking upgrade starts no further turn: whatever is queued
-            // stays a durable draft for the successor.
-            let mut live = live_set.lock().unwrap_or_else(PoisonError::into_inner);
-            if live.parking {
-                if let Some(turn) = turn.take() {
-                    turn.release(&mut live);
-                }
-                break;
-            }
-        }
         // `talk::drain` takes the store lock and can write/rename the talk
         // file. Keep the turn mutex out of that synchronous work: it protects
         // every talk's in-memory claim, not this talk's disk operation.
@@ -8998,19 +8868,8 @@ async fn drain_loop_started(
             .unwrap_or(0);
         let drained = blocking({
             let talks = talks.clone();
-            let live_set = Arc::clone(&live_set);
             move || {
-                // Promoting a draft is what starts a turn, so it is decided
-                // under the same lock a parking upgrade takes: either the
-                // promotion lands first (and its turn is waited for) or the
-                // draft stays queued.
-                let live = live_set.lock().unwrap_or_else(PoisonError::into_inner);
-                let result = if live.parking {
-                    Ok(None)
-                } else {
-                    talk::drain(&mut talk, &talks)
-                };
-                drop(live);
+                let result = talk::drain(&mut talk, &talks);
                 Ok((talk, result))
             }
         })
@@ -9110,48 +8969,61 @@ async fn talk_pending_edit(
     Path(id): Path<String>,
     body: std::result::Result<Json<EditTalkPending>, JsonRejection>,
 ) -> ApiResult<Json<TalkView>> {
-    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
-    let (view, reclaimed) = blocking({
-        let ui = Arc::clone(&ui);
-        move || {
-            let id = resolve_talk(&ui.talks, &id)?;
-            let mut talk = ui.talks.get(&id)?;
-            if !talk.status.open() {
-                return Err(ApiError::conflict(format!(
-                    "talk {} is {} and takes no more turns",
-                    talk.short(),
-                    talk.status.as_str()
-                )));
-            }
-            if !talk::edit_pending_message(
-                &mut talk,
-                &ui.talks,
-                &body.text,
-                &body.expected_text,
-                &body.expected_attachments,
-                body.message,
-            )? {
-                return Err(ApiError::conflict(
-                    "queued message changed; reload it before editing",
-                ));
-            }
-            let claim = match ui.begin_queued_talk_turn(&id)? {
-                Some(turn_guard) => {
-                    let (cfg, _) = Config::discover(&talk.repo, None)?;
-                    Some((talk.clone(), cfg, id.clone(), turn_guard))
+    let admission = ui.begin_admission()?;
+    admitted(admission, async move {
+        let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+        let id = {
+            let ui = Arc::clone(&ui);
+            blocking(move || resolve_talk(&ui.talks, &id)).await?
+        };
+        let _publication = crate::consult::publication_guard(&ui.talks, &id)
+            .await
+            .map_err(ApiError::from)?;
+        let (view, reclaimed) = blocking({
+            let ui = Arc::clone(&ui);
+            move || {
+                let mut talk = ui.talks.get(&id)?;
+                if !talk.status.open() {
+                    return Err(ApiError::conflict(format!(
+                        "talk {} is {} and takes no more turns",
+                        talk.short(),
+                        talk.status.as_str()
+                    )));
                 }
-                None => None,
-            };
-            let thinking = ui.is_thinking(&id);
-            Ok((TalkView::new(talk, thinking, &ui), claim))
+                if !talk::edit_pending_message(
+                    &mut talk,
+                    &ui.talks,
+                    &body.text,
+                    &body.expected_text,
+                    &body.expected_attachments,
+                    body.message,
+                )? {
+                    return Err(ApiError::conflict(
+                        "queued message changed; reload it before editing",
+                    ));
+                }
+                let claim = match ui.begin_queued_talk_turn(&id)? {
+                    Some(turn_guard) => {
+                        let (cfg, _) = Config::discover(&talk.repo, None)?;
+                        Some((talk.clone(), cfg, id.clone(), turn_guard))
+                    }
+                    None => None,
+                };
+                let thinking = ui.is_thinking(&id);
+                Ok((TalkView::new(talk, thinking, &ui), claim))
+            }
+        })
+        .await?;
+        if let Some((talk, cfg, id, turn_guard)) = reclaimed {
+            let talks = ui.talks.clone();
+            #[cfg(not(test))]
+            detach_talk_turn(talk, talks, cfg, id, turn_guard).await?;
+            #[cfg(test)]
+            tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
         }
+        Ok(Json(view))
     })
-    .await?;
-    if let Some((talk, cfg, id, turn_guard)) = reclaimed {
-        let talks = ui.talks.clone();
-        tokio::spawn(drain_loop(talk, talks, cfg, id, turn_guard));
-    }
-    Ok(Json(view))
+    .await
 }
 
 /// The 409 for a talk that takes no more turns.
@@ -9181,72 +9053,79 @@ async fn talk_agent(
     Path(id): Path<String>,
     Json(body): Json<TalkAgent>,
 ) -> ApiResult<Json<TalkView>> {
-    let id = {
-        let ui = Arc::clone(&ui);
-        blocking(move || resolve_talk(&ui.talks, &id)).await?
-    };
-    let repo = {
-        let ui = Arc::clone(&ui);
-        let id = id.clone();
-        blocking(move || Ok(ui.talks.get(&id)?.repo)).await?
-    };
-    let cfg = config_for(&repo).await?;
-    // Refuse before taking the claim; see `talk_implementers`.
-    {
-        let ui = Arc::clone(&ui);
-        let id = id.clone();
-        let cfg = cfg.clone();
-        let wanted = body.agent.clone();
-        blocking(move || {
-            agent::pick(&cfg.agents, Some(&wanted), &agent::installed)
-                .map_err(ApiError::bad_request_from)?;
-            refuse_if_closed(&ui.talks.get(&id)?)
-        })
-        .await?;
-    }
-    let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
-        return Err(ApiError::conflict(
-            "a talk turn is running; change the agent once it has answered",
-        ));
-    };
-    let switched = {
-        let ui = Arc::clone(&ui);
-        let id = id.clone();
-        let cfg = cfg.clone();
-        blocking(move || {
-            let spec = agent::pick(&cfg.agents, Some(&body.agent), &agent::installed)
-                .map_err(ApiError::bad_request_from)?;
-            let mut talk = ui.talks.get(&id)?;
-            if !talk.status.open() {
-                return Err(ApiError::conflict(format!(
-                    "talk {} is {} and takes no more turns",
-                    talk.short(),
-                    talk.status.as_str()
-                )));
-            }
-            talk::switch_agent(&mut talk, &ui.talks, &spec)?;
-            Ok(talk)
-        })
-        .await
-    };
-    // A `/say` that landed while this held the claim saw the talk busy and
-    // left a durable draft, trusting the claim's owner to drain it. So the
-    // claim is settled whatever the outcome. Release an empty draft's claim
-    // before replying; queued drafts continue independently of the handler.
-    let observed = ui.queued_generation(&id);
-    let fresh = {
-        let ui = Arc::clone(&ui);
-        let id = id.clone();
-        blocking(move || Ok(ui.talks.get(&id)?)).await
-    };
-    let draining = match fresh {
-        Ok(talk) => {
-            settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard, observed).await
+    let admission = ui.begin_admission()?;
+    admitted(admission, async move {
+        let id = {
+            let ui = Arc::clone(&ui);
+            blocking(move || resolve_talk(&ui.talks, &id)).await?
+        };
+        let _publication = crate::consult::publication_guard(&ui.talks, &id)
+            .await
+            .map_err(ApiError::from)?;
+        let repo = {
+            let ui = Arc::clone(&ui);
+            let id = id.clone();
+            blocking(move || Ok(ui.talks.get(&id)?.repo)).await?
+        };
+        let cfg = config_for(&repo).await?;
+        // Refuse before taking the claim; see `talk_implementers`.
+        {
+            let ui = Arc::clone(&ui);
+            let id = id.clone();
+            let cfg = cfg.clone();
+            let wanted = body.agent.clone();
+            blocking(move || {
+                agent::pick(&cfg.agents, Some(&wanted), &agent::installed)
+                    .map_err(ApiError::bad_request_from)?;
+                refuse_if_closed(&ui.talks.get(&id)?)
+            })
+            .await?;
         }
-        Err(_) => false,
-    };
-    let talk = switched?;
-    Ok(Json(TalkView::new(talk, draining, &ui)))
+        let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
+            return Err(ApiError::conflict(
+                "a talk turn is running; change the agent once it has answered",
+            ));
+        };
+        let switched = {
+            let ui = Arc::clone(&ui);
+            let id = id.clone();
+            let cfg = cfg.clone();
+            blocking(move || {
+                let spec = agent::pick(&cfg.agents, Some(&body.agent), &agent::installed)
+                    .map_err(ApiError::bad_request_from)?;
+                let mut talk = ui.talks.get(&id)?;
+                if !talk.status.open() {
+                    return Err(ApiError::conflict(format!(
+                        "talk {} is {} and takes no more turns",
+                        talk.short(),
+                        talk.status.as_str()
+                    )));
+                }
+                talk::switch_agent(&mut talk, &ui.talks, &spec)?;
+                Ok(talk)
+            })
+            .await
+        };
+        // A `/say` that landed while this held the claim saw the talk busy and
+        // left a durable draft, trusting the claim's owner to drain it. So the
+        // claim is settled whatever the outcome. Release an empty draft's claim
+        // before replying; queued drafts continue independently of the handler.
+        let observed = ui.queued_generation(&id);
+        let fresh = {
+            let ui = Arc::clone(&ui);
+            let id = id.clone();
+            blocking(move || Ok(ui.talks.get(&id)?)).await
+        };
+        let draining = match fresh {
+            Ok(talk) => {
+                settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard, observed).await
+            }
+            Err(_) => false,
+        };
+        let talk = switched?;
+        Ok(Json(TalkView::new(talk, draining, &ui)))
+    })
+    .await
 }
 
 /// The body of `POST /api/talks/{id}/persona`.
@@ -9263,74 +9142,81 @@ async fn talk_persona(
     Path(id): Path<String>,
     Json(body): Json<TalkPersona>,
 ) -> ApiResult<Json<TalkView>> {
-    let id = {
-        let ui = Arc::clone(&ui);
-        blocking(move || resolve_talk(&ui.talks, &id)).await?
-    };
-    let repo = {
-        let ui = Arc::clone(&ui);
-        let id = id.clone();
-        blocking(move || Ok(ui.talks.get(&id)?.repo)).await?
-    };
-    let cfg = config_for(&repo).await?;
-    // Refuse before taking the claim; see `talk_implementers`.
-    {
-        let ui = Arc::clone(&ui);
-        let id = id.clone();
-        let cfg = cfg.clone();
-        let wanted = body.persona.clone();
-        blocking(move || {
-            if persona::find(&cfg.talk.personas, &wanted).is_none() {
-                return Err(ApiError::bad_request(format!("unknown persona `{wanted}`")));
-            }
-            refuse_if_closed(&ui.talks.get(&id)?)
-        })
-        .await?;
-    }
-    let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
-        return Err(ApiError::conflict(
-            "a talk turn is running; change the persona once it has answered",
-        ));
-    };
-    let switched = {
-        let ui = Arc::clone(&ui);
-        let id = id.clone();
-        let cfg = cfg.clone();
-        blocking(move || {
-            let Some(chosen) = persona::find(&cfg.talk.personas, &body.persona) else {
-                return Err(ApiError::bad_request(format!(
-                    "unknown persona `{}`",
-                    body.persona
-                )));
-            };
-            let mut talk = ui.talks.get(&id)?;
-            if !talk.status.open() {
-                return Err(ApiError::conflict(format!(
-                    "talk {} is {} and takes no more turns",
-                    talk.short(),
-                    talk.status.as_str()
-                )));
-            }
-            talk::switch_persona(&mut talk, &ui.talks, &chosen.id)?;
-            Ok(talk)
-        })
-        .await
-    };
-    // As in `talk_agent`: settle the claim before replying, even on refusal.
-    let observed = ui.queued_generation(&id);
-    let fresh = {
-        let ui = Arc::clone(&ui);
-        let id = id.clone();
-        blocking(move || Ok(ui.talks.get(&id)?)).await
-    };
-    let draining = match fresh {
-        Ok(talk) => {
-            settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard, observed).await
+    let admission = ui.begin_admission()?;
+    admitted(admission, async move {
+        let id = {
+            let ui = Arc::clone(&ui);
+            blocking(move || resolve_talk(&ui.talks, &id)).await?
+        };
+        let _publication = crate::consult::publication_guard(&ui.talks, &id)
+            .await
+            .map_err(ApiError::from)?;
+        let repo = {
+            let ui = Arc::clone(&ui);
+            let id = id.clone();
+            blocking(move || Ok(ui.talks.get(&id)?.repo)).await?
+        };
+        let cfg = config_for(&repo).await?;
+        // Refuse before taking the claim; see `talk_implementers`.
+        {
+            let ui = Arc::clone(&ui);
+            let id = id.clone();
+            let cfg = cfg.clone();
+            let wanted = body.persona.clone();
+            blocking(move || {
+                if persona::find(&cfg.talk.personas, &wanted).is_none() {
+                    return Err(ApiError::bad_request(format!("unknown persona `{wanted}`")));
+                }
+                refuse_if_closed(&ui.talks.get(&id)?)
+            })
+            .await?;
         }
-        Err(_) => false,
-    };
-    let talk = switched?;
-    Ok(Json(TalkView::new(talk, draining, &ui)))
+        let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
+            return Err(ApiError::conflict(
+                "a talk turn is running; change the persona once it has answered",
+            ));
+        };
+        let switched = {
+            let ui = Arc::clone(&ui);
+            let id = id.clone();
+            let cfg = cfg.clone();
+            blocking(move || {
+                let Some(chosen) = persona::find(&cfg.talk.personas, &body.persona) else {
+                    return Err(ApiError::bad_request(format!(
+                        "unknown persona `{}`",
+                        body.persona
+                    )));
+                };
+                let mut talk = ui.talks.get(&id)?;
+                if !talk.status.open() {
+                    return Err(ApiError::conflict(format!(
+                        "talk {} is {} and takes no more turns",
+                        talk.short(),
+                        talk.status.as_str()
+                    )));
+                }
+                talk::switch_persona(&mut talk, &ui.talks, &chosen.id)?;
+                Ok(talk)
+            })
+            .await
+        };
+        // As in `talk_agent`: settle the claim before replying, even on refusal.
+        let observed = ui.queued_generation(&id);
+        let fresh = {
+            let ui = Arc::clone(&ui);
+            let id = id.clone();
+            blocking(move || Ok(ui.talks.get(&id)?)).await
+        };
+        let draining = match fresh {
+            Ok(talk) => {
+                settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard, observed).await
+            }
+            Err(_) => false,
+        };
+        let talk = switched?;
+        Ok(Json(TalkView::new(talk, draining, &ui)))
+    })
+    .await
 }
 
 /// The body of `POST /api/talks/{id}/implementers`.
@@ -9347,71 +9233,78 @@ async fn talk_implementers(
     Path(id): Path<String>,
     Json(body): Json<TalkImplementers>,
 ) -> ApiResult<Json<TalkView>> {
-    let id = {
-        let ui = Arc::clone(&ui);
-        blocking(move || resolve_talk(&ui.talks, &id)).await?
-    };
-    let repo = {
-        let ui = Arc::clone(&ui);
-        let id = id.clone();
-        blocking(move || Ok(ui.talks.get(&id)?.repo)).await?
-    };
-    let cfg = config_for(&repo).await?;
-    // Refuse a request that cannot succeed before taking the claim: a claim
-    // taken for it is handed to `drain_loop`, which holds the talk busy for a
-    // moment, so a refusal would make the next request see "busy" instead of
-    // its own answer. The checks after the claim stay the ones that decide.
-    {
-        let ui = Arc::clone(&ui);
-        let id = id.clone();
-        let cfg = cfg.clone();
-        let wanted = body.implementers;
-        blocking(move || {
-            talk::check_implementers(wanted, &cfg).map_err(ApiError::bad_request)?;
-            refuse_if_closed(&ui.talks.get(&id)?)
-        })
-        .await?;
-    }
-    let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
-        return Err(ApiError::conflict(
-            "a talk turn is running; change the implementers once it has answered",
-        ));
-    };
-    let switched = {
-        let ui = Arc::clone(&ui);
-        let id = id.clone();
-        let cfg = cfg.clone();
-        blocking(move || {
-            let chosen =
-                talk::check_implementers(body.implementers, &cfg).map_err(ApiError::bad_request)?;
-            let mut talk = ui.talks.get(&id)?;
-            if !talk.status.open() {
-                return Err(ApiError::conflict(format!(
-                    "talk {} is {} and takes no more turns",
-                    talk.short(),
-                    talk.status.as_str()
-                )));
-            }
-            talk::switch_implementers(&mut talk, &ui.talks, chosen)?;
-            Ok(talk)
-        })
-        .await
-    };
-    // As in `talk_agent`: settle the claim before replying, even on refusal.
-    let observed = ui.queued_generation(&id);
-    let fresh = {
-        let ui = Arc::clone(&ui);
-        let id = id.clone();
-        blocking(move || Ok(ui.talks.get(&id)?)).await
-    };
-    let draining = match fresh {
-        Ok(talk) => {
-            settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard, observed).await
+    let admission = ui.begin_admission()?;
+    admitted(admission, async move {
+        let id = {
+            let ui = Arc::clone(&ui);
+            blocking(move || resolve_talk(&ui.talks, &id)).await?
+        };
+        let _publication = crate::consult::publication_guard(&ui.talks, &id)
+            .await
+            .map_err(ApiError::from)?;
+        let repo = {
+            let ui = Arc::clone(&ui);
+            let id = id.clone();
+            blocking(move || Ok(ui.talks.get(&id)?.repo)).await?
+        };
+        let cfg = config_for(&repo).await?;
+        // Refuse a request that cannot succeed before taking the claim: a claim
+        // taken for it is handed to `drain_loop`, which holds the talk busy for a
+        // moment, so a refusal would make the next request see "busy" instead of
+        // its own answer. The checks after the claim stay the ones that decide.
+        {
+            let ui = Arc::clone(&ui);
+            let id = id.clone();
+            let cfg = cfg.clone();
+            let wanted = body.implementers;
+            blocking(move || {
+                talk::check_implementers(wanted, &cfg).map_err(ApiError::bad_request)?;
+                refuse_if_closed(&ui.talks.get(&id)?)
+            })
+            .await?;
         }
-        Err(_) => false,
-    };
-    let talk = switched?;
-    Ok(Json(TalkView::new(talk, draining, &ui)))
+        let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
+            return Err(ApiError::conflict(
+                "a talk turn is running; change the implementers once it has answered",
+            ));
+        };
+        let switched = {
+            let ui = Arc::clone(&ui);
+            let id = id.clone();
+            let cfg = cfg.clone();
+            blocking(move || {
+                let chosen = talk::check_implementers(body.implementers, &cfg)
+                    .map_err(ApiError::bad_request)?;
+                let mut talk = ui.talks.get(&id)?;
+                if !talk.status.open() {
+                    return Err(ApiError::conflict(format!(
+                        "talk {} is {} and takes no more turns",
+                        talk.short(),
+                        talk.status.as_str()
+                    )));
+                }
+                talk::switch_implementers(&mut talk, &ui.talks, chosen)?;
+                Ok(talk)
+            })
+            .await
+        };
+        // As in `talk_agent`: settle the claim before replying, even on refusal.
+        let observed = ui.queued_generation(&id);
+        let fresh = {
+            let ui = Arc::clone(&ui);
+            let id = id.clone();
+            blocking(move || Ok(ui.talks.get(&id)?)).await
+        };
+        let draining = match fresh {
+            Ok(talk) => {
+                settle_settings_turn(talk, ui.talks.clone(), cfg, id, turn_guard, observed).await
+            }
+            Err(_) => false,
+        };
+        let talk = switched?;
+        Ok(Json(TalkView::new(talk, draining, &ui)))
+    })
+    .await
 }
 
 /// `POST /api/talks/{id}/close`.
@@ -11019,39 +10912,6 @@ mod tests {
             } else {
                 "the restarted stand-in failed as well"
             }))
-        })
-    }
-
-    /// The address the parking loop knocks on, and what it heard there.
-    ///
-    /// A [`Launch`] is a plain function pointer, so a stand-in loop cannot
-    /// capture a fixture's address; this is how it is handed one. Only
-    /// `the_deck_answers_while_it_parks_and_frees_the_address_first` touches
-    /// these, so nothing else in this binary can race them.
-    static PARK_KNOCK: std::sync::Mutex<Option<SocketAddr>> = std::sync::Mutex::new(None);
-    static PARK_HEARD: std::sync::Mutex<Option<u16>> = std::sync::Mutex::new(None);
-
-    /// A loop that, once it is asked to stop, checks the deck still answers
-    /// before it goes.
-    ///
-    /// It stands in for a run mid-node: `finish_loop` waits for this future,
-    /// so the request it makes is strictly inside the park window - no sleep
-    /// and no polling needed to be sure of that.
-    fn launch_knocking_on_the_way_out(
-        _opts: daemon::Opts,
-        stop: daemon::Stop,
-    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
-        Box::pin(async move {
-            while !stop.stopped() {
-                tokio::time::sleep(Duration::from_millis(2)).await;
-            }
-            let addr = PARK_KNOCK
-                .lock()
-                .expect("park knock")
-                .expect("the test set an address");
-            let heard = request(addr, "GET", "/api/health", None).await.status;
-            *PARK_HEARD.lock().expect("park heard") = Some(heard);
-            Ok(())
         })
     }
 
@@ -14838,6 +14698,27 @@ mod tests {
                     )
                 })
                 .expect("the busy branch dropped the gate without using it");
+            assert!(
+                crate::consult::try_publication_guard(&talks, &id)
+                    .expect("publication fence")
+                    .is_none(),
+                "a queued worker cannot promote text before its successor reservation is published"
+            );
+
+            // A listener replacement queues its writer behind this accepted
+            // mutation. Even disconnecting the HTTP caller must not release
+            // admission before the write-to-worker handoff has completed.
+            let closing = Arc::clone(&ui.admissions).write_owned();
+            tokio::pin!(closing);
+            std::future::poll_fn(|cx| {
+                assert!(closing.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(
+                ui.begin_admission().is_err(),
+                "replacement blocks later admissions"
+            );
 
             // The turn that was running now finishes and gives the slot up
             // the way a real one does - through `drain_loop`, which finds
@@ -14853,6 +14734,19 @@ mod tests {
             // itself made no more progress since it handed the write off.
             handler.abort();
             let _ = handler.await;
+            std::future::poll_fn(|cx| {
+                assert!(
+                    closing.as_mut().poll(cx).is_pending(),
+                    "HTTP cancellation must not abandon a publishing transaction"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(
+                crate::consult::try_publication_guard(&talks, &id)
+                    .expect("publication fence after disconnect")
+                    .is_none()
+            );
 
             // Only now let the gated write proceed. It persists the draft
             // and reclaims the now-free slot from inside the task the busy
@@ -14860,6 +14754,17 @@ mod tests {
             // above, since that task was independent of the handler's own
             // future from the moment it was spawned.
             let _ = release_tx.send(());
+            drop(
+                tokio::time::timeout(Duration::from_secs(5), closing)
+                    .await
+                    .expect("short admission transaction should release for replacement"),
+            );
+            assert!(
+                crate::consult::try_publication_guard(&talks, &id)
+                    .expect("publication fence after acknowledgement")
+                    .is_some(),
+                "the publication fence is not retained by the long response"
+            );
 
             // A settled talk: the draft drained into an operator turn and
             // answered.
@@ -17475,105 +17380,6 @@ mod tests {
                 .is_none_or(|e| !e.contains("read-only file system")),
             "a fresh start does not keep showing why the last one died: {}",
             again.body
-        );
-    }
-
-    /// An upgrade parks the run in flight before it restarts, and a park waits
-    /// for the node - up to `timeout_implement`, an hour by default. The deck
-    /// has to answer for all of it: the operator has just been told a run is
-    /// finishing first, and this address is the only place that says how it is
-    /// going. It did not, once - the listener went with the `select!` arm that
-    /// began the handover, and the phone got `Cannot reach magi: Failed to
-    /// fetch` for the rest of the wave.
-    ///
-    /// The other half is the older rule: the address must be free *before* the
-    /// successor is started, or it dies on "address already in use" with its
-    /// stdio sent to null and the deck never comes back.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_deck_answers_while_it_parks_and_frees_the_address_first() {
-        let home = TempDir::new().expect("temp home");
-        let runs = home.path().join("runs");
-        std::fs::create_dir_all(&runs).expect("runs dir");
-        let ui = Ui::new(
-            Queue::at(home.path().join("queue")),
-            Questions::at(home.path().join("questions")),
-            Talks::at(home.path().join("talks")),
-            runs,
-            home.path().to_path_buf(),
-            PathBuf::from("/repo/magi"),
-        )
-        .with_worktrees_root(home.path().join("wt"))
-        .with_launch(launch_knocking_on_the_way_out);
-        let looping = ui.looping();
-        let turns = ui.turns();
-        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-        *PARK_KNOCK.lock().expect("park knock") = Some(addr);
-        let served = tokio::spawn(axum::serve(listener, ui.router()).into_future());
-
-        let started = request(addr, "POST", "/api/loop", Some(r#"{"running":true}"#)).await;
-        assert_eq!(started.status, 200, "the loop starts: {}", started.body);
-
-        // The successor's whole job, and the one thing it cannot do while this
-        // process still holds the socket.
-        //
-        // One bind is not enough, and the reason is not this process's order of
-        // operations: aborting the accept loop drops the listener, but axum
-        // serves each accepted connection on a task of its own, and those are
-        // not aborted. The requests above left sockets on this very address,
-        // and under BSD's bind rules (macOS) a live socket on 127.0.0.1:port
-        // makes a fresh bind fail with EADDRINUSE until its task is dropped.
-        // Production absorbs that in `bind_waiting`; so does this. Only
-        // `AddrInUse` is retried, and the listener is released before the
-        // closure returns - were the order wrong, the listener would outlive
-        // the closure and every attempt would fail. Inferred from the bind
-        // rules and the code; not reproduced on macOS.
-        let bound = std::sync::Mutex::new(None);
-        hand_over(
-            home.path(),
-            &looping,
-            &turns,
-            &|_: &[String]| Duration::from_secs(5),
-            served,
-            |_| {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                let attempt = loop {
-                    match std::net::TcpListener::bind(addr) {
-                        Ok(l) => {
-                            drop(l);
-                            break Ok(());
-                        }
-                        Err(e)
-                            if e.kind() == std::io::ErrorKind::AddrInUse
-                                && std::time::Instant::now() < deadline =>
-                        {
-                            std::thread::sleep(std::time::Duration::from_millis(10));
-                        }
-                        Err(e) => break Err(e.to_string()),
-                    }
-                };
-                *bound.lock().expect("bound") = Some(attempt);
-                Ok(1)
-            },
-        )
-        .await
-        .expect("hand over");
-
-        assert_eq!(
-            *PARK_HEARD.lock().expect("park heard"),
-            Some(200),
-            "the deck must answer while the loop is parking"
-        );
-        let attempt = bound
-            .lock()
-            .expect("bound")
-            .take()
-            .expect("the successor was started");
-        assert!(
-            attempt.is_ok(),
-            "and the address must be free by the time it is: {attempt:?}"
         );
     }
 
@@ -21428,15 +21234,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_is_refused_unless_the_run_stopped_somewhere_it_can_continue() {
+    async fn terminal_runs_cannot_be_resumed() {
         let fx = Fixture::start().await;
         let runs = fx.runs();
 
-        // Only a finished run and a failed one. An *interrupted* run - a
-        // parked one, or one whose daemon was killed mid-node - is the case
-        // resuming exists for: run 4043 sat at `reviewing` with the deck
-        // saying it could not be resumed, which was the one state where
-        // resuming was the only sensible answer.
         for (status, word) in [
             (RunStatus::Merged, "merged"),
             (RunStatus::Ready, "ready"),
@@ -21446,18 +21247,7 @@ mod tests {
             write_run(&runs, &id, status);
             let res = fx.post(&format!("/api/runs/{id}/resume"), None).await;
             assert_eq!(res.status, 409, "{word} must not be resumable");
-            let err = res.json()["error"].as_str().unwrap().to_owned();
-            assert!(err.contains(word), "the refusal names the status: {err}");
         }
-
-        // And an interrupted run is accepted: 202, with the resume running in
-        // the background. `Runner::resume` fails immediately here - the
-        // fixture's run points at a repository that does not exist - which is
-        // the point: the handler must not wait for it to find out.
-        let mid = "20260901-000000-midf";
-        write_run(&runs, mid, RunStatus::Reviewing);
-        let res = fx.post(&format!("/api/runs/{mid}/resume"), None).await;
-        assert_eq!(res.status, 202, "an interrupted run is resumable");
     }
 
     #[tokio::test]
@@ -21714,12 +21504,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_upgrade_is_refused_when_the_loop_belongs_to_another_process() {
+    async fn an_upgrade_is_refused_for_a_legacy_scheduler() {
         let fx = Fixture::start().await;
-        // Somebody else's `magi serve` owns the queue. Replacing this binary
-        // would leave that process running an old one against the same
-        // claims, which is worse than refusing.
         let mut beat = crate::daemon::Status::new();
+        beat.worker_protocol = None;
         beat.pid = 4321;
         beat.updated_at = jiff::Timestamp::now();
         crate::daemon::write_status_to(&fx.home.path().join("daemon.json"), &beat)
@@ -21727,9 +21515,6 @@ mod tests {
 
         let res = fx.post("/api/upgrade", None).await;
         assert_eq!(res.status, 409);
-        let err = res.json()["error"].as_str().unwrap().to_owned();
-        assert!(err.contains("4321"), "the refusal names the owner: {err}");
-        assert!(err.contains("old one against the same queue"), "{err}");
     }
 
     /// [`should_spawn_recheck`] must refuse for the same two reasons
@@ -21987,7 +21772,6 @@ mod tests {
             std::fs::read(updater::progress_path(home.path())).unwrap(),
             before
         );
-        assert!(!ui.lock_loop().resume_after_handover);
         assert!(!ui.lock_loop().live.as_ref().unwrap().stop.stopped());
         assert!(!ui.upgrade_spawned.load(std::sync::atomic::Ordering::SeqCst));
         // A conflicting request must not erase the actionable earlier failure.
@@ -22138,103 +21922,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn hand_over_advances_the_upgrade_progress_through_parking_and_restarting() {
-        let home = TempDir::new().expect("temp home");
-        let runs = home.path().join("runs");
-        std::fs::create_dir_all(&runs).expect("runs dir");
-        let ui = Ui::new(
-            Queue::at(home.path().join("queue")),
-            Questions::at(home.path().join("questions")),
-            Talks::at(home.path().join("talks")),
-            runs,
-            home.path().to_path_buf(),
-            PathBuf::from("/repo/magi"),
-        )
-        .with_launch(launch_idle);
-        let looping = ui.looping();
-        let turns = ui.turns();
-        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("bind loopback");
-        let served = tokio::spawn(axum::serve(listener, ui.router()).into_future());
-
-        let progress = crate::updater::Progress::new("0.5.1".to_owned(), "0.5.2".to_owned());
-        crate::updater::write_progress(home.path(), &progress).expect("seed progress");
-
-        hand_over(
-            home.path(),
-            &looping,
-            &turns,
-            &|_: &[String]| Duration::from_secs(5),
-            served,
-            |_| Ok(1),
-        )
-        .await
-        .expect("hand over");
-
-        let after = crate::updater::read_progress(home.path()).expect("progress on disk");
-        assert_eq!(
-            after.stage,
-            crate::updater::Stage::Restarting,
-            "hand_over owns the record through parking and up to restarting; \
-             the successor is what finishes it"
-        );
-    }
-
-    /// The successor is started exactly once on success, and exactly once on
-    /// failure too (a failed start is reported, never retried).
-    #[tokio::test]
-    async fn hand_over_calls_the_successor_exactly_once_and_logs_the_steps() {
-        for fail in [false, true] {
-            let home = TempDir::new().expect("temp home");
-            let ui = idle_ui(&home);
-            let looping = ui.looping();
-            let turns = ui.turns();
-            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-                .await
-                .expect("bind loopback");
-            let served = tokio::spawn(axum::serve(listener, ui.router()).into_future());
-            let progress = crate::updater::Progress::new("0.5.1".to_owned(), "0.5.2".to_owned());
-            crate::updater::write_progress(home.path(), &progress).expect("seed progress");
-
-            let calls = std::sync::atomic::AtomicUsize::new(0);
-            let outcome = hand_over(
-                home.path(),
-                &looping,
-                &turns,
-                &|_: &[String]| Duration::from_secs(5),
-                served,
-                |_| {
-                    calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    if fail {
-                        anyhow::bail!("no exec")
-                    } else {
-                        Ok(4242)
-                    }
-                },
-            )
-            .await;
-            assert_eq!(outcome.is_err(), fail);
-            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-
-            let log = std::fs::read_to_string(crate::updater::log_path(home.path()))
-                .expect("upgrade.log is written under the home");
-            for step in [
-                "entered",
-                "finish_loop",
-                "listener released",
-                "starting the successor",
-            ] {
-                assert!(log.contains(step), "missing `{step}` in:\n{log}");
-            }
-            assert!(
-                log.contains(if fail { "did not start" } else { "pid 4242" }),
-                "{log}"
-            );
-        }
-    }
-
     /// The handover signal is seen however the race falls, and wakes its one
     /// waiter once per signal - nothing here can spin.
     #[tokio::test]
@@ -22337,364 +22024,165 @@ mod tests {
         .with_launch(launch_idle)
     }
 
-    async fn park_fixture(
-        home: &TempDir,
-    ) -> (
-        Ui,
-        Arc<Mutex<LoopState>>,
-        Arc<Mutex<TalkTurns>>,
-        tokio::task::JoinHandle<std::io::Result<()>>,
-    ) {
-        let ui = idle_ui(home);
-        let looping = ui.looping();
-        let turns = ui.turns();
-        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+    #[tokio::test]
+    async fn start_during_scheduler_stop_is_busy_and_preserves_the_stop() {
+        let home = TempDir::new().expect("temp home");
+        let ui = idle_ui(&home);
+        let lease = crate::worker::try_lease(home.path(), "scheduler")
+            .expect("scheduler lease")
+            .expect("free");
+        crate::worker::request(home.path(), "scheduler", crate::worker::Control::Stop)
+            .expect("request stop");
+        let error = ui
+            .start_detached_loop()
             .await
-            .expect("bind loopback");
-        let served = tokio::spawn(axum::serve(listener, ui.clone().router()).into_future());
-        let progress = crate::updater::Progress::new("0.5.1".to_owned(), "0.5.2".to_owned());
-        crate::updater::write_progress(home.path(), &progress).expect("seed progress");
-        (ui, looping, turns, served)
+            .expect_err("transition is still live");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(error.message.contains("still running or stopping"));
+        assert_eq!(
+            crate::worker::control(home.path(), "scheduler").unwrap(),
+            Some(crate::worker::Control::Stop)
+        );
+        drop(lease);
     }
 
-    /// The hand-over does not release the address while a chat turn is in
-    /// flight, a `/say` arriving meanwhile starts nothing, and the successor is
-    /// started once the turn ends.
     #[tokio::test]
-    async fn hand_over_waits_for_a_running_chat_turn() {
+    async fn handover_releases_listener_without_waiting_for_execution_leases() {
         let home = TempDir::new().expect("temp home");
-        let (ui, looping, turns, served) = park_fixture(&home).await;
-        let ui = Arc::new(ui);
-        let id = "20260901-000000-chat";
-        let turn = ui.begin_talk_turn(id).expect("claim").expect("free");
-
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let handover = tokio::spawn({
-            let home = home.path().to_path_buf();
-            let turns = Arc::clone(&turns);
-            let calls = Arc::clone(&calls);
-            async move {
-                hand_over(
-                    &home,
-                    &looping,
-                    &turns,
-                    &|_: &[String]| Duration::from_secs(60),
-                    served,
-                    move |_| {
-                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Ok(1)
-                    },
-                )
-                .await
-            }
-        });
-
-        let waiting = async {
-            for _ in 0..200 {
-                if crate::updater::read_progress(home.path())
-                    .is_some_and(|p| p.parked_talks == [id.to_owned()])
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            panic!("the park never named the chat turn");
-        };
-        waiting.await;
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-
-        // A new turn is refused, a queued claim and a direct `/say` see a busy
-        // slot, and nothing new is live.
-        let refused = ui.begin_talk_turn("20260901-000000-late").err();
-        assert!(
-            refused.is_some_and(|e| e.message.contains("upgrade in progress")),
-            "a direct start says an upgrade is in progress"
-        );
-        assert!(
-            ui.begin_queued_talk_turn("20260901-000000-late")
-                .expect("queued claim")
-                .is_none()
-        );
-        assert!(matches!(
-            ui.begin_talk_turn_unless_pending("20260901-000000-late")
-                .expect("start"),
-            TalkTurnStart::Busy
-        ));
-        assert_eq!(turns.lock().unwrap().live.len(), 1);
-
-        // The health text names the turn.
-        let progress = crate::updater::read_progress(home.path()).expect("progress");
-        let view = upgrade_progress_view(&ui, progress);
-        assert!(
-            view.waiting_on.as_deref().is_some_and(|w| w.contains(id)),
-            "{:?}",
-            view.waiting_on
-        );
-
-        assert!(!handover.is_finished());
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-        drop(turn);
-        handover.await.expect("join").expect("hand over");
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(!turns.lock().unwrap().parking, "slots reopen afterwards");
-    }
-
-    /// Chat stays open while the loop is still parking, and closes only once
-    /// the loop is done; a turn started during the park is waited for.
-    #[tokio::test]
-    async fn hand_over_keeps_chat_open_until_the_loop_is_done() {
-        let home = TempDir::new().expect("temp home");
-        let (ui, looping, turns, served) = park_fixture(&home).await;
-        let ui = Arc::new(ui);
-        // A loop that ends only when told to.
-        let (end_loop, loop_ended) = tokio::sync::oneshot::channel::<()>();
-        lock_or_recover(&looping).live = Some(Live {
-            stop: daemon::Stop::new(),
-            handle: tokio::spawn(async move {
-                let _ = loop_ended.await;
-            }),
-            opts: daemon::Opts::default(),
-        });
-
-        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let handover = tokio::spawn({
-            let home = home.path().to_path_buf();
-            let turns = Arc::clone(&turns);
-            let calls = Arc::clone(&calls);
-            async move {
-                hand_over(
-                    &home,
-                    &looping,
-                    &turns,
-                    &|_: &[String]| Duration::from_secs(60),
-                    served,
-                    move |_| {
-                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        Ok(1)
-                    },
-                )
-                .await
-            }
-        });
-
-        let reached = async {
-            for _ in 0..200 {
-                if crate::updater::read_progress(home.path())
-                    .is_some_and(|p| p.stage == crate::updater::Stage::Parking)
-                {
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            panic!("the hand-over never reached parking");
-        };
-        reached.await;
-
-        // The loop is still parking: a chat turn starts.
-        assert!(!turns.lock().unwrap().parking);
-        let turn = ui
-            .begin_talk_turn("20260901-000000-chat")
+        let ui = idle_ui(&home);
+        let turns = ui
+            .begin_talk_turn("active-chat")
             .expect("claim")
-            .expect("a turn can start while the loop parks");
-
-        // The loop ends; the slot closes while the first turn is still held.
-        end_loop.send(()).expect("loop still waiting");
-        for _ in 0..200 {
-            if turns.lock().unwrap().parking {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-        assert!(
-            turns.lock().unwrap().parking,
-            "closed once the loop is done"
-        );
-        let refused = ui.begin_talk_turn("20260901-000000-late").err();
-        assert!(
-            refused.is_some_and(|e| e.message.contains("upgrade in progress")),
-            "no turn starts once the loop is done"
-        );
-        assert!(
-            ui.begin_queued_talk_turn("20260901-000000-late")
-                .expect("queued claim")
-                .is_none()
-        );
-        assert!(!handover.is_finished());
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-
-        drop(turn);
-        handover.await.expect("join").expect("hand over");
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-        assert!(!turns.lock().unwrap().parking, "slots reopen afterwards");
-    }
-
-    /// A turn that never ends cannot block the upgrade: past the bound the
-    /// hand-over proceeds and records which talk it gave up on.
-    #[tokio::test]
-    async fn hand_over_gives_up_on_a_stuck_chat_turn_after_the_bound() {
-        let home = TempDir::new().expect("temp home");
-        let (ui, looping, turns, served) = park_fixture(&home).await;
-        let id = "20260901-000000-stuk";
-        let _turn = ui.begin_talk_turn(id).expect("claim").expect("free");
-
-        let calls = std::sync::atomic::AtomicUsize::new(0);
-        hand_over(
-            home.path(),
-            &looping,
-            &turns,
-            &|_: &[String]| Duration::from_millis(300),
-            served,
-            |_| {
-                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(1)
-            },
-        )
-        .await
-        .expect("hand over");
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-
-        let progress = crate::updater::read_progress(home.path()).expect("progress");
-        assert_eq!(progress.stage, crate::updater::Stage::Restarting);
-        assert!(
-            progress.detail.as_deref().is_some_and(|d| d.contains(id)),
-            "{:?}",
-            progress.detail
-        );
-        let log = std::fs::read_to_string(crate::updater::log_path(home.path())).expect("log");
-        assert!(
-            log.contains("handing over anyway") && log.contains(id),
-            "{log}"
-        );
-    }
-
-    /// A drain that finds the upgrade parking leaves the queued draft alone
-    /// and gives the slot up, instead of starting another turn.
-    #[tokio::test]
-    async fn drain_loop_starts_no_turn_while_parking() {
-        let tmp = TempDir::new().expect("tempdir");
-        let repo = tmp.path().join("repo");
-        std::fs::create_dir_all(&repo).expect("repo dir");
-        std::fs::write(repo.join("magi.toml"), MOCK_AGENT_TOML).expect("write magi.toml");
-        let home = TempDir::new().expect("temp home");
-        let talks = Talks::at(home.path().join("talks"));
-        let ui = Ui::new(
-            Queue::at(home.path().join("queue")),
-            Questions::at(home.path().join("questions")),
-            talks.clone(),
-            home.path().join("runs"),
-            home.path().to_path_buf(),
-            repo.clone(),
-        )
-        .with_worktrees_root(home.path().join("wt"));
-        let cfg = config_for(&repo).await.expect("discover config");
-        let mut talk = talk::begin(&talks, &cfg, repo.clone(), Some("mock")).expect("begin talk");
-        let id = talk.id.clone();
-        talk::queue(&mut talk, &talks, "later", Vec::new()).expect("queue");
-        let turn = ui.begin_talk_turn(&id).expect("claim").expect("free");
-        let turns = ui.turns();
-        let parking = ParkingTurns::begin(&turns);
-
-        drain_loop(talk, talks.clone(), cfg, id.clone(), turn).await;
-
-        assert!(
-            turns.lock().unwrap().live.is_empty(),
-            "the slot is given up"
-        );
-        let fresh = talks.get(&id).expect("talk");
-        assert_eq!(fresh.pending, "later", "the draft is still queued");
-        assert!(fresh.turns.is_empty(), "no turn ran");
-        drop(parking);
-    }
-
-    /// Run `hand_over` against `ui` and return what the successor was told.
-    async fn handed_over(home: &TempDir, ui: Ui) -> bool {
-        let looping = ui.looping();
-        let turns = ui.turns();
+            .expect("free");
+        let execution = crate::worker::try_lease(home.path(), "active-task")
+            .expect("execution lease")
+            .expect("free");
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind loopback");
+        let address = listener.local_addr().expect("address");
+        let admissions = Arc::clone(&ui.admissions);
         let served = tokio::spawn(axum::serve(listener, ui.router()).into_future());
-        let told = std::sync::Mutex::new(None);
-        hand_over(
-            home.path(),
-            &looping,
-            &turns,
-            &|_: &[String]| Duration::from_secs(5),
-            served,
-            |resume| {
-                *told.lock().unwrap() = Some(resume);
+        let successor_started = std::sync::atomic::AtomicBool::new(false);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            hand_over(home.path(), &admissions, served, || {
+                successor_started.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(1)
-            },
+            }),
         )
         .await
-        .expect("hand over");
-        told.into_inner().unwrap().expect("successor was started")
+        .expect("restart must not wait for execution")
+        .expect("handover");
+        assert!(successor_started.load(std::sync::atomic::Ordering::SeqCst));
+        // BSD may retain the address briefly after listener release. The real
+        // successor uses the same bounded bind retry rather than a one-shot bind.
+        let successor = bind_waiting(address)
+            .await
+            .expect("successor binds released address");
+        assert_eq!(successor.local_addr().unwrap(), address);
+        assert!(turns.owns(), "the chat lease survives restart");
+        assert!(
+            crate::worker::try_lease(home.path(), "active-task")
+                .unwrap()
+                .is_none()
+        );
+        drop(execution);
+        drop(turns);
     }
 
     #[tokio::test]
-    async fn a_running_loop_is_resumed_by_the_successor() {
+    async fn handover_drains_admission_but_never_waits_for_the_chat_turn() {
         let home = TempDir::new().expect("temp home");
         let ui = idle_ui(&home);
-        ui.start_loop(None).expect("start");
-        ui.park_for_upgrade("0.1.0", Some("0.1.1")).expect("park");
-        // The idle loop sees the park and ends before the handover fires.
-        for _ in 0..500 {
-            if !ui.loop_view(None).running {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-        assert!(handed_over(&home, ui).await, "a running loop must resume");
-
-        let successor = idle_ui(&home);
-        assert!(!successor.loop_view(None).running);
-        assert!(successor.resume_after_handover(true));
-        assert!(successor.loop_view(None).running);
-        successor.stop_loop(None, false).expect("stop");
+        let admission = ui.begin_admission().expect("admit send");
+        let turn = ui
+            .begin_talk_turn("active-chat")
+            .expect("claim")
+            .expect("free");
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind loopback");
+        let address = listener.local_addr().expect("address");
+        let served = tokio::spawn(axum::serve(listener, ui.clone().router()).into_future());
+        let successor_called = std::sync::atomic::AtomicBool::new(false);
+        let handover = hand_over(home.path(), &ui.admissions, served, || {
+            successor_called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(1)
+        });
+        tokio::pin!(handover);
+        // Poll exactly to the writer waiting on our admission guard. This
+        // pins the race without sleeps or assumptions about task scheduling.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(handover.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(!successor_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            ui.begin_admission().is_err(),
+            "new ingress cannot race the drain"
+        );
+        assert_eq!(request(address, "GET", "/api/loop", None).await.status, 200);
+        drop(admission);
+        tokio::time::timeout(Duration::from_secs(2), handover)
+            .await
+            .expect("only publication may delay restart")
+            .expect("handover");
+        assert!(successor_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            turn.owns(),
+            "the detached chat turn is not awaited or cancelled"
+        );
+        assert!(
+            ui.begin_admission().is_err(),
+            "old accepted connections stay closed"
+        );
+        drop(turn);
     }
 
-    #[tokio::test]
-    async fn a_second_upgrade_request_keeps_the_resume_intent() {
-        let home = TempDir::new().expect("temp home");
-        let ui = idle_ui(&home);
-        ui.start_loop(None).expect("start");
-        ui.park_for_upgrade("0.1.0", Some("0.1.1"))
-            .expect("first park");
-        ui.park_for_upgrade("0.1.0", Some("0.1.1"))
-            .expect("second park");
-        assert!(handed_over(&home, ui).await);
+    #[test]
+    fn health_worker_metadata_never_contains_payload_or_result() {
+        let view = WorkerView::from(crate::worker::Job {
+            id: "job".into(),
+            sequence: 1,
+            kind: "service".into(),
+            key: "maintenance".into(),
+            payload: serde_json::json!({"env": {"TOKEN": "private"}}),
+            generation: "generation".into(),
+            version: Some("1.2.3".into()),
+            status: crate::worker::Status::Running,
+            result: Some("private diagnostics".into()),
+            pid: Some(4242),
+            created_at: 1,
+            finished_at: None,
+        });
+        let value = serde_json::to_value(view).expect("serialize public metadata");
+        assert_eq!(value["version"], "1.2.3");
+        assert_eq!(value["pid"], 4242);
+        assert!(value.get("payload").is_none());
+        assert!(value.get("result").is_none());
+        assert!(!value.to_string().contains("private"));
     }
 
-    #[tokio::test]
-    async fn a_stop_during_the_handover_wait_is_honoured() {
+    #[test]
+    fn upgraded_scheduler_remains_owned_by_a_replacement_web() {
         let home = TempDir::new().expect("temp home");
         let ui = idle_ui(&home);
-        ui.start_loop(None).expect("start");
-        ui.park_for_upgrade("0.1.0", Some("0.1.1")).expect("park");
-        ui.stop_loop(None, false).expect("stop");
-        assert!(!handed_over(&home, ui).await);
-    }
-
-    #[tokio::test]
-    async fn an_idle_loop_stays_stopped_across_the_handover() {
-        let home = TempDir::new().expect("temp home");
-        let ui = idle_ui(&home);
-        ui.park_for_upgrade("0.1.0", Some("0.1.1")).expect("park");
-        assert!(!handed_over(&home, ui).await);
-
-        let successor = idle_ui(&home);
-        assert!(!successor.resume_after_handover(false));
-        assert!(!successor.loop_view(None).running);
-    }
-
-    #[tokio::test]
-    async fn a_loop_the_operator_stopped_is_not_resumed() {
-        let home = TempDir::new().expect("temp home");
-        let ui = idle_ui(&home);
-        ui.start_loop(None).expect("start");
-        ui.stop_loop(None, false).expect("stop");
-        ui.park_for_upgrade("0.1.0", Some("0.1.1")).expect("park");
-        assert!(!handed_over(&home, ui).await);
+        std::fs::write(
+            home.path().join("daemon.json"),
+            serde_json::json!({
+                "schema": 2, "pid": 4242, "worker_protocol": 1,
+                "updated_at": Timestamp::now().to_string(), "idle": true,
+            })
+            .to_string(),
+        )
+        .expect("status");
+        let reading = daemon::read_status(home.path());
+        assert!(Foreign::of(reading.as_ref()).is_none());
+        let view = ui.runtime_loop_view(reading, &[]);
+        assert!(view.running);
+        assert!(view.owned);
     }
 
     #[test]
@@ -22703,105 +22191,6 @@ mod tests {
         assert!(!resume_requested(Some("0".into())));
         assert!(!resume_requested(Some("".into())));
         assert!(resume_requested(Some("1".into())));
-    }
-
-    #[test]
-    fn the_upgrade_button_arms_before_it_restarts_anything() {
-        // It ends the process the operator is talking to, and a phone in a
-        // pocket taps things. One tap arms, the second commits.
-        assert!(APP_JS.contains("upgrade: \"/api/upgrade\""));
-        assert!(APP_JS.contains("Replace the binary and restart?"));
-        assert!(APP_JS.contains("function confirmed("));
-        // Hidden when the loop is somebody else's, matching the 409 above -
-        // and hidden with nothing to install, matching the 200 "already
-        // current" branch: an operator on the newest build must not be
-        // offered a restart that would only park a run for nothing.
-        assert!(APP_JS.contains("show(upgradeBtn, canUpgrade)"));
-        // A park waits for the node in flight, up to an hour for an implement
-        // wave. Leaving the button reading "Upgrading…" for that long is the
-        // same mistake as an error rendered off screen: it looks wedged.
-        assert!(
-            APP_JS.contains("Parking, then restarting"),
-            "the button says what it is waiting for"
-        );
-        // And nothing to install must give the button back rather than
-        // pretending a restart is coming.
-        assert!(APP_JS.contains("if (!out.to)"));
-    }
-
-    #[test]
-    fn stopping_the_loop_arms_but_starting_does_not() {
-        // A stray tap must not leave the queue stopped overnight, so a stop is
-        // two taps through the same helper the upgrade uses; a start stays one.
-        assert!(APP_JS.contains("Finish the run(s) in flight, then stop claiming?"));
-        assert!(APP_JS.contains("Stop claiming new tasks? Nothing is in flight."));
-        assert!(APP_JS.contains("confirmed(button, question)"));
-        // The label put back on timeout is the one saved when arming, not a
-        // hard-coded upgrade caption that would rename the stop button.
-        assert!(!APP_JS.contains("setText(btn, \"Update & restart\");\n    }\n  }, 6000)"));
-        assert!(APP_JS.contains("const label = btn.textContent;"));
-        assert!(!APP_JS.contains("Neither direction is guarded"));
-    }
-
-    #[test]
-    fn the_running_version_is_shown_regardless_of_whether_an_update_exists() {
-        assert!(
-            APP_JS.contains("state.health.version"),
-            "the operator wants to know what is running even with nothing newer"
-        );
-        assert!(APP_JS.contains("id=\"daemon-version\"") || APP_CSS.contains(".daemon-version"));
-    }
-
-    #[test]
-    fn the_upgrade_button_names_its_destination() {
-        assert!(
-            APP_JS.contains("`Update to ${update.to}`"),
-            "pressing the button should not be a surprise about what it moves to"
-        );
-    }
-
-    #[test]
-    fn an_upgrade_in_progress_is_shown_as_stages_not_as_an_error() {
-        for stage in ["downloading", "replaced", "parking", "restarting"] {
-            assert!(
-                APP_JS.contains(&format!("\"{stage}\"")),
-                "the phone must be able to tell {stage} apart from the others"
-            );
-        }
-        assert!(APP_JS.contains(".waiting_on"));
-        // What replaced the bare "Cannot reach magi: Failed to fetch": a
-        // fetch failing while an upgrade is in flight is not an error, it is
-        // the sub-second gap `bind_waiting` covers, and it must not be
-        // reported as one.
-        assert!(APP_JS.contains("function reportUnreachableDuringUpgrade("));
-        assert!(APP_JS.contains("reconnects on its own"));
-    }
-
-    #[test]
-    fn a_failed_upgrade_does_not_lock_the_loop_controls() {
-        let body = &APP_JS[APP_JS.find("function renderLoop(").expect("renderLoop")
-            ..APP_JS.find("function upgrade(").expect("upgrade")];
-        assert!(!body.contains(
-            "upgradeStage === \"failed\") {\n    setAttr(box, \"data-state\", \"failed\")"
-        ));
-        assert!(body.contains("renderUpgradeError();"));
-        assert!(INDEX_HTML.contains("id=\"upgrade-error\""));
-    }
-
-    #[test]
-    fn an_overdue_upgrade_eventually_asks_for_a_human() {
-        // The ceiling has to clear a full hour-long park with room to spare,
-        // or an ordinary implement wave would be reported as a stuck upgrade.
-        assert!(APP_JS.contains("UPGRADE_WAIT_LIMIT_MS = 70 * 60 * 1000"));
-        assert!(APP_JS.contains("function upgradeOverdue("));
-    }
-
-    #[test]
-    fn coming_back_from_an_upgrade_says_which_version_it_landed_on() {
-        assert!(
-            APP_JS.contains("Updated to ${upgradeInfo.to"),
-            "the operator who asked for the restart wants to know it worked"
-        );
     }
 
     #[test]

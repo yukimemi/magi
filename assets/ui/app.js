@@ -112,15 +112,9 @@ const QUIET_HOLD_MS = 4000;
    been handed to the successor". Not `done` or `failed`: those are the two
    ways an upgrade stops moving. */
 const UPGRADE_BUSY_STAGES = new Set(["downloading", "replaced", "parking", "restarting"]);
-/* The ceiling on how long this page keeps quietly waiting for an upgrade to
-   finish - by reconnecting on its own, or by rendering the busy stages above
-   - before it says a human needs to look. A park waits for the run in flight
-   to reach its next node boundary, which can take as long as
-   `timeout_implement` (an hour, by default) for a run mid-implement, and that
-   whole wait is meant to look like patience, not failure. The margin past an
-   hour covers the download-and-replace step ahead of it and normal clock
-   skew between this page and the deck. */
-const UPGRADE_WAIT_LIMIT_MS = 70 * 60 * 1000;
+/* Detached restarts do not wait for task/chat nodes. Legacy parking remains
+   readable during the first migration, but new restarts should be prompt. */
+const UPGRADE_WAIT_LIMIT_MS = 5 * 60 * 1000;
 
 /* How long a background health poll may keep failing at the network level
    before the page says it cannot reach magi. A phone drops the network in a
@@ -690,6 +684,7 @@ const STATS_UNREADABLE_DISMISSED_KEY = "magi-stats-unreadable-dismissed";
 const state = {
   route: { name: "runs", id: null },
   health: null,
+  healthError: null,
   /* The last LoopView seen. Health carries one too; this is what a POST to
      /api/loop leaves behind, so the strip reflects a start or a stop before
      the next health tick. */
@@ -925,11 +920,9 @@ function announceQuietly(message) {
 }
 
 /* ---- loop strip -------------------------------------------------------- *
- * The loop runs inside this server, so this strip is both the report and the
- * control. Before it was, a task filed from a phone sat in the queue until
- * somebody reached a keyboard and typed `magi serve`, and the strip's own
- * wording said so — which is the one place this product still sent its
- * operator to a terminal.
+ * The web controls an independent scheduler; execution workers outlive both.
+ * The strip distinguishes dispatch being off from active work still running.
+ * Only queue-owned task workers are affected by its explicit Park control.
  *
  * Every branch below ends in a sentence about whether anything is going to
  * happen, because that is the question being asked, and the states differ in
@@ -991,8 +984,8 @@ function upgradeStageLabel(stage) {
   switch (stage) {
     case "downloading": return "Replacing the binary.";
     case "replaced": return "Binary replaced.";
-    case "parking": return "Parking before it restarts.";
-    case "restarting": return "Restarting.";
+    case "parking": return "Finishing the legacy upgrade migration.";
+    case "restarting": return "Restarting web and scheduler.";
     default: return "Upgrading.";
   }
 }
@@ -1004,8 +997,8 @@ function upgradeStageDetail(stage) {
   switch (stage) {
     case "downloading": return "Fetching and installing the new binary. This takes a few seconds.";
     case "replaced": return "About to hand the address to the successor.";
-    case "parking": return "Nothing was in flight; handing the address to the successor next.";
-    case "restarting": return "The address is released and the successor is starting. This page reconnects on its own.";
+    case "parking": return "The previous embedded scheduler is finishing its migration.";
+    case "restarting": return "Task and chat workers continue on their started executable. This page reconnects on its own.";
     default: return "";
   }
 }
@@ -1104,8 +1097,17 @@ function renderLoop() {
   const version = state.health && typeof state.health.version === "string"
     ? state.health.version.trim()
     : "";
-  setText(versionChip, version ? `v${version}` : "");
-  setAttr(versionChip, "title", version ? `magi ${version} is serving this page` : null);
+  const jobs = Array.isArray(state.health && state.health.jobs) ? state.health.jobs : [];
+  const executionJobs = jobs.filter((job) => job.kind !== "scheduler");
+  const taskJobs = executionJobs.filter((job) => job.kind === "task" && job.queue_owned === true);
+  const scheduler = jobs.find((job) => job.kind === "scheduler");
+  const workerVersions = [...new Set(executionJobs.map((job) => job.version ? `v${job.version}` : "starting"))].join(", ");
+  const workerSummary = executionJobs.length ? ` \u00b7 ${plural(executionJobs.length, "worker", "workers")} (${workerVersions})` : "";
+  const schedulerSummary = scheduler ? ` \u00b7 serve ${scheduler.version ? `v${scheduler.version}` : "starting"}` : "";
+  setText(versionChip, version ? `web v${version}${schedulerSummary}${workerSummary}` : "");
+  setAttr(versionChip, "title", version
+    ? [`Web ${version} serves this page.`, ...jobs.map((job) => `${job.kind} ${job.key}: ${job.version ? `v${job.version}` : "starting"} / ${job.generation} (pid ${job.pid || "starting"})`)].join("\n")
+    : null);
   show(versionChip, Boolean(version));
 
   /* The chip and every button live in one grid cell (.daemon-controls) so
@@ -1139,11 +1141,8 @@ function renderLoop() {
     syncControls();
   };
 
-  /* Offered only while a stop is waiting out a run, which is the moment the
-     wait is actually felt. A park stops at the run's next node boundary: the
-     work already recorded is kept and the run comes back as resumable, so the
-     binary can be replaced without waiting out a competition and without
-     throwing away an hour of paid agent calls. */
+  /* Explicit park remains available for active task workers even when the
+     scheduler has stopped; it is never an update prerequisite. */
   const parkControl = (label, note) => {
     setText(park, label);
     setAttr(park, "title", note);
@@ -1151,6 +1150,15 @@ function renderLoop() {
     park.onclick = () => setLoop(false, true);
     syncControls();
   };
+
+  if (state.healthError) {
+    setAttr(box, "data-state", "failed");
+    setAttr(box, "data-owned", null);
+    setText(text, "Scheduler and worker state unavailable.");
+    show(versionChip, false);
+    quiet(state.healthError);
+    return;
+  }
 
   if (!state.health) {
     setAttr(box, "data-state", null);
@@ -1218,28 +1226,16 @@ function renderLoop() {
      omitted rather than guessed. */
   const done = Number(daemon.completed);
   const tail = Number.isFinite(done) ? ` \u00b7 ${plural(done, "task done", "tasks done")}` : "";
-  /* Running at all, from either side: `loop.running` is this process's own
-     flag and flips the instant a start is accepted, while `daemon.running`
-     comes from the heartbeat file and lags it by up to a poll. Trusting only
-     the file showed "Loop is off", with a Start button, for seconds after the
-     operator had already started it. */
+  /* A durable startup reservation reports the scheduler before its first
+     heartbeat. Neither signal depends on the web generation that started it. */
   const running = Boolean(loop.running) || Boolean(daemon.running);
-  /* A loop somebody else's process owns. It is reported by the heartbeat
-     (`daemon.running`) while this process's own flag stays false, which is
-     also why `running` above is not enough to tell the two apart. */
-  const foreign = Boolean(daemon.running) && loop.owned === false && !loop.running;
+  /* Only legacy schedulers lack durable controls. A new detached scheduler
+     remains controllable even when another web generation started it. */
+  const foreign = Boolean(daemon.running) && loop.owned === false;
   setAttr(box, "data-owned", foreign ? "no" : null);
 
-  /* Offered whenever this process owns the deck, running or not, *and* a
-     newer release is actually known to exist: the binary can be replaced
-     either way, and an operator with fixes waiting should not have to start
-     the loop to install them. Hidden when the loop belongs to somebody else,
-     because replacing this binary would leave that process running an old
-     one against the same queue. With nothing to install or retry it stays
-     hidden, because restarting for an upgrade that would not happen used to park the run in
-     flight and drop every connection for nothing. The version this deck is
-     actually running is shown unconditionally, next to the strip, whether or
-     not there is anything newer. */
+  /* Offer replacement independently of scheduler state. Legacy embedded
+     schedulers need the one-time migration path; independent workers do not. */
   const update = state.health.update || { available: false, to: null };
   const canUpgrade = !foreign && (update.available || !$("upgrade-error").hidden);
   show(upgradeBtn, canUpgrade);
@@ -1250,42 +1246,30 @@ function renderLoop() {
     upgradeBtn.onclick = upgrade;
   }
 
-  /* Asked to stop. Two shapes reach here, and both are checked before
-     `running`, because the loop is still running while it winds down:
-
-     `loop.stopping` is the server saying a run is in flight, which it will
-     finish \u2014 killing the graph mid-node would leave worktrees, branches
-     and agent sessions behind and throw away calls already paid for, so magi
-     does not do it, and this can last tens of minutes.
-
-     A stop asked of an idle loop never reports `stopping` at all: it answers
-     "still running" and goes quiet within a poll. Without `stopAskedAt` that
-     read as a button that did nothing, so this page remembers its own
-     request \u2014 bounded, so a request that somehow did not take gives the
-     control back instead of claiming forever that a stop is coming. */
+  /* Stop ends scheduling promptly; execution workers remain independent.
+     Park is an explicit, separate request to stop at a node boundary. */
   const asked = !foreign && state.stopAskedAt > 0 && Date.now() - state.stopAskedAt < STOP_ASK_MS;
-  if (running && (loop.stopping || asked)) {
+  if (running && (loop.stopping || loop.parking || asked)) {
     setAttr(box, "data-state", "stopping");
-    const link = loop.stopping ? currentRunLink(daemon) : null;
     text.append(
-      el("b", { text: "Stopping." }),
-      loop.stopping
-        ? [link ? " It is finishing run " : " It is finishing the run it is on", link, " first, and will not abandon it."]
-        : " It stops as soon as it finishes the poll it is on.",
+      el("b", { text: loop.parking ? "Parking workers." : "Stopping the scheduler." }),
+      " No new task is claimed. Active workers are not cancelled.",
     );
-    quiet(loop.stopping
-      ? `Nothing new will be claimed after it${tail}. You can start it again once it has stopped.`
-      : `Nothing new will be claimed${tail}. This takes a few seconds when no run is in flight.`);
+    quiet(`The scheduler stops independently${tail}.`);
     if (loop.parking) {
-      text.append(" Parking at the next step.");
-    } else if (loop.stopping) {
+      text.append(" Task workers stop at their next node boundary.");
+    } else if (taskJobs.length > 0) {
       parkControl("Park at the next step",
-        "Stops the run after the step it is on and leaves it resumable, instead of waiting for the whole competition. Use this when you want to replace the binary.");
+        "Explicitly stops task workers at their next node boundary and leaves their runs resumable. Updating does not require this.");
     }
     return;
   }
 
   if (!running) {
+    if (taskJobs.length > 0) {
+      parkControl("Park active task workers",
+        "The scheduler is off, but task workers continue. Park explicitly stops them at their next node boundary.");
+    }
     const waiting = runnableTasks();
     const error = typeof loop.last_error === "string" && loop.last_error.trim() ? loop.last_error : null;
 
@@ -1315,9 +1299,9 @@ function renderLoop() {
     setAttr(box, "data-state", "off");
     text.append(
       el("b", { text: "Loop is off." }),
-      waiting === null
-        ? " Nothing has been claimed."
-        : " Nothing is queued, so nothing is waiting.",
+      executionJobs.length
+        ? ` ${plural(executionJobs.length, "execution worker continues", "execution workers continue")} independently.`
+        : waiting === null ? " Nothing has been claimed." : " Nothing is queued, so nothing is waiting.",
     );
     control("start", "Start the loop", `${startCost(loop)} Until one is filed it just watches the queue.`);
     return;
@@ -1361,43 +1345,19 @@ function renderLoop() {
     return;
   }
 
-  /* Two different promises, because they are two different facts: with a run
-     in flight the operator is being told they will wait for it, and with none
-     they are being told there is nothing to wait for. */
-  control("stop", "Stop the loop", daemon.current && daemon.current.length > 0
-    ? "It finishes the run(s) it is on first, then stops claiming. Nothing in flight is abandoned."
-    : "It stops claiming new tasks. Nothing is in flight, so nothing is interrupted.",
-  daemon.current && daemon.current.length > 0
-    ? "Finish the run(s) in flight, then stop claiming?"
-    : "Stop claiming new tasks? Nothing is in flight.");
+  if (taskJobs.length > 0) {
+    parkControl("Park at the next step",
+      "Explicitly stops task workers at their next node boundary and leaves runs resumable. Updating never requires parking.");
+  }
+  control("stop", "Stop the scheduler",
+    "Stops claiming new tasks promptly. Active task and chat workers continue independently.",
+    "Stop claiming new tasks? Active workers will continue.");
 }
 
-/* Start or stop the loop in this server. Starting is one tap: it is
-   repeatable. Stopping goes through `confirmed`, two taps, because a stray tap
-   from a phone in a pocket would otherwise leave the queue stopped overnight.
-
-   Neither direction is believed on request, either. A stop is accepted while
-   the loop is still running \u2014 reported as `stopping` when a run is in
-   flight, and as plain "running" when there is none and it will go quiet a
-   poll later \u2014 so "stopped" is announced from a view where `running` has
-   actually gone false, not from the tap. A 409 is followed by a refetch,
-   which is what replaces a button this page cannot honour with the sentence
-   explaining why. */
-/* Replace the binary and come back on it.
- *
- * The one thing the deck could not do for itself: `cargo install` cannot
- * overwrite a running executable, so every fix waited for a competition to end
- * or went in with the deck stopped. `kaishin` renames the running image aside
- * instead, so only the restart needs arranging - and the run in flight is
- * parked at its next node boundary first, which is why this costs at most one
- * step rather than a whole competition.
- *
- * The server answers 202 and then exits, so there is nothing to await here
- * beyond that acknowledgement: the phone learns the deck is back the same way
- * it learns everything else, by reconnecting. */
-/* The upgrade's own line under the strip. Kept out of `fail`'s alert: this is
-   not an error, and it has to survive the change-stream refreshes that redraw
-   the strip while the loop parks. */
+/* Replace the installed binary, then restart web and scheduler. Execution
+   workers stay alive on their original executable; no node or chat wait is
+   part of this handover. The phone reconnects after the 202 acknowledgement. */
+/* The upgrade's own line survives change-stream redraws during replacement. */
 function quietNote(text) {
   const why = $("loop-why");
   if (!why) return;
@@ -1437,11 +1397,7 @@ async function upgrade() {
       quietNote(detail);
       return;
     }
-    /* A park waits for the node in flight, which can be an hour. Leaving the
-       button reading "Upgrading…" for that long is the same mistake as an
-       error rendered off screen: it looks wedged. The strip says what it is
-       waiting for, and the phone finds out it is back by reconnecting. */
-    setText(btn, "Parking, then restarting\u2026");
+    setText(btn, "Restarting web and scheduler\u2026");
     quietNote(detail);
   } catch (error) {
     setText(btn, "Update & restart");
@@ -9788,6 +9744,7 @@ async function loadHealth({ applyRevisions = false, explicit = false } = {}) {
   const gen = unreachable.gen;
   try {
     state.health = await getJson(API.health);
+    state.healthError = null;
     renderBell();
     /* Through applyLoop rather than a bare render, so a loop that went quiet
        between ticks is confirmed here too: with the stream up, this interval
@@ -9803,6 +9760,10 @@ async function loadHealth({ applyRevisions = false, explicit = false } = {}) {
   } catch (error) {
     if (gen !== unreachable.gen) return;
     const network = !error.status && !(error instanceof SyntaxError);
+    if (!network) {
+      state.healthError = error.message;
+      renderLoop();
+    }
     if (network && !explicit && navigator.onLine === false) {
       /* Offline is not "magi is down"; the browser will say online again. */
       resetUnreachable();
@@ -9891,6 +9852,17 @@ function setRunEvidencePending(pending) {
 }
 
 async function loadRun(id, { background = false } = {}) {
+  // An ordinary duplicate joins the current read without replacing its
+  // callbacks or staging. Only a change signal requests a trailing refresh.
+  if (!background && state.detail.id === id) {
+    const pending = ["core", "evidence", "report"]
+      .map(section => detailSections.get(`run:${id}:${section}`))
+      .filter(Boolean);
+    if (pending.length) {
+      await Promise.allSettled(pending.map(job => job.promise));
+      return;
+    }
+  }
   const requestId = nextRunRequest(id);
   if (state.detail.id !== id) {
     state.detail = runShell(id, (state.runs || []).find(r => r.id === id));
@@ -9899,10 +9871,11 @@ async function loadRun(id, { background = false } = {}) {
     renderRunDetail();
   }
   const detail = state.detail;
+  const current = () => state.detail === detail && runDetailRequests.get(id) === requestId;
   const retry = () => loadRun(id, { background: true });
   sectionNotice("run-meta", "run-core-state", "Loading run…", null, { pending: true, snapshot: Boolean(detail.run && !detail.run.isShell) });
-  // Stage the two new responses without discarding the displayed snapshot.
-  // Shared staging also supports sectionRequest's coalesced trailing refresh.
+  // Only this refresh may stage responses or clear its pending notices.
+  // Older reads can finish while sectionRequest starts the coalesced refresh.
   detail.core = null;
   detail.evidence = null;
   const retain = Boolean(detail.run && !detail.run.isShell);
@@ -9930,7 +9903,7 @@ async function loadRun(id, { background = false } = {}) {
     setRunEvidencePending(false);
   };
   const core = sectionRequest(`run:${id}:core`, `${API.run(id)}/core`, run => {
-    if (state.detail !== detail) return;
+    if (!current()) return;
     detail.core = run;
     sectionNotice("run-meta", "run-core-state", "");
     if (!retain) {
@@ -9941,7 +9914,7 @@ async function loadRun(id, { background = false } = {}) {
     }
     applyEvidence();
   }, error => {
-    if (state.detail === detail) {
+    if (current()) {
       detail.core = null;
       detail.evidenceError = true;
       sectionNotice("run-meta", "run-core-state", `Run: ${error.message}`, retry);
@@ -9950,11 +9923,11 @@ async function loadRun(id, { background = false } = {}) {
     }
   }, false, background);
   const evidence = sectionRequest(`run:${id}:evidence`, API.run(id), run => {
-    if (state.detail !== detail) return;
+    if (!current()) return;
     detail.evidence = run;
     applyEvidence();
   }, error => {
-    if (state.detail !== detail) return;
+    if (!current()) return;
     detail.evidence = null;
     detail.evidenceError = true;
     sectionNotice("run-meta", "run-evidence-state", `Related status: ${error.message}`, retry);
@@ -9962,14 +9935,14 @@ async function loadRun(id, { background = false } = {}) {
     setRunEvidencePending(false);
   }, false, background);
   const report = sectionRequest(`run:${id}:report`, API.reportJson(id), view => {
-    if (state.detail !== detail) return;
+    if (!current()) return;
     detail.reportView = view;
     state.detail.reportLoading = false;
     sectionNotice("run-report-note", "run-report-state", "");
     renderReportCards();
     if (state.rawReport || view.schema !== REPORT_VIEW_SCHEMA || !Array.isArray(view.sections)) return loadRawReport(id);
   }, error => {
-    if (state.detail !== detail) return;
+    if (!current()) return;
     state.detail.reportLoading = false;
     sectionNotice("run-report-note", "run-report-state", `Report: ${error.message}`, retry);
     if (!detail.reportView) {

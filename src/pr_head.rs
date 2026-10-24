@@ -12,16 +12,43 @@ use anyhow::{Context, Result, bail};
 /// unlinking a locked inode would let a second caller lock a different one.
 /// Contention fails closed rather than blocking an async executor.
 pub(crate) fn owner_lock(home: &Path, id: &str) -> Result<OwnerLock> {
-    let path = home.join("runs").join(id).join("pr-owner.lock");
-    let file = std::fs::OpenOptions::new()
+    let file = owner_file(home, id)?;
+    try_lock_file(&file).context("public head ownership is being updated; retry later")?;
+    Ok(OwnerLock { _file: file })
+}
+
+fn owner_file(home: &Path, id: &str) -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(path)
-        .context("open public head ownership lock")?;
-    try_lock_file(&file).context("public head ownership is being updated; retry later")?;
-    Ok(OwnerLock { _file: file })
+        .open(home.join("runs").join(id).join("pr-owner.lock"))
+        .context("open public head ownership lock")
+}
+
+/// Execution boundaries wait for short maintenance transactions without
+/// blocking the runtime or releasing the execution lease they already own.
+pub(crate) async fn owner_lock_wait(
+    home: &Path,
+    id: &str,
+    wait: std::time::Duration,
+) -> Result<OwnerLock> {
+    let file = owner_file(home, id)?;
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match try_lock_file(&file) {
+            Ok(()) => return Ok(OwnerLock { _file: file }),
+            Err(error)
+                if (error.kind() == std::io::ErrorKind::WouldBlock
+                    || cfg!(windows) && error.raw_os_error() == Some(33))
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(error) => return Err(error).context("waiting for public head ownership"),
+        }
+    }
 }
 
 /// Explicitly unlock on Unix: another test/thread can fork while this lock is

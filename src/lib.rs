@@ -94,6 +94,7 @@ pub mod updater;
 pub mod verdict;
 pub mod waiter;
 pub mod web;
+pub mod worker;
 pub mod worktree_setup;
 
 pub mod choice_effect;

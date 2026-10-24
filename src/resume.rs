@@ -1,5 +1,5 @@
 //! Shared manual and owner-choice resume entry point.
-use anyhow::{Result, ensure};
+use anyhow::{Context as _, Result, ensure};
 use std::path::Path;
 
 /// Preflight is repeated by Runner's claim under the execution lease before
@@ -40,19 +40,54 @@ pub(crate) fn validate_unqueued(home: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn execute(id: &str) {
-    match crate::graph::Runner::resume(id) {
-        Ok(mut runner) => {
-            if let Err(e) = runner.execute().await {
-                tracing::warn!("resume of run {id} stopped: {e:#}");
-            }
-        }
-        Err(e) => tracing::warn!("run {id} could not be resumed: {e:#}"),
-    }
+/// Adopt a legacy ownerless run into the same claimed task-worker path as CLI
+/// resumes. Success acknowledges a durable worker, not an in-process future.
+pub(crate) async fn spawn_detached(home: &Path, id: &str) -> Result<crate::worker::Job> {
+    validate_unqueued(home, id)?;
+    let state = crate::run::RunState::load_under(id, home)?;
+    let queue = crate::queue::Queue::at(home.join("queue"));
+    let _serial = queue
+        .claim(&format!("resume-{id}"))
+        .context("another resume request is claiming this run")?;
+    let (mut task, claim) = crate::direct::claim_resume_owner(
+        &queue,
+        id,
+        &state.instruction,
+        &state.repo,
+        crate::queue::Source::Human,
+        &state.sources,
+    )?;
+    ensure!(
+        task.runs.last().is_some_and(|run| run == id)
+            && task.status != crate::queue::TaskStatus::Done,
+        "run queue owner changed"
+    );
+    // A crashed worker can leave its task Running after releasing its claim
+    // and execution lease. Preflight checked run liveness, and the task claim
+    // acquired above excludes a concurrent queue driver; no scheduler reclaim
+    // is required before this explicit resume.
+    task.release_operator("resume", None);
+    task.resume_override = Some(crate::queue::OperatorResume {
+        question_id: String::new(),
+        at: jiff::Timestamp::now(),
+        conductor_rehold: None,
+        forced: true,
+        pinned_run: Some(id.to_owned()),
+    });
+    queue.put(&mut task)?;
+    let opts = crate::daemon::Opts {
+        repo: task.repo.clone(),
+        config: task
+            .overrides
+            .as_ref()
+            .and_then(|options| options.config.clone()),
+        ..Default::default()
+    };
+    crate::daemon::spawn_claimed(home, &opts, &queue, &task, claim).await
 }
 
-pub(crate) fn start(id: String) {
-    tokio::spawn(async move { execute(&id).await });
+pub(crate) async fn start(home: &Path, id: String) -> Result<()> {
+    spawn_detached(home, &id).await.map(|_| ())
 }
 
 /// Hand a resumable run back to the queue task that owns it, pinned to that

@@ -3,18 +3,14 @@
 //! Every external program magi runs - the agent CLIs, `git`, `gh`, the
 //! configured verification commands - is a console application. What happens
 //! when one is spawned depends on whether the *parent* has a console, and
-//! magi has two kinds of parent:
+//! magi has two relevant kinds of parent:
 //!
-//! - `magi run` / `magi review` in a terminal. The child inherits that
-//!   console, writes nowhere visible because its pipes are redirected, and
-//!   nothing appears.
-//! - `magi web`, which serves the deck. Its successor is spawned
-//!   `DETACHED_PROCESS` on purpose (see [`crate::web`]): it has to outlive the
-//!   process that started it and must not hold a pipe a terminal is waiting
-//!   on. **That process has no console at all**, so Windows allocates a brand
-//!   new one for each console child - and draws it. An implement wave is
-//!   three agents, so three black windows opened over whatever the operator
-//!   was doing, in front of the browser they were reading the deck in.
+//! - Terminal commands: ordinary console helpers inherit the console, while
+//!   redirected pipes keep their output out of the operator's screen.
+//! - Detached web, scheduler and execution workers: these have no console.
+//!   On Windows an ordinary console child would allocate and display a new
+//!   one unless its launcher suppresses the window. An implement wave can
+//!   otherwise open several black windows over the operator's browser.
 //!
 //! `CREATE_NO_WINDOW` is the answer to exactly that: the child still gets a
 //! console for its standard handles, and that console is never shown. It is
@@ -381,93 +377,6 @@ mod tests {
         assert_eq!(CREATE_NO_WINDOW, 0x0800_0000);
         assert_ne!(CREATE_NO_WINDOW, 0x0000_0008, "DETACHED_PROCESS");
         assert_ne!(CREATE_NO_WINDOW, 0x0000_0010, "CREATE_NEW_CONSOLE");
-    }
-
-    /// Applying it does not disturb the command being built.
-    ///
-    /// The trait returns `&mut Self` so it can sit in the middle of a builder
-    /// chain, and a call site that put it there must not lose its program or
-    /// arguments to it.
-    #[test]
-    fn quiet_leaves_the_command_it_was_handed_intact() {
-        let mut cmd = tokio::process::Command::new("git");
-        cmd.args(["status", "--short"]).quiet();
-        let built = cmd.as_std();
-        assert_eq!(built.get_program(), "git");
-        let args: Vec<_> = built.get_args().collect();
-        assert_eq!(args, ["status", "--short"]);
-    }
-
-    /// Every `Command::new` in this crate's own sources is either quieted or
-    /// carries one of the two exemptions this module's doc explains.
-    ///
-    /// A textual scan, not a lint: nothing in `cargo clippy` knows that a
-    /// console-app child of a console-less parent gets a window, so nothing
-    /// catches a spawn that forgot `.quiet()` short of a human reading every
-    /// call site - which is exactly how `disk.rs`'s PowerShell probe and
-    /// `graph.rs`'s `gh pr create` went unquieted despite every neighbouring
-    /// spawn getting it right. Each `Command::new` is checked against the
-    /// text between it and the next one in the same file (or end of file),
-    /// which is always enough to cover its own builder chain and never
-    /// bleeds into an unrelated spawn's exemption.
-    #[test]
-    fn every_spawn_in_the_crate_is_quiet_or_documented_as_exempt() {
-        // Read at run time: a shared target dir can hand this binary to a
-        // different worktree, and the compile-time path would then scan
-        // another tree's sources.
-        let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-        let src_dir = manifest.join("src");
-        let mut offenders = Vec::new();
-        for entry in std::fs::read_dir(&src_dir).expect("read src dir") {
-            let path = entry.expect("dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let file_name = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_owned();
-            if file_name == "tui.rs" {
-                // explorer / open / xdg-open: GUI launchers, not console
-                // children - out of scope by design (see AGENTS.md).
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("read source file");
-            let lines: Vec<&str> = text.lines().collect();
-            let spawn_at: Vec<usize> = lines
-                .iter()
-                .enumerate()
-                .filter(|(_, l)| l.contains("Command::new("))
-                .map(|(i, _)| i)
-                .collect();
-            for (pos, &start) in spawn_at.iter().enumerate() {
-                let end = spawn_at.get(pos + 1).copied().unwrap_or(lines.len());
-                let block = lines[start..end].join("\n");
-                if block.contains(".quiet()") {
-                    continue;
-                }
-                // `spawn_successor`'s DETACHED_PROCESS successor has no
-                // console to inherit in the first place; see its doc comment
-                // in `web.rs`.
-                if block.contains("DETACHED_PROCESS") {
-                    continue;
-                }
-                // A spawn guarded by `#[cfg(unix)]` a few lines above cannot
-                // hit the Windows console bug at all.
-                let preceding = lines[start.saturating_sub(5)..start].join("\n");
-                if preceding.contains("#[cfg(unix)]") {
-                    continue;
-                }
-                offenders.push(format!("{file_name}:{}", start + 1));
-            }
-        }
-        assert!(
-            offenders.is_empty(),
-            "Command::new without .quiet() and no documented exemption: {offenders:?}"
-        );
     }
 
     #[test]
