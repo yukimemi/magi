@@ -100,16 +100,25 @@ fn parse(text: &str) -> Option<String> {
 }
 
 async fn generate(talk: &Talk, store: &Talks, cfg: &Config) -> Option<String> {
-    let mut chain = agent::pick_chain(
-        &cfg.agents,
-        cfg.roles.chatter.as_ref(),
-        &agent::installed,
-        "chatter",
-    )
-    .ok()?;
-    // Prefer the agent that just answered successfully, keeping the fallback order.
-    if let Some(at) = chain.iter().position(|spec| spec.id == talk.agent) {
-        chain[..=at].rotate_right(1);
+    let current = cfg
+        .agents
+        .iter()
+        .find(|spec| spec.id == talk.agent)?
+        .clone();
+    let mut chain = vec![current];
+    // An explicit agent stays pinned, just as it does for conversation replies.
+    if let Some(choice) = cfg.roles.chatter.as_ref()
+        && talk.fallback
+    {
+        for id in choice.ids() {
+            if chain.iter().any(|spec| spec.id == id) {
+                continue;
+            }
+            match agent::pick(&cfg.agents, Some(id), &agent::installed) {
+                Ok(spec) => chain.push(spec),
+                Err(error) => tracing::warn!("[roles] chatter: skipping `{id}`: {error:#}"),
+            }
+        }
     }
     let identity = crate::scrub::Identity::current();
     let body = prompt(talk, &identity);
@@ -460,6 +469,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn title_generation_respects_pinned_agents_and_opt_in_fallback() {
+        for in_chain in [false, true] {
+            for fallback in [false, true] {
+                for valid in [false, true] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let store = Talks::at(tmp.path().join("talks"));
+                    let attempts = tmp.path().join("attempts");
+                    let make = |id: &str, output: &str| {
+                        AgentSpec {
+                        id: id.into(),
+                        kind: crate::config::AgentKind::Command,
+                        model: None,
+                        command: vec!["sh".into(), "-c".into(),
+                            "cat >/dev/null; printf '%s\\n' \"$AGENT_ID\" >> \"$ATTEMPTS\"; printf '%s' \"$OUTPUT\"".into()],
+                        extra_args: vec![],
+                        env: [
+                            ("ATTEMPTS".into(), attempts.to_string_lossy().into_owned()),
+                            ("AGENT_ID".into(), id.into()),
+                            ("OUTPUT".into(), output.into()),
+                        ].into(),
+                        prompt_delivery: None,
+                        max_turn_secs: None,
+                    }
+                    };
+                    let pinned_output = if valid {
+                        r#"{"title":"選択した話題"}"#
+                    } else {
+                        "invalid"
+                    };
+                    let choice = if in_chain {
+                        vec!["other".into(), "pinned".into(), "other".into()]
+                    } else {
+                        vec!["other".into()]
+                    };
+                    let cfg = Config {
+                        agents: vec![
+                            make("other", r#"{"title":"予備の話題"}"#),
+                            make("pinned", pinned_output),
+                        ],
+                        roles: crate::config::Roles {
+                            chatter: Some(crate::config::AgentChoice::Chain(choice)),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let mut talk = chat();
+                    talk.repo = tmp.path().to_owned();
+                    talk.agent = "pinned".into();
+                    talk.fallback = fallback;
+                    exchange(&mut talk, "会話の抜粋");
+                    let result = generate(&talk, &store, &cfg).await;
+                    let expected = if valid {
+                        Some("選択した話題")
+                    } else if fallback {
+                        Some("予備の話題")
+                    } else {
+                        None
+                    };
+                    assert_eq!(result.as_deref(), expected);
+                    let called = std::fs::read_to_string(&attempts).unwrap();
+                    assert_eq!(
+                        called,
+                        if !valid && fallback {
+                            "pinned\nother\n"
+                        } else {
+                            "pinned\n"
+                        },
+                        "in_chain={in_chain}, fallback={fallback}, valid={valid}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn title_generation_uses_a_separate_seat_and_fallback_then_waits_five_exchanges() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Talks::at(tmp.path().join("talks"));
@@ -495,6 +579,8 @@ mod tests {
             ..Default::default()
         };
         let mut talk = chat();
+        talk.agent = "invalid".into();
+        talk.fallback = true;
         talk.repo = tmp.path().to_owned();
         exchange(&mut talk, "タイトル生成の対象");
         let seat = serde_json::to_value(&talk.seat).unwrap();
