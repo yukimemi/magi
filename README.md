@@ -625,7 +625,9 @@ than overwrite a draft changed by another action. Restarting the web or schedule
 does not terminate an in-flight Chat invocation: its independent worker retains
 the same conversation and CLI session, and the replacement web process displays
 its busy state and eventual reply. Submissions accepted after an update use the
-new executable; queued sends remain serialized behind the running turn.
+new executable; queued sends remain serialized behind the running turn. Chat
+execution, publication fencing and startup recovery are implemented together in
+`src/chat_worker.rs`; they do not use the legacy question consultation dispatcher.
 Use **Resume queued draft** for text-only or image-only recovery after an actual
 execution failure, rather than resending the stored message. A launch failure
 proven to have started no execution restores the recorded send to that draft;

@@ -35,6 +35,7 @@ pub mod chat_control;
 mod chat_merge;
 pub mod chat_notify;
 pub mod chat_watch;
+pub mod chat_worker;
 pub mod clean;
 pub mod conduct;
 pub mod config;

@@ -264,7 +264,7 @@ async fn chat_survives_web_restart_and_successor_submission_keeps_one_session() 
     assert!(talks.get(id).unwrap().turns.iter().any(|turn| turn.body == "response-1"));
     std::fs::write(state.join("release-2"), "go").unwrap();
     wait_for(|| talks.get(id).unwrap().turns.iter().any(|turn| turn.body == "response-2")
-        && !magi::consult::turn_worker_active(&talks, id), "both persisted responses").await;
+        && !magi::chat_worker::turn_worker_active(&talks, id), "both persisted responses").await;
     let talk = talks.get(id).unwrap();
     assert_eq!(talk.title.as_ref().unwrap().text, "再起動後の会話", "the separate title seat persisted its result");
     assert_eq!(talk.title.as_ref().unwrap().source, magi::talk::TitleSource::Generated);

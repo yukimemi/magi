@@ -1387,7 +1387,7 @@ impl Ui {
             // Another process (the CLI) can hold the turn through the
             // on-disk lease.
             || self.talks.turn_held(id)
-            || crate::consult::turn_worker_active(&self.talks, id)
+            || crate::chat_worker::turn_worker_active(&self.talks, id)
     }
 
     /// 表示専用の観測。ローカルの受付処理やワーカーストアの書き込みを待たない。
@@ -1438,7 +1438,7 @@ impl Ui {
             .talk_turns
             .lock()
             .map_err(|_| ApiError::internal("the talk turn lock was poisoned"))?;
-        if crate::consult::turn_worker_active(&self.talks, id) {
+        if crate::chat_worker::turn_worker_active(&self.talks, id) {
             if queued {
                 *live.queued.entry(id.to_owned()).or_default() += 1;
             }
@@ -1491,7 +1491,7 @@ impl Ui {
             .lock()
             .map_err(|_| ApiError::internal("the talk turn lock was poisoned"))?;
         // A detached worker owns its turn across web process replacement.
-        if live.live.contains(id) || crate::consult::turn_worker_active(&self.talks, id) {
+        if live.live.contains(id) || crate::chat_worker::turn_worker_active(&self.talks, id) {
             return Ok(TalkTurnStart::Busy);
         }
         let Some(lease) = self.talks.claim_turn(id).map_err(ApiError::from)? else {
@@ -8433,7 +8433,7 @@ async fn question_consult(
             }
         })
         .await?;
-        let _publication = crate::consult::publication_guard(&ui.talks, &talk.id)
+        let _publication = crate::chat_worker::publication_guard(&ui.talks, &talk.id)
             .await
             .map_err(ApiError::from)?;
         let (view, reclaimed, submitted) = blocking({
@@ -8466,7 +8466,7 @@ async fn question_consult(
         #[cfg(not(test))]
         {
             if let Some(id) = submitted {
-                crate::consult::spawn_turn(&ui.talks, &id)
+                crate::chat_worker::spawn_turn(&ui.talks, &id)
                     .await
                     .map_err(ApiError::from)?;
             }
@@ -9343,7 +9343,7 @@ async fn talk_say(
         })
         .await?
     };
-    let _publication = crate::consult::publication_guard(&ui.talks, &id)
+    let _publication = crate::chat_worker::publication_guard(&ui.talks, &id)
         .await.map_err(ApiError::from)?;
 
     // Pending recovery and a new immediate turn are decided under the same
@@ -9459,7 +9459,7 @@ async fn talk_say(
                     {
                         match written {
                             Ok((view, reclaimed)) => {
-                                let launched = crate::consult::spawn_turn(&ui.talks, &id).await;
+                                let launched = crate::chat_worker::spawn_turn(&ui.talks, &id).await;
                                 drop(reclaimed);
                                 match launched {
                                     Ok(_) => { let _ = tx.send(Ok(view)); }
@@ -9581,7 +9581,7 @@ async fn talk_say(
                 // The reservation becomes durable while this process still
                 // holds the talk lease. The child waits for that lease; the
                 // new UI sees its startup reservation immediately.
-                let result = crate::consult::spawn_recorded_turn(
+                let result = crate::chat_worker::spawn_recorded_turn(
                     &talks, &id, talk.turns.len() - 1,
                 ).await;
                 drop(turn_guard);
@@ -9638,7 +9638,7 @@ async fn talk_pending_resume(
             let asked = id.clone();
             blocking(move || resolve_talk(&ui.talks, &asked)).await?
         };
-        let _publication = crate::consult::publication_guard(&ui.talks, &id)
+        let _publication = crate::chat_worker::publication_guard(&ui.talks, &id)
             .await
             .map_err(ApiError::from)?;
         let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
@@ -9687,7 +9687,7 @@ async fn detach_talk_turn(
     id: String,
     turn: TalkTurnGuard,
 ) -> ApiResult<()> {
-    let launched = crate::consult::spawn_turn(&talks, &id).await;
+    let launched = crate::chat_worker::spawn_turn(&talks, &id).await;
     drop(turn);
     launched.map(|_| ()).map_err(ApiError::from)
 }
@@ -9740,7 +9740,7 @@ async fn drain_loop_started(
 ) {
     let pending = !talk.pending.is_empty() || !talk.pending_attachments.is_empty();
     let running = if pending {
-        match crate::consult::spawn_turn(&talks, &id).await {
+        match crate::chat_worker::spawn_turn(&talks, &id).await {
             Ok(_) => true,
             Err(error) => {
                 tracing::warn!("talk {id}: could not launch draft worker: {error:#}");
@@ -9907,7 +9907,7 @@ async fn talk_pending_edit(
             let ui = Arc::clone(&ui);
             blocking(move || resolve_talk(&ui.talks, &id)).await?
         };
-        let _publication = crate::consult::publication_guard(&ui.talks, &id)
+        let _publication = crate::chat_worker::publication_guard(&ui.talks, &id)
             .await
             .map_err(ApiError::from)?;
         let (view, reclaimed) = blocking({
@@ -9990,7 +9990,7 @@ async fn talk_agent(
             let ui = Arc::clone(&ui);
             blocking(move || resolve_talk(&ui.talks, &id)).await?
         };
-        let _publication = crate::consult::publication_guard(&ui.talks, &id)
+        let _publication = crate::chat_worker::publication_guard(&ui.talks, &id)
             .await
             .map_err(ApiError::from)?;
         let repo = {
@@ -10079,7 +10079,7 @@ async fn talk_persona(
             let ui = Arc::clone(&ui);
             blocking(move || resolve_talk(&ui.talks, &id)).await?
         };
-        let _publication = crate::consult::publication_guard(&ui.talks, &id)
+        let _publication = crate::chat_worker::publication_guard(&ui.talks, &id)
             .await
             .map_err(ApiError::from)?;
         let repo = {
@@ -10170,7 +10170,7 @@ async fn talk_implementers(
             let ui = Arc::clone(&ui);
             blocking(move || resolve_talk(&ui.talks, &id)).await?
         };
-        let _publication = crate::consult::publication_guard(&ui.talks, &id)
+        let _publication = crate::chat_worker::publication_guard(&ui.talks, &id)
             .await
             .map_err(ApiError::from)?;
         let repo = {
@@ -15745,7 +15745,7 @@ mod tests {
                 })
                 .expect("the busy branch dropped the gate without using it");
             assert!(
-                crate::consult::try_publication_guard(&talks, &id)
+                crate::chat_worker::try_publication_guard(&talks, &id)
                     .expect("publication fence")
                     .is_none(),
                 "a queued worker cannot promote text before its successor reservation is published"
@@ -15789,7 +15789,7 @@ mod tests {
             })
             .await;
             assert!(
-                crate::consult::try_publication_guard(&talks, &id)
+                crate::chat_worker::try_publication_guard(&talks, &id)
                     .expect("publication fence after disconnect")
                     .is_none()
             );
@@ -15806,7 +15806,7 @@ mod tests {
                     .expect("short admission transaction should release for replacement"),
             );
             assert!(
-                crate::consult::try_publication_guard(&talks, &id)
+                crate::chat_worker::try_publication_guard(&talks, &id)
                     .expect("publication fence after acknowledgement")
                     .is_some(),
                 "the publication fence is not retained by the long response"

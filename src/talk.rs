@@ -970,7 +970,7 @@ impl Talks {
     ///
     /// `None` means somebody else holds a fresh lease - the caller reports
     /// "a turn is already running" and must not start one. A lease is held
-    /// while its last beat is within [`crate::ask::LEASE_TTL`]; pids are never
+    /// while its last beat is within [`TURN_LEASE_TTL`]; pids are never
     /// consulted. A stale (or unreadable) lease is taken over: renamed to a
     /// unique name first, so of several takers only the one whose rename wins
     /// deletes it, and the claim itself is an exclusive create.
@@ -1064,7 +1064,7 @@ struct TurnRecord {
 
 impl TurnRecord {
     fn fresh(&self, now: Timestamp) -> bool {
-        now.as_second() - self.beat_at.as_second() <= crate::ask::LEASE_TTL.as_secs() as i64
+        now.as_second() - self.beat_at.as_second() <= TURN_LEASE_TTL.as_secs() as i64
     }
 }
 
@@ -1402,8 +1402,13 @@ impl Drop for TurnLock {
 }
 
 /// How often a running turn renews its lease: well inside
-/// [`crate::ask::LEASE_TTL`].
+/// [`TURN_LEASE_TTL`].
 pub const TURN_BEAT: Duration = Duration::from_secs(20);
+
+/// Maximum age of a conversation turn heartbeat before takeover is allowed.
+/// Independent of legacy question-holder leases; the persisted turn lease
+/// format and expiry remain stable across executable generations.
+pub const TURN_LEASE_TTL: Duration = Duration::from_secs(90);
 
 /// One talk's cross-process turn slot, released on drop (success, error,
 /// panic or a dropped handler future alike). Release only removes the file
@@ -4098,7 +4103,7 @@ mod tests {
         let old = a.claim_turn("t1").expect("claim").expect("held");
         let later = Timestamp::now()
             .checked_add(jiff::SignedDuration::from_secs(
-                crate::ask::LEASE_TTL.as_secs() as i64 + 5,
+                TURN_LEASE_TTL.as_secs() as i64 + 5,
             ))
             .expect("later");
         let new = b
@@ -4118,7 +4123,7 @@ mod tests {
         let old = a.claim_turn("t1").expect("claim").expect("held");
         let later = Timestamp::now()
             .checked_add(jiff::SignedDuration::from_secs(
-                crate::ask::LEASE_TTL.as_secs() as i64 + 5,
+                TURN_LEASE_TTL.as_secs() as i64 + 5,
             ))
             .expect("later");
         let _new = b
