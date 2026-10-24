@@ -762,23 +762,6 @@ pub(crate) mod windows {
         Ok(detached)
     }
 
-    #[cfg(test)]
-    mod worker_detach_tests {
-        use super::detached_flags_for_limits;
-        #[test]
-        fn ordinary_ancestor_job_does_not_require_breakaway_permission() {
-            assert_eq!(detached_flags_for_limits(0).unwrap(), 0x208);
-            assert_eq!(
-                detached_flags_for_limits(0x2000 | 0x0800).unwrap(),
-                0x0100_0208
-            );
-            assert_eq!(detached_flags_for_limits(0x2000 | 0x1000).unwrap(), 0x208);
-            assert_eq!(
-                detached_flags_for_limits(0x2000).unwrap_err().kind(),
-                std::io::ErrorKind::Unsupported
-            );
-        }
-    }
     pub struct Containment(Handle);
     impl Containment {
         pub fn assign(child: &std::process::Child) -> std::io::Result<Self> {
@@ -827,6 +810,23 @@ pub(crate) mod windows {
             return Err(std::io::Error::last_os_error());
         }
         Ok(available)
+    }
+    #[cfg(test)]
+    mod worker_detach_tests {
+        use super::detached_flags_for_limits;
+        #[test]
+        fn ordinary_ancestor_job_does_not_require_breakaway_permission() {
+            assert_eq!(detached_flags_for_limits(0).unwrap(), 0x208);
+            assert_eq!(
+                detached_flags_for_limits(0x2000 | 0x0800).unwrap(),
+                0x0100_0208
+            );
+            assert_eq!(detached_flags_for_limits(0x2000 | 0x1000).unwrap(), 0x208);
+            assert_eq!(
+                detached_flags_for_limits(0x2000).unwrap_err().kind(),
+                std::io::ErrorKind::Unsupported
+            );
+        }
     }
 }
 

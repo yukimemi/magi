@@ -65,7 +65,32 @@ async fn wait_for(mut condition: impl FnMut() -> bool, what: &str) {
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    .unwrap_or_else(|_| {
+        let home = magi::run::home();
+        if let Some(parent) = home.parent() {
+            for name in ["old.log", "new.log"] {
+                if let Ok(log) = std::fs::read_to_string(parent.join(name)) {
+                    eprintln!("{name}:\n{log}");
+                }
+            }
+        }
+        for state in ["jobs", "results"] {
+            if let Ok(entries) = std::fs::read_dir(home.join("workers").join(state)) {
+                for entry in entries.flatten() {
+                    if let Ok(log) = std::fs::read_to_string(entry.path().join("worker.log"))
+                        && !log.is_empty()
+                    {
+                        eprintln!("{}:\n{log}", entry.path().display());
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "questions: {:#?}",
+            Questions::at(home.join("questions")).list()
+        );
+        panic!("timed out waiting for {what}");
+    });
 }
 
 fn question(store: &Questions, repo: &Path, agent: &str, title: &str) -> Question {

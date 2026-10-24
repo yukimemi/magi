@@ -740,8 +740,7 @@ async fn watch_does_not_send_owner_drafts_or_reopen_closed_or_deleted_talks() {
             )
             .expect("delete");
         }
-        std::thread::sleep(std::time::Duration::from_millis(1300));
-        magi::chat_watch::sweep(w.tmp.path(), &w.talks);
+        await_all_watches(&w);
         if deleted {
             assert!(w.talks.get(&w.talk_id).is_err());
         } else {

@@ -1052,6 +1052,8 @@ reservations and `worker.log`; finished records move to `workers/results/<id>/`.
 The most recent 256 finished records are retained. Content-addressed executables
 live under `workers/generations/<sha256>/` and are deliberately retained, so an
 old worker's later helper commands cannot switch to a newly installed binary.
+Interrupted snapshot copies are reclaimed from staging paths only. On Windows,
+cleanup clears their readonly attribute without changing retained executables.
 Do not remove a generation while its workers are running. Health and the loop
 strip show active worker versions separately from the web version; worker
 configuration payloads and command output are not exposed by Health.

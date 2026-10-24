@@ -200,9 +200,14 @@ fn store_lock(home: &Path) -> Result<Lease> {
     }
 }
 
+#[cfg(unix)]
 fn sync_dir(path: &Path) -> Result<()> {
-    #[cfg(unix)]
     File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -706,11 +711,26 @@ fn pin_source(home: &Path, source: &Path) -> Result<Generation> {
 
 fn remove_staging(staging: &Path) -> Result<()> {
     #[cfg(windows)]
-    for entry in std::fs::read_dir(staging)? {
-        let entry = entry?;
-        let mut permissions = entry.metadata()?.permissions();
-        permissions.set_readonly(false);
-        std::fs::set_permissions(entry.path(), permissions)?;
+    {
+        use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn SetFileAttributesW(path: *const u16, attributes: u32) -> i32;
+        }
+        const READONLY: u32 = 0x1;
+        for entry in std::fs::read_dir(staging)? {
+            let entry = entry?;
+            let attributes = entry.metadata()?.file_attributes();
+            if attributes & READONLY != 0 {
+                let path: Vec<u16> = entry.path().as_os_str().encode_wide().chain([0]).collect();
+                // SAFETY: path is a live, NUL-terminated UTF-16 buffer. Clear
+                // only the Windows readonly attribute, preserving other bits.
+                if unsafe { SetFileAttributesW(path.as_ptr(), attributes & !READONLY) } == 0 {
+                    return Err(std::io::Error::last_os_error())
+                        .context("clear staging readonly attribute");
+                }
+            }
+        }
     }
     Ok(std::fs::remove_dir_all(staging)?)
 }
@@ -1296,7 +1316,14 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let old = root(home.path()).join("generations").join(".new-abandoned");
         std::fs::create_dir_all(&old).unwrap();
-        std::fs::write(old.join("partial"), b"interrupted copy").unwrap();
+        let partial = old.join("partial");
+        std::fs::write(&partial, b"interrupted copy").unwrap();
+        #[cfg(windows)]
+        {
+            let mut permissions = std::fs::metadata(&partial).unwrap().permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&partial, permissions).unwrap();
+        }
         let source = home.path().join("source");
         std::fs::write(&source, b"complete executable").unwrap();
         let generation = pin_source(home.path(), &source).unwrap();
