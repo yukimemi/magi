@@ -344,82 +344,218 @@ async fn a_notice_appended_to_an_operators_draft_is_not_started() {
     assert!(chat_notify::talks_to_start(&w.talks).is_empty());
 }
 
+// Keep raw records as well as decoded state: Queue::list deliberately skips
+// unreadable tasks. A failure must distinguish a skipped notice from lost
+// provenance or a later draft write, including leftover lock/break tickets.
+fn notice_state(w: &World, stage: &str) -> String {
+    let records = ["queue", "talks"].map(|dir| {
+        let entries = std::fs::read_dir(w.tmp.path().join(dir)).map(|entries| {
+            entries
+                .map(|entry| {
+                    entry.map(|entry| {
+                        let path = entry.path();
+                        let raw = std::fs::read_to_string(&path);
+                        let due = if dir == "queue" && path.extension().is_some_and(|e| e == "json")
+                        {
+                            Some(
+                                w.queue
+                                    .get(path.file_stem().unwrap().to_str().unwrap())
+                                    .map(|t| t.chat_notice_due()),
+                            )
+                        } else {
+                            None
+                        };
+                        (entry.file_name(), raw, due)
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        (dir, entries)
+    });
+    format!("{stage}: {records:#?}")
+}
+
+#[derive(Clone)]
+struct NoticeWarnings(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for NoticeWarnings {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn legacy_notice_case(w: &World, watch: bool, combined: bool, owner_after_notice: Option<bool>) {
+    // This helper never awaits or spawns. The subscriber is local to this case,
+    // so warnings from other test threads cannot contaminate the evidence.
+    let warnings = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let writer = NoticeWarnings(warnings.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let mut observations = Vec::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            legacy_notice_steps(w, watch, combined, owner_after_notice, &mut observations);
+        }));
+        if let Err(panic) = result {
+            observations.push(notice_state(w, "failure"));
+            eprintln!(
+                "watch={watch}, combined={combined}, owner_after_notice={owner_after_notice:?}\n{}\nwarnings:\n{}",
+                observations.join("\n"),
+                String::from_utf8_lossy(&warnings.lock().unwrap())
+            );
+            std::panic::resume_unwind(panic);
+        }
+    });
+}
+
+fn legacy_notice_steps(
+    w: &World,
+    watch: bool,
+    combined: bool,
+    owner_after_notice: Option<bool>,
+    observations: &mut Vec<String>,
+) {
+    let first = finished_task(w, &w.talk_id, "20260902-000000-aaaa");
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()),
+        vec![w.talk_id.clone()]
+    );
+    observations.push(notice_state(w, "first notice"));
+    let first_saved = w.queue.get(&first.id).unwrap();
+    let mut legacy = w.talks.get(&w.talk_id).expect("legacy draft");
+    if let Some(after) = owner_after_notice {
+        let owner = "unfinished operator thought";
+        if after {
+            let start = legacy.pending.len() + 2;
+            legacy.pending.push_str("\n\n");
+            legacy.pending.push_str(owner);
+            legacy.pending_breaks = Some(vec![start]);
+        } else {
+            let prefix = format!("{owner}\n\n");
+            legacy.pending.insert_str(0, &prefix);
+            legacy.pending_breaks = Some(vec![prefix.len()]);
+        }
+    }
+    if combined {
+        // Legacy metadata can combine sends even though breaks still
+        // records their boundaries. Preserve that wire shape directly
+        // instead of using the current metadata compaction in put.
+        legacy.pending_messages = vec![talk::Message {
+            display: None,
+            sender: None,
+            body: legacy.pending.clone(),
+            attachments: Vec::new(),
+            reply: None,
+        }];
+        std::fs::write(
+            w.talks.path_of(&legacy.id),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .expect("save combined legacy format");
+    } else {
+        legacy.pending_messages.clear();
+        w.talks.put(&mut legacy).expect("save plain legacy format");
+    }
+    let talks = Talks::at(w.tmp.path().join("talks"));
+    assert!(
+        talks
+            .get(&w.talk_id)
+            .unwrap()
+            .pending_messages
+            .iter()
+            .all(|m| m.sender.is_none())
+    );
+
+    observations.push(notice_state(w, "legacy draft"));
+    if watch {
+        let mut talk = talks.get(&w.talk_id).unwrap();
+        let report = magi::prompt::chat_watch_notice("job", "finished", "output");
+        assert!(talk::queue_once(&mut talk, &talks, &report, "watch:job:finished").unwrap());
+        observations.push(format!("watch immediately after queue_once: {talk:#?}"));
+    } else {
+        let next = finished_task(w, &w.talk_id, "20260902-000000-bbbb");
+        observations.push(notice_state(w, "second task saved, before sweep"));
+        assert_ne!(next.id, first.id, "filing must reserve a distinct task id");
+        assert!(next.chat_notice.is_none());
+        assert!(next.chat_notices.is_empty());
+        assert_eq!(next.chat_notice_due().as_deref(), Some("done"));
+        assert_eq!(
+            chat_notify::sweep(&w.queue, &talks, w.tmp.path()),
+            vec![w.talk_id.clone()]
+        );
+        assert_eq!(w.queue.list().len(), 2);
+        let first_after = w.queue.get(&first.id).unwrap();
+        assert_eq!(first_after.chat_notice, first_saved.chat_notice);
+        assert_eq!(first_after.chat_notices, first_saved.chat_notices);
+        for task in [&first, &next] {
+            let saved = w.queue.get(&task.id).unwrap();
+            assert_eq!(saved.runs, task.runs);
+            assert_eq!(saved.chat_notice_due(), None);
+            assert_eq!(
+                saved.chat_notice.unwrap().outcome,
+                ChatNoticeOutcome::Posted
+            );
+        }
+    }
+    observations.push(notice_state(w, "immediately after notification"));
+    let talks = Talks::at(w.tmp.path().join("talks"));
+    let mut mixed = talks.get(&w.talk_id).unwrap();
+    observations.push(format!("reloaded mixed draft: {mixed:#?}"));
+    assert_eq!(mixed.pending_messages[0].sender, None);
+    assert_eq!(
+        mixed.pending_messages.last().unwrap().sender,
+        Some(talk::Sender::Magi)
+    );
+    assert_eq!(
+        chat_notify::talks_to_start(&talks).contains(&w.talk_id),
+        owner_after_notice.is_none()
+    );
+
+    // Explicit operator provenance wins even when the text is a notice.
+    let notice = mixed.pending_messages.last().unwrap().body.clone();
+    talk::queue(&mut mixed, &talks, &notice, Vec::new()).unwrap();
+    assert!(chat_notify::talks_to_start(&talks).is_empty());
+}
+
 #[tokio::test]
 async fn legacy_notices_resume_after_new_task_or_watch_notices_arrive() {
     let _home = common::home_lock().await;
     for (watch, combined) in [(false, false), (true, false), (false, true), (true, true)] {
         for owner_after_notice in [None, Some(false), Some(true)] {
-            let w = world();
-            finished_task(&w, &w.talk_id, "20260902-000000-aaaa");
-            chat_notify::sweep(&w.queue, &w.talks, w.tmp.path());
-            let mut legacy = w.talks.get(&w.talk_id).expect("legacy draft");
-            if let Some(after) = owner_after_notice {
-                let owner = "unfinished operator thought";
-                if after {
-                    let start = legacy.pending.len() + 2;
-                    legacy.pending.push_str("\n\n");
-                    legacy.pending.push_str(owner);
-                    legacy.pending_breaks = Some(vec![start]);
-                } else {
-                    let prefix = format!("{owner}\n\n");
-                    legacy.pending.insert_str(0, &prefix);
-                    legacy.pending_breaks = Some(vec![prefix.len()]);
+            legacy_notice_case(&world(), watch, combined, owner_after_notice);
+        }
+    }
+}
+
+// Before filing reserved ids, the second task could inherit the first task's
+// completion history and sweep would silently skip its notice. Exercise the
+// collision through the legacy-draft path, not just the queue in isolation.
+#[tokio::test]
+async fn legacy_notices_resume_after_task_id_collision() {
+    let _home = common::home_lock().await;
+    for combined in [false, true] {
+        for owner_after_notice in [None, Some(false), Some(true)] {
+            let mut w = world();
+            let draws = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let source = draws.clone();
+            w.queue = w.queue.with_id_source(move || {
+                match source.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                    0 | 1 => "20260902-000000-aaaa".to_owned(),
+                    2 => "20260902-000000-bbbb".to_owned(),
+                    _ => panic!("unexpected additional id draw"),
                 }
-            }
-            if combined {
-                // Legacy metadata can combine sends even though breaks still
-                // records their boundaries. Preserve that wire shape directly
-                // instead of using the current metadata compaction in put.
-                legacy.pending_messages = vec![talk::Message {
-                    display: None,
-                    sender: None,
-                    body: legacy.pending.clone(),
-                    attachments: Vec::new(),
-                    reply: None,
-                }];
-                std::fs::write(
-                    w.talks.path_of(&legacy.id),
-                    serde_json::to_vec(&legacy).unwrap(),
-                )
-                .expect("save combined legacy format");
-            } else {
-                legacy.pending_messages.clear();
-                w.talks.put(&mut legacy).expect("save plain legacy format");
-            }
-            let talks = Talks::at(w.tmp.path().join("talks"));
-            assert!(
-                talks
-                    .get(&w.talk_id)
-                    .unwrap()
-                    .pending_messages
-                    .iter()
-                    .all(|m| m.sender.is_none())
-            );
-
-            if watch {
-                let mut talk = talks.get(&w.talk_id).unwrap();
-                let report = magi::prompt::chat_watch_notice("job", "finished", "output");
-                talk::queue_once(&mut talk, &talks, &report, "watch:job:finished").unwrap();
-            } else {
-                finished_task(&w, &w.talk_id, "20260902-000000-bbbb");
-                chat_notify::sweep(&w.queue, &talks, w.tmp.path());
-            }
-            let talks = Talks::at(w.tmp.path().join("talks"));
-            let mut mixed = talks.get(&w.talk_id).unwrap();
-            assert_eq!(mixed.pending_messages[0].sender, None);
-            assert_eq!(
-                mixed.pending_messages.last().unwrap().sender,
-                Some(talk::Sender::Magi)
-            );
-            assert_eq!(
-                chat_notify::talks_to_start(&talks).contains(&w.talk_id),
-                owner_after_notice.is_none()
-            );
-
-            // Explicit operator provenance wins even when the text is a notice.
-            let notice = mixed.pending_messages.last().unwrap().body.clone();
-            talk::queue(&mut mixed, &talks, &notice, Vec::new()).unwrap();
-            assert!(chat_notify::talks_to_start(&talks).is_empty());
+            });
+            legacy_notice_case(&w, false, combined, owner_after_notice);
+            assert_eq!(draws.load(std::sync::atomic::Ordering::SeqCst), 3);
         }
     }
 }
