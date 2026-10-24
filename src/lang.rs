@@ -21,6 +21,33 @@ pub fn is_japanese(language: &str) -> bool {
         || l.eq_ignore_ascii_case("日本語")
 }
 
+/// The language an agent is told to write in, by name.
+///
+/// `[graph] language` takes a code or a name, and a code reached the prompt
+/// verbatim: "Write all prose in ja" is an instruction a model can read as
+/// noise, and the questions agents asked came back in English on a repository
+/// configured for Japanese. Naming the language is the whole fix. The same
+/// name is what a CLI's own response-language setting expects.
+pub fn name(language: &str) -> &str {
+    if is_japanese(language) {
+        return "Japanese";
+    }
+    if is_english(language) {
+        return "English";
+    }
+    match language.trim() {
+        "de" => "German",
+        "fr" => "French",
+        "es" => "Spanish",
+        "ko" => "Korean",
+        "zh" => "Chinese",
+        // Anything else is passed through: the setting has always accepted a
+        // language name, and inventing a mapping for one magi cannot verify
+        // would be worse than repeating what the operator wrote.
+        other => other,
+    }
+}
+
 /// `[graph] language` of the repository at `repo`, read best-effort for
 /// callers with no run (and so no config of their own). An unreadable config
 /// is English: a hold reason must still get written.

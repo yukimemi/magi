@@ -528,7 +528,7 @@ pub(crate) async fn invoke_leased(
         .with_context(|| format!("write {}", prompt_path.display()))?;
 
     let plan = build_command(spec, seat, inv, &prompt_path)?;
-    tracing::debug!(seat = %seat.key, agent = %spec.id, argv = ?plan.argv, "spawning agent");
+    tracing::debug!(seat = %seat.key, agent = %spec.id, argv = ?plan.logged_argv(), "spawning agent");
     // Store scope evidence without environment values or arbitrary extra args.
     tokio::fs::write(
         inv.artifacts.join(format!("{}.access.json", inv.stem)),
@@ -801,6 +801,30 @@ fn file_name(p: &Path) -> String {
 struct Plan {
     argv: Vec<String>,
     stdin: Option<String>,
+}
+
+impl Plan {
+    /// Settings may have been loaded from a file containing credentials.
+    /// Log the option, never its value, including repeated and equals forms.
+    fn logged_argv(&self) -> Vec<&str> {
+        let mut settings_value = false;
+        self.argv
+            .iter()
+            .map(|arg| {
+                if settings_value {
+                    settings_value = false;
+                    "[redacted]"
+                } else if arg == "--settings" {
+                    settings_value = true;
+                    arg.as_str()
+                } else if arg.starts_with("--settings=") {
+                    "--settings=[redacted]"
+                } else {
+                    arg.as_str()
+                }
+            })
+            .collect()
+    }
 }
 
 /// How a file-delivered prompt is pointed at, per CLI.
@@ -1805,6 +1829,66 @@ pub fn pick(
         })
 }
 
+/// `spec` for a seat whose answer is posted to GitHub (a pull request title or
+/// description, a release reason), so the answer comes back in
+/// `github_language` whatever language the operator set for their own CLI.
+///
+/// claude applies the user-level `language` setting (`"language": "Japanese"`
+/// in `~/.claude/settings.json`) over a sentence in the prompt: the change
+/// summary prompt said "Write ... in English" and the description came back in
+/// Japanese, three times out of three when replayed, and in English every time
+/// with this override. A per-invocation `--settings` outranks the user file, so
+/// it is the CLI's own mechanism rather than more prompt wording. The other
+/// CLIs have no operator-level answer-language preference magi knows of and
+/// are returned unchanged.
+pub fn for_github_text(spec: &AgentSpec, github_language: &str, cwd: &Path) -> Result<AgentSpec> {
+    let mut spec = spec.clone();
+    if spec.kind == AgentKind::Claude {
+        // The CLI uses the last --settings value. Replace that value in
+        // place, preserving its settings and the precedence of earlier flags.
+        let mut existing = None;
+        let mut args = spec.extra_args.iter().enumerate();
+        while let Some((index, arg)) = args.next() {
+            if arg == "--settings" {
+                let (value_index, value) = args.next().context("--settings requires a value")?;
+                existing = Some((value_index, value.as_str(), false));
+            } else if let Some(value) = arg.strip_prefix("--settings=") {
+                existing = Some((index, value, true));
+            }
+        }
+        let mut settings = if let Some((_, value, _)) = existing {
+            let json = if value.trim_start().starts_with('{') {
+                value.to_owned()
+            } else {
+                std::fs::read_to_string(cwd.join(value))
+                    .context("cannot read existing seat --settings file")?
+            };
+            serde_json::from_str::<serde_json::Value>(&json)
+                .context("cannot parse existing seat --settings JSON")?
+        } else {
+            serde_json::json!({})
+        };
+        settings
+            .as_object_mut()
+            .context("seat --settings must be a JSON object")?
+            .insert(
+                "language".to_owned(),
+                serde_json::json!(crate::lang::name(github_language)),
+            );
+        let settings = settings.to_string();
+        if let Some((index, _, equals)) = existing {
+            spec.extra_args[index] = if equals {
+                format!("--settings={settings}")
+            } else {
+                settings
+            };
+        } else {
+            spec.extra_args.extend(["--settings".to_owned(), settings]);
+        }
+    }
+    Ok(spec)
+}
+
 /// Resolve a standalone seat's agent choice into the ordered chain to try.
 ///
 /// Unset (or empty) is [`pick`]'s default order, one entry. Otherwise each
@@ -2082,6 +2166,145 @@ mod tests {
         let second = plan_for(AgentKind::Claude, &seat, true);
         assert!(second.argv.windows(2).any(|w| w == ["--resume", &uuid]));
         assert!(!second.argv.iter().any(|a| a == "--session-id"));
+    }
+
+    #[test]
+    fn github_bound_claude_seats_override_the_operators_answer_language() {
+        let seat = SeatState::new("change-summary", "a", 7);
+        let art = Path::new("/art");
+        for (language, name) in [("en", "English"), ("", "English"), ("ja", "Japanese")] {
+            let claude =
+                for_github_text(&spec(AgentKind::Claude, None), language, Path::new(".")).unwrap();
+            let plan = build_command(
+                &claude,
+                &seat,
+                &inv(Path::new("."), art, false),
+                Path::new("/art/p.md"),
+            )
+            .unwrap();
+            let settings = format!(r#"{{"language":"{name}"}}"#);
+            assert!(
+                plan.argv
+                    .windows(2)
+                    .any(|w| w == ["--settings", settings.as_str()]),
+                "{:?}",
+                plan.argv
+            );
+            // The prompt still arrives on stdin, not as an argument a
+            // variadic flag could swallow.
+            assert_eq!(plan.stdin.as_deref(), Some("do the thing"));
+        }
+        for kind in [
+            AgentKind::Codex,
+            AgentKind::Opencode,
+            AgentKind::Antigravity,
+            AgentKind::Omp,
+        ] {
+            assert!(
+                for_github_text(&spec(kind, None), "en", Path::new("."))
+                    .unwrap()
+                    .extra_args
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn github_text_preserves_existing_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = serde_json::json!({
+            "language": "Japanese",
+            "env": { "SEAT_MODE": "configured" },
+            "apiKeyHelper": "credential-helper",
+            "hooks": { "Stop": [] }
+        });
+        std::fs::write(dir.path().join("seat-settings.json"), original.to_string()).unwrap();
+        for value in [original.to_string(), "./seat-settings.json".to_owned()] {
+            for equals in [false, true] {
+                let mut spec = spec(AgentKind::Claude, None);
+                // Earlier settings stay earlier; the CLI's last value wins.
+                spec.extra_args = vec!["--settings={\"language\":\"French\"}".to_owned()];
+                if equals {
+                    spec.extra_args.push(format!("--settings={value}"));
+                } else {
+                    spec.extra_args
+                        .extend(["--settings".to_owned(), value.clone()]);
+                }
+                spec.extra_args.push("--verbose".to_owned());
+                let updated = for_github_text(&spec, "en", dir.path()).unwrap();
+                assert_eq!(updated.extra_args.len(), spec.extra_args.len());
+                assert_eq!(updated.extra_args[0], spec.extra_args[0]);
+                assert_eq!(updated.extra_args.last(), spec.extra_args.last());
+                let value = &updated.extra_args[updated.extra_args.len() - 2];
+                let actual: serde_json::Value =
+                    serde_json::from_str(value.strip_prefix("--settings=").unwrap_or(value))
+                        .unwrap();
+                let mut expected = original.clone();
+                expected["language"] = serde_json::json!("English");
+                assert_eq!(actual, expected);
+            }
+        }
+        let on_disk: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("seat-settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(on_disk, original);
+    }
+
+    #[test]
+    fn github_text_settings_are_redacted_from_command_logging() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = serde_json::json!({ "env": { "AUTH_TOKEN": "test-only-secret" } });
+        std::fs::write(dir.path().join("seat-settings.json"), settings.to_string()).unwrap();
+        for equals in [false, true] {
+            let mut spec = spec(AgentKind::Claude, None);
+            spec.extra_args =
+                vec!["--settings={\"env\":{\"AUTH_TOKEN\":\"earlier-secret\"}}".to_owned()];
+            if equals {
+                spec.extra_args
+                    .push("--settings=./seat-settings.json".to_owned());
+            } else {
+                spec.extra_args
+                    .extend(["--settings".to_owned(), "./seat-settings.json".to_owned()]);
+            }
+            let spec = for_github_text(&spec, "en", dir.path()).unwrap();
+            let plan = build_command(
+                &spec,
+                &SeatState::new("change-summary", "a", 7),
+                &inv(dir.path(), dir.path(), false),
+                &dir.path().join("prompt.md"),
+            )
+            .unwrap();
+            // Execution still receives both the configured token and language.
+            let actual = plan.argv.last().unwrap();
+            let actual: serde_json::Value =
+                serde_json::from_str(actual.strip_prefix("--settings=").unwrap_or(actual)).unwrap();
+            assert_eq!(actual["env"]["AUTH_TOKEN"], "test-only-secret");
+            assert_eq!(actual["language"], "English");
+            let logged = format!("{:?}", plan.logged_argv());
+            assert!(!logged.contains("secret"));
+            assert!(!logged.contains("AUTH_TOKEN"));
+            assert!(logged.contains("[redacted]"));
+            assert_eq!(plan.logged_argv()[0], "claude");
+            assert!(plan.logged_argv().contains(&"--output-format"));
+        }
+    }
+
+    #[test]
+    fn github_text_rejects_unreadable_or_invalid_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("bad.json"), "invalid json").unwrap();
+        std::fs::write(dir.path().join("array.json"), "[]").unwrap();
+        for args in [
+            vec!["--settings"],
+            vec!["--settings", "missing.json"],
+            vec!["--settings=bad.json"],
+            vec!["--settings", "array.json"],
+        ] {
+            let mut spec = spec(AgentKind::Claude, None);
+            spec.extra_args = args.into_iter().map(str::to_owned).collect();
+            assert!(for_github_text(&spec, "en", dir.path()).is_err());
+        }
     }
 
     #[test]

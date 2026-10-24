@@ -47,30 +47,6 @@ pub struct Turn {
     pub body: String,
 }
 
-/// The language an agent is told to write in, by name.
-///
-/// `[graph] language` takes a code or a name, and a code reached the prompt
-/// verbatim: "Write all prose in ja" is an instruction a model can read as
-/// noise, and the questions agents asked came back in English on a repository
-/// configured for Japanese. Naming the language is the whole fix.
-fn language_name(language: &str) -> &str {
-    if crate::lang::is_japanese(language) {
-        return "Japanese";
-    }
-    match language.trim() {
-        "en" => "English",
-        "de" => "German",
-        "fr" => "French",
-        "es" => "Spanish",
-        "ko" => "Korean",
-        "zh" => "Chinese",
-        // Anything else is passed through: the setting has always accepted a
-        // language name, and inventing a mapping for one magi cannot verify
-        // would be worse than repeating what the operator wrote.
-        other => other,
-    }
-}
-
 /// Is this the default, where nothing needs saying?
 fn is_english(language: &str) -> bool {
     crate::lang::is_english(language)
@@ -82,7 +58,7 @@ fn lang(language: &str) -> String {
     }
     format!(
         "\n\nWrite all prose in {}. Keep the JSON keys and the labels as specified.",
-        language_name(language)
+        crate::lang::name(language)
     )
 }
 
@@ -96,7 +72,7 @@ fn hold_reason_language(language: &str) -> String {
     let name = if is_english(language) {
         "English"
     } else {
-        language_name(language)
+        crate::lang::name(language)
     };
     format!(
         "\n\nThe `reason` of a `hold` and any `recovery` note are shown to the \
@@ -134,7 +110,7 @@ pub const GITHUB_LANGUAGE_HEADING: &str = "# GitHub text language";
 /// and leaves the quality and confidentiality rules untouched.
 pub fn github_rule(language: &str, github_language: &str) -> String {
     if !is_english(github_language) {
-        let name = language_name(github_language);
+        let name = crate::lang::name(github_language);
         let mut s = format!(
             "\n\n{GITHUB_LANGUAGE_HEADING}\n\n\
              Pull request titles and bodies (the `TITLE:` line and the whole SUMMARY \
@@ -188,7 +164,7 @@ pub fn github_english_finding_titles(language: &str) -> String {
 /// [`github_rule`] for a reviewer's finding titles.
 pub fn github_finding_titles_rule(language: &str, github_language: &str) -> String {
     if !is_english(github_language) {
-        let name = language_name(github_language);
+        let name = crate::lang::name(github_language);
         let mut s = format!(
             "\n\n{GITHUB_LANGUAGE_HEADING}\n\n\
              Each finding's `title` can be copied into a pull request description, \
@@ -226,7 +202,7 @@ fn exempt_operator_prose(s: &mut String, language: &str, github_language: &str) 
             s,
             " The language instruction above does not apply to GitHub-facing \
              text: prose addressed to the operator stays in {}.",
-            language_name(language)
+            crate::lang::name(language)
         );
     }
 }
@@ -304,7 +280,7 @@ fn ask_the_owner(language: &str) -> String {
              they must be in {0} even though the flags and the filenames are \
              not. The same goes for every reply you send with `--thread`: the \
              owner reads that text too.",
-            language_name(language)
+            crate::lang::name(language)
         ));
     }
     s
@@ -1704,7 +1680,7 @@ pub fn change_summary_in(
     let language = if is_english(github_language) {
         "English"
     } else {
-        language_name(github_language)
+        crate::lang::name(github_language)
     };
     let ownership = child_run_ownership();
     let mut commits = String::new();
