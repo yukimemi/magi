@@ -228,7 +228,16 @@ cleanup can no longer release ownership merely by disappearing from the CLI's
 process tree. An undiscovered tool may finish naturally while cleanup waits;
 there is no timeout that converts an unknown writer into permission to reclaim.
 A wait exceeding one second logs a retention warning; pipe read errors retain
-the leases and log an error. Each invocation also gets
+the leases and log an error. After descendant termination and witness EOF,
+cleanup synchronously releases its worktree-output and cache reservations before
+releasing repository coordination, then signals completion. A subsequent
+repository operation therefore cannot contend with that cleanup owner's output
+reservations. Output leases remain independent locks: other owners or retention
+may acquire them, including between these releases. Reclamation is safe at that
+point because the tools have terminated. This cleanup handoff order does not
+change the shared build cache acquisition order described above.
+
+Each invocation also gets
 a fresh `MAGI_PROCESS_OWNER` environment token. Cleanup discovers processes
 with that token even after reparenting and freezes/kills them with the other
 tools. This covers tool launchers that close extra descriptors but preserve

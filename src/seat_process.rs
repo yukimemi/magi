@@ -1,4 +1,6 @@
 //! A cancelled invocation must leave a cleanup owner for both child and lease.
+//! After descendant termination and witness EOF, release this owner's output
+//! reservations before handing repository coordination to the next operation.
 use crate::repo_lock::SeatLease;
 use std::sync::{Arc, Mutex};
 use tokio::process::Child;
@@ -227,6 +229,9 @@ fn cleanup(
             }
             // Publish repository availability last: the next owner may
             // immediately reclaim outputs after acquiring coordination.
+            // OutputLease unlocks on drop, so this owner's reservations cannot
+            // cause contention after the handoff. Other owners and reclamation
+            // may still independently take them.
             drop(outputs);
             drop(lease);
             let _ = done.send(());
