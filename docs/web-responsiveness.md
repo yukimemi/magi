@@ -8,6 +8,12 @@ conversation detail endpoint remains compatible. Task instructions have a
 `/api/queue/{id}/core` endpoint; history and dependency evidence still come from
 the full detail endpoint. Core task responses never enable task actions.
 
+The conversation core returns Markdown without waiting for store-backed reference
+decoration. The existing renderer resolves those references asynchronously;
+paragraphs, lists, tables and inline code remain readable while links are pending.
+Code blocks and existing external links remain opaque. Exact and short-ID lookup
+tables avoid scanning every stored record for each word during decoration.
+
 Run detail and structured reports render independently. Text reports are read
 only for an unsupported/failed structured report or the Raw selection. A failed
 background refresh retains the previous content and exposes a local retry.
@@ -42,8 +48,24 @@ Unchanged task histories and run timelines retain their DOM nodes.
   scan failures preserve the last successful snapshot and are retried. Revision
   tokens include file identity and deletion, including question/notice stores.
   Question stores include lease and panel entries, not just JSON records.
+- Health capacity measurements have a separate demand-driven single flight.
+  Recursive runs/worktree/cache walks never delay the initial health response or
+  revision worker. Refreshes become eligible 60 seconds after the previous walk
+  finishes, not after it starts. Requests retain the last successful measurement
+  for each field during refresh or failure; a target-path change discards values
+  from the old scope. Cold/unavailable `runs_bytes` and `worktrees_bytes` are
+  `null`; optional free/cache values are omitted until known. A fully measured
+  empty tree is still `0`. Admission and cleanup use their existing authority.
 - No config or process-liveness cache was introduced. Mutation handlers retain
   their existing authoritative validation.
+
+The `health_disk_*` unit regressions hold a capacity walk open while concurrent
+health responses complete, then exercise single-flight refresh, failure recovery
+and scope changes. The real-router Chrome regression
+`linkify_builds_anchors_and_keeps_markup_as_text` opens an 85-turn synthetic
+conversation with health, related sections and reference responses held. It checks
+that the transcript renders first and real destination links arrive afterwards.
+No operator history is used by these fixtures.
 
 ## 実際の HTTP・ブラウザー比較（レビュー後に追加）
 

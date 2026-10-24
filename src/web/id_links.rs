@@ -4,6 +4,8 @@ use super::*;
 #[derive(Debug, Clone, Default)]
 pub(super) struct IdIndex {
     entries: Vec<Entry>,
+    by_id: HashMap<String, Vec<usize>>,
+    by_short: HashMap<String, Vec<usize>>,
 }
 #[derive(Debug, Clone)]
 struct Entry {
@@ -101,7 +103,7 @@ impl IdIndex {
                             valid: std::sync::OnceLock::new(),
                         })
                     });
-                index.entries.push(Entry {
+                index.insert(Entry {
                     kind,
                     id: id.clone(),
                     href: page_href(route, id),
@@ -133,12 +135,28 @@ impl IdIndex {
     }
 
     fn add(&mut self, kind: &'static str, id: &str, href: String) {
-        self.entries.push(Entry {
+        self.insert(Entry {
             kind,
             id: id.to_owned(),
             href,
             record: None, // Findings were decoded with their run; unit fixtures are trusted.
         });
+    }
+
+    fn insert(&mut self, entry: Entry) {
+        let position = self.entries.len();
+        self.by_id
+            .entry(entry.id.clone())
+            .or_default()
+            .push(position);
+        let short = crate::queue::short(&entry.id);
+        if short.len() == 4 && short.bytes().all(|b| b.is_ascii_hexdigit()) {
+            self.by_short
+                .entry(short.to_owned())
+                .or_default()
+                .push(position);
+        }
+        self.entries.push(entry);
     }
 
     fn resolve(&self, token: &str, _code: bool) -> Option<String> {
@@ -151,28 +169,30 @@ impl IdIndex {
             None => (None, token),
         };
         let short = id.len() == 4 && id.bytes().all(|b| b.is_ascii_hexdigit());
-        let eligible = |e: &&Entry| kind.is_none_or(|kind| e.kind == kind);
-        let exact: Vec<_> = self
-            .entries
-            .iter()
-            .filter(eligible)
-            .filter(|e| e.id == id)
-            .filter(|e| e.valid())
-            .collect();
-        let matches = if exact.is_empty() && short {
-            self.entries
-                .iter()
-                .filter(eligible)
-                .filter(|e| crate::queue::short(&e.id) == id)
-                .filter(|e| e.valid())
-                .collect()
-        } else {
-            exact
+        // Ordinary words must not scan every stored record. The same lookup
+        // tables serve transcript Markdown and deferred text decoration.
+        let matching = |shortened| {
+            let positions = if shortened {
+                self.by_short.get(id)
+            } else {
+                self.by_id.get(id)
+            };
+            positions
+                .into_iter()
+                .flatten()
+                .map(move |&position| &self.entries[position])
+                .filter(move |entry| kind.is_none_or(|kind| entry.kind == kind) && entry.valid())
         };
-        let first = matches.first()?;
-        matches
-            .iter()
-            .all(|e| e.href == first.href)
+        let mut exact = matching(false);
+        let (first, mut rest) = match exact.next() {
+            Some(first) => (first, exact),
+            None if short => {
+                let mut matches = matching(true);
+                (matches.next()?, matches)
+            }
+            None => return None,
+        };
+        rest.all(|entry| entry.href == first.href)
             .then(|| first.href.clone())
     }
 
@@ -230,6 +250,9 @@ impl IdIndex {
     }
 
     pub(super) fn markdown(&self, nodes: &mut Vec<md::Node>) {
+        if self.entries.is_empty() {
+            return;
+        }
         use md::Node;
         let mut linked = Vec::new();
         for mut node in std::mem::take(nodes) {
@@ -448,15 +471,9 @@ impl IndexCache {
                     });
                 }
                 let mut index = (*snapshot.ordinary).clone();
-                index.entries.extend(
-                    reviews
-                        .as_ref()
-                        .expect("initialized reviews")
-                        .index
-                        .entries
-                        .iter()
-                        .cloned(),
-                );
+                for entry in &reviews.as_ref().expect("initialized reviews").index.entries {
+                    index.insert(entry.clone());
+                }
                 Arc::new(index)
             }))
         } else {
@@ -564,6 +581,52 @@ mod tests {
         );
         assert!(index.resolve("dead", false).is_none());
         assert!(index.resolve("task@dead", false).is_some());
+    }
+
+    #[test]
+    fn indexed_resolution_preserves_exact_precedence_and_validated_ambiguity() {
+        let mut index = IdIndex::default();
+        index.add("task", "20260908-205803-dead", "#/tasks/long".into());
+        index.add("run", "20260908-205804-dead", "#/runs/long".into());
+        assert!(index.resolve("dead", false).is_none());
+        index.add("task", "dead", "#/tasks/exact".into());
+        assert_eq!(
+            index.resolve("dead", false).as_deref(),
+            Some("#/tasks/exact")
+        );
+        assert_eq!(
+            index.resolve("run@dead", false).as_deref(),
+            Some("#/runs/long")
+        );
+        index.add("run", "dead", "#/runs/exact".into());
+        assert!(index.resolve("dead", false).is_none());
+        assert_eq!(
+            index.resolve("task@dead", false).as_deref(),
+            Some("#/tasks/exact")
+        );
+
+        let home = tempfile::tempdir().unwrap();
+        let validation = Arc::new(RecordValidation {
+            root: home.path().join("missing"),
+            valid: std::sync::OnceLock::new(),
+        });
+        index.insert(Entry {
+            kind: "question",
+            id: "dead".into(),
+            href: "#/questions/invalid".into(),
+            record: Some(Arc::clone(&validation)),
+        });
+        index.add(
+            "question",
+            "20260908-205805-dead",
+            "#/questions/valid".into(),
+        );
+        assert_eq!(
+            index.resolve("question@dead", false).as_deref(),
+            Some("#/questions/valid")
+        );
+        assert_eq!(validation.valid.get(), Some(&false));
+        assert!(index.resolve("ordinary", false).is_none());
     }
 
     #[test]
