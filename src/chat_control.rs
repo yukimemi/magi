@@ -87,6 +87,17 @@ pub enum Operation {
         #[serde(default)]
         title: Option<String>,
     },
+    /// 保存された計画を作成、または所有者の個別承認で適用する。
+    ReconcileRetention {
+        /// 対象タスク ID。
+        task: String,
+        /// 保護する実装の完全な run ID。
+        authority: String,
+        /// 適用する保存済み計画 ID（省略時は計画のみ）。
+        apply: Option<String>,
+        /// 最新の所有者メッセージ全文。
+        quote: Option<String>,
+    },
     /// 個別確認後、生存が否定された run を破棄する。
     Abandon {
         /// 完全な run ID。
@@ -181,6 +192,34 @@ async fn execute(
                 },
             )?;
             format!("recorded `{choice}` for decision {}", q.short())
+        }
+        Operation::ReconcileRetention {
+            task,
+            authority,
+            apply,
+            quote,
+        } => {
+            let path = Box::pin(crate::retention::reconcile::run_chat(
+                home,
+                &task,
+                &authority,
+                apply.as_deref(),
+                crate::retention::reconcile::ChatRequest {
+                    talks,
+                    conversation: talk,
+                    quote: quote.as_deref(),
+                },
+            ))
+            .await?;
+            if apply.is_none() {
+                // Return the complete saved evidence through the capability bridge.
+                crate::retention::reconcile::chat_summary(&path)?
+            } else {
+                format!(
+                    "Applied saved plan {}",
+                    apply.as_deref().unwrap_or_default()
+                )
+            }
         }
         Operation::Abandon { run, quote } => {
             abandon(queue, talks, home, talk, &run, quote.as_deref())?;

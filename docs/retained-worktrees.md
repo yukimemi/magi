@@ -249,6 +249,53 @@ cleanup continue to refuse retention markers. Only this approval path accepts
 a plain, canonical historical blanket marker whose complete contents equal the
 task ID; the marker stays in place.
 
+### Standing conversation and phone approval
+
+From the task's standing conversation, ask for a retention plan. The chat runs:
+
+```sh
+magi task control reconcile-retention <task> --authority-run <full-run-id>
+```
+
+The existing `magi task reconcile-retention` spelling also routes through the
+same control channel when launched in a verified standing chat. Other seats
+cannot use it. No environment-variable changes or additional filesystem grants
+are needed. Planning saves a plan without an approval record or retirement.
+The response includes the exact plan ID, full task and authority IDs, expiry,
+protected historical sources, selected source, candidate paths and refusal
+reasons. Review the complete summary on the phone. If the response says
+`INCOMPLETE PRESENTATION`, obtain and inspect the complete saved plan through
+operator access; do not authorize from an incomplete display.
+
+After reviewing, the owner sends this single literal line as a new message:
+
+```text
+retention-apply: <plan-id> task=<full-task-id> authority=<full-run-id>
+```
+
+The chat repeats that entire latest owner message, without paraphrasing:
+
+```sh
+magi task --quote 'retention-apply: <plan-id> task=<full-task-id> authority=<full-run-id>' \
+  control reconcile-retention <full-task-id> --authority-run <full-run-id> --apply <plan-id>
+```
+
+A request to plan, a generic continuation, a combined or conditional instruction,
+an old message, or a queued retraction does not authorize application. The task
+must still belong to this conversation. Plans bind the conversation and expire
+24 hours after creation; legacy operator plans require fresh chat planning.
+Changed task, plan, authority or evidence requires inspection and replanning.
+The final commit section rechecks current owner evidence under its evidence lock
+and saves the owner conversation, turn/message positions and exact instruction
+in the versioned approval audit before the first durable retirement fence.
+
+After interruption, inspect the existing receipts and repeat the same apply
+with a fresh exact owner message as the latest send. A valid durable approval
+made within the deadline permits recovery even after the plan expires; expiry
+does not strand already fenced work. Every chat retry still requires explicit
+latest authorization, and all original proof and stale-write checks remain.
+Neither this workflow nor cleanup resumes the task or approves any merge.
+
 Only registered, canonical worktrees with recorded candidate/preparation
 identity can establish emptiness. Every entry in the run's worktree root must
 match that inventory. HEAD and candidate/preparation branches must equal the
