@@ -827,8 +827,10 @@ fn reconciliation_cli_rejects_non_chat_seats_and_preserves_direct_route() {
             .output()
             .unwrap(),
     );
-    assert!(
-        error.contains("authority must be a retained implementation"),
-        "{error}"
-    );
+    let expected = if cfg!(unix) {
+        "authority must be a retained implementation"
+    } else {
+        "retention reconciliation requires Unix leases"
+    };
+    assert!(error.contains(expected), "{error}");
 }
