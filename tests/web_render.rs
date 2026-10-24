@@ -4704,6 +4704,28 @@ async fn question_chat_link_survives_consultation_and_settlement() {
     let guard = common::home_lock().await;
     let fx = common::fixture(guard, common::Judges::Unanimous, false);
     let home = fx.tmp.path().join("magi-home");
+    // The consult button and origin-chat link belong to the retained legacy
+    // question path; with task-chat routing (the default) a question about a
+    // chat-filed task goes to that chat and never reaches this list.
+    let mut legacy = fx.config.clone();
+    legacy.graph.question_routing = false;
+    std::fs::write(fx.repo.join("magi.toml"), toml::to_string(&legacy).unwrap()).unwrap();
+    for args in [
+        vec!["add", "magi.toml"],
+        vec!["commit", "-m", "test: legacy question path"],
+        vec!["push", "origin", "main"],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&fx.repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     let talks = Talks::at(home.join("talks"));
     let mut chat = talk::begin(
         &talks,

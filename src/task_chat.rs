@@ -226,13 +226,26 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
         if q.routed_task.is_none() && !enabled_for(&tasks, &task_id) {
             continue;
         }
+        // A delivered decision that waits for the owner is left alone: it is
+        // rewritten only while it still lacks its task link (R2-1-1 / R2-2-1:
+        // every poll used to lock and rewrite it).
+        let needs_task = chat_routable(&q) && q.routed_task.as_deref() != Some(task_id.as_str());
+        if q.routed_chat.is_some() && !needs_task {
+            continue;
+        }
         let result = (|| -> Result<()> {
-            let (q, ()) = questions.update(&q.id, |r| {
-                if chat_routable(r) {
-                    r.routed_task = Some(task_id.clone());
-                }
-                Ok(())
-            })?;
+            let q = if needs_task {
+                questions
+                    .update(&q.id, |r| {
+                        if chat_routable(r) && r.routed_task.as_deref() != Some(task_id.as_str()) {
+                            r.routed_task = Some(task_id.clone());
+                        }
+                        Ok(())
+                    })?
+                    .0
+            } else {
+                q.clone()
+            };
             // Already queued approvals must not reopen a chat on every poll.
             if q.routed_chat.is_some() {
                 return Ok(());
@@ -438,5 +451,47 @@ mod tests {
         // so a read failure keeps the legacy question path.
         assert!(q.routed_task.is_none());
         assert!(questions.get(&q.id).unwrap().routed_task.is_none());
+    }
+
+    #[test]
+    fn a_delivered_decision_is_not_rewritten_on_every_sweep() {
+        let home = tempfile::tempdir().unwrap();
+        let queue = Queue::at(home.path().join("queue"));
+        let talks = talk::Talks::at(home.path().join("talks"));
+        let questions = Questions::at(home.path().join("questions"));
+        let mut task = Task::new(
+            "t".into(),
+            "i".into(),
+            home.path().to_path_buf(),
+            crate::queue::Source::Human,
+        );
+        queue.put(&mut task).unwrap();
+        let mut q = Question::new(
+            task.id.clone(),
+            "conduct".into(),
+            "conductor".into(),
+            "Finish?".into(),
+            String::new(),
+            vec!["finish".into(), "hold".into()],
+        );
+        q.actions
+            .insert("finish".into(), crate::ask::ChoiceAction::Done);
+        q.routed_task = Some(task.id.clone());
+        q.routed_chat = Some("chat".into());
+        questions.put(&mut q).unwrap();
+        assert!(awaits_decision(&q));
+        let path = questions.path_of(&q.id);
+        let before = std::fs::read(&path).unwrap();
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // A rewrite of identical bytes still replaces the file; give it a
+        // timestamp it could not share with the original write.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        sweep(&queue, &talks, &questions, home.path());
+        sweep(&queue, &talks, &questions, home.path());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            written
+        );
     }
 }

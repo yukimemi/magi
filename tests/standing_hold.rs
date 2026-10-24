@@ -332,6 +332,7 @@ async fn routed_decision_uses_its_own_standing_turn_without_legacy_consultation(
             extra_args: vec![],
             env: common::magi_cli_env(tmp.path(), "ANSWER_BIN"),
             prompt_delivery: None,
+            max_turn_secs: None,
         }],
         ..Config::default()
     };
