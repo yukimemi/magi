@@ -34,7 +34,7 @@ anyhow = "1.0.104"
 thiserror = "2.0.21"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-tokio = { version = "1.53.3", features = [
+tokio = { version = "1.54.1", features = [
   "rt",
   "rt-multi-thread",
   "macros",
