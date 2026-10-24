@@ -3391,6 +3391,20 @@ async fn start_service(
     cfg: Option<&Config>,
     busy: bool,
 ) -> Result<()> {
+    // Fetch policy is live configuration, unlike question recovery capacity.
+    // Reload before both cadence and eligibility, including disabled -> enabled.
+    let fetch_cfg = if operation == "fetch" {
+        match prepare(&opts.repo, opts) {
+            Ok(cfg) => Some(cfg),
+            Err(error) => {
+                tracing::warn!("could not reload periodic fetch configuration: {error:#}");
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
+    let cfg = fetch_cfg.as_ref().or(cfg);
     let ticks = home.join("service-ticks");
     std::fs::create_dir_all(&ticks)?;
     let receipt = ticks.join(format!("daemon-{operation}"));

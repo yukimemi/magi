@@ -8,6 +8,7 @@ use std::process::{Child, Stdio};
 use std::time::Duration;
 
 use common::{Judges, SeatBlock, fixture, home_lock, magi_cli};
+use magi::git;
 use magi::queue::{Queue, RunOverrides, Source, Task, TaskStatus};
 use magi::run::RunState;
 
@@ -183,5 +184,53 @@ async fn standalone_execution_finishes_after_its_following_cli_exits() {
     assert_eq!(finished.attempts, 1);
     assert_eq!(finished.runs, task.runs);
     assert_eq!(finished.passes.len(), 1);
+}
+}
+
+common::e2e! {
+async fn enabling_periodic_fetch_takes_effect_without_restarting_the_scheduler() {
+    let home = home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    let config = configure(&mut fx);
+    let home = magi::run::home();
+    let root = fx.tmp.path().join("scan");
+    let tracked = root.join("example.test").join("operator").join("tracked");
+    std::fs::create_dir_all(tracked.parent().unwrap()).unwrap();
+    git::git(
+        fx.tmp.path(),
+        &["clone", &fx.repo.to_string_lossy(), &tracked.to_string_lossy()],
+    ).await.unwrap();
+    let initial = git::rev_parse(&tracked, "refs/remotes/origin/main").await.unwrap();
+    let mut running = scheduler(&home, &fx.repo, &config, &fx.tmp.path().join("fetch.log"));
+    let pid = running.0.id();
+    wait_for(|| magi::daemon::read_status(&home).is_some_and(|reading|
+        reading.pid == Some(pid) && reading.polls > 0), "scheduler startup with fetch disabled").await;
+
+    std::fs::write(fx.repo.join("remote-update.txt"), "new remote content").unwrap();
+    git::git(&fx.repo, &["add", "remote-update.txt"]).await.unwrap();
+    git::git(&fx.repo, &["commit", "-m", "test: advance fetch source"]).await.unwrap();
+    let updated = git::rev_parse(&fx.repo, "main").await.unwrap();
+    assert_ne!(updated, initial);
+    assert_eq!(git::rev_parse(&tracked, "refs/remotes/origin/main").await.unwrap(), initial);
+
+    fx.config.repos.roots = vec![root];
+    fx.config.repos.fetch_interval = 1;
+    std::fs::write(&config, toml::to_string(&fx.config).unwrap()).unwrap();
+    tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            if git::rev_parse(&tracked, "refs/remotes/origin/main").await
+                .is_ok_and(|head| head == updated)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("live configuration must enable periodic fetch");
+    assert_eq!(git::rev_parse(&tracked, "HEAD").await.unwrap(), initial,
+        "fetch must not move the checkout");
+    assert_eq!(magi::daemon::read_status(&home).unwrap().pid, Some(pid));
+    running.stop();
+    wait_for(|| magi::worker::active(&home).is_ok_and(|jobs|
+        jobs.iter().all(|job| job.key != "service:daemon-fetch")), "fetch worker completion").await;
 }
 }
