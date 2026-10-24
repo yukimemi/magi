@@ -469,6 +469,8 @@ real exclusive lock through `repo_lock::SeatLease` without widening their
 sandbox. All chat turns (`queue::CHAT_NODE`), including consultation delivery
 and waiter-style continuations through `talk::turn`, bypass `SeatLease` and the
 per-repository gate: conversation must not wait behind repository work sessions.
+Transcript-only title generation (`talk-title`) uses the same scheduling bypass,
+with a separate read-only seat, no chat control bridge and no shared session.
 This bypass does not change their filesystem grants or sandbox policy. A fair per-repository
 gate admits concurrent readers or one editor;
 editors take their own OS lock after readers have released theirs. External
@@ -957,10 +959,12 @@ upstream CRLF, not drift worth committing — normalise back to LF and
 - **`blind.strip_lines` is consumed twice**: as case-insensitive substrings by
   `blind::strip_attribution`, and as generated `sed` addresses by
   `blind::commit_msg_hook`. Entries must stay plain literals, not regexes.
-- **A conversation's list title is derived in two places**: `talkOpener` /
-  `firstLine` in `assets/ui/app.js` and `web::talk_search_doc`, which feeds
-  `GET /api/search?scope=chats`. Both take the first non-empty line of the first
-  operator turn, trimmed, cut to 96 characters; change them together.
+- **Conversation titles are read in two places**: `talkOpener` / `firstLine`
+  in `assets/ui/app.js` and `web::talk_search_doc`. Both prefer `Talk.title.text`,
+  falling back to the first non-empty line of the first operator turn (96 chars).
+  `src/talk_title.rs` counts operator/persona exchanges by sender provenance:
+  initial successful reply, then five exchanges since the last attempt, even
+  when generation failed. Manual titles survive automatic updates and stale saves.
 - **`run::SCHEMA`** must be bumped whenever a `RunState` field changes meaning,
   or a resumed run will half-read someone else's state file.
 - **The settings screen writes the machine layer only** (`settings::save`, path

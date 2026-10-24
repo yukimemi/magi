@@ -81,6 +81,10 @@ fn turn_timeout(cfg: &Config) -> Duration {
 /// from every other seat magi ever opens.
 const SEAT: &str = "talk";
 
+#[path = "talk_title.rs"]
+mod title;
+pub use title::{ChatTitle, TitleSource};
+
 /// Prefix on a turn magi wrote rather than an agent.
 const MAGI_NOTE: &str = "magi: ";
 
@@ -521,6 +525,12 @@ pub struct Talk {
     pub status: TalkStatus,
     /// Everything said, oldest first.
     pub turns: Vec<Turn>,
+    /// Durable title; absent records retain the opener display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<ChatTitle>,
+    /// Exclusive transcript boundary of the last title attempt, including failures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title_attempted_at: Option<usize>,
     /// Recommendation-time question snapshots keyed by persona turn position.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub recommendations: std::collections::BTreeMap<usize, crate::consult::RecommendationManifest>,
@@ -879,6 +889,10 @@ impl Talks {
     /// whole reply; see `turn`'s own tail for what happens when even that is
     /// not enough.
     pub fn put(&self, t: &mut Talk) -> Result<()> {
+        self.put_inner(t, true)
+    }
+
+    fn put_inner(&self, t: &mut Talk, preserve_title: bool) -> Result<()> {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
         let previous = self.get(&t.id).ok();
@@ -886,6 +900,10 @@ impl Talks {
         // Existing manifests are immutable even when a stale handle saves.
         if let Some(old) = previous {
             t.recommendations = old.recommendations;
+            if preserve_title {
+                t.title = old.title;
+                t.title_attempted_at = old.title_attempted_at;
+            }
         }
         let questions = crate::ask::Questions::at(
             self.root
@@ -1645,6 +1663,8 @@ pub(crate) fn begin_with_id(
 
     let now = Timestamp::now();
     let mut talk = Talk {
+        title: None,
+        title_attempted_at: None,
         recommendations: Default::default(),
         posts_read_through: Some(0),
         pending_breaks: None,
@@ -3009,109 +3029,114 @@ async fn turn(
     // section atomic with `close`'s own - taken only for this tail and not
     // for the whole invocation above, so one talk's fifteen-minute turn does
     // not block another talk's close from proceeding.
-    let _guard = store.guard()?;
-    // A delete is the more final version of that same race: `put` writes
-    // unconditionally, so a talk removed while this turn was in flight must
-    // stay removed rather than being written back with this turn's reply
-    // appended to it. The reply is simply given up on - there is no
-    // conversation left for it to belong to.
-    let Ok(fresh) = store.get(&talk.id) else {
-        return Ok(());
-    };
-    talk.status = fresh.status;
-    // `queue` may have accepted another operator message while the CLI was
-    // running. This handle predates that write, so preserving only `status`
-    // would overwrite the durable draft when the reply is appended below.
-    talk.pending = fresh.pending;
-    talk.pending_breaks = fresh.pending_breaks;
-    talk.pending_messages = fresh.pending_messages;
-    talk.pending_attachments = fresh.pending_attachments;
-    talk.notified = fresh.notified;
-    // A `magi talk post` landed while the CLI ran: this handle predates it.
-    if fresh.turns.len() > talk.turns.len() {
-        let posted: Vec<Turn> = fresh.turns[talk.turns.len()..]
-            .iter()
-            .filter(|t| t.posted_by.is_some())
-            .cloned()
-            .collect();
-        talk.turns.extend(posted);
-    }
-    if let Some(from) = fell_back_from.filter(|_| failure.is_none()) {
-        // The switch persists: quota coming back does not move the chat
-        // home, an operator's switch does.
-        talk.turns.push(note(format!(
-            "agent changed from {from} to {} (fallback)",
-            talk.agent
-        )));
-    }
-    // The persona is in the session's context only once a turn has answered
-    // (a failed one may never have reached the agent), so only then is it clean.
-    if failure.is_none() {
-        talk.persona_dirty = false;
-        talk.implementers_dirty = false;
-        talk.posts_read_through = Some(prompt_turns);
-    }
-    talk.turns.push(reply);
-    if let Err(put_err) = store.put(talk) {
-        // `Talks::put` already retried the write itself - reaching here
-        // means a passing race is not what this is. An agent's answer,
-        // possibly the result of an hour-long call, must not vanish with
-        // nothing to show for it just because the very last step failed:
-        // pop it back off, stash its text beside the conversation, and
-        // replace it with a note the operator can actually see, the same
-        // mechanism the failure branches above already use for a quota or a
-        // timeout.
-        let lost = talk.turns.pop().expect("just pushed above");
-        let stash = stash_lost_turn(store, &talk.id, &stem, &lost);
-        let why = match &stash {
-            Ok(path) => format!(
-                "agent `{}` answered, but the reply could not be saved to \
+    {
+        let _guard = store.guard()?;
+        // A delete is the more final version of that same race: `put` writes
+        // unconditionally, so a talk removed while this turn was in flight must
+        // stay removed rather than being written back with this turn's reply
+        // appended to it. The reply is simply given up on - there is no
+        // conversation left for it to belong to.
+        let Ok(fresh) = store.get(&talk.id) else {
+            return Ok(());
+        };
+        talk.status = fresh.status;
+        // `queue` may have accepted another operator message while the CLI was
+        // running. This handle predates that write, so preserving only `status`
+        // would overwrite the durable draft when the reply is appended below.
+        talk.pending = fresh.pending;
+        talk.pending_breaks = fresh.pending_breaks;
+        talk.pending_messages = fresh.pending_messages;
+        talk.pending_attachments = fresh.pending_attachments;
+        talk.notified = fresh.notified;
+        // A `magi talk post` landed while the CLI ran: this handle predates it.
+        if fresh.turns.len() > talk.turns.len() {
+            let posted: Vec<Turn> = fresh.turns[talk.turns.len()..]
+                .iter()
+                .filter(|t| t.posted_by.is_some())
+                .cloned()
+                .collect();
+            talk.turns.extend(posted);
+        }
+        if let Some(from) = fell_back_from.filter(|_| failure.is_none()) {
+            // The switch persists: quota coming back does not move the chat
+            // home, an operator's switch does.
+            talk.turns.push(note(format!(
+                "agent changed from {from} to {} (fallback)",
+                talk.agent
+            )));
+        }
+        // The persona is in the session's context only once a turn has answered
+        // (a failed one may never have reached the agent), so only then is it clean.
+        if failure.is_none() {
+            talk.persona_dirty = false;
+            talk.implementers_dirty = false;
+            talk.posts_read_through = Some(prompt_turns);
+        }
+        talk.turns.push(reply);
+        if let Err(put_err) = store.put(talk) {
+            // `Talks::put` already retried the write itself - reaching here
+            // means a passing race is not what this is. An agent's answer,
+            // possibly the result of an hour-long call, must not vanish with
+            // nothing to show for it just because the very last step failed:
+            // pop it back off, stash its text beside the conversation, and
+            // replace it with a note the operator can actually see, the same
+            // mechanism the failure branches above already use for a quota or a
+            // timeout.
+            let lost = talk.turns.pop().expect("just pushed above");
+            let stash = stash_lost_turn(store, &talk.id, &stem, &lost);
+            let why = match &stash {
+                Ok(path) => format!(
+                    "agent `{}` answered, but the reply could not be saved to \
                  this conversation ({put_err:#}); the raw text was kept at \
                  {} - your message is saved, ask again",
-                talk.agent,
-                path.display()
-            ),
-            Err(stash_err) => format!(
-                "agent `{}` answered, but the reply could not be saved to \
+                    talk.agent,
+                    path.display()
+                ),
+                Err(stash_err) => format!(
+                    "agent `{}` answered, but the reply could not be saved to \
                  this conversation ({put_err:#}), and it could not be kept \
                  anywhere else either ({stash_err:#}); your message is \
                  saved, ask again",
-                talk.agent
-            ),
-        };
-        talk.turns.push(note(why.clone()));
-        // Writing the note also carries the seat this call already advanced -
-        // `agent::invoke` incremented `turns` and, for a vendor that reports
-        // its own session id, recorded that too. That is what keeps the next
-        // turn resuming the session the CLI is already holding instead of
-        // re-opening it, so losing the reply costs the transcript a turn but
-        // not the conversation.
-        return match store.put(talk) {
-            Ok(()) => bail!("{why}"),
-            Err(note_err) => {
-                // Even the short note failed to save, which means this
-                // conversation's file cannot be written at all right now -
-                // nothing is left for this call to retry or record. Pop the
-                // note so `talk.turns` matches the transcript on disk, and
-                // surface both failures for whoever reads the log.
-                //
-                // `talk.seat` is deliberately not wound back to match. The
-                // CLI really did take the turn and really did consume this
-                // seat's session id; pretending otherwise would be a second
-                // untruth on top of the unwritable file, and the handle is
-                // reloaded from disk by the next `drain` or `get` anyway -
-                // see `web::drain_loop`. What the seat cannot do is reach
-                // disk, so the record stays a turn behind the CLI until some
-                // later write lands, and a turn taken before then re-opens a
-                // session id the CLI already holds. That is the desync
-                // `20260907-011805-fb57` is about, and tolerating it belongs
-                // there rather than here: no write this branch could make
-                // would help, since a failed write is exactly what put it in
-                // this position twice over.
-                talk.turns.pop();
-                Err(note_err).context(why)
-            }
-        };
+                    talk.agent
+                ),
+            };
+            talk.turns.push(note(why.clone()));
+            // Writing the note also carries the seat this call already advanced -
+            // `agent::invoke` incremented `turns` and, for a vendor that reports
+            // its own session id, recorded that too. That is what keeps the next
+            // turn resuming the session the CLI is already holding instead of
+            // re-opening it, so losing the reply costs the transcript a turn but
+            // not the conversation.
+            return match store.put(talk) {
+                Ok(()) => bail!("{why}"),
+                Err(note_err) => {
+                    // Even the short note failed to save, which means this
+                    // conversation's file cannot be written at all right now -
+                    // nothing is left for this call to retry or record. Pop the
+                    // note so `talk.turns` matches the transcript on disk, and
+                    // surface both failures for whoever reads the log.
+                    //
+                    // `talk.seat` is deliberately not wound back to match. The
+                    // CLI really did take the turn and really did consume this
+                    // seat's session id; pretending otherwise would be a second
+                    // untruth on top of the unwritable file, and the handle is
+                    // reloaded from disk by the next `drain` or `get` anyway -
+                    // see `web::drain_loop`. What the seat cannot do is reach
+                    // disk, so the record stays a turn behind the CLI until some
+                    // later write lands, and a turn taken before then re-opens a
+                    // session id the CLI already holds. That is the desync
+                    // `20260907-011805-fb57` is about, and tolerating it belongs
+                    // there rather than here: no write this branch could make
+                    // would help, since a failed write is exactly what put it in
+                    // this position twice over.
+                    talk.turns.pop();
+                    Err(note_err).context(why)
+                }
+            };
+        }
+    }
+    if failure.is_none() {
+        title::refresh(talk, store, cfg).await;
     }
 
     match failure {
@@ -3741,6 +3766,8 @@ mod tests {
 
     fn ctx_talk(agent: &str, turns: Vec<Turn>) -> Talk {
         Talk {
+            title: None,
+            title_attempted_at: None,
             recommendations: Default::default(),
             posts_read_through: None,
             pending_breaks: None,
@@ -4102,6 +4129,8 @@ mod tests {
     fn the_frozen_json_field_names_round_trip_through_disk() {
         let (tmp, talks) = store();
         let mut talk = Talk {
+            title: None,
+            title_attempted_at: None,
             recommendations: Default::default(),
             posts_read_through: None,
             pending_breaks: None,
@@ -4967,12 +4996,12 @@ mod tests {
         }
     }
 
-    /// A mock whose script counts its own calls in `<dir>/<id>.calls` before
-    /// running `body`.
+    /// A mock whose script counts conversation calls (excluding title seats)
+    /// in `<dir>/<id>.calls` before running `body`.
     fn counting_agent(dir: &Path, id: &str, body: &str) -> AgentSpec {
         let calls = dir.join(format!("{id}.calls"));
         let script = format!(
-            "#!/bin/sh\necho x >> '{}'\n{body}\n",
+            "#!/bin/sh\nif [ \"$MAGI_NODE\" = chat ]; then echo x >> '{}'; fi\n{body}\n",
             calls.to_string_lossy()
         );
         let path = dir.join(format!("mock-{id}.sh"));
@@ -6431,6 +6460,8 @@ mod tests {
         let (tmp, talks) = store();
         let make = |id: &str, status: TalkStatus| {
             let mut t = Talk {
+                title: None,
+                title_attempted_at: None,
                 recommendations: Default::default(),
                 posts_read_through: None,
                 pending_breaks: None,

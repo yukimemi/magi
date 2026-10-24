@@ -172,14 +172,15 @@ fn repository_seat(inv: &Invocation<'_>) -> bool {
     // These roles consume supplied state, prompts and conversation history.
     // In particular, they must be able to deliver an answer or make queue
     // decisions while an editor holds its reservation waiting for that answer.
-    // Ordinary chat turns bypass repository scheduling, including waiter delivery.
+    // Ordinary chat turns and their transcript-only title seats bypass repository
+    // scheduling, including waiter delivery.
     // Investigation is an explicit continuation with nonblocking acquisition.
     if inv.scope == InvocationScope::ConsultationInvestigation {
         return true;
     }
     !matches!(
         inv.node,
-        crate::queue::CHAT_NODE | "deputy" | "conduct" | "dupes"
+        crate::queue::CHAT_NODE | "talk-title" | "deputy" | "conduct" | "dupes"
     ) && inv.scope != InvocationScope::ConsultationControl
 }
 
@@ -2438,7 +2439,7 @@ mod tests {
             assert!(!repository_writer(&i), "{node}");
             i.allow_write = true;
         }
-        for node in ["deputy", "judge", "review", "bump", "conduct"] {
+        for node in ["deputy", "judge", "review", "bump", "conduct", "talk-title"] {
             i.node = node;
             assert!(!repository_writer(&i), "{node}");
         }
@@ -2482,6 +2483,7 @@ mod tests {
             "waiter",
             "conduct",
             "dupes",
+            "talk-title",
         ] {
             for allow_write in [false, true] {
                 for writable in [&[][..], &roots[..]] {
@@ -2492,7 +2494,7 @@ mod tests {
                         repository_seat(&i),
                         !matches!(
                             node,
-                            crate::queue::CHAT_NODE | "deputy" | "conduct" | "dupes"
+                            crate::queue::CHAT_NODE | "talk-title" | "deputy" | "conduct" | "dupes"
                         ),
                         "{node}, allow_write={allow_write}, writable={writable:?}"
                     );
