@@ -3350,3 +3350,14 @@ runs. Workers racing the idle snapshot retain their executable and continue
 through handover; neither manual nor automatic restarts wait for execution
 leases. The handover drains only admission transactions. Failed-tag suppression
 is process-local, not run state; do not persist it or change `run::SCHEMA` for update bookkeeping.
+
+### New run and conversation identities are reserved before use
+
+`RunState::new` only builds an unreserved value. Every production creation path
+must call `reserve` (or `reserve_under`) before exposing its id, deriving branches
+or worktree paths, or linking it to a task. Resumes load the existing record and
+never reserve again. Reservation also excludes suffixes held by run history,
+because candidate branches and worktrees use the four-character short id.
+New conversations go through `Talks::create`; `Talks::put` is the update path.
+Both stores share `src/id_reserve.rs` with queue filing for bounded retries and
+injected candidate sources. Unknown I/O results are errors, never free ids.

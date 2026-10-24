@@ -39,6 +39,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::ask::Questions;
+use crate::id_reserve::{IdSource, path_exists};
 
 /// On-disk format for a queued task. Bumped when a field's meaning changes.
 ///
@@ -2226,31 +2227,6 @@ pub struct Queue {
     ids: IdSource,
 }
 
-/// Where candidate ids for new tasks come from. Injectable so a test can
-/// force a collision; production uses [`new_id`].
-#[derive(Clone)]
-struct IdSource(Option<std::sync::Arc<dyn Fn() -> String + Send + Sync>>);
-
-impl std::fmt::Debug for IdSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.0.is_some() {
-            "IdSource(custom)"
-        } else {
-            "IdSource"
-        })
-    }
-}
-
-/// Does `path` exist (a broken symlink counts)? Only `NotFound` is "no":
-/// any other failure is an error rather than a free slot.
-fn path_exists(path: &Path) -> Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(e).with_context(|| format!("stat {}", path.display())),
-    }
-}
-
 fn validate_attachments(sources: &[PathBuf]) -> Result<Vec<(&PathBuf, &str)>> {
     let mut wanted = Vec::new();
     for src in sources {
@@ -2272,9 +2248,6 @@ fn validate_attachments(sources: &[PathBuf]) -> Result<Vec<(&PathBuf, &str)>> {
     Ok(wanted)
 }
 
-/// How many candidate ids a new task may try before filing gives up.
-const FILE_ATTEMPTS: usize = 256;
-
 impl Queue {
     /// The operator's queue, `<home>/queue`.
     pub fn open() -> Self {
@@ -2286,7 +2259,7 @@ impl Queue {
     pub fn at(root: PathBuf) -> Self {
         Self {
             root,
-            ids: IdSource(None),
+            ids: IdSource::new(new_id),
         }
     }
 
@@ -2294,15 +2267,8 @@ impl Queue {
     /// a deterministic collision.
     #[doc(hidden)]
     pub fn with_id_source(mut self, f: impl Fn() -> String + Send + Sync + 'static) -> Self {
-        self.ids = IdSource(Some(std::sync::Arc::new(f)));
+        self.ids = IdSource::custom(f);
         self
-    }
-
-    fn mint_id(&self) -> String {
-        match &self.ids.0 {
-            Some(f) => f(),
-            None => new_id(),
-        }
     }
 
     /// File a new task: reserve its id atomically and write it without ever
@@ -2338,28 +2304,25 @@ impl Queue {
         mut undo: impl FnMut(&mut Task),
         store: bool,
     ) -> Result<()> {
-        let redraw_first = self.ids.0.is_some() && task.attachments.is_empty();
-        for attempt in 0..FILE_ATTEMPTS {
-            if attempt > 0 || redraw_first {
-                task.id = self.mint_id();
-            }
-            let _lock = self.lock_task(&task.id)?;
-            if path_exists(&self.path_of(&task.id))? {
-                continue;
-            }
-            if !hook(task)? {
-                continue;
-            }
-            if store {
-                if let Err(e) = self.write_record(task) {
-                    undo(task);
-                    return Err(e);
+        let redraw_first = self.ids.is_custom() && task.attachments.is_empty();
+        let initial = task.id.clone();
+        self.ids
+            .reserve((!redraw_first).then_some(initial.as_str()), "task", |id| {
+                task.id = id.to_owned();
+                let _lock = self.lock_task(&task.id)?;
+                if path_exists(&self.path_of(&task.id))? || !hook(task)? {
+                    return Ok(false);
                 }
-                task.unfiled = false;
-            }
-            return Ok(());
-        }
-        bail!("no free task id after {FILE_ATTEMPTS} attempts")
+                if store {
+                    if let Err(e) = self.write_record(task) {
+                        undo(task);
+                        return Err(e);
+                    }
+                    task.unfiled = false;
+                }
+                Ok(true)
+            })?;
+        Ok(())
     }
 
     /// Is `id` used by anything but a stored record: a claim file, or an

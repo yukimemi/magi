@@ -657,6 +657,7 @@ impl Runner {
         // to decide anything.
         state.fetched_base = Some(fetched_base);
         state.origin = Some(origin);
+        state.reserve()?;
         state.event("start", format!("run {} created", state.id));
         state.save()?;
         Ok(Self {
@@ -733,6 +734,7 @@ impl Runner {
         );
         state.fetched_base = Some(fetched_base);
         state.origin = Some(origin);
+        state.reserve()?;
 
         // Released before anything else touches the branch: a stale local
         // branch is moved with `git branch -f`, which git refuses while an
@@ -857,7 +859,12 @@ impl Runner {
         state.origin = Some(crate::run::Origin::queue(task));
         state.pr_head = Some(selection.branch.clone());
         state.pr_recovery = Some(selection.clone());
-        crate::pr_head::check_predecessors(&state, &selection.branch).await?;
+        state.reserve()?;
+        if let Err(e) = crate::pr_head::check_predecessors(&state, &selection.branch).await {
+            // Never leave a reserved record behind as a phantom owner of the head.
+            state.discard_reserved();
+            return Err(e);
+        }
         Self::open_selected(repo, state, roles, max_parallel, base_commit, selection).await
     }
 
@@ -872,9 +879,19 @@ impl Runner {
         let mut state = state;
         let branch = state.branch_for('A');
         let wait = repository_wait(&state, None);
-        let coordination = coordinate_operation(&mut state, repo, &wait).await?;
-        git::git(repo, &["branch", &branch, selection.source()]).await?;
-        drop(coordination);
+        let prepared = async {
+            let coordination = coordinate_operation(&mut state, repo, &wait).await?;
+            git::git(repo, &["branch", &branch, selection.source()]).await?;
+            drop(coordination);
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(e) = prepared {
+            // Nothing was exposed yet: do not leave a reserved record as a
+            // phantom owner of the public head.
+            state.discard_reserved();
+            return Err(e);
+        }
         state.event(
             "recovery",
             format!(
@@ -890,7 +907,10 @@ impl Runner {
             choice: None,
             task_instruction: Some(selection.instruction.clone()),
         };
-        state.save()?;
+        if let Err(e) = state.save() {
+            state.discard_reserved();
+            return Err(e);
+        }
         let id = state.id.clone();
         let opened = Self::open_review(
             repo,
