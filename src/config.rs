@@ -2120,16 +2120,13 @@ impl Config {
 
     /// The machine-wide layer's path, when there is one.
     ///
-    /// **A test build has none unless it names one.** A fixture is a complete
-    /// statement of the config under test, and the operator's own preferences
-    /// have no business being merged into it - least of all silently, on one
-    /// machine, in a suite that is green everywhere else.
+    /// **A unit-test build has no machine layer, including inherited env
+    /// overrides.** A fixture is a complete statement of the config under test;
+    /// `MAGI_CONFIG_DIR` can already be set by the process launching the suite.
+    /// Tests of machine configuration load their fixture paths explicitly.
     #[cfg(test)]
     pub(crate) fn machine_layer() -> Option<PathBuf> {
-        std::env::var(Self::CONFIG_DIR_ENV)
-            .ok()
-            .filter(|dir| !dir.trim().is_empty())
-            .map(|dir| PathBuf::from(dir).join("magi").join("config.toml"))
+        None
     }
 
     /// The machine-wide layer's path, when there is one.
@@ -3576,9 +3573,9 @@ lock_file = "{{ vars.bad }}"
     /// because a runner has no such file: the suite failed only where magi is
     /// actually used.
     ///
-    /// So a test build has no machine layer unless it asks for one, and this
-    /// is that promise. Written against a real file at the real location so
-    /// it fails if `machine_layer` starts reading it again.
+    /// A unit-test build ignores both the default machine location and any
+    /// inherited `MAGI_CONFIG_DIR`. Machine-layer fixtures are loaded explicitly.
+    /// This promise also holds when the launcher exports its own config path.
     #[test]
     fn a_test_build_does_not_read_the_operators_machine_config() {
         let repo = tempfile::tempdir().unwrap();
