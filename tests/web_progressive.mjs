@@ -622,6 +622,58 @@ for (const expired of [false, true]) test(`chat paging is on demand and recovers
   assert.equal(state.talks.length, 2);
 });
 
+for (const expired of [false, true]) for (const deltaFirst of [false, true]) {
+  test(`older chat pages preserve overlapping deltas (expired=${expired}, deltaFirst=${deltaFirst})`, async () => {
+    const requests = [];
+    const state = { talks: null, talkReads: {}, talkWaits: new Map(), rev: {} };
+    const loaders = source.slice(source.indexOf('const storeReads ='), source.indexOf('function loadRuns('));
+    const chatLoaders = source.slice(source.indexOf('let talksNext ='), source.indexOf('/* Refresh one conversation.'));
+    const api = runInNewContext(`${loaders}\n${chatLoaders}\n({ loadTalks, loadOlderTalks })`, {
+      state, API: { talks: '/api/talks' },
+      getJson: url => new Promise((resolve, reject) => requests.push({ url, resolve, reject })),
+      $: () => null, sectionNotice() {}, renderTalks() {}, refreshSearch() {}, trackTalkThinking() {},
+      sortTalks: list => list, ok() {}, setTimeout: () => 1, clearTimeout() {}, incrementalListRender: false,
+    });
+    const initial = api.loadTalks({ rev: 'r0' });
+    requests[0].resolve({ rows: [{ id: 'new' }, { id: 'updated', version: 0 }], next: 'cursor' });
+    await initial;
+    const older = api.loadOlderTalks();
+    let pageRequest = requests[1];
+    if (expired) {
+      pageRequest.reject(Object.assign(new Error('expired'), { status: 409 }));
+      await flush();
+      requests[2].resolve({ rows: [{ id: 'new' }], next: 'replacement' });
+      await flush();
+      pageRequest = requests[3];
+    }
+    const delta = api.loadTalks({ rev: 'r1', delta: {
+      base: 'r0', changed: ['updated', 'unreadable'], removed: ['deleted'],
+    } });
+    const deltaRequest = requests.at(-1);
+    const page = { rows: ['updated', 'unreadable', 'deleted', 'untouched'].map(id => ({ id, version: 0 })), next: 'older' };
+    if (deltaFirst) {
+      deltaRequest.resolve([{ id: 'updated', version: 1 }]);
+      await delta;
+      pageRequest.resolve(page);
+      await older;
+    } else {
+      pageRequest.resolve(page);
+      await older;
+      deltaRequest.resolve([{ id: 'updated', version: 1 }]);
+      await delta;
+    }
+    assert.equal(state.rev.talks, 'r1');
+    assert.equal(state.talks.find(row => row.id === 'updated').version, 1);
+    assert.ok(!state.talks.some(row => row.id === 'deleted' || row.id === 'unreadable'));
+    assert.ok(state.talks.some(row => row.id === 'untouched'), 'unaffected older rows still load');
+    // The accepted page must advance the cursor even when some rows were excluded.
+    const next = api.loadOlderTalks();
+    assert.equal(requests.at(-1).url, '/api/talks/page?before=older');
+    requests.at(-1).resolve({ rows: [], next: null });
+    await next;
+  });
+}
+
 for (const failSecondBatch of [false, true]) test(`coalesced chat deltas fetch all batches before applying (failure=${failSecondBatch})`, async () => {
   const ids = Array.from({ length: 60 }, (_, i) => `chat-${i}`);
   const requests = [];

@@ -6048,6 +6048,7 @@ function talkIsThinking(talk) {
 
 let talksNext = null;
 let olderTalksFlight = null;
+let olderTalksRead = null;
 function talkReadOptions(rows) {
   const reads = Object.fromEntries(rows.filter(row => state.talkReads[row.id]).map(row => [row.id, state.talkReads[row.id]]));
   return { headers: { "x-talk-reads": JSON.stringify(reads) } };
@@ -6075,6 +6076,8 @@ function loadOlderTalks() {
   if (olderTalksFlight) return olderTalksFlight;
   if (!talksNext) return Promise.resolve();
   const cursor = talksNext;
+  const read = { changed: new Set(), superseded: false };
+  olderTalksRead = read;
   olderTalksFlight = (async () => {
     let page;
     try {
@@ -6091,17 +6094,25 @@ function loadOlderTalks() {
       } while (next && !page.rows.some(row => !known.has(row.id)));
     }
     // A refresh may have replaced this membership snapshot while we waited.
-    if (talksNext !== cursor) return;
-    state.talks = mergeStore("talks", page.rows, { changed: [], removed: [] });
+    if (talksNext !== cursor || read.superseded) return;
+    // Deltas may finish while this page is in flight. Preserve both their
+    // updated rows and their deletions, including IDs not previously loaded.
+    const rows = page.rows.filter(row => !read.changed.has(row.id));
+    state.talks = mergeStore("talks", rows, { changed: [], removed: [] });
     talksNext = page.next;
     renderTalks();
     showOlderTalks();
-  })().finally(() => { olderTalksFlight = null; });
+  })().finally(() => { olderTalksFlight = null; olderTalksRead = null; });
   return olderTalksFlight;
 }
 
 function loadTalks(change) {
-  return loadStore("talks", API.talks, change, (list, partial, observed, fetched) => {
+  return loadStore("talks", API.talks, change, (list, partial, observed, fetched, delta) => {
+    if (olderTalksRead) {
+      if (delta) {
+        for (const id of [...delta.changed, ...delta.removed]) olderTalksRead.changed.add(id);
+      } else olderTalksRead.superseded = true;
+    }
     state.talks = list;
     for (const talk of fetched) trackTalkThinking(talk, observed.get(talk.id));
     renderStoreList(partial, renderTalks);
@@ -9552,7 +9563,7 @@ function loadStore(name, url, change, apply) {
             rows = await getJson(url);
             apply(rows, false, observed, rows);
           } else {
-            apply(partial ? mergeStore(name, rows, delta) : rows, partial || paged, observed, rows);
+            apply(partial ? mergeStore(name, rows, delta) : rows, partial || paged, observed, rows, partial ? delta : null);
           }
           // Only successful reads acknowledge the target. A later notification
           // may already be queued; its base will be checked on the next read.
