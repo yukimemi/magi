@@ -718,8 +718,8 @@ pub(crate) mod windows {
             UnlockFileEx(file, 0, 1, 0, &mut overlapped);
         }
     }
-    /// Detach without inheriting a parent-owned kill-on-close job. Ordinary
-    /// ancestor jobs (for example a CI runner) need not permit explicit breakaway.
+    /// Detach from the console and request breakaway only when the host allows
+    /// it. An external ancestor job can still contain and terminate workers.
     pub(crate) fn detached_flags() -> std::io::Result<u32> {
         let mut in_job = 0;
         if unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) } == 0 {
@@ -741,24 +741,15 @@ pub(crate) mod windows {
         {
             return Err(std::io::Error::last_os_error());
         }
-        detached_flags_for_limits(limits.flags)
-    }
-
-    fn detached_flags_for_limits(limits: u32) -> std::io::Result<u32> {
         let detached = 0x0000_0008 | 0x0000_0200;
-        if limits & 0x1000 != 0 {
+        if limits.flags & 0x1000 != 0 {
             return Ok(detached);
         } // SILENT_BREAKAWAY_OK
-        if limits & 0x0800 != 0 {
+        if limits.flags & 0x0800 != 0 {
             return Ok(detached | 0x0100_0000);
         } // BREAKAWAY_OK
-        if limits & 0x2000 != 0 {
-            // KILL_ON_JOB_CLOSE
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "cannot detach worker: containing kill-on-close Windows job forbids breakaway",
-            ));
-        }
+        // Inheriting an external job does not tie a child to this launcher's
+        // lifetime. Do not reject nested launches or bypass that job's limits.
         Ok(detached)
     }
 
@@ -810,23 +801,6 @@ pub(crate) mod windows {
             return Err(std::io::Error::last_os_error());
         }
         Ok(available)
-    }
-    #[cfg(test)]
-    mod worker_detach_tests {
-        use super::detached_flags_for_limits;
-        #[test]
-        fn ordinary_ancestor_job_does_not_require_breakaway_permission() {
-            assert_eq!(detached_flags_for_limits(0).unwrap(), 0x208);
-            assert_eq!(
-                detached_flags_for_limits(0x2000 | 0x0800).unwrap(),
-                0x0100_0208
-            );
-            assert_eq!(detached_flags_for_limits(0x2000 | 0x1000).unwrap(), 0x208);
-            assert_eq!(
-                detached_flags_for_limits(0x2000).unwrap_err().kind(),
-                std::io::ErrorKind::Unsupported
-            );
-        }
     }
 }
 

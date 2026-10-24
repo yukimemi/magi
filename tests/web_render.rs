@@ -5207,6 +5207,8 @@ async fn run_refresh_keeps_question_focus_and_blocks_stale_actions() {
             "window.deck && deck.state.detail.evidenceError === false && !!document.querySelector('#run-asks textarea')",
             Duration::from_secs(30)).await.unwrap();
         let out = browser.eval(&page, r#"(async () => {
+          // Finish boot's reads before establishing this refresh's baseline.
+          await deck.loadRun(deck.state.detail.id, {background: true});
           const box = document.querySelector('#run-asks textarea');
           const panel = document.querySelector('#run-ask-panel');
           box.value = 'An unfinished answer'; box.focus(); box.setSelectionRange(3, 8);
@@ -5226,18 +5228,33 @@ async fn run_refresh_keeps_question_focus_and_blocks_stale_actions() {
           probe.remove();
           const layoutSensitive = detectsShift && top() === before;
           const visible = tabs.getClientRects().length > 0 && tabs.getBoundingClientRect().height > 0;
-          let releaseCore, releaseEvidence;
+          let releasePrevious, releaseCore, releaseEvidence, markTrailingStarted;
+          const previousBarrier = new Promise(r => releasePrevious = r);
           const coreBarrier = new Promise(r => releaseCore = r);
           const evidenceBarrier = new Promise(r => releaseEvidence = r);
+          const trailingStarted = new Promise(r => markTrailingStarted = r);
+          const reads = {core: 0, evidence: 0};
+          const trailing = new Set();
           let fail = false;
           window.fetch = async (...args) => {
-            if (String(args[0]).match(/\/api\/runs\/[^/]+(?:\/core)?$/)) {
-              await (String(args[0]).endsWith('/core') ? coreBarrier : evidenceBarrier);
+            const url = String(args[0]);
+            if (url.match(/\/api\/runs\/[^/]+(?:\/core)?$/)) {
+              const section = url.endsWith('/core') ? 'core' : 'evidence';
+              if (++reads[section] === 1) {
+                await previousBarrier;
+              } else {
+                trailing.add(section);
+                if (trailing.size === 2) markTrailingStarted();
+                await (section === 'core' ? coreBarrier : evidenceBarrier);
+              }
               if (fail) throw new Error('deliberate failure');
             }
             return originalFetch(...args);
           };
+          const previous = deck.loadRun(deck.state.detail.id, {background: true});
           const refresh = deck.loadRun(deck.state.detail.id, {background: true});
+          // An ordinary duplicate must join without superseding this refresh.
+          const joined = deck.loadRun(deck.state.detail.id);
           const notice = document.querySelector('#run-evidence-state');
           const pendingLayout = visible && top() === before && (!notice || notice.hidden)
             && document.querySelector('#run-meta').getAttribute('aria-busy') === 'true';
@@ -5248,11 +5265,19 @@ async fn run_refresh_keeps_question_focus_and_blocks_stale_actions() {
           const pending = document.activeElement === box && !panel.hidden
             && box.value === 'An unfinished answer' && clicked === 0
             && button.getAttribute('aria-disabled') === 'true';
+          releasePrevious();
+          // Both trailing fetches start only after the old callbacks finish.
+          await trailingStarted;
+          button.click();
+          const stale = deck.state.detail.core === null && deck.state.detail.evidence === null
+            && deck.state.detail.evidencePending === true && clicked === 0
+            && document.querySelector('#run-meta').getAttribute('aria-busy') === 'true'
+            && top() === before;
           releaseCore();
           while (!deck.state.detail.core) await new Promise(requestAnimationFrame);
           const coreLayout = top() === before
             && document.querySelector('#run-meta').getAttribute('aria-busy') === 'true';
-          releaseEvidence(); await refresh;
+          releaseEvidence(); await Promise.all([previous, refresh, joined]);
           const completedLayout = top() === before
             && !document.querySelector('#run-meta').hasAttribute('aria-busy');
           const success = document.activeElement === box && box.selectionStart === 3 && box.selectionEnd === 8;
@@ -5266,12 +5291,13 @@ async fn run_refresh_keeps_question_focus_and_blocks_stale_actions() {
           const retry = !error.hidden && error.textContent.includes('deliberate failure')
             && !!error.querySelector('button');
           window.fetch = originalFetch;
-          return {pending, success, failure, pendingLayout, coreLayout, completedLayout, retry, layoutSensitive};
+          return {pending, stale, success, failure, pendingLayout, coreLayout, completedLayout, retry, layoutSensitive};
         })()"#).await.unwrap();
         assert_eq!(
             out,
             serde_json::json!({
                 "pending": true,
+                "stale": true,
                 "success": true,
                 "failure": true,
                 "pendingLayout": true,

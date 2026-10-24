@@ -4,6 +4,9 @@
 //! lease and acknowledge that reservation before dispatch. Reconciliation cancels
 //! an unacknowledged startup under the same store lock the child needs: a late
 //! child can never execute a cancelled operation. Process IDs are diagnostic only.
+//! Metadata publication closes its staging handle before atomic replacement.
+//! Windows replacement/delete-pending handoffs use the short, bounded lock-file
+//! retry policy; failed publication never releases an uncertain reservation.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -153,14 +156,16 @@ fn job_dir(home: &Path, id: &str) -> Result<PathBuf> {
 
 fn open_lock(path: &Path) -> Result<File> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create worker lock directory {}", parent.display()))?;
     }
-    Ok(OpenOptions::new()
+    OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(path)?)
+        .open(path)
+        .with_context(|| format!("open worker lock {}", path.display()))
 }
 
 fn try_lock(path: &Path) -> Result<Option<Lease>> {
@@ -173,7 +178,7 @@ fn try_lock(path: &Path) -> Result<Option<Lease>> {
         {
             Ok(None)
         }
-        Err(e) => Err(e.into()),
+        Err(e) => Err(e).with_context(|| format!("acquire worker lock {}", path.display())),
     }
 }
 
@@ -202,7 +207,10 @@ fn store_lock(home: &Path) -> Result<Lease> {
 
 #[cfg(unix)]
 fn sync_dir(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
+    File::open(path)
+        .with_context(|| format!("open worker directory for sync {}", path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync worker directory {}", path.display()))?;
     Ok(())
 }
 
@@ -213,17 +221,31 @@ fn sync_dir(_path: &Path) -> Result<()> {
 
 fn save(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path.parent().context("worker record has no parent")?;
-    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create worker record directory {}", parent.display()))?;
     let temp = parent.join(format!(".pending-{}", nonce()));
     let result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
-            .open(&temp)?;
-        serde_json::to_writer(&mut file, value)?;
-        file.flush()?;
-        file.sync_all()?;
-        replace(&temp, path)?;
+            .open(&temp)
+            .with_context(|| format!("create staged worker record {}", temp.display()))?;
+        serde_json::to_writer(&mut file, value)
+            .with_context(|| format!("serialize worker record {}", path.display()))?;
+        file.flush()
+            .with_context(|| format!("flush staged worker record {}", temp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync staged worker record {}", temp.display()))?;
+        // Publication must not retain our own writable staging handle. Windows
+        // readers may briefly deny deletion; only the atomic handoff retries.
+        drop(file);
+        replace(&temp, path).with_context(|| {
+            format!(
+                "publish worker record {} -> {}",
+                temp.display(),
+                path.display()
+            )
+        })?;
         sync_dir(parent)
     })();
     if result.is_err() {
@@ -239,30 +261,42 @@ fn replace(from: &Path, to: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn replace(from: &Path, to: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn MoveFileExW(from: *const u16, to: *const u16, flags: u32) -> i32;
-    }
-    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
-    // REPLACE_EXISTING | WRITE_THROUGH, without a remove/rename crash gap.
-    if unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), 1 | 8) } == 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
+    // std uses FileRenameInfoEx/POSIX semantics where supported, unlike
+    // MoveFileExW: a FILE_SHARE_DELETE reader may retain the previous record
+    // while the replacement becomes visible atomically. Readers that briefly
+    // deny deletion still get only the existing short Windows handoff budget.
+    crate::lock_file::Retry::new(None).run(|| std::fs::rename(from, to))?;
     Ok(())
+}
+
+// Atomic replacement can leave the old Windows name briefly delete-pending.
+// Keep that handoff bounded; malformed records and permanent IO errors propagate.
+fn open_record(path: &Path) -> std::io::Result<File> {
+    #[cfg(windows)]
+    {
+        crate::lock_file::Retry::new(None).run(|| File::open(path))
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)
+    }
 }
 
 /// Load a specific invocation, including a retained terminal result.
 pub fn get(home: &Path, id: &str) -> Result<Job> {
-    let file = match File::open(job_dir(home, id)?.join("job.json")) {
+    let path = job_dir(home, id)?.join("job.json");
+    let file = match open_record(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            File::open(root(home).join("results").join(id).join("job.json"))?
+            let retained = root(home).join("results").join(id).join("job.json");
+            open_record(&retained)
+                .with_context(|| format!("open retained worker record {}", retained.display()))?
         }
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("open worker record {}", path.display()));
+        }
     };
-    Ok(serde_json::from_reader(file)?)
+    serde_json::from_reader(file).with_context(|| format!("decode worker record {id}"))
 }
 
 /// Identify this detached invocation. Helpers inherit its identity, while a
@@ -278,10 +312,13 @@ pub fn current_job(home: &Path) -> Result<Option<Job>> {
 
 fn next_sequence(home: &Path) -> Result<u64> {
     let path = root(home).join("sequence.json");
-    let previous: u64 = match File::open(&path) {
-        Ok(file) => serde_json::from_reader(file)?,
+    let previous: u64 = match open_record(&path) {
+        Ok(file) => serde_json::from_reader(file)
+            .with_context(|| format!("decode worker sequence {}", path.display()))?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(error) => return Err(error.into()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("open worker sequence {}", path.display()));
+        }
     };
     let sequence = previous
         .checked_add(1)
@@ -343,7 +380,8 @@ fn terminal(home: &Path, job: &mut Job, status: Status, result: String) -> Resul
     job.status = status;
     job.result = Some(result);
     job.finished_at = Some(now());
-    save(&job_dir(home, &job.id)?.join("job.json"), job)?;
+    save(&job_dir(home, &job.id)?.join("job.json"), job)
+        .with_context(|| format!("publish worker {} terminal status {status:?}", job.id))?;
     // The result is authoritative now. Keep the directory in place while this
     // process owns live.lock and its stdout/stderr handles. Another store owner
     // retires it opportunistically after execution ownership is released.
@@ -367,7 +405,11 @@ fn retire(home: &Path, job: &Job) -> bool {
     match attempt() {
         Ok(retired) => retired,
         Err(error) => {
-            tracing::warn!(worker = %job.id, %error, "worker result retirement deferred");
+            tracing::warn!(
+                worker = %job.id,
+                error = %format_args!("{error:#}"),
+                "worker result retirement deferred"
+            );
             false
         }
     }
@@ -375,8 +417,17 @@ fn retire(home: &Path, job: &Job) -> bool {
 
 fn archive(home: &Path, job: &Job) -> Result<()> {
     let results = root(home).join("results");
-    std::fs::create_dir_all(&results)?;
-    std::fs::rename(job_dir(home, &job.id)?, results.join(&job.id))?;
+    std::fs::create_dir_all(&results)
+        .with_context(|| format!("create worker results directory {}", results.display()))?;
+    let from = job_dir(home, &job.id)?;
+    let to = results.join(&job.id);
+    std::fs::rename(&from, &to).with_context(|| {
+        format!(
+            "archive worker result {} -> {}",
+            from.display(),
+            to.display()
+        )
+    })?;
     sync_dir(&root(home).join("jobs"))?;
     sync_dir(&results)
 }
@@ -490,18 +541,22 @@ pub fn request(home: &Path, key: &str, control: Control) -> Result<()> {
 
 /// Read the latest durable owner request for a logical operation.
 pub fn control(home: &Path, key: &str) -> Result<Option<Control>> {
-    match File::open(control_path(home, key)) {
-        Ok(file) => Ok(Some(serde_json::from_reader(file)?)),
+    let path = control_path(home, key);
+    match open_record(&path) {
+        Ok(file) => serde_json::from_reader(file)
+            .map(Some)
+            .with_context(|| format!("decode worker control {}", path.display())),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+        Err(e) => Err(e).with_context(|| format!("open worker control {}", path.display())),
     }
 }
 
 fn clear_control_locked(home: &Path, key: &str) -> Result<()> {
-    match std::fs::remove_file(control_path(home, key)) {
+    let path = control_path(home, key);
+    match std::fs::remove_file(&path) {
         Ok(()) => sync_dir(&root(home).join("controls")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
+        Err(e) => Err(e).with_context(|| format!("remove worker control {}", path.display())),
     }
 }
 
@@ -788,10 +843,12 @@ fn reserve(
     };
     let jobs_dir = root(home).join("jobs");
     let staging = jobs_dir.join(format!(".new-{id}"));
-    std::fs::create_dir(&staging)?;
+    std::fs::create_dir(&staging)
+        .with_context(|| format!("create worker reservation staging {}", staging.display()))?;
     save(&staging.join("job.json"), &job)?;
     clear_control_locked(home, key)?;
-    std::fs::rename(&staging, job_dir(home, &id)?)?;
+    std::fs::rename(&staging, job_dir(home, &id)?)
+        .with_context(|| format!("publish worker {id} reservation from {}", staging.display()))?;
     sync_dir(&jobs_dir)?;
     Ok((job, true))
 }
@@ -822,11 +879,15 @@ fn detached_command(home: &Path, job: &Job, generation: &Generation) -> Result<C
     // Open before exec so argument parsing, startup panics, and task progress
     // remain diagnosable even before the child can publish its acknowledgement.
     // Archiving/pruning the reservation also archives/prunes its log.
+    let log_path = job_dir(home, &job.id)?.join("worker.log");
     let log = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(job_dir(home, &job.id)?.join("worker.log"))?;
-    let stderr = log.try_clone()?;
+        .open(&log_path)
+        .with_context(|| format!("open worker startup log {}", log_path.display()))?;
+    let stderr = log
+        .try_clone()
+        .with_context(|| format!("clone worker startup log {}", log_path.display()))?;
     let mut command = Command::new(&generation.executable);
     command
         .arg("__worker")
@@ -963,15 +1024,23 @@ pub async fn run(home: &Path, id: &str) -> Result<()> {
         }
         let lease =
             try_lock(&dir.join("live.lock"))?.context("worker execution lease is already held")?;
-        let current = std::env::current_exe()?.canonicalize()?;
-        let expected = executable(home, &job.generation)?.canonicalize()?;
+        let current = std::env::current_exe()
+            .context("locate running worker executable")?
+            .canonicalize()
+            .context("resolve running worker executable")?;
+        let expected = executable(home, &job.generation)?
+            .canonicalize()
+            .with_context(|| {
+                format!("resolve worker {id} reserved generation {}", job.generation)
+            })?;
         if current != expected {
             bail!("worker must execute its reserved immutable generation");
         }
         job.pid = Some(std::process::id());
         job.version = Some(env!("CARGO_PKG_VERSION").to_owned());
         job.status = Status::Running;
-        save(&dir.join("job.json"), &job)?;
+        save(&dir.join("job.json"), &job)
+            .with_context(|| format!("acknowledge worker {id} startup"))?;
         (job, lease)
     };
     let result = match job.kind.as_str() {
@@ -1415,6 +1484,77 @@ mod tests {
                 .join("worker.log")
                 .is_file()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn record_publication_survives_readers_and_short_delete_sharing_handoffs() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let home = tempfile::tempdir().unwrap();
+        let mut job = reservation(home.path(), "task:metadata-handoff");
+        let directory = job_dir(home.path(), &job.id).unwrap();
+        let path = directory.join("job.json");
+        let lease = try_lock(&directory.join("live.lock")).unwrap().unwrap();
+        let snapshot = File::open(&path).unwrap();
+        // This reader allows ordinary IO but temporarily denies replacement.
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 2) // FILE_SHARE_READ | FILE_SHARE_WRITE
+            .open(&path)
+            .unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(15));
+                drop(reader);
+            });
+            job.status = Status::Running;
+            save(&path, &job).unwrap();
+        });
+        let original: Job = serde_json::from_reader(snapshot).unwrap();
+        assert_eq!(original.status, Status::Starting);
+        assert_eq!(get(home.path(), &job.id).unwrap().status, Status::Running);
+        let running_snapshot = File::open(&path).unwrap();
+        terminal(home.path(), &mut job, Status::Finished, "completed".into()).unwrap();
+        assert_eq!(get(home.path(), &job.id).unwrap().status, Status::Finished);
+        let previous: Job = serde_json::from_reader(running_snapshot).unwrap();
+        assert_eq!(previous.status, Status::Running);
+        drop(lease);
+        assert!(active(home.path()).unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn denied_record_publication_preserves_reservation_and_original_os_error() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let home = tempfile::tempdir().unwrap();
+        let job = reservation(home.path(), "task:metadata-denied");
+        let directory = job_dir(home.path(), &job.id).unwrap();
+        let path = directory.join("job.json");
+        let reader = OpenOptions::new()
+            .read(true)
+            .share_mode(1 | 2) // Deny deletion for the entire handoff budget.
+            .open(&path)
+            .unwrap();
+        let mut acknowledged = job.clone();
+        acknowledged.status = Status::Running;
+        let error = save(&path, &acknowledged).unwrap_err();
+        assert!(format!("{error:#}").contains("publish worker record"));
+        let io = error.downcast_ref::<std::io::Error>().unwrap();
+        assert!(matches!(io.raw_os_error(), Some(5 | 32)));
+        assert_eq!(get(home.path(), &job.id).unwrap().status, Status::Starting);
+        assert_eq!(reservation(home.path(), &job.key).id, job.id);
+        assert!(std::fs::read_dir(&directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".pending-")
+        }));
+        drop(reader);
+        save(&path, &acknowledged).unwrap();
+        assert_eq!(get(home.path(), &job.id).unwrap().status, Status::Running);
     }
 
     #[test]

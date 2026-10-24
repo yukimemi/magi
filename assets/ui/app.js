@@ -9852,6 +9852,17 @@ function setRunEvidencePending(pending) {
 }
 
 async function loadRun(id, { background = false } = {}) {
+  // An ordinary duplicate joins the current read without replacing its
+  // callbacks or staging. Only a change signal requests a trailing refresh.
+  if (!background && state.detail.id === id) {
+    const pending = ["core", "evidence", "report"]
+      .map(section => detailSections.get(`run:${id}:${section}`))
+      .filter(Boolean);
+    if (pending.length) {
+      await Promise.allSettled(pending.map(job => job.promise));
+      return;
+    }
+  }
   const requestId = nextRunRequest(id);
   if (state.detail.id !== id) {
     state.detail = runShell(id, (state.runs || []).find(r => r.id === id));
@@ -9860,10 +9871,11 @@ async function loadRun(id, { background = false } = {}) {
     renderRunDetail();
   }
   const detail = state.detail;
+  const current = () => state.detail === detail && runDetailRequests.get(id) === requestId;
   const retry = () => loadRun(id, { background: true });
   sectionNotice("run-meta", "run-core-state", "Loading run…", null, { pending: true, snapshot: Boolean(detail.run && !detail.run.isShell) });
-  // Stage the two new responses without discarding the displayed snapshot.
-  // Shared staging also supports sectionRequest's coalesced trailing refresh.
+  // Only this refresh may stage responses or clear its pending notices.
+  // Older reads can finish while sectionRequest starts the coalesced refresh.
   detail.core = null;
   detail.evidence = null;
   const retain = Boolean(detail.run && !detail.run.isShell);
@@ -9891,7 +9903,7 @@ async function loadRun(id, { background = false } = {}) {
     setRunEvidencePending(false);
   };
   const core = sectionRequest(`run:${id}:core`, `${API.run(id)}/core`, run => {
-    if (state.detail !== detail) return;
+    if (!current()) return;
     detail.core = run;
     sectionNotice("run-meta", "run-core-state", "");
     if (!retain) {
@@ -9902,7 +9914,7 @@ async function loadRun(id, { background = false } = {}) {
     }
     applyEvidence();
   }, error => {
-    if (state.detail === detail) {
+    if (current()) {
       detail.core = null;
       detail.evidenceError = true;
       sectionNotice("run-meta", "run-core-state", `Run: ${error.message}`, retry);
@@ -9911,11 +9923,11 @@ async function loadRun(id, { background = false } = {}) {
     }
   }, false, background);
   const evidence = sectionRequest(`run:${id}:evidence`, API.run(id), run => {
-    if (state.detail !== detail) return;
+    if (!current()) return;
     detail.evidence = run;
     applyEvidence();
   }, error => {
-    if (state.detail !== detail) return;
+    if (!current()) return;
     detail.evidence = null;
     detail.evidenceError = true;
     sectionNotice("run-meta", "run-evidence-state", `Related status: ${error.message}`, retry);
@@ -9923,14 +9935,14 @@ async function loadRun(id, { background = false } = {}) {
     setRunEvidencePending(false);
   }, false, background);
   const report = sectionRequest(`run:${id}:report`, API.reportJson(id), view => {
-    if (state.detail !== detail) return;
+    if (!current()) return;
     detail.reportView = view;
     state.detail.reportLoading = false;
     sectionNotice("run-report-note", "run-report-state", "");
     renderReportCards();
     if (state.rawReport || view.schema !== REPORT_VIEW_SCHEMA || !Array.isArray(view.sections)) return loadRawReport(id);
   }, error => {
-    if (state.detail !== detail) return;
+    if (!current()) return;
     state.detail.reportLoading = false;
     sectionNotice("run-report-note", "run-report-state", `Report: ${error.message}`, retry);
     if (!detail.reportView) {

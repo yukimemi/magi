@@ -1031,6 +1031,11 @@ attempt refund. Its existing owner saves the result normally. Ordinary
 concurrency and the separate urgent lane remain bounded across scheduler
 replacement. Standalone CLI executions remain outside the scheduler's lanes.
 
+External supervisors can still terminate an entire process container. On Windows,
+a worker requests breakaway only when the host Job Object permits it; otherwise
+it retains that job's restrictions. Configure the supervisor to preserve worker
+containers when restarting only the web or scheduler.
+
 Short ownership-maintenance transactions are awaited at execution boundaries
 using the run's existing resource-wait budget, not an agent's runtime budget.
 An ordinary maintenance pass must not turn a live task into an immediate hold.
