@@ -84,3 +84,12 @@ tempfile = "3.27.0"
 # binary gains no dependency and no browser requirement.
 tokio-tungstenite = "0.30.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink"] }
+
+# Worker generations hash the whole executable (`worker::pin_source`, then
+# again to verify an existing generation). A debug test binary is ~130 MB and
+# unoptimized SHA-256 made each pin take ~6 s on an M1 and long enough on CI
+# runners to time out the first web request that starts a worker
+# (tests/web_resume_worker.rs). Optimizing only the hash crate keeps the rest
+# of a debug build debuggable.
+[profile.dev.package.sha2]
+opt-level = 3
