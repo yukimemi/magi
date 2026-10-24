@@ -528,7 +528,7 @@ pub(crate) async fn invoke_leased(
         .with_context(|| format!("write {}", prompt_path.display()))?;
 
     let plan = build_command(spec, seat, inv, &prompt_path)?;
-    tracing::debug!(seat = %seat.key, agent = %spec.id, argv = ?plan.argv, "spawning agent");
+    tracing::debug!(seat = %seat.key, agent = %spec.id, argv = ?plan.logged_argv(), "spawning agent");
     // Store scope evidence without environment values or arbitrary extra args.
     tokio::fs::write(
         inv.artifacts.join(format!("{}.access.json", inv.stem)),
@@ -801,6 +801,30 @@ fn file_name(p: &Path) -> String {
 struct Plan {
     argv: Vec<String>,
     stdin: Option<String>,
+}
+
+impl Plan {
+    /// Settings may have been loaded from a file containing credentials.
+    /// Log the option, never its value, including repeated and equals forms.
+    fn logged_argv(&self) -> Vec<&str> {
+        let mut settings_value = false;
+        self.argv
+            .iter()
+            .map(|arg| {
+                if settings_value {
+                    settings_value = false;
+                    "[redacted]"
+                } else if arg == "--settings" {
+                    settings_value = true;
+                    arg.as_str()
+                } else if arg.starts_with("--settings=") {
+                    "--settings=[redacted]"
+                } else {
+                    arg.as_str()
+                }
+            })
+            .collect()
+    }
 }
 
 /// How a file-delivered prompt is pointed at, per CLI.
@@ -2225,6 +2249,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(on_disk, original);
+    }
+
+    #[test]
+    fn github_text_settings_are_redacted_from_command_logging() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = serde_json::json!({ "env": { "AUTH_TOKEN": "test-only-secret" } });
+        std::fs::write(dir.path().join("seat-settings.json"), settings.to_string()).unwrap();
+        for equals in [false, true] {
+            let mut spec = spec(AgentKind::Claude, None);
+            spec.extra_args =
+                vec!["--settings={\"env\":{\"AUTH_TOKEN\":\"earlier-secret\"}}".to_owned()];
+            if equals {
+                spec.extra_args
+                    .push("--settings=./seat-settings.json".to_owned());
+            } else {
+                spec.extra_args
+                    .extend(["--settings".to_owned(), "./seat-settings.json".to_owned()]);
+            }
+            let spec = for_github_text(&spec, "en", dir.path()).unwrap();
+            let plan = build_command(
+                &spec,
+                &SeatState::new("change-summary", "a", 7),
+                &inv(dir.path(), dir.path(), false),
+                &dir.path().join("prompt.md"),
+            )
+            .unwrap();
+            // Execution still receives both the configured token and language.
+            let actual = plan.argv.last().unwrap();
+            let actual: serde_json::Value =
+                serde_json::from_str(actual.strip_prefix("--settings=").unwrap_or(actual)).unwrap();
+            assert_eq!(actual["env"]["AUTH_TOKEN"], "test-only-secret");
+            assert_eq!(actual["language"], "English");
+            let logged = format!("{:?}", plan.logged_argv());
+            assert!(!logged.contains("secret"));
+            assert!(!logged.contains("AUTH_TOKEN"));
+            assert!(logged.contains("[redacted]"));
+            assert_eq!(plan.logged_argv()[0], "claude");
+            assert!(plan.logged_argv().contains(&"--output-format"));
+        }
     }
 
     #[test]
