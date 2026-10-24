@@ -2427,10 +2427,6 @@ pub struct RunState {
     /// winner to check.
     #[serde(default)]
     pub base_sync: Option<BaseSync>,
-    /// Round whose failed catch-up verification must reach the fix chain before
-    /// another reviewer wave. Saved before dispatch; cleared with its FixRecord.
-    #[serde(default)]
-    pub catchup_repair: Option<usize>,
     /// The design-deliberation stage's output, when `[graph] advise` ran it:
     /// one record per advisor seat, plus the synthesis blended into the
     /// implementer's prompt. `None` when the stage is off, has not run yet,
@@ -2659,7 +2655,6 @@ impl RunState {
             release_bump: None,
             bump_decision_attempts: Vec::new(),
             base_sync: None,
-            catchup_repair: None,
             advice: None,
             advise_attempted: false,
             attachments: Vec::new(),
