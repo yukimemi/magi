@@ -527,6 +527,12 @@ async fn resolve_base(
     )
 }
 
+/// Outcome of the shared fixer chain, before caller-owned stop policy.
+enum FixStep {
+    Resource,
+    Recorded { report_lost: bool },
+}
+
 /// Exclusive claim on one run's repair or `magi fix`, released on drop — including
 /// on an early return or a panic.
 ///
@@ -5855,6 +5861,46 @@ impl Runner {
     }
 
     async fn review_loop(&mut self) -> Result<()> {
+        loop {
+            if self
+                .state
+                .base_sync
+                .as_ref()
+                .is_some_and(|s| s.conflict.is_some())
+            {
+                return Ok(());
+            }
+            if self.catchup_repairable() {
+                let record = self.state.reviews.last().expect("repairable round").clone();
+                let winner = self
+                    .state
+                    .winner()
+                    .cloned()
+                    .context("catch-up repair has no winner")?;
+                if !self.fix_review_round(&winner, record).await? {
+                    return Ok(());
+                }
+            }
+            self.review_loop_pass().await?;
+            if !self.catchup_repairable() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Derive an owed catch-up repair from durable round evidence, including
+    /// reentry after a crash before the fixer was dispatched.
+    fn catchup_repairable(&self) -> bool {
+        self.state.reviews.len() < self.state.config.graph.review_rounds
+            && self.state.reviews.last().is_some_and(|r| {
+                !r.clean
+                    && r.blocking == 0
+                    && r.fix.is_none()
+                    && r.e2e_status() == E2eStatus::Failed
+            })
+    }
+
+    async fn review_loop_pass(&mut self) -> Result<()> {
         // A base that would not rebase is a person's decision, not a review
         // round: nothing here would change the answer, and reviewers and a
         // fixer would be spending real budget on a tree that cannot land
@@ -5906,15 +5952,13 @@ impl Runner {
         // loop below has nothing left to do at all (its range is empty).
         // Retry that check directly instead, exactly the same retry
         // `stop_reviewing` already does for its own catch-up case.
-        if self
-            .state
-            .reviews
-            .last()
-            .is_some_and(|r| r.e2e_status() == E2eStatus::ResourceBlocked)
-        {
+        if self.state.reviews.last().is_some_and(|r| {
+            r.e2e_status() == E2eStatus::ResourceBlocked
+                || (r.e2e_status() == E2eStatus::Deferred && r.blocking == 0 && r.fix.is_none())
+        }) {
             let shell = self.state.config.shell();
             return self
-                .stop_reviewing(
+                .stop_unresolved_review(
                     "the last round's own verification never resolved",
                     &shell,
                     &winner.worktree,
@@ -6429,7 +6473,6 @@ impl Runner {
                 round_record.verified_head = Some(head.clone());
                 round_record.verified_at = Some(Timestamp::now());
             }
-            let this_round_verification = round_record.verification_summary(&head);
 
             if incomplete {
                 let missing: Vec<String> = round_record
@@ -6511,7 +6554,7 @@ impl Runner {
             if blocking == 0 && round_record.e2e_status() == E2eStatus::ResourceBlocked {
                 self.state.reviews.push(round_record);
                 return self
-                    .stop_reviewing(
+                    .stop_unresolved_review(
                         "the round's own verification could not run",
                         &shell,
                         &winner.worktree,
@@ -6532,243 +6575,289 @@ impl Runner {
                     .await;
             }
 
-            // Fix. The winner's own implementer seat continues its conversation:
-            // the competition is over, so context is pure benefit now.
-            let blocking_findings: Vec<_> = all_findings
-                .iter()
-                .filter(|f| f.severity.blocks())
-                .cloned()
-                .collect();
-            let fix_prompt = prompt::fix_in(
-                &self.state.instruction,
-                &blocking_findings,
-                this_round_verification.as_ref(),
-                round,
-                max_rounds,
-                &language,
-                &self.state.config.graph.github_language,
-            );
-            let timeout = Duration::from_secs(self.state.config.graph.timeout_fix);
-            let before = git::rev_parse(&winner.worktree, "HEAD").await?;
-            let (job, seat, out) = self
-                .ask_fixer(&winner, "fix", Some(round), |spec, seat| SeatJob {
-                    prompt: fix_prompt.clone(),
-                    spec,
-                    seat,
-                    cwd: winner.worktree.clone(),
-                    timeout,
-                    allow_write: true,
-                    sessions,
-                    artifacts: artifacts.clone(),
-                    stem: format!("fix-{round}"),
-                    handover: None,
-                })
-                .await;
-            // Not asked: the round is not recorded (so a resume repeats it),
-            // no fixer was handed over to, and the seat is left as it was.
-            if matches!(out, AgentOutcome::ResourceBlocked(_)) {
-                return self.stop_for_resource();
+            if !self.fix_review_round(&winner, round_record).await? {
+                return Ok(());
             }
-            let agent_id = seat.agent.clone();
+        }
+        Ok(())
+    }
 
-            let mut fix = FixRecord {
-                agent: agent_id,
-                addressed: Vec::new(),
-                rejected: Vec::new(),
-                notes: String::new(),
-                committed: false,
-                failed: None,
-                duration_ms: 0,
-                continuation: None,
-            };
-            let mut continuation = ContinuationRecord::not_needed();
-            let mut final_seat = seat.clone();
-            match out {
-                AgentOutcome::Ok(o) => {
-                    fix.duration_ms = o.duration_ms;
-                    let parsed = verdict::extract_json::<FixReport>(&o.text);
-                    // A parsed report standing next to a command this same
-                    // reply's own CLI never confirmed the exit status of is
-                    // not a resolved answer — the identical `CommandEvidence`
-                    // `state.jobs` renders, read here instead of only on
-                    // display, per the completion judgment and the shown
-                    // record needing to agree.
-                    let incomplete_reason = match &parsed {
-                        Ok(_) if has_unconfirmed_command(&o.commands) => Some(
-                            "the reply parsed, but it reported a command whose own CLI never \
-                             confirmed an exit status"
-                                .to_owned(),
-                        ),
-                        Ok(_) => None,
-                        Err(e) => Some(e.to_string()),
-                    };
-                    match incomplete_reason {
-                        None => {
-                            let report = parsed.expect("checked Ok above");
-                            fix.addressed = report.addressed;
-                            fix.rejected = report.rejected;
-                            fix.notes =
-                                blind::sanitize_prose(&report.notes, &self.state.config.blind);
-                        }
-                        Some(reason) => {
-                            let (resumed_seat, resolved, failure, cont) = self
-                                .continue_fix_report(seat, reason, &job, &prompts, &run_id, round)
-                                .await;
-                            fix.duration_ms += cont.cumulative_wait_ms;
-                            continuation = cont;
-                            final_seat = resumed_seat;
-                            match resolved {
-                                Some(report) => {
-                                    fix.addressed = report.addressed;
-                                    fix.rejected = report.rejected;
-                                    fix.notes = blind::sanitize_prose(
-                                        &report.notes,
-                                        &self.state.config.blind,
-                                    );
-                                }
-                                None => fix.failed = failure,
-                            }
-                        }
-                    }
-                }
-                // The CLI's raw error JSON is not a fix report to parse.
-                AgentOutcome::Dropped(o) => {
-                    fix.duration_ms = o.duration_ms;
-                    let why = o
-                        .dropped
-                        .as_ref()
-                        .map(|d| d.why.as_str())
-                        .unwrap_or("the CLI ended the stream without delivering its answer");
-                    fix.failed = Some(format!("the CLI dropped the stream ({why})"));
-                }
-                AgentOutcome::Quota(o) => {
-                    self.state.quota.push(QuotaLoss {
-                        seat: final_seat.key.clone(),
-                        node: "fix".to_owned(),
-                        at: Timestamp::now(),
-                        reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                    });
-                    fix.failed = Some("rate limited (quota); fixer could not run".to_owned());
-                }
-                AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => fix.failed = Some(e),
-            }
-            fix.continuation = Some(continuation);
-            self.state.seats.insert(final_seat.key.clone(), final_seat);
-            let coordination = self.coordinate(&winner.worktree).await?;
-            if let Ok(r) = git::rescue_commit(
-                &winner.worktree,
-                &format!("magi: review round {round} fixes (uncommitted work)"),
-            )
-            .await
-            {
-                self.state.note_withheld("fix", &r.withheld);
-            }
-            let after = git::rev_parse(&winner.worktree, "HEAD").await?;
-            fix.committed = after != before;
-            // Judged by what `git` says moved against base, never by the
-            // fixer's own `addressed`/`rejected` count — see
-            // `ReviewRound::progressed`. Propagated with `?`, the same as the
-            // `patch` snapshot above: swallowing this error would default
-            // `diff_after` to empty, which almost always differs from a
-            // non-empty `patch` and reads as "progressed" — exactly backwards
-            // for a `git` failure the stagnation check cannot see through.
-            let diff_after = git::diff(&winner.worktree, &base, "HEAD").await?;
-            drop(coordination);
-            let progressed = diff_after != patch;
-            let commit_note = if fix.committed {
-                "committed"
-            } else {
-                "NO new commit"
-            };
-            let tree_note = if progressed {
-                "changed vs base"
-            } else {
-                "unchanged vs base"
-            };
-            self.state.event(
-                "fix",
-                match &fix.failed {
-                    // Distinct on purpose from "0 addressed, 0 rejected": the
-                    // fixer's own diff still landed (blocking counts do keep
-                    // falling round over round), only its adoption report did
-                    // not come back, so this must never read like every
-                    // finding was reviewed and declined.
-                    Some(reason) => {
-                        format!(
-                            "round {round}: fixer's adoption report was lost ({reason}); \
-                             {commit_note}, tree {tree_note}"
-                        )
-                    }
-                    None => format!(
-                        "round {round}: {} addressed, {} rejected, {commit_note}, tree \
-                         {tree_note}{}",
-                        fix.addressed.len(),
-                        fix.rejected.len(),
-                        if continuation.outcome == ContinuationOutcome::Resumed {
-                            format!(
-                                " (adoption report recovered after {} continuation(s))",
-                                continuation.attempts
-                            )
-                        } else {
-                            String::new()
-                        },
-                    ),
-                },
-            );
-            round_record.fix = Some(fix);
-            round_record.progressed = progressed;
+    /// Run the same fix chain for an in-loop failure or a persisted catch-up failure.
+    /// False means admission or continuation policy stopped the review loop.
+    async fn fix_review_round(
+        &mut self,
+        winner: &Candidate,
+        mut round_record: ReviewRound,
+    ) -> Result<bool> {
+        let round = round_record.round;
+        let shell = self.state.config.shell();
+        let step = self.run_fix_round(winner, &mut round_record).await?;
+        if matches!(step, FixStep::Resource) {
+            self.stop_for_resource()?;
+            return Ok(false);
+        }
+        if self.state.reviews.len() < round {
             self.state.reviews.push(round_record);
-            self.state.save()?;
+        } else {
+            self.state.reviews[round - 1] = round_record;
+        }
+        self.state.save()?;
 
-            // The fixer's own report never came back this round, even after
-            // `continue_fix_report`'s own budget was spent on it — not an
-            // ordinary "no report" (dropped stream, quota, plain failure),
-            // which already reads that way and is left to the existing round
-            // budget. Stopping here, rather than opening another round, is
-            // what keeps a next reviewer/fixer wave from ever being
-            // dispatched onto `winner.worktree` while whatever the seat's
-            // last call may still have running there is unaccounted for: no
-            // process liveness check exists (and none is being added — see
-            // AGENTS.md/this task's own scope), so the only way to honour
-            // "nothing starts before a valid report returns" is to not start
-            // anything further on this worktree from this run at all.
-            if matches!(
+        // The fixer's own report never came back this round, even after
+        // `continue_fix_report`'s own budget was spent on it — not an
+        // ordinary "no report" (dropped stream, quota, plain failure),
+        // which already reads that way and is left to the existing round
+        // budget. Stopping here, rather than opening another round, is
+        // what keeps a next reviewer/fixer wave from ever being
+        // dispatched onto `winner.worktree` while whatever the seat's
+        // last call may still have running there is unaccounted for: no
+        // process liveness check exists (and none is being added — see
+        // AGENTS.md/this task's own scope), so the only way to honour
+        // "nothing starts before a valid report returns" is to not start
+        // anything further on this worktree from this run at all.
+        if matches!(step, FixStep::Recorded { report_lost: true }) {
+            self.stop_reviewing(
+                "the fixer's adoption report never came back, even after resuming its \
+                         own seat; refusing to start another round against the same worktree \
+                         while that is unresolved",
+                &shell,
+                &winner.worktree,
+            )
+            .await?;
+            return Ok(false);
+        }
+
+        let streak = self
+            .state
+            .reviews
+            .iter()
+            .rev()
+            .take_while(|r| !r.progressed)
+            .count();
+        if streak >= STAGNANT_LIMIT {
+            self.stop_reviewing(
+                &format!("the tree has not moved against base for {streak} round(s) in a row"),
+                &shell,
+                &winner.worktree,
+            )
+            .await?;
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    /// Execute the shared fixer chain; the caller owns persistence and stop policy.
+    async fn run_fix_round(
+        &mut self,
+        winner: &Candidate,
+        round_record: &mut ReviewRound,
+    ) -> Result<FixStep> {
+        let round = round_record.round;
+        let max_rounds = self.state.config.graph.review_rounds;
+        let run_id = self.state.id.clone();
+        let prompts = self.state.config.prompts.clone();
+        let language = self.state.config.graph.language.clone();
+        let sessions = self.state.config.graph.sessions;
+        let artifacts = self.merge_repair_artifacts();
+        let base = self.landing_base();
+        let patch = git::diff(&winner.worktree, &base, "HEAD").await?;
+        let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+        let this_round_verification = round_record.verification_summary(&head);
+        let all_findings: Vec<_> = round_record
+            .reviews
+            .iter()
+            .flat_map(|r| r.findings.iter().cloned())
+            .collect();
+        // Fix. The winner's own implementer seat continues its conversation:
+        // the competition is over, so context is pure benefit now.
+        let blocking_findings: Vec<_> = all_findings
+            .iter()
+            .filter(|f| f.severity.blocks())
+            .cloned()
+            .collect();
+        let fix_prompt = prompt::fix_in(
+            &self.state.instruction,
+            &blocking_findings,
+            this_round_verification.as_ref(),
+            round,
+            max_rounds,
+            &language,
+            &self.state.config.graph.github_language,
+        );
+        let timeout = Duration::from_secs(self.state.config.graph.timeout_fix);
+        let before = git::rev_parse(&winner.worktree, "HEAD").await?;
+        let (job, seat, out) = self
+            .ask_fixer(winner, "fix", Some(round), |spec, seat| SeatJob {
+                prompt: fix_prompt.clone(),
+                spec,
+                seat,
+                cwd: winner.worktree.clone(),
+                timeout,
+                allow_write: true,
+                sessions,
+                artifacts: artifacts.clone(),
+                stem: format!("fix-{round}"),
+                handover: None,
+            })
+            .await;
+        // Not asked: the round is not recorded (so a resume repeats it),
+        // no fixer was handed over to, and the seat is left as it was.
+        if matches!(out, AgentOutcome::ResourceBlocked(_)) {
+            return Ok(FixStep::Resource);
+        }
+        let agent_id = seat.agent.clone();
+
+        let mut fix = FixRecord {
+            agent: agent_id,
+            addressed: Vec::new(),
+            rejected: Vec::new(),
+            notes: String::new(),
+            committed: false,
+            failed: None,
+            duration_ms: 0,
+            continuation: None,
+        };
+        let mut continuation = ContinuationRecord::not_needed();
+        let mut final_seat = seat.clone();
+        match out {
+            AgentOutcome::Ok(o) => {
+                fix.duration_ms = o.duration_ms;
+                let parsed = verdict::extract_json::<FixReport>(&o.text);
+                // A parsed report standing next to a command this same
+                // reply's own CLI never confirmed the exit status of is
+                // not a resolved answer — the identical `CommandEvidence`
+                // `state.jobs` renders, read here instead of only on
+                // display, per the completion judgment and the shown
+                // record needing to agree.
+                let incomplete_reason = match &parsed {
+                    Ok(_) if has_unconfirmed_command(&o.commands) => Some(
+                        "the reply parsed, but it reported a command whose own CLI never \
+                             confirmed an exit status"
+                            .to_owned(),
+                    ),
+                    Ok(_) => None,
+                    Err(e) => Some(e.to_string()),
+                };
+                match incomplete_reason {
+                    None => {
+                        let report = parsed.expect("checked Ok above");
+                        fix.addressed = report.addressed;
+                        fix.rejected = report.rejected;
+                        fix.notes = blind::sanitize_prose(&report.notes, &self.state.config.blind);
+                    }
+                    Some(reason) => {
+                        let (resumed_seat, resolved, failure, cont) = self
+                            .continue_fix_report(seat, reason, &job, &prompts, &run_id, round)
+                            .await;
+                        fix.duration_ms += cont.cumulative_wait_ms;
+                        continuation = cont;
+                        final_seat = resumed_seat;
+                        match resolved {
+                            Some(report) => {
+                                fix.addressed = report.addressed;
+                                fix.rejected = report.rejected;
+                                fix.notes =
+                                    blind::sanitize_prose(&report.notes, &self.state.config.blind);
+                            }
+                            None => fix.failed = failure,
+                        }
+                    }
+                }
+            }
+            // The CLI's raw error JSON is not a fix report to parse.
+            AgentOutcome::Dropped(o) => {
+                fix.duration_ms = o.duration_ms;
+                let why = o
+                    .dropped
+                    .as_ref()
+                    .map(|d| d.why.as_str())
+                    .unwrap_or("the CLI ended the stream without delivering its answer");
+                fix.failed = Some(format!("the CLI dropped the stream ({why})"));
+            }
+            AgentOutcome::Quota(o) => {
+                self.state.quota.push(QuotaLoss {
+                    seat: final_seat.key.clone(),
+                    node: "fix".to_owned(),
+                    at: Timestamp::now(),
+                    reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
+                });
+                fix.failed = Some("rate limited (quota); fixer could not run".to_owned());
+            }
+            AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => fix.failed = Some(e),
+        }
+        fix.continuation = Some(continuation);
+        self.state.seats.insert(final_seat.key.clone(), final_seat);
+        let coordination = self.coordinate(&winner.worktree).await?;
+        if let Ok(r) = git::rescue_commit(
+            &winner.worktree,
+            &format!("magi: review round {round} fixes (uncommitted work)"),
+        )
+        .await
+        {
+            self.state.note_withheld("fix", &r.withheld);
+        }
+        let after = git::rev_parse(&winner.worktree, "HEAD").await?;
+        fix.committed = after != before;
+        // Judged by what `git` says moved against base, never by the
+        // fixer's own `addressed`/`rejected` count — see
+        // `ReviewRound::progressed`. Propagated with `?`, the same as the
+        // `patch` snapshot above: swallowing this error would default
+        // `diff_after` to empty, which almost always differs from a
+        // non-empty `patch` and reads as "progressed" — exactly backwards
+        // for a `git` failure the stagnation check cannot see through.
+        let diff_after = git::diff(&winner.worktree, &base, "HEAD").await?;
+        drop(coordination);
+        let progressed = diff_after != patch;
+        let commit_note = if fix.committed {
+            "committed"
+        } else {
+            "NO new commit"
+        };
+        let tree_note = if progressed {
+            "changed vs base"
+        } else {
+            "unchanged vs base"
+        };
+        self.state.event(
+            "fix",
+            match &fix.failed {
+                // Distinct on purpose from "0 addressed, 0 rejected": the
+                // fixer's own diff still landed (blocking counts do keep
+                // falling round over round), only its adoption report did
+                // not come back, so this must never read like every
+                // finding was reviewed and declined.
+                Some(reason) => {
+                    format!(
+                        "round {round}: fixer's adoption report was lost ({reason}); \
+                             {commit_note}, tree {tree_note}"
+                    )
+                }
+                None => format!(
+                    "round {round}: {} addressed, {} rejected, {commit_note}, tree \
+                         {tree_note}{}",
+                    fix.addressed.len(),
+                    fix.rejected.len(),
+                    if continuation.outcome == ContinuationOutcome::Resumed {
+                        format!(
+                            " (adoption report recovered after {} continuation(s))",
+                            continuation.attempts
+                        )
+                    } else {
+                        String::new()
+                    },
+                ),
+            },
+        );
+        round_record.fix = Some(fix);
+        round_record.progressed = progressed;
+        Ok(FixStep::Recorded {
+            report_lost: matches!(
                 continuation.outcome,
                 ContinuationOutcome::Exhausted
                     | ContinuationOutcome::QuotaLost
                     | ContinuationOutcome::NoSession
-            ) {
-                return self
-                    .stop_reviewing(
-                        "the fixer's adoption report never came back, even after resuming its \
-                         own seat; refusing to start another round against the same worktree \
-                         while that is unresolved",
-                        &shell,
-                        &winner.worktree,
-                    )
-                    .await;
-            }
-
-            let streak = self
-                .state
-                .reviews
-                .iter()
-                .rev()
-                .take_while(|r| !r.progressed)
-                .count();
-            if streak >= STAGNANT_LIMIT {
-                return self
-                    .stop_reviewing(
-                        &format!(
-                            "the tree has not moved against base for {streak} round(s) in a row"
-                        ),
-                        &shell,
-                        &winner.worktree,
-                    )
-                    .await;
-            }
-        }
-        Ok(())
+            ),
+        })
     }
 
     /// Decide, from the last recorded round's own verification, whether
@@ -6828,7 +6917,26 @@ impl Runner {
         self.state.contested_handoff = Some(contested);
     }
 
+    async fn stop_unresolved_review(
+        &mut self,
+        why: &str,
+        shell: &[String],
+        worktree: &Path,
+    ) -> Result<()> {
+        self.stop_reviewing_inner(why, shell, worktree, true).await
+    }
+
     async fn stop_reviewing(&mut self, why: &str, shell: &[String], worktree: &Path) -> Result<()> {
+        self.stop_reviewing_inner(why, shell, worktree, false).await
+    }
+
+    async fn stop_reviewing_inner(
+        &mut self,
+        why: &str,
+        shell: &[String],
+        worktree: &Path,
+        repairable: bool,
+    ) -> Result<()> {
         let round_idx = self.state.reviews.len() - 1;
         // A deferred round and a resource-blocked one are the same shape
         // here: neither has a real result yet, and both get one more
@@ -6913,9 +7021,17 @@ impl Runner {
                         )
                     })
                     .collect();
+                let can_repair = last.blocking == 0 && last.fix.is_none();
+                self.state.reviews[round_idx].clean = false;
                 self.state
                     .event("review", format!("{why}; e2e failed:\n{}", red.join("\n")));
                 self.state.status = RunStatus::Blocked;
+                if repairable
+                    && can_repair
+                    && self.state.reviews.len() < self.state.config.graph.review_rounds
+                {
+                    self.state.status = RunStatus::Reviewing;
+                }
             }
             // `needs_catchup_run` above already retried once this call; if
             // it is still blocked, this is magi's own admission it could
@@ -9682,7 +9798,11 @@ fn round_is_clean(
 /// handling of that shape) instead of this cheap recomputation guessing a
 /// verdict a real attempt never produced.
 pub(crate) fn review_conclusion(reviews: &[ReviewRound], max_rounds: usize) -> Option<RunStatus> {
-    if max_rounds == 0 || reviews.iter().any(|r| r.clean) {
+    if max_rounds == 0
+        || reviews.last().is_some_and(|r| {
+            r.clean && matches!(r.e2e_status(), E2eStatus::Passed | E2eStatus::NotConfigured)
+        })
+    {
         return Some(RunStatus::Gating);
     }
     let last = reviews.last()?;
@@ -9693,7 +9813,9 @@ pub(crate) fn review_conclusion(reviews: &[ReviewRound], max_rounds: usize) -> O
     if last.incomplete() && last.blocking == 0 {
         return Some(RunStatus::Blocked);
     }
-    if last.e2e_status() == E2eStatus::ResourceBlocked {
+    if last.e2e_status() == E2eStatus::ResourceBlocked
+        || (last.e2e_status() == E2eStatus::Deferred && last.blocking == 0 && last.fix.is_none())
+    {
         return None;
     }
     Some(if last.e2e.iter().all(CommandOutcome::ok) {
@@ -16369,6 +16491,202 @@ mod tests {
         assert_ne!(runner.state.status, RunStatus::Blocked);
 
         held.release();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn catchup_compile_failure_after_clean_base_sync_uses_remaining_review_rounds() {
+        ask_test_home();
+        for (max_rounds, reentry) in [(2, false), (2, true), (1, false)] {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir(&repo).unwrap();
+            init_repo(&repo);
+            let run_git = |args: &[&str]| {
+                let out = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&repo)
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{args:?}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            };
+            let origin = tmp.path().join("origin.git");
+            run_git(&["init", "--bare", origin.to_str().unwrap()]);
+            run_git(&["remote", "add", "origin", origin.to_str().unwrap()]);
+            std::fs::write(repo.join("spec.rs"), "struct AgentSpec {}\n").unwrap();
+            run_git(&["add", "spec.rs"]);
+            run_git(&["commit", "-m", "initial spec"]);
+            run_git(&["push", "origin", "main"]);
+            let base = git::rev_parse(&repo, "HEAD").await.unwrap();
+            run_git(&["checkout", "-b", "fix/review"]);
+            std::fs::write(
+                repo.join("check.rs"),
+                "include!(\"spec.rs\"); fn main() { let _ = AgentSpec {}; }\n",
+            )
+            .unwrap();
+            run_git(&["add", "check.rs"]);
+            run_git(&["commit", "-m", "use spec"]);
+            let reviewed = git::rev_parse(&repo, "HEAD").await.unwrap();
+            run_git(&["checkout", "main"]);
+            std::fs::write(
+                repo.join("spec.rs"),
+                "struct AgentSpec { max_turn_secs: u64 }\n",
+            )
+            .unwrap();
+            run_git(&["add", "spec.rs"]);
+            run_git(&["commit", "-m", "extend spec"]);
+            run_git(&["push", "origin", "main"]);
+            run_git(&["checkout", "fix/review"]);
+
+            let mut runner = runner_at(RunStatus::Reviewing);
+            runner.state.repo = repo.clone();
+            runner.state.base_commit = base;
+            runner.state.pr_head = Some("fix/review".into());
+            runner.state.config.graph.review_rounds = max_rounds;
+            runner.state.config.graph.worktree_root = Some(tmp.path().join("worktrees"));
+            runner.state.config.graph.sessions = false;
+            runner.state.config.disk.min_free_bytes = 0;
+            runner.state.config.verify.e2e =
+                vec!["rustc --emit=metadata -o ../check.rmeta check.rs || { echo 'error: could not compile fixture' >&2; exit 101; }".into()];
+            runner.state.candidates = vec![Candidate {
+                index: 0,
+                label: 'A',
+                agent: "fixture".into(),
+                branch: "fix/review".into(),
+                worktree: repo.clone(),
+                summary: String::new(),
+                stat: String::new(),
+                files: 1,
+                commits: 1,
+                empty: false,
+                failed: None,
+                verified_noop: None,
+                duration_ms: 0,
+                folded: false,
+            }];
+            runner.state.tally = Some(Tally {
+                first_choice: BTreeMap::new(),
+                borda: BTreeMap::new(),
+                winner: 'A',
+                rankings: 0,
+                unanimous_initial: true,
+                deliberated: false,
+                changed_votes: 0,
+                unanimous_final: true,
+                tie_break: None,
+                judges: 0,
+                present: 0,
+                quorum: 0,
+                met_quorum: true,
+                uncontested: Some("review-only".into()),
+            });
+            let mut last = review_round(false, 0, 1, 1, false, false);
+            last.head = reviewed.clone();
+            last.e2e_deferred = true;
+            last.e2e[0].resource_blocked = true;
+            last.e2e[0].output_tail = "waiting for the shared build cache".into();
+            if max_rounds == 1 {
+                last.e2e.clear();
+            }
+            runner.state.reviews = vec![last];
+            let calls = tmp.path().join("fix-calls");
+            let mut fixer = spec("repair");
+            fixer
+                .env
+                .insert("FIX_CALLS".into(), calls.display().to_string());
+            fixer.command = vec!["sh".into(), "-c".into(), r#"
+                echo fix >> "$FIX_CALLS"
+                grep -q E0063 "$MAGI_PROMPT_FILE" || exit 1
+                grep -q max_turn_secs "$MAGI_PROMPT_FILE" || exit 1
+                printf 'include!("spec.rs"); fn main() { let _ = AgentSpec { max_turn_secs: 0 }; }\n' > check.rs
+                printf '{"addressed":[],"rejected":[],"notes":"initialize the new field"}\n'
+            "#.into()];
+            let mut reviewer = spec("reviewer");
+            reviewer.command = vec![
+                "sh".into(),
+                "-c".into(),
+                "printf '%s\\n' '{\"summary\":\"clean\",\"vote\":\"approve\",\"findings\":[]}'"
+                    .into(),
+            ];
+            runner.roles.fixer = Some(vec![fixer]);
+            runner.roles.reviewers = vec![reviewer];
+
+            runner.sync_to_base().await.unwrap();
+            let rebased = git::rev_parse(&repo, "HEAD").await.unwrap();
+            assert_ne!(rebased, reviewed);
+            assert!(runner.state.base_sync.as_ref().unwrap().conflict.is_none());
+            if reentry {
+                // Simulate a crash after catch-up evidence was saved but before
+                // dispatching the fixer. No dedicated pending-repair field exists.
+                let shell = runner.state.config.shell();
+                runner
+                    .stop_unresolved_review("deferred verification", &shell, &repo)
+                    .await
+                    .unwrap();
+                assert!(runner.catchup_repairable());
+                assert!(!calls.exists());
+                runner.state = RunState::load(&runner.state.id).unwrap();
+                assert!(runner.catchup_repairable());
+            }
+            runner.review_loop().await.unwrap();
+            let first = &runner.state.reviews[0];
+            assert_eq!(first.head, reviewed);
+            assert_eq!(first.verified_head.as_deref(), Some(rebased.as_str()));
+            assert!(
+                first.verify_retried,
+                "a reproduced build failure gets exactly one retry: {:?}",
+                first.e2e
+            );
+            assert!(first.e2e[0].output_tail.contains("E0063"));
+            assert!(!runner.catchup_repairable());
+            if max_rounds == 2 {
+                assert_eq!(
+                    runner.state.status,
+                    RunStatus::Gating,
+                    "{}",
+                    crate::report::run(&runner.state)
+                );
+                assert_eq!(runner.state.reviews.len(), 2);
+                assert!(first.fix.as_ref().unwrap().committed);
+                assert!(runner.state.reviews[1].clean);
+                assert_eq!(
+                    runner
+                        .state
+                        .reviews
+                        .iter()
+                        .filter(|r| r.fix.is_some())
+                        .count(),
+                    1
+                );
+                assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+                assert_eq!(runner.state.reviews[1].e2e_status(), E2eStatus::Passed);
+            } else {
+                assert_eq!(runner.state.status, RunStatus::Blocked);
+                assert!(first.fix.is_none());
+                assert!(!calls.exists());
+                let recovery = crate::recovery::assess(
+                    "prior",
+                    Some(&runner.state),
+                    &runner.landing_base(),
+                    crate::recovery::Relation::Diverged,
+                );
+                assert_eq!(recovery.mode, crate::recovery::Mode::FullReview);
+                let reasons = recovery.reasons.join("\n");
+                assert!(
+                    reasons.contains(&reviewed) && reasons.contains(&rebased),
+                    "{reasons}"
+                );
+                assert!(
+                    reasons.contains("base sync to")
+                        && reasons.contains("additional review is required"),
+                    "{reasons}"
+                );
+            }
+        }
     }
 
     /// A resumed run — a fresh `Runner`, `self.state.reviews` already

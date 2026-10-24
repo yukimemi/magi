@@ -313,9 +313,24 @@ pub fn assess(
         Some(e) if e.output_tail.trim().is_empty() => rec
             .reasons
             .push("the failed verification kept no output to act on".to_owned()),
-        Some(e) if e.head != last.head => rec.reasons.push(
-            "the failed verification was about a different commit than the one reviewed".to_owned(),
-        ),
+        Some(e) if e.head != last.head => {
+            let sync = prior.base_sync.as_ref().map_or_else(
+                || "no base sync recorded".to_owned(),
+                |sync| {
+                    format!(
+                        "base sync to {}, {} rebase attempt(s), conflict: {}",
+                        sync.tip,
+                        sync.attempts,
+                        sync.conflict.as_deref().unwrap_or("none")
+                    )
+                },
+            );
+            rec.reasons.push(format!(
+                "the failed verification was about a different commit {} than the one reviewed {}; \
+                 {sync}; additional review is required before approval can carry forward",
+                e.head, last.head,
+            ));
+        }
         Some(_) => {}
     }
     match relation {
