@@ -837,6 +837,7 @@ pub fn fixture(home: HomeGuard, judges: Judges, require_fix: bool) -> Fixture {
         update: Update {
             mode: UpdateMode::Off,
             interval: None,
+            auto_restart: false,
         },
         ..Config::default()
     };

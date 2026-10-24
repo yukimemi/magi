@@ -282,6 +282,17 @@ impl Stage {
     }
 }
 
+/// Source of a shared update-and-restart request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpgradeTrigger {
+    /// Requested through the web UI.
+    #[default]
+    Manual,
+    /// Requested by the idle-only background checker.
+    Auto,
+}
+
 /// One upgrade's progress, persisted at [`progress_path`].
 ///
 /// Kept on disk rather than in memory because the process that finishes an
@@ -293,6 +304,9 @@ impl Stage {
 /// outlive the process that wrote it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Progress {
+    /// Whether the operator or the background checker requested this upgrade.
+    #[serde(default)]
+    pub trigger: UpgradeTrigger,
     /// Where this upgrade has gotten to.
     pub stage: Stage,
     /// Version this upgrade started from.
@@ -320,6 +334,7 @@ impl Progress {
     pub fn new(from: String, to: String) -> Self {
         let now = Timestamp::now();
         Self {
+            trigger: UpgradeTrigger::Manual,
             stage: Stage::Downloading,
             from,
             to: Some(to),
@@ -1002,6 +1017,7 @@ mod tests {
         let cfg = Update {
             mode: UpdateMode::Notify,
             interval: Some("1s".to_owned()),
+            auto_restart: false,
         };
         assert_eq!(
             effective_interval(&cfg),
@@ -1013,6 +1029,7 @@ mod tests {
         let sane = Update {
             mode: UpdateMode::Notify,
             interval: Some("2h".to_owned()),
+            auto_restart: false,
         };
         assert_eq!(
             effective_interval(&sane),
@@ -1062,6 +1079,7 @@ mod tests {
         let cfg = Update {
             mode: UpdateMode::Off,
             interval: None,
+            auto_restart: false,
         };
         assert!(spawn(&cfg, rt.handle()).is_none());
     }
@@ -1106,6 +1124,7 @@ mod tests {
             Checker::new(&Update {
                 mode: UpdateMode::Off,
                 interval: None,
+                auto_restart: false,
             })
             .is_none(),
             "an operator who writes mode = \"off\" means it"
@@ -1115,6 +1134,7 @@ mod tests {
                 Checker::new(&Update {
                     mode,
                     interval: None,
+                    auto_restart: false,
                 })
                 .is_some(),
                 "{mode:?} still asks the forge"
@@ -1225,6 +1245,15 @@ mod tests {
 
     fn at(secs: i64) -> Timestamp {
         Timestamp::from_second(secs).expect("timestamp")
+    }
+
+    #[test]
+    fn auto_upgrade_progress_defaults_old_records_to_manual() {
+        let progress = Progress::new("old".into(), "new".into());
+        let mut value = serde_json::to_value(progress).unwrap();
+        value.as_object_mut().unwrap().remove("trigger");
+        let old: Progress = serde_json::from_value(value).unwrap();
+        assert_eq!(old.trigger, UpgradeTrigger::Manual);
     }
 
     fn staged(stage: Stage, since: i64) -> Progress {

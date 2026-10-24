@@ -82,7 +82,6 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path as FsPath, PathBuf};
-#[cfg(test)]
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -637,6 +636,8 @@ pub struct Ui {
     upgrade_spawned: Arc<std::sync::atomic::AtomicBool>,
     /// Request failures before progress exists; never overwrite upgrade.json.
     upgrade_request_error: Arc<Mutex<Option<UpgradeRequestFailure>>>,
+    auto_failed_tag: Arc<Mutex<Option<String>>>,
+    upgrade_runner: UpgradeRunner,
     /// Runs this process is resuming right now.
     ///
     /// Separate from `talk_turns` because a run and a talk are different
@@ -729,6 +730,8 @@ impl Ui {
             upgrade_gate: Arc::default(),
             upgrade_spawned: Arc::default(),
             upgrade_request_error: Arc::default(),
+            auto_failed_tag: Arc::default(),
+            upgrade_runner: |home| Box::pin(upgrade_and_restart(home)),
             resuming: Arc::default(),
             repos_cache: repos::Cache::new(),
             machine_config: Config::machine_layer(),
@@ -927,6 +930,12 @@ impl Ui {
 
     /// Start a scheduler that outlives this web process.
     async fn start_detached_loop(&self) -> ApiResult<()> {
+        if self
+            .upgrade_spawned
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ApiError::conflict("an upgrade is in progress"));
+        }
         let reading = daemon::read_status(&self.home);
         if let Some(other) = Foreign::of(reading.as_ref()) {
             return Err(ApiError::conflict(format!(
@@ -988,6 +997,12 @@ impl Ui {
             )));
         }
         let mut state = self.lock_loop();
+        if self
+            .upgrade_spawned
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ApiError::conflict("an upgrade is in progress"));
+        }
         if state.live.as_ref().is_some_and(Live::alive) {
             return Err(ApiError::conflict(format!(
                 "this magi web process (pid {}) is already running the loop",
@@ -1326,6 +1341,39 @@ impl Ui {
         live.queued.get(id).copied().unwrap_or(0)
     }
 
+    /// Automatic updates begin only when execution and chat workers are idle.
+    /// A worker racing this snapshot survives the restart on its own executable.
+    fn auto_upgrade_busy(&self) -> bool {
+        #[cfg(test)]
+        if self
+            .lock_loop()
+            .live
+            .as_ref()
+            .is_some_and(|live| live.stop.busy_now())
+        {
+            return true;
+        }
+        crate::worker::active(&self.home)
+            .map_or(true, |jobs| jobs.iter().any(|job| job.kind != "scheduler"))
+            || !daemon::current_work(&self.home, Timestamp::now()).is_empty()
+            || !self
+                .resuming
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty()
+            || !self
+                .talk_turns
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .live
+                .is_empty()
+            || self
+                .talks
+                .list()
+                .iter()
+                .any(|talk| self.is_thinking(&talk.id))
+    }
+
     /// Claim a run for a resume, on the same reasoning as
     /// [`Ui::begin_talk_turn`]: a guard that releases on drop, so a
     /// disconnected phone does not wedge the run until the server restarts.
@@ -1334,6 +1382,12 @@ impl Ui {
             .resuming
             .lock()
             .map_err(|_| ApiError::internal("the resume lock was poisoned"))?;
+        if self
+            .upgrade_spawned
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ApiError::conflict("an upgrade is in progress"));
+        }
         if !live.insert(id.to_owned()) {
             return Err(ApiError::conflict(format!(
                 "run {id} is already being resumed"
@@ -1353,6 +1407,10 @@ impl Ui {
     /// one exception and the only place in this server where a client names a
     /// file; it is why [`valid_asset_name`] is checked before a path is built.
     pub fn router(self) -> Router {
+        Arc::new(self).shared_router()
+    }
+
+    fn shared_router(self: Arc<Self>) -> Router {
         Router::new()
             .route("/", get(index))
             .route("/app.css", get(app_css))
@@ -1456,7 +1514,7 @@ impl Ui {
                     .delete(magi_icon_delete),
             )
             .route("/api/events", get(events))
-            .with_state(Arc::new(self))
+            .with_state(self)
     }
 }
 
@@ -1714,13 +1772,9 @@ pub async fn serve(opts: Opts) -> Result<()> {
     report::set_color(false);
 
     let repo = normalize_default_repo(opts.repo).await;
-    let ui = Ui::open(repo).with_merge(opts.merge);
-    // Cloned before `ui.router()` consumes `ui` below: `hand_over` needs the
-    // home to bracket the parking and restarting stages, and `run_update_recheck`
-    // needs both it and the repo, and by then there is no `ui` left to read
-    // them from.
+    let ui = Arc::new(Ui::open(repo).with_merge(opts.merge));
+    // The listener and periodic checker share one upgrade gate and state.
     let home = ui.home.clone();
-    let repo = ui.repo.clone();
     let admissions = Arc::clone(&ui.admissions);
     // Settles a progress record a predecessor left non-terminal - either this
     // *is* the successor `spawn_successor` started, or the previous process
@@ -1742,10 +1796,8 @@ pub async fn serve(opts: Opts) -> Result<()> {
     // `/api/health`'s `update` field - and the phone's "Update & restart"
     // button, which reads the very same cache - would stay frozen on
     // whatever that single check found, no matter how many releases ship
-    // afterwards. This keeps it current instead. Detached: it must keep
-    // going for as long as this process serves, `serve` has nothing to await
-    // it for, and it exits on its own the moment the process does.
-    tokio::spawn(run_update_recheck(repo, home.clone()));
+    // afterwards. The periodic checker below keeps it current and is
+    // cancelled when the listener finishes.
     let port = if opts.port == 0 {
         std::env::var(RESTART_PORT_ENV)
             .ok()
@@ -1780,7 +1832,9 @@ pub async fn serve(opts: Opts) -> Result<()> {
 
     // On its own task, so nothing this function awaits can stop the address
     // being answered. `hand_over` is where it is given up.
-    let mut served = tokio::spawn(axum::serve(listener, ui.router()).into_future());
+    let recheck_ui = ui.clone();
+    let mut served = tokio::spawn(axum::serve(listener, ui.shared_router()).into_future());
+    let recheck = tokio::spawn(run_update_recheck(recheck_ui));
     let interrupted = async {
         if tokio::signal::ctrl_c().await.is_err() {
             // No handler on this platform, so there is no signal to act on.
@@ -1797,6 +1851,7 @@ pub async fn serve(opts: Opts) -> Result<()> {
             Err(e) => Err(e).context("the task serving the web UI ended"),
         },
         () = interrupted => {
+            recheck.abort();
             tracing::info!("shutting down the web UI; detached workers continue");
             close_admissions(&admissions).await;
             served.abort();
@@ -1804,10 +1859,13 @@ pub async fn serve(opts: Opts) -> Result<()> {
             Ok(())
         }
         () = handover => {
+            recheck.abort();
             let successor_home = home.clone();
             hand_over(&home, &admissions, served, move || spawn_successor(&successor_home, port, &executable)).await
         }
     };
+    recheck.abort();
+    let _ = recheck.await;
     updater::log_step(
         &home,
         &match &outcome {
@@ -2303,6 +2361,7 @@ struct UpdateView {
 /// [`updater::Progress`] as `/api/health` reports it.
 #[derive(Debug, Serialize)]
 struct UpgradeProgressView {
+    trigger: updater::UpgradeTrigger,
     stage: updater::Stage,
     from: String,
     to: Option<String>,
@@ -2367,39 +2426,71 @@ fn recheck_poll_period(cfg: &Update) -> Duration {
     (updater::effective_interval(cfg) / 8).clamp(UPDATE_RECHECK_POLL_MIN, UPDATE_RECHECK_POLL_MAX)
 }
 
-/// Keep `/api/health`'s `update` field current for as long as `magi web`
-/// stays up.
-///
-/// The CLI's own `spawn_update_check` (`main.rs`) runs once per invocation,
-/// which is enough for every other command: they exit in seconds. `magi web`
-/// can run for days, so a single startup check leaves the cache - and the
-/// phone's "Update & restart" button, which reads it via
-/// [`cached_update_view`] - frozen on whatever that one look found, however
-/// many releases ship afterwards. This is what notices the rest of them,
-/// re-reading the config each tick so a `magi.toml` edit while the server is
-/// up takes effect without a restart, the same way every other route here
-/// already does - both for whether checking is on at all and for how long
-/// the next sleep should be.
-///
-/// Notification-only even in install mode: a timer refreshes release metadata,
-/// while the explicit update action owns executable replacement and restart.
-async fn run_update_recheck(repo: PathBuf, home: PathBuf) {
+#[derive(Debug, PartialEq, Eq)]
+enum AutoUpgradeDecision {
+    Skip(&'static str),
+    Wait,
+    Trigger,
+}
+
+fn auto_upgrade_decision(
+    cfg: &Update,
+    disabled: bool,
+    in_motion: bool,
+    busy: bool,
+    tag: &str,
+    failed: Option<&str>,
+) -> AutoUpgradeDecision {
+    if !cfg.auto_restart || cfg.mode == UpdateMode::Off || disabled {
+        AutoUpgradeDecision::Skip("disabled")
+    } else if in_motion {
+        AutoUpgradeDecision::Skip("upgrade already in progress")
+    } else if failed == Some(tag) {
+        AutoUpgradeDecision::Skip("this release already failed; restart to retry")
+    } else if busy {
+        AutoUpgradeDecision::Wait
+    } else {
+        AutoUpgradeDecision::Trigger
+    }
+}
+
+/// Refresh the shared cache and optionally request the same handover as the UI.
+async fn run_update_recheck(ui: Arc<Ui>) {
     loop {
-        let (cfg, _) = Config::discover(&repo, None).unwrap_or_default();
-        tokio::time::sleep(recheck_poll_period(&cfg.update)).await;
-        if !should_spawn_recheck(&cfg.update) {
-            continue;
-        }
-        let Some(checker) = updater::Checker::new(&cfg.update) else {
-            continue;
+        let cfg = match Config::discover(&ui.repo, None) {
+            Ok((cfg, _)) => cfg,
+            Err(e) => {
+                updater::log_warn(
+                    &ui.home,
+                    &format!("auto-upgrade: config unavailable: {e:#}"),
+                );
+                tokio::time::sleep(UPDATE_RECHECK_POLL_MAX).await;
+                continue;
+            }
         };
-        let progress = updater::read_progress(&home);
-        if !update_recheck_due(&checker, progress.as_ref()) {
-            continue;
+        if should_spawn_recheck(&cfg.update)
+            && let Some(checker) = updater::Checker::new(&cfg.update)
+        {
+            let progress = updater::read_progress(&ui.home);
+            let mut latest = checker.cached_update();
+            if update_recheck_due(&checker, progress.as_ref()) {
+                match checker.newer_release().await {
+                    Ok(found) => latest = found,
+                    Err(e) => tracing::warn!("background update recheck failed: {e:#}"),
+                }
+            }
+            if cfg.update.auto_restart
+                && let Some(latest) = latest
+            {
+                let response =
+                    begin_upgrade(&ui, updater::UpgradeTrigger::Auto, Some(latest)).await;
+                updater::log_step(
+                    &ui.home,
+                    &format!("auto-upgrade: request status {}", response.status()),
+                );
+            }
         }
-        if let Err(e) = checker.newer_release().await {
-            tracing::warn!("background update recheck failed: {e:#}");
-        }
+        tokio::time::sleep(recheck_poll_period(&cfg.update)).await;
     }
 }
 
@@ -2473,6 +2564,7 @@ fn upgrade_progress_view(ui: &Ui, progress: updater::Progress) -> UpgradeProgres
     let stalled = updater::stall(&progress, lease.as_ref(), now);
     let waiting_on = waiting_on.or_else(|| stalled.as_ref().map(|s| s.waiting_on.clone()));
     UpgradeProgressView {
+        trigger: progress.trigger,
         stuck_for_secs: stalled.as_ref().map(|s| s.age_secs),
         stuck_kind: stalled.map(|s| s.kind),
         handover_alive: alive.is_some(),
@@ -2693,6 +2785,8 @@ impl Foreign {
 ///
 /// A plain function pointer, so [`Ui`] stays `Debug` and `Clone` without a
 /// trait object or a hand-written `Debug` impl for the sake of one seam.
+type UpgradeRunner = fn(PathBuf) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
 #[cfg(test)]
 type Launch = fn(daemon::Opts, daemon::Stop) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
@@ -2915,6 +3009,14 @@ impl UpgradeRequestFailure {
 /// Answers **202**: the reply has to reach the phone while this process can
 /// still send one, and the phone learns the deck is back by reconnecting.
 async fn upgrade_post(State(ui): State<Arc<Ui>>) -> Response {
+    begin_upgrade(&ui, updater::UpgradeTrigger::Manual, None).await
+}
+
+async fn begin_upgrade(
+    ui: &Arc<Ui>,
+    trigger: updater::UpgradeTrigger,
+    latest: Option<kaishin::LatestRelease>,
+) -> Response {
     let reading = daemon::read_status(&ui.home);
     if let Some(other) = Foreign::of(reading.as_ref()) {
         return ApiError::conflict(format!(
@@ -2936,7 +3038,63 @@ async fn upgrade_post(State(ui): State<Arc<Ui>>) -> Response {
     };
     // Hold the same gate through recording/clearing the request outcome, so
     // an older response cannot overwrite a retry's result.
-    finish_upgrade_request(&ui, upgrade_prepare(&ui).await)
+    if trigger == updater::UpgradeTrigger::Auto {
+        let cfg = match Config::discover(&ui.repo, None) {
+            Ok((cfg, _)) => cfg,
+            Err(e) => {
+                return ApiError::internal(format!("auto-upgrade config: {e:#}")).into_response();
+            }
+        };
+        let Some(latest) = latest else {
+            return StatusCode::NO_CONTENT.into_response();
+        };
+        let busy = ui.auto_upgrade_busy();
+        let failed = ui
+            .auto_failed_tag
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let decision = auto_upgrade_decision(
+            &cfg.update,
+            updater::disabled_by_env(),
+            ui.upgrade_spawned.load(std::sync::atomic::Ordering::SeqCst)
+                || upgrade_in_motion(updater::read_progress(&ui.home).as_ref()).is_some(),
+            busy,
+            &latest.tag_name,
+            failed.as_deref(),
+        );
+        if decision != AutoUpgradeDecision::Trigger {
+            let reason = match decision {
+                AutoUpgradeDecision::Wait => "busy; waiting for runs and chats to finish",
+                AutoUpgradeDecision::Skip(reason) => reason,
+                AutoUpgradeDecision::Trigger => unreachable!(),
+            };
+            updater::log_step(&ui.home, &format!("auto-upgrade: {reason}"));
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        // Close run admission, then recheck under the same request gate.
+        // A resume that got in before the flag is visible in `resuming`;
+        // one that arrives afterwards is refused by `begin_resume`.
+        ui.upgrade_spawned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if ui.auto_upgrade_busy() {
+            ui.upgrade_spawned
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            updater::log_step(&ui.home, "auto-upgrade: work started; waiting for idle");
+            return StatusCode::NO_CONTENT.into_response();
+        }
+        updater::log_step(&ui.home, "auto-upgrade: idle; beginning update and restart");
+        return finish_upgrade_request(
+            ui,
+            upgrade_checked_for(
+                ui,
+                env!("CARGO_PKG_VERSION").into(),
+                Ok(Some(latest)),
+                trigger,
+            ),
+        );
+    }
+    finish_upgrade_request(ui, upgrade_prepare(ui).await)
 }
 
 fn finish_upgrade_request(ui: &Ui, result: ApiResult<(StatusCode, Json<UpgradeView>)>) -> Response {
@@ -3019,6 +3177,15 @@ fn upgrade_checked(
     from: String,
     latest: anyhow::Result<Option<kaishin::LatestRelease>>,
 ) -> ApiResult<(StatusCode, Json<UpgradeView>)> {
+    upgrade_checked_for(ui, from, latest, updater::UpgradeTrigger::Manual)
+}
+
+fn upgrade_checked_for(
+    ui: &Arc<Ui>,
+    from: String,
+    latest: anyhow::Result<Option<kaishin::LatestRelease>>,
+    trigger: updater::UpgradeTrigger,
+) -> ApiResult<(StatusCode, Json<UpgradeView>)> {
     let latest = latest.map_err(|e| ApiError::internal(format!("check for a release: {e:#}")))?;
     let Some(latest) = latest else {
         return Ok((
@@ -3038,15 +3205,22 @@ fn upgrade_checked(
     // Recorded before the spawn, not inside it: the phone's next `/api/health`
     // poll must see a `Downloading` stage immediately, not whenever the
     // spawned task happens to get scheduled.
-    let progress = updater::Progress::new(from.clone(), latest.tag_name.clone());
+    let mut progress = updater::Progress::new(from.clone(), latest.tag_name.clone());
+    progress.trigger = trigger;
     updater::write_progress_logged(&ui.home, &progress);
 
     let home = ui.home.clone();
     ui.upgrade_spawned
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let spawned = Arc::clone(&ui.upgrade_spawned);
+    let runner = ui.upgrade_runner;
+    let failed = ui.auto_failed_tag.clone();
+    let tag = latest.tag_name.clone();
     tokio::spawn(async move {
-        if let Err(e) = upgrade_and_restart(home.clone()).await {
+        if let Err(e) = runner(home.clone()).await {
+            if trigger == updater::UpgradeTrigger::Auto {
+                *failed.lock().unwrap_or_else(PoisonError::into_inner) = Some(tag);
+            }
             tracing::error!("the upgrade did not complete: {e:#}");
             // A failure of this attempt says nothing about a handover an
             // earlier request already has in flight; checked and written
@@ -21528,6 +21702,7 @@ mod tests {
         assert!(!should_spawn_recheck(&crate::config::Update {
             mode: UpdateMode::Off,
             interval: None,
+            auto_restart: false,
         }));
 
         // SAFETY: single-threaded as far as this variable goes, the same
@@ -21538,6 +21713,7 @@ mod tests {
         let killed = should_spawn_recheck(&crate::config::Update {
             mode: UpdateMode::Notify,
             interval: None,
+            auto_restart: false,
         });
         unsafe {
             std::env::remove_var(crate::updater::NO_AUTOUPDATE_ENV);
@@ -21551,6 +21727,7 @@ mod tests {
         assert!(should_spawn_recheck(&crate::config::Update {
             mode: UpdateMode::Notify,
             interval: None,
+            auto_restart: false,
         }));
     }
 
@@ -21564,6 +21741,7 @@ mod tests {
         let short = crate::config::Update {
             mode: UpdateMode::Notify,
             interval: Some("1m".to_owned()),
+            auto_restart: false,
         };
         let period = recheck_poll_period(&short);
         assert!(
@@ -21576,6 +21754,7 @@ mod tests {
         let default = crate::config::Update {
             mode: UpdateMode::Notify,
             interval: None,
+            auto_restart: false,
         };
         assert_eq!(
             recheck_poll_period(&default),
@@ -21662,6 +21841,182 @@ mod tests {
                 .contains("disabled by MAGI_NO_AUTOUPDATE"),
             "{body:?}"
         );
+    }
+
+    #[test]
+    fn auto_upgrade_decision_respects_policy_work_and_failed_tags() {
+        use AutoUpgradeDecision::{Skip, Trigger, Wait};
+        let mut cfg = Update::default();
+        assert!(matches!(
+            auto_upgrade_decision(&cfg, false, false, false, "v2", None),
+            Skip(_)
+        ));
+        cfg.auto_restart = true;
+        assert_eq!(
+            auto_upgrade_decision(&cfg, false, false, false, "v2", None),
+            Trigger
+        );
+        assert_eq!(
+            auto_upgrade_decision(&cfg, false, false, true, "v2", None),
+            Wait
+        );
+        for (disabled, moving, failed) in [
+            (true, false, None),
+            (false, true, None),
+            (false, false, Some("v2")),
+        ] {
+            assert!(matches!(
+                auto_upgrade_decision(&cfg, disabled, moving, false, "v2", failed),
+                Skip(_)
+            ));
+        }
+        assert_eq!(
+            auto_upgrade_decision(&cfg, false, false, false, "v3", Some("v2")),
+            Trigger
+        );
+        cfg.mode = UpdateMode::Off;
+        assert!(matches!(
+            auto_upgrade_decision(&cfg, false, false, false, "v2", None),
+            Skip(_)
+        ));
+    }
+
+    #[test]
+    fn auto_upgrade_waits_for_detached_workers_but_not_the_scheduler() {
+        let home = TempDir::new().unwrap();
+        let ui = idle_ui(&home);
+        assert!(!ui.auto_upgrade_busy());
+        let directory = home.path().join("workers/jobs/abcdef");
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut job = crate::worker::Job {
+            id: "abcdef".into(),
+            sequence: 1,
+            kind: "scheduler".into(),
+            key: "scheduler".into(),
+            payload: serde_json::json!({}),
+            generation: "test".into(),
+            version: None,
+            status: crate::worker::Status::Running,
+            result: None,
+            pid: None,
+            created_at: 0,
+            finished_at: None,
+        };
+        let lease = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(directory.join("live.lock"))
+            .unwrap();
+        crate::pr_head::try_lock_file(&lease).unwrap();
+        let write = |job: &crate::worker::Job| {
+            std::fs::write(directory.join("job.json"), serde_json::to_vec(job).unwrap()).unwrap();
+        };
+        write(&job);
+        assert!(!ui.auto_upgrade_busy(), "an idle scheduler permits updates");
+        for kind in ["task", "chat"] {
+            job.kind = kind.into();
+            write(&job);
+            assert!(ui.auto_upgrade_busy(), "a detached {kind} defers updates");
+        }
+        drop(lease);
+        assert!(
+            !ui.auto_upgrade_busy(),
+            "completed execution permits updates"
+        );
+        std::fs::create_dir_all(home.path().join("workers/jobs/bad")).unwrap();
+        assert!(
+            ui.auto_upgrade_busy(),
+            "unreadable worker state defers updates"
+        );
+    }
+
+    fn fail_test_upgrade(_: PathBuf) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
+        Box::pin(async { anyhow::bail!("test installer failed") })
+    }
+
+    #[tokio::test]
+    async fn auto_upgrade_uses_shared_progress_and_failure_cleanup_only_when_idle() {
+        let home = TempDir::new().unwrap();
+        std::fs::write(
+            home.path().join("magi.toml"),
+            "[update]\nauto_restart = true\n",
+        )
+        .unwrap();
+        let mut ui = idle_ui(&home);
+        ui.repo = home.path().to_path_buf();
+        // Every successful trigger in this test uses this seam, never the installer.
+        ui.upgrade_runner = fail_test_upgrade;
+        let ui = Arc::new(ui);
+        let latest = || {
+            Some(kaishin::LatestRelease {
+                tag_name: "v999.0.0".into(),
+                html_url: String::new(),
+            })
+        };
+        ui.talk_turns.lock().unwrap().live.insert("busy".into());
+        assert_eq!(
+            begin_upgrade(&ui, updater::UpgradeTrigger::Auto, latest())
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        assert!(updater::read_progress(home.path()).is_none());
+        ui.talk_turns.lock().unwrap().live.clear();
+        let gate = ui.upgrade_gate.lock().await;
+        assert_eq!(
+            begin_upgrade(&ui, updater::UpgradeTrigger::Auto, latest())
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
+        drop(gate);
+        assert_eq!(
+            begin_upgrade(&ui, updater::UpgradeTrigger::Auto, latest())
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        let progress = updater::read_progress(home.path()).unwrap();
+        assert_eq!(progress.trigger, updater::UpgradeTrigger::Auto);
+        assert_eq!(progress.stage, updater::Stage::Downloading);
+        assert!(progress.parked_run.is_none());
+        assert!(ui.start_detached_loop().await.is_err());
+        assert!(ui.start_loop(None).is_err());
+        assert!(ui.begin_resume("late").is_err());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ui.upgrade_spawned.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let progress = updater::read_progress(home.path()).unwrap();
+        assert_eq!(progress.stage, updater::Stage::Failed);
+        assert_eq!(
+            begin_upgrade(&ui, updater::UpgradeTrigger::Auto, latest())
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+        // The manual shared path records the same progress and runs the same seam.
+        let result = upgrade_checked(&ui, "old".into(), Ok(latest()));
+        assert_eq!(
+            finish_upgrade_request(&ui, result).status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(
+            updater::read_progress(home.path()).unwrap().trigger,
+            updater::UpgradeTrigger::Manual
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ui.upgrade_spawned.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     fn seeded_progress(stage: crate::updater::Stage) -> crate::updater::Progress {

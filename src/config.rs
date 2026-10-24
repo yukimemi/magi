@@ -1047,6 +1047,8 @@ pub struct Update {
     pub mode: UpdateMode,
     /// Minimum time between checks, e.g. `24h`. kaishin's default when unset.
     pub interval: Option<String>,
+    /// Opt in to idle-only update and restart in `magi web`.
+    pub auto_restart: bool,
 }
 
 impl Default for Update {
@@ -1054,6 +1056,7 @@ impl Default for Update {
         Self {
             mode: UpdateMode::Notify,
             interval: None,
+            auto_restart: false,
         }
     }
 }
@@ -2485,6 +2488,12 @@ impl Config {
              # off | notify | install — checked in the background, throttled.\n\
              mode = \"notify\"\n\
              # interval = \"24h\"\n\n\
+             # Opt-in: magi web updates and restarts only after runs/chats finish.\n\
+             # auto_restart = false\n\
+             # Uses interval above; off / MAGI_NO_AUTOUPDATE disable it.\n\
+             # Standalone magi serve cannot restart. Busy work waits indefinitely.\n\
+             # Failed tags are skipped until process restart or a different tag.\n\
+             # Older binaries reject auto_restart: upgrade before adding the key.\n\n\
              [daemon]\n\
              # Minutes a release-bump pull request (chore/release-v*) may sit with\n\
              # no new commit and no check changing state before `magi serve`\n\
@@ -3598,6 +3607,17 @@ lock_file = "{{ vars.bad }}"
                 machine.display()
             );
         }
+    }
+
+    #[test]
+    fn auto_upgrade_config_defaults_and_opt_in() {
+        let default: Update = toml::from_str("").unwrap();
+        assert!(!default.auto_restart);
+        assert_eq!(default.mode, UpdateMode::Notify);
+        let enabled: Update = toml::from_str("auto_restart = true\ninterval = \"2h\"\n").unwrap();
+        assert!(enabled.auto_restart);
+        assert_eq!(enabled.interval.as_deref(), Some("2h"));
+        assert!(toml::from_str::<Update>("auto_restart = \"yes\"").is_err());
     }
 
     #[test]
