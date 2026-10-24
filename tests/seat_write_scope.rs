@@ -332,6 +332,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
         command: Vec::new(),
         extra_args: Vec::new(),
         prompt_delivery: None,
+        max_turn_secs: None,
         env: BTreeMap::from([
             (
                 "PATH".into(),
@@ -513,6 +514,7 @@ Write-Output 'real-lock-contends'
         ],
         extra_args: vec![],
         prompt_delivery: None,
+        max_turn_secs: None,
         env: BTreeMap::from([(
             "CHECK_LOCK".into(),
             fx.primary
@@ -673,6 +675,7 @@ mod coordination {
             ],
             extra_args: vec![],
             prompt_delivery: None,
+            max_turn_secs: None,
             env: BTreeMap::from([
                 ("COORDINATION_CHILD".into(), mode.into()),
                 (

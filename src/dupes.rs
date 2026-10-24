@@ -1112,6 +1112,7 @@ mod tests {
             extra_args: Vec::new(),
             env: Default::default(),
             prompt_delivery: None,
+            max_turn_secs: None,
         }
     }
 

@@ -3562,6 +3562,7 @@ mod tests {
             extra_args: Vec::new(),
             env: BTreeMap::new(),
             prompt_delivery: None,
+            max_turn_secs: None,
         }
     }
 
@@ -3791,6 +3792,7 @@ mod tests {
             extra_args: Vec::new(),
             env,
             prompt_delivery: None,
+            max_turn_secs: None,
         }
     }
 
@@ -4706,6 +4708,7 @@ mod tests {
             extra_args: Vec::new(),
             env: BTreeMap::new(),
             prompt_delivery: None,
+            max_turn_secs: None,
         }
     }
 

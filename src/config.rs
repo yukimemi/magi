@@ -194,9 +194,20 @@ pub struct AgentSpec {
     /// Override the per-kind prompt delivery default.
     #[serde(default)]
     pub prompt_delivery: Option<Delivery>,
+    /// Optional per-invocation cap, in seconds, for this CLI. The caller's
+    /// remaining budget still wins when shorter; successors keep their budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turn_secs: Option<u64>,
 }
 
 impl AgentSpec {
+    /// Limit one CLI turn without extending the caller's remaining budget.
+    pub fn turn_timeout(&self, budget: std::time::Duration) -> std::time::Duration {
+        self.max_turn_secs.map_or(budget, |secs| {
+            budget.min(std::time::Duration::from_secs(secs))
+        })
+    }
+
     /// Default prompt delivery for this agent.
     ///
     /// `opencode` and `agy` take the prompt as an argument, which on Windows
@@ -2146,6 +2157,7 @@ impl Config {
                     extra_args: Vec::new(),
                     env: BTreeMap::new(),
                     prompt_delivery: None,
+                    max_turn_secs: None,
                 });
             }
         }
@@ -3056,6 +3068,7 @@ lock_file = "{{ vars.bad }}"
             extra_args: Vec::new(),
             env: BTreeMap::new(),
             prompt_delivery: None,
+            max_turn_secs: None,
         }
     }
 
@@ -3938,6 +3951,29 @@ lock_file = "{{ vars.bad }}"
         .unwrap();
         let cfg = Config::load(&path).expect("comments must be inert, not rendered");
         assert_eq!(cfg.graph.implementers, 2);
+    }
+
+    #[test]
+    fn agent_turn_cap_round_trips_and_never_extends_the_budget() {
+        use std::time::Duration;
+
+        let mut s: AgentSpec =
+            toml::from_str("id = 'slow'\nkind = 'command'\ncommand = ['true']\n").unwrap();
+        let budget = Duration::from_millis(1500);
+        assert_eq!(s.max_turn_secs, None);
+        assert_eq!(s.turn_timeout(budget), budget);
+        assert!(!toml::to_string(&s).unwrap().contains("max_turn_secs"));
+        for (cap, expected) in [
+            (1, Duration::from_secs(1)),
+            (2, budget),
+            (0, Duration::ZERO),
+        ] {
+            s.max_turn_secs = Some(cap);
+            let saved = toml::to_string(&s).unwrap();
+            let loaded: AgentSpec = toml::from_str(&saved).unwrap();
+            assert_eq!(loaded.max_turn_secs, Some(cap));
+            assert_eq!(loaded.turn_timeout(budget), expected);
+        }
     }
 
     #[test]

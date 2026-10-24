@@ -3196,6 +3196,7 @@ mod tests {
                 ("STATUS".into(), exit.into()),
             ]),
             prompt_delivery: None,
+            max_turn_secs: None,
         }
     }
 

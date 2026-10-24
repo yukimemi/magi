@@ -6920,6 +6920,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             extra_args: Vec::new(),
             env: Default::default(),
             prompt_delivery: None,
+            max_turn_secs: None,
         }];
         state.candidates[0].agent = "mock".into();
     }
@@ -8616,6 +8617,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 extra_args: Vec::new(),
                 env: Default::default(),
                 prompt_delivery: None,
+                max_turn_secs: None,
             }],
             ..crate::config::Config::default()
         };

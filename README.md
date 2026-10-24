@@ -1102,6 +1102,7 @@ The full surface:
 id = "opus"
 kind = "claude"        # claude | opencode | antigravity | codex | command
 model = "opus"
+# max_turn_secs = 300   # optional cap per CLI invocation, including resumed turns
 
 [[agents]]
 id = "sonnet"
@@ -1200,6 +1201,12 @@ id = "mock"
 kind = "command"
 command = ["sh", "./mock-agent.sh"]   # {prompt_file} {cwd} {label} {session}
 ```
+
+An agent's optional `max_turn_secs` caps each invocation at the smaller of this
+limit and the caller's remaining budget. Unset leaves the caller's timeout
+unchanged. Use it to move on sooner from a slow CLI in a fallback chain while
+leaving the successor its own budget. It also applies to direct calls outside
+the graph; it does not reset or extend a node's budget. Zero times out immediately.
 
 `command` agents also receive `MAGI_SEAT`, `MAGI_TURN`, `MAGI_PROMPT_FILE` and
 `MAGI_ALLOW_WRITE` in the environment.
