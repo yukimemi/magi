@@ -1580,6 +1580,14 @@ fn operator_held_tasks_keep_ordinary_chat_decisions_available_without_lifting_th
                             })
                             .unwrap();
                     }
+                    if destination == "same" {
+                        // Updating a legacy consultation after the task exists
+                        // marks routing intent, but the outbox has not delivered
+                        // or assigned a chat. Its existing answer path still works.
+                        let pending = f.questions.get(&f.qid).unwrap();
+                        assert_eq!(pending.routed_task.as_deref(), Some(task.id.as_str()));
+                        assert!(pending.routed_chat.is_none());
+                    }
                     let out = choose(&f, &run, choice, &words);
                     assert!(
                         out.status.success(),

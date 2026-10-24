@@ -11,9 +11,9 @@
 //!
 //! - **Authorization.** `MAGI_NODE=chat` and `MAGI_RUN` equal to the exact id
 //!   of an open conversation ([`crate::chat_watch::authorize`]).
-//! - **Scope.** Only tasks that conversation filed itself
-//!   ([`Task::filed_by_chat`]) and the runs recorded in their `runs`. A
-//!   follow-up's inherited `origin_chat` does not count. Task ids and run ids
+//! - **Scope.** Tasks that conversation filed itself ([`Task::filed_by_chat`])
+//!   or whose decision destination is its persisted [`Task::chat`], and their
+//!   recorded runs. An inherited `origin_chat` alone does not count. Task ids and run ids
 //!   are checked against the queue under the task's claim, not trusted.
 //! - **Resume starts nothing here.** It pins the owning task to the run and
 //!   queues it; the loop's ordinary start logic resumes it under the graph's
@@ -74,6 +74,18 @@ pub enum Operation {
         head: String,
         /// 再実行対象の workflow run ID。
         workflows: Vec<String>,
+    },
+    /// タスクチャットで所有者の判断を記録する（マージを含む）。
+    Decide {
+        /// 質問 ID（完全または一意な接頭辞）。
+        question: String,
+        /// 記録された選択肢のラベル。
+        choice: String,
+        /// 互換性のための任意の引用（配送済みの判断では不要）。
+        quote: Option<String>,
+        /// 「use my text」で公開する置換タイトルそのもの。
+        #[serde(default)]
+        title: Option<String>,
     },
     /// 個別確認後、生存が否定された run を破棄する。
     Abandon {
@@ -150,11 +162,140 @@ async fn execute(
             let ids = rerun_checks(queue, home, talk, &run, &request, &head, &workflows).await?;
             format!("requested a rerun of workflow run(s) {}", ids.join(", "))
         }
+        Operation::Decide {
+            question,
+            choice,
+            quote,
+            title,
+        } => {
+            let q = record_decision(
+                queue,
+                talks,
+                home,
+                talk,
+                &question,
+                &choice,
+                DecisionInput {
+                    quote: quote.as_deref(),
+                    title: title.as_deref(),
+                },
+            )?;
+            format!("recorded `{choice}` for decision {}", q.short())
+        }
         Operation::Abandon { run, quote } => {
             abandon(queue, talks, home, talk, &run, quote.as_deref())?;
             format!("abandoned run {run}")
         }
     })
+}
+
+/// Record a routed decision for the task's own chat. The chat agent interprets
+/// the owner's request directly; no quote or additional consent evidence is
+/// required. Existing answer dispatch and transition checks still apply.
+pub fn decide(
+    queue: &Queue,
+    talks: &Talks,
+    home: &Path,
+    talk: &str,
+    question: &str,
+    choice: &str,
+    quote: Option<&str>,
+) -> Result<crate::ask::Question> {
+    record_decision(
+        queue,
+        talks,
+        home,
+        talk,
+        question,
+        choice,
+        DecisionInput { quote, title: None },
+    )
+}
+
+struct DecisionInput<'a> {
+    quote: Option<&'a str>,
+    title: Option<&'a str>,
+}
+
+fn record_decision(
+    queue: &Queue,
+    talks: &Talks,
+    home: &Path,
+    talk: &str,
+    question: &str,
+    choice: &str,
+    input: DecisionInput<'_>,
+) -> Result<crate::ask::Question> {
+    use crate::ask::{Answer, Questions};
+    let questions = Questions::at(home.join("questions"));
+    let id = questions.resolve_id(question)?;
+    let q = questions.get(&id)?;
+    ensure!(
+        q.routed_chat.as_deref() == Some(talk) && crate::task_chat::awaits_decision(&q),
+        "question {} is not a decision routed to this conversation",
+        q.short()
+    );
+    let task_id = q
+        .routed_task
+        .clone()
+        .context("question is not routed to a task")?;
+    ensure!(
+        owned(&queue.get(&task_id)?, talk),
+        "the task behind this decision is not owned by this conversation"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let (q, guard) = loop {
+        let mut busy = false;
+        let updated = questions.update(&q.id, |r| {
+            let guard = match talks.try_answer_guard()? {
+                Some(g) => g,
+                None => {
+                    busy = true;
+                    bail!("conversation evidence is locked by another process");
+                }
+            };
+            ensure!(
+                r.status.open(),
+                "question {} is already {}",
+                r.short(),
+                r.status.as_str()
+            );
+            let reply = r.resolve_reply(choice)?.to_owned();
+            let replacement = r.node == crate::github_text::ASK_NODE
+                && reply == crate::github_text::USE_MY_TEXT;
+            ensure!(replacement || input.title.is_none(), "--title is only valid for a publication decision's `use my text` choice");
+            let title = if replacement {
+                let title = input.title.context("use my text needs --title with the literal replacement title (no quote evidence required)")?;
+                ensure!(!title.trim().is_empty(), "replacement title must not be empty");
+                Some(title.to_owned())
+            } else { None };
+            let answer = if r.free_text() {
+                Answer::Text(reply.clone())
+            } else {
+                Answer::Choice(reply.clone())
+            };
+            crate::consult::refuse_operator_held(r, crate::queue::CHAT_NODE, &queue.list())?;
+            r.answer_authority = crate::consult::authorize_answer(
+                r,
+                talks,
+                &questions,
+                talk,
+                crate::queue::CHAT_NODE,
+                &reply,
+                input.quote,
+            )?;
+            r.publication_title = title;
+            r.answer(answer)?;
+            Ok(guard)
+        });
+        if busy && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            continue;
+        }
+        break updated?;
+    };
+    drop(guard);
+    Ok(q)
 }
 
 /// The exact owner instruction that confirms abandoning `run`.
@@ -173,7 +314,7 @@ pub fn authorize(talks: &Talks, run: &str, node: &str) -> Result<Talk> {
 
 /// Whether `task` was filed by exactly this conversation.
 fn owned(task: &Task, talk: &str) -> bool {
-    task.filed_by_chat() == Some(talk)
+    task.filed_by_chat() == Some(talk) || task.chat.as_deref() == Some(talk)
 }
 
 /// A task of this conversation, from a full or unambiguous-prefix id.

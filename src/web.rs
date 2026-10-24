@@ -411,6 +411,7 @@ struct TaskRelation {
     priority: i32,
     runs: Vec<String>,
     source: Source,
+    chat: Option<String>,
 }
 
 impl From<Task> for TaskRelation {
@@ -421,6 +422,7 @@ impl From<Task> for TaskRelation {
             priority: task.priority,
             runs: task.runs,
             source: task.source,
+            chat: task.chat,
         }
     }
 }
@@ -840,10 +842,15 @@ impl Ui {
     fn find_tasks_for_talk(&self, talk_id: &str) -> ApiResult<Vec<Task>> {
         self.indexed_tasks()?
             .into_iter()
-            .filter(|task| matches!(&task.source, Source::Agent { run, .. } if run == talk_id))
+            .filter(|task| {
+                task.chat.as_deref() == Some(talk_id)
+                    || matches!(&task.source, Source::Agent { run, .. } if run == talk_id)
+            })
             .map(|record| {
                 let task = self.queue.get(&record.id)?;
-                if !matches!(&task.source, Source::Agent { run, .. } if run == talk_id) {
+                if task.chat.as_deref() != Some(talk_id)
+                    && !matches!(&task.source, Source::Agent { run, .. } if run == talk_id)
+                {
                     return Err(ApiError::conflict("Task relationship changed; retry"));
                 }
                 Ok(task)
@@ -7502,6 +7509,8 @@ async fn notifications_read_all(State(ui): State<Arc<Ui>>) -> ApiResult<Json<ser
 struct NewAnswer {
     choice: Option<String>,
     text: Option<String>,
+    talk: Option<String>,
+    head: Option<String>,
 }
 
 async fn question_answer(
@@ -7545,7 +7554,30 @@ async fn question_answer(
         let cfg = deputy_config(&ui.repo);
         let (q, ()) = ui
             .questions
-            .update(&q.id, |r| r.answer(answer))
+            .update(&q.id, |r| {
+                anyhow::ensure!(
+                    r.routed_task.is_none() || r.merge_target.is_some(),
+                    "task decisions are free text in the task chat; its agent records them with `magi task control decide`"
+                );
+                let merge = matches!(&answer, ask::Answer::Choice(c)
+                    if crate::consult::consent(r, c) == crate::consult::Consent::Merge);
+                // Buttons retain their displayed chat/head binding. A direct
+                // decision does not require a button or a prior persona offer.
+                if r.routed_task.is_some() && r.merge_target.is_some() && merge
+                    && (body.talk.is_some() || body.head.is_some())
+                {
+                    let talk_id = body.talk.as_deref().context("approval button requires its chat")?;
+                    let head = body.head.as_deref().context("approval button requires the displayed head")?;
+                    let talk = ui.talks.get(talk_id)?;
+                    anyhow::ensure!(
+                        talk.status.open(),
+                        "approval chat is closed"
+                    );
+                    r.answer_chat_button(answer, talk_id, head)
+                } else {
+                    r.answer(answer)
+                }
+            })
             .map_err(ApiError::bad_request_from)?;
         let (tasks, talks, watches) =
             question_origin_inputs(&ui, std::slice::from_ref(&q)).unwrap_or_default();
@@ -7884,6 +7916,12 @@ fn panel_response(content_type: &'static str, download: bool, body: Vec<u8>) -> 
 /// tree per entry of `turns`, in order - parsed server-side so `app.js` never
 /// parses markdown itself - and the process-local `thinking` hint.
 #[derive(Debug, Serialize)]
+struct ChatApproval {
+    question: String,
+    target: crate::merge_decision::Target,
+}
+
+#[derive(Debug, Serialize)]
 struct TalkView {
     #[serde(flatten)]
     talk: Talk,
@@ -7891,6 +7929,7 @@ struct TalkView {
     /// Display-only Markdown, indexed by turn then message (legacy turns have one).
     turn_messages_md: Vec<Vec<Option<Vec<md::Node>>>>,
     pending_messages_md: Vec<Option<Vec<md::Node>>>,
+    merge_approvals: Vec<ChatApproval>,
     /// Whether [`Ui::begin_talk_turn`] currently holds this talk's turn in
     /// this server process.
     ///
@@ -8116,11 +8155,26 @@ impl TalkView {
             avatar_persona.icon = None;
         }
         let persona_avatar = avatar_url(home, &talk.id, &avatar_persona);
+        let approvals_store = ask::Questions::at(home.join("questions"));
+        let merge_approvals = talk
+            .notified
+            .iter()
+            .filter_map(|key| key.strip_prefix("question:"))
+            .filter_map(|id| approvals_store.get(id).ok())
+            .filter(|q| crate::task_chat::approval_offered(&talk, q))
+            .filter_map(|q| {
+                Some(ChatApproval {
+                    question: q.id,
+                    target: q.merge_target?,
+                })
+            })
+            .collect();
         let operator_name = cfg.and_then(|c| c.talk.operator_name()).map(str::to_owned);
         Self {
             turn_bodies_md,
             turn_messages_md,
             pending_messages_md,
+            merge_approvals,
             thinking,
             context,
             operator_name,
@@ -11466,6 +11520,7 @@ mod tests {
                 Ok(Json(NewAnswer {
                     choice: Some(crate::merge_decision::DISMISS.into()),
                     text: None,
+                    ..Default::default()
                 })),
             )
             .await
@@ -11718,6 +11773,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_chat_merge_accepts_direct_decisions_and_checks_optional_buttons() {
+        let home = TempDir::new().unwrap();
+        let ui = Arc::new(Ui::new(
+            Queue::at(home.path().join("queue")),
+            Questions::at(home.path().join("questions")),
+            Talks::at(home.path().join("talks")),
+            home.path().join("runs"),
+            home.path().to_owned(),
+            home.path().to_owned(),
+        ));
+        let talks = &ui.talks;
+        let chat =
+            talk::begin(talks, &stub_config(), home.path().to_owned(), Some("stub")).unwrap();
+        let mut q = Question::new(
+            "run".into(),
+            crate::land::APPROVAL_NODE.into(),
+            "land".into(),
+            "Merge?".into(),
+            String::new(),
+            vec!["merge".into(), "hold".into()],
+        );
+        q.routed_task = Some("task".into());
+        q.routed_chat = Some(chat.id.clone());
+        q.merge_target = Some(crate::merge_decision::Target {
+            pr: "https://example.test/pull/1".into(),
+            head: "head-a".into(),
+            language: "en".into(),
+        });
+        ui.questions.put(&mut q).unwrap();
+        let send = |body| {
+            question_answer(
+                State(ui.clone()),
+                Path(q.id.clone()),
+                Ok(Json(serde_json::from_value::<NewAnswer>(body).unwrap())),
+            )
+        };
+        let button = serde_json::json!({"choice":"merge", "talk":chat.id, "head":"head-a"});
+        assert!(send(serde_json::json!({"text":"merge"})).await.is_err());
+        let wrong_chat = serde_json::json!({"choice":"merge", "talk":"other", "head":"head-a"});
+        assert!(send(wrong_chat).await.is_err());
+        let stale = serde_json::json!({"choice":"merge", "talk":chat.id, "head":"old-head"});
+        assert!(send(stale).await.is_err());
+        assert!(ui.questions.get(&q.id).unwrap().status.open());
+        assert!(send(button.clone()).await.is_ok());
+        assert_eq!(
+            ui.questions.get(&q.id).unwrap().resolution().as_deref(),
+            Some("merge")
+        );
+        assert!(send(button).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn routed_approvals_accept_merge_and_hold_without_chat_buttons() {
+        let home = TempDir::new().unwrap();
+        let ui = Arc::new(Ui::new(
+            Queue::at(home.path().join("queue")),
+            Questions::at(home.path().join("questions")),
+            Talks::at(home.path().join("talks")),
+            home.path().join("runs"),
+            home.path().to_owned(),
+            home.path().to_owned(),
+        ));
+        for choice in [crate::land::APPROVE, crate::land::HOLD] {
+            let mut q = Question::new(
+                "run".into(),
+                crate::land::APPROVAL_NODE.into(),
+                "land".into(),
+                "Merge?".into(),
+                String::new(),
+                vec!["merge".into(), choice.into()],
+            );
+            q.routed_task = Some("task".into());
+            q.merge_target = Some(crate::merge_decision::Target {
+                pr: "https://example.test/pull/1".into(),
+                head: "head-a".into(),
+                language: "en".into(),
+            });
+            ui.questions.put(&mut q).unwrap();
+            let answer = |c: &str| {
+                question_answer(
+                    State(ui.clone()),
+                    Path(q.id.clone()),
+                    Ok(Json(
+                        serde_json::from_value::<NewAnswer>(serde_json::json!({ "choice": c }))
+                            .unwrap(),
+                    )),
+                )
+            };
+            let _ = answer(choice).await.unwrap();
+            assert_eq!(
+                ui.questions.get(&q.id).unwrap().resolution().as_deref(),
+                Some(choice)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_routed_decision_is_refused_on_the_question_route() {
+        let home = TempDir::new().unwrap();
+        let ui = Arc::new(Ui::new(
+            Queue::at(home.path().join("queue")),
+            Questions::at(home.path().join("questions")),
+            Talks::at(home.path().join("talks")),
+            home.path().join("runs"),
+            home.path().to_owned(),
+            home.path().to_owned(),
+        ));
+        let mut q = Question::new(
+            "run".into(),
+            crate::github_text::ASK_NODE.into(),
+            "posting-gate".into(),
+            "Post?".into(),
+            String::new(),
+            vec!["use fallback".into()],
+        );
+        q.routed_task = Some("task".into());
+        ui.questions.put(&mut q).unwrap();
+        let sent = question_answer(
+            State(ui.clone()),
+            Path(q.id.clone()),
+            Ok(Json(
+                serde_json::from_value::<NewAnswer>(serde_json::json!({"choice":"use fallback"}))
+                    .unwrap(),
+            )),
+        )
+        .await;
+        assert!(sent.is_err());
+        assert!(ui.questions.get(&q.id).unwrap().status.open());
+    }
+
+    #[tokio::test]
     async fn merge_decision_api_persists_exact_target_and_selected_action() {
         let fx = Fixture {
             home: TempDir::new().unwrap(),
@@ -11768,6 +11954,7 @@ mod tests {
                 Ok(Json(NewAnswer {
                     choice: Some(choice.into()),
                     text: None,
+                    ..Default::default()
                 })),
             )
             .await
@@ -11787,7 +11974,8 @@ mod tests {
                     Path(q.id.clone()),
                     Ok(Json(NewAnswer {
                         choice: Some("merge".into()),
-                        text: None
+                        text: None,
+                        ..Default::default()
                     }))
                 )
                 .await
@@ -11849,6 +12037,7 @@ mod tests {
             Ok(Json(NewAnswer {
                 choice: Some(crate::land::REPAIR.into()),
                 text: None,
+                ..Default::default()
             })),
         )
         .await
@@ -11963,6 +12152,7 @@ mod tests {
             Ok(Json(NewAnswer {
                 choice: None,
                 text: Some("chosen name".into()),
+                ..Default::default()
             })),
         )
         .await
@@ -12024,6 +12214,7 @@ mod tests {
             Ok(Json(NewAnswer {
                 choice: Some("hold".into()),
                 text: None,
+                ..Default::default()
             })),
         )
         .await

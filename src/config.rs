@@ -531,6 +531,11 @@ pub struct Graph {
     /// after merge repair (including repair that leaves the head unchanged).
     /// The pull request is opened either way; only the merge waits.
     pub hold_contested_merge: bool,
+    /// Route what used to be a question about a task to the chat attached to
+    /// that task (`crate::task_chat`): free text, no choices, no waiting. On by
+    /// default; off keeps the question store, deputies and waiter as they were
+    /// for this repository.
+    pub question_routing: bool,
     /// After a run's pull request merges, file the findings its last review
     /// round left open as follow-up tasks (`crate::followup`) instead of
     /// letting them vanish with the merge: every Major-or-above finding, and
@@ -630,6 +635,7 @@ impl Default for Graph {
             rerun_flaky_checks: true,
             land_approval: true,
             hold_contested_merge: true,
+            question_routing: true,
             file_followups: true,
             release_deputy_followups: true,
             answer_timeout: 86_400,

@@ -129,7 +129,8 @@ use crate::ask::Questions;
 ///
 /// 19: persist settled pass start times for upgrade-resume scheduling.
 /// Old passes default to unknown and use settlement order as an approximation.
-pub const SCHEMA: u32 = 19;
+/// 20: persist the task decision chat destination, defaulting to absent.
+pub const SCHEMA: u32 = 20;
 
 /// Candidate order only: all claims, lanes and eligibility gates still apply.
 /// Upgrade-parked runs retain their pass-start order ahead of ordinary work,
@@ -314,6 +315,9 @@ pub struct Task {
     pub repo: PathBuf,
     /// Who asked.
     pub source: Source,
+    /// Durable destination for task decision messages (including tasks filed outside chat).
+    #[serde(default)]
+    pub chat: Option<String>,
     /// Higher runs first; ties break oldest-first so nothing starves.
     #[serde(default)]
     pub priority: i32,
@@ -919,6 +923,7 @@ impl Task {
             sources: crate::refs::Sources::default(),
             repo,
             source,
+            chat: None,
             priority: 0,
             solo: false,
             status: TaskStatus::Queued,
@@ -2589,6 +2594,11 @@ impl Queue {
     fn merge_stored(&self, task: &mut Task) {
         if let Ok(mut stored) = read_path(&self.path_of(&task.id)) {
             stored.import_chat_notice();
+            // The task's message chat is recorded once and never rewound or
+            // dropped by a writer holding an older snapshot.
+            if task.chat.is_none() {
+                task.chat = stored.chat.clone();
+            }
             for key in stored.chat_notices {
                 if !task.chat_notices.contains(&key) {
                     task.chat_notices.push(key);
@@ -3727,6 +3737,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let q = Queue::at(dir.path().join("queue"));
         (dir, q)
+    }
+
+    #[test]
+    fn a_stale_write_does_not_drop_the_recorded_task_chat() {
+        let (_dir, q) = queue();
+        let mut stale = task("chat");
+        q.put(&mut stale).unwrap();
+        let mut fresh = q.get(&stale.id).unwrap();
+        fresh.chat = Some("talk-1".to_owned());
+        q.put(&mut fresh).unwrap();
+        q.put(&mut stale).unwrap();
+        assert_eq!(q.get(&stale.id).unwrap().chat.as_deref(), Some("talk-1"));
     }
 
     #[test]

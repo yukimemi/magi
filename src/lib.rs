@@ -87,6 +87,7 @@ pub mod settings;
 pub mod stats;
 mod stop_reason;
 pub mod talk;
+pub mod task_chat;
 pub mod triage;
 pub mod tui;
 pub mod updater;

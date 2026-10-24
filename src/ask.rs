@@ -609,6 +609,16 @@ pub struct Question {
     /// Exact PR and head displayed to the owner. Absent on legacy questions.
     #[serde(default)]
     pub merge_target: Option<crate::merge_decision::Target>,
+    /// Task decision outbox; retained until task-chat delivery is durable.
+    #[serde(default)]
+    pub routed_task: Option<String>,
+    /// Set after delivery; merge consent remains in this record.
+    #[serde(default)]
+    pub routed_chat: Option<String>,
+    /// Literal replacement title supplied with a routed publication decision.
+    /// This is publication data, not owner-consent evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_title: Option<String>,
     /// What the daemon does when a given choice is answered, keyed by the
     /// choice's exact text. Empty for an ordinary question. A key is always
     /// one of [`Question::choices`]; `#[serde(default)]` so older files read.
@@ -747,6 +757,9 @@ impl Question {
             posting_comparison: None,
             choices,
             merge_target: None,
+            routed_task: None,
+            routed_chat: None,
+            publication_title: None,
             actions: std::collections::BTreeMap::new(),
             panel: false,
             assets: Vec::new(),
@@ -828,6 +841,28 @@ impl Question {
     /// and "that is not one of the choices" and "this question is multiple
     /// choice" are different mistakes with different fixes.
     pub fn answer(&mut self, answer: Answer) -> Result<()> {
+        self.answer_inner(answer)
+    }
+
+    /// Optional chat buttons validate the displayed conversation and PR head.
+    pub(crate) fn answer_chat_button(
+        &mut self,
+        answer: Answer,
+        talk: &str,
+        head: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.routed_chat.as_deref() == Some(talk),
+            "wrong approval chat"
+        );
+        anyhow::ensure!(
+            self.merge_target.as_ref().is_some_and(|t| t.head == head),
+            "stale approval head"
+        );
+        self.answer_inner(answer)
+    }
+
+    fn answer_inner(&mut self, answer: Answer) -> Result<()> {
         match self.status {
             QuestionStatus::Answered => bail!(
                 "question {} was already answered; the run has moved on and a \
@@ -938,6 +973,9 @@ impl Question {
         quote: &str,
         note: Option<&str>,
     ) -> Result<()> {
+        if self.routed_task.is_some() {
+            bail!("task decisions are handled by the task chat, not a deputy");
+        }
         let Some(deputy) = &self.deputy else {
             bail!("question {} has no deputy", self.short());
         };
@@ -1508,6 +1546,15 @@ impl Questions {
     /// previous state readable rather than a truncated file that would strand
     /// the run waiting on it.
     pub fn put(&self, q: &mut Question) -> Result<()> {
+        if q.status.open()
+            && q.routed_task.is_none()
+            && let Some(home) = self.root.parent()
+        {
+            let tasks = crate::queue::Queue::at(home.join("queue")).list();
+            q.routed_task = crate::task_chat::task_of(q, &tasks).filter(|id| {
+                crate::task_chat::chat_routable(q) && crate::task_chat::enabled_for(&tasks, id)
+            });
+        }
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
         let body = serde_json::to_string_pretty(q).context("serialize question")?;
@@ -1548,6 +1595,29 @@ impl Questions {
                 }
                 Ok(())
             })
+        {
+            q = current;
+        }
+        // A previous routing version treated targetless release approvals as
+        // ordinary recovery decisions. If no saved head can be recovered,
+        // restore their compatibility card instead of leaving an approval
+        // that neither the chat button nor task control can answer.
+        if q.status.open()
+            && q.routed_task.is_some()
+            && !crate::task_chat::chat_routable(&q)
+            && let Ok((current, ())) =
+                self.update(&q.id, |current| {
+                    if current.status.open() && !crate::task_chat::chat_routable(current) {
+                        if current.consult.as_ref().is_some_and(|c| {
+                            current.routed_chat.as_deref() == Some(c.talk.as_str())
+                        }) {
+                            current.consult = None;
+                        }
+                        current.routed_task = None;
+                        current.routed_chat = None;
+                    }
+                    Ok(())
+                })
         {
             q = current;
         }
@@ -1666,6 +1736,12 @@ impl Questions {
         let mut abandoned = 0;
         for mut q in self.open_for(run) {
             if q.node == crate::bump::NOTICE_NODE {
+                continue;
+            }
+            // A routed task decision not yet delivered is a pending message
+            // for the chat, not a question the dead seat waits on; the
+            // sweep retires it once it is queued.
+            if q.routed_task.is_some() && q.routed_chat.is_none() {
                 continue;
             }
             q.abandon(&why);
@@ -2017,6 +2093,9 @@ async fn wait_loop(
 /// An error here is reported, not swallowed, so `magi notify --test` can show
 /// the operator why nothing arrives. The waiting path logs it and carries on.
 pub async fn notify(cmd: &config::Notify, q: &Question) -> Result<()> {
+    if q.routed_task.is_some() {
+        return Ok(());
+    }
     let mut summary = format!("Question {}: {}", q.short(), q.summary.trim());
     if q.status.open() {
         summary.push_str(&format!(
@@ -2295,6 +2374,25 @@ mod tests {
         assert_eq!(store.settle_run(&q.run, RunStatus::Failed).unwrap(), 0);
     }
 
+    #[test]
+    fn settle_run_keeps_an_undelivered_routed_decision() {
+        let (_dir, store) = store();
+        let mut q = choice_question();
+        q.routed_task = Some("task".into());
+        store.put(&mut q).unwrap();
+        assert_eq!(store.settle_run(&q.run, RunStatus::Failed).unwrap(), 0);
+        assert!(store.get(&q.id).unwrap().status.open());
+
+        // Once the chat has it, the ordinary settlement applies again.
+        store
+            .update(&q.id, |r| {
+                r.routed_chat = Some("chat".into());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(store.settle_run(&q.run, RunStatus::Failed).unwrap(), 1);
+    }
+
     fn choice_question() -> Question {
         Question::new(
             "20260902-201256-9fb7".to_owned(),
@@ -2360,6 +2458,8 @@ mod tests {
                 "merge_target",
                 "node",
                 "panel",
+                "routed_chat",
+                "routed_task",
                 "run",
                 "schema",
                 "seat",

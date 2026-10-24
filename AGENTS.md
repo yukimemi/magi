@@ -2695,7 +2695,8 @@ inherits `MAGI_RUN` / `MAGI_NODE`.
   talk's own session and lease. Atomic result records and
   `talk::queue_once` with `watch:<id>:finished` tolerate a restart between
   saving the draft and marking delivery. Transient I/O failures retry; closed
-  or deleted talks are skipped and never reopened. Delivery waits until the
+  or deleted talks are skipped and never reopened by this passive watch path.
+  Task decision delivery (`task_chat`) deliberately reopens closed talks. Delivery waits until the
   next serve startup if serve is stopped; the job continues independently.
 - **Automatic text stays automatic.** `prompt::chat_watch_notice` creates a
   fixed English report with scrubbed, clipped, defused output quoted as
@@ -3274,3 +3275,65 @@ files and 64 MiB per run; a limit or write failure retains all remaining trees.
 Run metadata, review records and existing artifacts survive. Unfinished-run,
 ownership, recovery-source, output-lease and Git-checkpoint protections still
 apply; fold never authorizes deletion of another run's source.
+
+### Task decision delivery
+
+This section supersedes earlier task-question waiting, choice and deputy rules;
+those rules now apply only to the retained non-task legacy workflow.
+
+Task-scoped Questions are a durable outbox for `task_chat::sweep`, not a
+conversation with their asker. `magi ask` posts and finishes; do not wait or
+start a deputy/waiter for these records. Decisions go as free text to the task's
+persisted `chat`, its own source chat, or its inherited origin chat. A missing
+chat is created with the chatter-chain head, default persona and one
+implementer. This decision path deliberately **reopens closed chats**; the
+passive completion/watch path still skips them. Keep those rules distinct.
+
+Use `magi task control` to apply chat decisions, retaining its existing state,
+ownership, liveness and confirmation checks. Automatic messages permit only
+investigation and reporting. Merge approval records stay open with their
+existing PR/head binding and deadlines. A persona reply containing the full
+approval ID presents optional Merge/Hold buttons. By owner decision (2026-10-23),
+the chat agent can record any routed decision, including merge, directly from
+the owner's request without a button, quote or other consent evidence.
+Silence is a hold; `land_approval` stays on by default. Keep the Question store and non-task legacy workflow until the
+next migration step.
+
+`[graph] question_routing` (default on) is the per-repository switch for task
+decision routing (`task_chat::enabled_for`, consulted by `Questions::put`,
+`task_chat::routes` and `task_chat::sweep`). Off restores the question/deputy/
+waiter path. `Queue::put_unlocked` keeps a stored `Task::chat` against stale
+writes, so the one chat per task is never lost.
+
+Update (step 2 scope): every task-scoped producer routes, including the posting
+gate, the branch-divergence question and non-merge release-watch questions
+(`task_chat::chat_routable`). Those three (`task_chat::awaits_decision`) are not
+abandoned on delivery: the record stays open for the machinery that reads its
+answer, and the chat settles it with `magi task control decide`
+(`chat_control::decide`: routed to that chat, owned task, open chat and record,
+valid offered choice). Merge and recovery decisions use the same command;
+no new owner-evidence checks apply to routed decisions. Existing consumers
+retain state, ownership, liveness and transition checks. The legacy non-routed
+consultation/evidence workflow remains unchanged. An approval or release-watch
+record offering `merge` with no `merge_target` is
+an old card and is never routed, even when its watch record identifies a task.
+`Questions::with_repair_choice` first attempts to recover the saved watch head;
+if none exists, it also clears any invalid routing from earlier versions so
+the compatibility card is usable again. Non-merge release recovery records
+still route. `task_chat::enabled_for` treats an unreadable
+repository config as "off", because `routed_task` is persisted and cannot be
+undone when the config returns. The button endpoint has no stronger caller
+identity than every other owner route (the tailnet is the boundary); what it
+validates is the optional chat binding and displayed head binding. A direct
+answer requires neither a prior persona offer nor a button. Open routed
+questions are filtered out of the Questions list client-side, not dropped
+from the API.
+
+Routed publication replacements use `magi task control decide <id> 'use my text'
+--title '<literal title>'`. `Question::publication_title` stores the replacement
+as data without quote evidence or a fabricated owner thread entry;
+`github_text::read_reply` passes it through the existing title vetting and
+publication path. Missing/empty title data cannot settle that choice.
+Applied triage decisions must not remain pending chat decisions:
+`triage::awaiting_task_chat` excludes `already_applied`, including dependency
+detachment, which does not change the root's operator generation.

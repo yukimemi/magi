@@ -7,8 +7,9 @@ use magi::ask::{Question, Questions};
 use magi::config::{AgentKind, AgentSpec, Config};
 use magi::talk::{self, Talks};
 
-#[tokio::test]
+common::e2e! {
 async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_cli() {
+    let _home = common::home_lock().await;
     let tmp = tempfile::tempdir().unwrap();
     magi::run::set_home(tmp.path().to_path_buf());
     let repo = tmp.path().join("repo");
@@ -64,6 +65,12 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
         }],
         ..Config::default()
     };
+    // This matrix covers retained legacy consultation and standing-answer
+    // authority, including the dismissal sandbox grants. Task-chat routing is
+    // covered separately below and must not accidentally replace this path.
+    cfg.graph.question_routing = false;
+    std::fs::write(repo.join("magi.toml"), toml::to_string(&cfg).unwrap()).unwrap();
+    assert!(!Config::discover(&repo, None).unwrap().0.graph.question_routing);
     assert!(!cfg.talk.allow_write);
     for choice in [
         "hold",
@@ -141,6 +148,10 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
                     owner_task = Some(task.id);
                 }
                 questions.put(&mut q).unwrap();
+                assert!(
+                    q.routed_task.is_none(),
+                    "legacy fixture must stay on the consultation path"
+                );
                 let mut t = talk::begin(&talks, &cfg, repo.clone(), Some("mock")).unwrap();
                 if destination != "none" {
                     let origin = if destination == "same" {
@@ -293,4 +304,99 @@ async fn standing_turn_grants_explicit_batch_decisions_and_answers_through_the_c
             }
         }
     }
+}
+
+}
+
+common::e2e! {
+async fn routed_decision_uses_its_own_standing_turn_without_legacy_consultation() {
+    let _home = common::home_lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    magi::run::set_home(tmp.path().to_path_buf());
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let script = tmp.path().join("decide.sh");
+    std::fs::write(
+        &script,
+        "cat >/dev/null\n\
+         \"$ANSWER_BIN\" task control decide \"$QUESTION\" hold || exit 32\n\
+         echo 'Decision recorded.'\n",
+    )
+    .unwrap();
+    let cfg = Config {
+        agents: vec![AgentSpec {
+            id: "mock".into(),
+            kind: AgentKind::Command,
+            model: None,
+            command: vec!["sh".into(), script.to_string_lossy().into_owned()],
+            extra_args: vec![],
+            env: common::magi_cli_env(tmp.path(), "ANSWER_BIN"),
+            prompt_delivery: None,
+            max_turn_secs: None,
+        }],
+        ..Config::default()
+    };
+    assert!(cfg.graph.question_routing);
+    std::fs::write(repo.join("magi.toml"), toml::to_string(&cfg).unwrap()).unwrap();
+    assert!(Config::discover(&repo, None).unwrap().0.graph.question_routing);
+    let talks = Talks::at(tmp.path().join("talks"));
+    let questions = Questions::at(tmp.path().join("questions"));
+    let queue = magi::queue::Queue::at(tmp.path().join("queue"));
+    let mut chat = talk::begin(&talks, &cfg, repo.clone(), Some("mock")).unwrap();
+    let other = talk::begin(&talks, &cfg, repo.clone(), Some("mock")).unwrap();
+    let mut task = magi::queue::Task::new(
+        "Original task".into(),
+        "Original instruction".into(),
+        repo,
+        magi::queue::Source::Human,
+    );
+    task.origin_chat = Some(chat.id.clone());
+    task.runs.push("20260902-000000-beef".into());
+    queue.put(&mut task).unwrap();
+    let mut q = Question::new(
+        task.runs[0].clone(),
+        magi::land::APPROVAL_NODE.into(),
+        "land".into(),
+        "Merge?".into(),
+        "Review this change".into(),
+        vec!["merge".into(), "hold".into()],
+    );
+    q.merge_target = Some(magi::merge_decision::Target {
+        pr: "https://example.test/pull/1".into(),
+        head: "head".into(),
+        language: "en".into(),
+    });
+    questions.put(&mut q).unwrap();
+    assert_eq!(q.routed_task.as_deref(), Some(task.id.as_str()));
+    assert!(magi::consult::begin(&questions, &talks, &q, &other).is_err());
+    assert!(questions.get(&q.id).unwrap().consult.is_none());
+    assert!(talks.get(&other.id).unwrap().pending.is_empty());
+    magi::task_chat::sweep(&queue, &talks, &questions, tmp.path());
+    let delivered = questions.get(&q.id).unwrap();
+    assert_eq!(delivered.routed_chat.as_deref(), Some(chat.id.as_str()));
+    assert!(
+        magi::chat_control::decide(&queue, &talks, tmp.path(), &other.id, &q.id, "hold", None)
+            .is_err()
+    );
+    chat = talks.get(&chat.id).unwrap();
+    assert_eq!(chat.pending_messages.len(), 1);
+    talk::drain(&mut chat, &talks).unwrap();
+    talk::record(&mut chat, &talks, "いったん保留して", vec![]).unwrap();
+    let mut cfg = cfg;
+    cfg.agents[0].env.insert("QUESTION".into(), q.id.clone());
+    let lease = talks.claim_turn(&chat.id).unwrap().unwrap();
+    talk::respond(&lease, &mut chat, &talks, &cfg, "いったん保留して")
+        .await
+        .unwrap();
+    let saved = questions.get(&q.id).unwrap();
+    assert_eq!(saved.resolution().as_deref(), Some("hold"));
+    assert!(saved.answer_authority.is_none());
+    assert_eq!(saved.routed_chat, delivered.routed_chat);
+    assert_eq!(
+        talks.list().len(),
+        2,
+        "delivery must not create another seat's chat"
+    );
+}
+
 }

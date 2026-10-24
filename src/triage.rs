@@ -926,7 +926,7 @@ fn ask_about_stuck_roots(
             .filter(|q| q.node == DEPS_NODE && q.run == *root_id)
             .max_by(|a, b| a.asked_at.cmp(&b.asked_at).then_with(|| a.id.cmp(&b.id)));
         match latest {
-            Some(q) if q.status.open() => continue,
+            Some(q) if q.status.open() || awaiting_task_chat(q, root) => continue,
             Some(q) if q.status == QuestionStatus::Answered && !root.triage_applied(&q.id) => {
                 continue;
             }
@@ -1110,7 +1110,7 @@ pub fn run_once(
         let w = wording(cfg.as_ref().map_or("en", |c| c.graph.language.as_str()));
 
         if let Some(q) = latest_triage_question(questions, &task.id) {
-            if q.status.open() {
+            if q.status.open() || awaiting_task_chat(&q, &task) {
                 // Already asked, still waiting - nothing to do this pass.
                 continue;
             }
@@ -1183,11 +1183,19 @@ pub fn open_question_for(questions: &Questions, task_id: &str) -> Option<Questio
 /// out of. `crate::conduct::apply_one` is exactly that caller.
 pub fn pending_for(questions: &Questions, task: &Task) -> bool {
     let own = match latest_triage_question(questions, &task.id) {
-        Some(q) if q.status.open() => true,
+        Some(q) if q.status.open() || awaiting_task_chat(&q, task) => true,
         Some(q) if q.status == QuestionStatus::Answered => !already_applied(task, &q),
         _ => false,
     };
     own || deps_pending(questions, task)
+}
+
+fn awaiting_task_chat(q: &Question, task: &Task) -> bool {
+    q.status != QuestionStatus::Abandoned
+        && q.routed_chat.is_some()
+        && !already_applied(task, q)
+        && task.resumption.as_ref().map_or(0, |r| r.generation) == q.triage_generation.unwrap_or(0)
+        && task.operator_decided_at.is_none_or(|at| at <= q.asked_at)
 }
 
 /// Is the latest [`DEPS_NODE`] question about `task` still open, or answered
@@ -1195,7 +1203,7 @@ pub fn pending_for(questions: &Questions, task: &Task) -> bool {
 /// answer and the next [`run_once`] pass must not be walked through.
 fn deps_pending(questions: &Questions, task: &Task) -> bool {
     match latest_question(questions, DEPS_NODE, &task.id) {
-        Some(q) if q.status.open() => true,
+        Some(q) if q.status.open() || awaiting_task_chat(&q, task) => true,
         Some(q) if q.status == QuestionStatus::Answered => !task.triage_applied(&q.id),
         _ => false,
     }

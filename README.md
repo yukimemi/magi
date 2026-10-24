@@ -456,9 +456,9 @@ command you would type yourself — and the conversation stays open, so any
 number of tasks can come out of it over time rather than ending the moment one
 does.
 
-## Panels: the agent formats its own confirmation screen
+## Legacy question panels: the agent formats its own confirmation screen
 
-One line of prose is not enough to decide anything. So an agent can hand over
+For legacy non-task questions, an agent can hand over
 a page it wrote itself:
 
 ```sh
@@ -509,7 +509,10 @@ The diffstat comes from `git diff --numstat`, not `--stat`: the `+++---` bar in
 in an irreversible decision.
 
 **Silence is a hold.** An unanswered approval never merges, and neither does
-anything other than the word `merge`.
+anything other than explicit approval. For task chats, the agent presents
+Merge/Hold buttons bound to the displayed PR head. The chat agent may also
+record the owner's merge request directly with
+`magi task control decide`; no button or quote evidence is required.
 
 A standing conversation can answer an exact owner decision even when the
 question was consulted elsewhere or never consulted. Use
@@ -635,6 +638,10 @@ than a consultation-destination error. For chat answers, operator-held refusal
 is specific to approval questions; ordinary triage, dependency and recovery questions remain
 answerable, and recording their answers does not itself lift the task's hold.
 
+`[graph] question_routing` (default `true`) sends what used to be a question
+about a task to that task's chat as free text. Setting it to `false` for a
+repository keeps the question store, deputies and waiter as they were there.
+
 Merge approval uses two independent controls: `land_approval=true` asks for
 every merge; `hold_contested_merge=true` asks for unresolved Major-or-above
 internal findings **or** a final rejecting reviewer vote, even with zero Major
@@ -743,6 +750,7 @@ Unix のチャット席では継承 FD、Windows ではローカル名前付き�
 | `magi task control hold <task> [reason]` / `release <task>` | the same transitions as `magi task hold` / `release` |
 | `magi task control retry <task> <instruction>` | replaces a queued or held task's instruction and queues it in one save; attempts restart as for any release, runs and history are kept |
 | `magi task control rerun-checks <full run id> --request <id> --head <sha> --workflow <id>` | 指定した head と失敗 workflow を再確認し、リクエスト単位で再実行する。同じ操作の再送には同じ request ID を使う。`chat-controls/<talk>/<request>.json` に受付を記録し、結果不明の再送は拒否する |
+| `magi task control decide <question id> <option> [--title "<replacement>"]` | records the owner's decision on publication (github-text), branch divergence, release recovery or merge approval routed to this chat. This includes repair, dismissal, withdrawal and replacement when available. No quote or extra consent evidence is required. `use my text` requires the literal replacement title as `--title` data, which the existing publication gate vets. The routed chat, owned task, open record and offered choice are checked; existing consumers and transition checks apply the answer. |
 | `magi task control abandon <full run id> --quote "<message>"` | destructive: the owner's latest persisted message must be exactly `abandon-run: <run id>` and `--quote` must repeat it; the shared liveness judge then runs under the owner lock and a Live or Unknown driver is refused |
 
 Windows の実 sandbox の限定チェックは認証済み CLI が必要。PowerShell で
@@ -751,18 +759,24 @@ Windows の実 sandbox の限定チェックは認証済み CLI が必要。Powe
 自身の task の保留が成功し、queue 内の検証用ファイルへの直接書込みが拒否されることを確認する。
 通常の子プロセス往復は `windows_chat_controls_through_real_cli_child` が検証する。
 
-Merging stays behind the approval gate. The Question system works unchanged
-alongside these commands.
+Merging stays behind the approval gate. Task decisions now arrive as free text
+in the associated chat; legacy non-task Questions remain available.
 
 ## When an agent needs you
 
 ```sh
-magi ask --summary "Which storage backend?" --choice SQLite --choice Redis
+magi ask --summary "Which storage backend?" --detail "Context and recommendation"
 ```
 
-That is the command an *agent* runs, mid-task, instead of guessing. It blocks;
-the question appears on your phone with the choices as buttons; the answer goes
-back on the agent's stdout. From a terminal, `magi answer` does the same job.
+From a task seat this posts free text to the task's chat and exits successfully.
+The asker finishes its turn; the chat discusses the decision with you and uses
+`magi task control` to apply it. No choices, deputy, or waiter are started. A
+closed associated chat is reopened; a task with no chat gets a new Solo chat.
+The daemon delivers the persisted message even after a restart.
+
+The remainder of this section describes the retained legacy workflow for
+questions without an associated task. Those questions block and return an
+answer on the asker's stdout, and `magi answer` remains available for them.
 
 A question is attributed to the seat that asked it — `run 9fb7 · node implement
 · seat impl-A` — because "who wants to know" is the first thing you need in
@@ -1468,3 +1482,24 @@ it. For a new card, chat approval requires the owner's exact latest message
 withdrawal and replacement require the exact offered token as the latest whole
 message. Silence, discussion, repair authorization and stale approvals never
 permit a merge.
+
+### Task decisions in chat
+
+Task questions (including `magi ask` from a task seat) are posted as free text
+in the task's chat and the asker finishes without waiting. The daemon uses the
+question record as a durable outbox, then runs the existing chat turn; it starts
+no deputy or waiter. If needed it opens a Solo chat with the chatter-chain head
+and default persona, and records that chat on the task for later messages.
+Decision delivery reopens a closed associated chat. Passive completion and
+watched-command notifications still skip closed chats.
+
+The chat discusses decisions with the owner and applies them through
+`magi task control`. Automatic reports do not authorize new tasks or repository
+edits. Merge approval remains default-on and bound to the displayed PR head:
+the chat agent presents Merge/Hold buttons by including the full approval ID in
+its reply. At the owner's request, the chat agent may also record merge directly
+with `magi task control decide`, without quote or other consent evidence.
+Buttons remain optional and validate their displayed head. Silence is a hold.
+Existing head verification and merge transitions remain in charge. The Question store and legacy non-task
+question/deputy/waiter workflows remain available during this migration.
+Delivery requires the daemon; pending outbox records survive a restart.

@@ -6379,6 +6379,30 @@ function renderTalk() {
   }
   state.prevTalkTurnCount = turnCount;
 
+  let approvals = $("talk-merge-approvals");
+  if (!approvals) {
+    approvals = el("div", { id: "talk-merge-approvals" });
+    $("talk-turns").after(approvals);
+  }
+  clear(approvals);
+  for (const approval of talk.merge_approvals || []) {
+    const row = el("div", { class: "talk-pending" },
+      el("p", { text: `Merge decision: ${approval.target.pr} at ${approval.target.head}` }));
+    row.append(el("p", { text: "You can also ask in this chat to repair findings, dismiss an obsolete approval, withdraw the PR, or replace its implementation. The agent checks which recovery operations are available and asks for any required confirmation." }));
+    for (const choice of ["merge", "hold"]) {
+      row.append(el("button", { class: "btn", type: "button", text: choice === "merge" ? "Merge this head" : "Hold", onclick: async (event) => {
+        event.currentTarget.disabled = true;
+        try {
+          await postJson(API.answer(approval.question), { choice, talk: talk.id, head: approval.target.head });
+          await loadTalk(talk.id);
+        } catch (error) {
+          row.append(el("p", { text: error.message }));
+        }
+      } }));
+    }
+    approvals.append(row);
+  }
+
   renderTalkTasks(talk);
 
   const canSay = status === "open";
@@ -9550,7 +9574,11 @@ function loadQuestions() {
   if (questionOriginController) questionOriginController.abort();
   return loadStore("questions", `${API.questions}/core`, null, list => {
     const previousById = new Map((state.questions || []).map(question => [question.id, question]));
-    state.questions = sortQuestions((Array.isArray(list) ? list : []).map(question => {
+    /* An open free-text decision routed to a task chat is decided there through
+       the chat agent, so it is not a card. A merge approval stays a card: if the
+       chat turn failed or never offered the buttons, the owner still has the
+       record, its "Open chat" link and the hold choice. */
+    state.questions = sortQuestions((Array.isArray(list) ? list : []).filter(question => !(question.routed_task && !question.merge_target && question.status === "open")).map(question => {
       const previous = previousById.get(question.id);
       if (!previous || previous.record_revision !== question.record_revision) return question;
       // Core rows omit origins; retain them until the fresh lookup completes.
