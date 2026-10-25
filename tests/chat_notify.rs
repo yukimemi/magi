@@ -1680,3 +1680,131 @@ async fn retired_run_questions_do_not_hide_a_later_failure_in_the_same_pass() {
             .contains("Later gate failure")
     );
 }
+
+#[tokio::test]
+async fn attention_reports_deliver_new_holds_after_history_pruning() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let mut task = Task::new(
+        "prune".into(),
+        "hold".into(),
+        w.tmp.path().into(),
+        Source::Human,
+    );
+    task.chat = Some(w.talk_id.clone());
+    task.hold_machine(Some("first hold".into()));
+    w.queue.put(&mut task).unwrap();
+    let store = magi::notices::Notices::at(w.tmp.path().join("notifications"));
+    let sweep = || magi::notice_delivery::sweep(&w.queue, &w.talks, w.tmp.path(), w.tmp.path());
+    sweep();
+    let first = store
+        .list()
+        .into_iter()
+        .find(|n| n.key == format!("task:{}", task.id))
+        .unwrap();
+    let before = w.talks.get(&w.talk_id).unwrap().notified.len();
+    for i in 0..=magi::notices::CAP {
+        store
+            .raise(magi::notices::Notice::info(
+                &format!("history:{i}"),
+                "history",
+            ))
+            .unwrap();
+    }
+    assert!(
+        store.get(&first.id).is_err(),
+        "delivered history was pruned"
+    );
+    task.release();
+    w.queue.put(&mut task).unwrap();
+    task.hold_machine(Some("second hold".into()));
+    w.queue.put(&mut task).unwrap();
+    let second = store.get(&first.id).unwrap();
+    assert_eq!(second.generation, 1);
+    assert_ne!(second.delivery_id, first.delivery_id);
+    // Isolate the task notice from the unrelated history drafts.
+    for n in store.list().into_iter().filter(|n| n.id != first.id) {
+        store.mark_read(&n.id).unwrap();
+    }
+    sweep();
+    assert!(drafts(&w).contains("second hold"));
+    assert_eq!(w.talks.get(&w.talk_id).unwrap().notified.len(), before + 1);
+    // Reopening the outbox after a crash must retain that same receipt identity.
+    let path = store.root().join(format!("{}.json", second.id));
+    std::fs::write(path, serde_json::to_vec(&second).unwrap()).unwrap();
+    sweep();
+    assert_eq!(w.talks.get(&w.talk_id).unwrap().notified.len(), before + 1);
+    assert!(!store.get(&second.id).unwrap().unread());
+}
+
+#[tokio::test]
+async fn attention_reports_page_new_run_passes_after_legacy_read_history() {
+    let _home = common::home_lock().await;
+    for stopped in [false, true] {
+        let w = world();
+        let store = magi::notices::Notices::at(w.tmp.path().join("notifications"));
+        let old: jiff::Timestamp = "2020-01-01T00:00:00Z".parse().unwrap();
+        let mut run = magi::run::RunState::new(
+            w.tmp.path().into(),
+            "main".into(),
+            "base".into(),
+            "task".into(),
+            Config::default(),
+        );
+        run.status = magi::run::RunStatus::Failed;
+        run.created_at = old - std::time::Duration::from_secs(1);
+        let notice = || {
+            if stopped {
+                magi::notices::run_stopped(&run.id, &run)
+            } else {
+                magi::notices::run_ended(&run).unwrap()
+            }
+        };
+        let mut legacy = serde_json::to_value(notice()).unwrap();
+        for field in ["since", "generation", "delivered", "delivery_id"] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        legacy["first_at"] = old.to_string().into();
+        legacy["last_at"] = old.to_string().into();
+        legacy["read_at"] = old.to_string().into();
+        let id = notice().id;
+        std::fs::create_dir_all(store.root()).unwrap();
+        std::fs::write(
+            store.root().join(format!("{id}.json")),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        // The first producer replay after upgrade must not page old history.
+        assert!(!store.raise_paged(notice()).unwrap().1);
+        // Restore the legacy fixture to exercise a new pass as the first raise.
+        std::fs::write(
+            store.root().join(format!("{id}.json")),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        run.begin_pass();
+        let new_notice = if stopped {
+            magi::notices::run_stopped(&run.id, &run)
+        } else {
+            magi::notices::run_ended(&run).unwrap()
+        };
+        let dir = w.tmp.path().join("runs").join(&run.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("run.json"), serde_json::to_vec(&run).unwrap()).unwrap();
+        let mut task = Task::new(
+            "legacy".into(),
+            "failure".into(),
+            w.tmp.path().into(),
+            Source::Human,
+        );
+        task.chat = Some(w.talk_id.clone());
+        task.start(run.id.clone());
+        w.queue.put(&mut task).unwrap();
+        assert!(store.raise_paged(new_notice.clone()).unwrap().1);
+        assert!(!store.raise_paged(new_notice).unwrap().1);
+        magi::notice_delivery::sweep(&w.queue, &w.talks, w.tmp.path(), w.tmp.path());
+        assert!(drafts(&w).contains(&run.id));
+        assert_eq!(w.talks.get(&w.talk_id).unwrap().notified.len(), 1);
+        assert!(!store.get(&id).unwrap().unread());
+    }
+}

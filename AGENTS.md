@@ -2236,9 +2236,12 @@ before `chat_notify::start_turns` / `consult::drain_turns`. Producers record thr
 - Keys are kind + subject, never prose. `Notice::raise_again` alone decides
   repeat paging for both chat delivery generations and `[notify]`: newer cause
   or severity rise, never wording changes. Stamp cause starts with `since`
-  (task held_at, run pass started_at), rather than poll time.
-- The talk saves `notice:<stable-id>:<generation>` with its automatic draft,
-  then the outbox saves the receipt. Retries cannot spend a second turn. Queue
+  (task held_at, run pass started_at), rather than poll time. For legacy records
+  without `since`, a cause starting after the saved `last_at` is new.
+- The talk saves `notice:<stable-id>:<delivery-id>:<generation>` with its automatic
+  draft, then the outbox saves the receipt. The persisted delivery id distinguishes
+  recurrences after history pruning; legacy records retain their old receipt key.
+  Retries cannot spend a second turn. Queue
   all drafts before starting talks so reports per conversation coalesce.
   Unsent owner drafts are never started by a report.
 - Recheck current task/run state before delivery. Released holds, replaced runs

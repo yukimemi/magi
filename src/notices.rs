@@ -104,6 +104,10 @@ pub struct Notice {
     /// On-disk format version.
     #[serde(default = "schema")]
     pub schema: u32,
+    /// Persistent incarnation, so pruning history cannot reuse a chat receipt.
+    /// Legacy records keep their original receipt key.
+    #[serde(default)]
+    pub delivery_id: Option<String>,
     /// Delivery generation, advanced only by the shared page decision.
     #[serde(default = "one")]
     pub generation: u32,
@@ -141,6 +145,7 @@ impl Notice {
             since: None,
             cause: None,
             schema: SCHEMA,
+            delivery_id: Some(format!("{now}-{:016x}", crate::rng::entropy())),
             generation: 1,
             delivered: 0,
         }
@@ -208,6 +213,7 @@ impl Notice {
     /// already carries it. This is the only place that decides.
     pub fn raise_again(&mut self, again: &Notice, now: Timestamp) -> bool {
         self.count = self.count.saturating_add(1);
+        let previous_last_at = self.last_at;
         self.last_at = now;
         if again.link.is_some() {
             self.link = again.link.clone();
@@ -219,14 +225,14 @@ impl Notice {
             self.subjects = again.subjects.clone();
         }
         let escalated = again.severity > self.severity;
-        // A newer cause is news even when it reads the same; an old record
-        // with no `since` just adopts one without lighting up again.
-        // A legacy record that a question had silenced has no `since` to
-        // compare, but a stamped raise that no question covers any more is not
-        // the cause that question was filed for: it pages.
+        // Legacy history lacks a cause timestamp. Only a cause that began
+        // after the saved raise is news; replaying that old failure is not.
+        // A previously covering question can also prove a new uncovered cause.
         let newer_cause = match (self.since, again.since) {
             (Some(old), Some(new)) => new > old,
-            (None, Some(_)) => self.covered_by.is_some() && again.covered_by.is_none(),
+            (None, Some(new)) => {
+                new > previous_last_at || (self.covered_by.is_some() && again.covered_by.is_none())
+            }
             _ => false,
         };
         self.since = self.since.max(again.since);

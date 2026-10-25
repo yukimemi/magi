@@ -848,8 +848,10 @@ view for these pending and legacy records. Delivery marks reports read.
 
 Every automatic delivery can spend a chat turn. Keys name kind + subject, never
 prose: repeated wording changes update evidence without another turn. A newer
-cause or severity escalation can page again. Chat receipts make interrupted
-outbox acknowledgements safe to retry. Reports cannot start an unsent owner draft
+cause or severity escalation can page again. Legacy history without a cause
+timestamp pages when a new run pass starts after its saved last raise. Persisted
+delivery identities distinguish recurrences after history pruning, while chat
+receipts make interrupted outbox acknowledgements safe to retry. Reports cannot start an unsent owner draft
 or count as owner approval. The chat investigates and summarizes; actions require
 an owner's request and the supported `magi task control` commands.
 
