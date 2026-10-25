@@ -3702,6 +3702,7 @@ async fn poll(
     limits: DispatchLimits,
 ) -> Result<()> {
     let mut attempted = Vec::new();
+    let mut settling_once_services = false;
     let interrupt_path = home.join("scheduler-interrupt.json");
     let mut interrupt = match std::fs::read(&interrupt_path) {
         Ok(body) => serde_json::from_slice(&body).context("read scheduler interrupt state")?,
@@ -3799,6 +3800,12 @@ async fn poll(
             "cache",
             "fetch",
         ] {
+            // Once an idle --once drain starts settling services, subsequent
+            // scans only consume their effects. An expired cadence receipt
+            // must not start another service and keep the drain alive.
+            if settling_once_services {
+                break;
+            }
             start_service(
                 home,
                 opts,
@@ -3919,6 +3926,7 @@ async fn poll(
             continue;
         }
         if owned.is_empty() && opts.once {
+            settling_once_services = true;
             // These finite services can own queue claims or publish answers.
             // A skipped claim is not an idle queue until they have finished;
             // scan again afterwards so their changes are actually scheduled.
@@ -10067,6 +10075,18 @@ mod tests {
             let mut q = action_question("fixture-run", ask::ChoiceAction::Done);
             questions.put(&mut q).unwrap();
             drop(claim);
+            // Model services that took longer than their cadence, without a
+            // wall-clock sleep. The final scans must not respawn them even
+            // though their receipts now permit another periodic invocation.
+            let expired =
+                serde_json::to_vec(&"2000-01-01T00:00:00Z".parse::<Timestamp>().unwrap()).unwrap();
+            for service in [operation, "housekeeping"] {
+                std::fs::write(
+                    home.join("service-ticks").join(format!("daemon-{service}")),
+                    &expired,
+                )
+                .unwrap();
+            }
             job.status = crate::worker::Status::Finished;
             std::fs::write(&record, serde_json::to_vec(&job).unwrap()).unwrap();
             drop(lease);
@@ -10077,6 +10097,14 @@ mod tests {
             let after = queue.get(&task.id).unwrap();
             assert_eq!(after.status, TaskStatus::Done, "answer after {operation}");
             assert!(after.action_applied(&q.id));
+            for service in [operation, "housekeeping"] {
+                assert_eq!(
+                    std::fs::read(home.join("service-ticks").join(format!("daemon-{service}")))
+                        .unwrap(),
+                    expired,
+                    "the final once rescan must not restart {service}"
+                );
+            }
         }
     }
 
