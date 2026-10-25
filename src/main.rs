@@ -2984,22 +2984,7 @@ async fn answer_cmd(args: AnswerArgs) -> Result<()> {
             if q.free_text() {
                 println!("      free text");
             } else {
-                let labelled: Vec<String> = q
-                    .choices
-                    .iter()
-                    .map(|c| match q.actions.get(c) {
-                        Some(a) => {
-                            let alias = match a {
-                                ask::ChoiceAction::Resume { .. } => "; alias: resume-run",
-                                ask::ChoiceAction::Hold => "; alias: keep-held",
-                                _ => "",
-                            };
-                            format!("{c} [{}{alias}]", a.describe())
-                        }
-                        None => c.clone(),
-                    })
-                    .collect();
-                println!("      {}", labelled.join(" | "));
+                println!("{}", q.reply_guidance());
             }
         }
         return Ok(());

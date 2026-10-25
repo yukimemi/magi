@@ -1887,6 +1887,12 @@ fn recovery_cli_rejects_stale_ambiguous_missing_and_mismatched_evidence() {
         let out = recovery_answer(&f, &run, &f.qid, alias, Some(words), true);
         assert_untouched(&f, &out);
         let err = String::from_utf8_lossy(&out.stderr);
+        if mode == "wrong action" {
+            assert!(
+                err.contains("alias mismatch with persisted recommendation"),
+                "{err}"
+            );
+        }
         assert!(
             err.contains("context")
                 || err.contains("evidence")

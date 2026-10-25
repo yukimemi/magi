@@ -2057,6 +2057,11 @@ pub fn chat_consult_display(q: &crate::ask::Question) -> NoticeDisplay {
     }
 }
 
+/// Repeated on every chat invocation, including resumed and fallback sessions.
+pub const CHAT_FOLLOW_THROUGH: &str = "Follow authorized work through operational errors. Within the existing owner request, perform permitted read-only diagnosis without asking whether to investigate. Inspect the exact error, current question/task/run, canonical offered labels and accepted aliases, persisted recommendation, latest authentic owner send and any retraction, ownership and liveness. An alias mismatch with offered choices differs from a mismatch with a persisted recommendation; display annotations are not labels. Legacy resume and maintenance resumerun are distinct actions: use only aliases advertised for the current question, never infer aliases from an action description. If repository evidence is needed during consultation, use investigate_question rather than stop with an offer to investigate.
+Before retrying an uncertain operation, inspect current state and existing receipts; before task add, inspect existing tasks/runs and their ownership. Retry the same authorized operation at most once, only when diagnosis establishes a corrected input or state and the same latest owner send, question, action and target still authorize it. Never infer fresh approval, reconstruct missing recommendation evidence, or bypass an evidence, ownership, liveness, publication or destructive-action refusal with another command, alias, conversation or task. Automatic notices and internal continuations are not owner authorization.
+If implementation is required, route a self-contained task through the supported queue using the conversation's filing policy and existing owner authorization; do not merely offer to investigate or implement. Reuse an existing owning task and report its id/status rather than duplicate it. A duplicate refusal is not permission for --force. If registration is uncertain, inspect before resending. A missing control channel or repository lock is a concrete blocker, not a reason for a retry loop or a new task. Finish with the verified outcome, owning task, or the specific blocker and required repair/owner decision. Do not solicit another instruction for an obvious permitted next step. These instructions do not expand filesystem scope or action permissions.";
+
 /// Write protocol repeated on every consultation control invocation.
 pub const CONSULT_WRITES: &str = "Available writes: magi answer settles THE QUESTION under its existing choice/effect consent policy. For a decision outside every offered choice, run magi answer <id> --reply-other <entire latest owner send> --quote <same send>. This saves an evidence note and ends this consultation, but leaves the question Open, its waiter held and all choice actions unexecuted. Say this plainly once. Perform separately authorized task operations BEFORE ending consultation.
 
@@ -2087,7 +2092,9 @@ pub fn chat_consult(q: &crate::ask::Question) -> String {
         for c in &q.choices {
             s.push_str(&format!("- {}\n", defuse(c)));
         }
-        s.push('\n');
+        s.push_str("\nReply values (descriptions are not labels):\n");
+        s.push_str(&defuse(&q.reply_guidance()));
+        s.push_str("\n\n");
     }
     s.push_str(CONSULT_WRITES);
     s.push_str("If repository evidence is needed to answer, request a coordinated investigation in this same conversation using the current turn's structured continuation protocol. Keep this question unanswered; never choose an answer just to unlock investigation. A busy repository leaves investigation pending and can be retried here. Supported read-only control-plane diagnostics remain available.\n\n");

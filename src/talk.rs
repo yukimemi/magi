@@ -2848,6 +2848,8 @@ async fn turn(
                     bail!("conversation turn ownership lost; investigation cancelled");
                 }
                 let consultation = validate_investigation(questions, store, &talk.id, &id)?;
+                let original_question = questions.get(&id)?;
+                let original_turns = talk.turns.clone();
                 validate_investigation_repository(questions, &id, &talk.repo)?;
                 let repository_lease =
                     crate::repo_lock::SeatLease::try_reader(&talk.repo, cfg.coordination.as_ref())
@@ -2874,7 +2876,7 @@ async fn turn(
                     stem: &investigation_stem,
                     ..inv.clone()
                 };
-                agent::invoke_leased(
+                let evidence = agent::invoke_leased(
                     spec,
                     &mut talk.seat,
                     &investigation,
@@ -2891,7 +2893,57 @@ async fn turn(
                         Ok(())
                     },
                 )
-                .await
+                .await?;
+                if !evidence.usable() || evidence.quota_exhausted() || evidence.dropped.is_some() {
+                    return Ok(evidence);
+                }
+                // Return to control once, without persisting an internal owner
+                // send or replacing the original recommendation manifest.
+                let check = || {
+                    if !lease.holds() {
+                        bail!("conversation turn ownership lost; continuation cancelled");
+                    }
+                    validate_investigation(questions, store, &talk.id, &id)?;
+                    validate_investigation_repository(questions, &id, &talk.repo)?;
+                    if questions.get(&id)? != original_question {
+                        bail!("question changed during investigation; continuation cancelled");
+                    }
+                    let fresh = store.get(&talk.id)?;
+                    if !fresh.pending.is_empty() || !fresh.pending_messages.is_empty() {
+                        bail!("new conversation input pending; read it before continuing");
+                    }
+                    if fresh
+                        .turns
+                        .iter()
+                        .filter(|t| sender(t, None) != Sender::Magi)
+                        .ne(original_turns
+                            .iter()
+                            .filter(|t| sender(t, None) != Sender::Magi))
+                    {
+                        bail!("conversation evidence changed; read it before continuing");
+                    }
+                    Ok(())
+                };
+                check()?;
+                let control_body = format!(
+                    "{body}\n\n# Read-only investigation result (not owner authorization)\n\n{}\n\nContinue the existing request in consultation control using the unchanged persisted owner evidence. This is the single return from investigation in this turn. Do not request another investigation; report a concrete blocker if evidence or authorization is still missing.",
+                    evidence.text
+                );
+                let control_stem = format!("{attempt_stem}-control");
+                let control = Invocation {
+                    prompt: &control_body,
+                    stem: &control_stem,
+                    ..inv.clone()
+                };
+                let mut out =
+                    agent::invoke_leased(spec, &mut talk.seat, &control, None, check).await?;
+                if investigation_request(&out).is_some() {
+                    out.text = format!(
+                        "Investigation completed for question {id}, but further evidence is required. No further automatic continuation was started. Evidence: {}",
+                        evidence.text
+                    );
+                }
+                Ok(out)
             };
             let investigation_result = wait.scope(continuation).await;
             if !lease.holds() {
@@ -2919,7 +2971,7 @@ async fn turn(
                         String::new()
                     };
                     out.text = format!(
-                        "Investigation pending for question {id}: {error}. {holder_hint}This investigation request made no answer or execution transition. Ask to investigate again in this conversation when repository coordination is available. The task awaiting this question may hold the lock; do not release another seat's lock. Supported read-only control-plane diagnostics remain available to decide the next step."
+                        "Investigation pending for question {id}: {error}. {holder_hint}No further automatic attempt will be made; inspect current state and receipts before retrying. Repository coordination or the reported state must be repaired before another investigation can proceed. The task awaiting this question may hold the lock; do not release another seat's lock. Supported read-only control-plane diagnostics remain available to decide the next step."
                     );
                     Ok(out)
                 }
@@ -3393,8 +3445,11 @@ pub fn briefing_for(
          Automatic messages authorize investigation and reporting only, not new tasks or repository edits. \
          Legacy non-task questions still use `magi answer <full-question-id> --reply <exact offered choice> --quote <entire latest owner message>`. \
          Direct instructions bind `<full-question-id>: <exact offered choice>`. \
-         Internal structured resume/keep-held choices also accept unique short question IDs and \
-         stable aliases `resume-run`, `resume run`, and `keep-held`, independent of localized labels. \
+         Legacy recovery choices with stored action `resume` accept unique short question IDs and \
+         stable aliases `resume-run` and `resume run`; hold choices accept `keep-held`. \
+         The maintenance action `resumerun` is distinct and does not accept those resume aliases. \
+         Read the current question's exact labels and accepted aliases with `magi answer --list`; \
+         action descriptions and display annotations are not reply values. \
          For natural recovery approval, first present exactly one explicit recommendation row \
          `<question-id>: <label or stable alias>`; its canonical action and target are saved with your reply. \
          In a later turn, interpret the real latest owner send in conversation context. Clear Japanese \
@@ -3438,8 +3493,8 @@ pub fn briefing_for(
          nothing matches or more than one checkout shares that name, ask the \
          operator which repository they mean (or run `magi repos` yourself \
          to see the candidates) rather than guessing.\n\n\
-         You cannot wait, and you cannot send the operator a message on your \
-         own: you only speak when they write. A task you file reports back \
+         Finish permitted diagnosis and safe retries during this turn. For deferred work, use \
+         the queue or a registered watch; do not promise an unregistered future message. A task you file reports back \
          into this conversation automatically when it finishes, is held or \
          fails, as a message headed \"{notice}\".\n\n\
          For a background command you run yourself, register it with \
@@ -3500,6 +3555,8 @@ pub fn briefing_for(
         repo = repo.display(),
         notice = crate::prompt::CHAT_TASK_NOTICE_HEADING,
     );
+    out.push_str("\n\n");
+    out.push_str(crate::prompt::CHAT_FOLLOW_THROUGH);
     out.push_str(&language_note(language));
     match (persona, operator_name) {
         (Some(p), n) => out.push_str(&crate::persona::section_for(p, n)),
@@ -5567,7 +5624,7 @@ mod tests {
         )
         .await
         .expect("first turn");
-        let first_prompt = &talk.turns[1].body;
+        let first_prompt = talk.turns[1].body.clone();
         assert!(first_prompt.contains("magi task add --solo"));
         assert!(first_prompt.contains("what does the queue module do?"));
 
@@ -5587,6 +5644,9 @@ mod tests {
             "the briefing is sent once, not on every turn: {second_prompt}"
         );
         assert!(second_prompt.contains("and how is it locked?"));
+        for prompt in [&first_prompt, second_prompt] {
+            assert!(prompt.contains(crate::prompt::CHAT_FOLLOW_THROUGH));
+        }
     }
 
     #[tokio::test]

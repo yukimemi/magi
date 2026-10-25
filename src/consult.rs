@@ -738,7 +738,12 @@ fn recovery_authority(
     if binding.choice != reply
         || recommended_choice(&recommendation.body, q, questions) != Some(reply)
     {
-        bail!("alias mismatch: the selected action differs from the persisted recommendation");
+        bail!(
+            "alias mismatch with persisted recommendation: selected label {} differs from saved label {} for question {}; correcting reply spelling cannot replace owner evidence",
+            serde_json::to_string(reply).expect("serialize selected label"),
+            serde_json::to_string(&binding.choice).expect("serialize saved label"),
+            q.id
+        );
     }
     Ok(AnswerAuthority {
         talk: talk.id.clone(),
