@@ -64,6 +64,10 @@ fn cleared(n: &Notice, task: Option<&Task>, run: Option<&serde_json::Value>) -> 
             return true;
         }
         if let Some(run) = run {
+            // Parking is an intentional stop, even if the failure status remains.
+            if run["parked"].as_bool() == Some(true) {
+                return true;
+            }
             let newer = run
                 .get("updated_at")
                 .and_then(|v| v.as_str())

@@ -1479,6 +1479,38 @@ async fn attention_reports_have_stable_run_and_global_destinations_and_preserve_
 }
 
 #[tokio::test]
+async fn attention_reports_cancel_parked_run_failures_before_delivery() {
+    let _home = common::home_lock().await;
+    for status in ["blocked", "stalled", "failed", "implementing"] {
+        let w = world();
+        let store = magi::notices::Notices::at(w.tmp.path().join("notifications"));
+        let n = store
+            .raise(magi::notices::Notice::error(
+                "run:parked-run",
+                "pending failure",
+            ))
+            .unwrap();
+        let dir = w.tmp.path().join("runs/parked-run");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A parked run can retain its failure status and an older timestamp.
+        let record = serde_json::json!({
+            "repo": w.tmp.path(), "status": status, "parked": true,
+            "updated_at": n.last_at - std::time::Duration::from_secs(1)
+        });
+        std::fs::write(dir.join("run.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+        for _ in 0..2 {
+            magi::notice_delivery::sweep(&w.queue, &w.talks, w.tmp.path(), w.tmp.path());
+        }
+        let saved = store.get(&n.id).unwrap();
+        assert!(!saved.unread());
+        assert_eq!(saved.delivered, saved.generation);
+        assert!(w.talks.get("notice-run-parked-run").is_err());
+        assert!(drafts(&w).is_empty());
+        assert!(chat_notify::talks_to_start(&w.talks).is_empty());
+    }
+}
+
+#[tokio::test]
 async fn attention_reports_defer_unknown_runs_and_cancel_resumed_legacy_failures() {
     let _home = common::home_lock().await;
     let w = world();
