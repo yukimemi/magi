@@ -70,8 +70,11 @@ async fn foreign_dirty_checkout_is_refused_before_filing_and_untouched() {
     assert!(!out.status.success());
     let message = String::from_utf8_lossy(&out.stderr);
     assert!(message.contains("dirty"), "{message}");
-    let canonical = std::fs::canonicalize(&path).unwrap();
-    let quoted = format!("'{}'", canonical.to_string_lossy().replace('\'', "'\\''"));
+    // Diagnostics use Git's worktree path spelling. On Windows it differs
+    // from std::fs::canonicalize's verbatim path, even for the same directory.
+    let holder = git::worktree_holding(&fx.repo, BRANCH).await.unwrap().unwrap();
+    assert_eq!(std::fs::canonicalize(&holder).unwrap(), std::fs::canonicalize(&path).unwrap());
+    let quoted = format!("'{}'", holder.to_string_lossy().replace('\'', "'\\''"));
     assert!(message.contains(&format!("git worktree remove {quoted}")), "{message}");
     assert!(message.contains("renri remove 'feat/by-hand' -y --non-interactive"), "{message}");
     let queue = magi::queue::Queue::at(cli_home.join("queue"));
