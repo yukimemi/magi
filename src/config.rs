@@ -985,6 +985,27 @@ pub enum MergeStyle {
     Rebase,
 }
 
+/// Whether pull request landing requires readable CI results.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MergeCi {
+    /// Wait for readable check results before landing (the default).
+    #[default]
+    Expected,
+    /// Ignore the rollup; repository verification and approval still apply.
+    None,
+}
+
+impl MergeCi {
+    /// Translate configuration into the landing decision policy.
+    pub fn expectation(self) -> crate::land::CiExpectation {
+        match self {
+            Self::Expected => crate::land::CiExpectation::Expected,
+            Self::None => crate::land::CiExpectation::Absent,
+        }
+    }
+}
+
 /// Merge policy.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
@@ -992,6 +1013,8 @@ pub struct Merge {
     /// Default is [`MergeMode::None`]: magi never touches your base branch
     /// unless you ask it to.
     pub mode: MergeMode,
+    /// CI expectation for landing. Opt out only in repositories without CI.
+    pub ci: MergeCi,
     /// Base branch. Defaults to the branch checked out when the run started.
     pub base: Option<String>,
     /// How the winner is attached to `base`; see [`MergeStyle`]. Ignored by
@@ -1018,6 +1041,7 @@ impl Default for Merge {
     fn default() -> Self {
         Self {
             mode: MergeMode::None,
+            ci: MergeCi::Expected,
             base: None,
             style: MergeStyle::default(),
             remote: "origin".to_owned(),
@@ -1071,7 +1095,8 @@ pub enum ReleaseMode {
     Actions,
     /// magi does, from this machine: no CI is awaited, the owner approves the
     /// merge, and magi then tags and runs [`Release::commands`]. See
-    /// [`crate::release_local`].
+    /// [`crate::release_local`]. For ordinary pull requests without CI, also set
+    /// `[merge] ci = "none"` in the repository config.
     Local,
 }
 
@@ -2483,6 +2508,9 @@ impl Config {
              [merge]\n\
              # none | local | pr\n\
              mode = \"none\"\n\
+             # expected (default) | none. Set none only in repository config without CI.\n\
+             # Ignores all check statuses; reviews and approval still apply.\n\
+             # ci = \"expected\"\n\
              # release_bump = true  # Rust (Cargo.toml) repositories only; a no-op elsewhere\n\n\
              [update]\n\
              # off | notify | install — checked in the background, throttled.\n\
@@ -2508,6 +2536,7 @@ impl Config {
              # runs `commands` from a clean checkout of the merge commit. A\n\
              # failure holds the release with a notice; it is never retried blind.\n\
              # Needs `magi serve` running and [daemon] release_stall_minutes > 0.\n\
+             # For ordinary pull requests without CI, also set [merge] ci = \"none\".\n\
              # mode = \"actions\"\n\
              # Run in order; the first failure stops. They see MAGI_RELEASE_VERSION,\n\
              # MAGI_RELEASE_TAG, MAGI_RELEASE_COMMIT and MAGI_RELEASE_PR. Make them\n\
@@ -3085,6 +3114,19 @@ lock_file = "{{ vars.bad }}"
             prompt_delivery: None,
             max_turn_secs: None,
         }
+    }
+
+    #[test]
+    fn merge_ci_defaults_expected_and_requires_an_explicit_valid_opt_out() {
+        let default: Merge = toml::from_str("").unwrap();
+        assert_eq!(default.ci, MergeCi::Expected);
+        let config = layered("", "[merge]\nci = \"none\"\n").unwrap();
+        assert_eq!(
+            config.merge.ci.expectation(),
+            crate::land::CiExpectation::Absent
+        );
+        assert!(toml::from_str::<Merge>("ci = \"typo\"").is_err());
+        assert!(Config::starter_toml().contains("# ci = \"expected\""));
     }
 
     #[test]

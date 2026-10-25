@@ -343,17 +343,13 @@ pub enum CiExpectation {
     /// Checks will come: wait for them, judge them (the default, and what
     /// [`decide`] always uses).
     Expected,
-    /// No check will ever report (`[release] mode = "local"` on a repository
-    /// whose Actions never run). Waiting out [`CHECKS_GRACE`] or reading
-    /// `unknown` as a refusal would stall forever, so the checks are read as
-    /// absent and the pull request is ready as soon as it merges cleanly.
+    /// The repository explicitly disables CI expectations with `[merge] ci = "none"`.
+    /// Ignore all check statuses while retaining conflicts and review comments.
     Absent,
 }
 
-/// [`decide`] with the CI expectation made explicit. `Expected` is exactly
-/// [`decide`]; `Absent` reads the absence of CI as the reason to proceed, and
-/// still stops for a conflict (the base moved), which a rebase cures and no
-/// check state does.
+/// [`decide`] with the CI expectation made explicit. `Absent` ignores the
+/// rollup, but still requires conflicts and review comments to be resolved.
 pub fn decide_with(
     pr: &PrState,
     round: usize,
@@ -373,12 +369,12 @@ pub fn decide_with(
         return Step::Rebase;
     }
 
-    if ci == CiExpectation::Absent {
-        return Step::Merge;
-    }
-
     let spent = round >= budget;
-    match pr.checks {
+    let checks = match ci {
+        CiExpectation::Expected => pr.checks,
+        CiExpectation::Absent => Checks::Green,
+    };
+    match checks {
         Checks::Pending => Step::Wait,
         Checks::Unknown if waited < CHECKS_GRACE => Step::Wait,
         Checks::Unknown => Step::GiveUp {
@@ -413,7 +409,12 @@ pub fn decide_with(
         Checks::Green if pr.review_comments.is_empty() => Step::Merge,
         Checks::Green => {
             let what = format!(
-                "checks are green but {} review comment(s) are unresolved: {}",
+                "{} but {} review comment(s) are unresolved: {}",
+                if ci == CiExpectation::Absent {
+                    "CI is not expected"
+                } else {
+                    "checks are green"
+                },
                 pr.review_comments.len(),
                 authors(&pr.review_comments)
             );
@@ -488,6 +489,7 @@ fn direct_merge_is_safe(
     round: usize,
     budget: usize,
     waited: Duration,
+    ci: CiExpectation,
 ) -> bool {
     let Some(fresh) = fresh else {
         return false;
@@ -503,7 +505,7 @@ fn direct_merge_is_safe(
     }
     let mut pr = fresh.pr.clone();
     pr.review_comments.retain(|c| !shown.contains(&c.body));
-    decide(&pr, round, budget, waited) == Step::Merge
+    decide_with(&pr, round, budget, waited, ci) == Step::Merge
 }
 
 /// What GitHub is still waiting for, for the stop reason when an armed merge
@@ -3598,7 +3600,12 @@ enum Refused {
 
 /// Judged from the pull request's state after the refusal, never from the
 /// refusal's wording, which belongs to the forge and changes.
-fn classify_refusal(after: Option<&Seen>, rechecked: bool, observed_head: &str) -> Refused {
+fn classify_refusal(
+    after: Option<&Seen>,
+    rechecked: bool,
+    observed_head: &str,
+    ci: CiExpectation,
+) -> Refused {
     let Some(after) = after else {
         // Unreadable is not evidence of anything; the next loop reads again.
         return Refused::Pending;
@@ -3616,7 +3623,8 @@ fn classify_refusal(after: Option<&Seen>, rechecked: bool, observed_head: &str) 
         return Refused::Pending;
     }
     let state = after.merge_state.to_ascii_uppercase();
-    if matches!(after.pr.checks, Checks::Pending | Checks::Unknown)
+    if (ci == CiExpectation::Expected
+        && matches!(after.pr.checks, Checks::Pending | Checks::Unknown))
         || state.is_empty()
         || state == "UNKNOWN"
     {
@@ -4132,6 +4140,13 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
     // Counted apart from `round`: a rebase is not a fix, and a base that
     // moved is not the change's fault.
     let mut rebases = 0usize;
+    let ci = state.config.merge.ci.expectation();
+    if ci == CiExpectation::Absent {
+        state.event(
+            "land",
+            "CI not expected ([merge] ci = \"none\"); check status ignored",
+        );
+    }
     let mut waited = Duration::ZERO;
     // Comment bodies the fixer has already been shown. A comment is
     // outstanding until it has been handed over once; after that it is a
@@ -4349,7 +4364,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
         } else {
             waited
         };
-        let proposed = decide(&pr, round, budget, decision_wait);
+        let proposed = decide_with(&pr, round, budget, decision_wait, ci);
         if pr.checks == Checks::Red && pr.blocking == Blocking::Unsaid && proposed == Step::Wait {
             if waited >= WAIT_CEILING {
                 stop_disarmed(
@@ -4371,7 +4386,10 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
         // than by the rollup's aggregate: another run still pending, or a fix
         // budget already spent, must not keep a flaky failure from its one
         // rerun. It spends no round and no attempt.
-        if pr.state == PrLifecycle::Open && state.config.graph.rerun_flaky_checks {
+        if ci == CiExpectation::Expected
+            && pr.state == PrLifecycle::Open
+            && state.config.graph.rerun_flaky_checks
+        {
             let include_optional = pr.checks == Checks::Red
                 && matches!(proposed, Step::Fix { .. } | Step::GiveUp { .. });
             let failing = rerunnable_with(&seen.contexts, include_optional);
@@ -4653,6 +4671,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                         round,
                         budget,
                         waited,
+                        ci,
                     ) {
                         if waited >= WAIT_CEILING {
                             let why = "the pull request did not settle on the approved head \
@@ -4778,7 +4797,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                     write_pr_state_through(state, pr.state);
                     return Ok(pr);
                 }
-                let verdict = classify_refusal(after_seen.as_ref(), rechecked, &observed_head);
+                let verdict = classify_refusal(after_seen.as_ref(), rechecked, &observed_head, ci);
                 match verdict {
                     Refused::Final => {
                         let merge_state = after_seen
@@ -6633,6 +6652,46 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             assert_eq!(decide_with(&p, 0, 4, Duration::ZERO, Absent), Step::Merge);
             assert_eq!(decide_with(&p, 4, 4, CHECKS_GRACE, Absent), Step::Merge);
         }
+        // Third-party statuses never change the review decision, even at budget.
+        for comments in [0, 1] {
+            for round in [0, 4] {
+                let absent = decide_with(
+                    &pr(Checks::Unknown, &[], comments),
+                    round,
+                    4,
+                    CHECKS_GRACE,
+                    Absent,
+                );
+                for checks in [Checks::Green, Checks::Red, Checks::Pending] {
+                    assert_eq!(
+                        decide_with(
+                            &pr(checks, &["third-party"], comments),
+                            round,
+                            4,
+                            Duration::ZERO,
+                            Absent
+                        ),
+                        absent
+                    );
+                }
+                if comments != 0 {
+                    assert!(matches!(absent, Step::Fix { .. } | Step::GiveUp { .. }));
+                    assert_eq!(matches!(absent, Step::GiveUp { .. }), round == 4);
+                }
+            }
+        }
+        let empty = pr(Checks::Unknown, &[], 0);
+        for waited in [Duration::ZERO, CHECKS_GRACE + POLL] {
+            assert_eq!(decide_with(&empty, 0, 4, waited, Absent), Step::Merge);
+        }
+        assert_eq!(
+            decide_with(&empty, 0, 4, Duration::ZERO, Expected),
+            Step::Wait
+        );
+        assert_eq!(
+            decide_with(&empty, 0, 4, CHECKS_GRACE, Expected),
+            Step::GiveUp { reason: "no check status is readable on the pull request after 3 minute(s); refusing to merge on a guess".to_owned() }
+        );
         // A conflict is not a check: it still wants the rebase.
         let mut p = pr(Checks::Unknown, &[], 0);
         p.blocking = Blocking::Conflict;
@@ -9909,11 +9968,17 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             (Some(open(Checks::Green, "BLOCKED")), true, Refused::Final),
         ];
         for (after, rechecked, want) in table {
-            assert_eq!(classify_refusal(after.as_ref(), rechecked, "a"), want);
+            assert_eq!(
+                classify_refusal(after.as_ref(), rechecked, "a", CiExpectation::Expected),
+                want
+            );
         }
         let mut closed = open(Checks::Green, "CLEAN");
         closed.pr.state = PrLifecycle::Closed;
-        assert_eq!(classify_refusal(Some(&closed), false, "a"), Refused::Final);
+        assert_eq!(
+            classify_refusal(Some(&closed), false, "a", CiExpectation::Expected),
+            Refused::Final
+        );
     }
 
     #[tokio::test]
@@ -10212,7 +10277,82 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     fn a_refusal_read_against_another_commits_checks_is_pending() {
         let mut after = seen("a", Checks::Green, "BLOCKED", false);
         after.rollup_head = "old".to_owned();
-        assert_eq!(classify_refusal(Some(&after), true, "a"), Refused::Pending);
+        assert_eq!(
+            classify_refusal(Some(&after), true, "a", CiExpectation::Expected),
+            Refused::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_ci_empty_rollup_reaches_approval_then_merges_on_the_approved_head() {
+        let mut state = landing_state();
+        state.config.merge.ci = crate::config::MergeCi::None;
+        state.config.graph.land_approval = true;
+        let forge = Scripted::new(
+            vec![seen("a", Checks::Unknown, "CLEAN", false)],
+            vec![(true, "")],
+        );
+        land_with(&mut state, URL, &forge).await.unwrap();
+        assert!(state.parked);
+        assert_eq!(forge.calls(), ["view"]);
+        let store = ask::Questions::open();
+        let mut q = store
+            .get(&state.land_approval.as_ref().unwrap().question)
+            .unwrap();
+        q.answer(ask::Answer::Choice(APPROVE.to_owned())).unwrap();
+        store.put(&mut q).unwrap();
+
+        land_with(&mut state, URL, &forge).await.unwrap();
+        assert_eq!(forge.calls(), ["view", "view", "view", "merge", "view"]);
+        assert_eq!(state.status, RunStatus::Merged);
+        assert_eq!(
+            value_of(&forge.argvs()[0], "--match-head-commit"),
+            Some("a")
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_ci_ignores_failed_workflow_runs_without_rerunning_them() {
+        let mut state = landing_state();
+        state.config.merge.ci = crate::config::MergeCi::None;
+        let forge = Scripted::new(vec![red("a", Some("7"))], vec![(true, "")]);
+        land_with(&mut state, URL, &forge).await.unwrap();
+        assert!(forge.reruns.lock().unwrap().is_empty());
+        assert_eq!(forge.calls(), ["view", "view", "merge", "view"]);
+        assert_eq!(state.status, RunStatus::Merged);
+    }
+
+    #[test]
+    fn absent_ci_still_requires_a_readable_matching_head_and_resolved_comments() {
+        let shown = BTreeSet::new();
+        let guard = |s: Option<&Seen>| {
+            direct_merge_is_safe(s, "a", &shown, 0, 4, Duration::ZERO, CiExpectation::Absent)
+        };
+        let mut fresh = seen("a", Checks::Unknown, "CLEAN", false);
+        assert!(guard(Some(&fresh)));
+        assert!(!guard(None));
+        fresh.rollup_head = "old".to_owned();
+        assert!(!guard(Some(&fresh)));
+        fresh.rollup_head = "a".to_owned();
+        fresh.head = "b".to_owned();
+        assert!(!guard(Some(&fresh)));
+        assert!(!guard(Some(&seen("a", Checks::Unknown, "CLEAN", true))));
+        assert!(!guard(Some(&seen("a", Checks::Unknown, "DIRTY", false))));
+    }
+
+    #[test]
+    fn absent_ci_refusal_does_not_wait_for_third_party_checks() {
+        for checks in [Checks::Unknown, Checks::Pending, Checks::Red, Checks::Green] {
+            let after = seen("a", checks, "BLOCKED", false);
+            assert_eq!(
+                classify_refusal(Some(&after), false, "a", CiExpectation::Absent),
+                Refused::Recheck
+            );
+            assert_eq!(
+                classify_refusal(Some(&after), true, "a", CiExpectation::Absent),
+                Refused::Final
+            );
+        }
     }
 
     #[tokio::test]
@@ -10860,7 +11000,17 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     fn the_direct_merge_guard_needs_the_approved_head_bound_to_its_checks() {
         let shown = BTreeSet::new();
         let ok = seen("a", Checks::Green, "CLEAN", false);
-        let guard = |s: Option<&Seen>| direct_merge_is_safe(s, "A", &shown, 0, 4, Duration::ZERO);
+        let guard = |s: Option<&Seen>| {
+            direct_merge_is_safe(
+                s,
+                "A",
+                &shown,
+                0,
+                4,
+                Duration::ZERO,
+                CiExpectation::Expected,
+            )
+        };
         assert!(guard(Some(&ok)));
         assert!(!guard(None));
         assert!(!guard(Some(&seen("b", Checks::Green, "CLEAN", false))));

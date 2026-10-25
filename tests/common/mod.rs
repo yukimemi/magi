@@ -828,6 +828,7 @@ pub fn fixture(home: HomeGuard, judges: Judges, require_fix: bool) -> Fixture {
         },
         merge: Merge {
             mode: MergeMode::None,
+            ci: Default::default(),
             base: None,
             style: MergeStyle::default(),
             remote: "origin".to_owned(),
