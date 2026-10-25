@@ -1119,7 +1119,7 @@ function renderLoop() {
     : "";
   const knownVersions = [version, ...jobs.map((job) => job.version)]
     .filter((value) => typeof value === "string")
-    .map((value) => value.trim())
+    .map((value) => value.trim().replace(/^v/, ""))
     .filter((value) => value && value !== "starting");
   const mismatch = new Set(knownVersions).size > 1;
   const versionAvailable = Boolean(version) && !state.healthError;
@@ -1184,7 +1184,6 @@ function renderLoop() {
     setAttr(box, "data-state", null);
     setAttr(box, "data-owned", null);
     setText(text, "Connecting\u2026");
-    setText(versionChip, "");
     show(versionChip, false);
     quiet(null);
     return;

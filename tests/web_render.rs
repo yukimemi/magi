@@ -4956,10 +4956,12 @@ async fn loop_version_details_stay_compact_and_preserve_toggle_state() {
             .unwrap();
         let result = browser.eval(&page, r##"(async () => {
           const check = (ok, why) => { if (!ok) throw new Error(why); };
+          deck.state.health = null; deck.state.healthError = null; deck.renderLoop();
+          check(document.getElementById('loop-version').textContent === 'i', 'connecting preserves info icon');
           const health = {version:'0.1.0', loop:{running:true}, daemon:{idle:true},
             update:{available:true, to:'v0.2.0'}, jobs:[
               {kind:'scheduler', key:'serve', version:'0.1.0', generation:'web', pid:1},
-              {kind:'task', key:'task-1', queue_owned:true, version:' 0.1.0 ', generation:'worker', pid:2},
+              {kind:'task', key:'task-1', queue_owned:true, version:' v0.1.0 ', generation:'worker', pid:2},
               {kind:'chat', key:'chat-1', version:'starting'}, {kind:'task', key:'task-2'}]};
           deck.state.health = health; deck.renderLoop();
           await new Promise(resolve => requestAnimationFrame(resolve));
@@ -4981,11 +4983,14 @@ async fn loop_version_details_stay_compact_and_preserve_toggle_state() {
           };
           check(info.tagName === 'BUTTON' && info.type === 'button' && info.getAttribute('aria-controls') === detail.id, 'native toggle');
           check(info.textContent === 'i' && info.getAttribute('aria-expanded') === 'false' && detail.hidden, 'initially compact');
-          check(!info.dataset.mismatch && !info.getAttribute('aria-label').includes('versions differ'), 'unknown and starting versions ignored');
+          check(!info.dataset.mismatch && !info.getAttribute('aria-label').includes('versions differ'), 'v prefix normalized; unknown and starting versions ignored');
+          const normalColor = getComputedStyle(info).color;
           for (const id of ['loop-toggle', 'loop-park', 'loop-upgrade']) check(!document.getElementById(id).hidden, id + ' visible');
           compact();
           health.jobs[1].version = '0.0.9'; deck.renderLoop();
           check(info.dataset.mismatch === 'yes' && info.getAttribute('aria-label').includes('versions differ'), 'mismatch marker');
+          const mismatchStyle = getComputedStyle(info);
+          check(mismatchStyle.color !== normalColor && mismatchStyle.borderTopColor === mismatchStyle.color && mismatchStyle.color === getComputedStyle(info, '::after').backgroundColor, 'mismatch colors text and border amber');
           compact();
           info.click();
           check(!detail.hidden && info.getAttribute('aria-expanded') === 'true' && info.getAttribute('aria-label').startsWith('Hide'), 'tap opens');

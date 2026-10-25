@@ -355,6 +355,7 @@ a { color: inherit; text-decoration: none; }
 }
 .daemon-controls:has([data-armed="yes"]) { grid-column: 1 / -1; grid-row: 3; flex-wrap: wrap; }
 .daemon-version { flex: none; position: relative; }
+.daemon-version[data-mismatch="yes"] { border-color: var(--on-gold); color: var(--on-gold); }
 .daemon-version[data-mismatch="yes"]::after {
   content: ""; position: absolute; top: 0; right: 0;
   width: 4px; height: 4px; border-radius: 50%; background: var(--on-gold);
