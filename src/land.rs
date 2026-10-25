@@ -3941,6 +3941,35 @@ async fn restore_landing_worktree(state: &mut RunState) -> Result<()> {
         }
         git::git(&winner.worktree, &["read-tree", "-m", "-u", "HEAD"]).await?;
     }
+    if let (Some(checkout), Some(from)) = (&state.foreign_checkout, &state.land_rebase_from) {
+        anyhow::ensure!(
+            git::is_ancestor(&winner.worktree, &checkout.synced_head, from).await,
+            "landing synchronization started outside the foreign checkout history"
+        );
+        if !git::is_ancestor(&winner.worktree, from, "HEAD").await {
+            // The rebase's tree already includes the base and the fixer's
+            // resolutions. Retain that exact tree, but join the pre-sync
+            // history so delivery remains fast-forward. Keep the checkpoint
+            // until this succeeds: a crash after rebase (or after this merge)
+            // must recover through this same idempotent path before gating.
+            git::git(
+                &winner.worktree,
+                &[
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "merge",
+                    "--strategy=ours",
+                    "--no-ff",
+                    "--no-autostash",
+                    "--no-edit",
+                    "-m",
+                    "Merge pre-sync history into the repaired landing tree",
+                    from,
+                ],
+            )
+            .await?;
+        }
+    }
     crate::worktree_setup::prepare(&state.config, &state.repo, &winner.worktree).await?;
     state.land_rebase_from = None;
     state.save()?;
@@ -7241,6 +7270,143 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         git::git(&state.repo, &["checkout", "winner"])
             .await
             .unwrap();
+    }
+
+    async fn foreign_landing_fixture() -> (tempfile::TempDir, RunState, String, std::path::PathBuf)
+    {
+        let (tmp, mut state, old) = landing_git_fixture().await;
+        let path = tmp.path().join("foreign");
+        git::worktree_add_branch(&state.repo, &path, "task-head", &old)
+            .await
+            .unwrap();
+        state.foreign_checkout = Some(
+            crate::foreign_checkout::inspect(&state.repo, "task-head", &path)
+                .await
+                .unwrap(),
+        );
+        state.config.merge.mode = crate::config::MergeMode::Pr;
+        state.save().unwrap();
+        (tmp, state, old, path)
+    }
+
+    #[tokio::test]
+    async fn foreign_landing_sync_and_interrupted_resumes_preserve_delivery_ancestry() {
+        for phase in 0..4 {
+            let (_tmp, mut state, old, path) = foreign_landing_fixture().await;
+            advance_landing_base(&state).await;
+            state.config.verify.gate = vec!["test -f advance && test -f change".into()];
+            if phase == 0 {
+                // The live Step::Rebase path uses this same synchronization
+                // and publication pair, without going through resume.
+                assert_eq!(
+                    rebase_landing_worktree(&mut state, "origin/main")
+                        .await
+                        .unwrap(),
+                    crate::rebase::Rebased::Applied
+                );
+            } else {
+                interrupt_landing_rebase(&mut state).await;
+                let repaired_tree = git::tree_of(&state.repo, "HEAD").await.unwrap();
+                if phase == 2 {
+                    git::sync_to_head(&state.repo).await.unwrap();
+                } else if phase == 3 {
+                    // Crash after joining history, before clearing its saved
+                    // start. Repeating restoration must not add another merge.
+                    restore_landing_worktree(&mut state).await.unwrap();
+                    let joined = git::rev_parse(&state.repo, "HEAD").await.unwrap();
+                    state.land_rebase_from = Some(old.clone());
+                    state.save().unwrap();
+                    restore_landing_worktree(&mut state).await.unwrap();
+                    assert_eq!(git::rev_parse(&state.repo, "HEAD").await.unwrap(), joined);
+                }
+                state.save().unwrap();
+                state = RunState::load(&state.id).unwrap();
+                restore_landing_worktree(&mut state).await.unwrap();
+                assert_eq!(
+                    git::tree_of(&state.repo, "HEAD").await.unwrap(),
+                    repaired_tree
+                );
+            }
+            let head = if phase == 0 {
+                let forge = Scripted::new(vec![seen(&old, Checks::Green, "CLEAN", false)], vec![]);
+                publish_landing_head(&mut state, &old, &green_pr().url, &forge)
+                    .await
+                    .unwrap()
+            } else {
+                resume_observed_head(&mut state, &old).await.unwrap()
+            };
+            assert!(git::is_ancestor(&state.repo, &old, &head).await);
+            assert!(git::is_ancestor(&state.repo, "origin/main", &head).await);
+            assert_eq!(git::rev_parse(&path, "HEAD").await.unwrap(), head);
+            assert_eq!(
+                git::remote_head(&state.repo, "origin", "task-head")
+                    .await
+                    .unwrap(),
+                Some(head.clone())
+            );
+            assert_eq!(state.gate_head.as_deref(), Some(head.as_str()));
+            assert_eq!(state.foreign_checkout.as_ref().unwrap().synced_head, head);
+            assert!(state.gate_allows_progress());
+            assert!(state.land_rebase_from.is_none());
+            assert!(!state.land_sync_pending);
+            assert!(git::is_clean(&path).await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_landing_conflict_repair_can_resume_and_publish_without_losing_ancestry() {
+        let (_tmp, mut state, old, path) = foreign_landing_fixture().await;
+        git::git(&state.repo, &["checkout", "main"]).await.unwrap();
+        std::fs::write(state.repo.join("change"), "conflicting base change").unwrap();
+        git::commit_all(&state.repo, "conflicting base")
+            .await
+            .unwrap();
+        git::git(&state.repo, &["push", "origin", "main"])
+            .await
+            .unwrap();
+        git::git(&state.repo, &["checkout", "winner"])
+            .await
+            .unwrap();
+        landing_gate_fixer(
+            &mut state,
+            "cat >/dev/null; printf resolved > change; printf '{\"addressed\":[],\"rejected\":[],\"notes\":\"resolved\"}'",
+        );
+        state.config.graph.gate_fix_rounds = 0;
+        state.config.verify.gate = vec!["exit 1".into()];
+        assert!(resume_observed_head(&mut state, &old).await.is_err());
+        assert!(state.rebase_fixes.iter().any(|fix| fix.finished));
+        let repaired = git::rev_parse(&state.repo, "HEAD").await.unwrap();
+        assert!(git::is_ancestor(&state.repo, &old, &repaired).await);
+        assert_eq!(
+            std::fs::read_to_string(state.repo.join("change")).unwrap(),
+            "resolved"
+        );
+        // A red gate must neither deliver nor publish the repaired tree.
+        assert_eq!(git::rev_parse(&path, "HEAD").await.unwrap(), old);
+        assert_eq!(
+            git::remote_head(&state.repo, "origin", "task-head")
+                .await
+                .unwrap(),
+            Some(old.clone())
+        );
+        state = RunState::load(&state.id).unwrap();
+        state.config.verify.gate = vec!["grep -q resolved change".into()];
+        let head = resume_observed_head(&mut state, &old).await.unwrap();
+        assert_eq!(head, repaired);
+        assert_eq!(git::rev_parse(&path, "HEAD").await.unwrap(), head);
+        assert_eq!(
+            std::fs::read_to_string(path.join("change")).unwrap(),
+            "resolved"
+        );
+        assert_eq!(
+            git::remote_head(&state.repo, "origin", "task-head")
+                .await
+                .unwrap(),
+            Some(head.clone())
+        );
+        assert_eq!(state.gate_head.as_deref(), Some(head.as_str()));
+        assert!(git::is_ancestor(&state.repo, "origin/main", &head).await);
+        assert!(git::is_clean(&path).await.unwrap());
     }
 
     #[tokio::test]

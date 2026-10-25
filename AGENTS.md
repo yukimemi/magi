@@ -3379,3 +3379,8 @@ failed fetches retain the saved local head even if a tracking ref survives.
 Automatic base synchronization merges into the shadow branch instead of rebasing,
 so the saved foreign head remains an ancestor for fast-forward delivery. A merge
 conflict is aborted and blocks the run with both checkouts retained.
+Landing synchronization retains the existing rebase/fixer path, then joins the
+saved pre-sync head with an `ours` merge before gating or publication. This keeps
+the repaired tree and fast-forward delivery ancestry. `land_rebase_from` remains
+the recovery checkpoint until restoration and that ancestry join complete;
+resumes must perform the same join before clearing it.
