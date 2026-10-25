@@ -1616,7 +1616,11 @@ async fn maintenance_named_resume_never_replaces_an_exhausted_run() {
             let receipt = std::fs::read_to_string(s.home.join("choice-actions")
                 .join(format!("{}.json", q.id))).unwrap();
             assert!(receipt.contains("refused or failed"), "{receipt}");
-            assert!(receipt.contains("can be resumed"), "{receipt}");
+            assert!(receipt.contains("review budget exhausted (1/1 rounds used)"), "{receipt}");
+            assert!(!receipt.contains("only a stalled or blocked"), "{receipt}");
+            assert!(receipt.contains("magi review <saved-branch> --task <task-id> --merge none"), "{receipt}");
+            assert!(receipt.contains("review-only successor with a new review budget"), "{receipt}");
+            assert!(receipt.contains("does not resume this run"), "{receipt}");
             assert_eq!(std::fs::read(&path).unwrap(), before);
             let runs_after = std::fs::read_dir(s.home.join("runs")).unwrap()
                 .map(|entry| entry.unwrap().file_name()).collect::<std::collections::BTreeSet<_>>();
