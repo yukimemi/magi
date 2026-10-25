@@ -1041,11 +1041,14 @@ where
                 Ok(s) if s.liveness(false) == Liveness::Live => {
                     ActionDecision::Refuse("run already has a live driver".into())
                 }
-                Ok(s) if crate::handover::can_resume(&s) => ActionDecision::Resume(run.clone()),
-                Ok(_) => ActionDecision::Refuse((p.resume_cannot_progress)(
-                    q.short(),
-                    ask::short_id(run),
-                )),
+                Ok(s) => match crate::handover::resume_refusal(&s) {
+                    None => ActionDecision::Resume(run.clone()),
+                    Some(reason) => ActionDecision::Refuse((p.resume_cannot_progress)(
+                        q.short(),
+                        ask::short_id(run),
+                        &reason.diagnostic(&s),
+                    )),
+                },
                 Err(e) => ActionDecision::Refuse((p.resume_unreadable)(
                     q.short(),
                     ask::short_id(run),
@@ -1083,7 +1086,7 @@ struct Phrases {
     no_run_to_recover: &'static str,
     could_not_start: &'static str,
     resume_not_latest: fn(&str, &str) -> String,
-    resume_cannot_progress: fn(&str, &str) -> String,
+    resume_cannot_progress: fn(&str, &str, &str) -> String,
     resume_unreadable: fn(&str, &str, &str) -> String,
     /// A takeover refusal: the operator-facing text. English is the error's own
     /// `Display`; a translation keeps the machine detail apart in parentheses.
@@ -1110,8 +1113,8 @@ const PHRASES_EN: Phrases = Phrases {
     resume_not_latest: |q, run| {
         format!("question {q} asked to resume run {run}, which is not this task's latest run")
     },
-    resume_cannot_progress: |q, run| {
-        format!("question {q} asked to resume run {run}, which cannot make progress")
+    resume_cannot_progress: |q, run, reason| {
+        format!("question {q} asked to resume run {run}, which cannot make progress: {reason}")
     },
     resume_unreadable: |q, run, e| {
         format!("question {q} asked to resume run {run}, which could not be read: {e}")
@@ -1143,8 +1146,8 @@ const PHRASES_JA: Phrases = Phrases {
             "質問 {q} は run {run} の再開を求めましたが、これはタスクの最新の run ではありません"
         )
     },
-    resume_cannot_progress: |q, run| {
-        format!("質問 {q} は run {run} の再開を求めましたが、これは進行できません")
+    resume_cannot_progress: |q, run, reason| {
+        format!("質問 {q} は run {run} の再開を求めましたが、これは進行できません: {reason}")
     },
     resume_unreadable: |q, run, e| {
         format!("質問 {q} は run {run} の再開を求めましたが、読み込めませんでした: {e}")
@@ -4007,10 +4010,9 @@ async fn public_resume_owner(
             owner.is_none(),
             "multiple retained public owners; inspect run lineage"
         );
-        anyhow::ensure!(
-            crate::handover::can_resume(&state),
-            "public owner cannot resume"
-        );
+        if let Some(reason) = crate::handover::resume_refusal_under(&state, Some(home)) {
+            anyhow::bail!(reason.diagnostic(&state));
+        }
         let claimed = is_working_on_other(home, id, Timestamp::now())?;
         anyhow::ensure!(
             state.liveness_under(home, claimed) == crate::run::Liveness::Dead,
@@ -11565,7 +11567,18 @@ mod tests {
                 decide_action(&task, &question, &PHRASES_EN, |_| Ok(state.clone())),
                 ActionDecision::Resume(state.id.clone())
             );
-            assert!(crate::resume::validate(home.path(), &state.id).is_err());
+            let error = crate::resume::validate(home.path(), &state.id)
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("review budget exhausted"), "{error}");
+            assert!(
+                error.contains(if review_rounds == 0 {
+                    "review is disabled"
+                } else {
+                    "gate already ran"
+                }),
+                "{error}"
+            );
 
             // An unexecuted gate still has work to do with or without reviews.
             state.gate_ran = false;
@@ -11803,6 +11816,185 @@ mod tests {
             Starter::Resume("stalled-run".to_owned()),
             "manual release must preserve the normal resume path"
         );
+    }
+
+    #[test]
+    fn resume_refusals_explain_admission_without_changing_task_or_run() {
+        crate::run::pin_test_home();
+        use crate::handover::{ResumeRefusal, resume_refusal_under};
+        let home = tempfile::tempdir().unwrap();
+        let mut exhausted = run_state(RunStatus::Blocked);
+        exhausted.driver_exited = true;
+        exhausted.config.graph.review_rounds = 3;
+        exhausted.reviews = (1..=3).map(review_round).collect();
+        for refusal in [
+            ResumeRefusal::ReviewBudget { used: 3, limit: 3 },
+            ResumeRefusal::Status(RunStatus::Ready),
+            ResumeRefusal::Released("20261022-000000-aaaa".into()),
+            ResumeRefusal::Retired("retirement-successor".into()),
+            ResumeRefusal::OwnershipTransferred("20261022-000000-bbbb".into()),
+        ] {
+            let mut state = exhausted.clone();
+            let expected = match refusal {
+                ResumeRefusal::Status(_) => {
+                    state.status = RunStatus::Ready;
+                    "status `ready`"
+                }
+                ResumeRefusal::Released(ref target) => {
+                    state.released_to = Some(target.clone());
+                    "execution was released"
+                }
+                ResumeRefusal::Retired(ref target) => {
+                    state.retired_to = Some(target.clone());
+                    "execution was retired"
+                }
+                ResumeRefusal::OwnershipTransferred(ref target) => {
+                    state.pr_taken_over_by = Some(target.clone());
+                    "PR ownership was transferred"
+                }
+                _ => "review budget exhausted (3/3 rounds used)",
+            };
+            assert_eq!(
+                resume_refusal_under(&state, Some(home.path())),
+                Some(refusal.clone())
+            );
+            assert_eq!(
+                refusal.successor(),
+                state
+                    .released_to
+                    .as_deref()
+                    .or(state.retired_to.as_deref())
+                    .or(state.pr_taken_over_by.as_deref())
+            );
+            state.save_under(home.path()).unwrap();
+            let queue = Queue::at(home.path().join("queue"));
+            let mut task = Task::new(
+                "retained implementation".into(),
+                state.instruction.clone(),
+                state.repo.clone(),
+                Source::Agent {
+                    run: "talk".into(),
+                    node: crate::queue::CHAT_NODE.into(),
+                },
+            );
+            task.runs.push(state.id.clone());
+            task.hold_machine(Some("stopped".into()));
+            queue.put(&mut task).unwrap();
+            let before_task = serde_json::to_value(queue.get(&task.id).unwrap()).unwrap();
+            let before_run = serde_json::to_value(&state).unwrap();
+            let error = crate::chat_control::resume(&queue, home.path(), "talk", &state.id)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(!error.contains("only a stalled or blocked"), "{error}");
+            if matches!(refusal, ResumeRefusal::Status(_)) {
+                assert!(
+                    error.contains("is final; there is nothing left to resume"),
+                    "{error}"
+                );
+            }
+            if matches!(refusal, ResumeRefusal::ReviewBudget { .. }) {
+                assert!(error.contains("magi review <saved-branch> --task <task-id> --merge none"));
+                assert!(error.contains("review-only successor with a new review budget"));
+                assert!(error.contains("does not resume this run"));
+            }
+            for target in [
+                &state.released_to,
+                &state.retired_to,
+                &state.pr_taken_over_by,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let short = if state.retired_to.as_ref() == Some(target) {
+                    target.as_str()
+                } else {
+                    crate::run::short_of(target)
+                };
+                assert!(
+                    error.contains(&format!("run {short}; inspect `magi show {short}`")),
+                    "{error}"
+                );
+                if short != target {
+                    assert!(!error.contains(target), "full successor id leaked: {error}");
+                }
+            }
+            assert_eq!(
+                serde_json::to_value(queue.get(&task.id).unwrap()).unwrap(),
+                before_task
+            );
+            assert_eq!(
+                serde_json::to_value(RunState::load_under(&state.id, home.path()).unwrap())
+                    .unwrap(),
+                before_run
+            );
+            let question = action_question(&state.id, resume_action(&state.id));
+            for phrases in [&PHRASES_EN, &PHRASES_JA] {
+                let ActionDecision::Refuse(detail) =
+                    decide_action(&task, &question, phrases, |_| Ok(state.clone()))
+                else {
+                    panic!("refusal expected");
+                };
+                assert!(detail.contains(expected), "{detail}");
+            }
+        }
+        // Preserve predicate ordering, while keeping every recorded destination visible.
+        exhausted.status = RunStatus::Ready;
+        exhausted.released_to = Some("released".into());
+        exhausted.retired_to = Some("retired".into());
+        exhausted.pr_taken_over_by = Some("owner".into());
+        let reason = resume_refusal_under(&exhausted, Some(home.path())).unwrap();
+        assert_eq!(reason, ResumeRefusal::Status(RunStatus::Ready));
+        let detail = reason.diagnostic(&exhausted);
+        for target in ["released", "retired", "owner"] {
+            assert!(detail.contains(&format!("magi show {target}")));
+        }
+    }
+
+    #[test]
+    fn resume_checkpoint_admission_uses_the_supplied_question_store() {
+        let home = tempfile::tempdir().unwrap();
+        let mut state = run_state(RunStatus::Blocked);
+        state.driver_exited = true;
+        state.config.graph.review_rounds = 1;
+        state.reviews = vec![review_round(1)];
+        assert!(crate::handover::resume_refusal_under(&state, Some(home.path())).is_some());
+        for checkpoint in ["publication", "approval", "armed", "landing", "question"] {
+            let mut saved = state.clone();
+            match checkpoint {
+                "publication" => saved.pr_publication_pending = true,
+                "approval" => {
+                    saved.land_approval = Some(crate::run::LandApproval {
+                        question: "approval".into(),
+                        head: "head".into(),
+                    })
+                }
+                "armed" => saved.land_armed_head = Some("head".into()),
+                "landing" => saved.status = RunStatus::Landing,
+                _ => {
+                    let mut question = ask::Question::new(
+                        saved.id.clone(),
+                        "review".into(),
+                        "review-1".into(),
+                        "continue?".into(),
+                        String::new(),
+                        vec!["continue".into()],
+                    );
+                    ask::Questions::at(home.path().join("questions"))
+                        .put(&mut question)
+                        .unwrap();
+                }
+            }
+            saved.save_under(home.path()).unwrap();
+            assert!(
+                crate::handover::resume_refusal_under(&saved, Some(home.path())).is_none(),
+                "{checkpoint}"
+            );
+            assert!(
+                crate::resume::validate(home.path(), &saved.id).is_ok(),
+                "{checkpoint}"
+            );
+        }
     }
 
     #[test]

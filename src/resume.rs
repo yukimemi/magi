@@ -8,13 +8,9 @@ pub(crate) fn validate(home: &Path, id: &str) -> Result<crate::run::RunState> {
     ensure!(crate::run::is_run_id(id), "invalid run id");
     let _owner = crate::pr_head::owner_lock(home, id)?;
     let state = crate::run::RunState::load_under(id, home)?;
-    ensure!(
-        crate::handover::can_resume(&state),
-        "run {} is `{}`, and only a stalled or blocked run can be resumed",
-        state.short(),
-        state.status.as_str()
-    );
-    ensure!(state.pr_taken_over_by.is_none(), "run ownership moved");
+    if let Some(reason) = crate::handover::resume_refusal_under(&state, Some(home)) {
+        anyhow::bail!(reason.diagnostic(&state));
+    }
     let claims = crate::daemon::is_working_on(home, id, jiff::Timestamp::now());
     ensure!(
         state.liveness_under(home, claims) != crate::run::Liveness::Live,
