@@ -1035,6 +1035,15 @@ function initLoopDetail() {
 }
 initLoopDetail();
 
+// Version details open only on request; health polling preserves that intent.
+let loopVersionOpen = false;
+const loopVersionToggle = $("loop-version");
+if (loopVersionToggle) loopVersionToggle.onclick = () => {
+  loopVersionOpen = !loopVersionOpen;
+  setAttr(loopVersionToggle, "aria-expanded", String(loopVersionOpen));
+  setAttr(loopVersionToggle, "aria-label", `${loopVersionOpen ? "Hide" : "Show"} version details${loopVersionToggle.dataset.mismatch === "yes" ? "; versions differ" : ""}`);
+  show($("loop-version-detail"), loopVersionOpen && !loopVersionToggle.hidden);
+};
 // Separate from the transient transport alert: normal polling must not erase
 // an update failure before someone can read it or after the page reloads.
 let upgradeSending = false;
@@ -1104,13 +1113,24 @@ function renderLoop() {
   const workerVersions = [...new Set(executionJobs.map((job) => job.version ? `v${job.version}` : "starting"))].join(", ");
   const workerSummary = executionJobs.length ? ` \u00b7 ${plural(executionJobs.length, "worker", "workers")} (${workerVersions})` : "";
   const schedulerSummary = scheduler ? ` \u00b7 serve ${scheduler.version ? `v${scheduler.version}` : "starting"}` : "";
-  setText(versionChip, version ? `web v${version}${schedulerSummary}${workerSummary}` : "");
-  setAttr(versionChip, "title", version
-    ? [`Web ${version} serves this page.`, ...jobs.map((job) => `${job.kind} ${job.key}: ${job.version ? `v${job.version}` : "starting"} / ${job.generation} (pid ${job.pid || "starting"})`)].join("\n")
-    : null);
-  show(versionChip, Boolean(version));
+  const versionDetail = $("loop-version-detail");
+  const detail = version
+    ? [`web v${version}${schedulerSummary}${workerSummary}`, `Web ${version} serves this page.`, ...jobs.map((job) => `${job.kind} ${job.key}: ${job.version ? `v${job.version}` : "starting"} / ${job.generation} (pid ${job.pid || "starting"})`)].join("\n")
+    : "";
+  const knownVersions = [version, ...jobs.map((job) => job.version)]
+    .filter((value) => typeof value === "string")
+    .map((value) => value.trim().replace(/^v/, ""))
+    .filter((value) => value && value !== "starting");
+  const mismatch = new Set(knownVersions).size > 1;
+  const versionAvailable = Boolean(version) && !state.healthError;
+  setText(versionDetail, detail);
+  setAttr(versionChip, "data-mismatch", mismatch ? "yes" : null);
+  setAttr(versionChip, "aria-expanded", String(versionAvailable && loopVersionOpen));
+  setAttr(versionChip, "aria-label", `${loopVersionOpen ? "Hide" : "Show"} version details${mismatch ? "; versions differ" : ""}`);
+  show(versionChip, versionAvailable);
+  show(versionDetail, versionAvailable && loopVersionOpen);
 
-  /* The chip and every button live in one grid cell (.daemon-controls) so
+  /* The info toggle and every button live in one grid cell (.daemon-controls) so
      that hiding or showing any one of them never changes how many items the
      .daemon grid itself is laying out. Called from every place below that
      touches one of their `hidden` flags, so the wrapper's own visibility
@@ -1164,7 +1184,6 @@ function renderLoop() {
     setAttr(box, "data-state", null);
     setAttr(box, "data-owned", null);
     setText(text, "Connecting\u2026");
-    setText(versionChip, "");
     show(versionChip, false);
     quiet(null);
     return;

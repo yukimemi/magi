@@ -302,7 +302,7 @@ a { color: inherit; text-decoration: none; }
 
 /* ---- loop strip -------------------------------------------------------- *
  * One slim line: dot, status sentence (ellipsised), an (i) toggle and the
- * .daemon-controls cluster (build chip + live buttons). The cluster is always
+ * .daemon-controls cluster (version info + live buttons). The cluster is always
  * exactly one grid item, so how many of its children are visible never changes
  * the item count. The long explanation (#loop-why) is folded away: it is the
  * tooltip of .daemon-body, opens under the line via the (i) toggle
@@ -353,13 +353,26 @@ a { color: inherit; text-decoration: none; }
   align-items: center;
   gap: var(--s2);
 }
-.daemon-controls:has([data-armed="yes"]),
-.daemon-controls:has(.daemon-version:not([hidden])) { grid-column: 1 / -1; grid-row: 3; flex-wrap: wrap; }
-.daemon-version {
-  font-family: var(--mono);
-  font-size: .6875rem;
-  color: var(--ink-3);
-  white-space: normal;
+.daemon-controls:has([data-armed="yes"]) { grid-column: 1 / -1; grid-row: 3; flex-wrap: wrap; }
+.daemon-version { flex: none; position: relative; }
+.daemon-version[data-mismatch="yes"] { border-color: var(--on-gold); color: var(--on-gold); }
+.daemon-version[data-mismatch="yes"]::after {
+  content: ""; position: absolute; top: 0; right: 0;
+  width: 4px; height: 4px; border-radius: 50%; background: var(--on-gold);
+}
+.daemon-version-detail {
+  grid-column: 1 / -1; grid-row: 4;
+  padding: var(--s1) 0;
+  font: .6875rem/1.5 var(--mono);
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+@media (max-width: 480px) {
+  .daemon { grid-template-columns: auto minmax(32px, 1fr) auto minmax(0, auto); gap: 0 var(--s1); }
+  .daemon-controls { min-width: 0; gap: var(--s1); }
+  .daemon .daemon-controls .daemon-btn:not([data-armed="yes"]) {
+    flex: 0 1 auto; min-width: 0; padding: 0 var(--s1);
+    overflow: hidden; text-overflow: ellipsis;
+  }
 }
 .daemon .daemon-btn {
   flex: none;

@@ -27,7 +27,7 @@ function harness(saved = null) {
   const client = runInNewContext([
     slice('async function request(', 'const deleteReq ='),
     slice('function upgradeOverdue(', 'function initLoopDetail('),
-    slice('let upgradeSending =', 'async function setLoop('),
+    slice('let loopVersionOpen =', 'async function setLoop('),
     '({upgrade, renderLoop, renderUpgradeError})',
   ].join('\n'), context);
   client.renderLoop();

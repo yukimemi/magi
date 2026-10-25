@@ -4926,6 +4926,139 @@ async fn question_chat_link_survives_consultation_and_settlement() {
 }
 
 #[tokio::test]
+async fn loop_version_details_stay_compact_and_preserve_toggle_state() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP loop versions: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let base = serve_with_client_probe(
+        &home,
+        Queue::at(home.join("queue")),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Upgrade,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
+    for (width, height, mobile) in [(390, 844, true), (1280, 900, false)] {
+        let page = browser
+            .open_page(&base, width, height, mobile)
+            .await
+            .unwrap();
+        browser
+            .wait_for(&page, "!!window.deck", Duration::from_secs(30))
+            .await
+            .unwrap();
+        let result = browser.eval(&page, r##"(async () => {
+          const check = (ok, why) => { if (!ok) throw new Error(why); };
+          deck.state.health = null; deck.state.healthError = null; deck.renderLoop();
+          check(document.getElementById('loop-version').textContent === 'i', 'connecting preserves info icon');
+          const health = {version:'0.1.0', loop:{running:true}, daemon:{idle:true},
+            update:{available:true, to:'v0.2.0'}, jobs:[
+              {kind:'scheduler', key:'serve', version:'0.1.0', generation:'web', pid:1},
+              {kind:'task', key:'task-1', queue_owned:true, version:' v0.1.0 ', generation:'worker', pid:2},
+              {kind:'chat', key:'chat-1', version:'starting'}, {kind:'task', key:'task-2'}]};
+          deck.state.health = health; deck.renderLoop();
+          await new Promise(resolve => requestAnimationFrame(resolve));
+          const info = document.getElementById('loop-version');
+          const detail = document.getElementById('loop-version-detail');
+          const box = document.getElementById('daemon');
+          const hash = location.hash;
+          const compact = () => {
+            const r = box.getBoundingClientRect();
+            const controls = [...document.querySelectorAll('#loop-controls > *, #loop-more, .daemon-dot')].filter(e => !e.hidden);
+            const rects = controls.map(e => e.getBoundingClientRect());
+            check(r.height <= 42, 'status must occupy one line: ' + r.height);
+            check(box.scrollWidth <= box.clientWidth && r.right <= innerWidth, 'header overflow');
+            for (const [i, rect] of rects.entries()) {
+              check(rect.left >= 0 && rect.right <= innerWidth, 'control outside viewport');
+              check(Math.abs(rect.top + rect.height/2 - (rects[0].top + rects[0].height/2)) < 2, 'controls must share one line');
+              for (const other of rects.slice(i+1)) check(rect.right <= other.left || other.right <= rect.left, 'controls overlap');
+            }
+          };
+          check(info.tagName === 'BUTTON' && info.type === 'button' && info.getAttribute('aria-controls') === detail.id, 'native toggle');
+          check(info.textContent === 'i' && info.getAttribute('aria-expanded') === 'false' && detail.hidden, 'initially compact');
+          check(!info.dataset.mismatch && !info.getAttribute('aria-label').includes('versions differ'), 'v prefix normalized; unknown and starting versions ignored');
+          const normalColor = getComputedStyle(info).color;
+          for (const id of ['loop-toggle', 'loop-park', 'loop-upgrade']) check(!document.getElementById(id).hidden, id + ' visible');
+          compact();
+          health.jobs[1].version = '0.0.9'; deck.renderLoop();
+          check(info.dataset.mismatch === 'yes' && info.getAttribute('aria-label').includes('versions differ'), 'mismatch marker');
+          const mismatchStyle = getComputedStyle(info);
+          check(mismatchStyle.color !== normalColor && mismatchStyle.borderTopColor === mismatchStyle.color && mismatchStyle.color === getComputedStyle(info, '::after').backgroundColor, 'mismatch colors text and border amber');
+          compact();
+          info.click();
+          check(!detail.hidden && info.getAttribute('aria-expanded') === 'true' && info.getAttribute('aria-label').startsWith('Hide'), 'tap opens');
+          check(detail.getBoundingClientRect().top >= document.getElementById('loop-controls').getBoundingClientRect().bottom, 'details below controls');
+          check(detail.textContent.includes('web v0.1.0') && detail.textContent.includes('serve v0.1.0') && detail.textContent.includes('task task-1: v0.0.9'), 'version breakdown');
+          info.focus(); deck.renderLoop();
+          check(!detail.hidden && document.activeElement === info, 'refresh preserves expansion and focus');
+          deck.state.healthError = 'offline'; deck.renderLoop();
+          check(info.hidden && detail.hidden && info.getAttribute('aria-expanded') === 'false', 'offline hides details');
+          deck.state.healthError = null; deck.renderLoop();
+          check(!detail.hidden, 'reconnect preserves expansion intent');
+          info.focus();
+          check(location.hash === hash, 'toggle does not navigate');
+          return true;
+        })()"##).await.expect("loop version layout assertions");
+        assert_eq!(result, true, "loop versions at {width}px");
+        // Include text so CDP emits the character event used by native Enter activation.
+        for (key, code, vk, text, expanded) in [
+            ("Enter", "Enter", 13, "\r", "false"),
+            (" ", "Space", 32, " ", "true"),
+        ] {
+            for kind in ["keyDown", "keyUp"] {
+                browser
+                    .call(
+                        Some(&page.session),
+                        "Input.dispatchKeyEvent",
+                        serde_json::json!({
+                            "type": kind, "key": key, "code": code, "windowsVirtualKeyCode": vk,
+                            "text": if kind == "keyDown" { text } else { "" },
+                            "unmodifiedText": if kind == "keyDown" { text } else { "" },
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let value = browser
+                .eval(
+                    &page,
+                    "document.getElementById('loop-version').getAttribute('aria-expanded')",
+                )
+                .await
+                .unwrap();
+            assert_eq!(value, expanded, "keyboard toggle at {width}px");
+        }
+        let result = browser.eval(&page, r##"(() => {
+          const check = (ok, why) => { if (!ok) throw new Error(why); };
+          const info = document.getElementById('loop-version');
+          const detail = document.getElementById('loop-version-detail');
+          const controls = document.getElementById('loop-controls');
+          const stop = document.getElementById('loop-toggle');
+          stop.click(); deck.renderLoop();
+          check(stop.dataset.armed === 'yes' && stop.textContent.includes('Stop claiming'), 'stop confirmation preserved');
+          check(getComputedStyle(controls).gridRowStart === '3', 'confirmation controls keep separate row');
+          check(detail.getBoundingClientRect().top >= controls.getBoundingClientRect().bottom, 'details below confirmation');
+          deck.state.health.upgrade = {stage:'downloading', to:'v0.2.0'};
+          deck.renderLoop();
+          check(document.getElementById('daemon').dataset.state === 'upgrading', 'upgrade progress state');
+          check(document.querySelector('.daemon-text').textContent.includes('Replacing the binary.'), 'upgrade progress label');
+          check(stop.hidden && document.getElementById('loop-park').hidden && document.getElementById('loop-upgrade').hidden, 'upgrade controls unchanged');
+          check(!detail.hidden, 'upgrade refresh preserves details');
+          return true;
+        })()"##).await.expect("confirmation and upgrade layout assertions");
+        assert_eq!(result, true, "confirmation and upgrade at {width}px");
+        browser.close_page(&page).await;
+    }
+}
+
+#[tokio::test]
 async fn upgrade_failures_remain_readable_and_retryable_on_phone() {
     let Some(chrome) = cdp::find_chrome() else {
         assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
