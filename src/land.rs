@@ -3831,12 +3831,15 @@ fn check_landing_resources(
 ) -> Result<()> {
     if let Some(blocked) = outcomes.iter().find(|outcome| outcome.resource_blocked) {
         let detail = format!("{}: {}", blocked.command, blocked.output_tail);
-        state.resource_block = Some(crate::run::ResourceBlock {
-            node: node.into(),
-            kind: "shared build cache".into(),
-            detail: detail.clone(),
-            at: jiff::Timestamp::now(),
-        });
+        state
+            .resource_block
+            .get_or_insert_with(|| crate::run::ResourceBlock {
+                cause: crate::run::ResourceBlockCause::Other,
+                node: node.into(),
+                kind: "shared build cache".into(),
+                detail: detail.clone(),
+                at: jiff::Timestamp::now(),
+            });
         state.event("resource", &detail);
         state.save()?;
         bail!("landing verification could not start: {detail}");
@@ -9225,11 +9228,19 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             pr_run(home.path(), id, "repo", RunStatus::Ready, PR, "open");
             let mut s = RunState::load_under(id, home.path()).unwrap();
             s.driver_exited = false;
+            // Model legacy driver evidence, not a newly reserved unstarted run.
+            s.driver_claimed = None;
             if id == live_id {
                 s.driver_pid = Some(std::process::id());
                 s.driver_started_at = crate::proc::process_started_at(std::process::id());
             }
             s.save_under(home.path()).unwrap();
+            if id == unknown_id {
+                assert_eq!(
+                    s.liveness_under(home.path(), false),
+                    crate::run::Liveness::Unknown
+                );
+            }
         }
         let known = BTreeMap::from([(PR.to_owned(), PrLifecycle::Merged)]);
         assert_eq!(apply_pr_states(home.path(), &known), 0);

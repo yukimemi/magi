@@ -1684,7 +1684,7 @@ impl ReviewRound {
                     .map(|why| format!(" ({why})"))
                     .unwrap_or_default()
             ),
-            E2eStatus::ResourceBlocked => "result: could not run — the shared build cache was \
+            E2eStatus::ResourceBlocked => "result: could not run — a required resource was \
                                             not available. This is evidence about the machine, \
                                             not about the patch."
                 .to_owned(),
@@ -1864,17 +1864,72 @@ pub struct ResourceWait {
     pub limit_secs: u64,
 }
 
-/// A resumable stop caused by an infrastructure wait that ran out.
+/// Why a resource operation stopped. Older records did not retain this evidence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ResourceBlockCause {
+    /// No structured evidence was saved.
+    #[default]
+    Unrecorded,
+    /// The resource wait actually exhausted its own budget.
+    Timeout {
+        /// Measured wait duration.
+        waited_secs: u64,
+        /// Configured resource wait budget.
+        limit_secs: u64,
+    },
+    /// Acquisition was cancelled, possibly by a known park request.
+    Cancelled {
+        /// Available only when the caller retained the park request.
+        park: Option<ParkCause>,
+    },
+    /// An infrastructure error, rather than an elapsed wait.
+    Other,
+}
+
+/// A resumable resource stop; earlier nodes or peers may already have run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceBlock {
-    /// Node whose agents were not started.
+    /// Node whose operation was blocked or interrupted.
     pub node: String,
     /// What stayed busy.
     pub kind: String,
-    /// Why the wait ended, in words.
+    /// Structured evidence from the point where acquisition ended.
+    #[serde(default)]
+    pub cause: ResourceBlockCause,
+    /// Why the operation ended, in words.
     pub detail: String,
     /// When it ended.
     pub at: Timestamp,
+}
+
+impl ResourceBlock {
+    /// Shared CLI, queue-hold and Web wording. Never infer a timeout from a
+    /// resource kind or a legacy record's configured budget.
+    #[must_use]
+    pub fn description(&self) -> String {
+        let reason = match &self.cause {
+            ResourceBlockCause::Timeout {
+                waited_secs,
+                limit_secs,
+            } => format!("resource wait timed out after {waited_secs}s (limit {limit_secs}s)"),
+            ResourceBlockCause::Cancelled { park: Some(cause) } => {
+                format!("resource wait cancelled for parking ({})", cause.label())
+            }
+            ResourceBlockCause::Cancelled { park: None } => "resource wait cancelled".into(),
+            ResourceBlockCause::Other => "resource operation blocked".into(),
+            ResourceBlockCause::Unrecorded if self.detail == "the run is parking" => {
+                "resource wait cancelled for parking (request source unrecorded)".into()
+            }
+            ResourceBlockCause::Unrecorded
+                if self.detail == "the wait for the build cache was cancelled" =>
+            {
+                "resource wait cancelled (request source unrecorded)".into()
+            }
+            ResourceBlockCause::Unrecorded => "resource stop cause unrecorded".into(),
+        };
+        format!("{}: {}: {reason} ({})", self.node, self.kind, self.detail)
+    }
 }
 
 impl ActiveSeat {
@@ -2312,10 +2367,11 @@ pub struct RunState {
     /// Cleared the moment the wait ends, whichever way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_wait: Option<ResourceWait>,
-    /// The run stopped because a shared resource stayed busy past
-    /// `[graph] timeout_resource_wait`. Not an agent failure: no agent was
-    /// spawned, no seat history, handover or quota loss was recorded, and a
-    /// resume asks the same agent again. Cleared by the resume.
+    /// The run stopped on a resource operation. This does not establish a timeout.
+    /// Pre-spawn acquisition failures do not spend the affected agent's budget,
+    /// alter its seat history or cause fallback. Earlier operations may have
+    /// completed; resource interruption can also stop a running operation.
+    /// Cleared by resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_block: Option<ResourceBlock>,
     /// The run that took this run's worktree over, when one did — see
@@ -2378,6 +2434,11 @@ pub struct RunState {
     /// legacy records may retain the old pid with `driver_exited = true`.
     #[serde(default)]
     pub driver_pid: Option<u32>,
+    /// Whether execution has ever claimed this record. New runs persist false
+    /// before exposure, then true atomically with their first pass and PID.
+    /// None is legacy/unknown, never evidence that execution did not start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_claimed: Option<bool>,
     /// The OS-reported moment [`Self::driver_pid`] started, recorded in the
     /// same breath as the pid itself — an opaque marker
     /// (`crate::proc::process_started_at`, epoch seconds as an integer
@@ -2649,6 +2710,7 @@ impl RunState {
             seats: BTreeMap::new(),
             active: BTreeMap::new(),
             driver_pid: None,
+            driver_claimed: Some(false),
             driver_started_at: None,
             driver_exited: false,
             pr: None,

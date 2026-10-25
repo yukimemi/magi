@@ -8865,7 +8865,7 @@ function buildReviewRounds(rounds, gate, roundsMd) {
           ? el("span", { class: "tag", "data-tone": "gold", text: "e2e deferred" })
           : null,
         Array.isArray(round.e2e) && round.e2e.some((o) => o && o.resource_blocked)
-          ? el("span", { class: "tag", "data-tone": "gold", text: "e2e could not run (cache unavailable)" })
+          ? el("span", { class: "tag", "data-tone": "gold", text: "e2e could not run (resource unavailable)" })
           : null,
         round.verdict
           ? voteTag(round.verdict, "verdict: ")

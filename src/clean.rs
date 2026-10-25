@@ -1337,6 +1337,7 @@ mod tests {
         write_blocked_run(&runs, live_id, ts("2026-08-01T00:00:00Z"));
         let mut status = crate::daemon::Status::new();
         status.current = vec![crate::daemon::Current {
+            worker: None,
             task: "20260905-000000-task".to_owned(),
             run: live_id.to_owned(),
         }];
@@ -1762,6 +1763,7 @@ mod tests {
         let now = Timestamp::now() + SignedDuration::new((MIN_ORPHAN_AGE_SECS + 1) as i64, 0);
         let mut status = crate::daemon::Status::new();
         status.current = vec![crate::daemon::Current {
+            worker: None,
             task: "20260905-000000-t111".to_owned(),
             run: "20260905-000000-cccc".to_owned(),
         }];

@@ -400,16 +400,30 @@ fn is_disk_hold(task: &Task) -> bool {
 /// still in force. `None` means this hold's cause is not one this module
 /// knows how to re-check at all, and a human has to look.
 fn machine_cause_resolved(task: &Task, cfg: &Config) -> Option<bool> {
+    machine_cause_resolved_under(task, cfg, &crate::run::home())
+}
+
+fn machine_cause_resolved_under(task: &Task, cfg: &Config, home: &Path) -> Option<bool> {
     if task
         .hold_reason
         .as_deref()
         .is_some_and(|r| r.starts_with(crate::cache::RESOURCE_HOLD))
     {
-        // The shared build cache's lease: free again (or no cache at all)
-        // means the same run can resume.
+        // A free lease resolves contention, not malformed manifests, failed
+        // metadata writes, cancellation, or unknown infrastructure failures.
+        // Require evidence from the exact latest run before auto-releasing.
+        let id = task.runs.last()?;
+        let state = crate::run::RunState::load_under(id, home).ok()?;
+        let block = state.resource_block.as_ref()?;
+        if state.id != *id
+            || block.kind != "shared build cache"
+            || !matches!(block.cause, crate::run::ResourceBlockCause::Timeout { .. })
+        {
+            return None;
+        }
         return Some(
             cfg.cache_dir()
-                .is_none_or(|dir| !crate::cache::in_use(&crate::run::home(), &dir)),
+                .is_none_or(|dir| !crate::cache::in_use(home, &dir)),
         );
     }
     if !is_disk_hold(task) {
@@ -1238,6 +1252,57 @@ mod tests {
 
     fn task(title: &str, repo: PathBuf) -> Task {
         Task::new(title.to_owned(), format!("do {title}"), repo, Source::Human)
+    }
+
+    #[test]
+    fn resource_holds_only_auto_release_a_proven_cache_wait_timeout() {
+        use crate::run::{ResourceBlock, ResourceBlockCause, RunState};
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::default(); // No configured cache means no busy lease.
+        assert!(cfg.cache_dir().is_none());
+        let mut state = RunState::new(
+            dir.path().into(),
+            "main".into(),
+            "base".into(),
+            "verify".into(),
+            cfg.clone(),
+        );
+        let mut task = task("verify", dir.path().into());
+        task.runs = vec![state.id.clone()];
+        task.hold_machine(Some("[resource] cache operation stopped".into()));
+        for cause in [
+            ResourceBlockCause::Other,
+            ResourceBlockCause::Unrecorded,
+            ResourceBlockCause::Cancelled { park: None },
+        ] {
+            state.resource_block = Some(ResourceBlock {
+                node: "gate".into(),
+                kind: "shared build cache".into(),
+                detail: "persistent metadata or manifest error".into(),
+                cause,
+                at: Timestamp::now(),
+            });
+            state.save_under(dir.path()).unwrap();
+            // Repeated triage must retain the hold even though the lease is free.
+            for _ in 0..3 {
+                assert_eq!(machine_cause_resolved_under(&task, &cfg, dir.path()), None);
+            }
+        }
+        let block = state.resource_block.as_mut().unwrap();
+        block.cause = ResourceBlockCause::Timeout {
+            waited_secs: 10,
+            limit_secs: 10,
+        };
+        state.save_under(dir.path()).unwrap();
+        assert_eq!(
+            machine_cause_resolved_under(&task, &cfg, dir.path()),
+            Some(true)
+        );
+        state.resource_block.as_mut().unwrap().kind = "repository coordination".into();
+        state.save_under(dir.path()).unwrap();
+        assert_eq!(machine_cause_resolved_under(&task, &cfg, dir.path()), None);
+        task.runs = vec!["unreadable-run".into()];
+        assert_eq!(machine_cause_resolved_under(&task, &cfg, dir.path()), None);
     }
 
     /// `[disk] min_free_bytes = 0` written next to a fictional repo, so

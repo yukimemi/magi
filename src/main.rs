@@ -5789,6 +5789,7 @@ mod tests {
         // A live daemon working on it is ordinary progress, not an orphan.
         let mut beat = daemon::Status::new();
         beat.current = vec![daemon::Current {
+            worker: None,
             task: t.id.clone(),
             run: "20260903-080619-01c2".to_owned(),
         }];
@@ -5804,6 +5805,7 @@ mod tests {
         let mut status = magi::daemon::Status::new();
         status.pid = 4242;
         status.current = vec![magi::daemon::Current {
+            worker: None,
             task: "20260902-140501-t111".to_owned(),
             run: "20260902-140502-r111".to_owned(),
         }];
@@ -5824,6 +5826,7 @@ mod tests {
         let mut status = magi::daemon::Status::new();
         status.updated_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(60);
         status.current = vec![magi::daemon::Current {
+            worker: None,
             task: "20260902-140501-t111".to_owned(),
             run: "20260902-140502-r111".to_owned(),
         }];
@@ -7786,6 +7789,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
         // killed process, and deleting those is the point of the command.
         let mut beat = magi::daemon::Status::new();
         beat.current = vec![magi::daemon::Current {
+            worker: None,
             task: "20260901-000000-task".to_owned(),
             run: run_running.to_owned(),
         }];

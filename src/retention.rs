@@ -1828,7 +1828,10 @@ mod tests {
         runs[6].save_under(&f.home).unwrap();
         runs[7].driver_exited = false;
         runs[7].driver_pid = None;
+        runs[7].driver_claimed = None; // Legacy record without first-claim evidence.
         runs[7].save_under(&f.home).unwrap();
+        assert_eq!(runs[7].liveness_under(&f.home, false), Liveness::Unknown);
+
         let hidden = &runs[8].candidates[0].worktree;
         git::git(hidden, &["update-index", "--assume-unchanged", "source"])
             .await

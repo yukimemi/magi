@@ -563,6 +563,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut old = predecessor(home.path());
         let next = predecessor(home.path());
+        // Missing legacy evidence remains unknown, unlike a record marked unstarted.
+        old.driver_claimed = None;
+        assert_eq!(old.liveness_under(home.path(), false), Liveness::Unknown);
+
         assert!(validate_predecessor(&mut old, &next, home.path(), false).is_err());
         old.driver_exited = true;
         assert!(validate_predecessor(&mut old, &next, home.path(), false).is_ok());
