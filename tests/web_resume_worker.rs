@@ -101,7 +101,7 @@ async fn configure(fx: &mut common::Fixture) -> std::path::PathBuf {
 
 async fn web(home: &Path, repo: &Path, log: &Path) -> (Web, SocketAddr) {
     let output = File::create(log).unwrap();
-    let process = Web(magi_cli(home)
+    let mut process = Web(magi_cli(home)
         .args(["web", "--bind", "127.0.0.1", "--port", "0", "--repo"])
         .arg(repo)
         .env("NO_COLOR", "1")
@@ -114,6 +114,12 @@ async fn web(home: &Path, repo: &Path, log: &Path) -> (Web, SocketAddr) {
     let mut address = None;
     wait_for(
         || {
+            if let Some(status) = process.0.try_wait().expect("check web startup") {
+                panic!(
+                    "web exited before listening ({status}): {}",
+                    std::fs::read_to_string(log).unwrap_or_default()
+                );
+            }
             address = std::fs::read_to_string(log).ok().and_then(|log| {
                 let start = log.find("http://127.0.0.1:")? + "http://".len();
                 let text: String = log[start..]
@@ -154,6 +160,35 @@ async fn request(
         });
         (status, value)
     }).await.expect("HTTP request timeout")
+}
+
+// Exercise the CLI isolation with inherited handover values, without changing
+// this test process's environment or requiring loopback network permission.
+#[test]
+fn fresh_web_cli_isolates_inherited_handover_but_allows_explicit_replacement() {
+    let home = tempfile::tempdir().unwrap();
+    for replacement in [false, true] {
+        let mut cli = magi_cli(home.path());
+        if replacement {
+            cli.env("MAGI_WEB_RESTART_PORT", "45678")
+                .env("MAGI_WEB_RESUME_LOOP", "1");
+        }
+        let mut child = std::process::Command::new("sh");
+        child
+            .env("MAGI_WEB_RESTART_PORT", "7878")
+            .env("MAGI_WEB_RESUME_LOOP", "1");
+        common::magi_cli_environment(&cli, &mut child);
+        let check = if replacement {
+            r#"test "$MAGI_WEB_RESTART_PORT" = 45678 && test "$MAGI_WEB_RESUME_LOOP" = 1"#
+        } else {
+            r#"test -z "${MAGI_WEB_RESTART_PORT+x}" && test -z "${MAGI_WEB_RESUME_LOOP+x}""#
+        };
+        let output = child
+            .args(["-c", check])
+            .output()
+            .expect("check CLI handover isolation");
+        assert!(output.status.success(), "replacement={replacement}");
+    }
 }
 
 async fn manual_web_resume_after_web_replacement(orphaned_running: bool) {

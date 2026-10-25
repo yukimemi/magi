@@ -10744,6 +10744,12 @@ async fn run_commands(
         let started = Instant::now();
         let mut cmd = tokio::process::Command::new(&shell[0]);
         cmd.quiet();
+        // Verify the checkout as a standalone caller. Worker ownership and
+        // pinned executable selection belong to this driver, not to tests or
+        // tools it runs. Preserve home/seat context and Running's containment.
+        for key in crate::worker::INVOCATION_ENV {
+            cmd.env_remove(key);
+        }
         cmd.args(&shell[1..])
             .arg(command)
             .current_dir(cwd)
@@ -16304,6 +16310,202 @@ mod tests {
             RunStatus::Blocked,
             "must not read as resource-blocked on a lease it never asked for"
         );
+    }
+
+    /// A separate process carries a live worker's environment throughout all
+    /// verification entry points; the parallel harness never changes its env.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verification_is_standalone_inside_a_live_worker() {
+        const CHILD: &str = "MAGI_VERIFY_WORKER_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let generation = crate::worker::pin_current(home.path()).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "graph::tests::verification_is_standalone_inside_a_live_worker",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("MAGI_HOME", home.path())
+                .env("MAGI_WORKER_HOME", home.path())
+                .env("MAGI_WORKER_ID", "abcdef")
+                .env("MAGI_WORKER_GENERATION", &generation.id)
+                .env("MAGI_WORKER_EXE", &generation.executable)
+                .env("MAGI_RUN", "verification-parent")
+                .env("MAGI_NODE", "gate")
+                .env("MAGI_SEAT", "worker-fixture")
+                .env("MAGI_TURN_SCOPE", "fixture-scope")
+                .env("MAGI_PROCESS_OWNER", "fixture-owner")
+                .env("MAGI_NO_AUTOUPDATE", "0")
+                .env("VERIFY_EXPECT_PATH", std::env::var_os("PATH").unwrap())
+                .env("VERIFY_AUTH_TOKEN", "fixture-auth")
+                .env(
+                    "VERIFY_EXPECT_TOOLCHAIN",
+                    std::env::var_os("RUSTUP_TOOLCHAIN").unwrap_or_default(),
+                )
+                .env(
+                    "VERIFY_EXPECT_CACHE",
+                    std::env::var_os("CARGO_TARGET_DIR").unwrap_or_default(),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let home = crate::run::home();
+        let directory = home.join("workers/jobs/abcdef");
+        std::fs::create_dir_all(&directory).unwrap();
+        let job = crate::worker::Job {
+            id: "abcdef".into(),
+            sequence: 1,
+            kind: "task".into(),
+            key: "task:verification".into(),
+            payload: serde_json::json!({}),
+            generation: std::env::var("MAGI_WORKER_GENERATION").unwrap(),
+            version: Some(env!("CARGO_PKG_VERSION").into()),
+            status: crate::worker::Status::Running,
+            result: None,
+            pid: Some(std::process::id()),
+            created_at: 0,
+            finished_at: None,
+        };
+        std::fs::write(
+            directory.join("job.json"),
+            serde_json::to_vec(&job).unwrap(),
+        )
+        .unwrap();
+        let _lease = crate::worker::execution_lease_for_test(&directory.join("live.lock"));
+        let assert_worker = || {
+            assert_eq!(
+                crate::worker::current_job(&home).unwrap().unwrap().id,
+                job.id
+            );
+            assert_eq!(crate::worker::active(&home).unwrap().len(), 1);
+            assert_eq!(
+                crate::worker::helper_executable(&home).unwrap(),
+                PathBuf::from(std::env::var_os("MAGI_WORKER_EXE").unwrap())
+            );
+            assert!(
+                crate::updater::Checker::new(&crate::config::Update {
+                    mode: crate::config::UpdateMode::Notify,
+                    interval: None,
+                    auto_restart: false,
+                })
+                .is_none(),
+                "the driver remains pinned, even while tests are standalone"
+            );
+        };
+        assert_worker();
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        // Keep storage, seat/control context, containment and tool lookup.
+        // No inherited values (or credentials) are printed on success.
+        let probe = r#"test -z "${MAGI_WORKER_ID+x}" &&
+            test -z "${MAGI_WORKER_GENERATION+x}" &&
+            test -z "${MAGI_WORKER_HOME+x}" &&
+            test -z "${MAGI_WORKER_EXE+x}" &&
+            test "$MAGI_HOME/repo" -ef . &&
+            test "$MAGI_RUN" = verification-parent &&
+            test "$MAGI_NODE" = gate &&
+            test "$MAGI_SEAT" = worker-fixture &&
+            test "$MAGI_TURN_SCOPE" = fixture-scope &&
+            test -n "$MAGI_PROCESS_OWNER" &&
+            test "$PATH" = "$VERIFY_EXPECT_PATH" &&
+            test "$VERIFY_AUTH_TOKEN" = fixture-auth &&
+            test "$RUSTUP_TOOLCHAIN" = "$VERIFY_EXPECT_TOOLCHAIN" &&
+            test "$CARGO_TARGET_DIR" = "$VERIFY_EXPECT_CACHE""#;
+        // Negative control: an ordinary child inherits the contamination.
+        assert!(
+            !std::process::Command::new("sh")
+                .args(["-c", probe])
+                .current_dir(&repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let unrelated_home = tempfile::tempdir().unwrap();
+        assert!(
+            crate::worker::current_job(unrelated_home.path()).is_err(),
+            "an inherited worker id cannot be resolved in a unit fixture's home"
+        );
+        let mut runner = runner_at(RunStatus::Gating);
+        runner.state.repo = repo.clone();
+        runner.state.config.disk.min_free_bytes = 0;
+        runner.state.config.coordination = crate::config::test_coordination();
+        std::fs::write(repo.join(".git/updater.contract"), "test-protocol-v1\n").unwrap();
+        runner.state.config.verify.e2e = vec![format!("{probe} && printf 'e2e\\n' >> phases")];
+        runner.state.config.verify.pre_gate = vec![format!("{probe} && printf 'pre\\n' >> phases")];
+        runner.state.config.verify.gate = vec![format!("{probe} && printf 'gate\\n' >> phases")];
+        let winner = Candidate {
+            index: 0,
+            label: 'A',
+            agent: "fixture".into(),
+            branch: "main".into(),
+            worktree: repo.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: false,
+        };
+        let (e2e, retried, pids) = run_e2e_with_retry(
+            &mut runner.state,
+            &["sh".into(), "-c".into()],
+            &[format!("{probe} && printf initial")],
+            &repo,
+            Duration::from_secs(10),
+            "initial",
+        )
+        .await;
+        assert!(!retried && pids.is_empty());
+        assert_eq!(e2e[0].code, Some(0), "{e2e:?}");
+        assert_eq!(e2e[0].output_tail, "initial");
+        let gate = runner.run_gate(&winner).await.unwrap();
+        assert!(gate.iter().all(CommandOutcome::ok), "{gate:?}");
+        // An interrupted repair must recheck e2e from saved state. Landing
+        // reuses that state and must run both pre-gate and gate again.
+        runner.state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
+            head: git::rev_parse(&repo, "HEAD").await.unwrap(),
+            passed: false,
+            outcomes: Vec::new(),
+        });
+        runner.state.save().unwrap();
+        let mut resumed = RunState::load(&runner.state.id).unwrap();
+        let wait = crate::repo_lock::WaitPolicy::default();
+        assert!(matches!(
+            check_gate_repair_e2e(&mut resumed, &winner, &wait)
+                .await
+                .unwrap(),
+            GateFix::Retry
+        ));
+        let saved = RunState::load(&resumed.id).unwrap();
+        let repair = saved.gate_repair_e2e.unwrap();
+        assert!(repair.passed);
+        assert_eq!(repair.outcomes.len(), 1);
+        assert!(repair.outcomes[0].ok());
+        let landing = run_landing_gate(&mut resumed, &winner, &wait)
+            .await
+            .unwrap();
+        assert_eq!(landing.len(), 1);
+        assert!(landing[0].ok(), "{landing:?}");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("phases")).unwrap(),
+            "pre\ngate\ne2e\npre\ngate\n"
+        );
+        assert_worker();
     }
 
     #[cfg(unix)]

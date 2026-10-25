@@ -117,16 +117,17 @@ where
     }
     *free -= 1;
     drop(free);
-    let out = std::process::Command::new(std::env::current_exe().expect("current_exe"))
+    let mut command = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+    for key in WORKER_ENV {
+        command.env_remove(key);
+    }
+    let out = command
         .args([name, "--exact", "--nocapture", "--test-threads=1"])
         .env(CHILD_ENV, "1")
         .env_remove("MAGI_RUN")
         .env_remove("MAGI_NODE")
         .env_remove("MAGI_SEAT")
         .env_remove("MAGI_TURN_SCOPE")
-        .env_remove("MAGI_WORKER_ID")
-        .env_remove("MAGI_WORKER_GENERATION")
-        .env_remove("MAGI_WORKER_HOME")
         // Named and empty: no machine layer. `Config::discover` in an
         // integration binary links the non-test library, so the operator's own
         // `config.toml` would otherwise merge with a fixture's `magi.toml` and

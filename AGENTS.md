@@ -3360,6 +3360,17 @@ through handover; neither manual nor automatic restarts wait for execution
 leases. The handover drains only admission transactions. Failed-tag suppression
 is process-local, not run state; do not persist it or change `run::SCHEMA` for update bookkeeping.
 
+### Verification runs as a standalone caller
+
+`graph::run_commands` removes only `worker::INVOCATION_ENV` from verification
+children (e2e, pre-gate and gate, including landing and gate-repair rechecks).
+Unit and integration subprocess isolation uses that same list. Inherited worker
+identity can resolve against a fixture's unrelated home, and a pinned worker
+generation suppresses updater checks or selects an old helper executable.
+Keep `MAGI_HOME`, seat metadata, process containment, toolchain/cache settings
+and authentication available; fixture storage belongs to each test. Never
+change the driver's environment or normal worker/agent launch semantics here.
+
 ### New run and conversation identities are reserved before use
 
 `RunState::new` only builds an unreserved value. Every production creation path
