@@ -801,6 +801,36 @@ impl Question {
         self.choices.is_empty()
     }
 
+    /// Exact reply values, kept separate from human action descriptions.
+    /// Resolve each advertised alias through the real parser, including ambiguity.
+    pub fn reply_guidance(&self) -> String {
+        self.choices
+            .iter()
+            .map(|label| {
+                let aliases: Vec<_> = ["resume-run", "keep-held"]
+                    .into_iter()
+                    .filter(|alias| self.resolve_reply(alias).ok() == Some(label.as_str()))
+                    .collect();
+                let exact = serde_json::to_string(label).expect("serialize label");
+                let reply = if aliases.is_empty() {
+                    format!("exact label: {exact}")
+                } else {
+                    format!(
+                        "exact label: {exact}; accepted aliases: {}",
+                        aliases.join(", ")
+                    )
+                };
+                match self.actions.get(label) {
+                    Some(action) => {
+                        format!("{reply}; effect (not reply text): {}", action.describe())
+                    }
+                    None => reply,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Resolve terminal aliases to the exact stored label before authorization.
     /// Aliases describe structured effects, never translated display text.
     pub fn resolve_reply<'a>(&'a self, reply: &'a str) -> Result<&'a str> {
@@ -823,7 +853,8 @@ impl Question {
         match matches.as_slice() {
             [(label, _)] => Ok(label.as_str()),
             [] => bail!(
-                "alias mismatch: `{reply}` is not an offered label or supported action alias; inspect `magi answer --list`"
+                "alias mismatch with offered choices: `{reply}` is not an offered label or supported action alias; exact labels: {}; inspect `magi answer --list`, copy the intended offered label verbatim into --reply, and retry once only if the same owner authorization still holds (action descriptions and bracketed annotations are not reply values)",
+                serde_json::to_string(&self.choices).expect("serialize labels")
             ),
             _ => bail!(
                 "ambiguous action alias: `{reply}` matches multiple choices; select the intended offered label"
@@ -4103,6 +4134,47 @@ mod tests {
         q.answer(Answer::Choice("SQLite".to_owned())).unwrap();
         let shown = answer_for_agent(&q, "SQLite");
         assert!(shown.contains("new") && !shown.contains("old"), "{shown}");
+    }
+
+    #[test]
+    fn reply_guidance_distinguishes_resume_actions_and_display_annotations() {
+        let mut q = choice_question();
+        q.choices = vec!["daemon: resume".into(), "daemon: hold".into()];
+        q.actions.insert(
+            q.choices[0].clone(),
+            ChoiceAction::ResumeRun {
+                run: "run-a".into(),
+            },
+        );
+        q.actions.insert(q.choices[1].clone(), ChoiceAction::Hold);
+        assert!(!q.reply_guidance().contains("accepted aliases: resume-run"));
+        assert!(q.reply_guidance().contains("accepted aliases: keep-held"));
+        assert!(
+            q.resolve_reply("resume-run")
+                .unwrap_err()
+                .to_string()
+                .contains("with offered choices")
+        );
+        assert_eq!(q.resolve_reply("daemon: resume").unwrap(), "daemon: resume");
+        assert!(
+            q.resolve_reply("daemon: resume [resume run run-a]")
+                .is_err()
+        );
+        q.actions.insert(
+            q.choices[0].clone(),
+            ChoiceAction::Resume {
+                run: "run-a".into(),
+            },
+        );
+        assert!(q.reply_guidance().contains("accepted aliases: resume-run"));
+        q.choices.push("another resume".into());
+        q.actions.insert(
+            "another resume".into(),
+            ChoiceAction::Resume {
+                run: "run-b".into(),
+            },
+        );
+        assert!(!q.reply_guidance().contains("accepted aliases: resume-run"));
     }
 
     #[test]

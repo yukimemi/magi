@@ -158,8 +158,14 @@ Investigation has read-only filesystem access, no extra writable roots and no
 sandbox bypass, including in write-enabled standing conversations. It may inspect
 existing files/history within the standing permissions, but cannot fetch, edit,
 answer, close, withdraw, discard or resume. Its lease follows the ordinary process
-cleanup lifetime, including cancellation and descendants. The next operator turn
-returns to consultation control while the question remains open. Unregistered
+cleanup lifetime, including cancellation and descendants. After a successful
+investigation, the launcher returns to consultation control once in the same
+turn. It revalidates the turn lease, consultation, unchanged question, repository,
+unchanged persisted conversation evidence and absence of pending input before
+starting control. Evidence stays internal; no owner send or recommendation
+binding is added. A second investigation request
+is reported as a blocker, not repeated. Existing action guards still decide
+whether the unchanged owner instruction authorizes any operation. Unregistered
 repositories follow the existing no-coordination policy; invalid registrations
 and unsupported platforms fail closed.
 
@@ -168,8 +174,8 @@ reply immediately. The lock owner is unknown; the task awaiting this question ma
 be holding it. Never release another seat's lock or answer merely to investigate.
 When queue state identifies a related running task, the reply includes its ID and
 `magi task show` command as a diagnostic lead, without claiming lock ownership.
-Use read-only control-plane diagnostics and ask to investigate again in the same
-conversation when coordination is available. No question or execution state is
+Use read-only control-plane diagnostics and report the concrete coordination
+blocker in the same conversation. No question or execution state is
 changed by this transition. Genuine decisions still go through `magi answer`
 with its exact action-specific evidence and owner checks.
 

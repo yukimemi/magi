@@ -613,7 +613,7 @@ fn diagnose_authorization_failure(
     quote: Option<&str>,
 ) -> &'static str {
     if !q.free_text() && !q.choices.iter().any(|choice| choice == reply) {
-        return "alias mismatch: resolve an offered label or supported action alias with `magi answer --list`";
+        return "alias mismatch: run `magi answer --list`, copy the intended offered label verbatim into --reply, and retry once only if the same owner authorization still holds";
     }
     let queued_owner = (!talk.pending.is_empty() || !talk.pending_messages.is_empty())
         && (talk.pending_messages.is_empty()
@@ -738,7 +738,12 @@ fn recovery_authority(
     if binding.choice != reply
         || recommended_choice(&recommendation.body, q, questions) != Some(reply)
     {
-        bail!("alias mismatch: the selected action differs from the persisted recommendation");
+        bail!(
+            "alias mismatch with persisted recommendation: selected label {} differs from saved label {} for question {}; correcting reply spelling cannot replace owner evidence; use the saved recommended label only if it still reflects the owner's intent, or present one new explicit recommendation if the owner's intent changed and obtain current owner authorization before answering",
+            serde_json::to_string(reply).expect("serialize selected label"),
+            serde_json::to_string(&binding.choice).expect("serialize saved label"),
+            q.id
+        );
     }
     Ok(AnswerAuthority {
         talk: talk.id.clone(),
