@@ -1143,6 +1143,19 @@ redundant:
   instruction to merge as the approval agent judges it (see the deputy
   section: it no longer has to be the single word), merges.
 
+**CI failures are attributed before spending a fix round.** A red check with
+unreadable (`UNKNOWN`) merge state waits up to three minutes per head, persisted
+across resumes; rerunning CI does not extend that deadline. If a red check would
+lead to repair, optional checks also receive the configured one automatic rerun
+per head/workflow run. An independently reproduced failure on the current remote
+base can park landing on a typed owner question and refund the task attempt once
+per execution pass. Attribution requires complete structured failure annotations,
+matching check/app identities and locations on base, a completed rerun, and no
+intersection with changed paths or CI/build configuration. Missing or ambiguous
+evidence retains the ordinary safe stop. This never authorizes merging over a
+required failure or bypasses either approval gate. A resume reobserves the PR;
+it cannot automatically rerun the same workflow run again.
+
 An unattended merge requires flipping both, which is two deliberate choices.
 Do not "simplify" them into one flag: the useful middle state - magi does the
 watching and the fixing, a human owns the irreversible step - is exactly the

@@ -394,6 +394,7 @@ pub fn decide_with(
         // - and pull request 37's only red check was an *action* that could
         // not fetch its own binary. Merge, and name them so the record is
         // honest about what was red when it landed.
+        Checks::Red if pr.blocking == Blocking::Unsaid && waited < CHECKS_GRACE => Step::Wait,
         Checks::Red if !pr.blocking.stops_a_merge() && pr.review_comments.is_empty() => Step::Merge,
         Checks::Red => {
             let what = format!(
@@ -3384,6 +3385,9 @@ trait Forge {
         }
         Ok(())
     }
+    async fn attribution(&self, _state: &RunState, _seen: &Seen) -> Option<CiEvidence> {
+        None
+    }
     async fn view(&self, repo: &Path, pr_url: &str) -> Result<Seen>;
     async fn merge(&self, repo: &Path, argv: &[String]) -> Result<(bool, String)>;
     async fn poll(&self);
@@ -3409,6 +3413,9 @@ trait Forge {
 struct GhForge;
 
 impl Forge for GhForge {
+    async fn attribution(&self, state: &RunState, seen: &Seen) -> Option<CiEvidence> {
+        collect_ci_evidence(state, seen).await
+    }
     async fn view(&self, repo: &Path, pr_url: &str) -> Result<Seen> {
         observe(repo, pr_url).await
     }
@@ -4117,6 +4124,7 @@ async fn resume_landing_head<F: Forge>(
 
 async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> Result<PrState> {
     crate::pr_head::ensure_owner(state)?;
+    state.land_unrelated = None;
     let reopening_hold = crate::merge_decision::resumable_hold(state);
     let repo = state.repo.clone();
     let budget = state.config.graph.land_rounds;
@@ -4326,12 +4334,47 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
             }
         }
 
+        // The merge-state grace is head-bound and durable. Reruns reset the
+        // checks clock, but must not extend this deadline across resumes.
+        let decision_wait = if pr.checks == Checks::Red && pr.blocking == Blocking::Unsaid {
+            let first = state
+                .land_unsaid
+                .get_or_insert_with(|| (seen.head.clone(), forge.now()));
+            if !first.0.eq_ignore_ascii_case(&seen.head) {
+                *first = (seen.head.clone(), forge.now());
+            }
+            let elapsed = Duration::from_secs(forge.now().saturating_sub(first.1).max(0) as u64);
+            state.save()?;
+            elapsed
+        } else {
+            waited
+        };
+        let proposed = decide(&pr, round, budget, decision_wait);
+        if pr.checks == Checks::Red && pr.blocking == Blocking::Unsaid && proposed == Step::Wait {
+            if waited >= WAIT_CEILING {
+                stop_disarmed(
+                    forge,
+                    state,
+                    &repo,
+                    &pr,
+                    "merge state remained unreadable; refusing to merge on a guess",
+                )
+                .await?;
+                return Ok(pr);
+            }
+            waited += POLL;
+            forge.poll().await;
+            continue;
+        }
+
         // A failed workflow run is rerun once, judged by its own run rather
         // than by the rollup's aggregate: another run still pending, or a fix
         // budget already spent, must not keep a flaky failure from its one
         // rerun. It spends no round and no attempt.
         if pr.state == PrLifecycle::Open && state.config.graph.rerun_flaky_checks {
-            let failing = rerunnable(&seen.contexts);
+            let include_optional = pr.checks == Checks::Red
+                && matches!(proposed, Step::Fix { .. } | Step::GiveUp { .. });
+            let failing = rerunnable_with(&seen.contexts, include_optional);
             let now = forge.now();
             match rerun_step(&failing, state.land_reruns.as_ref(), &seen.head, now) {
                 RerunStep::Rerun(runs) => {
@@ -4396,7 +4439,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
             }
         }
 
-        let step = decide(&pr, round, budget, waited);
+        let step = proposed;
         // Armed on exactly this head: the forge is doing the waiting. A
         // decision to merge (or keep waiting) is only watched, never re-armed
         // and never re-approved; anything else - a red check, a comment, a
@@ -4434,6 +4477,33 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 stop(state, &repo, &pr, &why).await?;
                 return Ok(pr);
             }
+        }
+        if pr.checks == Checks::Red
+            && matches!(step, Step::Fix { .. } | Step::GiveUp { .. })
+            && pr.review_comments.is_empty()
+            && let Some(evidence) = forge.attribution(state, &seen).await
+            && evidence.unrelated(&seen.head, &pr.failing)
+        {
+            if owner_stop(state, &mut pr, forge).await? {
+                return Ok(pr);
+            }
+            // Attribution does not authorize action against an unseen push.
+            let fresh = forge.view(&repo, pr_url).await?;
+            if fresh.head != seen.head
+                || fresh.rollup_head != seen.rollup_head
+                || fresh.pr.state != PrLifecycle::Open
+                || fresh.pr.checks != Checks::Red
+                || fresh.pr.failing != pr.failing
+                || fresh
+                    .pr
+                    .review_comments
+                    .iter()
+                    .any(|c| !shown.contains(&c.body))
+            {
+                continue;
+            }
+            hold_unrelated(state, &pr, evidence).await?;
+            return Ok(pr);
         }
         match step {
             Step::Wait => {
@@ -4873,6 +4943,33 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                         forge.poll().await;
                     }
                     Fixed::Declined if was_red => {
+                        // Review comments may have required this round even
+                        // when CI was unrelated. Once the fixer has read them,
+                        // use the same structural attribution before charging
+                        // a no-commit stop to the task.
+                        if let Some(evidence) = forge.attribution(state, &seen).await
+                            && evidence.unrelated(&seen.head, &pr.failing)
+                        {
+                            let fresh = forge.view(&repo, pr_url).await?;
+                            if fresh.head != seen.head
+                                || fresh.rollup_head != seen.rollup_head
+                                || fresh.pr.state != PrLifecycle::Open
+                                || fresh.pr.checks != Checks::Red
+                                || fresh.pr.failing != pr.failing
+                                || fresh
+                                    .pr
+                                    .review_comments
+                                    .iter()
+                                    .any(|c| !shown.contains(&c.body))
+                            {
+                                continue;
+                            }
+                            if owner_stop(state, &mut pr, forge).await? {
+                                return Ok(pr);
+                            }
+                            hold_unrelated(state, &pr, evidence).await?;
+                            return Ok(pr);
+                        }
                         let why = format!(
                             "the fixer produced no commit while {} check(s) were failing \
                              ({}); stopping instead of looping on an unchanged tree",
@@ -4899,6 +4996,305 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
             }
         }
     }
+}
+
+/// Owner decision for a CI failure independently reproduced on the base.
+pub const CI_HOLD_NODE: &str = "land-ci-unrelated";
+
+/// Durable machine-hold evidence, bound to one observed PR head.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CiHold {
+    /// Head that exhibited the independently reproduced failures.
+    pub head: String,
+    /// Typed owner question controlling resumption.
+    pub question: String,
+    /// Complete structured facts used to attribute the failures.
+    pub evidence: CiEvidence,
+}
+
+/// Only structured forge annotations are compared, never log prose.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct CiFailure {
+    path: String,
+    start_line: u64,
+    end_line: u64,
+    title: String,
+    message: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CiCheckEvidence {
+    label: String,
+    head_check: u64,
+    base_check: u64,
+    app: u64,
+    run: String,
+    base_run: String,
+    head_failures: Vec<CiFailure>,
+    base_failures: Vec<CiFailure>,
+    rerun_exhausted: bool,
+}
+
+/// Pinned Git diff and forge failure annotations used for CI attribution.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CiEvidence {
+    head: String,
+    base: String,
+    changed: Vec<String>,
+    checks: Vec<CiCheckEvidence>,
+}
+
+impl CiEvidence {
+    /// Every red check must have the same located failure on the base, outside
+    /// the diff. Changes to CI/build configuration invalidate this inference.
+    fn unrelated(&self, head: &str, failing: &[String]) -> bool {
+        if self.head != head
+            || self.base.is_empty()
+            || failing.is_empty()
+            || self.changed.iter().any(|p| {
+                p.starts_with(".github/")
+                    || p.starts_with(".config/")
+                    || p.starts_with(".cargo/")
+                    || matches!(
+                        p.rsplit('/').next().unwrap_or(p),
+                        "Cargo.toml"
+                            | "Cargo.lock"
+                            | "Makefile.toml"
+                            | "build.rs"
+                            | "rust-toolchain.toml"
+                    )
+            })
+        {
+            return false;
+        }
+        failing.iter().all(|label| {
+            let matches: Vec<_> = self.checks.iter().filter(|c| &c.label == label).collect();
+            matches.len() == 1
+                && matches[0].rerun_exhausted
+                && !matches[0].head_failures.is_empty()
+                && matches[0].head_failures.iter().all(|f| {
+                    // Workflow-level exit-code annotations do not identify a
+                    // failing test or source file, and prove nothing here.
+                    !f.path.is_empty()
+                        && !f.path.starts_with('.')
+                        && !f.path.contains("..")
+                        && !f.path.starts_with('/')
+                        && !self.changed.contains(&f.path)
+                        && matches[0].base_failures.contains(f)
+                })
+        })
+    }
+}
+
+async fn ci_json(repo: &Path, endpoint: String) -> Option<serde_json::Value> {
+    let (ok, body) = gh(repo, &["api".into(), endpoint]).await.ok()?;
+    if !ok {
+        return None;
+    }
+    serde_json::from_str(&body).ok()
+}
+
+async fn ci_annotations(repo: &Path, check: &serde_json::Value) -> Option<Vec<CiFailure>> {
+    let count = check.pointer("/output/annotations_count")?.as_u64()?;
+    if count == 0 || count >= 100 {
+        return None;
+    }
+    let id = check.get("id")?.as_u64()?;
+    let value = ci_json(
+        repo,
+        format!("repos/{{owner}}/{{repo}}/check-runs/{id}/annotations?per_page=100"),
+    )
+    .await?;
+    let annotations = value.as_array()?;
+    if annotations.len() != count as usize {
+        return None;
+    }
+    annotations
+        .iter()
+        .filter(|a| a["annotation_level"] == "failure")
+        .map(|a| {
+            Some(CiFailure {
+                path: a["path"].as_str()?.into(),
+                start_line: a["start_line"].as_u64()?,
+                end_line: a["end_line"].as_u64()?,
+                title: a["title"].as_str()?.into(),
+                message: a["message"].as_str()?.into(),
+            })
+        })
+        .collect()
+}
+
+async fn ci_runs(repo: &Path, sha: &str) -> Option<Vec<serde_json::Value>> {
+    let value = ci_json(
+        repo,
+        format!("repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100&filter=latest"),
+    )
+    .await?;
+    let runs = value["check_runs"].as_array()?;
+    if value["total_count"].as_u64()? != runs.len() as u64 || runs.len() >= 100 {
+        return None;
+    }
+    Some(runs.clone())
+}
+
+async fn collect_ci_evidence(state: &RunState, seen: &Seen) -> Option<CiEvidence> {
+    let repo = &state.repo;
+    let base_ref = format!("refs/remotes/{}/{}", state.config.merge.remote, seen.base);
+    let base = git::git_raw(repo, &["rev-parse", "--verify", &base_ref])
+        .await
+        .ok()?;
+    if !base.ok() {
+        return None;
+    }
+    let range = format!("{}...{}", base.stdout, seen.head);
+    // No rename detection: both old and new paths must count as changed.
+    let diff = git::git_raw(
+        repo,
+        &["diff", "--no-renames", "--name-only", "-z", &range, "--"],
+    )
+    .await
+    .ok()?;
+    if !diff.ok() {
+        return None;
+    }
+    let head_runs = ci_runs(repo, &seen.head).await?;
+    let base_runs = ci_runs(repo, &base.stdout).await?;
+    let mut checks = Vec::new();
+    for label in &seen.pr.failing {
+        let matching = |runs: &[serde_json::Value]| {
+            runs.iter()
+                .filter(|r| r["name"].as_str() == Some(label))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let heads = matching(&head_runs);
+        let bases = matching(&base_runs);
+        if heads.len() != 1 || bases.len() != 1 {
+            return None;
+        }
+        let h = &heads[0];
+        let b = &bases[0];
+        if h["conclusion"] != "failure"
+            || b["conclusion"] != "failure"
+            || h["status"] != "completed"
+            || b["status"] != "completed"
+            || h["head_sha"].as_str()? != seen.head
+            || b["head_sha"].as_str()? != base.stdout
+            || h.pointer("/app/id")?.as_u64()? != b.pointer("/app/id")?.as_u64()?
+        {
+            return None;
+        }
+        let run = run_of(h["details_url"].as_str()?)?;
+        let contexts: Vec<_> = seen.contexts.iter().filter(|c| &c.label == label).collect();
+        if contexts.len() != 1
+            || contexts[0].run.as_ref() != Some(&run)
+            || contexts[0].verdict != Verdict::Fail
+        {
+            return None;
+        }
+        // A persisted request alone is not a completed rerun: require the
+        // workflow's structured attempt number as well.
+        let workflow =
+            ci_json(repo, format!("repos/{{owner}}/{{repo}}/actions/runs/{run}")).await?;
+        let base_run = run_of(b["details_url"].as_str()?)?;
+        let base_workflow = ci_json(
+            repo,
+            format!("repos/{{owner}}/{{repo}}/actions/runs/{base_run}"),
+        )
+        .await?;
+        if base_workflow["head_sha"].as_str()? != base.stdout
+            || base_workflow["head_branch"].as_str()? != seen.base
+            || base_workflow["status"] != "completed"
+            || base_workflow["conclusion"] != "failure"
+            || base_workflow["workflow_id"].as_u64()? != workflow["workflow_id"].as_u64()?
+        {
+            return None;
+        }
+        let exhausted = state
+            .land_reruns
+            .as_ref()
+            .is_some_and(|r| r.head == seen.head && r.runs.contains_key(&run))
+            && workflow["head_sha"].as_str()? == seen.head
+            && workflow["run_attempt"].as_u64()? > 1
+            && workflow["status"] == "completed";
+        checks.push(CiCheckEvidence {
+            label: label.clone(),
+            head_check: h["id"].as_u64()?,
+            base_check: b["id"].as_u64()?,
+            app: h.pointer("/app/id")?.as_u64()?,
+            run,
+            base_run,
+            head_failures: ci_annotations(repo, h).await?,
+            base_failures: ci_annotations(repo, b).await?,
+            rerun_exhausted: exhausted,
+        });
+    }
+    Some(CiEvidence {
+        head: seen.head.clone(),
+        base: base.stdout,
+        changed: diff
+            .stdout
+            .split('\0')
+            .filter(|p| !p.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        checks,
+    })
+}
+
+async fn hold_unrelated(state: &mut RunState, pr: &PrState, evidence: CiEvidence) -> Result<()> {
+    let detail = serde_json::to_string(&evidence)?;
+    let resume = "daemon: CI を確認して同じ run を再開する".to_owned();
+    let hold = "operator: 保留して後で判断する".to_owned();
+    let mut q = ask::Question::new(
+        state.id.clone(),
+        CI_HOLD_NODE.into(),
+        "land".into(),
+        "base でも再現する CI の失敗を検出したため、試行を消費せず保留しました".into(),
+        format!(
+            "必須チェックや承認は省略しません。再開時にも同じ workflow run は自動再実行しません。\n構造化された判定根拠:\n{detail}"
+        ),
+        vec![resume.clone(), hold.clone()],
+    );
+    q.actions.insert(
+        resume,
+        ask::ChoiceAction::Resume {
+            run: state.id.clone(),
+        },
+    );
+    q.actions.insert(hold, ask::ChoiceAction::Hold);
+    ask::Questions::open().put_executable(&mut q)?;
+    state.land_unrelated = Some(CiHold {
+        head: evidence.head.clone(),
+        question: q.id.clone(),
+        evidence,
+    });
+    state.event("land", format!("[ci-unrelated] base reproduces every located failure after rerun; owner question {}: {detail}", q.id));
+    state.end_pass_parked(crate::run::ParkCause::Question);
+    state.parked = true;
+    state.save()?;
+    if let Err(e) = ask::notify(&state.config.notify, &q).await {
+        tracing::warn!("could not notify about CI hold: {e:#}");
+    }
+    // A durable question and evidence are sufficient even if commenting fails.
+    let body = stop_comment(
+        &state.id,
+        "CI failures independently reproduced on the base; awaiting an owner decision without charging the task attempt",
+    );
+    let (_, body) = crate::github_text::prepare(state, "", &body);
+    gh(
+        &state.repo,
+        &[
+            "pr".into(),
+            "comment".into(),
+            pr.number.to_string(),
+            "--body".into(),
+            body,
+        ],
+    )
+    .await
+    .ok();
+    Ok(())
 }
 
 /// One observation, plus the two things [`PrState`] deliberately does not carry:
@@ -4947,10 +5343,18 @@ enum RerunStep {
 /// Failed checks a rerun may help: a failure of a check that blocks (`required`
 /// unreadable counts), as `(label, run)`. Judged one workflow run at a time;
 /// pending checks in another run do not delay this run's rerun.
+#[cfg(test)]
 fn rerunnable(contexts: &[CheckInfo]) -> Vec<(String, Option<String>)> {
+    rerunnable_with(contexts, false)
+}
+
+fn rerunnable_with(
+    contexts: &[CheckInfo],
+    include_optional: bool,
+) -> Vec<(String, Option<String>)> {
     contexts
         .iter()
-        .filter(|c| c.verdict == Verdict::Fail && c.required != Some(false))
+        .filter(|c| c.verdict == Verdict::Fail && (include_optional || c.required != Some(false)))
         // `gh run rerun --failed` refuses a run with a job still going.
         .filter(|c| {
             c.run.as_ref().is_none_or(|r| {
@@ -6485,8 +6889,9 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         // And silence from the forge is not consent.
         let mut unsaid = pr(Checks::Red, &["coverage"], 0);
         unsaid.blocking = Blocking::Unsaid;
+        assert_eq!(decide(&unsaid, 0, 4, Duration::ZERO), Step::Wait);
         assert!(matches!(
-            decide(&unsaid, 0, 4, Duration::ZERO),
+            decide(&unsaid, 0, 4, CHECKS_GRACE),
             Step::Fix { .. }
         ));
     }
@@ -9318,6 +9723,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     /// Answers views from a script (the last one repeats), merges from a
     /// queue, and records every call so a test can assert the order.
     struct Scripted {
+        evidence: Mutex<Option<CiEvidence>>,
         views: Mutex<VecDeque<Seen>>,
         merges: Mutex<VecDeque<(bool, String)>>,
         fix: Mutex<Option<Fixed>>,
@@ -9340,6 +9746,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     impl Scripted {
         fn new(views: Vec<Seen>, merges: Vec<(bool, &str)>) -> Self {
             Self {
+                evidence: Mutex::new(None),
                 views: Mutex::new(views.into()),
                 merges: Mutex::new(
                     merges
@@ -9368,6 +9775,9 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     }
 
     impl Forge for Scripted {
+        async fn attribution(&self, _state: &RunState, _seen: &Seen) -> Option<CiEvidence> {
+            self.evidence.lock().unwrap().clone()
+        }
         async fn view(&self, _repo: &Path, _url: &str) -> Result<Seen> {
             self.log.lock().unwrap().push("view");
             if *self.unreadable_after_merge.lock().unwrap()
@@ -10060,6 +10470,160 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         ]);
         let labels: Vec<_> = got.iter().map(|(l, _)| l.as_str()).collect();
         assert_eq!(labels, ["required", "unknown"]);
+    }
+
+    fn unrelated_ci_fixture() -> CiEvidence {
+        let failure = CiFailure {
+            path: "tests/web_render.rs".into(),
+            start_line: 42,
+            end_line: 42,
+            title: "question_identity_disclosure_copy_and_live_updates".into(),
+            message: "assertion failed".into(),
+        };
+        CiEvidence {
+            head: "a".into(),
+            base: "base-sha".into(),
+            changed: vec![
+                "AGENTS.md".into(),
+                "src/talk.rs".into(),
+                "tests/consult_investigation.rs".into(),
+            ],
+            checks: vec![CiCheckEvidence {
+                label: "coverage".into(),
+                head_check: 70,
+                base_check: 60,
+                app: 1,
+                run: "7".into(),
+                base_run: "6".into(),
+                head_failures: vec![failure.clone()],
+                base_failures: vec![failure],
+                rerun_exhausted: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn unrelated_ci_requires_complete_structural_evidence_for_every_failure() {
+        let good = unrelated_ci_fixture();
+        let red = vec!["coverage".into()];
+        assert!(good.unrelated("a", &red));
+        assert!(!good.unrelated("another-head", &red));
+        assert!(!good.unrelated("a", &["coverage".into(), "test".into()]));
+        assert!(!good.unrelated("a", &[]));
+        for mutation in 0..8 {
+            let mut bad = good.clone();
+            match mutation {
+                0 => bad.checks[0].rerun_exhausted = false,
+                1 => bad.checks[0].base_failures.clear(),
+                2 => bad.checks[0].head_failures.clear(),
+                3 => bad.changed.push("tests/web_render.rs".into()),
+                4 => bad.changed.push(".github/workflows/ci.yml".into()),
+                5 => bad.checks[0].base_failures[0].message = "different failure".into(),
+                6 => bad.checks.push(bad.checks[0].clone()),
+                _ => bad.base.clear(),
+            }
+            assert!(!bad.unrelated("a", &red), "mutation {mutation}");
+        }
+    }
+
+    #[test]
+    fn red_unknown_merge_state_waits_before_repair_but_never_implies_merge() {
+        let pr = seen("a", Checks::Red, "UNKNOWN", false).pr;
+        assert_eq!(decide(&pr, 0, 2, Duration::ZERO), Step::Wait);
+        assert!(matches!(decide(&pr, 0, 2, CHECKS_GRACE), Step::Fix { .. }));
+        assert!(matches!(
+            decide(&pr, 2, 2, CHECKS_GRACE),
+            Step::GiveUp { .. }
+        ));
+        let optional = CheckInfo {
+            label: "coverage".into(),
+            verdict: Verdict::Fail,
+            required: Some(false),
+            run: Some("7".into()),
+        };
+        assert!(rerunnable_with(std::slice::from_ref(&optional), false).is_empty());
+        assert_eq!(
+            rerunnable_with(&[optional], true),
+            vec![("coverage".into(), Some("7".into()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn unrelated_ci_after_a_comment_round_does_not_charge_a_no_commit_stop() {
+        let mut state = landing_state();
+        let mut red = coverage_unknown();
+        red.pr = seen("a", Checks::Red, "BLOCKED", true).pr;
+        red.pr.failing = vec!["coverage".into()];
+        let forge = Scripted::new(vec![red], vec![]);
+        *forge.evidence.lock().unwrap() = Some(unrelated_ci_fixture());
+        *forge.fix.lock().unwrap() = Some(Fixed::Declined);
+        land_with(&mut state, RERUN_PR, &forge).await.unwrap();
+        assert!(forge.calls().contains(&"fix"));
+        assert!(state.land_unrelated.is_some());
+        assert!(state.parked);
+        assert!(
+            !state
+                .events
+                .iter()
+                .any(|e| e.message.contains("fixer produced no commit"))
+        );
+    }
+
+    fn coverage_unknown() -> Seen {
+        let mut s = red("a", Some("7"));
+        s.pr.blocking = Blocking::Unsaid;
+        s.merge_state = "UNKNOWN".into();
+        s.pr.failing = vec!["coverage".into()];
+        s.contexts[0].label = "coverage".into();
+        s.contexts[0].required = Some(false);
+        s
+    }
+
+    #[tokio::test]
+    async fn run_196c_unknown_then_unstable_does_not_spend_a_fix_round() {
+        let mut state = landing_state();
+        let unknown = coverage_unknown();
+        let mut unstable = unknown.clone();
+        unstable.pr.blocking = Blocking::of("UNSTABLE");
+        unstable.merge_state = "UNSTABLE".into();
+        let forge = Scripted::new(vec![unknown, unstable], vec![(true, "")]);
+        land_with(&mut state, RERUN_PR, &forge).await.unwrap();
+        assert!(!forge.calls().contains(&"fix"));
+        assert!(!forge.calls().contains(&"rerun"));
+        assert_eq!(state.status, RunStatus::Merged);
+        assert_eq!(state.pr.unwrap().round, 0);
+    }
+
+    #[tokio::test]
+    async fn run_196c_persistent_unknown_reruns_optional_once_then_parks_with_evidence() {
+        let mut state = landing_state();
+        let forge = Scripted::new(vec![coverage_unknown()], vec![]);
+        *forge.evidence.lock().unwrap() = Some(unrelated_ci_fixture());
+        land_with(&mut state, RERUN_PR, &forge).await.unwrap();
+        assert_eq!(*forge.reruns.lock().unwrap(), ["7"]);
+        assert!(!forge.calls().contains(&"fix"));
+        assert!(state.parked);
+        assert_eq!(state.status, RunStatus::Landing);
+        assert_eq!(state.pr.as_ref().unwrap().round, 0);
+        let hold = state.land_unrelated.as_ref().unwrap();
+        let q = ask::Questions::open().get(&hold.question).unwrap();
+        assert!(
+            q.actions
+                .values()
+                .any(|a| matches!(a, ask::ChoiceAction::Resume { .. }))
+        );
+        assert!(
+            state
+                .events
+                .iter()
+                .any(|e| e.message.contains("[ci-unrelated]") && e.message.contains("base-sha"))
+        );
+        let first = state.land_unsaid.clone();
+        // A resume on this head neither extends UNKNOWN grace nor reruns 7.
+        state.parked = false;
+        land_with(&mut state, RERUN_PR, &forge).await.unwrap();
+        assert_eq!(state.land_unsaid, first);
+        assert_eq!(*forge.reruns.lock().unwrap(), ["7"]);
     }
 
     fn red(head: &str, run: Option<&str>) -> Seen {

@@ -2034,6 +2034,40 @@ fn settle_and_diagnose(
         }
         return;
     }
+    if let Some(hold) = state.land_unrelated.as_ref().filter(|hold| {
+        state.parked
+            && state.status == RunStatus::Landing
+            && state
+                .pr_pushed_head
+                .as_ref()
+                .is_none_or(|h| h == &hold.head)
+            && task.runs.last() == Some(&state.id)
+    }) {
+        // Settlement and crash recovery share this idempotency key. A later
+        // explicit resume is a new pass and may refund its own attempt once.
+        let pass = state.passes.last().map_or(0, |p| p.index);
+        if !task
+            .passes
+            .iter()
+            .any(|p| p.run == state.id && p.pass_index == pass)
+        {
+            task.attempts = task.attempts.saturating_sub(1);
+        }
+        task.hold_machine(Some(format!(
+            "[ci-unrelated] CI failure reproduced on base; owner question {}",
+            hold.question
+        )));
+        task.last_error = Some(detail.to_owned());
+        task.diagnostic = None;
+        task.record_pass_at(
+            &state.id,
+            pass,
+            state.passes.last().map(|p| p.started_at),
+            attempts_before,
+            Some(crate::run::ParkCause::Question),
+        );
+        return;
+    }
     let unresolved = task.hold_notice_cause.clone();
     if !verdict.parked
         && task
@@ -6721,6 +6755,71 @@ mod tests {
     /// A run that stopped on an infrastructure wait asked no agent anything:
     /// the task is held by the machine under a `[resource]` reason (resumable,
     /// re-checked by triage), and the attempt it started is given back.
+    #[test]
+    fn unrelated_ci_refunds_once_per_pass_and_holds_for_the_owner() {
+        let mut state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".into(),
+            "base".into(),
+            "task".into(),
+            Config::default(),
+        );
+        state.status = RunStatus::Landing;
+        state.parked = true;
+        state.pr_pushed_head = Some("head".into());
+        state.land_unrelated = Some(
+            serde_json::from_value(serde_json::json!({
+                "head": "head", "question": "ci-question",
+                "evidence": {"head": "head", "base": "base", "changed": [], "checks": []}
+            }))
+            .unwrap(),
+        );
+        let mut t = task();
+        t.start(state.id.clone());
+        let verdict = Verdict {
+            status: RunStatus::Landing,
+            left_pr: true,
+            quota_hit: false,
+            parked: true,
+            no_viable_candidates: false,
+        };
+        settle_and_diagnose(&mut t, verdict, "CI hold", 2, &state);
+        assert_eq!(t.attempts, 0);
+        assert_eq!(t.status, TaskStatus::Held);
+        assert!(!t.operator_held());
+        assert!(
+            t.hold_reason
+                .as_deref()
+                .unwrap()
+                .starts_with("[ci-unrelated]")
+        );
+        // A second settlement must not refund an earlier task attempt.
+        t.attempts = 1;
+        settle_and_diagnose(&mut t, verdict, "CI hold", 2, &state);
+        assert_eq!(t.attempts, 1);
+        assert_eq!(t.passes.len(), 1);
+        assert_eq!(t.passes[0].cost, crate::queue::PassCost::Refunded);
+        state.pr_pushed_head = Some("new-head".into());
+        state.parked = false;
+        state.status = RunStatus::Blocked;
+        let stale = Verdict {
+            status: RunStatus::Blocked,
+            parked: false,
+            ..verdict
+        };
+        settle_and_diagnose(&mut t, stale, "stale CI hold", 2, &state);
+        assert_eq!(t.attempts, 1);
+        // A new execution pass can refund its own newly charged attempt.
+        state.begin_pass();
+        state.begin_pass();
+        state.status = RunStatus::Landing;
+        state.parked = true;
+        state.pr_pushed_head = Some("head".into());
+        settle_and_diagnose(&mut t, verdict, "CI hold on resume", 2, &state);
+        assert_eq!(t.attempts, 0);
+        assert_eq!(t.passes.len(), 2);
+    }
+
     #[test]
     fn a_resource_blocked_run_holds_its_task_and_spends_no_attempt() {
         let mut state = RunState::new(

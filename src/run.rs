@@ -2286,6 +2286,12 @@ pub struct RunState {
     /// when the head moves.
     #[serde(default)]
     pub land_reruns: Option<LandReruns>,
+    /// First unreadable merge-state observation per head, independent of reruns.
+    #[serde(default)]
+    pub land_unsaid: Option<(String, i64)>,
+    /// Structured CI evidence and owner question for a machine hold.
+    #[serde(default)]
+    pub land_unrelated: Option<crate::land::CiHold>,
     /// The merge-approval question `land` last filed, and the head commit its
     /// panel showed. An answer is only honoured for that exact commit: a fix
     /// or rebase push makes a new head the owner has not seen.
@@ -2679,6 +2685,8 @@ impl RunState {
             contested_handoff: None,
             land_armed_head: None,
             land_reruns: None,
+            land_unsaid: None,
+            land_unrelated: None,
             land_approval: None,
             merge_repairs: Vec::new(),
             merge_decision: None,
