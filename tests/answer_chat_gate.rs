@@ -1892,6 +1892,22 @@ fn recovery_cli_rejects_stale_ambiguous_missing_and_mismatched_evidence() {
                 err.contains("alias mismatch with persisted recommendation"),
                 "{err}"
             );
+            assert!(
+                err.contains(&format!("selected label {RECOVERY_HOLD:?}")),
+                "{err}"
+            );
+            assert!(
+                err.contains(&format!("saved label {RECOVERY_LABEL:?}")),
+                "{err}"
+            );
+            assert!(
+                err.contains("present one new explicit recommendation"),
+                "{err}"
+            );
+            assert!(
+                err.contains("obtain current owner authorization before answering"),
+                "{err}"
+            );
         }
         assert!(
             err.contains("context")

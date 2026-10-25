@@ -853,7 +853,7 @@ impl Question {
         match matches.as_slice() {
             [(label, _)] => Ok(label.as_str()),
             [] => bail!(
-                "alias mismatch with offered choices: `{reply}` is not an offered label or supported action alias; exact labels: {}; inspect `magi answer --list` (action descriptions and bracketed annotations are not reply values)",
+                "alias mismatch with offered choices: `{reply}` is not an offered label or supported action alias; exact labels: {}; inspect `magi answer --list`, copy the intended offered label verbatim into --reply, and retry once only if the same owner authorization still holds (action descriptions and bracketed annotations are not reply values)",
                 serde_json::to_string(&self.choices).expect("serialize labels")
             ),
             _ => bail!(

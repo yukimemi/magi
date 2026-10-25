@@ -486,6 +486,8 @@ async fn corrected_answer_follows_diagnosis_in_the_same_authorized_turn() {
     talk::say(&lease, &mut f.talk, &f.talks, &f.cfg, "hold", Vec::new()).await.unwrap();
     let error = std::fs::read_to_string(f.trace.join("first.error")).unwrap();
     assert!(error.contains("alias mismatch with offered choices"), "{error}");
+    assert!(error.contains("copy the intended offered label verbatim into --reply"), "{error}");
+    assert!(error.contains("retry once only if the same owner authorization still holds"), "{error}");
     let answered = f.questions.get(&f.question.id).unwrap();
     assert!(!answered.status.open(), "{}", std::fs::read_to_string(f.trace.join("retry.result")).unwrap());
     let saved = f.talks.get(&f.talk.id).unwrap();

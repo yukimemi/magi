@@ -5291,6 +5291,16 @@ mod tests {
     }
 
     #[test]
+    fn briefing_checks_existing_ownership_before_filing_after_errors() {
+        for write in [false, true] {
+            let briefing = briefing(Path::new("/repo"), "en", write);
+            assert!(briefing.contains("before task add, run `magi task list`"));
+            assert!(briefing.contains("route a self-contained task through the supported queue"));
+            assert!(briefing.contains("Reuse an existing owning task and report its id/status"));
+        }
+    }
+
+    #[test]
     fn briefing_names_the_operator_with_or_without_a_persona() {
         let plain = briefing(Path::new("/repo"), "en", false);
         let named = briefing_with(Path::new("/repo"), "en", false, None, Some("Commander"));
