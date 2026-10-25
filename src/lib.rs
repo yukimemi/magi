@@ -110,13 +110,13 @@ pub(crate) fn standalone_test(name: &str) -> bool {
     if std::env::var(CHILD).as_deref() == Ok(name) {
         return true;
     }
-    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+    let mut command = std::process::Command::new(std::env::current_exe().expect("test executable"));
+    for key in worker::INVOCATION_ENV {
+        command.env_remove(key);
+    }
+    let output = command
         .args(["--exact", name, "--nocapture"])
         .env(CHILD, name)
-        .env_remove("MAGI_WORKER_ID")
-        .env_remove("MAGI_WORKER_GENERATION")
-        .env_remove("MAGI_WORKER_HOME")
-        .env_remove("MAGI_WORKER_EXE")
         .output()
         .expect("standalone test process");
     assert!(

@@ -6,12 +6,7 @@ use std::path::Path;
 pub(super) const SEAT_ENV: [&str; 4] = ["MAGI_RUN", "MAGI_NODE", "MAGI_SEAT", "MAGI_TURN_SCOPE"];
 // These resets apply to spawned CLIs. Library-embedding test hosts retain their
 // explicit MAGI_WORKER_EXE when copying child isolation settings back to a host.
-pub(super) const WORKER_ENV: [&str; 4] = [
-    "MAGI_WORKER_EXE",
-    "MAGI_WORKER_ID",
-    "MAGI_WORKER_GENERATION",
-    "MAGI_WORKER_HOME",
-];
+pub(super) const WORKER_ENV: [&str; 4] = magi::worker::INVOCATION_ENV;
 
 /// Start the real CLI in a caller-owned temporary home. Keep that directory
 /// alive until the child exits. Callers may override the cwd and environment.

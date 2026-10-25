@@ -22,6 +22,17 @@ use sha2::{Digest, Sha256};
 const STARTUP_SECONDS: u64 = 30;
 const RETAIN_FINISHED: usize = 256;
 
+/// Identity and executable selection inherited by descendants of a worker.
+/// Verification commands and standalone test fixtures remove these overrides:
+/// they test the checkout, rather than act on behalf of the enclosing worker.
+/// Keep runtime storage, seat metadata and process containment context intact.
+pub const INVOCATION_ENV: [&str; 4] = [
+    "MAGI_WORKER_ID",
+    "MAGI_WORKER_GENERATION",
+    "MAGI_WORKER_HOME",
+    "MAGI_WORKER_EXE",
+];
+
 /// Durable execution state. Starting reservations count as occupied slots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
