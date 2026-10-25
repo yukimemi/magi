@@ -24,6 +24,13 @@ pub fn magi_cli(home: &Path) -> std::process::Command {
     for key in SEAT_ENV.into_iter().chain(WORKER_ENV) {
         command.env_remove(key);
     }
+    // A fresh CLI belongs to this fixture, not the web server that launched
+    // the test. In particular, a retained restart port overrides `--port 0`
+    // and makes independent web tests contend for the operator's listener.
+    // Tests of an actual successor may explicitly set these after this call.
+    command
+        .env_remove("MAGI_WEB_RESTART_PORT")
+        .env_remove("MAGI_WEB_RESUME_LOOP");
     command
 }
 
