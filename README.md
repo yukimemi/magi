@@ -832,12 +832,33 @@ has no reply of its own. Related open questions have a separate response link
 in the notification centre. A notification that fails is logged
 and ignored: a broken webhook is not a reason to throw away an implementation.
 
-The same command also fires for the web UI's notices (the header bell): a run
-that ended badly, a held task, a failed release bump, a merge with red checks.
-It fires when a notice is new, its message changed or its severity rose - not
-for an identical repeat, a dismissed notice, or one an open question already
-pages for - with the notice's message as `{summary}` and, when it links to a
-run, that id as `{run}` (empty otherwise).
+Attention reports (blocked/stopped runs, held tasks, disk holds, release bump
+failures and conductor updates) are delivered as free text to the related task's
+chat. Delivery reuses task-decision routing, including reopening closed chats,
+chatter agent selection, default persona and Solo. Runs without a task get a
+persistent run conversation; global reports go to the home's **operations chat**
+(`notice-operations`), using the first daemon repository context.
+
+The notification store is a durable outbox. The daemon coalesces queued reports
+per chat, checks whether the cause cleared, and suppresses reports already
+covered by a related question or posted completion report. Read/dismissed legacy
+history does not replay; unread history is reconciled. Unavailable evidence or a
+failed delivery stays pending for retry. The bell/list remains a compatibility
+view for these pending and legacy records. Delivery marks reports read.
+
+Every automatic delivery can spend a chat turn. Keys name kind + subject, never
+prose: repeated wording changes update evidence without another turn. A newer
+cause or severity escalation can page again. Legacy history without a cause
+timestamp pages when a new run pass starts after its saved last raise. Persisted
+delivery identities distinguish recurrences after history pruning, while chat
+receipts make interrupted outbox acknowledgements safe to retry. Reports cannot start an unsent owner draft
+or count as owner approval. The chat investigates and summarizes; actions require
+an owner's request and the supported `magi task control` commands.
+
+The same page decision also fires `[notify]` once for a new cause or escalation,
+with the notice message as `{summary}` and its linked run as `{run}` (empty
+otherwise). A question covering that cause suppresses the second page. Release
+bump failures use this same decision rather than a separate webhook.
 
 A placeholder is replaced verbatim inside one argv element: nothing escapes it
 for JSON or anything else. For a Discord webhook, a naive

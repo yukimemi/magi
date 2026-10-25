@@ -1288,3 +1288,523 @@ async fn different_settings_on_one_task_require_distinct_decisions_and_chat_turn
         vec![w.talk_id.clone()]
     );
 }
+
+// Attention reports reuse task-decision destinations and automatic-turn safety.
+#[tokio::test]
+async fn attention_reports_coalesce_reopen_and_retry_without_replaying_prose() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let mut task = Task::new(
+        "attention".into(),
+        "investigate".into(),
+        w.tmp.path().into(),
+        Source::Human,
+    );
+    task.chat = Some(w.talk_id.clone());
+    task.hold_machine(Some("gate exited 1".into()));
+    w.queue.put(&mut task).unwrap();
+    let store = magi::notices::Notices::at(w.tmp.path().join("notifications"));
+    let mut chat = w.talks.get(&w.talk_id).unwrap();
+    talk::close(&mut chat, &w.talks).unwrap();
+    let sweep = || magi::notice_delivery::sweep(&w.queue, &w.talks, w.tmp.path(), w.tmp.path());
+    sweep();
+    let delivered = w.talks.get(&w.talk_id).unwrap();
+    assert!(delivered.status.open());
+    assert!(delivered.pending.contains("gate exited 1"));
+    assert!(delivered.pending.contains(&task.id));
+    assert_eq!(
+        chat_notify::talks_to_start(&w.talks),
+        vec![w.talk_id.clone()]
+    );
+    let notice = store
+        .list()
+        .into_iter()
+        .find(|n| n.key == format!("task:{}", task.id))
+        .unwrap();
+    assert_eq!(notice.delivered, notice.generation);
+    // Simulate termination after the talk write but before the outbox receipt.
+    let path = store.root().join(format!("{}.json", notice.id));
+    let mut value = serde_json::to_value(&notice).unwrap();
+    value["delivered"] = 0.into();
+    value["read_at"] = serde_json::Value::Null;
+    std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    sweep();
+    assert_eq!(drafts(&w), delivered.pending);
+    store
+        .raise(
+            magi::notices::Notice::warn(&notice.key, "gate exited 1 with extra context")
+                .since(notice.since)
+                .link(magi::notices::Link::Task {
+                    id: task.id.clone(),
+                }),
+        )
+        .unwrap();
+    sweep();
+    assert_eq!(
+        drafts(&w),
+        delivered.pending,
+        "wording cannot spend another turn"
+    );
+    // A second report queues beside the first: one talk to start.
+    store
+        .raise(
+            magi::notices::Notice::warn("action:task", "retry action failed").link(
+                magi::notices::Link::Task {
+                    id: task.id.clone(),
+                },
+            ),
+        )
+        .unwrap();
+    sweep();
+    assert_eq!(chat_notify::talks_to_start(&w.talks).len(), 1);
+    assert!(drafts(&w).contains("retry action failed"));
+    let before = w.talks.get(&w.talk_id).unwrap().notified.len();
+    store
+        .raise(
+            magi::notices::Notice::warn(&notice.key, "gate exited 1 again")
+                .since(Some(
+                    notice.since.unwrap() + std::time::Duration::from_secs(1),
+                ))
+                .link(magi::notices::Link::Task {
+                    id: task.id.clone(),
+                }),
+        )
+        .unwrap();
+    sweep();
+    assert_eq!(w.talks.get(&w.talk_id).unwrap().notified.len(), before + 1);
+    sweep();
+    assert_eq!(w.talks.get(&w.talk_id).unwrap().notified.len(), before + 1);
+}
+
+#[tokio::test]
+async fn attention_reports_skip_released_tasks_and_delivered_questions() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let mut task = Task::new(
+        "attention".into(),
+        "investigate".into(),
+        w.tmp.path().into(),
+        Source::Human,
+    );
+    task.chat = Some(w.talk_id.clone());
+    task.hold_machine(Some("old cause".into()));
+    w.queue.put(&mut task).unwrap();
+    let sweep = || magi::notice_delivery::sweep(&w.queue, &w.talks, w.tmp.path(), w.tmp.path());
+    w.queue
+        .modify(&task.id, |t| {
+            t.release();
+            true
+        })
+        .unwrap();
+    sweep();
+    assert!(drafts(&w).is_empty());
+    let questions = magi::ask::Questions::at(w.tmp.path().join("questions"));
+    let mut question = magi::ask::Question::new(
+        task.id.clone(),
+        "conduct".into(),
+        "conductor".into(),
+        "failure".into(),
+        String::new(),
+        vec![],
+    );
+    question.routed_chat = Some(w.talk_id.clone());
+    question.abandon("forwarded to task chat");
+    questions.put(&mut question).unwrap();
+    w.queue
+        .modify(&task.id, |t| {
+            t.hold_machine(Some("new cause".into()));
+            true
+        })
+        .unwrap();
+    // Coverage is cause-aware: a question before the new hold cannot hide it.
+    sweep();
+    assert!(drafts(&w).contains("new cause"));
+    let mut covered = magi::notices::Notice::warn("task:t", "failure").about([task.id.clone()]);
+    assert!(!magi::notices::covers(&question, &covered));
+    covered.covered_by = Some(question.id.clone());
+    assert!(magi::notices::covers(&question, &covered));
+}
+
+#[tokio::test]
+async fn attention_reports_have_stable_run_and_global_destinations_and_preserve_owner_drafts() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let mut global = w.talks.get(&w.talk_id).unwrap();
+    global.id = "notice-operations".into();
+    w.talks.put(&mut global).unwrap();
+    talk::queue(&mut global, &w.talks, "unfinished owner draft", Vec::new()).unwrap();
+    let mut run_chat = w.talks.get(&w.talk_id).unwrap();
+    run_chat.id = "notice-run-run-1".into();
+    w.talks.put(&mut run_chat).unwrap();
+    let dir = w.tmp.path().join("runs/run-1");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("run.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "repo": w.tmp.path(), "status": "blocked", "pr": {"url": "https://example.test/pr/1"}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let store = magi::notices::Notices::at(w.tmp.path().join("notifications"));
+    store
+        .raise(magi::notices::Notice::warn(
+            "global:cleanup",
+            "cleanup failed",
+        ))
+        .unwrap();
+    store
+        .raise(
+            magi::notices::Notice::error("run:run-1", "run blocked: missing gate")
+                .link(magi::notices::Link::Run { id: "run-1".into() }),
+        )
+        .unwrap();
+    magi::notice_delivery::sweep(&w.queue, &w.talks, w.tmp.path(), w.tmp.path());
+    assert_eq!(
+        chat_notify::talks_to_start(&w.talks),
+        vec![run_chat.id.clone()]
+    );
+    assert!(
+        w.talks
+            .get(&global.id)
+            .unwrap()
+            .pending
+            .contains("cleanup failed")
+    );
+    let draft = w.talks.get(&run_chat.id).unwrap().pending;
+    assert!(draft.contains("missing gate"));
+    assert!(draft.contains("https://example.test/pr/1"));
+    assert!(!magi::prompt::is_completion_notice("owner text"));
+    assert!(magi::prompt::is_completion_notice(&draft));
+}
+
+#[tokio::test]
+async fn attention_reports_cancel_parked_run_failures_before_delivery() {
+    let _home = common::home_lock().await;
+    for status in ["blocked", "stalled", "failed", "implementing"] {
+        let w = world();
+        let store = magi::notices::Notices::at(w.tmp.path().join("notifications"));
+        let n = store
+            .raise(magi::notices::Notice::error(
+                "run:parked-run",
+                "pending failure",
+            ))
+            .unwrap();
+        let dir = w.tmp.path().join("runs/parked-run");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A parked run can retain its failure status and an older timestamp.
+        let record = serde_json::json!({
+            "repo": w.tmp.path(), "status": status, "parked": true,
+            "updated_at": n.last_at - std::time::Duration::from_secs(1)
+        });
+        std::fs::write(dir.join("run.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+        for _ in 0..2 {
+            magi::notice_delivery::sweep(&w.queue, &w.talks, w.tmp.path(), w.tmp.path());
+        }
+        let saved = store.get(&n.id).unwrap();
+        assert!(!saved.unread());
+        assert_eq!(saved.delivered, saved.generation);
+        assert!(w.talks.get("notice-run-parked-run").is_err());
+        assert!(drafts(&w).is_empty());
+        assert!(chat_notify::talks_to_start(&w.talks).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn attention_reports_defer_unknown_runs_and_cancel_resumed_legacy_failures() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let store = magi::notices::Notices::at(w.tmp.path().join("notifications"));
+    let n = store
+        .raise(
+            magi::notices::Notice::error("run:run-unknown", "old failure").link(
+                magi::notices::Link::Run {
+                    id: "run-unknown".into(),
+                },
+            ),
+        )
+        .unwrap();
+    let sweep = || magi::notice_delivery::sweep(&w.queue, &w.talks, w.tmp.path(), w.tmp.path());
+    sweep();
+    assert!(
+        store.get(&n.id).unwrap().unread(),
+        "lookup failure never proves clearance"
+    );
+    let dir = w.tmp.path().join("runs/run-unknown");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("run.json"), serde_json::to_vec(&serde_json::json!({
+        "repo": w.tmp.path(), "status": "implementing", "updated_at": n.last_at + std::time::Duration::from_secs(1)
+    })).unwrap()).unwrap();
+    // Legacy unread history has no receipt/generation fields.
+    let path = store.root().join(format!("{}.json", n.id));
+    let mut legacy = serde_json::to_value(&n).unwrap();
+    legacy.as_object_mut().unwrap().remove("generation");
+    legacy.as_object_mut().unwrap().remove("delivered");
+    std::fs::write(path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    sweep();
+    assert!(!store.get(&n.id).unwrap().unread());
+    assert!(w.talks.get("notice-run-run-unknown").is_err());
+    assert!(drafts(&w).is_empty());
+}
+
+#[tokio::test]
+async fn attention_reports_preserve_pending_outbox_and_page_recurrences_once() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let store = magi::notices::Notices::at(w.tmp.path().join("notifications"));
+    let start = jiff::Timestamp::now();
+    let sent = std::cell::RefCell::new(Vec::new());
+    let raise = |cause| {
+        magi::notices::raise_in_with(
+            w.tmp.path(),
+            magi::notices::Notice::warn("global:failure", "same cause").since(Some(cause)),
+            &|page| sent.borrow_mut().push(page),
+        )
+    };
+    raise(start);
+    raise(start);
+    raise(start + std::time::Duration::from_secs(1));
+    assert_eq!(sent.borrow().len(), 2, "one notify decision per cause");
+    for i in 0..magi::notices::CAP {
+        store
+            .raise(magi::notices::Notice::warn(
+                &format!("pending:{i}"),
+                "pending",
+            ))
+            .unwrap();
+    }
+    assert_eq!(
+        store.list().len(),
+        magi::notices::CAP + 1,
+        "pending deliveries cannot be evicted"
+    );
+}
+
+#[tokio::test]
+async fn attention_reports_keep_release_failures_after_merge_until_explicitly_cleared() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let mut chat = w.talks.get(&w.talk_id).unwrap();
+    chat.id = "notice-run-release-run".into();
+    w.talks.put(&mut chat).unwrap();
+    let store = magi::notices::Notices::at(w.tmp.path().join("notifications"));
+    let notice = store
+        .raise(
+            magi::notices::Notice::error("release-bump:release-run", "release command exited 9")
+                .since(Some(jiff::Timestamp::now()))
+                .link(magi::notices::Link::Url {
+                    url: "https://example.test/pr/2".into(),
+                }),
+        )
+        .unwrap();
+    let dir = w.tmp.path().join("runs/release-run");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut record = serde_json::json!({"repo":w.tmp.path(), "status":"merged", "release_bump": {
+        "problem":"command exited 9", "action_required":"retry release"},
+        "updated_at":notice.last_at + std::time::Duration::from_secs(1)});
+    std::fs::write(dir.join("run.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+    magi::notice_delivery::sweep(&w.queue, &w.talks, w.tmp.path(), w.tmp.path());
+    assert!(
+        w.talks
+            .get(&chat.id)
+            .unwrap()
+            .pending
+            .contains("release command exited 9")
+    );
+    // A genuinely new failure can clear before its next delivery.
+    let later = notice.last_at + std::time::Duration::from_secs(2);
+    store
+        .raise(magi::notices::Notice::error(&notice.key, "same failure").since(Some(later)))
+        .unwrap();
+    let pending = w.talks.get(&chat.id).unwrap().pending;
+    record["release_bump"] = serde_json::json!({"problem":null,"action_required":null});
+    record["updated_at"] = serde_json::to_value(later + std::time::Duration::from_secs(1)).unwrap();
+    std::fs::write(dir.join("run.json"), serde_json::to_vec(&record).unwrap()).unwrap();
+    magi::notice_delivery::sweep(&w.queue, &w.talks, w.tmp.path(), w.tmp.path());
+    assert_eq!(w.talks.get(&chat.id).unwrap().pending, pending);
+    assert!(!store.get(&notice.id).unwrap().unread());
+}
+
+#[tokio::test]
+async fn retired_run_questions_do_not_hide_a_later_failure_in_the_same_pass() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let mut chat = w.talks.get(&w.talk_id).unwrap();
+    chat.id = "notice-run-run-later".into();
+    w.talks.put(&mut chat).unwrap();
+    let pass_started = jiff::Timestamp::now();
+    let questions = magi::ask::Questions::at(w.tmp.path().join("questions"));
+    let mut q = magi::ask::Question::new(
+        "run-later".into(),
+        "implement".into(),
+        "seat".into(),
+        "Earlier implementation decision".into(),
+        String::new(),
+        vec![],
+    );
+    q.routed_chat = Some(chat.id.clone());
+    q.abandon("forwarded to task chat");
+    questions.put(&mut q).unwrap();
+    let dir = w.tmp.path().join("runs/run-later");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("run.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "repo":w.tmp.path(), "status":"blocked"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let pages = std::cell::RefCell::new(Vec::new());
+    magi::notices::raise_in_with(
+        w.tmp.path(),
+        magi::notices::Notice::error("run:run-later", "Later gate failure")
+            .about(["run-later"])
+            .since(Some(pass_started))
+            .link(magi::notices::Link::Run {
+                id: "run-later".into(),
+            }),
+        &|page| pages.borrow_mut().push(page),
+    );
+    assert_eq!(
+        pages.borrow().len(),
+        1,
+        "a retired decision cannot suppress the later failure's notifier"
+    );
+    magi::notice_delivery::sweep(&w.queue, &w.talks, w.tmp.path(), w.tmp.path());
+    assert!(
+        w.talks
+            .get(&chat.id)
+            .unwrap()
+            .pending
+            .contains("Later gate failure")
+    );
+}
+
+#[tokio::test]
+async fn attention_reports_deliver_new_holds_after_history_pruning() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let mut task = Task::new(
+        "prune".into(),
+        "hold".into(),
+        w.tmp.path().into(),
+        Source::Human,
+    );
+    task.chat = Some(w.talk_id.clone());
+    task.hold_machine(Some("first hold".into()));
+    w.queue.put(&mut task).unwrap();
+    let store = magi::notices::Notices::at(w.tmp.path().join("notifications"));
+    let sweep = || magi::notice_delivery::sweep(&w.queue, &w.talks, w.tmp.path(), w.tmp.path());
+    sweep();
+    let first = store
+        .list()
+        .into_iter()
+        .find(|n| n.key == format!("task:{}", task.id))
+        .unwrap();
+    let before = w.talks.get(&w.talk_id).unwrap().notified.len();
+    for i in 0..=magi::notices::CAP {
+        store
+            .raise(magi::notices::Notice::info(
+                &format!("history:{i}"),
+                "history",
+            ))
+            .unwrap();
+    }
+    assert!(
+        store.get(&first.id).is_err(),
+        "delivered history was pruned"
+    );
+    task.release();
+    w.queue.put(&mut task).unwrap();
+    task.hold_machine(Some("second hold".into()));
+    w.queue.put(&mut task).unwrap();
+    let second = store.get(&first.id).unwrap();
+    assert_eq!(second.generation, 1);
+    assert_ne!(second.delivery_id, first.delivery_id);
+    // Isolate the task notice from the unrelated history drafts.
+    for n in store.list().into_iter().filter(|n| n.id != first.id) {
+        store.mark_read(&n.id).unwrap();
+    }
+    sweep();
+    assert!(drafts(&w).contains("second hold"));
+    assert_eq!(w.talks.get(&w.talk_id).unwrap().notified.len(), before + 1);
+    // Reopening the outbox after a crash must retain that same receipt identity.
+    let path = store.root().join(format!("{}.json", second.id));
+    std::fs::write(path, serde_json::to_vec(&second).unwrap()).unwrap();
+    sweep();
+    assert_eq!(w.talks.get(&w.talk_id).unwrap().notified.len(), before + 1);
+    assert!(!store.get(&second.id).unwrap().unread());
+}
+
+#[tokio::test]
+async fn attention_reports_page_new_run_passes_after_legacy_read_history() {
+    let _home = common::home_lock().await;
+    for stopped in [false, true] {
+        let w = world();
+        let store = magi::notices::Notices::at(w.tmp.path().join("notifications"));
+        let old: jiff::Timestamp = "2020-01-01T00:00:00Z".parse().unwrap();
+        let mut run = magi::run::RunState::new(
+            w.tmp.path().into(),
+            "main".into(),
+            "base".into(),
+            "task".into(),
+            Config::default(),
+        );
+        run.status = magi::run::RunStatus::Failed;
+        run.created_at = old - std::time::Duration::from_secs(1);
+        let notice = || {
+            if stopped {
+                magi::notices::run_stopped(&run.id, &run)
+            } else {
+                magi::notices::run_ended(&run).unwrap()
+            }
+        };
+        let mut legacy = serde_json::to_value(notice()).unwrap();
+        for field in ["since", "generation", "delivered", "delivery_id"] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        legacy["first_at"] = old.to_string().into();
+        legacy["last_at"] = old.to_string().into();
+        legacy["read_at"] = old.to_string().into();
+        let id = notice().id;
+        std::fs::create_dir_all(store.root()).unwrap();
+        std::fs::write(
+            store.root().join(format!("{id}.json")),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        // The first producer replay after upgrade must not page old history.
+        assert!(!store.raise_paged(notice()).unwrap().1);
+        // Restore the legacy fixture to exercise a new pass as the first raise.
+        std::fs::write(
+            store.root().join(format!("{id}.json")),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        run.begin_pass();
+        let new_notice = if stopped {
+            magi::notices::run_stopped(&run.id, &run)
+        } else {
+            magi::notices::run_ended(&run).unwrap()
+        };
+        let dir = w.tmp.path().join("runs").join(&run.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("run.json"), serde_json::to_vec(&run).unwrap()).unwrap();
+        let mut task = Task::new(
+            "legacy".into(),
+            "failure".into(),
+            w.tmp.path().into(),
+            Source::Human,
+        );
+        task.chat = Some(w.talk_id.clone());
+        task.start(run.id.clone());
+        w.queue.put(&mut task).unwrap();
+        assert!(store.raise_paged(new_notice.clone()).unwrap().1);
+        assert!(!store.raise_paged(new_notice).unwrap().1);
+        magi::notice_delivery::sweep(&w.queue, &w.talks, w.tmp.path(), w.tmp.path());
+        assert!(drafts(&w).contains(&run.id));
+        assert_eq!(w.talks.get(&w.talk_id).unwrap().notified.len(), 1);
+        assert!(!store.get(&id).unwrap().unread());
+    }
+}

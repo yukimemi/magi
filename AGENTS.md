@@ -2219,66 +2219,50 @@ go into a task file:
   - An opencode judge dropped out on a permission refusal, and the report showed
     it only as one ranking fewer.
 
-### The notification centre is not the question queue
+### Attention reports use the task-decision chat transport
 
-`src/notices.rs` backs the web header's bell. A notice is something to *know*
-(a failed release bump, a blocked run, a held task, a disk hold), never
-something to answer, so it does not reuse `ask::Questions`.
+`src/notices.rs` is a durable outbox for facts, never an owner decision.
+`notice_delivery::sweep` runs after task decision and completion reconciliation,
+before `chat_notify::start_turns` / `consult::drain_turns`. Producers record through
+`notices::raise` / `raise_in` / `raise_with`; explicit release-bump stores use
+`Notices::raise_with` for the same page decision, never an independent webhook.
 
-- **Dedupe key = kind + subject, never prose** (`release-bump:<run>`,
-  `task:<id>`, `disk:<repo>`). The file name is derived from the key by a
-  stable FNV-1a (`notices::id_of`) - not `DefaultHasher` - so processes and
-  builds agree on it and no lock is needed. Keep producer messages free of
-  anything that varies between retries: a changed message relights a read
-  notice, so a number in the wording turns a retry loop into a flood.
-- **Dismiss is a tombstone.** An identical re-raise does not resurrect it; a
-  changed message or a higher severity does. Consequence accepted: a real
-  recurrence with identical wording stays hidden until the 200-notice cap
-  prunes the tombstone.
-- **`notifications_rev` lives in three places that must stay aligned**: the
-  `events` tuple, `HealthView`, and `applyRevisions_` / the initial load in
-  `app.js`. Miss one and the badge stops updating live (health is the
-  fallback when the stream is down).
-- **Producers go through `notices::raise` / `raise_in`** and are best-effort:
-  a failed write is a `tracing::warn`, never a failed run. `raise` is a no-op
-  in a unit test that never pinned a home (`run::try_home`).
-
-- **One cause pages once.** A `Notice` carries `subjects` (the task / run ids it
-  is about) and `covered_by`. When an open question whose `run` equals a
-  subject exists and is about the same kind of cause (a conduct / triage question
-  covers that task's hold and handover notices, a question from inside a run
-  covers that run's ended / stopped notices, and the two never cross) - at raise time (`notices::raise_in`) or is filed afterwards
-  (`Questions::put`, first write only, via `notices::quiet_for`) - the notice is
-  still written, but already read and pointing at the question. Dedupe is
-  expressed as read state, never as a tombstone, so a recurrence with a changed
-  message or higher severity pages again; `Task::hold_reason` is untouched, so
-  `magi task show` keeps the reason. The release / land question
-  (`bump::NOTICE_NODE`) never covers anything.
-- **`Notice::since` identifies the cause.** A task hold's notice carries
-  `Task::held_at` (stamped on entering `Held`, kept by a re-hold, cleared by
-  `release`; `queue::SCHEMA` 9). `notices::covers` ignores a question filed
-  before `since`: it is about an older cause, and silencing a new hold or
-  handover failure behind it would hide the failure. A question filed after the
-  hold still covers it however late. Missing a duplicate costs one extra page;
-  hiding a failure costs the failure, so the rule errs towards paging. A notice
-  with no `since` keeps the old broad rule. `Notices::cover` re-checks under
-  the lock. A later `since` on the same key relights the notice - the one
-  exception to the tombstone rule: hold, release, hold again pages again.
-- **A notice also fires `[notify]`, decided in one place.** `Notice::raise_again`
-  returns whether the raise pages (relit and not covered; a brand-new
-  uncovered notice pages too); `notices::raise_in_with` sends a `Page` through
-  an injected closure. The real sender runs on its own thread and runtime and
-  is a no-op until `notices::install_pager()` (called in `async_main`), so a
-  test that pins a home never reaches the operator's config. A producer with a
-  repo config passes it via `notices::raise_with`; every other one gets the
-  machine layer's `[notify]`. `land::announce_red_merge` must not call
-  `ask::notify_text` itself: the notice already pages, and a second call would
-  page a merged-red twice (and ignore `covered_by`).
-- **A refused handover is one page.** `daemon` no longer raises a separate
-  `handover:<id>`; the hold's own `task:<id>` notice (from `Queue::put`) is the
-  page, and the release guidance rides in the hold reason with fixed wording.
-  `covers` still matches a `handover:` key for records written earlier. A page
-  already delivered cannot be retracted when a question arrives later.
+- Reuse `task_chat::destination`: reserve `Task::chat` under the task lock,
+  release it before any talk operation, prefer the existing chat, reopen closed
+  chats. Creation uses the chatter chain, default persona and Solo.
+- A run with no queue task uses `notice-run-<full-run-id>`. True global reports
+  use `notice-operations`, one persistent conversation per home. Its first
+  creation saves the daemon repo context; `begin_with_id` serializes creation.
+- Keys are kind + subject, never prose. `Notice::raise_again` alone decides
+  repeat paging for both chat delivery generations and `[notify]`: newer cause
+  or severity rise, never wording changes. Stamp cause starts with `since`
+  (task held_at, run pass started_at), rather than poll time. For legacy records
+  without `since`, a cause starting after the saved `last_at` is new.
+- The talk saves `notice:<stable-id>:<delivery-id>:<generation>` with its automatic
+  draft, then the outbox saves the receipt. The persisted delivery id distinguishes
+  recurrences after history pruning; legacy records retain their old receipt key.
+  Retries cannot spend a second turn. Queue
+  all drafts before starting talks so reports per conversation coalesce.
+  Unsent owner drafts are never started by a report.
+- Recheck current task/run state before delivery. Released holds, replaced runs
+  and runs positively observed to have moved on are read without delivery.
+  Read errors defer; a terminal run alone never clears a release-bump failure.
+  Covers/covered_by retain kind and cause-time matching, including questions
+  retired after task-chat delivery only when the notice already records that
+  question in covered_by, and posted task completion receipts. A delivered
+  question alone cannot cover a later unrelated failure in the same run pass.
+  Release-watch supplies a separate cause identity (phase plus head/check or
+  release progress); material state transitions advance delivery without using
+  message prose as a key.
+- Legacy unread history follows the same checks. Read/dismissed history never
+  replays. Pending unread deliveries are exempt from the 200-record history cap.
+- Automatic reports use a fixed English heading, scrubbed/defused/clipped facts,
+  full task/run IDs, state and PR. The briefing permits investigation and summary;
+  only an owner's request authorizes supported `magi task control` actions.
+- The bell/list remains as a compatibility view for deferred/unavailable
+  destinations and legacy records. Do not retire it while these remain visible.
+  `notifications_rev` is unchanged in the events tuple, HealthView and app.js
+  applyRevisions_/initial load; keep all three aligned if removing the UI later.
 
 ### A release PR is watched until it lands
 

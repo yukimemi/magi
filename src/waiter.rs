@@ -441,7 +441,12 @@ impl Waiter {
                     q.short(),
                     q.summary
                 ),
-            ),
+            )
+            .link(if q.run_names_task() {
+                notices::Link::Task { id: q.run.clone() }
+            } else {
+                notices::Link::Run { id: q.run.clone() }
+            }),
         );
         let _ = self.store.update(&q.id, |r| {
             r.waiter = None;

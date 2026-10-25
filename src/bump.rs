@@ -27,6 +27,7 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, Invocation, SeatState};
+#[cfg(test)]
 use crate::ask;
 use crate::config::AgentSpec;
 use crate::git;
@@ -1356,7 +1357,7 @@ fn record_skip(state: &mut RunState, store: Option<&Notices>, skip: &Skip) {
         id: state.id.clone(),
     });
     let store = store.cloned().unwrap_or_else(Notices::open);
-    if let Err(e) = store.raise(notice) {
+    if let Err(e) = store.raise_with(notice, &state.config.notify) {
         state.event("bump", format!("could not raise a notice: {e:#}"));
     }
     state.event("bump", format!("needs attention: {action}"));
@@ -1925,7 +1926,12 @@ fn surface_problem_in(
         }),
     };
     let notice = store
-        .raise(notice)
+        .raise_with(
+            notice
+                .about([state.id.clone()])
+                .for_run(Some(state.id.clone())),
+            &state.config.notify,
+        )
         .context("raise the release-bump notification")?;
     state.event("bump", format!("needs attention: {action}"));
     let comment = pr_url
@@ -1957,35 +1963,11 @@ async fn report_problem_in(
     pending: bool,
 ) {
     match surface_problem_in(state, store, pr_url, version, reason, pending) {
-        Ok((notice, comment)) => {
+        Ok((_notice, comment)) => {
             if let (Some(url), Some(body)) = (pr_url, comment)
                 && let Err(e) = gh_pr_comment(state, url, &body).await
             {
                 state.event("bump", format!("could not comment on {url}: {e:#}"));
-            }
-            // The webhook still speaks in question terms; a transient,
-            // never-stored one carries the text so it is not lost.
-            let summary = match pr_url {
-                Some(url) if pending => format!("Release PR could not be updated: {url}"),
-                Some(url) => format!("Release PR needs a human: {url}"),
-                None if crate::lang::is_japanese(&state.config.graph.language) => {
-                    "リリースバンプが実行されませんでした".to_owned()
-                }
-                None => "Release bump did not run".to_owned(),
-            };
-            let q = ask::Question::new(
-                state.id.clone(),
-                NOTICE_NODE.to_owned(),
-                "bump".to_owned(),
-                summary,
-                notice.message.clone(),
-                Vec::new(),
-            );
-            if let Err(e) = ask::notify(&state.config.notify, &q).await {
-                tracing::warn!(
-                    "could not notify about the release bump of {}: {e:#}",
-                    state.id
-                );
             }
         }
         Err(e) => state.event("bump", format!("could not raise a notice: {e:#}")),
