@@ -2245,7 +2245,12 @@ before `chat_notify::start_turns` / `consult::drain_turns`. Producers record thr
   and runs positively observed to have moved on are read without delivery.
   Read errors defer; a terminal run alone never clears a release-bump failure.
   Covers/covered_by retain kind and cause-time matching, including questions
-  retired after task-chat delivery and posted task completion receipts.
+  retired after task-chat delivery only when the notice already records that
+  question in covered_by, and posted task completion receipts. A delivered
+  question alone cannot cover a later unrelated failure in the same run pass.
+  Release-watch supplies a separate cause identity (phase plus head/check or
+  release progress); material state transitions advance delivery without using
+  message prose as a key.
 - Legacy unread history follows the same checks. Read/dismissed history never
   replays. Pending unread deliveries are exempt from the 200-record history cap.
 - Automatic reports use a fixed English heading, scrubbed/defused/clipped facts,

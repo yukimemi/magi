@@ -1419,10 +1419,10 @@ async fn attention_reports_skip_released_tasks_and_delivered_questions() {
     // Coverage is cause-aware: a question before the new hold cannot hide it.
     sweep();
     assert!(drafts(&w).contains("new cause"));
-    assert!(magi::notices::covers(
-        &question,
-        &magi::notices::Notice::warn("task:t", "failure").about([task.id.clone()])
-    ));
+    let mut covered = magi::notices::Notice::warn("task:t", "failure").about([task.id.clone()]);
+    assert!(!magi::notices::covers(&question, &covered));
+    covered.covered_by = Some(question.id.clone());
+    assert!(magi::notices::covers(&question, &covered));
 }
 
 #[tokio::test]
@@ -1623,4 +1623,60 @@ async fn attention_reports_keep_release_failures_after_merge_until_explicitly_cl
     magi::notice_delivery::sweep(&w.queue, &w.talks, w.tmp.path(), w.tmp.path());
     assert_eq!(w.talks.get(&chat.id).unwrap().pending, pending);
     assert!(!store.get(&notice.id).unwrap().unread());
+}
+
+#[tokio::test]
+async fn retired_run_questions_do_not_hide_a_later_failure_in_the_same_pass() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let mut chat = w.talks.get(&w.talk_id).unwrap();
+    chat.id = "notice-run-run-later".into();
+    w.talks.put(&mut chat).unwrap();
+    let pass_started = jiff::Timestamp::now();
+    let questions = magi::ask::Questions::at(w.tmp.path().join("questions"));
+    let mut q = magi::ask::Question::new(
+        "run-later".into(),
+        "implement".into(),
+        "seat".into(),
+        "Earlier implementation decision".into(),
+        String::new(),
+        vec![],
+    );
+    q.routed_chat = Some(chat.id.clone());
+    q.abandon("forwarded to task chat");
+    questions.put(&mut q).unwrap();
+    let dir = w.tmp.path().join("runs/run-later");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("run.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "repo":w.tmp.path(), "status":"blocked"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let pages = std::cell::RefCell::new(Vec::new());
+    magi::notices::raise_in_with(
+        w.tmp.path(),
+        magi::notices::Notice::error("run:run-later", "Later gate failure")
+            .about(["run-later"])
+            .since(Some(pass_started))
+            .link(magi::notices::Link::Run {
+                id: "run-later".into(),
+            }),
+        &|page| pages.borrow_mut().push(page),
+    );
+    assert_eq!(
+        pages.borrow().len(),
+        1,
+        "a retired decision cannot suppress the later failure's notifier"
+    );
+    magi::notice_delivery::sweep(&w.queue, &w.talks, w.tmp.path(), w.tmp.path());
+    assert!(
+        w.talks
+            .get(&chat.id)
+            .unwrap()
+            .pending
+            .contains("Later gate failure")
+    );
 }

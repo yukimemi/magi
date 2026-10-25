@@ -98,6 +98,9 @@ pub struct Notice {
     /// it; `None` keeps the broad coverage of notices without one.
     #[serde(default)]
     pub since: Option<Timestamp>,
+    /// Producer-defined cause identity (phase and immutable target), never prose.
+    #[serde(default)]
+    pub cause: Option<String>,
     /// On-disk format version.
     #[serde(default = "schema")]
     pub schema: u32,
@@ -136,6 +139,7 @@ impl Notice {
             related_run: None,
             covered_by: None,
             since: None,
+            cause: None,
             schema: SCHEMA,
             generation: 1,
             delivered: 0,
@@ -176,6 +180,12 @@ impl Notice {
     /// Record when the reported cause began.
     pub fn since(mut self, at: Option<Timestamp>) -> Self {
         self.since = at;
+        self
+    }
+
+    /// Distinguish material producer state transitions without keying on wording.
+    pub fn cause(mut self, cause: impl Into<String>) -> Self {
+        self.cause = Some(cause.into());
         self
     }
 
@@ -221,7 +231,14 @@ impl Notice {
         };
         self.since = self.since.max(again.since);
         // Wording is evidence, never a reason to spend another agent turn.
-        let relit = escalated || newer_cause;
+        let changed_cause = again
+            .cause
+            .as_ref()
+            .is_some_and(|cause| self.cause.as_ref() != Some(cause));
+        if again.cause.is_some() {
+            self.cause = again.cause.clone();
+        }
+        let relit = escalated || newer_cause || changed_cause;
         self.message = again.message.clone();
         if relit {
             self.generation = self.generation.saturating_add(1);
@@ -973,7 +990,12 @@ pub fn raise_with(notice: Notice, notify: &crate::config::Notify) {
 /// card. Missing a duplicate costs one extra page; hiding a failure costs the
 /// failure. A notice without `since` keeps the broad rule.
 pub fn covers(q: &crate::ask::Question, n: &Notice) -> bool {
-    if !(q.status.open() || q.routed_chat.is_some()) || !n.subjects.contains(&q.run) {
+    // Delivery alone proves no relationship to a later failure in the same
+    // run pass. Retired questions only retain coverage already recorded while
+    // they were open; never infer a cause match from the run ID or pass start.
+    let recorded_coverage =
+        q.routed_chat.is_some() && n.covered_by.as_deref() == Some(q.id.as_str());
+    if !(q.status.open() || recorded_coverage) || !n.subjects.contains(&q.run) {
         return false;
     }
     if n.since.is_some_and(|since| q.asked_at < since) {
@@ -1205,6 +1227,32 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(s.list().len(), 1);
+    }
+
+    #[test]
+    fn producer_cause_transitions_page_once_without_using_message_prose() {
+        let (dir, store) = store();
+        let sent = std::cell::RefCell::new(Vec::new());
+        let raise = |cause: &str, message: &str| {
+            raise_in_with(
+                dir.path(),
+                Notice::warn("release-pr:pr", message).cause(cause),
+                &|p| sent.borrow_mut().push(p),
+            )
+        };
+        raise("approval:h1", "approval is needed");
+        let id = id_of("release-pr:pr");
+        store.mark_read(&id).unwrap();
+        raise("approval:h1", "approval wording updated");
+        assert!(!store.get(&id).unwrap().unread());
+        raise("merge-failed:h1", "merge refused");
+        assert!(store.get(&id).unwrap().unread());
+        assert_eq!(sent.borrow().len(), 2);
+        assert_eq!(store.get(&id).unwrap().generation, 2);
+        store.mark_read(&id).unwrap();
+        raise("merge-failed:h1", "merge refusal wording updated");
+        assert_eq!(sent.borrow().len(), 2);
+        assert!(!store.get(&id).unwrap().unread());
     }
 
     #[test]

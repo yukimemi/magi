@@ -761,10 +761,11 @@ impl Watcher {
         state.held_task.into_iter().chain(state.run).collect()
     }
 
-    fn raise(&self, pr: &str, url: &str, message: String) {
+    fn raise(&self, pr: &str, url: &str, cause: String, message: String) {
         notices::raise_in(
             &self.home,
             Notice::warn(&notice_key(pr), message)
+                .cause(cause)
                 .link(Link::Url {
                     url: url.to_owned(),
                 })
@@ -908,11 +909,21 @@ impl Watcher {
                     }
                 }
                 if ok {
-                    self.raise(&pr, url, rerun_message(&pr));
+                    self.raise(
+                        &pr,
+                        url,
+                        format!("rerun:{}:{}", snap.head, st.fingerprint),
+                        rerun_message(&pr),
+                    );
                 }
             }
             Step::Escalate(why) => {
-                self.raise(&pr, url, human_message(&pr));
+                self.raise(
+                    &pr,
+                    url,
+                    format!("checks-held:{}:{}", snap.head, st.fingerprint),
+                    human_message(&pr),
+                );
                 let mut q = Question::new(
                     String::new(),
                     crate::bump::NOTICE_NODE.to_owned(),
@@ -1008,7 +1019,12 @@ impl Watcher {
                     LocalStep::Ask => {
                         st.held_head = None;
                         st.asked_head = Some(snap.head.clone());
-                        self.raise(pr, &snap.url, approval_message(pr));
+                        self.raise(
+                            pr,
+                            &snap.url,
+                            format!("approval:{}", snap.head),
+                            approval_message(pr),
+                        );
                         let mut q = Question::new(
                             String::new(),
                             crate::bump::NOTICE_NODE.to_owned(),
@@ -1058,6 +1074,7 @@ impl Watcher {
                                 self.raise(
                                     pr,
                                     &snap.url,
+                                    format!("merge-failed:{}", snap.head),
                                     format!(
                                         "Release PR {pr} could not be merged; merge it by hand"
                                     ),
@@ -1176,7 +1193,17 @@ impl Watcher {
             Err(e) => {
                 job.failed = Some(format!("{e:#}"));
                 self.hold_task(&mut st, &format!("release {} failed: {e:#}", job.tag()));
-                self.raise(pr, &st.url, failed_message(pr));
+                self.raise(
+                    pr,
+                    &st.url,
+                    format!(
+                        "release-failed:{}:{}:{}",
+                        job.commit,
+                        job.done,
+                        job.log.len()
+                    ),
+                    failed_message(pr),
+                );
                 self.file_job_question(pr, &mut st, &job);
                 st.job = Some(job);
                 self.save(pr, &st);
@@ -1376,7 +1403,17 @@ impl Watcher {
             }
         }
         if !st.ignored && st.held.as_deref() != Some(why.as_str()) {
-            self.raise(pr, &st.url, failed_message(pr));
+            self.raise(
+                pr,
+                &st.url,
+                format!(
+                    "release-failed:{}:{}:{}",
+                    job.commit,
+                    job.done,
+                    job.log.len()
+                ),
+                failed_message(pr),
+            );
             self.file_job_question(pr, st, job);
         }
         false
@@ -2225,6 +2262,41 @@ mod tests {
         assert_eq!(qs.len(), 1, "one approval question, not one per lap");
         assert_eq!(qs[0].choices, vec![land::APPROVE, land::HOLD]);
         assert!(fake.merges.lock().unwrap().is_empty(), "silence is a hold");
+    }
+
+    #[tokio::test]
+    async fn a_merge_failure_pages_after_the_approval_notice_was_delivered() {
+        let (dir, fake, w) = rig();
+        *fake.local.lock().unwrap() = true;
+        *fake.snap.lock().unwrap() = Some(open(vec![]));
+        let repo = PathBuf::from("/nowhere");
+        w.lap(std::slice::from_ref(&repo), 60, 1, &|| false).await;
+        let store = Notices::at(dir.path().join("notifications"));
+        let approval = store.list().pop().unwrap();
+        assert_eq!(approval.cause.as_deref(), Some("approval:h1"));
+        // A chat receipt leaves the outbox read; the same key must relight
+        // when the approved merge itself fails, despite identical severity.
+        store.mark_read(&approval.id).unwrap();
+        let question = w.questions().list().pop().unwrap();
+        answer(&w, &question.id, land::APPROVE);
+        *fake.merge_fails.lock().unwrap() = true;
+        w.lap(std::slice::from_ref(&repo), 60, 2, &|| false).await;
+        let failure = store.get(&approval.id).unwrap();
+        assert!(failure.unread());
+        assert_eq!(failure.generation, approval.generation + 1);
+        assert_eq!(failure.cause.as_deref(), Some("merge-failed:h1"));
+        assert!(failure.message.contains("could not be merged"));
+        store.mark_read(&failure.id).unwrap();
+        let restarted = Watcher::new(Box::new(fake.clone()), dir.path().to_path_buf());
+        restarted
+            .lap(std::slice::from_ref(&repo), 60, 3, &|| false)
+            .await;
+        assert_eq!(fake.merges.lock().unwrap().len(), 1);
+        assert!(!store.get(&approval.id).unwrap().unread());
+        assert_eq!(
+            store.get(&approval.id).unwrap().generation,
+            failure.generation
+        );
     }
 
     #[tokio::test]
