@@ -383,28 +383,101 @@ pub(crate) fn landing_checkpoint(state: &RunState) -> bool {
             .is_some_and(|m| m.mode == crate::config::MergeMode::Pr && !m.empty)
 }
 
+/// Why a stopped execution cannot be resumed, in admission-check order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResumeRefusal {
+    Status(RunStatus),
+    Released,
+    Retired,
+    OwnershipTransferred,
+    ReviewBudget { used: usize, limit: usize },
+    ReviewDisabled,
+    CleanReviewGateRan,
+}
+
+impl ResumeRefusal {
+    pub(crate) fn diagnostic(&self, state: &RunState) -> String {
+        let reason = match self {
+            Self::Status(status) => format!("status `{}` does not admit resumption", status.as_str()),
+            Self::Released => "execution was released".into(),
+            Self::Retired => "execution was retired".into(),
+            Self::OwnershipTransferred => "PR ownership was transferred".into(),
+            Self::ReviewBudget { used, limit } => format!("review budget exhausted ({used}/{limit} rounds used)"),
+            Self::CleanReviewGateRan => "review already has a clean round and the gate already ran; no retryable checkpoint remains".into(),
+            Self::ReviewDisabled => "review is disabled (review_rounds = 0) and no retryable checkpoint or pending gate remains".into(),
+        };
+        let mut detail = format!("run {} cannot resume: {reason}.", state.short());
+        for (label, target) in [
+            ("released to", &state.released_to),
+            ("retired to", &state.retired_to),
+            ("PR ownership moved to", &state.pr_taken_over_by),
+        ] {
+            if let Some(target) = target {
+                detail.push_str(&format!(" {label} run {target}; inspect `magi show {target}` before choosing any further action."));
+            }
+        }
+        detail.push_str(&format!(
+            " Inspect `magi show {}` for retained work and ownership.",
+            state.id
+        ));
+        if matches!(self, Self::ReviewBudget { .. } | Self::ReviewDisabled) {
+            detail.push_str(" To continue the retained implementation, first confirm its saved candidate branch and owning task with `magi task show <task-id>`. When the task is eligible and no driver is live, explicitly use `magi review <saved-branch> --task <task-id> --merge none --review-rounds <positive-rounds>`. This creates a review-only successor with a new review budget; it does not resume this run or start a new implementation competition. Existing ownership and checkpoint checks still apply.");
+        }
+        detail
+    }
+}
+
 /// Shared admission policy for queue retries, typed actions and control resume.
-/// Review exhaustion does not spend a publication or landing checkpoint, or
-/// prevent pending review verification or gate work from retrying an
-/// infrastructure wait.
+/// Review exhaustion does not spend publication or landing checkpoints, or
+/// prevent pending verification or gate work from retrying infrastructure waits.
 pub(crate) fn can_resume(state: &RunState) -> bool {
+    resume_refusal(state).is_none()
+}
+
+pub(crate) fn resume_refusal(state: &RunState) -> Option<ResumeRefusal> {
+    resume_refusal_under(state, crate::run::try_home().as_deref())
+}
+
+/// Explicit stores keep validation and question checkpoints in the same home.
+pub(crate) fn resume_refusal_under(state: &RunState, home: Option<&Path>) -> Option<ResumeRefusal> {
+    if !state.status.resumable() {
+        return Some(ResumeRefusal::Status(state.status));
+    }
+    if state.released() {
+        return Some(ResumeRefusal::Released);
+    }
+    if state.retired_to.is_some() {
+        return Some(ResumeRefusal::Retired);
+    }
+    if state.pr_taken_over_by.is_some() {
+        return Some(ResumeRefusal::OwnershipTransferred);
+    }
     let review = crate::graph::review_conclusion(&state.reviews, state.config.graph.review_rounds);
-    state.status.resumable()
-        && !state.released()
-        && state.retired_to.is_none()
-        && state.pr_taken_over_by.is_none()
-        && (resume_checkpoint(state)
-            || crate::run::try_home().is_some_and(|home| has_resume_checkpoint(state, &home))
-            || ((state.config.graph.review_rounds == 0
-                || state.reviews.iter().any(|round| round.clean))
-                && (!state.gate_ran || state.resource_block.is_some()))
-            || (state.resource_block.is_some() && review == Some(RunStatus::Gating))
-            || (review.is_none()
-                && state.reviews.last().is_some_and(|round| {
-                    round.e2e_status() == crate::run::E2eStatus::ResourceBlocked
-                }))
-            || !(state.status == RunStatus::Blocked
-                && state.reviews.len() >= state.config.graph.review_rounds))
+    let allowed = resume_checkpoint(state)
+        || home.is_some_and(|home| has_resume_checkpoint(state, home))
+        || ((state.config.graph.review_rounds == 0
+            || state.reviews.iter().any(|round| round.clean))
+            && (!state.gate_ran || state.resource_block.is_some()))
+        || (state.resource_block.is_some() && review == Some(RunStatus::Gating))
+        || (review.is_none()
+            && state
+                .reviews
+                .last()
+                .is_some_and(|round| round.e2e_status() == crate::run::E2eStatus::ResourceBlocked))
+        || !(state.status == RunStatus::Blocked
+            && state.reviews.len() >= state.config.graph.review_rounds);
+    if allowed {
+        None
+    } else if state.config.graph.review_rounds == 0 {
+        Some(ResumeRefusal::ReviewDisabled)
+    } else if state.reviews.iter().any(|round| round.clean) {
+        Some(ResumeRefusal::CleanReviewGateRan)
+    } else {
+        Some(ResumeRefusal::ReviewBudget {
+            used: state.reviews.len(),
+            limit: state.config.graph.review_rounds,
+        })
+    }
 }
 
 fn resume_checkpoint(state: &RunState) -> bool {
