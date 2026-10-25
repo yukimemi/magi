@@ -156,3 +156,115 @@ esac
     assert!(git::is_clean(&path).await.unwrap());
 }
 }
+
+async fn advance_base(fx: &common::Fixture) -> String {
+    std::fs::write(fx.repo.join("base-update.txt"), "new base work\n").unwrap();
+    commit(&fx.repo, "advance base during foreign review").await;
+    git::git(&fx.repo, &["push", "origin", "main"])
+        .await
+        .unwrap();
+    git::rev_parse(&fx.repo, "HEAD").await.unwrap()
+}
+
+common::e2e! {
+async fn foreign_review_preserves_ancestry_when_base_already_advanced() {
+    let guard = common::home_lock().await;
+    let fx = fixture(guard, Judges::Unanimous, true);
+    let path = foreign(&fx).await;
+    let original = git::rev_parse(&path, "HEAD").await.unwrap();
+    let base = advance_base(&fx).await;
+    let mut runner = Runner::review(&fx.repo, BRANCH, fx.config.clone(), Origin::operator()).await.unwrap();
+    runner.execute().await.unwrap();
+    assert_eq!(runner.state.status, RunStatus::Ready, "{:?}", runner.state.events);
+    let delivered = git::rev_parse(&path, "HEAD").await.unwrap();
+    assert!(git::is_ancestor(&fx.repo, &original, &delivered).await);
+    assert!(git::is_ancestor(&fx.repo, &base, &delivered).await);
+    assert!(path.join("base-update.txt").exists());
+    assert!(path.join("fixed.txt").exists());
+    assert!(git::is_clean(&path).await.unwrap());
+}
+}
+
+common::e2e! {
+async fn foreign_review_preserves_ancestry_when_base_advances_after_start() {
+    let guard = common::home_lock().await;
+    let fx = fixture(guard, Judges::Unanimous, true);
+    let path = foreign(&fx).await;
+    let original = git::rev_parse(&path, "HEAD").await.unwrap();
+    let mut runner = Runner::review(&fx.repo, BRANCH, fx.config.clone(), Origin::operator()).await.unwrap();
+    let base = advance_base(&fx).await;
+    runner.execute().await.unwrap();
+    assert_eq!(runner.state.status, RunStatus::Ready, "{:?}", runner.state.events);
+    let delivered = git::rev_parse(&path, "HEAD").await.unwrap();
+    assert!(git::is_ancestor(&fx.repo, &original, &delivered).await);
+    assert!(git::is_ancestor(&fx.repo, &base, &delivered).await);
+    assert!(path.join("fixed.txt").exists());
+    assert!(git::is_clean(&path).await.unwrap());
+}
+}
+
+common::e2e! {
+async fn foreign_review_does_not_adopt_a_deleted_remote_tip_from_stale_tracking() {
+    let guard = common::home_lock().await;
+    let fx = fixture(guard, Judges::Unanimous, true);
+    let path = foreign(&fx).await;
+    let original = git::rev_parse(&path, "HEAD").await.unwrap();
+    let tree = git::rev_parse(&path, "HEAD^{tree}").await.unwrap();
+    let stale = git::git(&path, &["commit-tree", &tree, "-p", &original, "-m", "remote-only commit"]).await.unwrap();
+    git::git(&fx.repo, &["push", "origin", &format!("{stale}:refs/heads/{BRANCH}")]).await.unwrap();
+    assert_eq!(git::rev_parse(&fx.repo, &format!("origin/{BRANCH}")).await.unwrap(), stale);
+    let origin = git::git(&fx.repo, &["remote", "get-url", "origin"]).await.unwrap();
+    git::git(Path::new(&origin), &["update-ref", "-d", &format!("refs/heads/{BRANCH}")]).await.unwrap();
+    assert!(git::remote_head(&fx.repo, "origin", BRANCH).await.unwrap().is_none());
+    let mut runner = Runner::review(&fx.repo, BRANCH, fx.config.clone(), Origin::operator()).await.unwrap();
+    assert_eq!(git::rev_parse(&runner.state.winner().unwrap().worktree, "HEAD").await.unwrap(), original);
+    runner.execute().await.unwrap();
+    assert_eq!(runner.state.status, RunStatus::Ready, "{:?}", runner.state.events);
+    let delivered = git::rev_parse(&path, "HEAD").await.unwrap();
+    assert!(git::is_ancestor(&fx.repo, &original, &delivered).await);
+    assert!(!git::is_ancestor(&fx.repo, &stale, &delivered).await);
+    assert!(git::is_clean(&path).await.unwrap());
+}
+}
+
+common::e2e! {
+async fn foreign_base_merge_conflict_retains_both_clean_checkouts() {
+    let guard = common::home_lock().await;
+    let fx = fixture(guard, Judges::Unanimous, true);
+    let path = foreign(&fx).await;
+    let original = git::rev_parse(&path, "HEAD").await.unwrap();
+    let mut runner = Runner::review(&fx.repo, BRANCH, fx.config.clone(), Origin::operator()).await.unwrap();
+    let shadow = runner.state.winner().unwrap().worktree.clone();
+    std::fs::write(fx.repo.join("note.txt"), "conflicting base note\n").unwrap();
+    commit(&fx.repo, "add conflicting base note").await;
+    git::git(&fx.repo, &["push", "origin", "main"]).await.unwrap();
+    runner.execute().await.unwrap();
+    assert_eq!(runner.state.status, RunStatus::Blocked);
+    assert!(runner.state.base_sync.as_ref().unwrap().conflict.as_ref().unwrap().contains("could not merge"));
+    assert_eq!(git::rev_parse(&path, "HEAD").await.unwrap(), original);
+    assert_eq!(git::rev_parse(&shadow, "HEAD").await.unwrap(), original);
+    assert!(git::is_clean(&path).await.unwrap());
+    assert!(git::is_clean(&shadow).await.unwrap());
+    assert!(!git::rev_exists(&shadow, "MERGE_HEAD").await);
+    assert!(runner.state.merge.is_none());
+}
+}
+
+common::e2e! {
+async fn foreign_review_adopts_a_fresh_remote_descendant() {
+    let guard = common::home_lock().await;
+    let fx = fixture(guard, Judges::Unanimous, true);
+    let path = foreign(&fx).await;
+    let original = git::rev_parse(&path, "HEAD").await.unwrap();
+    let tree = git::rev_parse(&path, "HEAD^{tree}").await.unwrap();
+    let remote = git::git(&path, &["commit-tree", &tree, "-p", &original, "-m", "remote-only commit"]).await.unwrap();
+    git::git(&fx.repo, &["push", "origin", &format!("{remote}:refs/heads/{BRANCH}")]).await.unwrap();
+    let mut runner = Runner::review(&fx.repo, BRANCH, fx.config.clone(), Origin::operator()).await.unwrap();
+    assert_eq!(git::rev_parse(&runner.state.winner().unwrap().worktree, "HEAD").await.unwrap(), remote);
+    runner.execute().await.unwrap();
+    assert_eq!(runner.state.status, RunStatus::Ready, "{:?}", runner.state.events);
+    let delivered = git::rev_parse(&path, "HEAD").await.unwrap();
+    assert!(git::is_ancestor(&fx.repo, &remote, &delivered).await);
+    assert!(git::is_clean(&path).await.unwrap());
+}
+}

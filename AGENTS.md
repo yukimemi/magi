@@ -3373,3 +3373,9 @@ locked foreign holders. Completion and every publication path must pass through
 branch, clean status (including untracked files) and saved head, then fast-forward
 only. A moved checkout or rewritten review history blocks delivery and retains
 the isolated fixes; never force-move the operator's branch to recover.
+
+Remote tips may seed the shadow branch only after a successful branch fetch;
+failed fetches retain the saved local head even if a tracking ref survives.
+Automatic base synchronization merges into the shadow branch instead of rebasing,
+so the saved foreign head remains an ancestor for fast-forward delivery. A merge
+conflict is aborted and blocks the run with both checkouts retained.

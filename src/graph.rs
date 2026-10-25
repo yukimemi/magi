@@ -1102,12 +1102,16 @@ impl Runner {
         let review_branch = if let Some(checkout) = &state.foreign_checkout {
             let shadow = format!("magi/{}/review", state.short());
             let tracking = format!("{}/{branch}", state.config.merge.remote);
-            let head = match git::rev_parse(repo, &tracking).await {
-                Ok(remote) if git::is_ancestor(repo, &checkout.synced_head, &remote).await => {
-                    remote
+            // A surviving tracking ref is not evidence that the remote still
+            // offers this tip. Adopt it only after a successful fetch here.
+            let fetched = git::fetch(repo, &state.config.merge.remote, branch).await;
+            let mut head = checkout.synced_head.clone();
+            if matches!(fetched, Ok(out) if out.ok()) {
+                let remote = git::rev_parse(repo, &tracking).await?;
+                if git::is_ancestor(repo, &checkout.synced_head, &remote).await {
+                    head = remote;
                 }
-                _ => checkout.synced_head.clone(),
-            };
+            }
             git::git(repo, &["branch", &shadow, &head]).await?;
             shadow
         } else {
@@ -4821,6 +4825,10 @@ impl Runner {
     /// doc warns about ("two answers to a question nobody notices until a
     /// diff is wrong").
     ///
+    /// Foreign-checkout reviews instead merge the base into the owned shadow
+    /// worktree, preserving the ancestry required for fast-forward delivery.
+    /// A conflicting merge is aborted and held for operator resolution.
+    ///
     /// A conflict is not the end of the road: the standing rebase is handed
     /// to the fixer seat, at most `graph.review_rounds` times, counted in
     /// `state.rebase_fixes` (so it survives a park/resume and is shared with
@@ -4955,7 +4963,7 @@ impl Runner {
         if attempts >= BASE_SYNC_ROUNDS && !recovery {
             let why = format!(
                 "{base_branch} moved {behind} commit(s) ahead of {} after {BASE_SYNC_ROUNDS} \
-                 rebase(s); rebasing again would only race it",
+                 synchronization(s); synchronizing again would only race it",
                 winner.branch
             );
             self.state.status = RunStatus::Blocked;
@@ -4969,6 +4977,58 @@ impl Runner {
             self.state.event("land", why);
             self.hold_base_sync_kind(crate::base_sync_recovery::StopKind::Exhausted)
                 .await?;
+            self.state.save()?;
+            return Ok(());
+        }
+
+        if self.state.foreign_checkout.is_some() {
+            // Delivery to the operator's checkout is fast-forward only. A
+            // rebase here would discard its saved head from our ancestry.
+            let wait = repository_wait(&self.state, None);
+            let _coordination = coordinate_operation(&mut self.state, &repo, &wait).await?;
+            let merged = git::git_raw(
+                &winner.worktree,
+                &[
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "merge",
+                    "--no-ff",
+                    "--no-autostash",
+                    "--no-edit",
+                    "-m",
+                    &format!("Merge {tracking} before verifying"),
+                    &tip,
+                ],
+            )
+            .await?;
+            let conflict = if merged.ok() {
+                refresh_reviewed_commits(&mut self.state, &winner.branch).await;
+                self.state.event(
+                    "land",
+                    format!("merged {tracking} into {} before verifying", winner.branch),
+                );
+                None
+            } else {
+                if git::rev_exists(&winner.worktree, "MERGE_HEAD").await {
+                    git::git(&winner.worktree, &["merge", "--abort"]).await?;
+                }
+                let why = format!(
+                    "could not merge {tracking} into {} without rewriting foreign checkout history: {}",
+                    winner.branch,
+                    merged.stderr.chars().take(600).collect::<String>()
+                );
+                self.state.status = RunStatus::Blocked;
+                self.state.event("land", &why);
+                Some(why)
+            };
+            let synced = conflict.is_none();
+            self.state.base_sync = Some(BaseSync {
+                tip,
+                behind: if synced { 0 } else { behind },
+                attempts: attempts + 1,
+                conflict,
+                already_in: None,
+            });
             self.state.save()?;
             return Ok(());
         }
