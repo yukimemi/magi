@@ -11830,9 +11830,9 @@ mod tests {
         for refusal in [
             ResumeRefusal::ReviewBudget { used: 3, limit: 3 },
             ResumeRefusal::Status(RunStatus::Ready),
-            ResumeRefusal::Released,
-            ResumeRefusal::Retired,
-            ResumeRefusal::OwnershipTransferred,
+            ResumeRefusal::Released("20261022-000000-aaaa".into()),
+            ResumeRefusal::Retired("retirement-successor".into()),
+            ResumeRefusal::OwnershipTransferred("20261022-000000-bbbb".into()),
         ] {
             let mut state = exhausted.clone();
             let expected = match refusal {
@@ -11840,16 +11840,16 @@ mod tests {
                     state.status = RunStatus::Ready;
                     "status `ready`"
                 }
-                ResumeRefusal::Released => {
-                    state.released_to = Some("release-successor".into());
+                ResumeRefusal::Released(ref target) => {
+                    state.released_to = Some(target.clone());
                     "execution was released"
                 }
-                ResumeRefusal::Retired => {
-                    state.retired_to = Some("retirement-successor".into());
+                ResumeRefusal::Retired(ref target) => {
+                    state.retired_to = Some(target.clone());
                     "execution was retired"
                 }
-                ResumeRefusal::OwnershipTransferred => {
-                    state.pr_taken_over_by = Some("pr-successor".into());
+                ResumeRefusal::OwnershipTransferred(ref target) => {
+                    state.pr_taken_over_by = Some(target.clone());
                     "PR ownership was transferred"
                 }
                 _ => "review budget exhausted (3/3 rounds used)",
@@ -11857,6 +11857,14 @@ mod tests {
             assert_eq!(
                 resume_refusal_under(&state, Some(home.path())),
                 Some(refusal.clone())
+            );
+            assert_eq!(
+                refusal.successor(),
+                state
+                    .released_to
+                    .as_deref()
+                    .or(state.retired_to.as_deref())
+                    .or(state.pr_taken_over_by.as_deref())
             );
             state.save_under(home.path()).unwrap();
             let queue = Queue::at(home.path().join("queue"));
@@ -11879,6 +11887,12 @@ mod tests {
                 .to_string();
             assert!(error.contains(expected), "{error}");
             assert!(!error.contains("only a stalled or blocked"), "{error}");
+            if matches!(refusal, ResumeRefusal::Status(_)) {
+                assert!(
+                    error.contains("is final; there is nothing left to resume"),
+                    "{error}"
+                );
+            }
             if matches!(refusal, ResumeRefusal::ReviewBudget { .. }) {
                 assert!(error.contains("magi review <saved-branch> --task <task-id> --merge none"));
                 assert!(error.contains("review-only successor with a new review budget"));
@@ -11892,7 +11906,18 @@ mod tests {
             .into_iter()
             .flatten()
             {
-                assert!(error.contains(&format!("magi show {target}")), "{error}");
+                let short = if state.retired_to.as_ref() == Some(target) {
+                    target.as_str()
+                } else {
+                    crate::run::short_of(target)
+                };
+                assert!(
+                    error.contains(&format!("run {short}; inspect `magi show {short}`")),
+                    "{error}"
+                );
+                if short != target {
+                    assert!(!error.contains(target), "full successor id leaked: {error}");
+                }
             }
             assert_eq!(
                 serde_json::to_value(queue.get(&task.id).unwrap()).unwrap(),

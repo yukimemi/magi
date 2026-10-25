@@ -387,32 +387,56 @@ pub(crate) fn landing_checkpoint(state: &RunState) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResumeRefusal {
     Status(RunStatus),
-    Released,
-    Retired,
-    OwnershipTransferred,
+    Released(String),
+    Retired(String),
+    OwnershipTransferred(String),
     ReviewBudget { used: usize, limit: usize },
     ReviewDisabled,
     CleanReviewGateRan,
 }
 
 impl ResumeRefusal {
+    /// The recorded new owner, when admission was refused by an ownership move.
+    pub(crate) fn successor(&self) -> Option<&str> {
+        match self {
+            Self::Released(to) | Self::Retired(to) | Self::OwnershipTransferred(to) => Some(to),
+            _ => None,
+        }
+    }
+
     pub(crate) fn diagnostic(&self, state: &RunState) -> String {
         let reason = match self {
-            Self::Status(status) => format!("status `{}` does not admit resumption", status.as_str()),
-            Self::Released => "execution was released".into(),
-            Self::Retired => "execution was retired".into(),
-            Self::OwnershipTransferred => "PR ownership was transferred".into(),
+            Self::Status(status) => format!("status `{}` is final; there is nothing left to resume", status.as_str()),
+            Self::Released(_) => "execution was released".into(),
+            Self::Retired(_) => "execution was retired".into(),
+            Self::OwnershipTransferred(_) => "PR ownership was transferred".into(),
             Self::ReviewBudget { used, limit } => format!("review budget exhausted ({used}/{limit} rounds used)"),
             Self::CleanReviewGateRan => "review already has a clean round and the gate already ran; no retryable checkpoint remains".into(),
             Self::ReviewDisabled => "review is disabled (review_rounds = 0) and no retryable checkpoint or pending gate remains".into(),
         };
         let mut detail = format!("run {} cannot resume: {reason}.", state.short());
+        if let Some(target) = self.successor() {
+            let target = if matches!(self, Self::Retired(_)) {
+                target
+            } else {
+                crate::run::short_of(target)
+            };
+            detail.push_str(&format!(" Successor: run {target}; inspect `magi show {target}` before choosing any further action."));
+        }
         for (label, target) in [
             ("released to", &state.released_to),
             ("retired to", &state.retired_to),
             ("PR ownership moved to", &state.pr_taken_over_by),
         ] {
             if let Some(target) = target {
+                if self.successor() == Some(target.as_str()) {
+                    continue;
+                }
+                let target = if label == "retired to" {
+                    target.as_str()
+                } else {
+                    crate::run::short_of(target)
+                };
                 detail.push_str(&format!(" {label} run {target}; inspect `magi show {target}` before choosing any further action."));
             }
         }
@@ -443,14 +467,14 @@ pub(crate) fn resume_refusal_under(state: &RunState, home: Option<&Path>) -> Opt
     if !state.status.resumable() {
         return Some(ResumeRefusal::Status(state.status));
     }
-    if state.released() {
-        return Some(ResumeRefusal::Released);
+    if let Some(to) = &state.released_to {
+        return Some(ResumeRefusal::Released(to.clone()));
     }
-    if state.retired_to.is_some() {
-        return Some(ResumeRefusal::Retired);
+    if let Some(to) = &state.retired_to {
+        return Some(ResumeRefusal::Retired(to.clone()));
     }
-    if state.pr_taken_over_by.is_some() {
-        return Some(ResumeRefusal::OwnershipTransferred);
+    if let Some(to) = &state.pr_taken_over_by {
+        return Some(ResumeRefusal::OwnershipTransferred(to.clone()));
     }
     let review = crate::graph::review_conclusion(&state.reviews, state.config.graph.review_rounds);
     let allowed = resume_checkpoint(state)
