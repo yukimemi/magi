@@ -20,6 +20,71 @@ use magi::land::APPROVAL_NODE;
 use magi::queue::{Queue, Source, Task, TaskStatus};
 use magi::run::{Candidate, CommandOutcome, MergeOutcome, ReviewRound, RunState, RunStatus, Tally};
 
+const PR_URL: &str = "https://example.invalid/x/y/pull/1";
+const GH_REJECTION: &str = "Unrecognized option: 'json'";
+
+/// A native executable on both Unix and Windows, with no shell or network
+/// dependency. Libtest rejects `gh pr view ... --json ...` before running any
+/// tests. The fixture must not accidentally call an installed, authenticated
+/// gh: an invalid URL alone does not bound its network/credential-helper waits.
+#[derive(Debug)]
+struct UnavailableGh {
+    _dir: tempfile::TempDir,
+    executable: std::path::PathBuf,
+}
+
+impl UnavailableGh {
+    fn install() -> Self {
+        let dir = tempfile::tempdir().expect("temporary gh directory");
+        let executable = dir.path().join(if cfg!(windows) { "gh.exe" } else { "gh" });
+        std::fs::copy(std::env::current_exe().unwrap(), &executable)
+            .expect("copy native test binary");
+        let mut paths = vec![dir.path().to_path_buf()];
+        paths.extend(std::env::split_paths(
+            &std::env::var_os("PATH").unwrap_or_default(),
+        ));
+        // SAFETY: called only by the isolated test's setup, before its async
+        // body starts any tasks or subprocesses. Each test owns its process.
+        unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
+        Self {
+            _dir: dir,
+            executable,
+        }
+    }
+
+    async fn assert_selected(&self, repo: &std::path::Path) {
+        // Exercise the same PATH lookup, cwd and option that land uses,
+        // including Windows' executable search, rather than just invoking
+        // the absolute path we copied to.
+        let output = tokio::process::Command::new("gh")
+            .args(["pr", "view", PR_URL, "--json", "url"])
+            .current_dir(repo)
+            .output()
+            .await
+            .expect("spawn fixture gh through PATH");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains(GH_REJECTION),
+            "fixture gh {} must reject --json: {output:?}",
+            self.executable.display()
+        );
+    }
+}
+
+// Run setup inside common's isolated child, before the async test body. PATH
+// must never change in the parent, where libtest can run tests concurrently.
+macro_rules! approval_test {
+    (async fn $name:ident($gh:ident) $body:block) => {
+        #[test]
+        fn $name() {
+            common::isolated(stringify!($name), || {
+                let $gh = UnavailableGh::install();
+                async move $body
+            });
+        }
+    };
+}
+
 /// Write `config` to a `magi.toml` under `dir` and hand back the path, so
 /// `Opts::config` can point the daemon at it explicitly rather than at
 /// whatever layer stack `fx.repo` would otherwise resolve.
@@ -53,7 +118,13 @@ fn daemon_config(fx: &common::Fixture) -> magi::config::Config {
 /// daemon was still advancing, which task/run owned its slot, and what the
 /// persisted run states said when the guard fired. The daemon status path is
 /// inside this fixture's locked, temporary home.
-async fn serve_once(opts: Opts, queue: &Queue, task_ids: &[&str], scenario: &str) {
+async fn serve_once(
+    opts: Opts,
+    queue: &Queue,
+    task_ids: &[&str],
+    scenario: &str,
+    gh: &UnavailableGh,
+) {
     const HANG_GUARD: Duration = Duration::from_secs(60);
 
     let started = Instant::now();
@@ -76,10 +147,26 @@ async fn serve_once(opts: Opts, queue: &Queue, task_ids: &[&str], scenario: &str
                 .flat_map(|task| task.runs)
                 .map(|id| match RunState::load(&id) {
                     Ok(run) => format!(
-                        "{id}: status={:?}, parked={}, last_event={:?}",
+                        "{id}: status={:?}, parked={}, active={:?}, pr={:?}, merge={:?}, \
+                         tail_events={:?}, questions={:?}",
                         run.status,
                         run.parked,
-                        run.events.last()
+                        run.active,
+                        run.pr,
+                        run.merge,
+                        run.events.iter().rev().take(8).collect::<Vec<_>>(),
+                        ask::Questions::open()
+                            .list()
+                            .into_iter()
+                            .filter(|q| q.run == id)
+                            .map(|q| format!(
+                                "{}: node={}, status={:?}, resolution={:?}",
+                                q.id,
+                                q.node,
+                                q.status,
+                                q.resolution()
+                            ))
+                            .collect::<Vec<_>>()
                     ),
                     Err(error) => format!("{id}: {error:#}"),
                 })
@@ -89,7 +176,8 @@ async fn serve_once(opts: Opts, queue: &Queue, task_ids: &[&str], scenario: &str
                 .unwrap_or_else(|error| format!("unreadable {}: {error}", status_path.display()));
             panic!(
                 "{scenario}: daemon exceeded the {}s hang guard after {:?}; \
-                 status at {}: {status}; tasks: {tasks:#?}; runs: {runs:#?}",
+                 status at {}: {status}; tasks: {tasks:#?}; runs: {runs:#?}; \
+                 fixture gh: {gh:?}; expected rejection: {GH_REJECTION}",
                 HANG_GUARD.as_secs(),
                 started.elapsed(),
                 status_path.display(),
@@ -178,7 +266,7 @@ fn parked_run(repo: &std::path::Path, config: &magi::config::Config) -> RunState
     state.merge = Some(MergeOutcome {
         mode: MergeMode::Pr,
         ok: true,
-        detail: "https://example.invalid/x/y/pull/1".to_owned(),
+        detail: PR_URL.to_owned(),
         empty: false,
     });
     state.status = RunStatus::Landing;
@@ -198,10 +286,11 @@ fn approval_question(run: &str) -> ask::Question {
     )
 }
 
-common::e2e! {
-async fn a_task_parked_on_land_approval_does_not_block_another_runnable_task() {
+approval_test! {
+async fn a_task_parked_on_land_approval_does_not_block_another_runnable_task(gh) {
     let home = home_lock().await;
     let fx = fixture(home, Judges::Unanimous, false);
+    gh.assert_selected(&fx.repo).await;
 
     let config = daemon_config(&fx);
     let config_path = write_config(fx.tmp.path(), &config);
@@ -256,6 +345,7 @@ async fn a_task_parked_on_land_approval_does_not_block_another_runnable_task() {
         &queue,
         &[&task_a.id, &task_b.id],
         "the drain must not hang on the parked task",
+        &gh,
     )
     .await;
 
@@ -289,10 +379,11 @@ async fn a_task_parked_on_land_approval_does_not_block_another_runnable_task() {
 }
 }
 
-common::e2e! {
-async fn once_the_approval_answers_the_daemon_resumes_the_run_on_its_own() {
+approval_test! {
+async fn once_the_approval_answers_the_daemon_resumes_the_run_on_its_own(gh) {
     let home = home_lock().await;
     let fx = fixture(home, Judges::Unanimous, false);
+    gh.assert_selected(&fx.repo).await;
 
     let config = daemon_config(&fx);
     let config_path = write_config(fx.tmp.path(), &config);
@@ -345,15 +436,16 @@ async fn once_the_approval_answers_the_daemon_resumes_the_run_on_its_own() {
         &queue,
         &[&task.id],
         "the answered approval must resume without hanging",
+        &gh,
     )
     .await;
 
     // The run was resumed through `Runner::resume`, not recompeted: the same
     // run id is still the task's only run, and `land` was re-entered - proven
     // by the status moving on from `Landing` rather than staying parked
-    // forever with an answer nobody acted on. There is no real `gh` in this
-    // sandbox, so the concrete outcome is `Blocked`, not `Merged`; what this
-    // test cares about is that magi *tried*, unattended.
+    // forever with an answer nobody acted on. The fixture gh rejects the
+    // observation deterministically, so the outcome must be `Blocked` with
+    // that rejection recorded, proving magi *tried*, unattended.
     // `Task::start` records a run id on every attempt, including a resume of
     // the same run - so a second entry here is expected. What must not
     // happen is a *different* id appearing, which is what a fresh
@@ -367,17 +459,21 @@ async fn once_the_approval_answers_the_daemon_resumes_the_run_on_its_own() {
     );
 
     let run_after = RunState::load(&run.id).expect("run readable");
-    assert_ne!(
+    assert_eq!(
         run_after.status,
-        RunStatus::Landing,
+        RunStatus::Blocked,
         "an answered approval must not leave the run parked forever: {:?} \
          (task last_error: {:?})",
         run_after.status,
         after.last_error
     );
+    assert!(!run_after.parked, "the approval wait was cleared");
+    assert!(run_after.pr.is_none(), "no PR observation succeeded");
     assert!(
-        run_after.events.iter().any(|e| e.node == "land"),
-        "the resume actually re-entered `land`: {:?}",
+        run_after.events.iter().any(|e| e.node == "land"
+            && e.message.contains(&format!("gave up: gh pr view {PR_URL}:"))
+            && e.message.contains(GH_REJECTION)),
+        "the resumed land must record the fixture gh's rejection: {:?}",
         run_after.events
     );
 }

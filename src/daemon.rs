@@ -3702,6 +3702,7 @@ async fn poll(
     limits: DispatchLimits,
 ) -> Result<()> {
     let mut attempted = Vec::new();
+    let mut settling_once_services = false;
     let interrupt_path = home.join("scheduler-interrupt.json");
     let mut interrupt = match std::fs::read(&interrupt_path) {
         Ok(body) => serde_json::from_slice(&body).context("read scheduler interrupt state")?,
@@ -3799,6 +3800,12 @@ async fn poll(
             "cache",
             "fetch",
         ] {
+            // Once an idle --once drain starts settling services, subsequent
+            // scans only consume their effects. An expired cadence receipt
+            // must not start another service and keep the drain alive.
+            if settling_once_services {
+                break;
+            }
             start_service(
                 home,
                 opts,
@@ -3919,14 +3926,21 @@ async fn poll(
             continue;
         }
         if owned.is_empty() && opts.once {
-            while crate::worker::active(home)?
-                .iter()
-                .any(|job| job.key == "service:daemon-housekeeping")
-            {
-                stop.idle(RECHECK_WHILE_BUSY).await;
-                if stop.stopped() {
-                    return Ok(());
-                }
+            settling_once_services = true;
+            // These finite services can own queue claims or publish answers.
+            // A skipped claim is not an idle queue until they have finished;
+            // scan again afterwards so their changes are actually scheduled.
+            if crate::worker::active(home)?.iter().any(|job| {
+                job.kind == "daemon-service"
+                    && matches!(
+                        job.key.as_str(),
+                        "service:daemon-housekeeping"
+                            | "service:daemon-conductor"
+                            | "service:daemon-maintenance"
+                    )
+            }) {
+                stop.idle(RECHECK_WHILE_BUSY.min(opts.poll)).await;
+                continue;
             }
             break;
         }
@@ -9992,6 +10006,106 @@ mod tests {
             shared.stopped(),
             "a clone is the same stop; that is how the loop and its caller share one"
         );
+    }
+
+    #[tokio::test]
+    async fn once_drain_rechecks_answers_after_queue_services_release_their_claims() {
+        for operation in ["conductor", "maintenance", "housekeeping"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut opts, queue, _, home, worktrees) = idle_loop(dir.path());
+            opts.once = true;
+            opts.poll = Duration::from_millis(1);
+            let mut task = task();
+            task.runs.push("fixture-run".into());
+            queue.put(&mut task).unwrap();
+            let claim = queue.claim(&task.id).unwrap();
+
+            // Model a live service holding the task's claim across the
+            // scheduler's dispatch scan. No real subprocess or timed race.
+            let directory = home.join("workers/jobs/abcdef");
+            std::fs::create_dir_all(&directory).unwrap();
+            let lease = std::fs::File::create(directory.join("live.lock")).unwrap();
+            crate::pr_head::try_lock_file(&lease).unwrap();
+            let mut job = crate::worker::Job {
+                id: "abcdef".into(),
+                sequence: 1,
+                kind: "daemon-service".into(),
+                key: format!("service:daemon-{operation}"),
+                payload: serde_json::Value::Null,
+                generation: "fixture".into(),
+                version: None,
+                status: crate::worker::Status::Running,
+                result: None,
+                pid: Some(std::process::id()),
+                created_at: Timestamp::now().as_second() as u64,
+                finished_at: None,
+            };
+            let record = directory.join("job.json");
+            std::fs::write(&record, serde_json::to_vec(&job).unwrap()).unwrap();
+
+            let status = Arc::new(Mutex::new(Status::new()));
+            let stop = Stop::new();
+            let mut drain = Box::pin(poll(
+                &opts,
+                &queue,
+                &status,
+                &home,
+                &worktrees,
+                &stop,
+                DispatchLimits {
+                    max_concurrent: 1,
+                    pause_for_interrupts: false,
+                    recovery_cfg: None,
+                },
+            ));
+            std::future::poll_fn(|cx| {
+                use std::future::Future;
+                assert!(
+                    drain.as_mut().poll(cx).is_pending(),
+                    "--once must wait for {operation} to release its queue claim"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(lock(&status).polls > 0, "the dispatch scan was exercised");
+
+            // An answer arrives while the service still owns the claim. A
+            // fresh scheduling pass must apply it before declaring idle.
+            let questions = Questions::at(home.join("questions"));
+            let mut q = action_question("fixture-run", ask::ChoiceAction::Done);
+            questions.put(&mut q).unwrap();
+            drop(claim);
+            // Model services that took longer than their cadence, without a
+            // wall-clock sleep. The final scans must not respawn them even
+            // though their receipts now permit another periodic invocation.
+            let expired =
+                serde_json::to_vec(&"2000-01-01T00:00:00Z".parse::<Timestamp>().unwrap()).unwrap();
+            for service in [operation, "housekeeping"] {
+                std::fs::write(
+                    home.join("service-ticks").join(format!("daemon-{service}")),
+                    &expired,
+                )
+                .unwrap();
+            }
+            job.status = crate::worker::Status::Finished;
+            std::fs::write(&record, serde_json::to_vec(&job).unwrap()).unwrap();
+            drop(lease);
+            tokio::time::timeout(Duration::from_secs(2), drain)
+                .await
+                .expect("the settled service must allow the drain to finish")
+                .unwrap();
+            let after = queue.get(&task.id).unwrap();
+            assert_eq!(after.status, TaskStatus::Done, "answer after {operation}");
+            assert!(after.action_applied(&q.id));
+            for service in [operation, "housekeeping"] {
+                assert_eq!(
+                    std::fs::read(home.join("service-ticks").join(format!("daemon-{service}")))
+                        .unwrap(),
+                    expired,
+                    "the final once rescan must not restart {service}"
+                );
+            }
+        }
     }
 
     #[test]
