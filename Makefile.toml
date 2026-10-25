@@ -5,7 +5,6 @@
 # cargo-nextest installed, `test-targets` warns and falls back to `cargo test`.
 [env]
 PJ_RUST_TEST_RUNNER = "nextest"
-
 [tasks.default]
 alias = "check"
 
