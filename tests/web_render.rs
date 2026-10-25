@@ -5007,10 +5007,11 @@ async fn loop_version_details_stay_compact_and_preserve_toggle_state() {
           return true;
         })()"##).await.expect("loop version layout assertions");
         assert_eq!(result, true, "loop versions at {width}px");
-        // Native keyboard activation must work, rather than a synthetic click handler test.
-        for (key, code, vk, expanded) in
-            [("Enter", "Enter", 13, "false"), (" ", "Space", 32, "true")]
-        {
+        // Include text so CDP emits the character event used by native Enter activation.
+        for (key, code, vk, text, expanded) in [
+            ("Enter", "Enter", 13, "\r", "false"),
+            (" ", "Space", 32, " ", "true"),
+        ] {
             for kind in ["keyDown", "keyUp"] {
                 browser
                     .call(
@@ -5018,6 +5019,8 @@ async fn loop_version_details_stay_compact_and_preserve_toggle_state() {
                         "Input.dispatchKeyEvent",
                         serde_json::json!({
                             "type": kind, "key": key, "code": code, "windowsVirtualKeyCode": vk,
+                            "text": if kind == "keyDown" { text } else { "" },
+                            "unmodifiedText": if kind == "keyDown" { text } else { "" },
                         }),
                     )
                     .await
