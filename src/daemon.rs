@@ -3645,7 +3645,9 @@ fn task_worker_spawn_error(home: &Path, request: &TaskWorker, error: anyhow::Err
         home,
         Notice::error(
             "loop:worker-startup",
-            format!("Task {} worker could not be started or acknowledged: {}. Scheduler dispatch stopped; already reserved workers may still complete.", request.task, error.to_string().lines().next().unwrap_or("unknown startup error")),
+            // Startup diagnostics may contain private child-process details;
+            // keep them in the local error/log rather than the chat or notifier.
+            format!("Task {} worker could not be started or acknowledged. Scheduler dispatch stopped; already reserved workers may still complete. Inspect the local execution log and reservation worker.log for startup details.", request.task),
         ).link(Link::Task { id: request.task.clone() }),
     );
     Err(error).with_context(|| {
@@ -6184,7 +6186,7 @@ mod tests {
             standalone: false,
         };
         let job = starting_task_reservation(home.path(), &request);
-        task_worker_spawn_error(
+        let error = task_worker_spawn_error(
             home.path(),
             &request,
             anyhow::anyhow!("worker startup is unacknowledged: private-error-detail"),
@@ -6203,6 +6205,20 @@ mod tests {
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].key, "loop:worker-startup");
         assert!(!notices[0].message.contains("private-error-detail"));
+        assert!(notices[0].message.contains(&request.task));
+        assert!(
+            notices[0]
+                .message
+                .contains("could not be started or acknowledged")
+        );
+        assert!(notices[0].message.contains("worker.log"));
+        assert_eq!(
+            notices[0].link,
+            Some(Link::Task {
+                id: request.task.clone()
+            })
+        );
+        assert!(format!("{error:#}").contains("private-error-detail"));
     }
 
     #[test]
