@@ -66,23 +66,36 @@ pub(crate) fn maintenance(home: &Path, id: &str) -> Result<ExecutionLease> {
 }
 
 /// A held lease is evidence of an execution, including within a long-lived
-/// daemon. A free lease proves death only when its metadata names this pass.
-/// The caller supplies the same process judge used for legacy records.
+/// daemon. A free lease proves death when its metadata names this pass, or
+/// a durable marker proves execution never claimed the record. Missing legacy
+/// metadata is not such a marker. The caller supplies the process judge.
 pub(crate) fn judge(state: &RunState, home: &Path, fallback: Liveness) -> Liveness {
     if state.driver_exited {
         // A daemon claim always wins, even in the gap after graph completion.
         return fallback;
     }
     let dir = home.join("runs").join(&state.id);
-    let Ok(body) = std::fs::read(dir.join("driver.json")) else {
-        return fallback;
-    };
-    let Ok(recorded) = serde_json::from_slice::<Identity>(&body) else {
-        return Liveness::Unknown;
-    };
-    if recorded != Identity::of(state) || recorded.pass.is_none() {
-        return fallback;
+    match std::fs::read(dir.join("driver.json")) {
+        Ok(body) => {
+            let Ok(recorded) = serde_json::from_slice::<Identity>(&body) else {
+                return Liveness::Unknown;
+            };
+            if recorded != Identity::of(state) || recorded.pass.is_none() {
+                return fallback;
+            }
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && state.driver_claimed == Some(false)
+                && state.driver_pid.is_none()
+                && state.driver_started_at.is_none()
+                && state.passes.is_empty()
+                && state.active.is_empty() => {}
+        Err(_) => return fallback,
     }
+    // Both a matching prior pass and a durable never-claimed record can be
+    // admitted only with a free lease. The latter also reaches every queue
+    // preflight, so a public owner can recover before its first driver claim.
     match lease(home, &state.id) {
         Ok(_) => Liveness::Dead,
         Err(e)
@@ -447,6 +460,7 @@ mod tests {
         stale.save_under(home.path()).unwrap();
         let mut previous = crate::daemon::Status::new();
         previous.current.push(crate::daemon::Current {
+            worker: None,
             task: "task".into(),
             run: stale.id.clone(),
         });

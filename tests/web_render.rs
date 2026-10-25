@@ -5521,6 +5521,9 @@ async fn run_landing_renders_when_core_precedes_identical_evidence() {
     );
     merged.id = "20260901-000009-cc09".into();
     merged.status = RunStatus::Merged;
+    // Core always reports unknown liveness; a record without the first-claim
+    // marker (legacy) keeps the evidence payload equally unknown.
+    merged.driver_claimed = None;
     merged.pr = Some(magi::run::PrRecord {
         url: "https://github.com/example/repo/pull/7".into(),
         number: 7,

@@ -1317,6 +1317,7 @@ impl Runner {
                 // in memory for queue settlement without overwriting a concurrent
                 // retirement or publication transaction.
                 self.state.resource_block = Some(crate::run::ResourceBlock {
+                    cause: crate::run::ResourceBlockCause::Other,
                     node: "start".into(),
                     kind: "worktree maintenance".into(),
                     detail: detail.clone(),
@@ -1327,9 +1328,16 @@ impl Runner {
         };
         let disk = RunState::load(&self.state.id)?;
         crate::pr_head::ensure_owner(&disk)?;
-        if disk.liveness(false) == crate::run::Liveness::Live {
-            bail!("run already has a live driver; wait for its execution to end");
-        }
+        let claimed =
+            crate::daemon::is_working_on_other(&crate::run::home(), &disk.id, Timestamp::now())?;
+        // Only proven-live ownership refuses here. Unknown records (legacy runs
+        // with no claim marker or process identity) fall through to the
+        // exclusive execution lease taken just below, which is what actually
+        // keeps a second driver out.
+        anyhow::ensure!(
+            disk.liveness(claimed) != crate::run::Liveness::Live,
+            "run already has a live driver; wait for its execution to end"
+        );
         if let Some(to) = &disk.released_to {
             bail!(
                 "run {} cannot continue: its worktree was released to run {}",
@@ -1378,6 +1386,7 @@ impl Runner {
         state.driver_pid = Some(pid);
         state.driver_started_at = crate::proc::process_started_at(pid);
         state.driver_exited = false;
+        state.driver_claimed = Some(true);
         state.begin_pass();
         execution.driver.bind(state);
         state.save()?;
@@ -1576,9 +1585,13 @@ impl Runner {
     /// resumable. Unstarted seats have no result; completed peers retain
     /// their saved candidate state.
     fn stop_for_resource(&mut self) -> Result<()> {
-        // A wait abandoned because the run is parking stays a park.
-        if self.state.resource_block.is_some() && !(self.pause.parked() || self.interrupt.parked())
-        {
+        // Resource acquisition observes cancellation inside a node. Complete
+        // the same durable park as every other node boundary before returning.
+        if self.pause.parked() || self.interrupt.parked() {
+            self.park_here()?;
+            return Ok(());
+        }
+        if self.state.resource_block.is_some() {
             self.state.status = RunStatus::Blocked;
         }
         self.state.save()
@@ -1612,7 +1625,20 @@ impl Runner {
         if !self.pause.parked() && !self.interrupt.parked() {
             return Ok(false);
         }
+        if self.state.parked {
+            return Ok(true);
+        }
         let cause = self.interrupt.cause().or_else(|| self.pause.cause());
+        if let Some(block) = &mut self.state.resource_block
+            && matches!(
+                block.cause,
+                crate::run::ResourceBlockCause::Cancelled { .. }
+            )
+        {
+            block.cause = crate::run::ResourceBlockCause::Cancelled {
+                park: cause.clone(),
+            };
+        }
         let why = match cause.as_ref().map(ParkCause::label) {
             Some(reason) => format!(
                 "parked after `{}` ({reason}) — resume to carry on from here",
@@ -7041,7 +7067,7 @@ impl Runner {
                 self.state.event(
                     "review",
                     format!(
-                        "{why}; e2e could not run (shared build cache unavailable); not \
+                        "{why}; e2e could not run (resource unavailable); not \
                          deciding yet"
                     ),
                 );
@@ -7736,6 +7762,7 @@ impl Runner {
                     // anything is published (see `guarded_pr_message`).
                     if self.state.resource_block.is_none() {
                         self.state.resource_block = Some(crate::run::ResourceBlock {
+                            cause: crate::run::ResourceBlockCause::Other,
                             node: "pr-summary".to_owned(),
                             kind: "shared resource".to_owned(),
                             detail: why,
@@ -9314,6 +9341,7 @@ fn repository_wait(
 fn record_repository_block(state: &mut RunState, error: &anyhow::Error) {
     if error.is::<crate::repo_lock::ResourceBlocked>() {
         state.resource_block = Some(crate::run::ResourceBlock {
+            cause: crate::run::ResourceBlockCause::Other,
             node: "repository".into(),
             kind: if error.to_string().contains("disk pressure") {
                 "disk pressure"
@@ -9412,18 +9440,26 @@ async fn wave(
         if jobs_had_a_writer {
             let owner = crate::cache::Owner::here(run, node, "*", Path::new("(wave)"), "");
             let cancel = move || pauses.is_some_and(|(a, b)| a.parked() || b.parked());
-            match acquire_cache_lease(state, cache_dir, &owner, resource_limit, node, &cancel).await
+            match acquire_cache_lease(
+                state,
+                cache_dir,
+                &owner,
+                resource_limit,
+                node,
+                node,
+                &cancel,
+            )
+            .await
             {
                 Ok(Some(g)) => Some(g),
                 // Parking: leave without spawning anything. The run parks at
                 // the next boundary and the seats are asked afresh on resume.
                 Ok(None) => {
-                    state.resource_block = Some(crate::run::ResourceBlock {
-                        node: node.to_owned(),
-                        kind: "shared build cache".to_owned(),
-                        detail: "the run is parking".to_owned(),
-                        at: Timestamp::now(),
-                    });
+                    if let Some(block) = &mut state.resource_block {
+                        block.cause = crate::run::ResourceBlockCause::Cancelled {
+                            park: pauses.and_then(|(a, b)| b.cause().or_else(|| a.cause())),
+                        };
+                    }
                     return block_wave(
                         jobs,
                         state,
@@ -9440,12 +9476,6 @@ async fn wave(
                     // not hold, and an agent that cannot be given one is not
                     // asked at all: the run stops resumably instead.
                     let why = format!("{e:#}");
-                    state.resource_block = Some(crate::run::ResourceBlock {
-                        node: node.to_owned(),
-                        kind: "shared build cache".to_owned(),
-                        detail: why.clone(),
-                        at: Timestamp::now(),
-                    });
                     state.event(
                         "resource",
                         format!("{node}: no agent was started - {why}; resume to ask the same agents again"),
@@ -9633,6 +9663,7 @@ async fn wave(
             && state.resource_block.is_none()
         {
             state.resource_block = Some(crate::run::ResourceBlock {
+                cause: crate::run::ResourceBlockCause::Other,
                 node: node.to_owned(),
                 kind: if why.contains("disk pressure") {
                     "disk pressure"
@@ -10265,6 +10296,7 @@ async fn acquire_cache_lease(
     cache_dir: &Path,
     owner: &crate::cache::Owner,
     budget: Duration,
+    node: &str,
     context: &str,
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<Option<crate::cache::Guard>> {
@@ -10315,16 +10347,38 @@ async fn acquire_cache_lease(
     )
     .await;
     state.resource_wait = None;
-    match waited {
-        Ok(g) => Ok(g),
-        Err(e) => {
-            state.event("verify", format!("{context}: {e:#}"));
-            if let Err(e2) = state.save() {
-                tracing::warn!("could not persist a cache wait timeout: {e2:#}");
-            }
-            Err(e)
+    let cause = match &waited {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(crate::run::ResourceBlockCause::Cancelled { park: None }),
+        Err(error) if error.is::<crate::cache::WaitTimeout>() => {
+            Some(crate::run::ResourceBlockCause::Timeout {
+                waited_secs: started.elapsed().as_secs(),
+                limit_secs: budget.as_secs(),
+            })
         }
+        Err(_) => Some(crate::run::ResourceBlockCause::Other),
+    };
+    if let Some(cause) = cause {
+        let detail = match &waited {
+            Ok(_) => "the wait for the build cache was cancelled".to_owned(),
+            Err(error) => format!("{error:#}"),
+        };
+        state.resource_block = Some(crate::run::ResourceBlock {
+            cause,
+            node: node.to_owned(),
+            kind: "shared build cache".into(),
+            detail,
+            at: Timestamp::now(),
+        });
+        state.event(
+            "resource",
+            state.resource_block.as_ref().unwrap().description(),
+        );
     }
+    if let Err(error) = state.save() {
+        tracing::warn!("could not persist cache acquisition outcome: {error:#}");
+    }
+    waited
 }
 
 /// The lease state could not be read at all (unreadable lease file, a
@@ -10341,6 +10395,22 @@ impl std::fmt::Display for CacheCheckError {
 }
 
 impl std::error::Error for CacheCheckError {}
+
+/// Keep a specific acquisition outcome when the caller adds command evidence.
+fn record_cache_error(state: &mut RunState, node: &str, error: &anyhow::Error) {
+    state
+        .resource_block
+        .get_or_insert_with(|| crate::run::ResourceBlock {
+            cause: crate::run::ResourceBlockCause::Other,
+            node: node.to_owned(),
+            kind: "shared build cache".into(),
+            detail: format!("{error:#}"),
+            at: Timestamp::now(),
+        });
+    if let Err(error) = state.save() {
+        tracing::warn!("could not persist cache resource block: {error:#}");
+    }
+}
 
 /// Run `body` — a verify command batch — while holding the shared build
 /// cache's lease, so this run's own full verification (`e2e`, `gate`) can
@@ -10386,15 +10456,22 @@ where
     let resource_limit = Duration::from_secs(state.config.graph.timeout_resource_wait);
     let guard = if let Some(cache_dir) = cache_dir {
         let owner = crate::cache::Owner::here(&state.id, node, seat, worktree, head);
-        match acquire_cache_lease(state, cache_dir, &owner, resource_limit, context, &|| {
-            wait.cancelled()
-        })
+        match acquire_cache_lease(
+            state,
+            cache_dir,
+            &owner,
+            resource_limit,
+            node,
+            context,
+            &|| wait.cancelled(),
+        )
         .await
         .and_then(|g| {
             g.ok_or_else(|| anyhow::anyhow!("the wait for the build cache was cancelled"))
         }) {
             Ok(g) => Some(g),
             Err(e) => {
+                record_cache_error(state, node, &e);
                 return Ok((
                     vec![CommandOutcome {
                         command: "(waiting for the shared build cache)".into(),
@@ -10419,6 +10496,7 @@ where
             &identity,
             &state.config.verify.cargo_manifests(),
         ) {
+            record_cache_error(state, node, &e);
             state.event(
                 "verify",
                 format!(
@@ -10734,6 +10812,7 @@ async fn run_commands(
                 running.finish().await;
                 if let Some(reason) = pressure {
                     state.resource_block = Some(crate::run::ResourceBlock {
+                        cause: crate::run::ResourceBlockCause::Other,
                         node: node.to_owned(),
                         kind: "disk pressure".to_owned(),
                         detail: reason.clone(),
@@ -14944,6 +15023,196 @@ mod tests {
         );
         let last = runner.state.events.last().expect("a park event");
         assert!(last.message.contains("0.121.0"), "{}", last.message);
+    }
+
+    #[tokio::test]
+    async fn driver_admission_accepts_a_freshly_minted_record_under_its_lease() {
+        crate::run::pin_test_home();
+        let mut runner = runner_at(RunStatus::Reviewing);
+        runner.state.save().unwrap();
+        let mut execution = runner.claim_driver().await.expect("first execution");
+        assert_eq!(execution.runner.state.passes.len(), 1);
+        execution
+            .driver
+            .finish(&mut execution.runner.state)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn driver_admission_resumes_a_record_saved_before_its_first_claim() {
+        crate::run::pin_test_home();
+        let mut runner = runner_at(RunStatus::Reviewing);
+        runner.state.config.agents = vec![conductor()];
+        runner.state.config.graph.timeout_resource_wait = 0;
+        runner.state.save().unwrap();
+        let id = runner.state.id.clone();
+        let owner = crate::pr_head::owner_lock(&crate::run::home(), &id).unwrap();
+        assert!(runner.claim_driver().await.is_err());
+        drop(owner);
+        drop(runner);
+        let mut resumed = Runner::resume(&id).unwrap();
+        assert_eq!(resumed.state.driver_claimed, Some(false));
+        assert_eq!(resumed.state.liveness(false), crate::run::Liveness::Dead);
+        assert_eq!(resumed.state.liveness(true), crate::run::Liveness::Live);
+        let mut execution = resumed
+            .claim_driver()
+            .await
+            .expect("retry initial claim after reload");
+        assert_eq!(execution.runner.state.driver_claimed, Some(true));
+        assert_eq!(execution.runner.state.passes.len(), 1);
+        execution
+            .driver
+            .finish(&mut execution.runner.state)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn driver_admission_preclaim_marker_does_not_bypass_an_execution_lease() {
+        crate::run::pin_test_home();
+        let mut runner = runner_at(RunStatus::Reviewing);
+        runner.state.config.agents = vec![conductor()];
+        runner.state.save().unwrap();
+        let id = runner.state.id.clone();
+        let lease = crate::driver::maintenance(&crate::run::home(), &id).unwrap();
+        let mut resumed = Runner::resume(&id).unwrap();
+        assert_eq!(resumed.state.liveness(false), crate::run::Liveness::Live);
+        assert!(resumed.claim_driver().await.is_err());
+        assert!(RunState::load(&id).unwrap().passes.is_empty());
+        drop(lease);
+        let mut execution = resumed.claim_driver().await.unwrap();
+        execution
+            .driver
+            .finish(&mut execution.runner.state)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn driver_admission_accepts_legacy_unknown_process_with_a_proven_free_pass_lease() {
+        crate::run::pin_test_home();
+        let mut runner = runner_at(RunStatus::Reviewing);
+        let state = &mut runner.state;
+        state.config.agents = vec![conductor()];
+        state.driver_claimed = None;
+        state.driver_pid = Some(std::process::id());
+        state.driver_started_at = None;
+        state.begin_pass();
+        state.save().unwrap();
+        let lease = crate::driver::maintenance(&crate::run::home(), &state.id).unwrap();
+        std::fs::write(
+            state.dir().join("driver.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "pid": state.driver_pid, "started_at": null,
+                "pass": state.passes[0].started_at, "pass_index": state.passes[0].index,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(state.liveness(false), crate::run::Liveness::Live);
+        drop(lease);
+        assert_eq!(state.liveness(false), crate::run::Liveness::Dead);
+        let mut resumed = Runner::resume(&state.id).unwrap();
+        assert!(!resumed.state.driver_exited);
+        let mut execution = resumed
+            .claim_driver()
+            .await
+            .expect("lease proves previous execution ended");
+        assert_eq!(execution.runner.state.passes.len(), 2);
+        execution
+            .driver
+            .finish(&mut execution.runner.state)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn driver_admission_admits_a_legacy_record_without_a_claim_marker() {
+        crate::run::pin_test_home();
+        let mut runner = runner_at(RunStatus::Reviewing);
+        let mut json = serde_json::to_value(&runner.state).unwrap();
+        json.as_object_mut().unwrap().remove("driver_claimed");
+        runner.state = serde_json::from_value(json).unwrap();
+        assert_eq!(runner.state.driver_claimed, None);
+        runner.state.save().unwrap();
+        let mut execution = runner
+            .claim_driver()
+            .await
+            .expect("the execution lease, not a missing marker, excludes a second driver");
+        assert_eq!(execution.runner.state.passes.len(), 1);
+        execution
+            .driver
+            .finish(&mut execution.runner.state)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn driver_admission_refuses_a_proven_live_driver() {
+        crate::run::pin_test_home();
+        let mut runner = runner_at(RunStatus::Reviewing);
+        let pid = std::process::id();
+        runner.state.driver_pid = Some(pid);
+        runner.state.driver_started_at = crate::proc::process_started_at(pid);
+        assert!(runner.state.driver_started_at.is_some());
+        runner.state.save().unwrap();
+        let error = runner
+            .claim_driver()
+            .await
+            .err()
+            .expect("a live driver must refuse");
+        assert!(error.to_string().contains("live driver"), "{error:#}");
+        let saved = RunState::load(&runner.state.id).unwrap();
+        assert_eq!(saved.driver_pid, Some(pid));
+        assert_eq!(saved.status, RunStatus::Reviewing);
+        assert!(saved.passes.is_empty());
+    }
+
+    #[test]
+    fn parking_resource_halt_persists_the_pass_once() {
+        crate::run::pin_test_home();
+        let mut runner = runner_at(RunStatus::Reviewing);
+        runner.state.begin_pass();
+        runner.state.resource_block = Some(crate::run::ResourceBlock {
+            node: "fix".into(),
+            kind: "shared build cache".into(),
+            detail: "cancelled".into(),
+            at: Timestamp::now(),
+            cause: crate::run::ResourceBlockCause::Cancelled { park: None },
+        });
+        let cause = ParkCause::Upgrade {
+            from: "old".into(),
+            to: Some("new".into()),
+        };
+        runner.pause.park_for(cause.clone());
+        // Both direct fixer exits and graph resource boundaries must complete
+        // parking, rather than returning a stale Reviewing record.
+        runner.stop_for_resource().unwrap();
+        assert!(runner.resource_halt().unwrap());
+        assert!(runner.park_here().unwrap());
+        let saved = RunState::load(&runner.state.id).unwrap();
+        assert!(saved.parked);
+        assert_eq!(saved.status, RunStatus::Reviewing);
+        assert!(saved.passes[0].ended_at.is_some());
+        assert_eq!(
+            saved.passes[0].end,
+            Some(crate::run::PassEnd::Parked {
+                cause: cause.clone()
+            })
+        );
+        assert_eq!(
+            saved.resource_block.unwrap().cause,
+            crate::run::ResourceBlockCause::Cancelled { park: Some(cause) }
+        );
+        assert_eq!(
+            saved
+                .events
+                .iter()
+                .filter(|event| event.node == "park")
+                .count(),
+            1
+        );
     }
 
     /// `watch_interrupt` and `on_pause` are genuinely independent: an ordinary
@@ -19409,6 +19678,82 @@ mod resource_wait_tests {
         assert_eq!(outcomes.len(), 1);
         assert!(outcomes[0].resource_blocked);
         assert!(st.resource_wait.is_none());
+        assert!(matches!(
+            st.resource_block.unwrap().cause,
+            crate::run::ResourceBlockCause::Timeout { limit_secs: 0, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn verification_resource_error_does_not_claim_an_elapsed_timeout() {
+        crate::run::pin_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[invalid").unwrap();
+        let cache = tmp.path().join("cache");
+        let mut state = state(21600);
+        let wait = repository_wait(&state, None);
+        let (outcomes, _) = with_cache_lease(
+            &mut state,
+            Some(&cache),
+            "gate",
+            "gate",
+            tmp.path(),
+            "head",
+            Duration::from_secs(60),
+            "gate",
+            &wait,
+            |_, _| async { panic!("freshness failure must not start verification") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].resource_blocked);
+        let block = state.resource_block.unwrap();
+        assert_eq!(block.cause, crate::run::ResourceBlockCause::Other);
+        assert!(!block.description().contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_cache_wait_preserves_the_park_cause_without_starting_an_agent() {
+        crate::run::pin_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let _held = hold(&cache);
+        let mut state = state(21600);
+        let pause = Pause::new();
+        let interrupt = Pause::new();
+        let cause = ParkCause::Operator;
+        pause.park_for(cause.clone());
+        let prompts = Prompts::default();
+        let ctx = WaveCtx {
+            run: "test",
+            node: "fix",
+            prompts: &prompts,
+            cache: Some(&cache),
+            round: None,
+            carry_seats: false,
+            pauses: Some((&pause, &interrupt)),
+        };
+        let result = wave(
+            vec![job(
+                sh("writer", "exit 99"),
+                tmp.path(),
+                Duration::from_secs(1),
+            )],
+            Arc::new(Semaphore::new(1)),
+            &ctx,
+            &mut state,
+            0,
+        )
+        .await;
+        assert!(matches!(result[0].2, AgentOutcome::ResourceBlocked(_)));
+        assert_eq!(result[0].1.turns, 0);
+        assert!(!tmp.path().join("art/impl-A.prompt.md").exists());
+        assert_eq!(
+            state.resource_block.unwrap().cause,
+            crate::run::ResourceBlockCause::Cancelled { park: Some(cause) }
+        );
+        assert!(state.active.is_empty());
     }
 
     #[tokio::test]
@@ -19547,6 +19892,10 @@ mod resource_wait_tests {
         assert!(FailClass::of(out).is_none(), "not a failure class");
         let block = st.resource_block.as_ref().expect("recorded for the resume");
         assert_eq!(block.kind, "shared build cache");
+        assert!(matches!(
+            block.cause,
+            crate::run::ResourceBlockCause::Timeout { limit_secs: 1, .. }
+        ));
         assert!(st.handovers.is_empty() && st.seat_history.is_empty() && st.quota.is_empty());
         assert!(st.active.is_empty());
     }

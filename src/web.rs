@@ -11905,7 +11905,13 @@ mod tests {
         // Unknown liveness and armed auto-merge both fail without settling.
         state.driver_exited = false;
         state.driver_pid = None;
+        state.driver_claimed = None; // No durable proof of an unstarted execution.
         state.save_under(fx.home.path()).unwrap();
+        assert_eq!(
+            state.liveness_under(fx.home.path(), false),
+            crate::run::Liveness::Unknown
+        );
+
         assert_eq!(fx.post(&path, Some(&body)).await.status, 400);
         state.driver_exited = true;
         state.land_armed_head = Some("head".into());
@@ -21103,6 +21109,7 @@ mod tests {
         q.put(&mut t2).expect("put t2");
         let mut beat = crate::daemon::Status::new();
         beat.current = vec![crate::daemon::Current {
+            worker: None,
             task: t2.id.clone(),
             run: "20260901-000000-r222".to_owned(),
         }];
@@ -21202,6 +21209,7 @@ mod tests {
         write_run(&runs, run_running, RunStatus::Prep);
         let mut beat = crate::daemon::Status::new();
         beat.current = vec![crate::daemon::Current {
+            worker: None,
             task: "20260901-000000-task".to_owned(),
             run: run_running.to_owned(),
         }];
@@ -21487,6 +21495,7 @@ mod tests {
 
         let mut beat = crate::daemon::Status::new();
         beat.current = vec![crate::daemon::Current {
+            worker: None,
             task: "20260901-000000-task".to_owned(),
             run: id.to_owned(),
         }];
@@ -21547,6 +21556,7 @@ mod tests {
 
         let mut beat = crate::daemon::Status::new();
         beat.current = vec![crate::daemon::Current {
+            worker: None,
             task: "20260901-000000-task".to_owned(),
             run: id.to_owned(),
         }];
@@ -21626,6 +21636,7 @@ mod tests {
         // is already driving, whether that is one run or several.
         let mut beat = crate::daemon::Status::new();
         beat.current = vec![crate::daemon::Current {
+            worker: None,
             task: "20260901-000000-task".to_owned(),
             run: "20260901-000000-othr".to_owned(),
         }];

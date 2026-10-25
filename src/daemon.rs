@@ -96,6 +96,9 @@ pub const STALLED_RUNNING: Duration = Duration::from_secs(30 * 60);
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Current {
+    /// Worker reservation that produced this claim; absent on legacy drivers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
     /// Task id being run.
     pub task: String,
     /// Run id the task produced.
@@ -483,6 +486,7 @@ pub fn current_work(home: &Path, now: Timestamp) -> Vec<Current> {
                     .and_then(|task| task.runs.last().cloned())
                     .unwrap_or_default();
                 Ok(Current {
+                    worker: Some(job.id),
                     task: request.task,
                     run,
                 })
@@ -492,9 +496,11 @@ pub fn current_work(home: &Path, now: Timestamp) -> Vec<Current> {
     match workers {
         Ok(workers) => {
             for worker in workers {
-                if let Some(existing) = current.iter_mut().find(|c| c.task == worker.task) {
-                    *existing = worker;
-                } else {
+                if !current.iter().any(|claim| {
+                    claim.task == worker.task
+                        && claim.run == worker.run
+                        && claim.worker == worker.worker
+                }) {
                     current.push(worker);
                 }
             }
@@ -508,6 +514,7 @@ pub fn current_work(home: &Path, now: Timestamp) -> Vec<Current> {
                     .list()
                     .into_iter()
                     .map(|task| Current {
+                        worker: None,
                         task: task.id,
                         run: task.runs.last().cloned().unwrap_or_default(),
                     }),
@@ -516,6 +523,7 @@ pub fn current_work(home: &Path, now: Timestamp) -> Vec<Current> {
                 crate::run::list_ids_in(&home.join("runs"))
                     .into_iter()
                     .map(|run| Current {
+                        worker: None,
                         task: String::new(),
                         run,
                     }),
@@ -529,6 +537,38 @@ pub fn current_work(home: &Path, now: Timestamp) -> Vec<Current> {
 #[must_use]
 pub fn is_working_on(home: &Path, run: &str, now: Timestamp) -> bool {
     current_work(home, now).iter().any(|c| c.run == run)
+}
+
+/// Admission may ignore only this process's confirmed worker reservation.
+/// Keep anonymous/legacy daemon claims and every other worker, even for the
+/// same task. The run's execution lease and process identity are checked by
+/// the caller under the owner lock as well.
+pub(crate) fn is_working_on_other(home: &Path, run: &str, now: Timestamp) -> Result<bool> {
+    // A helper or test may inherit an identity from a different run store.
+    // That identity grants no exception here; retain all ownership evidence.
+    let same_home = std::env::var_os("MAGI_WORKER_HOME")
+        .is_some_and(|worker_home| Path::new(&worker_home) == home);
+    let caller = if same_home {
+        crate::worker::current_job(home)?
+    } else {
+        None
+    }
+    .filter(|job| {
+        job.kind == "task"
+            && job.status == crate::worker::Status::Running
+            && job.pid == Some(std::process::id())
+    });
+    Ok(other_claims_run(
+        &current_work(home, now),
+        run,
+        caller.as_ref().map(|job| job.id.as_str()),
+    ))
+}
+
+fn other_claims_run(claims: &[Current], run: &str, caller: Option<&str>) -> bool {
+    claims
+        .iter()
+        .any(|claim| claim.run == run && !(caller.is_some() && claim.worker.as_deref() == caller))
 }
 
 /// Whether a live daemon is working on a run whose short id is this one.
@@ -1951,7 +1991,8 @@ fn settle_and_diagnose(
     }
     let attempts_before = task.attempts;
     // A run that stopped because a shared resource stayed busy was never a
-    // failure of the task or of any agent: nothing was asked. The attempt is
+    // failure of the task or of an agent. Earlier nodes may have run; only
+    // the blocked operation lacks a result. The attempt is
     // refunded and the task is held by the machine, under a reason `triage`
     // can re-check, so the same run resumes with the same agents once the
     // resource is free. A park request still wins (it is the operator's).
@@ -1972,11 +2013,9 @@ fn settle_and_diagnose(
             )));
         } else {
             task.hold_machine(Some(format!(
-                "{}{} stayed busy past the resource-wait limit before `{}` could start; \
-             no agent was asked and no attempt was spent",
+                "{}{}; no attempt was spent; resume to retry the affected operation",
                 crate::cache::RESOURCE_HOLD,
-                block.kind,
-                block.node
+                block.description()
             )));
         }
         if let Some(pass) = state.passes.last() {
@@ -3649,8 +3688,10 @@ async fn poll(
             .collect();
         let current: Vec<_> = requests
             .iter()
-            .filter(|request| !request.standalone)
-            .map(|request| Current {
+            .zip(&jobs)
+            .filter(|(request, _)| !request.standalone)
+            .map(|(request, job)| Current {
+                worker: Some(job.id.clone()),
                 task: request.task.clone(),
                 run: queue
                     .get(&request.task)
@@ -3890,13 +3931,6 @@ async fn public_resume_owner(
     runs: &[String],
     repo: &Path,
 ) -> Result<Option<RunState>> {
-    // This worker's reservation protects cleanup, but is not evidence that a
-    // previous driver is still executing. Keep every other claim and the run's
-    // own execution lease/process checks authoritative.
-    let current_task = crate::worker::current_job(home)?
-        .filter(|job| job.kind == "task" && job.pid == Some(std::process::id()))
-        .map(|job| serde_json::from_value::<TaskWorker>(job.payload).map(|request| request.task))
-        .transpose()?;
     let mut owner = None;
     for id in runs.iter().collect::<std::collections::BTreeSet<_>>() {
         let _lock = resume_owner_lock(home, id).await?;
@@ -3921,9 +3955,7 @@ async fn public_resume_owner(
             crate::handover::can_resume(&state),
             "public owner cannot resume"
         );
-        let claimed = current_work(home, Timestamp::now())
-            .iter()
-            .any(|claim| claim.run == *id && current_task.as_deref() != Some(claim.task.as_str()));
+        let claimed = is_working_on_other(home, id, Timestamp::now())?;
         anyhow::ensure!(
             state.liveness_under(home, claimed) == crate::run::Liveness::Dead,
             "public owner's driver is live or unknown; wait before retrying"
@@ -4014,6 +4046,7 @@ async fn attempt(
         task.start(owner.id.clone());
         record(queue, task);
         lock(status).current.push(Current {
+            worker: None,
             task: task.id.clone(),
             run: owner.id,
         });
@@ -4250,14 +4283,13 @@ async fn attempt(
     // An explicit `magi review <branch>` is reviewed whatever happens to the
     // branch unless an explicit implementer change requires fresh work. An
     // unfinished run of the same task still wins, so a retry resumes.
-    let proposed = match (&review_branch, &unfinished, &task.review_of) {
-        (None, None, Some(branch)) => Starter::Review(branch.clone()),
-        _ => choose_starter(
-            review_branch.as_deref(),
-            branch_exists,
-            unfinished.as_deref(),
-        ),
-    };
+    let proposed = review_retry_starter(
+        task,
+        previous.as_ref(),
+        review_branch.as_deref(),
+        branch_exists,
+        unfinished.as_deref(),
+    );
     let retry_selected = task.replacement.is_some()
         && task.resumption.is_some()
         && !task.fresh_start
@@ -4640,6 +4672,7 @@ async fn attempt(
     task.start(run.clone());
     record(queue, task);
     lock(status).current.push(Current {
+        worker: None,
         task: task.id.clone(),
         run,
     });
@@ -5643,6 +5676,32 @@ fn choose_starter(
     }
 }
 
+/// Reuse a compatible latest review owner instead of taking its checked-out
+/// branch into a new run. Different branches and changed criteria still use
+/// the ordinary review/takeover policy.
+fn review_retry_starter(
+    task: &Task,
+    previous: Option<&RunState>,
+    branch: Option<&str>,
+    exists: bool,
+    unfinished: Option<&str>,
+) -> Starter {
+    if let Some(run) = previous
+        && unfinished == Some(run.id.as_str())
+        && run.reviewed_commits.is_some()
+        && branch.is_some_and(|branch| {
+            exists && run.candidates.len() == 1 && run.candidates[0].branch == branch
+        })
+        && may_resume_run(run, task)
+    {
+        return Starter::Resume(run.id.clone());
+    }
+    match (branch, unfinished, &task.review_of) {
+        (None, None, Some(branch)) => Starter::Review(branch.clone()),
+        _ => choose_starter(branch, exists, unfinished),
+    }
+}
+
 /// Consume a retained review only while its authored criteria still match.
 fn take_review_branch(task: &mut Task, previous: Option<&RunState>) -> Option<String> {
     let branch = task.review_branch.take();
@@ -6160,6 +6219,113 @@ mod tests {
     }
 
     #[test]
+    fn starting_worker_projects_the_previous_run_without_owning_its_execution() {
+        let home = tempfile::tempdir().unwrap();
+        let queue = Queue::at(home.path().join("queue"));
+        let mut task = task();
+        task.runs = vec!["previous".into()];
+        queue.put(&mut task).unwrap();
+        let request = TaskWorker {
+            opts: Opts::default(),
+            queue: home.path().join("queue"),
+            task: task.id.clone(),
+            lane: PermitKind::Ordinary,
+            standalone: false,
+        };
+        let job = starting_task_reservation(home.path(), &request);
+        let claims = current_work(home.path(), Timestamp::now());
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].worker.as_deref(), Some(job.id.as_str()));
+        assert_eq!(claims[0].run, "previous");
+        assert!(other_claims_run(&claims, "previous", None));
+        // Only after confirming the executing caller may admission ignore
+        // this exact projection. Cleanup continues to observe it as live.
+        assert!(!other_claims_run(&claims, "previous", Some(&job.id)));
+        assert!(is_working_on(home.path(), "previous", Timestamp::now()));
+    }
+
+    #[test]
+    fn admission_excludes_only_the_callers_exact_reservation() {
+        let own = Current {
+            worker: Some("own".into()),
+            task: "same-task".into(),
+            run: "previous".into(),
+        };
+        assert!(!other_claims_run(
+            std::slice::from_ref(&own),
+            "previous",
+            Some("own")
+        ));
+        assert!(other_claims_run(
+            std::slice::from_ref(&own),
+            "previous",
+            None
+        ));
+        for worker in [None, Some("other".into())] {
+            let other = Current {
+                worker,
+                ..own.clone()
+            };
+            assert!(other_claims_run(
+                &[own.clone(), other],
+                "previous",
+                Some("own")
+            ));
+        }
+        let legacy: Current =
+            serde_json::from_str(r#"{"task":"same-task","run":"previous"}"#).unwrap();
+        assert!(other_claims_run(&[legacy], "previous", Some("own")));
+    }
+
+    #[test]
+    fn review_retry_resumes_only_the_matching_authorized_latest_owner() {
+        let mut task = task();
+        let mut run = run_state(RunStatus::Reviewing);
+        run.task_instruction = Some(task.instruction.clone());
+        run.reviewed_commits = Some(vec!["committed-fix".into()]);
+        let branch = "magi/test/B";
+        run.candidates.push(crate::run::Candidate {
+            branch: branch.into(),
+            ..candidate('B', "preserved work", false, None)
+        });
+        task.runs = vec![run.id.clone()];
+        let unfinished = unfinished_run_with(&task.runs, task.short(), |_| Ok(run.clone()));
+        assert_eq!(
+            review_retry_starter(&task, Some(&run), Some(branch), true, unfinished.as_deref()),
+            Starter::Resume(run.id.clone())
+        );
+        assert!(matches!(
+            review_retry_starter(
+                &task,
+                Some(&run),
+                Some("different"),
+                true,
+                unfinished.as_deref()
+            ),
+            Starter::Review(_)
+        ));
+        assert_eq!(
+            review_retry_starter(
+                &task,
+                Some(&run),
+                Some(branch),
+                false,
+                unfinished.as_deref()
+            ),
+            Starter::Start
+        );
+        task.instruction.push_str(" changed criteria");
+        assert!(matches!(
+            review_retry_starter(&task, Some(&run), Some(branch), true, unfinished.as_deref()),
+            Starter::Review(_)
+        ));
+        assert!(matches!(
+            review_retry_starter(&task, Some(&run), Some(branch), true, None),
+            Starter::Review(_)
+        ));
+    }
+
+    #[test]
     fn a_live_worker_reservation_prevents_reclaim_before_its_task_claim() {
         let dir = tempfile::tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
@@ -6534,6 +6700,7 @@ mod tests {
         );
         state.status = RunStatus::Blocked;
         state.resource_block = Some(crate::run::ResourceBlock {
+            cause: crate::run::ResourceBlockCause::Other,
             node: "graft".to_owned(),
             kind: "shared build cache".to_owned(),
             detail: "timed out".to_owned(),
@@ -6596,6 +6763,10 @@ mod tests {
             &state,
         );
         assert_eq!(p.status, TaskStatus::Parked);
+        assert_eq!(
+            p.attempts, 0,
+            "parking refunds once rather than also settling the resource hold"
+        );
     }
 
     #[test]
@@ -8879,6 +9050,7 @@ mod tests {
         alive.save_under(&home).unwrap();
         let mut status = Status::new();
         status.current = vec![Current {
+            worker: None,
             task: "20260101-000000-task".to_owned(),
             run: alive.id.clone(),
         }];
@@ -9015,6 +9187,7 @@ mod tests {
         status.idle = false;
         status.completed = 7;
         status.current = vec![Current {
+            worker: None,
             task: "20260902-000000-t111".to_owned(),
             run: "20260902-000001-r111".to_owned(),
         }];
@@ -9082,6 +9255,7 @@ mod tests {
 
         let mut status = Status::new();
         status.current = vec![Current {
+            worker: None,
             task: "20260903-080340-0167".to_owned(),
             run: mine.to_owned(),
         }];
@@ -9115,6 +9289,7 @@ mod tests {
 
         let mut status = Status::new();
         status.current = vec![Current {
+            worker: None,
             task: "20260903-080340-0167".to_owned(),
             run: "20260903-080619-01c2".to_owned(),
         }];
@@ -9181,6 +9356,7 @@ mod tests {
         assert_eq!(
             reading.current,
             vec![Current {
+                worker: None,
                 task: "20260902-140501-aaaa".to_owned(),
                 run: "20260902-140502-bbbb".to_owned(),
             }]
@@ -10184,6 +10360,7 @@ mod tests {
 
         let mut status = Status::new();
         status.current = vec![Current {
+            worker: None,
             task: t.id.clone(),
             run: "20260903-080619-01c2".to_owned(),
         }];
@@ -11201,6 +11378,7 @@ mod tests {
             }
             state.gate_ran = false;
             state.resource_block = Some(crate::run::ResourceBlock {
+                cause: crate::run::ResourceBlockCause::Other,
                 node: if stage == "review-e2e" {
                     "review"
                 } else {

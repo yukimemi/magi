@@ -391,6 +391,7 @@ async fn an_unknown_legacy_driver_is_refused_without_treating_missing_pid_as_pro
     let fx = fixture(_home, Judges::Unanimous, true);
     let (mut old, wt) = old_run(&fx);
     old.driver_exited = false;
+    old.driver_claimed = None;
     old.save().unwrap();
     let error = Runner::review_taking_over(
         &fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[&old])), magi::run::Origin::operator(),
@@ -407,6 +408,7 @@ async fn a_legacy_unclaimed_run_can_execute_park_and_then_hand_over() {
     let fx = fixture(_home, Judges::Unanimous, true);
     let (mut old, wt) = old_run(&fx);
     old.driver_exited = false;
+    old.driver_claimed = None;
     old.driver_pid = None;
     old.driver_started_at = None;
     // Like a review-only run before its first graph claim, the candidate

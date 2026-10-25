@@ -671,9 +671,7 @@ pub fn run(state: &RunState) -> String {
                 // never the same yellow/red a real attempt earns, since
                 // nothing here is evidence about the patch (see
                 // `E2eStatus::ResourceBlocked`'s own doc).
-                E2eStatus::ResourceBlocked => {
-                    yellow("e2e could not run (shared build cache unavailable)")
-                }
+                E2eStatus::ResourceBlocked => yellow("e2e could not run (resource unavailable)"),
             };
             let e2e = if r.verify_retried {
                 format!("{e2e}, retried once")
@@ -1212,17 +1210,12 @@ pub fn run(state: &RunState) -> String {
 /// alone is not proof of anything.
 pub fn active_seats(state: &RunState, live: Liveness) -> String {
     let mut s = String::new();
-    // A run that stopped on an infrastructure wait says so: no agent failed
-    // and none was asked, and a resume asks the same ones.
-    if let Some(b) = &state.resource_block {
+    if let Some(block) = &state.resource_block {
         let _ = writeln!(
             s,
-            "\n{}\n  {}: {} stayed busy past the resource-wait limit; no agent was started \
-             ({}). Resume to ask the same agents again.",
+            "\n{}\n  {}. Resume to retry the affected operation.",
             bold("waiting on a resource"),
-            b.node,
-            b.kind,
-            b.detail
+            block.description()
         );
     }
     if state.active.is_empty() {
@@ -2272,7 +2265,7 @@ mod tests {
             verdict: None,
         }];
         let text = run(&s);
-        assert!(text.contains("shared build cache unavailable"), "{text}");
+        assert!(text.contains("resource unavailable"), "{text}");
         assert!(!text.contains("e2e RED"), "{text}");
         assert!(!text.contains("build/link failure"), "{text}");
     }
@@ -2512,6 +2505,65 @@ mod tests {
             "an unproven state must read as uncertain, not dead: {text}"
         );
         assert!(!text.contains("no live daemon"), "{text}");
+    }
+
+    #[test]
+    fn resource_block_reports_saved_evidence_in_text_and_web() {
+        use crate::run::{ResourceBlock, ResourceBlockCause};
+        let legacy = serde_json::json!({
+            "node": "fix", "kind": "shared build cache",
+            "detail": "the run is parking", "at": "2026-10-24T09:01:51Z"
+        });
+        let block: ResourceBlock = serde_json::from_value(legacy).unwrap();
+        assert_eq!(block.cause, ResourceBlockCause::Unrecorded);
+        for (cause, detail, expected) in [
+            (
+                ResourceBlockCause::Unrecorded,
+                "the run is parking",
+                "cancelled for parking",
+            ),
+            (ResourceBlockCause::Unrecorded, "busy", "cause unrecorded"),
+            (
+                ResourceBlockCause::Other,
+                "metadata write denied",
+                "operation blocked",
+            ),
+            (
+                ResourceBlockCause::Timeout {
+                    waited_secs: 12,
+                    limit_secs: 10,
+                },
+                "busy",
+                "timed out after 12s (limit 10s)",
+            ),
+            (
+                ResourceBlockCause::Cancelled {
+                    park: Some(crate::run::ParkCause::Operator),
+                },
+                "cancelled",
+                "cancelled for parking",
+            ),
+        ] {
+            let mut state = state();
+            state.resource_block = Some(ResourceBlock {
+                cause: cause.clone(),
+                detail: detail.into(),
+                ..block.clone()
+            });
+            let text = active_seats(&state, Liveness::Dead);
+            assert!(text.contains(expected), "{text}");
+            assert!(
+                !text.contains("no agent was started"),
+                "earlier nodes may have run"
+            );
+            assert_eq!(
+                crate::report_view::build_with(&state, Liveness::Dead, None).active_seats,
+                text
+            );
+            let saved = serde_json::to_value(&state.resource_block).unwrap();
+            let reloaded: ResourceBlock = serde_json::from_value(saved).unwrap();
+            assert_eq!(reloaded.cause, cause);
+        }
     }
 
     #[test]

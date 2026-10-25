@@ -173,6 +173,7 @@ async fn a_run_already_being_worked_on_by_another_process_refuses_a_targeted_fix
 
     let mut beat = magi::daemon::Status::new();
     beat.current = vec![magi::daemon::Current {
+        worker: None,
         task: "some-task".to_owned(),
         run: runner.state.id.clone(),
     }];

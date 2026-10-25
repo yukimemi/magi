@@ -1304,6 +1304,9 @@ async fn maintenance_resume_refuses_a_live_driver_and_abandon_refuses_unknown() 
     run.driver_started_at = magi::proc::process_started_at(std::process::id());
     assert!(run.driver_started_at.is_some(), "the test requires process identity");
     run.driver_exited = false;
+    // A legacy record: only a new run's persisted never-claimed marker is proof
+    // that no driver ever existed, so without it the missing pid is unknown.
+    run.driver_claimed = None;
     run.save_under(&s.home).unwrap();
     let mut q = maintenance_question(&s, ChoiceAction::ResumeRun { run: run.id.clone() });
     q.answer(Answer::Choice(q.choices[0].clone())).unwrap();

@@ -144,7 +144,8 @@ impl Released {
             return;
         };
         let claimed =
-            crate::daemon::is_working_on(&self.home, &self.old_id, jiff::Timestamp::now());
+            crate::daemon::is_working_on_other(&self.home, &self.old_id, jiff::Timestamp::now())
+                .unwrap_or(true);
         if state.released_to.as_deref() != Some(self.successor.as_str())
             || state.status == RunStatus::Superseded
             || state.pr_taken_over_by.is_some()
@@ -294,7 +295,7 @@ async fn inspect(
     state: &RunState,
     home: &Path,
 ) -> Result<Holder> {
-    let claimed = crate::daemon::is_working_on(home, &state.id, jiff::Timestamp::now());
+    let claimed = crate::daemon::is_working_on_other(home, &state.id, jiff::Timestamp::now())?;
     let liveness = state.liveness_under(home, claimed);
     // Spelled out: `status.showUntrackedFiles=no` in a user's config would
     // otherwise hide new files from `git status` and let them be deleted.

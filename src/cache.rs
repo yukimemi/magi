@@ -514,10 +514,21 @@ pub fn in_use(home: &Path, cache_dir: &Path) -> bool {
         || crate::retention::OutputLease::cache(home, cache_dir, true).is_err()
 }
 
-/// Prefix of the machine hold a task gets when its run stopped because this
-/// lease stayed busy past `[graph] timeout_resource_wait`. `triage` reads it to
-/// release the task once the lease is free; keep both in sync.
+/// Prefix of a resource machine hold. `triage` uses it when rechecking
+/// availability; the prefix alone does not establish an elapsed timeout.
 pub const RESOURCE_HOLD: &str = "[resource] ";
+
+/// A proven elapsed cache wait, distinct from cancellation and I/O errors.
+#[derive(Debug)]
+pub struct WaitTimeout(pub String);
+
+impl std::fmt::Display for WaitTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WaitTimeout {}
 
 /// Acquire the lease for `cache_dir`, waiting out contention rather than
 /// failing on the first busy owner — but never past `budget`, and the wait
@@ -568,12 +579,13 @@ pub async fn wait_for_unless(
                 }
                 let elapsed = start.elapsed();
                 if elapsed >= budget {
-                    bail!(
+                    return Err(WaitTimeout(format!(
                         "timed out after {}s waiting for the build cache at {} ({})",
                         budget.as_secs(),
                         cache_dir.display(),
                         busy.describe()
-                    );
+                    ))
+                    .into());
                 }
                 tokio::time::sleep(poll.min(budget - elapsed)).await;
             }

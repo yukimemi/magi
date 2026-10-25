@@ -322,6 +322,7 @@ fn infra_stop(state: &mut RunState, detail: String) -> anyhow::Error {
 fn block(state: &mut RunState, kind: &str, detail: String) -> anyhow::Error {
     let detail = format!("rebase recovery: {detail}");
     state.resource_block = Some(crate::run::ResourceBlock {
+        cause: crate::run::ResourceBlockCause::Other,
         node: "rebase".into(),
         kind: kind.into(),
         detail: detail.clone(),
