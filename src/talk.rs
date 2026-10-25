@@ -6675,12 +6675,11 @@ mod tests {
     }
 
     #[test]
-    fn the_briefing_says_the_chat_cannot_push_and_tasks_report_back() {
+    fn the_briefing_requires_registered_deferred_work_and_tasks_report_back() {
         let b = briefing_for(Path::new("/r"), "en", false, None, None, 1);
-        assert!(
-            b.contains("cannot send the operator a message on your own"),
-            "{b}"
-        );
+        assert!(b.contains("Finish permitted diagnosis and safe retries during this turn"));
+        assert!(b.contains("For deferred work, use the queue or a registered watch"));
+        assert!(b.contains("do not promise an unregistered future message"));
         assert!(b.contains(crate::prompt::CHAT_TASK_NOTICE_HEADING));
         assert!(b.contains("magi talk watch --timeout 900"));
         assert!(b.contains("nor a successfully registered watch"));
