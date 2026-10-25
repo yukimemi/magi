@@ -57,6 +57,7 @@ pub mod lang;
 mod lock_file;
 pub mod md;
 pub mod merge_decision;
+pub mod notice_delivery;
 pub mod notices;
 pub mod persona;
 pub mod persona_icon;

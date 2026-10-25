@@ -1,38 +1,12 @@
-//! Notices: what needs the operator's attention but is not a question.
+//! Durable attention-report outbox, reconciled into task/run chats by
+//! [`crate::notice_delivery`]. Reports are facts to investigate, never decisions
+//! or owner authority. The compatibility list remains for deferred delivery.
 //!
-//! A merged run whose release bump failed, a task held after three attempts, a
-//! disk gate that refused to start work - each used to end in a log line or in
-//! a question-shaped record nobody could answer. A [`Notice`] is the missing
-//! shape: something to *know*, with a severity, a timestamp and an optional
-//! link, that the operator marks read or dismisses. It is deliberately not a
-//! [`crate::ask::Question`]: nothing waits on it and there is nothing to answer.
-//!
-//! # Shape
-//!
-//! The same split as [`crate::queue`] and [`crate::ask`]. [`Notice`] is data
-//! plus *pure* transitions; [`Notices`] owns every filesystem call and is
-//! constructed with its root, so a test drives a real store in a temp
-//! directory and nothing here is process-global.
-//!
-//! One notice is one JSON file, written atomically, because `magi serve`,
-//! `magi web` and the CLI all write here from different processes and a rename
-//! is the only cross-process write that needs no coordination. The file name is
-//! derived from the notice's *key* by a stable function, which is what makes
-//! deduplication lock-free: two processes raising the same problem write the
-//! same file. A raise racing another may lose one increment of `count`; that is
-//! accepted.
-//!
-//! # Deduplication, and what dismissing means
-//!
-//! A key names a kind and a subject (`release-bump:<run>`, `task:<id>`), never
-//! the prose. Raising a key that exists bumps `count` and `last_at`. It returns
-//! the notice to *unread* only when the message changed or the severity rose:
-//! a retry loop re-raising the identical problem must not relight the bell.
-//! Dismissal is a tombstone (`dismissed_at`) rather than a delete, so the same
-//! message re-raised does not resurrect what the operator already waved away.
-//! The cost is that a genuine recurrence with identical wording stays hidden
-//! until the cap prunes the tombstone; producers should therefore keep
-//! messages stable and put anything that varies elsewhere.
+//! Keys name kind + subject, never prose. Repeats update evidence without
+//! another page; only a newer cause or severity escalation advances delivery.
+//! Chat drafts persist their receipt key atomically before outbox acknowledgement.
+//! Read/dismissed legacy history is never replayed, and pending unread records
+//! are never evicted by the history cap.
 
 use std::path::{Path, PathBuf};
 
@@ -44,8 +18,7 @@ use serde::{Deserialize, Serialize};
 /// than this one; every field added later must carry `#[serde(default)]`.
 pub const SCHEMA: u32 = 1;
 
-/// The most notices kept. Pruned on every write: obsolete first, then
-/// dismissed, read and unread, oldest first within each.
+/// The history cap. Pending unread deliveries are exempt.
 pub const CAP: usize = 200;
 
 /// How serious a notice is. Ordered so a rise is a plain comparison.
@@ -112,9 +85,12 @@ pub struct Notice {
     /// names one of them already pages the operator for the same cause.
     #[serde(default)]
     pub subjects: Vec<String>,
+    /// Run association when the display link points elsewhere (for example a PR).
+    #[serde(default)]
+    pub related_run: Option<String>,
     /// The question that carries this notice as context, when it was filed
     /// already read for that reason. Never a tombstone: a recurrence with a
-    /// changed message or higher severity is unread again.
+    /// newer cause or higher severity is unread again.
     #[serde(default)]
     pub covered_by: Option<String>,
     /// When the cause this notice reports began (a task's `held_at`). A
@@ -125,6 +101,12 @@ pub struct Notice {
     /// On-disk format version.
     #[serde(default = "schema")]
     pub schema: u32,
+    /// Delivery generation, advanced only by the shared page decision.
+    #[serde(default = "one")]
+    pub generation: u32,
+    /// Last generation durably accepted by a chat.
+    #[serde(default)]
+    pub delivered: u32,
 }
 
 fn one() -> u32 {
@@ -151,9 +133,12 @@ impl Notice {
             read_at: None,
             dismissed_at: None,
             subjects: Vec::new(),
+            related_run: None,
             covered_by: None,
             since: None,
             schema: SCHEMA,
+            generation: 1,
+            delivered: 0,
         }
     }
 
@@ -164,6 +149,12 @@ impl Notice {
         S: Into<String>,
     {
         self.subjects = subjects.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Associate a run independently of the display link.
+    pub fn for_run(mut self, run: Option<String>) -> Self {
+        self.related_run = run;
         self
     }
 
@@ -199,17 +190,20 @@ impl Notice {
         self.read_at.is_none() && self.dismissed_at.is_none()
     }
 
-    /// Fold a repeat of this notice into it. Always counts; only a changed
-    /// message or a higher severity makes it unread and visible again.
+    /// Fold a repeat into this notice. Wording updates evidence; a newer cause
+    /// or higher severity makes it unread and advances delivery.
     ///
     /// Returns whether this raise should page the operator: it relit the
-    /// notice (new message, higher severity, newer cause) and no open question
+    /// notice (higher severity or newer cause) and no open question
     /// already carries it. This is the only place that decides.
     pub fn raise_again(&mut self, again: &Notice, now: Timestamp) -> bool {
         self.count = self.count.saturating_add(1);
         self.last_at = now;
         if again.link.is_some() {
             self.link = again.link.clone();
+        }
+        if again.related_run.is_some() {
+            self.related_run = again.related_run.clone();
         }
         if !again.subjects.is_empty() {
             self.subjects = again.subjects.clone();
@@ -225,12 +219,12 @@ impl Notice {
             (None, Some(_)) => self.covered_by.is_some() && again.covered_by.is_none(),
             _ => false,
         };
-        if again.since.is_some() {
-            self.since = again.since;
-        }
-        let relit = again.message != self.message || escalated || newer_cause;
+        self.since = self.since.max(again.since);
+        // Wording is evidence, never a reason to spend another agent turn.
+        let relit = escalated || newer_cause;
+        self.message = again.message.clone();
         if relit {
-            self.message = again.message.clone();
+            self.generation = self.generation.saturating_add(1);
             self.severity = self.severity.max(again.severity);
             self.read_at = None;
             self.dismissed_at = None;
@@ -431,6 +425,37 @@ impl Notices {
         self.raise_paged(incoming).map(|(n, _)| n)
     }
 
+    /// File through the common page decision, including explicit-store producers.
+    pub fn raise_with(
+        &self,
+        mut incoming: Notice,
+        notify: &crate::config::Notify,
+    ) -> Result<Notice> {
+        if let Some(home) = self.root.parent()
+            && let Some(q) = covering_question(home, &incoming)
+        {
+            incoming.covered_by = Some(q);
+        }
+        let (notice, page) = self.raise_paged(incoming)?;
+        if page {
+            send_page(
+                Page {
+                    run: notice
+                        .related_run
+                        .clone()
+                        .or_else(|| match &notice.link {
+                            Some(Link::Run { id }) => Some(id.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default(),
+                    summary: notice.message.clone(),
+                },
+                Some(notify.clone()),
+            );
+        }
+        Ok(notice)
+    }
+
     /// [`Notices::raise`], also saying whether the raise should page.
     pub fn raise_paged(&self, incoming: Notice) -> Result<(Notice, bool)> {
         let out = self.locked(&incoming.id.clone(), || {
@@ -474,7 +499,7 @@ impl Notices {
     }
 
     /// Load, change and save one notice under its lock.
-    fn update(&self, id: &str, change: impl FnOnce(&mut Notice)) -> Result<Notice> {
+    pub(crate) fn update(&self, id: &str, change: impl FnOnce(&mut Notice)) -> Result<Notice> {
         if !valid_id(id) {
             bail!("`{id}` is not a notification id");
         }
@@ -487,7 +512,7 @@ impl Notices {
     }
 
     /// Every notice on disk, unreadable files skipped, newest first.
-    fn all(&self) -> Vec<Notice> {
+    pub(crate) fn all(&self) -> Vec<Notice> {
         let mut all: Vec<Notice> = std::fs::read_dir(&self.root)
             .into_iter()
             .flatten()
@@ -549,7 +574,11 @@ impl Notices {
                 .cmp(&a.keep_rank())
                 .then_with(|| b.last_at.cmp(&a.last_at))
         });
-        for n in all.split_off(CAP) {
+        for n in all
+            .split_off(CAP)
+            .into_iter()
+            .filter(|n| n.obsolete() || !n.unread() || n.delivered >= n.generation)
+        {
             let _ = std::fs::remove_file(self.path_of(&n.id));
         }
     }
@@ -653,12 +682,24 @@ pub fn run_ended(state: &crate::run::RunState) -> Option<Notice> {
     (failed && !state.parked).then(|| {
         Notice::error(
             &format!("run:{}", state.id),
-            format!("Run {} ended {}.", state.short(), state.status.as_str()),
+            format!(
+                "Run {} ended {}. {}",
+                state.id,
+                state.status.as_str(),
+                run_cause(state)
+            ),
         )
         .link(Link::Run {
             id: state.id.clone(),
         })
         .about([state.id.clone()])
+        .since(Some(
+            state
+                .passes
+                .last()
+                .map(|p| p.started_at)
+                .unwrap_or(state.created_at),
+        ))
     })
 }
 
@@ -800,10 +841,37 @@ pub fn conductor_resumption(
 pub fn run_stopped(id: &str, state: &crate::run::RunState) -> Notice {
     Notice::error(
         &format!("run:{id}"),
-        format!("Run {} stopped with an error.", state.short()),
+        format!("Run {} stopped with an error. {}", id, run_cause(state)),
     )
     .link(Link::Run { id: id.to_owned() })
     .about([id.to_owned()])
+    .since(Some(
+        state
+            .passes
+            .last()
+            .map(|p| p.started_at)
+            .unwrap_or(state.created_at),
+    ))
+}
+
+/// Last recorded graph evidence; immediate errors are attached by the caller.
+fn run_cause(state: &crate::run::RunState) -> String {
+    let cause = state
+        .prep_failure
+        .as_deref()
+        .or_else(|| state.resource_block.as_ref().map(|b| b.detail.as_str()))
+        .or_else(|| {
+            state
+                .candidate_preservation
+                .values()
+                .next()
+                .map(String::as_str)
+        })
+        .or_else(|| state.events.last().map(|e| e.message.as_str()));
+    cause
+        .and_then(|s| s.lines().find(|line| !line.trim().is_empty()))
+        .unwrap_or("No cause recorded; inspect the run.")
+        .to_owned()
 }
 
 /// One page for the operator's `[notify]` command.
@@ -905,7 +973,7 @@ pub fn raise_with(notice: Notice, notify: &crate::config::Notify) {
 /// card. Missing a duplicate costs one extra page; hiding a failure costs the
 /// failure. A notice without `since` keeps the broad rule.
 pub fn covers(q: &crate::ask::Question, n: &Notice) -> bool {
-    if !q.status.open() || !n.subjects.contains(&q.run) {
+    if !(q.status.open() || q.routed_chat.is_some()) || !n.subjects.contains(&q.run) {
         return false;
     }
     if n.since.is_some_and(|since| q.asked_at < since) {
@@ -950,10 +1018,14 @@ pub fn raise_in_with(home: &Path, mut notice: Notice, send: &dyn Fn(Page)) {
     }
     match Notices::at(home.join("notifications")).raise_paged(notice) {
         Ok((n, true)) => send(Page {
-            run: match &n.link {
-                Some(Link::Run { id }) => id.clone(),
-                _ => String::new(),
-            },
+            run: n
+                .related_run
+                .clone()
+                .or_else(|| match &n.link {
+                    Some(Link::Run { id }) => Some(id.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default(),
             summary: n.message.clone(),
         }),
         Ok(_) => {}
@@ -1136,7 +1208,7 @@ mod tests {
     }
 
     #[test]
-    fn a_repeat_counts_but_stays_read_and_a_change_relights_it() {
+    fn a_repeat_updates_evidence_without_relighting_it() {
         let now = Timestamp::now();
         let mut n = Notice::warn("task:1", "held");
         n.mark_read(now);
@@ -1144,7 +1216,7 @@ mod tests {
         assert_eq!(n.count, 2);
         assert!(n.read_at.is_some(), "identical repeat stays read");
         n.raise_again(&Notice::warn("task:1", "held differently"), now);
-        assert!(n.unread());
+        assert!(!n.unread());
         assert_eq!(n.message, "held differently");
     }
 
@@ -1608,7 +1680,7 @@ mod tests {
     }
 
     #[test]
-    fn a_page_fires_on_new_changed_and_escalated_only() {
+    fn a_page_fires_on_new_causes_and_escalation_only() {
         let dir = tempfile::tempdir().unwrap();
         let h = dir.path();
         let n = || Notice::warn("run:p1", "stopped").link(Link::Run { id: "p1".into() });
@@ -1621,7 +1693,7 @@ mod tests {
             }]
         );
         assert!(pages(h, n()).is_empty(), "identical re-raise is silent");
-        assert_eq!(pages(h, Notice::warn("run:p1", "stopped again")).len(), 1);
+        assert!(pages(h, Notice::warn("run:p1", "stopped again")).is_empty());
         assert_eq!(pages(h, Notice::error("run:p1", "stopped again")).len(), 1);
         assert!(pages(h, Notice::error("run:p1", "stopped again")).is_empty());
     }
@@ -1634,7 +1706,7 @@ mod tests {
     }
 
     #[test]
-    fn a_dismissed_tombstone_stays_silent_until_it_changes() {
+    fn a_dismissed_tombstone_ignores_wording_changes() {
         let dir = tempfile::tempdir().unwrap();
         let h = dir.path();
         pages(h, Notice::warn("disk:r", "low"));
@@ -1642,7 +1714,7 @@ mod tests {
             .dismiss(&id_of("disk:r"))
             .unwrap();
         assert!(pages(h, Notice::warn("disk:r", "low")).is_empty());
-        assert_eq!(pages(h, Notice::warn("disk:r", "lower")).len(), 1);
+        assert!(pages(h, Notice::warn("disk:r", "lower")).is_empty());
     }
 
     #[test]

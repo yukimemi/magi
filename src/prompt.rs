@@ -1751,6 +1751,9 @@ pub struct DeputyPrompt<'a> {
 /// Heading of automatic task decisions, excluded from owner consent evidence.
 pub const TASK_MESSAGE_HEADING: &str = "Task decision message";
 
+/// Heading for automatic attention reports, excluded from owner evidence.
+pub const ATTENTION_NOTICE_HEADING: &str = "Attention report";
+
 /// Heading for passive completion reports.
 pub const CHAT_TASK_NOTICE_HEADING: &str = "Update on a task you filed";
 
@@ -1763,6 +1766,7 @@ pub fn is_completion_notice(message: &str) -> bool {
         CHAT_TASK_NOTICE_HEADING,
         CHAT_WATCH_NOTICE_HEADING,
         TASK_MESSAGE_HEADING,
+        ATTENTION_NOTICE_HEADING,
     ]
     .iter()
     .any(|heading| message.trim_start().starts_with(&format!("# {heading}\n")))
@@ -2012,6 +2016,7 @@ pub fn defuse(text: &str) -> String {
     let mut out = text.to_owned();
     for marker in [
         TASK_MESSAGE_HEADING,
+        ATTENTION_NOTICE_HEADING,
         CHAT_CONSULT_HEADING,
         CHAT_CONSULT_END,
         CHAT_TASK_NOTICE_HEADING,

@@ -1229,7 +1229,7 @@ impl Runner {
     /// Every way a run is driven - the queue loop, `magi run`, a resume from
     /// the phone - ends here, so this is the one place a run that ended
     /// Blocked / Stalled / Failed, or died with an error, is announced to the
-    /// notification centre. Best-effort: see [`crate::notices::raise`].
+    /// attention-report outbox. Best-effort: see [`crate::notices::raise`].
     pub async fn execute(&mut self) -> Result<()> {
         if let Some(selection) = &self.state.pr_recovery
             && (selection.source_proof.is_some() || selection.source_run.is_some())
@@ -1282,7 +1282,17 @@ impl Runner {
         };
         execution.driver.finish(&mut runner.state).await?;
         let ended = if result.is_err() {
-            Some(crate::notices::run_stopped(&runner.state.id, &runner.state))
+            Some({
+                let mut notice = crate::notices::run_stopped(&runner.state.id, &runner.state);
+                if let Err(error) = &result {
+                    notice.message = format!(
+                        "Run {} stopped with an error: {}",
+                        runner.state.id,
+                        error.to_string().lines().next().unwrap_or("unknown error")
+                    );
+                }
+                notice
+            })
         } else {
             crate::notices::run_ended(&runner.state)
         };

@@ -77,17 +77,12 @@ pub(crate) fn routes(q: &Question, home: &Path) -> bool {
     task_of_with_watches(q, &tasks, &watches).is_some_and(|id| enabled_for(&tasks, &id))
 }
 
-/// Reserve the destination under the task lock, then deliver without it.
-/// A stable creation id and persisted link let retries recover interrupted delivery.
-/// Never wait for a talk lock while holding the task write lock: chat decisions
-/// can hold the talk answer guard while updating this same task.
-pub fn post(
+/// Shared task destination reservation for decisions and attention reports.
+pub(crate) fn destination(
     queue: &Queue,
     talks: &Talks,
-    home: &Path,
     task_id: &str,
-    q: &Question,
-) -> Result<String> {
+) -> Result<(Task, talk::Talk)> {
     let mut reserved = None;
     queue.modify(task_id, |task| {
         let associated = task
@@ -104,16 +99,22 @@ pub fn post(
         changed
     })?;
     let (task, id) = reserved.context("task chat destination was not reserved")?;
-    let repo = task.repo.clone();
+    let chat = destination_in(talks, &task.repo, &id)?;
+    Ok((task, chat))
+}
+
+/// Stable IDs also reserve run-only and home-wide operations conversations.
+/// Creation is serialized by `begin_with_id`; the first repo context persists.
+pub(crate) fn destination_in(talks: &Talks, repo: &Path, id: &str) -> Result<talk::Talk> {
     let load = |id: &str| -> Result<talk::Talk> {
         if talks.path_of(id).exists() {
             talks.get(id)
         } else {
-            let (cfg, _) = Config::discover(&repo, None)?;
+            let (cfg, _) = Config::discover(repo, None)?;
             talk::begin_with_id(
                 talks,
                 &cfg,
-                repo.clone(),
+                repo.to_path_buf(),
                 None,
                 &talk::Preferred {
                     agent: None,
@@ -124,11 +125,27 @@ pub fn post(
             )
         }
     };
-    let mut chat = load(&id)?;
-    // Unlike passive completion/watch notifications, decisions reopen.
+    let mut chat = load(id)?;
+    // Decisions and attention reports both reopen their destination.
     if !chat.status.open() {
         talk::reopen(&mut chat, talks)?;
     }
+    Ok(chat)
+}
+
+/// Reserve the destination under the task lock, then deliver without it.
+/// A stable creation id and persisted link let retries recover interrupted delivery.
+/// Never wait for a talk lock while holding the task write lock: chat decisions
+/// can hold the talk answer guard while updating this same task.
+pub fn post(
+    queue: &Queue,
+    talks: &Talks,
+    home: &Path,
+    task_id: &str,
+    q: &Question,
+) -> Result<String> {
+    let (task, mut chat) = destination(queue, talks, task_id)?;
+    let id = chat.id.clone();
     let run = if q.run == task.id {
         task.runs.last().map(String::as_str).unwrap_or("none")
     } else {

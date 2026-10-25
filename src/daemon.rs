@@ -1402,7 +1402,12 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                 Notice::warn(
                     &format!("action:{}", q.id),
                     format!("Choice action {} was not completed: {e:#}", q.id),
-                ),
+                )
+                .link(if q.run_names_task() {
+                    Link::Task { id: q.run.clone() }
+                } else {
+                    Link::Run { id: q.run.clone() }
+                }),
             );
         }
     }
@@ -1505,7 +1510,7 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
                             "Approval action is waiting: no task owns run {}. Inspect `magi show {}` and restore its original queue owner; do not file a competing task.",
                             q.run, q.run
                         ),
-                    ),
+                    ).link(Link::Run { id: q.run.clone() }),
                 );
             }
             continue;
@@ -3640,8 +3645,8 @@ fn task_worker_spawn_error(home: &Path, request: &TaskWorker, error: anyhow::Err
         home,
         Notice::error(
             "loop:worker-startup",
-            "A task worker could not be started or acknowledged. Scheduler dispatch stopped; already reserved workers may still complete. Startup details are kept in the local execution log.",
-        ),
+            format!("Task {} worker could not be started or acknowledged: {}. Scheduler dispatch stopped; already reserved workers may still complete.", request.task, error.to_string().lines().next().unwrap_or("unknown startup error")),
+        ).link(Link::Task { id: request.task.clone() }),
     );
     Err(error).with_context(|| {
         format!(
@@ -3736,6 +3741,7 @@ async fn poll(
         reconcile_task_questions(queue, &questions);
         let talks = crate::talk::Talks::at(home.join("talks"));
         crate::chat_notify::sweep(queue, &talks, home);
+        crate::notice_delivery::sweep(queue, &talks, home, &opts.repo);
         crate::chat_watch::sweep(home, &talks);
         let mut turns = tokio::task::JoinSet::new();
         crate::chat_notify::start_turns(&talks, stop.parking(), &mut turns);
@@ -4240,7 +4246,7 @@ async fn attempt(
         notices::raise(
             Notice::warn(
                 &format!("disk:{}", repo.display()),
-                "A task was held for want of free disk space; free some, then release it from the queue.",
+                format!("Task {} held for want of free disk space: {reason}. Free some, then release it from the queue.", task.id),
             )
             .link(Link::Task {
                 id: task.id.clone(),
@@ -5064,7 +5070,13 @@ async fn maybe_prune_cache_between_runs(
                 home,
                 Notice::warn(
                     "housekeep:cache",
-                    "Pruning the shared build cache failed; disk usage may keep growing.",
+                    format!(
+                        "Pruning the shared build cache failed: {}. Disk usage may keep growing.",
+                        e.to_string()
+                            .lines()
+                            .next()
+                            .unwrap_or("unknown cleanup error")
+                    ),
                 ),
             );
         }
@@ -5919,7 +5931,11 @@ fn record(queue: &Queue, task: &mut Task) {
         tracing::error!("could not record task {}: {e:#}", task.short());
         let notice = Notice::error(
             "loop:record",
-            "The loop could not save a task's state; check the disk.",
+            format!(
+                "Task {} state could not be saved: {}. Check the disk.",
+                task.id,
+                e.to_string().lines().next().unwrap_or("unknown save error")
+            ),
         )
         .link(Link::Task {
             id: task.id.clone(),

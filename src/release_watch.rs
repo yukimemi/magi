@@ -756,12 +756,20 @@ impl Watcher {
         Questions::at(self.home.join("questions"))
     }
 
+    fn notice_subjects(&self, pr: &str) -> Vec<String> {
+        let state = self.load(pr);
+        state.held_task.into_iter().chain(state.run).collect()
+    }
+
     fn raise(&self, pr: &str, url: &str, message: String) {
         notices::raise_in(
             &self.home,
-            Notice::warn(&notice_key(pr), message).link(Link::Url {
-                url: url.to_owned(),
-            }),
+            Notice::warn(&notice_key(pr), message)
+                .link(Link::Url {
+                    url: url.to_owned(),
+                })
+                .about(self.notice_subjects(pr))
+                .for_run(self.load(pr).run),
         );
     }
 
@@ -1299,11 +1307,12 @@ impl Watcher {
     fn raise_released(&self, pr: &str, url: &str, job: &Job) {
         notices::raise_in(
             &self.home,
-            Notice::info(&released_key(pr), format!("Released {} ({pr})", job.tag())).link(
-                Link::Url {
+            Notice::info(&released_key(pr), format!("Released {} ({pr})", job.tag()))
+                .link(Link::Url {
                     url: url.to_owned(),
-                },
-            ),
+                })
+                .about(self.notice_subjects(pr))
+                .for_run(self.load(pr).run),
         );
     }
 
