@@ -1619,11 +1619,33 @@ mod tests {
     #[test]
     fn terminal_records_are_bounded_without_pruning_live_reservations() {
         let home = tempfile::tempdir().unwrap();
-        for i in 0..RETAIN_FINISHED + 3 {
-            let mut job = reservation(home.path(), &format!("task:{i}"));
-            terminal(home.path(), &mut job, Status::Finished, "done".into()).unwrap();
-        }
         let live = reservation(home.path(), "task:live");
+        // Exercise retention, not hundreds of durable reservation publications.
+        // Use a real terminal record as the on-disk template; reservation and
+        // terminal publication have their own tests above.
+        let mut finished = reservation(home.path(), "task:finished");
+        terminal(home.path(), &mut finished, Status::Finished, "done".into()).unwrap();
+        let template_dir = job_dir(home.path(), &finished.id).unwrap();
+        std::fs::remove_dir_all(template_dir).unwrap();
+        for i in 0..RETAIN_FINISHED + 3 {
+            let mut job = finished.clone();
+            job.id = format!("{i:032x}");
+            job.key = format!("task:{i}");
+            job.sequence += i as u64;
+            let directory = job_dir(home.path(), &job.id).unwrap();
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                directory.join("job.json"),
+                serde_json::to_vec(&job).unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            std::fs::read_dir(root(home.path()).join("jobs"))
+                .unwrap()
+                .count(),
+            RETAIN_FINISHED + 4
+        );
         let jobs = records(home.path()).unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(

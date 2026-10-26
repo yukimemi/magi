@@ -93,3 +93,9 @@ futures-util = { version = "0.3.34", default-features = false, features = ["sink
 # of a debug build debuggable.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Test binaries need source locations and backtraces, but not full variable
+# debug information. This also reduces repeated integration-test linking and
+# the executable bytes hashed by worker-generation tests. Release is unchanged.
+[profile.test]
+debug = 1
