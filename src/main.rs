@@ -675,6 +675,18 @@ enum TalkCmd {
 /// Direct control of this chat's own tasks and runs (standing chat seat only).
 #[derive(Debug, Subcommand)]
 enum ControlCmd {
+    /// Merge a PR with exact, head-bound owner authorization.
+    MergePr {
+        repo: String,
+        number: u64,
+        #[arg(long)]
+        head: String,
+        #[arg(long)]
+        request: String,
+        /// Entire latest owner message authorizing this merge.
+        #[arg(long)]
+        quote: Option<String>,
+    },
     /// Queue a stopped, blocked or parked run to be resumed by the loop.
     Resume {
         /// Full run id.
@@ -752,6 +764,7 @@ enum TaskCmd {
     /// Resume, hold, release, retry, rerun checks, decide or abandon tasks
     /// and runs. Only the standing chat seat (`MAGI_NODE=chat`, `MAGI_RUN` =
     /// an open conversation) may use it.
+    /// Direct PR merges require an exact owner instruction and head SHA.
     Control {
         /// What to do.
         #[command(subcommand)]
@@ -3387,6 +3400,19 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             let talk_id = talk.id.as_str();
             use magi::chat_control as cc;
             let operation = match op {
+                ControlCmd::MergePr {
+                    repo,
+                    number,
+                    head,
+                    request,
+                    quote,
+                } => cc::Operation::MergePr {
+                    repo,
+                    number,
+                    head,
+                    request,
+                    quote,
+                },
                 ControlCmd::Resume { run } => cc::Operation::Resume { run },
                 ControlCmd::Hold { id, reason } => cc::Operation::Hold {
                     task: id,

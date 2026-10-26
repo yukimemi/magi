@@ -1740,6 +1740,7 @@ async fn approval_gate(
     contested: Option<&ContestedHandoff>,
     head: &str,
 ) -> Result<ApprovalGate> {
+    let _chat_merge = crate::chat_merge::target_lock_wait(&crate::run::home(), &pr.url).await?;
     let store = ask::Questions::open();
     // An answer belongs to the commit its panel showed. A question recorded
     // for another head - or none recorded at all, as for a question filed

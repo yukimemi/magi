@@ -699,6 +699,11 @@ impl Talks {
         }
     }
 
+    /// Freeze owner evidence for a direct PR merge using the store's writer lock.
+    pub(crate) fn try_answer_guard(&self) -> Result<Option<StoreGuard<'_>>> {
+        self.try_guard()
+    }
+
     /// Try both locks once, without waiting: the process mutex first, then
     /// the file lock beside the records.
     fn try_guard(&self) -> Result<Option<StoreGuard<'_>>> {
@@ -1044,7 +1049,7 @@ impl Talks {
 
 /// What [`Talks::guard`] hands out: the in-process mutex plus the
 /// cross-process file lock. The file lock is released first.
-struct StoreGuard<'a> {
+pub(crate) struct StoreGuard<'a> {
     _file: TurnLock,
     _mutex: MutexGuard<'a, ()>,
 }
@@ -1079,7 +1084,7 @@ fn read_turn(path: &Path) -> Option<TurnRecord> {
 }
 
 /// A takeover lock older than this belonged to a taker that died inside it.
-const TAKEOVER_LOCK_TTL: Duration = Duration::from_secs(10);
+pub(crate) const TAKEOVER_LOCK_TTL: Duration = Duration::from_secs(10);
 
 /// A break ticket older than this belonged to a taker that died holding it;
 /// the next generation's ticket may then be tried for the same dead token.
@@ -3234,7 +3239,13 @@ pub fn briefing_for(
          <plan-id>`. Chat plans bind this conversation and expire after 24 \
          hours; a changed or expired plan needs replanning, an interrupted \
          application reuses its plan, and the plan's fences and proofs still \
-         apply. These commands use the turn's inherited control channel \
+         apply. To merge a PR (including bot PRs), the latest owner send must be exactly \
+         `merge-pr: <owner/repo>#<number> head=<full SHA> request=<id>`. Only then use \
+         `magi task control merge-pr <owner/repo> <number> \
+         --head <full SHA> --request <id> --quote \"<entire message>\"`. Recommendations, generated notices, thanks and silence \
+         never authorize merging. Pending land approval questions must use their existing approval path. \
+         A forge refusal must be reported without retrying with other flags. Reuse the request ID \
+         after uncertain delivery; it never reissues a merge. These commands use the turn's inherited control channel \
          without changing repository permissions, network policy or working \
          directory. If that channel is unavailable, report the command error; \
          never edit store files to apply an operation.\n\n\
@@ -6204,8 +6215,9 @@ mod tests {
         assert!(brief.contains("You can act on any task or run directly, whoever filed it"));
         assert!(brief.contains("`magi task control abandon <full run id>`"));
         assert!(brief.contains("When the owner asks to apply it, run the same command"));
+        assert!(brief.contains("merge-pr: <owner/repo>#<number> head=<full SHA> request=<id>"));
+        assert!(brief.contains("--request <id> --quote"));
         for gone in [
-            "--quote",
             "--recovery-consent",
             "abandon-run:",
             "retention-apply:",
