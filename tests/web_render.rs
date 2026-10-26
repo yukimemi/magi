@@ -4983,10 +4983,42 @@ async fn loop_version_details_stay_compact_and_preserve_toggle_state() {
           };
           check(info.tagName === 'BUTTON' && info.type === 'button' && info.getAttribute('aria-controls') === detail.id, 'native toggle');
           check(info.textContent === 'i' && info.getAttribute('aria-expanded') === 'false' && detail.hidden, 'initially compact');
-          check(['loop-more', 'loop-version', 'loop-version-detail'].every(id => !document.getElementById(id)), 'old ids are gone');
+          check(!document.querySelector('#loop-more, #loop-version, #loop-version-detail'), 'old ids are gone');
           check([...document.querySelectorAll('.daemon button')].filter(b => !b.hidden && b.textContent === 'i').length === 1, 'exactly one visible info button');
           check(info.getAttribute('aria-label') === 'Show details', 'closed label');
           check(!info.dataset.mismatch && !info.getAttribute('aria-label').includes('versions differ'), 'v prefix normalized; unknown and starting versions ignored');
+          const why = document.getElementById('loop-why');
+          const detailWhy = document.getElementById('loop-detail-why');
+          const detailVersion = document.getElementById('loop-detail-version');
+          const expanded = (open, label) => {
+            check(!info.hidden && detail.hidden === !open && info.getAttribute('aria-expanded') === String(open), label);
+          };
+          // Exercise both content sources independently, retaining the user's
+          // intent even when a refresh temporarily removes all content.
+          for (const open of [false, true]) {
+            if (open) info.click();
+            health.version = ''; deck.renderLoop();
+            expanded(open, 'status-only preserves toggle state');
+            check(!detailWhy.hidden && detailWhy.textContent === why.textContent && detailVersion.hidden, 'status-only sections');
+            health.version = '0.1.0'; deck.renderLoop();
+            why.hidden = true;
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            expanded(open, 'version-only preserves toggle state');
+            check(detailWhy.hidden && !detailVersion.hidden, 'version-only sections');
+            why.hidden = false; why.textContent = 'Changed outside health rendering';
+            await new Promise(resolve => requestAnimationFrame(resolve));
+            expanded(open, 'external status writes preserve toggle state');
+            check(!detailWhy.hidden && detailWhy.textContent === why.textContent, 'external status writes synchronize');
+            deck.state.healthError = 'offline'; deck.renderLoop();
+            check(info.hidden && detail.hidden && info.getAttribute('aria-expanded') === 'false', 'offline hides details');
+            deck.state.healthError = null; deck.renderLoop();
+            expanded(open, 'reconnect restores toggle state');
+            deck.state.health = null; deck.renderLoop();
+            check(info.hidden && detail.hidden && info.getAttribute('aria-expanded') === 'false', 'empty refresh hides details');
+            deck.state.health = health; deck.renderLoop();
+            expanded(open, 'returning content restores toggle state');
+          }
+          info.click();
           const normalColor = getComputedStyle(info).color;
           for (const id of ['loop-toggle', 'loop-park', 'loop-upgrade']) check(!document.getElementById(id).hidden, id + ' visible');
           compact();
@@ -5048,6 +5080,8 @@ async fn loop_version_details_stay_compact_and_preserve_toggle_state() {
           stop.click(); deck.renderLoop();
           check(stop.dataset.armed === 'yes' && stop.textContent.includes('Stop claiming'), 'stop confirmation preserved');
           check(getComputedStyle(controls).gridRowStart === '3', 'confirmation controls keep separate row');
+          check(document.getElementById('loop-why').getBoundingClientRect().bottom <= controls.getBoundingClientRect().top, 'confirmation explanation above controls');
+          check(document.getElementById('loop-detail-why').hidden && !document.getElementById('loop-detail-why').textContent.trim(), 'confirmation explanation not duplicated in panel');
           check(detail.getBoundingClientRect().top >= controls.getBoundingClientRect().bottom, 'details below confirmation');
           deck.state.health.upgrade = {stage:'downloading', to:'v0.2.0'};
           deck.renderLoop();
