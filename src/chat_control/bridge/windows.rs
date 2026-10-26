@@ -261,7 +261,7 @@ mod tests {
     use crate::queue::{Queue, Source, Task, TaskStatus};
 
     #[tokio::test]
-    async fn authenticated_connections_are_isolated_scoped_and_revoked() {
+    async fn authenticated_connections_are_isolated_and_revoked() {
         let tmp = tempfile::tempdir().unwrap();
         let talks = crate::talk::Talks::at(tmp.path().join("talks"));
         let mut talk: crate::talk::Talk = serde_json::from_value(serde_json::json!({
@@ -325,14 +325,11 @@ mod tests {
         assert!(b.is_ok(), "{b:?}");
         assert_eq!(queue.get(&tasks[0].id).unwrap().status, TaskStatus::Held);
         assert_eq!(queue.get(&tasks[1].id).unwrap().status, TaskStatus::Held);
-        assert!(
-            request_at(&bridge.name, &bridge.token, &hold(2))
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("outcome")
-        );
-        assert_eq!(queue.get(&tasks[2].id).unwrap().status, TaskStatus::Queued);
+        // A task another conversation filed is controlled like any other: the
+        // owner's chat request is not limited to the tasks this chat filed.
+        let other = request_at(&bridge.name, &bridge.token, &hold(2)).await;
+        assert!(other.is_ok(), "{other:?}");
+        assert_eq!(queue.get(&tasks[2].id).unwrap().status, TaskStatus::Held);
         let release = Operation::Release {
             task: tasks[0].id.clone(),
         };

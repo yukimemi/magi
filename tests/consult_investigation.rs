@@ -1,8 +1,10 @@
-//! Consultation continuations use the same session without supplying owner evidence.
+//! A consultation uses the standing chat's session and does not queue behind
+//! repository work. A pending consultation grants no extra access: even a
+//! read-only chat keeps its read-only sandbox and answers over the inherited
+//! control bridge. Owner requests run through the CLI with no quote evidence.
 #![cfg(unix)]
 mod common;
 
-use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
@@ -48,51 +50,34 @@ impl Fixture {
         let trace = tmp.path().join("trace");
         std::fs::create_dir(&trace).unwrap();
         let mode = tmp.path().join("mode");
-        std::fs::write(&mode, "investigate").unwrap();
+        std::fs::write(&mode, "reply").unwrap();
         let cli = tmp.path().join("codex");
         std::fs::write(&cli, r#"#!/bin/sh
 cat >/dev/null
+# Title generation reuses the agent on its own seat at turn 0; it must not
+# overwrite the conversation's first-turn trace.
+[ "$MAGI_SEAT" = "talk-title" ] && exit 0
 cp "$MAGI_PROMPT_FILE" "$TRACE/$MAGI_TURN.prompt"
 printf '%s\n' "$@" > "$TRACE/$MAGI_TURN.args"
 printf '%s\n' "$MAGI_ALLOW_WRITE" > "$TRACE/$MAGI_TURN.write"
 printf '%s\n' '{"type":"thread.started","thread_id":"standing-session"}'
-case "$(cat "$MAGI_PROMPT_FILE")" in
-  *'Current turn scope: consultation investigation'*)
-    if [ "$(cat "$MODE")" = investigation_closed ]; then cp "$CLOSED_RECORD" "$TALK_RECORD"; fi
-    if [ "$(cat "$MODE")" = investigation_withdrawn ]; then cp "$WITHDRAWN_RECORD" "$QUESTION_RECORD"; fi
-    printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Evidence inspected; owner decision still needed."}}';;
-  *'# Read-only investigation result'*)
-    if [ "$(cat "$MODE")" = retry ]; then
-      if ! "$MAGI_BINARY" answer "$QUESTION_ID" --reply hold --quote "$OWNER_SEND" >"$TRACE/retry.result" 2>&1; then
-        printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Blocked: missing owner authorization; investigation delivery is not approval."}}'
-        exit 0
-      fi
-    fi
-    if [ "$(cat "$MODE")" = repeat ]; then
-      printf '%s\n' "$REQUEST_EVENT"
-    else
-      printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Evidence inspected; continued control with original owner evidence."}}'
-    fi;;
-  *)
-    case "$(cat "$MODE")" in
-      retry)
-        "$MAGI_BINARY" answer "$QUESTION_ID" --reply 'hold [hold the task]' --quote "$OWNER_SEND" >"$TRACE/first.error" 2>&1
-        printf '%s\n' "$REQUEST_EVENT";;
-      investigate|repeat|investigation_closed|investigation_withdrawn) printf '%s\n' "$REQUEST_EVENT";;
-      closed) cp "$CLOSED_RECORD" "$TALK_RECORD"; printf '%s\n' "$REQUEST_EVENT";;
-      failed) printf '%s\n' "$REQUEST_EVENT"; exit 1;;
-      quoted) printf '%s\n' "$QUOTED_EVENT";;
-      *) printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Control reply."}}';;
-    esac;;
+case "$(cat "$MODE")" in
+  answer) "$ANSWER_BIN" answer "$QUESTION" --reply hold > "$TRACE/$MAGI_TURN.answer" 2>&1 || exit 9;;
+  closed) cp "$CLOSED_RECORD" "$TALK_RECORD";;
 esac
+printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Turn reply."}}'
 "#).unwrap();
         std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut cfg = Config {
             coordination: Some(toml::from_str("contract_file='updater.contract'\ncontract_token='test-v1'\nlock_file='updater.lock'").unwrap()),
             ..Config::default()
         };
-        // Investigation must remain read-only even when the standing chat can edit.
+        // The standing conversation's own access applies to a consultation too.
         cfg.talk.allow_write = true;
+        let mut env = common::magi_cli_env(tmp.path(), "ANSWER_BIN");
+        env.insert("PATH".into(), cli_path);
+        env.insert("TRACE".into(), trace.to_str().unwrap().into());
+        env.insert("MODE".into(), mode.to_str().unwrap().into());
         cfg.agents = vec![AgentSpec {
             id: "fixture".into(),
             kind: AgentKind::Codex,
@@ -101,11 +86,7 @@ esac
             extra_args: Vec::new(),
             prompt_delivery: None,
             max_turn_secs: None,
-            env: BTreeMap::from([
-                ("PATH".into(), cli_path),
-                ("TRACE".into(), trace.to_str().unwrap().into()),
-                ("MODE".into(), mode.to_str().unwrap().into()),
-            ]),
+            env,
         }];
         let talks = Talks::at(tmp.path().join("talks"));
         let questions = Questions::at(tmp.path().join("questions"));
@@ -142,7 +123,7 @@ esac
             task_repo.clone(),
             "main".into(),
             "base-head".into(),
-            "Task awaiting evidence".into(),
+            "Task awaiting the owner".into(),
             cfg.clone(),
         );
         run.parked = true;
@@ -179,17 +160,9 @@ esac
         questions.beat(&question.id, magi::ask::WaiterKind::Daemon);
         let waiter_lease = questions.lease_path(&question.id);
         execution_files.push((waiter_lease.clone(), std::fs::read(waiter_lease).unwrap()));
-        let request = serde_json::json!({"investigate_question": question.id}).to_string();
-        let event = |text: String| {
-            serde_json::json!({"type":"item.completed", "item":{"type":"agent_message", "text":text}}).to_string()
-        };
         cfg.agents[0]
             .env
-            .insert("REQUEST_EVENT".into(), event(request.clone()));
-        cfg.agents[0].env.insert(
-            "QUOTED_EVENT".into(),
-            event(format!("```json\n{request}\n```")),
-        );
+            .insert("QUESTION".into(), question.id.clone());
         Self {
             _tmp: tmp,
             talks,
@@ -226,111 +199,127 @@ esac
         )
         .await
         .unwrap();
-        self.unchanged();
     }
 
     fn seat(&self) -> magi::agent::SeatState {
         serde_json::from_value(serde_json::to_value(&self.talk).unwrap()["seat"].clone()).unwrap()
     }
 
+    fn trace(&self, turn: usize, kind: &str) -> String {
+        std::fs::read_to_string(self.trace.join(format!("{turn}.{kind}"))).unwrap()
+    }
+
+    /// The question is still the owner's to decide, and no execution state moved.
     fn unchanged(&self) {
         assert_eq!(
             self.questions.get(&self.question.id).unwrap(),
             self.question
         );
+        assert!(self.question.status.open());
         for (path, original) in &self.execution_files {
             assert_eq!(&std::fs::read(path).unwrap(), original);
         }
     }
+
+    fn lock(path: &std::path::Path) -> std::fs::File {
+        use std::os::fd::AsRawFd as _;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.join(".git/updater.lock"))
+            .unwrap();
+        // SAFETY: the descriptor stays open until the returned file drops.
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        lock
+    }
 }
 
 common::e2e! {
-async fn consultation_investigates_on_delivery_and_natural_followup_then_returns_to_control() {
+async fn consultation_is_an_ordinary_turn_with_the_standing_session_and_access() {
     let mut f = Fixture::new().await;
     f.delivery().await;
-    assert_eq!(f.talk.turns.len(), 2, "internal request is not an operator send");
-    assert_eq!(f.seat().turns, 3);
+    assert_eq!(f.seat().turns, 1);
     assert_eq!(f.seat().captured_session.as_deref(), Some("standing-session"));
-    assert!(f.talk.turns.last().unwrap().body.contains("Evidence inspected"));
-    let args = std::fs::read_to_string(f.trace.join("1.args")).unwrap();
-    assert!(args.contains("resume\nstanding-session"));
-    assert!(!args.contains("dangerously-bypass"));
-    assert!(!args.contains("writable_roots"));
-    assert_eq!(std::fs::read_to_string(f.trace.join("1.write")).unwrap().trim(), "0");
-    assert!(std::fs::read_to_string(f.trace.join("1.prompt")).unwrap().contains("launcher holds the exclusive repository lock"));
-    f.say("Please investigate why this failed before I choose an answer.").await;
-    assert_eq!(f.talk.turns.len(), 4);
-    assert_eq!(f.seat().turns, 6);
-    // Investigation's internal request never becomes authentic owner authority.
-    let out = common::magi_cli(f._tmp.path())
-        .args(["answer", &f.question.id, "--reply", magi::land::APPROVE, "--quote", "Please investigate why this failed before I choose an answer."])
-        .env("MAGI_CONFIG_DIR", "")
-        .env("MAGI_RUN", &f.talk.id).env("MAGI_NODE", "chat").output().unwrap();
-    assert!(!out.status.success());
-    f.unchanged();
-    std::fs::write(&f.mode, "control").unwrap();
-    f.say("What decision is still needed?").await;
-    assert_eq!(f.seat().turns, 7);
-    let prompt = std::fs::read_to_string(f.trace.join("6.prompt")).unwrap();
-    assert!(prompt.contains("Current turn scope: consultation control"));
+    let prompt = f.trace(0, "prompt");
+    assert!(prompt.contains(&f.question.id), "{prompt}");
+    assert!(!prompt.contains("Current turn scope"));
+    assert!(!prompt.contains("investigate_question"));
+    // A chat turn is never scheduled behind repository work.
     assert!(!prompt.contains("launcher holds the exclusive repository lock"));
-    let instruction = "hold".to_string();
-    f.say(&instruction).await;
-    let out = common::magi_cli(f._tmp.path())
-        .args(["answer", &f.question.id, "--reply", "hold", "--quote", &instruction])
-        .env("MAGI_CONFIG_DIR", "")
-        .env("MAGI_RUN", &f.talk.id).env("MAGI_NODE", "chat").output().unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // The repository's `[talk] allow_write` applies unchanged.
+    assert!(f.trace(0, "args").contains("dangerously-bypass"));
+    assert_eq!(f.trace(0, "write").trim(), "1");
+    f.say("What decision is still needed?").await;
+    f.unchanged();
+    assert_eq!(f.seat().turns, 2);
+    assert!(f.trace(1, "args").contains("resume\nstanding-session"));
+    assert_eq!(f.trace(1, "write").trim(), "1");
+    assert_eq!(f.talk.turns.last().unwrap().body, "Turn reply.");
+}
+}
+
+common::e2e! {
+async fn owner_request_in_a_consultation_is_answered_by_the_turn_without_a_quote() {
+    let mut f = Fixture::new().await;
+    f.delivery().await;
+    std::fs::write(&f.mode, "answer").unwrap();
+    f.say("それは保留にしておいて").await;
+    let answer = f.trace(1, "answer");
     let answered = f.questions.get(&f.question.id).unwrap();
-    assert!(!answered.status.open());
+    assert!(!answered.status.open(), "{answer}");
+    assert_eq!(answered.resolution().as_deref(), Some(magi::land::HOLD));
     assert_eq!(answered.consult, f.question.consult);
     assert_eq!(answered.waiter, f.question.waiter);
-    f.question = answered;
-    f.say("Now continue our ordinary conversation.").await;
-    let prompt = std::fs::read_to_string(f.trace.join("8.prompt")).unwrap();
-    assert!(prompt.contains("Current turn scope: ordinary repository conversation"));
-    assert!(!prompt.contains("Current turn scope: consultation control"));
-
+    // Recording the answer moves no execution state by itself.
+    for (path, original) in &f.execution_files {
+        assert_eq!(&std::fs::read(path).unwrap(), original);
+    }
 }
 }
 
 common::e2e! {
-async fn busy_consultation_investigation_stays_open_and_can_retry_in_same_conversation() {
-    use std::os::fd::AsRawFd as _;
+async fn consultation_turn_does_not_wait_behind_repository_coordination() {
     let mut f = Fixture::new().await;
-    let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
-        .open(f.talk.repo.join(".git/updater.lock")).unwrap();
-    // SAFETY: descriptor remains open until explicitly unlocked below.
-    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
-    tokio::time::timeout(std::time::Duration::from_secs(10), f.delivery()).await.unwrap();
+    // The task awaiting this answer may hold the repository's lock.
+    let lock = Fixture::lock(&f.talk.repo);
+    tokio::time::timeout(std::time::Duration::from_secs(10), f.delivery())
+        .await
+        .expect("a consultation never waits for repository coordination");
     assert_eq!(f.seat().turns, 1);
-    assert!(!f.trace.join("1.prompt").exists());
-    assert!(f.talk.turns.last().unwrap().body.contains("Investigation pending"));
-    assert!(f.talk.turns.last().unwrap().body.contains("owner unknown"));
-    // SAFETY: this test owns the external descriptor, never another seat's lock.
-    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
-    f.say("Investigate again now.").await;
-    assert_eq!(f.seat().turns, 4);
-    assert!(f.talk.turns.last().unwrap().body.contains("Evidence inspected"));
+    assert!(!f.trace(0, "prompt").contains("launcher holds the exclusive repository lock"));
+    assert_eq!(f.talk.turns.last().unwrap().body, "Turn reply.");
+    drop(lock);
 }
 }
 
 common::e2e! {
-async fn quoted_and_failed_investigation_requests_do_not_start_repository_turns() {
-    let mut f = Fixture::new().await;
-    std::fs::write(&f.mode, "quoted").unwrap();
-    f.delivery().await;
+async fn foreign_repository_consultation_runs_in_the_standing_conversation() {
+    let mut f = Fixture::with_task_repository(true).await;
+    let target = PathBuf::from(f.question.cwd.as_ref().unwrap());
+    let lock = Fixture::lock(&target);
+    tokio::time::timeout(std::time::Duration::from_secs(10), f.delivery())
+        .await
+        .expect("a foreign repository's coordination does not hold the chat");
     assert_eq!(f.seat().turns, 1);
-    std::fs::write(&f.mode, "failed").unwrap();
-    assert!(talk::say(&f.talks.claim_turn(&f.talk.id).unwrap().unwrap(), &mut f.talk, &f.talks, &f.cfg, "Investigate", Vec::new()).await.is_err());
-    assert_eq!(f.seat().turns, 2);
-    assert!(!f.trace.join("2.prompt").exists());
+    // The turn runs in the standing checkout; the task's repository and its
+    // coordination policy are neither entered nor borrowed.
+    let args = f.trace(0, "args");
+    assert!(args.contains(&*f.talk.repo.to_string_lossy()), "{args}");
+    assert!(!args.contains(&*target.to_string_lossy()), "{args}");
+    drop(lock);
+    f.say("Is it still waiting?").await;
     f.unchanged();
+    assert_eq!(f.seat().turns, 2);
 }
 }
 
 common::e2e! {
-async fn closing_during_control_response_cancels_investigation_before_repository_spawn() {
+async fn closing_during_a_consultation_turn_keeps_the_conversation_closed() {
     let mut f = Fixture::new().await;
     let mut closed = f.talks.get(&f.talk.id).unwrap();
     closed.status = talk::TalkStatus::Closed;
@@ -341,70 +330,15 @@ async fn closing_during_control_response_cancels_investigation_before_repository
     std::fs::write(&f.mode, "closed").unwrap();
     f.delivery().await;
     assert_eq!(f.seat().turns, 1);
-    assert!(!f.trace.join("1.prompt").exists());
+    // The reply to the last message before the close cannot reopen it, and
+    // the question stays open for the owner (checked by `delivery`).
     assert_eq!(f.talks.get(&f.talk.id).unwrap().status, talk::TalkStatus::Closed);
-    assert!(f.talk.turns.last().unwrap().body.contains("investigation cancelled"));
 }
 }
 
 common::e2e! {
-async fn foreign_repository_consultation_stays_pending_even_when_standing_repository_is_free() {
-    use std::os::fd::AsRawFd as _;
-    let mut f = Fixture::with_task_repository(true).await;
-    let target = PathBuf::from(f.question.cwd.as_ref().unwrap());
-    let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
-        .open(target.join(".git/updater.lock")).unwrap();
-    // SAFETY: this test owns the descriptor through both consultation turns.
-    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
-    tokio::time::timeout(std::time::Duration::from_secs(10), f.delivery()).await.unwrap();
-    assert_eq!(f.seat().turns, 1);
-    assert!(!f.trace.join("1.prompt").exists());
-    let reply = &f.talk.turns.last().unwrap().body;
-    assert!(reply.contains("Investigation pending"));
-    assert!(reply.contains("repository differs"));
-    assert!(reply.contains("magi task show"));
-    // SAFETY: release only this test's descriptor, never another seat's lock.
-    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
-    // An idle foreign repository still cannot borrow the standing policy.
-    // Missing cwd must not make the persisted task/run association disappear.
-    f.question.cwd = None;
-    f.questions.put(&mut f.question).unwrap();
-    f.say("Investigate again without changing or answering the question.").await;
-    assert_eq!(f.seat().turns, 2);
-    assert!(!f.trace.join("2.prompt").exists());
-    assert!(f.talk.turns.last().unwrap().body.contains("repository differs"));
-}
-}
-
-common::e2e! {
-async fn unresolved_consultation_repository_does_not_fall_back_to_question_cwd() {
+async fn ending_one_consultation_keeps_the_other_open_and_the_turns_ordinary() {
     let mut f = Fixture::new().await;
-    let queue = magi::queue::Queue::at(f._tmp.path().join("queue"));
-    let task = queue.list().into_iter().find(|t| t.runs.contains(&f.question.run)).unwrap();
-    let paths = [
-        queue.path_of(&task.id),
-        f._tmp.path().join("runs").join(&f.question.run).join("run.json"),
-    ];
-    for path in &paths {
-        std::fs::remove_file(path).unwrap();
-    }
-    f.execution_files.retain(|(path, _)| !paths.contains(path));
-    // cwd still exists, but does not establish the task's repository policy.
-    assert!(f.question.cwd.is_some());
-    f.delivery().await;
-    assert_eq!(f.seat().turns, 1);
-    assert!(!f.trace.join("1.prompt").exists());
-    let reply = &f.talk.turns.last().unwrap().body;
-    assert!(reply.contains("Investigation pending"));
-    assert!(reply.contains("cannot resolve consulted task repository"));
-    assert!(reply.contains("restore that metadata"));
-}
-}
-
-common::e2e! {
-async fn ending_one_consultation_keeps_other_consults_then_restores_the_next_turn() {
-    let mut f = Fixture::new().await;
-    std::fs::write(&f.mode, "control").unwrap();
     f.delivery().await;
     let mut other = magi::ask::Question::new(
         f.question.run.clone(), "implement".into(), "implement".into(),
@@ -412,141 +346,88 @@ async fn ending_one_consultation_keeps_other_consults_then_restores_the_next_tur
     );
     f.questions.put(&mut other).unwrap();
     magi::consult::begin(&f.questions, &f.talks, &other, &f.talk).unwrap();
-    // Drain the actual delivery and persist a later authentic owner send.
     f.talk = f.talks.get(&f.talk.id).unwrap();
     talk::drain(&mut f.talk, &f.talks).unwrap().unwrap();
     let words = "Reimplement from scratch instead";
     talk::record(&mut f.talk, &f.talks, words, Vec::new()).unwrap();
-    let guard = f.talks.answer_guard().unwrap();
-    f.questions.update(&f.question.id, |q| magi::consult::record_other(q, &f.talk, words, Some(words))).unwrap();
-    drop(guard);
+    f.questions.update(&f.question.id, |q| magi::consult::record_other(q, words)).unwrap();
     f.question = f.questions.get(&f.question.id).unwrap();
     assert!(f.question.status.open());
     assert!(f.question.answer.is_none());
     assert!(magi::consult::pending_consults(&f.questions, &f.talk.id));
     f.say("One question is still pending.").await;
-    let prompt = std::fs::read_to_string(f.trace.join("1.prompt")).unwrap();
-    assert!(prompt.contains("Current turn scope: consultation control"));
-    talk::record(&mut f.talk, &f.talks, words, Vec::new()).unwrap();
-    let guard = f.talks.answer_guard().unwrap();
-    f.questions.update(&other.id, |q| magi::consult::record_other(q, &f.talk, words, Some(words))).unwrap();
-    drop(guard);
+    f.unchanged();
+    f.questions.update(&other.id, |q| magi::consult::record_other(q, words)).unwrap();
     assert!(!magi::consult::pending_consults(&f.questions, &f.talk.id));
     f.say("Continue our ordinary conversation.").await;
-    let prompt = std::fs::read_to_string(f.trace.join("2.prompt")).unwrap();
-    assert!(prompt.contains("Current turn scope: ordinary repository conversation"));
-    assert!(!prompt.contains("Current turn scope: consultation control"));
-}
-}
-
-common::e2e! {
-async fn investigation_returns_once_without_a_new_owner_send_or_retry_loop() {
-    let mut f = Fixture::new().await;
-    std::fs::write(&f.mode, "repeat").unwrap();
-    f.delivery().await;
-    assert_eq!(f.seat().turns, 3);
-    assert_eq!(f.talk.turns.len(), 2);
-    let prompt = std::fs::read_to_string(f.trace.join("2.prompt")).unwrap();
-    assert!(prompt.contains("Current turn scope: consultation control"));
-    assert!(prompt.contains("not owner authorization"));
-    assert!(prompt.contains("at most once"));
-    assert!(f.talk.turns.last().unwrap().body.contains("No further automatic continuation"));
-    assert!(!f.trace.join("3.prompt").exists());
-}
-}
-
-common::e2e! {
-async fn closing_during_investigation_blocks_return_to_control() {
-    let mut f = Fixture::new().await;
-    let mut closed = f.talks.get(&f.talk.id).unwrap();
-    closed.status = talk::TalkStatus::Closed;
-    let record = f._tmp.path().join("closed.json");
-    std::fs::write(&record, serde_json::to_vec(&closed).unwrap()).unwrap();
-    f.cfg.agents[0].env.insert("CLOSED_RECORD".into(), record.to_str().unwrap().into());
-    f.cfg.agents[0].env.insert("TALK_RECORD".into(), f.talks.path_of(&f.talk.id).to_str().unwrap().into());
-    std::fs::write(&f.mode, "investigation_closed").unwrap();
-    f.delivery().await;
-    assert_eq!(f.seat().turns, 2);
-    assert!(!f.trace.join("2.prompt").exists());
-    assert!(f.talk.turns.last().unwrap().body.contains("conversation closed"));
-}
-}
-
-common::e2e! {
-async fn corrected_answer_follows_diagnosis_in_the_same_authorized_turn() {
-    let mut f = Fixture::new().await;
-    std::fs::write(&f.mode, "control").unwrap();
-    f.delivery().await;
-    f.cfg.agents[0].env.extend(common::magi_cli_env(f._tmp.path(), "MAGI_BINARY"));
-    f.cfg.agents[0].env.insert("MAGI_CONFIG_DIR".into(), "".into());
-    f.cfg.agents[0].env.insert("QUESTION_ID".into(), f.question.id.clone());
-    f.cfg.agents[0].env.insert("OWNER_SEND".into(), "hold".into());
-    std::fs::write(&f.mode, "retry").unwrap();
-    let lease = f.talks.claim_turn(&f.talk.id).unwrap().unwrap();
-    talk::say(&lease, &mut f.talk, &f.talks, &f.cfg, "hold", Vec::new()).await.unwrap();
-    let error = std::fs::read_to_string(f.trace.join("first.error")).unwrap();
-    assert!(error.contains("alias mismatch with offered choices"), "{error}");
-    assert!(error.contains("copy the intended offered label verbatim into --reply"), "{error}");
-    assert!(error.contains("retry once only if the same owner authorization still holds"), "{error}");
-    let answered = f.questions.get(&f.question.id).unwrap();
-    assert!(!answered.status.open(), "{}", std::fs::read_to_string(f.trace.join("retry.result")).unwrap());
-    let saved = f.talks.get(&f.talk.id).unwrap();
-    assert_eq!(saved.turns[2].body, "hold");
-    assert_eq!(saved.turns[2].who, talk::Who::Operator);
-    assert_eq!(f.talk.turns.len(), 4, "no synthetic owner send");
-    assert_eq!(f.seat().turns, 4, "one control/investigation/control sequence");
-    f.question = answered;
     f.unchanged();
+    // With or without a pending consultation, every turn had the same access.
+    for turn in 0..f.seat().turns {
+        assert_eq!(f.trace(turn, "write").trim(), "1", "turn {turn}");
+        assert!(!f.trace(turn, "prompt").contains("Current turn scope"));
+    }
+}
+}
+
+async fn read_only_consultation_answers(free_text: bool) {
+    let mut f = Fixture::new().await;
+    f.cfg.talk.allow_write = false;
+    let (q, ()) = f
+        .questions
+        .update(&f.question.id, |q| {
+            q.node = "ordinary-question".into();
+            q.merge_target = None;
+            q.choices = if free_text {
+                vec![]
+            } else {
+                vec!["hold".into()]
+            };
+            Ok(())
+        })
+        .unwrap();
+    f.question = q;
+    assert!(!magi::task_chat::awaits_decision(&f.question));
+    f.delivery().await;
+    f.say("回答前に相談を続けます。").await;
+    // A pending consultation changes nothing about the turn's access.
+    for turn in [0, 1] {
+        let args = f.trace(turn, "args");
+        assert!(args.contains("read-only"), "{args}");
+        assert!(!args.contains("workspace-write"), "{args}");
+        assert!(!args.contains("dangerously-bypass"), "{args}");
+        assert!(
+            !args.contains(f._tmp.path().join("questions").to_str().unwrap()),
+            "{args}"
+        );
+        assert_eq!(f.trace(turn, "write").trim(), "0");
+    }
+    std::fs::write(&f.mode, "answer").unwrap();
+    f.say("hold と回答してください。").await;
+    let saved = f.questions.get(&f.question.id).unwrap();
+    assert!(f.trace(2, "args").contains("read-only"));
+    assert_eq!(f.trace(2, "write").trim(), "0");
+    assert_eq!(saved.status, magi::ask::QuestionStatus::Answered);
+    let expected = if free_text {
+        magi::ask::Answer::Text("hold".into())
+    } else {
+        magi::ask::Answer::Choice("hold".into())
+    };
+    assert_eq!(saved.answer, Some(expected));
+    assert!(!magi::consult::pending_consults(&f.questions, &f.talk.id));
+    std::fs::write(&f.mode, "reply").unwrap();
+    f.say("通常の会話を続けます。").await;
+    assert!(f.trace(3, "args").contains("read-only"));
+    assert_eq!(f.trace(3, "write").trim(), "0");
+}
+
+common::e2e! {
+async fn read_only_consultation_can_answer_an_ordinary_question() {
+    read_only_consultation_answers(false).await;
 }
 }
 
 common::e2e! {
-async fn pending_owner_retraction_during_investigation_blocks_control() {
-    let mut f = Fixture::new().await;
-    let mut pending = f.talks.get(&f.talk.id).unwrap();
-    pending.pending = "Stop; do not resume".into();
-    let record = f._tmp.path().join("pending.json");
-    std::fs::write(&record, serde_json::to_vec(&pending).unwrap()).unwrap();
-    f.cfg.agents[0].env.insert("CLOSED_RECORD".into(), record.to_str().unwrap().into());
-    f.cfg.agents[0].env.insert("TALK_RECORD".into(), f.talks.path_of(&f.talk.id).to_str().unwrap().into());
-    std::fs::write(&f.mode, "investigation_closed").unwrap();
-    f.delivery().await;
-    assert_eq!(f.seat().turns, 2);
-    assert!(!f.trace.join("2.prompt").exists());
-    assert!(f.talk.turns.last().unwrap().body.contains("new conversation input pending"));
-    assert_eq!(f.talk.pending, "Stop; do not resume");
-}
-}
-
-common::e2e! {
-async fn investigation_delivery_does_not_authorize_a_corrected_answer() {
-    let mut f = Fixture::new().await;
-    f.cfg.agents[0].env.extend(common::magi_cli_env(f._tmp.path(), "MAGI_BINARY"));
-    f.cfg.agents[0].env.insert("MAGI_CONFIG_DIR".into(), "".into());
-    f.cfg.agents[0].env.insert("QUESTION_ID".into(), f.question.id.clone());
-    f.cfg.agents[0].env.insert("OWNER_SEND".into(), "hold".into());
-    std::fs::write(&f.mode, "retry").unwrap();
-    f.delivery().await;
-    assert_eq!(f.seat().turns, 3);
-    let refusal = std::fs::read_to_string(f.trace.join("retry.result")).unwrap();
-    assert!(refusal.contains("no owner message"), "{refusal}");
-    assert!(f.talk.turns.last().unwrap().body.contains("Blocked: missing owner authorization"));
-    f.unchanged();
-}
-}
-
-common::e2e! {
-async fn withdrawn_consultation_during_investigation_blocks_control() {
-    let mut f = Fixture::new().await;
-    f.question.consult = None;
-    let record = f._tmp.path().join("withdrawn.json");
-    std::fs::write(&record, serde_json::to_vec(&f.question).unwrap()).unwrap();
-    f.cfg.agents[0].env.insert("WITHDRAWN_RECORD".into(), record.to_str().unwrap().into());
-    f.cfg.agents[0].env.insert("QUESTION_RECORD".into(), f.questions.path_of(&f.question.id).to_str().unwrap().into());
-    std::fs::write(&f.mode, "investigation_withdrawn").unwrap();
-    f.delivery().await;
-    assert_eq!(f.seat().turns, 2);
-    assert!(!f.trace.join("2.prompt").exists());
-    assert!(f.talk.turns.last().unwrap().body.contains("no longer open for consultation in this conversation"));
+async fn read_only_consultation_can_answer_a_free_text_question() {
+    read_only_consultation_answers(true).await;
 }
 }

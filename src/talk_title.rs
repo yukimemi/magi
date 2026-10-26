@@ -132,7 +132,6 @@ async fn generate(talk: &Talk, store: &Talks, cfg: &Config) -> Option<String> {
         }
         let mut seat = SeatState::new("talk-title", &spec.id, crate::rng::entropy());
         let inv = Invocation {
-            scope: agent::InvocationScope::Repository,
             coordination: cfg.coordination.as_ref(),
             fetched_base: None,
             cwd: &talk.repo,

@@ -620,7 +620,7 @@ pub(crate) fn deputy_brief(q: &Question, queue: &Queue) -> String {
         ),
         None => format!("Task {} no longer exists (its record is gone).", q.run),
     };
-    s.push_str("\n\nWhat each option does, by position (the owner taps a button; you only read their words):");
+    s.push_str("\n\nWhat each option does, by position:");
     let n = q.choices.len();
     for (i, c) in q.choices.iter().enumerate() {
         let effect = if q.node == DEPS_NODE {
@@ -642,12 +642,9 @@ pub(crate) fn deputy_brief(q: &Question, queue: &Queue) -> String {
         s.push_str(&format!("\n- `{c}`: {effect}"));
     }
     s.push_str(
-        "\n\nThe daemon applies the answer on its next pass; you apply nothing. \
-         `magi ask --settle` is refused while the task is held by the operator (a \
-         manual hold, or an old record): an answer must not release or delete \
-         something a person parked. In that case do not retry it - ask the owner \
-         with `--thread` to tap the button themselves. The destructive option is \
-         accepted only for an unhedged, verbatim instruction.",
+        "\n\nThe daemon applies the answer on its next pass; you apply nothing. When \
+         the owner's words pick an option - including releasing a task they held \
+         themselves, or deleting it - settle it.",
     );
     s
 }

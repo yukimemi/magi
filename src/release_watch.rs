@@ -465,7 +465,8 @@ pub(crate) fn deputy_brief(q: &Question, home: &Path) -> String {
         "This question was filed by magi's release watcher about a release pull \
          request. Whatever the owner picks, only the watcher acts on it, on its \
          next lap; you apply nothing and never close, merge, rerun or push \
-         anything. Silence is a hold.",
+         anything yourself. When the owner's words pick an option, settle it. \
+         Silence is a hold.",
     );
     match state_for_question(home, &q.id) {
         Some(st) => {
@@ -481,7 +482,7 @@ pub(crate) fn deputy_brief(q: &Question, home: &Path) -> String {
         ),
     }
     if let Some(target) = &q.merge_target {
-        s.push_str(&format!("\n\nThis approval is bound to PR {} at head `{}`. A deputy merge requires the owner's whole latest message and quote to be exactly `merge {}`. A standing conversation can bind it as `{}: merge {}`. A generic batch instruction never authorizes merge.", target.pr, target.head, target.head, q.id, target.head));
+        s.push_str(&format!("\n\nThis approval is bound to PR {} at head `{}`: a settled `{}` merges exactly that head, and a newer head is never merged on this answer.", target.pr, target.head, land::APPROVE));
     }
     s.push_str("\n\nWhat each option does:");
     for c in &q.choices {
@@ -507,9 +508,8 @@ pub(crate) fn deputy_brief(q: &Question, home: &Path) -> String {
         s.push_str(&format!("\n- `{c}`: {what}"));
     }
     s.push_str(
-        "\n\nIf the owner's words ask for the pull request itself to be closed, that \
-         is something only they can do by hand; do not read it as a choice unless \
-         it plainly means stop watching.",
+        "\n\nNo option closes the pull request itself. If the owner asks for it to \
+         be closed, tell them so in the thread; `leave it` only stops watching.",
     );
     s
 }
@@ -1937,9 +1937,7 @@ mod tests {
         let say = "クローズしていいよ。private repo だから、何回やっても失敗しちゃうから";
         w.questions().update(&id, |q| q.say(say)).unwrap();
         w.questions()
-            .update(&id, |q| {
-                q.settle_by_deputy(&seat, LEAVE_IT, "クローズしていいよ", None)
-            })
+            .update(&id, |q| q.settle_by_deputy(&seat, LEAVE_IT, None))
             .unwrap();
         let q = w.questions().get(&id).unwrap();
         assert_eq!(q.answer, Some(Answer::Choice(LEAVE_IT.to_owned())));

@@ -1412,7 +1412,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconciliation_standing_chat_requires_exact_current_owner_authority() {
+    async fn reconciliation_standing_chat_applies_the_owners_request_without_a_phrase() {
         use crate::{
             chat_control::{Operation, dispatch},
             talk::{self, Talks},
@@ -1422,68 +1422,47 @@ mod tests {
         let clean = f.run("ae01", false).await;
         let queue = crate::queue::Queue::at(f.home.join("queue"));
         let talks = Talks::at(f.home.join("talks"));
-        let mut conversation: talk::Talk = serde_json::from_value(serde_json::json!({
-            "schema":1,"id":"talk-owner","repo":f.repo,"agent":"worker","status":"open","turns":[],
-            "created_at":Timestamp::now(),"updated_at":Timestamp::now(),
-            "seat":crate::agent::SeatState::new("talk","worker",1)
-        }))
-        .unwrap();
-        talks.put(&mut conversation).unwrap();
-        let mut task = f.task(&[source.clone(), clean.clone()]);
-        let operation = |apply: Option<&str>, quote: Option<&str>| Operation::ReconcileRetention {
-            task: task.id.clone(),
-            authority: source.id.clone(),
-            apply: apply.map(str::to_owned),
-            quote: quote.map(str::to_owned),
+        let open_talk = |id: &str| -> talk::Talk {
+            let mut conversation = serde_json::from_value(serde_json::json!({
+                "schema":1,"id":id,"repo":f.repo,"agent":"worker","status":"open","turns":[],
+                "created_at":Timestamp::now(),"updated_at":Timestamp::now(),
+                "seat":crate::agent::SeatState::new("talk","worker",1)
+            }))
+            .unwrap();
+            talks.put(&mut conversation).unwrap();
+            conversation
         };
-        assert!(
-            dispatch(
-                &queue,
-                &f.home,
-                &talks,
-                &conversation.id,
-                operation(None, None)
-            )
-            .await
-            .is_err()
-        );
-        task.chat = Some(conversation.id.clone());
-        queue.put(&mut task).unwrap();
+        let conversation = open_talk("talk-owner");
+        let other = open_talk("talk-other");
+        // A task this chat did not file: the owner's request covers it too.
+        let task = f.task(&[source.clone(), clean.clone()]);
         crate::pr_recovery::retain_sources(&task, &f.home).unwrap();
-        let operation = |apply: Option<&str>, quote: Option<&str>| Operation::ReconcileRetention {
+        let operation = |apply: Option<&str>| Operation::ReconcileRetention {
             task: task.id.clone(),
             authority: source.id.clone(),
             apply: apply.map(str::to_owned),
-            quote: quote.map(str::to_owned),
         };
+        // A plan saved outside the chat is not applied through it.
         let legacy_path = reconcile::run(&f.home, &task.id, &source.id, None)
             .await
             .unwrap();
         let legacy: serde_json::Value =
             serde_json::from_slice(&std::fs::read(legacy_path).unwrap()).unwrap();
         let legacy_id = legacy["id"].as_str().unwrap();
-        let legacy_words = reconcile::apply_instruction(legacy_id, &task.id, &source.id);
-        talk::record(&mut conversation, &talks, &legacy_words, vec![]).unwrap();
         assert!(
             dispatch(
                 &queue,
                 &f.home,
                 &talks,
                 &conversation.id,
-                operation(Some(legacy_id), Some(&legacy_words))
+                operation(Some(legacy_id))
             )
             .await
             .is_err()
         );
-        let summary = dispatch(
-            &queue,
-            &f.home,
-            &talks,
-            &conversation.id,
-            operation(None, None),
-        )
-        .await
-        .unwrap();
+        let summary = dispatch(&queue, &f.home, &talks, &conversation.id, operation(None))
+            .await
+            .unwrap();
         assert!(summary.contains("Complete review summary"));
         assert!(summary.contains(&source.id) && summary.contains(&clean.id));
         let root = f.home.join("retention-reconciliations");
@@ -1496,80 +1475,15 @@ mod tests {
         assert_eq!(plan["version"], 2);
         assert!(clean.candidates[0].worktree.exists());
         assert!(!dir.join("approved.json").exists());
-        let expected = reconcile::apply_instruction(id, &task.id, &source.id);
-        for words in [
-            "continue".to_owned(),
-            format!("{expected}\nand another plan"),
-            reconcile::apply_instruction("wrong-plan", &task.id, &source.id),
-            reconcile::apply_instruction(id, "wrong-task", &source.id),
-            reconcile::apply_instruction(id, &task.id, "wrong-authority"),
-        ] {
-            talk::record(&mut conversation, &talks, &words, vec![]).unwrap();
-            assert!(
-                dispatch(
-                    &queue,
-                    &f.home,
-                    &talks,
-                    &conversation.id,
-                    operation(Some(id), Some(&words))
-                )
+        // The plan stays bound to the conversation it was saved for.
+        assert!(
+            dispatch(&queue, &f.home, &talks, &other.id, operation(Some(id)))
                 .await
                 .is_err()
-            );
-            assert!(!dir.join("approved.json").exists());
-        }
-        talk::record(&mut conversation, &talks, &expected, vec![]).unwrap();
-        assert!(
-            dispatch(
-                &queue,
-                &f.home,
-                &talks,
-                &conversation.id,
-                operation(Some(id), None)
-            )
-            .await
-            .is_err()
-        );
-        conversation.pending = "wait".into();
-        talks.put(&mut conversation).unwrap();
-        assert!(
-            dispatch(
-                &queue,
-                &f.home,
-                &talks,
-                &conversation.id,
-                operation(Some(id), Some(&expected))
-            )
-            .await
-            .is_err()
-        );
-        conversation.pending.clear();
-        talks.put(&mut conversation).unwrap();
-        talk::record(&mut conversation, &talks, "wait", vec![]).unwrap();
-        let error = reconcile::interrupt_chat_after_fence(
-            &f.home,
-            &task,
-            id,
-            reconcile::ChatRequest {
-                talks: &talks,
-                conversation: &conversation.id,
-                quote: Some(&expected),
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            !error.to_string().contains("simulated interruption"),
-            "{error:#}"
         );
         assert!(!dir.join("approved.json").exists());
-        assert!(
-            RunState::load_under(&clean.id, &f.home)
-                .unwrap()
-                .retired_to
-                .is_none()
-        );
-        talk::record(&mut conversation, &talks, &expected, vec![]).unwrap();
+        // No owner phrase or quote: the request itself applies the plan. An
+        // interruption after the durable fence keeps the audit for a retry.
         let error = reconcile::interrupt_chat_after_fence(
             &f.home,
             &task,
@@ -1577,7 +1491,6 @@ mod tests {
             reconcile::ChatRequest {
                 talks: &talks,
                 conversation: &conversation.id,
-                quote: Some(&expected),
             },
         )
         .await
@@ -1588,25 +1501,12 @@ mod tests {
         );
         assert!(clean.candidates[0].worktree.exists());
         assert!(dir.join("approved.json").exists());
-        talk::record(&mut conversation, &talks, "wait", vec![]).unwrap();
-        assert!(
-            dispatch(
-                &queue,
-                &f.home,
-                &talks,
-                &conversation.id,
-                operation(Some(id), Some(&expected))
-            )
-            .await
-            .is_err()
-        );
-        talk::record(&mut conversation, &talks, &expected, vec![]).unwrap();
         dispatch(
             &queue,
             &f.home,
             &talks,
             &conversation.id,
-            operation(Some(id), Some(&expected)),
+            operation(Some(id)),
         )
         .await
         .unwrap();
@@ -1615,27 +1515,16 @@ mod tests {
         let audit: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("approved.json")).unwrap()).unwrap();
         assert_eq!(audit["version"], 2);
-        assert_eq!(audit["owner"]["conversation"], conversation.id);
-        assert_eq!(audit["owner"]["evidence"]["instruction"], expected);
-        talk::record(&mut conversation, &talks, "continue", vec![]).unwrap();
-        assert!(
-            dispatch(
-                &queue,
-                &f.home,
-                &talks,
-                &conversation.id,
-                operation(Some(id), Some(&expected))
-            )
-            .await
-            .is_err()
+        assert_eq!(
+            audit["owner"],
+            serde_json::json!({"conversation": conversation.id})
         );
-        talk::record(&mut conversation, &talks, &expected, vec![]).unwrap();
         dispatch(
             &queue,
             &f.home,
             &talks,
             &conversation.id,
-            operation(Some(id), Some(&expected)),
+            operation(Some(id)),
         )
         .await
         .unwrap();

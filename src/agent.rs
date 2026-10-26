@@ -90,22 +90,9 @@ pub fn has_session(kind: AgentKind, seat: &SeatState, sessions_enabled: bool) ->
     }
 }
 
-/// Repository access is independent of control-plane write grants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InvocationScope {
-    /// Ordinary repository seat with its configured access.
-    Repository,
-    /// Question control and supplied evidence without repository scheduling.
-    ConsultationControl,
-    /// Read-only repository continuation with nonblocking coordination.
-    ConsultationInvestigation,
-}
-
 /// One agent invocation.
 #[derive(Debug, Clone)]
 pub struct Invocation<'a> {
-    /// Explicit access scope for this turn, independent of writable roots.
-    pub scope: InvocationScope,
     /// Rendered repository coordination policy for this invocation.
     pub coordination: Option<&'a crate::config::Coordination>,
     /// Launcher fetch evidence, unchanged on session resume.
@@ -160,8 +147,7 @@ pub struct Invocation<'a> {
 }
 
 fn repository_writer(inv: &Invocation<'_>) -> bool {
-    inv.scope == InvocationScope::Repository
-        && inv.allow_write
+    inv.allow_write
         && (matches!(
             inv.node,
             "implement" | "fix" | "graft" | "gate-fix" | "land" | "rebase"
@@ -172,16 +158,12 @@ fn repository_seat(inv: &Invocation<'_>) -> bool {
     // These roles consume supplied state, prompts and conversation history.
     // In particular, they must be able to deliver an answer or make queue
     // decisions while an editor holds its reservation waiting for that answer.
-    // Ordinary chat turns and their transcript-only title seats bypass repository
+    // Chat turns and their transcript-only title seats bypass repository
     // scheduling, including waiter delivery.
-    // Investigation is an explicit continuation with nonblocking acquisition.
-    if inv.scope == InvocationScope::ConsultationInvestigation {
-        return true;
-    }
     !matches!(
         inv.node,
         crate::queue::CHAT_NODE | "talk-title" | "deputy" | "conduct" | "dupes"
-    ) && inv.scope != InvocationScope::ConsultationControl
+    )
 }
 
 /// Resolve the additional write scope for a repository editing seat.
@@ -427,33 +409,16 @@ pub async fn invoke(
 ) -> Result<AgentOutput> {
     // Wait for repository scheduling before spawning or starting a seat's
     // budget. Readers hold the real lock; editors exclude local readers while
-    // taking their own repository-prescribed lock inside the seat.
-    let lease = if inv.scope == InvocationScope::ConsultationInvestigation {
-        crate::repo_lock::SeatLease::try_reader(inv.cwd, inv.coordination).await?
-    } else if repository_seat(inv) {
+    // taking their own repository-prescribed lock inside the seat. Running
+    // owns the lease through descendant cleanup on cancel.
+    let lease = if repository_seat(inv) {
         crate::repo_lock::SeatLease::for_checkout(inv.cwd, inv.allow_write, inv.coordination)
             .await?
     } else {
         None
     };
-    invoke_leased(spec, seat, inv, lease, || Ok(())).await
-}
-
-/// Also used by consultation continuations after nonblocking acquisition and
-/// revalidation. Running owns the lease through descendant cleanup on cancel.
-pub(crate) async fn invoke_leased(
-    spec: &AgentSpec,
-    seat: &mut SeatState,
-    inv: &Invocation<'_>,
-    lease: Option<crate::repo_lock::SeatLease>,
-    start_check: impl FnOnce() -> Result<()> + Send,
-) -> Result<AgentOutput> {
-    let readonly = inv.scope == InvocationScope::ConsultationInvestigation;
     let inv = &Invocation {
         timeout: spec.turn_timeout(inv.timeout),
-        allow_write: inv.allow_write && !readonly,
-        unsandboxed: inv.unsandboxed && inv.scope == InvocationScope::Repository,
-        writable: if readonly { &[] } else { inv.writable },
         ..inv.clone()
     };
     let mut outputs = Vec::new();
@@ -472,30 +437,10 @@ pub(crate) async fn invoke_leased(
         }
     }
 
-    let scope = match inv.scope {
-        InvocationScope::ConsultationControl => Some(
-            "Current turn scope: consultation control. This replaces all earlier per-turn scope restrictions, including investigation's prohibition on answering. Repository access is suspended. Use supplied context and supported read-only magi control-plane diagnostics; do not inspect repository files/history, fetch, test or edit. If evidence is needed (including an operator request to investigate), return ONLY a JSON object {\"investigate_question\":\"<full open question id>\"}. The launcher will attempt a coordinated read-only continuation in this same conversation. Do not answer or resolve the question to obtain access. Only magi answer settles a question. Additional writes are limited to individually evidenced task add, release, hold, done and priority; use --quote of the entire latest persisted owner send after delivery. No direct merge, discard, withdrawal, posting or other write commands; existing answer-specific effect checks remain in force. These restrictions last this whole invocation even after consultation ends. Consultation task instructions use the literal task-operation JSON protocol explained below. --reply-other records the owner's literal decision and ends consultation only, leaving the question open and waiter held. Owner decisions still require magi answer with exact required evidence.",
-        ),
-        InvocationScope::ConsultationInvestigation => Some(
-            "Current turn scope: consultation investigation. This supersedes earlier control-only restrictions for this invocation. Investigate repository evidence within the standing conversation's read-only permissions. No repository edits, fetch or other Git/network mutations; use existing history and files. Do not run tests that write into the repository. Do not answer, close, withdraw, discard or resume anything, or invoke magi answer. Return evidence and remaining decision points. The launcher may return to consultation control once in this same turn, with the original owner evidence unchanged; investigation itself authorizes no action.",
-        ),
-        InvocationScope::Repository if inv.node == "chat" => Some(
-            "Current turn scope: ordinary repository conversation. This replaces earlier per-turn consultation restrictions. Use the standing conversation permissions and current filesystem sandbox; owner decisions still require magi answer and exact authorization evidence.",
-        ),
-        InvocationScope::Repository => None,
-    };
     let mut prompt = inv.prompt.to_owned();
     if inv.node == crate::queue::CHAT_NODE {
         prompt.push_str("\n\n");
         prompt.push_str(crate::prompt::CHAT_FOLLOW_THROUGH);
-    }
-    if let Some(scope) = scope {
-        prompt.push_str("\n\n");
-        prompt.push_str(scope);
-        if inv.scope == InvocationScope::ConsultationControl {
-            prompt.push_str("\n\n");
-            prompt.push_str(crate::prompt::CONSULT_WRITES);
-        }
     }
     if let Some(lease) = lease.as_ref().filter(|lease| lease.delegated) {
         prompt.push_str(&format!("\n\nRepository coordination: the launcher holds the exclusive repository lock at {} for this invocation. Do not acquire a second lock or release/delete it. Repository access remains read-only.", lease.path.display()));
@@ -574,14 +519,6 @@ pub(crate) async fn invoke_leased(
         .env("MAGI_TURN", seat.turns.to_string())
         .env("MAGI_RUN", inv.run)
         .env("MAGI_NODE", inv.node)
-        .env(
-            "MAGI_TURN_SCOPE",
-            match inv.scope {
-                InvocationScope::ConsultationControl => "consultation-control",
-                InvocationScope::ConsultationInvestigation => "consultation-investigation",
-                InvocationScope::Repository => "repository",
-            },
-        )
         .env("MAGI_PROMPT_FILE", &prompt_path)
         .env("MAGI_ALLOW_WRITE", if inv.allow_write { "1" } else { "0" })
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -620,9 +557,7 @@ pub(crate) async fn invoke_leased(
     let _chat_controls = {
         use crate::chat_control::bridge::{self, Bridge};
         bridge::clear_environment(&mut cmd);
-        let bridge = if inv.node == crate::queue::CHAT_NODE
-            && inv.scope == InvocationScope::Repository
-        {
+        let bridge = if inv.node == crate::queue::CHAT_NODE {
             crate::run::try_home().and_then(|home| {
                 match Bridge::start(&home, inv.run, inv.artifacts) {
                     Ok(bridge) => Some(bridge),
@@ -645,9 +580,6 @@ pub(crate) async fn invoke_leased(
         bridge
     };
 
-    // The final consultation/turn check is synchronous: no await separates
-    // it from spawning and transferring the lease to Running.
-    start_check()?;
     let mut running = crate::seat_process::Running::spawn(cmd, lease, outputs)
         .with_context(|| format!("spawn `{}` for seat {}", plan.argv[0], seat.key))?;
     // Feed stdin from a task rather than inline: a `command` agent that never
@@ -2029,7 +1961,6 @@ mod tests {
 
     fn inv<'a>(cwd: &'a Path, art: &'a Path, allow_write: bool) -> Invocation<'a> {
         Invocation {
-            scope: crate::agent::InvocationScope::Repository,
             coordination: None,
             fetched_base: None,
             cwd,
@@ -2400,31 +2331,6 @@ mod tests {
         assert!(!mk(false).argv.iter().any(|a| a.contains("writable_roots")));
     }
 
-    #[tokio::test]
-    async fn investigation_checks_cancellation_after_artifacts_before_spawning() {
-        let tmp = tempfile::tempdir().unwrap();
-        let artifacts = tmp.path().join("artifacts");
-        let mut invocation = inv(tmp.path(), &artifacts, true);
-        invocation.scope = InvocationScope::ConsultationInvestigation;
-        invocation.unsandboxed = true;
-        let mut seat = SeatState::new("chat", "fixture", 1);
-        let error = invoke_leased(
-            &spec(AgentKind::Command, None),
-            &mut seat,
-            &invocation,
-            None,
-            || {
-                assert!(artifacts.join("t.prompt.md").exists());
-                bail!("question closed during preparation")
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("question closed"));
-        assert_eq!(seat.turns, 0);
-        assert!(!artifacts.join("t.out").exists());
-    }
-
     #[test]
     fn repository_write_scope_covers_editing_nodes_without_changing_other_roles() {
         let mut i = inv(Path::new("."), Path::new("/art"), true);
@@ -2452,20 +2358,11 @@ mod tests {
         i.writable = &roots;
         assert!(
             repository_writer(&i),
-            "roots alone do not select consultation"
+            "explicit roots do not change the role"
         );
-        i.scope = InvocationScope::ConsultationControl;
-        assert!(!repository_writer(&i), "consultation keeps explicit grants");
-        assert!(!repository_seat(&i));
-        i.allow_write = false;
-        i.writable = &[];
-        assert!(!repository_seat(&i), "control scope needs no write roots");
-        i.scope = InvocationScope::ConsultationInvestigation;
-        assert!(repository_seat(&i));
-        i.allow_write = true;
         assert!(
-            !repository_writer(&i),
-            "investigation never gains editing grants"
+            !repository_seat(&i),
+            "chat turns bypass repository scheduling"
         );
     }
 
@@ -2911,7 +2808,6 @@ mod tests {
             &spec(AgentKind::Antigravity, None),
             &seat,
             &Invocation {
-                scope: crate::agent::InvocationScope::Repository,
                 coordination: None,
                 fetched_base: None,
                 cwd: Path::new("."),
@@ -3381,7 +3277,6 @@ mod tests {
             &s,
             &mut seat,
             &Invocation {
-                scope: crate::agent::InvocationScope::Repository,
                 coordination: None,
                 fetched_base: None,
                 cwd: dir.path(),
@@ -3422,7 +3317,6 @@ mod tests {
             &s,
             &mut seat,
             &Invocation {
-                scope: crate::agent::InvocationScope::Repository,
                 coordination: None,
                 fetched_base: None,
                 cwd: dir.path(),
@@ -3473,7 +3367,6 @@ mod tests {
             &s,
             &mut seat,
             &Invocation {
-                scope: crate::agent::InvocationScope::Repository,
                 coordination: None,
                 fetched_base: None,
                 cwd: dir.path(),
@@ -3523,7 +3416,6 @@ mod tests {
             &s,
             &mut seat,
             &Invocation {
-                scope: crate::agent::InvocationScope::Repository,
                 coordination: None,
                 fetched_base: None,
                 cwd: dir.path(),
@@ -3572,7 +3464,6 @@ mod tests {
             &s,
             &mut seat,
             &Invocation {
-                scope: crate::agent::InvocationScope::Repository,
                 coordination: None,
                 fetched_base: None,
                 cwd: dir.path(),
@@ -3611,7 +3502,6 @@ mod tests {
             &s,
             &mut seat,
             &Invocation {
-                scope: crate::agent::InvocationScope::Repository,
                 coordination: None,
                 fetched_base: None,
                 cwd: dir.path(),

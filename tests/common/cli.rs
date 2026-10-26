@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub(super) const SEAT_ENV: [&str; 4] = ["MAGI_RUN", "MAGI_NODE", "MAGI_SEAT", "MAGI_TURN_SCOPE"];
+pub(super) const SEAT_ENV: [&str; 3] = ["MAGI_RUN", "MAGI_NODE", "MAGI_SEAT"];
 // These resets apply to spawned CLIs. Library-embedding test hosts retain their
 // explicit MAGI_WORKER_EXE when copying child isolation settings back to a host.
 pub(super) const WORKER_ENV: [&str; 4] = magi::worker::INVOCATION_ENV;

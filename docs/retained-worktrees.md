@@ -267,33 +267,23 @@ reasons. Review the complete summary on the phone. If the response says
 `INCOMPLETE PRESENTATION`, obtain and inspect the complete saved plan through
 operator access; do not authorize from an incomplete display.
 
-After reviewing, the owner sends this single literal line as a new message:
-
-```text
-retention-apply: <plan-id> task=<full-task-id> authority=<full-run-id>
-```
-
-The chat repeats that entire latest owner message, without paraphrasing:
+When the owner asks to apply it, in their own words, the chat runs:
 
 ```sh
-magi task --quote 'retention-apply: <plan-id> task=<full-task-id> authority=<full-run-id>' \
-  control reconcile-retention <full-task-id> --authority-run <full-run-id> --apply <plan-id>
+magi task control reconcile-retention <full-task-id> --authority-run <full-run-id> --apply <plan-id>
 ```
 
-A request to plan, a generic continuation, a combined or conditional instruction,
-an old message, or a queued retraction does not authorize application. The task
-must still belong to this conversation. Plans bind the conversation and expire
-24 hours after creation; legacy operator plans require fresh chat planning.
-Changed task, plan, authority or evidence requires inspection and replanning.
-The final commit section rechecks current owner evidence under its evidence lock
-and saves the owner conversation, turn/message positions and exact instruction
-in the versioned approval audit before the first durable retirement fence.
+Plans bind the conversation that planned them and expire 24 hours after
+creation; legacy operator plans require fresh chat planning. Changed task,
+plan, authority or Git artifacts require inspection and replanning. Before the
+first durable retirement fence, the versioned approval audit records the
+conversation that applied the plan.
 
-After interruption, inspect the existing receipts and repeat the same apply
-with a fresh exact owner message as the latest send. A valid durable approval
-made within the deadline permits recovery even after the plan expires; expiry
-does not strand already fenced work. Every chat retry still requires explicit
-latest authorization, and all original proof and stale-write checks remain.
+After interruption, inspect the existing receipts and repeat the same apply.
+A valid durable approval made within the deadline permits recovery even after
+the plan expires; expiry does not strand already fenced work. All original
+proof and stale-write checks remain on every retry. Older audits that recorded
+the owner's former `retention-apply:` line stay readable.
 Neither this workflow nor cleanup resumes the task or approves any merge.
 
 Only registered, canonical worktrees with recorded candidate/preparation

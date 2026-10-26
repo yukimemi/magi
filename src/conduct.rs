@@ -1328,7 +1328,6 @@ impl Conductor {
                 format!("turn-{}-{}", seat.turns + 1, spec.id)
             };
             let inv = Invocation {
-                scope: crate::agent::InvocationScope::Repository,
                 coordination: cfg.coordination.as_ref(),
                 fetched_base: None,
                 cwd: repo,

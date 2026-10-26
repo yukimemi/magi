@@ -628,7 +628,7 @@ async fn a_clear_merge_with_a_follow_up_request_merges_and_files_the_tasks() {
     s.store.update(&land.id, |q| q.say(say)).unwrap();
     script(&s, &[
         FOLLOW_UP,
-        "MAGI ask --settle \"$qid\" --choice merge --quote 'マージしていいよ'",
+        "MAGI ask --settle \"$qid\" --choice merge",
     ]);
 
     turn(&mut deputies(&s, 2)).await;
@@ -650,25 +650,6 @@ async fn a_clear_merge_with_a_follow_up_request_merges_and_files_the_tasks() {
 }
 
 common::e2e! {
-async fn a_non_verbatim_quote_is_refused_and_the_question_stays_open() {
-    let s = scene(home_lock().await);
-    let land = file_land(&s.store, "Merge #7?");
-    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
-    s.store.update(&land.id, |q| q.say("マージしていいよ")).unwrap();
-    script(&s, &[
-        "MAGI ask --settle \"$qid\" --choice merge --quote 'ぜひマージしてください'",
-    ]);
-
-    turn(&mut deputies(&s, 2)).await;
-
-    let q = s.store.get(&land.id).unwrap();
-    assert_eq!(q.status, QuestionStatus::Open, "an invented quote is no basis: {:?}", q.thread);
-    assert!(q.answer.is_none());
-    assert!(follow_ups(&s).is_empty());
-}
-}
-
-common::e2e! {
 async fn a_settle_note_naming_the_filed_task_lands_on_the_thread() {
     let s = scene(home_lock().await);
     let land = file_land(&s.store, "Merge #7?");
@@ -677,7 +658,7 @@ async fn a_settle_note_naming_the_filed_task_lands_on_the_thread() {
     s.store.update(&land.id, |q| q.say(say)).unwrap();
     script(&s, &[
         FOLLOW_UP,
-        "MAGI ask --settle \"$qid\" --choice merge --quote 'マージしていいよ' \
+        "MAGI ask --settle \"$qid\" --choice merge \
          --note 'Filed Fix R1-1 (held; released after the merge unless its hold reason says otherwise).'",
     ]);
 
@@ -698,9 +679,9 @@ async fn a_release_merge_settle_can_say_the_follow_ups_were_not_queued() {
     let land = file_land(&s.store, "Merge #7?");
     s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
     s.store.update(&land.id, |q| q.say("マージしていいよ。フォローアップも積んで")).unwrap();
-    // A deputy without authority to file: it settles and says so.
+    // A deputy that filed nothing settles and says so.
     script(&s, &[
-        "MAGI ask --settle \"$qid\" --choice merge --quote 'マージしていいよ' \
+        "MAGI ask --settle \"$qid\" --choice merge \
          --note 'Follow-ups were NOT queued; file them yourself.'",
     ]);
 
@@ -714,11 +695,10 @@ async fn a_release_merge_settle_can_say_the_follow_ups_were_not_queued() {
 }
 
 common::e2e! {
-async fn an_operator_held_task_refuses_a_verbatim_merge_settle() {
+async fn a_merge_settle_on_an_operator_held_task_goes_through_without_a_quote() {
     let s = scene(home_lock().await);
     let land = file_land(&s.store, "Merge #7?");
     s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
-    s.store.update(&land.id, |q| q.say("マージしていいよ")).unwrap();
     let queue = magi::queue::Queue::at(s.home.join("queue"));
     let mut task = magi::queue::Task::new(
         "held by the operator".to_owned(),
@@ -730,67 +710,23 @@ async fn an_operator_held_task_refuses_a_verbatim_merge_settle() {
     task.hold_manual(Some("operator says wait".to_owned()));
     queue.put(&mut task).unwrap();
     assert!(queue.get(&task.id).unwrap().operator_held());
-    // Verify that the nested CLI can read the fixture too; a mismatched
-    // binary or home must not look like a failure of the hold policy.
+    // The owner speaks after their own hold: that answer is the newer decision.
+    s.store.update(&land.id, |q| q.say("マージしていいよ")).unwrap();
     let inspect = format!("MAGI task show {} > /dev/null", task.id);
     script(&s, &[
         &inspect,
-        "MAGI ask --settle \"$qid\" --choice merge --quote 'マージしていいよ'",
+        "MAGI ask --settle \"$qid\" --choice merge",
     ]);
 
     turn(&mut deputies(&s, 2)).await;
+    assert_actions_succeeded(&s, 2);
 
-    let statuses = std::fs::read_to_string(s.fx.repo.join("deputy-action-status")).unwrap();
-    let output = std::fs::read_to_string(s.fx.repo.join("deputy-action-output")).unwrap();
-    let statuses: Vec<_> = statuses.lines().collect();
-    assert_eq!(statuses.len(), 2, "{output}");
-    assert_eq!(statuses[0], "0", "the CLI must read the held task: {output}");
-    assert_ne!(statuses[1], "0", "the CLI must refuse settlement: {output}");
-    assert!(output.contains("held by the operator"), "{output}");
+    let q = s.store.get(&land.id).unwrap();
+    assert_eq!(q.status, QuestionStatus::Answered, "{:?}", q.thread);
+    assert_eq!(q.resolution().as_deref(), Some("merge"));
+    // Settling records the answer only; land applies it to the saved head.
     let held = queue.get(&task.id).unwrap();
-    assert!(held.operator_held(), "settlement must preserve the operator hold");
     assert_eq!(held.runs, task.runs);
-    let q = s.store.get(&land.id).unwrap();
-    assert_eq!(q.status, QuestionStatus::Open, "{:?}", q.thread);
-    assert!(q.answer.is_none());
-}
-}
-
-common::e2e! {
-async fn an_unreadable_task_file_refuses_a_settle_instead_of_skipping_the_hold_check() {
-    let s = scene(home_lock().await);
-    let land = file_land(&s.store, "Merge #7?");
-    s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
-    s.store.update(&land.id, |q| q.say("マージしていいよ")).unwrap();
-    let queue = magi::queue::Queue::at(s.home.join("queue"));
-    let mut task = magi::queue::Task::new(
-        "held by the operator, written by a newer build".to_owned(),
-        "instruction".to_owned(),
-        s.fx.repo.clone(),
-        magi::queue::Source::Human,
-    );
-    task.runs.push(land.run.clone());
-    task.hold_manual(Some("operator says wait".to_owned()));
-    queue.put(&mut task).unwrap();
-    // A field this build does not know: `Task` rejects it, so the record
-    // cannot be read here, and the hold on it cannot be seen either.
-    let path = queue.path_of(&task.id);
-    let mut record: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    record["from_a_newer_build"] = serde_json::json!(true);
-    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
-    assert!(queue.get(&task.id).is_err());
-    script(&s, &["MAGI ask --settle \"$qid\" --choice merge --quote 'マージしていいよ'"]);
-
-    turn(&mut deputies(&s, 2)).await;
-
-    let statuses = std::fs::read_to_string(s.fx.repo.join("deputy-action-status")).unwrap();
-    let output = std::fs::read_to_string(s.fx.repo.join("deputy-action-output")).unwrap();
-    assert_ne!(statuses.lines().next(), Some("0"), "the CLI must refuse settlement: {output}");
-    assert!(output.contains("cannot be read"), "{output}");
-    let q = s.store.get(&land.id).unwrap();
-    assert_eq!(q.status, QuestionStatus::Open, "{:?}", q.thread);
-    assert!(q.answer.is_none());
 }
 }
 
@@ -1033,31 +969,23 @@ fn settle_ready(mut q: Question, said: &str) -> Question {
 }
 
 #[test]
-fn a_destructive_choice_settles_only_on_an_unhedged_quote() {
+fn a_destructive_choice_settles_on_the_deputys_reading_without_a_quote() {
+    // Deleting a task or dropping commits: the deputy's reading of the owner's
+    // words is the authority, with no hedge check and no quote.
     let triage = unasked_questions().remove(3);
     let key = magi::ask::deputy_seat_key(&triage.id);
-    for (said, quote, ok) in [
-        ("discard it", "discard it", true),
-        ("maybe discard it", "discard it", false),
-        ("discard it if CI is red", "discard it", false),
-        ("discard it. actually wait", "discard it", false),
-    ] {
+    for said in ["discard it", "うん、消しちゃって"] {
         let mut q = settle_ready(triage.clone(), said);
-        let r = q.settle_by_deputy(&key, "discard", quote, None);
-        assert_eq!(r.is_ok(), ok, "{said:?}: {r:?}");
+        q.settle_by_deputy(&key, "discard", None).unwrap();
+        assert_eq!(q.resolution().as_deref(), Some("discard"));
     }
-    // The task is released, not deleted: no mechanical hedge gate.
-    let mut q = settle_ready(triage.clone(), "maybe release it");
-    q.settle_by_deputy(&key, "resume", "maybe release it", None)
-        .unwrap();
-    // A divergence answer drops commits either way.
     let div = unasked_questions().pop().unwrap();
-    let mut q = settle_ready(div.clone(), "keep the remote, I guess?");
-    assert!(
-        q.settle_by_deputy(&key, "keep remote", "keep the remote", None)
-            .is_err()
-    );
-    assert!(magi::deputy::destructive(&div, "push local"));
+    let mut q = settle_ready(div.clone(), "remote のほうで");
+    // Only this question's own deputy seat may settle it.
+    assert!(q.settle_by_deputy(&key, "keep remote", None).is_err());
+    let own = magi::ask::deputy_seat_key(&div.id);
+    q.settle_by_deputy(&own, "keep remote", None).unwrap();
+    assert_eq!(q.resolution().as_deref(), Some("keep remote"));
 }
 
 common::e2e! {
@@ -1114,7 +1042,7 @@ fn generic_brief_offers_read_only_investigation_only_for_a_run_id() {
         .join("artifacts");
     assert!(with.contains(&artifacts.display().to_string()));
     assert!(with.contains("read-only"));
-    assert!(with.contains("not yours to guess"));
+    assert!(with.contains("When the owner's words pick an option, settle it"));
     assert!(with.contains("`use fallback`"));
 
     for run in ["", "a1b2c3"] {
@@ -1136,7 +1064,7 @@ async fn deputy_non_hold_owner_choices_remain_independent_of_consultation_destin
         q.consult = Some(magi::ask::ChatConsult { talk: "different-standing-conversation".into(), at: Timestamp::now() });
         q.say(choice).unwrap();
         s.store.put(&mut q).unwrap();
-        let command = format!("MAGI ask --settle \"$qid\" --choice '{choice}' --quote '{choice}'");
+        let command = format!("MAGI ask --settle \"$qid\" --choice '{choice}'");
         script(&s, &[&command]);
         turn(&mut deputies(&s, 2)).await;
         assert_actions_succeeded(&s, 1);
@@ -1216,7 +1144,7 @@ async fn maintenance_release_is_bound_to_the_hold_and_applies_once_after_settle(
     assert!(!magi::run::is_run_id(&q.id), "question IDs are independent of run IDs");
     q.say("daemon: execute").unwrap();
     s.store.put(&mut q).unwrap();
-    script(&s, &["MAGI ask --settle \"$qid\" --choice 'daemon: execute' --quote 'daemon: execute'"]);
+    script(&s, &["MAGI ask --settle \"$qid\" --choice 'daemon: execute'"]);
     turn(&mut deputies(&s, 2)).await;
     assert_actions_succeeded(&s, 1);
     assert_eq!(s.store.get(&q.id).unwrap().status, QuestionStatus::Answered);
@@ -1262,9 +1190,12 @@ async fn maintenance_release_is_bound_to_the_hold_and_applies_once_after_settle(
     manual.say("daemon: execute").unwrap();
     s.store.put(&mut manual).unwrap();
     turn(&mut deputies(&s, 2)).await;
-    assert_eq!(s.store.get(&manual.id).unwrap().status, QuestionStatus::Open,
-        "a deputy cannot settle a typed release of an operator-held target");
-    assert!(queue.get(&task.id).unwrap().operator_held());
+    assert_eq!(s.store.get(&manual.id).unwrap().status, QuestionStatus::Answered,
+        "the owner's words settle a typed release of their own hold");
+    magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
+    let released = queue.get(&task.id).unwrap();
+    assert_eq!(released.status, TaskStatus::Queued);
+    assert!(released.action_applied(&manual.id));
 }
 }
 
@@ -1531,7 +1462,7 @@ async fn maintenance_resume_preserves_operator_decisions_after_deputy_settle() {
             ChoiceAction::ResumeRun { run: run.id.clone() });
         q.say("daemon: execute").unwrap();
         s.store.put(&mut q).unwrap();
-        script(&s, &["MAGI ask --settle \"$qid\" --choice 'daemon: execute' --quote 'daemon: execute'"]);
+        script(&s, &["MAGI ask --settle \"$qid\" --choice 'daemon: execute'"]);
         turn(&mut deputies(&s, 2)).await;
         assert_actions_succeeded(&s, 1);
         assert_eq!(s.store.get(&q.id).unwrap().status, QuestionStatus::Answered);
@@ -1542,7 +1473,8 @@ async fn maintenance_resume_preserves_operator_decisions_after_deputy_settle() {
         } else {
             task.release_operator("manual", None);
         }
-        assert!(task.operator_decided_at.unwrap() > q.asked_at);
+        let answered_at = s.store.get(&q.id).unwrap().answered_at.unwrap();
+        assert!(task.operator_decided_at.unwrap() > answered_at, "a decision newer than the answer");
         queue.put(&mut task).unwrap();
         let run_before = std::fs::read(s.home.join("runs").join(&run.id).join("run.json")).unwrap();
         for _ in 0..2 {
@@ -1558,7 +1490,7 @@ async fn maintenance_resume_preserves_operator_decisions_after_deputy_settle() {
             assert_eq!(std::fs::read(s.home.join("runs").join(&run.id).join("run.json")).unwrap(), run_before);
         }
         let receipt = std::fs::read_to_string(s.home.join("choice-actions").join(format!("{}.json", q.id))).unwrap();
-        assert!(receipt.contains("superseded by an operator hold or newer operator decision"), "{receipt}");
+        assert!(receipt.contains("superseded by a newer operator decision"), "{receipt}");
     }
 }
 }

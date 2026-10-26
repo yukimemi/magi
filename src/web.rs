@@ -7640,24 +7640,24 @@ async fn question_answer(
         let (q, ()) = ui
             .questions
             .update(&q.id, |r| {
-                anyhow::ensure!(
-                    r.routed_task.is_none() || r.merge_target.is_some(),
-                    "task decisions are free text in the task chat; its agent records them with `magi task control decide`"
-                );
-                let merge = matches!(&answer, ask::Answer::Choice(c)
-                    if crate::consult::consent(r, c) == crate::consult::Consent::Merge);
+                let merge = matches!(&answer, ask::Answer::Choice(c) if c == crate::land::APPROVE);
                 // Buttons retain their displayed chat/head binding. A direct
                 // decision does not require a button or a prior persona offer.
-                if r.routed_task.is_some() && r.merge_target.is_some() && merge
+                if r.routed_task.is_some()
+                    && r.merge_target.is_some()
+                    && merge
                     && (body.talk.is_some() || body.head.is_some())
                 {
-                    let talk_id = body.talk.as_deref().context("approval button requires its chat")?;
-                    let head = body.head.as_deref().context("approval button requires the displayed head")?;
+                    let talk_id = body
+                        .talk
+                        .as_deref()
+                        .context("approval button requires its chat")?;
+                    let head = body
+                        .head
+                        .as_deref()
+                        .context("approval button requires the displayed head")?;
                     let talk = ui.talks.get(talk_id)?;
-                    anyhow::ensure!(
-                        talk.status.open(),
-                        "approval chat is closed"
-                    );
+                    anyhow::ensure!(talk.status.open(), "approval chat is closed");
                     r.answer_chat_button(answer, talk_id, head)
                 } else {
                     r.answer(answer)
@@ -12080,7 +12080,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_routed_decision_is_refused_on_the_question_route() {
+    async fn a_routed_decision_records_a_plain_answer_on_the_question_route() {
         let home = TempDir::new().unwrap();
         let ui = Arc::new(Ui::new(
             Queue::at(home.path().join("queue")),
@@ -12109,8 +12109,11 @@ mod tests {
             )),
         )
         .await;
-        assert!(sent.is_err());
-        assert!(ui.questions.get(&q.id).unwrap().status.open());
+        let _ = sent.unwrap();
+        assert_eq!(
+            ui.questions.get(&q.id).unwrap().resolution().as_deref(),
+            Some("use fallback")
+        );
     }
 
     #[tokio::test]
@@ -12173,10 +12176,6 @@ mod tests {
             let disk = fx.questions().get(&q.id).unwrap();
             assert_eq!(disk.merge_target, q.merge_target);
             assert_eq!(disk.consult, q.consult);
-            assert!(
-                disk.answer_authority.is_none(),
-                "a direct owner card is its own decision"
-            );
             assert_eq!(disk.resolution().as_deref(), Some(choice));
             assert!(
                 question_answer(

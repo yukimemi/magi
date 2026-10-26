@@ -2318,7 +2318,6 @@ impl Runner {
                     spec,
                     &mut seat,
                     &Invocation {
-                        scope: crate::agent::InvocationScope::Repository,
                         coordination: self.state.config.coordination.as_ref(),
                         fetched_base: None,
                         cwd,
@@ -9580,7 +9579,6 @@ async fn wave(
                     &job.spec,
                     &mut seat,
                     &Invocation {
-                        scope: crate::agent::InvocationScope::Repository,
                         coordination: coordination.as_ref(),
                         fetched_base: fetched_base.as_ref(),
                         cwd: &job.cwd,
@@ -16336,7 +16334,6 @@ mod tests {
                 .env("MAGI_RUN", "verification-parent")
                 .env("MAGI_NODE", "gate")
                 .env("MAGI_SEAT", "worker-fixture")
-                .env("MAGI_TURN_SCOPE", "fixture-scope")
                 .env("MAGI_PROCESS_OWNER", "fixture-owner")
                 .env("MAGI_NO_AUTOUPDATE", "0")
                 .env("VERIFY_EXPECT_PATH", std::env::var_os("PATH").unwrap())
@@ -16417,7 +16414,6 @@ mod tests {
             test "$MAGI_RUN" = verification-parent &&
             test "$MAGI_NODE" = gate &&
             test "$MAGI_SEAT" = worker-fixture &&
-            test "$MAGI_TURN_SCOPE" = fixture-scope &&
             test -n "$MAGI_PROCESS_OWNER" &&
             test "$PATH" = "$VERIFY_EXPECT_PATH" &&
             test "$VERIFY_AUTH_TOKEN" = fixture-auth &&

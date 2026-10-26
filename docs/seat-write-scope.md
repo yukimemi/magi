@@ -29,7 +29,7 @@ Only `questions` and `notifications` are added from the control plane. Queue,
 run and chat stores and the state root are not added. Commands such as
 `magi task add` are consequently not enabled for sandboxed implementers by this
 change. Notification webhooks remain best effort; network access is not added.
-Deputies and consulted chats keep their existing explicit, purpose-specific
+Deputies and chats keep their existing explicit, purpose-specific
 grants and do not gain repository metadata access through this policy.
 
 ## Parent-owned review and verification
@@ -128,61 +128,22 @@ pre-gate edits. Rescue commits release their repository lease before entering
 verification. This matches editing waves and avoids a cache holder waiting
 for a repository reserved by the very verification waiting for its cache.
 
-Control-plane seats (`conduct`, `dupes`, and `deputy`) and ordinary chat turns
+Control-plane seats (`conduct`, `dupes`, and `deputy`) and chat turns
 (`queue::CHAT_NODE`), including consult drains, completion notices and waiter-style
 continuations delivered through `talk::turn`, stay outside repository scheduling.
-They never acquire or wait on a `SeatLease` or the per-repository gate.
-Consultation investigation is the explicit exception described below. Explicit invocation scope, independently
-of question-store write grants, selects consultation control or investigation.
-Control turns may use supplied context and supported read-only magi diagnostics
-while the task seat waits for an answer. They cannot inspect repository evidence.
-
-Investigation reuses the standing repository's coordination policy only when
-persisted task or run metadata identifies the same canonical repository path.
-A different repository, conflicting metadata, or an unresolved target produces
-an investigation-pending reply before lease acquisition or repository access.
-The question's agent working directory alone is not a policy source. Cross-repository
-consultation remains available for control-plane diagnostics and owner decisions;
-investigation does not switch checkouts or borrow another repository's policy.
-
-When evidence is needed, the conversation returns a single structured final
-response (`{"investigate_question":"<full question id>"}`). Only an entire
-successful response is interpreted, never a quoted/fenced example or failed
-output. The launcher checks that the question is still open and consulted to
-this conversation, tries the fair local reader gate and external OS lock without
-waiting, then rechecks the question and conversation before continuing the same
-seat/session. This is an internal continuation, not another operator message;
-exact-answer authorization keeps its original persisted send boundaries.
-
-Investigation has read-only filesystem access, no extra writable roots and no
-sandbox bypass, including in write-enabled standing conversations. It may inspect
-existing files/history within the standing permissions, but cannot fetch, edit,
-answer, close, withdraw, discard or resume. Its lease follows the ordinary process
-cleanup lifetime, including cancellation and descendants. After a successful
-investigation, the launcher returns to consultation control once in the same
-turn. It revalidates the turn lease, consultation, unchanged question, repository,
-unchanged persisted conversation evidence and absence of pending input before
-starting control. Evidence stays internal; no owner send or recommendation
-binding is added. A second investigation request
-is reported as a blocker, not repeated. Existing action guards still decide
-whether the unchanged owner instruction authorizes any operation. Unregistered
-repositories follow the existing no-coordination policy; invalid registrations
-and unsupported platforms fail closed.
-
-A busy editor, queued writer or external lock produces an investigation-pending
-reply immediately. The lock owner is unknown; the task awaiting this question may
-be holding it. Never release another seat's lock or answer merely to investigate.
-When queue state identifies a related running task, the reply includes its ID and
-`magi task show` command as a diagnostic lead, without claiming lock ownership.
-Use read-only control-plane diagnostics and report the concrete coordination
-blocker in the same conversation. No question or execution state is
-changed by this transition. Genuine decisions still go through `magi answer`
-with its exact action-specific evidence and owner checks.
+They never acquire or wait on a `SeatLease` or the per-repository gate. A
+consultation turn is an ordinary chat turn: no separate investigation or
+control mode and no repository lease.
 
 Ordinary chats retain their existing filesystem grants and sandbox policy without
-repository scheduling. Read-only chats remain read-only; write-enabled chats
-retain their shared Git and question-store grants. Consultation delivery grants
-no repository edit permission.
+repository scheduling. Read-only chats remain read-only; a chat in a repository
+that opted in with `[talk] allow_write` may write, runs unsandboxed and gets the
+question and queue stores as writable roots. An open question or a consultation
+grants no extra write access and no repository edit permission. A chat's
+`magi answer --reply` / `--reply-other` and `magi task control ...` go over the
+turn's inherited control bridge instead: the launcher records them outside the
+sandbox, including an obsolete approval's dismissal that saves its run record,
+so they work in a read-only chat without any runs directory grant.
 
 Repository readers (including judges, advisors and reviewers) still wait for
 the editor: allowing them through would violate the shared-lock contract.

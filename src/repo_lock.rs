@@ -188,7 +188,7 @@ impl SeatLease {
         coordination: Option<&crate::config::Coordination>,
         wait: &WaitPolicy,
     ) -> Result<Option<Self>> {
-        let Some(mut permit) = Self::checkout(cwd, true, coordination, wait, false).await? else {
+        let Some(mut permit) = Self::checkout(cwd, true, coordination, wait).await? else {
             return Ok(None);
         };
         permit._lock = Some(
@@ -223,15 +223,7 @@ impl SeatLease {
         coordination: Option<&crate::config::Coordination>,
         wait: &WaitPolicy,
     ) -> Result<Option<Self>> {
-        Self::checkout(cwd, allow_write, coordination, wait, false).await
-    }
-
-    /// Consultations must never wait behind the task awaiting their answer.
-    pub(crate) async fn try_reader(
-        cwd: &Path,
-        coordination: Option<&crate::config::Coordination>,
-    ) -> Result<Option<Self>> {
-        Self::checkout(cwd, false, coordination, &WaitPolicy::current(), true).await
+        Self::checkout(cwd, allow_write, coordination, wait).await
     }
 
     async fn checkout(
@@ -239,7 +231,6 @@ impl SeatLease {
         allow_write: bool,
         coordination: Option<&crate::config::Coordination>,
         wait: &WaitPolicy,
-        immediate: bool,
     ) -> Result<Option<Self>> {
         let Some(coordination) = coordination else {
             return Ok(None);
@@ -280,30 +271,6 @@ impl SeatLease {
                 _read: None,
                 _write: Some(permit),
                 _lock: None,
-            }));
-        }
-        if immediate {
-            if wait.cancelled() {
-                return Err(ResourceBlocked("investigation cancelled".into()).into());
-            }
-            let permit = gate.try_read_owned().map_err(|_| {
-                ResourceBlocked(
-                    "repository is reserved by an editor or queued writer (owner unknown)".into(),
-                )
-            })?;
-            let lock = Lease::acquire(path.clone()).map_err(|e| {
-                if contended(&e) {
-                    ResourceBlocked("repository is locked externally (owner unknown)".into()).into()
-                } else {
-                    e
-                }
-            })?;
-            return Ok(Some(Self {
-                path,
-                delegated: true,
-                _lock: Some(lock),
-                _read: Some(permit),
-                _write: None,
             }));
         }
         let mut announced = false;
@@ -648,73 +615,6 @@ mod tests {
             )
             .await
             .is_err()
-        );
-    }
-
-    #[tokio::test]
-    #[cfg(unix)]
-    async fn investigation_reader_never_waits_and_respects_queued_writers() {
-        let dir = tempfile::tempdir().unwrap();
-        crate::git::git(dir.path(), &["init"]).await.unwrap();
-        let common = common_dir(dir.path()).await.unwrap().unwrap();
-        let coordination = crate::config::test_coordination();
-        let policy = coordination.as_ref().unwrap();
-        std::fs::write(common.join(&policy.contract_file), &policy.contract_token).unwrap();
-        let path = common.join(&policy.lock_file);
-        let acquire = || SeatLease::try_reader(dir.path(), coordination.as_ref());
-        let first = acquire().await.unwrap();
-        let second = acquire().await.unwrap();
-        assert!(exclusive(&path).is_err());
-        // Queue directly on the shared gate: a timeout around for_checkout
-        // could expire during Git resolution before the writer ever queues.
-        let gate = GATES
-            .lock()
-            .unwrap()
-            .get(&path)
-            .and_then(Weak::upgrade)
-            .unwrap();
-        let editor = gate.write_owned();
-        tokio::pin!(editor);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), &mut editor)
-                .await
-                .is_err()
-        );
-        // A queued writer must stop even a reader that could share the OS lock.
-        assert!(acquire().await.err().unwrap().is::<ResourceBlocked>());
-        drop(first);
-        assert!(exclusive(&path).is_err());
-        drop(second);
-        let editor = editor.await;
-        assert!(acquire().await.err().unwrap().is::<ResourceBlocked>());
-        drop(editor);
-        let external = Lease {
-            _file: exclusive(&path).unwrap(),
-        };
-        assert!(acquire().await.err().unwrap().is::<ResourceBlocked>());
-        drop(external);
-        // External contention must release the local read reservation.
-        drop(
-            SeatLease::for_checkout(dir.path(), true, coordination.as_ref())
-                .await
-                .unwrap(),
-        );
-        let cancelled = WaitPolicy::new(Duration::ZERO, || true);
-        assert!(
-            cancelled
-                .scope(acquire())
-                .await
-                .err()
-                .unwrap()
-                .is::<ResourceBlocked>()
-        );
-        drop(acquire().await.unwrap());
-        assert!(exclusive(&path).is_ok());
-        assert!(
-            SeatLease::try_reader(dir.path(), None)
-                .await
-                .unwrap()
-                .is_none()
         );
     }
 

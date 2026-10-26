@@ -411,9 +411,6 @@ enum Command {
     /// something worth doing but out of scope runs `magi task add`, and the
     /// task is attributed to its run rather than to a passing human.
     Task {
-        /// Entire latest owner send authorizing one consultation task operation.
-        #[arg(long, global = true)]
-        quote: Option<String>,
         /// What to do with the queue.
         #[command(subcommand)]
         command: TaskCmd,
@@ -558,18 +555,14 @@ enum Command {
         /// `--thread` - refused for a question this run did not ask.
         #[arg(long, conflicts_with = "settle")]
         wait: Option<String>,
-        /// For a conductor question's deputy only: record that the owner's own
-        /// words decided it. Takes the question id; give the decided option
-        /// as the single `--choice` and the owner's words as `--quote`.
-        /// Refused unless this is that question's deputy seat, the option was
-        /// offered, and the quote is something the owner actually said.
-        /// Nothing is applied here - the daemon acts on the recorded answer
-        /// exactly as it does for one tapped on the phone.
-        #[arg(long, requires = "quote")]
+        /// For a question's deputy only: record the option the owner's own
+        /// words decided. Takes the question id; give the decided option as
+        /// the single `--choice`. Refused unless this is that question's
+        /// deputy seat and the option was offered. Nothing is applied here -
+        /// the daemon acts on the recorded answer exactly as it does for one
+        /// tapped on the phone.
+        #[arg(long)]
         settle: Option<String>,
-        /// The owner's words that justify `--settle`, verbatim.
-        #[arg(long, requires = "settle")]
-        quote: Option<String>,
         /// Your own report on a `--settle`, shown to the owner under the
         /// "Settled as" line: what you did besides recording the choice (task
         /// ids filed) and which of their requests you could not carry out.
@@ -584,16 +577,12 @@ enum Command {
         /// The answer: an offered label, supported internal action alias, or free text.
         #[arg(long, conflicts_with_all = ["list", "say", "ask_chat"])]
         reply: Option<String>,
-        /// Record the owner's literal alternative and end consultation only; the question stays open.
-        #[arg(long, requires = "quote", conflicts_with_all = ["reply", "say", "ask_chat", "list", "recovery_consent"])]
-        reply_other: Option<String>,
-        /// Entire latest persisted owner send for a chat decision. Direct: `<full-id>: <choice>`; explicit batch instructions bind the preceding recommendations. Merge, public content and destructive effects retain specific consent requirements.
-        #[arg(long)]
-        quote: Option<String>,
-        /// Agent interpretation of the complete latest owner send approving
-        /// the single persisted internal resume/keep-held recommendation.
+        /// The literal replacement title for a publication decision's `use my text`.
         #[arg(long, requires = "reply")]
-        recovery_consent: Option<String>,
+        title: Option<String>,
+        /// Record the owner's alternative as a note and end consultation only; the question stays open.
+        #[arg(long, conflicts_with_all = ["reply", "say", "ask_chat", "list"])]
+        reply_other: Option<String>,
         /// Speak back without deciding: a clarifying question, a request for
         /// more context. The run stays parked; the agent picks the
         /// conversation back up with `magi ask --thread`. Exclusive with
@@ -732,7 +721,7 @@ enum ControlCmd {
         #[arg(long = "workflow", required = true)]
         workflows: Vec<String>,
     },
-    /// Record a decision routed to this chat, without quote evidence.
+    /// Record a decision routed to this chat.
     Decide {
         /// Question id from the automatic message.
         question: String,
@@ -742,7 +731,7 @@ enum ControlCmd {
         #[arg(long)]
         title: Option<String>,
     },
-    /// Plan or individually authorize retention reconciliation for this chat's task.
+    /// Plan or apply retention reconciliation for a task.
     ReconcileRetention {
         id: String,
         #[arg(long)]
@@ -750,8 +739,7 @@ enum ControlCmd {
         #[arg(long)]
         apply: Option<String>,
     },
-    /// Abandon a run whose driver is proven gone. Needs the owner's exact
-    /// message `abandon-run: <run id>` as the latest send, and `--quote` of it.
+    /// Abandon a run whose driver is proven gone.
     Abandon {
         /// Full run id.
         run: String,
@@ -761,10 +749,9 @@ enum ControlCmd {
 /// Operations on the queue.
 #[derive(Debug, Subcommand)]
 enum TaskCmd {
-    /// Resume, hold, release, retry, rerun checks or abandon, for the tasks
-    /// and runs this chat filed. Only the standing chat seat
-    /// (`MAGI_NODE=chat`, `MAGI_RUN` = an open conversation) may use it.
-    /// Merging is not available here.
+    /// Resume, hold, release, retry, rerun checks, decide or abandon tasks
+    /// and runs. Only the standing chat seat (`MAGI_NODE=chat`, `MAGI_RUN` =
+    /// an open conversation) may use it.
     Control {
         /// What to do.
         #[command(subcommand)]
@@ -1158,11 +1145,7 @@ async fn async_main() -> Result<()> {
     // Overlap the release check with the command: a run spends minutes waiting
     // on agent latency, so this is free, and it is drained with a bounded wait
     // before runtime shutdown imposes its own bound on lingering work.
-    let pending = if consultation_scope() {
-        None
-    } else {
-        spawn_update_check(&command)
-    };
+    let pending = spawn_update_check(&command);
     let result = dispatch(command).await;
     updater::finalize(pending, std::time::Duration::from_millis(1500)).await;
     result
@@ -1369,57 +1352,7 @@ fn exit_status(result: Result<()>, status: RunStatus, left_pr: bool) -> Result<(
     })
 }
 
-fn consultation_scope() -> bool {
-    matches!(
-        std::env::var("MAGI_TURN_SCOPE").as_deref(),
-        Ok("consultation-control" | "consultation-investigation")
-    )
-}
-
-fn consultation_command_allowed(command: &Command, investigation: bool) -> bool {
-    match command {
-        Command::Task {
-            command: TaskCmd::List { .. } | TaskCmd::Show { .. },
-            ..
-        }
-        | Command::List { .. }
-        | Command::Show { .. }
-        | Command::Stats { .. } => true,
-        Command::Task {
-            command:
-                TaskCmd::Add { .. }
-                | TaskCmd::Hold { .. }
-                | TaskCmd::Release { .. }
-                | TaskCmd::Done { .. }
-                | TaskCmd::Priority { .. },
-            ..
-        } => !investigation,
-        Command::Answer {
-            say,
-            ask_chat,
-            reply,
-            reply_other,
-            ..
-        } => {
-            say.is_none()
-                && !ask_chat
-                && (!investigation || (reply.is_none() && reply_other.is_none()))
-        }
-        _ => false,
-    }
-}
-
 async fn dispatch(command: Command) -> Result<()> {
-    if consultation_scope()
-        && !consultation_command_allowed(
-            &command,
-            std::env::var("MAGI_TURN_SCOPE").as_deref() == Ok("consultation-investigation"),
-        )
-    {
-        bail!(
-            "command excluded by this invocation's consultation scope; only supported diagnostics, evidenced task operations and magi answer are available"
-        );
-    }
     match command {
         Command::Worker { home, id } => magi::worker::run(&home, &id).await,
         Command::Run {
@@ -1930,7 +1863,6 @@ async fn dispatch(command: Command) -> Result<()> {
             thread,
             wait,
             settle,
-            quote,
             note,
         } => {
             ask_cmd(AskArgs {
@@ -1945,7 +1877,6 @@ async fn dispatch(command: Command) -> Result<()> {
                 thread,
                 wait,
                 settle,
-                quote,
                 note,
             })
             .await
@@ -1954,27 +1885,25 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::Answer {
             id,
             reply,
-            quote,
+            title,
             say,
             ask_chat,
             list,
-            recovery_consent,
             reply_other,
         } => {
             answer_cmd(AnswerArgs {
                 id,
                 reply,
-                quote,
+                title,
                 say,
                 ask_chat,
                 list,
-                recovery_consent,
                 reply_other,
             })
             .await
         }
 
-        Command::Task { command, quote } => task_cmd(command, quote).await,
+        Command::Task { command } => task_cmd(command).await,
 
         Command::Talk { command } => match command {
             TalkCmd::Post { talk_id, message } => talk_post(&talk_id, &message),
@@ -2469,7 +2398,6 @@ struct AskArgs {
     thread: Option<String>,
     wait: Option<String>,
     settle: Option<String>,
-    quote: Option<String>,
     note: Option<String>,
 }
 
@@ -2499,7 +2427,6 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         thread,
         wait,
         settle,
-        quote,
         note,
     } = args;
 
@@ -2513,13 +2440,7 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         return ask_wait_cmd(&store, &cfg, timeout, &id).await;
     }
     if let Some(id) = settle {
-        return ask_settle_cmd(
-            &store,
-            &id,
-            &choices,
-            quote.as_deref().unwrap_or_default(),
-            note.as_deref(),
-        );
+        return ask_settle_cmd(&store, &id, &choices, note.as_deref());
     }
     let summary = summary.context("give --summary, or resume a wait with --wait <question-id>")?;
 
@@ -2693,18 +2614,16 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
     }
 }
 
-/// `magi ask --settle <id> --choice <label> --quote <words>`: a deputy of a
-/// conductor question or a merge approval recording that the owner's free text decided it.
+/// `magi ask --settle <id> --choice <label>`: a question's deputy recording
+/// the option the owner's own words decided.
 ///
 /// The seat is `MAGI_SEAT`, set only by `agent::invoke`, so it cannot be
 /// claimed from a shell; [`ask::Question::settle_by_deputy`] compares it with
-/// the seat recorded on the question. A task the operator holds by hand is
-/// never settled this way: an answer must not be able to release it.
+/// the seat recorded on the question.
 fn ask_settle_cmd(
     store: &ask::Questions,
     id: &str,
     choices: &[String],
-    quote: &str,
     note: Option<&str>,
 ) -> Result<()> {
     let [label] = choices else {
@@ -2715,56 +2634,7 @@ fn ask_settle_cmd(
     }
     let seat = std::env::var("MAGI_SEAT").unwrap_or_default();
     let resolved = store.resolve_id(id)?;
-    let queue = magi::queue::Queue::open();
-    store.update(&resolved, |q| {
-        // A conductor's or triage question's `run` is the task id; a merge
-        // approval's is the run id, so the task is the one that run belongs to
-        // (as for any other kind that names a run).
-        // A release-watch question has no run; its watch record names the run
-        // that opened the pull request, when it knows one.
-        // An unreadable task file fails closed: it may be the operator-held
-        // task this answer must not settle, and skipping it as "unknown" is
-        // exactly how a newer schema once slipped past this guard.
-        let task = match queue.get(&q.run) {
-            Ok(task) => Some(task),
-            Err(e) if queue.path_of(&q.run).exists() => bail!(
-                "task {} cannot be read ({e:#}); refusing to settle, since it may be held by the operator",
-                q.run
-            ),
-            Err(_) => None,
-        };
-        let task = task
-            .or_else(|| queue.list().into_iter().find(|t| t.runs.contains(&q.run)))
-            .or_else(|| {
-                (magi::deputy::kind_of(q) == Some(magi::deputy::Kind::Release))
-                    .then(|| magi::release_watch::task_of_question(&magi::run::home(), q, &queue))
-                    .flatten()
-            });
-        if task.is_none()
-            && let Some(path) = queue.unreadable().first()
-        {
-            bail!(
-                "{} cannot be read; refusing to settle, since the task this question belongs to may be held by the operator",
-                path.display()
-            );
-        }
-        if let Some(task) = task
-            && task.operator_held()
-        {
-            bail!(
-                "task {} is held by the operator; an answer cannot settle it",
-                task.short()
-            );
-        }
-        if let Some(action) = q.actions.get(label) {
-            for target in queue.list() {
-                if action.targets(&target) && target.operator_held() {
-                    bail!("target task {} is held by the operator", target.short());
-                }
-            }
-        }
-        q.settle_by_deputy(&seat, label, quote, note)
-    })?;
+    store.update(&resolved, |q| q.settle_by_deputy(&seat, label, note))?;
     println!("settled on `{label}`; the daemon applies it from here");
     if let Some(note) = note.map(str::trim).filter(|n| !n.is_empty()) {
         println!("note recorded for the owner: {note}");
@@ -2946,11 +2816,10 @@ fn resolved_before_the_wait_even_starts(q: &ask::Question) -> Result<Option<Stri
 struct AnswerArgs {
     id: Option<String>,
     reply: Option<String>,
-    quote: Option<String>,
+    title: Option<String>,
     say: Option<String>,
     ask_chat: bool,
     list: bool,
-    recovery_consent: Option<String>,
     reply_other: Option<String>,
 }
 
@@ -2958,11 +2827,10 @@ async fn answer_cmd(args: AnswerArgs) -> Result<()> {
     let AnswerArgs {
         id,
         reply,
-        quote,
+        title,
         say,
         ask_chat,
         list,
-        recovery_consent,
         reply_other,
     } = args;
     let store = ask::Questions::open();
@@ -2999,22 +2867,25 @@ async fn answer_cmd(args: AnswerArgs) -> Result<()> {
             .context("nothing is waiting on you")?,
     };
 
+    // The owner's request, typed in a terminal or carried out by a chat agent,
+    // is recorded as an ordinary answer; existing consumers act on it. A chat
+    // turn's sandbox may not reach magi's stores, so a chat seat sends it over
+    // its inherited control bridge exactly like `magi task control`, and the
+    // launcher records it; every other caller writes the store directly.
+    let node = agent_env().map(|(_, node)| node);
+    let chat = node.as_deref() == Some(magi::queue::CHAT_NODE);
+
     if let Some(text) = reply_other {
-        let (run, node) = agent_env().context("--reply-other requires the consulted chat seat")?;
-        if node != magi::queue::CHAT_NODE {
-            bail!("--reply-other requires the consulted chat seat");
-        }
-        let talks = magi::talk::Talks::open();
-        // Never wait on the evidence lock while holding a question lock.
-        let _guard = talks.answer_guard()?;
-        let talk = talks.get(&run)?;
-        store.update(&q.id, |r| {
-            magi::consult::record_other(r, &talk, &text, quote.as_deref())
-        })?;
-        println!(
-            "consultation ended for {}; decision recorded as a note. Question remains open and its waiter remains held; no choice action executed.",
-            q.short()
-        );
+        let report = if chat {
+            control_from_chat(magi::chat_control::Operation::ReplyOther {
+                question: q.id.clone(),
+                text,
+            })
+            .await?
+        } else {
+            magi::consult::reply_other(&store, &q.id, &text)?
+        };
+        println!("{report}");
         return Ok(());
     }
 
@@ -3063,106 +2934,52 @@ async fn answer_cmd(args: AnswerArgs) -> Result<()> {
     }
 
     let reply = reply.context("give the answer with --reply, or ask back with --say")?;
-    let answer = if q.free_text() {
-        ask::Answer::Text(reply)
-    } else {
-        ask::Answer::Choice(reply)
-    };
-    // A routed decision belongs to the task chat: a chat seat answers with the
-    // same ownership rules as `magi task control decide`, the owner may answer
-    // from a terminal, but another agent seat may not.
+    // Routing, not consent: a routed decision belongs to the task chat. The
+    // owner may answer it from a terminal and any chat may record it, but an
+    // unattended agent seat (implementer, reviewer, ...) may not.
     anyhow::ensure!(
-        q.routed_task.is_none()
-            || q.merge_target.is_some()
-            || agent_env().is_none_or(|(_, node)| node == magi::queue::CHAT_NODE),
+        q.routed_task.is_none() || q.merge_target.is_some() || node.is_none() || chat,
         "task decisions are free text in the task chat; its agent records them with `magi task control decide`"
     );
-    let tasks = magi::queue::Queue::open().list();
-    let talks = magi::talk::Talks::open();
-    let seat = agent_env();
-    let evidence_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    let (q, evidence_guard) = loop {
-        let mut evidence_busy = false;
-        let updated = store.update(&q.id, |r| {
-            let evidence_guard = if seat
-                .as_ref()
-                .is_some_and(|(_, node)| node == magi::queue::CHAT_NODE)
-            {
-                match talks.try_answer_guard()? {
-                    Some(guard) => Some(guard),
-                    None => {
-                        evidence_busy = true;
-                        bail!("conversation evidence is locked by another process");
-                    }
-                }
-            } else {
-                None
-            };
-            let answer = match &answer {
-                ask::Answer::Choice(value) => ask::Answer::Choice(r.resolve_reply(value)?.to_owned()),
-                other => other.clone(),
-            };
-            if let Some((run, node)) = &seat {
-                magi::consult::refuse_operator_held(r, node, &tasks)?;
-                let reply = match &answer {
-                    ask::Answer::Choice(s) | ask::Answer::Text(s) => s,
-                };
-                r.answer_authority = if let Some(words) = recovery_consent.as_deref() {
-                    if quote.as_deref().is_some_and(|quote| quote != words) {
-                        bail!("stale persisted evidence: --quote and --recovery-consent must contain the same entire owner send");
-                    }
-                    magi::consult::authorize_recovery(r, &talks, &store, (run, node), reply, words)?
-                } else {
-                    magi::consult::authorize_answer(
-                        r, &talks, &store, run, node, reply, quote.as_deref(),
-                    )?
-                };
-            } else if recovery_consent.is_some() {
-                bail!("missing context: --recovery-consent requires a standing conversation seat");
-            }
-            r.answer(answer.clone())?;
-            // Returning the guard retains it through Questions::update's atomic
-            // write; dropping it in this closure would leave a retraction race.
-            Ok(evidence_guard)
-        });
-        if evidence_busy && std::time::Instant::now() < evidence_deadline {
-            // Never wait under the expiring question lock. update has released
-            // it; the next attempt will read the latest question under a new lock.
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            continue;
-        }
-        break updated?;
+    let report = if chat {
+        control_from_chat(magi::chat_control::Operation::Answer {
+            question: q.id.clone(),
+            reply,
+            title,
+        })
+        .await?
+    } else {
+        ask::record_answer(&store, &q.id, &reply, title.as_deref())?
     };
-    drop(evidence_guard);
-    println!("answered {} {}", q.short(), q.summary);
-    if q.node == magi::land::APPROVAL_NODE
-        && q.resolution().as_deref() == Some(magi::merge_decision::DISMISS)
-    {
-        println!(
-            "Obsolete approval ended; its execution is retired, history retained and PR unchanged. No merge or replacement was authorized."
-        );
-    }
-    if q.node == magi::land::APPROVAL_NODE
-        && q.resolution().as_deref() != Some(magi::merge_decision::DISMISS)
-        && q.resolution()
-            .as_deref()
-            .is_some_and(magi::merge_decision::stops)
-    {
-        println!(
-            "Decision recorded; the existing owner must resume to apply it. This answer command has not closed a PR, dispatched replacement work or approved a merge. A running magi serve / magi web resumes the parked owner; otherwise use `magi run --resume {}`. Do not create another task.",
-            q.run
-        );
-    }
-    if q.node == magi::land::APPROVAL_NODE && q.resolution().as_deref() == Some(magi::land::REPAIR)
-    {
-        println!(
-            "Repair requested; this answer command has not started repair or approved a merge. \
-             A running magi serve / magi web resumes the existing run. Without one, \
-             run `magi run --resume {}` to start repair and re-review; do not create another task or run.",
-            q.run
-        );
-    }
+    println!("{report}");
     Ok(())
+}
+
+/// Only launched chats need the bridge; agent environment variables alone
+/// are also used as provenance by ordinary terminal commands.
+fn chat_has_control_channel() -> bool {
+    std::env::var("MAGI_NODE").as_deref() == Ok(queue::CHAT_NODE)
+        && magi::chat_control::has_channel()
+}
+
+/// Send a chat seat's task filing or answer through [`magi::chat_control::dispatch`]:
+/// the turn's inherited bridge when it has one, the same authorized local
+/// route otherwise. Only an open standing chat may.
+async fn control_from_chat(operation: magi::chat_control::Operation) -> Result<String> {
+    let talks = magi::talk::Talks::open();
+    let talk = magi::chat_control::authorize(
+        &talks,
+        &std::env::var("MAGI_RUN").unwrap_or_default(),
+        magi::queue::CHAT_NODE,
+    )?;
+    magi::chat_control::dispatch(
+        &Queue::open(),
+        &magi::run::home(),
+        &talks,
+        &talk.id,
+        operation,
+    )
+    .await
 }
 
 /// The record of a question that is no longer open: its status, answer and
@@ -3180,12 +2997,6 @@ fn print_question_record(q: &ask::Question) {
             ask::Answer::Text(text) => ("answer", text),
         };
         println!("      {kind}: {}", text.trim().replace('\n', "\n        "));
-    }
-    if let Some(authority) = &q.answer_authority {
-        println!(
-            "      authorized by chat {} turn {} message {} ({})",
-            authority.talk, authority.turn, authority.message, authority.instruction_fingerprint
-        );
     }
     for t in &q.thread {
         let who = if t.who == ask::Who::Operator {
@@ -3234,8 +3045,8 @@ async fn refuse_duplicates(
     Ok(())
 }
 
-async fn task_cmd(command: TaskCmd, quote: Option<String>) -> Result<()> {
-    task_cmd_with_quote(command, Queue::open(), quote.as_deref()).await
+async fn task_cmd(command: TaskCmd) -> Result<()> {
+    task_cmd_on(command, Queue::open()).await
 }
 
 /// [`task_cmd`], against an explicit queue rather than the operator's own -
@@ -3243,75 +3054,7 @@ async fn task_cmd(command: TaskCmd, quote: Option<String>) -> Result<()> {
 /// `Queue::open` reads, which only the first caller in the binary may do (see
 /// `run::set_home`'s doc and `run_rm_cmd_guards_and_removes`, the test that
 /// already claims that spot).
-#[cfg(test)]
 async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
-    task_cmd_with_quote(command, q, None).await
-}
-
-async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) -> Result<()> {
-    let seat = agent_env();
-    let scoped = consultation_scope();
-    let chat = seat
-        .as_ref()
-        .filter(|(_, node)| node == magi::queue::CHAT_NODE);
-    // Ordinary queue commands neither need a global home nor conversation
-    // storage. A chat's provenance alone does not require its talk to exist.
-    let stores =
-        (scoped || chat.is_some()).then(|| (magi::talk::Talks::open(), ask::Questions::open()));
-    let restricted = scoped
-        || chat.is_some_and(|(run, _)| {
-            magi::consult::pending_consults(&stores.as_ref().expect("chat stores").1, run)
-        });
-    if restricted && chat.is_none() {
-        bail!("consultation task operations require the standing chat seat");
-    }
-    let mut evidence = if restricted {
-        Some(
-            stores
-                .as_ref()
-                .expect("consultation stores")
-                .0
-                .answer_guard()?,
-        )
-    } else {
-        None
-    };
-    let talk = if restricted {
-        Some(
-            stores
-                .as_ref()
-                .expect("consultation stores")
-                .0
-                .get(&chat.expect("chat seat").0)?,
-        )
-    } else {
-        None
-    };
-    let authorize = |op: magi::consult::TaskOperation| -> Result<()> {
-        if restricted {
-            magi::consult::authorize_task_operation(
-                &stores.as_ref().expect("consultation stores").1,
-                talk.as_ref().context("missing chat")?,
-                &op,
-                quote,
-            )?;
-        }
-        Ok(())
-    };
-    if restricted
-        && !matches!(
-            &command,
-            TaskCmd::Add { .. }
-                | TaskCmd::Release { .. }
-                | TaskCmd::Hold { .. }
-                | TaskCmd::Done { .. }
-                | TaskCmd::Priority { .. }
-                | TaskCmd::List { .. }
-                | TaskCmd::Show { .. }
-        )
-    {
-        bail!("task operation is excluded during consultation");
-    }
     match command {
         TaskCmd::Add {
             sources,
@@ -3329,34 +3072,6 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
             json,
             implementers,
         } => {
-            if restricted {
-                let t = talk.as_ref().context("missing chat")?;
-                if instruction.is_empty()
-                    || file.is_some()
-                    || issue.is_some()
-                    || title.is_some()
-                    || priority != 0
-                    || hold.is_some()
-                    || urgent
-                    || !attach.is_empty()
-                    || force
-                    || implementers.is_some()
-                    || sources.supplied()
-                    || std::fs::canonicalize(&repo)? != std::fs::canonicalize(&t.repo)?
-                {
-                    bail!(
-                        "consultation task add supports positional text, --solo and the conversation repository only; other execution options need an ordinary turn"
-                    );
-                }
-                authorize(magi::consult::TaskOperation::Add {
-                    instruction: instruction.join(" "),
-                    solo,
-                })?;
-            }
-            // Preparation can await repository discovery and a duplicate judge
-            // for longer than the evidence lock's TTL. Let owner messages be
-            // saved during that work; reacquire and revalidate before publishing.
-            drop(evidence.take());
             if let Some(why) = mistyped_command(
                 "magi task add",
                 &instruction,
@@ -3402,52 +3117,53 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                 )
                 .await?;
             }
-            let _publish_evidence = if restricted {
-                let (talks, questions) = stores.as_ref().expect("consultation stores");
-                let guard = talks.answer_guard()?;
-                let fresh = talks.get(&chat.expect("chat seat").0)?;
-                magi::consult::authorize_task_operation(
-                    questions,
-                    &fresh,
-                    &magi::consult::TaskOperation::Add {
-                        instruction: text.clone(),
-                        solo,
-                    },
-                    quote,
-                )?;
-                if std::fs::canonicalize(&fresh.repo)? != repo {
-                    bail!("conversation repository changed during task preparation");
-                }
-                Some(guard)
-            } else {
-                None
-            };
             let selected = if sources.supplied() {
                 let (cfg, _) = Config::discover(&repo, None)?;
                 sources.resolve(&repo, &cfg).await?
             } else {
                 Default::default()
             };
-            let mut task = Task::new(title, text, repo, source);
-            task.sources = selected;
-            if let Some(reason) = hold {
-                task.hold_manual(Some(reason));
-            }
-            task.priority = priority;
-            task.solo = solo;
-            task.urgent = urgent;
-            if implementers.is_some() {
-                task.overrides = Some(magi::queue::RunOverrides {
-                    candidates: implementers,
-                    ..Default::default()
-                });
-            }
-            if !attach.is_empty() {
-                let attach = absolute_paths(&attach, &cwd);
-                q.attach_and_put(&mut task, &attach)?;
+            let task = if chat_has_control_channel() {
+                let response = control_from_chat(magi::chat_control::Operation::Add {
+                    filing: Box::new(magi::chat_control::Filing {
+                        title,
+                        instruction: text,
+                        repo,
+                        source,
+                        sources: selected,
+                        hold,
+                        priority,
+                        solo,
+                        urgent,
+                        implementers,
+                        attach: absolute_paths(&attach, &cwd),
+                    }),
+                })
+                .await?;
+                serde_json::from_str::<Task>(&response)?
             } else {
-                q.put(&mut task)?;
-            }
+                let mut task = Task::new(title, text, repo, source);
+                task.sources = selected;
+                if let Some(reason) = hold {
+                    task.hold_manual(Some(reason));
+                }
+                task.priority = priority;
+                task.solo = solo;
+                task.urgent = urgent;
+                if implementers.is_some() {
+                    task.overrides = Some(magi::queue::RunOverrides {
+                        candidates: implementers,
+                        ..Default::default()
+                    });
+                }
+                if !attach.is_empty() {
+                    let attach = absolute_paths(&attach, &cwd);
+                    q.attach_and_put(&mut task, &attach)?;
+                } else {
+                    q.put(&mut task)?;
+                }
+                task
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&task)?);
             } else {
@@ -3709,7 +3425,6 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                     question,
                     choice,
                     title,
-                    quote: quote.map(str::to_owned),
                 },
                 ControlCmd::ReconcileRetention {
                     id,
@@ -3719,12 +3434,8 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                     task: id,
                     authority: authority_run,
                     apply,
-                    quote: quote.map(str::to_owned),
                 },
-                ControlCmd::Abandon { run } => cc::Operation::Abandon {
-                    run,
-                    quote: quote.map(str::to_owned),
-                },
+                ControlCmd::Abandon { run } => cc::Operation::Abandon { run },
             };
             println!(
                 "{}",
@@ -3735,10 +3446,6 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
 
         TaskCmd::Hold { id, reason } => {
             let resolved = q.resolve_id(&id)?;
-            authorize(magi::consult::TaskOperation::Hold {
-                task: resolved.clone(),
-                reason: reason.join(" "),
-            })?;
             let _claim = q
                 .claim(&resolved)
                 .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
@@ -3779,21 +3486,18 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
         }
 
         TaskCmd::Priority { id, priority } => {
-            let resolved = q.resolve_id(&id)?;
-            authorize(magi::consult::TaskOperation::Priority {
-                task: resolved.clone(),
-                priority,
-            })?;
-            // Claimed the same way the phone's edit routes are: a `.lock`
-            // means a daemon owns this task's file right now, and a write
-            // from here would be lost under its next save - or worse, land
-            // between two of its writes.
-            let _claim = q
-                .claim(&resolved)
-                .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
-            let mut t = q.get(&resolved)?;
-            t.set_priority(priority)?;
-            q.put(&mut t)?;
+            if chat_has_control_channel() {
+                println!(
+                    "{}",
+                    control_from_chat(magi::chat_control::Operation::Priority {
+                        task: id,
+                        priority,
+                    })
+                    .await?
+                );
+                return Ok(());
+            }
+            let t = magi::chat_control::set_priority(&q, &id, priority)?;
             println!("{} priority now {} - {}", t.short(), t.priority, t.title);
             Ok(())
         }
@@ -3872,29 +3576,20 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
         }
 
         TaskCmd::Done { id } => {
-            let resolved = q.resolve_id(&id)?;
-            authorize(magi::consult::TaskOperation::Done {
-                task: resolved.clone(),
-            })?;
-            let _claim = q
-                .claim(&resolved)
-                .context("task is claimed by a running daemon")?;
-            let mut t = q.get(&resolved)?;
-            t.succeed();
-            // Closing a task by hand (a manual GitHub merge, say) is just as
-            // much a finished story as the loop's own `Merged`/`Ready` path -
-            // see `daemon::supersede_prior_runs`'s own doc.
-            magi::daemon::supersede_prior_runs(&t, &magi::run::home());
-            q.put(&mut t)?;
+            if chat_has_control_channel() {
+                println!(
+                    "{}",
+                    control_from_chat(magi::chat_control::Operation::Done { task: id }).await?
+                );
+                return Ok(());
+            }
+            let t = magi::chat_control::done(&q, &magi::run::home(), &id)?;
             println!("done {} {}", t.short(), t.title);
             Ok(())
         }
 
         TaskCmd::Release { id } => {
             let resolved = q.resolve_id(&id)?;
-            authorize(magi::consult::TaskOperation::Release {
-                task: resolved.clone(),
-            })?;
             let _claim = q
                 .claim(&resolved)
                 .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
@@ -3928,7 +3623,6 @@ async fn task_cmd_with_quote(command: TaskCmd, q: Queue, quote: Option<&str>) ->
                             task: id,
                             authority: authority_run,
                             apply,
-                            quote: quote.map(str::to_owned),
                         },
                     )
                     .await?
@@ -7193,7 +6887,6 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
             .env_remove("MAGI_HOME")
             .env_remove("MAGI_RUN")
             .env_remove("MAGI_NODE")
-            .env_remove("MAGI_TURN_SCOPE")
             .output()
             .unwrap();
         assert!(

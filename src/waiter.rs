@@ -609,7 +609,6 @@ impl Waiter {
         let stem = format!("deliver-{}", now.as_second());
         let cache_dir = None;
         let inv = Invocation {
-            scope: crate::agent::InvocationScope::Repository,
             coordination: target.coordination.as_ref(),
             fetched_base: target.fetched_base.as_ref(),
             cwd: &target.cwd,

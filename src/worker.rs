@@ -920,7 +920,6 @@ fn detached_command(home: &Path, job: &Job, generation: &Generation) -> Result<C
         .env_remove("MAGI_RUN")
         .env_remove("MAGI_NODE")
         .env_remove("MAGI_SEAT")
-        .env_remove("MAGI_TURN_SCOPE")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr));
@@ -1480,7 +1479,7 @@ mod tests {
         )
         .unwrap();
         let mut command = detached_command(home.path(), &job, &generation).unwrap();
-        for key in ["MAGI_RUN", "MAGI_NODE", "MAGI_SEAT", "MAGI_TURN_SCOPE"] {
+        for key in ["MAGI_RUN", "MAGI_NODE", "MAGI_SEAT"] {
             assert!(
                 command
                     .get_envs()

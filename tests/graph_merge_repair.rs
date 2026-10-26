@@ -27,7 +27,7 @@ case "$1 $2" in
  'pr merge') case "$*" in *--disable-auto*)
    if test -f "$REPAIR_FORGE/late-answer"; then
      rm "$REPAIR_FORGE/late-answer"
-     (unset MAGI_RUN MAGI_NODE MAGI_SEAT MAGI_TURN_SCOPE; cd "$REPAIR_HOME" || exit; "$REPAIR_CLI" answer "$REPAIR_LATE_QUESTION" --reply "$REPAIR_LATE_CHOICE") > "$REPAIR_FORGE/late-answer-result" 2>&1 || exit 97
+     (unset MAGI_RUN MAGI_NODE MAGI_SEAT; cd "$REPAIR_HOME" || exit; "$REPAIR_CLI" answer "$REPAIR_LATE_QUESTION" --reply "$REPAIR_LATE_CHOICE") > "$REPAIR_FORGE/late-answer-result" 2>&1 || exit 97
    fi
    exit 0 ;; *) exit 99 ;; esac ;;
  'pr comment') exit 0 ;;
@@ -971,7 +971,7 @@ async fn approval_gate_late_stop(choice: &str, during_gate: bool) {
     if during_gate {
         runner.state.gate_ran = false;
         runner.state.gate_head = None;
-        runner.state.config.verify.gate = vec![r#"rm "$REPAIR_FORGE/late-answer" && (unset MAGI_RUN MAGI_NODE MAGI_SEAT MAGI_TURN_SCOPE; cd "$REPAIR_HOME" && "$REPAIR_CLI" answer "$REPAIR_LATE_QUESTION" --reply "$REPAIR_LATE_CHOICE")"#.into()];
+        runner.state.config.verify.gate = vec![r#"rm "$REPAIR_FORGE/late-answer" && (unset MAGI_RUN MAGI_NODE MAGI_SEAT; cd "$REPAIR_HOME" && "$REPAIR_CLI" answer "$REPAIR_LATE_QUESTION" --reply "$REPAIR_LATE_CHOICE")"#.into()];
     } else {
         runner.state.land_armed_head =
             Some(runner.state.land_approval.as_ref().unwrap().head.clone());

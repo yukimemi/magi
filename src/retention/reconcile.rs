@@ -39,32 +39,26 @@ struct ChatBinding {
     expires_at: jiff::Timestamp,
 }
 
-/// Standing-chat evidence supplied only by the centralized control dispatcher.
+/// The standing chat carrying out the owner's request, supplied only by the
+/// centralized control dispatcher.
 pub(crate) struct ChatRequest<'a> {
     pub talks: &'a crate::talk::Talks,
     pub conversation: &'a str,
-    pub quote: Option<&'a str>,
 }
 
-/// Exact individual owner authorization for a saved reconciliation plan.
-pub fn apply_instruction(plan: &str, task: &str, authority: &str) -> String {
+/// The owner phrase that older chat approval audits recorded as evidence.
+fn legacy_apply_instruction(plan: &str, task: &str, authority: &str) -> String {
     format!("retention-apply: {plan} task={task} authority={authority}")
 }
 
 impl ChatRequest<'_> {
-    fn validate(&self, home: &Path, queue: &Queue, task: &Task) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         crate::chat_control::authorize(self.talks, self.conversation, crate::queue::CHAT_NODE)?;
-        ensure!(
-            !crate::consult::pending_consults(
-                &crate::ask::Questions::at(home.join("questions")),
-                self.conversation
-            ),
-            "retention control is excluded during consultation"
-        );
-        crate::chat_control::owned_task(queue, self.conversation, &task.id)?;
         Ok(())
     }
 
+    /// The owner audit for applying a chat plan: the conversation the plan
+    /// was saved for, within its expiry.
     fn approval(&self, plan: &Plan, approved: bool) -> Result<serde_json::Value> {
         let binding = plan
             .chat
@@ -78,10 +72,7 @@ impl ChatRequest<'_> {
             approved || jiff::Timestamp::now() <= binding.expires_at,
             "chat plan expired; replan"
         );
-        let expected = apply_instruction(&plan.id, &plan.task.id, &plan.authority);
-        let talk = self.talks.get(self.conversation)?;
-        let evidence = crate::consult::exact_owner_authorization(&talk, &expected, self.quote)?;
-        Ok(serde_json::json!({"conversation": self.conversation, "evidence": evidence}))
+        Ok(serde_json::json!({"conversation": self.conversation}))
     }
 }
 
@@ -635,7 +626,7 @@ async fn run_inner(
         .context("task is claimed; park it before maintenance")?;
     let task = queue.get(&id)?;
     if let Some(chat) = &chat {
-        chat.validate(home, &queue, &task)?;
+        chat.validate()?;
     }
     let raw: serde_json::Value = read(&queue.path_of(&id))?;
     let known = serde_json::to_value(&task)?;
@@ -887,14 +878,16 @@ fn validate_approval(approval: &serde_json::Value, plan: &Plan) -> Result<()> {
             .context("owner audit requires a chat plan")?;
         let owner = &approval["owner"];
         let evidence = &owner["evidence"];
-        approval.as_object().is_some_and(|o| o.len() == 7)
-            && owner.as_object().is_some_and(|o| o.len() == 2)
+        // Older audits also carry the owner phrase that applied them.
+        let legacy = owner.as_object().is_some_and(|o| o.len() == 2)
             && evidence.as_object().is_some_and(|o| o.len() == 3)
-            && owner["conversation"] == binding.conversation
             && evidence["instruction"]
-                == apply_instruction(&plan.id, &plan.task.id, &plan.authority)
+                == legacy_apply_instruction(&plan.id, &plan.task.id, &plan.authority)
             && evidence["turn"].as_u64().is_some()
-            && evidence["message"].as_u64().is_some()
+            && evidence["message"].as_u64().is_some();
+        approval.as_object().is_some_and(|o| o.len() == 7)
+            && (owner.as_object().is_some_and(|o| o.len() == 1) || legacy)
+            && owner["conversation"] == binding.conversation
             && at >= plan.at
             && at <= binding.expires_at
     } else {
@@ -1083,9 +1076,6 @@ async fn apply_plan(
     let verified_snapshot = snapshot(home, task).await?;
     let verified_refs = refs(&task.repo).await?;
     {
-        // Acquire evidence before the task-write lock; never wait for a
-        // conversation writer while holding the task's short write section.
-        let _answer_guard = chat.map(|c| c.talks.answer_guard()).transpose()?;
         let _write = queue.lock_task(&task.id)?;
         ensure!(
             serde_json::to_value(queue.get(&task.id)?)? == serde_json::to_value(task)?,
@@ -1108,7 +1098,7 @@ async fn apply_plan(
         );
         let approved = dir.join("approved.json").try_exists()?;
         let owner = if let Some(chat) = chat {
-            chat.validate(home, queue, task)?;
+            chat.validate()?;
             Some(chat.approval(plan, approved)?)
         } else {
             None
@@ -1269,35 +1259,27 @@ mod tests {
         }
     }
 
-    fn owner_talk(talks: &crate::talk::Talks) -> crate::talk::Talk {
-        let mut talk = serde_json::from_value(serde_json::json!({
-            "schema":1,"id":"talk-owner","repo":".","agent":"worker","status":"open","turns":[],
-            "created_at":jiff::Timestamp::now(),"updated_at":jiff::Timestamp::now(),
-            "seat":crate::agent::SeatState::new("talk","worker",1)
-        }))
-        .unwrap();
-        talks.put(&mut talk).unwrap();
-        talk
-    }
-
     #[test]
-    fn chat_plan_binding_expiry_and_legacy_approval_are_strict() {
+    fn chat_plan_applies_without_an_owner_phrase_and_audits_stay_strict() {
         let temp = tempfile::tempdir().unwrap();
         let talks = crate::talk::Talks::at(temp.path().join("talks"));
-        let mut talk = owner_talk(&talks);
         let mut plan = chat_plan();
-        let words = apply_instruction(&plan.id, &plan.task.id, &plan.authority);
         let request = ChatRequest {
             talks: &talks,
-            conversation: &talk.id.clone(),
-            quote: Some(&words),
+            conversation: "talk-owner",
         };
-        assert!(request.approval(&plan, false).is_err());
-        crate::talk::record(&mut talk, &talks, &words, vec![]).unwrap();
+        // The chat's request is the approval: no owner phrase or quote.
         let owner = request.approval(&plan, false).unwrap();
         let audit = serde_json::json!({"version":2,"plan":plan.id,"task":plan.task.id,
             "authority":plan.authority,"sources":plan.history,"owner":owner,"approved_at":jiff::Timestamp::now()});
         validate_approval(&audit, &plan).unwrap();
+        // Audits written with the former owner phrase stay readable.
+        let mut phrased = audit.clone();
+        phrased["owner"]["evidence"] = serde_json::json!({"turn":0,"message":0,
+            "instruction":legacy_apply_instruction(&plan.id, &plan.task.id, &plan.authority)});
+        validate_approval(&phrased, &plan).unwrap();
+        phrased["owner"]["evidence"]["instruction"] = "something else".into();
+        assert!(validate_approval(&phrased, &plan).is_err());
         for field in [
             "plan",
             "task",
@@ -1322,7 +1304,7 @@ mod tests {
         assert!(validate_approval(&legacy, &plan).is_err());
         plan.chat.as_mut().unwrap().conversation = "another-talk".into();
         assert!(request.approval(&plan, false).is_err());
-        plan.chat.as_mut().unwrap().conversation = talk.id.clone();
+        plan.chat.as_mut().unwrap().conversation = "talk-owner".into();
         plan.at = plan
             .at
             .checked_sub(std::time::Duration::from_secs(172800))
