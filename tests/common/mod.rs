@@ -127,7 +127,6 @@ where
         .env_remove("MAGI_RUN")
         .env_remove("MAGI_NODE")
         .env_remove("MAGI_SEAT")
-        .env_remove("MAGI_TURN_SCOPE")
         // Named and empty: no machine layer. `Config::discover` in an
         // integration binary links the non-test library, so the operator's own
         // `config.toml` would otherwise merge with a fixture's `magi.toml` and

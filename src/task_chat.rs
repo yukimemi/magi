@@ -49,8 +49,8 @@ pub(crate) fn chat_routable(q: &Question) -> bool {
 /// Routed questions whose answer is consumed by machinery (the posting gate,
 /// the branch-divergence reconcile, the release watcher) rather than by a
 /// step-1 control command. They stay open after delivery and the chat settles
-/// them with `magi task control decide`, including merge and recovery decisions.
-/// The agent records the owner's request without quote evidence.
+/// them with `magi task control decide`, including merge and recovery
+/// decisions: the agent records the owner's request as it is.
 pub fn awaits_decision(q: &Question) -> bool {
     q.merge_target.is_some()
         || (chat_routable(q)
@@ -135,8 +135,7 @@ pub(crate) fn destination_in(talks: &Talks, repo: &Path, id: &str) -> Result<tal
 
 /// Reserve the destination under the task lock, then deliver without it.
 /// A stable creation id and persisted link let retries recover interrupted delivery.
-/// Never wait for a talk lock while holding the task write lock: chat decisions
-/// can hold the talk answer guard while updating this same task.
+/// Never wait for a talk lock while holding the task write lock.
 pub fn post(
     queue: &Queue,
     talks: &Talks,
@@ -176,7 +175,7 @@ pub fn post(
     );
     let instructions = if let Some(target) = &q.merge_target {
         format!(
-            "\nMerge decision {} for PR {} at head {}: explain the decision and include this full question ID in your reply to offer the chat buttons. Buttons are optional; record the owner's merge request directly with `magi task control decide {} merge`. For non-merge recovery (repair, dismiss, withdraw or replacement), discuss the owner's intent as free text and use `magi task control decide {} <option>`; existing transition checks still apply. Silence is a hold.\n",
+            "\nMerge decision {} for PR {} at head {}: explain the decision and include this full question ID in your reply to offer the chat buttons. Buttons are optional; when the owner asks to merge, record it with `magi task control decide {} merge` (exactly this head is merged). For non-merge recovery (repair, dismiss, withdraw or replacement), carry out what the owner asks with `magi task control decide {} <option>`. Silence is a hold.\n",
             q.id, target.pr, target.head, q.id, q.id
         )
     } else if awaits_decision(q) {
@@ -193,7 +192,7 @@ pub fn post(
             )
         };
         format!(
-            "\nDecision {}: discuss it with the owner as free text.{offered} Apply the owner's decision only with `magi task control decide {} <option>`; its task ownership and existing transition checks still apply. No quote or extra consent evidence is required. For a publication `use my text` decision, add `--title <literal replacement title>` to pass the title as data. Do not decide without the owner's explicit words and do not start a deputy/waiter. Silence is a hold.\n",
+            "\nDecision {}: discuss it with the owner as free text.{offered} When the owner decides, record it with `magi task control decide {} <option>`. For a publication `use my text` decision, add `--title <literal replacement title>` to pass the title as data. Do not start a deputy/waiter. Silence is a hold.\n",
             q.id, q.id
         )
     } else {
@@ -352,8 +351,8 @@ mod tests {
         });
         assert!(q.clone().answer(Answer::Choice("merge".into())).is_ok());
         assert!(
-            q.settle_by_deputy("seat", "merge", "merge head-a", None)
-                .is_err()
+            q.settle_by_deputy("seat", "merge", None).is_err(),
+            "a routed decision is the task chat's, never a deputy's"
         );
         assert!(
             q.answer_chat_button(Answer::Choice("merge".into()), "other-chat", "head-a")

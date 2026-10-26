@@ -90,8 +90,10 @@ pub(crate) async fn start(home: &Path, id: String) -> Result<()> {
 /// exact run, so the loop's ordinary start logic resumes it under the graph's
 /// execution lease. Never starts a driver itself. `Ok(false)` means no task
 /// has this run as its latest, and the caller falls back to
-/// [`validate_unqueued`]. `decided_before` refuses when the owner held or
-/// decided something newer than the request; `applied` marks a question's
+/// [`validate_unqueued`]. The resume is the owner's explicit request (a chat
+/// command or an answered question), so it also releases an operator hold.
+/// `decided_before` (when the owner answered) refuses only when the owner
+/// held or decided something newer than that; `applied` marks a question's
 /// action as applied in the same write.
 pub(crate) fn pin_queued(
     queue: &crate::queue::Queue,
@@ -115,12 +117,11 @@ pub(crate) fn pin_queued(
         "run queue owner changed"
     );
     ensure!(
-        !task.operator_held()
-            && match decided_before {
-                Some(asked) => task.operator_decided_at.is_none_or(|at| at <= asked),
-                None => true,
-            },
-        "resume was superseded by an operator hold or newer operator decision"
+        match decided_before {
+            Some(answered) => task.operator_decided_at.is_none_or(|at| at <= answered),
+            None => true,
+        },
+        "resume was superseded by a newer operator decision"
     );
     if applied.is_none()
         && task.status == TaskStatus::Queued

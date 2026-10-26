@@ -75,7 +75,7 @@ resume behavior. A stopped selected recovery requires explicit release or a
 new selection; it never automatically starts another competition.
 
 The normal landing path still checks CI on the exact public head, rechecks the
-forge before merge, and binds owner consent and the merge command to that head.
+forge before merge, and binds the owner's merge approval and the merge command to that head.
 Local review/e2e/gate evidence is checked both before initial publication and immediately
 before requesting approval/merge. If a formatter, gate fixer, CI fixer or rebase
 changes the head, old evidence cannot authorize a merge: request a fresh recovery

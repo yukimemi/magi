@@ -1,10 +1,11 @@
-//! The chat approval gate, through the real `magi answer` binary.
+//! Owner decisions a chat carries out, through the real `magi answer` binary.
 //!
-//! `consult::validate_answer` is unit-tested directly, but the gate only takes
-//! effect inside `answer_cmd`'s `agent_env()` branch. These tests spawn the
-//! binary with `MAGI_RUN` / `MAGI_NODE` set the way an agent seat gets them, so
-//! dropping the env lookup, the node check, the `--quote` hand-over or the
-//! validate call fails here and not only in review.
+//! A chat agent records the owner's request as an ordinary answer: no quote,
+//! consent phrase or "only this conversation" ownership applies, a merge
+//! included. These tests spawn the binary with `MAGI_RUN` / `MAGI_NODE` set
+//! the way the standing chat seat gets them, so a guard that creeps back into
+//! `answer_cmd` or the task commands fails here. What stays: an offered
+//! choice, once-only answers, the saved merge target, and queue claims.
 
 mod common;
 
@@ -23,11 +24,8 @@ struct Fixture {
     talk_id: String,
 }
 
-fn fixture() -> Fixture {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let talks = Talks::at(tmp.path().join("talks"));
-    let questions = Questions::at(tmp.path().join("questions"));
-    let cfg = Config {
+fn mock_config() -> Config {
+    Config {
         agents: vec![AgentSpec {
             id: "mock".to_owned(),
             kind: AgentKind::Command,
@@ -39,7 +37,14 @@ fn fixture() -> Fixture {
             max_turn_secs: None,
         }],
         ..Config::default()
-    };
+    }
+}
+
+fn fixture() -> Fixture {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let talks = Talks::at(tmp.path().join("talks"));
+    let questions = Questions::at(tmp.path().join("questions"));
+    let cfg = mock_config();
     let mut t = talk::begin(&talks, &cfg, tmp.path().to_path_buf(), Some("mock")).expect("talk");
 
     let mut q = magi::ask::Question::new(
@@ -54,8 +59,7 @@ fn fixture() -> Fixture {
     assert!(magi::consult::begin(&questions, &talks, &q, &t).expect("begin"));
 
     // What the drain does: the queued hand-over becomes an operator turn, and
-    // the owner's own reply follows it. `pending` ends up empty, so the gate
-    // must read the stored turns.
+    // the owner's own reply follows it.
     let owner = |body: &str| talk::Turn {
         sender: None,
         breaks: Some(Vec::new()),
@@ -84,19 +88,26 @@ fn fixture() -> Fixture {
     }
 }
 
-fn answer(f: &Fixture, run: &str, quote: Option<&str>) -> Output {
-    let mut cmd = common::magi_cli(f.tmp.path());
-    cmd.arg("answer")
-        .arg(&f.qid)
-        .args(["--reply", magi::land::APPROVE])
-        .env_remove("MAGI_RUN")
-        .env_remove("MAGI_NODE")
+/// `magi answer <id> --reply <reply>` from the standing chat seat `run`.
+fn choose_as(f: &Fixture, run: &str, id: &str, reply: &str) -> Output {
+    common::magi_cli(f.tmp.path())
+        .args(["answer", id, "--reply", reply])
         .env("MAGI_RUN", run)
-        .env("MAGI_NODE", magi::queue::CHAT_NODE);
-    if let Some(q) = quote {
-        cmd.args(["--quote", q]);
-    }
-    cmd.output().expect("spawn magi")
+        .env("MAGI_NODE", magi::queue::CHAT_NODE)
+        .output()
+        .expect("spawn magi")
+}
+
+fn choose(f: &Fixture, run: &str, reply: &str) -> Output {
+    choose_as(f, run, &f.qid, reply)
+}
+
+fn assert_success(out: &Output) {
+    assert!(
+        out.status.success(),
+        "should go through: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn assert_untouched(f: &Fixture, out: &Output) {
@@ -107,8 +118,87 @@ fn assert_untouched(f: &Fixture, out: &Output) {
     assert!(q.answer.is_none(), "nothing may be written");
 }
 
+/// A chat command run from the consulted conversation's seat.
+fn chat_command(f: &Fixture, args: &[&str]) -> Output {
+    common::magi_cli(f.tmp.path())
+        .args(args)
+        .current_dir(f.tmp.path())
+        .env("MAGI_CONFIG_DIR", "")
+        .env("MAGI_RUN", &f.talk_id)
+        .env("MAGI_NODE", magi::queue::CHAT_NODE)
+        .output()
+        .unwrap()
+}
+
+/// Another open standing chat: not the one the question was handed to.
+fn other_chat(f: &Fixture) -> String {
+    let talks = Talks::at(f.tmp.path().join("talks"));
+    talk::begin(
+        &talks,
+        &mock_config(),
+        f.tmp.path().to_path_buf(),
+        Some("mock"),
+    )
+    .expect("other talk")
+    .id
+}
+
 #[test]
-fn legacy_consult_repair_requires_exact_owner_choice_and_keeps_original_handoff() {
+fn a_chat_merge_without_a_quote_is_recorded() {
+    let f = fixture();
+    let out = choose(&f, &f.talk_id, magi::land::APPROVE);
+    assert_success(&out);
+    let q = f.questions.get(&f.qid).expect("question");
+    assert_eq!(q.status, QuestionStatus::Answered);
+    assert_eq!(q.resolution().as_deref(), Some(magi::land::APPROVE));
+    // Recorded once: a second decision is refused, the first one stands.
+    assert!(!choose(&f, &f.talk_id, magi::land::HOLD).status.success());
+    assert_eq!(
+        f.questions.get(&f.qid).unwrap().resolution().as_deref(),
+        Some(magi::land::APPROVE)
+    );
+}
+
+#[test]
+fn a_chat_merge_from_a_different_chat_is_recorded() {
+    let f = fixture();
+    let out = choose(&f, &other_chat(&f), magi::land::APPROVE);
+    assert_success(&out);
+    let q = f.questions.get(&f.qid).unwrap();
+    assert_eq!(q.resolution().as_deref(), Some(magi::land::APPROVE));
+    // The consultation record is delivery history, not an owner restriction.
+    assert_eq!(q.consult.unwrap().talk, f.talk_id);
+}
+
+#[test]
+fn a_chat_merge_keeps_the_saved_target_without_reciting_the_head() {
+    let f = fixture();
+    let target = magi::merge_decision::Target {
+        pr: "https://github.com/example/repo/pull/42".into(),
+        head: "reviewed-head".into(),
+        language: "ja".into(),
+    };
+    f.questions
+        .update(&f.qid, |q| {
+            q.merge_target = Some(target.clone());
+            Ok(())
+        })
+        .unwrap();
+    assert_success(&choose(&f, &f.talk_id, magi::land::APPROVE));
+    let q = f.questions.get(&f.qid).unwrap();
+    assert_eq!(q.resolution().as_deref(), Some(magi::land::APPROVE));
+    // The merge stays bound to the reviewed head the card named.
+    assert_eq!(q.merge_target, Some(target));
+}
+
+#[test]
+fn a_chat_answer_still_needs_an_offered_choice() {
+    let f = fixture();
+    assert_untouched(&f, &choose(&f, &f.talk_id, "merge everything"));
+}
+
+#[test]
+fn legacy_consult_repair_records_the_owners_choice_and_keeps_original_handoff() {
     let f = fixture();
     let q = f.questions.get(&f.qid).unwrap();
     let mut state = magi::run::RunState::new(
@@ -131,36 +221,9 @@ fn legacy_consult_repair_requires_exact_owner_choice_and_keeps_original_handoff(
     })).unwrap());
     state.save_under(f.tmp.path()).unwrap();
     let talks = Talks::at(f.tmp.path().join("talks"));
-    let mut t = talks.get(&f.talk_id).unwrap();
-    let old_handoff = t.turns[0].body.clone();
+    let old_handoff = talks.get(&f.talk_id).unwrap().turns[0].body.clone();
     assert!(!old_handoff.contains(magi::land::REPAIR));
-    let submit = || {
-        common::magi_cli(f.tmp.path())
-            .args([
-                "answer",
-                &f.qid,
-                "--reply",
-                magi::land::REPAIR,
-                "--quote",
-                magi::land::REPAIR,
-            ])
-            .env("MAGI_RUN", &f.talk_id)
-            .env("MAGI_NODE", magi::queue::CHAT_NODE)
-            .output()
-            .unwrap()
-    };
-    t.pending = format!("maybe {}", magi::land::REPAIR);
-    t.pending_breaks = Some(Vec::new());
-    talks.put(&mut t).unwrap();
-    assert_untouched(&f, &submit());
-    t.pending = magi::land::REPAIR.into();
-    talks.put(&mut t).unwrap();
-    let out = submit();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert_success(&choose(&f, &f.talk_id, magi::land::REPAIR));
     let answered = f.questions.get(&f.qid).unwrap();
     assert_eq!(answered.resolution().as_deref(), Some(magi::land::REPAIR));
     assert_eq!(
@@ -171,42 +234,6 @@ fn legacy_consult_repair_requires_exact_owner_choice_and_keeps_original_handoff(
     let disk = magi::run::RunState::load_under(&state.id, f.tmp.path()).unwrap();
     assert!(disk.merge_repairs.is_empty());
     assert_eq!(disk.instruction, "Original instruction");
-}
-
-#[test]
-fn a_chat_merge_without_a_quote_is_refused() {
-    let f = fixture();
-    let out = answer(&f, &f.talk_id, None);
-    assert_untouched(&f, &out);
-    let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
-    assert!(
-        err.contains("quote"),
-        "refusal should name the quote: {err}"
-    );
-}
-
-#[test]
-fn a_chat_merge_with_words_the_owner_never_wrote_is_refused() {
-    let f = fixture();
-    let out = answer(&f, &f.talk_id, Some("ship it immediately"));
-    assert_untouched(&f, &out);
-}
-
-#[test]
-fn a_chat_merge_from_a_different_chat_is_refused() {
-    let f = fixture();
-    let out = answer(&f, "20260902-000000-dead", Some("merge it now"));
-    assert_untouched(&f, &out);
-}
-
-#[test]
-fn a_chat_merge_quoting_the_owner_is_accepted() {
-    let f = fixture();
-    let out = answer(&f, &f.talk_id, Some("merge it now"));
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert!(out.status.success(), "should be accepted: {err}");
-    let q = f.questions.get(&f.qid).expect("question");
-    assert_eq!(q.status, QuestionStatus::Answered);
 }
 
 #[test]
@@ -259,467 +286,53 @@ fn ask_chat_busy_exits_unsuccessfully_without_changing_state() {
     );
 }
 
-// Persist through the real owner-send entry point, preserving sender and send
-// boundaries rather than manufacturing an owner-looking assistant paragraph.
-fn standing_owner(f: &Fixture, words: &str, recommendations: Option<&str>) -> String {
-    let talks = Talks::at(f.tmp.path().join("talks"));
-    let mut t = talks.get(&f.talk_id).unwrap();
-    t.id = "20260903-000000-cafe".into();
-    t.turns.clear();
-    if let Some(body) = recommendations {
-        let mut reply = talks.get(&f.talk_id).unwrap().turns[0].clone();
-        reply.sender = Some(talk::Sender::Persona);
-        reply.who = talk::Who::Agent;
-        reply.body = body.into();
-        reply.at = Timestamp::now();
-        t.turns.push(reply);
-    }
-    talks.put(&mut t).unwrap();
-    talk::record(&mut t, &talks, words, vec![]).unwrap();
-    t.id
-}
-
-fn hold(f: &Fixture, run: &str, words: &str) -> Output {
-    common::magi_cli(f.tmp.path())
-        .args(["answer", &f.qid, "--reply", "hold", "--quote", words])
-        .env("MAGI_RUN", run)
-        .env("MAGI_NODE", magi::queue::CHAT_NODE)
-        .output()
-        .unwrap()
-}
-
 #[test]
-fn explicitly_bound_cross_chat_and_unconsulted_holds_record_owner_evidence() {
-    for unconsulted in [false, true] {
-        let f = fixture();
-        let original = f.questions.get(&f.qid).unwrap().consult;
-        if unconsulted {
-            f.questions
-                .update(&f.qid, |q| {
-                    q.consult = None;
-                    Ok(())
-                })
-                .unwrap();
-        }
-        let words = format!("{}: hold", f.qid);
-        let run = standing_owner(&f, &words, None);
-        let talks = Talks::at(f.tmp.path().join("talks"));
-        // A running original consultation must not block an explicit hold.
-        let _active = talks.claim_turn(&f.talk_id).unwrap().unwrap();
-        let out = hold(&f, &run, &words);
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let q = f.questions.get(&f.qid).unwrap();
-        assert_eq!(q.resolution().as_deref(), Some("hold"));
-        assert!(q.chosen_action().is_none());
-        let evidence = q.answer_authority.unwrap();
-        assert_eq!(evidence.talk, run);
-        assert_eq!(evidence.question, f.qid);
-        assert_eq!(evidence.instruction, words);
-        assert_eq!(evidence.choice, "hold");
-        assert!(evidence.recommendation_turn.is_none());
-        assert_eq!(q.consult, if unconsulted { None } else { original });
-        assert!(!magi::consult::pending_consults(&f.questions, &f.talk_id));
-        // The old seat cannot override the decision; neither can a repeat.
-        assert!(
-            !answer(&f, &f.talk_id, Some("merge it now"))
-                .status
-                .success()
-        );
-        assert!(!hold(&f, &run, &words).status.success());
-    }
-}
-
-#[test]
-fn explicit_batch_binds_each_preceding_recommendation_without_approving_merge() {
+fn concurrent_chat_answers_have_one_winner_and_no_second_execution() {
     let f = fixture();
-    let mut second = f.questions.get(&f.qid).unwrap();
-    second.id = "20260904-000000-abcd".into();
-    second.consult = None;
-    f.questions.put(&mut second).unwrap();
-    let words = "ありがと！じゃあそれぞれ回答してー！";
-    let recommendations = format!(
-        "| Question | PR | Recommendation |\n| --- | --- | --- |\n| `{}` | #1 | `hold` |\n| `abcd` | #2 | `hold` |",
-        f.qid
-    );
-    let run = standing_owner(&f, words, Some(&recommendations));
-    assert!(!answer(&f, &run, Some(words)).status.success());
-    let out = hold(&f, &run, words);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let first = f.questions.get(&f.qid).unwrap().answer_authority.unwrap();
-    assert_eq!(first.recommendation_turn, Some(0));
-    assert!(first.recommendation_fingerprint.is_some());
-    let other = Fixture {
-        qid: second.id,
-        ..f
-    };
-    assert!(hold(&other, &run, words).status.success());
-}
-
-#[test]
-fn standing_holds_reject_missing_ambiguous_conditional_and_retracted_intent() {
-    for words in [
-        "thanks",
-        "ありがとう",
-        "maybe answer each as recommended",
-        "answer each as recommended if checks pass",
-        "answer each as recommended, actually wait",
-        "それぞれ回答してもいい？",
-        "それぞれ回答して、やっぱり待って",
-        "\"answer each as recommended\"",
-    ] {
-        let f = fixture();
-        let run = standing_owner(&f, words, Some(&format!("- `{}`: hold", f.qid)));
-        assert_untouched(&f, &hold(&f, &run, words));
-    }
-    for recommendation in [
-        "choices: merge / hold",
-        "hold if checks fail",
-        "hold / merge",
-    ] {
-        let f = fixture();
-        let words = "answer each as recommended";
-        let run = standing_owner(&f, words, Some(&format!("{}: {recommendation}", f.qid)));
-        assert_untouched(&f, &hold(&f, &run, words));
-    }
-}
-
-#[test]
-fn standing_evidence_requires_real_sends_fresh_questions_and_current_instructions() {
-    for mode in [
-        "generated owner",
-        "generated recommendation",
-        "queued retraction",
-        "old instruction",
-        "old recommendation",
-        "answered",
-        "abandoned",
-        "already replied",
-        "wrong quote",
-        "hold action",
-    ] {
-        let f = fixture();
-        let words = "answer each as recommended";
-        let run = standing_owner(&f, words, Some(&format!("{}: hold", f.qid)));
-        let talks = Talks::at(f.tmp.path().join("talks"));
-        let mut t = talks.get(&run).unwrap();
-        match mode {
-            "generated owner" => t.turns[1].messages[0].sender = Some(talk::Sender::Magi),
-            "generated recommendation" => t.turns[0].sender = Some(talk::Sender::Magi),
-            "queued retraction" => {
-                talk::queue(&mut t, &talks, "wait", vec![]).unwrap();
-            }
-            "old instruction" => t.turns[1].at = Timestamp::UNIX_EPOCH,
-            "old recommendation" => t.turns[0].at = Timestamp::UNIX_EPOCH,
-            "already replied" => t.turns.push(t.turns[0].clone()),
-            _ => {}
-        }
-        talks.put(&mut t).unwrap();
-        f.questions
-            .update(&f.qid, |q| {
-                match mode {
-                    "answered" => q.answer(magi::ask::Answer::Choice("hold".into()))?,
-                    "abandoned" => q.abandon("gone"),
-                    "hold action" => {
-                        q.actions
-                            .insert("hold".into(), magi::ask::ChoiceAction::Done);
-                    }
-                    _ => {}
-                }
-                Ok(())
-            })
-            .unwrap();
-        let before = std::fs::read(f.questions.path_of(&f.qid)).unwrap();
-        let quote = if mode == "wrong quote" {
-            "never said"
-        } else {
-            words
-        };
-        assert!(!hold(&f, &run, quote).status.success(), "{mode}");
-        assert_eq!(
-            std::fs::read(f.questions.path_of(&f.qid)).unwrap(),
-            before,
-            "{mode}"
-        );
-    }
-}
-
-#[test]
-fn ambiguous_short_ids_and_conflicting_recommendations_do_not_bind_a_batch() {
-    for ambiguous_id in [false, true] {
-        let f = fixture();
-        let q = f.questions.get(&f.qid).unwrap();
-        let mut duplicate = q.clone();
-        duplicate.id = format!("20260905-000000-{}", q.short());
-        if ambiguous_id {
-            f.questions.put(&mut duplicate).unwrap();
-        }
-        let rows = if ambiguous_id {
-            format!("{}: hold", q.short())
-        } else {
-            format!("{}: hold\n{}: merge", q.id, q.id)
-        };
-        let words = "answer each as recommended";
-        let run = standing_owner(&f, words, Some(&rows));
-        assert_untouched(&f, &hold(&f, &run, words));
-    }
-}
-
-#[test]
-fn same_chat_single_word_hold_remains_supported() {
-    let f = fixture();
-    let talks = Talks::at(f.tmp.path().join("talks"));
-    let mut t = talks.get(&f.talk_id).unwrap();
-    talk::record(&mut t, &talks, "hold", vec![]).unwrap();
-    assert!(hold(&f, &t.id, "hold").status.success());
-    assert_eq!(
-        f.questions.get(&f.qid).unwrap().resolution().as_deref(),
-        Some("hold")
-    );
-}
-
-#[test]
-fn concurrent_standing_answers_settle_once_and_keep_the_winning_authority() {
-    let f = fixture();
-    let words = format!("{}: hold", f.qid);
-    let first = standing_owner(&f, &words, None);
-    let talks = Talks::at(f.tmp.path().join("talks"));
-    let mut t = talks.get(&first).unwrap();
-    t.id = "20260906-000000-dec0".into();
-    talks.put(&mut t).unwrap();
-    let second = t.id;
+    f.questions
+        .update(&f.qid, |q| {
+            q.choices
+                .extend([magi::land::REPAIR.into(), "retry".into()]);
+            Ok(())
+        })
+        .unwrap();
+    let other = "20260907-000000-c0de";
     let (a, b) = std::thread::scope(|scope| {
-        let a = scope.spawn(|| hold(&f, &first, &words));
-        let b = scope.spawn(|| hold(&f, &second, &words));
+        let a = scope.spawn(|| choose(&f, &f.talk_id, magi::land::REPAIR));
+        let b = scope.spawn(|| choose(&f, other, "retry"));
         (a.join().unwrap(), b.join().unwrap())
     });
     assert_ne!(a.status.success(), b.status.success());
-    let saved = f.questions.get(&f.qid).unwrap();
-    assert_eq!(saved.resolution().as_deref(), Some("hold"));
     assert_eq!(
-        saved.answer_authority.unwrap().talk,
-        if a.status.success() { first } else { second }
+        f.questions.get(&f.qid).unwrap().resolution().as_deref(),
+        Some(if a.status.success() {
+            magi::land::REPAIR
+        } else {
+            "retry"
+        })
     );
 }
 
 #[test]
-fn generated_and_quoted_recommendations_do_not_authorize_but_hold_is_separate_from_closure() {
-    for (format, accepted) in [
-        ("> {}: hold", false),
-        ("```\n{}: hold\n```", false),
-        ("````\n```\n{}: hold\n```\n````", false),
-        ("> Example\n{}: hold", false),
-        ("    {}: hold", false),
-        ("- {}: hold、その後PRを閉じる", true),
-    ] {
-        let f = fixture();
-        let words = "answer each as recommended";
-        let run = standing_owner(&f, words, Some(&format.replace("{}", &f.qid)));
-        let out = hold(&f, &run, words);
-        assert_eq!(
-            out.status.success(),
-            accepted,
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        if accepted {
-            let saved = f.questions.get(&f.qid).unwrap();
-            assert_eq!(saved.resolution().as_deref(), Some("hold"));
-            assert!(saved.chosen_action().is_none());
-        } else {
-            assert_untouched(&f, &out);
-        }
-    }
-}
-
-#[test]
-fn legacy_recorded_send_boundaries_support_existing_owner_authorization() {
-    for boundaries in [false, true] {
-        let f = fixture();
-        let words = "ありがと！じゃあそれぞれ回答してー！";
-        let run = standing_owner(&f, words, Some(&format!("{}: hold", f.qid)));
-        let talks = Talks::at(f.tmp.path().join("talks"));
-        let mut t = talks.get(&run).unwrap();
-        t.turns[1].sender = None;
-        t.turns[1].messages[0].sender = None;
-        if !boundaries {
-            t.turns[1].breaks = None;
-        }
-        talks.put(&mut t).unwrap();
-        let out = hold(&f, &run, words);
-        assert_eq!(
-            out.status.success(),
-            boundaries,
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-}
-
-#[test]
-fn a_same_chat_batch_is_not_a_specific_merge_confirmation() {
+fn a_chat_answer_after_a_manual_answer_is_refused_and_keeps_the_record() {
     let f = fixture();
-    let words = "ありがと！じゃあそれぞれ回答してー！";
-    let talks = Talks::at(f.tmp.path().join("talks"));
-    let mut t = talks.get(&f.talk_id).unwrap();
-    let mut recommendation = t.turns[0].clone();
-    recommendation.who = talk::Who::Agent;
-    recommendation.sender = Some(talk::Sender::Persona);
-    recommendation.body = format!("{}: merge", f.qid);
-    recommendation.at = Timestamp::now();
-    t.turns.push(recommendation);
-    talks.put(&mut t).unwrap();
-    talk::record(&mut t, &talks, words, vec![]).unwrap();
-    let out = answer(&f, &f.talk_id, Some(words));
-    assert_untouched(&f, &out);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("specific reviewed PR and head"));
+    let (settled, ()) = f
+        .questions
+        .update(&f.qid, |q| {
+            q.answer(magi::ask::Answer::Choice("hold".into()))
+        })
+        .unwrap();
+    let out = choose(&f, &f.talk_id, magi::land::APPROVE);
+    assert!(!out.status.success());
+    assert_eq!(
+        serde_json::to_value(f.questions.get(&f.qid).unwrap()).unwrap(),
+        serde_json::to_value(settled).unwrap(),
+        "the manual answer must survive"
+    );
 }
 
 #[test]
-fn generated_sends_do_not_replace_the_latest_real_owner_instruction() {
-    for mode in ["queued", "drained", "coalesced", "posted"] {
-        let f = fixture();
-        let words = format!("{}: hold", f.qid);
-        let run = standing_owner(&f, &words, None);
-        let talks = Talks::at(f.tmp.path().join("talks"));
-        let mut t = talks.get(&run).unwrap();
-        if mode == "posted" {
-            let mut post = t.turns[0].clone();
-            post.who = talk::Who::Agent;
-            post.sender = Some(talk::Sender::Magi);
-            post.body = "merge it now".into();
-            post.messages.clear();
-            t.turns.push(post);
-        } else if mode == "coalesced" {
-            t.turns[0].body.push_str("\n\nmerge it now");
-            t.turns[0].messages.push(talk::Message {
-                display: None,
-                sender: Some(talk::Sender::Magi),
-                body: "merge it now".into(),
-                attachments: vec![],
-                reply: None,
-            });
-            t.turns[0].breaks = Some(vec![words.len() + 2]);
-        } else {
-            talk::queue_magi(&mut t, &talks, "merge it now").unwrap();
-            if mode == "drained" {
-                talk::drain(&mut t, &talks).unwrap();
-            }
-        }
-        talks.put(&mut t).unwrap();
-        let out = hold(&f, &run, &words);
-        assert!(
-            out.status.success(),
-            "{mode}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let evidence = f.questions.get(&f.qid).unwrap().answer_authority.unwrap();
-        assert_eq!(evidence.instruction, words);
-        assert_eq!(evidence.turn, 0);
-        assert_eq!(evidence.message, 0);
-    }
-}
-
-#[test]
-fn batch_holds_reject_entire_ambiguous_or_conditional_recommendations() {
-    for template in [
-        "- {}: hold | merge",
-        "- {}: hold\n  ただしチェック失敗時のみ",
-        "- {}: hold\n  or merge",
-        "- {}: `hold` | `merge`",
-        "- {}: hold、ただしチェック失敗時のみ",
-        "- {}: hold、チェック失敗なら",
-        "- {}: hold、その後PRを閉じる、ただしチェック失敗時のみ",
-        "| Question | Choice | Reason |\n| --- | --- | --- |\n| {} | hold | only if checks fail |",
-        "| Question | Choice | Reason |\n| --- | --- | --- |\n| {} | hold | ただしチェック失敗時のみ |",
-    ] {
-        let f = fixture();
-        let words = "answer each as recommended";
-        let run = standing_owner(&f, words, Some(&template.replace("{}", &f.qid)));
-        assert_untouched(&f, &hold(&f, &run, words));
-    }
-}
-
-#[test]
-fn cli_waits_for_the_conversation_evidence_lock_before_reading_owner_intent() {
-    let f = fixture();
-    let words = format!("{}: hold", f.qid);
-    let run = standing_owner(&f, &words, None);
-    let talks = Talks::at(f.tmp.path().join("talks"));
-    let guard = talks.answer_guard().unwrap();
-    std::thread::scope(|scope| {
-        let answer = scope.spawn(|| hold(&f, &run, &words));
-        // Evidence contention must wait outside the short-lived question lock.
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        assert!(
-            !answer.is_finished(),
-            "the CLI must also wait for conversation updates"
-        );
-        assert!(f.questions.get(&f.qid).unwrap().status.open());
-        drop(guard);
-        let out = answer.join().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    });
-}
-
-#[test]
-fn cli_reloads_a_concurrently_settled_question_after_evidence_contention() {
-    let f = fixture();
-    let words = format!("{}: hold", f.qid);
-    let run = standing_owner(&f, &words, None);
-    let talks = Talks::at(f.tmp.path().join("talks"));
-    let guard = talks.answer_guard().unwrap();
-    std::thread::scope(|scope| {
-        let answer = scope.spawn(|| hold(&f, &run, &words));
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        assert!(
-            !answer.is_finished(),
-            "the CLI must be waiting for evidence"
-        );
-
-        // A manual hold needs no conversation evidence and must be able to
-        // settle immediately, without waiting for the question lock to expire.
-        let started = std::time::Instant::now();
-        let (settled, ()) = f
-            .questions
-            .update(&f.qid, |q| {
-                q.answer(magi::ask::Answer::Choice("hold".into()))
-            })
-            .unwrap();
-        let elapsed = started.elapsed();
-        drop(guard);
-        let out = answer.join().unwrap();
-        assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "evidence contention retained the question lock for {elapsed:?}"
-        );
-        assert!(
-            !out.status.success(),
-            "the competing answer already settled it: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let saved = f.questions.get(&f.qid).unwrap();
-        assert_eq!(
-            serde_json::to_value(saved).unwrap(),
-            serde_json::to_value(settled).unwrap(),
-            "the manual answer and its lack of conversation authority must survive"
-        );
-    });
-}
-
-#[test]
-fn consultation_waiting_for_evidence_cannot_undo_a_manual_cli_hold() {
+fn a_late_consultation_cannot_undo_a_manual_cli_hold() {
     let f = fixture();
     let talks = Talks::at(f.tmp.path().join("talks"));
     let mut destination = talks.get(&f.talk_id).unwrap();
@@ -731,370 +344,32 @@ fn consultation_waiting_for_evidence_cannot_undo_a_manual_cli_hold() {
         })
         .unwrap();
     let q = f.questions.get(&f.qid).unwrap();
-    let guard = talks.answer_guard().unwrap();
-    std::thread::scope(|scope| {
-        let dispatch = scope.spawn(|| magi::consult::begin(&f.questions, &talks, &q, &destination));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        while f.questions.get(&f.qid).unwrap().consult.is_none() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "consultation did not start"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        // Direct operator answers require no chat evidence. Dispatch must let
-        // this command settle without waiting for a question lock to expire.
-        let started = std::time::Instant::now();
-        let out = common::magi_cli(f.tmp.path())
-            .args(["answer", &f.qid, "--reply", "hold"])
-            .env_remove("MAGI_RUN")
-            .env_remove("MAGI_NODE")
-            .output()
-            .unwrap();
-        let elapsed = started.elapsed();
-        let settled = f.questions.get(&f.qid).unwrap();
-        drop(guard);
-        let dispatched = dispatch.join().unwrap().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(3),
-            "question lock was retained: {elapsed:?}"
-        );
-        assert!(!dispatched, "a settled question must not be dispatched");
-        assert_eq!(settled.resolution().as_deref(), Some("hold"));
-        assert_eq!(
-            serde_json::to_value(f.questions.get(&f.qid).unwrap()).unwrap(),
-            serde_json::to_value(settled).unwrap()
-        );
-        let destination = talks.get(&destination.id).unwrap();
-        assert_eq!(destination.status, talk::TalkStatus::Closed);
-        assert!(destination.pending.is_empty());
-        assert!(destination.pending_messages.is_empty());
-        assert!(!magi::consult::pending_consults(
-            &f.questions,
-            &destination.id
-        ));
-    });
-}
-
-#[test]
-fn batch_holds_validate_surrounding_headings_and_paragraphs() {
-    for (template, accepted) in [
-        ("## チェックが失敗した場合のみ\n\n- {}: hold", false),
-        ("チェックが失敗した場合のみ\n\n- {}: hold", false),
-        ("- {}: hold\n\nただしチェック失敗時のみ", false),
-        (
-            "## Recommendations\n\nOnly if checks fail:\n\n- {}: hold",
-            false,
-        ),
-        (
-            "Only if checks fail\n===================\n\n- {}: hold",
-            false,
-        ),
-        (
-            "## Recommendations\n\n### チェックが失敗した場合のみ\n\n- {}: hold",
-            false,
-        ),
-        (
-            "Only if checks fail:\n\n| Question | Choice |\n| --- | --- |\n| {} | hold |",
-            false,
-        ),
-        (
-            "| Question | Choice |\n| --- | --- |\n| {} | hold |\n\nただしチェック失敗時のみ",
-            false,
-        ),
-        (
-            "## Recommendations\n\n- {}: hold\n\nThe decision stays on hold.",
-            true,
-        ),
-        ("> Only if checks fail\n\n- {}: hold", true),
-        ("```text\nOnly if checks fail\n```\n\n- {}: hold", true),
-    ] {
-        let f = fixture();
-        let words = "answer each as recommended";
-        let run = standing_owner(&f, words, Some(&template.replace("{}", &f.qid)));
-        let talks = Talks::at(f.tmp.path().join("talks"));
-        assert_eq!(
-            magi::consult::authorized_holds(&f.questions, &talks.get(&run).unwrap()),
-            accepted
-        );
-        let out = hold(&f, &run, words);
-        assert_eq!(
-            out.status.success(),
-            accepted,
-            "{template}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        if !accepted {
-            assert_untouched(&f, &out);
-        }
-    }
-}
-
-#[test]
-fn a_direct_owner_hold_does_not_inherit_conditions_from_assistant_prose() {
-    let f = fixture();
-    let words = format!("{}: hold", f.qid);
-    let recommendations = format!("## チェックが失敗した場合のみ\n\n- {}: hold", f.qid);
-    let run = standing_owner(&f, &words, Some(&recommendations));
-    let out = hold(&f, &run, &words);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        f.questions
-            .get(&f.qid)
-            .unwrap()
-            .answer_authority
-            .unwrap()
-            .recommendation_turn
-            .is_none()
-    );
-}
-
-#[test]
-fn chat_merge_preserves_the_recorded_head_confirmation_requirement() {
-    let f = fixture();
-    f.questions
-        .update(&f.qid, |q| {
-            q.merge_target = Some(magi::merge_decision::Target {
-                pr: "https://github.com/example/repo/pull/42".into(),
-                head: "reviewed-head".into(),
-                language: "ja".into(),
-            });
-            Ok(())
-        })
-        .unwrap();
-    assert_untouched(&f, &answer(&f, &f.talk_id, Some("merge it now")));
-    let talks = Talks::at(f.tmp.path().join("talks"));
-    let mut t = talks.get(&f.talk_id).unwrap();
-    talk::queue(&mut t, &talks, "merge stale-head", vec![]).unwrap();
-    assert_untouched(&f, &answer(&f, &f.talk_id, Some("merge stale-head")));
-    talk::queue(&mut t, &talks, "merge reviewed-head", vec![]).unwrap();
-    let out = answer(&f, &f.talk_id, Some("merge reviewed-head"));
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(
-        f.questions.get(&f.qid).unwrap().resolution().as_deref(),
-        Some("merge")
-    );
-}
-
-fn choose(f: &Fixture, run: &str, choice: &str, words: &str) -> Output {
-    common::magi_cli(f.tmp.path())
-        .args(["answer", &f.qid, "--reply", choice, "--quote", words])
-        .env("MAGI_RUN", run)
-        .env("MAGI_NODE", magi::queue::CHAT_NODE)
+    let out = common::magi_cli(f.tmp.path())
+        .args(["answer", &f.qid, "--reply", "hold"])
+        .env_remove("MAGI_RUN")
+        .env_remove("MAGI_NODE")
         .output()
-        .unwrap()
+        .unwrap();
+    assert_success(&out);
+    let settled = f.questions.get(&f.qid).unwrap();
+    assert_eq!(settled.resolution().as_deref(), Some("hold"));
+    assert!(magi::consult::begin(&f.questions, &talks, &q, &destination).is_err());
+    assert_eq!(
+        serde_json::to_value(f.questions.get(&f.qid).unwrap()).unwrap(),
+        serde_json::to_value(settled).unwrap()
+    );
+    let destination = talks.get(&destination.id).unwrap();
+    assert_eq!(destination.status, talk::TalkStatus::Closed);
+    assert!(destination.pending.is_empty());
+    assert!(destination.pending_messages.is_empty());
+    assert!(!magi::consult::pending_consults(
+        &f.questions,
+        &destination.id
+    ));
 }
 
 #[test]
-fn non_hold_batch_decisions_use_current_manifests_across_consultation_destinations() {
-    for destination in ["same", "other", "none"] {
-        for choice in [magi::land::REPAIR, "retry", "requeue", "use fallback"] {
-            let f = fixture();
-            f.questions
-                .update(&f.qid, |q| {
-                    q.choices.push(choice.into());
-                    if choice != magi::land::REPAIR {
-                        q.node = "recovery".into();
-                    }
-                    if choice == "requeue" {
-                        q.actions
-                            .insert(choice.into(), magi::ask::ChoiceAction::Requeue);
-                    }
-                    if destination == "none" {
-                        q.consult = None;
-                    }
-                    Ok(())
-                })
-                .unwrap();
-            let words = "おっけーそれぞれ回答してー";
-            let run = standing_owner(&f, words, Some(&format!("{}: {choice}", f.qid)));
-            if destination == "same" {
-                f.questions
-                    .update(&f.qid, |q| {
-                        q.consult.as_mut().unwrap().talk = run.clone();
-                        Ok(())
-                    })
-                    .unwrap();
-            }
-            let out = choose(&f, &run, choice, words);
-            assert!(
-                out.status.success(),
-                "{destination}/{choice}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let q = f.questions.get(&f.qid).unwrap();
-            assert_eq!(q.resolution().as_deref(), Some(choice));
-            assert_eq!(q.answer_authority.unwrap().choice, choice);
-            assert!(!choose(&f, &run, choice, words).status.success());
-        }
-    }
-}
-
-#[test]
-fn non_hold_manifests_reject_changed_questions_recommendations_and_busy_consultations() {
-    for mode in ["choice", "target", "content", "recommendation", "active"] {
-        let f = fixture();
-        f.questions
-            .update(&f.qid, |q| {
-                q.choices.push(magi::land::REPAIR.into());
-                Ok(())
-            })
-            .unwrap();
-        let words = "おっけーそれぞれ回答してー";
-        let run = standing_owner(
-            &f,
-            words,
-            Some(&format!("{}: {}", f.qid, magi::land::REPAIR)),
-        );
-        let talks = Talks::at(f.tmp.path().join("talks"));
-        let _lease = if mode == "active" {
-            talks.claim_turn(&f.talk_id).unwrap()
-        } else {
-            None
-        };
-        if mode == "recommendation" {
-            let mut t = talks.get(&run).unwrap();
-            t.turns[0].body.push_str("\nChanged recommendation");
-            talks.put(&mut t).unwrap();
-        }
-        f.questions
-            .update(&f.qid, |q| {
-                match mode {
-                    "choice" => q.choices.push("different choice".into()),
-                    "content" => q.detail.push_str("Changed content"),
-                    "target" => {
-                        q.merge_target = Some(magi::merge_decision::Target {
-                            pr: "https://example.test/pull/1".into(),
-                            head: "changed".into(),
-                            language: "en".into(),
-                        })
-                    }
-                    _ => {}
-                }
-                Ok(())
-            })
-            .unwrap();
-        let out = choose(&f, &run, magi::land::REPAIR, words);
-        assert_untouched(&f, &out);
-        let error = String::from_utf8_lossy(&out.stderr);
-        assert!(!error.contains("different chat"), "{error}");
-        assert!(
-            error.contains(if mode == "active" {
-                "original consultation is active"
-            } else {
-                "unchanged question target/content"
-            }),
-            "{mode}: {error}"
-        );
-    }
-}
-
-#[test]
-fn batch_reports_action_specific_missing_consent_in_every_conversation() {
-    for choice in [
-        "merge",
-        magi::merge_decision::WITHDRAW,
-        "reimplement:primary",
-        "post original",
-        "discard",
-        "complete task",
-    ] {
-        let f = fixture();
-        f.questions
-            .update(&f.qid, |q| {
-                q.choices.push(choice.into());
-                q.merge_target = Some(magi::merge_decision::Target {
-                    pr: "https://example.test/pull/1".into(),
-                    head: "reviewed-head".into(),
-                    language: "en".into(),
-                });
-                if choice == "post original" {
-                    q.node = magi::github_text::ASK_NODE.into();
-                }
-                if choice == "complete task" {
-                    q.node = magi::conduct::NODE.into();
-                    q.decision_context =
-                        Some(r#"[null,null,null,["complete","task:owner"]]"#.into());
-                }
-                if choice == "discard" {
-                    q.actions
-                        .insert(choice.into(), magi::ask::ChoiceAction::Done);
-                }
-                Ok(())
-            })
-            .unwrap();
-        let words = "おっけーそれぞれ回答してー";
-        let run = standing_owner(&f, words, Some(&format!("{}: {choice}", f.qid)));
-        let out = choose(&f, &run, choice, words);
-        assert_untouched(&f, &out);
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(err.contains("batch"), "{choice}: {err}");
-        assert!(!err.contains("different chat"), "{err}");
-    }
-}
-
-#[test]
-fn cross_chat_merge_and_closure_require_individual_bound_tokens() {
-    for choice in [
-        "merge",
-        magi::merge_decision::WITHDRAW,
-        "reimplement:primary",
-    ] {
-        let f = fixture();
-        f.questions
-            .update(&f.qid, |q| {
-                q.choices.push(choice.into());
-                q.merge_target = Some(magi::merge_decision::Target {
-                    pr: "https://example.test/pull/1".into(),
-                    head: "reviewed-head".into(),
-                    language: "en".into(),
-                });
-                Ok(())
-            })
-            .unwrap();
-        let words = format!(
-            "{}: {}",
-            f.qid,
-            if choice == "merge" {
-                "merge reviewed-head"
-            } else {
-                choice
-            }
-        );
-        let run = standing_owner(&f, &words, None);
-        let out = choose(&f, &run, choice, &words);
-        assert!(
-            out.status.success(),
-            "{choice}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert_eq!(
-            f.questions
-                .get(&f.qid)
-                .unwrap()
-                .answer_authority
-                .unwrap()
-                .instruction,
-            words
-        );
-    }
-}
-
-#[test]
-fn japanese_batch_dismisses_obsolete_execution_without_touching_its_pr() {
+fn chat_dismisses_an_obsolete_execution_without_touching_its_pr() {
     for unconsulted in [false, true] {
         let f = fixture();
         let (q, ()) = f
@@ -1136,18 +411,8 @@ fn japanese_batch_dismisses_obsolete_execution_without_touching_its_pr() {
             red_at_merge: vec![],
         });
         state.save_under(f.tmp.path()).unwrap();
-        let words = "おっけーそれぞれ回答してー";
-        let run = standing_owner(
-            &f,
-            words,
-            Some(&format!("{}: {}", q.id, magi::merge_decision::DISMISS)),
-        );
-        let out = choose(&f, &run, magi::merge_decision::DISMISS, words);
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let out = choose(&f, &f.talk_id, magi::merge_decision::DISMISS);
+        assert_success(&out);
         let stopped = magi::run::RunState::load_under(&q.run, f.tmp.path()).unwrap();
         // A terminal blocked status is retained as history; the persisted
         // dismissal, rather than a fabricated new run, retires its execution.
@@ -1156,17 +421,8 @@ fn japanese_batch_dismisses_obsolete_execution_without_touching_its_pr() {
         let decision = stopped.merge_decision.unwrap();
         assert_eq!(decision.choice, magi::merge_decision::DISMISS);
         assert!(!decision.closed);
-        assert_eq!(
-            f.questions
-                .get(&q.id)
-                .unwrap()
-                .answer_authority
-                .unwrap()
-                .instruction,
-            words
-        );
         assert!(
-            !choose(&f, &run, magi::merge_decision::DISMISS, words)
+            !choose(&f, &f.talk_id, magi::merge_decision::DISMISS)
                 .status
                 .success()
         );
@@ -1174,102 +430,103 @@ fn japanese_batch_dismisses_obsolete_execution_without_touching_its_pr() {
 }
 
 #[test]
-fn explicit_public_content_and_literal_owner_title_are_bound_to_the_question() {
-    for choice in [
-        magi::github_text::POST_ORIGINAL,
-        magi::github_text::USE_REWRITE,
-        magi::github_text::USE_MY_TEXT,
+fn chat_posts_the_original_or_the_rewrite_without_a_quote() {
+    for (choice, reply) in [
+        (
+            magi::github_text::POST_ORIGINAL,
+            magi::github_text::Reply::Original,
+        ),
+        (
+            magi::github_text::USE_REWRITE,
+            magi::github_text::Reply::Rewrite,
+        ),
     ] {
-        let f = fixture();
-        let (q, ()) = f
-            .questions
-            .update(&f.qid, |q| {
-                q.node = magi::github_text::ASK_NODE.into();
-                q.choices = vec![choice.into(), magi::github_text::USE_FALLBACK.into()];
-                q.consult = None;
-                Ok(())
-            })
-            .unwrap();
-        let token = magi::consult::question_fingerprint(&q);
-        let words = format!(
-            "{}: {choice} {token}{}",
-            q.id,
-            if choice == magi::github_text::USE_MY_TEXT {
-                "\nOwner's explicit replacement title"
-            } else {
-                ""
-            }
-        );
-        let run = standing_owner(&f, &words, None);
-        let out = choose(&f, &run, choice, &words);
-        assert!(
-            out.status.success(),
-            "{choice}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let answered = f.questions.get(&q.id).unwrap();
-        if choice == magi::github_text::USE_MY_TEXT {
-            assert_eq!(
-                magi::github_text::read_reply(&answered),
-                magi::github_text::Reply::Title("Owner's explicit replacement title".into())
-            );
-        }
-        assert!(answered.answer_authority.is_some());
-        if choice == magi::github_text::USE_MY_TEXT {
-            let mut changed = answered.clone();
-            changed.detail.push_str("Changed content");
-            changed.thread.push(magi::ask::Turn {
-                who: magi::ask::Who::Operator,
-                body: "Stale thread title".into(),
-                at: Timestamp::now(),
-                note: None,
-            });
-            assert_eq!(
-                magi::github_text::read_reply(&changed),
-                magi::github_text::Reply::Fallback
-            );
+        for consulted in [true, false] {
+            let f = fixture();
+            f.questions
+                .update(&f.qid, |q| {
+                    q.node = magi::github_text::ASK_NODE.into();
+                    q.choices = vec![choice.into(), magi::github_text::USE_FALLBACK.into()];
+                    if !consulted {
+                        q.consult = None;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let prompt = magi::prompt::chat_consult(&f.questions.get(&f.qid).unwrap());
+            assert!(prompt.contains("wait for the owner to choose"));
+            assert!(!prompt.contains("answer it yourself"));
+            assert_success(&choose(&f, &f.talk_id, choice));
+            let answered = f.questions.get(&f.qid).unwrap();
+            assert_eq!(answered.resolution().as_deref(), Some(choice));
+            assert_eq!(magi::github_text::read_reply(&answered), reply);
         }
     }
 }
 
 #[test]
-fn competing_non_hold_instructions_have_one_winner_and_no_second_execution() {
-    let f = fixture();
-    f.questions
-        .update(&f.qid, |q| {
-            q.choices
-                .extend([magi::land::REPAIR.into(), "retry".into()]);
-            Ok(())
-        })
-        .unwrap();
-    let words = format!("{}: {}", f.qid, magi::land::REPAIR);
-    let first = standing_owner(&f, &words, None);
-    let talks = Talks::at(f.tmp.path().join("talks"));
-    let mut t = talks.get(&first).unwrap();
-    t.id = "20260907-000000-c0de".into();
-    t.turns.clear();
-    talks.put(&mut t).unwrap();
-    let second_words = format!("{}: retry", f.qid);
-    talk::record(&mut t, &talks, &second_words, vec![]).unwrap();
-    let (a, b) = std::thread::scope(|scope| {
-        let a = scope.spawn(|| choose(&f, &first, magi::land::REPAIR, &words));
-        let b = scope.spawn(|| choose(&f, &t.id, "retry", &second_words));
-        (a.join().unwrap(), b.join().unwrap())
-    });
-    assert_ne!(a.status.success(), b.status.success());
-    let q = f.questions.get(&f.qid).unwrap();
-    assert_eq!(
-        q.answer_authority.unwrap().choice,
-        if a.status.success() {
-            magi::land::REPAIR
-        } else {
-            "retry"
+fn chat_use_my_text_publishes_the_owners_latest_title() {
+    for old_thread in [false, true] {
+        let f = fixture();
+        f.questions
+            .update(&f.qid, |q| {
+                q.node = magi::github_text::ASK_NODE.into();
+                q.choices = vec![
+                    magi::github_text::USE_MY_TEXT.into(),
+                    magi::github_text::USE_FALLBACK.into(),
+                ];
+                if old_thread {
+                    q.say("Earlier English title")?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let title = "Owner's replacement title";
+        let talks = Talks::at(f.tmp.path().join("talks"));
+        let mut chat = talks.get(&f.talk_id).unwrap();
+        talk::record(&mut chat, &talks, title, vec![]).unwrap();
+        let before = f.questions.get(&f.qid).unwrap();
+        let prompt = magi::prompt::chat_consult(&before);
+        assert!(prompt.contains("--title '<literal replacement title>'"));
+        assert!(!before.thread.iter().any(|turn| turn.body == title));
+        let answer = |choice: &str, title: Option<&str>| {
+            let mut cli = common::magi_cli(f.tmp.path());
+            cli.args(["answer", &f.qid, "--reply", choice])
+                .env("MAGI_RUN", &f.talk_id)
+                .env("MAGI_NODE", magi::queue::CHAT_NODE);
+            if let Some(title) = title {
+                cli.args(["--title", title]);
+            }
+            cli.output().unwrap()
+        };
+        for (choice, title) in [
+            (magi::github_text::USE_MY_TEXT, None),
+            (magi::github_text::USE_MY_TEXT, Some("   ")),
+            (magi::github_text::USE_FALLBACK, Some(title)),
+        ] {
+            assert!(!answer(choice, title).status.success());
+            assert_eq!(f.questions.get(&f.qid).unwrap(), before);
         }
-    );
+        assert_success(&answer(magi::github_text::USE_MY_TEXT, Some(title)));
+        let saved = f.questions.get(&f.qid).unwrap();
+        assert_eq!(saved.publication_title.as_deref(), Some(title));
+        assert_eq!(saved.thread, before.thread);
+        assert!(saved.answer_authority.is_none());
+        assert_eq!(
+            magi::github_text::read_reply(&saved),
+            magi::github_text::Reply::Title(title.into())
+        );
+        assert!(
+            !answer(magi::github_text::USE_MY_TEXT, Some("Later title"))
+                .status
+                .success()
+        );
+        assert_eq!(f.questions.get(&f.qid).unwrap(), saved);
+    }
 }
 
 #[test]
-fn unconsulted_free_text_uses_the_complete_bound_owner_answer() {
+fn unconsulted_free_text_records_the_chats_answer() {
     let f = fixture();
     f.questions
         .update(&f.qid, |q| {
@@ -1280,142 +537,11 @@ fn unconsulted_free_text_uses_the_complete_bound_owner_answer() {
         })
         .unwrap();
     let text = "Use the existing local cache.";
-    let words = format!("{}: {text}", f.qid);
-    let run = standing_owner(&f, &words, None);
-    let talks = Talks::at(f.tmp.path().join("talks"));
-    assert!(magi::consult::authorized_answers(
-        &f.questions,
-        &talks.get(&run).unwrap()
-    ));
-    let out = choose(&f, &run, text, &words);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert_success(&choose(&f, &other_chat(&f), text));
     assert_eq!(
         f.questions.get(&f.qid).unwrap().resolution().as_deref(),
         Some(text)
     );
-}
-
-#[test]
-fn use_my_text_never_reuses_old_thread_content_without_a_new_literal_title() {
-    let f = fixture();
-    let (q, ()) = f
-        .questions
-        .update(&f.qid, |q| {
-            q.node = magi::github_text::ASK_NODE.into();
-            q.choices = vec![magi::github_text::USE_MY_TEXT.into()];
-            q.say("Stale title from an earlier discussion")?;
-            Ok(())
-        })
-        .unwrap();
-    let words = format!(
-        "{}: use my text {}",
-        q.id,
-        magi::consult::question_fingerprint(&q)
-    );
-    let run = standing_owner(&f, &words, None);
-    let out = choose(&f, &run, magi::github_text::USE_MY_TEXT, &words);
-    assert_untouched(&f, &out);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("literal replacement title"));
-}
-
-#[test]
-fn owner_code_examples_do_not_authorize_non_hold_actions() {
-    for prefix in ["    ", "\t", "> ", "```\n"] {
-        let f = fixture();
-        f.questions
-            .update(&f.qid, |q| {
-                q.choices.push(magi::land::REPAIR.into());
-                Ok(())
-            })
-            .unwrap();
-        let words = format!("{prefix}{}: {}", f.qid, magi::land::REPAIR);
-        let run = standing_owner(&f, &words, None);
-        let out = choose(&f, &run, magi::land::REPAIR, &words);
-        assert_untouched(&f, &out);
-        assert!(String::from_utf8_lossy(&out.stderr).contains("quoted or code-block"));
-    }
-}
-
-#[test]
-fn same_chat_replacement_title_cannot_be_authorized_by_hold_or_old_thread_text() {
-    for words in ["hold", "thanks", "use my text"] {
-        let f = fixture();
-        f.questions
-            .update(&f.qid, |q| {
-                q.node = magi::github_text::ASK_NODE.into();
-                q.choices = vec![
-                    magi::github_text::USE_MY_TEXT.into(),
-                    magi::github_text::USE_FALLBACK.into(),
-                ];
-                q.say("Earlier English title")?;
-                Ok(())
-            })
-            .unwrap();
-        let talks = Talks::at(f.tmp.path().join("talks"));
-        let mut t = talks.get(&f.talk_id).unwrap();
-        talk::record(&mut t, &talks, words, vec![]).unwrap();
-        let before = std::fs::read(f.questions.path_of(&f.qid)).unwrap();
-        let out = choose(&f, &t.id, magi::github_text::USE_MY_TEXT, words);
-        assert_untouched(&f, &out);
-        assert!(String::from_utf8_lossy(&out.stderr).contains("literal replacement title"));
-        assert_eq!(std::fs::read(f.questions.path_of(&f.qid)).unwrap(), before);
-    }
-}
-
-#[test]
-fn same_chat_replacement_title_uses_bound_current_owner_text_and_retains_evidence() {
-    let f = fixture();
-    let (q, ()) = f
-        .questions
-        .update(&f.qid, |q| {
-            q.node = magi::github_text::ASK_NODE.into();
-            q.choices = vec![magi::github_text::USE_MY_TEXT.into()];
-            q.say("Earlier English title")?;
-            Ok(())
-        })
-        .unwrap();
-    let talks = Talks::at(f.tmp.path().join("talks"));
-    let mut t = talks.get(&f.talk_id).unwrap();
-    let words = format!(
-        "{}: use my text {}\nCurrent explicitly supplied title",
-        q.id,
-        magi::consult::question_fingerprint(&q)
-    );
-    talk::record(&mut t, &talks, &words, vec![]).unwrap();
-    let out = choose(&f, &t.id, magi::github_text::USE_MY_TEXT, &words);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let answered = f.questions.get(&f.qid).unwrap();
-    assert_eq!(
-        magi::github_text::read_reply(&answered),
-        magi::github_text::Reply::Title("Current explicitly supplied title".into())
-    );
-    assert_eq!(answered.answer_authority.unwrap().instruction, words);
-}
-
-fn title_deputy(f: &Fixture, words: &str) -> Output {
-    common::magi_cli(f.tmp.path())
-        .args([
-            "ask",
-            "--settle",
-            &f.qid,
-            "--choice",
-            magi::github_text::USE_MY_TEXT,
-            "--quote",
-            words,
-        ])
-        .env("MAGI_NODE", magi::deputy::NODE)
-        .env("MAGI_RUN", &f.questions.get(&f.qid).unwrap().run)
-        .env("MAGI_SEAT", "title-deputy")
-        .output()
-        .unwrap()
 }
 
 fn posting_deputy_question(f: &Fixture) -> magi::ask::Question {
@@ -1423,6 +549,7 @@ fn posting_deputy_question(f: &Fixture) -> magi::ask::Question {
         .update(&f.qid, |q| {
             q.node = magi::github_text::ASK_NODE.into();
             q.seat = magi::github_text::ASK_SEAT.into();
+            q.consult = None;
             q.choices = vec![
                 magi::github_text::USE_FALLBACK.into(),
                 magi::github_text::USE_MY_TEXT.into(),
@@ -1437,204 +564,121 @@ fn posting_deputy_question(f: &Fixture) -> magi::ask::Question {
         .0
 }
 
-#[test]
-fn deputy_replacement_title_rejects_hold_retraction_and_quoted_or_missing_consent() {
-    for mode in [
-        "hold",
-        "never mind",
-        "do not post",
-        "use my text",
-        "おっけーそれぞれ回答してー",
-        "conditional",
-        "code",
-        "stale quote",
-    ] {
-        let f = fixture();
-        let q = posting_deputy_question(&f);
-        let instruction = format!(
-            "{}: use my text {}\nCurrent literal title",
-            q.id,
-            magi::consult::question_fingerprint(&q)
-        );
-        let latest = match mode {
-            "conditional" => format!("Maybe {instruction}"),
-            "code" => format!("    {instruction}"),
-            "stale quote" => "hold".into(),
-            text => text.into(),
-        };
-        f.questions
-            .update(&f.qid, |q| {
-                q.say(&instruction)?;
-                q.say(&latest)
-            })
-            .unwrap();
-        let before = std::fs::read(f.questions.path_of(&f.qid)).unwrap();
-        let quote = if mode == "stale quote" {
-            &instruction
-        } else {
-            &latest
-        };
-        let out = title_deputy(&f, quote);
-        assert_untouched(&f, &out);
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("posting confirmation"),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let q = f.questions.get(&f.qid).unwrap();
-        assert_eq!(
-            magi::github_text::read_reply(&q),
-            magi::github_text::Reply::Fallback
-        );
-        assert_eq!(std::fs::read(f.questions.path_of(&f.qid)).unwrap(), before);
-    }
+fn title_deputy(f: &Fixture) -> Output {
+    common::magi_cli(f.tmp.path())
+        .args([
+            "ask",
+            "--settle",
+            &f.qid,
+            "--choice",
+            magi::github_text::USE_MY_TEXT,
+        ])
+        .env("MAGI_NODE", magi::deputy::NODE)
+        .env("MAGI_RUN", &f.questions.get(&f.qid).unwrap().run)
+        .env("MAGI_SEAT", "title-deputy")
+        .output()
+        .unwrap()
 }
 
 #[test]
-fn deputy_replacement_title_requires_current_content_binding_and_publishes_only_literal_text() {
+fn deputy_settles_use_my_text_on_the_owners_literal_title_without_a_quote() {
     let f = fixture();
-    let q = posting_deputy_question(&f);
-    let instruction = format!(
-        "{}: use my text {}\nCurrent literal title",
-        q.id,
-        magi::consult::question_fingerprint(&q)
-    );
-    f.questions.update(&f.qid, |q| q.say(&instruction)).unwrap();
-    let out = title_deputy(&f, &instruction);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    posting_deputy_question(&f);
+    f.questions
+        .update(&f.qid, |q| q.say("Current literal title"))
+        .unwrap();
+    assert_success(&title_deputy(&f));
     let answered = f.questions.get(&f.qid).unwrap();
     assert_eq!(
         magi::github_text::read_reply(&answered),
         magi::github_text::Reply::Title("Current literal title".into())
     );
-    assert!(
-        answered
-            .thread
-            .iter()
-            .any(|turn| turn.who == magi::ask::Who::Operator && turn.body == instruction)
-    );
     let before = std::fs::read(f.questions.path_of(&f.qid)).unwrap();
-    assert!(!title_deputy(&f, &instruction).status.success());
+    assert!(!title_deputy(&f).status.success(), "settled once");
     assert_eq!(std::fs::read(f.questions.path_of(&f.qid)).unwrap(), before);
-    let mut changed = answered;
-    changed.detail.push_str("Changed saved content");
-    assert_eq!(
-        magi::github_text::read_reply(&changed),
-        magi::github_text::Reply::Fallback
-    );
 }
 
 #[test]
-fn operator_held_tasks_keep_ordinary_chat_decisions_available_without_lifting_the_hold() {
+fn chat_decisions_on_operator_held_tasks_go_through_without_lifting_the_hold() {
     for node in [magi::triage::NODE, magi::triage::DEPS_NODE, "recovery"] {
-        for destination in ["same", "other", "none"] {
-            for batch in [false, true] {
-                for choice in ["hold", "retry"] {
-                    let f = fixture();
-                    let (q, ()) = f
-                        .questions
-                        .update(&f.qid, |q| {
-                            q.node = node.into();
-                            q.choices = vec![
-                                "retry".into(),
-                                "wait".into(),
-                                "discard".into(),
-                                "hold".into(),
-                            ];
-                            if destination == "none" {
-                                q.consult = None;
-                            }
-                            Ok(())
-                        })
-                        .unwrap();
-                    let queue = magi::queue::Queue::at(f.tmp.path().join("queue"));
-                    let mut task = magi::queue::Task::new(
-                        "Held task".into(),
-                        "Original task".into(),
-                        f.tmp.path().into(),
-                        magi::queue::Source::Human,
-                    );
-                    task.runs.push(q.run.clone());
-                    task.hold_manual(Some("Owner says wait".into()));
-                    queue.put(&mut task).unwrap();
-                    let before = std::fs::read(queue.path_of(&task.id)).unwrap();
-                    let words = if batch {
-                        "おっけーそれぞれ回答してー".into()
-                    } else {
-                        format!("{}: {choice}", q.id)
-                    };
-                    let run = standing_owner(
-                        &f,
-                        &words,
-                        batch.then(|| format!("{}: {choice}", q.id)).as_deref(),
-                    );
-                    if destination == "same" {
-                        f.questions
-                            .update(&f.qid, |q| {
-                                q.consult.as_mut().unwrap().talk = run.clone();
-                                Ok(())
-                            })
-                            .unwrap();
-                    }
-                    if destination == "same" {
-                        // Updating a legacy consultation after the task exists
-                        // marks routing intent, but the outbox has not delivered
-                        // or assigned a chat. Its existing answer path still works.
-                        let pending = f.questions.get(&f.qid).unwrap();
-                        assert_eq!(pending.routed_task.as_deref(), Some(task.id.as_str()));
-                        assert!(pending.routed_chat.is_none());
-                    }
-                    let out = choose(&f, &run, choice, &words);
-                    assert!(
-                        out.status.success(),
-                        "{node}/{destination}/{batch}/{choice}: {}",
-                        String::from_utf8_lossy(&out.stderr)
-                    );
-                    assert_eq!(
-                        f.questions.get(&f.qid).unwrap().resolution().as_deref(),
-                        Some(choice)
-                    );
-                    assert!(queue.get(&task.id).unwrap().operator_held());
-                    assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
-                }
-            }
+        for choice in ["hold", "retry", "discard"] {
+            let f = fixture();
+            let (q, ()) = f
+                .questions
+                .update(&f.qid, |q| {
+                    q.node = node.into();
+                    q.choices = vec![
+                        "retry".into(),
+                        "wait".into(),
+                        "discard".into(),
+                        "hold".into(),
+                    ];
+                    Ok(())
+                })
+                .unwrap();
+            let queue = magi::queue::Queue::at(f.tmp.path().join("queue"));
+            let mut task = magi::queue::Task::new(
+                "Held task".into(),
+                "Original task".into(),
+                f.tmp.path().into(),
+                magi::queue::Source::Human,
+            );
+            task.runs.push(q.run.clone());
+            task.hold_manual(Some("Owner says wait".into()));
+            queue.put(&mut task).unwrap();
+            let before = std::fs::read(queue.path_of(&task.id)).unwrap();
+            let out = choose(&f, &f.talk_id, choice);
+            assert!(
+                out.status.success(),
+                "{node}/{choice}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                f.questions.get(&f.qid).unwrap().resolution().as_deref(),
+                Some(choice)
+            );
+            // Recording an answer never lifts a hold by itself.
+            assert!(queue.get(&task.id).unwrap().operator_held());
+            assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
         }
     }
 }
 
 #[test]
-fn operator_held_chat_approvals_still_refuse_even_explicit_holds() {
+fn chat_approvals_on_operator_held_tasks_are_recorded() {
     for node in [magi::land::APPROVAL_NODE, magi::bump::NOTICE_NODE] {
-        let f = fixture();
-        let (q, ()) = f
-            .questions
-            .update(&f.qid, |q| {
-                q.node = node.into();
-                if node == magi::bump::NOTICE_NODE {
-                    q.seat = "release-watch".into();
-                }
-                Ok(())
-            })
-            .unwrap();
-        let queue = magi::queue::Queue::at(f.tmp.path().join("queue"));
-        let mut task = magi::queue::Task::new(
-            "Held approval".into(),
-            "Original task".into(),
-            f.tmp.path().into(),
-            magi::queue::Source::Human,
-        );
-        task.runs.push(q.run.clone());
-        task.hold_manual(Some("Owner says wait".into()));
-        queue.put(&mut task).unwrap();
-        let words = format!("{}: hold", q.id);
-        let run = standing_owner(&f, &words, None);
-        let out = choose(&f, &run, "hold", &words);
-        assert_untouched(&f, &out);
-        assert!(String::from_utf8_lossy(&out.stderr).contains("held by the operator"));
+        for choice in [magi::land::APPROVE, magi::land::HOLD] {
+            let f = fixture();
+            let (q, ()) = f
+                .questions
+                .update(&f.qid, |q| {
+                    q.node = node.into();
+                    if node == magi::bump::NOTICE_NODE {
+                        q.seat = "release-watch".into();
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            let queue = magi::queue::Queue::at(f.tmp.path().join("queue"));
+            let mut task = magi::queue::Task::new(
+                "Held approval".into(),
+                "Original task".into(),
+                f.tmp.path().into(),
+                magi::queue::Source::Human,
+            );
+            task.runs.push(q.run.clone());
+            task.hold_manual(Some("Owner says wait".into()));
+            queue.put(&mut task).unwrap();
+            let prompt = magi::prompt::chat_consult(&f.questions.get(&f.qid).unwrap());
+            assert!(prompt.contains("the merge waits for the owner"));
+            assert!(!prompt.contains("answer it yourself"));
+            assert_success(&choose(&f, &f.talk_id, choice));
+            assert_eq!(
+                f.questions.get(&f.qid).unwrap().resolution().as_deref(),
+                Some(choice)
+            );
+            assert!(queue.get(&task.id).unwrap().operator_held());
+        }
     }
 }
 
@@ -1662,33 +706,8 @@ fn recovery_fixture() -> Fixture {
     f
 }
 
-fn recovery_answer(
-    f: &Fixture,
-    run: &str,
-    id: &str,
-    reply: &str,
-    words: Option<&str>,
-    interpreted: bool,
-) -> Output {
-    let mut cmd = common::magi_cli(f.tmp.path());
-    cmd.args(["answer", id, "--reply", reply])
-        .env("MAGI_RUN", run)
-        .env("MAGI_NODE", magi::queue::CHAT_NODE);
-    if let Some(words) = words {
-        cmd.args([
-            if interpreted {
-                "--recovery-consent"
-            } else {
-                "--quote"
-            },
-            words,
-        ]);
-    }
-    cmd.output().unwrap()
-}
-
 #[test]
-fn recovery_cli_accepts_short_and_full_ids_with_stable_aliases_and_localized_labels() {
+fn chat_answers_accept_short_and_full_ids_with_stable_aliases_and_localized_labels() {
     for short in [true, false] {
         for alias in [
             "resume run",
@@ -1700,370 +719,58 @@ fn recovery_cli_accepts_short_and_full_ids_with_stable_aliases_and_localized_lab
             "resume",
             RECOVERY_LABEL,
         ] {
-            for quoted in [true, false] {
-                let f = recovery_fixture();
-                let q = f.questions.get(&f.qid).unwrap();
-                let id = if short { q.short() } else { &f.qid };
-                let words = if alias == "resume run" && !quoted {
-                    format!("{id} {alias}")
-                } else {
-                    format!("{id}: {alias}")
-                };
-                let run = standing_owner(&f, &words, None);
-                let out =
-                    recovery_answer(&f, &run, id, alias, quoted.then_some(words.as_str()), false);
-                assert!(
-                    out.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
-                let q = f.questions.get(&f.qid).unwrap();
-                assert_eq!(q.resolution().as_deref(), Some(RECOVERY_LABEL));
-                assert_eq!(q.answer_authority.unwrap().instruction, words);
-                // Recording a decision does not start a fresh competition or release ownership.
-                assert!(!f.tmp.path().join("runs").exists());
-                let twice = recovery_answer(&f, &run, id, alias, Some(&words), false);
-                assert!(!twice.status.success());
-            }
-        }
-    }
-}
-
-#[test]
-fn recovery_cli_accepts_japanese_hold_and_diagnoses_refused_bindings() {
-    for mode in ["保留", "missing", "queued", "quote", "consent"] {
-        let f = recovery_fixture();
-        let words = if mode == "consent" {
-            "考え中".into()
-        } else {
-            format!("{}: 保留", f.qid)
-        };
-        let run = standing_owner(&f, &words, None);
-        let talks = Talks::at(f.tmp.path().join("talks"));
-        let mut t = talks.get(&run).unwrap();
-        if mode == "missing" {
-            t.turns.clear();
-        } else if mode == "queued" {
-            t.pending = "待って".into();
-        }
-        talks.put(&mut t).unwrap();
-        let quote = if mode == "quote" { "保留" } else { &words };
-        let out = recovery_answer(&f, &run, &f.qid, "保留", Some(quote), false);
-        if mode == "保留" {
+            let f = recovery_fixture();
+            let q = f.questions.get(&f.qid).unwrap();
+            let id = if short { q.short() } else { &f.qid };
+            let out = choose_as(&f, &f.talk_id, id, alias);
             assert!(
                 out.status.success(),
-                "{}",
+                "{alias}: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            let q = f.questions.get(&f.qid).unwrap();
-            assert_eq!(q.resolution().as_deref(), Some(RECOVERY_HOLD));
-            assert_eq!(q.answer_authority.unwrap().instruction, words);
-        } else {
-            assert_untouched(&f, &out);
-            let expected = match mode {
-                "missing" => "missing context",
-                "consent" => "insufficient consent",
-                _ => "stale persisted evidence",
-            };
-            assert!(
-                String::from_utf8_lossy(&out.stderr).contains(expected),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
+            assert_eq!(
+                f.questions.get(&f.qid).unwrap().resolution().as_deref(),
+                Some(RECOVERY_LABEL)
             );
+            // Recording a decision does not start a fresh competition or release ownership.
+            assert!(!f.tmp.path().join("runs").exists());
+            assert!(!choose_as(&f, &f.talk_id, id, alias).status.success());
         }
     }
-}
-
-#[test]
-fn recovery_cli_interprets_natural_japanese_with_current_persisted_recommendation() {
-    for generated in [false, true] {
-        for (alias, label) in [("resume-run", RECOVERY_LABEL), ("keep-held", RECOVERY_HOLD)] {
-            let f = recovery_fixture();
-            let words = "はい、それで進めてください。";
-            let recommendation = if alias == "keep-held" {
-                format!(
-                    "| Question | Recommendation |\n| --- | --- |\n| {} | keep-held |",
-                    f.qid
-                )
-            } else {
-                format!("{}: {label}", f.qid)
-            };
-            let run = standing_owner(&f, words, Some(&recommendation));
-            if generated {
-                let talks = Talks::at(f.tmp.path().join("talks"));
-                let mut t = talks.get(&run).unwrap();
-                let mut notice = t.turns[0].clone();
-                notice.sender = Some(talk::Sender::Magi);
-                notice.body = "generated: resume something else".into();
-                t.turns.insert(1, notice.clone());
-                // Save a new transcript so its publication-time manifest indices stay correct.
-                t.id = "20260903-000000-d00d".into();
-                t.recommendations.clear();
-                t.turns.push(notice);
-                talks.put(&mut t).unwrap();
-                let out = recovery_answer(&f, &t.id, &f.qid, alias, Some(words), true);
-                assert!(
-                    out.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
-            } else {
-                let out = recovery_answer(&f, &run, &f.qid, alias, Some(words), true);
-                assert!(
-                    out.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
-            }
-            let evidence = f.questions.get(&f.qid).unwrap().answer_authority.unwrap();
-            assert_eq!(evidence.instruction, words);
-            assert!(evidence.recovery_interpretation.is_some());
-            assert_eq!(evidence.recommendation_turn, Some(0));
-        }
-    }
-}
-
-#[test]
-fn recovery_cli_rejects_stale_ambiguous_missing_and_mismatched_evidence() {
-    for mode in [
-        "no recommendation",
-        "changed target",
-        "changed actions",
-        "retraction",
-        "queued retraction",
-        "multiple recommendations",
-        "wrong action",
-        "quoted send",
-        "generated send",
-    ] {
-        let f = recovery_fixture();
-        let words = if mode == "quoted send" {
-            "> はい、それで進めて"
-        } else {
-            "はい、それで進めて"
-        };
-        let mut recommendation = format!("{}: {RECOVERY_LABEL}", f.qid);
-        if mode == "multiple recommendations" {
-            let mut other = f.questions.get(&f.qid).unwrap();
-            other.id = "20260903-000000-aaaa".into();
-            f.questions.put(&mut other).unwrap();
-            recommendation.push_str(&format!("\n\n{}: {RECOVERY_LABEL}", other.id));
-        }
-        let run = standing_owner(
-            &f,
-            words,
-            (mode != "no recommendation").then_some(recommendation.as_str()),
-        );
-        let talks = Talks::at(f.tmp.path().join("talks"));
-        if matches!(mode, "changed target" | "changed actions") {
-            f.questions
-                .update(&f.qid, |q| {
-                    if mode == "changed target" {
-                        q.run = "20260903-000000-dead".into();
-                    } else {
-                        q.actions
-                            .insert(RECOVERY_LABEL.into(), magi::ask::ChoiceAction::Requeue);
-                    }
-                    Ok(())
-                })
-                .unwrap();
-        } else if matches!(mode, "retraction" | "queued retraction" | "generated send") {
-            let mut t = talks.get(&run).unwrap();
-            if mode == "queued retraction" {
-                t.pending = "待って、再開しないで".into();
-                t.pending_messages.clear();
-            } else if mode == "generated send" {
-                t.turns.last_mut().unwrap().sender = Some(talk::Sender::Magi);
-            } else {
-                talk::record(&mut t, &talks, "待って、再開しないで", vec![]).unwrap();
-            }
-            talks.put(&mut t).unwrap();
-        }
-        let alias = if mode == "wrong action" {
-            "keep-held"
-        } else {
-            "resume-run"
-        };
-        let out = recovery_answer(&f, &run, &f.qid, alias, Some(words), true);
-        assert_untouched(&f, &out);
-        let err = String::from_utf8_lossy(&out.stderr);
-        if mode == "wrong action" {
-            assert!(
-                err.contains("alias mismatch with persisted recommendation"),
-                "{err}"
-            );
-            assert!(
-                err.contains(&format!("selected label {RECOVERY_HOLD:?}")),
-                "{err}"
-            );
-            assert!(
-                err.contains(&format!("saved label {RECOVERY_LABEL:?}")),
-                "{err}"
-            );
-            assert!(
-                err.contains("present one new explicit recommendation"),
-                "{err}"
-            );
-            assert!(
-                err.contains("obtain current owner authorization before answering"),
-                "{err}"
-            );
-        }
-        assert!(
-            err.contains("context")
-                || err.contains("evidence")
-                || err.contains("consent")
-                || err.contains("alias mismatch"),
-            "{mode}: {err}"
-        );
-    }
-}
-
-#[test]
-fn recovery_cli_does_not_extend_merge_posting_or_destructive_consent() {
-    for node in [
-        magi::land::APPROVAL_NODE,
-        magi::github_text::ASK_NODE,
-        "internal-recovery",
-    ] {
-        for action in [
-            magi::ask::ChoiceAction::Requeue,
-            magi::ask::ChoiceAction::Done,
-            magi::ask::ChoiceAction::Resume {
-                run: "20260902-000000-beef".into(),
-            },
-        ] {
-            if node == "internal-recovery"
-                && matches!(action, magi::ask::ChoiceAction::Resume { .. })
-            {
-                continue;
-            }
-            let f = recovery_fixture();
-            f.questions
-                .update(&f.qid, |q| {
-                    q.node = node.into();
-                    q.actions.insert(RECOVERY_LABEL.into(), action.clone());
-                    Ok(())
-                })
-                .unwrap();
-            let words = "はい、それで進めて";
-            let run = standing_owner(&f, words, Some(&format!("{}: {RECOVERY_LABEL}", f.qid)));
-            let out = recovery_answer(&f, &run, &f.qid, RECOVERY_LABEL, Some(words), true);
-            assert_untouched(&f, &out);
-            assert!(String::from_utf8_lossy(&out.stderr).contains("insufficient consent"));
-        }
-    }
-}
-
-#[test]
-fn recovery_cli_does_not_reconstruct_old_bindings_or_accept_alias_collisions() {
-    for mode in [
-        "old manifest",
-        "alias collision",
-        "prefix",
-        "bad alias",
-        "partial quote",
-    ] {
-        let f = recovery_fixture();
-        let words = "はい、それで進めてください";
-        let run = standing_owner(&f, words, Some(&format!("{}: resume-run", f.qid)));
-        let talks = Talks::at(f.tmp.path().join("talks"));
-        let mut t = talks.get(&run).unwrap();
-        if mode == "old manifest" {
-            // put deliberately preserves existing manifests, so model an old
-            // on-disk transcript before recovery bindings existed.
-            t.recommendations.get_mut(&0).unwrap().recovery.clear();
-            std::fs::write(
-                f.tmp.path().join("talks").join(format!("{run}.json")),
-                serde_json::to_vec(&t).unwrap(),
-            )
-            .unwrap();
-        } else if mode == "alias collision" {
-            f.questions
-                .update(&f.qid, |q| {
-                    q.actions.insert(
-                        RECOVERY_HOLD.into(),
-                        magi::ask::ChoiceAction::Resume { run: q.run.clone() },
-                    );
-                    Ok(())
-                })
-                .unwrap();
-        }
-        if mode == "prefix" {
-            let q = f.questions.get(&f.qid).unwrap();
-            let prefix = &q.id[..q.id.len() - 2];
-            let words = format!("{prefix}: resume run");
-            let run = standing_owner(&f, &words, None);
-            let out = recovery_answer(&f, &run, prefix, "resume-run", Some(&words), false);
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            continue;
-        }
-        let out = recovery_answer(
-            &f,
-            &run,
-            &f.qid,
-            if mode == "bad alias" {
-                "requeue-run"
-            } else {
-                "resume-run"
-            },
-            Some(if mode == "partial quote" {
-                "はい"
-            } else {
-                words
-            }),
-            true,
-        );
-        assert_untouched(&f, &out);
-    }
-}
-
-#[test]
-fn recovery_recommendation_uses_existing_question_grants_and_excludes_legacy_requeue() {
     let f = recovery_fixture();
-    let words = "はい、それで進めてください";
-    let run = standing_owner(&f, words, Some(&format!("{}: resume-run", f.qid)));
-    let talks = Talks::at(f.tmp.path().join("talks"));
-    let t = talks.get(&run).unwrap();
-    assert!(magi::consult::authorized_answers(&f.questions, &t));
-    let roots = magi::consult::answer_write_roots(&f.questions, &talks, &t);
-    assert_eq!(roots.len(), 2);
-    assert!(roots.contains(&f.tmp.path().join("questions")));
-    assert!(!roots.contains(&f.tmp.path().to_path_buf()));
-
-    for choice in [0, 1] {
-        let f = recovery_fixture();
-        f.questions
-            .update(&f.qid, |q| {
-                q.node = "triage".into();
-                q.seat = "triage".into();
-                q.triage_generation = Some(0);
-                q.actions.clear();
-                Ok(())
-            })
-            .unwrap();
-        let label = if choice == 0 {
-            RECOVERY_LABEL
-        } else {
-            RECOVERY_HOLD
-        };
-        let run = standing_owner(&f, words, Some(&format!("{}: {label}", f.qid)));
-        let out = recovery_answer(&f, &run, &f.qid, label, Some(words), true);
-        assert_eq!(
-            out.status.success(),
-            choice == 1,
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    assert_success(&choose(&f, &f.talk_id, "保留"));
+    assert_eq!(
+        f.questions.get(&f.qid).unwrap().resolution().as_deref(),
+        Some(RECOVERY_HOLD)
+    );
 }
 
 #[test]
-fn recovery_cli_preserves_pending_merge_approval_and_existing_run_ownership() {
+fn ambiguous_and_unknown_aliases_are_refused_but_prefixes_resolve() {
+    let f = recovery_fixture();
+    f.questions
+        .update(&f.qid, |q| {
+            q.actions.insert(
+                RECOVERY_HOLD.into(),
+                magi::ask::ChoiceAction::Resume { run: q.run.clone() },
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert_untouched(&f, &choose(&f, &f.talk_id, "resume-run"));
+    let f = recovery_fixture();
+    assert_untouched(&f, &choose(&f, &f.talk_id, "requeue-run"));
+    let f = recovery_fixture();
+    let prefix = &f.qid[..f.qid.len() - 2];
+    assert_success(&choose_as(&f, &f.talk_id, prefix, "resume-run"));
+    assert_eq!(
+        f.questions.get(&f.qid).unwrap().resolution().as_deref(),
+        Some(RECOVERY_LABEL)
+    );
+}
+
+#[test]
+fn chat_resume_answer_preserves_pending_merge_approval_and_existing_run_ownership() {
     let f = recovery_fixture();
     let mut state = magi::run::RunState::new(
         f.tmp.path().into(),
@@ -2111,14 +818,7 @@ fn recovery_cli_preserves_pending_merge_approval_and_existing_run_ownership() {
     task.hold_machine(Some("mise github-cli has been repaired".into()));
     queue.put(&mut task).unwrap();
     let task_before = serde_json::to_value(&task).unwrap();
-    let words = "はい、それで進めてください";
-    let run = standing_owner(&f, words, Some(&format!("{}: resume-run", f.qid)));
-    let out = recovery_answer(&f, &run, &f.qid, "resume-run", Some(words), true);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert_success(&choose(&f, &f.talk_id, "resume-run"));
     assert!(f.questions.get(&approval.id).unwrap().answer.is_none());
     let after = magi::run::RunState::load_under(&state.id, f.tmp.path()).unwrap();
     assert_eq!(serde_json::to_value(&after).unwrap(), before);
@@ -2128,168 +828,12 @@ fn recovery_cli_preserves_pending_merge_approval_and_existing_run_ownership() {
         serde_json::to_value(queue.get(&task.id).unwrap()).unwrap(),
         task_before
     );
-    let out = recovery_answer(&f, &run, &f.qid, "resume-run", Some(words), true);
-    assert!(!out.status.success());
+    assert!(!choose(&f, &f.talk_id, "resume-run").status.success());
     assert!(f.questions.get(&approval.id).unwrap().answer.is_none());
 }
 
 #[test]
-fn recovery_cli_generated_sends_in_the_owner_turn_do_not_replace_real_evidence() {
-    let f = recovery_fixture();
-    let words = "はい、それで進めてください";
-    let run = standing_owner(&f, words, Some(&format!("{}: resume-run", f.qid)));
-    let talks = Talks::at(f.tmp.path().join("talks"));
-    let mut t = talks.get(&run).unwrap();
-    let turn = t.turns.last_mut().unwrap();
-    let mut notice = turn.messages[0].clone();
-    notice.sender = Some(talk::Sender::Magi);
-    notice.body = "generated notice: no owner authorization".into();
-    turn.messages.insert(0, notice.clone());
-    turn.messages.push(notice);
-    turn.body = turn
-        .messages
-        .iter()
-        .map(|m| m.body.as_str())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    talks.put(&mut t).unwrap();
-    let out = recovery_answer(&f, &run, &f.qid, "resume-run", Some(words), true);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let authority = f.questions.get(&f.qid).unwrap().answer_authority.unwrap();
-    assert_eq!(authority.instruction, words);
-    assert_eq!(authority.message, 1);
-}
-
-#[test]
-fn guarded_quote_whitespace_keeps_legacy_comparison_and_complete_owner_evidence() {
-    for choice in ["merge", magi::github_text::POST_ORIGINAL, "complete task"] {
-        for padded_owner in [false, true] {
-            let f = fixture();
-            let (q, ()) = f
-                .questions
-                .update(&f.qid, |q| {
-                    q.consult = None;
-                    q.choices = vec![choice.into()];
-                    if choice == "merge" {
-                        q.merge_target = Some(magi::merge_decision::Target {
-                            pr: "https://example.test/pull/1".into(),
-                            head: "reviewed-head".into(),
-                            language: "en".into(),
-                        });
-                    } else if choice == magi::github_text::POST_ORIGINAL {
-                        q.node = magi::github_text::ASK_NODE.into();
-                    } else {
-                        q.node = "implement".into();
-                        q.actions
-                            .insert(choice.into(), magi::ask::ChoiceAction::Done);
-                    }
-                    Ok(())
-                })
-                .unwrap();
-            let command = if choice == "merge" {
-                format!("{}: merge reviewed-head", q.id)
-            } else if choice == magi::github_text::POST_ORIGINAL {
-                format!(
-                    "{}: {choice} {}",
-                    q.id,
-                    magi::consult::question_fingerprint(&q)
-                )
-            } else {
-                format!("{}: {choice}", q.id)
-            };
-            let padded = format!(" {command} \n");
-            let (words, quote) = if padded_owner {
-                (&padded, &command)
-            } else {
-                (&command, &padded)
-            };
-            let run = standing_owner(&f, words, None);
-            let out = choose(&f, &run, choice, quote);
-            assert!(
-                out.status.success(),
-                "{choice}: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            assert_eq!(
-                f.questions
-                    .get(&f.qid)
-                    .unwrap()
-                    .answer_authority
-                    .unwrap()
-                    .instruction,
-                *words
-            );
-        }
-    }
-}
-
-#[test]
-fn recovery_quote_whitespace_still_requires_the_exact_complete_owner_send() {
-    for interpreted in [false, true] {
-        let f = recovery_fixture();
-        let words = if interpreted {
-            "はい、それで進めてください".into()
-        } else {
-            format!("{}: resume-run", f.qid)
-        };
-        let run = standing_owner(&f, &words, Some(&format!("{}: resume-run", f.qid)));
-        let out = recovery_answer(
-            &f,
-            &run,
-            &f.qid,
-            "resume-run",
-            Some(&format!("{words}\n")),
-            interpreted,
-        );
-        assert_untouched(&f, &out);
-        assert!(String::from_utf8_lossy(&out.stderr).contains("stale persisted evidence"));
-    }
-}
-
-fn consult_owner(f: &Fixture, words: &str) {
-    let talks = Talks::at(f.tmp.path().join("talks"));
-    let mut t = talks.get(&f.talk_id).unwrap();
-    t.pending.clear();
-    t.pending_messages.clear();
-    t.pending_breaks = None;
-    t.turns.push(talk::Turn {
-        sender: Some(talk::Sender::Operator),
-        breaks: Some(Vec::new()),
-        messages: vec![talk::Message {
-            sender: Some(talk::Sender::Operator),
-            display: None,
-            body: words.into(),
-            attachments: vec![],
-            reply: None,
-        }],
-        posted_by: None,
-        who: talk::Who::Operator,
-        body: words.into(),
-        at: Timestamp::now(),
-        attachments: vec![],
-        usage: None,
-    });
-    talks.put(&mut t).unwrap();
-}
-
-fn consult_command(f: &Fixture, args: &[&str]) -> Output {
-    common::magi_cli(f.tmp.path())
-        .args(args)
-        .current_dir(f.tmp.path())
-        .env("MAGI_RUN", &f.talk_id)
-        .env("MAGI_NODE", magi::queue::CHAT_NODE)
-        .env("MAGI_TURN_SCOPE", "consultation-control")
-        .output()
-        .unwrap()
-}
-
-#[test]
-fn consult_task_add_binds_current_owner_operation_and_execution_arguments() {
-    use magi::consult::TaskOperation;
+fn consulted_chat_files_tasks_with_ordinary_options_and_no_quote() {
     let f = fixture();
     assert!(
         Command::new("git")
@@ -2300,277 +844,94 @@ fn consult_task_add_binds_current_owner_operation_and_execution_arguments() {
             .status
             .success()
     );
-    let op = TaskOperation::Add {
-        instruction: "Reimplement from scratch".into(),
-        solo: true,
-    };
-    let words = op.instruction();
-    consult_owner(&f, &words);
+    assert!(magi::consult::pending_consults(&f.questions, &f.talk_id));
     let queue = magi::queue::Queue::at(f.tmp.path().join("queue"));
-    for args in [
-        vec!["task", "add", "--solo", "Reimplement from scratch"],
-        vec![
+    let out = chat_command(&f, &["task", "add", "--solo", "Reimplement from scratch"]);
+    assert_success(&out);
+    let out = chat_command(
+        &f,
+        &[
             "task",
             "add",
-            "--quote",
-            &words,
-            "--solo",
+            "--urgent",
+            "--priority",
+            "3",
             "Port the old code",
         ],
-        vec!["task", "add", "--quote", &words, "Reimplement from scratch"],
-        vec![
-            "task",
-            "add",
-            "--quote",
-            &words,
-            "--solo",
-            "--urgent",
-            "Reimplement from scratch",
-        ],
-    ] {
-        let out = consult_command(&f, &args);
-        assert!(
-            !out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(queue.list().is_empty());
-    }
-    let out = consult_command(
-        &f,
-        &[
-            "task",
-            "add",
-            "--quote",
-            &words,
-            "--solo",
-            "Reimplement from scratch",
-        ],
     );
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert_success(&out);
     let tasks = queue.list();
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0].instruction, "Reimplement from scratch");
-    assert!(tasks[0].solo);
-    assert_eq!(tasks[0].chat_talk(), Some(f.talk_id.as_str()));
-    consult_owner(&f, "Wait; do not file that task");
-    let out = consult_command(
-        &f,
-        &[
-            "task",
-            "add",
-            "--quote",
-            &words,
-            "--solo",
-            "Reimplement from scratch",
-        ],
-    );
-    assert!(!out.status.success());
-    assert_eq!(queue.list().len(), 1);
+    assert_eq!(tasks.len(), 2);
+    let solo = tasks
+        .iter()
+        .find(|t| t.instruction == "Reimplement from scratch")
+        .unwrap();
+    assert!(solo.solo);
+    assert_eq!(solo.chat_talk(), Some(f.talk_id.as_str()));
+    let urgent = tasks
+        .iter()
+        .find(|t| t.instruction == "Port the old code")
+        .unwrap();
+    assert!(urgent.urgent);
+    assert_eq!(urgent.priority, 3);
+    // Filing work is not an answer.
+    assert!(f.questions.get(&f.qid).unwrap().answer.is_none());
 }
 
 #[test]
-fn consult_task_evidence_rejects_wrong_target_predelivery_queued_and_generated_sends() {
-    use magi::consult::TaskOperation;
+fn consulted_chat_operates_a_task_it_did_not_file_and_keeps_queue_claims() {
     let f = fixture();
+    let queue = magi::queue::Queue::at(f.tmp.path().join("queue"));
     let mut task = magi::queue::Task::new(
         "old work".into(),
         "old work".into(),
         f.tmp.path().into(),
         magi::queue::Source::Human,
     );
-    task.hold_manual(None);
-    let queue = magi::queue::Queue::at(f.tmp.path().join("queue"));
     queue.put(&mut task).unwrap();
-    let words = TaskOperation::Release {
-        task: task.id.clone(),
-    }
-    .instruction();
-    consult_owner(&f, &words);
-    let out = consult_command(&f, &["task", "priority", &task.id, "5", "--quote", &words]);
-    assert!(!out.status.success());
-    let talks = Talks::at(f.tmp.path().join("talks"));
-    let mut t = talks.get(&f.talk_id).unwrap();
-    let original = t.clone();
-    t.pending = "Stop".into();
-    t.pending_messages.clear();
-    talks.put(&mut t).unwrap();
-    assert!(
-        !consult_command(&f, &["task", "release", &task.id, "--quote", &words])
-            .status
-            .success()
-    );
-    t = original.clone();
-    t.turns.last_mut().unwrap().messages[0].sender = Some(talk::Sender::Magi);
-    t.turns.last_mut().unwrap().sender = Some(talk::Sender::Magi);
-    talks.put(&mut t).unwrap();
-    assert!(
-        !consult_command(&f, &["task", "release", &task.id, "--quote", &words])
-            .status
-            .success()
-    );
-    t = original.clone();
-    t.turns.last_mut().unwrap().at = "2000-01-01T00:00:00Z".parse().unwrap();
-    talks.put(&mut t).unwrap();
-    assert!(
-        !consult_command(&f, &["task", "release", &task.id, "--quote", &words])
-            .status
-            .success()
-    );
-    talks.put(&mut original.clone()).unwrap();
-    let wrong = TaskOperation::Release {
-        task: "different-task".into(),
-    }
-    .instruction();
-    consult_owner(&f, &wrong);
-    assert!(
-        !consult_command(&f, &["task", "release", &task.id, "--quote", &wrong])
-            .status
-            .success()
-    );
-    consult_owner(&f, &words);
-    let out = consult_command(&f, &["task", "release", &task.id, "--quote", &words]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(queue.get(&task.id).unwrap().status.runnable());
-}
-
-#[test]
-fn consult_other_is_a_note_without_answer_or_choice_effect_and_invocation_stays_restricted() {
-    let f = fixture();
-    let words = "Reimplement from scratch instead of porting";
-    consult_owner(&f, words);
-    assert!(
-        !consult_command(
-            &f,
-            &[
-                "answer",
-                &f.qid,
-                "--reply-other",
-                words,
-                "--quote",
-                "old words"
-            ]
-        )
-        .status
-        .success()
-    );
-    let out = consult_command(
-        &f,
-        &["answer", &f.qid, "--reply-other", words, "--quote", words],
-    );
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("waiter remains held"));
-    let q = f.questions.get(&f.qid).unwrap();
-    assert!(q.status.open());
-    assert!(q.answer.is_none());
-    assert_eq!(q.consult_outcome.unwrap().text, words);
-    assert!(!magi::consult::pending_consults(&f.questions, &f.talk_id));
     for args in [
-        vec!["task", "rm", "anything"],
-        vec!["run", "rm", "anything"],
-        vec!["task", "urgent", "anything"],
+        vec!["task", "hold", &task.id, "Wait for replacement"],
+        vec!["task", "release", &task.id],
+        vec!["task", "priority", &task.id, "5"],
+        vec!["task", "done", &task.id],
     ] {
-        let out = consult_command(&f, &args);
-        assert!(!out.status.success());
-        assert!(String::from_utf8_lossy(&out.stderr).contains("consultation scope"));
-    }
-    let op = magi::consult::TaskOperation::Release {
-        task: "anything".into(),
-    }
-    .instruction();
-    consult_owner(&f, &op);
-    assert!(
-        !consult_command(&f, &["task", "release", "anything", "--quote", &op])
-            .status
-            .success()
-    );
-}
-
-#[test]
-fn consult_task_hold_priority_and_done_keep_queue_claims_and_exact_run_grants() {
-    use magi::consult::TaskOperation;
-    let f = fixture();
-    let queue = magi::queue::Queue::at(f.tmp.path().join("queue"));
-    let mut task = magi::queue::Task::new(
-        "old work".into(),
-        "old work".into(),
-        f.tmp.path().into(),
-        magi::queue::Source::Human,
-    );
-    task.runs = vec!["20260902-000000-abcd".into(), "20260902-000000-cdef".into()];
-    for run in &task.runs {
-        std::fs::create_dir_all(f.tmp.path().join("runs").join(run)).unwrap();
-    }
-    queue.put(&mut task).unwrap();
-    for (op, args) in [
-        (
-            TaskOperation::Hold {
-                task: task.id.clone(),
-                reason: "Wait for replacement".into(),
-            },
-            vec!["task", "hold", &task.id, "Wait for replacement"],
-        ),
-        (
-            TaskOperation::Priority {
-                task: task.id.clone(),
-                priority: 5,
-            },
-            vec!["task", "priority", &task.id, "5"],
-        ),
-        (
-            TaskOperation::Done {
-                task: task.id.clone(),
-            },
-            vec!["task", "done", &task.id],
-        ),
-    ] {
-        let words = op.instruction();
-        consult_owner(&f, &words);
+        // A running daemon's claim still wins over the chat's request.
         let claim = queue.claim(&task.id).unwrap();
-        let mut quoted_args = vec!["task", "--quote", &words];
-        quoted_args.extend_from_slice(&args[1..]);
-        let args = quoted_args;
-        assert!(!consult_command(&f, &args).status.success());
+        assert!(!chat_command(&f, &args).status.success(), "{args:?}");
         drop(claim);
-        let talks = Talks::at(f.tmp.path().join("talks"));
-        let t = talks.get(&f.talk_id).unwrap();
-        let roots = magi::consult::answer_write_roots(&f.questions, &talks, &t);
-        assert!(roots.contains(&queue.root().to_path_buf()));
-        assert!(!roots.contains(&f.tmp.path().to_path_buf()));
-        assert!(!roots.contains(&f.tmp.path().join("runs")));
-        for run in &task.runs {
-            assert_eq!(
-                roots.contains(&f.tmp.path().join("runs").join(run)),
-                matches!(op, TaskOperation::Done { .. })
-            );
-        }
-        let out = consult_command(&f, &args);
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        assert_success(&chat_command(&f, &args));
         let saved = queue.get(&task.id).unwrap();
-        match op {
-            TaskOperation::Hold { .. } => assert!(saved.operator_held()),
-            TaskOperation::Priority { .. } => assert_eq!(saved.priority, 5),
-            TaskOperation::Done { .. } => assert_eq!(saved.status, magi::queue::TaskStatus::Done),
+        match args[1] {
+            "hold" => assert!(saved.operator_held()),
+            "release" => assert!(saved.status.runnable()),
+            "priority" => assert_eq!(saved.priority, 5),
+            "done" => assert_eq!(saved.status, magi::queue::TaskStatus::Done),
             _ => unreachable!(),
         }
     }
     assert!(f.questions.get(&f.qid).unwrap().answer.is_none());
+}
+
+#[test]
+fn reply_other_is_a_note_without_answer_or_choice_effect() {
+    let f = fixture();
+    let words = "Reimplement from scratch instead of porting";
+    let out = chat_command(&f, &["answer", &f.qid, "--reply-other", words]);
+    assert_success(&out);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("waiter remains held"));
+    let q = f.questions.get(&f.qid).unwrap();
+    assert!(q.status.open());
+    assert!(q.answer.is_none());
+    let outcome = q.consult_outcome.unwrap();
+    assert_eq!(outcome.text, words);
+    assert_eq!(outcome.talk, f.talk_id);
+    assert!(!magi::consult::pending_consults(&f.questions, &f.talk_id));
+    // The consultation has ended; a second note has nothing to end.
+    assert!(
+        !chat_command(&f, &["answer", &f.qid, "--reply-other", "Another idea"])
+            .status
+            .success()
+    );
 }
 
 #[test]
@@ -2591,109 +952,27 @@ fn ordinary_chat_task_add_does_not_require_an_existing_talk_record() {
         .env("MAGI_CONFIG_DIR", "")
         .env("MAGI_RUN", "missing-standing-chat")
         .env("MAGI_NODE", magi::queue::CHAT_NODE)
-        .env("MAGI_TURN_SCOPE", "repository")
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert_success(&out);
     let tasks = magi::queue::Queue::at(f.tmp.path().join("queue")).list();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].instruction, "Independent work");
-}
-
-#[cfg(unix)]
-#[test]
-fn consult_task_add_rechecks_owner_evidence_after_async_preparation() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let f = fixture();
-    assert!(
-        Command::new("git")
-            .arg("init")
-            .current_dir(f.tmp.path())
+    for args in [
+        vec!["task", "priority", &tasks[0].id, "9"],
+        vec!["task", "done", &tasks[0].id],
+    ] {
+        let out = common::magi_cli(f.tmp.path())
+            .args(args)
+            .env("MAGI_RUN", "missing-standing-chat")
+            .env("MAGI_NODE", magi::queue::CHAT_NODE)
             .output()
-            .unwrap()
-            .status
-            .success()
-    );
-    let words = magi::consult::TaskOperation::Add {
-        instruction: "Reimplement from scratch".into(),
-        solo: true,
+            .unwrap();
+        assert_success(&out);
     }
-    .instruction();
-    consult_owner(&f, &words);
-    let bin = f.tmp.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
-    let marker = f.tmp.path().join("preparing");
-    let resume = f.tmp.path().join("continue");
-    let git = magi::config::find_program_on("git", &std::env::var_os("PATH").unwrap()).unwrap();
-    let wrapper = bin.join("git");
-    std::fs::write(
-        &wrapper,
-        r#"#!/bin/sh
-if [ "$1" = rev-parse ] && [ "$2" = --show-toplevel ]; then
-    touch "$PREP_MARKER"
-    attempts=0
-    while [ ! -f "$PREP_CONTINUE" ]; do
-        attempts=$((attempts + 1))
-        [ "$attempts" -lt 2000 ] || exit 1
-        sleep 0.01
-    done
-fi
-exec "$REAL_GIT" "$@"
-"#,
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let path = std::env::join_paths(
-        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-    )
-    .unwrap();
-    let child = common::magi_cli(f.tmp.path())
-        .args([
-            "task",
-            "--quote",
-            &words,
-            "add",
-            "--solo",
-            "Reimplement from scratch",
-        ])
-        .current_dir(f.tmp.path())
-        .env("MAGI_CONFIG_DIR", "")
-        .env("MAGI_RUN", &f.talk_id)
-        .env("MAGI_NODE", magi::queue::CHAT_NODE)
-        .env("MAGI_TURN_SCOPE", "consultation-control")
-        .env("PATH", path)
-        .env("REAL_GIT", git)
-        .env("PREP_MARKER", &marker)
-        .env("PREP_CONTINUE", &resume)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+    let saved = magi::queue::Queue::at(f.tmp.path().join("queue"))
+        .get(&tasks[0].id)
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !marker.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let reached = marker.exists();
-    let talks = Talks::at(f.tmp.path().join("talks"));
-    let mut t = talks.get(&f.talk_id).unwrap();
-    let retraction = talk::queue(&mut t, &talks, "Stop; do not file that task", vec![]);
-    std::fs::write(&resume, "continue").unwrap();
-    let out = child.wait_with_output().unwrap();
-    retraction.unwrap();
-    assert!(
-        reached,
-        "preparation did not reach the asynchronous repository check: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("post-delivery owner evidence"));
-    assert!(
-        magi::queue::Queue::at(f.tmp.path().join("queue"))
-            .list()
-            .is_empty()
-    );
+    assert_eq!(saved.priority, 9);
+    assert_eq!(saved.status, magi::queue::TaskStatus::Done);
 }

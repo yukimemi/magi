@@ -974,129 +974,6 @@ pub fn upgrade_repair_choice(q: &mut ask::Question, state: &RunState) -> bool {
     before != (q.choices.clone(), q.actions.clone(), q.merge_target.clone())
 }
 
-/// Whether `quote` is a verbatim part of the owner's `message` and nothing in
-/// the whole message carries a hedge, a condition, a negation, a question or a
-/// retraction. Used by `deputy::destructive`.
-///
-/// The whole message is read, not just the quote's sentence: a condition or a
-/// second thought in another sentence ("Merge it. Only if CI passes.") makes
-/// the approval conditional all the same. Doubt anywhere is `false`.
-pub fn unhedged(message: &str, quote: &str) -> bool {
-    let quote = quote.trim();
-    !quote.is_empty() && message.contains(quote) && !hedged(message) && !retracts(message)
-}
-
-/// Hedging, conditional, negated or interrogative wording. ASCII words are
-/// matched as whole words so `note` is not `not`. A bare negation or stop word
-/// (`no`, `stop`, `nope`, ...) anywhere in the message voids the approval.
-fn hedged(text: &str) -> bool {
-    const WORDS: &[&str] = &[
-        "maybe",
-        "probably",
-        "perhaps",
-        "might",
-        "if",
-        "unless",
-        "not",
-        "no",
-        "nope",
-        "stop",
-        "dont",
-        "abort",
-        "revert",
-        "undo",
-        "never",
-        "wait",
-        "hold",
-        "cancel",
-        "but",
-        "think",
-        "guess",
-        "suppose",
-        "unsure",
-        "yet",
-        "except",
-        "only",
-        "cannot",
-        "should",
-        "once",
-        "provided",
-        "providing",
-        "when",
-        "whenever",
-        "after",
-        "until",
-        "before",
-        "assuming",
-        "given",
-        "while",
-        "whether",
-        "depending",
-        "pending",
-    ];
-    const JA: &[&str] = &[
-        "かも",
-        "たぶん",
-        "多分",
-        "なら",
-        "たら",
-        "ちょっと待",
-        "しないで",
-        "しない",
-        "保留",
-        "まだ",
-        "ただし",
-        "やめ",
-        "いや",
-        "止め",
-        "だめ",
-        "ダメ",
-        "じゃない",
-        "ではない",
-        "ですか",
-        "かな",
-        "でしょう",
-        "思う",
-        "でも",
-        "けど",
-        "ただ",
-        "次第",
-        "場合",
-        "限り",
-        "条件",
-        "とき",
-        "まで",
-        "後で",
-    ];
-    if text.contains(['?', '？']) || JA.iter().any(|w| text.contains(w)) {
-        return true;
-    }
-    text.to_lowercase()
-        .replace('\u{2019}', "'")
-        .split(|c: char| !(c.is_alphanumeric() || c == '\'') || !c.is_ascii())
-        .filter(|w| !w.is_empty())
-        .any(|w| WORDS.contains(&w) || w.ends_with("n't"))
-}
-
-/// Wording that takes back what the rest of the message said. Bare negation
-/// and stop words are `hedged`'s whole-word list, not substrings here.
-fn retracts(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    [
-        "やっぱ",
-        "待って",
-        "撤回",
-        "never mind",
-        "actually",
-        "on second thought",
-    ]
-    .iter()
-    .any(|w| lower.contains(w))
-        || lower
-            .split(|c: char| !c.is_ascii_alphabetic())
-            .any(|w| w == "wait")
-}
-
 /// Graph node recorded on the approval question.
 ///
 /// The phone keys its high-stakes card off this rather than off the choice
@@ -1761,33 +1638,30 @@ fn contested_to_ask(state: &RunState) -> Option<ContestedHandoff> {
 /// What a merge-approval question's deputy is told: the pull request, the run,
 /// what each answer does, and the evidence saved when the question was filed.
 ///
-/// A snapshot taken when the deputy is attached, so it says so and points at
-/// `magi show` / `gh pr view` for anything current. `state` is `None` for a run
-/// that cannot be read; what is missing is named as missing, and no past
-/// approval basis is rebuilt from today's state.
+/// Rebuilt for every deputy turn, it is still a snapshot of that moment, so it
+/// says so and points at `magi show` / `gh pr view` for anything current.
+/// `state` is `None` for a run that cannot be read; what is missing is named as
+/// missing, and no past approval basis is rebuilt from today's state.
 pub fn deputy_brief(q: &ask::Question, state: Option<&RunState>) -> String {
     let mut s = format!(
         "This is the merge approval for run {run} (`magi show {run}`). The question's \
          own text above names the pull request. Answering `{APPROVE}` squash-merges \
-         it into the base branch, which cannot be undone; `{HOLD}` leaves the pull \
-         request open. Silence is a hold: the owner not answering never merges. Only \
-         the owner choosing `{APPROVE}`, or clearly telling you to merge in their \
-         own words, merges. Whether their wording is a clear, unconditional instruction \
-         is your judgement alone: if it is doubtful, conditional, retracted or a \
-         question, do not settle - ask back with `magi ask --thread`. Doubt and \
-         silence are a hold.\n\n\
-         This brief is a snapshot from when you were attached: check `magi show {run}` \
-         and `gh pr view` (read-only) before telling the owner anything current. \
-         You run with permission to write the question record, and what keeps you \
-         from touching anything else is this brief and your instructions - so do \
-         not change files, branches or the pull request.",
+         it into the base branch; `{HOLD}` leaves the pull request open. Silence is a \
+         hold: the owner not answering never merges. When the owner tells you to \
+         merge, in whatever words, settle `{APPROVE}`; when they ask for what another \
+         offered choice does, settle that one. If you cannot tell what they want, ask \
+         with `magi ask --thread`.\n\n\
+         This brief is a snapshot from when your turn started: check `magi show {run}` \
+         and `gh pr view` (read-only) before telling the owner anything current. The \
+         driver carries out the merge, repair, withdrawal or replacement: do not \
+         change files, branches or the pull request yourself.",
         run = q.run
     );
     if let Some(target) = &q.merge_target {
-        s.push_str(&format!("\n\nThis decision names PR {} at head `{}`. Merge through chat requires the owner's latest whole message and quote to be exactly `merge {}`. Discussion alone never approves. For hold, repair, withdrawal or replacement, use the exact offered token from the owner's latest whole message. Withdrawal explicitly closes the PR and ends the task. Replacement closes the old PR before dispatching a new attempt with the selected implementer; do not start a separate task yourself.", target.pr, target.head, target.head));
+        s.push_str(&format!("\n\nThis decision names PR {} at head `{}`. A settled `{APPROVE}` merges exactly that head; a newer head is never merged on this answer. Withdrawal explicitly closes the PR and ends the task. Replacement closes the old PR before dispatching a new attempt with the selected implementer; do not start a separate task for it yourself.", target.pr, target.head));
     }
     if q.choices.iter().any(|c| c == REPAIR) {
-        s.push_str("\n\n`fix findings and re-review` requests one repair and bounded re-review on the existing PR. It never approves a merge. Settle this choice only when the owner's whole latest message is exactly this label; otherwise discuss it with `--thread`. The driver performs the repair; do not edit or queue another task. Updated review and gate results require a fresh merge decision.");
+        s.push_str("\n\n`fix findings and re-review` requests one repair and bounded re-review on the existing PR. It never approves a merge. The driver performs the repair; do not edit or queue another task for it. Updated review and gate results require a fresh merge decision.");
     }
     if q.detail.contains("Approval required because:") || q.detail.contains("承認が必要な理由:")
     {
@@ -5654,7 +5528,6 @@ pub async fn fix_round(
             &spec,
             &mut seat,
             &Invocation {
-                scope: crate::agent::InvocationScope::Repository,
                 coordination: state.config.coordination.as_ref(),
                 fetched_base: state.fetched_base.as_ref(),
                 cwd: &winner.worktree,
@@ -9100,27 +8973,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         );
         q = store.get(&q.id).unwrap();
         assert!(q.answer.is_none());
-        talk.turns.push(crate::talk::Turn {
-            sender: None,
-            breaks: Some(Vec::new()),
-            messages: Vec::new(),
-            posted_by: None,
-            who: crate::talk::Who::Operator,
-            body: "merge abc".into(),
-            at: Timestamp::now(),
-            attachments: Vec::new(),
-            usage: None,
-        });
-        talks.put(&mut talk).unwrap();
-        crate::consult::validate_answer(
-            &q,
-            &talks,
-            &talk.id,
-            crate::queue::CHAT_NODE,
-            APPROVE,
-            Some("merge abc"),
-        )
-        .unwrap();
+        // The owner's merge answer (from the chat or the card) is the approval.
         q.answer(ask::Answer::Choice(APPROVE.to_owned())).unwrap();
         store.put(&mut q).unwrap();
 

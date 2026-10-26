@@ -1,7 +1,7 @@
 //! A turn-scoped inherited channel, without filesystem or network grants.
 //!
-//! The launcher executes typed requests as the talk fixed at startup. The
-//! channel cannot name a different talk, execute a command, or approve a merge.
+//! The launcher executes typed [`crate::chat_control::Operation`]s as the talk fixed
+//! at startup. The channel cannot name a different talk or execute a command.
 //! An unlinked file descriptor supplies process-associated POSIX record locks
 //! so concurrent CLI tool calls cannot interleave frames on the shared pipes.
 use std::io::Write as _;

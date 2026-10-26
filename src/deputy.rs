@@ -13,8 +13,8 @@
 //! runs one short-lived agent seat that is handed what the conductor knew
 //! ([`brief`]: the task, why it asked, what each option leads to), blocks on
 //! the question with `magi ask --wait`, answers back in the thread with
-//! `magi ask --thread`, and - when the owner's own words clearly pick an
-//! option - records that with `magi ask --settle`. Applying the outcome is not
+//! `magi ask --thread`, and - when the owner's words pick an option - records
+//! that with `magi ask --settle`. Applying the outcome is not
 //! the deputy's job: an answered conductor question goes through the daemon's
 //! existing `resolve_blockers` / action path, exactly as one tapped on the
 //! phone does.
@@ -39,16 +39,15 @@
 //! - **A merge approval is served too, but stays land's.** Its deputy has no
 //!   `cwd` (so the waiter never touches it), its deadline is `asked_at +
 //!   answer_timeout` and never moves on a reply ([`deadline`]), and the only
-//!   thing that retires it is `daemon::land_resume_state`. A say alone never
-//!   merges: `--settle` accepts `merge` only for the owner's own word `merge`.
+//!   thing that retires it is `daemon::land_resume_state`. Silence is a hold;
+//!   a settled `merge` lets land merge the head it saved, nothing newer.
 //! - **A release-watch question is served too, and stays the watcher's.** The
 //!   escalation, local-mode approval and failed-release questions
 //!   ([`crate::release_watch`], node `release-bump`, seat `release-watch`) have
 //!   no asker, so a say reached nobody. Its deputy has no `cwd` either, a
 //!   fixed `asked_at + answer_timeout` deadline ([`deadline`]), and applies
 //!   nothing: `--settle` records a choice and the watcher applies it on its next
-//!   lap. A local approval's `merge` / `hold` go through the merge-approval
-//!   rules ([`merge_gated`]). A deputy never closes or merges the pull request.
+//!   lap. A deputy never closes or merges the pull request itself.
 //! - **Every open question the owner can say something to has a listener.**
 //!   [`Kind::Triage`] serves the triage questions; [`Kind::Generic`] is the
 //!   fallback for any other question with choices and no `cwd` (the divergence
@@ -58,9 +57,11 @@
 //!   resumed and expired by the waiter beside the deputy. A test enumerates
 //!   every node filed without an asker, so a new kind of question cannot ship
 //!   without one.
-//! - **No new authority.** A deputy does not edit, merge or touch the queue,
-//!   and `--settle` accepts only an offered label backed by a verbatim quote
-//!   of the owner, never on a task the operator holds.
+//! - **The owner's words are the authority.** The deputy reads what the owner
+//!   said and carries it out: `--settle` records the offered label it read
+//!   from those words, with no quote. Magi checks only that the caller is this
+//!   question's deputy seat, the label is offered and the question is open;
+//!   applying it stays with the daemon or the component that asked.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -216,9 +217,9 @@ pub fn generic_brief(
     let mut s = format!(
         "This question was filed by magi (node `{}`, seat `{}`) with no agent \
          waiting on it. Magi records the owner's answer and the component that \
-         asked applies it; you apply nothing. {knows} A choice whose effect you \
-         cannot read is not yours to guess: do not settle it, ask the owner \
-         what they mean with `--thread` instead.",
+         asked applies it; you apply nothing. {knows} When the owner's words \
+         pick an option, settle it; when you cannot tell which option they \
+         mean, ask them with `--thread`.",
         q.node, q.seat
     );
     if let Some(run) = run {
@@ -247,30 +248,12 @@ pub fn generic_brief(
                 None => s.push_str(&format!(
                     "\n- `{c}`: {}",
                     crate::choice_effect::describe(q, c)
-                        .unwrap_or_else(|| "unsupported legacy choice; do not settle".into())
+                        .unwrap_or_else(|| "unsupported legacy choice; nothing applies it".into())
                 )),
             }
         }
     }
     s
-}
-
-/// Is picking `label` on `q` something that cannot be taken back, so that
-/// `--settle` must hold the owner's words to the same mechanical standard as a
-/// merge (`land::unhedged`)? Discarding a task deletes it; a divergence answer
-/// drops commits.
-pub fn destructive(q: &Question, label: &str) -> bool {
-    crate::consult::destructive_effect(q, label)
-}
-
-/// Does `--settle` hold `q` to the merge-approval rules (the verbatim quote of
-/// the latest message for `merge`, the whole message for `hold`)? A merge
-/// approval, and any other served question that offers `merge` (the release
-/// watcher's local-mode approval merges just as irreversibly).
-pub fn merge_gated(q: &Question) -> bool {
-    q.node == crate::land::APPROVAL_NODE
-        || (kind_of(q).is_some_and(|k| k != Kind::Conduct)
-            && q.choices.iter().any(|c| c == crate::land::APPROVE))
 }
 
 /// Does `q`'s clock run from `asked_at` and never move on a reply? True for the
@@ -446,16 +429,7 @@ impl Deputies {
         self.store
             .update(&q.id, |r| {
                 if r.deputy.is_none() {
-                    r.deputy = Some(Deputy::new(match kind {
-                        Kind::Conduct => brief(&r.run, &r.detail, &r.choices, &r.actions),
-                        Kind::Land => crate::land::deputy_brief(r, state.as_ref()),
-                        Kind::Release => crate::release_watch::deputy_brief(r, &self.home),
-                        Kind::Triage => crate::triage::deputy_brief(
-                            r,
-                            &crate::queue::Queue::at(self.home.join("queue")),
-                        ),
-                        Kind::Generic => generic_brief(r, &r.actions, &self.home),
-                    }));
+                    r.deputy = Some(Deputy::new(brief_for(&self.home, r, kind, state.as_ref())));
                 }
                 if kind == Kind::Conduct && r.cwd.is_none() {
                     r.cwd = Some(repo.clone());
@@ -607,6 +581,25 @@ impl Deputies {
             }
         }
         self.inflight.clear();
+    }
+}
+
+/// The brief for a `kind` question, from what the question stored and the
+/// current state (`state` is the run record of a merge approval).
+fn brief_for(
+    home: &Path,
+    q: &Question,
+    kind: Kind,
+    state: Option<&crate::run::RunState>,
+) -> String {
+    match kind {
+        Kind::Conduct => brief(&q.run, &q.detail, &q.choices, &q.actions),
+        Kind::Land => crate::land::deputy_brief(q, state),
+        Kind::Release => crate::release_watch::deputy_brief(q, home),
+        Kind::Triage => {
+            crate::triage::deputy_brief(q, &crate::queue::Queue::at(home.join("queue")))
+        }
+        Kind::Generic => generic_brief(q, &q.actions, home),
     }
 }
 
@@ -789,9 +782,24 @@ impl Job {
         let read = &thread[..q.delivered_turns.min(thread.len())];
         let unread = q.unread_from_owner();
         let snapshot = q.thread.len();
+        // Only a conductor question's stored brief reaches the seat: it holds
+        // the conductor's own reasoning, which nothing else records, and never
+        // stated settle rules. Every other kind's brief is rebuilt from the
+        // question and today's state for each turn, so a brief stored by an
+        // older build (with owner-evidence rules since removed) never comes
+        // back; the stored copy remains only as a record.
+        let brief = match kind_of(&q) {
+            Some(kind @ (Kind::Land | Kind::Release | Kind::Triage | Kind::Generic)) => {
+                let state = (kind == Kind::Land)
+                    .then(|| crate::run::RunState::load(&q.run).ok())
+                    .flatten();
+                brief_for(&self.home, &q, kind, state.as_ref())
+            }
+            Some(Kind::Conduct) | None => dep.brief.clone(),
+        };
         let current_brief = format!(
             "{}\n\n{}\n\n{}",
-            dep.brief,
+            brief,
             crate::choice_effect::brief(&q),
             crate::queue::dependency_facts(
                 &crate::queue::Queue::at(self.home.join("queue")),
@@ -849,17 +857,17 @@ impl Job {
         let artifacts = self.store.root().join(format!("{}.deputy", q.id));
         let cache_dir = cfg.cache_dir();
         // `magi ask` writes the question record and its lock, which a read-only
-        // sandbox refuses, so the seat cannot be read-only. It is told never to
-        // edit anything; the daemon, not the deputy, applies outcomes.
+        // sandbox refuses, so the seat cannot be read-only. It edits no
+        // repository files; the daemon, not the deputy, applies outcomes.
         let allow_write = true;
         // The question store is outside the repository, and `magi ask` writes it.
-        // A merge approval's deputy also files follow-up tasks with `magi task
-        // add`, which writes the queue; that is the one other place it writes.
+        // A deputy also files the follow-up tasks the owner asks for with
+        // `magi task add`, which writes the queue; that is the one other place
+        // it writes.
         let writable = [self.store.root().to_path_buf(), self.home.join("queue")];
         macro_rules! invocation {
             ($prompt:expr, $stem:expr, $timeout:expr) => {
                 Invocation {
-                    scope: crate::agent::InvocationScope::Repository,
                     coordination: cfg.coordination.as_ref(),
                     fetched_base: None,
                     cwd: &cwd,

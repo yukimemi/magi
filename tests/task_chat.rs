@@ -54,9 +54,12 @@ async fn delivery_waiting_for_chat_does_not_block_task_writes() {
     task.origin_chat = Some(chat.id.clone());
     queue.put(&mut task).unwrap();
     let q = question("run-a");
-    // This is the guard a chat decision holds while its side effects update
-    // the task. Delivery must never hold the task lock while waiting for it.
-    let answer = talks.answer_guard().unwrap();
+    // Another process holds the talk store lock (as a chat turn or decision
+    // does while it writes). Delivery must never hold the task lock while
+    // waiting for it.
+    std::fs::create_dir_all(talks.root()).unwrap();
+    let store_lock = talks.root().join(".store.turn.lock");
+    std::fs::write(&store_lock, "held-by-another-process").unwrap();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         let delivery = scope.spawn(|| {
@@ -85,11 +88,11 @@ async fn delivery_waiting_for_chat_does_not_block_task_writes() {
         let written = written_rx.recv_timeout(std::time::Duration::from_secs(5));
         let waiting = done_rx.try_recv().is_err();
         // Release before asserting so even a regression joins both workers.
-        drop(answer);
+        std::fs::remove_file(&store_lock).unwrap();
         writer.join().unwrap();
         let delivered = delivery.join().unwrap().unwrap();
         assert!(reserved, "destination must be persisted before waiting for the chat");
-        assert!(waiting, "delivery must wait for the held chat guard");
+        assert!(waiting, "delivery must wait for the held talk store lock");
         assert!(written.unwrap().unwrap(), "task writes must finish while the chat is locked");
         assert_eq!(delivered, chat.id);
     });
@@ -127,8 +130,6 @@ async fn existing_closed_chat_reopens_and_delivery_is_durable_once() {
     assert_eq!(magi::chat_notify::talks_to_start(&talks), std::slice::from_ref(&chat.id));
     assert_eq!(queue.get(&task.id).unwrap().chat, Some(chat.id.clone()));
     assert!(!questions.get(&q.id).unwrap().status.open());
-    assert!(magi::chat_control::owned_task(&queue, &chat.id, &task.id).is_ok());
-    assert!(magi::chat_control::owned_task(&queue, "stranger", &task.id).is_err());
     let mut later = question("run-a");
     questions.put(&mut later).unwrap();
     magi::task_chat::sweep(&queue, &talks, &questions, &home);
@@ -209,20 +210,12 @@ async fn routed_merge_accepts_chat_decision_without_quote_or_button() {
     assert!(magi::deputy::fixed_clock(&q));
     // The owner can ask naturally; neither an offered card nor a quote is required.
     assert!(q.clone().answer(Answer::Choice("merge".into())).is_ok());
-    talk::record(&mut chat, &talks, "マージして", vec![]).unwrap();
-    assert!(magi::consult::validate_answer(&q, &talks, &chat.id, magi::queue::CHAT_NODE, "merge", None).is_ok());
-    assert!(magi::consult::authorize_answer(&q, &talks, &questions, &chat.id, magi::queue::CHAT_NODE, "merge", None).is_ok());
-    let mut unrelated = Task::new("Unrelated".into(), "Work".into(), fx.repo.clone(), Source::Human);
-    queue.put(&mut unrelated).unwrap();
-    let mut wrong_task = q.clone();
-    wrong_task.routed_task = Some(unrelated.id);
-    assert!(magi::consult::authorize_answer(&wrong_task, &talks, &questions, &chat.id, magi::queue::CHAT_NODE, "merge", None).is_err());
     assert!(!magi::task_chat::approval_offered(&chat, &q));
-    let answered = magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, magi::land::APPROVE, None).unwrap();
+    let answered = magi::chat_control::decide(&talks, &home, &chat.id, &q.id, magi::land::APPROVE).unwrap();
     assert_eq!(answered.resolution().as_deref(), Some("merge"));
     assert_eq!(answered.merge_target.as_ref().unwrap().head, "reviewed-head");
     assert!(answered.answer_authority.is_none());
-    assert!(magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, magi::land::APPROVE, None).is_err());
+    assert!(magi::chat_control::decide(&talks, &home, &chat.id, &q.id, magi::land::APPROVE).is_err());
     // The compatibility `magi answer` CLI uses the same routed policy from a
     // chat seat, rather than falling back to legacy consultation evidence.
     let mut next = question("run-a");
@@ -237,6 +230,31 @@ async fn routed_merge_accepts_chat_decision_without_quote_or_button() {
         .output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(questions.get(&next.id).unwrap().resolution().as_deref(), Some("merge"));
+    // Routing, not consent: an unattended agent seat cannot answer a routed
+    // task decision through `magi answer`; the task chat records it.
+    let mut plain = question("run-a");
+    plain.answer_timeout = 3600;
+    // A structured action keeps the routed record open for the machinery.
+    plain.actions.insert("old choice".into(), magi::ask::ChoiceAction::Hold);
+    questions.put(&mut plain).unwrap();
+    magi::task_chat::sweep(&queue, &talks, &questions, &home);
+    assert!(questions.get(&plain.id).unwrap().routed_task.is_some());
+    let answer = |node: &str| {
+        common::magi_cli(&home)
+            .args(["answer", &plain.id, "--reply", "old choice"])
+            .env("MAGI_RUN", "run-a").env("MAGI_NODE", node)
+            .output().unwrap()
+    };
+    let refused = answer("implement");
+    assert!(!refused.status.success());
+    let still = questions.get(&plain.id).unwrap();
+    assert!(still.status.open(), "{:?} {}", still.status, String::from_utf8_lossy(&refused.stderr));
+    let output = common::magi_cli(&home)
+        .args(["answer", &plain.id, "--reply", "old choice"])
+        .env("MAGI_RUN", &chat.id).env("MAGI_NODE", magi::queue::CHAT_NODE)
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(!questions.get(&plain.id).unwrap().status.open());
     // A delivered approval never reopens a subsequently closed conversation.
     talk::close(&mut chat, &talks).unwrap();
     magi::task_chat::sweep(&queue, &talks, &questions, &home);
@@ -281,13 +299,11 @@ async fn forwarded_triage_does_not_file_another_question_while_chat_decides() {
     task.origin_chat = Some(chat.id.clone());
     task.hold_machine(Some("Needs a decision".into()));
     queue.put(&mut task).unwrap();
-    assert!(magi::chat_control::owned_task(&queue, &chat.id, &task.id).is_err(), "origin alone grants no control");
     let mut q = question(&task.id);
     q.node = magi::triage::NODE.into();
     questions.put(&mut q).unwrap();
     magi::task_chat::sweep(&queue, &talks, &questions, &home);
     let stored = queue.get(&task.id).unwrap();
-    assert!(magi::chat_control::owned_task(&queue, &chat.id, &task.id).is_ok());
     assert!(magi::triage::pending_for(&questions, &stored));
     for _ in 0..2 {
         assert!(magi::triage::run_once(&queue, &questions, None, jiff::Timestamp::now()).asked.is_empty());
@@ -374,13 +390,12 @@ async fn approval_recovery_uses_chat_control_without_quote_evidence() {
         questions.put(&mut q).unwrap();
         magi::task_chat::sweep(&queue, &talks, &questions, &home);
         assert!(talks.get(&chat.id).unwrap().pending.contains("non-merge recovery"));
-        assert!(magi::chat_control::decide(&queue, &talks, &home, &other.id, &q.id, &choice, None).is_err());
-        assert!(magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, "not offered", None).is_err());
+        assert!(magi::chat_control::decide(&talks, &home, &chat.id, &q.id, "not offered").is_err());
         talk::close(&mut chat, &talks).unwrap();
-        assert!(magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, &choice, None).is_err());
-        magi::talk::reopen(&mut chat, &talks).unwrap();
-        talk::record(&mut chat, &talks, "進めて", vec![]).unwrap();
-        let answered = magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, &choice, None).unwrap();
+        assert!(magi::chat_control::decide(&talks, &home, &chat.id, &q.id, &choice).is_err(), "a closed chat speaks for nobody");
+        // Any open chat records the owner's request: there is no routed-chat
+        // or task-ownership scope.
+        let answered = magi::chat_control::decide(&talks, &home, &other.id, &q.id, &choice).unwrap();
         assert_eq!(answered.resolution().as_deref(), Some(choice.as_str()));
         assert!(answered.answer_authority.is_none());
         if choice == magi::merge_decision::DISMISS {
@@ -431,17 +446,18 @@ async fn publication_divergence_and_release_decisions_route_and_wait_for_the_cha
         assert!(q.status.open());
         assert_eq!(q.routed_chat.as_deref(), Some(chat.id.as_str()));
         assert!(magi::deputy::kind_of(&q).is_none());
-        // Another conversation or an invalid choice records nothing.
-        assert!(magi::chat_control::decide(&queue, &talks, &home, &other.id, id, &q.choices[0], None).is_err());
+        // An invalid choice records nothing.
+        assert!(magi::chat_control::decide(&talks, &home, &chat.id, id, "not offered").is_err());
         assert!(questions.get(id).unwrap().status.open());
-        assert!(magi::chat_control::decide(&queue, &talks, &home, &chat.id, id, "not offered", Some("x")).is_err());
     }
     // Each producer's decision is accepted without quote evidence and remains
     // on its existing consumer path, including exact publication choices.
-    for id in &ids {
+    for (i, id) in ids.iter().enumerate() {
         let q = questions.get(id).unwrap();
         talk::record(&mut chat, &talks, "進めて", vec![]).unwrap();
-        let answered = magi::chat_control::decide(&queue, &talks, &home, &chat.id, id, &q.choices[0], None).unwrap();
+        // Another open chat may record it too: no routed-chat scope.
+        let speaker = if i == 0 { &other.id } else { &chat.id };
+        let answered = magi::chat_control::decide(&talks, &home, speaker, id, &q.choices[0]).unwrap();
         assert_eq!(answered.resolution().as_deref(), Some(q.choices[0].as_str()));
     }
 }
@@ -465,7 +481,7 @@ async fn applied_routed_dependency_detach_stops_waiting_and_allows_a_new_decisio
     let q = questions.list().into_iter().find(|q| q.node == magi::triage::DEPS_NODE).unwrap();
     magi::task_chat::sweep(&queue, &talks, &questions, &home);
     assert!(magi::triage::pending_for(&questions, &root));
-    magi::chat_control::decide(&queue, &talks, &home, &chat.id, &q.id, &q.choices[2], None).unwrap();
+    magi::chat_control::decide(&talks, &home, &chat.id, &q.id, &q.choices[2]).unwrap();
     assert!(magi::triage::pending_for(&questions, &queue.get(&root.id).unwrap()), "answered but not yet applied");
     assert_eq!(magi::triage::apply_answers(&queue, &questions), [root.id.clone()]);
     let after = queue.get(&root.id).unwrap();

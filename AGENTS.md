@@ -874,10 +874,9 @@ codex counterpart of claude's `bypassPermissions`), because `magi task add`
 writes into magi's queue under the home directory and `git fetch` needs
 credentials and the network, which the sandbox refuses. `Invocation::unsandboxed`
 carries it and only `talk.rs` sets it, through `talk::turn_access`; it takes effect
-only together with `allow_write`. A turn that is writable merely because a
-handed-over question is open (`consulted`) keeps the sandbox and only gets the
-question store as a writable root. Consequence accepted: such a turn can write
-outside the repository and reach the network, and what limits it is the prompt
+only together with `allow_write`. Consequence accepted: an opted-in turn can
+write outside the repository and reach the network, and what limits it is the
+prompt
 and the briefing's "small explicit edits only, everything else to the queue".
 `codex_talk_turn_bypasses_sandbox_only_when_opted_in` pins the shape (the flag
 sits before `resume`).
@@ -1834,7 +1833,9 @@ not move on a say.
   (`q.deputy.is_some()`): resuming the conductor's seat there would fork it.
 - **`Question::deputy` is persisted and written only through `Questions::update`**
   (the owner's say and answer write the same file). It holds the brief, the agent,
-  the `SeatState` and `starts`. A restarted daemon resumes the seat only when
+  the `SeatState` and `starts`. A non-conductor deputy's brief is regenerated
+  from current code every turn; the stored one is only a record (a conductor
+  deputy keeps its stored brief). A restarted daemon resumes the seat only when
   `agent::has_session` says so; otherwise a fresh seat gets the whole context
   again. `ask::SCHEMA` is 5 for it, `#[serde(default)]` as ever.
 - **Bounded twice.** `daemon.max_deputies` (default 2) at once, and
@@ -1843,12 +1844,14 @@ not move on a say.
   question, and `daemon::resolve_blockers` then moves a task blocked on an
   abandoned conductor question to a machine hold.
 - **An unread say extends the deadline only for a deputy that can read it**: one with a fresh lease, or one that can still start (`deputy::can_start`: `daemon.max_deputies > 0` and a readable config) with starts left. Past the deadline with none of those, the waiter retires the question. `QuestionView::deputies_enabled` tells the UI, which then says nobody listens and only a choice resolves it.
-- **A say is not a decision.** The deputy answers it with `magi ask --thread`
-  (repeating the choices, which a reply replaces). `magi ask --settle` records an
-  answer only for `MAGI_NODE=deputy` with the seat recorded on the question, an
-  offered label, and a verbatim quote of something the owner said, and never on
-  an `operator_held` task. Applying the outcome stays with the daemon's existing
-  answer path; the deputy applies nothing. It runs with `allow_write: true` because `magi ask` writes the question record and a read-only sandbox (codex) refuses that; like opencode/omp seats, its read-only-ness rests on the prompt.
+- **A say is not a decision until the deputy settles it.** The deputy answers a
+  say with `magi ask --thread` (repeating the choices, which a reply replaces)
+  and, when the owner's words decide the question, records that with
+  `magi ask --settle <id> --choice <label>`. `Question::settle_by_deputy`
+  checks only that `MAGI_NODE=deputy` holds the seat recorded on the question,
+  the label is offered and the question is open; an operator hold on the task
+  does not refuse it. Applying the outcome stays with the daemon's existing
+  answer path; the deputy applies nothing. Every deputy seat runs with `allow_write: true` and gets the question store and the queue directory as writable roots: `magi ask` writes the question record (a read-only sandbox such as codex refuses that) and the deputy files the follow-up tasks the owner asks for with `magi task add`. Like opencode/omp seats, what else it writes rests on the prompt.
 - **A fresh seat takes a short handover turn first**, so its session id is persisted before the hours-long `magi ask --wait` turn (`agent::invoke` learns it only on return). The claim file covers only the start decision (60 s stale), the lease covers the turn, and a spent deputy (`MAX_STARTS`) no longer shields an expired question from the waiter.
 - **The UI says who listens.** `web::holder_of` returns `deputy` only for a fresh
   lease on a question with a deputy, and `nobody` for a conductor question that
@@ -1856,41 +1859,29 @@ not move on a say.
   `daemon`.
 - **A merge approval (`land::APPROVAL_NODE`) has a deputy too, and stays land's.**
   `deputy::kind_of` picks the kind; a land deputy gets `land::deputy_brief` (PR,
-  run, base/winner, contested findings, "merge is irreversible, silence is a
-  hold"; a missing run record is named as missing, never reconstructed). It has
+  run, base/winner, contested findings, "silence is a hold"; a missing run
+  record is named as missing, never reconstructed). It has
   **no `cwd`**, so the waiter's `decide` stays `Idle` for it - the `q.deputy`
   skip rule only ever matters for conductor questions. Its deadline is
   `deputy::deadline`: `asked_at + answer_timeout`, never moved by a reply, the
   same instant `daemon::land_resume_state` abandons the question; land is the
-  only thing that retires an approval. `--settle` on an approval accepts
-  `hold` only when the owner's whole message is that word, and `merge` when the
-  quote is a verbatim part of the owner's **latest** message, possibly among
-  other requests (`Question::settle_by_deputy`). Whether that wording is a
-  clear, unconditional instruction to merge is the approval agent's judgement
-  alone: there is no word list. The only mechanical guards are not judgements -
-  the quote is non-empty and verbatim from the latest message (so the agent
-  cannot invent a basis), the label is an offered one, the seat is the
-  deputy's, and `operator_held` tasks refuse a settle. The owner chose this on
-  purpose - a keyword check refused real instructions and could not read
-  intent anyway - and a wrong merge is recoverable by revert. The prompt and
-  `land::deputy_brief` tell the agent that doubtful, conditional, retracted or
-  questioning wording is not to be settled: it asks back with `--thread`
-  (doubt and silence are a hold), and the button always works. Silence is still a
-  hold, and `operator_held` tasks still refuse a settle. A reply that asks for
+  only thing that retires an approval. `--settle` records `merge` or `hold`
+  when the owner's words ask for it, possibly among other requests. Reading
+  that intent is the deputy's judgement alone: there is no word list or
+  wording check. The owner chose this on purpose - a mechanical check refused
+  real instructions - and a wrong merge is reverted. Silence is still a hold,
+  and the button always works. A reply that asks for
   **follow-up tasks** is carried out by the deputy with `magi task add --hold
   <reason>` (the task is filed already held by hand, so nothing runs before the
   pull request lands, and it says so). Once the merge is confirmed,
   `followup::settle_deputy_tasks` releases them (see "A merge must not take
   open findings with it"); the hold reason must name the pull request, which
   the prompt tells the deputy to do. Without that, only `magi task release`
-  runs it. The deputy
-  seat now also gets the queue directory as a writable root, so - as for
-  opencode / omp seats - its being limited to those two writes rests on the
-  prompt, not on the sandbox. `magi task add` from `MAGI_NODE=deputy` leaves
-  the claims of the approved run's own task out of the `dupes` check (never
-  `--force`); every other claim still refuses. The
-  operator-held check resolves the task through the run id. `holder_of` says
-  `nobody` for an approval with no live deputy, and `app.js` says so.
+  runs it. `magi
+  task add` from `MAGI_NODE=deputy` leaves the claims of the approved run's
+  own task out of the `dupes` check (never `--force`); every other claim still
+  refuses. `holder_of` says `nobody` for an approval with no live deputy, and
+  `app.js` says so.
 - **A release-watch question has a deputy too, and stays the watcher's.**
   `deputy::kind_of` returns `Kind::Release` only for `node == bump::NOTICE_NODE`
   *and* `seat == "release-watch"` (bump files choice-less notices on the same
@@ -1902,15 +1893,13 @@ not move on a say.
   (`deputy::fixed_clock`); an expired question is left to "silence is a hold".
   `release_watch::deputy_brief` says what each choice does, matched to
   `apply_answer`: `leave it` stops watching and dismisses the notice, it does
-  **not** close the pull request. The deputy applies nothing and never merges,
-  closes, reruns or pushes: `--settle` records a choice and the watcher applies it
-  on its next lap (`WatchState::applied` makes that once). `deputy::merge_gated`
-  puts a local approval's `merge` / `hold` under the merge-approval rules
-  (verbatim quote for `merge`, whole message for `hold`); `ask_settle_cmd` finds the task for the
-  `operator_held` check through `WatchState::run` and, when the record or run is
-  unknown, lets the settle through (nothing here releases a task). As for
-  opencode / omp seats, the deputy runs with `allow_write` and its read-only-ness
-  rests on the prompt. It is given no follow-up-task authority.
+  **not** close the pull request. The deputy applies nothing itself:
+  `--settle` records the choice the owner asked for (a local approval's
+  `merge` included) and the watcher applies it on its next lap
+  (`WatchState::applied` makes that once). Follow-up tasks the owner asks for
+  are filed with plain `magi task add` (as triage and generic deputies do);
+  what no command can do (closing a PR, rerunning CI, pushing) is reported in
+  `--note` / `--thread`.
 - **Every open question the owner can say something to has a deputy.**
   `deputy::Kind::Triage` serves `triage::NODE` / `triage::DEPS_NODE` (brief:
   `triage::deputy_brief`, which lists each position as `interpret_answer` /
@@ -1921,30 +1910,22 @@ not move on a say.
   `magi ask` from inside a run records its `cwd` and keeps its asker / waiter,
   and a seat's node is its own name (a reviewer's `review` is also the
   divergence node). A choice-less question and `bump`'s own notices stay
-  unserved. `generic_brief` states only what the question stored and tells the
-  seat to ask back (`--thread`) rather than guess an effect it cannot read.
+  unserved. `generic_brief` states only what the question stored; an effect
+  it cannot read is never guessed.
 - **Only a conductor question is ever given a `cwd`** (`Deputies::attach`).
   Any other kind with one would be resumed and expired by the waiter beside its
   deputy. Triage / Generic deputies run in the task's repo (`Question::run` as a
   task id) or the serve repo, on a last-activity clock like a conductor's; the
   waiter never retires a `cwd`-less question, so an expired one stays open (as it
   did before) and only an unread say starts a deputy after the deadline.
-- **`--settle` gates were widened, not loosened.** `ask_settle_cmd` resolves the
-  task through `run` as a task id *or* as a run id for every kind, so the
-  `operator_held` refusal covers Triage and Generic (most triage holds are
-  operator's, so their deputy asks the owner to tap the button).
-  `deputy::merge_gated` applies to any served non-conductor kind that offers
-  `merge`. `deputy::destructive` (triage discard, the divergence answers) needs
-  the owner's latest message to pass `land::unhedged`, the hedge / negation /
-  retraction check `land::merge_intent` is built on.
 - **A settle can carry a note** (`magi ask --settle ... --note`, `ask::Turn::note`,
   `ask::SCHEMA` 7, `#[serde(default)]`). It is the deputy's own report - task ids it
   filed, requests it could not carry out - stored on the "Settled as" turn by
-  `settle_by_deputy` only after every guard passed. magi does not verify it, which is
+  `settle_by_deputy` only when the settle succeeds. magi does not verify it, which is
   why it is a field of its own and not part of `body`; the web card shows it under the
   turn (`thread_notes_md`), `magi answer <id>` on a closed question prints it, and a
-  resumed deputy reads it back as `(note: ...)`. Deputies with no authority to file
-  tasks are told to name any request they did not carry out.
+  resumed deputy reads it back as `(note: ...)`. Requests no command can carry
+  out (closing a PR, rerunning CI, pushing) are named there.
 - **A new question node must be added to `unasked_questions()` in
   `tests/deputy.rs`**, which asserts `deputy::kind_of` is `Some` for each node
   filed without an asker; a node that is not listed there can ship unheard.
@@ -2592,9 +2573,8 @@ own turn machinery runs it. No new seat, no new waiter, never a fresh agent.
 - **Scheduler replacement cancels nothing.** Already-reserved Chat jobs continue;
   later service ticks use the replacement generation. Explicit parking still
   suppresses new automatic starts.
-- **The notice is not the owner's word.** `consult::latest_message` skips
-  messages that are a task notice, so a merge approval's `--quote` can never
-  be taken from one.
+- **The notice is not the owner's word.** It is automatic data: the chat
+  briefing tells the agent never to treat it as an owner request.
 - **`magi talk post <talk-id> <message>`** appends an agent turn
   (`Turn::posted_by` = the posting run) without a draft, a lease or a turn.
   `chat_notify::authorize_post`: `MAGI_RUN` and `MAGI_NODE` must both be set,
@@ -2610,9 +2590,9 @@ own turn machinery runs it. No new seat, no new waiter, never a fresh agent.
   that filed tasks and registered watches report back; `Talk::notified` and
   `Turn::posted_by` are `#[serde(default)]`, `talk::SCHEMA` is unchanged.
 
-### The chat controls its own tasks and runs directly
+### The chat controls tasks and runs directly
 
-`src/chat_control.rs`, `magi task control resume|hold|release|retry|rerun-checks|abandon`.
+`src/chat_control.rs`, `magi task control resume|hold|release|retry|rerun-checks|decide|abandon`.
 It adds who-may-ask and what-about, nothing else: every effect reuses an
 existing transition (`resume::pin_queued`, extracted from the daemon's
 `ResumeRun` branch; `Task::hold_manual`; `Task::release_operator`;
@@ -2620,11 +2600,10 @@ existing transition (`resume::pin_queued`, extracted from the daemon's
 `driver::abandon_proven_dead`). Do not reimplement them here.
 
 - **Authorization.** `MAGI_NODE=chat` and `MAGI_RUN` equal to an open talk id
-  (`chat_watch::authorize`). **Scope** is `Task::filed_by_chat() == talk` and
-  the runs in that task's `runs`; an inherited `origin_chat` or follow-up is
-  out. Execution commands need a full run id. The relation is re-checked under
-  the task's claim. Not in `consultation_command_allowed`, so a consultation
-  excludes it.
+  (`chat_watch::authorize`). Targets resolve normally: any task id, not only
+  the tasks this chat filed, since the owner may direct any work from a chat.
+  Execution commands need a full run id. An open consultation does not block
+  these commands.
 - **Resume queues, never starts.** It pins the task (`OperatorResume`, no question) and the loop resumes under the execution lease.
   Question なしの再送では同じ run の既存 pin を維持し、履歴を増やさない。
   `resume_override.question_id` は空文字列とし、架空の Question ID を記録しない。
@@ -2636,19 +2615,29 @@ existing transition (`resume::pin_queued`, extracted from the daemon's
   `chat-controls/<talk>/<request>.json` に受付を記録する。ledger の識別子は
   `chat:<talk>:<request>`。同一 ID の別操作への使い回しと結果不明時の再送を拒否し、
   共通遷移で head・workflow の一致を再確認する。
-- **Abandon** requires the owner's latest persisted send to be exactly
-  `abandon-run: <run>` and `--quote` of it, under the talk evidence guard,
-  then the shared Dead-only judge. The grammar is the same idea as
-  `consult::TaskOperation`.
-- **Out of scope:** merging。通常のチャットは既存の sandbox・network・cwd を維持し、
+- **Abandon** needs only the owner's request (no phrase): the shared Dead-only
+  judge (`driver::abandon_proven_dead`) runs under the owner lock, and a Live
+  or Unknown driver is refused.
+- **Transport.** 通常のチャットは既存の sandbox・network・cwd を維持し、
   queue / questions / choice-actions / run / transcript への書き込み権限を追加しない。
   `chat_control::bridge` が Unix の継承済み通信路で型付き操作だけをランチャーへ渡す。
-  ランチャーは起動時の talk を固定し、要求ごとに open・非 consultation・所属・確認文・
-  既存遷移の条件を検証する。任意コマンド、パス、別の talk、merge は要求できない。
+  ランチャーは起動時の talk を固定し、要求ごとに open と既存遷移の条件を検証する。
+  任意コマンド、パス、別の talk は要求できない。merge 承認は `decide` で回答として
+  記録し、既存の land 処理が保存済み head に対して実行する。
   同時 CLI は継承した未リンクの lock FD の POSIX process lock で直列化し、
   request ID で応答を照合する。通信路の準備失敗は警告のみで会話を継続する。
   完了・中断・fallback は通信路を破棄する。非 Unix には通信路を提供しない。
-  CLI を席の外から実行する場合も、従来どおり chat / open talk / 所属の認可が必要。
+  CLI を席の外から実行する場合も、従来どおり chat / open talk の認可が必要。
+- **Answers.** A chat seat's `magi answer --reply` / `--reply-other`
+  (`MAGI_NODE=chat`) is sent as `Operation::Answer` / `Operation::ReplyOther`
+  through the same `chat_control::dispatch` (bridge, or the local route with
+  the same Unavailable + `MAGI_ALLOW_WRITE=1` fallback), and the launcher
+  records it with the terminal's own `ask::record_answer` /
+  `consult::reply_other`, an obsolete approval's run-record dismissal
+  included. So a read-only chat answers without any write grant; an open
+  question or consultation never widens a turn's access (`talk::turn_access`
+  follows `[talk] allow_write` alone). Terminal, deputy and other seats write
+  directly. `--say` stays direct.
 - The Question system is untouched and keeps working in parallel.
 
 ### Telling the chat how a command it watched ended
@@ -2691,9 +2680,9 @@ inherits `MAGI_RUN` / `MAGI_NODE`.
   next serve startup if serve is stopped; the job continues independently.
 - **Automatic text stays automatic.** `prompt::chat_watch_notice` creates a
   fixed English report with scrubbed, clipped, defused output quoted as
-  untrusted data. `prompt::is_completion_notice` is shared by draft-start
-  detection and `consult::latest_message`, so a report cannot become an owner
-  approval quote and cannot start an owner's unsent draft. The chat briefing
+  untrusted data. `prompt::is_completion_notice` keeps a report from starting
+  an owner's unsent draft, and the chat briefing treats it as data, never as an
+  owner request. The chat briefing
   forbids promises to report back unless task filing or watch registration
   succeeded. Watches do not grant additional repository write permissions.
 
@@ -2709,13 +2698,9 @@ with `magi answer` or puts the decision points to the owner in the chat.
 - **One judge.** `consult::origin_talk` is the only place that decides a
   question has a chat to ask (open question, task from a chat, existing
   talk, and never `bump::NOTICE_NODE`). Closed talks can be reopened. Merge
-  approvals can be consulted,
-  but the chat must wait for explicit owner confirmation. `magi answer` from
-  a chat supports independent current owner evidence through
-  `consult::authorize_answer`; consultation delivery is not authority.
-  `--quote` must bind the latest persisted owner send and exact question/choice.
-  The README decision matrix documents individual and batch consent, manifests,
-  retained legacy same-chat answers and downstream execution restrictions.
+  approvals can be consulted; silence is a hold. The chat records the owner's
+  decision with `magi answer <id> --reply <choice>`, merge included; delivery
+  itself decides nothing.
   `QuestionView::can_consult_chat` records eligibility. Navigation uses
   `consult::associated_talk` / `associated_talk_with_watches` separately:
   `Question::run_names_task()` distinguishes exact task ids from run ids;
@@ -2736,35 +2721,12 @@ with `magi answer` or puts the decision points to the owner in the chat.
   a second tap is a no-op. Written through `Questions::update`.
 - **The talk-turn gate is cross-process.** `Ui::talk_turns` (in-process, source of the 409 / queued / busy responses) is layered with an on-disk lease, `<talks>/<id>.turn` (`Talks::claim_turn` -> `talk::TurnLease`; not a `*.json`, so `list` ignores it and `revision` skips it). Content `{token, pid, beat_at}`; held means a beat within `ask::LEASE_TTL` (90 s), no pid checks. Acquire is `create_new`; a stale or unreadable lease is replaced only under a short-lived exclusive `<id>.turn.lock` (aged out after 10 s), so one taker wins. Release / beat only act while the file still carries the guard's own token. The web claim inserts into `live` first, then takes the lease, and undoes the insert if the lease is refused; `is_thinking` is `live` or `Talks::turn_held`. `talk::respond` and `talk::say` take a `&TurnLease` for that talk (checked against the talk's id) and run the turn inside `TurnLease::beating` every `talk::TURN_BEAT` (20 s), no extra task, so a starter without a lease does not compile; `turn` stays private. A crashed turn leaves the talk busy for up to 90 s. `magi answer --ask-chat` (`consult::start_turn`) takes the lease *before* `consult::begin`, then drains the draft and runs the turn synchronously; a lease held elsewhere is reported (`Started::Busy`, non-zero exit) and leaves no consult record or draft. `say` against a lease held by another process answers 409 (`TalkTurnStart::Foreign`) rather than queueing, since no local drain loop would ever answer that draft. Every change to an existing lease (takeover, beat, release) happens under the `.turn.lock`, new leases are published by hard-linking a complete file, and a beat that finds the lease taken over stops the turn. Publication (`publish_exclusive`) is `hard_link` first; only an *unsupported* error falls back to an exclusive `create_new` of the path itself, written through that handle (never a `rename` over it), and `lease_blocks` treats an empty file younger than 10 s as held. Removing a lock is `remove_if_carries` (rename aside, verify, restore exclusively), used by both `TurnLock::take` and its `Drop`; no path-only compare-and-unlink exists, so a fourth party publishing during the microseconds the file is aside can still overlap with the displaced holder until TTL (warned). A guard releases the on-disk lease before the in-process slot.
 - **Consultation activity is persisted separately from question resolution.**
-  `consult::active_consult` / `pending_consults` exclude answered/abandoned
-  questions and questions with `consult_outcome`. `magi answer --reply-other`
-  saves the latest whole owner send as an evidenced note and ends consultation
-  without changing `Question::answer`, Open status, choice actions or waiter.
-  The next turn becomes ordinary only when no active consultation remains.
-  Keep the invocation's initial scope throughout; closing a question mid-turn
-  must not unlock other writes in that same process.
-- **Additional writes have a closed consent inventory.** Consultation control
-  permits only `task add|release|hold|done|priority` beyond `magi answer`.
-  `consult::TaskOperation` binds exact operation/arguments and full resolved task
-  ids to a real latest owner send after delivery, quoted whole with `--quote`.
-  The owner instruction is `task-operation: <typed JSON>` (README has examples),
-  not a substring, assistant interpretation or batch instruction. Natural
-  language outside that grammar needs the exact required instruction presented
-  once. Task add permits positional text, optional `--solo` and the conversation
-  repository with default execution options. Keep existing claims/state checks.
-  Hold the conversation evidence lock from validation through queue publication
-  and `done` history writes. Task add releases preliminary evidence before async
-  preparation, then reacquires the lock and validates the latest persisted talk
-  again immediately before publication. Destructive operations and other task mutations
-  stay excluded; answer-specific stricter effect policies are unchanged.
-- **Scope and grants travel together.** `MAGI_TURN_SCOPE` carries the invocation
-  scope into supported CLI commands even after consultation ends. Investigation
-  permits diagnostics only; control permits the closed write inventory. Grant
-  questions, evidence locks and queue storage, plus exact history directories for
-  evidenced `done`, never the whole state root or a sandbox bypass. The CLI is
-  the authorization boundary; writable directories alone do not enforce policy.
-  Both delivery and per-turn scope prompts must explain available writes and
-  that an alternative note leaves the question/waiter unresolved.
+  Answered/abandoned questions and questions with `consult_outcome` are no
+  longer active consultations. `magi answer --reply-other` saves the owner's
+  alternative as a note and ends consultation without changing
+  `Question::answer`, Open status, choice actions or waiter. A consultation
+  adds no restriction to the chat: the same turn can investigate, answer and
+  run `magi task` commands for the owner.
 
 - **No new seat, no new waiter.** The text goes in through `talk::queue`, and
   the talk's own turn gate and session run it. The web route starts the drain
@@ -2979,23 +2941,11 @@ fallback; a language-withheld field becomes neutral.
   matches; an edit failure blocks the run. A missing rewrite falls back, as do
   silence, timeout and abandonment. Restart and retry reuse the saved pair;
   no text is copied into event messages or notifications.
-- **A deputy may settle `post original` or `use rewrite` only under the
-  irreversible-choice guard.** `deputy::destructive` names it by *label* (not
-  position: the retry question has the same choices, but never rely on order), so `--settle` needs a
-  verbatim quote of the owner's latest message that passes `github_text::posting_authorized`.
-  `github_text::deputy_brief` is appended to the Generic brief for this node and
-  says publishing is irreversible and doubt means asking back with `--thread`.
-  A consulted chat is held to the same rule: `consult::validate_answer` requires
-  `--quote` from the owner's latest message, passing `github_text::posting_authorized`, for
-  `post original` and `use rewrite` (`use fallback` stays unguarded).
-  `consult::QuestionKind` selects this policy by node; posting replies must be
-  offered choices. The quote must identify the chosen text explicitly. Posting
-  tolerates a leading Japanese discourse dismissal and specific explanation
-  wording about insufficient detail, while conditions, negation and retraction
-  still reject it. Before sentence splitting, quoted or parenthesized context in
-  either the message or evidence requires clarification, even with unmatched
-  delimiters; only single-quote apostrophes between ASCII letters are exempt.
-  Merge approvals retain their separate quote/hold policy.
+- **A deputy or chat records `post original`, `use rewrite` or `use fallback`
+  as the owner asks**, by *label* (never position: the retry question has the
+  same choices). No wording check applies. `github_text::deputy_brief` is
+  appended to the Generic brief for this node and explains what each choice
+  publishes.
 - **A replacement goes through the same gate** (`github_text::vet_title`, with
   the `language_judge` when configured). Sensitive data is rejected, never
   redacted into text the owner did not write. A failing reply gets one more
@@ -3131,7 +3081,7 @@ question state or guessing the boundary within arbitrary question detail.
 
 Approval choice tokens are stable; `Question::merge_target` holds the displayed
 PR/head independently of localized labels. Stop actions survive head movement;
-merge consent does not. Closed owner decisions retire the old execution even
+merge approval does not. Closed owner decisions retire the old execution even
 before a replacement run exists. Replacement ownership stays in the same queue
 task, with `Task::replacement` and `RunState::replaces` linking the attempts.
 `graph.selected_implementer` pins both the implementation seats and their
@@ -3160,29 +3110,29 @@ agent replies retain their own authorization. A delivery rejection uses HTTP
 422 / `question_text_unavailable`, preserving drafts and all previously saved
 text; decision choices are independent of delivery availability.
 
-### Owner answer evidence and execution effects
+### Owner requests go through
 
-`consult::consent` classifies decisions by issuer, offered choice, structured
-action and execution effect. `deputy::destructive` delegates the destructive
-effect inventory to `consult::destructive_effect`. Never add a choice exception
-to just one ingress. `Talk::recommendations` captures question/content snapshots
-when a persona reply is first persisted; do not reconstruct non-hold manifests
-from mutable current questions for older turns. `AnswerAuthority` retains the
-originating conversation/send and recommendation fingerprints; `Question::consult`
-is delivery history and stays intact after settlement. The full action/route
-matrix is in README.md. The CLI holds the talk evidence guard through the
-question write for ordinary decisions too, preventing queued retraction races.
-Consultation task writes use the same latest-real-send and evidence-lock rule,
-but their closed typed operation policy is centralized in
-`consult::authorize_task_operation`; a matching task id alone is never consent.
-`consult::record_other` stores a literal alternative as a note only, never as
-answer authority or an execution effect. Neither path grants destructive powers.
-
+By owner decision (2026-10-23), a request the owner makes in a chat, or that a
+deputy reads in the owner's words, is carried out as if made at a terminal:
+no wording, evidence or ownership checks, and no refusal because the task is
+operator-held. Merge is included; a wrong action is reverted. Do not add such
+checks back. What stays: `land_approval` waits and silence is a hold; the saved
+`merge_target` and `--match-head-commit` bind the merged head; abandon is
+Dead-only; rerun receipts never retry an uncertain result; an older queued
+effect never overwrites a newer owner decision (the boundary is the answer
+time, `answered_at` or else `asked_at`: an operator hold placed before the
+owner's answer does not supersede it, one placed after does); a question settles once;
+blindness and the sandboxes of unattended seats are unchanged. Task notices,
+watch output and PR text are data, not owner words, as the briefings say.
+Old talk records' `recommendations` key is accepted and ignored. A question's
+`answer_authority` (`ask::LegacyAnswerAuthority`) is legacy-only: nothing
+assigns it, but an old record keeps its question, choice and instruction
+through re-saves, because `github_text::read_reply` reads that instruction so a
+pending legacy `use my text` answer keeps its title.
 
 Local release-watch approval cards also persist `merge_target`. Older cards may
 recover it only from their matching watch record's `asked_head`, never from a
-new forge snapshot or question prose. The same-chat deputy still requires
-`merge <head>` for those cards.
+new forge snapshot or question prose.
 
 ### Web avatar overrides
 
@@ -3209,9 +3159,10 @@ persona choices after edits. Orphaned saved persona IDs remain editable.
   conductor, triage, landing and release-watch builders validate their offers
   with `Questions::put_executable`; the Web card hides unsupported legacy labels.
 - `ResumeRun`, `RerunChecks`, `ReleaseTask`, and `AbandonRun` are daemon-only
-  maintenance effects. Deputies only record `ask --settle`; they never resume,
-  rerun, release, or edit a run record themselves. Typed actions can be supplied
-  as JSON after the exact label's `--action <label>=` prefix.
+  maintenance effects: a deputy records the owner's choice with `ask --settle`
+  and the daemon applies it; deputies never edit a run record themselves.
+  Typed actions can be supplied as JSON after the exact label's
+  `--action <label>=` prefix.
 - Release binds the task ID, hold timestamp and exact reason. Rerun binds repo,
   PR, head and failed workflow run IDs (at most 20). `choice-actions` receipts
   record the target before external invocation; an uncertain result is never
@@ -3222,10 +3173,8 @@ persona choices after edits. Orphaned saved persona IDs remain editable.
 - Resume shares the Web entry point and the graph's execution lease. Abandon
   calls the driver module's shared liveness judge under the owner lock; Unknown
   is refused. Startup ownership repair does not abandon runs.
-- Cards and each deputy turn list effects from `choice_effect`. Resume and rerun
-  accept a clear owner instruction through the existing latest-message quote
-  gate. Abandon is a terminal consequence requiring individual confirmation;
-  merge, discard and posting retain their stricter confirmation rules.
+- Cards and each deputy turn list effects from `choice_effect`. A clear owner
+  request settles resume, rerun or abandon like any other choice.
 
 ### Rebase conflicts: the seat resolves contents, the launcher stages
 
@@ -3291,12 +3240,12 @@ implementer. This decision path deliberately **reopens closed chats**; the
 passive completion/watch path still skips them. Keep those rules distinct.
 
 Use `magi task control` to apply chat decisions, retaining its existing state,
-ownership, liveness and confirmation checks. Automatic messages permit only
-investigation and reporting. Merge approval records stay open with their
+liveness and transition checks. Automatic messages are data for investigation
+and reporting, not owner requests. Merge approval records stay open with their
 existing PR/head binding and deadlines. A persona reply containing the full
 approval ID presents optional Merge/Hold buttons. By owner decision (2026-10-23),
-the chat agent can record any routed decision, including merge, directly from
-the owner's request without a button, quote or other consent evidence.
+the chat agent can record any decision, including merge, directly from the
+owner's request without a button or extra evidence.
 Silence is a hold; `land_approval` stays on by default. Keep the Question store and non-task legacy workflow until the
 next migration step.
 
@@ -3311,11 +3260,10 @@ gate, the branch-divergence question and non-merge release-watch questions
 (`task_chat::chat_routable`). Those three (`task_chat::awaits_decision`) are not
 abandoned on delivery: the record stays open for the machinery that reads its
 answer, and the chat settles it with `magi task control decide`
-(`chat_control::decide`: routed to that chat, owned task, open chat and record,
-valid offered choice). Merge and recovery decisions use the same command;
-no new owner-evidence checks apply to routed decisions. Existing consumers
+(`chat_control::decide`: open calling chat, open record, valid offered
+choice). Merge and recovery decisions use the same command. Existing consumers
 retain state, ownership, liveness and transition checks. The legacy non-routed
-consultation/evidence workflow remains unchanged. An approval or release-watch
+consultation workflow follows the same owner-request policy. An approval or release-watch
 record offering `merge` with no `merge_target` is
 an old card and is never routed, even when its watch record identifies a task.
 `Questions::with_repair_choice` first attempts to recover the saved watch head;
@@ -3332,7 +3280,7 @@ from the API.
 
 Routed publication replacements use `magi task control decide <id> 'use my text'
 --title '<literal title>'`. `Question::publication_title` stores the replacement
-as data without quote evidence or a fabricated owner thread entry;
+as data without a fabricated owner thread entry;
 `github_text::read_reply` passes it through the existing title vetting and
 publication path. Missing/empty title data cannot settle that choice.
 Applied triage decisions must not remain pending chat decisions:

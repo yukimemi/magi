@@ -72,7 +72,6 @@ fn slow_release_auth_does_not_delay_cli_exit() {
             .env_remove("GITHUB_TOKEN")
             // This test alone exercises updates, through fake gh and a private cache.
             .env_remove("MAGI_NO_AUTOUPDATE")
-            .env_remove("MAGI_TURN_SCOPE")
             .env_remove("MAGI_RUN")
             .env_remove("MAGI_NODE")
             .stdin(Stdio::null())

@@ -952,14 +952,10 @@ where
         && q.resolution()
             .as_deref()
             .is_some_and(crate::merge_decision::stops);
-    // Repair and stop actions are new decisions on an existing approval card. A
-    // manual hold before that answer must not discard it just because the
-    // card predates the hold. Keep the older policy for other choice actions.
-    let decision_at = if repair || stopping {
-        q.answered_at.unwrap_or(q.asked_at)
-    } else {
-        q.asked_at
-    };
+    // An answer is the owner's decision as of when it was given: a manual hold
+    // placed before it (even after the question was asked) was seen and
+    // overruled by it, while a hold or release after it supersedes it.
+    let decision_at = q.answered_at.unwrap_or(q.asked_at);
     if task.operator_decided_at.is_some_and(|at| at > decision_at) {
         return if repair || stopping {
             ActionDecision::Refuse(format!(
@@ -1299,7 +1295,8 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                     ask::ChoiceAction::ResumeRun { run } => {
                         crate::resume::validate(home, run)?;
                         record("started")?;
-                        if !crate::resume::pin_queued(queue, run, Some(q.asked_at), Some(&q.id))? {
+                        let decided = q.answered_at.unwrap_or(q.asked_at);
+                        if !crate::resume::pin_queued(queue, run, Some(decided), Some(&q.id))? {
                             crate::resume::validate_unqueued(home, run)?;
                             crate::resume::start(home, run.clone()).await?;
                         }
@@ -1334,7 +1331,9 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                             task.status == TaskStatus::Held
                                 && task.held_at == Some(*held_at)
                                 && task.hold_reason.as_deref() == reason.as_deref()
-                                && task.operator_decided_at.is_none_or(|at| at <= q.asked_at),
+                                && task
+                                    .operator_decided_at
+                                    .is_none_or(|at| at <= q.answered_at.unwrap_or(q.asked_at)),
                             "task no longer has the hold this question names"
                         );
                         task.release_operator("choice", Some(&q.id));
@@ -11526,8 +11525,7 @@ mod tests {
             controlled.runs.push(state.id.clone());
             controlled.hold_machine(Some("land stopped".into()));
             queue.put(&mut controlled).unwrap();
-            let resumed =
-                crate::chat_control::resume(&queue, home.path(), "talk", &state.id).unwrap();
+            let resumed = crate::chat_control::resume(&queue, home.path(), &state.id).unwrap();
             assert_eq!(resumed.status, TaskStatus::Queued);
             assert_eq!(
                 resumed.resume_override.unwrap().pinned_run,
@@ -11679,8 +11677,7 @@ mod tests {
             controlled.runs.push(state.id.clone());
             controlled.hold_machine(Some("verification resource unavailable".into()));
             queue.put(&mut controlled).unwrap();
-            let resumed =
-                crate::chat_control::resume(&queue, home.path(), "talk", &state.id).unwrap();
+            let resumed = crate::chat_control::resume(&queue, home.path(), &state.id).unwrap();
             assert_eq!(resumed.status, TaskStatus::Queued);
             assert_eq!(
                 resumed.resume_override.unwrap().pinned_run,
@@ -11882,7 +11879,7 @@ mod tests {
             queue.put(&mut task).unwrap();
             let before_task = serde_json::to_value(queue.get(&task.id).unwrap()).unwrap();
             let before_run = serde_json::to_value(&state).unwrap();
-            let error = crate::chat_control::resume(&queue, home.path(), "talk", &state.id)
+            let error = crate::chat_control::resume(&queue, home.path(), &state.id)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(expected), "{error}");

@@ -292,17 +292,6 @@ pub enum ChoiceAction {
 }
 
 impl ChoiceAction {
-    /// Queue owners affected by a named maintenance action.
-    pub fn targets(&self, task: &crate::queue::Task) -> bool {
-        match self {
-            Self::ReleaseTask { task: id, .. } => task.id == *id,
-            Self::ResumeRun { run } | Self::AbandonRun { run } | Self::Resume { run } => {
-                task.runs.contains(run)
-            }
-            _ => false,
-        }
-    }
-
     /// Maintenance effects are applied exclusively by the daemon.
     pub fn maintenance(&self) -> bool {
         matches!(
@@ -705,9 +694,13 @@ pub struct Question {
     /// that the chat was asked, so a second tap does not post it twice.
     #[serde(default)]
     pub consult: Option<ChatConsult>,
-    /// Persisted owner evidence for a standing conversation answer.
+    /// Owner evidence a chat answer persisted before owner requests went
+    /// through without consent checks. Kept (reduced to the fields below) so
+    /// an old record keeps loading (`deny_unknown_fields`) and an old pending
+    /// `use my text` answer keeps its title through a re-save
+    /// ([`crate::github_text::read_reply`]); nothing assigns it any more.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub answer_authority: Option<crate::consult::AnswerAuthority>,
+    pub answer_authority: Option<LegacyAnswerAuthority>,
     /// Owner decision outside the choices; ends consultation without answering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consult_outcome: Option<crate::consult::ConsultOutcome>,
@@ -724,6 +717,19 @@ pub struct ChatConsult {
     pub talk: String,
     /// When it was posted.
     pub at: Timestamp,
+}
+
+/// The part of an old record's `answer_authority` that is still read: the
+/// owner instruction an old pending `use my text` answer took its title from.
+/// Every other key of the old evidence is ignored on load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyAnswerAuthority {
+    /// Question the old evidence was bound to.
+    pub question: String,
+    /// Choice the old evidence was bound to.
+    pub choice: String,
+    /// The owner's full instruction.
+    pub instruction: String,
 }
 
 impl Question {
@@ -853,7 +859,7 @@ impl Question {
         match matches.as_slice() {
             [(label, _)] => Ok(label.as_str()),
             [] => bail!(
-                "alias mismatch with offered choices: `{reply}` is not an offered label or supported action alias; exact labels: {}; inspect `magi answer --list`, copy the intended offered label verbatim into --reply, and retry once only if the same owner authorization still holds (action descriptions and bracketed annotations are not reply values)",
+                "alias mismatch with offered choices: `{reply}` is not an offered label or supported action alias; exact labels: {}; inspect `magi answer --list`, copy the intended offered label verbatim into --reply, and retry once (action descriptions and bracketed annotations are not reply values)",
                 serde_json::to_string(&self.choices).expect("serialize labels")
             ),
             _ => bail!(
@@ -934,7 +940,14 @@ impl Question {
             ),
             _ => {}
         }
-        if body.eq_ignore_ascii_case(crate::land::HOLD) && self.actions.contains_key(body) {
+        // `hold` is the safe word: it may carry the hold effect itself, but a
+        // producer that put any other effect behind it made a mistake.
+        if body.eq_ignore_ascii_case(crate::land::HOLD)
+            && self
+                .actions
+                .get(body)
+                .is_some_and(|a| *a != ChoiceAction::Hold)
+        {
             bail!("hold cannot execute a question action");
         }
         self.answered_at = Some(Timestamp::now());
@@ -987,23 +1000,18 @@ impl Question {
         }
     }
 
-    /// A deputy recording that the owner's own words settled the question.
+    /// A deputy recording the owner's decision, read from the owner's words.
     ///
-    /// The owner decided in free text ("setup done") on a question that offers
-    /// choices, so no choice was ever tapped. This records `label` as the
-    /// answer - and nothing else: applying it is the daemon's existing path
-    /// for an answered conductor question. Refused unless the caller is this
-    /// question's deputy seat, `label` is one of the offered choices, and
-    /// `quote` appears verbatim in something the owner said; the quote is
-    /// kept in the thread as an agent turn so the record shows what the
-    /// decision rests on.
-    pub fn settle_by_deputy(
-        &mut self,
-        seat: &str,
-        label: &str,
-        quote: &str,
-        note: Option<&str>,
-    ) -> Result<()> {
+    /// The owner decided in free text ("setup done", "merge it") on a
+    /// question that offers choices, so no choice was ever tapped. This
+    /// records `label` as the answer - and nothing else: applying it is the
+    /// daemon's or component's existing path for an answered question. The
+    /// deputy's reading of the owner's words is the authority; no quote is
+    /// needed. Refused only when the question is routed to a task chat (that
+    /// chat settles it), the caller is not this question's deputy seat,
+    /// `label` is not an offered choice, or the question is no longer open.
+    /// `note` is the deputy's optional explanation, kept with the record.
+    pub fn settle_by_deputy(&mut self, seat: &str, label: &str, note: Option<&str>) -> Result<()> {
         if self.routed_task.is_some() {
             bail!("task decisions are handled by the task chat, not a deputy");
         }
@@ -1020,85 +1028,10 @@ impl Question {
                 self.short()
             );
         }
-        let quote = quote.trim();
-        if quote.is_empty()
-            || !self
-                .thread
-                .iter()
-                .any(|t| t.who == Who::Operator && t.body.contains(quote))
-        {
-            bail!(
-                "the quote is not something the owner said on question {}",
-                self.short()
-            );
-        }
-        // The owner's latest message is what counts (an earlier one may since
-        // have been qualified or withdrawn).
-        let latest = self
-            .thread
-            .iter()
-            .rev()
-            .find(|t| t.who == Who::Operator)
-            .map(|t| {
-                if self.node == crate::github_text::ASK_NODE && !crate::deputy::merge_gated(self) {
-                    t.body.as_str()
-                } else {
-                    t.body.trim()
-                }
-            });
-        if let Some(message) = latest {
-            crate::consult::validate_batch_effect(self, label, message, quote)?;
-        }
-        if self.node == crate::github_text::ASK_NODE && label == crate::github_text::USE_MY_TEXT {
-            let message = latest.context("use my text requires a current owner instruction with the literal replacement title")?;
-            crate::consult::validate_effect(self, label, message, quote, true)?;
-        } else if crate::deputy::merge_gated(self) {
-            // The merge is irreversible and a say is not a decision. `hold` must
-            // be the latest message exactly. For `merge`, whether the words are
-            // a clear, unhedged instruction is the deputy's judgement alone;
-            // all magi checks is that the quote is a verbatim part of that
-            // latest message.
-            let ok = if label == crate::land::APPROVE {
-                latest.is_some_and(|m| match &self.merge_target {
-                    Some(target) => m == format!("merge {}", target.head) && quote == m,
-                    None => m.contains(quote),
-                })
-            } else {
-                latest.is_some_and(|m| crate::merge_decision::exact_owner_choice(label, m, quote))
-            };
-            if !ok {
-                bail!(
-                    "on a merge approval `{label}` settles it only when the quote is a \
-                     verbatim part of the owner's latest message ({}); if the wording is \
-                     doubtful, ask what they mean with `--thread` instead",
-                    if label == crate::land::HOLD {
-                        "for `hold`, the whole message"
-                    } else {
-                        "the quote must be the instruction itself"
-                    }
-                );
-            }
-        } else if self.node == crate::github_text::ASK_NODE
-            && crate::deputy::destructive(self, label)
-        {
-            if !latest.is_some_and(|m| crate::github_text::posting_authorized(m, quote, label)) {
-                bail!(
-                    "posting confirmation requires an explicit, unconditional instruction for the chosen text quoted verbatim from the latest owner message"
-                );
-            }
-        } else if crate::deputy::destructive(self, label)
-            && !latest.is_some_and(|m| crate::land::unhedged(m, quote))
-        {
-            bail!(
-                "`{label}` cannot be undone; it settles question {} only when the owner's \
-                 latest message clearly says so, unhedged and quoted verbatim (no maybe / if \
-                 / not / question); ask what they mean with `--thread` instead",
-                self.short()
-            );
-        }
+        self.answer(Answer::Choice(label.to_owned()))?;
         self.thread.push(Turn {
             who: Who::Agent,
-            body: format!("Settled as `{label}` on the owner's words: \"{quote}\""),
+            body: format!("Settled as `{label}` on the owner's words."),
             at: Timestamp::now(),
             note: note
                 .map(str::trim)
@@ -1106,7 +1039,7 @@ impl Question {
                 .map(str::to_owned),
         });
         self.delivered_turns = self.thread.len();
-        self.answer(Answer::Choice(label.to_owned()))
+        Ok(())
     }
 
     /// The owner speaking back without answering: a request for context, a
@@ -1960,6 +1893,72 @@ fn hold(store: &Questions, id: &str) {
     if let Err(e) = took {
         tracing::debug!("could not note the wait on question {id}: {e:#}");
     }
+}
+
+/// Record the owner's `magi answer --reply` on question `id` (a full id) and
+/// return what to print. The terminal's direct path and a chat turn's control
+/// bridge ([`crate::chat_control::Operation::Answer`]) both land here, so a
+/// chat answer is the same ordinary answer whatever the turn's sandbox.
+///
+/// A choice reply is resolved against the offered labels; a free-text question
+/// takes the reply verbatim. `title` is the literal replacement for the posting
+/// gate's `use my text` choice and is refused anywhere else. Side effects of
+/// the answer itself (an obsolete approval's dismissal saving its run record)
+/// happen in [`Questions::update`]; existing consumers act on the rest.
+pub fn record_answer(
+    store: &Questions,
+    id: &str,
+    reply: &str,
+    title: Option<&str>,
+) -> Result<String> {
+    let (q, ()) = store.update(id, |r| {
+        let answer = if r.free_text() {
+            Answer::Text(reply.to_owned())
+        } else {
+            Answer::Choice(r.resolve_reply(reply)?.to_owned())
+        };
+        let replacement = r.node == crate::github_text::ASK_NODE
+            && matches!(&answer, Answer::Choice(choice) if choice == crate::github_text::USE_MY_TEXT);
+        if replacement {
+            let title =
+                title.context("use my text needs --title with the literal replacement title")?;
+            if title.trim().is_empty() {
+                bail!("replacement title must not be empty");
+            }
+            r.publication_title = Some(title.to_owned());
+        } else if title.is_some() {
+            bail!("--title is only valid for a publication decision's `use my text` choice");
+        }
+        r.answer(answer)
+    })?;
+    let mut out = format!("answered {} {}", q.short(), q.summary);
+    let resolution = q.resolution();
+    let approval = q.node == crate::land::APPROVAL_NODE;
+    if approval && resolution.as_deref() == Some(crate::merge_decision::DISMISS) {
+        out.push_str(
+            "\nObsolete approval ended; its execution is retired, history retained and PR unchanged. No merge or replacement was authorized.",
+        );
+    }
+    if approval
+        && resolution.as_deref() != Some(crate::merge_decision::DISMISS)
+        && resolution
+            .as_deref()
+            .is_some_and(crate::merge_decision::stops)
+    {
+        out.push_str(&format!(
+            "\nDecision recorded; the existing owner must resume to apply it. This answer command has not closed a PR, dispatched replacement work or approved a merge. A running magi serve / magi web resumes the parked owner; otherwise use `magi run --resume {}`. Do not create another task.",
+            q.run
+        ));
+    }
+    if approval && resolution.as_deref() == Some(crate::land::REPAIR) {
+        out.push_str(&format!(
+            "\nRepair requested; this answer command has not started repair or approved a merge. \
+             A running magi serve / magi web resumes the existing run. Without one, \
+             run `magi run --resume {}` to start repair and re-review; do not create another task or run.",
+            q.run
+        ));
+    }
+    Ok(out)
 }
 
 /// Record that the agent has read everything so far, so the daemon waiter does
@@ -3418,41 +3417,22 @@ mod tests {
     }
 
     #[test]
-    fn deputy_batch_words_never_replace_specific_consent_or_a_recommendation_manifest() {
-        for choice in [
-            crate::merge_decision::WITHDRAW,
-            "reimplement:primary",
-            "retry",
-            "discard",
-        ] {
-            let mut q = approval_question();
-            q.choices.push(choice.into());
-            if matches!(choice, "retry" | "discard") {
-                q.node = "recovery".into();
-            }
-            if choice == "discard" {
-                q.actions.insert(choice.into(), ChoiceAction::Done);
-            }
-            let words = "おっけーそれぞれ回答してー";
-            q.say(words).unwrap();
-            let error = q
-                .settle_by_deputy("deputy-x", choice, words, None)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains(if choice == "retry" {
-                    "manifest"
-                } else {
-                    "individual owner confirmation"
-                }),
-                "{choice}: {error}"
-            );
-            assert!(q.status.open());
-        }
-    }
-
-    #[test]
-    fn merge_decision_deputy_requires_current_head_confirmation_and_exact_stop_tokens() {
+    fn a_deputy_settles_merge_and_recovery_on_the_owners_words_without_a_quote() {
+        let target = || crate::merge_decision::Target {
+            pr: "PR 42".into(),
+            head: "abc".into(),
+            language: "en".into(),
+        };
+        // A merge among other requests: the deputy's reading is the authority.
+        let mut q = approval_question();
+        q.merge_target = Some(target());
+        q.say("マージしていいよ。残りのレビュー指摘はフォローアップタスクとして積んで")
+            .unwrap();
+        q.settle_by_deputy("deputy-x", crate::land::APPROVE, None)
+            .unwrap();
+        assert_eq!(q.resolution().as_deref(), Some(crate::land::APPROVE));
+        assert_eq!(q.merge_target, Some(target()), "the merge stays head-bound");
+        // Recovery and stop choices need no exact token either.
         for choice in [
             crate::land::HOLD,
             crate::land::REPAIR,
@@ -3460,333 +3440,70 @@ mod tests {
             "reimplement:beta",
         ] {
             let mut q = approval_question();
-            q.node = crate::land::APPROVAL_NODE.into();
-            q.choices = vec!["merge".into(), choice.into()];
-            q.merge_target = Some(crate::merge_decision::Target {
-                pr: "PR 42".into(),
-                head: "abc".into(),
-                language: "en".into(),
-            });
-            q.say(format!("Should we choose {choice}?")).unwrap();
-            assert!(
-                q.settle_by_deputy("deputy-x", choice, choice, None)
-                    .is_err()
-            );
-            q.say(choice).unwrap();
-            q.settle_by_deputy("deputy-x", choice, choice, None)
+            q.choices = vec![crate::land::APPROVE.into(), choice.into()];
+            q.merge_target = Some(target());
+            q.say("ちょっと待って、そっちでお願い").unwrap();
+            q.settle_by_deputy("deputy-x", choice, Some("owner chose this"))
                 .unwrap();
             assert_eq!(q.resolution().as_deref(), Some(choice));
         }
-        let mut q = approval_question();
-        q.node = crate::land::APPROVAL_NODE.into();
-        q.choices = vec!["merge".into(), "hold".into()];
-        q.merge_target = Some(crate::merge_decision::Target {
-            pr: "PR 42".into(),
-            head: "new-head".into(),
-            language: "en".into(),
-        });
-        q.say("merge old-head").unwrap();
-        assert!(
-            q.settle_by_deputy("deputy-x", "merge", "merge old-head", None)
-                .is_err()
+        // A local release approval settles the same way.
+        let mut release = Question::new(
+            String::new(),
+            crate::bump::NOTICE_NODE.into(),
+            "release-watch".into(),
+            "Release?".into(),
+            String::new(),
+            vec![crate::land::APPROVE.into(), crate::land::HOLD.into()],
         );
-        q.say("merge new-head").unwrap();
-        q.settle_by_deputy("deputy-x", "merge", "merge new-head", None)
+        release.deputy = approval_question().deputy;
+        release.say("リリースしていいよ").unwrap();
+        release
+            .settle_by_deputy("deputy-x", crate::land::APPROVE, None)
             .unwrap();
+        assert_eq!(release.resolution().as_deref(), Some(crate::land::APPROVE));
     }
 
     #[test]
-    fn merge_repair_deputy_settle_requires_the_exact_latest_owner_choice() {
-        let mut q = approval_question();
-        q.choices.push(crate::land::REPAIR.into());
-        q.say("maybe fix findings and re-review").unwrap();
-        assert!(
-            q.settle_by_deputy("deputy-x", crate::land::REPAIR, crate::land::REPAIR, None)
-                .is_err()
-        );
-        q.say(crate::land::REPAIR).unwrap();
-        q.settle_by_deputy("deputy-x", crate::land::REPAIR, crate::land::REPAIR, None)
-            .unwrap();
-        assert_eq!(q.resolution().as_deref(), Some(crate::land::REPAIR));
-        assert_eq!(
-            crate::land::approval(q.resolution().as_deref()),
-            crate::land::Approval::Repair
-        );
-    }
-
-    #[test]
-    fn a_merge_approval_settles_on_a_verbatim_quote_of_the_latest_message() {
-        let mut q = approval_question();
-        q.say("merge").unwrap();
-        q.reply("sure?", vec!["merge".into(), "hold".into()])
-            .unwrap();
-        q.say(" Merge it please ").unwrap();
-        assert!(
-            q.settle_by_deputy("deputy-x", "merge", "   ", None)
-                .is_err(),
-            "an empty quote is refused"
-        );
-        assert!(
-            q.settle_by_deputy("deputy-x", "merge", "ship it", None)
-                .is_err(),
-            "a quote the owner never said is refused"
-        );
-        assert_eq!(q.status, QuestionStatus::Open);
-        q.settle_by_deputy("deputy-x", "merge", "Merge it please", None)
-            .unwrap();
-        assert_eq!(q.resolution().as_deref(), Some("merge"));
-    }
-
-    #[test]
-    fn posting_the_original_text_needs_an_unhedged_verbatim_quote() {
-        use crate::github_text::{POST_ORIGINAL, USE_FALLBACK};
-        let mk = || {
-            let mut q = Question::new(
-                "run".into(),
-                crate::github_text::ASK_NODE.into(),
-                crate::github_text::ASK_SEAT.into(),
-                "s".into(),
-                String::new(),
-                vec![USE_FALLBACK.into(), POST_ORIGINAL.into()],
-            );
-            let mut dep = Deputy::new("brief".into());
-            dep.seat = Some(crate::agent::SeatState::new("deputy-x", "alpha", 1));
-            q.deputy = Some(dep);
-            q
-        };
-        let mut hedged = mk();
-        hedged.say("Post the original, maybe?").unwrap();
-        assert!(
-            hedged
-                .settle_by_deputy("deputy-x", POST_ORIGINAL, "Post the original", None)
-                .is_err()
-        );
-        let mut clear = mk();
-        clear.say("Post the original text as it is.").unwrap();
-        clear
-            .settle_by_deputy("deputy-x", POST_ORIGINAL, "Post the original text", None)
-            .unwrap();
-        assert_eq!(clear.resolution().as_deref(), Some(POST_ORIGINAL));
-        let mut japanese = mk();
-        let words = "いいや、まだ説明が足りない。元の説明で投稿してください。";
-        japanese.say(words).unwrap();
-        japanese
-            .settle_by_deputy("deputy-x", POST_ORIGINAL, words, None)
-            .unwrap();
-        let mut unrelated = mk();
-        unrelated.say("Proceed with the task").unwrap();
-        assert!(
-            unrelated
-                .settle_by_deputy("deputy-x", POST_ORIGINAL, "Proceed with the task", None)
-                .is_err()
-        );
-        for words in [
-            "OK, post the original",
-            "Yes, post original",
-            "I'd like to post the original",
-        ] {
-            let mut natural = mk();
-            natural.say(words).unwrap();
-            natural
-                .settle_by_deputy("deputy-x", POST_ORIGINAL, words, None)
-                .unwrap();
-        }
-        for (message, quote) in [
-            (
-                "ログには「元の説明で投稿しました」と記録されています。",
-                "ログには「元の説明で投稿しました」と記録されています。",
-            ),
-            (
-                "ログには「元の説明で投稿してください」と記録されています。",
-                "元の説明で投稿してください",
-            ),
-        ] {
-            let mut descriptive = mk();
-            descriptive.say(message).unwrap();
-            assert!(
-                descriptive
-                    .settle_by_deputy("deputy-x", POST_ORIGINAL, quote, None)
-                    .is_err()
-            );
-            assert!(descriptive.status.open());
-            assert!(descriptive.answer.is_none());
-        }
-        let mut descriptive = mk();
-        let message = "Post original was the option I saw.";
-        descriptive.say(message).unwrap();
-        for quote in [message, "Post original"] {
-            assert!(
-                descriptive
-                    .settle_by_deputy("deputy-x", POST_ORIGINAL, quote, None)
-                    .is_err()
-            );
-            assert!(descriptive.status.open());
-            assert!(descriptive.answer.is_none());
-        }
-        // The changed text is the safe default: no extra guard beyond the quote.
-        let mut safe = mk();
-        safe.say("use the fallback").unwrap();
-        safe.settle_by_deputy("deputy-x", USE_FALLBACK, "use the fallback", None)
-            .unwrap();
-    }
-
-    #[test]
-    fn posting_deputy_rejects_multiline_quoted_context() {
+    fn a_deputy_settles_posting_and_destructive_choices_without_a_quote() {
         use crate::github_text::{ASK_NODE, ASK_SEAT, POST_ORIGINAL, USE_FALLBACK, USE_REWRITE};
-        for (command, choice) in [
-            ("Post original", POST_ORIGINAL),
-            ("Use rewrite", USE_REWRITE),
-        ] {
-            for message in [
-                format!("The log contains:\n```\n{command}\n```"),
-                format!("The log contains:\n\"\n{command}\n\""),
-                format!("The log says: “Reported. {command}.”"),
-                format!("The log says: “\n{command}\n”"),
-            ]
-            .into_iter()
-            .chain(crate::github_text::reported_posting_messages(command))
-            {
-                let mut q = Question::new(
-                    "run".into(),
-                    ASK_NODE.into(),
-                    ASK_SEAT.into(),
-                    "s".into(),
-                    String::new(),
-                    vec![USE_FALLBACK.into(), choice.into()],
-                );
-                let mut dep = Deputy::new("brief".into());
-                dep.seat = Some(crate::agent::SeatState::new("deputy-x", "alpha", 1));
-                q.deputy = Some(dep);
-                q.say(&message).unwrap();
-                let tmp = tempfile::tempdir().unwrap();
-                let questions = Questions::at(tmp.path().join("questions"));
-                questions.put(&mut q).unwrap();
-                for quote in [command, message.as_str()] {
-                    assert!(
-                        questions
-                            .update(&q.id, |stored| {
-                                stored.settle_by_deputy("deputy-x", choice, quote, None)
-                            })
-                            .is_err()
-                    );
-                    let after = questions.get(&q.id).unwrap();
-                    assert!(after.status.open());
-                    assert!(after.answer.is_none());
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn posting_the_rewrite_needs_an_unhedged_verbatim_quote() {
-        use crate::github_text::{USE_FALLBACK, USE_REWRITE};
-        let mk = || {
+        for choice in [POST_ORIGINAL, USE_REWRITE] {
             let mut q = Question::new(
                 "run".into(),
-                crate::github_text::ASK_NODE.into(),
-                crate::github_text::ASK_SEAT.into(),
+                ASK_NODE.into(),
+                ASK_SEAT.into(),
                 "s".into(),
                 String::new(),
-                vec![USE_FALLBACK.into(), USE_REWRITE.into()],
+                vec![USE_FALLBACK.into(), choice.into()],
             );
-            let mut dep = Deputy::new("brief".into());
-            dep.seat = Some(crate::agent::SeatState::new("deputy-x", "alpha", 1));
-            q.deputy = Some(dep);
-            q
-        };
-        let mut hedged = mk();
-        hedged.say("Use the rewrite, maybe?").unwrap();
-        assert!(
-            hedged
-                .settle_by_deputy("deputy-x", USE_REWRITE, "Use the rewrite", None)
-                .is_err()
-        );
-        let mut descriptive = mk();
-        let message = "Use rewrite was the option I saw.";
-        descriptive.say(message).unwrap();
-        for quote in [message, "Use rewrite"] {
-            assert!(
-                descriptive
-                    .settle_by_deputy("deputy-x", USE_REWRITE, quote, None)
-                    .is_err()
-            );
-            assert!(descriptive.status.open());
-            assert!(descriptive.answer.is_none());
+            q.deputy = approval_question().deputy;
+            q.say("それでいいよ、投稿して").unwrap();
+            q.settle_by_deputy("deputy-x", choice, None).unwrap();
+            assert_eq!(q.resolution().as_deref(), Some(choice));
         }
-        for words in [
-            "Use the rewrite text as it is.",
-            "I'd like to use the rewrite",
-            "修正版で投稿してください。",
-        ] {
-            let mut clear = mk();
-            clear.say(words).unwrap();
-            clear
-                .settle_by_deputy("deputy-x", USE_REWRITE, words, None)
-                .unwrap();
-            assert_eq!(clear.resolution().as_deref(), Some(USE_REWRITE));
-        }
-        // The changed text is the safe default: no extra guard beyond the quote.
-        let mut safe = mk();
-        safe.say("use the fallback").unwrap();
-        safe.settle_by_deputy("deputy-x", USE_FALLBACK, "use the fallback", None)
+        let mut discard = approval_question();
+        discard.node = "recovery".into();
+        discard.choices.push("discard".into());
+        discard.actions.insert("discard".into(), ChoiceAction::Done);
+        discard.say("おっけーそれぞれ回答してー").unwrap();
+        discard
+            .settle_by_deputy("deputy-x", "discard", None)
             .unwrap();
+        assert_eq!(discard.chosen_action(), Some(&ChoiceAction::Done));
     }
 
     #[test]
-    fn a_local_release_approval_is_held_to_the_merge_rules_but_an_escalation_is_not() {
-        let mk = |choices: Vec<String>| {
-            let mut q = Question::new(
-                String::new(),
-                crate::bump::NOTICE_NODE.into(),
-                "release-watch".into(),
-                "Release?".into(),
-                String::new(),
-                choices,
-            );
-            let mut dep = Deputy::new("brief".into());
-            dep.seat = Some(crate::agent::SeatState::new("deputy-x", "alpha", 1));
-            q.deputy = Some(dep);
-            q
-        };
-        let mut approval = mk(vec!["merge".into(), "hold".into()]);
-        assert!(crate::deputy::merge_gated(&approval));
-        approval.say("マージしていいよ").unwrap();
-        assert!(
-            approval
-                .settle_by_deputy("deputy-x", "merge", "ぜひマージして", None)
-                .is_err(),
-            "a quote the owner never said is refused"
-        );
-        approval
-            .settle_by_deputy("deputy-x", "merge", "マージしていいよ", None)
+    fn hold_may_carry_the_hold_effect_but_no_other_action() {
+        let mut q = choice_question();
+        q.choices = vec![crate::land::HOLD.into(), "finish".into()];
+        q.actions
+            .insert(crate::land::HOLD.into(), ChoiceAction::Hold);
+        q.clone()
+            .answer(Answer::Choice(crate::land::HOLD.into()))
             .unwrap();
-
-        let mut esc = mk(vec!["rerun again".into(), "hold".into(), "leave it".into()]);
-        assert!(!crate::deputy::merge_gated(&esc));
-        esc.say("もう監視はいらない").unwrap();
-        esc.settle_by_deputy("deputy-x", "leave it", "監視はいらない", None)
-            .unwrap();
-        assert_eq!(esc.resolution().as_deref(), Some("leave it"));
-    }
-
-    #[test]
-    fn a_merge_among_other_requests_settles_but_hold_needs_the_whole_message() {
-        let mut q = approval_question();
-        q.say("マージしていいよ。残りのレビュー指摘はフォローアップタスクとして積んで")
-            .unwrap();
-        assert!(
-            q.settle_by_deputy("deputy-x", "merge", "どこかの言葉", None)
-                .is_err(),
-            "the quote must be the owner's"
-        );
-        assert!(
-            q.settle_by_deputy("deputy-x", "hold", "マージしていいよ", None)
-                .is_err(),
-            "`hold` still needs the whole message"
-        );
-        q.settle_by_deputy("deputy-x", "merge", "マージしていいよ", None)
-            .unwrap();
-        assert_eq!(q.resolution().as_deref(), Some("merge"));
+        q.actions
+            .insert(crate::land::HOLD.into(), ChoiceAction::Done);
+        assert!(q.answer(Answer::Choice(crate::land::HOLD.into())).is_err());
     }
 
     fn settle_ready() -> Question {
@@ -3816,12 +3533,7 @@ mod tests {
         store.put(&mut q).unwrap();
         store
             .update(&id, |q| {
-                q.settle_by_deputy(
-                    "deputy-x",
-                    "yes",
-                    "setup done",
-                    Some("  no follow-up was queued  "),
-                )
+                q.settle_by_deputy("deputy-x", "yes", Some("  no follow-up was queued  "))
             })
             .unwrap();
         let back = store.get(&id).unwrap();
@@ -3836,8 +3548,7 @@ mod tests {
     fn an_empty_or_blank_settle_note_is_no_note() {
         for note in [None, Some(""), Some("  \n ")] {
             let mut q = settle_ready();
-            q.settle_by_deputy("deputy-x", "yes", "setup done", note)
-                .unwrap();
+            q.settle_by_deputy("deputy-x", "yes", note).unwrap();
             assert_eq!(q.thread.last().unwrap().note, None, "{note:?}");
             let json = serde_json::to_string(&q).unwrap();
             assert!(!json.contains("\"note\""), "no key when there is none");
@@ -3848,12 +3559,9 @@ mod tests {
     fn a_refused_settle_leaves_no_note_behind() {
         let mut q = settle_ready();
         let before = q.thread.clone();
+        assert!(q.settle_by_deputy("deputy-x", "maybe", Some("n")).is_err());
         assert!(
-            q.settle_by_deputy("deputy-x", "yes", "never said this", Some("n"))
-                .is_err()
-        );
-        assert!(
-            q.settle_by_deputy("someone-else", "yes", "setup done", Some("n"))
+            q.settle_by_deputy("someone-else", "yes", Some("n"))
                 .is_err()
         );
         assert_eq!(q.thread, before);
@@ -3869,21 +3577,7 @@ mod tests {
     }
 
     #[test]
-    fn a_quote_from_an_earlier_owner_message_does_not_settle_a_merge() {
-        let mut q = approval_question();
-        q.say("merge").unwrap();
-        q.reply("sure?", vec!["merge".into(), "hold".into()])
-            .unwrap();
-        q.say("wait, hold off").unwrap();
-        assert!(
-            q.settle_by_deputy("deputy-x", "merge", "merge", None)
-                .is_err()
-        );
-        assert_eq!(q.status, QuestionStatus::Open);
-    }
-
-    #[test]
-    fn a_deputy_settles_only_on_an_offered_choice_and_the_owners_own_words() {
+    fn a_deputy_settles_only_its_own_open_question_on_an_offered_choice() {
         let mut q = Question::new(
             "task".to_owned(),
             "conduct".to_owned(),
@@ -3899,30 +3593,62 @@ mod tests {
         q.deputy = Some(dep);
         q.say("setup done, go ahead").unwrap();
 
+        assert!(q.settle_by_deputy("someone-else", "yes", None).is_err());
+        assert!(q.settle_by_deputy("deputy-x", "maybe", None).is_err());
+        let mut routed = q.clone();
+        routed.routed_task = Some("task".into());
         assert!(
-            q.settle_by_deputy("someone-else", "yes", "setup done", None)
-                .is_err()
+            routed.settle_by_deputy("deputy-x", "yes", None).is_err(),
+            "a routed decision belongs to the task chat"
         );
-        assert!(
-            q.settle_by_deputy("deputy-x", "maybe", "setup done", None)
-                .is_err()
-        );
-        assert!(
-            q.settle_by_deputy("deputy-x", "yes", "never said this", None)
-                .is_err()
-        );
-        assert!(q.settle_by_deputy("deputy-x", "yes", "  ", None).is_err());
         assert_eq!(q.status, QuestionStatus::Open);
 
-        q.settle_by_deputy("deputy-x", "yes", "setup done", None)
-            .unwrap();
+        q.settle_by_deputy("deputy-x", "yes", None).unwrap();
         assert_eq!(q.status, QuestionStatus::Answered);
         assert_eq!(q.resolution().as_deref(), Some("yes"));
         let last = q.thread.last().unwrap();
         assert_eq!(last.who, Who::Agent);
+        assert!(last.body.starts_with("Settled as `yes`"));
+        let turns = q.thread.len();
         assert!(
-            last.body.contains("setup done"),
-            "the quote stays on the record"
+            q.settle_by_deputy("deputy-x", "no", None).is_err(),
+            "a settled question is not settled twice"
+        );
+        assert_eq!(q.thread.len(), turns);
+    }
+
+    #[test]
+    fn old_answer_evidence_still_loads_and_survives_a_re_save() {
+        let q = choice_question();
+        let mut v = serde_json::to_value(&q).unwrap();
+        v["answer_authority"] = serde_json::json!({
+            "talk": "talk", "turn": 0, "message": 0,
+            "instruction": "id: use my text fp\nA title",
+            "instruction_fingerprint": "f", "recommendation_turn": null,
+            "recommendation_fingerprint": null, "question": q.id, "choice": "SQLite",
+            "question_fingerprint": "g", "recovery_interpretation": "r"
+        });
+        let back: Question = serde_json::from_value(v).unwrap();
+        let legacy = back.answer_authority.as_ref().unwrap();
+        assert_eq!(legacy.question, q.id);
+        assert_eq!(legacy.instruction, "id: use my text fp\nA title");
+        // A re-save keeps what an old pending `use my text` answer needs, and
+        // nothing else of the old evidence.
+        let written = serde_json::to_value(&back).unwrap();
+        assert_eq!(
+            written["answer_authority"],
+            serde_json::json!({
+                "question": q.id, "choice": "SQLite",
+                "instruction": "id: use my text fp\nA title"
+            })
+        );
+        let again: Question = serde_json::from_value(written).unwrap();
+        assert_eq!(again.answer_authority, back.answer_authority);
+        assert!(
+            serde_json::to_value(&q)
+                .unwrap()
+                .get("answer_authority")
+                .is_none()
         );
     }
 

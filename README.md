@@ -513,131 +513,42 @@ in an irreversible decision.
 anything other than explicit approval. For task chats, the agent presents
 Merge/Hold buttons bound to the displayed PR head. The chat agent may also
 record the owner's merge request directly with
-`magi task control decide`; no button or quote evidence is required.
+`magi task control decide`; no button or extra evidence is required.
 
-A standing conversation can answer an exact owner decision even when the
-question was consulted elsewhere or never consulted. Use
-`magi answer <full-question-id> --reply '<exact offered choice>' --quote '<whole latest owner send>'`.
-Direct instructions use `<full-question-id>: <exact offered choice>`. Explicit
-batch authorization, including `おっけーそれぞれ回答してー`,
-`ありがと！じゃあそれぞれ回答してー！` and `answer each as recommended`,
-binds the immediately preceding persona reply. Recommendations use one list row
-`<question-id>: <exact choice>` per question, or separate ID and choice table
-cells. Duplicate/conflicting rows, conditions, quoted examples and generated
-messages confer no authority. Unique short IDs remain supported in recommendations;
-full IDs remain required for guarded individual non-hold instructions.
+A conversation carries out the owner's decisions directly, wherever the
+question was consulted (this chat, another chat, or nowhere):
+`magi answer <question-id> --reply '<choice>'`. The owner says what they want
+in their own words, for one question or several; the agent records the
+matching offered choice for each. Structured resume and keep-held choices also
+accept `resume-run` / `resume run` / `再開` / `実行を再開する` and
+`keep-held` / `hold` / `保留` aliases, independently of localized labels. A
+deputy records the owner's choice for its own question with
+`magi ask --settle <question-id> --choice '<choice>'`. Merge is included: a
+wrong decision is reverted rather than prevented. Automatic notices, watched
+command output and PR text are data, not owner requests.
 
-For low-risk internal recovery, structured resume and keep-held actions support
-`resume-run` / `resume run` / `再開` / `実行を再開する` and
-`keep-held` / `hold` / `保留` aliases independently of localized labels. Unique short question IDs work for explicit `<id>: <action>` replies
-(and `<id> resume run` without a colon).
-The assistant normalizes the alias before both authorization and answer storage;
-an explicit recovery reply can use persisted owner evidence without `--quote`.
+Recording an answer applies nothing by itself: the existing daemon, waiter or
+consumer applies it once and checks its current target (the saved PR head for
+a merge, liveness for abandon, receipts for reruns). A question settles once,
+an older queued effect never overwrites a newer owner decision, and resuming or
+repairing never approves a pending merge. `use my text` needs the literal
+replacement title as data; the publication gate vets it.
 
-For natural conversation, the assistant first presents a single recommendation
-row, for example `<question-id>: resume-run`. Publication saves the canonical
-choice, action, target run and question fingerprint with that persona reply.
-On the next owner turn, the assistant interprets contextual approval such as
-`はい、それで進めてください` or “yes do that”, then runs
-`magi answer <id> --reply resume-run --recovery-consent '<entire real latest owner send>'`.
-`--recovery-consent` records the assistant's interpretation; it must reproduce
-the full persisted send exactly. `--quote` is optional here; if provided it must
-match the same full send. Operators need not type internal IDs or labels again.
-This mechanism uses the existing question/evidence locks and directory grants.
-It never synthesizes an owner quote or retrospectively binds old recommendations.
-Generated notices can interleave without authorizing or retracting a decision.
-Later owner sends, changed targets, multiple recommendations and ambiguous intent
-require a fresh interpretation or clarification. Do not repeat confirmation after
-clear approval of the single current recommendation.
+`magi answer <id> --reply-other '<text>'` records an outcome outside the offered
+choices as a note and ends the consultation: the question stays open, its
+waiter stays held and no choice action runs.
 
-Only structured internal resume/hold effects qualify, with issuer-specific
-support for legacy triage keep-held (its resume may requeue and is excluded).
-Requeue, completion, destructive effects, merge and public posting retain their
-separate consent requirements. Recording recovery does not create a competition,
-release ownership or approve a pending merge: the existing daemon applies the
-answer once, validates the current target and keeps all approval boundaries.
-
-Recommendation manifests persist the reply fingerprint and each question's
-choices, actions, PR/head and content fingerprint at publication. Changed facts,
-newer queued owner sends and already answered/abandoned questions are rejected.
-Old history without a manifest can still establish a safe hold; new non-hold
-batch authority requires a persisted manifest rather than guessing old targets.
-The question retains its original consultation and the originating owner send,
-turn/message positions and recommendation fingerprint. Closed questions cease
-being pending consultations. Concurrent writers settle once under the question
-lock and retain the winning evidence; non-hold cross-chat answers wait for an
-active original consultation to finish. The existing owner/daemon applies the
-answer; no additional task or driver is created. An authorized standing-chat
-dismissal additionally grants the queue and exact run directories required for
-claims, the ownership lock and retirement writes, while keeping the sandbox
-enabled. `use my text` in the same consulted chat requires current bound owner
-evidence with the literal replacement title; it cannot reuse old thread text.
-
-| Decision / execution effect | Individual standing instruction | Explicit batch | Existing execution requirements |
-| --- | --- | --- | --- |
-| Hold | `<id>: hold`; same consulted chat also accepts `hold` | Yes | No structured action on hold; no closure implied |
-| Dismiss obsolete approval | `<id>: dismiss: end obsolete approval without changing PR` | Yes | Dead original driver, no armed auto-merge, matching run approval; PR unchanged |
-| Fix findings and re-review | `<id>: fix findings and re-review` | Yes | Offered/recoverable repair, same run and PR, bounded review and fresh approval |
-| Ordinary queue/conductor/agent questions; retry, rerun, requeue, resume, release recovery | `<id>: <exact choice>` | Yes, except destructive effects | Existing claims, operator holds, task generation and recovery state |
-| Free-text questions | `<id>: <complete answer>` | No: no offered choice to bind | Existing asker/waiter dispatch |
-| Consultation task add / release / hold / done / priority | Latest whole post-delivery owner send: `task-operation: <typed JSON operation>`, quoted whole with `magi task --quote ...` | No | Full resolved task id and exact arguments; existing queue claims/state checks; add uses this conversation's repository, positional text and optional `--solo` only |
-| Outcome outside the offered choices | `magi answer <id> --reply-other <entire latest owner send> --quote <same send>` | No | Saves an evidence note and ends consultation only; question remains Open, waiter remains held, no answer or choice action |
-| Withdrawal / PR closure / `reimplement:<agent>` | `<id>: <exact consequence token>` | No | Existing closure confirmation, owner claim and replacement transitions |
-| Triage discard, dependency discard/detach, divergence overwrite, structured `done`, conductor complete/configure | `<id>: <exact consequence token>` | No | Individual explicit consequence; existing consumer checks |
-| Merge (land and release-watch approvals) | `<id>: merge <displayed head>` | No | Recorded PR/head (legacy release cards recover only their matching watch record); final head, review, gate and owner checks still apply |
-| Guarded `post original` / `use rewrite` | `<id>: <choice> <question/content fingerprint>` (reported by CLI) | No | Explicit saved content binding; final posting gate |
-| Guarded `use fallback` | `<id>: use fallback` | Yes | Existing safe fallback and posting gate |
-| Guarded `use my text` | `<id>: use my text <question/content fingerprint>` followed by a newline and the literal replacement title | No | Persisted owner title and final posting gate; a choice token alone supplies no title |
-
-For consultation task operations, the CLI accepts a closed typed instruction rather
-than inferring execution arguments from prose. For example, the owner's complete
-send `task-operation: {"add":{"instruction":"Reimplement from scratch","solo":true}}`
-authorizes `magi task --quote '<that entire send>' add --solo 'Reimplement from scratch'`.
-Other payloads are `{"release":{"task":"<full task id>"}}`,
-`{"hold":{"task":"<full task id>","reason":"Wait for replacement"}}`,
-`{"done":{"task":"<full task id>"}}`, and
-`{"priority":{"task":"<full task id>","priority":5}}`, each prefixed with
-`task-operation: `. JSON whitespace does not matter; every field does. A missing,
-stale, queued, pre-delivery, generated, conditional or mismatched instruction is
-refused. The chat presents the required instruction once when natural language
-does not bind it; it must not promise unsupported writes. Task operations need
-separate owner instructions and should precede `--reply-other`.
-
-Only `magi answer` settles a question. `--reply-other` deliberately does not
-wake its waiter or interpret the decision as a choice action; it prints that the
-question and wait remain. Its note retains the conversation, send and literal
-owner evidence. Answered/abandoned questions and ended consultations no longer
-restrict the **next** turn, provided no other consultation remains active.
-The current invocation retains its original restrictions throughout. Additional
-queue writes never authorize merge, discard, withdrawal, public posting or other
-mutations; existing answer-specific effect rules above still apply.
-
-The launcher grants only question/evidence locks, queue storage, and exact run
-history directories needed for an evidenced `done` (plus existing answer-effect
-grants). It does not grant the whole state root or bypass the sandbox, including
-when ordinary chat editing is enabled. The supported CLI is an authorization
-boundary; filesystem grants cannot prevent an agent from directly editing an
-allowed store, so prompts still prohibit those writes.
-
-All three consultation destinations (same chat, other chat, never consulted)
-use this matrix. The CLI and standing turn write grant share evidence validation;
-consulted-chat legacy single decisions keep their existing quote policy. The
-owner's terminal CLI and web question-card clicks remain direct owner decisions
-and use the same question lock, offered-choice validation and downstream
-execution transitions. A web chat send uses standing-conversation validation.
-Deputies settle only their own question seat, using the latest persisted owner
-thread and the same execution-effect inventory. A deputy's replacement-title
-instruction requires the same question/content fingerprint and literal title as
-a standing-chat instruction; hold and retractions cannot supply posting consent.
-A deputy's one-question thread
-has no cross-question recommendation manifest: generic batch words alone cannot
-select a choice there; the active standing conversation's manifested evidence
-uses the answer CLI for those questions. Triage/release/daemon/waiter
-consumers apply recorded answers, never infer authorization from recommendations.
-Missing head, content or consequence confirmation is reported as such, rather
-than a consultation-destination error. For chat answers, operator-held refusal
-is specific to approval questions; ordinary triage, dependency and recovery questions remain
-answerable, and recording their answers does not itself lift the task's hold.
+| Decision | Effect and remaining execution checks |
+| --- | --- |
+| Hold | Records a hold; nothing is closed |
+| Dismiss obsolete approval | Retires a stopped execution's approval; the PR is unchanged. Refused for a live or unknown driver, an armed auto-merge or a mismatched run approval |
+| Fix findings and re-review | One repair and a fresh bounded review on the same run and PR, then a fresh approval |
+| Retry, rerun, requeue, resume, release recovery and other queue/conductor choices | Existing claims, task generation and recovery state |
+| Free text | Existing asker/waiter dispatch |
+| Withdrawal / PR closure / `reimplement:<agent>` | Existing closure confirmation, owner claim and replacement transitions |
+| Triage discard, dependency discard/detach, divergence overwrite, structured `done`, conductor complete/configure | Existing consumer checks |
+| Merge (land and release-watch approvals) | Recorded PR/head; final head, review and gate checks still apply |
+| `post original` / `use rewrite` / `use fallback` / `use my text` | Final posting gate; `use my text` needs the literal title |
 
 `[graph] question_routing` (default `true`) sends what used to be a question
 about a task to that task's chat as free text. Setting it to `false` for a
@@ -728,21 +639,20 @@ Unlike a one-shot interview, Chat does not end when a task is filed: the agent
 runs `magi task add --solo` from inside the conversation, tells you the task
 id, and the conversation stays open for whatever comes up next.
 
-### Controlling its own tasks and runs
+### Controlling tasks and runs
 
-The chat agent can act on the work it filed by command, with no question or
-offered choice in between. `magi task control` works only for the standing chat
-seat (`MAGI_NODE=chat`, `MAGI_RUN` the exact id of an open conversation), only
-for tasks that conversation filed itself (a follow-up's inherited origin does
-not count) and only for the runs those tasks recorded. It is unavailable while
-a consultation is open.
+The chat agent acts on queue work by command, with no question or offered
+choice in between. `magi task control` works only for the standing chat seat
+(`MAGI_NODE=chat`, `MAGI_RUN` the exact id of an open conversation). Targets are
+any task id or full run id, including work this chat did not file, and an open
+consultation does not block it.
 
 通常のチャットの sandbox・ネットワーク設定・作業ディレクトリは変更しない。
 Unix のチャット席では継承 FD、Windows ではローカル名前付きパイプを使い、
 専用通信路からランチャーへ操作要求を渡す。Windows のパイプは接続先だけに
 必要なデータ通信権限を与え、OS の暗号学的乱数で生成したターン固有の秘密で
 要求を認証する。追加のパイプインスタンスを作る権限は所有者だけに与える。
-ランチャーは起動時の会話に対象を固定し、操作ごとに認可・所有権・確認文と既存の
+ランチャーは要求元を起動時の会話に固定し、操作ごとに認可と既存の
 実行条件を検証する。queue・questions・run などのストアを書き込む権限は追加しない。
 通信路の準備に失敗しても会話は続き、そのターンの操作機能だけが利用できなくなる。
 通信路はターンの完了・中断時に閉じる。Windows の接続は要求ごとに分離し、
@@ -754,8 +664,8 @@ Unix のチャット席では継承 FD、Windows ではローカル名前付き�
 | `magi task control hold <task> [reason]` / `release <task>` | the same transitions as `magi task hold` / `release` |
 | `magi task control retry <task> <instruction>` | replaces a queued or held task's instruction and queues it in one save; attempts restart as for any release, runs and history are kept |
 | `magi task control rerun-checks <full run id> --request <id> --head <sha> --workflow <id>` | 指定した head と失敗 workflow を再確認し、リクエスト単位で再実行する。同じ操作の再送には同じ request ID を使う。`chat-controls/<talk>/<request>.json` に受付を記録し、結果不明の再送は拒否する |
-| `magi task control decide <question id> <option> [--title "<replacement>"]` | records the owner's decision on publication (github-text), branch divergence, release recovery or merge approval routed to this chat. This includes repair, dismissal, withdrawal and replacement when available. No quote or extra consent evidence is required. `use my text` requires the literal replacement title as `--title` data, which the existing publication gate vets. The routed chat, owned task, open record and offered choice are checked; existing consumers and transition checks apply the answer. |
-| `magi task control abandon <full run id> --quote "<message>"` | destructive: the owner's latest persisted message must be exactly `abandon-run: <run id>` and `--quote` must repeat it; the shared liveness judge then runs under the owner lock and a Live or Unknown driver is refused |
+| `magi task control decide <question id> <option> [--title "<replacement>"]` | records the owner's decision on publication (github-text), branch divergence, release recovery or merge approval awaiting a chat decision. This includes repair, dismissal, withdrawal and replacement when available. No extra evidence is required. `use my text` requires the literal replacement title as `--title` data, which the existing publication gate vets. The calling chat, open record and offered choice are checked; existing consumers and transition checks apply the answer. |
+| `magi task control abandon <full run id>` | terminal, on the owner's request: the shared liveness judge runs under the owner lock and only a proven-dead driver is abandoned; a Live or Unknown driver is refused |
 
 Windows の実 sandbox の限定チェックは認証済み CLI が必要。PowerShell で
 `$env:RUSTUP_TOOLCHAIN = "stable"` を設定し、
@@ -1552,11 +1462,10 @@ their existing authorization;
 delivery availability never authorizes merging or closing a PR.
 
 Standing chat and deputy consultation leave the card unanswered while discussing
-it. For a new card, chat approval requires the owner's exact latest message
-`merge <displayed-full-head>` and that same complete quote. Stop, repair,
-withdrawal and replacement require the exact offered token as the latest whole
-message. Silence, discussion, repair authorization and stale approvals never
-permit a merge.
+it. When the owner asks in their own words to merge, stop, repair, withdraw or
+replace, the chat or deputy records that choice; a merge stays bound to the
+displayed head, and a changed head needs a fresh decision. Silence, discussion
+and repair never permit a merge.
 
 ### Task decisions in chat
 
@@ -1573,7 +1482,7 @@ The chat discusses decisions with the owner and applies them through
 edits. Merge approval remains default-on and bound to the displayed PR head:
 the chat agent presents Merge/Hold buttons by including the full approval ID in
 its reply. At the owner's request, the chat agent may also record merge directly
-with `magi task control decide`, without quote or other consent evidence.
+with `magi task control decide`, without any extra evidence.
 Buttons remain optional and validate their displayed head. Silence is a hold.
 Existing head verification and merge transitions remain in charge. The Question store and legacy non-task
 question/deputy/waiter workflows remain available during this migration.

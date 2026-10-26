@@ -15,7 +15,8 @@
 //! [`Divergence::Genuine`] - the safe side of every doubt.
 
 /// Node the daemon records on the divergence question (`daemon`'s `Diverged`
-/// arm). There is no agent behind it, so `crate::deputy::destructive` names it.
+/// arm). There is no agent behind it; the choice effects are described by
+/// `crate::choice_effect`.
 pub const NODE: &str = "review";
 
 /// Seat recorded on the divergence question, with [`NODE`].

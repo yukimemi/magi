@@ -375,9 +375,9 @@ async fn post_original_opens_the_pull_request_with_the_unmodified_text() {
 }
 }
 
-common::e2e! {
-async fn routed_replacement_title_reaches_publication_after_restart_without_quote_evidence() {
+async fn replacement_title_reaches_publication(routed: bool) {
     let mut fx = fixture(home_lock().await, Judges::Unanimous, false);
+    fx.config.graph.question_routing = routed;
     let log = install_fake_gh(fx.tmp.path());
     let description = "TITLE: 日本語のタイトルです
 Adds note.txt. token=abcdef0123456789abcdef";
@@ -387,36 +387,74 @@ Adds note.txt. token=abcdef0123456789abcdef";
     let talks = magi::talk::Talks::open();
     let store = ask::Questions::open();
     let mut chat = magi::talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
-    let mut task = Task::new("Publication".into(), TASK.into(), fx.repo.clone(),
-        Source::Agent { run: chat.id.clone(), node: magi::queue::CHAT_NODE.into() });
+    let mut task = Task::new(
+        "Publication".into(),
+        TASK.into(),
+        fx.repo.clone(),
+        Source::Agent {
+            run: chat.id.clone(),
+            node: magi::queue::CHAT_NODE.into(),
+        },
+    );
     task.runs.push(run_id.clone());
     queue.put(&mut task).unwrap();
-    magi::task_chat::sweep(&queue, &talks, &store, &home);
+    if routed {
+        magi::task_chat::sweep(&queue, &talks, &store, &home);
+    }
     let q = withheld_questions(&run_id).remove(0);
-    assert_eq!(q.routed_chat.as_deref(), Some(chat.id.as_str()));
-    assert!(q.choices.contains(&magi::github_text::USE_MY_TEXT.to_owned()));
+    if routed {
+        assert_eq!(q.routed_chat.as_deref(), Some(chat.id.as_str()));
+    } else {
+        assert!(q.routed_chat.is_none());
+        assert!(q.routed_task.is_none());
+    }
+    assert!(
+        q.choices
+            .contains(&magi::github_text::USE_MY_TEXT.to_owned())
+    );
     let title = "fix: preserve the owner's replacement title";
-    magi::talk::record(&mut chat, &talks, &format!("このタイトルで公開して: {title}"), vec![]).unwrap();
+    magi::talk::record(
+        &mut chat,
+        &talks,
+        &format!("このタイトルで公開して: {title}"),
+        vec![],
+    )
+    .unwrap();
     let decide = |choice: &str, title: Option<&str>| {
         let mut cli = common::magi_cli(&home);
         cli.args(["task", "control", "decide", &q.id, choice])
-            .env("MAGI_RUN", &chat.id).env("MAGI_NODE", magi::queue::CHAT_NODE);
-        if let Some(title) = title { cli.args(["--title", title]); }
+            .env("MAGI_RUN", &chat.id)
+            .env("MAGI_NODE", magi::queue::CHAT_NODE);
+        if let Some(title) = title {
+            cli.args(["--title", title]);
+        }
         cli.output().unwrap()
     };
-    for (choice, title) in [(magi::github_text::USE_MY_TEXT, None),
+    for (choice, title) in [
+        (magi::github_text::USE_MY_TEXT, None),
         (magi::github_text::USE_MY_TEXT, Some("   ")),
-        (magi::github_text::USE_FALLBACK, Some(title))] {
+        (magi::github_text::USE_FALLBACK, Some(title)),
+    ] {
         assert!(!decide(choice, title).status.success());
         assert!(store.get(&q.id).unwrap().status.open());
     }
     let output = decide(magi::github_text::USE_MY_TEXT, Some(title));
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let saved = store.get(&q.id).unwrap();
     assert_eq!(saved.publication_title.as_deref(), Some(title));
     assert!(saved.answer_authority.is_none());
-    assert!(saved.thread.is_empty(), "the title is data, not a fabricated owner turn");
-    assert_eq!(magi::github_text::read_reply(&saved), magi::github_text::Reply::Title(title.into()));
+    assert!(
+        saved.thread.is_empty(),
+        "the title is data, not a fabricated owner turn"
+    );
+    assert_eq!(
+        magi::github_text::read_reply(&saved),
+        magi::github_text::Reply::Title(title.into())
+    );
     let mut runner = Runner::resume(&run_id).unwrap();
     runner.execute().await.unwrap();
     let made = creates(&log);
@@ -427,5 +465,16 @@ Adds note.txt. token=abcdef0123456789abcdef";
     assert!(gate.resolved);
     assert_eq!(gate.chosen_title.as_deref(), Some(title));
     assert_eq!(runner.state.status, RunStatus::Ready);
+}
+
+common::e2e! {
+async fn routed_replacement_title_reaches_publication_after_restart_without_quote_evidence() {
+    replacement_title_reaches_publication(true).await;
+}
+}
+
+common::e2e! {
+async fn non_routed_replacement_title_reaches_publication_after_restart() {
+    replacement_title_reaches_publication(false).await;
 }
 }

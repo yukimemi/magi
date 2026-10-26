@@ -74,25 +74,20 @@ impl Fixture {
     fn saved(&self) -> Task {
         self.queue().get(&self.task.id).unwrap()
     }
-    fn cli(&self, args: &[&str], node: &str, scope: &str) -> Output {
+    fn cli(&self, args: &[&str], node: &str) -> Output {
         common::magi_cli(self.tmp.path())
             .args(["task"])
             .args(args)
             .env("MAGI_CONFIG_DIR", "")
             .env("MAGI_RUN", &self.talk)
             .env("MAGI_NODE", node)
-            .env("MAGI_TURN_SCOPE", scope)
             .output()
             .unwrap()
     }
     fn control(&self, args: &[&str]) -> Output {
         let mut all = vec!["control"];
         all.extend_from_slice(args);
-        self.cli(&all, CHAT_NODE, "repository")
-    }
-    fn owner(&self, words: &str) {
-        let mut t = self.talks.get(&self.talk).unwrap();
-        talk::record(&mut t, &self.talks, words, vec![]).unwrap();
+        self.cli(&all, CHAT_NODE)
     }
 }
 
@@ -125,9 +120,9 @@ fn ordinary_chat_turn_uses_inherited_controls_without_store_grants() {
 #[cfg(unix)]
 #[test]
 #[ignore = "requires the installed CLI sandbox and permission to launch it"]
-fn sandboxed_chat_turn_controls_own_work_and_refuses_unrelated_writes() {
+fn sandboxed_chat_turn_controls_work_and_refuses_unrelated_writes() {
     common::isolated(
-        "sandboxed_chat_turn_controls_own_work_and_refuses_unrelated_writes",
+        "sandboxed_chat_turn_controls_work_and_refuses_unrelated_writes",
         || chat_turn_controls(true, false, false),
     );
 }
@@ -195,7 +190,7 @@ async fn chat_turn_controls(sandbox: bool, broken_store: bool, missing_channel: 
     let mut t = f.talks.get(&f.talk).unwrap();
     t.repo = repo.clone();
     f.talks.put(&mut t).unwrap();
-    let words = format!("abandon-run: {}", f.run.id);
+    let words = "please clean up the stopped run";
     let mut cfg = f.run.config.clone();
     assert!(!cfg.talk.allow_write);
     let bin = f.tmp.path().join("bin");
@@ -233,14 +228,10 @@ def control(*args):
     assert p.returncode == 0, (args, p.stdout, p.stderr)
     return p.stdout
 # The server binds the capability to this talk even if the child spoofs env.
+# Another chat's task is the owner's work too: holding it goes through.
 other = subprocess.run([binary, 'task', 'control', 'hold', os.environ['FOREIGN_TASK']],
                        capture_output=True, text=True, pass_fds=fds, env={**os.environ, 'MAGI_RUN':os.environ['FOREIGN_TALK']})
-assert other.returncode != 0
-assert 'not filed by this conversation' in other.stderr, other.stderr
-bad = subprocess.run([binary, 'task', '--quote', 'invented', 'control', 'abandon', run],
-                     capture_output=True, text=True, pass_fds=fds)
-assert bad.returncode != 0
-assert 'individual owner confirmation' in bad.stderr, bad.stderr
+assert other.returncode == 0, other.stderr
 # Both planning spellings cross the bridge and preserve the unanswered-decision guard.
 for prefix in [[], ['control']]:
     planned = subprocess.run([binary, 'task', *prefix, 'reconcile-retention', task,
@@ -256,7 +247,7 @@ request, response, lock = (int(os.environ[n]) for n in ['MAGI_CHAT_CONTROL_FD', 
 fcntl.lockf(lock, fcntl.LOCK_EX)
 operation = {'operation':'Hold', 'task':os.environ['TEST_TASK'], 'reason':'orphan'}
 if os.environ['ORPHAN_ID'] == '2':
-    operation['task'] = os.environ['FOREIGN_TASK']
+    operation['task'] = 'no-such-task'
 body = json.dumps({'id':int(os.environ['ORPHAN_ID']), 'operation':operation}).encode()
 frame = struct.pack('>I', len(body)) + body
 while frame:
@@ -286,10 +277,11 @@ if os.environ['TEST_SANDBOX'] == '0':
                                capture_output=True, text=True, pass_fds=fds,
                                env={**os.environ, name:'999999', 'MAGI_ALLOW_WRITE':allowed})
             assert (p.returncode == 0) == (allowed == '1'), (p.stdout, p.stderr)
-    denied = subprocess.run([binary, 'task', 'control', 'hold', os.environ['FOREIGN_TASK']],
+    # The local fallback still authorizes the standing chat it speaks for.
+    denied = subprocess.run([binary, 'task', 'control', 'hold', task],
                             capture_output=True, text=True, pass_fds=fds,
-                            env={**os.environ, 'MAGI_CHAT_CONTROL_FD':'999999', 'MAGI_ALLOW_WRITE':'1'})
-    assert denied.returncode != 0 and 'not filed by this conversation' in denied.stderr, denied.stderr
+                            env={**os.environ, 'MAGI_RUN':'no-such-talk', 'MAGI_CHAT_CONTROL_FD':'999999', 'MAGI_ALLOW_WRITE':'1'})
+    assert denied.returncode != 0, denied.stdout
     # A usable descriptor that disconnects after transmission must never fall
     # back locally, even when write permission is available.
     read, write = os.pipe()
@@ -315,7 +307,7 @@ control('control', 'release', task)
 control('control', 'retry', task, 'revised instruction'+' '*8192)
 control('control', 'resume', run)
 control('control', 'rerun-checks', run, '--request', 'sandbox-check', '--head', 'current', '--workflow', '42')
-control('--quote', 'abandon-run: '+run, 'control', 'abandon', run)
+control('control', 'abandon', run)
 if os.environ['TEST_SANDBOX'] == '1':
     home = pathlib.Path(os.environ['MAGI_HOME'])
     for p in [pathlib.Path(os.environ['REPO'])/'protected', home/'runs/unrelated/protected',
@@ -396,7 +388,7 @@ fi
         .env
         .extend(common::magi_cli_env(f.tmp.path(), "MAGI_TEST_BINARY"));
     let lease = f.talks.claim_turn(&f.talk).unwrap().unwrap();
-    talk::say(&lease, &mut t, &f.talks, &cfg, &words, vec![])
+    talk::say(&lease, &mut t, &f.talks, &cfg, words, vec![])
         .await
         .unwrap();
     if broken_store {
@@ -409,6 +401,11 @@ fi
         .unwrap();
     assert_eq!(f.saved().instruction.trim_end(), "revised instruction");
     assert_eq!(f.saved().status, TaskStatus::Queued);
+    assert_eq!(
+        f.queue().get(&foreign.id).unwrap().status,
+        TaskStatus::Held,
+        "another chat's task is controlled on the owner's request"
+    );
     assert_eq!(
         RunState::load_under(&f.run.id, f.tmp.path())
             .unwrap()
@@ -480,41 +477,38 @@ async fn resume_is_pinned_idempotent_and_does_not_start_a_driver() {
         std::fs::read(f.tmp.path().join("runs").join(&f.run.id).join("run.json")).unwrap()
     );
     passed(f.control(&["hold", &f.task.id, "manual decision"]));
-    refused(f.control(&["resume", &f.run.id]));
-    passed(f.control(&["release", &f.task.id]));
+    // An explicit resume is the owner's request: it releases their own hold.
     passed(f.control(&["resume", &f.run.id]));
+    let resumed = f.saved();
+    assert!(!resumed.operator_held());
+    assert_eq!(resumed.status, TaskStatus::Queued);
     let _claim = f.queue().claim(&f.task.id).unwrap();
     refused(f.control(&["hold", &f.task.id, "busy"]));
 }
 
 #[tokio::test]
-async fn abandon_requires_current_individual_consent_and_proven_dead_liveness() {
+async fn abandon_needs_no_phrase_but_only_a_proven_dead_driver() {
     let _home = common::home_lock().await;
     let mut f = Fixture::new();
-    refused(f.control(&["abandon", &f.run.id]));
-    let words = format!("abandon-run: {}", f.run.id);
-    f.owner(&words);
     let run_id = f.run.id.clone();
-    let args = ["--quote", &words, "control", "abandon", &run_id];
+    let args = ["control", "abandon", &run_id];
     f.run.driver_exited = false;
     f.run.save_under(f.tmp.path()).unwrap();
     assert_eq!(f.run.liveness_under(f.tmp.path(), false), Liveness::Unknown);
-    assert!(refused(f.cli(&args, CHAT_NODE, "repository")).contains("liveness is not proven gone"));
+    assert!(refused(f.cli(&args, CHAT_NODE)).contains("liveness is not proven gone"));
     f.run.driver_pid = Some(std::process::id());
     f.run.driver_started_at = magi::proc::process_started_at(std::process::id());
     f.run.save_under(f.tmp.path()).unwrap();
     assert_eq!(f.run.liveness_under(f.tmp.path(), false), Liveness::Live);
-    assert!(refused(f.cli(&args, CHAT_NODE, "repository")).contains("liveness is not proven gone"));
+    assert!(refused(f.cli(&args, CHAT_NODE)).contains("liveness is not proven gone"));
     f.run.driver_pid = None;
     f.run.driver_started_at = None;
     f.run.driver_exited = true;
     f.run.save_under(f.tmp.path()).unwrap();
     assert_eq!(f.run.liveness_under(f.tmp.path(), false), Liveness::Dead);
-    let mut t = f.talks.get(&f.talk).unwrap();
-    talk::queue(&mut t, &f.talks, "wait", vec![]).unwrap();
-    refused(f.cli(&args, CHAT_NODE, "repository"));
-    talk::clear_pending(&mut t, &f.talks).unwrap();
-    passed(f.cli(&args, CHAT_NODE, "repository"));
+    // No owner phrase or quote: the chat's request is enough once the driver
+    // is proven gone.
+    passed(f.cli(&args, CHAT_NODE));
     assert_eq!(
         RunState::load_under(&f.run.id, f.tmp.path())
             .unwrap()
@@ -584,7 +578,6 @@ esac
             .env("MAGI_CONFIG_DIR", "")
             .env("MAGI_RUN", &f.talk)
             .env("MAGI_NODE", CHAT_NODE)
-            .env("MAGI_TURN_SCOPE", "repository")
             .env(
                 "PATH",
                 format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
@@ -715,7 +708,6 @@ fn chat_controls_through_real_cli_child() {
             &spec,
             &mut seat,
             &magi::agent::Invocation {
-                scope: magi::agent::InvocationScope::Repository,
                 coordination: None,
                 fetched_base: None,
                 cwd: f.tmp.path(),
@@ -739,6 +731,249 @@ fn chat_controls_through_real_cli_child() {
         assert_eq!(f.saved().status, TaskStatus::Held);
         assert_eq!(f.saved().hold_reason.as_deref(), Some("via launcher"));
     });
+}
+
+/// A read-only chat seat files a follow-up and answers through the launcher.
+/// The CLI reads a decoy home with read-only queue and question stores; filing,
+/// attachment copying and the obsolete approval's dismissal must reach the
+/// launcher's stores through the inherited bridge.
+#[cfg(unix)]
+#[test]
+fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
+    common::isolated(
+        "chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record",
+        || async {
+            use std::os::unix::fs::PermissionsExt as _;
+            let f = Fixture::new();
+            let home = f.tmp.path();
+            magi::run::set_home(home.to_owned());
+            let questions = magi::ask::Questions::at(home.join("questions"));
+            // An ordinary (not task-chat routed) approval, answered here.
+            let repo = home.join("repository");
+            std::fs::create_dir(&repo).unwrap();
+            assert!(
+                std::process::Command::new("git")
+                    .args(["init", "-q"])
+                    .arg(&repo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let mut repo_cfg = Config::default();
+            repo_cfg.graph.question_routing = false;
+            std::fs::write(repo.join("magi.toml"), toml::to_string(&repo_cfg).unwrap()).unwrap();
+            let mut state = RunState::new(
+                repo.clone(),
+                "main".into(),
+                "head".into(),
+                "Original task".into(),
+                f.run.config.clone(),
+            );
+            let mut approval = magi::ask::Question::new(
+                state.id.clone(),
+                magi::land::APPROVAL_NODE.into(),
+                "land".into(),
+                "Merge?".into(),
+                String::new(),
+                vec![
+                    "merge".into(),
+                    "hold".into(),
+                    magi::merge_decision::DISMISS.into(),
+                ],
+            );
+            state.status = RunStatus::Landing;
+            state.parked = true;
+            state.driver_exited = true;
+            state.land_approval = Some(magi::run::LandApproval {
+                question: approval.id.clone(),
+                head: "head".into(),
+            });
+            state.pr = Some(magi::run::PrRecord {
+                url: "https://example.test/pull/1".into(),
+                number: 1,
+                state: "open".into(),
+                checks: "green".into(),
+                round: 1,
+                rounds: 2,
+                red_at_merge: vec![],
+            });
+            state.save_under(home).unwrap();
+            approval.merge_target = Some(magi::merge_decision::Target {
+                pr: "https://example.test/pull/1".into(),
+                head: "head".into(),
+                language: "en".into(),
+            });
+            let mut owner = Task::new(
+                "Original task".into(),
+                "Original instruction".into(),
+                repo.clone(),
+                Source::Human,
+            );
+            owner.runs.push(state.id.clone());
+            owner.status = TaskStatus::Parked;
+            f.queue().put(&mut owner).unwrap();
+            questions.put(&mut approval).unwrap();
+            let mut free = magi::ask::Question::new(
+                "20260902-000000-beef".into(),
+                "implement".into(),
+                "impl-A".into(),
+                "Which file?".into(),
+                String::new(),
+                Vec::new(),
+            );
+            questions.put(&mut free).unwrap();
+            assert!(approval.routed_task.is_none() && free.routed_task.is_none());
+
+            // The decoy home holds copies of what the CLI reads; its question
+            // store is read-only, so a direct answer could not even lock it.
+            let decoy = home.join("decoy");
+            let decoy_questions = magi::ask::Questions::at(decoy.join("questions"));
+            for q in [&approval, &free] {
+                decoy_questions
+                    .put(&mut questions.get(&q.id).unwrap())
+                    .unwrap();
+            }
+            std::fs::create_dir_all(decoy.join("talks")).unwrap();
+            std::fs::copy(
+                f.talks.path_of(&f.talk),
+                Talks::at(decoy.join("talks")).path_of(&f.talk),
+            )
+            .unwrap();
+            let readonly = |mode| {
+                std::fs::set_permissions(
+                    decoy.join("questions"),
+                    std::fs::Permissions::from_mode(mode),
+                )
+                .unwrap();
+            };
+            std::fs::create_dir_all(decoy.join("queue")).unwrap();
+            std::fs::set_permissions(decoy.join("queue"), std::fs::Permissions::from_mode(0o555))
+                .unwrap();
+            readonly(0o555);
+
+            // Completing a task after a successful retry must also retire the
+            // prior blocked run, a write the read-only seat cannot perform.
+            let mut successful = RunState::new(
+                home.to_owned(),
+                "main".into(),
+                "head".into(),
+                "Retry".into(),
+                f.run.config.clone(),
+            );
+            successful.status = RunStatus::Ready;
+            successful.driver_exited = true;
+            successful.save_under(home).unwrap();
+            let mut completed = f.saved();
+            completed.runs.push(successful.id.clone());
+            f.queue().put(&mut completed).unwrap();
+            let attachment = home.join("follow-up.txt");
+            std::fs::write(&attachment, "Owner's context").unwrap();
+            let artifacts = f.talks.artifacts_of(&f.talk);
+            let mut spec = f.run.config.agents[0].clone();
+            spec.env.extend(common::magi_cli_env(home, "ANSWER_BIN"));
+            spec.env
+                .insert("DECOY".into(), decoy.to_string_lossy().into_owned());
+            spec.env.insert("FREE".into(), free.id.clone());
+            spec.env
+                .insert("COMPLETE_TASK".into(), completed.id.clone());
+            spec.env.insert(
+                "FILING_ATTACH".into(),
+                attachment.to_string_lossy().into_owned(),
+            );
+            spec.env
+                .insert("FILING_REPO".into(), repo.to_string_lossy().into_owned());
+            spec.env.insert("APPROVAL".into(), approval.id.clone());
+            spec.env
+                .insert("DISMISS".into(), magi::merge_decision::DISMISS.into());
+            spec.command = vec![
+                "sh".into(),
+                "-c".into(),
+                "cat >/dev/null\n\
+                 test \"$MAGI_ALLOW_WRITE\" = 0 || exit 31\n\
+                 test -n \"$MAGI_CHAT_CONTROL_FD\" || exit 32\n\
+                 MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" task add --repo \"$FILING_REPO\" --solo --urgent --priority 7 --implementers 2 --attach \"$FILING_ATTACH\" --hold 'owner requested' --title 'Follow-up' -- 'Implement follow-up work' || exit 35\n\
+                 MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" task priority \"$COMPLETE_TASK\" 12 || exit 36\n\
+                 MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" task done \"$COMPLETE_TASK\" || exit 37\n\
+                 MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" answer \"$FREE\" --reply src/lib.rs || exit 33\n\
+                 MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" answer \"$APPROVAL\" --reply \"$DISMISS\" || exit 34\n"
+                    .into(),
+            ];
+            let mut seat = magi::agent::SeatState::new("chat", "mock", 1);
+            let output = magi::agent::invoke(
+                &spec,
+                &mut seat,
+                &magi::agent::Invocation {
+                    coordination: None,
+                    fetched_base: None,
+                    cwd: home,
+                    prompt: "",
+                    timeout: std::time::Duration::from_secs(30),
+                    allow_write: false,
+                    unsandboxed: false,
+                    sessions: false,
+                    artifacts: &artifacts,
+                    stem: "answer",
+                    run: &f.talk,
+                    node: CHAT_NODE,
+                    cache_dir: None,
+                    attachments: &[],
+                    writable: &[],
+                },
+            )
+            .await
+            .unwrap();
+            readonly(0o755);
+            std::fs::set_permissions(decoy.join("queue"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            assert!(output.usable(), "{output:?}");
+            let filed = f
+                .queue()
+                .list()
+                .into_iter()
+                .find(|task| task.title == "Follow-up")
+                .expect("launcher filed the task");
+            assert_eq!(filed.instruction, "Implement follow-up work");
+            assert_eq!(filed.filed_by_chat(), Some(f.talk.as_str()));
+            assert_eq!(filed.status, TaskStatus::Held);
+            assert_eq!(filed.priority, 7);
+            assert!(filed.solo && filed.urgent);
+            assert_eq!(filed.overrides.as_ref().unwrap().candidates, Some(2));
+            assert_eq!(filed.attachments.len(), 1);
+            assert!(Queue::at(decoy.join("queue")).list().is_empty());
+            assert_eq!(f.saved().priority, 12);
+            assert_eq!(f.saved().status, TaskStatus::Done);
+            assert_eq!(
+                RunState::load_under(&f.run.id, home).unwrap().status,
+                RunStatus::Superseded
+            );
+            // The launcher's report comes back through the bridge.
+            assert!(output.text.contains("answered"), "{output:?}");
+            assert!(
+                output.text.contains("Obsolete approval ended"),
+                "{output:?}"
+            );
+
+            assert_eq!(
+                questions.get(&free.id).unwrap().resolution().as_deref(),
+                Some("src/lib.rs")
+            );
+            assert_eq!(
+                questions.get(&approval.id).unwrap().resolution().as_deref(),
+                Some(magi::merge_decision::DISMISS)
+            );
+            let run = RunState::load_under(&state.id, home).unwrap();
+            assert_eq!(
+                run.merge_decision.unwrap().choice,
+                magi::merge_decision::DISMISS
+            );
+            assert_eq!(run.status, RunStatus::Superseded);
+            assert_eq!(run.pr.unwrap().state, "open");
+            assert_eq!(f.queue().get(&owner.id).unwrap().status, TaskStatus::Done);
+            for q in [&free, &approval] {
+                assert!(decoy_questions.get(&q.id).unwrap().status.open());
+            }
+        },
+    );
 }
 
 #[cfg(windows)]
@@ -775,7 +1010,6 @@ Do both even if one fails. Include the exact STORE_WRITE result and control resu
                 &spec,
                 &mut seat,
                 &magi::agent::Invocation {
-                    scope: magi::agent::InvocationScope::Repository,
                     coordination: None,
                     fetched_base: None,
                     cwd: f.tmp.path(),
@@ -814,7 +1048,7 @@ fn reconciliation_cli_rejects_non_chat_seats_and_preserves_direct_route() {
         &f.run.id,
     ];
     for node in ["implement-1", "review-1", "task", ""] {
-        let error = refused(f.cli(&args, node, "repository"));
+        let error = refused(f.cli(&args, node));
         assert!(error.contains("standing chat"), "{error}");
     }
     let error = refused(
@@ -823,7 +1057,6 @@ fn reconciliation_cli_rejects_non_chat_seats_and_preserves_direct_route() {
             .args(args)
             .env_remove("MAGI_RUN")
             .env_remove("MAGI_NODE")
-            .env_remove("MAGI_TURN_SCOPE")
             .output()
             .unwrap(),
     );
