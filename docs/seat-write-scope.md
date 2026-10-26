@@ -35,13 +35,16 @@ grants and do not gain repository metadata access through this policy.
 
 ## Requested editing network policy
 
-`[graph] editing_network = "restricted" | "enabled"` defaults to `restricted`.
-For sandboxed repository writers, the launcher passes the requested boolean via
+`[graph] editing_network = "restricted" | "enabled"` defaults to `enabled`, so a
+codex repository writer can run tests that start local servers, as claude seats
+(which run without an OS sandbox) always could. For sandboxed repository
+writers, the launcher passes the requested boolean via
 `sandbox_workspace_write.network_access`, retaining `workspace-write`,
 `approval_policy="never"`, existing writable roots, coordination and process
 containment. `enabled` permits outbound traffic as well as local test servers;
-the supported setting cannot grant loopback alone. This repository opts in for
-its browser tests. Other roles and adapters retain their existing policy.
+the supported setting cannot grant loopback alone. `restricted` turns networking
+off for a repository that wants it. Other roles and adapters retain their
+existing policy.
 
 `Invocation` carries the configured policy through initial turns, resumes,
 fallbacks and waiter delivery. The same policy function supplies the argv,

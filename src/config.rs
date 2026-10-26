@@ -369,15 +369,17 @@ pub struct Roles {
 }
 
 /// Requested network access for sandboxed repository editing seats.
-/// Enabled permits outbound traffic as well as local test servers; parent
+/// Enabled (the default) permits outbound traffic as well as local test
+/// servers, matching claude seats, which run without an OS sandbox; parent
 /// restrictions still apply. This is not a loopback-only firewall.
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EditingNetwork {
-    /// Keep networking disabled for sandboxed repository writers.
-    #[default]
+    /// Keep networking disabled for sandboxed repository writers. Tests that
+    /// start local servers then fail inside the seat.
     Restricted,
     /// Request networking, including outbound traffic and local test servers.
+    #[default]
     Enabled,
 }
 
@@ -385,7 +387,7 @@ pub enum EditingNetwork {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Graph {
-    /// Opt-in network access for sandboxed repository writers.
+    /// Network access for sandboxed repository writers (default enabled).
     pub editing_network: EditingNetwork,
     /// Gate GitHub prose before posting. Secret redaction remains mandatory when disabled.
     pub github_text_guard: bool,
@@ -2962,8 +2964,8 @@ fn remote_layers(repo: &Path) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn editing_network_defaults_restricted_and_requires_explicit_opt_in() {
-        assert_eq!(Graph::default().editing_network, EditingNetwork::Restricted);
+    fn editing_network_defaults_enabled_and_can_be_restricted() {
+        assert_eq!(Graph::default().editing_network, EditingNetwork::Enabled);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("policy.toml");
         for (value, expected) in [
