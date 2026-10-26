@@ -266,6 +266,69 @@ pub(crate) async fn merge(
     .await?
 }
 
+/// Read only persisted send boundaries; generated posts never supply consent.
+/// The caller retains the conversation writer lock through the transaction.
+fn exact_owner_authorization(
+    talk: &crate::talk::Talk,
+    expected: &str,
+    quote: Option<&str>,
+) -> Result<serde_json::Value> {
+    use crate::talk::{Sender, Who, sender};
+
+    let queued_owner = (!talk.pending.is_empty() || !talk.pending_messages.is_empty())
+        && (talk.pending_messages.is_empty()
+            || talk
+                .pending_messages
+                .iter()
+                .any(|m| m.sender != Some(Sender::Magi)));
+    ensure!(
+        talk.status.open() && !queued_owner,
+        "no current persisted owner instruction; drain newer messages first"
+    );
+    for (turn_index, turn) in talk.turns.iter().enumerate().rev() {
+        if sender(turn, None) == Sender::Magi {
+            continue;
+        }
+        ensure!(
+            turn.who == Who::Operator && turn.posted_by.is_none(),
+            "no current persisted owner instruction"
+        );
+        let latest = turn
+            .messages
+            .iter()
+            .enumerate()
+            .rfind(|(_, send)| sender(turn, Some(send)) == Sender::Operator);
+        let Some((message_index, send)) = latest else {
+            if !turn.messages.is_empty()
+                && turn.messages.iter().all(|m| m.sender == Some(Sender::Magi))
+            {
+                continue;
+            }
+            anyhow::bail!("no recorded owner send boundaries");
+        };
+        ensure!(
+            send.sender.is_some()
+                || (turn.breaks.is_some()
+                    && turn
+                        .messages
+                        .iter()
+                        .map(|m| m.body.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                        == turn.body),
+            "owner send boundaries cannot be verified"
+        );
+        ensure!(
+            send.body == expected && quote == Some(expected),
+            "requires the latest individual owner message and --quote exactly `{expected}`"
+        );
+        return Ok(
+            serde_json::json!({"turn":turn_index,"message":message_index,"instruction":send.body}),
+        );
+    }
+    anyhow::bail!("no current persisted owner instruction")
+}
+
 async fn merge_with(
     home: &Path,
     talks: &Talks,
@@ -285,8 +348,7 @@ async fn merge_with(
         !crate::consult::pending_consults(&crate::ask::Questions::at(home.join("questions")), talk),
         "merge excluded during consultation"
     );
-    let evidence =
-        crate::consult::exact_owner_authorization(&conversation, &action.instruction(), quote)?;
+    let evidence = exact_owner_authorization(&conversation, &action.instruction(), quote)?;
     let dir = home.join("chat-controls").join(talk);
     std::fs::create_dir_all(&dir)?;
     let lock = std::fs::OpenOptions::new()
@@ -302,7 +364,7 @@ async fn merge_with(
             prior.action == action,
             "request ID already binds a different operation"
         );
-        if prior.status != "started" && prior.status != "unknown" {
+        if prior.status != "started" && prior.status != "unknown" && prior.status != "pending" {
             return Ok(prior.detail);
         }
         prior
@@ -337,10 +399,11 @@ async fn merge_with(
             .await
         {
             Ok((true, _)) => {
-                rec.status = "merged".into();
-                rec.detail = format!("merged {url} at authorized head {}", rec.action.head);
+                // A zero exit can mean queued or auto-merge enabled. Persist
+                // acceptance, then require a forge-confirmed MERGED lifecycle.
+                rec.status = "pending".into();
+                rec.detail = "forge accepted merge command; completion not confirmed".into();
                 save(&path, &rec)?;
-                return Ok(rec.detail);
             }
             Ok((false, output)) => {
                 rec.detail = format!("forge refused or outcome unknown: {output}")
@@ -360,6 +423,15 @@ async fn merge_with(
             receipt.status = "merged".into();
             receipt.detail = format!("merged {url} at authorized head {}", receipt.action.head);
         }
+        Ok(after)
+            if canonical(&after.url) == canonical(&url)
+                && after.state == "OPEN"
+                && receipt.status == "pending" =>
+        {
+            receipt.detail = format!(
+                "merge pending for {url}; forge still reports OPEN; reuse this request ID to check only"
+            );
+        }
         Ok(after) if canonical(&after.url) == canonical(&url) && after.state != "MERGED" => {
             receipt.status = "refused".into();
             receipt.detail = format!(
@@ -368,7 +440,9 @@ async fn merge_with(
             );
         }
         _ => {
-            receipt.status = "unknown".into();
+            if receipt.status != "pending" {
+                receipt.status = "unknown".into();
+            }
             receipt.detail = format!(
                 "outcome unknown; reuse this request ID to check only: {}",
                 receipt.detail
@@ -416,6 +490,11 @@ mod tests {
             head_ref_oid: request().head,
             title: "chore(deps): update dependency".into(),
         }
+    }
+    fn merged_snapshot() -> Snapshot {
+        let mut seen = snapshot();
+        seen.state = "MERGED".into();
+        seen
     }
     struct Fake {
         views: Mutex<VecDeque<Result<Snapshot>>>,
@@ -499,6 +578,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn newer_owner_send_and_pending_retraction_invalidate_prior_authorization() {
+        for queued in [false, true] {
+            let (home, talks) = fixture(&request().instruction());
+            let mut talk = talks.get("talk-a").unwrap();
+            if queued {
+                talk.pending = "hold".into();
+                talks.put(&mut talk).unwrap();
+            } else {
+                crate::talk::record(&mut talk, &talks, "thanks", vec![]).unwrap();
+            }
+            let fake = Fake::new(home.path(), vec![], true);
+            assert!(apply(home.path(), &talks, &fake).await.is_err());
+            assert_eq!(*fake.calls.lock().unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn quote_must_be_the_whole_exact_message() {
+        let (home, talks) = fixture(&request().instruction());
+        let fake = Fake::new(home.path(), vec![], true);
+        for quote in [
+            "merge-pr: team/project#7".to_owned(),
+            format!("{}\n", request().instruction()),
+        ] {
+            assert!(
+                merge_with(
+                    home.path(),
+                    &talks,
+                    "talk-a",
+                    request(),
+                    Some(&quote),
+                    &fake
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert_eq!(*fake.calls.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn head_mismatch_draft_unknown_and_wrong_pr_are_refused() {
         for variant in 0..6 {
             let (home, talks) = fixture(&request().instruction());
@@ -520,7 +640,11 @@ mod tests {
     #[tokio::test]
     async fn happy_path_records_evidence_and_retry_never_merges_twice() {
         let (home, talks) = fixture(&request().instruction());
-        let fake = Fake::new(home.path(), vec![Ok(snapshot())], true);
+        let fake = Fake::new(
+            home.path(),
+            vec![Ok(snapshot()), Ok(merged_snapshot())],
+            true,
+        );
         let first = apply(home.path(), &talks, &fake).await.unwrap();
         assert!(first.starts_with("merged "));
         assert_eq!(apply(home.path(), &talks, &fake).await.unwrap(), first);
@@ -528,6 +652,84 @@ mod tests {
         let receipt: Receipt =
             serde_json::from_slice(&std::fs::read(&fake.receipt).unwrap()).unwrap();
         assert_eq!(receipt.evidence["instruction"], request().instruction());
+    }
+
+    #[tokio::test]
+    async fn successful_command_that_only_queues_is_pending_until_confirmed() {
+        let (home, talks) = fixture(&request().instruction());
+        let fake = Fake::new(
+            home.path(),
+            vec![Ok(snapshot()), Ok(snapshot()), Ok(merged_snapshot())],
+            true,
+        );
+        let first = apply(home.path(), &talks, &fake).await.unwrap();
+        assert!(first.starts_with("merge pending"));
+        let receipt: Receipt =
+            serde_json::from_slice(&std::fs::read(&fake.receipt).unwrap()).unwrap();
+        assert_eq!(receipt.status, "pending");
+        assert!(
+            apply(home.path(), &talks, &fake)
+                .await
+                .unwrap()
+                .starts_with("merged ")
+        );
+        assert_eq!(*fake.calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_command_with_unknown_confirmation_stays_read_only() {
+        let (home, talks) = fixture(&request().instruction());
+        let fake = Fake::new(
+            home.path(),
+            vec![
+                Ok(snapshot()),
+                Err(anyhow::anyhow!("unavailable")),
+                Ok(snapshot()),
+                Ok(merged_snapshot()),
+            ],
+            true,
+        );
+        assert!(
+            apply(home.path(), &talks, &fake)
+                .await
+                .unwrap()
+                .contains("outcome unknown")
+        );
+        assert!(
+            apply(home.path(), &talks, &fake)
+                .await
+                .unwrap()
+                .starts_with("merge pending")
+        );
+        assert!(
+            apply(home.path(), &talks, &fake)
+                .await
+                .unwrap()
+                .starts_with("merged ")
+        );
+        assert_eq!(*fake.calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_command_removed_without_merging_is_never_reported_merged() {
+        let (home, talks) = fixture(&request().instruction());
+        let mut closed = snapshot();
+        closed.state = "CLOSED".into();
+        let fake = Fake::new(
+            home.path(),
+            vec![Ok(snapshot()), Ok(snapshot()), Ok(closed)],
+            true,
+        );
+        assert!(
+            apply(home.path(), &talks, &fake)
+                .await
+                .unwrap()
+                .starts_with("merge pending")
+        );
+        let result = apply(home.path(), &talks, &fake).await.unwrap();
+        assert!(result.contains("merge not applied (CLOSED)"));
+        assert_eq!(apply(home.path(), &talks, &fake).await.unwrap(), result);
+        assert_eq!(*fake.calls.lock().unwrap(), 1);
     }
 
     #[tokio::test]
@@ -623,7 +825,11 @@ mod tests {
     #[tokio::test]
     async fn request_collision_and_reused_evidence_cannot_change_target() {
         let (home, talks) = fixture(&request().instruction());
-        let fake = Fake::new(home.path(), vec![Ok(snapshot())], true);
+        let fake = Fake::new(
+            home.path(),
+            vec![Ok(snapshot()), Ok(merged_snapshot())],
+            true,
+        );
         apply(home.path(), &talks, &fake).await.unwrap();
         let mut changed = request();
         changed.number = 8;
