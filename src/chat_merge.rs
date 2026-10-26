@@ -98,6 +98,18 @@ pub(crate) fn target_lock(home: &Path, url: &str) -> Result<TargetLock> {
     Ok(TargetLock(file))
 }
 
+// A concurrent fork can inherit the open file description. Explicit unlocking
+// must release the request before a retry even while that child retains it.
+fn request_lock(dir: &Path, request: &str) -> Result<TargetLock> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(format!("{request}.lock")))?;
+    crate::pr_head::try_lock_file(&file)?;
+    Ok(TargetLock(file))
+}
+
 fn canonical(url: &str) -> Option<String> {
     let url = url.trim_end_matches('/').to_ascii_lowercase();
     let rest = url.strip_prefix("https://")?;
@@ -351,12 +363,7 @@ async fn merge_with(
     let evidence = exact_owner_authorization(&conversation, &action.instruction(), quote)?;
     let dir = home.join("chat-controls").join(talk);
     std::fs::create_dir_all(&dir)?;
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join(format!("{}.lock", action.request)))?;
-    crate::pr_head::try_lock_file(&lock)?;
+    let _request = request_lock(&dir, &action.request)?;
     let path = dir.join(format!("{}.json", action.request));
     let mut receipt = if path.exists() {
         let prior: Receipt = serde_json::from_slice(&std::fs::read(&path)?)?;
@@ -892,6 +899,22 @@ mod tests {
         let mut action = request();
         action.head = "abc".into();
         assert!(action.validate().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_lock_releases_even_while_an_inherited_descriptor_is_open() {
+        let home = tempfile::tempdir().unwrap();
+        let first = request_lock(home.path(), "merge-1").unwrap();
+        // A clone shares the file description just as a concurrent fork does.
+        let inherited = first.0.try_clone().unwrap();
+        assert!(request_lock(home.path(), "merge-1").is_err());
+        drop(first);
+        let retry = request_lock(home.path(), "merge-1").unwrap();
+        drop(inherited);
+        assert!(request_lock(home.path(), "merge-1").is_err());
+        drop(retry);
+        assert!(request_lock(home.path(), "merge-1").is_ok());
     }
 
     #[test]
