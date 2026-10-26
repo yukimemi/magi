@@ -85,6 +85,7 @@ async fn ask_decision(
                 &mut seat,
                 &Invocation {
                     coordination: state.config.coordination.as_ref(),
+                    editing_network: state.config.graph.editing_network,
                     fetched_base: None,
                     cwd: repo,
                     prompt,
@@ -203,6 +204,7 @@ async fn guard_reason(
                 seat,
                 &Invocation {
                     coordination: state.config.coordination.as_ref(),
+                    editing_network: state.config.graph.editing_network,
                     fetched_base: None,
                     cwd: repo,
                     prompt: &rewrite,

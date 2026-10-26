@@ -95,6 +95,8 @@ pub fn has_session(kind: AgentKind, seat: &SeatState, sessions_enabled: bool) ->
 pub struct Invocation<'a> {
     /// Rendered repository coordination policy for this invocation.
     pub coordination: Option<&'a crate::config::Coordination>,
+    /// Requested policy; never overrides restrictions inherited from the parent.
+    pub editing_network: crate::config::EditingNetwork,
     /// Launcher fetch evidence, unchanged on session resume.
     pub fetched_base: Option<&'a crate::run::FetchedBase>,
     /// Working directory. Always a real checkout, so every CLI can read the
@@ -154,6 +156,13 @@ fn repository_writer(inv: &Invocation<'_>) -> bool {
         ) || inv.node == crate::queue::CHAT_NODE)
 }
 
+/// One source for argv, evidence and current-turn guidance. This records a
+/// request to the backend, not effective access under inherited restrictions.
+fn requested_network_access(kind: AgentKind, inv: &Invocation<'_>) -> Option<bool> {
+    (kind == AgentKind::Codex && repository_writer(inv) && !inv.unsandboxed)
+        .then_some(inv.editing_network == crate::config::EditingNetwork::Enabled)
+}
+
 fn repository_seat(inv: &Invocation<'_>) -> bool {
     // These roles consume supplied state, prompts and conversation history.
     // In particular, they must be able to deliver an answer or make queue
@@ -196,6 +205,7 @@ fn editing_access_note(
     kind: AgentKind,
     unsandboxed: bool,
     base: Option<&crate::run::FetchedBase>,
+    network: Option<bool>,
 ) -> String {
     let mut note = String::from(
         "Launcher repository access contract (applies to this turn and overrides earlier fetch/commit instructions):\n",
@@ -212,7 +222,12 @@ fn editing_access_note(
     if kind != AgentKind::Codex || unsandboxed {
         return note;
     }
-    note.push_str("Network access is restricted by the seat sandbox. A shared Git directory grant does not guarantee access to protected Git administration paths. Use local status, diff and log to inspect the checkout. If add/commit is denied, leave the implementation files in this assigned worktree: the launcher saves eligible edits after the seat exits. Do not repeatedly retry denied fetches or ask the owner to approve unavailable sandbox permissions. If an essential operation (including rebase continuation or dependency download) is still impossible, stop with an actionable infrastructure report naming the operation, target and error; the operator must repair/deploy the launcher environment before a single new attempt. Do not use bypass flags, change permissions, edit another checkout, or claim a network failure proves host DNS is broken. Specification questions remain valid.\n");
+    note.push_str(if network == Some(true) {
+        "The launcher requests network access for repository tests, including local test servers and outbound traffic. This request is not proof of effective access. "
+    } else {
+        "Network access is restricted by the seat sandbox. "
+    });
+    note.push_str("A shared Git directory grant does not guarantee access to protected Git administration paths. Use local status, diff and log to inspect the checkout. If add/commit is denied, leave the implementation files in this assigned worktree: the launcher saves eligible edits after the seat exits. Do not repeatedly retry denied fetches or ask the owner to approve unavailable sandbox permissions. If an operation is denied, record the operation, target, exact error and impact; do not bypass the denial or repeat it without a changed environment. Distinguish reproducing the current defect, writing a correction for a future launcher process, and validating a deployed launcher. An expected reproduction failure (for example a denied local test-server bind during launcher repair) is defect evidence, not a reason to abandon independently permitted source edits. Continue those edits and focused checks, retain eligible changes, and hand real launcher/browser validation to the parent-owned verification path. Source changes affect future launches only: a child process cannot relax inherited parent restrictions. If a genuinely required operation (including rebase continuation or dependency download) blocks all remaining permitted work, stop with an actionable infrastructure report; identify the deployment or environment repair needed before retrying that operation. Do not claim deployment or browser success without real evidence. Do not use bypass flags, change permissions, edit another checkout, or claim a network failure proves host DNS is broken. Specification questions remain valid.\n");
     note
 }
 
@@ -462,6 +477,7 @@ pub async fn invoke(
             spec.kind,
             inv.unsandboxed,
             inv.fetched_base,
+            requested_network_access(spec.kind, inv),
         ));
     }
     let inv = &Invocation {
@@ -487,9 +503,7 @@ pub async fn invoke(
             "kind": spec.kind,
             "allow_write": inv.allow_write,
             "unsandboxed": inv.unsandboxed,
-            "requested_network_access": if spec.kind == AgentKind::Codex && repository_writer(inv) && !inv.unsandboxed {
-                Some(false)
-            } else { None },
+            "requested_network_access": requested_network_access(spec.kind, inv),
             "writable_roots": inv.writable,
             "fetched_base": inv.fetched_base,
         }))?,
@@ -966,9 +980,9 @@ fn build_command(
                 // that asks blocks until its timeout kills it.
                 argv.push("-c".to_owned());
                 argv.push("approval_policy=\"never\"".to_owned());
-                if repository_writer(inv) {
+                if let Some(enabled) = requested_network_access(spec.kind, inv) {
                     argv.push("-c".to_owned());
-                    argv.push("sandbox_workspace_write.network_access=false".to_owned());
+                    argv.push(format!("sandbox_workspace_write.network_access={enabled}"));
                 }
                 if inv.allow_write && !inv.writable.is_empty() {
                     let roots: Vec<String> = inv
@@ -1962,6 +1976,7 @@ mod tests {
     fn inv<'a>(cwd: &'a Path, art: &'a Path, allow_write: bool) -> Invocation<'a> {
         Invocation {
             coordination: None,
+            editing_network: crate::config::EditingNetwork::Restricted,
             fetched_base: None,
             cwd,
             prompt: "do the thing",
@@ -1991,7 +2006,7 @@ mod tests {
 
     #[test]
     fn editing_access_requires_fetch_evidence_and_keeps_snapshot() {
-        let missing = editing_access_note(AgentKind::Codex, false, None);
+        let missing = editing_access_note(AgentKind::Codex, false, None, Some(false));
         assert!(missing.contains("No successful launcher fetch evidence"));
         let base = crate::run::FetchedBase {
             remote: "origin".into(),
@@ -1999,7 +2014,7 @@ mod tests {
             commit: "0123456789abcdef".into(),
             fetched_at: "2026-10-18T00:00:00Z".parse().unwrap(),
         };
-        let note = editing_access_note(AgentKind::Codex, false, Some(&base));
+        let note = editing_access_note(AgentKind::Codex, false, Some(&base), Some(false));
         for expected in [
             "origin/main",
             "0123456789abcdef",
@@ -2019,7 +2034,7 @@ mod tests {
             AgentKind::Command,
         ] {
             for unsandboxed in [false, true] {
-                let scoped = editing_access_note(kind, unsandboxed, Some(&base));
+                let scoped = editing_access_note(kind, unsandboxed, Some(&base), Some(false));
                 assert!(scoped.contains(&base.commit));
                 assert!(scoped.contains("Do not fetch again"));
                 let restricted = kind == AgentKind::Codex && !unsandboxed;
@@ -2031,7 +2046,7 @@ mod tests {
                 ] {
                     assert_eq!(scoped.contains(claim), restricted, "{kind:?}/{unsandboxed}");
                     assert_eq!(
-                        editing_access_note(kind, unsandboxed, None).contains(claim),
+                        editing_access_note(kind, unsandboxed, None, Some(false)).contains(claim),
                         restricted,
                         "{kind:?}/{unsandboxed} without fetch evidence",
                     );
@@ -2041,52 +2056,113 @@ mod tests {
         let roundtrip: crate::run::FetchedBase =
             serde_json::from_str(&serde_json::to_string(&base).unwrap()).unwrap();
         assert_eq!(
-            editing_access_note(AgentKind::Codex, false, Some(&roundtrip)),
+            editing_access_note(AgentKind::Codex, false, Some(&roundtrip), Some(false)),
             note
         );
     }
 
     #[test]
     fn editing_network_policy_is_explicit_on_initial_and_resume() {
-        for resumed in [false, true] {
-            let mut seat = SeatState::new("impl-A", "a", 7);
-            if resumed {
-                seat.turns = 1;
-                seat.captured_session = Some("fixture-thread".into());
+        use crate::config::EditingNetwork::{Enabled, Restricted};
+        for network in [Restricted, Enabled] {
+            for resumed in [false, true] {
+                let mut seat = SeatState::new("impl-A", "a", 7);
+                if resumed {
+                    seat.turns = 1;
+                    seat.captured_session = Some("fixture-thread".into());
+                }
+                for node in [
+                    "implement",
+                    "fix",
+                    "graft",
+                    "gate-fix",
+                    "land",
+                    "rebase",
+                    crate::queue::CHAT_NODE,
+                ] {
+                    let mut invocation = inv(Path::new("."), Path::new("/art"), true);
+                    invocation.node = node;
+                    invocation.editing_network = network;
+                    let plan = build_command(
+                        &spec(AgentKind::Codex, None),
+                        &seat,
+                        &invocation,
+                        Path::new("/art/p.md"),
+                    )
+                    .unwrap();
+                    let requested =
+                        requested_network_access(AgentKind::Codex, &invocation).unwrap();
+                    assert_eq!(requested, network == Enabled);
+                    let at = plan
+                        .argv
+                        .iter()
+                        .position(|s| {
+                            s == &format!("sandbox_workspace_write.network_access={requested}")
+                        })
+                        .unwrap();
+                    if resumed {
+                        assert!(at < plan.argv.iter().position(|s| s == "resume").unwrap());
+                    }
+                    assert!(plan.argv.iter().any(|s| s == "workspace-write"));
+                    assert!(plan.argv.iter().any(|s| s == "approval_policy=\"never\""));
+                    assert!(!plan.argv.iter().any(|s| s.contains("bypass")));
+                    let note = editing_access_note(AgentKind::Codex, false, None, Some(requested));
+                    assert_eq!(note.contains("requests network access"), requested);
+                    assert_eq!(note.contains("Network access is restricted"), !requested);
+                    for kind in [AgentKind::Claude, AgentKind::Command] {
+                        assert_eq!(requested_network_access(kind, &invocation), None);
+                    }
+                    invocation.unsandboxed = true;
+                    assert_eq!(
+                        requested_network_access(AgentKind::Codex, &invocation),
+                        None
+                    );
+                }
+                for (node, write) in [
+                    ("review", false),
+                    ("implement", false),
+                    ("deputy", true),
+                    ("conduct", true),
+                    ("talk-title", false),
+                ] {
+                    let mut invocation = inv(Path::new("."), Path::new("/art"), write);
+                    invocation.node = node;
+                    invocation.editing_network = network;
+                    assert_eq!(
+                        requested_network_access(AgentKind::Codex, &invocation),
+                        None
+                    );
+                    let plan = build_command(
+                        &spec(AgentKind::Codex, None),
+                        &seat,
+                        &invocation,
+                        Path::new("/art/p.md"),
+                    )
+                    .unwrap();
+                    assert!(!plan.argv.iter().any(|s| s.contains("network_access")));
+                }
             }
-            let mut invocation = inv(Path::new("."), Path::new("/art"), true);
-            invocation.node = "implement";
-            let plan = build_command(
-                &spec(AgentKind::Codex, None),
-                &seat,
-                &invocation,
-                Path::new("/art/p.md"),
-            )
-            .unwrap();
-            let policy = plan
-                .argv
-                .iter()
-                .position(|s| s == "sandbox_workspace_write.network_access=false")
-                .unwrap();
-            if resumed {
-                assert!(policy < plan.argv.iter().position(|s| s == "resume").unwrap());
+        }
+    }
+
+    #[test]
+    fn editing_access_keeps_infrastructure_repair_actionable() {
+        for network in [Some(false), Some(true)] {
+            let note = editing_access_note(AgentKind::Codex, false, None, network);
+            for expected in [
+                "expected reproduction failure",
+                "not a reason to abandon independently permitted source edits",
+                "Source changes affect future launches only",
+                "a child process cannot relax inherited parent restrictions",
+                "parent-owned verification path",
+                "operation, target, exact error and impact",
+                "blocks all remaining permitted work, stop",
+                "Do not use bypass flags",
+                "Do not claim deployment or browser success without real evidence",
+            ] {
+                assert!(note.contains(expected), "missing {expected}");
             }
-            assert!(!plan.argv.iter().any(|s| s.contains("bypass")));
-            invocation.node = "deputy";
-            let deputy = build_command(
-                &spec(AgentKind::Codex, None),
-                &seat,
-                &invocation,
-                Path::new("/art/p.md"),
-            )
-            .unwrap();
-            assert!(!deputy.argv.iter().any(|s| s.contains("network_access")));
-            assert!(
-                !plan_for(AgentKind::Codex, &seat, false)
-                    .argv
-                    .iter()
-                    .any(|s| s.contains("writable_roots"))
-            );
+            assert!(!note.contains("before a single new attempt"));
         }
     }
 
@@ -2809,6 +2885,7 @@ mod tests {
             &seat,
             &Invocation {
                 coordination: None,
+                editing_network: crate::config::EditingNetwork::Restricted,
                 fetched_base: None,
                 cwd: Path::new("."),
                 prompt: "p",
@@ -3278,6 +3355,7 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
+                editing_network: crate::config::EditingNetwork::Restricted,
                 fetched_base: None,
                 cwd: dir.path(),
                 prompt: "unused",
@@ -3318,6 +3396,7 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
+                editing_network: crate::config::EditingNetwork::Restricted,
                 fetched_base: None,
                 cwd: dir.path(),
                 prompt: "unused",
@@ -3368,6 +3447,7 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
+                editing_network: crate::config::EditingNetwork::Restricted,
                 fetched_base: None,
                 cwd: dir.path(),
                 prompt: "unused",
@@ -3417,6 +3497,7 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
+                editing_network: crate::config::EditingNetwork::Restricted,
                 fetched_base: None,
                 cwd: dir.path(),
                 prompt: &big,
@@ -3465,6 +3546,7 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
+                editing_network: crate::config::EditingNetwork::Restricted,
                 fetched_base: None,
                 cwd: dir.path(),
                 prompt: "unused",
@@ -3503,6 +3585,7 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
+                editing_network: crate::config::EditingNetwork::Restricted,
                 fetched_base: None,
                 cwd: dir.path(),
                 prompt: "unused",

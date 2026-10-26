@@ -2319,6 +2319,7 @@ impl Runner {
                     &mut seat,
                     &Invocation {
                         coordination: self.state.config.coordination.as_ref(),
+                        editing_network: self.state.config.graph.editing_network,
                         fetched_base: None,
                         cwd,
                         prompt: &prompt,
@@ -9553,6 +9554,7 @@ async fn wave(
         let spawned_tx = spawned_tx.clone();
         let repository_wait = repository_wait.clone();
         let coordination = state.config.coordination.clone();
+        let editing_network = state.config.graph.editing_network;
         let fetched_base = state.fetched_base.clone();
         set.spawn(async move {
             // A wait for a parallelism slot is scheduling, not the agent: it
@@ -9580,6 +9582,7 @@ async fn wave(
                     &mut seat,
                     &Invocation {
                         coordination: coordination.as_ref(),
+                        editing_network,
                         fetched_base: fetched_base.as_ref(),
                         cwd: &job.cwd,
                         prompt: &job.prompt,
@@ -14308,6 +14311,39 @@ mod tests {
             assert!(runner.state.candidates[0].folded);
             assert_eq!(runner.state.tally.as_ref().unwrap().winner, 'B');
         }
+    }
+
+    #[tokio::test]
+    async fn infrastructure_failure_report_retains_eligible_candidate_edits() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        runner.state.candidates.retain(|c| c.label == 'A');
+        runner.state.tally = None;
+        runner.state.judge_skipped = false;
+        let candidate = &mut runner.state.candidates[0];
+        candidate.summary = "Reproduction bind denied with EPERM; source repair complete, deployed browser validation remains parent-owned.".into();
+        candidate.failed = Some("deployment validation unavailable".into());
+        std::fs::write(
+            candidate.worktree.join("repair"),
+            "future launcher policy\n",
+        )
+        .unwrap();
+        runner
+            .state
+            .candidate_preservation
+            .insert('A', "awaiting persistence".into());
+        runner.persist_candidates().await.unwrap();
+        let candidate = &runner.state.candidates[0];
+        assert!(!candidate.empty);
+        assert_eq!(candidate.commits, 1);
+        assert_eq!(candidate.files, 1);
+        assert!(candidate.failed.is_none());
+        assert!(candidate.summary.contains("EPERM"));
+        assert!(
+            crate::run::read_artifact(&runner.state, "cand-A.patch")
+                .unwrap()
+                .contains("future launcher policy")
+        );
+        assert!(runner.state.candidate_preservation.is_empty());
     }
 
     #[tokio::test]

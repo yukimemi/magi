@@ -869,6 +869,7 @@ impl Job {
             ($prompt:expr, $stem:expr, $timeout:expr) => {
                 Invocation {
                     coordination: cfg.coordination.as_ref(),
+                    editing_network: cfg.graph.editing_network,
                     fetched_base: None,
                     cwd: &cwd,
                     prompt: $prompt,
