@@ -1033,7 +1033,6 @@ function initLoopDetail() {
   };
   sync();
 }
-initLoopDetail();
 
 // The open intent is a click-only flag: health polling and reconnects never
 // reset it, and an empty panel merely hides while the flag is kept.
@@ -1060,6 +1059,7 @@ function syncLoopInfo() {
   show(info, hasContent);
   show($("loop-detail"), open);
 }
+initLoopDetail();
 // Separate from the transient transport alert: normal polling must not erase
 // an update failure before someone can read it or after the page reloads.
 let upgradeSending = false;
