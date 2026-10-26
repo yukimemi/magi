@@ -1080,7 +1080,12 @@ pub async fn run(home: &Path, id: &str) -> Result<()> {
 }
 
 fn hex_digest(hash: Sha256) -> String {
-    format!("{:x}", hash.finalize())
+    // sha2 0.11's `finalize` returns a `hybrid_array::Array`, which no
+    // longer implements `LowerHex`, so format the bytes individually.
+    hash.finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 fn digest(bytes: &[u8]) -> String {
     let mut hash = Sha256::new();
