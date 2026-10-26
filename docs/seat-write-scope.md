@@ -28,9 +28,62 @@ permission is broader than a single lock file and is deliberately documented.
 Only `questions` and `notifications` are added from the control plane. Queue,
 run and chat stores and the state root are not added. Commands such as
 `magi task add` are consequently not enabled for sandboxed implementers by this
-change. Notification webhooks remain best effort; network access is not added.
+change. Notification webhooks remain best effort; network policy is configured
+separately as described below.
 Deputies and chats keep their existing explicit, purpose-specific
 grants and do not gain repository metadata access through this policy.
+
+## Requested editing network policy
+
+`[graph] editing_network = "restricted" | "enabled"` defaults to `restricted`.
+For sandboxed repository writers, the launcher passes the requested boolean via
+`sandbox_workspace_write.network_access`, retaining `workspace-write`,
+`approval_policy="never"`, existing writable roots, coordination and process
+containment. `enabled` permits outbound traffic as well as local test servers;
+the supported setting cannot grant loopback alone. This repository opts in for
+its browser tests. Other roles and adapters retain their existing policy.
+
+`Invocation` carries the configured policy through initial turns, resumes,
+fallbacks and waiter delivery. The same policy function supplies the argv,
+`requested_network_access` in `*.access.json`, and current-turn guidance. This
+is a request, not evidence of effective access: host or managed restrictions
+can still deny networking, and a child cannot relax inherited parent restrictions.
+Git administration-path denials are separate from network denials and remain
+possible even with the common directory grant.
+
+During infrastructure repair, a failed reproduction is evidence of the current
+defect. It does not prevent independently permitted source edits for a future
+launcher. Record denied operations, targets, exact errors and their impact;
+continue independent edits and focused checks without bypasses or futile
+retries. Stop when a required denial blocks all remaining permitted work.
+Candidate preservation rescues eligible edits independently of a failure report;
+this does not establish successful deployment or validation.
+
+Repository configuration comes from the launcher's fetched base, never the
+candidate working tree. Deployment therefore requires integrating the policy
+and source changes, deploying the rebuilt launcher, and preparing a new seat
+from the fetched base through the existing preparation/base-sync paths. Deploy
+the updated launcher before it discovers a base with the new setting: older
+launchers reject the unknown graph key. Saved runs retain their saved policy;
+resuming an old restricted run does not reload the candidate configuration. No
+seat-side fetch is required. A parent running the old launcher cannot gain the
+new policy merely by executing a newly built child under inherited restrictions.
+The parent-owned verification path must inspect fresh access evidence, verify
+local server bind/browser execution and the unrelated-write denial, and check
+coordination/containment before declaring the browser blocker resolved. Source
+and fixture checks alone do not demonstrate resolution of the existing blocked
+browser task. Genuine parent/managed-policy or protected Git-path denials must
+be reported separately with the operation and error.
+
+In the restricted repair seat, `RUSTUP_TOOLCHAIN=stable cargo test --locked
+--lib editing_` also selected four existing web tests. All four failed at
+`src/web.rs`'s `bind loopback` with `Os { code: 1, kind: PermissionDenied,
+message: "Operation not permitted" }`; the ten other selected tests passed.
+This is reproduction evidence under the current inherited seat restrictions,
+not a test of the deployed correction. Do not retry those binds in the same
+environment or treat them as a source-editing blocker. The existing browser
+task's blocker remains unproven resolved until parent-owned real verification
+succeeds after deployment.
 
 ## Parent-owned review and verification
 

@@ -1286,6 +1286,7 @@ async fn ask_judge(cfg: &Config, cwd: &Path, title: &str, body: &str) -> Result<
         let mut seat = agent::SeatState::new("github-text", &spec.id, crate::rng::entropy());
         let inv = agent::Invocation {
             coordination: cfg.coordination.as_ref(),
+            editing_network: cfg.graph.editing_network,
             fetched_base: None,
             cwd,
             prompt: &prompt,

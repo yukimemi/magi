@@ -349,60 +349,68 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
         fetched_at: "2026-10-18T00:00:00Z".parse().unwrap(),
     };
     let artifacts = fx._tmp.path().join("artifacts");
-    for node in ["implement", "fix", "graft", "gate-fix", "land", "rebase", "chat"] {
-        let mut seat = SeatState::new("fixture-seat", "fixture", 1);
-        for resumed in [false, true] {
-            if resumed {
-                seat.captured_session = Some("fixture-session".into());
-            }
-            let out = invoke(
-                &spec,
-                &mut seat,
-                &Invocation {
-                    coordination: Some(coordination()),
-                    fetched_base: Some(&fetched_base),
-                    cwd: &fx.seat,
-                    prompt: "fixture",
-                    timeout: Duration::from_secs(10),
-                    allow_write: true,
-                    unsandboxed: false,
-                    sessions: true,
-                    artifacts: &artifacts,
-                    stem: node,
-                    run: "fixture-run",
-                    node,
-                    cache_dir: None,
-                    attachments: &[],
-                    writable: &[],
-                },
-            )
-            .await
-            .unwrap();
-            assert!(out.usable(), "{out:?}");
-            let prompt = std::fs::read_to_string(artifacts.join(format!("{node}.prompt.md"))).unwrap();
-            assert!(prompt.contains("fixture-pinned-base"), "{node}, resumed={resumed}");
-            assert!(prompt.contains("Do not fetch again"));
-            let access: serde_json::Value = serde_json::from_slice(
-                &std::fs::read(artifacts.join(format!("{node}.access.json"))).unwrap(),
-            ).unwrap();
-            assert_eq!(access["fetched_base"]["commit"], "fixture-pinned-base");
+    for network in [magi::config::EditingNetwork::Restricted, magi::config::EditingNetwork::Enabled] {
+        for node in ["implement", "fix", "graft", "gate-fix", "land", "rebase", "chat"] {
+            let mut seat = SeatState::new("fixture-seat", "fixture", 1);
+            for resumed in [false, true] {
+                if resumed {
+                    seat.captured_session = Some("fixture-session".into());
+                }
+                let out = invoke(
+                    &spec,
+                    &mut seat,
+                    &Invocation {
+                        coordination: Some(coordination()),
+                        editing_network: network,
+                        fetched_base: Some(&fetched_base),
+                        cwd: &fx.seat,
+                        prompt: "fixture",
+                        timeout: Duration::from_secs(10),
+                        allow_write: true,
+                        unsandboxed: false,
+                        sessions: true,
+                        artifacts: &artifacts,
+                        stem: node,
+                        run: "fixture-run",
+                        node,
+                        cache_dir: None,
+                        attachments: &[],
+                        writable: &[],
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(out.usable(), "{out:?}");
+                let prompt = std::fs::read_to_string(artifacts.join(format!("{node}.prompt.md"))).unwrap();
+                assert!(prompt.contains("fixture-pinned-base"), "{node}, resumed={resumed}");
+                assert!(prompt.contains("Do not fetch again"));
+                let access: serde_json::Value = serde_json::from_slice(
+                    &std::fs::read(artifacts.join(format!("{node}.access.json"))).unwrap(),
+                ).unwrap();
+                assert_eq!(access["fetched_base"]["commit"], "fixture-pinned-base");
+                let enabled = network == magi::config::EditingNetwork::Enabled;
+                assert_eq!(access["requested_network_access"], enabled);
+                assert_eq!(prompt.contains("requests network access"), enabled);
+                assert_eq!(prompt.contains("Network access is restricted"), !enabled);
 
-            let args = std::fs::read_to_string(&args_path).unwrap();
-            let roots = worktree_writable_roots(&fx.seat, &fx.home).await.unwrap();
-            assert!(
-                args.contains(&format!(
-                    "sandbox_workspace_write.writable_roots={}",
-                    serde_json::to_string(&roots).unwrap()
-                )),
-                "{node}, resumed={resumed}: {args}"
-            );
-            assert_eq!(args.lines().any(|s| s == "resume"), resumed);
-            assert!(args.contains("workspace-write"));
-            assert!(!args.contains("bypass"));
-            assert_eq!(
-                std::fs::read_to_string(&home_path).unwrap().trim(),
-                fx.home.canonicalize().unwrap().to_str().unwrap()
-            );
+                let args = std::fs::read_to_string(&args_path).unwrap();
+                assert!(args.lines().any(|s| s == format!("sandbox_workspace_write.network_access={enabled}")));
+                let roots = worktree_writable_roots(&fx.seat, &fx.home).await.unwrap();
+                assert!(
+                    args.contains(&format!(
+                        "sandbox_workspace_write.writable_roots={}",
+                        serde_json::to_string(&roots).unwrap()
+                    )),
+                    "{node}, resumed={resumed}: {args}"
+                );
+                assert_eq!(args.lines().any(|s| s == "resume"), resumed);
+                assert!(args.contains("workspace-write"));
+                assert!(!args.contains("bypass"));
+                assert_eq!(
+                    std::fs::read_to_string(&home_path).unwrap().trim(),
+                    fx.home.canonicalize().unwrap().to_str().unwrap()
+                );
+            }
         }
     }
     // Other roles keep their explicit grants and home environment. Even a
@@ -412,6 +420,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
         let mut seat = SeatState::new("fixture-seat", "fixture", 1);
         invoke(&spec, &mut seat, &Invocation {
             coordination: Some(coordination()),
+            editing_network: magi::config::EditingNetwork::Restricted,
             fetched_base: None,
             cwd: &fx.seat, prompt: "fixture", timeout: Duration::from_secs(10),
             allow_write, unsandboxed: false, sessions: false,
@@ -421,6 +430,9 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
         let args = std::fs::read_to_string(&args_path).unwrap();
         assert!(!args.contains(fx.primary.join(".git").canonicalize().unwrap().to_str().unwrap()));
         assert_eq!(args.contains("writable_roots"), allow_write);
+        assert!(!args.contains("network_access"));
+        let access: serde_json::Value = serde_json::from_slice(&std::fs::read(artifacts.join(format!("{node}.access.json"))).unwrap()).unwrap();
+        assert!(access["requested_network_access"].is_null());
         assert_eq!(std::fs::read_to_string(&home_path).unwrap().trim(), "incorrect-store");
     }
 }
@@ -520,6 +532,7 @@ Write-Output 'real-lock-contends'
     let artifacts = fx._tmp.path().join("reader-artifacts");
     let inv = Invocation {
         coordination: Some(coordination()),
+        editing_network: magi::config::EditingNetwork::Restricted,
         fetched_base: None,
         cwd: &fx.seat,
         prompt: "fixture read-only work",
@@ -693,6 +706,7 @@ mod coordination {
     ) -> Invocation<'a> {
         Invocation {
             coordination: Some(coordination()),
+            editing_network: magi::config::EditingNetwork::Restricted,
             fetched_base: None,
             cwd: &fx.seat,
             prompt: "fixture",
@@ -747,6 +761,7 @@ mod coordination {
             let first_inv = Invocation {
                 node: magi::queue::CHAT_NODE,
                 coordination: policy,
+                editing_network: magi::config::EditingNetwork::Restricted,
                 ..invocation(fx, &first_art, allow_write)
             };
             let second_inv = Invocation {
@@ -799,6 +814,7 @@ mod coordination {
         let run_inv = Invocation {
             node: "implement",
             coordination: Some(&policy),
+            editing_network: magi::config::EditingNetwork::Restricted,
             ..invocation(&fx, &run_art, false)
         };
         let mut run_seat = SeatState::new("implement", "fixture", 1);
@@ -859,6 +875,7 @@ lock_file = "kanade-sync.lock"
         let art = fx._tmp.path().join("art");
         let inv = Invocation {
             coordination: cfg.coordination.as_ref(),
+            editing_network: magi::config::EditingNetwork::Restricted,
             fetched_base: None,
             ..invocation(&fx, &art, false)
         };

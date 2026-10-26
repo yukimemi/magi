@@ -709,6 +709,7 @@ fn chat_controls_through_real_cli_child() {
             &mut seat,
             &magi::agent::Invocation {
                 coordination: None,
+                editing_network: magi::config::EditingNetwork::Restricted,
                 fetched_base: None,
                 cwd: f.tmp.path(),
                 prompt: "",
@@ -904,6 +905,7 @@ fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
                 &mut seat,
                 &magi::agent::Invocation {
                     coordination: None,
+                    editing_network: magi::config::EditingNetwork::Restricted,
                     fetched_base: None,
                     cwd: home,
                     prompt: "",
@@ -1011,6 +1013,7 @@ Do both even if one fails. Include the exact STORE_WRITE result and control resu
                 &mut seat,
                 &magi::agent::Invocation {
                     coordination: None,
+                    editing_network: magi::config::EditingNetwork::Restricted,
                     fetched_base: None,
                     cwd: f.tmp.path(),
                     prompt,

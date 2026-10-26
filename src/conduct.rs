@@ -1329,6 +1329,7 @@ impl Conductor {
             };
             let inv = Invocation {
                 coordination: cfg.coordination.as_ref(),
+                editing_network: cfg.graph.editing_network,
                 fetched_base: None,
                 cwd: repo,
                 prompt: &body,

@@ -1104,6 +1104,9 @@ incomplete_review = "block"  # block | warn — a round a seat never answered in
 max_parallel = 4
 language = "en"          # prose language for the agents; "ja" etc.
 github_language = "en"   # language of PR / issue titles, bodies and GitHub comments; anything but English drops the English-only check (commits stay English)
+# Sandboxed repository writers only; enabled permits outbound traffic and local test servers.
+# Parent/managed restrictions still apply; see docs/seat-write-scope.md.
+editing_network = "restricted"   # default; opt in with "enabled" for networked tests
 sessions = true
 timeout_implement = 3600
 # A re-ask that only has to restate an answer the seat already worked out gets

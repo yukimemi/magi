@@ -71,6 +71,8 @@ base = "main"
 style = "squash"
 
 [graph]
+# Repository tests start local servers; this also permits outbound network access.
+editing_network = "enabled"
 # `cargo make check` on this repository takes ~1450s on a warm cache on this
 # machine — measured, not guessed — against a `timeout_review` default of
 # 1200s, which `timeout_verify` inherits when it is unset. That made the gate

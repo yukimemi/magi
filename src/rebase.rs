@@ -204,6 +204,7 @@ pub async fn rebase_with_fixer(
                 &mut seat,
                 &Invocation {
                     coordination: state.config.coordination.as_ref(),
+                    editing_network: state.config.graph.editing_network,
                     fetched_base: state.fetched_base.as_ref(),
                     cwd: scratch,
                     prompt: &prompt_text,

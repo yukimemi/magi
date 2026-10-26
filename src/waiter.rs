@@ -180,6 +180,7 @@ pub fn decide_owned(
 /// Everything needed to resume one seat.
 struct Target {
     coordination: Option<crate::config::Coordination>,
+    editing_network: crate::config::EditingNetwork,
     fetched_base: Option<crate::run::FetchedBase>,
     spec: AgentSpec,
     seat: SeatState,
@@ -418,6 +419,7 @@ impl Waiter {
         }
         Ok(Target {
             coordination: cfg.coordination.clone(),
+            editing_network: cfg.graph.editing_network,
             fetched_base,
             spec,
             seat,
@@ -610,6 +612,7 @@ impl Waiter {
         let cache_dir = None;
         let inv = Invocation {
             coordination: target.coordination.as_ref(),
+            editing_network: target.editing_network,
             fetched_base: target.fetched_base.as_ref(),
             cwd: &target.cwd,
             prompt: &body,
@@ -735,6 +738,46 @@ impl Drop for Release {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editing_network_waiter_target_retains_saved_run_policy() {
+        use crate::config::EditingNetwork::{Enabled, Restricted};
+        for network in [Restricted, Enabled] {
+            let home = tempfile::tempdir().unwrap();
+            let mut cfg = Config::default();
+            cfg.graph.editing_network = network;
+            cfg.graph.sessions = true;
+            cfg.agents = vec![toml::from_str("id = 'fixture'\nkind = 'codex'\n").unwrap()];
+            let mut state = RunState::new(
+                home.path().into(),
+                "main".into(),
+                "0".repeat(40),
+                "repair".into(),
+                cfg,
+            );
+            state.status = crate::run::RunStatus::Implementing;
+            let mut seat = agent::SeatState::new("impl-A", "fixture", 1);
+            seat.turns = 1;
+            seat.captured_session = Some("saved-thread".into());
+            state.seats.insert(seat.key.clone(), seat);
+            state.save_under(home.path()).unwrap();
+            let mut q = asked(0);
+            q.run = state.id;
+            q.cwd = Some(home.path().to_string_lossy().into_owned());
+            let waiter = Waiter::new(
+                Questions::at(home.path().join("questions")),
+                home.path().into(),
+                None,
+            );
+            let target = waiter.target(&q).unwrap();
+            assert_eq!(target.editing_network, network);
+            assert!(target.allow_write);
+            assert_eq!(
+                target.seat.captured_session.as_deref(),
+                Some("saved-thread")
+            );
+        }
+    }
 
     #[test]
     fn retry_backoff_survives_a_new_finite_waiter() {
