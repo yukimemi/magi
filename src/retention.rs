@@ -2612,6 +2612,9 @@ mod tests {
             pinned_run: Some(empty.id.clone()),
         });
         let mut update = tokio::task::spawn_blocking(move || queue.put(&mut selected));
+        // The proof is released only after the update returns, so correctness
+        // is decided by ordering, not speed. The 60-second bound only detects
+        // a writer blocked behind the proof; it is not a performance threshold.
         let updated_while_blocked = match tokio::time::timeout(watchdog, &mut update).await {
             Ok(result) => {
                 result.unwrap().unwrap();
