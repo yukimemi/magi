@@ -699,11 +699,6 @@ impl Talks {
         }
     }
 
-    /// Freeze owner evidence for a direct PR merge using the store's writer lock.
-    pub(crate) fn try_answer_guard(&self) -> Result<Option<StoreGuard<'_>>> {
-        self.try_guard()
-    }
-
     /// Try both locks once, without waiting: the process mutex first, then
     /// the file lock beside the records.
     fn try_guard(&self) -> Result<Option<StoreGuard<'_>>> {
@@ -3240,13 +3235,15 @@ pub fn briefing_for(
          <plan-id>`. Chat plans bind this conversation and expire after 24 \
          hours; a changed or expired plan needs replanning, an interrupted \
          application reuses its plan, and the plan's fences and proofs still \
-         apply. To merge a PR (including bot PRs), the latest owner send must be exactly \
-         `merge-pr: <owner/repo>#<number> head=<full SHA> request=<id>`. Only then use \
+         apply. When the owner asks in their own words to merge a PR (including bot PRs), \
+         read the current head from the forge, then run \
          `magi task control merge-pr <owner/repo> <number> \
-         --head <full SHA> --request <id> --quote \"<entire message>\"`. Recommendations, generated notices, thanks and silence \
+         --head <full SHA> --request <id>`. Generate a fresh request ID for each owner request; \
+         the owner need not type an ID or a fixed phrase. Recommendations, generated notices and silence \
          never authorize merging. Pending land approval questions must use their existing approval path. \
-         A forge refusal must be reported without retrying with other flags. Reuse the request ID \
-         after uncertain delivery; it never reissues a merge. These commands use the turn's inherited control channel \
+         A forge refusal must be reported without retrying with other flags or bypassing required checks or rulesets. \
+         Reuse the request ID after uncertain delivery; it never reissues a merge. \
+         These commands use the turn's inherited control channel \
          without changing repository permissions, network policy or working \
          directory. If that channel is unavailable, report the command error; \
          never edit store files to apply an operation.\n\n\
@@ -6216,9 +6213,13 @@ mod tests {
         assert!(brief.contains("You can act on any task or run directly, whoever filed it"));
         assert!(brief.contains("`magi task control abandon <full run id>`"));
         assert!(brief.contains("When the owner asks to apply it, run the same command"));
-        assert!(brief.contains("merge-pr: <owner/repo>#<number> head=<full SHA> request=<id>"));
-        assert!(brief.contains("--request <id> --quote"));
+        assert!(brief.contains("owner asks in their own words to merge a PR"));
+        assert!(brief.contains("read the current head from the forge"));
+        assert!(brief.contains("--head <full SHA> --request <id>"));
+        assert!(brief.contains("Generate a fresh request ID for each owner request"));
         for gone in [
+            "--quote",
+            "merge-pr:",
             "--recovery-consent",
             "abandon-run:",
             "retention-apply:",

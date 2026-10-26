@@ -675,7 +675,7 @@ enum TalkCmd {
 /// Direct control of this chat's own tasks and runs (standing chat seat only).
 #[derive(Debug, Subcommand)]
 enum ControlCmd {
-    /// Merge a PR with exact, head-bound owner authorization.
+    /// Merge a PR at the head read from the forge when the owner asks.
     MergePr {
         repo: String,
         number: u64,
@@ -683,9 +683,6 @@ enum ControlCmd {
         head: String,
         #[arg(long)]
         request: String,
-        /// Entire latest owner message authorizing this merge.
-        #[arg(long)]
-        quote: Option<String>,
     },
     /// Queue a stopped, blocked or parked run to be resumed by the loop.
     Resume {
@@ -764,7 +761,7 @@ enum TaskCmd {
     /// Resume, hold, release, retry, rerun checks, decide or abandon tasks
     /// and runs. Only the standing chat seat (`MAGI_NODE=chat`, `MAGI_RUN` =
     /// an open conversation) may use it.
-    /// Direct PR merges require an exact owner instruction and head SHA.
+    /// Direct PR merges require the current forge head SHA.
     Control {
         /// What to do.
         #[command(subcommand)]
@@ -3405,13 +3402,11 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                     number,
                     head,
                     request,
-                    quote,
                 } => cc::Operation::MergePr {
                     repo,
                     number,
                     head,
                     request,
-                    quote,
                 },
                 ControlCmd::Resume { run } => cc::Operation::Resume { run },
                 ControlCmd::Hold { id, reason } => cc::Operation::Hold {
@@ -5560,6 +5555,45 @@ mod tests {
         let text = doctor_queue_and_loop(dir.path());
 
         assert!(text.contains("unreadable 1"), "{text}");
+    }
+
+    #[test]
+    fn merge_pr_accepts_agent_arguments_without_a_quote() {
+        let head = "a".repeat(40);
+        let args = [
+            "magi",
+            "task",
+            "control",
+            "merge-pr",
+            "team/project",
+            "7",
+            "--head",
+            &head,
+            "--request",
+            "merge-1",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Some(Command::Task {
+            command:
+                TaskCmd::Control {
+                    op:
+                        ControlCmd::MergePr {
+                            repo,
+                            number,
+                            head: parsed_head,
+                            request,
+                        },
+                },
+            ..
+        }) = cli.command
+        else {
+            panic!("expected merge-pr control command");
+        };
+        assert_eq!(repo, "team/project");
+        assert_eq!(number, 7);
+        assert_eq!(parsed_head, head);
+        assert_eq!(request, "merge-1");
+        assert!(Cli::try_parse_from(args.into_iter().chain(["--quote", "マージして"])).is_err());
     }
 
     #[test]

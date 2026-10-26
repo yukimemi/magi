@@ -7,8 +7,7 @@
 //! abandon a dead run, and record the owner's choice for a decision the
 //! machinery waits on (a merge included). The owner's request in the chat is
 //! the authority: no quote, fixed phrase or "only tasks this chat filed" scope
-//! applies to those existing operations. Direct PR merging is the exception:
-//! it requires the exact persisted owner instruction and quote. Every command goes
+//! applies, including to direct PR merges. Every command goes
 //! through the transitions the rest of magi already uses ([`crate::resume`],
 //! [`Task::hold_manual`], [`Task::release_operator`], [`Task::edit`],
 //! [`crate::daemon::rerun_checks_once`], [`crate::driver::abandon_proven_dead`],
@@ -31,7 +30,7 @@
 //! - **A merge waits for the owner.** It is recorded only when the owner asks
 //!   for it; the land driver then merges the saved head with
 //!   `--match-head-commit`.
-//! - **Direct PR merging requires an exact, head-bound owner instruction.**
+//! - **Direct PR merging binds the head read from the forge.**
 //!   Pending land approvals retain their existing decision path.
 
 use std::path::Path;
@@ -74,10 +73,8 @@ pub enum Operation {
         number: u64,
         /// Full authorized head SHA.
         head: String,
-        /// Idempotency key named in the owner's instruction.
+        /// Agent-generated idempotency key for this request.
         request: String,
-        /// Entire latest persisted owner send.
-        quote: Option<String>,
     },
     /// 既存 run の再開を queue に登録する。
     Resume {
@@ -274,7 +271,6 @@ async fn execute(
             number,
             head,
             request,
-            quote,
         } => {
             crate::chat_merge::merge(
                 home,
@@ -286,7 +282,6 @@ async fn execute(
                     head,
                     request,
                 },
-                quote.as_deref(),
             )
             .await?
         }
