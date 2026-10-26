@@ -99,14 +99,14 @@
     <span class="daemon-text">Connecting…</span>
     <span class="daemon-why" id="loop-why" hidden></span>
   </span>
-  <!-- Opens the explanation for touch screens, where the tooltip on
-       .daemon-body is unreachable. Hidden while there is nothing to explain. -->
-  <button class="daemon-more" type="button" id="loop-more" aria-expanded="false" aria-controls="loop-why" aria-label="Show details" hidden>i</button>
-  <!-- One grid cell, always, whatever mix of the info toggle and the up to
+  <!-- One grid cell, always, whatever mix of the info button and the up to
        three buttons below happen to be visible, so the strip stays one slim
-       row — see .daemon-controls in app.css. -->
+       row — see .daemon-controls in app.css. The single (i) button opens the
+       one #loop-detail panel (status explanation and version details); it is
+       also the touch-screen route to the tooltip on .daemon-body. Hidden while
+       there is nothing to show. -->
   <span class="daemon-controls" id="loop-controls">
-    <button class="daemon-more daemon-version" type="button" id="loop-version" aria-expanded="false" aria-controls="loop-version-detail" aria-label="Show version details" hidden>i</button>
+    <button class="daemon-info" type="button" id="loop-info" aria-expanded="false" aria-controls="loop-detail" aria-label="Show details" hidden>i</button>
     <button class="btn daemon-btn" type="button" id="loop-toggle" aria-describedby="loop-why" hidden></button>
     <!-- Explicit park is separate from scheduler stop and update/restart:
          task workers stop at their next node boundary only when requested. -->
@@ -115,7 +115,10 @@
          controls that do, and it arms on the first tap. -->
     <button class="btn btn-quiet daemon-btn" type="button" id="loop-upgrade" aria-describedby="loop-why" hidden>Update &amp; restart</button>
   </span>
-  <div class="daemon-version-detail" id="loop-version-detail" hidden></div>
+  <div class="daemon-detail" id="loop-detail" hidden>
+    <div class="daemon-detail-why" id="loop-detail-why" hidden></div>
+    <div class="daemon-detail-version" id="loop-detail-version" hidden></div>
+  </div>
 </div>
 
 <div class="upgrade-error" id="upgrade-error" role="alert" hidden>

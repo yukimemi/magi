@@ -1005,45 +1005,61 @@ function upgradeStageDetail(stage) {
 
 /* The strip is one slim line: the explanatory sentence (#loop-why) is written
    by many places, so rather than patch each one a single observer mirrors it
-   into a tooltip and shows the (i) toggle only while there is something to
-   explain. The sentence itself opens on demand (data-more) or on its own for
-   a failure, an upgrade note or a pending stop confirmation (see app.css). */
+   into a tooltip and into the one (i) panel (#loop-detail, with the version
+   details). A failure, an upgrade note or a pending stop confirmation shows
+   the sentence inline instead (see app.css), so the panel does not repeat it. */
 function initLoopDetail() {
   const why = $("loop-why");
-  const more = $("loop-more");
   const box = $("daemon");
-  if (!why || !more || !box) return;
+  if (!why || !box) return;
   const sync = () => {
     const note = why.hidden ? "" : (why.textContent || "").trim();
     setAttr(box.querySelector(".daemon-body"), "title", note || null);
-    show(more, Boolean(note));
-    if (!note) more.setAttribute("aria-expanded", "false");
+    syncLoopInfo();
   };
   new MutationObserver(sync).observe(why, { childList: true, characterData: true, subtree: true, attributes: true, attributeFilter: ["hidden"] });
+  /* The forced-inline states change the panel's content too. */
+  new MutationObserver(syncLoopInfo).observe(box, { subtree: true, attributes: true, attributeFilter: ["data-state", "data-upgrade-failed", "data-armed"] });
   /* The status sentence can carry an error or a stuck-handover message that
      the ellipsis cuts: keep it readable as a tooltip too. */
   const text = box.querySelector(".daemon-text");
   const syncText = () => setAttr(text, "title", (text.textContent || "").trim() || null);
   new MutationObserver(syncText).observe(text, { childList: true, characterData: true, subtree: true });
   syncText();
-  more.onclick = () => {
-    const open = box.dataset.more !== "yes";
-    box.dataset.more = open ? "yes" : "";
-    more.setAttribute("aria-expanded", String(open));
+  const info = $("loop-info");
+  if (info) info.onclick = () => {
+    loopInfoOpen = !loopInfoOpen;
+    syncLoopInfo();
   };
   sync();
 }
-initLoopDetail();
 
-// Version details open only on request; health polling preserves that intent.
-let loopVersionOpen = false;
-const loopVersionToggle = $("loop-version");
-if (loopVersionToggle) loopVersionToggle.onclick = () => {
-  loopVersionOpen = !loopVersionOpen;
-  setAttr(loopVersionToggle, "aria-expanded", String(loopVersionOpen));
-  setAttr(loopVersionToggle, "aria-label", `${loopVersionOpen ? "Hide" : "Show"} version details${loopVersionToggle.dataset.mismatch === "yes" ? "; versions differ" : ""}`);
-  show($("loop-version-detail"), loopVersionOpen && !loopVersionToggle.hidden);
-};
+// The open intent is a click-only flag: health polling and reconnects never
+// reset it, and an empty panel merely hides while the flag is kept.
+let loopInfoOpen = false;
+let loopVersionText = "";
+let loopVersionsDiffer = false;
+function syncLoopInfo() {
+  const box = $("daemon");
+  const why = $("loop-why");
+  const info = $("loop-info");
+  if (!box || !why || !info) return;
+  const armed = Boolean(box.querySelector('[data-armed="yes"]'));
+  const inline = armed || box.dataset.state === "failed" || box.dataset.upgradeFailed === "yes";
+  const note = why.hidden || inline ? "" : (why.textContent || "").trim();
+  const hasContent = Boolean(note) || Boolean(loopVersionText);
+  const open = loopInfoOpen && hasContent;
+  setText($("loop-detail-why"), note);
+  show($("loop-detail-why"), Boolean(note));
+  setText($("loop-detail-version"), loopVersionText);
+  show($("loop-detail-version"), Boolean(loopVersionText));
+  setAttr(info, "data-mismatch", loopVersionsDiffer && loopVersionText ? "yes" : null);
+  setAttr(info, "aria-expanded", String(open));
+  setAttr(info, "aria-label", `${loopInfoOpen ? "Hide" : "Show"} details${loopVersionsDiffer && loopVersionText ? "; versions differ" : ""}`);
+  show(info, hasContent);
+  show($("loop-detail"), open);
+}
+initLoopDetail();
 // Separate from the transient transport alert: normal polling must not erase
 // an update failure before someone can read it or after the page reloads.
 let upgradeSending = false;
@@ -1102,7 +1118,6 @@ function renderLoop() {
      operator who tapped Update & restart had to curl the server to find out
      whether the new binary came back. Hidden rather than guessed while the
      first health tick is outstanding. */
-  const versionChip = $("loop-version");
   const version = state.health && typeof state.health.version === "string"
     ? state.health.version.trim()
     : "";
@@ -1113,7 +1128,6 @@ function renderLoop() {
   const workerVersions = [...new Set(executionJobs.map((job) => job.version ? `v${job.version}` : "starting"))].join(", ");
   const workerSummary = executionJobs.length ? ` \u00b7 ${plural(executionJobs.length, "worker", "workers")} (${workerVersions})` : "";
   const schedulerSummary = scheduler ? ` \u00b7 serve ${scheduler.version ? `v${scheduler.version}` : "starting"}` : "";
-  const versionDetail = $("loop-version-detail");
   const detail = version
     ? [`web v${version}${schedulerSummary}${workerSummary}`, `Web ${version} serves this page.`, ...jobs.map((job) => `${job.kind} ${job.key}: ${job.version ? `v${job.version}` : "starting"} / ${job.generation} (pid ${job.pid || "starting"})`)].join("\n")
     : "";
@@ -1123,21 +1137,19 @@ function renderLoop() {
     .filter((value) => value && value !== "starting");
   const mismatch = new Set(knownVersions).size > 1;
   const versionAvailable = Boolean(version) && !state.healthError;
-  setText(versionDetail, detail);
-  setAttr(versionChip, "data-mismatch", mismatch ? "yes" : null);
-  setAttr(versionChip, "aria-expanded", String(versionAvailable && loopVersionOpen));
-  setAttr(versionChip, "aria-label", `${loopVersionOpen ? "Hide" : "Show"} version details${mismatch ? "; versions differ" : ""}`);
-  show(versionChip, versionAvailable);
-  show(versionDetail, versionAvailable && loopVersionOpen);
+  loopVersionText = versionAvailable ? detail : "";
+  loopVersionsDiffer = mismatch;
 
-  /* The info toggle and every button live in one grid cell (.daemon-controls) so
+  /* The info button and every button live in one grid cell (.daemon-controls) so
      that hiding or showing any one of them never changes how many items the
      .daemon grid itself is laying out. Called from every place below that
      touches one of their `hidden` flags, so the wrapper's own visibility
      always tracks whether it actually has anything in it. */
   const syncControls = () => {
-    show(controls, !versionChip.hidden || !button.hidden || !park.hidden || !upgradeBtn.hidden);
+    syncLoopInfo();
+    show(controls, !$("loop-info").hidden || !button.hidden || !park.hidden || !upgradeBtn.hidden);
   };
+  syncControls();
 
   /* `question` is set only for a stop, which is confirmed by a second tap. A
      redraw while that tap is pending keeps showing the question, so the
@@ -1175,7 +1187,6 @@ function renderLoop() {
     setAttr(box, "data-state", "failed");
     setAttr(box, "data-owned", null);
     setText(text, "Scheduler and worker state unavailable.");
-    show(versionChip, false);
     quiet(state.healthError);
     return;
   }
@@ -1184,7 +1195,6 @@ function renderLoop() {
     setAttr(box, "data-state", null);
     setAttr(box, "data-owned", null);
     setText(text, "Connecting\u2026");
-    show(versionChip, false);
     quiet(null);
     return;
   }
