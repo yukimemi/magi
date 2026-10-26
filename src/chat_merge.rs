@@ -1,4 +1,5 @@
-//! Individually authorized, head-bound pull request merges for standing chats.
+//! Head-bound pull request merges for standing chats, carried out on the owner's
+//! plain-language request.
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
@@ -289,7 +290,7 @@ async fn merge_with(
         );
         ensure!(
             seen.head_ref_oid.eq_ignore_ascii_case(&action.head),
-            "PR head differs from authorized SHA"
+            "PR head differs from the given SHA"
         );
         ensure!(
             !seen.title.trim().is_empty() && !seen.title.contains(['\n', '\r', '\0']),
@@ -328,7 +329,7 @@ async fn merge_with(
                     .eq_ignore_ascii_case(&receipt.action.head) =>
         {
             receipt.status = "merged".into();
-            receipt.detail = format!("merged {url} at authorized head {}", receipt.action.head);
+            receipt.detail = format!("merged {url} at head {}", receipt.action.head);
         }
         Ok(after)
             if canonical(&after.url) == canonical(&url)

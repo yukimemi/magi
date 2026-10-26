@@ -30,8 +30,9 @@
 //! - **A merge waits for the owner.** It is recorded only when the owner asks
 //!   for it; the land driver then merges the saved head with
 //!   `--match-head-commit`.
-//! - **Direct PR merging binds the head read from the forge.**
-//!   Pending land approvals retain their existing decision path.
+//! - **Direct PR merging is head-bound, not phrase-bound.** The chat reads the
+//!   head from the forge and merges on the owner's plain request. Pending land
+//!   approvals retain their existing decision path.
 
 use std::path::Path;
 
@@ -65,15 +66,15 @@ pub enum Operation {
         /// New priority.
         priority: i32,
     },
-    /// Merge an explicitly authorized PR, once per request.
+    /// Merge a PR the owner asked for, once per request.
     MergePr {
         /// Exact owner/repository name.
         repo: String,
         /// Pull request number.
         number: u64,
-        /// Full authorized head SHA.
+        /// Full head SHA the chat just read from the forge.
         head: String,
-        /// Agent-generated idempotency key for this request.
+        /// Idempotency key minted by the chat agent.
         request: String,
     },
     /// 既存 run の再開を queue に登録する。
