@@ -7,8 +7,7 @@
 //! abandon a dead run, and record the owner's choice for a decision the
 //! machinery waits on (a merge included). The owner's request in the chat is
 //! the authority: no quote, fixed phrase or "only tasks this chat filed" scope
-//! applies to those existing operations. Direct PR merging is the exception:
-//! it requires the exact persisted owner instruction and quote. Every command goes
+//! applies, including to direct PR merges. Every command goes
 //! through the transitions the rest of magi already uses ([`crate::resume`],
 //! [`Task::hold_manual`], [`Task::release_operator`], [`Task::edit`],
 //! [`crate::daemon::rerun_checks_once`], [`crate::driver::abandon_proven_dead`],
@@ -31,8 +30,9 @@
 //! - **A merge waits for the owner.** It is recorded only when the owner asks
 //!   for it; the land driver then merges the saved head with
 //!   `--match-head-commit`.
-//! - **Direct PR merging requires an exact, head-bound owner instruction.**
-//!   Pending land approvals retain their existing decision path.
+//! - **Direct PR merging is head-bound, not phrase-bound.** The chat reads the
+//!   head from the forge and merges on the owner's plain request. Pending land
+//!   approvals retain their existing decision path.
 
 use std::path::Path;
 
@@ -66,18 +66,16 @@ pub enum Operation {
         /// New priority.
         priority: i32,
     },
-    /// Merge an explicitly authorized PR, once per request.
+    /// Merge a PR the owner asked for, once per request.
     MergePr {
         /// Exact owner/repository name.
         repo: String,
         /// Pull request number.
         number: u64,
-        /// Full authorized head SHA.
+        /// Full head SHA the chat just read from the forge.
         head: String,
-        /// Idempotency key named in the owner's instruction.
+        /// Idempotency key minted by the chat agent.
         request: String,
-        /// Entire latest persisted owner send.
-        quote: Option<String>,
     },
     /// 既存 run の再開を queue に登録する。
     Resume {
@@ -274,7 +272,6 @@ async fn execute(
             number,
             head,
             request,
-            quote,
         } => {
             crate::chat_merge::merge(
                 home,
@@ -286,7 +283,6 @@ async fn execute(
                     head,
                     request,
                 },
-                quote.as_deref(),
             )
             .await?
         }
