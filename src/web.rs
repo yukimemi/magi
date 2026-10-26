@@ -22114,27 +22114,9 @@ mod tests {
             assert!(ui.auto_upgrade_busy(), "a detached {kind} defers updates");
         }
         drop(lease);
-        // A lib test thread that spawns with `pre_exec` forks this process, and
-        // the child shares the lock's open file description until its exec
-        // closes it (O_CLOEXEC). So the lock can outlive `drop` for a moment;
-        // wait for it to be really free (bounded) before judging the state,
-        // instead of racing whatever other test happens to be spawning.
-        let free = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let probe = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(directory.join("live.lock"))
-                .unwrap();
-            if crate::pr_head::try_lock_file(&probe).is_ok() {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < free,
-                "the worker lease was never released"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        // Lease::drop explicitly unlocks even if a concurrent fork inherited
+        // the descriptor. Check the real decision directly: a raw flock probe
+        // here could itself be inherited and keep the worker looking busy.
         assert!(
             !ui.auto_upgrade_busy(),
             "completed execution permits updates"
