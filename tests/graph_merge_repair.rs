@@ -818,7 +818,10 @@ async fn decision_reimplementation_retires_owner_before_requeue_and_preserves_se
     serve_decision(&fx, &dispatch).await;
     let after = magi::queue::Queue::open().get(&task.id).unwrap();
     assert_eq!(after.status, magi::queue::TaskStatus::Held, "error={:?}; hold={:?}; runs={:?}; pin={:?}", after.last_error, after.hold_reason, after.runs, after.replacement);
-    assert!(after.operator_held());
+    assert!(!after.operator_held());
+    assert_eq!(after.hold_source, Some(magi::queue::HoldSource::Machine));
+    assert_eq!(after.attempts, owner.attempts, "unavailable implementer refunds the attempt");
+    assert!(after.hold_reason.as_deref().unwrap().contains("agent usage limit"));
     assert_eq!(after.runs.len(), 2);
     let replacement = RunState::load(after.runs.last().unwrap()).unwrap();
     assert_eq!(replacement.candidates.len(), 1);

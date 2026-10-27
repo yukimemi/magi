@@ -1011,8 +1011,12 @@ upstream CRLF, not drift worth committing — normalise back to LF and
   so neither is immediately re-asked and both can hand over to another agent.
   Authentication raises a notice keyed by agent id asking to re-authenticate.
   A fixer chain ending in a usage limit or authentication failure uses its
-  caller's resource deferral path. The same applies to missing-report
-  continuations: gate and review fix rounds remain unspent until recovery.
+  caller's resource deferral path, except best-effort graft, which records
+  the loss, restores its tree and proceeds to review and gate. The same applies
+  to missing-report continuations: gate and review fix rounds remain unspent
+  until recovery. Operator fixes rescue edits, release their worktree and save
+  an unreported outcome before deferring; retry explicitly with `magi fix`
+  after recovery (`--allow-stale` if the saved work moved the branch).
 - **A node with no available agents stops resumably.** When every final seat
   of an advisor, implementation or shared structured wave ends on quota/auth,
   record a `ResourceBlock` and stop `Blocked` before completing the node.

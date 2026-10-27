@@ -630,6 +630,9 @@ if has "Your patch was reviewed"; then
   # resume, `MOCK_FIX_INCOMPLETE_SEAT` does.
   if { [ -n "$MOCK_FIX_INCOMPLETE_SEAT" ] && { case ",$MOCK_FIX_INCOMPLETE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; } \
     || { [ -n "$MOCK_FIX_ALWAYS_INCOMPLETE_SEAT" ] && { case ",$MOCK_FIX_ALWAYS_INCOMPLETE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; }; then
+    if [ -n "$MOCK_FIX_UNCOMMITTED" ]; then
+      echo "work before report loss" > retained-fix.txt
+    fi
     printf "I'll pause here until the background test run reports back. I will continue once it completes.\n"
     exit 0
   fi

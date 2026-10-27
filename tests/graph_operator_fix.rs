@@ -332,3 +332,83 @@ async fn a_follow_up_review_claims_and_settles_the_task_that_owns_the_run() {
     assert!(q.claim(&id).is_ok(), "the claim was released");
 }
 }
+
+async fn unavailable_operator_fix_can_be_retried(failure: &str) {
+    let home = common::home_lock().await;
+    let (_fx, mut runner) = ready_run_with_two_minor_findings(home).await;
+    let picked = runner.state.last_round_findings()[0].id.clone();
+    let seat = format!("impl-{}", runner.state.winner().unwrap().label);
+    for agent in &mut runner.state.config.agents {
+        if failure == "MOCK_CONTINUATION_AUTH" {
+            agent
+                .env
+                .insert("MOCK_FIX_INCOMPLETE_SEAT".into(), seat.clone());
+            agent.env.insert("MOCK_FIX_UNCOMMITTED".into(), "1".into());
+            agent.env.insert(failure.into(), "1".into());
+        } else {
+            agent.env.insert(failure.into(), seat.clone());
+        }
+    }
+    runner
+        .fix_selected(std::slice::from_ref(&picked), "retryable outage", false)
+        .await
+        .expect("deferred fix");
+    assert_eq!(runner.state.status, RunStatus::Blocked);
+    assert!(runner.state.resource_block.is_some());
+    assert!(!runner.state.worktree_root().join("operator-fix").exists());
+    let disk = RunState::load(&runner.state.id).unwrap();
+    let request = disk.operator_fixes.last().unwrap();
+    assert!(request.fix.as_ref().unwrap().failed.is_some());
+    assert_eq!(request.findings[0].outcome, OperatorFixOutcome::Unreported);
+    if failure == "MOCK_CONTINUATION_AUTH" {
+        assert!(request.fix.as_ref().unwrap().committed);
+        assert!(
+            request.result_head.is_some(),
+            "work before report loss is retained"
+        );
+        let retained = magi::git::git(
+            &disk.repo,
+            &[
+                "show",
+                &format!("{}:retained-fix.txt", request.result_head.as_ref().unwrap()),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(retained.trim(), "work before report loss");
+    }
+    // An explicit retry reuses the branch after cleanup and clears the
+    // previous resource block, without any manual worktree repair.
+    for agent in &mut runner.state.config.agents {
+        agent.env.remove(failure);
+        agent.env.remove("MOCK_FIX_INCOMPLETE_SEAT");
+        agent.env.remove("MOCK_FIX_UNCOMMITTED");
+    }
+    runner
+        .fix_selected(std::slice::from_ref(&picked), "availability restored", true)
+        .await
+        .expect("retry after recovery");
+    assert!(runner.state.resource_block.is_none());
+    assert!(!runner.state.worktree_root().join("operator-fix").exists());
+    let retried = runner.state.operator_fixes.last().unwrap();
+    assert!(retried.fix.as_ref().unwrap().failed.is_none());
+    assert!(retried.follow_up_review_run.is_some());
+}
+
+common::e2e! {
+async fn quota_limited_operator_fix_cleans_up_and_can_be_retried() {
+    unavailable_operator_fix_can_be_retried("MOCK_QUOTA_SEAT").await;
+}
+}
+
+common::e2e! {
+async fn unauthenticated_operator_fix_cleans_up_and_can_be_retried() {
+    unavailable_operator_fix_can_be_retried("MOCK_AUTH_SEAT").await;
+}
+}
+
+common::e2e! {
+async fn operator_fix_report_outage_preserves_work_and_can_be_retried() {
+    unavailable_operator_fix_can_be_retried("MOCK_CONTINUATION_AUTH").await;
+}
+}

@@ -5357,6 +5357,10 @@ impl Runner {
             return Err(e);
         }
 
+        // This explicit operator request retries availability independently
+        // of execute(); the previous call has already saved and cleaned up.
+        self.state.resource_block = None;
+
         let run_id = self.state.id.clone();
         let prompts = self.state.config.prompts.clone();
         let language = self.state.config.graph.language.clone();
@@ -5473,10 +5477,8 @@ impl Runner {
                 fix.failed = Some(format!("the fixer was not started: {e}"));
             }
         }
-        if self.state.resource_block.is_some() {
-            self.state.seats.insert(final_seat.key.clone(), final_seat);
-            return self.stop_for_resource();
-        }
+        // Even a deferred call must rescue edits, release the worktree and
+        // finalize its record below so an explicit `magi fix` can retry.
         if fix.continuation.is_none() {
             fix.continuation = Some(ContinuationRecord::not_needed());
         }
@@ -5553,6 +5555,9 @@ impl Runner {
         // Saved again now that the fixer's own outcome is final, on top of
         // the save right after the request was first pushed above.
         self.state.save()?;
+        if self.state.resource_block.is_some() {
+            return self.stop_for_resource();
+        }
 
         if committed {
             self.state.event(
@@ -5753,7 +5758,11 @@ impl Runner {
             break;
         }
         let (job, seat, out) = last.expect("the fixer chain always has an entry");
-        if let AgentOutcome::Quota(output) = &out {
+        if let AgentOutcome::Quota(output) = &out
+            && node != "graft"
+        {
+            // Graft is best effort: its caller records the loss and restores
+            // the pre-graft tree, then proceeds to review and gate.
             // Every fallback was tried. Machine outages cannot be repaired by
             // spending a fix round; use each caller's resumable resource path.
             let loss = QuotaLoss::from_report(seat.key.clone(), node, output.quota.as_ref());
