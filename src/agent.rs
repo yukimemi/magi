@@ -95,8 +95,6 @@ pub fn has_session(kind: AgentKind, seat: &SeatState, sessions_enabled: bool) ->
 pub struct Invocation<'a> {
     /// Rendered repository coordination policy for this invocation.
     pub coordination: Option<&'a crate::config::Coordination>,
-    /// Requested policy; never overrides restrictions inherited from the parent.
-    pub editing_network: crate::config::EditingNetwork,
     /// Launcher fetch evidence, unchanged on session resume.
     pub fetched_base: Option<&'a crate::run::FetchedBase>,
     /// Working directory. Always a real checkout, so every CLI can read the
@@ -106,14 +104,11 @@ pub struct Invocation<'a> {
     pub prompt: &'a str,
     /// Wall-clock limit; the process tree is killed when it elapses.
     pub timeout: Duration,
-    /// May the agent modify files? Judges and reviewers may not.
+    /// May the agent modify files? Judges and reviewers may not. Together
+    /// with an editing node (see [`repository_writer`]) it also drops a codex
+    /// seat's OS sandbox and approval gate, as claude's `bypassPermissions`
+    /// does for every claude seat.
     pub allow_write: bool,
-    /// Drop the CLI's own sandbox and approval gate. Conversational talk
-    /// turns only, and only together with `allow_write`: it is the codex
-    /// counterpart of claude's `bypassPermissions`. Unattended seats
-    /// (implementer, judge, reviewer, deputy, ...) never set it, and only
-    /// `talk.rs` may.
-    pub unsandboxed: bool,
     /// Continue this seat's conversation when the CLI supports it.
     pub sessions: bool,
     /// Directory for prompt / stdout / stderr artifacts.
@@ -144,23 +139,26 @@ pub struct Invocation<'a> {
     /// Directories outside `cwd` the seat may write, when it may write at all.
     /// Explicit, purpose-specific grants (for example a deputy's stores).
     /// Repository editing seats also receive the shared Git directory and
-    /// question control-plane directories in [`invoke`].
+    /// question control-plane directories in [`invoke`]; adapters that widen
+    /// a workspace per directory (agy's `--add-dir`) need them, while a codex
+    /// editing seat runs without a sandbox and ignores them.
     pub writable: &'a [PathBuf],
 }
 
+/// A repository editing seat: implementer, fixer, grafter, gate fixer, land
+/// or rebase resolver, or a chat turn the repository opted into writing.
+///
+/// For codex this is also the whole sandbox policy: these seats run with
+/// `--dangerously-bypass-approvals-and-sandbox` (owner decision 2026-10-27),
+/// matching claude's `bypassPermissions`, because codex's seatbelt sandbox
+/// refuses `$TMPDIR` and aborts Chrome, so repository tests cannot run inside
+/// it. Every other seat keeps its sandbox.
 fn repository_writer(inv: &Invocation<'_>) -> bool {
     inv.allow_write
         && (matches!(
             inv.node,
             "implement" | "fix" | "graft" | "gate-fix" | "land" | "rebase"
         ) || inv.node == crate::queue::CHAT_NODE)
-}
-
-/// One source for argv, evidence and current-turn guidance. This records a
-/// request to the backend, not effective access under inherited restrictions.
-fn requested_network_access(kind: AgentKind, inv: &Invocation<'_>) -> Option<bool> {
-    (kind == AgentKind::Codex && repository_writer(inv) && !inv.unsandboxed)
-        .then_some(inv.editing_network == crate::config::EditingNetwork::Enabled)
 }
 
 fn repository_seat(inv: &Invocation<'_>) -> bool {
@@ -200,15 +198,10 @@ pub async fn worktree_writable_roots(cwd: &Path, home: &Path) -> Result<Vec<Path
     Ok(roots)
 }
 
-/// Current-turn instructions override stale fetch/commit requirements in history.
-fn editing_access_note(
-    kind: AgentKind,
-    unsandboxed: bool,
-    base: Option<&crate::run::FetchedBase>,
-    network: Option<bool>,
-) -> String {
+/// Current-turn instructions override stale fetch requirements in history.
+fn editing_access_note(base: Option<&crate::run::FetchedBase>) -> String {
     let mut note = String::from(
-        "Launcher repository access contract (applies to this turn and overrides earlier fetch/commit instructions):\n",
+        "Launcher repository access contract (applies to this turn and overrides earlier fetch instructions):\n",
     );
     if let Some(base) = base {
         note.push_str(&format!(
@@ -218,16 +211,6 @@ fn editing_access_note(
     } else {
         note.push_str("No successful launcher fetch evidence is supplied for this invocation. Do not describe local tracking refs as freshly fetched. If fresh remote evidence is essential, report an infrastructure blocker requiring a launcher fetch and a new prepared turn.\n");
     }
-    // Only the sandboxed backend has this verified access restriction.
-    if kind != AgentKind::Codex || unsandboxed {
-        return note;
-    }
-    note.push_str(if network == Some(true) {
-        "The launcher requests network access for repository tests, including local test servers and outbound traffic. This request is not proof of effective access. "
-    } else {
-        "Network access is restricted by the seat sandbox. "
-    });
-    note.push_str("A shared Git directory grant does not guarantee access to protected Git administration paths. Use local status, diff and log to inspect the checkout. If add/commit is denied, leave the implementation files in this assigned worktree: the launcher saves eligible edits after the seat exits. Do not repeatedly retry denied fetches or ask the owner to approve unavailable sandbox permissions. If an operation is denied, record the operation, target, exact error and impact; do not bypass the denial or repeat it without a changed environment. Distinguish reproducing the current defect, writing a correction for a future launcher process, and validating a deployed launcher. An expected reproduction failure (for example a denied local test-server bind during launcher repair) is defect evidence, not a reason to abandon independently permitted source edits. Continue those edits and focused checks, retain eligible changes, and hand real launcher/browser validation to the parent-owned verification path. Source changes affect future launches only: a child process cannot relax inherited parent restrictions. If a genuinely required operation (including rebase continuation or dependency download) blocks all remaining permitted work, stop with an actionable infrastructure report; identify the deployment or environment repair needed before retrying that operation. Do not claim deployment or browser success without real evidence. Do not use bypass flags, change permissions, edit another checkout, or claim a network failure proves host DNS is broken. Specification questions remain valid.\n");
     note
 }
 
@@ -473,12 +456,7 @@ pub async fn invoke(
     }
     if repository_writer(inv) {
         prompt.push_str("\n\n");
-        prompt.push_str(&editing_access_note(
-            spec.kind,
-            inv.unsandboxed,
-            inv.fetched_base,
-            requested_network_access(spec.kind, inv),
-        ));
+        prompt.push_str(&editing_access_note(inv.fetched_base));
     }
     let inv = &Invocation {
         writable: &writable,
@@ -502,8 +480,7 @@ pub async fn invoke(
             "launcher_version": env!("CARGO_PKG_VERSION"),
             "kind": spec.kind,
             "allow_write": inv.allow_write,
-            "unsandboxed": inv.unsandboxed,
-            "requested_network_access": requested_network_access(spec.kind, inv),
+            "unsandboxed": repository_writer(inv),
             "writable_roots": inv.writable,
             "fetched_base": inv.fetched_base,
         }))?,
@@ -958,13 +935,14 @@ fn build_command(
             argv.push(inv.cwd.to_string_lossy().into_owned());
             // Codex is the only kind whose read-only-ness is enforced by the
             // CLI rather than by the prompt: a judge or reviewer seat cannot
-            // write even if it decides to try. Implementers get the workspace.
-            // The one exception is a conversational talk turn that the
-            // repository opted into (`unsandboxed` and `allow_write`): it
-            // drops sandbox and approvals altogether, as claude's
-            // `bypassPermissions` does, so `magi task add`, `git fetch` and
-            // the like are not refused. Nothing else ever gets the bypass.
-            if inv.allow_write && inv.unsandboxed {
+            // write even if it decides to try. Repository editing seats
+            // (implementer, fixer, grafter, gate fixer, land, rebase and an
+            // opted-in chat turn - see `repository_writer`) drop sandbox and
+            // approvals altogether, as claude's `bypassPermissions` does: the
+            // seatbelt sandbox refuses `$TMPDIR` and aborts Chrome, so the
+            // repository's own tests could not run (owner decision
+            // 2026-10-27). Every other seat keeps its sandbox.
+            if repository_writer(inv) {
                 argv.push("--dangerously-bypass-approvals-and-sandbox".to_owned());
             } else {
                 argv.push("--sandbox".to_owned());
@@ -980,10 +958,6 @@ fn build_command(
                 // that asks blocks until its timeout kills it.
                 argv.push("-c".to_owned());
                 argv.push("approval_policy=\"never\"".to_owned());
-                if let Some(enabled) = requested_network_access(spec.kind, inv) {
-                    argv.push("-c".to_owned());
-                    argv.push(format!("sandbox_workspace_write.network_access={enabled}"));
-                }
                 if inv.allow_write && !inv.writable.is_empty() {
                     let roots: Vec<String> = inv
                         .writable
@@ -1976,13 +1950,11 @@ mod tests {
     fn inv<'a>(cwd: &'a Path, art: &'a Path, allow_write: bool) -> Invocation<'a> {
         Invocation {
             coordination: None,
-            editing_network: crate::config::EditingNetwork::Restricted,
             fetched_base: None,
             cwd,
             prompt: "do the thing",
             timeout: Duration::from_secs(900),
             allow_write,
-            unsandboxed: false,
             sessions: true,
             artifacts: art,
             stem: "t",
@@ -2006,7 +1978,7 @@ mod tests {
 
     #[test]
     fn editing_access_requires_fetch_evidence_and_keeps_snapshot() {
-        let missing = editing_access_note(AgentKind::Codex, false, None, Some(false));
+        let missing = editing_access_note(None);
         assert!(missing.contains("No successful launcher fetch evidence"));
         let base = crate::run::FetchedBase {
             remote: "origin".into(),
@@ -2014,155 +1986,102 @@ mod tests {
             commit: "0123456789abcdef".into(),
             fetched_at: "2026-10-18T00:00:00Z".parse().unwrap(),
         };
-        let note = editing_access_note(AgentKind::Codex, false, Some(&base), Some(false));
+        let note = editing_access_note(Some(&base));
         for expected in [
             "origin/main",
             "0123456789abcdef",
             "2026-10-18T00:00:00Z",
             "Do not fetch again",
-            "launcher saves eligible edits",
-            "Specification questions remain valid",
         ] {
             assert!(note.contains(expected), "missing {expected}");
         }
-        for kind in [
-            AgentKind::Codex,
-            AgentKind::Claude,
-            AgentKind::Opencode,
-            AgentKind::Antigravity,
-            AgentKind::Omp,
-            AgentKind::Command,
-        ] {
-            for unsandboxed in [false, true] {
-                let scoped = editing_access_note(kind, unsandboxed, Some(&base), Some(false));
-                assert!(scoped.contains(&base.commit));
-                assert!(scoped.contains("Do not fetch again"));
-                let restricted = kind == AgentKind::Codex && !unsandboxed;
-                for claim in [
-                    "Network access is restricted",
-                    "protected Git administration paths",
-                    "launcher saves eligible edits",
-                    "unavailable sandbox permissions",
-                ] {
-                    assert_eq!(scoped.contains(claim), restricted, "{kind:?}/{unsandboxed}");
-                    assert_eq!(
-                        editing_access_note(kind, unsandboxed, None, Some(false)).contains(claim),
-                        restricted,
-                        "{kind:?}/{unsandboxed} without fetch evidence",
-                    );
-                }
-            }
+        // Editing seats run without an OS sandbox, so nothing tells them
+        // their network, Git or temporary-directory access is restricted.
+        for text in [&missing, &note] {
+            assert!(!text.to_lowercase().contains("sandbox"), "{text}");
+            assert!(!text.contains("Network access is restricted"), "{text}");
         }
         let roundtrip: crate::run::FetchedBase =
             serde_json::from_str(&serde_json::to_string(&base).unwrap()).unwrap();
-        assert_eq!(
-            editing_access_note(AgentKind::Codex, false, Some(&roundtrip), Some(false)),
-            note
-        );
+        assert_eq!(editing_access_note(Some(&roundtrip)), note);
     }
 
     #[test]
-    fn editing_network_policy_is_explicit_on_initial_and_resume() {
-        use crate::config::EditingNetwork::{Enabled, Restricted};
-        for network in [Restricted, Enabled] {
-            for resumed in [false, true] {
-                let mut seat = SeatState::new("impl-A", "a", 7);
-                if resumed {
-                    seat.turns = 1;
-                    seat.captured_session = Some("fixture-thread".into());
-                }
-                for node in [
-                    "implement",
-                    "fix",
-                    "graft",
-                    "gate-fix",
-                    "land",
-                    "rebase",
-                    crate::queue::CHAT_NODE,
-                ] {
-                    let mut invocation = inv(Path::new("."), Path::new("/art"), true);
-                    invocation.node = node;
-                    invocation.editing_network = network;
-                    let plan = build_command(
-                        &spec(AgentKind::Codex, None),
-                        &seat,
-                        &invocation,
-                        Path::new("/art/p.md"),
-                    )
-                    .unwrap();
-                    let requested =
-                        requested_network_access(AgentKind::Codex, &invocation).unwrap();
-                    assert_eq!(requested, network == Enabled);
-                    let at = plan
-                        .argv
-                        .iter()
-                        .position(|s| {
-                            s == &format!("sandbox_workspace_write.network_access={requested}")
-                        })
-                        .unwrap();
-                    if resumed {
-                        assert!(at < plan.argv.iter().position(|s| s == "resume").unwrap());
-                    }
-                    assert!(plan.argv.iter().any(|s| s == "workspace-write"));
-                    assert!(plan.argv.iter().any(|s| s == "approval_policy=\"never\""));
-                    assert!(!plan.argv.iter().any(|s| s.contains("bypass")));
-                    let note = editing_access_note(AgentKind::Codex, false, None, Some(requested));
-                    assert_eq!(note.contains("requests network access"), requested);
-                    assert_eq!(note.contains("Network access is restricted"), !requested);
-                    for kind in [AgentKind::Claude, AgentKind::Command] {
-                        assert_eq!(requested_network_access(kind, &invocation), None);
-                    }
-                    invocation.unsandboxed = true;
-                    assert_eq!(
-                        requested_network_access(AgentKind::Codex, &invocation),
-                        None
-                    );
-                }
-                for (node, write) in [
-                    ("review", false),
-                    ("implement", false),
-                    ("deputy", true),
-                    ("conduct", true),
-                    ("talk-title", false),
-                ] {
-                    let mut invocation = inv(Path::new("."), Path::new("/art"), write);
-                    invocation.node = node;
-                    invocation.editing_network = network;
-                    assert_eq!(
-                        requested_network_access(AgentKind::Codex, &invocation),
-                        None
-                    );
-                    let plan = build_command(
-                        &spec(AgentKind::Codex, None),
-                        &seat,
-                        &invocation,
-                        Path::new("/art/p.md"),
-                    )
-                    .unwrap();
-                    assert!(!plan.argv.iter().any(|s| s.contains("network_access")));
-                }
+    fn codex_editing_seats_bypass_the_sandbox_on_initial_and_resume() {
+        const BYPASS: &str = "--dangerously-bypass-approvals-and-sandbox";
+        let roots = [PathBuf::from("/shared/git"), PathBuf::from("/questions")];
+        for resumed in [false, true] {
+            let mut seat = SeatState::new("impl-A", "a", 7);
+            if resumed {
+                seat.turns = 1;
+                seat.captured_session = Some("fixture-thread".into());
             }
-        }
-    }
-
-    #[test]
-    fn editing_access_keeps_infrastructure_repair_actionable() {
-        for network in [Some(false), Some(true)] {
-            let note = editing_access_note(AgentKind::Codex, false, None, network);
-            for expected in [
-                "expected reproduction failure",
-                "not a reason to abandon independently permitted source edits",
-                "Source changes affect future launches only",
-                "a child process cannot relax inherited parent restrictions",
-                "parent-owned verification path",
-                "operation, target, exact error and impact",
-                "blocks all remaining permitted work, stop",
-                "Do not use bypass flags",
-                "Do not claim deployment or browser success without real evidence",
+            let build = |invocation: &Invocation<'_>| {
+                build_command(
+                    &spec(AgentKind::Codex, None),
+                    &seat,
+                    invocation,
+                    Path::new("/art/p.md"),
+                )
+                .unwrap()
+            };
+            for node in [
+                "implement",
+                "fix",
+                "graft",
+                "gate-fix",
+                "land",
+                "rebase",
+                crate::queue::CHAT_NODE,
             ] {
-                assert!(note.contains(expected), "missing {expected}");
+                let mut invocation = inv(Path::new("."), Path::new("/art"), true);
+                invocation.node = node;
+                invocation.writable = &roots;
+                let plan = build(&invocation);
+                let at = plan.argv.iter().position(|s| s == BYPASS);
+                assert!(at.is_some(), "{node}: {:?}", plan.argv);
+                if resumed {
+                    let resume = plan.argv.iter().position(|s| s == "resume").unwrap();
+                    assert!(at.unwrap() < resume, "{node}: {:?}", plan.argv);
+                }
+                // No sandbox, approval or sandbox-scoped override survives.
+                assert!(!plan.argv.iter().any(|s| s == "--sandbox"), "{node}");
+                assert!(!plan.argv.iter().any(|s| s == "-c"), "{node}");
             }
-            assert!(!note.contains("before a single new attempt"));
+            for (node, write) in [
+                ("review", false),
+                ("judge", false),
+                ("advise", false),
+                ("implement", false),
+                ("fix", false),
+                ("dupes", false),
+                ("conduct", false),
+                ("waiter", false),
+                ("talk-title", false),
+                (crate::queue::CHAT_NODE, false),
+                ("deputy", true),
+            ] {
+                let mut invocation = inv(Path::new("."), Path::new("/art"), write);
+                invocation.node = node;
+                let plan = build(&invocation);
+                assert!(!plan.argv.iter().any(|s| s == BYPASS), "{node}");
+                let mode = if write {
+                    "workspace-write"
+                } else {
+                    "read-only"
+                };
+                assert!(
+                    plan.argv.windows(2).any(|w| w == ["--sandbox", mode]),
+                    "{node}: {:?}",
+                    plan.argv
+                );
+                assert!(
+                    plan.argv
+                        .windows(2)
+                        .any(|w| w == ["-c", "approval_policy=\"never\""]),
+                    "{node}"
+                );
+            }
         }
     }
 
@@ -2531,47 +2450,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_talk_turn_bypasses_sandbox_only_when_opted_in() {
-        const BYPASS: &str = "--dangerously-bypass-approvals-and-sandbox";
-        let mut seat = SeatState::new("talk", "a", 7);
-        let build = |seat: &SeatState, allow_write: bool, unsandboxed: bool| {
-            let mut i = inv(Path::new("."), Path::new("/art"), allow_write);
-            i.unsandboxed = unsandboxed;
-            build_command(
-                &spec(AgentKind::Codex, None),
-                seat,
-                &i,
-                Path::new("/art/p.md"),
-            )
-            .unwrap()
-        };
-
-        // (a) both set: bypass, and none of the sandbox flags.
-        let first = build(&seat, true, true);
-        assert!(first.argv.iter().any(|a| a == BYPASS));
-        assert!(!first.argv.iter().any(|a| a == "--sandbox"));
-        assert!(!first.argv.iter().any(|a| a.starts_with("approval_policy")));
-
-        // (b) the flag precedes the `resume` subcommand.
-        seat.captured_session = Some("thread-1".to_owned());
-        seat.turns = 1;
-        let resumed = build(&seat, true, true);
-        let at = |p: &Plan, x: &str| p.argv.iter().position(|a| a == x).unwrap();
-        assert!(at(&resumed, BYPASS) < at(&resumed, "resume"));
-
-        // (c) without write access the read-only sandbox stays.
-        let ro = build(&seat, false, true);
-        assert!(!ro.argv.iter().any(|a| a == BYPASS));
-        assert!(ro.argv.windows(2).any(|w| w == ["--sandbox", "read-only"]));
-    }
-
-    #[test]
     fn codex_is_sandboxed_reads_stdin_and_puts_resume_last() {
         let mut seat = SeatState::new("judge-1", "a", 7);
 
         // 1. Read-only is enforced by the CLI, not by the prompt - the only
-        //    roster member for which that is true - and nothing ever asks for
-        //    the bypass.
+        //    roster member for which that is true - and only repository
+        //    editing seats (see `codex_editing_seats_bypass_the_sandbox_on_initial_and_resume`)
+        //    ever get the bypass. A seat that may write without editing the
+        //    repository (a deputy's stores) keeps the workspace sandbox.
         let ro = plan_for(AgentKind::Codex, &seat, false);
         assert!(ro.argv.windows(2).any(|w| w == ["--sandbox", "read-only"]));
         let rw = plan_for(AgentKind::Codex, &seat, true);
@@ -2580,24 +2466,7 @@ mod tests {
                 .windows(2)
                 .any(|w| w == ["--sandbox", "workspace-write"])
         );
-        // `unsandboxed` without a talk turn's opt-in never reaches an unattended
-        // seat, and on its own it never lifts a read-only seat either.
-        let mut ro_flagged = inv(Path::new("."), Path::new("/art"), false);
-        ro_flagged.unsandboxed = true;
-        let ro_flagged = build_command(
-            &spec(AgentKind::Codex, None),
-            &seat,
-            &ro_flagged,
-            Path::new("/art/p.md"),
-        )
-        .unwrap();
-        assert!(
-            ro_flagged
-                .argv
-                .windows(2)
-                .any(|w| w == ["--sandbox", "read-only"])
-        );
-        for p in [&ro, &rw, &ro_flagged] {
+        for p in [&ro, &rw] {
             assert!(
                 !p.argv
                     .iter()
@@ -2885,13 +2754,11 @@ mod tests {
             &seat,
             &Invocation {
                 coordination: None,
-                editing_network: crate::config::EditingNetwork::Restricted,
                 fetched_base: None,
                 cwd: Path::new("."),
                 prompt: "p",
                 timeout: Duration::from_secs(3600),
                 allow_write: true,
-                unsandboxed: false,
                 sessions: true,
                 artifacts: Path::new("/art"),
                 stem: "t",
@@ -3355,13 +3222,11 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
-                editing_network: crate::config::EditingNetwork::Restricted,
                 fetched_base: None,
                 cwd: dir.path(),
                 prompt: "unused",
                 timeout: Duration::from_secs(30),
                 allow_write: true,
-                unsandboxed: false,
                 sessions: true,
                 artifacts: &art,
                 stem: "impl-A",
@@ -3396,13 +3261,11 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
-                editing_network: crate::config::EditingNetwork::Restricted,
                 fetched_base: None,
                 cwd: dir.path(),
                 prompt: "unused",
                 timeout: Duration::from_secs(30),
                 allow_write: true,
-                unsandboxed: false,
                 sessions: true,
                 artifacts: &dir.path().join("artifacts"),
                 stem: "cache",
@@ -3447,13 +3310,11 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
-                editing_network: crate::config::EditingNetwork::Restricted,
                 fetched_base: None,
                 cwd: dir.path(),
                 prompt: "unused",
                 timeout: Duration::from_secs(30),
                 allow_write: false,
-                unsandboxed: false,
                 sessions: true,
                 artifacts: &dir.path().join("artifacts"),
                 stem: "no-cache",
@@ -3497,13 +3358,11 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
-                editing_network: crate::config::EditingNetwork::Restricted,
                 fetched_base: None,
                 cwd: dir.path(),
                 prompt: &big,
                 timeout: Duration::from_secs(60),
                 allow_write: true,
-                unsandboxed: false,
                 sessions: true,
                 artifacts: &dir.path().join("artifacts"),
                 stem: "big",
@@ -3546,13 +3405,11 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
-                editing_network: crate::config::EditingNetwork::Restricted,
                 fetched_base: None,
                 cwd: dir.path(),
                 prompt: "unused",
                 timeout: Duration::from_millis(300),
                 allow_write: true,
-                unsandboxed: false,
                 sessions: true,
                 artifacts: &dir.path().join("artifacts"),
                 stem: "slow",
@@ -3585,7 +3442,6 @@ mod tests {
             &mut seat,
             &Invocation {
                 coordination: None,
-                editing_network: crate::config::EditingNetwork::Restricted,
                 fetched_base: None,
                 cwd: dir.path(),
                 prompt: "unused",
@@ -3595,7 +3451,6 @@ mod tests {
                 // which is a dice roll rather than a test.
                 timeout: Duration::from_secs(10),
                 allow_write: true,
-                unsandboxed: false,
                 sessions: true,
                 artifacts: &artifacts,
                 stem: "chatty",

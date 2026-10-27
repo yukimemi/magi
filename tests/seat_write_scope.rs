@@ -25,122 +25,6 @@ fn checked(cmd: &mut Command) -> Output {
     out
 }
 
-/// Run outside an enclosing seat sandbox. This records administration-path
-/// behavior rather than assuming that a common-directory grant overrides it.
-#[cfg(target_os = "macos")]
-#[tokio::test]
-#[ignore = "requires the installed sandbox and permission to launch sandbox-exec"]
-async fn sandbox_git_operations_and_network_policy() {
-    let fx = Fixture::new();
-    let roots = worktree_writable_roots(&fx.seat, &fx.home).await.unwrap();
-    let unrelated = fx.home.join("queue");
-    std::fs::create_dir(&unrelated).unwrap();
-    checked(Command::new("git").current_dir(&fx.seat).args([
-        "remote",
-        "add",
-        "origin",
-        fx.primary.to_str().unwrap(),
-    ]));
-    let baseline = checked(Command::new("/usr/bin/python3").args([
-        "-c",
-        "import socket; print(socket.getaddrinfo('github.com', 443))",
-    ]));
-    println!(
-        "host DNS succeeded: {}",
-        String::from_utf8_lossy(&baseline.stdout)
-    );
-    let script = r#"
-import json, os, pathlib, socket, subprocess
-pathlib.Path('probe').write_text('sandbox edit\n')
-for args in [['status', '--short'], ['diff'], ['log', '-1', '--oneline'],
-             ['add', 'probe'], ['-c', 'user.name=Fixture', '-c',
-              'user.email=fixture@example.invalid', 'commit', '-m', 'probe'],
-             ['fetch', 'origin', 'main']]:
-    p = subprocess.run(['git'] + args, capture_output=True, text=True)
-    print(json.dumps({'operation': args, 'exit': p.returncode, 'error': p.stderr}), flush=True)
-    if args[0] in ['status', 'diff', 'log']:
-        assert p.returncode == 0
-try:
-    pathlib.Path(os.environ['UNRELATED']).write_text('denied')
-except PermissionError:
-    print('unrelated-denied', flush=True)
-else:
-    raise AssertionError('unrelated write succeeded')
-s = socket.socket()
-s.settimeout(2)
-result = s.connect_ex(('127.0.0.1', int(os.environ['PROBE_PORT'])))
-print(json.dumps({'network_enabled': os.environ['PROBE_NETWORK'], 'connect_exit': result}), flush=True)
-assert (result == 0) == (os.environ['PROBE_NETWORK'] == 'true')
-try:
-    print(json.dumps({'dns': socket.getaddrinfo('github.com', 443)}), flush=True)
-except OSError as e:
-    print(json.dumps({'dns_error': str(e)}), flush=True)
-    assert os.environ['PROBE_NETWORK'] == 'false', 'DNS must work with network enabled'
-"#;
-    // Loopback comparison isolates network policy from external DNS outages.
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect(
-        "host sandbox probe needs loopback bind permission; run outside the enclosing seat sandbox",
-    );
-    for network in ["false", "true"] {
-        let out = Command::new("codex")
-            .current_dir(&fx.seat)
-            .args(["sandbox", "-c", "sandbox_mode=\"workspace-write\"", "-c"])
-            .arg(format!(
-                "sandbox_workspace_write.writable_roots={}",
-                serde_json::to_string(&roots).unwrap()
-            ))
-            .args([
-                "-c",
-                "sandbox_workspace_write.exclude_slash_tmp=true",
-                "-c",
-                "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-                "-c",
-            ])
-            .arg(format!("sandbox_workspace_write.network_access={network}"))
-            .args(["/usr/bin/python3", "-c", script])
-            .env("UNRELATED", unrelated.join("denied"))
-            .env("PROBE_NETWORK", network)
-            .env(
-                "PROBE_PORT",
-                listener.local_addr().unwrap().port().to_string(),
-            )
-            .output()
-            .unwrap();
-        println!(
-            "network={network}: {}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert!(out.status.success(), "sandbox probe failed: {out:?}");
-        assert!(!unrelated.join("denied").exists());
-    }
-    // Exercise the launcher's real preservation route, including the saved tree.
-    checked(
-        Command::new("git")
-            .current_dir(&fx.seat)
-            .args(["config", "user.name", "Fixture"]),
-    );
-    checked(Command::new("git").current_dir(&fx.seat).args([
-        "config",
-        "user.email",
-        "fixture@example.invalid",
-    ]));
-    let saved = magi::git::rescue_commit(&fx.seat, "fixture: launcher save")
-        .await
-        .unwrap();
-    let tree = checked(
-        Command::new("git")
-            .current_dir(&fx.seat)
-            .args(["show", "HEAD:probe"]),
-    );
-    assert_eq!(String::from_utf8_lossy(&tree.stdout), "sandbox edit\n");
-    assert!(saved.withheld.is_empty());
-    println!(
-        "launcher rescue committed={}, saved HEAD:probe verified",
-        saved.committed
-    );
-}
-
 struct Fixture {
     _tmp: tempfile::TempDir,
     primary: PathBuf,
@@ -300,7 +184,7 @@ async fn seatbelt_enforces_resolved_write_scope() {
 
 common::e2e! {
 #[cfg(unix)]
-async fn invoked_editing_seats_receive_scope_on_first_turn_and_resume() {
+async fn invoked_editing_seats_run_unsandboxed_on_first_turn_and_resume() {
     use magi::agent::{Invocation, SeatState, invoke};
     use magi::config::{AgentKind, AgentSpec};
     use std::collections::BTreeMap;
@@ -349,90 +233,85 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
         fetched_at: "2026-10-18T00:00:00Z".parse().unwrap(),
     };
     let artifacts = fx._tmp.path().join("artifacts");
-    for network in [magi::config::EditingNetwork::Restricted, magi::config::EditingNetwork::Enabled] {
-        for node in ["implement", "fix", "graft", "gate-fix", "land", "rebase", "chat"] {
-            let mut seat = SeatState::new("fixture-seat", "fixture", 1);
-            for resumed in [false, true] {
-                if resumed {
-                    seat.captured_session = Some("fixture-session".into());
-                }
-                let out = invoke(
-                    &spec,
-                    &mut seat,
-                    &Invocation {
-                        coordination: Some(coordination()),
-                        editing_network: network,
-                        fetched_base: Some(&fetched_base),
-                        cwd: &fx.seat,
-                        prompt: "fixture",
-                        timeout: Duration::from_secs(10),
-                        allow_write: true,
-                        unsandboxed: false,
-                        sessions: true,
-                        artifacts: &artifacts,
-                        stem: node,
-                        run: "fixture-run",
-                        node,
-                        cache_dir: None,
-                        attachments: &[],
-                        writable: &[],
-                    },
-                )
-                .await
-                .unwrap();
-                assert!(out.usable(), "{out:?}");
-                let prompt = std::fs::read_to_string(artifacts.join(format!("{node}.prompt.md"))).unwrap();
-                assert!(prompt.contains("fixture-pinned-base"), "{node}, resumed={resumed}");
-                assert!(prompt.contains("Do not fetch again"));
-                let access: serde_json::Value = serde_json::from_slice(
-                    &std::fs::read(artifacts.join(format!("{node}.access.json"))).unwrap(),
-                ).unwrap();
-                assert_eq!(access["fetched_base"]["commit"], "fixture-pinned-base");
-                let enabled = network == magi::config::EditingNetwork::Enabled;
-                assert_eq!(access["requested_network_access"], enabled);
-                assert_eq!(prompt.contains("requests network access"), enabled);
-                assert_eq!(prompt.contains("Network access is restricted"), !enabled);
-
-                let args = std::fs::read_to_string(&args_path).unwrap();
-                assert!(args.lines().any(|s| s == format!("sandbox_workspace_write.network_access={enabled}")));
-                let roots = worktree_writable_roots(&fx.seat, &fx.home).await.unwrap();
-                assert!(
-                    args.contains(&format!(
-                        "sandbox_workspace_write.writable_roots={}",
-                        serde_json::to_string(&roots).unwrap()
-                    )),
-                    "{node}, resumed={resumed}: {args}"
-                );
-                assert_eq!(args.lines().any(|s| s == "resume"), resumed);
-                assert!(args.contains("workspace-write"));
-                assert!(!args.contains("bypass"));
-                assert_eq!(
-                    std::fs::read_to_string(&home_path).unwrap().trim(),
-                    fx.home.canonicalize().unwrap().to_str().unwrap()
-                );
+    let roots = worktree_writable_roots(&fx.seat, &fx.home).await.unwrap();
+    for node in ["implement", "fix", "graft", "gate-fix", "land", "rebase", "chat"] {
+        let mut seat = SeatState::new("fixture-seat", "fixture", 1);
+        for resumed in [false, true] {
+            if resumed {
+                seat.captured_session = Some("fixture-session".into());
             }
+            let out = invoke(
+                &spec,
+                &mut seat,
+                &Invocation {
+                    coordination: Some(coordination()),
+                    fetched_base: Some(&fetched_base),
+                    cwd: &fx.seat,
+                    prompt: "fixture",
+                    timeout: Duration::from_secs(10),
+                    allow_write: true,
+                    sessions: true,
+                    artifacts: &artifacts,
+                    stem: node,
+                    run: "fixture-run",
+                    node,
+                    cache_dir: None,
+                    attachments: &[],
+                    writable: &[],
+                },
+            )
+            .await
+            .unwrap();
+            assert!(out.usable(), "{out:?}");
+            let prompt = std::fs::read_to_string(artifacts.join(format!("{node}.prompt.md"))).unwrap();
+            assert!(prompt.contains("fixture-pinned-base"), "{node}, resumed={resumed}");
+            assert!(prompt.contains("Do not fetch again"));
+            assert!(!prompt.contains("Network access is restricted"), "{node}");
+            let access: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(artifacts.join(format!("{node}.access.json"))).unwrap(),
+            ).unwrap();
+            assert_eq!(access["fetched_base"]["commit"], "fixture-pinned-base");
+            assert_eq!(access["unsandboxed"], true, "{node}");
+            // The resolved scope is still recorded (agy widens per directory),
+            // but codex runs without a sandbox to scope.
+            assert_eq!(access["writable_roots"], serde_json::json!(roots), "{node}");
+
+            let args = std::fs::read_to_string(&args_path).unwrap();
+            assert!(
+                args.lines().any(|s| s == "--dangerously-bypass-approvals-and-sandbox"),
+                "{node}, resumed={resumed}: {args}"
+            );
+            assert!(!args.lines().any(|s| s == "--sandbox"), "{node}: {args}");
+            assert!(!args.contains("sandbox_workspace_write"), "{node}: {args}");
+            assert!(!args.contains("approval_policy"), "{node}: {args}");
+            assert_eq!(args.lines().any(|s| s == "resume"), resumed);
+            assert_eq!(
+                std::fs::read_to_string(&home_path).unwrap().trim(),
+                fx.home.canonicalize().unwrap().to_str().unwrap()
+            );
         }
     }
-    // Other roles keep their explicit grants and home environment. Even a
-    // writable deputy must not inherit shared repository metadata access.
+    // Other roles keep their sandbox, explicit grants and home environment.
+    // Even a writable deputy must not inherit shared repository metadata access.
     let explicit = [fx.home.join("questions").canonicalize().unwrap()];
     for (node, allow_write) in [("review", false), ("implement", false), ("deputy", true)] {
         let mut seat = SeatState::new("fixture-seat", "fixture", 1);
         invoke(&spec, &mut seat, &Invocation {
             coordination: Some(coordination()),
-            editing_network: magi::config::EditingNetwork::Restricted,
             fetched_base: None,
             cwd: &fx.seat, prompt: "fixture", timeout: Duration::from_secs(10),
-            allow_write, unsandboxed: false, sessions: false,
+            allow_write, sessions: false,
             artifacts: &artifacts, stem: node, run: "fixture-run", node,
             cache_dir: None, attachments: &[], writable: &explicit,
         }).await.unwrap();
         let args = std::fs::read_to_string(&args_path).unwrap();
         assert!(!args.contains(fx.primary.join(".git").canonicalize().unwrap().to_str().unwrap()));
         assert_eq!(args.contains("writable_roots"), allow_write);
-        assert!(!args.contains("network_access"));
+        assert!(!args.contains("bypass"), "{node}: {args}");
+        let mode = if allow_write { "workspace-write" } else { "read-only" };
+        assert!(args.lines().any(|s| s == mode), "{node}: {args}");
         let access: serde_json::Value = serde_json::from_slice(&std::fs::read(artifacts.join(format!("{node}.access.json"))).unwrap()).unwrap();
-        assert!(access["requested_network_access"].is_null());
+        assert_eq!(access["unsandboxed"], false, "{node}");
         assert_eq!(std::fs::read_to_string(&home_path).unwrap().trim(), "incorrect-store");
     }
 }
@@ -532,13 +411,11 @@ Write-Output 'real-lock-contends'
     let artifacts = fx._tmp.path().join("reader-artifacts");
     let inv = Invocation {
         coordination: Some(coordination()),
-        editing_network: magi::config::EditingNetwork::Restricted,
         fetched_base: None,
         cwd: &fx.seat,
         prompt: "fixture read-only work",
         timeout: Duration::from_secs(10),
         allow_write: false,
-        unsandboxed: false,
         sessions: false,
         artifacts: &artifacts,
         stem: "reader",
@@ -706,13 +583,11 @@ mod coordination {
     ) -> Invocation<'a> {
         Invocation {
             coordination: Some(coordination()),
-            editing_network: magi::config::EditingNetwork::Restricted,
             fetched_base: None,
             cwd: &fx.seat,
             prompt: "fixture",
             timeout: Duration::from_secs(20),
             allow_write,
-            unsandboxed: false,
             sessions: false,
             artifacts: art,
             stem: "fixture",
@@ -761,7 +636,6 @@ mod coordination {
             let first_inv = Invocation {
                 node: magi::queue::CHAT_NODE,
                 coordination: policy,
-                editing_network: magi::config::EditingNetwork::Restricted,
                 ..invocation(fx, &first_art, allow_write)
             };
             let second_inv = Invocation {
@@ -814,7 +688,6 @@ mod coordination {
         let run_inv = Invocation {
             node: "implement",
             coordination: Some(&policy),
-            editing_network: magi::config::EditingNetwork::Restricted,
             ..invocation(&fx, &run_art, false)
         };
         let mut run_seat = SeatState::new("implement", "fixture", 1);
@@ -875,7 +748,6 @@ lock_file = "kanade-sync.lock"
         let art = fx._tmp.path().join("art");
         let inv = Invocation {
             coordination: cfg.coordination.as_ref(),
-            editing_network: magi::config::EditingNetwork::Restricted,
             fetched_base: None,
             ..invocation(&fx, &art, false)
         };
@@ -1163,78 +1035,29 @@ fn shared_lock_contention_prevents_work_and_release_allows_reacquisition() {
 }
 
 #[tokio::test]
-#[ignore = "requires PowerShell and a host that can launch the real CLI sandbox"]
-async fn sandbox_seat_can_lock_ask_and_receive_answer_but_cannot_write_unrelated_state() {
-    question_route(true).await;
-}
-
-#[tokio::test]
 #[ignore = "requires PowerShell; validates the supported CLI route without a sandbox"]
 async fn host_seat_can_lock_ask_and_receive_answer() {
-    question_route(false).await;
-}
-
-async fn question_route(sandbox: bool) {
     let fx = Fixture::new();
-    let roots = worktree_writable_roots(&fx.seat, &fx.home).await.unwrap();
-    let unrelated = fx.home.join("queue");
-    std::fs::create_dir(&unrelated).unwrap();
-    let denial = if sandbox {
-        r#"try { [IO.File]::WriteAllText($env:UNRELATED, 'bad'); exit 25 }
-  catch { Write-Output 'unrelated-denied' }"#
-    } else {
-        ""
-    };
     let script = format!(
         r#"{ACQUIRE}
 try {{
-  {denial}
   & $env:MAGI_TEST_BINARY ask --repo . --summary 'fixture question' --detail fixture --timeout 30
   if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}
 }} finally {{ $lock.Dispose() }}
 "#
     );
-    let mut cmd = if sandbox {
-        Command::new("codex")
-    } else {
-        Command::new("pwsh")
-    };
-    if sandbox {
-        cmd.args(["sandbox", "-c", "sandbox_mode=\"workspace-write\"", "-c"])
-            .arg(format!(
-                "sandbox_workspace_write.writable_roots={}",
-                serde_json::to_string(&roots).unwrap()
-            ))
-            .args([
-                "-c",
-                "sandbox_workspace_write.exclude_slash_tmp=true",
-                "-c",
-                "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-            ])
-            .arg("pwsh");
-    }
+    let mut cmd = Command::new("pwsh");
     let cli = common::magi_cli(&fx.home);
     common::magi_cli_environment(&cli, &mut cmd);
     cmd.current_dir(&fx.seat)
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .env("MAGI_TEST_BINARY", cli.get_program())
-        .env("UNRELATED", unrelated.join("denied"))
         .env_remove("MAGI_RUN")
         .env_remove("MAGI_NODE")
         .env_remove("MAGI_SEAT")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let store = Questions::at(fx.home.join("questions"));
-    if sandbox {
-        let mut holder = held_lock(&fx);
-        let refused = cmd.output().unwrap();
-        assert_eq!(refused.status.code(), Some(23), "{refused:?}");
-        assert!(
-            store.list().is_empty(),
-            "no question before lock acquisition"
-        );
-        release_lock(&mut holder);
-    }
     let mut child = Running(cmd.spawn().unwrap());
     let deadline = Instant::now() + Duration::from_secs(25);
     let question = loop {
@@ -1244,7 +1067,7 @@ try {{
         if let Some(status) = child.0.try_wait().unwrap() {
             let out = child.0.stderr.take().unwrap();
             panic!(
-                "sandbox exited before filing a question: {status}; {}",
+                "seat exited before filing a question: {status}; {}",
                 std::io::read_to_string(out).unwrap()
             );
         }
@@ -1266,9 +1089,5 @@ try {{
     assert!(child.0.wait().unwrap().success());
     let stdout = std::io::read_to_string(child.0.stdout.take().unwrap()).unwrap();
     assert!(stdout.contains("fixture-answer"), "{stdout}");
-    if sandbox {
-        assert!(stdout.contains("unrelated-denied"), "{stdout}");
-    }
-    assert!(!unrelated.join("denied").exists());
     assert!(fx.primary.join(".git/updater.lock").is_file());
 }

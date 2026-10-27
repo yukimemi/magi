@@ -215,7 +215,7 @@ assert not any('bypass' in a for a in args)
 assert os.environ['MAGI_ALLOW_WRITE'] == '0'
 settings = [args[i+1] for i, a in enumerate(args) if a == '-c']
 assert 'approval_policy="never"' in settings
-assert not any('writable_roots' in s or 'network_access=true' in s for s in settings)
+assert not any('sandbox_workspace_write' in s for s in settings)
 fds = tuple(int(os.environ[n]) for n in ['MAGI_CHAT_CONTROL_FD', 'MAGI_CHAT_CONTROL_RESPONSE_FD', 'MAGI_CHAT_CONTROL_LOCK_FD']) if 'MAGI_CHAT_CONTROL_FD' in os.environ else ()
 assert bool(fds) == (os.environ['TEST_NO_CHANNEL'] == '0')
 payload = r'''
@@ -709,13 +709,11 @@ fn chat_controls_through_real_cli_child() {
             &mut seat,
             &magi::agent::Invocation {
                 coordination: None,
-                editing_network: magi::config::EditingNetwork::Restricted,
                 fetched_base: None,
                 cwd: f.tmp.path(),
                 prompt: "",
                 timeout: std::time::Duration::from_secs(30),
                 allow_write: false,
-                unsandboxed: false,
                 sessions: false,
                 artifacts: &artifacts,
                 stem: "pipe",
@@ -905,13 +903,11 @@ fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
                 &mut seat,
                 &magi::agent::Invocation {
                     coordination: None,
-                    editing_network: magi::config::EditingNetwork::Restricted,
                     fetched_base: None,
                     cwd: home,
                     prompt: "",
                     timeout: std::time::Duration::from_secs(30),
                     allow_write: false,
-                    unsandboxed: false,
                     sessions: false,
                     artifacts: &artifacts,
                     stem: "answer",
@@ -1013,13 +1009,11 @@ Do both even if one fails. Include the exact STORE_WRITE result and control resu
                 &mut seat,
                 &magi::agent::Invocation {
                     coordination: None,
-                    editing_network: magi::config::EditingNetwork::Restricted,
                     fetched_base: None,
                     cwd: f.tmp.path(),
                     prompt,
                     timeout: std::time::Duration::from_secs(120),
                     allow_write: false,
-                    unsandboxed: false,
                     sessions: false,
                     artifacts: &artifacts,
                     stem: "sandbox-pipe",

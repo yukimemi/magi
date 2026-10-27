@@ -26,67 +26,38 @@ writes, including refs and sibling worktree administration. Directory-level
 permission is broader than a single lock file and is deliberately documented.
 
 Only `questions` and `notifications` are added from the control plane. Queue,
-run and chat stores and the state root are not added. Commands such as
-`magi task add` are consequently not enabled for sandboxed implementers by this
-change. Notification webhooks remain best effort; network policy is configured
-separately as described below.
+run and chat stores and the state root are not added. Notification webhooks
+remain best effort.
 Deputies and chats keep their existing explicit, purpose-specific
 grants and do not gain repository metadata access through this policy.
 
-## Requested editing network policy
+## Codex editing seats run without the OS sandbox
 
-`[graph] editing_network = "restricted" | "enabled"` defaults to `enabled`, so a
-codex repository writer can run tests that start local servers, as claude seats
-(which run without an OS sandbox) always could. For sandboxed repository
-writers, the launcher passes the requested boolean via
-`sandbox_workspace_write.network_access`, retaining `workspace-write`,
-`approval_policy="never"`, existing writable roots, coordination and process
-containment. `enabled` permits outbound traffic as well as local test servers;
-the supported setting cannot grant loopback alone. `restricted` turns networking
-off for a repository that wants it. Other roles and adapters retain their
-existing policy.
+Owner decision 2026-10-27: a codex repository editing seat
+(`agent::repository_writer`: write-enabled `implement`, `fix`, `graft`,
+`gate-fix`, `land`, `rebase`, and an opted-in chat turn) runs with
+`--dangerously-bypass-approvals-and-sandbox`, exactly like claude seats under
+`bypassPermissions`. Inside codex's macOS seatbelt sandbox the seat could not
+create temporary directories under `$TMPDIR` (`Operation not permitted`) and
+Chrome aborted without a `DevToolsActivePort`, so magi's own browser and
+integration tests could not run and editing tasks ended as no-ops. Opening the
+network alone (the former `[graph] editing_network` setting, now removed) was
+not enough.
 
-`Invocation` carries the configured policy through initial turns, resumes,
-fallbacks and waiter delivery. The same policy function supplies the argv,
-`requested_network_access` in `*.access.json`, and current-turn guidance. This
-is a request, not evidence of effective access: host or managed restrictions
-can still deny networking, and a child cannot relax inherited parent restrictions.
-Git administration-path denials are separate from network denials and remain
-possible even with the common directory grant.
+The bypass replaces `--sandbox`, `approval_policy` and the
+`sandbox_workspace_write.*` overrides, and precedes `resume`, on initial turns,
+resumes, fallbacks and waiter delivery alike. `*.access.json` records
+`"unsandboxed": true` for such a seat. Its current-turn guidance names only the
+launcher's fetched base; it no longer tells the seat that network, Git
+administration or temporary-directory access is restricted. Judges,
+reviewers, advisors, deputies, the conductor, dupes, title seats and every
+other read-only seat keep their sandbox unchanged. A config that still sets
+`[graph] editing_network` fails to load (`deny_unknown_fields`).
 
-During infrastructure repair, a failed reproduction is evidence of the current
-defect. It does not prevent independently permitted source edits for a future
-launcher. Record denied operations, targets, exact errors and their impact;
-continue independent edits and focused checks without bypasses or futile
-retries. Stop when a required denial blocks all remaining permitted work.
-Candidate preservation rescues eligible edits independently of a failure report;
-this does not establish successful deployment or validation.
-
-Repository configuration comes from the launcher's fetched base, never the
-candidate working tree. Deployment therefore requires integrating the policy
-and source changes, deploying the rebuilt launcher, and preparing a new seat
-from the fetched base through the existing preparation/base-sync paths. Deploy
-the updated launcher before it discovers a base with the new setting: older
-launchers reject the unknown graph key. Saved runs retain their saved policy;
-resuming an old restricted run does not reload the candidate configuration. No
-seat-side fetch is required. A parent running the old launcher cannot gain the
-new policy merely by executing a newly built child under inherited restrictions.
-The parent-owned verification path must inspect fresh access evidence, verify
-local server bind/browser execution and the unrelated-write denial, and check
-coordination/containment before declaring the browser blocker resolved. Source
-and fixture checks alone do not demonstrate resolution of the existing blocked
-browser task. Genuine parent/managed-policy or protected Git-path denials must
-be reported separately with the operation and error.
-
-In the restricted repair seat, `RUSTUP_TOOLCHAIN=stable cargo test --locked
---lib editing_` also selected four existing web tests. All four failed at
-`src/web.rs`'s `bind loopback` with `Os { code: 1, kind: PermissionDenied,
-message: "Operation not permitted" }`; the ten other selected tests passed.
-This is reproduction evidence under the current inherited seat restrictions,
-not a test of the deployed correction. Do not retry those binds in the same
-environment or treat them as a source-editing blocker. The existing browser
-task's blocker remains unproven resolved until parent-owned real verification
-succeeds after deployment.
+The resolved write scope above is still computed for editing seats: agy needs
+it for `--add-dir`, the child's `MAGI_HOME` is pinned to the granted store, and
+the access evidence records it. Repository coordination, `SeatLease` and process
+containment are unchanged.
 
 ## Parent-owned review and verification
 
@@ -116,7 +87,7 @@ are unchanged.
 
 | Adapter | Additional scope | Enforcement limits |
 | --- | --- | --- |
-| Codex | `sandbox_workspace_write.writable_roots`, before `resume` | Retains `workspace-write`, `approval_policy=never`; unrelated writes remain denied by the CLI's OS sandbox. Host/managed policies can further restrict these grants. |
+| Codex | None for editing seats, which run with `--dangerously-bypass-approvals-and-sandbox` before `resume`; a write-enabled non-editing seat (deputy) gets `sandbox_workspace_write.writable_roots` | Editing seats have no OS boundary, as with claude. Other write-enabled seats retain `workspace-write` and `approval_policy=never`; unrelated writes remain denied by the CLI's OS sandbox. Read-only seats keep `--sandbox read-only`. |
 | Antigravity | Repeated `--add-dir` on initial and resumed invocations | Workspace membership, not a verified equivalent OS write boundary. Existing permission mode remains unchanged. |
 | Claude | No additional flag required | Existing permission bypass has no checkout-only filesystem boundary. |
 | opencode / omp | No additional flag required | Existing auto modes provide no enforced read-only or checkout-only filesystem boundary. |
@@ -276,10 +247,11 @@ both ownership witnesses before reparenting, and abrupt launcher process death,
 are outside this containment contract. Do not register launchers that discard
 both witnesses while leaving tools running.
 
-macOS/Linux enforcement depends on the installed CLI and OS sandbox. Windows
-sandbox behavior and Antigravity terminal restrictions have not been validated
-by the host tests here. An already-running seat retains its old scope: a source
-patch or newly built binary cannot widen the outer sandbox that launched it.
+macOS/Linux enforcement for sandboxed (non-editing) codex seats depends on the
+installed CLI and OS sandbox. Windows sandbox behavior and Antigravity terminal
+restrictions have not been validated by the host tests here. An already-running
+seat retains its old scope: a source patch or newly built binary cannot widen
+the outer sandbox that launched it.
 
 ## Verification and recovery
 
@@ -297,20 +269,21 @@ RUSTUP_TOOLCHAIN=stable cargo test --locked --lib graph::tests::fold_run_
 RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope readonly_invocation -- --ignored --nocapture
 RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope shared_lock_contention -- --ignored --nocapture
 RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope host_seat -- --ignored --nocapture
-RUSTUP_TOOLCHAIN=stable cargo test --locked --test seat_write_scope sandbox_seat -- --ignored --nocapture
 ```
 
-The host tests are explicit because they need PowerShell and an installed CLI
-whose `sandbox` command accepts a command directly (verified help on 0.160.0).
-They use disposable repositories with linked worktrees and a separate fake
-state store, never production records. The lock fixture uses the real .NET
+The host tests are explicit because they need PowerShell. They use disposable
+repositories with linked worktrees and a separate fake state store, never
+production records. The lock fixture uses the real .NET
 `FileStream` / `FileShare.None` contract: contention refuses work, closing the
 holder releases it, and reacquisition succeeds without deleting the file. The
-sandbox fixture first verifies contention prevents question creation, then
-acquires the released lock, denies a sibling queue write, files a real
-`magi ask`, and receives a reply through `magi answer`. Temporary-directory
-default grants are disabled for the denial assertion. Neither test substitutes
-for verifying the deployed daemon and its actual seat environment.
+host-seat fixture acquires the lock, files a real `magi ask`, and receives a
+reply through `magi answer`. Neither test substitutes for verifying the
+deployed daemon and its actual seat environment.
+
+The verification records below predate the 2026-10-27 decision. The codex
+sandbox fixtures they cite (`sandbox_seat_can_lock_ask_and_receive_answer_but_cannot_write_unrelated_state`,
+`sandbox_git_operations_and_network_policy`) and the `editing_network` setting
+were removed with it; the records are kept as history.
 
 Task `20261016-031545-f3b5` remains manually held. Its failed runs
 `20261016-060517-e0cf` and `20261016-061144-d496` produced no implementation;

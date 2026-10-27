@@ -105,10 +105,9 @@ pub async fn rebase_with_fixer(
             }
         }
         // A fixer that already worked on *this* stop point may have left the
-        // contents resolved with only the staging undone (a sandbox refusing
-        // Git's metadata, a run killed between the steps). Finish that before
-        // the budget is looked at: re-confirming resolved files is not a
-        // conflict round.
+        // contents resolved with only the staging undone (a run killed between
+        // the steps). Finish that before the budget is looked at:
+        // re-confirming resolved files is not a conflict round.
         if let Launch::Advanced = launcher_stage(state, scratch, &orig, &onto_sha).await? {
             continue;
         }
@@ -204,13 +203,11 @@ pub async fn rebase_with_fixer(
                 &mut seat,
                 &Invocation {
                     coordination: state.config.coordination.as_ref(),
-                    editing_network: state.config.graph.editing_network,
                     fetched_base: state.fetched_base.as_ref(),
                     cwd: scratch,
                     prompt: &prompt_text,
                     timeout: Duration::from_secs(state.config.graph.timeout_fix),
                     allow_write: true,
-                    unsandboxed: false,
                     sessions: state.config.graph.sessions,
                     artifacts: &artifacts,
                     stem: &stem,
@@ -588,8 +585,8 @@ async fn mutate(
 
 /// Stage what the fixer resolved and continue the sequencer, as the launcher.
 ///
-/// The seat only edits contents (its sandbox may refuse Git's metadata, e.g.
-/// the index lock). Everything here is re-derived from Git inside the
+/// The seat only edits contents; staging and continuing stay with the
+/// launcher. Everything here is re-derived from Git inside the
 /// repository's coordination lease, so an interrupted pass is simply run
 /// again: the current unmerged set must lie inside the round's recorded
 /// paths, none may still hold markers, nothing outside them may have been

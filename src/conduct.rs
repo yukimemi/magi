@@ -1329,7 +1329,6 @@ impl Conductor {
             };
             let inv = Invocation {
                 coordination: cfg.coordination.as_ref(),
-                editing_network: cfg.graph.editing_network,
                 fetched_base: None,
                 cwd: repo,
                 prompt: &body,
@@ -1337,7 +1336,6 @@ impl Conductor {
                 // The conductor never edits anything - it only decides what
                 // blocks a task and what to do about one stuck or finished.
                 allow_write: false,
-                unsandboxed: false,
                 sessions: cfg.graph.sessions,
                 artifacts: &artifacts,
                 stem: &stem,
