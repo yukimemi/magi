@@ -8647,6 +8647,9 @@ impl Runner {
                         continue;
                     }
                 }
+                Ok(_) if self.state.resource_block.is_some() => {
+                    return self.stop_for_resource();
+                }
                 Ok(pr) if self.state.parked => {
                     // `land` already saved the parked marker; nothing here
                     // overrides `status` back to a terminal value while an
@@ -8753,6 +8756,21 @@ impl Runner {
             let result = land::fix_round(&mut self.state, &pr, i + 1, budget, &reason, "").await;
             match result {
                 Ok(land::Fixed::Committed { .. } | land::Fixed::Declined) => {}
+                Ok(land::Fixed::Deferred) => {
+                    // An unavailable fixer did not spend this repair request.
+                    // Restore partial fallback work before retrying it, as for
+                    // an interrupted repair, without closing the request.
+                    let worktree = self
+                        .state
+                        .winner()
+                        .context("repair has no winning branch")?
+                        .worktree
+                        .clone();
+                    self.graft_restore(&worktree, &request.head).await?;
+                    self.state.merge_repairs[i].phase = Phase::Requested;
+                    self.stop_for_resource()?;
+                    return Ok(false);
+                }
                 Ok(land::Fixed::Failed(why)) => {
                     self.hold_merge_repair(
                         i,

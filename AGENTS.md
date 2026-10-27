@@ -1011,7 +1011,11 @@ upstream CRLF, not drift worth committing — normalise back to LF and
   so neither is immediately re-asked and both can hand over to another agent.
   Authentication raises a notice keyed by agent id asking to re-authenticate.
   A fixer chain ending in a usage limit or authentication failure uses its
-  caller's resource deferral path, except best-effort graft, which records
+  caller's resource deferral path, including the independent landing fixer
+  chain: it records the final agent/cause and defers without handing off the
+  PR or spending a fix round. Resume retries its checks/comments; an explicit
+  merge-repair request remains pending after restoring partial fixer work.
+  This excludes best-effort graft, which records
   the loss, restores its tree and proceeds to review and gate. The same applies
   to missing-report continuations: gate and review fix rounds remain unspent
   until recovery. Operator fixes rescue edits, release their worktree and save

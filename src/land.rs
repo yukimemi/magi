@@ -4881,6 +4881,14 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                         "land",
                         format!("round {round}: fixer declined the comments, nothing committed"),
                     ),
+                    Fixed::Deferred => {
+                        // No fixer was available to judge these comments or
+                        // checks. Keep the previous completed-round count and
+                        // return without handing the PR off as a task failure.
+                        state.status = RunStatus::Blocked;
+                        state.save()?;
+                        return Ok(pr);
+                    }
                     Fixed::Failed(why) => {
                         stop(state, &repo, &pr, &format!("the fix round failed: {why}")).await?;
                         return Ok(pr);
@@ -5461,6 +5469,8 @@ pub enum Fixed {
     },
     /// The fixer ran and chose to change nothing.
     Declined,
+    /// Machine availability prevented a result; retry this round on resume.
+    Deferred,
     /// The fixer could not run, or said nothing usable.
     Failed(String),
 }
@@ -5554,16 +5564,19 @@ pub async fn fix_round(
             crate::graph::record_handover(state, "land", &seat_key, &spec.id, next, &class, &why);
             continue;
         }
-        last = Some(out);
+        last = Some((seat_key, out));
         break;
     }
-    let out = last.expect("the fixer chain always has an entry");
+    let (seat_key, out) = last.expect("the fixer chain always has an entry");
 
     match out {
         Ok(o) if o.quota_exhausted() => {
-            return Ok(Fixed::Failed(
-                "rate limited (quota); the fixer could not run".to_owned(),
-            ));
+            let loss = crate::run::QuotaLoss::from_report(seat_key, "land", o.quota.as_ref());
+            crate::graph::block_machine_outage(state, "land", std::slice::from_ref(&loss));
+            state.quota.push(loss);
+            state.status = RunStatus::Blocked;
+            state.save()?;
+            return Ok(Fixed::Deferred);
         }
         Ok(o) if !o.usable() => {
             return Ok(Fixed::Failed(format!(
@@ -10727,6 +10740,36 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(state.status, RunStatus::Merged);
         assert!(!forge.calls().contains(&"fix"));
         assert_eq!(state.pr.as_ref().unwrap().round, 0);
+    }
+
+    #[tokio::test]
+    async fn a_deferred_landing_fix_keeps_its_round_for_resume() {
+        let mut state = landing_state();
+        state.config.graph.land_rounds = 1;
+        let forge = Scripted::new(vec![seen("a", Checks::Green, "CLEAN", true)], vec![]);
+        *forge.fix.lock().unwrap() = Some(Fixed::Deferred);
+        let pr = land_with(&mut state, RERUN_PR, &forge).await.unwrap();
+        assert_eq!(pr.state, PrLifecycle::Open);
+        assert_eq!(state.status, RunStatus::Blocked);
+        assert_eq!(state.pr.as_ref().unwrap().round, 0);
+        assert!(
+            state.merge_decision.is_none(),
+            "no ordinary failure handoff"
+        );
+        assert!(forge.argvs().is_empty(), "no merge on outage");
+
+        let recovered = Scripted::new(
+            vec![
+                seen("a", Checks::Green, "CLEAN", true),
+                seen("b", Checks::Green, "CLEAN", false),
+            ],
+            vec![(true, "")],
+        );
+        *recovered.fix.lock().unwrap() = Some(Fixed::Committed { head: "b".into() });
+        land_with(&mut state, RERUN_PR, &recovered).await.unwrap();
+        assert_eq!(state.status, RunStatus::Merged);
+        assert_eq!(state.pr.as_ref().unwrap().round, 1);
+        assert_eq!(recovered.calls().iter().filter(|c| **c == "fix").count(), 1);
     }
 
     #[tokio::test]
