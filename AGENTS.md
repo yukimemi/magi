@@ -1598,6 +1598,13 @@ re-sends the policy whenever it is not Solo. Enforcement is the prompt only;
 repo config (`talk::check_implementers`), so `--repo` pointing elsewhere is
 checked only when the task runs.
 
+`src/main.rs::resolve_repo` also resolves chat filing's short `--repo` names.
+`[repos] auto_clone` defaults to false; when enabled, only a validated explicit
+`owner/repo` with no local match is confirmed by `gh` and cloned into the first
+root's GitHub layout, using literal `clone_command` argv (default: `gh repo clone`).
+Local ambiguity still fails, bare names and stats never clone, and repository
+config continues to come from the remote base commit.
+
 ### Web and scheduler restart independently of execution workers
 
 `src/worker.rs` owns durable detached reservations, execution leases and immutable

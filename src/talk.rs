@@ -2978,7 +2978,8 @@ fn attachment_note(store: &Talks, talk_id: &str, attachments: &[Attachment]) -> 
 /// line an agent asked to change some other repository has no way to know
 /// that option exists, and the only path it can see - asking the operator to
 /// dictate a full path - is exactly the friction this change exists to
-/// remove. A miss or an ambiguous name still fails the command outright, so
+/// remove. With `[repos] auto_clone`, an explicit owner/repo miss can be
+/// confirmed and acquired on GitHub. An unresolved or ambiguous name fails, so
 /// the instruction is to ask rather than guess when that happens - the
 /// silent-decision line this task must not cross.
 pub fn briefing(repo: &Path, language: &str, allow_write: bool) -> String {
@@ -3190,7 +3191,10 @@ pub fn briefing_for(
          If the operator asks for something in a different repository, \
          --repo does not have to be a full path: --repo owner/repo (or just \
          repo, when that is unambiguous) is resolved against local checkouts \
-         the same way `magi repos` lists them. If the command fails because \
+         the same way `magi repos` lists them. With [repos] auto_clone enabled, \
+         an explicit owner/repo that is missing locally can be confirmed on GitHub \
+         and cloned under the first configured root. Bare names never clone. \
+         If the command fails because \
          nothing matches or more than one checkout shares that name, ask the \
          operator which repository they mean (or run `magi repos` yourself \
          to see the candidates) rather than guessing.\n\n\

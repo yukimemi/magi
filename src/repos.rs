@@ -5,7 +5,7 @@
 //!
 //! # Read-only, and cheap enough to repeat
 //!
-//! Nothing here creates, deletes or writes anything, and no root is ever
+//! Discovery never creates, deletes or writes anything, and no root is ever
 //! reached over the network - the whole point is that this is a filesystem
 //! fact about the operator's own machine. [`Cache`] exists only because a scan
 //! still means walking however many roots the operator configured on every
@@ -15,7 +15,8 @@
 //! `git` to confirm a candidate [`discover`] found by filesystem shape alone
 //! actually works, because a caller substituting it for an unresolved
 //! `--repo .` needs more than a plausible path before using it silently -
-//! see its own doc.
+//! see its own doc. The opt-in CLI acquisition helpers in [`crate::repo_clone`]
+//! are separate from discovery and perform network access only after a local miss.
 //!
 //! # One implementation, two callers
 //!
@@ -60,11 +61,14 @@ pub fn scan(roots: &[PathBuf]) -> Vec<Repo> {
         for host in subdirs(root) {
             for owner in subdirs(&host) {
                 for dir in subdirs(&owner) {
-                    if !dir.join(".git").exists() {
+                    if !dir.join(".git").exists() || crate::repo_clone::acquisition_incomplete(&dir)
+                    {
                         continue;
                     }
                     let path = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-                    if !seen.insert(path.clone()) {
+                    if crate::repo_clone::acquisition_incomplete(&path)
+                        || !seen.insert(path.clone())
+                    {
                         continue;
                     }
                     let name = format!("{}/{}", file_name(&owner), file_name(&dir));
@@ -146,7 +150,7 @@ fn collect(dir: &Path, depth: u32, seen: &mut HashSet<PathBuf>, out: &mut Vec<Ca
         match main_checkout(&child) {
             Some(main) => {
                 let path = main.canonicalize().unwrap_or(main);
-                if seen.insert(path.clone()) {
+                if !crate::repo_clone::acquisition_incomplete(&path) && seen.insert(path.clone()) {
                     let name = file_name(&path).into_owned();
                     let owner_name = path
                         .parent()
@@ -178,7 +182,7 @@ fn collect(dir: &Path, depth: u32, seen: &mut HashSet<PathBuf>, out: &mut Vec<Ca
 fn main_checkout(dir: &Path) -> Option<PathBuf> {
     let dot_git = dir.join(".git");
     if dot_git.is_dir() {
-        return Some(dir.to_path_buf());
+        return (!crate::repo_clone::acquisition_incomplete(dir)).then(|| dir.to_path_buf());
     }
     let contents = std::fs::read_to_string(&dot_git).ok()?;
     let gitdir = contents.strip_prefix("gitdir:")?.trim();
@@ -187,7 +191,8 @@ fn main_checkout(dir: &Path) -> Option<PathBuf> {
     if git_dir.file_name()?.to_str()? != ".git" {
         return None;
     }
-    Some(git_dir.parent()?.to_path_buf())
+    let main = git_dir.parent()?;
+    (!crate::repo_clone::acquisition_incomplete(main)).then(|| main.to_path_buf())
 }
 
 /// Whether `hint` mentions `token` as a whole word. `/`, `-` and `_` count as

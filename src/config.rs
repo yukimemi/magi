@@ -1425,6 +1425,12 @@ pub struct Repos {
     /// with a `.git` directory. Empty by default - nothing is scanned unless
     /// asked to be.
     pub roots: Vec<PathBuf>,
+    /// Allow explicit owner/repo misses to be confirmed with gh and cloned.
+    pub auto_clone: bool,
+    /// Literal argv template; {repo}, {owner}, {name}, {dest} are substituted.
+    /// Defaults to `gh repo clone https://github.com/{repo}.git {dest}`.
+    /// Declare in a single layer.
+    pub clone_command: Option<Vec<String>>,
     /// How long a scan is trusted before the next request re-scans it,
     /// seconds. `0` means never trust it: scan on every request. Defaults to
     /// a day, the same order of magnitude as [`Graph::answer_timeout`] for
@@ -1443,6 +1449,8 @@ impl Default for Repos {
     fn default() -> Self {
         Self {
             roots: Vec::new(),
+            auto_clone: false,
+            clone_command: None,
             scan_ttl: 86_400,
             fetch_interval: 600,
         }
@@ -3632,6 +3640,8 @@ lock_file = "{{ vars.bad }}"
         assert_eq!(Config::default().repos.roots, Vec::<PathBuf>::new());
         assert_eq!(Config::default().repos.scan_ttl, 86_400);
         assert_eq!(Config::default().repos.fetch_interval, 600);
+        assert!(!Config::default().repos.auto_clone);
+        assert!(Config::default().repos.clone_command.is_none());
     }
 
     #[test]

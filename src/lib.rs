@@ -77,6 +77,7 @@ pub mod refs;
 pub mod release_local;
 pub mod release_manifest;
 pub mod release_watch;
+pub mod repo_clone;
 mod repo_lock;
 pub mod report;
 pub mod report_view;
