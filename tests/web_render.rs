@@ -2150,7 +2150,7 @@ async fn client_harness(browser: &mut cdp::Browser, page: &cdp::Page) {
         .expect("install client harness");
 }
 
-#[tokio::test]
+common::e2e! {
 async fn machine_settings_context_and_overrides_fit_phone_and_desktop() {
     let Some(chrome) = cdp::find_chrome() else {
         assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
@@ -2159,6 +2159,13 @@ async fn machine_settings_context_and_overrides_fit_phone_and_desktop() {
     };
     let guard = common::home_lock().await;
     let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    // Publish only the roster: graph counts must stay at their default source
+    // until this scene injects the repository overrides it checks below.
+    publish_fixture_config(
+        &fx,
+        toml::to_string(&std::collections::BTreeMap::from([("agents", &fx.config.agents)]))
+            .expect("serialize settings roster"),
+    ).await;
     let home = fx.tmp.path().join("magi-home");
     let base = serve_with_client_probe(
         &home,
@@ -2177,18 +2184,23 @@ async fn machine_settings_context_and_overrides_fit_phone_and_desktop() {
             .expect("page");
         // Inspect the live client's state, so there is only one settings
         // renderer and one request sequence throughout these interactions.
-        browser
+        let loaded = browser
             .wait_for(
                 &page,
                 "!!document.querySelector('#settings-body .set-role') && document.getElementById('settings-repo')?.disabled === false",
                 Duration::from_secs(30),
             )
-            .await
-            .expect("live client settings loaded before checking geometry and states");
+            .await;
+        if let Err(error) = loaded {
+            settings_failure(&mut browser, &page, &base, width, "initial load").await;
+            panic!("live client settings loaded before checking geometry and states: {error}");
+        }
         let result = browser.eval(&page, r#"(async () => {
           const s = deck.settingsState;
           const data = structuredClone(s.data);
           if (data.error || !data.roles.length) return ['fixture config did not load'];
+          if (data.machine.path !== null || data.machine.exists) return ['fixture read machine configuration'];
+          if (JSON.stringify(data.agents.map(a => a.id).sort()) !== JSON.stringify(['alpha', 'beta', 'gamma'])) return ['fixture roster did not load'];
           data.repositories = [
             {name: 'owner/same-name', path: '/checkouts/one/' + 'long-repository-name-'.repeat(8)},
             {name: 'owner/same-name', path: '/checkouts/two/same-name'}
@@ -2253,13 +2265,48 @@ async fn machine_settings_context_and_overrides_fit_phone_and_desktop() {
             if (s.data.repo !== 'newest') fails.push('stale response replaced selection');
           } finally { window.confirm = confirm; window.fetch = fetch; }
           return fails;
-        })()"#).await.expect("settings geometry and states");
+        })()"#).await;
+        if !result
+            .as_ref()
+            .is_ok_and(|value| *value == serde_json::json!([]))
+        {
+            settings_failure(&mut browser, &page, &base, width, "geometry and states").await;
+        }
+        let result = result.expect("settings geometry and states");
         assert_eq!(
             result,
             serde_json::json!([]),
             "settings at {width}px: {result}"
         );
         browser.close_page(&page).await;
+    }
+}
+}
+
+async fn settings_failure(
+    browser: &mut cdp::Browser,
+    page: &cdp::Page,
+    base: &str,
+    width: u32,
+    stage: &str,
+) {
+    let state = browser
+        .eval(
+            page,
+            r#"({
+      settingsState: window.deck?.settingsState,
+      body: document.getElementById('settings-body')?.innerText,
+      error: document.getElementById('settings-error-text')?.innerText
+    })"#,
+        )
+        .await;
+    eprintln!("settings failure at {width}px ({stage}): {state:?}");
+    eprintln!(
+        "settings browser events: {:?}",
+        browser.take_events(&page.session)
+    );
+    if let Some(requests) = diag::Requests::for_url(base) {
+        eprintln!("settings HTTP trace: {}", requests.snapshot());
     }
 }
 
@@ -3248,14 +3295,18 @@ async fn fixture_roster_loads_without_the_machine_layer() {
 /// The server discovers config from origin/main, rather than the in-memory
 /// fixture used to seed talks. Give both sides the same mock roster.
 async fn publish_fixture_roster(fx: &common::Fixture) {
-    std::fs::write(
-        fx.repo.join("magi.toml"),
+    publish_fixture_config(
+        fx,
         toml::to_string(&fx.config).expect("serialize fixture config"),
     )
-    .expect("write fixture config");
+    .await;
+}
+
+async fn publish_fixture_config(fx: &common::Fixture, text: String) {
+    std::fs::write(fx.repo.join("magi.toml"), text).expect("write fixture config");
     for args in [
         vec!["add", "magi.toml"],
-        vec!["commit", "-m", "configure chat test roster"],
+        vec!["commit", "-m", "configure test roster"],
         vec!["push", "origin", "main"],
     ] {
         magi::git::git(&fx.repo, &args)
