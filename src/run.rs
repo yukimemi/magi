@@ -741,14 +741,14 @@ pub struct QuotaLoss {
 
 impl QuotaLoss {
     /// Preserve the cause and agent alongside the seat at every loss site.
-    pub fn new(seat: String, node: &str, quota: &crate::agent::Quota) -> Self {
+    pub fn from_report(seat: String, node: &str, quota: Option<&crate::agent::Quota>) -> Self {
         Self {
             seat,
             node: node.to_owned(),
             at: Timestamp::now(),
-            reset: quota.reset.clone(),
-            cause: quota.cause,
-            agent: quota.agent.clone(),
+            reset: quota.and_then(|q| q.reset.clone()),
+            cause: quota.map(|q| q.cause).unwrap_or_default(),
+            agent: quota.map(|q| q.agent.clone()).unwrap_or_default(),
         }
     }
 }
@@ -3956,6 +3956,26 @@ pub fn read_artifact(run: &RunState, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quota_loss_from_report_preserves_machine_failure_details() {
+        let report = crate::agent::Quota {
+            reset: Some("in 1h".into()),
+            cause: crate::agent::QuotaCause::Authentication,
+            agent: "alpha".into(),
+        };
+        let loss = QuotaLoss::from_report("advisor-1".into(), "advise", Some(&report));
+        assert_eq!(loss.seat, "advisor-1");
+        assert_eq!(loss.node, "advise");
+        assert_eq!(loss.reset, report.reset);
+        assert_eq!(loss.cause, report.cause);
+        assert_eq!(loss.agent, report.agent);
+
+        let absent = QuotaLoss::from_report("advisor-2".into(), "advise", None);
+        assert_eq!(absent.reset, None);
+        assert_eq!(absent.cause, crate::agent::QuotaCause::UsageLimit);
+        assert!(absent.agent.is_empty());
+    }
+
     fn pass_state() -> RunState {
         RunState::new(
             PathBuf::from("/repo"),

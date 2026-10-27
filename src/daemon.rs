@@ -6901,14 +6901,14 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(i, agent)| {
-                QuotaLoss::new(
+                QuotaLoss::from_report(
                     format!("advisor-{i}"),
                     "advise",
-                    &crate::agent::Quota {
+                    Some(&crate::agent::Quota {
                         cause: crate::agent::QuotaCause::Authentication,
                         agent: agent.to_owned(),
                         reset: None,
-                    },
+                    }),
                 )
             })
             .collect();
@@ -9876,6 +9876,20 @@ mod tests {
             node: "judge".into(),
             at: at.parse().unwrap(),
             reset: reset.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn authentication_losses_never_arm_a_cooldown_even_with_reset_hints() {
+        let now = Timestamp::now();
+        for reset in [None, Some("in 1h")] {
+            let auth = crate::agent::Quota {
+                cause: crate::agent::QuotaCause::Authentication,
+                agent: "alpha".into(),
+                reset: reset.map(str::to_owned),
+            };
+            let loss = QuotaLoss::from_report("advisor-1".into(), "advise", Some(&auth));
+            assert_eq!(cooldown_until(&[loss], now), None);
         }
     }
 

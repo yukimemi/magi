@@ -1566,7 +1566,7 @@ fn codex_quota(stdout: &str) -> Option<Quota> {
     Some(Quota {
         reset: message
             .split_once("try again at ")
-            .map(|(_, hint)| hint.trim().to_owned())
+            .map(|(_, hint)| hint.trim().trim_end_matches('.').trim().to_owned())
             .filter(|hint| !hint.is_empty()),
         cause: QuotaCause::UsageLimit,
         agent: String::new(),
@@ -2958,7 +2958,7 @@ mod tests {
         assert_eq!(auth.reset, None);
         let limit = extract(AgentKind::Codex, CODEX_LIMIT).quota.unwrap();
         assert_eq!(limit.cause, QuotaCause::UsageLimit);
-        assert_eq!(limit.reset.as_deref(), Some("Oct 27th, 2026 6:18 PM."));
+        assert_eq!(limit.reset.as_deref(), Some("Oct 27th, 2026 6:18 PM"));
         // Duplicate events still yield one classification.
         assert!(
             extract(AgentKind::Codex, &format!("{CODEX_LIMIT}\n{CODEX_LIMIT}"))
