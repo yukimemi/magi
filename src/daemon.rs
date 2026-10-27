@@ -1734,6 +1734,8 @@ pub struct Verdict {
 /// | `Stalled`, quota hit                   | `Failed` (requeued) | **no**        |
 /// | `Failed`, quota hit, no viable cand.   | `Failed` (requeued) | **no**        |
 /// | `Stalled`, no quota                    | `Failed`, or `Held`  | yes          |
+/// | recorded authentication/resource stop | `Held` (machine)     | **no**       |
+/// | recorded usage-limit node stop       | `Failed` (requeued)  | **no**       |
 /// | `Blocked` with a PR                    | `Held`               | yes          |
 /// | `Blocked`, `Failed` otherwise          | `Failed`, or `Held`  | yes          |
 /// | `VerifiedNoop`                          | `Held`               | yes          |
@@ -1996,6 +1998,28 @@ fn settle_and_diagnose(
         task.hold_manual(Some(format!("Selected implementer `{}` was unavailable, failed or hit quota before producing a viable implementation. No other implementer was dispatched. Inspect the run, restore availability, then explicitly release this task.", replacement.agent)));
         return;
     }
+    if !verdict.parked && verdict.quota_hit && state.status == RunStatus::Stalled {
+        let mut agents: Vec<_> = state
+            .quota
+            .iter()
+            .filter(|q| {
+                q.cause == crate::agent::QuotaCause::Authentication
+                    && state
+                        .passes
+                        .last()
+                        .is_none_or(|pass| q.at >= pass.started_at)
+            })
+            .map(|q| q.agent.as_str())
+            .collect();
+        agents.sort_unstable();
+        agents.dedup();
+        if !agents.is_empty() {
+            task.stall(detail);
+            task.notice_cause("agent-authentication", None, None);
+            task.hold_machine(Some(format!("[authentication] Agents {} cannot authenticate; re-authenticate, then resume the held task. No attempt was spent.", agents.join(", "))));
+            return;
+        }
+    }
     let attempts_before = task.attempts;
     // A run that stopped because a shared resource stayed busy was never a
     // failure of the task or of an agent. Earlier nodes may have run; only
@@ -2012,7 +2036,20 @@ fn settle_and_diagnose(
         task.last_error = Some(detail.to_owned());
         task.diagnostic = None;
         task.attempts = task.attempts.saturating_sub(1);
-        if block.kind == "disk pressure" {
+        if block.kind == "agent authentication" {
+            task.hold_machine(Some(format!(
+                "[authentication] {}; no attempt was spent",
+                block.detail
+            )));
+        } else if block.kind == "agent usage limit" {
+            // Usage limits keep the existing cooldown-and-resume policy.
+            if let Some(agent) = &state.config.graph.selected_implementer {
+                task.hold_machine(Some(format!("[agent usage limit] Selected implementer `{agent}` is unavailable. No other implementer was dispatched; resume after usage is available. No attempt was spent.")));
+            } else {
+                task.status = TaskStatus::Failed;
+                task.last_error = Some(block.detail.clone());
+            }
+        } else if block.kind == "disk pressure" {
             task.hold_machine(Some(format!(
                 "{}{}",
                 crate::disk::RUNNING_PRESSURE,
@@ -2190,7 +2227,12 @@ fn reclaim(task: &mut Task, last_run: Option<RunState>, max_attempts: usize, lan
             let verdict = Verdict {
                 status: state.status,
                 left_pr: state.pr.is_some(),
-                quota_hit: !state.quota.is_empty(),
+                quota_hit: state.quota.iter().any(|loss| {
+                    state
+                        .passes
+                        .last()
+                        .is_none_or(|pass| loss.at >= pass.started_at)
+                }),
                 parked: state.parked,
                 no_viable_candidates: state.viable().is_empty(),
             };
@@ -4984,8 +5026,8 @@ fn withheld_text_wait(task: &Task) -> Option<u64> {
 /// `Runner::recover_stall` drops a `QuotaLoss` when its seat ranks again, so
 /// the vector can shrink and shift under a resume. A retried seat that hits
 /// quota again is a `push` with a new `at`, so it shows up as new here.
-/// `reclaim` deliberately keeps reading the whole history: after a crash there
-/// is no attempt boundary to diff against.
+/// Crash recovery uses the recorded pass start as its boundary when available;
+/// legacy records without passes retain their original history-based policy.
 fn losses_this_attempt(before: &[QuotaLoss], after: &[QuotaLoss]) -> Vec<QuotaLoss> {
     after
         .iter()
@@ -4997,6 +5039,10 @@ fn losses_this_attempt(before: &[QuotaLoss], after: &[QuotaLoss]) -> Vec<QuotaLo
 /// When the loop-wide quota cooldown should end, given this attempt's losses;
 /// `None` when there were none. Reset-hint parsing and the cap live here.
 fn cooldown_until(quota: &[QuotaLoss], now: Timestamp) -> Option<Timestamp> {
+    let quota: Vec<_> = quota
+        .iter()
+        .filter(|q| q.cause == crate::agent::QuotaCause::UsageLimit)
+        .collect();
     if quota.is_empty() {
         return None;
     }
@@ -6836,6 +6882,68 @@ mod tests {
     }
 
     #[test]
+    fn orphan_recovery_does_not_refund_a_previous_pass_loss() {
+        let mut state = run_state(RunStatus::Failed);
+        state
+            .quota
+            .push(loss("advisor-1", "2026-10-22T14:38:00Z", None));
+        state.begin_pass();
+        let mut t = task();
+        t.start(state.id.clone());
+        reclaim(&mut t, Some(state), 2, "en");
+        assert_eq!(t.attempts, 1);
+    }
+
+    #[test]
+    fn an_all_seats_unauthenticated_node_refunds_and_holds_without_retry() {
+        let mut state = run_state(RunStatus::Blocked);
+        let losses: Vec<_> = ["alpha", "beta"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, agent)| {
+                QuotaLoss::new(
+                    format!("advisor-{i}"),
+                    "advise",
+                    &crate::agent::Quota {
+                        cause: crate::agent::QuotaCause::Authentication,
+                        agent: agent.to_owned(),
+                        reset: None,
+                    },
+                )
+            })
+            .collect();
+        crate::graph::block_machine_outage(&mut state, "advise", &losses);
+        state.quota = losses;
+        let mut t = task();
+        t.start(state.id.clone());
+        let verdict = Verdict {
+            status: state.status,
+            left_pr: false,
+            quota_hit: true,
+            parked: false,
+            no_viable_candidates: true,
+        };
+        settle_and_diagnose(&mut t, verdict, "authentication unavailable", 2, &state);
+        assert_eq!(t.attempts, 0);
+        assert_eq!(t.status, TaskStatus::Held);
+        assert!(!t.operator_held());
+        let reason = t.hold_reason.as_deref().unwrap();
+        assert!(reason.starts_with("[authentication]"));
+        assert!(
+            reason.contains("alpha")
+                && reason.contains("beta")
+                && reason.contains("re-authenticate")
+        );
+        assert!(cooldown_until(&state.quota, Timestamp::now()).is_none());
+        // Orphan recovery uses the same settlement and cannot spend an attempt.
+        let mut orphan = task();
+        orphan.start(state.id.clone());
+        reclaim(&mut orphan, Some(state), 2, "en");
+        assert_eq!(orphan.attempts, 0);
+        assert_eq!(orphan.status, TaskStatus::Held);
+    }
+
+    #[test]
     fn a_resource_blocked_run_holds_its_task_and_spends_no_attempt() {
         let mut state = RunState::new(
             PathBuf::from("/repo"),
@@ -7907,6 +8015,8 @@ mod tests {
         t.start("20260907-025000-a1b2".to_owned());
         let mut state = run_state(RunStatus::Failed);
         state.quota.push(QuotaLoss {
+            cause: crate::agent::QuotaCause::UsageLimit,
+            agent: String::new(),
             seat: "cand-a".to_owned(),
             node: "implement".to_owned(),
             at: Timestamp::now(),
@@ -9760,6 +9870,8 @@ mod tests {
 
     fn loss(seat: &str, at: &str, reset: Option<&str>) -> QuotaLoss {
         QuotaLoss {
+            cause: crate::agent::QuotaCause::UsageLimit,
+            agent: String::new(),
             seat: seat.into(),
             node: "judge".into(),
             at: at.parse().unwrap(),

@@ -518,11 +518,15 @@ pub fn run(state: &RunState) -> String {
         if !state.quota.is_empty() {
             let _ = writeln!(
                 s,
-                "  rate limited  {}",
+                "  unavailable   {}",
                 state
                     .quota
                     .iter()
-                    .map(|q| q.seat.as_str())
+                    .map(|q| if q.cause == crate::agent::QuotaCause::Authentication {
+                        format!("{} ({}: re-authenticate)", q.seat, q.agent)
+                    } else {
+                        format!("{} (usage limit)", q.seat)
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             );

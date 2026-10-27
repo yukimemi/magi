@@ -2462,6 +2462,49 @@ impl Runner {
             self.resume_unconfirmed_commands(&mut results, &sent, &prompts, &run_id)
                 .await;
         }
+        // Do not finalize failed candidates when the entire wave needs machine
+        // recovery: leaving them pending resumes this node with its work intact.
+        if !results.is_empty()
+            && results
+                .iter()
+                .all(|(_, _, out)| matches!(out, AgentOutcome::Quota(_)))
+        {
+            let losses: Vec<_> = results
+                .iter()
+                .map(|(_, seat, out)| {
+                    let AgentOutcome::Quota(o) = out else {
+                        unreachable!()
+                    };
+                    QuotaLoss::new(
+                        seat.key.clone(),
+                        "implement",
+                        o.quota.as_ref().expect("classified machine failure"),
+                    )
+                })
+                .collect();
+            self.state.quota.extend(losses.clone());
+            for (_, seat, _) in results {
+                self.state.seats.insert(seat.key.clone(), seat);
+            }
+            for &i in &todo {
+                let label = self.state.candidates[i].label;
+                self.state.interrupted_implementations.insert(label);
+                self.state
+                    .candidate_preservation
+                    .insert(label, "machine outage awaiting persistence".into());
+            }
+            // Preserve partial edits too, while keeping every interrupted seat
+            // pending even when its tree already contains an inherited patch.
+            block_machine_outage(&mut self.state, "implement", &losses);
+            self.state.save()?;
+            self.persist_candidates().await?;
+            for &i in &todo {
+                self.state
+                    .interrupted_implementations
+                    .insert(self.state.candidates[i].label);
+            }
+            return self.stop_for_resource();
+        }
         let resource_blocked = self.state.resource_block.is_some() || wave_blocked(&results);
 
         let selected_failed = self.state.config.graph.selected_implementer.is_some()
@@ -2532,12 +2575,11 @@ impl Runner {
                     )
                 }
                 AgentOutcome::Quota(o) => {
-                    self.state.quota.push(QuotaLoss {
-                        seat: seat_key,
-                        node: "implement".to_owned(),
-                        at: Timestamp::now(),
-                        reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                    });
+                    self.state.quota.push(QuotaLoss::new(
+                        seat_key,
+                        "implement",
+                        o.quota.as_ref().expect("classified machine failure"),
+                    ));
                     (
                         String::new(),
                         o.duration_ms,
@@ -3231,12 +3273,11 @@ impl Runner {
                 }
                 AgentOutcome::Quota(o) => {
                     cumulative_wait_ms += o.duration_ms;
-                    self.state.quota.push(QuotaLoss {
-                        seat: seat.key.clone(),
-                        node: "fix".to_owned(),
-                        at: Timestamp::now(),
-                        reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                    });
+                    self.state.quota.push(QuotaLoss::new(
+                        seat.key.clone(),
+                        "fix",
+                        o.quota.as_ref().expect("classified machine failure"),
+                    ));
                     self.state.event(
                         "fix",
                         format!(
@@ -4459,12 +4500,11 @@ impl Runner {
             AgentOutcome::Ok(_) => {}
             AgentOutcome::Dropped(_) => why = Some("the CLI dropped the stream".to_owned()),
             AgentOutcome::Quota(o) => {
-                self.state.quota.push(QuotaLoss {
-                    seat: seat.key.clone(),
-                    node: "graft".to_owned(),
-                    at: Timestamp::now(),
-                    reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                });
+                self.state.quota.push(QuotaLoss::new(
+                    seat.key.clone(),
+                    "graft",
+                    o.quota.as_ref().expect("classified machine failure"),
+                ));
                 why = Some("rate limited (quota)".to_owned());
             }
             AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => {
@@ -5416,12 +5456,11 @@ impl Runner {
                 fix.failed = Some(format!("the CLI dropped the stream ({why})"));
             }
             AgentOutcome::Quota(o) => {
-                self.state.quota.push(QuotaLoss {
-                    seat: final_seat.key.clone(),
-                    node: "fix".to_owned(),
-                    at: Timestamp::now(),
-                    reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                });
+                self.state.quota.push(QuotaLoss::new(
+                    final_seat.key.clone(),
+                    "fix",
+                    o.quota.as_ref().expect("classified machine failure"),
+                ));
                 fix.failed = Some("rate limited (quota); fixer could not run".to_owned());
             }
             AgentOutcome::Failed(e) => fix.failed = Some(e),
@@ -5816,12 +5855,11 @@ impl Runner {
         let failed = match &out {
             AgentOutcome::Ok(_) | AgentOutcome::ResourceBlocked(_) => None,
             AgentOutcome::Quota(o) => {
-                self.state.quota.push(QuotaLoss {
-                    seat: seat.key.clone(),
-                    node: "fix".to_owned(),
-                    at: Timestamp::now(),
-                    reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                });
+                self.state.quota.push(QuotaLoss::new(
+                    seat.key.clone(),
+                    "fix",
+                    o.quota.as_ref().expect("classified machine failure"),
+                ));
                 Some("rate limited (quota); the fixer could not run".to_owned())
             }
             AgentOutcome::Dropped(_) => Some("the CLI dropped the stream".to_owned()),
@@ -6809,12 +6847,11 @@ impl Runner {
                 fix.failed = Some(format!("the CLI dropped the stream ({why})"));
             }
             AgentOutcome::Quota(o) => {
-                self.state.quota.push(QuotaLoss {
-                    seat: final_seat.key.clone(),
-                    node: "fix".to_owned(),
-                    at: Timestamp::now(),
-                    reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                });
+                self.state.quota.push(QuotaLoss::new(
+                    final_seat.key.clone(),
+                    "fix",
+                    o.quota.as_ref().expect("classified machine failure"),
+                ));
                 fix.failed = Some("rate limited (quota); fixer could not run".to_owned());
             }
             AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => fix.failed = Some(e),
@@ -7390,12 +7427,11 @@ impl Runner {
                 record.error = Some("the CLI dropped the stream".to_owned());
             }
             AgentOutcome::Quota(o) => {
-                self.state.quota.push(QuotaLoss {
-                    seat: seat.key.clone(),
-                    node: "gate-fix".to_owned(),
-                    at: Timestamp::now(),
-                    reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                });
+                self.state.quota.push(QuotaLoss::new(
+                    seat.key.clone(),
+                    "gate-fix",
+                    o.quota.as_ref().expect("classified machine failure"),
+                ));
                 record.error = Some("rate limited (quota); fixer could not run".to_owned());
             }
             AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => record.error = Some(e),
@@ -9600,8 +9636,8 @@ async fn wave(
                 .err()
                 .is_some_and(|error| error.is::<agent::ExecutionInterrupted>());
             let out = match out {
-                Ok(o) if o.usable() => AgentOutcome::Ok(o),
                 Ok(o) if o.quota_exhausted() => AgentOutcome::Quota(o),
+                Ok(o) if o.usable() => AgentOutcome::Ok(o),
                 // Billed work the CLI failed to hand over is not an ordinary
                 // failure, but its text is the CLI's raw error JSON, not an
                 // answer — `Dropped` keeps it out of `Ok` so a caller cannot
@@ -10030,7 +10066,7 @@ where
             .cloned()
         };
     let mut fresh: Vec<Option<String>> = vec![None; n];
-    let mut last_quota: Vec<Option<Option<String>>> = vec![None; n];
+    let mut last_quota: Vec<Option<agent::Quota>> = vec![None; n];
     let mut pending: Vec<usize> = (0..n).collect();
 
     // Per seat the work is bounded by `roster.len().max(1) * (1 + retries)`
@@ -10179,7 +10215,7 @@ where
             let parsed = match out {
                 AgentOutcome::Ok(o) => parse(&o.text).map(|v| (v, o)),
                 AgentOutcome::Quota(o) => {
-                    last_quota[i] = Some(o.quota.as_ref().and_then(|q| q.reset.clone()));
+                    last_quota[i] = o.quota.clone();
                     Err(anyhow::anyhow!("rate limited (quota); not retrying now"))
                 }
                 // Not a parseable answer: the nudge loop re-asks it, which is
@@ -10231,14 +10267,24 @@ where
     // One loss per seat whose chain ended on a quota: the intermediate ones
     // were absorbed by a handover and are not losses.
     for (i, q) in last_quota.into_iter().enumerate() {
-        if let Some(reset) = q {
-            losses.push(QuotaLoss {
-                seat: originals[i].seat.key.clone(),
-                node: ctx.node.to_owned(),
-                at: Timestamp::now(),
-                reset,
-            });
+        if let Some(quota) = q {
+            losses.push(QuotaLoss::new(
+                originals[i].seat.key.clone(),
+                ctx.node,
+                &quota,
+            ));
         }
+    }
+
+    // A stalled quorum already has its own recovery checkpoint. Refresh
+    // its missing seats before deciding whether it can resume.
+    if state.status != RunStatus::Stalled
+        && n > 0
+        && losses.len() == n
+        && done.iter().all(|r| r.as_ref().is_some_and(Result::is_err))
+    {
+        block_machine_outage(state, ctx.node, losses);
+        state.quota.append(losses);
     }
 
     seats
@@ -10253,6 +10299,41 @@ where
             )
         })
         .collect()
+}
+
+/// A node with no available agent has no task verdict. Preserve the node
+/// checkpoint and record why a subsequent explicit resume is needed.
+pub(crate) fn block_machine_outage(state: &mut RunState, node: &str, losses: &[QuotaLoss]) {
+    let mut auth: Vec<_> = losses
+        .iter()
+        .filter(|loss| loss.cause == agent::QuotaCause::Authentication)
+        .map(|loss| loss.agent.clone())
+        .collect();
+    auth.sort();
+    auth.dedup();
+    let (kind, detail) = if auth.is_empty() {
+        (
+            "agent usage limit",
+            "All seats reached their agent usage limits; resume after usage is available"
+                .to_owned(),
+        )
+    } else {
+        (
+            "agent authentication",
+            format!(
+                "Agents {} cannot authenticate; re-authenticate these agents, then resume the held task",
+                auth.join(", ")
+            ),
+        )
+    };
+    state.resource_block = Some(crate::run::ResourceBlock {
+        node: node.to_owned(),
+        kind: kind.to_owned(),
+        cause: crate::run::ResourceBlockCause::Other,
+        detail: detail.clone(),
+        at: Timestamp::now(),
+    });
+    state.event(node, detail);
 }
 
 /// Did the wave end without asking any agent (see [`block_wave`])?
@@ -13099,6 +13180,112 @@ mod tests {
         runner.roles.judges = vec![spec("judge")];
         runner.prep().await.unwrap();
         runner
+    }
+
+    const AUTH_OUTAGE: &str = r#"{"is_error":true,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed"}"#;
+
+    #[tokio::test]
+    async fn all_unauthenticated_wave_stops_the_node_without_nudges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runner = registered_runner(tmp.path()).await;
+        let prompts = runner.state.config.prompts.clone();
+        let run = runner.state.id.clone();
+        let ctx = WaveCtx {
+            carry_seats: false,
+            pauses: None,
+            run: &run,
+            node: "advise",
+            prompts: &prompts,
+            cache: None,
+            round: None,
+        };
+        let jobs: Vec<_> = ["alpha", "beta"]
+            .into_iter()
+            .map(|id| SeatJob {
+                spec: scripted(id, AUTH_OUTAGE),
+                seat: SeatState::new(id, id, 7),
+                prompt: "propose".into(),
+                cwd: runner.state.candidates[0].worktree.clone(),
+                timeout: Duration::from_secs(10),
+                allow_write: false,
+                sessions: false,
+                artifacts: agent::artifacts_dir(&runner.state.dir()),
+                stem: id.into(),
+                handover: None,
+            })
+            .collect();
+        let mut losses = Vec::new();
+        let results = ask_wave_with(
+            jobs.clone(),
+            runner.sem.clone(),
+            2,
+            &[],
+            &ctx,
+            &mut losses,
+            &mut runner.state,
+            &|_: &str| Ok(()),
+        )
+        .await;
+        assert!(
+            results
+                .iter()
+                .all(|(seat, result, nudges)| seat.turns == 1 && result.is_err() && *nudges == 0)
+        );
+        assert_eq!(runner.state.quota.len(), 2);
+        assert!(
+            runner
+                .state
+                .quota
+                .iter()
+                .all(|q| q.cause == agent::QuotaCause::Authentication && !q.agent.is_empty())
+        );
+        assert!(!runner.state.advise_attempted);
+        runner.stop_for_resource().unwrap();
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert_eq!(runner.state.resource_block.as_ref().unwrap().node, "advise");
+        assert_eq!(
+            runner.state.resource_block.as_ref().unwrap().kind,
+            "agent authentication"
+        );
+        // A machine loss followed by an ordinary failure is not evidence
+        // that the whole node was unavailable, and must not earn a refund.
+        runner.state.resource_block = None;
+        runner.state.quota.clear();
+        let mut mixed = jobs;
+        mixed[1].spec.command = vec!["false".into()];
+        let results = ask_wave_with(
+            mixed,
+            runner.sem.clone(),
+            0,
+            &[],
+            &ctx,
+            &mut losses,
+            &mut runner.state,
+            &|_: &str| Ok(()),
+        )
+        .await;
+        assert!(results.iter().all(|(_, res, _)| res.is_err()));
+        assert!(runner.state.resource_block.is_none());
+        assert_eq!(losses.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_implementation_keeps_its_candidate_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runner = registered_runner(tmp.path()).await;
+        let implementer = scripted("implement", AUTH_OUTAGE);
+        runner.roles.implementers = vec![implementer.clone()];
+        runner.state.config.agents = vec![implementer];
+        runner.implement().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert_eq!(runner.state.quota.len(), 1);
+        assert_eq!(
+            runner.state.quota[0].cause,
+            agent::QuotaCause::Authentication
+        );
+        let candidate = &runner.state.candidates[0];
+        assert!(candidate.failed.is_none() && !candidate.empty && candidate.commits == 0);
+        assert_eq!(runner.state.seats["impl-A"].turns, 1);
     }
 
     #[tokio::test]

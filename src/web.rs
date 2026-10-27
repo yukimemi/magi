@@ -5438,6 +5438,7 @@ enum RunExit {
     /// An earlier pass of a run id that appears again: it stopped short.
     Interrupted,
     Parked,
+    MachineBlocked,
     QuotaStall,
     /// Stalled on a resumed pass with quota losses on record: they may be
     /// left over from an earlier pass, so whether this one was refunded is
@@ -5479,6 +5480,8 @@ impl RunExit {
             Self::Interrupted
         } else if s.parked {
             Self::Parked
+        } else if status == RunStatus::Blocked && s.resource_block.is_some() {
+            Self::MachineBlocked
         } else if !status.done() {
             Self::InProgress
         } else if matches!(status, RunStatus::Merged) {
@@ -5510,7 +5513,7 @@ impl RunExit {
 
     fn cost(self) -> AttemptCost {
         match self {
-            Self::Parked | Self::QuotaStall => AttemptCost::Refunded,
+            Self::Parked | Self::QuotaStall | Self::MachineBlocked => AttemptCost::Refunded,
             Self::Merged
             | Self::Ready
             | Self::Stalled
@@ -5531,6 +5534,7 @@ impl RunExit {
             Self::Unreadable => "record unreadable".to_owned(),
             Self::Interrupted => "interrupted before the run finished".to_owned(),
             Self::Parked => "parked, attempt refunded".to_owned(),
+            Self::MachineBlocked => "machine unavailable, attempt refunded".to_owned(),
             Self::QuotaStall => "quota stall, attempt refunded".to_owned(),
             Self::ResumedQuotaStall => "stalled after a resume, refund unknown".to_owned(),
             Self::Merged => "merged".to_owned(),
@@ -5704,6 +5708,7 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
                 "Stalled: the judging panel never reached a quorum, so there is no verdict."
                     .to_owned()
             }
+            RunStatus::Blocked if s.resource_block.is_some() => format!("Blocked: {}.", s.resource_block.as_ref().unwrap().description()),
             RunStatus::Blocked => "Blocked: review or gate left something open.".to_owned(),
             RunStatus::Failed => "Failed: the graph could not complete.".to_owned(),
             RunStatus::VerifiedNoop => {
@@ -5764,6 +5769,8 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
             None => " Parked at a node boundary; the attempt was handed back and the run resumes."
                 .to_owned(),
         }
+    } else if status == RunStatus::Blocked && s.resource_block.is_some() {
+        " The machine could not complete this node; no attempt was spent. Restore agent availability and resume the task.".to_owned()
     } else if !status.done()
         || matches!(
             status,
@@ -16026,6 +16033,8 @@ mod tests {
         let quota = || {
             flow_run(RunStatus::Stalled, |s| {
                 s.quota.push(crate::run::QuotaLoss {
+                    cause: crate::agent::QuotaCause::UsageLimit,
+                    agent: String::new(),
                     seat: "judge-1".to_owned(),
                     node: "judge".to_owned(),
                     at: Timestamp::now(),
@@ -16066,6 +16075,8 @@ mod tests {
                 FA,
                 Some(flow_run(RunStatus::Stalled, |s| {
                     s.quota.push(crate::run::QuotaLoss {
+                        cause: crate::agent::QuotaCause::UsageLimit,
+                        agent: String::new(),
                         seat: "judge-1".to_owned(),
                         node: "judge".to_owned(),
                         at: Timestamp::now(),
@@ -16224,6 +16235,8 @@ mod tests {
     fn an_earlier_pass_with_a_recorded_rate_limit_does_not_claim_it_as_the_cause() {
         let v = earlier_pass_view(|s| {
             s.quota.push(crate::run::QuotaLoss {
+                cause: crate::agent::QuotaCause::UsageLimit,
+                agent: String::new(),
                 seat: "judge-1".to_owned(),
                 node: "judge".to_owned(),
                 at: Timestamp::now(),

@@ -29,6 +29,12 @@ pub(crate) fn of(state: &RunState, latest: Option<(&str, RunStatus)>) -> Option<
     }
     .or_else(|| {
         state
+            .resource_block
+            .as_ref()
+            .map(|block| block.description())
+    })
+    .or_else(|| {
+        state
             .base_sync
             .as_ref()?
             .conflict
@@ -254,6 +260,8 @@ mod tests {
     fn quota_is_not_inferred_from_old_history_for_blocked_runs() {
         let mut s = state();
         s.quota.push(QuotaLoss {
+            cause: crate::agent::QuotaCause::UsageLimit,
+            agent: String::new(),
             seat: "judge-1".into(),
             node: "judge".into(),
             at: s.created_at,
