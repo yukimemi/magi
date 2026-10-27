@@ -3975,6 +3975,16 @@ async fn resolve_repo_with_clone(
     hint: Option<&str>,
     allow_clone: bool,
 ) -> Result<PathBuf> {
+    resolve_repo_with_gh(repo, cwd, hint, allow_clone, "gh").await
+}
+
+async fn resolve_repo_with_gh(
+    repo: &Path,
+    cwd: &Path,
+    hint: Option<&str>,
+    allow_clone: bool,
+    gh: &str,
+) -> Result<PathBuf> {
     match repo.canonicalize() {
         Ok(canonical) => {
             if let Err(e) = magi::git::toplevel(&canonical).await {
@@ -4010,21 +4020,27 @@ async fn resolve_repo_with_clone(
             // layer at all.
             let (cfg, _) = Config::discover(cwd, None)
                 .with_context(|| format!("--repo {} does not exist", repo.display()))?;
-            if let Some(path) = local_repo_by_name(repo, &cfg.repos.roots)? {
-                return Ok(path);
-            }
-            if allow_clone && cfg.repos.auto_clone {
-                let query = repo.to_string_lossy();
-                if query.contains('/') && !repo.is_absolute() {
-                    repos::validate_github_name(&query)?;
-                    let _lock = repos::clone_lock(&cfg.repos).await?;
-                    if let Some(path) = local_repo_by_name(repo, &cfg.repos.roots)? {
-                        return Ok(path);
+            match local_repo_by_name(repo, &cfg.repos.roots) {
+                Lookup::Found(path) => Ok(path),
+                Lookup::Ambiguous(error) => Err(error),
+                Lookup::Missing(error) => {
+                    if allow_clone && cfg.repos.auto_clone {
+                        let query = repo.to_string_lossy();
+                        if query.contains('/') && !repo.is_absolute() {
+                            magi::repo_clone::validate_github_name(&query)?;
+                            let _lock = magi::repo_clone::clone_lock(&cfg.repos).await?;
+                            match local_repo_by_name(repo, &cfg.repos.roots) {
+                                Lookup::Found(path) => return Ok(path),
+                                Lookup::Ambiguous(error) => return Err(error),
+                                Lookup::Missing(_) => {}
+                            }
+                            return magi::repo_clone::clone_github_with_gh(&query, &cfg.repos, gh)
+                                .await;
+                        }
                     }
-                    return repos::clone_github(&query, &cfg.repos).await;
+                    Err(error)
                 }
             }
-            resolve_repo_by_name(repo, &cfg.repos.roots)
         }
     }
 }
@@ -4039,33 +4055,41 @@ async fn resolve_repo_with_clone(
 /// the wrong repository with nothing on screen to say so, and the whole
 /// point of this path is to save a round trip asking the operator, not to
 /// remove the one case that genuinely needs to ask.
+#[cfg(test)]
 fn resolve_repo_by_name(repo: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
-    local_repo_by_name(repo, roots)?.with_context(|| {
-        format!(
-            "--repo {} does not exist, and no checkout named `{}` was found under [repos] roots",
-            repo.display(),
-            repo.display()
-        )
-    })
+    match local_repo_by_name(repo, roots) {
+        Lookup::Found(path) => Ok(path),
+        Lookup::Missing(error) | Lookup::Ambiguous(error) => Err(error),
+    }
 }
 
-fn local_repo_by_name(repo: &Path, roots: &[PathBuf]) -> Result<Option<PathBuf>> {
+/// Only a true local miss permits acquisition; ambiguity remains an error.
+enum Lookup {
+    Found(PathBuf),
+    Missing(anyhow::Error),
+    Ambiguous(anyhow::Error),
+}
+
+fn local_repo_by_name(repo: &Path, roots: &[PathBuf]) -> Lookup {
     let query = repo.to_string_lossy().replace('\\', "/");
     let hits: Vec<repos::Repo> = repos::scan(roots)
         .into_iter()
         .filter(|r| r.name == query || r.name.rsplit('/').next() == Some(query.as_str()))
         .collect();
     match hits.len() {
-        1 => Ok(Some(hits.into_iter().next().expect("exactly one hit").path)),
-        0 => Ok(None),
-        n => bail!(
+        1 => Lookup::Found(hits.into_iter().next().expect("exactly one hit").path),
+        0 => Lookup::Missing(anyhow::anyhow!(
+            "--repo {} does not exist, and no checkout named `{query}` was found under [repos] roots",
+            repo.display()
+        )),
+        n => Lookup::Ambiguous(anyhow::anyhow!(
             "--repo `{query}` matches {n} checkouts under [repos] roots ({}); use a full path \
              or the exact owner/repo name to disambiguate",
             hits.iter()
                 .map(|r| r.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
-        ),
+        )),
     }
 }
 
@@ -6609,19 +6633,6 @@ mod tests {
         for path in [&gh, &clone] {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        struct RestorePath(Option<std::ffi::OsString>);
-        impl Drop for RestorePath {
-            fn drop(&mut self) {
-                match &self.0 {
-                    Some(path) => unsafe { std::env::set_var("PATH", path) },
-                    None => unsafe { std::env::remove_var("PATH") },
-                }
-            }
-        }
-        let old = RestorePath(std::env::var_os("PATH"));
-        let paths =
-            std::iter::once(bin.clone()).chain(std::env::split_paths(old.0.as_deref().unwrap()));
-        unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
         let mut cfg = magi::config::Repos {
             roots: vec![tmp.path().join("root with spaces")],
             auto_clone: true,
@@ -6649,9 +6660,15 @@ mod tests {
             "-sample/project",
         ] {
             assert!(
-                resolve_repo(Path::new(name), tmp.path(), None)
-                    .await
-                    .is_err(),
+                resolve_repo_with_gh(
+                    Path::new(name),
+                    tmp.path(),
+                    None,
+                    true,
+                    gh.to_str().unwrap()
+                )
+                .await
+                .is_err(),
                 "{name}"
             );
         }
@@ -6662,16 +6679,34 @@ mod tests {
         );
         cfg.auto_clone = false;
         save(&cfg);
-        let err = resolve_repo(Path::new("sample/project"), tmp.path(), None)
-            .await
-            .unwrap_err();
+        let err = resolve_repo_with_gh(
+            Path::new("sample/project"),
+            tmp.path(),
+            None,
+            true,
+            gh.to_str().unwrap(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("no checkout named"));
         assert!(!gh.with_extension("log").exists());
         cfg.auto_clone = true;
         save(&cfg);
         let (first, concurrent) = tokio::join!(
-            resolve_repo(Path::new("sample/project"), tmp.path(), None),
-            resolve_repo(Path::new("sample/project"), tmp.path(), None)
+            resolve_repo_with_gh(
+                Path::new("sample/project"),
+                tmp.path(),
+                None,
+                true,
+                gh.to_str().unwrap()
+            ),
+            resolve_repo_with_gh(
+                Path::new("sample/project"),
+                tmp.path(),
+                None,
+                true,
+                gh.to_str().unwrap()
+            )
         );
         let first = first.unwrap();
         assert_eq!(concurrent.unwrap(), first);
@@ -6683,9 +6718,15 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(
-            resolve_repo(Path::new("sample/project"), tmp.path(), None)
-                .await
-                .unwrap(),
+            resolve_repo_with_gh(
+                Path::new("sample/project"),
+                tmp.path(),
+                None,
+                true,
+                gh.to_str().unwrap()
+            )
+            .await
+            .unwrap(),
             first
         );
         assert_eq!(
@@ -6698,9 +6739,15 @@ mod tests {
         );
         // An ambiguous owner/repo match is never repaired by acquiring another checkout.
         std::fs::create_dir_all(cfg.roots[0].join("other.host/sample/project/.git")).unwrap();
-        let err = resolve_repo(Path::new("sample/project"), tmp.path(), None)
-            .await
-            .unwrap_err();
+        let err = resolve_repo_with_gh(
+            Path::new("sample/project"),
+            tmp.path(),
+            None,
+            true,
+            gh.to_str().unwrap(),
+        )
+        .await
+        .unwrap_err();
         assert!(err.to_string().contains("matches 2 checkouts"));
         assert_eq!(
             std::fs::read_to_string(gh.with_extension("log")).unwrap(),
