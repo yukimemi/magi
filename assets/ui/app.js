@@ -1038,6 +1038,7 @@ function initLoopDetail() {
 // reset it, and an empty panel merely hides while the flag is kept.
 let loopInfoOpen = false;
 let loopVersionText = "";
+let loopWebVersionText = "";
 let loopVersionsDiffer = false;
 function syncLoopInfo() {
   const box = $("daemon");
@@ -1051,6 +1052,8 @@ function syncLoopInfo() {
   const open = loopInfoOpen && hasContent;
   setText($("loop-detail-why"), note);
   show($("loop-detail-why"), Boolean(note));
+  setText($("loop-web-version"), loopWebVersionText);
+  show($("loop-web-version"), Boolean(loopWebVersionText));
   setText($("loop-detail-version"), loopVersionText);
   show($("loop-detail-version"), Boolean(loopVersionText));
   setAttr(info, "data-mismatch", loopVersionsDiffer && loopVersionText ? "yes" : null);
@@ -1138,6 +1141,7 @@ function renderLoop() {
   const mismatch = new Set(knownVersions).size > 1;
   const versionAvailable = Boolean(version) && !state.healthError;
   loopVersionText = versionAvailable ? detail : "";
+  loopWebVersionText = versionAvailable ? `v${version.replace(/^v/, "")}` : "";
   loopVersionsDiffer = mismatch;
 
   /* The info button and every button live in one grid cell (.daemon-controls) so
