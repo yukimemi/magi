@@ -372,6 +372,11 @@ pub struct Roles {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Graph {
+    /// Retired `editing_network` (codex editing seats run unsandboxed since
+    /// v0.208.0). Run records written by v0.205-v0.207 snapshot it in their
+    /// config, so the key is still accepted and ignored; never written.
+    #[serde(rename = "editing_network", skip_serializing)]
+    pub retired_editing_network: Option<serde::de::IgnoredAny>,
     /// Gate GitHub prose before posting. Secret redaction remains mandatory when disabled.
     pub github_text_guard: bool,
     /// Language of pull request / issue titles, bodies and GitHub comments
@@ -613,6 +618,7 @@ impl Default for Graph {
             github_language: "en".into(),
             implementers: 1,
             selected_implementer: None,
+            retired_editing_network: None,
             judges: 3,
             deliberate_rounds: 1,
             reviewers: 3,
@@ -2945,6 +2951,28 @@ fn remote_layers(repo: &Path) -> Result<Vec<PathBuf>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn run_records_with_the_retired_editing_network_key_still_load() {
+        // Run records from v0.205-v0.207 carry it in their config snapshot.
+        for value in ["enabled", "restricted"] {
+            let mut graph = serde_json::to_value(Graph::default()).unwrap();
+            graph["editing_network"] = serde_json::json!(value);
+            let back: Graph = serde_json::from_value(graph).unwrap();
+            assert!(
+                serde_json::to_value(&back)
+                    .unwrap()
+                    .get("editing_network")
+                    .is_none()
+            );
+            let from_toml: Graph = toml::from_str(&format!("editing_network = {value:?}")).unwrap();
+            assert!(
+                !toml::to_string(&from_toml)
+                    .unwrap()
+                    .contains("editing_network")
+            );
+        }
+    }
+
     #[test]
     fn coordination_defaults_off_and_validates_rendered_layer_values() {
         let dir = tempfile::tempdir().unwrap();
