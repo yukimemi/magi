@@ -155,3 +155,51 @@ async fn a_fallback_that_is_the_winners_author_gets_a_fresh_fix_seat() {
     assert_ne!(state.seats["fix"].claude_session, state.seats[&format!("impl-{}", winner.label)].claude_session);
 }
 }
+
+common::e2e! {
+async fn authentication_outages_defer_gate_and_review_fixes_without_spending_attempts() {
+    for node in ["gate-fix", "fix"] {
+        let home = common::home_lock().await;
+        let mut fx = fixture(home, Judges::Unanimous, node == "fix");
+        fx.config.disk.min_free_bytes = 0;
+        fx.config.graph.gate_fix_rounds = 1;
+        fx.config.roles.fixer = chain(&["beta", "gamma"]);
+        if node == "gate-fix" {
+            fx.config.verify.gate = vec![GATE_NEEDS_FIX.to_owned()];
+        }
+        for agent in &mut fx.config.agents {
+            if ["beta", "gamma"].contains(&agent.id.as_str()) {
+                agent.env.insert("MOCK_AUTH_SEAT".into(), "fix".into());
+                agent.env.insert("MOCK_ONLY_NODE".into(), node.into());
+            }
+        }
+        let mut runner = Runner::start(&fx.repo, "create note.txt".into(), fx.config.clone(), magi::run::Origin::operator()).await.unwrap();
+        let mut task = magi::queue::Task::new("Authentication outage".into(), "create note.txt".into(), fx.repo.clone(), magi::queue::Source::Human);
+        task.start(runner.state.id.clone());
+        let result = runner.execute().await;
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert_eq!(runner.state.resource_block.as_ref().unwrap().node, node);
+        assert!(runner.state.gate_fixes.is_empty());
+        assert!(runner.state.reviews.iter().all(|round| round.fix.is_none()));
+        assert_eq!(runner.state.quota.len(), 1);
+        assert_eq!(runner.state.quota[0].cause, magi::agent::QuotaCause::Authentication);
+        let queue = magi::queue::Queue::open();
+        queue.put(&mut task).unwrap();
+        magi::daemon::finish_attempt(2, &queue, &mut task, &runner.state, &[], result);
+        assert_eq!(task.attempts, 0);
+        assert_eq!(task.status, magi::queue::TaskStatus::Held);
+        assert!(!task.operator_held());
+        assert!(task.hold_reason.as_deref().unwrap().contains("re-authenticate"));
+        let id = runner.state.id.clone();
+        drop(runner);
+        let mut saved = magi::run::RunState::load(&id).unwrap();
+        for agent in &mut saved.config.agents { agent.env.remove("MOCK_AUTH_SEAT"); }
+        saved.save().unwrap();
+        let mut resumed = Runner::resume(&id).unwrap();
+        resumed.execute().await.unwrap();
+        assert_eq!(resumed.state.status, RunStatus::Ready, "{}", magi::report::run(&resumed.state));
+        if node == "gate-fix" { assert_eq!(resumed.state.gate_fixes.len(), 1); }
+    }
+}
+}
