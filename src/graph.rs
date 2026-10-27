@@ -13019,6 +13019,31 @@ mod tests {
     /// to make real (and, if it runs at all, real*ly fail*) git calls.
     #[tokio::test]
     async fn selected_public_ancestry_survives_obsolete_candidate_and_current_base_sync() {
+        const CHILD: &str = "MAGI_SELECTED_PUBLIC_ANCESTRY_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            // Other tests reconcile every run in the process-global home,
+            // briefly taking owner locks. This ancestry test expects an idle
+            // predecessor, so give it its own process and pinned test home.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "graph::tests::selected_public_ancestry_survives_obsolete_candidate_and_current_base_sync",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("MAGI_WORKER_HOME")
+                .env_remove("MAGI_WORKER_ID")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         ask_test_home();
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
