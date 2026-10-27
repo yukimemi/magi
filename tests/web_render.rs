@@ -5008,6 +5008,8 @@ async fn loop_version_details_stay_compact_and_preserve_toggle_state() {
         let result = browser.eval(&page, r##"(async () => {
           const check = (ok, why) => { if (!ok) throw new Error(why); };
           deck.state.health = null; deck.state.healthError = null; deck.renderLoop();
+          const webVersion = document.getElementById('loop-web-version');
+          check(webVersion.hidden && !webVersion.textContent, 'connecting hides web version');
           check(document.getElementById('loop-info').textContent === 'i', 'connecting preserves info icon');
           const health = {version:'0.1.0', loop:{running:true}, daemon:{idle:true},
             update:{available:true, to:'v0.2.0'}, jobs:[
@@ -5032,6 +5034,9 @@ async fn loop_version_details_stay_compact_and_preserve_toggle_state() {
               for (const other of rects.slice(i+1)) check(rect.right <= other.left || other.right <= rect.left, 'controls overlap');
             }
           };
+          check(!webVersion.hidden && webVersion.textContent === 'v0.1.0', 'collapsed web version only');
+          check(webVersion.tagName === 'SPAN' && webVersion.nextElementSibling === info, 'version directly precedes info');
+          const fullyReadable = () => check(webVersion.clientWidth >= webVersion.scrollWidth && webVersion.clientWidth > 0, 'normal version is fully readable');
           check(info.tagName === 'BUTTON' && info.type === 'button' && info.getAttribute('aria-controls') === detail.id, 'native toggle');
           check(info.textContent === 'i' && info.getAttribute('aria-expanded') === 'false' && detail.hidden, 'initially compact');
           check(!document.querySelector('#loop-more, #loop-version, #loop-version-detail'), 'old ids are gone');
@@ -5050,7 +5055,10 @@ async fn loop_version_details_stay_compact_and_preserve_toggle_state() {
             if (open) info.click();
             health.version = ''; deck.renderLoop();
             expanded(open, 'status-only preserves toggle state');
+            check(webVersion.hidden && !webVersion.textContent, 'empty version hides compact text');
             check(!detailWhy.hidden && detailWhy.textContent === why.textContent && detailVersion.hidden, 'status-only sections');
+            health.version = ' v0.1.0 '; deck.renderLoop();
+            check(!webVersion.hidden && webVersion.textContent === 'v0.1.0', 'compact version normalizes prefix and whitespace');
             health.version = '0.1.0'; deck.renderLoop();
             why.hidden = true;
             await new Promise(resolve => requestAnimationFrame(resolve));
@@ -5061,10 +5069,13 @@ async fn loop_version_details_stay_compact_and_preserve_toggle_state() {
             expanded(open, 'external status writes preserve toggle state');
             check(!detailWhy.hidden && detailWhy.textContent === why.textContent, 'external status writes synchronize');
             deck.state.healthError = 'offline'; deck.renderLoop();
+            check(webVersion.hidden && !webVersion.textContent, 'offline hides compact version');
             check(info.hidden && detail.hidden && info.getAttribute('aria-expanded') === 'false', 'offline hides details');
             deck.state.healthError = null; deck.renderLoop();
             expanded(open, 'reconnect restores toggle state');
+            check(!webVersion.hidden && webVersion.textContent === 'v0.1.0', 'reconnect restores compact version');
             deck.state.health = null; deck.renderLoop();
+            check(webVersion.hidden && !webVersion.textContent, 'missing health hides compact version');
             check(info.hidden && detail.hidden && info.getAttribute('aria-expanded') === 'false', 'empty refresh hides details');
             deck.state.health = health; deck.renderLoop();
             expanded(open, 'returning content restores toggle state');
@@ -5073,11 +5084,21 @@ async fn loop_version_details_stay_compact_and_preserve_toggle_state() {
           const normalColor = getComputedStyle(info).color;
           for (const id of ['loop-toggle', 'loop-park', 'loop-upgrade']) check(!document.getElementById(id).hidden, id + ' visible');
           compact();
+          if (innerWidth >= 1280) fullyReadable();
           health.jobs[1].version = '0.0.9'; deck.renderLoop();
           check(info.dataset.mismatch === 'yes' && info.getAttribute('aria-label').includes('versions differ'), 'mismatch marker');
           const mismatchStyle = getComputedStyle(info);
           check(mismatchStyle.color !== normalColor && mismatchStyle.borderTopColor === mismatchStyle.color && mismatchStyle.color === getComputedStyle(info, '::after').backgroundColor, 'mismatch colors text and border amber');
           compact();
+          check(webVersion.textContent === 'v0.1.0' && getComputedStyle(webVersion).color !== mismatchStyle.color, 'mismatch stays on info button');
+          const jobs = health.jobs, update = health.update;
+          health.jobs = []; health.update = {available:false};
+          health.version = '0.197.0'; deck.renderLoop();
+          compact(); fullyReadable();
+          health.version = '0.197.0-' + 'long-build-metadata'.repeat(30); deck.renderLoop();
+          compact();
+          check(webVersion.scrollWidth > webVersion.clientWidth && getComputedStyle(webVersion).textOverflow === 'ellipsis', 'long version truncates');
+          health.version = '0.1.0'; health.jobs = jobs; health.update = update; deck.renderLoop();
           info.click();
           check(!detail.hidden && info.getAttribute('aria-expanded') === 'true' && info.getAttribute('aria-label').startsWith('Hide details'), 'tap opens');
           check(detail.getBoundingClientRect().top >= document.getElementById('loop-controls').getBoundingClientRect().bottom, 'details below controls');
@@ -5140,6 +5161,12 @@ async fn loop_version_details_stay_compact_and_preserve_toggle_state() {
           check(document.querySelector('.daemon-text').textContent.includes('Replacing the binary.'), 'upgrade progress label');
           check(stop.hidden && document.getElementById('loop-park').hidden && document.getElementById('loop-upgrade').hidden, 'upgrade controls unchanged');
           check(!detail.hidden, 'upgrade refresh preserves details');
+          deck.state.health.upgrade = {stage:'failed', detail:'Download interrupted', to:'v0.2.0'};
+          deck.renderLoop();
+          check(document.getElementById('daemon').dataset.upgradeFailed === 'yes', 'failed upgrade stays expanded');
+          check(document.getElementById('loop-why').getBoundingClientRect().top >= controls.getBoundingClientRect().bottom, 'failure explanation stays below controls');
+          check(controls.scrollWidth <= controls.clientWidth && controls.getBoundingClientRect().right <= innerWidth, 'failure controls fit viewport');
+          check(!document.getElementById('loop-web-version').hidden && !detail.hidden, 'failure retains version and details');
           return true;
         })()"##).await.expect("confirmation and upgrade layout assertions");
         assert_eq!(result, true, "confirmation and upgrade at {width}px");
