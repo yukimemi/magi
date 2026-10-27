@@ -522,8 +522,8 @@ async fn resolve_base(
         "cannot read {tracking} ({why}); refusing to branch off the local \
          `{base_branch}`, which may be behind. Fix the remote, or set [merge] \
          base / remote in magi.toml. This is launcher preparation: check the \
-         launcher's Git administration access, network and repository coordination \
-         before retrying; an unattended seat cannot approve those permissions"
+         launcher's network, Git access and repository coordination before \
+         retrying"
     )
 }
 
@@ -2319,13 +2319,11 @@ impl Runner {
                     &mut seat,
                     &Invocation {
                         coordination: self.state.config.coordination.as_ref(),
-                        editing_network: self.state.config.graph.editing_network,
                         fetched_base: None,
                         cwd,
                         prompt: &prompt,
                         timeout,
                         allow_write: false,
-                        unsandboxed: false,
                         sessions: false,
                         artifacts,
                         stem: &if n == 0 {
@@ -9554,7 +9552,6 @@ async fn wave(
         let spawned_tx = spawned_tx.clone();
         let repository_wait = repository_wait.clone();
         let coordination = state.config.coordination.clone();
-        let editing_network = state.config.graph.editing_network;
         let fetched_base = state.fetched_base.clone();
         set.spawn(async move {
             // A wait for a parallelism slot is scheduling, not the agent: it
@@ -9582,13 +9579,11 @@ async fn wave(
                     &mut seat,
                     &Invocation {
                         coordination: coordination.as_ref(),
-                        editing_network,
                         fetched_base: fetched_base.as_ref(),
                         cwd: &job.cwd,
                         prompt: &job.prompt,
                         timeout: job.timeout,
                         allow_write: job.allow_write,
-                        unsandboxed: false,
                         sessions: job.sessions,
                         artifacts: &job.artifacts,
                         stem: &job.stem,

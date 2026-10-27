@@ -461,9 +461,11 @@ Outside every `kata:` marker, so this survives `kata apply`.
 
 `agent::invoke` grants repository editing nodes their actual shared Git
 directory plus the `questions` and `notifications` stores, through the backend's
-supported directory mechanism. Keep this policy centralized for initial turns,
-resumes, fallbacks and waiter delivery. Never replace it with a sandbox bypass
-or the entire state root. Deputies/chats retain explicit grants. For read-only
+supported directory mechanism (agy's `--add-dir`; a codex editing seat runs
+without a sandbox and needs none, see "codex is the only seat whose read-only
+mode is enforced"). Keep this policy centralized for initial turns,
+resumes, fallbacks and waiter delivery. Never widen a read-only or deputy seat
+to the entire state root. Deputies/chats retain explicit grants. For read-only
 seats in repositories registered through `[coordination]`, the launcher holds the
 real exclusive lock through `repo_lock::SeatLease` without widening their
 sandbox. All chat turns (`queue::CHAT_NODE`), including consultation delivery
@@ -860,28 +862,30 @@ under review every round. Do not "fix" this by withholding `--auto`.
 ### codex is the only seat whose read-only mode is enforced
 
 `--sandbox read-only` is refused by the CLI, not by the prompt, so a codex
-judge or reviewer cannot write even if it decides to. Implementers get
-`workspace-write`. **No unattended seat ever gets
-`--dangerously-bypass-approvals-and-sandbox`** (implementer, judge, reviewer,
-deputy, waiter, conductor, fixer ...) — it would throw away the one enforced
-guarantee in the roster, and `codex_is_sandboxed_reads_stdin_and_puts_resume_last`
-fails if it appears for them.
+judge or reviewer cannot write even if it decides to. **Unattended read-only
+seats never get `--dangerously-bypass-approvals-and-sandbox`** (judge,
+reviewer, advisor, conductor, dupes, title ...): it would throw away
+the one enforced guarantee in the roster. Neither does a deputy, which may
+write only its stores: it keeps `--sandbox workspace-write` with explicit
+`writable_roots`.
 
-**The one exception is a conversational talk turn** (`src/talk.rs`) in a
-repository that opted in with `[talk] allow_write`. There the turn runs with
-the bypass instead of `--sandbox` / `approval_policy` / `writable_roots` (the
-codex counterpart of claude's `bypassPermissions`), because `magi task add`
-writes into magi's queue under the home directory and `git fetch` needs
-credentials and the network, which the sandbox refuses. `Invocation::unsandboxed`
-carries it and only `talk.rs` sets it, through `talk::turn_access`; it takes effect
-only together with `allow_write`. Consequence accepted: an opted-in turn can
-write outside the repository and reach the network, and what limits it is the
-prompt
-and the briefing's "small explicit edits only, everything else to the queue".
-`codex_talk_turn_bypasses_sandbox_only_when_opted_in` pins the shape (the flag
-sits before `resume`).
+**Codex repository editing seats do get the bypass** — implementer, fixer,
+grafter, gate fixer, land and rebase resolvers, and a chat turn in a
+repository that opted in with `[talk] allow_write` (`agent::repository_writer`),
+on every initial turn, resume, fallback and waiter delivery to such a seat.
+Owner decision 2026-10-27: they run without the OS sandbox, matching claude's
+`bypassPermissions`, because codex's macOS seatbelt sandbox refuses temporary
+directories under `$TMPDIR` and aborts Chrome, so magi's own browser and
+integration tests could not run and editing tasks ended as no-ops. The flag
+replaces `--sandbox` / `approval_policy` / `writable_roots` and sits before
+`resume`. Consequence accepted: an editing seat can write outside its worktree
+and reach the network; what limits it is the prompt, the worktree discipline
+and the launcher's own checks, exactly as for claude.
+`codex_editing_seats_bypass_the_sandbox_on_initial_and_resume` pins which roles
+get it and `codex_is_sandboxed_reads_stdin_and_puts_resume_last` that the rest
+do not.
 
-Unattended seats also pass `-c approval_policy="never"`: a seat that stops to
+Sandboxed unattended seats also pass `-c approval_policy="never"`: a seat that stops to
 ask blocks until its node timeout kills it, and there is nobody at the
 terminal during a run.
 
@@ -893,7 +897,7 @@ opencode, `--auto-approve` gates every permission, reads included, and a
 non-interactive seat without it cannot open its prompt file at all. So magi
 always passes it, and read-only-ness for those seats rests on the prompt plus
 the worktree discipline named above — never on the flag. `--dangerously-bypass-
-approvals-and-sandbox` appears nowhere for omp (codex's talk-turn exception does not extend to it).
+approvals-and-sandbox` appears nowhere for omp (codex's editing-seat exception does not extend to it).
 
 The extraction is the part that will be got wrong by anyone reading the event
 names instead of the stream. `omp -p --mode=json` emits `agent_end` **only** for
@@ -2582,8 +2586,8 @@ own turn machinery runs it. No new seat, no new waiter, never a fresh agent.
   source is that talk. It writes under `Talks::guard` onto the freshest
   record; `talk::turn`'s tail keeps posts that landed while the CLI ran, and
   the next resumed turn carries them as a `# Posted by a task` block. A codex
-  implementer's `workspace-write` sandbox cannot reach the talks store, so the
-  command can fail there with an error; no writable root is added for it.
+  implementer runs unsandboxed (see "codex is the only seat whose read-only
+  mode is enforced"), so it reaches the talks store like a claude seat does.
 - **Known noise.** A `Blocked` task is reported again whenever its blockers or
   reason change (conductor block, unblock, block again).
 - The briefing (`talk::briefing_for`) tells the chat it cannot wait or push and
@@ -2635,8 +2639,8 @@ existing transition (`resume::pin_queued`, extracted from the daemon's
   records it with the terminal's own `ask::record_answer` /
   `consult::reply_other`, an obsolete approval's run-record dismissal
   included. So a read-only chat answers without any write grant; an open
-  question or consultation never widens a turn's access (`talk::turn_access`
-  follows `[talk] allow_write` alone). Terminal, deputy and other seats write
+  question or consultation never widens a turn's access (`talk::turn` takes
+  `allow_write` from `[talk] allow_write` alone). Terminal, deputy and other seats write
   directly. `--say` stays direct.
 - The Question system is untouched and keeps working in parallel.
 

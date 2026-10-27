@@ -1481,10 +1481,9 @@ pub fn rebase_conflict(c: &RebaseConflict<'_>) -> String {
             often right; pick one side only when the other is truly \
             superseded.\n\
          2. Only edit the conflicted paths listed above, and leave the result in \
-            the working tree. Staging and continuing are **not your job**: the \
-            sandbox may forbid writing Git's metadata, so after you finish, \
-            magi validates the paths, stages them and runs `git rebase \
-            --continue` itself. Do not run `git add` or `git rebase \
+            the working tree. Staging and continuing are **not your job**: \
+            after you finish, magi validates the paths, stages them and runs \
+            `git rebase --continue` itself. Do not run `git add` or `git rebase \
             --continue`; if git stops again on the next commit, you will be \
             asked about that one in a later round.\n\
          3. Do not run `git rebase --abort` or `--skip`, do not reset or move \

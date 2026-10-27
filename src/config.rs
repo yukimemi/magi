@@ -368,27 +368,10 @@ pub struct Roles {
     pub language_judge: Option<AgentChoice>,
 }
 
-/// Requested network access for sandboxed repository editing seats.
-/// Enabled (the default) permits outbound traffic as well as local test
-/// servers, matching claude seats, which run without an OS sandbox; parent
-/// restrictions still apply. This is not a loopback-only firewall.
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum EditingNetwork {
-    /// Keep networking disabled for sandboxed repository writers. Tests that
-    /// start local servers then fail inside the seat.
-    Restricted,
-    /// Request networking, including outbound traffic and local test servers.
-    #[default]
-    Enabled,
-}
-
 /// Graph shape and limits.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Graph {
-    /// Network access for sandboxed repository writers (default enabled).
-    pub editing_network: EditingNetwork,
     /// Gate GitHub prose before posting. Secret redaction remains mandatory when disabled.
     pub github_text_guard: bool,
     /// Language of pull request / issue titles, bodies and GitHub comments
@@ -626,7 +609,6 @@ pub struct Graph {
 impl Default for Graph {
     fn default() -> Self {
         Self {
-            editing_network: EditingNetwork::default(),
             github_text_guard: true,
             github_language: "en".into(),
             implementers: 1,
@@ -2963,25 +2945,6 @@ fn remote_layers(repo: &Path) -> Result<Vec<PathBuf>> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn editing_network_defaults_enabled_and_can_be_restricted() {
-        assert_eq!(Graph::default().editing_network, EditingNetwork::Enabled);
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("policy.toml");
-        for (value, expected) in [
-            ("restricted", EditingNetwork::Restricted),
-            ("enabled", EditingNetwork::Enabled),
-        ] {
-            std::fs::write(&path, format!("[graph]\nediting_network = {value:?}\n")).unwrap();
-            let cfg = Config::load(&path).unwrap();
-            assert_eq!(cfg.graph.editing_network, expected);
-            let restored: Graph = toml::from_str(&toml::to_string(&cfg.graph).unwrap()).unwrap();
-            assert_eq!(restored.editing_network, expected);
-        }
-        std::fs::write(&path, "[graph]\nediting_network = 'loopback'\n").unwrap();
-        assert!(Config::load(&path).is_err());
-    }
-
     #[test]
     fn coordination_defaults_off_and_validates_rendered_layer_values() {
         let dir = tempfile::tempdir().unwrap();

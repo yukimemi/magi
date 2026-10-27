@@ -133,13 +133,11 @@ async fn generate(talk: &Talk, store: &Talks, cfg: &Config) -> Option<String> {
         let mut seat = SeatState::new("talk-title", &spec.id, crate::rng::entropy());
         let inv = Invocation {
             coordination: cfg.coordination.as_ref(),
-            editing_network: cfg.graph.editing_network,
             fetched_base: None,
             cwd: &talk.repo,
             prompt: &body,
             timeout: remaining,
             allow_write: false,
-            unsandboxed: false,
             sessions: false,
             artifacts: &artifacts,
             stem: &format!("title-{}-{}", talk.turns.len(), spec.id),

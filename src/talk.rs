@@ -29,10 +29,11 @@
 //! bigger than a small, operator-named edit to the queue, and still tells the
 //! agent to say what it changed.
 //!
-//! With `[talk] allow_write` on, a codex turn also runs unsandboxed
-//! ([`turn_access`]), as a claude turn already does under `bypassPermissions`:
-//! otherwise `magi task add` (writes to magi's queue under the home directory)
-//! or `git fetch` is refused by the sandbox. Unattended seats never get this.
+//! With `[talk] allow_write` on, a codex turn also runs unsandboxed, as every
+//! codex repository editing seat does and as a claude turn already does under
+//! `bypassPermissions`: otherwise `magi task add` (writes to magi's queue under
+//! the home directory) or `git fetch` is refused by the sandbox. Read-only
+//! turns and unattended read-only seats never get this.
 //!
 //! `--solo` rather than a plain `magi task add` is the point of pairing this
 //! module with [`crate::queue::Task::solo`]. A task that came out of a
@@ -2513,15 +2514,18 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // - The other `magi task ...` commands write the `questions` and `queue`
     //   stores directly. They get the same explicit store grant a deputy has
     //   (`Invocation::writable` below), which takes effect whenever the turn
-    //   may write: `[talk] allow_write` turns, where codex also runs
-    //   unsandboxed (`turn_access`). A read-only claude turn withholds only
-    //   file-editing tools, so the CLI still writes the stores; a read-only
-    //   codex sandbox refuses them, leaving the bridge.
+    //   may write: `[talk] allow_write` turns, where a codex turn also runs
+    //   unsandboxed (see `agent::repository_writer`). A read-only claude turn
+    //   withholds only file-editing tools, so the CLI still writes the
+    //   stores; a read-only codex sandbox refuses them, leaving the bridge.
     let stores: Vec<PathBuf> = home
         .iter()
         .flat_map(|home| [home.join("questions"), home.join("queue")])
         .collect();
-    let (allow_write, unsandboxed) = turn_access(cfg.talk.allow_write);
+    // Only the repository's own `[talk] allow_write` lets a turn write. Every
+    // chat turn, including one with an open or handed-over question, gets
+    // exactly this: a question or consultation never widens access.
+    let allow_write = cfg.talk.allow_write;
 
     let artifacts = store.artifacts_of(&talk.id);
     // From the transcript, not the seat: a switched agent's seat restarts at
@@ -2667,7 +2671,6 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         };
         let inv = Invocation {
             coordination: cfg.coordination.as_ref(),
-            editing_network: cfg.graph.editing_network,
             fetched_base: None,
             cwd: &talk.repo,
             prompt: &body,
@@ -2677,7 +2680,6 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             // the default keeps a conversational edit from landing in a checkout
             // no run or review can claim.
             allow_write,
-            unsandboxed,
             sessions: cfg.graph.sessions,
             artifacts: &artifacts,
             stem: &attempt_stem,
@@ -2955,14 +2957,6 @@ fn attachment_note(store: &Talks, talk_id: &str, attachments: &[Attachment]) -> 
     }
     out.push('\n');
     out
-}
-
-/// What a turn may do: `(allow_write, unsandboxed)`. Only the repository's own
-/// `[talk] allow_write` lets a turn write, and it also lifts the CLI sandbox
-/// (codex's counterpart of claude's `bypassPermissions`). Every chat turn,
-/// including one with an open or handed-over question, gets exactly this.
-pub(crate) fn turn_access(talk_allow_write: bool) -> (bool, bool) {
-    (talk_allow_write, talk_allow_write)
 }
 
 /// The briefing the agent opens with, sent once as part of its first turn.
@@ -3495,13 +3489,6 @@ fn new_attachment_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn turn_access_lifts_the_sandbox_only_for_the_talk_opt_in() {
-        use super::turn_access;
-        assert_eq!(turn_access(false), (false, false));
-        assert_eq!(turn_access(true), (true, true));
-    }
-
     #[test]
     fn the_briefing_points_at_origin_main_not_the_working_tree() {
         let b = briefing(Path::new("/r"), "en", false);
