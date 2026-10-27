@@ -239,10 +239,10 @@ pub async fn rebase_with_fixer(
         let mut quota = false;
         match out {
             Ok(o) if o.quota_exhausted() => {
-                state.quota.push(QuotaLoss::new(
+                state.quota.push(QuotaLoss::from_report(
                     seat_name,
                     "rebase",
-                    o.quota.as_ref().expect("classified machine failure"),
+                    o.quota.as_ref(),
                 ));
                 error = Some("rate limited (quota); the fixer could not run".to_owned());
                 quota = true;

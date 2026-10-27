@@ -2628,11 +2628,7 @@ impl Runner {
                     let AgentOutcome::Quota(o) = out else {
                         unreachable!()
                     };
-                    QuotaLoss::new(
-                        seat.key.clone(),
-                        "implement",
-                        o.quota.as_ref().expect("classified machine failure"),
-                    )
+                    QuotaLoss::from_report(seat.key.clone(), "implement", o.quota.as_ref())
                 })
                 .collect();
             self.state.quota.extend(losses.clone());
@@ -2728,10 +2724,10 @@ impl Runner {
                     )
                 }
                 AgentOutcome::Quota(o) => {
-                    self.state.quota.push(QuotaLoss::new(
+                    self.state.quota.push(QuotaLoss::from_report(
                         seat_key,
                         "implement",
-                        o.quota.as_ref().expect("classified machine failure"),
+                        o.quota.as_ref(),
                     ));
                     (
                         String::new(),
@@ -3426,10 +3422,10 @@ impl Runner {
                 }
                 AgentOutcome::Quota(o) => {
                     cumulative_wait_ms += o.duration_ms;
-                    self.state.quota.push(QuotaLoss::new(
+                    self.state.quota.push(QuotaLoss::from_report(
                         seat.key.clone(),
                         "fix",
-                        o.quota.as_ref().expect("classified machine failure"),
+                        o.quota.as_ref(),
                     ));
                     self.state.event(
                         "fix",
@@ -4659,10 +4655,10 @@ impl Runner {
             AgentOutcome::Ok(_) => {}
             AgentOutcome::Dropped(_) => why = Some("the CLI dropped the stream".to_owned()),
             AgentOutcome::Quota(o) => {
-                self.state.quota.push(QuotaLoss::new(
+                self.state.quota.push(QuotaLoss::from_report(
                     seat.key.clone(),
                     "graft",
-                    o.quota.as_ref().expect("classified machine failure"),
+                    o.quota.as_ref(),
                 ));
                 why = Some("rate limited (quota)".to_owned());
             }
@@ -5738,10 +5734,10 @@ impl Runner {
                 fix.failed = Some(format!("the CLI dropped the stream ({why})"));
             }
             AgentOutcome::Quota(o) => {
-                self.state.quota.push(QuotaLoss::new(
+                self.state.quota.push(QuotaLoss::from_report(
                     final_seat.key.clone(),
                     "fix",
-                    o.quota.as_ref().expect("classified machine failure"),
+                    o.quota.as_ref(),
                 ));
                 fix.failed = Some("rate limited (quota); fixer could not run".to_owned());
             }
@@ -6137,10 +6133,10 @@ impl Runner {
         let failed = match &out {
             AgentOutcome::Ok(_) | AgentOutcome::ResourceBlocked(_) => None,
             AgentOutcome::Quota(o) => {
-                self.state.quota.push(QuotaLoss::new(
+                self.state.quota.push(QuotaLoss::from_report(
                     seat.key.clone(),
                     "fix",
-                    o.quota.as_ref().expect("classified machine failure"),
+                    o.quota.as_ref(),
                 ));
                 Some("rate limited (quota); the fixer could not run".to_owned())
             }
@@ -7132,10 +7128,10 @@ impl Runner {
                 fix.failed = Some(format!("the CLI dropped the stream ({why})"));
             }
             AgentOutcome::Quota(o) => {
-                self.state.quota.push(QuotaLoss::new(
+                self.state.quota.push(QuotaLoss::from_report(
                     final_seat.key.clone(),
                     "fix",
-                    o.quota.as_ref().expect("classified machine failure"),
+                    o.quota.as_ref(),
                 ));
                 fix.failed = Some("rate limited (quota); fixer could not run".to_owned());
             }
@@ -7744,10 +7740,10 @@ impl Runner {
                 record.error = Some("the CLI dropped the stream".to_owned());
             }
             AgentOutcome::Quota(o) => {
-                self.state.quota.push(QuotaLoss::new(
+                self.state.quota.push(QuotaLoss::from_report(
                     seat.key.clone(),
                     "gate-fix",
-                    o.quota.as_ref().expect("classified machine failure"),
+                    o.quota.as_ref(),
                 ));
                 record.error = Some("rate limited (quota); fixer could not run".to_owned());
             }
@@ -10642,10 +10638,10 @@ where
     // were absorbed by a handover and are not losses.
     for (i, q) in last_quota.into_iter().enumerate() {
         if let Some(quota) = q {
-            losses.push(QuotaLoss::new(
+            losses.push(QuotaLoss::from_report(
                 originals[i].seat.key.clone(),
                 ctx.node,
-                &quota,
+                Some(&quota),
             ));
         }
     }
