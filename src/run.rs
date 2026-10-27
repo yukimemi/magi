@@ -3938,8 +3938,8 @@ fn is_frame(line: &str, after_frame: bool) -> bool {
     rest.starts_with("0x") || rest.contains("::")
 }
 
-/// Lines after a trigger that belong to it (assertion text, `left`/`right`).
-fn trigger_context(line: &str) -> Option<usize> {
+/// Priority (lower first) and following context (assertion text, `left`/`right`).
+fn trigger_context(line: &str) -> Option<(u8, usize)> {
     // Match colored nextest markers without changing the stored evidence.
     let mut plain = String::new();
     let mut chars = line.chars();
@@ -3957,22 +3957,22 @@ fn trigger_context(line: &str) -> Option<usize> {
     }
     let t = plain.trim();
     if t.starts_with("[full output:") || t.starts_with("[full output could not be saved:") {
-        Some(0)
+        Some((0, 0))
     } else if t.contains("panicked at") {
-        Some(6)
+        Some((0, 6))
     } else if (t.starts_with("---- ") && t.ends_with(" ----"))
         || t.starts_with("--- STDERR:")
         || t.starts_with("--- STDOUT:")
     {
-        Some(3)
+        Some((1, 3))
+    } else if t.starts_with("FAIL ") || t.contains("FAIL [") {
+        Some((1, 4))
     } else if t.starts_with("error:")
         || t.starts_with("error[")
-        || t.starts_with("FAIL ")
-        || t.contains("FAIL [")
         || t.starts_with("failures:")
         || t.contains("test result: FAILED")
     {
-        Some(4)
+        Some((2, 4))
     } else {
         None
     }
@@ -3998,10 +3998,14 @@ fn clip_line(line: &str, max: usize) -> &str {
 /// 3. otherwise keep excerpts, each from a failure marker (`panicked at`,
 ///    `---- test stdout ----`, nextest `FAIL`/`STDERR`, `error:`, ...) through
 ///    a few following lines (the assertion and `left`/`right`), share the
-///    budget evenly between excerpts and drop the later ones when it runs
-///    out, then append the final tail (where `test result:` lives).
+///    budget evenly between selected excerpts. Select panics first, then test
+///    stdout/stderr and nextest failure blocks, then generic diagnostics: noisy
+///    compiler errors must not crowd out the test failure reason. Within each
+///    priority keep earlier excerpts, then render in original order and append
+///    the final tail (where `test result:` lives).
 ///
-/// Adjacent excerpts merge only while small: a long stdout line must not
+/// Adjacent excerpts merge only within the same priority and while small:
+/// a long stdout line must not
 /// consume the budget of a following panic anchor. Short output is returned
 /// unchanged. The full text belongs in an artifact.
 pub fn summarize_verify(text: &str, max: usize) -> String {
@@ -4044,27 +4048,31 @@ pub fn summarize_verify(text: &str, max: usize) -> String {
         used += kept[tail_start].len() + 1;
     }
     // Excerpts as merged half-open line ranges.
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let mut ranges: Vec<(usize, usize, u8)> = Vec::new();
     for (i, line) in kept[..tail_start].iter().enumerate() {
-        if let Some(after) = trigger_context(line) {
+        if let Some((priority, after)) = trigger_context(line) {
             let end = (i + 1 + after).min(tail_start);
             match ranges.last_mut() {
                 Some(last)
-                    if i <= last.1
+                    if priority == last.2
+                        && i <= last.1
                         && end - last.0 <= 20
                         && kept[last.0..end].iter().map(|l| l.len() + 1).sum::<usize>() <= 1024 =>
                 {
                     last.1 = last.1.max(end);
                 }
-                _ => ranges.push((i, end)),
+                _ => ranges.push((i, end, priority)),
             }
         }
     }
     let budget = max.saturating_sub(used + overhead);
     let shown = ranges.len().min((budget / 240).max(1));
+    ranges.sort_by_key(|&(start, _, priority)| (priority, start));
+    let mut selected = ranges[..shown].to_vec();
+    selected.sort_by_key(|&(start, _, _)| start);
     let per = budget / shown.max(1);
     let mut body = String::new();
-    for &(a, b) in &ranges[..shown] {
+    for &(a, b, _) in &selected {
         let mut block = String::new();
         for line in &kept[a..b] {
             let remaining = per.saturating_sub(block.len() + 1);
@@ -4190,6 +4198,35 @@ mod tests {
         assert!(compact.contains("panicked at"));
         assert!(compact.contains("artifacts/gate-1.out"));
         assert_eq!(summarize_verify("short 日本語\n", 1024), "short 日本語\n");
+    }
+
+    #[test]
+    fn summarize_verify_prioritizes_late_test_failures_over_diagnostics() {
+        let mut text = String::new();
+        for _ in 0..130 {
+            text.push_str("error: diagnostic\n");
+            text.push_str(&"ordinary build log\n".repeat(21));
+        }
+        text.push_str("---- late_test stdout ----\ntest stdout summary\n");
+        text.push_str("thread 'late_test' panicked at tests/late.rs:42:9:\nassertion `left == right` failed\n  left: 1\n right: 2\n");
+        text.push_str("--- STDERR: ---\ntest stderr summary\n");
+        text.push_str(&"ordinary test log\n".repeat(4000));
+        text.push_str("test result: FAILED\n");
+
+        let summary = summarize_verify(&text, 32 * 1024);
+        assert!(summary.len() <= 32 * 1024);
+        for expected in [
+            "---- late_test stdout ----",
+            "test stdout summary",
+            "panicked at tests/late.rs:42:9:",
+            "assertion `left == right` failed",
+            "left: 1",
+            "right: 2",
+            "test stderr summary",
+            "test result: FAILED",
+        ] {
+            assert!(summary.contains(expected), "missing {expected}");
+        }
     }
 
     #[test]
