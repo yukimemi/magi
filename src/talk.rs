@@ -584,6 +584,9 @@ pub struct Talk {
     /// post twice; never pruned by a drain or a close.
     #[serde(default)]
     pub notified: Vec<String>,
+    /// Semantic automatic-delivery receipts; retained for the life of this talk.
+    #[serde(default)]
+    pub notice_receipts: Vec<String>,
     /// Automatic notice references, saved atomically with their draft and key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completion_notices: Vec<crate::chat_notify::CompletionReference>,
@@ -1611,6 +1614,7 @@ pub(crate) fn begin_with_id(
         implementers,
         implementers_dirty: false,
         notified: Vec::new(),
+        notice_receipts: Vec::new(),
         completion_notices: Vec::new(),
         created_at: now,
         updated_at: now,
@@ -1668,6 +1672,8 @@ pub fn record_reply(
     talk.pending_messages = fresh.pending_messages;
     talk.pending_attachments = fresh.pending_attachments;
     talk.notified = fresh.notified;
+    talk.notice_receipts = fresh.notice_receipts;
+    talk.completion_notices = fresh.completion_notices;
     if !talk.status.open() {
         bail!(
             "talk {} is {} and takes no more turns",
@@ -1859,13 +1865,13 @@ pub(crate) fn queue_once_matching(
         store,
         text,
         Vec::new(),
-        Some((key, reference)),
+        Some((key, reference, None)),
         previous,
         (None, Sender::Magi, None),
     )
 }
 
-/// Persist display facts with the notice, reference and deduplication key under one lock.
+/// Queue a notice without semantic suppression (for explicitly requested watches).
 pub(crate) fn queue_notice(
     talk: &mut Talk,
     store: &Talks,
@@ -1875,12 +1881,28 @@ pub(crate) fn queue_notice(
     reference: Option<&crate::chat_notify::CompletionReference>,
     display: crate::prompt::NoticeDisplay,
 ) -> Result<bool> {
+    queue_semantic_notice(talk, store, text, key, previous, (reference, None), display)
+}
+
+/// Persist display facts with the notice, reference and deduplication key under one lock.
+pub(crate) fn queue_semantic_notice(
+    talk: &mut Talk,
+    store: &Talks,
+    text: &str,
+    key: &str,
+    previous: &dyn Fn(&str) -> bool,
+    receipt: (
+        Option<&crate::chat_notify::CompletionReference>,
+        Option<String>,
+    ),
+    display: crate::prompt::NoticeDisplay,
+) -> Result<bool> {
     queue_keyed(
         talk,
         store,
         text,
         Vec::new(),
-        Some((key, reference)),
+        Some((key, receipt.0, receipt.1)),
         previous,
         (None, Sender::Magi, Some(display)),
     )
@@ -1910,12 +1932,18 @@ pub(crate) fn queue_magi_display(
     .map(|_| ())
 }
 
+type NoticeKey<'a> = (
+    &'a str,
+    Option<&'a crate::chat_notify::CompletionReference>,
+    Option<String>,
+);
+
 fn queue_keyed(
     talk: &mut Talk,
     store: &Talks,
     text: &str,
     attachments: Vec<Attachment>,
-    key: Option<(&str, Option<&crate::chat_notify::CompletionReference>)>,
+    key: Option<NoticeKey<'_>>,
     previous: &dyn Fn(&str) -> bool,
     source: (
         Option<ReplyTarget>,
@@ -1931,20 +1959,22 @@ fn queue_keyed(
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
-    if !fresh.status.open() {
+    let automatic = key.as_ref().is_some_and(|k| k.2.is_some());
+    if !fresh.status.open() && !automatic {
         bail!(
             "talk {} is {} and takes no more turns",
             fresh.short(),
             fresh.status.as_str()
         );
     }
-    if !append_pending(&mut fresh, text, attachments, key, previous, source)? {
-        *talk = fresh;
-        return Ok(false);
+    let added = append_pending(&mut fresh, text, attachments, key, previous, source)?;
+    if added && automatic {
+        fresh.status = TalkStatus::Open;
     }
+    // Persist new transport keys even when their semantic receipt already exists.
     store.put(&mut fresh)?;
     *talk = fresh;
-    Ok(true)
+    Ok(added)
 }
 
 /// Dispatch consultation under both store locks, including reopening, without
@@ -1977,7 +2007,7 @@ fn append_pending(
     fresh: &mut Talk,
     text: &str,
     attachments: Vec<Attachment>,
-    key: Option<(&str, Option<&crate::chat_notify::CompletionReference>)>,
+    key: Option<NoticeKey<'_>>,
     previous: &dyn Fn(&str) -> bool,
     source: (
         Option<ReplyTarget>,
@@ -1985,11 +2015,21 @@ fn append_pending(
         Option<crate::prompt::NoticeDisplay>,
     ),
 ) -> Result<bool> {
-    if let Some((key, reference)) = key {
+    if let Some((key, reference, semantic)) = key {
         if fresh.notified.iter().any(|k| k == key || previous(k)) {
             return Ok(false);
         }
         fresh.notified.push(key.to_owned());
+        if let Some(semantic) = semantic {
+            if fresh
+                .notice_receipts
+                .iter()
+                .any(|old| crate::notice_semantics::covers(old, &semantic))
+            {
+                return Ok(false);
+            }
+            fresh.notice_receipts.push(semantic);
+        }
         if let Some(reference) = reference {
             fresh.completion_notices.push(reference.clone());
         }
@@ -2819,6 +2859,8 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         talk.pending_messages = fresh.pending_messages;
         talk.pending_attachments = fresh.pending_attachments;
         talk.notified = fresh.notified;
+        talk.notice_receipts = fresh.notice_receipts;
+        talk.completion_notices = fresh.completion_notices;
         // A `magi talk post` landed while the CLI ran: this handle predates it.
         if fresh.turns.len() > talk.turns.len() {
             let posted: Vec<Turn> = fresh.turns[talk.turns.len()..]
@@ -3541,6 +3583,7 @@ mod tests {
             implementers: 1,
             implementers_dirty: false,
             notified: Vec::new(),
+            notice_receipts: Vec::new(),
             completion_notices: Vec::new(),
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
@@ -3904,6 +3947,7 @@ mod tests {
             implementers: 1,
             implementers_dirty: false,
             notified: Vec::new(),
+            notice_receipts: Vec::new(),
             completion_notices: Vec::new(),
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
@@ -6128,6 +6172,7 @@ mod tests {
                 implementers: 1,
                 implementers_dirty: false,
                 notified: Vec::new(),
+                notice_receipts: Vec::new(),
                 completion_notices: Vec::new(),
                 created_at: Timestamp::now(),
                 updated_at: Timestamp::now(),
@@ -6301,6 +6346,99 @@ mod tests {
         assert!(post(&talks, &talk.id, "  ", "r").is_err());
         close(&mut talk, &talks).expect("close");
         assert!(post(&talks, &talk.id, "late", "r").is_err());
+    }
+
+    #[test]
+    fn semantic_receipts_survive_restart_concurrent_sources_and_unacknowledged_delivery() {
+        let (_tmp, talks) = store();
+        let mut talk = ctx_talk("mock", Vec::new());
+        talks.put(&mut talk).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let workers: Vec<_> = (0..4)
+            .map(|index| {
+                let talks = Talks::at(talks.root.clone());
+                let barrier = barrier.clone();
+                let id = talk.id.clone();
+                std::thread::spawn(move || {
+                    let mut stale = talks.get(&id).unwrap();
+                    barrier.wait();
+                    queue_semantic_notice(
+                        &mut stale,
+                        &talks,
+                        "same failure",
+                        &format!("source-{index}"),
+                        &|_| false,
+                        (None, Some("semantic-failure".into())),
+                        crate::prompt::NoticeDisplay {
+                            facts: "failure".into(),
+                            output: None,
+                            task: None,
+                            run: None,
+                        },
+                    )
+                    .unwrap()
+                })
+            })
+            .collect();
+        let count = workers
+            .into_iter()
+            .map(|w| usize::from(w.join().unwrap()))
+            .sum::<usize>();
+        assert_eq!(count, 1);
+        talk = talks.get(&talk.id).unwrap();
+        assert_eq!(talk.pending_messages.len(), 1);
+        assert_eq!(talk.notified.len(), 4);
+        drain(&mut talk, &talks).unwrap();
+        let mut stale = talks.get(&talk.id).unwrap();
+        stale.notice_receipts.clear();
+        record(&mut stale, &talks, "owner message", Vec::new()).unwrap();
+        assert_eq!(talks.get(&talk.id).unwrap().notice_receipts.len(), 1);
+        close(&mut talk, &talks).unwrap();
+        // Simulates a crash after talk save but before source acknowledgment,
+        // including a regenerated source key and a freshly loaded store.
+        let restarted = Talks::at(talks.root.clone());
+        assert!(
+            !queue_semantic_notice(
+                &mut talk,
+                &restarted,
+                "reworded failure",
+                "retry",
+                &|_| false,
+                (None, Some("semantic-failure".into())),
+                crate::prompt::NoticeDisplay {
+                    facts: "failure".into(),
+                    output: None,
+                    task: None,
+                    run: None
+                }
+            )
+            .unwrap()
+        );
+        assert!(!talk.status.open());
+        assert!(talk.pending.is_empty());
+        assert!(talk.notified.contains(&"retry".into()));
+        assert!(
+            queue_semantic_notice(
+                &mut talk,
+                &restarted,
+                "new failure",
+                "new",
+                &|_| false,
+                (None, Some("new-evidence".into())),
+                crate::prompt::NoticeDisplay {
+                    facts: "new".into(),
+                    output: None,
+                    task: None,
+                    run: None
+                }
+            )
+            .unwrap()
+        );
+        assert!(talk.status.open());
+        // Literal owner sends and explicit injected updates bypass semantics.
+        queue(&mut talk, &restarted, "same failure", Vec::new()).unwrap();
+        queue_magi(&mut talk, &restarted, "same failure").unwrap();
+        assert_eq!(talk.pending_messages.len(), 3);
     }
 
     #[test]

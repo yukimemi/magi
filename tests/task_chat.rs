@@ -134,7 +134,8 @@ async fn existing_closed_chat_reopens_and_delivery_is_durable_once() {
     questions.put(&mut later).unwrap();
     magi::task_chat::sweep(&queue, &talks, &questions, &home);
     assert_eq!(talks.list().len(), 1);
-    assert_eq!(talks.get(&chat.id).unwrap().pending_messages.len(), 2);
+    assert_eq!(talks.get(&chat.id).unwrap().pending_messages.len(), 1);
+    assert_eq!(questions.get(&later.id).unwrap().routed_chat.as_deref(), Some(chat.id.as_str()));
 }
 }
 
@@ -159,7 +160,7 @@ async fn new_chat_is_solo_default_and_recovers_an_unrecorded_creation() {
     assert!(chat.persona.is_empty());
     assert_eq!(chat.agent, "alpha");
     // Reserving the task link no longer serializes talk creation. Two
-    // simultaneous first deliveries must retain both drafts in the same talk.
+    // simultaneous equivalent deliveries retain one draft and both source keys.
     let mut other = self::task(&fx.repo, Source::Human);
     queue.put(&mut other).unwrap();
     let first = question("run-a");
@@ -176,7 +177,7 @@ async fn new_chat_is_solo_default_and_recovers_an_unrecorded_creation() {
     });
     assert_eq!(one, two);
     let concurrent = talks.get(&one).unwrap();
-    assert_eq!(concurrent.pending_messages.len(), 2);
+    assert_eq!(concurrent.pending_messages.len(), 1);
     for q in [&first, &second] {
         assert!(concurrent.notified.contains(&format!("question:{}", q.id)));
     }
