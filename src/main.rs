@@ -256,6 +256,9 @@ enum Command {
         /// Continue an interrupted run.
         #[arg(long, value_name = "RUN_ID", conflicts_with_all = ["instruction", "file", "issue"])]
         resume: Option<String>,
+        /// Authorize one additional base rebase after movement exhausted its budget.
+        #[arg(long, requires = "resume", conflicts_with = "dry_run")]
+        recover_base: bool,
         #[command(flatten)]
         opts: RunOpts,
     },
@@ -1371,6 +1374,7 @@ async fn dispatch(command: Command) -> Result<()> {
             file,
             issue,
             resume,
+            recover_base,
             opts,
         } => {
             // A single trailing word is a run id: `magi run rm <id>`. More
@@ -1410,7 +1414,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 );
             }
             if let Some(id) = resume {
-                return resume_run(&id, opts.dry_run).await;
+                return resume_run(&id, opts.dry_run, recover_base).await;
             }
             let queue = Queue::open();
             if let Some(task_id) = opts.task.as_deref() {
@@ -4390,7 +4394,7 @@ async fn run_existing_task(
 /// `magi run --resume <run>`: the run's owning task is claimed for the
 /// duration (so no loop resumes it too), and filed first when the run never
 /// had one. A live loop that would resume the run itself is handed the task.
-async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
+async fn resume_run(id: &str, dry_run: bool, recover_base: bool) -> Result<()> {
     let runner = Runner::resume(id)?;
     println!(
         "{}",
@@ -4433,6 +4437,9 @@ async fn resume_run(id: &str, dry_run: bool) -> Result<()> {
         task_source(None).await,
         &runner.state.sources,
     )?;
+    if recover_base {
+        Runner::authorize_base_recovery(&home, &run_id, &task.id).await?;
+    }
     // The loop picks `task.runs.last()`, so it only resumes *this* run when it
     // is that one and nothing else steers the attempt elsewhere.
     let loop_resumes = task.runs.last() == Some(&run_id)

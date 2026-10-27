@@ -116,7 +116,7 @@ pub(crate) const STAGNANT_LIMIT: usize = 2;
 /// default. Counted across both call sites in [`Runner::finish_after_tally`]
 /// (once before review, once before the gate), because either one finding
 /// the base still moving is the same signal.
-const BASE_SYNC_ROUNDS: usize = 4;
+pub(crate) const BASE_SYNC_ROUNDS: usize = 4;
 
 /// How many times [`Runner::continue_fix_report`] will resume the fixer's own
 /// seat when its CLI turn ended cleanly — usable, non-empty, exit 0 — but the
@@ -1190,6 +1190,105 @@ impl Runner {
         })
     }
 
+    /// Authorize exactly one additional rebase, under the caller's queue task
+    /// claim and the same owner/execution locks used by run maintenance.
+    pub async fn authorize_base_recovery(home: &Path, id: &str, task: &str) -> Result<()> {
+        Self::authorize_base_recovery_request(home, id, task, false).await
+    }
+
+    /// Queue release uses its durable approval generation exactly once.
+    pub(crate) async fn authorize_base_recovery_from_resumption(
+        home: &Path,
+        id: &str,
+        task: &str,
+    ) -> Result<()> {
+        Self::authorize_base_recovery_request(home, id, task, true).await
+    }
+
+    async fn authorize_base_recovery_request(
+        home: &Path,
+        id: &str,
+        task: &str,
+        resumption: bool,
+    ) -> Result<()> {
+        let _owner = crate::pr_head::owner_lock(home, id)?;
+        let mut state = RunState::load_under(id, home)?;
+        crate::pr_head::ensure_owner(&state)?;
+        let queued = crate::queue::Queue::at(home.join("queue")).get(task)?;
+        anyhow::ensure!(
+            queued.runs.last().is_some_and(|run| run == id)
+                && queued.status != crate::queue::TaskStatus::Done
+                && !queued.fresh_start
+                && queued.review_branch.is_none(),
+            "run task ownership changed"
+        );
+        anyhow::ensure!(
+            state
+                .origin
+                .as_ref()
+                .and_then(|o| o.task.as_deref())
+                .is_none_or(|owner| owner == task),
+            "run belongs to another task"
+        );
+        let claimed = crate::daemon::is_working_on_other(home, id, Timestamp::now())?;
+        anyhow::ensure!(
+            state.liveness_under(home, claimed) == crate::run::Liveness::Dead,
+            "run is live or its ownership is unknown"
+        );
+        // Judge the previous driver's lease before acquiring our maintenance
+        // lease. The owner lock excludes new driver claims across both steps.
+        let _execution = crate::driver::maintenance(home, id)?;
+        anyhow::ensure!(
+            state.status.resumable()
+                && state.released_to.is_none()
+                && state.retired_to.is_none()
+                && state.pr_taken_over_by.is_none(),
+            "run ownership is final"
+        );
+        anyhow::ensure!(state.base_sync_blocked(), "run has no base-sync stop");
+        anyhow::ensure!(
+            !state.pr_publication_pending
+                && !crate::handover::landing_checkpoint(&state)
+                && state.merge_decision.is_none(),
+            "publication or landing has its own retained checkpoint; base recovery cannot replace it"
+        );
+        let winner = state.winner().context("run has no retained winner")?;
+        anyhow::ensure!(
+            git::is_clean(&winner.worktree).await?,
+            "retained worktree has uncommitted changes"
+        );
+        let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+        anyhow::ensure!(
+            git::rev_parse(&state.repo, &format!("refs/heads/{}", winner.branch)).await? == head,
+            "retained worktree does not match the winner branch"
+        );
+        state.record_base_sync_stop(&head);
+        state.save()?;
+        if resumption {
+            anyhow::ensure!(
+                crate::daemon::compatible_run_instruction(&state, &queued),
+                "resumption instruction does not match the retained run"
+            );
+            let approval = queued
+                .resumption
+                .as_ref()
+                .context("no operator resumption")?;
+            anyhow::ensure!(
+                approval.instruction == queued.instruction,
+                "resumption approval does not match the current task instruction"
+            );
+            state.authorize_base_sync_resumption(task, approval)?;
+        } else {
+            state.authorize_base_sync(task)?;
+        }
+        state.event(
+            "base-recovery",
+            "owner authorized one additional base rebase; fresh verification required",
+        );
+        state.save()?;
+        Ok(())
+    }
+
     /// Reopen an existing run.
     pub fn resume(id: &str) -> Result<Self> {
         let state = RunState::load(id)?;
@@ -1355,6 +1454,11 @@ impl Runner {
                 crate::run::short_of(to)
             );
         }
+        anyhow::ensure!(
+            serde_json::to_value(&disk.base_sync_recovery)?
+                == serde_json::to_value(&self.state.base_sync_recovery)?,
+            "base recovery changed since this run was loaded; reload the saved run"
+        );
         let driver = crate::driver::DriverGuard::acquire(&crate::run::home(), &disk)?;
         let mut execution = DriverExecution {
             runner: self,
@@ -1409,6 +1513,18 @@ impl Runner {
         // Preservation may invalidate an old empty classification. Resolve it
         // before any resume shortcut can reuse a verdict or publish a branch.
         self.persist_candidates().await?;
+        // A saved base stop outranks stage markers, including legacy Voting.
+        // Recovery never reenters implementation, deliberation or voting.
+        if self.state.base_sync_blocked() {
+            self.sync_to_base().await?;
+            if !self.state.base_sync_blocked()
+                && self.state.status != RunStatus::AlreadyInBase
+                && !self.resource_halt()?
+            {
+                self.finish_after_tally().await?;
+            }
+            return Ok(());
+        }
         if self
             .state
             .merge_decision
@@ -1744,7 +1860,7 @@ impl Runner {
         // a second time, and the gate is the one node whose "green" gets
         // acted on.
         self.sync_to_base().await?;
-        if self.resource_halt()? {
+        if self.hold_base_sync().await? || self.resource_halt()? {
             return Ok(());
         }
         if self.state.status == RunStatus::AlreadyInBase {
@@ -1755,7 +1871,7 @@ impl Runner {
             return Ok(());
         }
         self.sync_to_base().await?;
-        if self.resource_halt()? {
+        if self.hold_base_sync().await? || self.resource_halt()? {
             return Ok(());
         }
         if self.state.status == RunStatus::AlreadyInBase {
@@ -3512,13 +3628,16 @@ impl Runner {
     // ---------------------------------------------------------- deliberate
 
     async fn deliberate(&mut self) -> Result<()> {
+        if self.hold_base_sync().await? {
+            return Ok(());
+        }
         // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
         // agent files with `magi task add` name the run that paid for it. The
         // prompt overlay is cloned alongside it because the waves borrow it
         // while `self` is mutably borrowed by the node's own bookkeeping.
         let run_id = self.state.id.clone();
         let prompts = self.state.config.prompts.clone();
-        if !self.state.deliberation.is_empty() {
+        if !self.state.deliberation.is_empty() || self.state.tally.is_some() {
             return Ok(());
         }
         let tops: Vec<char> = self
@@ -3675,13 +3794,16 @@ impl Runner {
     // ---------------------------------------------------------------- vote
 
     async fn vote(&mut self) -> Result<()> {
+        if self.hold_base_sync().await? {
+            return Ok(());
+        }
         // Attribution for every agent this node spawns: `MAGI_RUN` lets a task the
         // agent files with `magi task add` name the run that paid for it. The
         // prompt overlay is cloned alongside it because the waves borrow it
         // while `self` is mutably borrowed by the node's own bookkeeping.
         let run_id = self.state.id.clone();
         let prompts = self.state.config.prompts.clone();
-        if !self.state.votes.is_empty() {
+        if !self.state.votes.is_empty() || self.state.tally.is_some() {
             return Ok(());
         }
         let viable: Vec<char> = self.state.viable().into_iter().map(|c| c.label).collect();
@@ -4619,6 +4741,40 @@ impl Runner {
 
     // ------------------------------------------------------------ base sync
 
+    async fn hold_base_sync(&mut self) -> Result<bool> {
+        self.hold_base_sync_as(None).await
+    }
+
+    async fn hold_base_sync_kind(
+        &mut self,
+        kind: crate::base_sync_recovery::StopKind,
+    ) -> Result<()> {
+        self.hold_base_sync_as(Some(kind)).await?;
+        Ok(())
+    }
+
+    async fn hold_base_sync_as(
+        &mut self,
+        kind: Option<crate::base_sync_recovery::StopKind>,
+    ) -> Result<bool> {
+        if !self.state.base_sync_blocked() {
+            self.state.base_sync_recovery.stop = None;
+            return Ok(false);
+        }
+        let head = match self.state.winner() {
+            Some(w) => git::rev_parse(&w.worktree, "HEAD")
+                .await
+                .unwrap_or_default(),
+            None => String::new(),
+        };
+        self.state.record_base_sync_stop(&head);
+        if let Some(kind) = kind {
+            self.state.base_sync_recovery.stop.as_mut().unwrap().kind = kind;
+        }
+        self.state.save()?;
+        Ok(true)
+    }
+
     /// Land the winner's tree on the current tip of `<remote>/<base>` before
     /// anything verifies it.
     ///
@@ -4660,6 +4816,7 @@ impl Runner {
         if self.state.status == RunStatus::AlreadyInBase {
             return Ok(());
         }
+        self.hold_base_sync().await?;
         let conflicted = self
             .state
             .base_sync
@@ -4674,7 +4831,8 @@ impl Runner {
         let base_branch = self.state.base_branch.clone();
         let tracking = format!("{remote}/{base_branch}");
 
-        git::fetch(&repo, &remote, &base_branch).await.ok();
+        let fetched_base =
+            matches!(git::fetch(&repo, &remote, &base_branch).await, Ok(o) if o.ok());
         // No network, or the remote never had this branch: the run already
         // started from a fetched `<remote>/<base>` (`resolve_base` refuses
         // otherwise), and one that got this far is not blocked by a fetch
@@ -4702,8 +4860,25 @@ impl Runner {
         {
             return Ok(());
         }
+        if conflicted && self.state.base_recovery_pending() {
+            let authorization = self.state.base_sync_recovery.authorizations.last().unwrap();
+            let owner =
+                crate::queue::Queue::at(crate::run::home().join("queue")).get(&authorization.task);
+            if !fetched_base
+                || git::rev_parse(&repo, &format!("refs/heads/{}", winner.branch)).await? != head
+                || !git::is_clean(&winner.worktree).await?
+                || !owner.is_ok_and(|t| t.runs.last() == Some(&self.state.id))
+            {
+                return Ok(());
+            }
+        }
+        let recovery = conflicted && self.state.consume_base_recovery(&head);
         if conflicted {
-            return Ok(());
+            // Consumption (including a refused changed HEAD) is durable before Git.
+            self.state.save()?;
+            if !recovery {
+                return Ok(());
+            }
         }
 
         if behind == 0 {
@@ -4741,15 +4916,17 @@ impl Runner {
             self.state.base_sync = Some(BaseSync {
                 tip,
                 behind: 0,
-                attempts,
+                attempts: attempts + usize::from(recovery),
                 conflict,
                 already_in: None,
             });
+            self.hold_base_sync_kind(crate::base_sync_recovery::StopKind::Publication)
+                .await?;
             self.state.save()?;
             return Ok(());
         }
 
-        if attempts >= BASE_SYNC_ROUNDS {
+        if attempts >= BASE_SYNC_ROUNDS && !recovery {
             let why = format!(
                 "{base_branch} moved {behind} commit(s) ahead of {} after {BASE_SYNC_ROUNDS} \
                  rebase(s); rebasing again would only race it",
@@ -4764,6 +4941,8 @@ impl Runner {
                 already_in: None,
             });
             self.state.event("land", why);
+            self.hold_base_sync_kind(crate::base_sync_recovery::StopKind::Exhausted)
+                .await?;
             self.state.save()?;
             return Ok(());
         }
@@ -4810,29 +4989,32 @@ impl Runner {
             self.state.base_sync = Some(BaseSync {
                 tip,
                 behind,
-                attempts,
+                attempts: attempts + usize::from(recovery),
                 conflict: Some(why.clone()),
                 already_in: None,
             });
             self.state.event("land", why);
+            self.hold_base_sync_kind(crate::base_sync_recovery::StopKind::Publication)
+                .await?;
             self.state.save()?;
             return Ok(());
         }
 
         let scratch = self.state.dir().join("base-sync");
-        let rebased = match crate::rebase::rebase_with_fixer(
-            &mut self.state,
-            &scratch,
-            &winner.branch,
-            &tracking,
-        )
-        .await
-        {
-            Ok(crate::rebase::Rebased::Applied) => Ok(None),
-            Ok(crate::rebase::Rebased::Stopped(why)) => Ok(Some(why)),
-            Err(e) => Err(e),
-        };
+        let rebased =
+            match crate::rebase::rebase_with_fixer(&mut self.state, &scratch, &winner.branch, &tip)
+                .await
+            {
+                Ok(crate::rebase::Rebased::Applied) => Ok(None),
+                Ok(crate::rebase::Rebased::Stopped(why)) => Ok(Some(why)),
+                Err(e) => Err(e),
+            };
         let attempts = attempts + 1;
+        let stop_kind = match &rebased {
+            Ok(None) => crate::base_sync_recovery::StopKind::Publication,
+            Ok(Some(_)) => crate::base_sync_recovery::StopKind::Conflict,
+            Err(_) => crate::base_sync_recovery::StopKind::Unknown,
+        };
         match rebased {
             Ok(None) => {
                 // The branch ref moved, but a worktree that already had it
@@ -4914,6 +5096,10 @@ impl Runner {
                 self.state.event("land", why);
             }
         }
+        if !self.state.base_sync_blocked() {
+            self.state.base_sync_recovery.stop = None;
+        }
+        self.hold_base_sync_kind(stop_kind).await?;
         self.state.save()?;
         Ok(())
     }
@@ -5046,11 +5232,14 @@ impl Runner {
                     already_in: None,
                 });
                 self.state.event("land", why);
+                self.hold_base_sync_kind(crate::base_sync_recovery::StopKind::ClosingIntegratedPr)
+                    .await?;
                 self.state.save()?;
                 return Ok(true);
             }
         }
         self.state.status = RunStatus::AlreadyInBase;
+        self.state.base_sync_recovery.stop = None;
         self.state.base_sync = Some(BaseSync {
             tip: tip.to_owned(),
             behind,
@@ -5895,6 +6084,9 @@ impl Runner {
     }
 
     async fn review_loop(&mut self) -> Result<()> {
+        if self.hold_base_sync().await? {
+            return Ok(());
+        }
         loop {
             if self
                 .state
@@ -7096,6 +7288,9 @@ impl Runner {
     // ----------------------------------------------------------------- gate
 
     async fn gate(&mut self) -> Result<()> {
+        if self.hold_base_sync().await? {
+            return Ok(());
+        }
         // Judged by the review record itself, not by `status`: a solo
         // candidate's `judge`/`deliberate` skip rewrites `status` on every
         // reentry (see `judge`), and trusting it here is exactly how a run
@@ -8242,6 +8437,9 @@ impl Runner {
     }
 
     async fn merge(&mut self) -> Result<()> {
+        if self.hold_base_sync().await? {
+            return Ok(());
+        }
         // Same reasoning as `gate`: ask the review and gate records directly
         // rather than `status`, which a solo-candidate `judge`/`deliberate`
         // skip can rewrite on reentry to something that no longer says
@@ -14813,6 +15011,591 @@ mod tests {
     // `RunState::new`, so they never collide there.
     fn ask_test_home() {
         crate::run::pin_test_home();
+    }
+
+    #[cfg(unix)]
+    async fn exhausted_base_fixture() -> (tempfile::TempDir, Runner, String, String) {
+        ask_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        let base = git::rev_parse(&repo, "HEAD").await.unwrap();
+        let origin = tmp.path().join("origin.git");
+        git::git(&repo, &["init", "--bare", origin.to_str().unwrap()])
+            .await
+            .unwrap();
+        git::git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        )
+        .await
+        .unwrap();
+        git::git(&repo, &["checkout", "-b", "fix/retained"])
+            .await
+            .unwrap();
+        std::fs::write(repo.join("retained"), "retained change").unwrap();
+        git::git(&repo, &["add", "."]).await.unwrap();
+        git::git(&repo, &["commit", "-m", "retained implementation"])
+            .await
+            .unwrap();
+        let head = git::rev_parse(&repo, "HEAD").await.unwrap();
+        git::git(&repo, &["checkout", "main"]).await.unwrap();
+        std::fs::write(repo.join("base-change"), "new base").unwrap();
+        git::git(&repo, &["add", "."]).await.unwrap();
+        git::git(&repo, &["commit", "-m", "base moved"])
+            .await
+            .unwrap();
+        git::git(&repo, &["push", "origin", "main"]).await.unwrap();
+        git::git(&repo, &["checkout", "fix/retained"])
+            .await
+            .unwrap();
+        let mut runner = runner_at(RunStatus::Voting);
+        runner.state.repo = repo.clone();
+        runner.state.base_commit = base;
+        runner.state.config.graph.worktree_root = Some(tmp.path().join("worktrees"));
+        runner.state.config.disk.min_free_bytes = 0;
+        runner.state.config.graph.review_rounds = 1;
+        runner.state.config.verify.e2e = vec!["true".into()];
+        runner.state.config.verify.gate = vec!["true".into()];
+        runner.state.candidates = vec![Candidate {
+            index: 0,
+            label: 'A',
+            agent: "fixture".into(),
+            branch: "fix/retained".into(),
+            worktree: repo.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: false,
+        }];
+        runner.state.tally = Some(Tally {
+            first_choice: BTreeMap::new(),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 0,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 0,
+            present: 0,
+            quorum: 0,
+            met_quorum: true,
+            uncontested: Some("review-only".into()),
+        });
+        let mut task = crate::queue::Task::new(
+            "fixture".into(),
+            "fixture".into(),
+            repo,
+            crate::queue::Source::Human,
+        );
+        task.link_run(&runner.state.id);
+        crate::queue::Queue::open().put(&mut task).unwrap();
+        runner.state.origin = Some(crate::run::Origin::queue(&task.id));
+        runner.state.base_sync = Some(BaseSync {
+            tip: String::new(),
+            behind: 1,
+            attempts: BASE_SYNC_ROUNDS,
+            conflict: None,
+            already_in: None,
+        });
+        runner.sync_to_base().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        (tmp, runner, head, task.id)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_authorizes_its_worker_but_rejects_other_workers() {
+        const CHILD: &str = "MAGI_BASE_RECOVERY_WORKER_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "graph::tests::base_recovery_authorizes_its_worker_but_rejects_other_workers",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("MAGI_HOME", home.path())
+                .env("MAGI_WORKER_HOME", home.path())
+                .env("MAGI_WORKER_ID", "abcdef")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::run::set_home(PathBuf::from(std::env::var_os("MAGI_HOME").unwrap()));
+        let (_tmp, mut runner, _head, task) = exhausted_base_fixture().await;
+        let home = crate::run::home();
+        let queue = crate::queue::Queue::open();
+        let mut owner = queue.get(&task).unwrap();
+        owner.release_operator("test-release", None);
+        owner.start(runner.state.id.clone());
+        queue.put(&mut owner).unwrap();
+        runner.state.driver_exited = true;
+        runner.state.task_instruction = Some(owner.instruction.clone());
+        runner.state.save().unwrap();
+        let _claim = queue.claim(&task).unwrap();
+        let reserve = |id: &str| {
+            let directory = home.join("workers/jobs").join(id);
+            std::fs::create_dir_all(&directory).unwrap();
+            let job = crate::worker::Job {
+                id: id.into(),
+                sequence: 1,
+                kind: "task".into(),
+                key: format!("task:{task}"),
+                payload: serde_json::json!({"opts": crate::daemon::Opts::default(), "queue": queue.root(), "task": task}),
+                generation: "fixture-generation".into(),
+                version: None,
+                status: crate::worker::Status::Running,
+                result: None,
+                pid: Some(std::process::id()),
+                created_at: 0,
+                finished_at: None,
+            };
+            std::fs::write(
+                directory.join("job.json"),
+                serde_json::to_vec(&job).unwrap(),
+            )
+            .unwrap();
+            crate::worker::execution_lease_for_test(&directory.join("live.lock"))
+        };
+        let _own = reserve("abcdef");
+        let other = reserve("fedcba");
+        assert!(
+            Runner::authorize_base_recovery_from_resumption(&home, &runner.state.id, &task)
+                .await
+                .is_err()
+        );
+        assert!(
+            RunState::load(&runner.state.id)
+                .unwrap()
+                .base_sync_recovery
+                .authorizations
+                .is_empty()
+        );
+        drop(other);
+        assert!(crate::daemon::is_working_on(
+            &home,
+            &runner.state.id,
+            Timestamp::now()
+        ));
+        assert!(
+            !crate::daemon::is_working_on_other(&home, &runner.state.id, Timestamp::now()).unwrap()
+        );
+        Runner::authorize_base_recovery_from_resumption(&home, &runner.state.id, &task)
+            .await
+            .unwrap();
+        assert!(
+            RunState::load(&runner.state.id)
+                .unwrap()
+                .base_recovery_pending()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_authorizes_a_crashed_driver_with_a_free_matching_lease() {
+        let (_tmp, mut runner, _head, task) = exhausted_base_fixture().await;
+        let home = crate::run::home();
+        runner.state.driver_pid = Some(std::process::id());
+        runner.state.driver_started_at = crate::proc::process_started_at(std::process::id());
+        runner.state.driver_exited = false;
+        runner.state.begin_pass();
+        runner.state.save().unwrap();
+        let mut driver = crate::driver::DriverGuard::acquire(&home, &runner.state).unwrap();
+        driver.record(&runner.state).unwrap();
+        let saved = std::fs::read(runner.state.dir().join("run.json")).unwrap();
+        // Preserve the durable claim as if the process died before Drop saved.
+        drop(driver);
+        std::fs::write(runner.state.dir().join("run.json"), saved).unwrap();
+        assert_eq!(
+            runner.state.liveness_under(&home, false),
+            crate::run::Liveness::Dead
+        );
+        let queue = crate::queue::Queue::open();
+        let _claim = queue.claim(&task).unwrap();
+        Runner::authorize_base_recovery(&home, &runner.state.id, &task)
+            .await
+            .unwrap();
+        let disk = RunState::load(&runner.state.id).unwrap();
+        assert!(!disk.driver_exited);
+        assert!(disk.base_recovery_pending());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_retries_integrated_pr_closure_without_authorizing_a_rebase() {
+        const CHILD: &str = "MAGI_BASE_RECOVERY_CLOSURE_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = tempfile::tempdir().unwrap();
+            let gh = tmp.path().join("gh");
+            std::fs::write(&gh, r#"#!/bin/sh
+case "$1 $2" in
+  'pr view') printf '{"headRefName":"fix/retained","headRefOid":"%s","baseRefName":"main","state":"OPEN","isCrossRepository":false}' "$(git rev-parse fix/retained)" ;;
+  'pr close') if [ ! -f "$MAGI_BASE_CLOSURE_MARKER" ]; then touch "$MAGI_BASE_CLOSURE_MARKER"; echo 'transient closure failure' >&2; exit 1; fi ;;
+  *) exit 2 ;;
+esac
+"#).unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut paths = vec![tmp.path().to_path_buf()];
+            paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "graph::tests::base_recovery_retries_integrated_pr_closure_without_authorizing_a_rebase", "--nocapture"])
+                .env(CHILD, "1")
+                .env("MAGI_BASE_CLOSURE_MARKER", tmp.path().join("closure-attempted"))
+                .env("PATH", std::env::join_paths(paths).unwrap())
+                .env_remove("MAGI_WORKER_HOME").env_remove("MAGI_WORKER_ID")
+                .output().unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (_tmp, mut runner, head, task) = exhausted_base_fixture().await;
+        let repo = runner.state.repo.clone();
+        git::git(&repo, &["checkout", "main"]).await.unwrap();
+        git::git(&repo, &["cherry-pick", &head]).await.unwrap();
+        git::git(&repo, &["push", "origin", "main"]).await.unwrap();
+        git::git(&repo, &["checkout", "fix/retained"])
+            .await
+            .unwrap();
+        runner.state.pr = Some(crate::run::PrRecord {
+            url: "https://example.test/project/pull/1".into(),
+            number: 1,
+            state: "open".into(),
+            checks: "unknown".into(),
+            round: 0,
+            rounds: 1,
+            red_at_merge: Vec::new(),
+        });
+        runner.sync_to_base().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert_eq!(
+            runner.state.base_sync_recovery.stop.as_ref().unwrap().kind,
+            crate::base_sync_recovery::StopKind::ClosingIntegratedPr
+        );
+        assert!(runner.state.base_sync_closure_pending());
+        assert!(crate::handover::can_resume(&runner.state));
+        let queue = crate::queue::Queue::open();
+        assert!(!crate::base_sync_recovery::held_task(
+            &queue,
+            &queue.get(&task).unwrap()
+        ));
+        assert!(runner.state.authorize_base_sync(&task).is_err());
+        // Legacy closure stops have no typed stop but must retain the checkpoint.
+        runner.state.base_sync_recovery.stop = None;
+        runner.state.status = RunStatus::Voting;
+        runner.state.gate_ran = true;
+        runner.state.config.graph.review_rounds = 0;
+        runner.state.save().unwrap();
+        assert!(crate::handover::can_resume(&runner.state));
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        runner.execute_graph().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::AlreadyInBase);
+        assert_eq!(runner.state.pr.as_ref().unwrap().state, "closed");
+        assert_eq!(
+            runner.state.base_sync.as_ref().unwrap().attempts,
+            BASE_SYNC_ROUNDS
+        );
+        assert!(runner.state.base_sync_recovery.authorizations.is_empty());
+        assert_eq!(git::rev_parse(&repo, "HEAD").await.unwrap(), head);
+        assert!(runner.state.reviews.is_empty());
+        assert!(runner.state.gate.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_authorization_requires_current_owner_free_lease_and_clean_tree() {
+        let (_tmp, mut runner, _head, task) = exhausted_base_fixture().await;
+        runner.state.driver_exited = true;
+        runner.state.save().unwrap();
+        let home = crate::run::home();
+        let queue = crate::queue::Queue::open();
+        let _claim = queue.claim(&task).unwrap();
+        let lease = crate::driver::maintenance(&home, &runner.state.id).unwrap();
+        assert!(
+            Runner::authorize_base_recovery(&home, &runner.state.id, &task)
+                .await
+                .is_err()
+        );
+        drop(lease);
+        std::fs::write(runner.state.repo.join("dirty"), "retained uncommitted work").unwrap();
+        assert!(
+            Runner::authorize_base_recovery(&home, &runner.state.id, &task)
+                .await
+                .is_err()
+        );
+        std::fs::remove_file(runner.state.repo.join("dirty")).unwrap();
+        Runner::authorize_base_recovery(&home, &runner.state.id, &task)
+            .await
+            .unwrap();
+        let disk = RunState::load(&runner.state.id).unwrap();
+        assert!(disk.base_recovery_pending());
+        assert_eq!(disk.base_sync_recovery.authorizations.len(), 1);
+        assert!(
+            Runner::authorize_base_recovery(&home, &runner.state.id, &task)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            RunState::load(&runner.state.id)
+                .unwrap()
+                .base_sync_recovery
+                .authorizations
+                .len(),
+            1
+        );
+        let mut owner = queue.get(&task).unwrap();
+        owner.runs.push("20260101-000000-ffff".into());
+        queue.put(&mut owner).unwrap();
+        let error = Runner::authorize_base_recovery(&home, &runner.state.id, &task)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("run task ownership changed"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_legacy_voting_and_repeated_resume_stay_blocked() {
+        let (_tmp, mut runner, head, _) = exhausted_base_fixture().await;
+        let mut legacy = serde_json::to_value(&runner.state).unwrap();
+        legacy.as_object_mut().unwrap().remove("base_sync_recovery");
+        legacy["status"] = serde_json::json!("voting");
+        runner.state = serde_json::from_value(legacy).unwrap();
+        runner.state.save().unwrap();
+        for _ in 0..3 {
+            runner.execute_graph().await.unwrap();
+            assert_eq!(runner.state.status, RunStatus::Blocked);
+            assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 4);
+            assert!(!crate::handover::can_resume(&runner.state));
+            assert_eq!(
+                git::rev_parse(&runner.state.repo, "HEAD").await.unwrap(),
+                head
+            );
+            assert!(runner.state.reviews.is_empty());
+            assert!(!runner.state.gate_ran);
+        }
+        let notice = crate::notices::run_ended(&runner.state).unwrap();
+        let stop = runner.state.base_sync_recovery.stop.clone().unwrap();
+        runner.state.begin_pass();
+        runner.state.status = RunStatus::Voting;
+        runner.deliberate().await.unwrap();
+        runner.vote().await.unwrap();
+        runner.finish_after_tally().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert_eq!(runner.state.base_sync_recovery.stop.as_ref(), Some(&stop));
+        assert_eq!(
+            crate::notices::run_ended(&runner.state).unwrap().since,
+            notice.since
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_never_authorizes_conflicts_publication_or_unknown_stops() {
+        let (_tmp, mut runner, head, task) = exhausted_base_fixture().await;
+        for detail in [
+            "fix/retained conflicts with origin/main and did not rebase: conflict",
+            "rebased fix/retained locally but origin refused the push",
+            "unknown failure",
+        ] {
+            runner.state.base_sync.as_mut().unwrap().conflict = Some(detail.into());
+            runner.state.record_base_sync_stop(&head);
+            assert!(runner.state.authorize_base_sync(&task).is_err());
+            runner.state.status = RunStatus::Voting;
+            runner.execute_graph().await.unwrap();
+            assert_eq!(runner.state.status, RunStatus::Blocked);
+            assert!(!crate::handover::can_resume(&runner.state));
+            assert_eq!(
+                git::rev_parse(&runner.state.repo, "HEAD").await.unwrap(),
+                head
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_consumption_survives_crash_without_another_attempt() {
+        let (_tmp, mut runner, head, task) = exhausted_base_fixture().await;
+        runner.state.authorize_base_sync(&task).unwrap();
+        assert!(runner.state.consume_base_recovery(&head));
+        runner.state.save().unwrap();
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        runner.execute_graph().await.unwrap();
+        assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 5);
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert!(!runner.state.consume_base_recovery(&head));
+        assert!(!crate::handover::can_resume(&runner.state));
+        runner.state.authorize_base_sync(&task).unwrap();
+        assert_eq!(runner.state.base_sync_recovery.authorizations.len(), 2);
+        assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 5);
+        assert_eq!(
+            git::rev_parse(&runner.state.repo, "HEAD").await.unwrap(),
+            head
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_success_requires_new_review_e2e_and_gate() {
+        let (_tmp, mut runner, head, task) = exhausted_base_fixture().await;
+        let mut old_review = review_round(true, 0, 1, 1, false, true);
+        old_review.head = head.clone();
+        old_review.verified_head = Some(head.clone());
+        runner.state.reviews = vec![old_review];
+        runner.state.gate = vec![CommandOutcome {
+            command: "old gate".into(),
+            code: None,
+            output_tail: "timed out after 2400s".into(),
+            duration_ms: 2_400_000,
+            resource_blocked: false,
+        }];
+        runner.state.gate_ran = true;
+        runner.state.gate_head = Some(head.clone());
+        runner.state.land_approval = Some(crate::run::LandApproval {
+            question: "old-head-approval".into(),
+            head: head.clone(),
+        });
+        runner.state.authorize_base_sync(&task).unwrap();
+        runner.sync_to_base().await.unwrap();
+        assert!(!runner.state.base_sync_blocked());
+        let fresh = git::rev_parse(&runner.state.repo, "HEAD").await.unwrap();
+        assert_ne!(head, fresh);
+        assert!(runner.state.reviews.is_empty());
+        assert!(!runner.state.gate_ran);
+        let saved = &runner.state.base_sync_recovery.authorizations[0];
+        assert_eq!(saved.reviews[0].head, head);
+        assert_eq!(saved.gate_head.as_deref(), Some(head.as_str()));
+        assert!(saved.gate_ran);
+        assert!(!saved.gate[0].ok());
+        runner.review_loop().await.unwrap();
+        runner.gate().await.unwrap();
+        assert_eq!(runner.state.reviews[0].head, fresh);
+        assert_eq!(
+            runner.state.reviews[0].verified_head.as_deref(),
+            Some(fresh.as_str())
+        );
+        assert_eq!(runner.state.gate_head.as_deref(), Some(fresh.as_str()));
+        assert!(runner.state.gate_ran);
+        assert!(runner.state.gate.iter().all(CommandOutcome::ok));
+        assert_eq!(runner.state.land_approval.as_ref().unwrap().head, head);
+        assert_ne!(runner.state.land_approval.as_ref().unwrap().head, fresh);
+        assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 5);
+        assert_eq!(
+            std::fs::read_to_string(runner.state.repo.join("retained")).unwrap(),
+            "retained change"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_moving_base_stops_again_after_one_authorized_rebase() {
+        let (_tmp, mut runner, _head, task) = exhausted_base_fixture().await;
+        let queue = crate::queue::Queue::open();
+        let mut owner = queue.get(&task).unwrap();
+        owner.release_operator("test-resume", None);
+        queue.put(&mut owner).unwrap();
+        let generation = owner.resumption.as_ref().unwrap().generation;
+        runner.state.task_instruction = Some(owner.instruction.clone());
+        runner.state.driver_exited = true;
+        runner.state.save().unwrap();
+        let home = crate::run::home();
+        let _claim = queue.claim(&task).unwrap();
+        owner.resumption.as_mut().unwrap().at =
+            runner.state.base_sync_recovery.stop.as_ref().unwrap().at;
+        queue.put(&mut owner).unwrap();
+        assert!(
+            Runner::authorize_base_recovery_from_resumption(&home, &runner.state.id, &task)
+                .await
+                .is_err(),
+            "an approval from before the stop grants nothing"
+        );
+        owner.resumption.as_mut().unwrap().at = Timestamp::now();
+        queue.put(&mut owner).unwrap();
+        Runner::authorize_base_recovery_from_resumption(&home, &runner.state.id, &task)
+            .await
+            .unwrap();
+        assert!(
+            Runner::authorize_base_recovery_from_resumption(&home, &runner.state.id, &task)
+                .await
+                .is_err()
+        );
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        assert_eq!(
+            runner.state.base_sync_recovery.authorizations[0].generation,
+            Some(generation)
+        );
+        runner.sync_to_base().await.unwrap();
+        let repo = runner.state.repo.clone();
+        let head = git::rev_parse(&repo, "HEAD").await.unwrap();
+        git::git(&repo, &["checkout", "main"]).await.unwrap();
+        std::fs::write(repo.join("base-change"), "base moved again").unwrap();
+        git::git(&repo, &["add", "."]).await.unwrap();
+        git::git(&repo, &["commit", "-m", "move base again"])
+            .await
+            .unwrap();
+        git::git(&repo, &["push", "origin", "main"]).await.unwrap();
+        git::git(&repo, &["checkout", "fix/retained"])
+            .await
+            .unwrap();
+        runner.finish_after_tally().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 5);
+        assert_eq!(git::rev_parse(&repo, "HEAD").await.unwrap(), head);
+        assert!(!runner.state.base_recovery_pending());
+        assert!(!crate::handover::can_resume(&runner.state));
+        assert!(!runner.state.gate_ran);
+        // Even replaying the generation with a later timestamp grants nothing.
+        owner.resumption.as_mut().unwrap().at = Timestamp::now();
+        queue.put(&mut owner).unwrap();
+        assert!(
+            Runner::authorize_base_recovery_from_resumption(&home, &runner.state.id, &task)
+                .await
+                .is_err()
+        );
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        runner.sync_to_base().await.unwrap();
+        assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 5);
+        assert_eq!(runner.state.base_sync_recovery.authorizations.len(), 1);
+        assert_eq!(git::rev_parse(&repo, "HEAD").await.unwrap(), head);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_tally_skips_deliberation_and_voting_without_a_sync_stop() {
+        let (_tmp, mut runner, _, _) = exhausted_base_fixture().await;
+        runner.state.base_sync = None;
+        runner.state.status = RunStatus::Blocked;
+        let mut second = runner.state.candidates[0].clone();
+        second.label = 'B';
+        runner.state.candidates.push(second);
+        assert!(runner.state.votes.is_empty());
+        assert!(runner.state.deliberation.is_empty());
+        runner.deliberate().await.unwrap();
+        runner.vote().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert!(runner.state.votes.is_empty());
+        assert!(runner.state.deliberation.is_empty());
     }
 
     /// A minimal, git-free `Runner` at a given status — `settle_questions`

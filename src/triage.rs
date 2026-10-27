@@ -852,6 +852,10 @@ fn apply_deps_answer(queue: &Queue, questions: &Questions, q: &Question, now: Ti
                 question: q.summary.clone(),
                 answer: q.resolution().unwrap_or_default(),
             });
+            if crate::base_sync_recovery::held_task(queue, &root) {
+                root.mark_triage_applied(&q.id);
+                return queue.put(&mut root).is_ok();
+            }
             root.release_operator("triage-dependencies", Some(&q.id));
             root.resume_override = Some(OperatorResume {
                 question_id: q.id.clone(),
@@ -924,6 +928,9 @@ fn ask_about_stuck_roots(
         let Some(root) = current.task(root_id) else {
             continue;
         };
+        if crate::base_sync_recovery::held_task(queue, root) {
+            continue;
+        }
         let dependants: Vec<&Task> = dependant_ids
             .iter()
             .filter_map(|d| current.task(d))
@@ -1033,6 +1040,10 @@ pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
         });
         if !newer_decision {
             match action {
+                AnswerAction::Resume if crate::base_sync_recovery::held_task(queue, &task) => {
+                    // The original answer remains in answers; it cannot authorize
+                    // a new implementation or an additional base rebase.
+                }
                 AnswerAction::Resume => {
                     task.release_operator("triage", Some(&q.id));
                     task.resume_override = Some(OperatorResume {
@@ -1106,6 +1117,9 @@ pub fn run_once(
         // between the listing above and the claim just taken must not be
         // clobbered by a decision based on the stale copy.
         if task.status != TaskStatus::Held {
+            continue;
+        }
+        if crate::base_sync_recovery::held_task(queue, &task) {
             continue;
         }
         // A question about what this task freezes is already the one question
@@ -1249,6 +1263,58 @@ mod tests {
 
     fn task(title: &str, repo: PathBuf) -> Task {
         Task::new(title.to_owned(), format!("do {title}"), repo, Source::Human)
+    }
+
+    #[test]
+    fn base_recovery_stops_suppress_generic_and_dependency_resume_offers() {
+        let (dir, queue, questions) = store();
+        let mut root = task("base stop", dir.path().to_path_buf());
+        let mut run = crate::run::RunState::new(
+            dir.path().to_path_buf(),
+            "main".into(),
+            "base".into(),
+            "retained implementation".into(),
+            Config::default(),
+        );
+        run.status = crate::run::RunStatus::Voting;
+        run.base_sync = Some(crate::run::BaseSync {
+            tip: "tip".into(),
+            behind: 3,
+            attempts: 4,
+            conflict: Some("persisted exhaustion".into()),
+            already_in: None,
+        });
+        run.save_under(dir.path()).unwrap();
+        root.link_run(&run.id);
+        root.hold_machine(Some("base stop".into()));
+        queue.put(&mut root).unwrap();
+        let mut dependent = task("dependent", dir.path().to_path_buf());
+        dependent.blocked_by = vec![root.id.clone()];
+        dependent.status = TaskStatus::Blocked;
+        queue.put(&mut dependent).unwrap();
+        for _ in 0..2 {
+            let report = run_once(&queue, &questions, None, Timestamp::now());
+            assert!(report.asked.is_empty());
+            assert!(report.resumed.is_empty());
+        }
+        // A generic question offered by an older launcher cannot release this
+        // task into a replacement competition after the fix is installed.
+        let q = file_question(
+            &questions,
+            &root,
+            Bucket::MachineUnknown,
+            &EN,
+            Timestamp::now(),
+        )
+        .unwrap();
+        let mut q = q;
+        q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+        questions.put_executable(&mut q).unwrap();
+        apply_answers(&queue, &questions);
+        let saved = queue.get(&root.id).unwrap();
+        assert_eq!(saved.status, TaskStatus::Held);
+        assert!(saved.triage_applied(&q.id));
+        assert_eq!(saved.runs, vec![run.id]);
     }
 
     #[test]
