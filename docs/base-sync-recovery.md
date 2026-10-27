@@ -1,8 +1,8 @@
 # Recovering exhausted base synchronization
 
 A saved base-sync stop is terminal `Blocked`, even if an older launcher saved
-it as `Voting`. Ordinary resume does not grant another rebase. The shared
-resume admission policy suppresses that offer, and queue settlement holds the
+it as `Voting`. Resume without a new explicit owner approval does not grant
+another rebase. The shared resume admission policy suppresses that offer, and queue settlement holds the
 existing task instead of starting a replacement competition.
 
 After inspecting retained changes and current ownership, an owner can authorize
@@ -21,8 +21,10 @@ exhaustion requires the exact four-rebase stop message and counter.
 Authorization records the task, run, stopped candidate HEAD, base tip and time.
 Consumption is saved before Git runs and reserves one additional attempt;
 ordinary resume after an interrupted attempt cannot spend it again. A new
-explicit `--recover-base` invocation is a new authorization. A request already
-pending must be resumed instead of authorized again. The cumulative attempt
+explicit `--recover-base` invocation is a new authorization. An explicit queue
+release after the stop also authorizes recovery through the daemon; its approval
+generation can authorize only once, including after another base movement. A
+request already pending must be resumed instead of authorized again. The cumulative attempt
 counter is never reset. Recovery requires a successful base fetch, rebases onto
 that fetched SHA and retains existing publication leases. If the base moves
 again, the run stops again rather than chasing it.

@@ -1193,6 +1193,24 @@ impl Runner {
     /// Authorize exactly one additional rebase, under the caller's queue task
     /// claim and the same owner/execution locks used by run maintenance.
     pub async fn authorize_base_recovery(home: &Path, id: &str, task: &str) -> Result<()> {
+        Self::authorize_base_recovery_request(home, id, task, false).await
+    }
+
+    /// Queue release uses its durable approval generation exactly once.
+    pub(crate) async fn authorize_base_recovery_from_resumption(
+        home: &Path,
+        id: &str,
+        task: &str,
+    ) -> Result<()> {
+        Self::authorize_base_recovery_request(home, id, task, true).await
+    }
+
+    async fn authorize_base_recovery_request(
+        home: &Path,
+        id: &str,
+        task: &str,
+        resumption: bool,
+    ) -> Result<()> {
         let _owner = crate::pr_head::owner_lock(home, id)?;
         let _execution = crate::driver::maintenance(home, id)?;
         let mut state = RunState::load_under(id, home)?;
@@ -1244,7 +1262,23 @@ impl Runner {
         );
         state.record_base_sync_stop(&head);
         state.save()?;
-        state.authorize_base_sync(task)?;
+        if resumption {
+            anyhow::ensure!(
+                crate::daemon::compatible_run_instruction(&state, &queued),
+                "resumption instruction does not match the retained run"
+            );
+            let approval = queued
+                .resumption
+                .as_ref()
+                .context("no operator resumption")?;
+            anyhow::ensure!(
+                approval.instruction == queued.instruction,
+                "resumption approval does not match the current task instruction"
+            );
+            state.authorize_base_sync_resumption(task, approval)?;
+        } else {
+            state.authorize_base_sync(task)?;
+        }
         state.event(
             "base-recovery",
             "owner authorized one additional base rebase; fresh verification required",
@@ -3601,7 +3635,7 @@ impl Runner {
         // while `self` is mutably borrowed by the node's own bookkeeping.
         let run_id = self.state.id.clone();
         let prompts = self.state.config.prompts.clone();
-        if !self.state.deliberation.is_empty() {
+        if !self.state.deliberation.is_empty() || self.state.tally.is_some() {
             return Ok(());
         }
         let tops: Vec<char> = self
@@ -3767,7 +3801,7 @@ impl Runner {
         // while `self` is mutably borrowed by the node's own bookkeeping.
         let run_id = self.state.id.clone();
         let prompts = self.state.config.prompts.clone();
-        if !self.state.votes.is_empty() {
+        if !self.state.votes.is_empty() || self.state.tally.is_some() {
             return Ok(());
         }
         let viable: Vec<char> = self.state.viable().into_iter().map(|c| c.label).collect();
@@ -15265,7 +15299,40 @@ mod tests {
     #[tokio::test]
     async fn base_recovery_moving_base_stops_again_after_one_authorized_rebase() {
         let (_tmp, mut runner, _head, task) = exhausted_base_fixture().await;
-        runner.state.authorize_base_sync(&task).unwrap();
+        let queue = crate::queue::Queue::open();
+        let mut owner = queue.get(&task).unwrap();
+        owner.release_operator("test-resume", None);
+        queue.put(&mut owner).unwrap();
+        let generation = owner.resumption.as_ref().unwrap().generation;
+        runner.state.task_instruction = Some(owner.instruction.clone());
+        runner.state.driver_exited = true;
+        runner.state.save().unwrap();
+        let home = crate::run::home();
+        let _claim = queue.claim(&task).unwrap();
+        owner.resumption.as_mut().unwrap().at =
+            runner.state.base_sync_recovery.stop.as_ref().unwrap().at;
+        queue.put(&mut owner).unwrap();
+        assert!(
+            Runner::authorize_base_recovery_from_resumption(&home, &runner.state.id, &task)
+                .await
+                .is_err(),
+            "an approval from before the stop grants nothing"
+        );
+        owner.resumption.as_mut().unwrap().at = Timestamp::now();
+        queue.put(&mut owner).unwrap();
+        Runner::authorize_base_recovery_from_resumption(&home, &runner.state.id, &task)
+            .await
+            .unwrap();
+        assert!(
+            Runner::authorize_base_recovery_from_resumption(&home, &runner.state.id, &task)
+                .await
+                .is_err()
+        );
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        assert_eq!(
+            runner.state.base_sync_recovery.authorizations[0].generation,
+            Some(generation)
+        );
         runner.sync_to_base().await.unwrap();
         let repo = runner.state.repo.clone();
         let head = git::rev_parse(&repo, "HEAD").await.unwrap();
@@ -15286,6 +15353,37 @@ mod tests {
         assert!(!runner.state.base_recovery_pending());
         assert!(!crate::handover::can_resume(&runner.state));
         assert!(!runner.state.gate_ran);
+        // Even replaying the generation with a later timestamp grants nothing.
+        owner.resumption.as_mut().unwrap().at = Timestamp::now();
+        queue.put(&mut owner).unwrap();
+        assert!(
+            Runner::authorize_base_recovery_from_resumption(&home, &runner.state.id, &task)
+                .await
+                .is_err()
+        );
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        runner.sync_to_base().await.unwrap();
+        assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 5);
+        assert_eq!(runner.state.base_sync_recovery.authorizations.len(), 1);
+        assert_eq!(git::rev_parse(&repo, "HEAD").await.unwrap(), head);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_tally_skips_deliberation_and_voting_without_a_sync_stop() {
+        let (_tmp, mut runner, _, _) = exhausted_base_fixture().await;
+        runner.state.base_sync = None;
+        runner.state.status = RunStatus::Blocked;
+        let mut second = runner.state.candidates[0].clone();
+        second.label = 'B';
+        runner.state.candidates.push(second);
+        assert!(runner.state.votes.is_empty());
+        assert!(runner.state.deliberation.is_empty());
+        runner.deliberate().await.unwrap();
+        runner.vote().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert!(runner.state.votes.is_empty());
+        assert!(runner.state.deliberation.is_empty());
     }
 
     fn runner_at(status: RunStatus) -> Runner {

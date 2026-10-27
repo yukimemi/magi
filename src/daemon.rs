@@ -4138,12 +4138,28 @@ async fn attempt(
         && task.review_branch.is_none()
         && task.pr_recovery.is_none()
     {
-        task.hold_machine(Some("Base synchronization remains stopped. Inspect the retained run; for movement exhaustion, explicitly use `magi run --resume <run> --recover-base`. Ordinary release grants no additional rebase and starts no replacement competition.".into()));
-        // Retain the existing stop identity when an old release reached the queue.
-        task.base_sync_notice(&held);
-        task.resume_override = None;
-        record(queue, task);
-        return Vec::new();
+        // Authorization still takes the owner lock and execution lease and
+        // rechecks liveness, retained HEAD and ownership before saving.
+        let authorized = if task.resumption.is_some() && compatible_run_instruction(&held, task) {
+            let home = queue.root().parent().expect("queue has a home");
+            match Runner::authorize_base_recovery_from_resumption(home, &held.id, &task.id).await {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::debug!(run = %held.id, %error, "base recovery resumption refused");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if !authorized {
+            task.hold_machine(Some("Base synchronization remains stopped. Inspect the retained run; for movement exhaustion, explicitly use `magi run --resume <run> --recover-base`. A release without a new owner approval grants no additional rebase and starts no replacement competition.".into()));
+            // Retain the existing stop identity when an old release reached the queue.
+            task.base_sync_notice(&held);
+            task.resume_override = None;
+            record(queue, task);
+            return Vec::new();
+        }
     }
     let unfinished = (!task.fresh_start)
         .then(|| unfinished_run(&resume_runs, task.short()))

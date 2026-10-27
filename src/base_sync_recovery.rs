@@ -49,6 +49,9 @@ pub struct Authorization {
     pub at: Timestamp,
     /// Persisted before any Git mutation. An interrupted consumption grants no retry.
     pub consumed: bool,
+    /// Queue approval generation, absent for an explicit recovery command.
+    #[serde(default)]
+    pub generation: Option<u64>,
     /// Historical evidence stays attached to its original heads.
     pub reviews: Vec<ReviewRound>,
     /// Prior gate outcomes, never evidence for the recovered head.
@@ -164,11 +167,41 @@ impl RunState {
             stop,
             at: Timestamp::now(),
             consumed: false,
+            generation: None,
             reviews: Vec::new(),
             gate: Vec::new(),
             gate_head: None,
             gate_ran: false,
         });
+        Ok(())
+    }
+
+    pub(crate) fn authorize_base_sync_resumption(
+        &mut self,
+        task: &str,
+        approval: &crate::queue::Resumption,
+    ) -> Result<()> {
+        let stop = self
+            .base_sync_recovery
+            .stop
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no recorded base-sync stop"))?;
+        ensure!(
+            approval.at > stop.at,
+            "approval predates the base-sync stop"
+        );
+        ensure!(
+            !self.base_sync_recovery.authorizations.iter().any(|a| {
+                a.task == task && a.generation.is_some_and(|g| g >= approval.generation)
+            }),
+            "operator resumption generation already used"
+        );
+        self.authorize_base_sync(task)?;
+        self.base_sync_recovery
+            .authorizations
+            .last_mut()
+            .unwrap()
+            .generation = Some(approval.generation);
         Ok(())
     }
 
