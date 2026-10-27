@@ -6141,7 +6141,7 @@ fn diagnostic(state: &RunState) -> Option<String> {
             "gate `{}` failed ({}):\n{}",
             o.command,
             notices::exit_status(o.code),
-            crate::run::tail(&o.output_tail, DIAGNOSTIC_OUTPUT_TAIL)
+            crate::run::summarize_verify(&o.output_tail, DIAGNOSTIC_OUTPUT_TAIL)
         ));
     }
 
@@ -8447,6 +8447,25 @@ mod tests {
             "expected the display label, not the wire spelling: {d}"
         );
         assert!(!d.contains("verified_noop"), "{d}");
+    }
+
+    #[test]
+    fn diagnostic_keeps_gate_panic_before_large_backtrace() {
+        let mut state = run_state(RunStatus::Failed);
+        state.gate.push(crate::run::CommandOutcome {
+            command: "cargo test".into(),
+            code: Some(101),
+            output_tail: format!(
+                "---- widget stdout ----\nwidget log\nthread 'widget' panicked at widget.rs:12:\nassertion failed: widget missing\n{}test result: FAILED\n",
+                "  41: 0x1234 - backtrace frame\n".repeat(10000)
+            ),
+            duration_ms: 1,
+            resource_blocked: false,
+        });
+        let d = diagnostic(&state).unwrap();
+        assert!(d.contains("panicked at widget.rs:12"), "{d}");
+        assert!(d.contains("assertion failed: widget missing"));
+        assert!(d.contains("widget log"));
     }
 
     #[test]

@@ -11052,17 +11052,15 @@ async fn run_commands(
             // The full text is kept whatever the summary dropped. A fresh
             // name per command so a resume or retry never overwrites an
             // earlier run's output. A failed write changes no verdict.
-            let name = (1..)
-                .map(|n| format!("{task}-{n}.out"))
-                .find(|n| !crate::run::artifact_path(state, n).exists())
-                .unwrap_or_default();
-            match write_artifact(state, &name, &body) {
-                Ok(_) if summary != body => {
+            match crate::run::write_verification_artifact(state, task, &body) {
+                Ok(name) if summary != body => {
                     summary = format!("[full output: artifacts/{name}]\n{summary}");
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    tracing::warn!("could not save the full {task} output: {e:#}");
+                    let warning = format!("could not save the full {task} output: {e:#}");
+                    tracing::warn!("{warning}");
+                    state.event(node, warning);
                     if summary != body {
                         summary = format!("[full output could not be saved: {e:#}]\n{summary}");
                     }
@@ -17381,6 +17379,25 @@ esac
         let full = crate::run::read_artifact(&state, "gate-1.out").unwrap();
         assert!(full.len() > 500_000 && full.contains("boom assertion"));
         assert!(crate::run::read_artifact(&state, "gate-2.out").is_some());
+
+        // Storage failures are evidence too; preserve the command's verdict.
+        std::fs::remove_dir_all(state.dir().join("artifacts")).unwrap();
+        std::fs::write(state.dir().join("artifacts"), "blocked").unwrap();
+        let (outcomes, _) = run_commands(
+            &mut state,
+            "gate",
+            "gate",
+            0,
+            &["sh".into(), "-c".into()],
+            &["echo failure-output; exit 7".into()],
+            tmp.path(),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(outcomes[0].code, Some(7));
+        assert!(state.events.iter().any(|e| {
+            e.node == "gate" && e.message.contains("could not save the full gate output:")
+        }));
     }
 
     #[cfg(unix)]

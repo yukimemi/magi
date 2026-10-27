@@ -3940,8 +3940,25 @@ fn is_frame(line: &str, after_frame: bool) -> bool {
 
 /// Lines after a trigger that belong to it (assertion text, `left`/`right`).
 fn trigger_context(line: &str) -> Option<usize> {
-    let t = line.trim();
-    if t.contains("panicked at") {
+    // Match colored nextest markers without changing the stored evidence.
+    let mut plain = String::new();
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.clone().next() == Some('[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    let t = plain.trim();
+    if t.starts_with("[full output:") || t.starts_with("[full output could not be saved:") {
+        Some(0)
+    } else if t.contains("panicked at") {
         Some(6)
     } else if (t.starts_with("---- ") && t.ends_with(" ----"))
         || t.starts_with("--- STDERR:")
@@ -3984,10 +4001,17 @@ fn clip_line(line: &str, max: usize) -> &str {
 ///    budget evenly between excerpts and drop the later ones when it runs
 ///    out, then append the final tail (where `test result:` lives).
 ///
-/// Short output is returned unchanged. The full text belongs in an artifact.
+/// Adjacent excerpts merge only while small: a long stdout line must not
+/// consume the budget of a following panic anchor. Short output is returned
+/// unchanged. The full text belongs in an artifact.
 pub fn summarize_verify(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_owned();
+    }
+    // Tiny callers cannot fit the explanatory header. Respect their exact
+    // byte bound, including UTF-8 boundaries, without a larger tail marker.
+    if max < 256 {
+        return clip_line(text, max).to_owned();
     }
     let mut kept: Vec<&str> = Vec::new();
     let mut dropped = 0usize;
@@ -4025,7 +4049,13 @@ pub fn summarize_verify(text: &str, max: usize) -> String {
         if let Some(after) = trigger_context(line) {
             let end = (i + 1 + after).min(tail_start);
             match ranges.last_mut() {
-                Some(last) if i <= last.1 => last.1 = last.1.max(end),
+                Some(last)
+                    if i <= last.1
+                        && end - last.0 <= 20
+                        && kept[last.0..end].iter().map(|l| l.len() + 1).sum::<usize>() <= 1024 =>
+                {
+                    last.1 = last.1.max(end);
+                }
                 _ => ranges.push((i, end)),
             }
         }
@@ -4037,10 +4067,11 @@ pub fn summarize_verify(text: &str, max: usize) -> String {
     for &(a, b) in &ranges[..shown] {
         let mut block = String::new();
         for line in &kept[a..b] {
-            let line = clip_line(line, 600);
-            if block.len() + line.len() + 1 > per {
+            let remaining = per.saturating_sub(block.len() + 1);
+            if remaining == 0 {
                 break;
             }
+            let line = clip_line(line, 600.min(remaining));
             block.push_str(line);
             block.push('\n');
         }
@@ -4059,9 +4090,34 @@ pub fn summarize_verify(text: &str, max: usize) -> String {
         text.len(),
     );
     if out.len() > max {
-        return tail(&out, max);
+        return clip_line(&out, max).to_owned();
     }
     out
+}
+
+/// Reserve a fresh verification artifact atomically, so concurrent writes,
+/// retries and resumes cannot overwrite earlier evidence.
+pub fn write_verification_artifact(run: &RunState, stem: &str, body: &str) -> Result<String> {
+    use std::io::Write as _;
+    let dir = run.dir().join("artifacts");
+    std::fs::create_dir_all(&dir)?;
+    for sequence in 1.. {
+        let name = format!("{stem}-{sequence}.out");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(&name))
+        {
+            Ok(mut file) => {
+                file.write_all(body.as_bytes())
+                    .with_context(|| format!("write artifacts/{name}"))?;
+                return Ok(name);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("create artifacts/{name}")),
+        }
+    }
+    unreachable!()
 }
 
 /// Path of a run artifact.
@@ -4086,6 +4142,107 @@ pub fn read_artifact(run: &RunState, name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn summarize_verify_preserves_failure_context_and_bounds() {
+        let mut text = String::from("[full output: artifacts/gate-1.out]\n");
+        for name in ["first", "second"] {
+            text.push_str(&format!("---- {name} stdout ----\nmy test output\n"));
+            text.push_str(&format!("thread '{name}' panicked at tests/check.rs:42:9:\nassertion `left == right` failed\n  left: 1\n right: 2\n"));
+            for frame in 0..4000 {
+                text.push_str(&format!(
+                    "  {frame}: 0x102e80de0 - backtrace frame with 日本語\n"
+                ));
+            }
+        }
+        text.push_str("---- second stderr ----\nsecond test stderr\n");
+        text.push_str(&"unrelated output\n".repeat(1000));
+        text.push_str(
+            "\x1b[31mFAIL [0.01s] suite third\x1b[0m\n--- STDOUT: ---\nthird test stdout\n",
+        );
+        text.push_str(&"stdout noise\n".repeat(10000));
+        text.push_str("--- STDERR: ---\nthird test stderr\n");
+        text.push_str("thread 'third' panicked at test.rs:1:\nthird assertion\n");
+        text.push_str(&"backtrace noise\n".repeat(10000));
+        text.push_str("test result: FAILED. 0 passed; 3 failed\n");
+        let summary = summarize_verify(&text, 32 * 1024);
+        assert!(summary.len() <= 32 * 1024);
+        for expected in [
+            "thread 'first' panicked at",
+            "thread 'second' panicked at",
+            "thread 'third' panicked at",
+            "my test output",
+            "second test stderr",
+            "FAIL [0.01s] suite third",
+            "third test stdout",
+            "third test stderr",
+            "panicked at tests/check.rs:42:9",
+            "left: 1",
+            "right: 2",
+            "third assertion",
+            "test result: FAILED",
+            "artifacts/gate-1.out",
+        ] {
+            assert!(summary.contains(expected), "missing {expected}: {summary}");
+        }
+        assert_eq!(summarize_verify(&summary, 32 * 1024), summary);
+        let compact = summarize_verify(&summary, 2000);
+        assert!(compact.len() <= 2000);
+        assert!(compact.contains("panicked at"));
+        assert!(compact.contains("artifacts/gate-1.out"));
+        assert_eq!(summarize_verify("short 日本語\n", 1024), "short 日本語\n");
+    }
+
+    #[test]
+    fn summarize_verify_reports_overflow_and_handles_long_utf8_lines() {
+        let text = (0..1000)
+            .map(|i| {
+                format!(
+                    "thread '{i}' panicked at test.rs:1:\n{}\n",
+                    "あ".repeat(2000)
+                )
+            })
+            .collect::<String>();
+        for max in (0..=256).chain([800, 2000, 32 * 1024]) {
+            let summary = summarize_verify(&text, max);
+            assert!(summary.len() <= max);
+            if max >= 256 {
+                assert!(summary.contains("more excerpt(s) not shown"));
+            }
+        }
+        let compiler = format!(
+            "error[E0063]: missing field\n{}done",
+            "noise\n".repeat(20000)
+        );
+        assert!(summarize_verify(&compiler, 2000).contains("error[E0063]"));
+    }
+
+    #[test]
+    fn verification_artifacts_reserve_names_atomically() {
+        pin_test_home();
+        let state = pass_state();
+        let names = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let state = &state;
+                    scope.spawn(move || {
+                        let body = format!("output {i}");
+                        let name = write_verification_artifact(state, "gate", &body).unwrap();
+                        (name, body)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let unique: BTreeSet<_> = names.iter().map(|(name, _)| name).collect();
+        assert_eq!(unique.len(), names.len());
+        for (name, body) in names {
+            assert_eq!(read_artifact(&state, &name).unwrap(), body);
+        }
+    }
+
     fn pass_state() -> RunState {
         RunState::new(
             PathBuf::from("/repo"),
