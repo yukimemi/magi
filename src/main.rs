@@ -1526,6 +1526,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 config: config.as_deref().map(|c| absolute_path(c, &cwd)),
                 inherit_daemon_options: false,
             };
+            let repo = resolve_repo(&repo, &cwd, None).await?;
             let (mut cfg, from) =
                 Config::discover_fetched(&repo, overrides.config.as_deref()).await?;
             if !force {
@@ -1547,7 +1548,6 @@ async fn dispatch(command: Command) -> Result<()> {
             // cache through this repository, so it must not start blind on a
             // disk that is already too full to finish it.
             disk_precheck(&repo, &cfg)?;
-            let repo = resolve_repo(&repo, &cwd, None).await?;
             let filing = magi::direct::Filing {
                 title: format!("review {branch}"),
                 instruction: format!(
@@ -3966,6 +3966,15 @@ fn asking_is_not_this_seat_s_job(node: &str) -> Option<String> {
 /// fail in the first place - so it is re-checked with `git::toplevel`
 /// before ever replacing the operator's own directory.
 async fn resolve_repo(repo: &Path, cwd: &Path, hint: Option<&str>) -> Result<PathBuf> {
+    resolve_repo_with_clone(repo, cwd, hint, true).await
+}
+
+async fn resolve_repo_with_clone(
+    repo: &Path,
+    cwd: &Path,
+    hint: Option<&str>,
+    allow_clone: bool,
+) -> Result<PathBuf> {
     match repo.canonicalize() {
         Ok(canonical) => {
             if let Err(e) = magi::git::toplevel(&canonical).await {
@@ -4001,6 +4010,20 @@ async fn resolve_repo(repo: &Path, cwd: &Path, hint: Option<&str>) -> Result<Pat
             // layer at all.
             let (cfg, _) = Config::discover(cwd, None)
                 .with_context(|| format!("--repo {} does not exist", repo.display()))?;
+            if let Some(path) = local_repo_by_name(repo, &cfg.repos.roots)? {
+                return Ok(path);
+            }
+            if allow_clone && cfg.repos.auto_clone {
+                let query = repo.to_string_lossy();
+                if query.contains('/') && !repo.is_absolute() {
+                    repos::validate_github_name(&query)?;
+                    let _lock = repos::clone_lock(&cfg.repos).await?;
+                    if let Some(path) = local_repo_by_name(repo, &cfg.repos.roots)? {
+                        return Ok(path);
+                    }
+                    return repos::clone_github(&query, &cfg.repos).await;
+                }
+            }
             resolve_repo_by_name(repo, &cfg.repos.roots)
         }
     }
@@ -4017,18 +4040,24 @@ async fn resolve_repo(repo: &Path, cwd: &Path, hint: Option<&str>) -> Result<Pat
 /// point of this path is to save a round trip asking the operator, not to
 /// remove the one case that genuinely needs to ask.
 fn resolve_repo_by_name(repo: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
+    local_repo_by_name(repo, roots)?.with_context(|| {
+        format!(
+            "--repo {} does not exist, and no checkout named `{}` was found under [repos] roots",
+            repo.display(),
+            repo.display()
+        )
+    })
+}
+
+fn local_repo_by_name(repo: &Path, roots: &[PathBuf]) -> Result<Option<PathBuf>> {
     let query = repo.to_string_lossy().replace('\\', "/");
     let hits: Vec<repos::Repo> = repos::scan(roots)
         .into_iter()
         .filter(|r| r.name == query || r.name.rsplit('/').next() == Some(query.as_str()))
         .collect();
     match hits.len() {
-        1 => Ok(hits.into_iter().next().expect("exactly one hit").path),
-        0 => bail!(
-            "--repo {} does not exist, and no checkout named `{query}` was found under \
-             [repos] roots",
-            repo.display()
-        ),
+        1 => Ok(Some(hits.into_iter().next().expect("exactly one hit").path)),
+        0 => Ok(None),
         n => bail!(
             "--repo `{query}` matches {n} checkouts under [repos] roots ({}); use a full path \
              or the exact owner/repo name to disambiguate",
@@ -4053,7 +4082,7 @@ fn resolve_repo_by_name(repo: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
 /// is refused rather than guessed at, for the same reason
 /// [`resolve_repo_by_name`] refuses one.
 async fn resolve_stats_repo(value: &Path, cwd: &Path, states: &[RunState]) -> Result<PathBuf> {
-    match resolve_repo(value, cwd, None).await {
+    match resolve_repo_with_clone(value, cwd, None, false).await {
         Ok(p) => Ok(p),
         Err(e) => {
             let query = value.to_string_lossy().replace('\\', "/");
@@ -6561,6 +6590,122 @@ mod tests {
             .await
             .expect_err("an ambiguous short name must not pick one silently");
         assert!(err.to_string().contains("matches 2 checkouts"), "{err:#}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_repo_auto_clone_is_explicit_local_first_and_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let machine = tmp.path().join("config");
+        std::fs::create_dir_all(machine.join("magi")).unwrap();
+        let _machine = NoMachineConfig::set_dir(machine.to_str().unwrap());
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let gh = bin.join("gh");
+        std::fs::write(&gh, "#!/bin/sh\necho view >> \"$0.log\"\nprintf '%s' '{\"nameWithOwner\":\"sample/project\"}'\n" ).unwrap();
+        let clone = bin.join("clone");
+        std::fs::write(&clone, "#!/bin/sh\necho clone >> \"$0.log\"\n[ \"$3\" = 'literal argument' ] || exit 8\ngit init -q \"$2\"\n").unwrap();
+        for path in [&gh, &clone] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        struct RestorePath(Option<std::ffi::OsString>);
+        impl Drop for RestorePath {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(path) => unsafe { std::env::set_var("PATH", path) },
+                    None => unsafe { std::env::remove_var("PATH") },
+                }
+            }
+        }
+        let old = RestorePath(std::env::var_os("PATH"));
+        let paths =
+            std::iter::once(bin.clone()).chain(std::env::split_paths(old.0.as_deref().unwrap()));
+        unsafe { std::env::set_var("PATH", std::env::join_paths(paths).unwrap()) };
+        let mut cfg = magi::config::Repos {
+            roots: vec![tmp.path().join("root with spaces")],
+            auto_clone: true,
+            clone_command: Some(vec![
+                clone.display().to_string(),
+                "{repo}".into(),
+                "{dest}".into(),
+                "literal argument".into(),
+            ]),
+            ..Default::default()
+        };
+        let save = |cfg: &magi::config::Repos| {
+            std::fs::write(
+                machine.join("magi/config.toml"),
+                format!("[repos]\n{}", toml::to_string(cfg).unwrap()),
+            )
+            .unwrap();
+        };
+        save(&cfg);
+        for name in [
+            "project",
+            "bad!/project",
+            "sample/../project",
+            "sample/..",
+            "-sample/project",
+        ] {
+            assert!(
+                resolve_repo(Path::new(name), tmp.path(), None)
+                    .await
+                    .is_err(),
+                "{name}"
+            );
+        }
+        assert!(
+            resolve_repo_with_clone(Path::new("sample/project"), tmp.path(), None, false)
+                .await
+                .is_err()
+        );
+        cfg.auto_clone = false;
+        save(&cfg);
+        let err = resolve_repo(Path::new("sample/project"), tmp.path(), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no checkout named"));
+        assert!(!gh.with_extension("log").exists());
+        cfg.auto_clone = true;
+        save(&cfg);
+        let (first, concurrent) = tokio::join!(
+            resolve_repo(Path::new("sample/project"), tmp.path(), None),
+            resolve_repo(Path::new("sample/project"), tmp.path(), None)
+        );
+        let first = first.unwrap();
+        assert_eq!(concurrent.unwrap(), first);
+        assert_eq!(
+            first,
+            cfg.roots[0]
+                .join("github.com/sample/project")
+                .canonicalize()
+                .unwrap()
+        );
+        assert_eq!(
+            resolve_repo(Path::new("sample/project"), tmp.path(), None)
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            std::fs::read_to_string(gh.with_extension("log")).unwrap(),
+            "view\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(clone.with_extension("log")).unwrap(),
+            "clone\n"
+        );
+        // An ambiguous owner/repo match is never repaired by acquiring another checkout.
+        std::fs::create_dir_all(cfg.roots[0].join("other.host/sample/project/.git")).unwrap();
+        let err = resolve_repo(Path::new("sample/project"), tmp.path(), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("matches 2 checkouts"));
+        assert_eq!(
+            std::fs::read_to_string(gh.with_extension("log")).unwrap(),
+            "view\n"
+        );
     }
 
     #[test]
