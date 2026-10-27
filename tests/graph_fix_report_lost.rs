@@ -241,3 +241,36 @@ async fn a_valid_first_try_report_mentioning_waiting_is_never_resumed() {
     );
 }
 }
+
+common::e2e! {
+async fn an_authentication_outage_during_report_recovery_defers_the_fix_round() {
+    let home = common::home_lock().await;
+    let mut fx = fixture_with_fix_report_lost(home, &["impl-A"]);
+    fx.config.verify.e2e = vec!["test -f fixed.txt".into()];
+    for agent in &mut fx.config.agents { agent.env.insert("MOCK_CONTINUATION_AUTH".into(), "1".into()); }
+    let mut runner = Runner::start(&fx.repo, "create note.txt".into(), fx.config.clone(), magi::run::Origin::operator()).await.unwrap();
+    let result = runner.execute().await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(runner.state.status, RunStatus::Blocked);
+    assert_eq!(runner.state.resource_block.as_ref().unwrap().kind, "agent authentication");
+    assert!(runner.state.reviews.iter().all(|round| round.fix.is_none()));
+    assert!(runner.state.dir().join("artifacts/fix-1-continue1.out").exists());
+    assert_eq!(runner.state.quota.len(), 1);
+    let mut task = magi::queue::Task::new("Report recovery outage".into(), "create note.txt".into(), fx.repo.clone(), magi::queue::Source::Human);
+    task.start(runner.state.id.clone());
+    let queue = magi::queue::Queue::open();
+    queue.put(&mut task).unwrap();
+    magi::daemon::finish_attempt(2, &queue, &mut task, &runner.state, &[], result);
+    assert_eq!(task.attempts, 0);
+    assert_eq!(task.status, magi::queue::TaskStatus::Held);
+    let id = runner.state.id.clone();
+    drop(runner);
+    let mut saved = magi::run::RunState::load(&id).unwrap();
+    for agent in &mut saved.config.agents { agent.env.remove("MOCK_CONTINUATION_AUTH"); }
+    saved.save().unwrap();
+    let mut resumed = Runner::resume(&id).unwrap();
+    resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.status, RunStatus::Ready, "{}", magi::report::run(&resumed.state));
+    assert_eq!(resumed.state.reviews[0].round, 1);
+}
+}

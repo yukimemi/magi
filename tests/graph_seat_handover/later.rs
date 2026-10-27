@@ -266,3 +266,37 @@ async fn a_judge_recovering_from_a_stall_is_handed_over_for_its_ranking_and_its_
     assert!(state.tally.as_ref().expect("tally").met_quorum);
 }
 }
+
+common::e2e! {
+async fn deliberation_outages_are_evaluated_across_all_turns() {
+    for all_seats in [false, true] {
+        let home = common::home_lock().await;
+        let mut fx = common::fixture(home, Judges::Split, false);
+        for agent in &mut fx.config.agents {
+            agent.env.insert("MOCK_ONLY_NODE".into(), "deliberate".into());
+            agent.env.insert("MOCK_QUOTA_SEAT".into(), if all_seats { "judge-1,judge-2,judge-3" } else { "judge-3" }.into());
+        }
+        let runner = run(&fx).await;
+        if !all_seats {
+            assert_eq!(runner.state.status, magi::run::RunStatus::Ready);
+            assert!(runner.state.resource_block.is_none());
+            assert_eq!(runner.state.deliberation[0].turns.len(), 2);
+            assert_eq!(runner.state.votes.len(), 3);
+            continue;
+        }
+        assert_eq!(runner.state.status, magi::run::RunStatus::Blocked);
+        assert!(runner.state.deliberation.is_empty());
+        assert!(runner.state.votes.is_empty());
+        assert_eq!(runner.state.quota.len(), 3);
+        let id = runner.state.id.clone();
+        drop(runner);
+        let mut saved = RunState::load(&id).unwrap();
+        for agent in &mut saved.config.agents { agent.env.remove("MOCK_QUOTA_SEAT"); }
+        saved.save().unwrap();
+        let mut resumed = Runner::resume(&id).unwrap();
+        resumed.execute().await.unwrap();
+        assert_eq!(resumed.state.status, magi::run::RunStatus::Ready, "{}", magi::report::run(&resumed.state));
+        assert_eq!(resumed.state.deliberation[0].turns.len(), 3);
+    }
+}
+}
