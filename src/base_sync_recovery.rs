@@ -15,6 +15,8 @@ pub enum StopKind {
     Conflict,
     /// A remote ownership or publication operation failed.
     Publication,
+    /// The change was integrated, but closing its PR failed and may be retried.
+    ClosingIntegratedPr,
     /// Legacy or unexpected evidence cannot justify recovery.
     Unknown,
 }
@@ -78,6 +80,27 @@ impl RunState {
             .is_some_and(|s| s.conflict.is_some())
     }
 
+    /// This checkpoint only rechecks integration and retries PR closure. It
+    /// never clears the conflict guard or grants an additional rebase.
+    pub(crate) fn base_sync_closure_pending(&self) -> bool {
+        let Some(detail) = self
+            .base_sync
+            .as_ref()
+            .and_then(|sync| sync.conflict.as_ref())
+        else {
+            return false;
+        };
+        let Some(winner) = self.winner() else {
+            return false;
+        };
+        // Also recognizes the diagnostic written before typed stops existed.
+        let prefix = format!(
+            "{} is already in {}/{}, but its pull request could not be closed (",
+            winner.branch, self.config.merge.remote, self.base_branch
+        );
+        detail.starts_with(&prefix) && detail.ends_with("); resume to retry")
+    }
+
     /// Legacy exhaustion is recognized only by the exact message and budget.
     /// Once recorded, its identity remains stable across no-progress passes.
     pub(crate) fn record_base_sync_stop(&mut self, head: &str) {
@@ -100,7 +123,9 @@ impl RunState {
             "{} moved {} commit(s) ahead of {} after {} rebase(s); rebasing again would only race it",
             self.base_branch, sync.behind, w.branch, crate::graph::BASE_SYNC_ROUNDS
         ));
-        let kind = if sync.attempts == crate::graph::BASE_SYNC_ROUNDS
+        let kind = if self.base_sync_closure_pending() {
+            StopKind::ClosingIntegratedPr
+        } else if sync.attempts == crate::graph::BASE_SYNC_ROUNDS
             && expected.as_deref() == Some(detail.as_str())
         {
             StopKind::Exhausted
@@ -236,7 +261,11 @@ pub(crate) fn held_run(queue: &crate::queue::Queue, task: &crate::queue::Task) -
     task.runs
         .last()
         .and_then(|id| RunState::load_under(id, home).ok())
-        .filter(|state| state.base_sync_blocked() && !state.base_recovery_pending())
+        .filter(|state| {
+            state.base_sync_blocked()
+                && !state.base_recovery_pending()
+                && !state.base_sync_closure_pending()
+        })
 }
 
 impl crate::queue::Task {

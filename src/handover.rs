@@ -479,7 +479,7 @@ pub(crate) fn resume_refusal_under(state: &RunState, home: Option<&Path>) -> Opt
         return Some(ResumeRefusal::OwnershipTransferred(to.clone()));
     }
     if state.base_sync_blocked() {
-        return if state.base_recovery_pending() {
+        return if state.base_recovery_pending() || state.base_sync_closure_pending() {
             None
         } else {
             Some(ResumeRefusal::BaseSyncStop)

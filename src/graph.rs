@@ -1212,7 +1212,6 @@ impl Runner {
         resumption: bool,
     ) -> Result<()> {
         let _owner = crate::pr_head::owner_lock(home, id)?;
-        let _execution = crate::driver::maintenance(home, id)?;
         let mut state = RunState::load_under(id, home)?;
         crate::pr_head::ensure_owner(&state)?;
         let queued = crate::queue::Queue::at(home.join("queue")).get(task)?;
@@ -1231,11 +1230,14 @@ impl Runner {
                 .is_none_or(|owner| owner == task),
             "run belongs to another task"
         );
-        let claimed = crate::daemon::is_working_on(home, id, Timestamp::now());
+        let claimed = crate::daemon::is_working_on_other(home, id, Timestamp::now())?;
         anyhow::ensure!(
             state.liveness_under(home, claimed) == crate::run::Liveness::Dead,
             "run is live or its ownership is unknown"
         );
+        // Judge the previous driver's lease before acquiring our maintenance
+        // lease. The owner lock excludes new driver claims across both steps.
+        let _execution = crate::driver::maintenance(home, id)?;
         anyhow::ensure!(
             state.status.resumable()
                 && state.released_to.is_none()
@@ -5230,7 +5232,7 @@ impl Runner {
                     already_in: None,
                 });
                 self.state.event("land", why);
-                self.hold_base_sync_kind(crate::base_sync_recovery::StopKind::Publication)
+                self.hold_base_sync_kind(crate::base_sync_recovery::StopKind::ClosingIntegratedPr)
                     .await?;
                 self.state.save()?;
                 return Ok(true);
@@ -15114,6 +15116,218 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn base_recovery_authorizes_its_worker_but_rejects_other_workers() {
+        const CHILD: &str = "MAGI_BASE_RECOVERY_WORKER_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "graph::tests::base_recovery_authorizes_its_worker_but_rejects_other_workers",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("MAGI_HOME", home.path())
+                .env("MAGI_WORKER_HOME", home.path())
+                .env("MAGI_WORKER_ID", "abcdef")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        crate::run::set_home(PathBuf::from(std::env::var_os("MAGI_HOME").unwrap()));
+        let (_tmp, mut runner, _head, task) = exhausted_base_fixture().await;
+        let home = crate::run::home();
+        let queue = crate::queue::Queue::open();
+        let mut owner = queue.get(&task).unwrap();
+        owner.release_operator("test-release", None);
+        owner.start(runner.state.id.clone());
+        queue.put(&mut owner).unwrap();
+        runner.state.driver_exited = true;
+        runner.state.task_instruction = Some(owner.instruction.clone());
+        runner.state.save().unwrap();
+        let _claim = queue.claim(&task).unwrap();
+        let reserve = |id: &str| {
+            let directory = home.join("workers/jobs").join(id);
+            std::fs::create_dir_all(&directory).unwrap();
+            let job = crate::worker::Job {
+                id: id.into(),
+                sequence: 1,
+                kind: "task".into(),
+                key: format!("task:{task}"),
+                payload: serde_json::json!({"opts": crate::daemon::Opts::default(), "queue": queue.root(), "task": task}),
+                generation: "fixture-generation".into(),
+                version: None,
+                status: crate::worker::Status::Running,
+                result: None,
+                pid: Some(std::process::id()),
+                created_at: 0,
+                finished_at: None,
+            };
+            std::fs::write(
+                directory.join("job.json"),
+                serde_json::to_vec(&job).unwrap(),
+            )
+            .unwrap();
+            crate::worker::execution_lease_for_test(&directory.join("live.lock"))
+        };
+        let _own = reserve("abcdef");
+        let other = reserve("fedcba");
+        assert!(
+            Runner::authorize_base_recovery_from_resumption(&home, &runner.state.id, &task)
+                .await
+                .is_err()
+        );
+        assert!(
+            RunState::load(&runner.state.id)
+                .unwrap()
+                .base_sync_recovery
+                .authorizations
+                .is_empty()
+        );
+        drop(other);
+        assert!(crate::daemon::is_working_on(
+            &home,
+            &runner.state.id,
+            Timestamp::now()
+        ));
+        assert!(
+            !crate::daemon::is_working_on_other(&home, &runner.state.id, Timestamp::now()).unwrap()
+        );
+        Runner::authorize_base_recovery_from_resumption(&home, &runner.state.id, &task)
+            .await
+            .unwrap();
+        assert!(
+            RunState::load(&runner.state.id)
+                .unwrap()
+                .base_recovery_pending()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_authorizes_a_crashed_driver_with_a_free_matching_lease() {
+        let (_tmp, mut runner, _head, task) = exhausted_base_fixture().await;
+        let home = crate::run::home();
+        runner.state.driver_pid = Some(std::process::id());
+        runner.state.driver_started_at = crate::proc::process_started_at(std::process::id());
+        runner.state.driver_exited = false;
+        runner.state.begin_pass();
+        runner.state.save().unwrap();
+        let mut driver = crate::driver::DriverGuard::acquire(&home, &runner.state).unwrap();
+        driver.record(&runner.state).unwrap();
+        let saved = std::fs::read(runner.state.dir().join("run.json")).unwrap();
+        // Preserve the durable claim as if the process died before Drop saved.
+        drop(driver);
+        std::fs::write(runner.state.dir().join("run.json"), saved).unwrap();
+        assert_eq!(
+            runner.state.liveness_under(&home, false),
+            crate::run::Liveness::Dead
+        );
+        let queue = crate::queue::Queue::open();
+        let _claim = queue.claim(&task).unwrap();
+        Runner::authorize_base_recovery(&home, &runner.state.id, &task)
+            .await
+            .unwrap();
+        let disk = RunState::load(&runner.state.id).unwrap();
+        assert!(!disk.driver_exited);
+        assert!(disk.base_recovery_pending());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_retries_integrated_pr_closure_without_authorizing_a_rebase() {
+        const CHILD: &str = "MAGI_BASE_RECOVERY_CLOSURE_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let tmp = tempfile::tempdir().unwrap();
+            let gh = tmp.path().join("gh");
+            std::fs::write(&gh, r#"#!/bin/sh
+case "$1 $2" in
+  'pr view') printf '{"headRefName":"fix/retained","headRefOid":"%s","baseRefName":"main","state":"OPEN","isCrossRepository":false}' "$(git rev-parse fix/retained)" ;;
+  'pr close') if [ ! -f "$MAGI_BASE_CLOSURE_MARKER" ]; then touch "$MAGI_BASE_CLOSURE_MARKER"; echo 'transient closure failure' >&2; exit 1; fi ;;
+  *) exit 2 ;;
+esac
+"#).unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let mut paths = vec![tmp.path().to_path_buf()];
+            paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "graph::tests::base_recovery_retries_integrated_pr_closure_without_authorizing_a_rebase", "--nocapture"])
+                .env(CHILD, "1")
+                .env("MAGI_BASE_CLOSURE_MARKER", tmp.path().join("closure-attempted"))
+                .env("PATH", std::env::join_paths(paths).unwrap())
+                .env_remove("MAGI_WORKER_HOME").env_remove("MAGI_WORKER_ID")
+                .output().unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (_tmp, mut runner, head, task) = exhausted_base_fixture().await;
+        let repo = runner.state.repo.clone();
+        git::git(&repo, &["checkout", "main"]).await.unwrap();
+        git::git(&repo, &["cherry-pick", &head]).await.unwrap();
+        git::git(&repo, &["push", "origin", "main"]).await.unwrap();
+        git::git(&repo, &["checkout", "fix/retained"])
+            .await
+            .unwrap();
+        runner.state.pr = Some(crate::run::PrRecord {
+            url: "https://example.test/project/pull/1".into(),
+            number: 1,
+            state: "open".into(),
+            checks: "unknown".into(),
+            round: 0,
+            rounds: 1,
+            red_at_merge: Vec::new(),
+        });
+        runner.sync_to_base().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert_eq!(
+            runner.state.base_sync_recovery.stop.as_ref().unwrap().kind,
+            crate::base_sync_recovery::StopKind::ClosingIntegratedPr
+        );
+        assert!(runner.state.base_sync_closure_pending());
+        assert!(crate::handover::can_resume(&runner.state));
+        let queue = crate::queue::Queue::open();
+        assert!(!crate::base_sync_recovery::held_task(
+            &queue,
+            &queue.get(&task).unwrap()
+        ));
+        assert!(runner.state.authorize_base_sync(&task).is_err());
+        // Legacy closure stops have no typed stop but must retain the checkpoint.
+        runner.state.base_sync_recovery.stop = None;
+        runner.state.status = RunStatus::Voting;
+        runner.state.gate_ran = true;
+        runner.state.config.graph.review_rounds = 0;
+        runner.state.save().unwrap();
+        assert!(crate::handover::can_resume(&runner.state));
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        runner.execute_graph().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::AlreadyInBase);
+        assert_eq!(runner.state.pr.as_ref().unwrap().state, "closed");
+        assert_eq!(
+            runner.state.base_sync.as_ref().unwrap().attempts,
+            BASE_SYNC_ROUNDS
+        );
+        assert!(runner.state.base_sync_recovery.authorizations.is_empty());
+        assert_eq!(git::rev_parse(&repo, "HEAD").await.unwrap(), head);
+        assert!(runner.state.reviews.is_empty());
+        assert!(runner.state.gate.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn base_recovery_authorization_requires_current_owner_free_lease_and_clean_tree() {
         let (_tmp, mut runner, _head, task) = exhausted_base_fixture().await;
         runner.state.driver_exited = true;
@@ -15214,6 +15428,7 @@ mod tests {
             runner.state.status = RunStatus::Voting;
             runner.execute_graph().await.unwrap();
             assert_eq!(runner.state.status, RunStatus::Blocked);
+            assert!(!crate::handover::can_resume(&runner.state));
             assert_eq!(
                 git::rev_parse(&runner.state.repo, "HEAD").await.unwrap(),
                 head

@@ -39,3 +39,8 @@ through an independently supported configuration/review workflow before landing.
 
 Unchanged stops retain their time and notification identity across driver
 passes. No task, branch or worktree must be deleted to use this transition.
+
+A failed attempt to close an already-integrated PR remains an ordinary resume
+checkpoint, including legacy saved diagnostics. Resume rechecks integration and
+public-head ownership before retrying closure; it grants no additional rebase.
+Other publication failures still require inspection and cannot use this path.
