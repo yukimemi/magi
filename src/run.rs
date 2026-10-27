@@ -722,6 +722,12 @@ pub struct VoteRecord {
 /// whose panel collapsed does not masquerade as a healthy one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaLoss {
+    /// Machine-side cause; legacy losses are usage limits.
+    #[serde(default)]
+    pub cause: crate::agent::QuotaCause,
+    /// Agent that needs recovery (empty in legacy records).
+    #[serde(default)]
+    pub agent: String,
     /// Seat key, e.g. `judge-1` or `review-2`.
     pub seat: String,
     /// Node that was running, e.g. `judge`, `vote`, `review`.
@@ -731,6 +737,20 @@ pub struct QuotaLoss {
     /// Reset hint if the CLI printed one, free text.
     #[serde(default)]
     pub reset: Option<String>,
+}
+
+impl QuotaLoss {
+    /// Preserve the cause and agent alongside the seat at every loss site.
+    pub fn new(seat: String, node: &str, quota: &crate::agent::Quota) -> Self {
+        Self {
+            seat,
+            node: node.to_owned(),
+            at: Timestamp::now(),
+            reset: quota.reset.clone(),
+            cause: quota.cause,
+            agent: quota.agent.clone(),
+        }
+    }
 }
 
 /// A seat handed from one roster agent to the next after the first failed it

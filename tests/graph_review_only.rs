@@ -269,11 +269,8 @@ async fn a_reviewer_rate_limited_by_quota_gates_clean_on_the_answered_panel() {
 
 common::e2e! {
 async fn a_panel_lost_entirely_to_quota_still_waits_instead_of_deciding_on_nobody() {
-    // The other half of the same fix: excluding a rate-limited seat from
-    // quorum must never go so far as calling a round clean with nobody left
-    // to have reviewed it. With every seat quota'd this falls back to the
-    // pre-existing behaviour — wait out the round budget, then `Blocked` —
-    // exactly as an ordinary (non-quota) silent panel already does.
+    // No reviewer is available: leave the current round pending so a
+    // resumed run retries it after machine recovery without spending rounds.
     let _home = common::home_lock().await;
     let mut fx = fixture_with_quota(_home, &["review-1", "review-2"]);
     fx.config.graph.review_rounds = 1;
@@ -290,14 +287,8 @@ async fn a_panel_lost_entirely_to_quota_still_waits_instead_of_deciding_on_nobod
     runner.execute().await.expect("execute");
     let state = &runner.state;
 
-    assert_eq!(state.reviews.len(), 1, "{:?}", state.reviews);
-    let round = &state.reviews[0];
-    assert_eq!(round.answered, 0);
-    assert_eq!(round.expected, 2);
-    assert!(
-        !round.clean,
-        "a panel with nobody left to review must never gate clean: {round:?}"
-    );
+    assert!(state.reviews.is_empty(), "the interrupted round stays pending");
+    assert_eq!(state.resource_block.as_ref().unwrap().node, "review");
     assert_eq!(state.quota.len(), 2, "{:?}", state.quota);
     assert_eq!(state.status, RunStatus::Blocked);
 }

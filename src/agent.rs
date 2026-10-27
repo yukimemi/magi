@@ -214,17 +214,34 @@ fn editing_access_note(base: Option<&crate::run::FetchedBase>) -> String {
     note
 }
 
-/// Evidence that a CLI ran out of its rate limit / quota, distinct from an
-/// ordinary failure.
+/// Evidence of a CLI usage limit or authentication outage, distinct from an
+/// ordinary task failure.
 ///
 /// `reset` is free text: CLIs render the reset time in their own locale, and
 /// parsing it exactly would be a bug factory. When it is not readable we say
 /// nothing rather than invent a format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Quota {
+    /// Machine-side cause; old records describe a usage limit.
+    #[serde(default)]
+    pub cause: QuotaCause,
+    /// Agent id, filled by the invocation boundary.
+    #[serde(default)]
+    pub agent: String,
     /// Human-readable reset time, when the CLI printed one.
     #[serde(default)]
     pub reset: Option<String>,
+}
+
+/// Why an invocation needs machine-side recovery rather than a task retry.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaCause {
+    /// Subscription usage must reset or be replenished.
+    #[default]
+    UsageLimit,
+    /// The operator must restore the CLI's authenticated session.
+    Authentication,
 }
 
 /// A CLI hung up on its own stream while the agent was working.
@@ -282,7 +299,7 @@ pub struct AgentOutput {
     pub duration_ms: u64,
     /// Artifact file names, relative to the run's `artifacts/` directory.
     pub artifacts: Vec<String>,
-    /// Rate-limit / quota exhaustion, when it can be told apart from a normal
+    /// Usage limit or authentication outage, when distinguishable from a normal
     /// failure. `None` for a normal failure, a timeout, or a CLI we cannot
     /// read — the conservative default.
     #[serde(default)]
@@ -308,10 +325,13 @@ pub struct AgentOutput {
 impl AgentOutput {
     /// Did the CLI exit cleanly with something to say?
     pub fn usable(&self) -> bool {
-        !self.timed_out && self.exit_code == Some(0) && !self.text.trim().is_empty()
+        !self.quota_exhausted()
+            && !self.timed_out
+            && self.exit_code == Some(0)
+            && !self.text.trim().is_empty()
     }
 
-    /// Did this invocation run out of the CLI's rate limit / quota?
+    /// Does this invocation need machine-side quota or authentication recovery?
     pub fn quota_exhausted(&self) -> bool {
         self.quota.is_some()
     }
@@ -663,7 +683,14 @@ pub async fn invoke(
     if spec.kind == AgentKind::Antigravity && extracted.quota.is_none() {
         extracted.quota = agy_quota(&stdout, &stderr);
     }
-    if let Some(quota) = &extracted.quota {
+    if let Some(quota) = &mut extracted.quota {
+        quota.agent.clone_from(&spec.id);
+        if quota.cause == QuotaCause::Authentication {
+            let _ = crate::notices::Notices::open().raise(crate::notices::Notice::warn(
+                &format!("agent-authentication:{}", spec.id),
+                format!("Agent `{}` cannot authenticate. Re-authenticate this agent, then resume the held task.", spec.id),
+            ));
+        }
         // A quota response carries usage too, so it can look like a dropped
         // stream; a rate limit is never worth re-asking, so it wins.
         extracted.dropped = None;
@@ -671,7 +698,8 @@ pub async fn invoke(
             seat = %seat.key,
             agent = %spec.id,
             reset = ?quota.reset,
-            "agent is out of quota"
+            cause = ?quota.cause,
+            "agent needs machine-side recovery"
         );
     }
     if let Some(session) = extracted.session {
@@ -1360,7 +1388,7 @@ fn extract_answer(kind: AgentKind, stdout: &str) -> Extracted {
                 text,
                 session,
                 status,
-                quota: None,
+                quota: codex_quota(stdout),
                 dropped: None,
                 commands,
                 context_tokens: None,
@@ -1510,18 +1538,63 @@ fn tail_chars(s: &str, max: usize) -> String {
     s.chars().skip(count - max).collect()
 }
 
-/// Recognise claude's rate-limit error shape, when it is present.
+/// Require both the observed top-level limit event and a failed turn. Text
+/// inside an assistant message is never evidence of an outage.
+fn codex_quota(stdout: &str) -> Option<Quota> {
+    let mut message = None;
+    let mut failed = false;
+    for line in stdout.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v.get("type").and_then(serde_json::Value::as_str) {
+            Some("error") => {
+                if let Some(m) = v.get("message").and_then(serde_json::Value::as_str)
+                    && m.starts_with("You've hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits")
+                {
+                    message = Some(m.to_owned());
+                }
+            }
+            Some("turn.failed") => failed = true,
+            _ => {}
+        }
+    }
+    if !failed {
+        return None;
+    }
+    let message = message?;
+    Some(Quota {
+        reset: message
+            .split_once("try again at ")
+            .map(|(_, hint)| hint.trim().to_owned())
+            .filter(|hint| !hint.is_empty()),
+        cause: QuotaCause::UsageLimit,
+        agent: String::new(),
+    })
+}
+
+/// Recognise claude's usage-limit and expired OAuth error shapes, when it is present.
 ///
 /// Recognises `is_error: true` with a session-limit result or the structured
 /// pair `api_error_status: 429` (number or string), `api_error: usage_limit_reached`;
-/// every other CLI (and any future shape) returns `None` and is treated as an
-/// ordinary failure — the conservative side.
+/// also accepts the observed api_error result for an expired OAuth session.
+/// Unknown error shapes remain ordinary failures.
 fn claude_quota(v: &serde_json::Value) -> Option<Quota> {
     let is_err = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
     if !is_err {
         return None;
     }
     let result = v.get("result").and_then(|r| r.as_str()).unwrap_or("");
+    if v.get("terminal_reason").and_then(serde_json::Value::as_str) == Some("api_error")
+        && result.starts_with("Failed to authenticate:")
+        && result.contains("OAuth session expired and could not be refreshed")
+    {
+        return Some(Quota {
+            reset: None,
+            cause: QuotaCause::Authentication,
+            agent: String::new(),
+        });
+    }
     let status = v.get("api_error_status");
     let usage_limit = (status.and_then(serde_json::Value::as_u64) == Some(429)
         || status.and_then(serde_json::Value::as_str) == Some("429"))
@@ -1537,7 +1610,11 @@ fn claude_quota(v: &serde_json::Value) -> Option<Quota> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    Some(Quota { reset })
+    Some(Quota {
+        reset,
+        cause: QuotaCause::UsageLimit,
+        agent: String::new(),
+    })
 }
 
 /// Recognise `agy` running out of quota, from either stream.
@@ -1585,7 +1662,11 @@ fn agy_quota(stdout: &str, stderr: &str) -> Option<Quota> {
         .map(|(_, rest)| rest.trim().trim_end_matches('.').trim())
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    Some(Quota { reset })
+    Some(Quota {
+        reset,
+        cause: QuotaCause::UsageLimit,
+        agent: String::new(),
+    })
 }
 
 /// Recognise a CLI that gave up on its own stream while the agent was working.
@@ -2866,6 +2947,67 @@ mod tests {
         assert_eq!(p.stdin.as_deref(), Some("do the thing"));
     }
 
+    const EXPIRED_AUTH: &str = r#"{"is_error":true,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed"}"#;
+    const CODEX_LIMIT: &str = r#"{"type":"error","message":"You've hit your usage limit. Visit https://chatgpt.com/settings/usage to purchase more credits or try again at Oct 27th, 2026 6:18 PM."}
+{"type":"turn.failed","error":{"message":"You've hit your usage limit."}}"#;
+
+    #[test]
+    fn observed_machine_failures_are_detected_conservatively() {
+        let auth = extract(AgentKind::Claude, EXPIRED_AUTH).quota.unwrap();
+        assert_eq!(auth.cause, QuotaCause::Authentication);
+        assert_eq!(auth.reset, None);
+        let limit = extract(AgentKind::Codex, CODEX_LIMIT).quota.unwrap();
+        assert_eq!(limit.cause, QuotaCause::UsageLimit);
+        assert_eq!(limit.reset.as_deref(), Some("Oct 27th, 2026 6:18 PM."));
+        // Duplicate events still yield one classification.
+        assert!(
+            extract(AgentKind::Codex, &format!("{CODEX_LIMIT}\n{CODEX_LIMIT}"))
+                .quota
+                .is_some()
+        );
+        let without_reset = CODEX_LIMIT.replace(" or try again at Oct 27th, 2026 6:18 PM", "");
+        assert!(
+            extract(AgentKind::Codex, &without_reset)
+                .quota
+                .unwrap()
+                .reset
+                .is_none()
+        );
+        for text in [
+            EXPIRED_AUTH.replace("true", "false"),
+            EXPIRED_AUTH.replace("api_error", "unknown"),
+            EXPIRED_AUTH.replace(
+                "OAuth session expired and could not be refreshed",
+                "unknown error",
+            ),
+        ] {
+            assert!(extract(AgentKind::Claude, &text).quota.is_none());
+        }
+        assert!(
+            extract(AgentKind::Codex, CODEX_LIMIT.lines().next().unwrap())
+                .quota
+                .is_none()
+        );
+        assert!(
+            extract(
+                AgentKind::Codex,
+                &CODEX_LIMIT.replace("You've hit your usage limit.", "Something failed.")
+            )
+            .quota
+            .is_none()
+        );
+        let quoted = serde_json::json!({"type":"item.completed","item":{"type":"agent_message","text":CODEX_LIMIT}}).to_string();
+        assert!(extract(AgentKind::Codex, &quoted).quota.is_none());
+        assert!(extract(AgentKind::Codex, EXPIRED_AUTH).quota.is_none());
+        assert!(
+            extract(AgentKind::Antigravity, EXPIRED_AUTH)
+                .quota
+                .is_none()
+        );
+        let legacy: Quota = serde_json::from_str(r#"{"reset":null}"#).unwrap();
+        assert_eq!(legacy.cause, QuotaCause::UsageLimit);
+    }
+
     #[test]
     fn claude_rate_limit_is_detected_and_reset_read_when_present() {
         // The exact shape observed in the wild (run 20260831-031005-ae94).
@@ -3601,7 +3743,11 @@ mod tests {
             timed_out: false,
             duration_ms: 0,
             artifacts: Vec::new(),
-            quota: quota.then_some(Quota { reset: None }),
+            quota: quota.then_some(Quota {
+                reset: None,
+                cause: QuotaCause::UsageLimit,
+                agent: String::new(),
+            }),
             dropped: None,
             commands: Vec::new(),
             context_tokens: None,
