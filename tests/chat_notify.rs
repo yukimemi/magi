@@ -1920,3 +1920,83 @@ async fn semantic_automatic_sources_share_receipts_without_settling_decisions() 
         );
     }
 }
+
+#[tokio::test]
+async fn semantic_decisions_without_context_deliver_new_summary_or_detail() {
+    let _home = common::home_lock().await;
+    for with_target in [false, true] {
+        let w = world();
+        let mut task = Task::new(
+            "decision".into(),
+            "work".into(),
+            w.tmp.path().into(),
+            Source::Human,
+        );
+        task.chat = Some(w.talk_id.clone());
+        task.runs.push("run-a".into());
+        task.hold_machine(Some("awaiting owner decision".into()));
+        w.queue.put(&mut task).unwrap();
+        let questions = magi::ask::Questions::at(w.tmp.path().join("questions"));
+        let mut first = magi::ask::Question::new(
+            "run-a".into(),
+            "implement".into(),
+            "impl-A".into(),
+            "Connection failure".into(),
+            "The connection is unavailable".into(),
+            vec!["resume".into(), "hold".into()],
+        );
+        first.actions.insert(
+            "resume".into(),
+            magi::ask::ChoiceAction::Resume {
+                run: "run-a".into(),
+            },
+        );
+        first
+            .actions
+            .insert("hold".into(), magi::ask::ChoiceAction::Hold);
+        if with_target {
+            first.merge_target = Some(magi::merge_decision::Target {
+                pr: "https://example.test/pull/1".into(),
+                head: "head-a".into(),
+                language: "en".into(),
+            });
+        }
+        first.routed_task = Some(task.id.clone());
+        assert!(first.decision_context.is_none());
+        questions.put(&mut first).unwrap();
+        magi::task_chat::sweep(&w.queue, &w.talks, &questions, w.tmp.path());
+        let mut chat = w.talks.get(&w.talk_id).unwrap();
+        assert_eq!(chat.pending_messages.len(), 1);
+        talk::drain(&mut chat, &w.talks).unwrap();
+        talk::close(&mut chat, &w.talks).unwrap();
+
+        for change in ["same", "summary", "detail"] {
+            let mut next = first.clone();
+            next.id.push_str(&format!("-{change}"));
+            match change {
+                "summary" => next.summary = "Newly verified data corruption".into(),
+                "detail" => next.detail = "A new integrity check verified data corruption".into(),
+                _ => {}
+            }
+            questions.put(&mut next).unwrap();
+            magi::task_chat::sweep(&w.queue, &w.talks, &questions, w.tmp.path());
+            chat = w.talks.get(&w.talk_id).unwrap();
+            let changed = change != "same";
+            assert_eq!(chat.status.open(), changed);
+            assert_eq!(chat.pending_messages.len(), usize::from(changed));
+            if changed {
+                assert!(chat.pending.contains("data corruption"));
+                talk::drain(&mut chat, &w.talks).unwrap();
+                talk::close(&mut chat, &w.talks).unwrap();
+            }
+            let routed = questions.get(&next.id).unwrap();
+            assert_eq!(routed.routed_chat.as_deref(), Some(w.talk_id.as_str()));
+            assert!(routed.status.open());
+        }
+        assert!(questions.get(&first.id).unwrap().status.open());
+        assert_eq!(
+            w.queue.get(&task.id).unwrap().status,
+            magi::queue::TaskStatus::Held
+        );
+    }
+}

@@ -10,11 +10,9 @@ fn decision(q: &Question) -> Value {
     // Structured producer context identifies the subject independently of prose.
     let subject = if let Some(context) = &q.decision_context {
         json!(context)
-    } else if q.merge_target.is_some() || !q.actions.is_empty() {
-        // Executable effects and bound targets express the decision itself;
-        // explanatory wording is not a new owner choice.
-        json!(q.node)
     } else {
+        // Effects and targets alone cannot prove the underlying evidence is
+        // unchanged. Unstructured questions may carry new facts in their prose.
         json!([q.summary, q.detail])
     };
     json!([subject, q.choices, q.actions, q.merge_target])
