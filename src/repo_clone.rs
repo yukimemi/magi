@@ -165,22 +165,40 @@ pub async fn clone_github_with_gh(
     let marker = incomplete_marker(&dest);
     std::fs::OpenOptions::new().write(true).create_new(true).open(&marker)
         .with_context(|| format!("cannot mark acquisition at {}; inspect any previous failed acquisition and its marker {}", dest.display(), marker.display()))?;
-    // Leave the marker on every failure, including cancellation/process exit.
-    acquisition_command(&argv).await?;
-    let canonical = dest
-        .canonicalize()
-        .with_context(|| format!("command {argv:?} did not create {}", dest.display()))?;
-    let top = crate::git::toplevel(&canonical).await.with_context(|| {
-        format!(
+    // Cancellation/process exit must keep the marker: the child may still run.
+    // A completed failure can safely clear it only when no destination exists.
+    let acquired: anyhow::Result<PathBuf> = async {
+        acquisition_command(&argv).await?;
+        let canonical = dest
+            .canonicalize()
+            .with_context(|| format!("command {argv:?} did not create {}", dest.display()))?;
+        let top = crate::git::toplevel(&canonical).await.with_context(|| {
+            format!(
+                "command {argv:?} did not create a checkout at {}",
+                dest.display()
+            )
+        })?;
+        ensure!(
+            top.canonicalize()? == canonical && canonical.join(".git").exists(),
             "command {argv:?} did not create a checkout at {}",
             dest.display()
-        )
+        );
+        Ok(canonical)
+    }
+    .await;
+    let canonical = acquired.map_err(|error| {
+        if matches!(std::fs::symlink_metadata(&dest),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        {
+            if let Err(cleanup) = std::fs::remove_file(&marker) {
+                return error.context(format!(
+                    "remove acquisition marker {} after failure: {cleanup}",
+                    marker.display()
+                ));
+            }
+        }
+        error
     })?;
-    ensure!(
-        top.canonicalize()? == canonical && canonical.join(".git").exists(),
-        "command {argv:?} did not create a checkout at {}",
-        dest.display()
-    );
     std::fs::remove_file(&marker).with_context(|| {
         format!(
             "publish completed acquisition by removing {}",
@@ -287,10 +305,9 @@ mod acquisition_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains(&clone) && error.contains("clone-failed"));
-        std::fs::remove_file(incomplete_marker(
-            &cfg.roots[0].join("github.com/sample/project"),
-        ))
-        .unwrap();
+        assert!(!acquisition_incomplete(
+            &cfg.roots[0].join("github.com/sample/project")
+        ));
         let clone = script(tmp.path(), "clone", "exit 0");
         cfg.clone_command = Some(vec![clone]);
         assert!(
@@ -321,6 +338,74 @@ mod acquisition_tests {
                 .unwrap_err()
                 .to_string()
                 .contains("nonempty roots")
+        );
+    }
+
+    #[tokio::test]
+    async fn acquisition_retries_after_failure_without_a_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gh = script(
+            tmp.path(),
+            "gh",
+            "echo '{\"nameWithOwner\":\"sample/project\"}'",
+        );
+        let mut cfg = crate::config::Repos {
+            roots: vec![tmp.path().join("root")],
+            clone_command: Some(vec![
+                tmp.path().join("missing-command").display().to_string(),
+            ]),
+            ..Default::default()
+        };
+        let dest = cfg.roots[0].join("github.com/sample/project");
+        assert!(
+            clone_github_with_gh("sample/project", &cfg, &gh)
+                .await
+                .is_err()
+        );
+        assert!(!dest.exists());
+        assert!(!acquisition_incomplete(&dest));
+        let clone = script(
+            tmp.path(),
+            "clone",
+            r#"if [ ! -f "$0.attempted" ]; then
+    touch "$0.attempted"
+    echo transient-failure >&2
+    exit 9
+fi
+git init -q "$1""#,
+        );
+        cfg.clone_command = Some(vec![clone, "{dest}".into()]);
+        let error = clone_github_with_gh("sample/project", &cfg, &gh)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("transient-failure"));
+        assert!(!dest.exists());
+        assert!(!acquisition_incomplete(&dest));
+        let acquired = clone_github_with_gh("sample/project", &cfg, &gh)
+            .await
+            .unwrap();
+        assert_eq!(acquired, dest.canonicalize().unwrap());
+        assert!(!acquisition_incomplete(&dest));
+
+        // A failed command that did create a checkout must remain quarantined.
+        cfg.roots = vec![tmp.path().join("partial")];
+        let partial = cfg.roots[0].join("github.com/sample/project");
+        let clone = script(tmp.path(), "partial-clone", "git init -q \"$1\"; exit 9");
+        cfg.clone_command = Some(vec![clone, "{dest}".into()]);
+        assert!(
+            clone_github_with_gh("sample/project", &cfg, &gh)
+                .await
+                .is_err()
+        );
+        assert!(partial.join(".git").exists());
+        assert!(acquisition_incomplete(&partial));
+        assert!(crate::repos::scan(&cfg.roots).is_empty());
+        assert!(
+            clone_github_with_gh("sample/project", &cfg, &gh)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("already exists")
         );
     }
 

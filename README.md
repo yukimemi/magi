@@ -1182,10 +1182,12 @@ match the first root. Commands that fail or create a checkout elsewhere report
 an error; magi does not switch to another repository. Simultaneous acquisitions
 under the same root are serialized and recheck local matches. An incomplete
 acquisition is hidden from discovery and refused by direct path resolution.
-A sibling `.magi-clone@<name>` marker is removed only after successful checkout
-validation. If a clone fails or is interrupted, inspect and repair or remove the
-partial checkout before manually removing its marker and retrying. After
-acquisition, repository configuration still comes from the remote base commit.
+A sibling `.magi-clone@<name>` marker is removed after successful checkout
+validation, or after a completed failure that leaves no destination, allowing a
+retry. If a partial checkout remains or acquisition is interrupted, inspect and
+repair or remove the partial checkout before manually removing its marker and
+retrying. After acquisition, repository configuration still comes from the
+remote base commit.
 
 `mode = "none"` is the default on purpose: magi prints the merge command and
 stops. It does not touch your base branch unless you ask it to.
