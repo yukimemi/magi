@@ -2003,8 +2003,8 @@ pub struct BaseSync {
     /// this round tried to close the gap. Zero means the tree already
     /// contained `tip`.
     pub behind: usize,
-    /// Rebase attempts spent so far this run, bounded by
-    /// `graph::BASE_SYNC_ROUNDS`.
+    /// Cumulative rebase attempts. The ordinary cap is `graph::BASE_SYNC_ROUNDS`;
+    /// each explicit base recovery authorization may reserve one more.
     pub attempts: usize,
     /// What git said, if the most recent rebase attempt conflicted or could
     /// not be pushed. `Some` here is what makes a `Blocked` run read as
@@ -2494,6 +2494,9 @@ pub struct RunState {
     /// winner to check.
     #[serde(default)]
     pub base_sync: Option<BaseSync>,
+    /// Stable stop identity and single-use owner authorizations, with prior evidence.
+    #[serde(default)]
+    pub base_sync_recovery: crate::base_sync_recovery::Recovery,
     /// The design-deliberation stage's output, when `[graph] advise` ran it:
     /// one record per advisor seat, plus the synthesis blended into the
     /// implementer's prompt. `None` when the stage is off, has not run yet,
@@ -2725,6 +2728,7 @@ impl RunState {
             release_bump: None,
             bump_decision_attempts: Vec::new(),
             base_sync: None,
+            base_sync_recovery: Default::default(),
             advice: None,
             advise_attempted: false,
             attachments: Vec::new(),

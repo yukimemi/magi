@@ -2071,7 +2071,11 @@ fn settle_and_diagnose(
         return;
     }
     let unresolved = task.hold_notice_cause.clone();
-    if !verdict.parked
+    if state.base_sync_blocked() {
+        // No automatic retry may turn a retained sync stop into a new competition.
+        task.hold_machine(Some(detail.to_owned()));
+        task.last_error = Some(detail.to_owned());
+    } else if !verdict.parked
         && task
             .pr_recovery
             .as_ref()
@@ -2129,7 +2133,9 @@ fn settle_and_diagnose(
         );
     }
     if task.status == TaskStatus::Held {
-        if state.prep_failure.is_none() {
+        if state.base_sync_blocked() {
+            task.base_sync_notice(state);
+        } else if state.prep_failure.is_none() {
             task.notice_cause(
                 label(verdict.status),
                 Some(&state.id),
@@ -4127,6 +4133,18 @@ async fn attempt(
         return Vec::new();
     }
 
+    if let Some(held) = crate::base_sync_recovery::held_run(queue, task)
+        && !task.fresh_start
+        && task.review_branch.is_none()
+        && task.pr_recovery.is_none()
+    {
+        task.hold_machine(Some("Base synchronization remains stopped. Inspect the retained run; for movement exhaustion, explicitly use `magi run --resume <run> --recover-base`. Ordinary release grants no additional rebase and starts no replacement competition.".into()));
+        // Retain the existing stop identity when an old release reached the queue.
+        task.base_sync_notice(&held);
+        task.resume_override = None;
+        record(queue, task);
+        return Vec::new();
+    }
     let unfinished = (!task.fresh_start)
         .then(|| unfinished_run(&resume_runs, task.short()))
         .flatten()
@@ -8525,6 +8543,43 @@ mod tests {
             }
             assert!(t.pr_recovery.is_some());
         }
+    }
+
+    #[test]
+    fn base_recovery_settlement_holds_without_replacement_or_duplicate_notice_cause() {
+        let mut state = run_state(RunStatus::Voting);
+        state.base_sync = Some(crate::run::BaseSync {
+            tip: "base-tip".into(),
+            behind: 3,
+            attempts: 4,
+            conflict: Some("base stopped".into()),
+            already_in: None,
+        });
+        state.record_base_sync_stop("candidate-head");
+        let mut t = task();
+        t.start(state.id.clone());
+        let verdict = Verdict {
+            status: RunStatus::Blocked,
+            left_pr: false,
+            quota_hit: false,
+            parked: false,
+            no_viable_candidates: false,
+        };
+        settle_and_diagnose(&mut t, verdict, "base stopped", 10, &state);
+        assert_eq!(
+            t.status,
+            TaskStatus::Held,
+            "unspent task attempts cannot start another competition"
+        );
+        let at = t.held_at;
+        let cause = t.hold_notice_cause.clone();
+        state.begin_pass();
+        t.release_operator("test-resume", None);
+        t.start(state.id.clone());
+        settle_and_diagnose(&mut t, verdict, "base stopped", 10, &state);
+        assert_eq!(t.status, TaskStatus::Held);
+        assert_eq!(t.held_at, at);
+        assert_eq!(t.hold_notice_cause, cause);
     }
 
     #[test]

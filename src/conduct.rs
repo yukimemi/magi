@@ -780,6 +780,19 @@ fn apply_one(
         return Ok(());
     }
 
+    if crate::base_sync_recovery::held_task(queue, &task)
+        && (d.recovery == Some(Recovery::Requeue)
+            || d.question_decision
+                .as_ref()
+                .is_some_and(|q| q.operation == QuestionOperation::Resume)
+            || d.actions
+                .values()
+                .any(|a| matches!(a, ChoiceAction::Resume { .. })))
+    {
+        // Additional base rebases require their own explicit authorization.
+        return Ok(());
+    }
+
     // A claimed task may have deferred the pre-scheduling triage sweep.
     // Leave an open or answered-unapplied question to that sweep rather
     // than move the task out from under it.
@@ -2966,6 +2979,51 @@ printf '%s\n' "$MOCK_REPLY"
             },
         };
         assert!(unrelated.identity(&t).is_err());
+    }
+
+    #[test]
+    fn base_recovery_conductor_cannot_offer_or_requeue_an_unchanged_stop() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("retained base stop");
+        let mut state = RunState::new(
+            dir.path().into(),
+            "main".into(),
+            "base".into(),
+            "retained work".into(),
+            Config::default(),
+        );
+        state.base_sync = Some(crate::run::BaseSync {
+            tip: "tip".into(),
+            behind: 3,
+            attempts: 4,
+            conflict: Some("exhausted".into()),
+            already_in: None,
+        });
+        state.save_under(dir.path()).unwrap();
+        t.link_run(&state.id);
+        t.hold_machine(Some("base stopped".into()));
+        queue.put(&mut t).unwrap();
+        let d = Decision {
+            id: t.id.clone(),
+            recovery: Some(Recovery::Requeue),
+            ..Decision::default()
+        };
+        apply_one(&queue, &questions, &d, None).unwrap();
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
+        let d = Decision {
+            id: t.id.clone(),
+            question: Some("Resume?".into()),
+            question_decision: Some(QuestionDecision {
+                operation: QuestionOperation::Resume,
+                target: QuestionTarget::Run { id: state.id },
+            }),
+            ..Decision::default()
+        };
+        apply_one(&queue, &questions, &d, None).unwrap();
+        assert!(questions.list().is_empty());
+        assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
     }
 
     #[test]

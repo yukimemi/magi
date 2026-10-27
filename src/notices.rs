@@ -718,9 +718,12 @@ pub fn run_ended(state: &crate::run::RunState) -> Option<Notice> {
         .about([state.id.clone()])
         .since(Some(
             state
-                .passes
-                .last()
-                .map(|p| p.started_at)
+                .base_sync_recovery
+                .stop
+                .as_ref()
+                .filter(|_| state.base_sync_blocked())
+                .map(|s| s.at)
+                .or_else(|| state.passes.last().map(|p| p.started_at))
                 .unwrap_or(state.created_at),
         ))
     })
@@ -870,9 +873,12 @@ pub fn run_stopped(id: &str, state: &crate::run::RunState) -> Notice {
     .about([id.to_owned()])
     .since(Some(
         state
-            .passes
-            .last()
-            .map(|p| p.started_at)
+            .base_sync_recovery
+            .stop
+            .as_ref()
+            .filter(|_| state.base_sync_blocked())
+            .map(|s| s.at)
+            .or_else(|| state.passes.last().map(|p| p.started_at))
             .unwrap_or(state.created_at),
     ))
 }

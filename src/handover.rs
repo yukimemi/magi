@@ -393,6 +393,7 @@ pub(crate) enum ResumeRefusal {
     ReviewBudget { used: usize, limit: usize },
     ReviewDisabled,
     CleanReviewGateRan,
+    BaseSyncStop,
 }
 
 impl ResumeRefusal {
@@ -406,6 +407,7 @@ impl ResumeRefusal {
 
     pub(crate) fn diagnostic(&self, state: &RunState) -> String {
         let reason = match self {
+            Self::BaseSyncStop => "base synchronization is stopped; inspect the retained work. For movement exhaustion only, use `magi run --resume <run> --recover-base` to authorize one additional rebase and fresh verification".into(),
             Self::Status(status) => format!("status `{}` is final; there is nothing left to resume", status.as_str()),
             Self::Released(_) => "execution was released".into(),
             Self::Retired(_) => "execution was retired".into(),
@@ -475,6 +477,13 @@ pub(crate) fn resume_refusal_under(state: &RunState, home: Option<&Path>) -> Opt
     }
     if let Some(to) = &state.pr_taken_over_by {
         return Some(ResumeRefusal::OwnershipTransferred(to.clone()));
+    }
+    if state.base_sync_blocked() {
+        return if state.base_recovery_pending() {
+            None
+        } else {
+            Some(ResumeRefusal::BaseSyncStop)
+        };
     }
     let review = crate::graph::review_conclusion(&state.reviews, state.config.graph.review_rounds);
     let allowed = resume_checkpoint(state)
