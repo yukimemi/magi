@@ -5739,7 +5739,29 @@ impl Runner {
             last = Some((job, seat, out));
             break;
         }
-        last.expect("the fixer chain always has an entry")
+        let (job, seat, out) = last.expect("the fixer chain always has an entry");
+        if let AgentOutcome::Quota(output) = &out
+            && output
+                .quota
+                .as_ref()
+                .is_some_and(|quota| quota.cause == agent::QuotaCause::Authentication)
+        {
+            // Every fallback was tried. Authentication cannot be repaired by
+            // spending a fix round; use each caller's resumable resource path.
+            let loss = QuotaLoss::from_report(seat.key.clone(), node, output.quota.as_ref());
+            block_machine_outage(&mut self.state, node, std::slice::from_ref(&loss));
+            self.state.quota.push(loss);
+            self.state.seats.insert(seat.key.clone(), seat.clone());
+            self.state.status = RunStatus::Blocked;
+            return (
+                job,
+                seat,
+                AgentOutcome::ResourceBlocked(
+                    "fixer authentication unavailable; re-authenticate and resume".into(),
+                ),
+            );
+        }
+        (job, seat, out)
     }
 
     /// The one repair a verification-only failure earns (see
@@ -10231,6 +10253,13 @@ where
             };
             let quota = class == Some(FailClass::Quota);
             let failed = parsed.is_err();
+            if !failed && matches!(ctx.node, "judge" | "vote") {
+                // A validated answer restores this seat's quorum presence,
+                // including on the normal path after an all-seat block.
+                state
+                    .quota
+                    .retain(|loss| loss.seat != originals[i].seat.key);
+            }
             done[i] = Some(parsed);
             if carry && !failed {
                 let h = state

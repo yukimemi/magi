@@ -352,3 +352,32 @@ async fn the_full_panel_present_is_still_a_healthy_ready() {
     );
 }
 }
+
+common::e2e! {
+async fn blocked_judge_and_vote_waves_restore_quorum_on_the_first_healthy_resume() {
+    for node in ["judge", "vote"] {
+        let home = common::home_lock().await;
+        let mut fx = fixture_with_quota(home, &["judge-1", "judge-2", "judge-3"]);
+        for agent in &mut fx.config.agents {
+            agent.env.insert("MOCK_ONLY_NODE".into(), node.into());
+        }
+        let mut runner = Runner::start(&fx.repo, "create note.txt".into(), fx.config.clone(), magi::run::Origin::operator()).await.unwrap();
+        runner.execute().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert_eq!(runner.state.quota.len(), 3);
+        assert!(runner.state.quota.iter().all(|loss| loss.node == node));
+        let id = runner.state.id.clone();
+        drop(runner);
+        let mut saved = magi::run::RunState::load(&id).unwrap();
+        for agent in &mut saved.config.agents { agent.env.remove("MOCK_QUOTA_SEAT"); }
+        saved.save().unwrap();
+        let mut resumed = Runner::resume(&id).unwrap();
+        resumed.execute().await.unwrap();
+        assert_eq!(resumed.state.status, RunStatus::Ready, "{}", report::run(&resumed.state));
+        assert!(resumed.state.quota.is_empty());
+        let tally = resumed.state.tally.as_ref().unwrap();
+        assert!(tally.met_quorum);
+        assert_eq!(tally.present, 3);
+    }
+}
+}

@@ -1010,6 +1010,8 @@ upstream CRLF, not drift worth committing — normalise back to LF and
   records); losses also retain the agent id. Both use `AgentOutcome::Quota`,
   so neither is immediately re-asked and both can hand over to another agent.
   Authentication raises a notice keyed by agent id asking to re-authenticate.
+  A fixer chain ending in authentication failure uses its caller's resource
+  deferral path: gate and review fix rounds remain unspent until recovery.
 - **A node with no available agents stops resumably.** When every final seat
   of an advisor, implementation or shared structured wave ends on quota/auth,
   record a `ResourceBlock` and stop `Blocked` before completing the node.
@@ -1034,7 +1036,10 @@ upstream CRLF, not drift worth committing — normalise back to LF and
   the seats recorded in `RunState::quota` for the judge/vote nodes (never a
   healthy seat), and if the re-tally restores the quorum the run picks up and
   finishes; for a seat that ranks again its `QuotaLoss` is dropped so `tally`
-  counts it present. If the quota is still out, the seat fails again, the run
+  counts it present. Successful validated judge/vote answers also clear the
+  seat's previous losses on the normal path after an all-seat `Blocked` wave;
+  the first healthy resume must restore quorum without another stall.
+  If the quota is still out, the seat fails again, the run
   stays `Stalled` and the marker is persisted (the normal end-of-execute save
   sits below the `Stalled` return), so it stays resumable for a later retry.
 

@@ -396,6 +396,13 @@ fi
 # fall through to the implementation branch below, so a seat that had just been
 # rate limited answered a retry with a SUMMARY block claiming it created
 # note.txt — which looks like success, and hid the very retry this forbids.
+# Authentication outages use the same node/seat filters as quota, but need
+# explicit operator recovery rather than a timed reset.
+if [ -n "$MOCK_AUTH_SEAT" ] && { case ",$MOCK_AUTH_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && only; then
+  printf '%s\n' '{"is_error":true,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed"}'
+  exit 1
+fi
+
 if [ -n "$MOCK_QUOTA_SEAT" ] && { case ",$MOCK_QUOTA_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && only; then
   printf '{"is_error":true,"terminal_reason":"api_error","result":"You'\''ve hit your session limit","session_id":"quota-test"}\n'
   exit 1
