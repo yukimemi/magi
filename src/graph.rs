@@ -15013,9 +15013,6 @@ mod tests {
         crate::run::pin_test_home();
     }
 
-    /// A minimal, git-free `Runner` at a given status — `settle_questions`
-    /// reads nothing else off it.
-
     #[cfg(unix)]
     async fn exhausted_base_fixture() -> (tempfile::TempDir, Runner, String, String) {
         ask_test_home();
@@ -15601,6 +15598,8 @@ esac
         assert!(runner.state.deliberation.is_empty());
     }
 
+    /// A minimal, git-free `Runner` at a given status — `settle_questions`
+    /// reads nothing else off it.
     fn runner_at(status: RunStatus) -> Runner {
         let mut state = RunState::new(
             PathBuf::from("/nonexistent/repo"),
