@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::config::{MergeMode, MergeStyle};
 use crate::run::{
     CommandOutcome, ContinuationOutcome, E2eStatus, GateStatus, JobStatus, Liveness,
-    OperatorFixOutcome, RunState, RunStatus, tail,
+    OperatorFixOutcome, RunState, RunStatus,
 };
 use crate::stats::{RepoStats, Stats};
 use crate::verdict::ReviewVote;
@@ -793,7 +793,11 @@ pub fn run(state: &RunState) -> String {
                 };
                 let _ = writeln!(s, "    {label}  {}", o.command);
                 if !o.ok() {
-                    let _ = writeln!(s, "{}", dim(&tail(&o.output_tail, 2_000)));
+                    let _ = writeln!(
+                        s,
+                        "{}",
+                        dim(&crate::run::summarize_verify(&o.output_tail, 2_000))
+                    );
                 }
             }
             for rec in &r.reviews {
@@ -998,7 +1002,11 @@ pub fn run(state: &RunState) -> String {
                 o.command
             );
             if !o.ok() {
-                let _ = writeln!(s, "{}", dim(&tail(&o.output_tail, 2_000)));
+                let _ = writeln!(
+                    s,
+                    "{}",
+                    dim(&crate::run::summarize_verify(&o.output_tail, 2_000))
+                );
             }
         }
         if let Some(c) = &state.pre_gate_commit {
@@ -1025,7 +1033,11 @@ pub fn run(state: &RunState) -> String {
                     o.command
                 );
                 if !o.ok() {
-                    let _ = writeln!(s, "{}", dim(&tail(&o.output_tail, 2_000)));
+                    let _ = writeln!(
+                        s,
+                        "{}",
+                        dim(&crate::run::summarize_verify(&o.output_tail, 2_000))
+                    );
                 }
             }
         }

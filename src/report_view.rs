@@ -677,7 +677,7 @@ fn command(o: &CommandOutcome, warn_instead_of_fail: bool) -> CommandView {
         state,
         code: o.code,
         duration_ms: o.duration_ms,
-        output_tail: (!o.ok()).then(|| tail(&o.output_tail, OUTPUT_TAIL)),
+        output_tail: (!o.ok()).then(|| crate::run::summarize_verify(&o.output_tail, OUTPUT_TAIL)),
     }
 }
 

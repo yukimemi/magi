@@ -3918,6 +3918,152 @@ pub fn tail(text: &str, max: usize) -> String {
     )
 }
 
+/// Bytes of verification output recorded and handed to fixers/reviewers.
+pub const VERIFY_SUMMARY: usize = 32_768;
+
+/// A backtrace frame line (`  41: 0x102e80de0 - <path>::{closure#0}` or
+/// `  3: std::panicking::begin_panic`), or the `at file:line` line under one.
+/// Deliberately narrow: a frame needs a number, a colon and either an address
+/// or a path, so ordinary `12: something` output is never dropped.
+fn is_frame(line: &str, after_frame: bool) -> bool {
+    let t = line.trim_start();
+    if after_frame && t.starts_with("at ") {
+        return true;
+    }
+    let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || !t[digits..].starts_with(": ") {
+        return false;
+    }
+    let rest = t[digits + 2..].trim_start();
+    rest.starts_with("0x") || rest.contains("::")
+}
+
+/// Lines after a trigger that belong to it (assertion text, `left`/`right`).
+fn trigger_context(line: &str) -> Option<usize> {
+    let t = line.trim();
+    if t.contains("panicked at") {
+        Some(6)
+    } else if (t.starts_with("---- ") && t.ends_with(" ----"))
+        || t.starts_with("--- STDERR:")
+        || t.starts_with("--- STDOUT:")
+    {
+        Some(3)
+    } else if t.starts_with("error:")
+        || t.starts_with("error[")
+        || t.starts_with("FAIL ")
+        || t.contains("FAIL [")
+        || t.starts_with("failures:")
+        || t.contains("test result: FAILED")
+    {
+        Some(4)
+    } else {
+        None
+    }
+}
+
+fn clip_line(line: &str, max: usize) -> &str {
+    if line.len() <= max {
+        return line;
+    }
+    let mut cut = max;
+    while !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &line[..cut]
+}
+
+/// Summarise verification output to roughly `max` bytes, keeping the reason a
+/// command failed. A plain tail is useless for a failing test: the panic
+/// message sits hundreds of KB before the end, behind a backtrace. So:
+///
+/// 1. backtrace frame lines are dropped (counted in the header);
+/// 2. if that already fits, the rest is returned whole;
+/// 3. otherwise keep excerpts, each from a failure marker (`panicked at`,
+///    `---- test stdout ----`, nextest `FAIL`/`STDERR`, `error:`, ...) through
+///    a few following lines (the assertion and `left`/`right`), share the
+///    budget evenly between excerpts and drop the later ones when it runs
+///    out, then append the final tail (where `test result:` lives).
+///
+/// Short output is returned unchanged. The full text belongs in an artifact.
+pub fn summarize_verify(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_owned();
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropped = 0usize;
+    let mut prev_frame = false;
+    for line in text.lines() {
+        let frame = is_frame(line, prev_frame);
+        if frame {
+            dropped += 1;
+        } else {
+            kept.push(line);
+        }
+        prev_frame = frame;
+    }
+    let total: usize = kept.iter().map(|l| l.len() + 1).sum();
+    let note = if dropped > 0 {
+        format!(" ({dropped} backtrace frame line(s) dropped)")
+    } else {
+        String::new()
+    };
+    let overhead = 300;
+    if total + overhead <= max {
+        return format!("[... output reduced{note} ...]\n{}\n", kept.join("\n"));
+    }
+    // The tail comes first so that excerpts never repeat it.
+    let tail_budget = (max / 4).min(4_096);
+    let mut tail_start = kept.len();
+    let mut used = 0usize;
+    while tail_start > 0 && used + kept[tail_start - 1].len() < tail_budget {
+        tail_start -= 1;
+        used += kept[tail_start].len() + 1;
+    }
+    // Excerpts as merged half-open line ranges.
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (i, line) in kept[..tail_start].iter().enumerate() {
+        if let Some(after) = trigger_context(line) {
+            let end = (i + 1 + after).min(tail_start);
+            match ranges.last_mut() {
+                Some(last) if i <= last.1 => last.1 = last.1.max(end),
+                _ => ranges.push((i, end)),
+            }
+        }
+    }
+    let budget = max.saturating_sub(used + overhead);
+    let shown = ranges.len().min((budget / 240).max(1));
+    let per = budget / shown.max(1);
+    let mut body = String::new();
+    for &(a, b) in &ranges[..shown] {
+        let mut block = String::new();
+        for line in &kept[a..b] {
+            let line = clip_line(line, 600);
+            if block.len() + line.len() + 1 > per {
+                break;
+            }
+            block.push_str(line);
+            block.push('\n');
+        }
+        body.push_str(&block);
+        body.push_str("[...]\n");
+    }
+    let hidden = ranges.len() - shown;
+    let more = if hidden > 0 {
+        format!("; {hidden} more excerpt(s) not shown")
+    } else {
+        String::new()
+    };
+    let tail_text: String = kept[tail_start..].iter().flat_map(|l| [*l, "\n"]).collect();
+    let out = format!(
+        "[... output reduced from {} bytes{note}; {shown} failure excerpt(s) kept{more}, then the end ...]\n{body}{tail_text}",
+        text.len(),
+    );
+    if out.len() > max {
+        return tail(&out, max);
+    }
+    out
+}
+
 /// Path of a run artifact.
 pub fn artifact_path(run: &RunState, name: &str) -> PathBuf {
     run.dir().join("artifacts").join(name)
@@ -4666,6 +4812,40 @@ mod tests {
         assert!(t.ends_with("line 99\n"));
         assert!(t.len() < 120);
         assert_eq!(tail("short", 40), "short");
+    }
+
+    #[test]
+    fn summarize_verify_keeps_panics_behind_a_huge_backtrace() {
+        let mut text =
+            String::from("running 1 test\ntest a ... FAILED\n\nfailures:\n\n---- a stdout ----\n");
+        text.push_str("thread 'a' panicked at tests/a.rs:9:5:\nassertion `left == right` failed\n  left: 1\n right: 2\nstack backtrace:\n");
+        for i in 0..6000 {
+            text.push_str(&format!("  {i}: 0x102e80de0 - <web_render::x::{{closure#0}}>\n             at /rustc/abc/library/core/src/ops/function.rs:250:5\n"));
+        }
+        text.push_str("\nfailures:\n    a\n\ntest result: FAILED. 0 passed; 1 failed\n");
+        assert!(text.len() > 400_000);
+        let s = summarize_verify(&text, VERIFY_SUMMARY);
+        assert!(s.contains("panicked at tests/a.rs:9:5"));
+        assert!(s.contains("left: 1") && s.contains("right: 2"));
+        assert!(s.contains("---- a stdout ----"));
+        assert!(s.contains("test result: FAILED"));
+        assert!(!s.contains("0x102e80de0"));
+        assert!(s.len() <= VERIFY_SUMMARY);
+        // Re-summarising to a smaller budget still keeps the panic.
+        assert!(summarize_verify(&s, 1_500).contains("panicked at tests/a.rs:9:5"));
+        assert_eq!(summarize_verify("short", 100), "short");
+    }
+
+    #[test]
+    fn summarize_verify_keeps_panics_when_the_noise_is_not_frames() {
+        let mut text = String::from("---- t stdout ----\nthread 't' panicked at x.rs:1:1:\nboom\n");
+        text.push_str(&"noise line\n".repeat(50_000));
+        text.push_str("test result: FAILED\n");
+        let s = summarize_verify(&text, 8_000);
+        assert!(s.contains("panicked at x.rs:1:1"));
+        assert!(s.contains("boom"));
+        assert!(s.contains("test result: FAILED"));
+        assert!(s.len() <= 8_000);
     }
 
     #[test]

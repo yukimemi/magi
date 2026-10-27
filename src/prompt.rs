@@ -1267,7 +1267,7 @@ pub fn recovery_fix(
 }
 
 /// How much of one failed gate command's output the fixer is shown.
-const GATE_FIX_TAIL: usize = 6_000;
+const GATE_FIX_TAIL: usize = crate::run::VERIFY_SUMMARY;
 
 /// Prompt for the fixer when the final `verify.gate` failed on a tree the
 /// reviewers had already cleared.
@@ -1310,7 +1310,7 @@ pub fn gate_fix_in(
             o.command,
             o.code
                 .map_or_else(|| "no exit code".to_owned(), |c| c.to_string()),
-            crate::run::tail(&o.output_tail, GATE_FIX_TAIL).trim()
+            crate::run::summarize_verify(&o.output_tail, GATE_FIX_TAIL).trim()
         );
     }
     s.push_str(
