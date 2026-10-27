@@ -203,8 +203,12 @@ pub fn head_of(text: &str, max: usize) -> String {
 }
 
 fn evidence_from(round: &ReviewRound, prior: &RunState) -> Option<Evidence> {
-    let scrub =
-        |s: &str| crate::scrub::scrub(&tail_of(s, TAIL_MAX), &crate::scrub::Identity::current());
+    let scrub = |s: &str| {
+        crate::scrub::scrub(
+            &crate::run::summarize_verify(s, TAIL_MAX),
+            &crate::scrub::Identity::current(),
+        )
+    };
     let failed = |o: &&CommandOutcome| !o.ok() && !o.resource_blocked;
     if round.e2e_status() == E2eStatus::Failed
         && let (Some(o), Some(head)) = (round.e2e.iter().find(failed), &round.verified_head)
@@ -480,6 +484,28 @@ mod tests {
         assert_eq!(e.command, "cargo test");
         assert_eq!(e.head, "aaa111");
         assert!(e.output_tail.contains("quiet_spawn"));
+    }
+
+    #[test]
+    fn verification_recovery_preserves_panic_before_large_backtrace() {
+        let output = format!(
+            "[full output: artifacts/e2e-1.out]\n---- widget stdout ----\nwidget log\nthread 'widget' panicked at widget.rs:12:\nassertion failed: widget missing\n{}test result: FAILED\n",
+            "  41: 0x1234 - backtrace frame\n".repeat(10000)
+        );
+        let p = prior(round("aaa111", vec![outcome(101, &output)]));
+        let r = assess("r1", Some(&p), "base1", Relation::Same);
+        let prompt = crate::prompt::recovery_fix("repair widget", &r, 2, "en");
+        assert!(prompt.contains("panicked at widget.rs:12"));
+        assert!(prompt.contains("assertion failed: widget missing"));
+        let evidence = r.evidence.unwrap();
+        assert!(evidence.output_tail.len() <= TAIL_MAX);
+        assert!(evidence.output_tail.contains("panicked at widget.rs:12"));
+        assert!(
+            evidence
+                .output_tail
+                .contains("assertion failed: widget missing")
+        );
+        assert!(evidence.output_tail.contains("artifacts/e2e-1.out"));
     }
 
     #[test]

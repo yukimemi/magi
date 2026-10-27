@@ -52,16 +52,13 @@ use crate::run::{
     GithubTextChoice, GraftOutcome, GraftRecord, Handover, JobRecord, JobStatus, Judgement,
     MergeOutcome, OperatorFixFinding, OperatorFixOutcome, OperatorFixRequest, Origin, ParkCause,
     QuotaLoss, ReviewRecord, ReviewRevoteRecord, ReviewRound, RunState, RunStatus, SeatHistory,
-    Tally, VoteRecord, tail, write_artifact,
+    Tally, VoteRecord, summarize_verify, write_artifact,
 };
 use crate::verdict::{
     self, FinalVote, Finding, FixReport, Position, Proposal, Ranking, Review, ReviewRevote,
     ReviewVote, Severity,
 };
 use crate::worktree_setup;
-
-/// How much verification output is kept and fed back to the fixer.
-const OUTPUT_TAIL: usize = 8_000;
 
 /// Bytes of a failing command's output kept in an event, so the reason a run
 /// stopped is readable from the report without opening `run.json`.
@@ -7243,7 +7240,7 @@ impl Runner {
                             "`{}` -> {:?}\n{}",
                             o.command,
                             o.code,
-                            tail(&o.output_tail, EVENT_OUTPUT_TAIL)
+                            summarize_verify(&o.output_tail, EVENT_OUTPUT_TAIL)
                         )
                     })
                     .collect();
@@ -7428,7 +7425,7 @@ impl Runner {
                         format!(
                             "FAIL ({:?})\n{}",
                             o.code,
-                            tail(&o.output_tail, EVENT_OUTPUT_TAIL)
+                            summarize_verify(&o.output_tail, EVENT_OUTPUT_TAIL)
                         )
                     }
                 ),
@@ -10832,7 +10829,10 @@ fn e2e_outcome_label(o: &CommandOutcome) -> String {
     } else {
         format!("FAIL ({:?})", o.code)
     };
-    format!("{reason}\n{}", tail(&o.output_tail, EVENT_OUTPUT_TAIL))
+    format!(
+        "{reason}\n{}",
+        summarize_verify(&o.output_tail, EVENT_OUTPUT_TAIL)
+    )
 }
 
 /// Run `verify.e2e`, retrying once if the first attempt could not build or
@@ -11047,10 +11047,30 @@ async fn run_commands(
             }
             Err(e) => (None, format!("failed to spawn `{}`: {e}", shell[0])),
         };
+        let mut summary = summarize_verify(&body, crate::run::VERIFY_SUMMARY);
+        if !body.is_empty() {
+            // The full text is kept whatever the summary dropped. A fresh
+            // name per command so a resume or retry never overwrites an
+            // earlier run's output. A failed write changes no verdict.
+            match crate::run::write_verification_artifact(state, task, &body) {
+                Ok(name) if summary != body => {
+                    summary = format!("[full output: artifacts/{name}]\n{summary}");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    let warning = format!("could not save the full {task} output: {e:#}");
+                    tracing::warn!("{warning}");
+                    state.event(node, warning);
+                    if summary != body {
+                        summary = format!("[full output could not be saved: {e:#}]\n{summary}");
+                    }
+                }
+            }
+        }
         out.push(CommandOutcome {
             command: command.clone(),
             code,
-            output_tail: tail(&body, OUTPUT_TAIL),
+            output_tail: summary,
             duration_ms: started.elapsed().as_millis() as u64,
             resource_blocked: false,
         });
@@ -11499,7 +11519,7 @@ pub(crate) async fn run_landing_gate(
                     format!(
                         "FAIL ({:?})\n{}",
                         o.code,
-                        tail(&o.output_tail, EVENT_OUTPUT_TAIL)
+                        summarize_verify(&o.output_tail, EVENT_OUTPUT_TAIL)
                     )
                 }
             ),
@@ -12999,6 +13019,31 @@ mod tests {
     /// to make real (and, if it runs at all, real*ly fail*) git calls.
     #[tokio::test]
     async fn selected_public_ancestry_survives_obsolete_candidate_and_current_base_sync() {
+        const CHILD: &str = "MAGI_SELECTED_PUBLIC_ANCESTRY_TEST";
+        if std::env::var_os(CHILD).is_none() {
+            // Other tests reconcile every run in the process-global home,
+            // briefly taking owner locks. This ancestry test expects an idle
+            // predecessor, so give it its own process and pinned test home.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "graph::tests::selected_public_ancestry_survives_obsolete_candidate_and_current_base_sync",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("MAGI_WORKER_HOME")
+                .env_remove("MAGI_WORKER_ID")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         ask_test_home();
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
@@ -17316,6 +17361,68 @@ esac
             "pre\ngate\ne2e\npre\ngate\n"
         );
         assert_worker();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn verification_keeps_the_panic_and_the_full_output() {
+        crate::run::pin_test_home();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.disk.min_free_bytes = 0;
+        let mut state = RunState::new(
+            tmp.path().to_owned(),
+            "main".into(),
+            "base".into(),
+            "verification evidence".into(),
+            config,
+        );
+        let script = "echo \"thread 'x' panicked at t.rs:1:1:\"; echo 'boom assertion'; \
+                      i=0; while [ $i -lt 20000 ]; do echo \"  $i: 0xabc - <a::b>\"; \
+                      echo '             at /x/y.rs:1:1'; i=$((i+1)); done; exit 101";
+        let mut names = Vec::new();
+        for _ in 0..2 {
+            let (outcomes, _) = run_commands(
+                &mut state,
+                "gate",
+                "gate",
+                0,
+                &["sh".into(), "-c".into()],
+                &[script.into()],
+                tmp.path(),
+                Duration::from_secs(60),
+            )
+            .await;
+            let tail = &outcomes[0].output_tail;
+            assert!(tail.contains("panicked at t.rs:1:1"), "{tail}");
+            assert!(tail.contains("boom assertion"));
+            assert!(tail.len() <= crate::run::VERIFY_SUMMARY + 100);
+            let line = tail.lines().next().unwrap();
+            names.push(line.to_owned());
+        }
+        assert_ne!(names[0], names[1], "the second run must not overwrite");
+        let full = crate::run::read_artifact(&state, "gate-1.out").unwrap();
+        assert!(full.len() > 500_000 && full.contains("boom assertion"));
+        assert!(crate::run::read_artifact(&state, "gate-2.out").is_some());
+
+        // Storage failures are evidence too; preserve the command's verdict.
+        std::fs::remove_dir_all(state.dir().join("artifacts")).unwrap();
+        std::fs::write(state.dir().join("artifacts"), "blocked").unwrap();
+        let (outcomes, _) = run_commands(
+            &mut state,
+            "gate",
+            "gate",
+            0,
+            &["sh".into(), "-c".into()],
+            &["echo failure-output; exit 7".into()],
+            tmp.path(),
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(outcomes[0].code, Some(7));
+        assert!(state.events.iter().any(|e| {
+            e.node == "gate" && e.message.contains("could not save the full gate output:")
+        }));
     }
 
     #[cfg(unix)]
