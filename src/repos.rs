@@ -61,11 +61,14 @@ pub fn scan(roots: &[PathBuf]) -> Vec<Repo> {
         for host in subdirs(root) {
             for owner in subdirs(&host) {
                 for dir in subdirs(&owner) {
-                    if !dir.join(".git").exists() {
+                    if !dir.join(".git").exists() || crate::repo_clone::acquisition_incomplete(&dir)
+                    {
                         continue;
                     }
                     let path = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-                    if !seen.insert(path.clone()) {
+                    if crate::repo_clone::acquisition_incomplete(&path)
+                        || !seen.insert(path.clone())
+                    {
                         continue;
                     }
                     let name = format!("{}/{}", file_name(&owner), file_name(&dir));
@@ -147,7 +150,7 @@ fn collect(dir: &Path, depth: u32, seen: &mut HashSet<PathBuf>, out: &mut Vec<Ca
         match main_checkout(&child) {
             Some(main) => {
                 let path = main.canonicalize().unwrap_or(main);
-                if seen.insert(path.clone()) {
+                if !crate::repo_clone::acquisition_incomplete(&path) && seen.insert(path.clone()) {
                     let name = file_name(&path).into_owned();
                     let owner_name = path
                         .parent()
@@ -179,7 +182,7 @@ fn collect(dir: &Path, depth: u32, seen: &mut HashSet<PathBuf>, out: &mut Vec<Ca
 fn main_checkout(dir: &Path) -> Option<PathBuf> {
     let dot_git = dir.join(".git");
     if dot_git.is_dir() {
-        return Some(dir.to_path_buf());
+        return (!crate::repo_clone::acquisition_incomplete(dir)).then(|| dir.to_path_buf());
     }
     let contents = std::fs::read_to_string(&dot_git).ok()?;
     let gitdir = contents.strip_prefix("gitdir:")?.trim();
@@ -188,7 +191,8 @@ fn main_checkout(dir: &Path) -> Option<PathBuf> {
     if git_dir.file_name()?.to_str()? != ".git" {
         return None;
     }
-    Some(git_dir.parent()?.to_path_buf())
+    let main = git_dir.parent()?;
+    (!crate::repo_clone::acquisition_incomplete(main)).then(|| main.to_path_buf())
 }
 
 /// Whether `hint` mentions `token` as a whole word. `/`, `-` and `_` count as

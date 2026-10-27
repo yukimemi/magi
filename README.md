@@ -1166,10 +1166,13 @@ trigger network access. The default is `false` to keep unattended filing from
 acquiring repositories unless explicitly enabled. Read-only listing and stats
 never acquire repositories.
 
-Acquisition validates GitHub names, confirms access using
-`gh repo view owner/repo --json nameWithOwner`, and rejects redirects to a
-different name (case-only differences are accepted). It then runs
-`gh repo clone {repo} {dest}` by default. `gh` must be installed and authenticated.
+Acquisition validates GitHub names and confirms access using
+`gh repo view https://github.com/owner/repo --json nameWithOwner`.
+Redirects to a different name are rejected (case-only differences are accepted).
+It then runs
+`gh repo clone https://github.com/{repo}.git {dest}` by default, so `GH_HOST`
+cannot redirect these gh commands to another host. `gh` must be installed and
+authenticated.
 `clone_command` is an argv array with `{repo}`, `{owner}`, `{name}`, and `{dest}`
 placeholders, passed directly without a shell. Declare it in one config layer;
 arrays are never concatenated into a command. The destination must be
@@ -1177,8 +1180,12 @@ arrays are never concatenated into a command. The destination must be
 overwritten. For the `shoka` example above, configure shoka's own clone root to
 match the first root. Commands that fail or create a checkout elsewhere report
 an error; magi does not switch to another repository. Simultaneous acquisitions
-under the same root are serialized and recheck local matches. After acquisition,
-repository configuration still comes from the remote base commit.
+under the same root are serialized and recheck local matches. An incomplete
+acquisition is hidden from discovery and refused by direct path resolution.
+A sibling `.magi-clone@<name>` marker is removed only after successful checkout
+validation. If a clone fails or is interrupted, inspect and repair or remove the
+partial checkout before manually removing its marker and retrying. After
+acquisition, repository configuration still comes from the remote base commit.
 
 `mode = "none"` is the default on purpose: magi prints the merge command and
 stops. It does not touch your base branch unless you ask it to.

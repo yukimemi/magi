@@ -1,6 +1,6 @@
 //! Opt-in acquisition after the CLI repository resolver establishes a local miss.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Validate an explicit GitHub owner/repository before invoking external tools.
@@ -70,6 +70,21 @@ pub async fn clone_lock(cfg: &crate::config::Repos) -> anyhow::Result<CloneLock>
     }
 }
 
+/// A sibling file survives failed/cancelled acquisitions without pre-creating
+/// the destination (some configured clone tools require it to be absent).
+fn incomplete_marker(checkout: &Path) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".magi-clone@");
+    name.push(checkout.file_name().unwrap_or_default());
+    checkout.with_file_name(name)
+}
+
+/// Discovery must not expose a checkout until its acquisition has succeeded.
+/// Treat unreadable markers as incomplete rather than publishing uncertain state.
+pub fn acquisition_incomplete(checkout: &Path) -> bool {
+    !matches!(std::fs::symlink_metadata(incomplete_marker(checkout)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
 /// Acquire a confirmed GitHub repository at the configured layout destination.
 /// Called only after a local miss under the resolver's acquisition lock.
 /// `gh` is the executable path, allowing tests to avoid changing PATH.
@@ -96,7 +111,7 @@ pub async fn clone_github_with_gh(
         gh.to_owned(),
         "repo".into(),
         "view".into(),
-        repo.into(),
+        format!("https://github.com/{repo}"),
         "--json".into(),
         "nameWithOwner".into(),
     ];
@@ -127,7 +142,7 @@ pub async fn clone_github_with_gh(
         gh.to_owned(),
         "repo".into(),
         "clone".into(),
-        "{repo}".into(),
+        "https://github.com/{repo}.git".into(),
         "{dest}".into(),
     ];
     let template = cfg.clone_command.as_ref().unwrap_or(&default);
@@ -147,6 +162,10 @@ pub async fn clone_github_with_gh(
         })
         .collect();
     std::fs::create_dir_all(dest.parent().context("clone destination has no parent")?)?;
+    let marker = incomplete_marker(&dest);
+    std::fs::OpenOptions::new().write(true).create_new(true).open(&marker)
+        .with_context(|| format!("cannot mark acquisition at {}; inspect any previous failed acquisition and its marker {}", dest.display(), marker.display()))?;
+    // Leave the marker on every failure, including cancellation/process exit.
     acquisition_command(&argv).await?;
     let canonical = dest
         .canonicalize()
@@ -162,6 +181,12 @@ pub async fn clone_github_with_gh(
         "command {argv:?} did not create a checkout at {}",
         dest.display()
     );
+    std::fs::remove_file(&marker).with_context(|| {
+        format!(
+            "publish completed acquisition by removing {}",
+            marker.display()
+        )
+    })?;
     Ok(canonical)
 }
 
@@ -262,6 +287,10 @@ mod acquisition_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains(&clone) && error.contains("clone-failed"));
+        std::fs::remove_file(incomplete_marker(
+            &cfg.roots[0].join("github.com/sample/project"),
+        ))
+        .unwrap();
         let clone = script(tmp.path(), "clone", "exit 0");
         cfg.clone_command = Some(vec![clone]);
         assert!(
@@ -301,10 +330,12 @@ mod acquisition_tests {
         let gh = script(
             tmp.path(),
             "gh",
-            r#"if [ "$2" = view ]; then
+            r#"export GH_HOST=enterprise.invalid
+if [ "$2" = view ]; then
+    [ "$3" = https://github.com/sample/project ] || exit 8
     echo '{"nameWithOwner":"Sample/Project"}'
 else
-    [ "$1" = repo ] && [ "$2" = clone ] && [ "$3" = sample/project ] || exit 8
+    [ "$1" = repo ] && [ "$2" = clone ] && [ "$3" = https://github.com/sample/project.git ] || exit 8
     git init -q "$4"
 fi"#,
         );

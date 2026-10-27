@@ -1428,7 +1428,8 @@ pub struct Repos {
     /// Allow explicit owner/repo misses to be confirmed with gh and cloned.
     pub auto_clone: bool,
     /// Literal argv template; {repo}, {owner}, {name}, {dest} are substituted.
-    /// Defaults to `gh repo clone {repo} {dest}`. Declare in a single layer.
+    /// Defaults to `gh repo clone https://github.com/{repo}.git {dest}`.
+    /// Declare in a single layer.
     pub clone_command: Option<Vec<String>>,
     /// How long a scan is trusted before the next request re-scans it,
     /// seconds. `0` means never trust it: scan on every request. Defaults to

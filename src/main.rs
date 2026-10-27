@@ -3987,28 +3987,41 @@ async fn resolve_repo_with_gh(
 ) -> Result<PathBuf> {
     match repo.canonicalize() {
         Ok(canonical) => {
-            if let Err(e) = magi::git::toplevel(&canonical).await {
-                if repo == Path::new(".") {
-                    if let Some(home) = dirs::home_dir() {
-                        if let Some(found) =
-                            repos::discover_verified(&home, &[], hint, magi::updater::repo_name())
-                                .await
-                        {
-                            eprintln!(
-                                "the default --repo `.` ({}) is not a git checkout; using {} \
+            let top = match magi::git::toplevel(&canonical).await {
+                Ok(top) => top,
+                Err(e) => {
+                    if repo == Path::new(".") {
+                        if let Some(home) = dirs::home_dir() {
+                            if let Some(found) = repos::discover_verified(
+                                &home,
+                                &[],
+                                hint,
+                                magi::updater::repo_name(),
+                            )
+                            .await
+                            {
+                                eprintln!(
+                                    "the default --repo `.` ({}) is not a git checkout; using {} \
                                  instead - {}",
-                                canonical.display(),
-                                found.path.display(),
-                                found.reason,
-                            );
-                            return Ok(found.path);
+                                    canonical.display(),
+                                    found.path.display(),
+                                    found.reason,
+                                );
+                                return Ok(found.path);
+                            }
                         }
                     }
+                    return Err(e).with_context(|| {
+                        format!("--repo {} is not a git working tree", canonical.display())
+                    });
                 }
-                return Err(e).with_context(|| {
-                    format!("--repo {} is not a git working tree", canonical.display())
-                });
-            }
+            };
+            anyhow::ensure!(
+                !magi::repo_clone::acquisition_incomplete(&canonical)
+                    && !magi::repo_clone::acquisition_incomplete(&top),
+                "--repo {} has an incomplete acquisition; inspect the checkout and its acquisition marker before using it",
+                canonical.display()
+            );
             Ok(canonical)
         }
         Err(_) => {
@@ -6752,6 +6765,122 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(gh.with_extension("log")).unwrap(),
             "view\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resolve_repo_hides_running_and_failed_acquisitions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let machine = tmp.path().join("config");
+        std::fs::create_dir_all(machine.join("magi")).unwrap();
+        let _machine = NoMachineConfig::set_dir(machine.to_str().unwrap());
+        let gh = tmp.path().join("gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\necho view >> \"$0.log\"\necho '{\"nameWithOwner\":\"sample/project\"}'\n",
+        )
+        .unwrap();
+        let clone = tmp.path().join("clone");
+        std::fs::write(
+            &clone,
+            r#"#!/bin/sh
+git init -q "$1" || exit 7
+touch "$0.ready"
+tries=0
+while [ ! -f "$0.release" ]; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 1000 ] || exit 8
+    sleep 0.01
+done
+[ ! -f "$0.fail" ] || exit 9
+"#,
+        )
+        .unwrap();
+        for path in [&gh, &clone] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut cfg = magi::config::Repos {
+            roots: vec![tmp.path().join("root")],
+            auto_clone: true,
+            clone_command: Some(vec![clone.display().to_string(), "{dest}".into()]),
+            ..Default::default()
+        };
+        let save = |cfg: &magi::config::Repos| {
+            std::fs::write(
+                machine.join("magi/config.toml"),
+                format!("[repos]\n{}", toml::to_string(cfg).unwrap()),
+            )
+            .unwrap();
+        };
+        save(&cfg);
+        let dest = cfg.roots[0].join("github.com/sample/project");
+        let resolve = || {
+            resolve_repo_with_gh(
+                Path::new("sample/project"),
+                tmp.path(),
+                None,
+                true,
+                gh.to_str().unwrap(),
+            )
+        };
+        let observer = async {
+            let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !clone.with_extension("ready").exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            let hidden = repos::scan(&cfg.roots).is_empty();
+            let direct = resolve_repo(&dest, tmp.path(), None).await;
+            let competing =
+                tokio::time::timeout(std::time::Duration::from_millis(100), resolve()).await;
+            // Release the child before asserting, so failures cannot strand it.
+            std::fs::write(clone.with_extension("release"), "").unwrap();
+            (ready, hidden, direct, competing)
+        };
+        let (first, (ready, hidden, direct, competing)) = tokio::join!(resolve(), observer);
+        first.unwrap();
+        ready.unwrap();
+        assert!(hidden, "an in-progress checkout must not be listed");
+        assert!(
+            direct
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete acquisition")
+        );
+        assert!(
+            competing.is_err(),
+            "a second acquisition must wait for completion"
+        );
+        assert_eq!(resolve().await.unwrap(), dest.canonicalize().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(gh.with_extension("log")).unwrap(),
+            "view\n"
+        );
+
+        cfg.roots = vec![tmp.path().join("failed")];
+        save(&cfg);
+        std::fs::write(clone.with_extension("fail"), "").unwrap();
+        assert!(resolve().await.unwrap_err().to_string().contains("failed"));
+        assert!(repos::scan(&cfg.roots).is_empty());
+        let err = resolve().await.unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        let failed_dest = cfg.roots[0].join("github.com/sample/project");
+        assert!(
+            resolve_repo(&failed_dest, tmp.path(), None)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete acquisition")
+        );
+        cfg.auto_clone = false;
+        save(&cfg);
+        assert!(resolve().await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(gh.with_extension("log")).unwrap(),
+            "view\nview\n"
         );
     }
 
