@@ -3269,11 +3269,9 @@ impl Runner {
                 }
                 AgentOutcome::Quota(o) => {
                     cumulative_wait_ms += o.duration_ms;
-                    self.state.quota.push(QuotaLoss::from_report(
-                        seat.key.clone(),
-                        "fix",
-                        o.quota.as_ref(),
-                    ));
+                    let loss = QuotaLoss::from_report(seat.key.clone(), "fix", o.quota.as_ref());
+                    block_machine_outage(&mut self.state, "fix", std::slice::from_ref(&loss));
+                    self.state.quota.push(loss);
                     self.state.event(
                         "fix",
                         format!(
@@ -3555,7 +3553,8 @@ impl Runner {
         // while `self` is mutably borrowed by the node's own bookkeeping.
         let run_id = self.state.id.clone();
         let prompts = self.state.config.prompts.clone();
-        if !self.state.deliberation.is_empty() {
+        let rounds = self.state.config.graph.deliberate_rounds;
+        if self.state.deliberation.len() >= rounds {
             return Ok(());
         }
         let tops: Vec<char> = self
@@ -3564,7 +3563,6 @@ impl Runner {
             .iter()
             .filter_map(|j| j.ranking.first().copied())
             .collect();
-        let rounds = self.state.config.graph.deliberate_rounds;
         if tops.len() < 2 || tops.iter().all(|t| *t == tops[0]) || rounds == 0 {
             if tops.len() >= 2 && tops.iter().all(|t| *t == tops[0]) {
                 self.state.event(
@@ -3597,8 +3595,10 @@ impl Runner {
         // Judges argue in sequence so that a turn can answer the one before it;
         // that is the difference between deliberation and three parallel
         // monologues.
-        for round in 1..=rounds {
+        for round in self.state.deliberation.len() + 1..=rounds {
             let mut turns: Vec<DeliberationTurn> = Vec::new();
+            let mut round_losses = Vec::new();
+            let mut asked = 0;
             for (j, spec) in self.roles.judges.clone().into_iter().enumerate() {
                 if self.state.judgements[j].failed.is_some() {
                     continue;
@@ -3650,6 +3650,7 @@ impl Runner {
                 // handed to the next roster agent, which gets the full
                 // context. An empty answer is a turn, not a failure.
                 let mut losses = Vec::new();
+                asked += 1;
                 let mut results = ask_wave_with::<String>(
                     vec![job],
                     Arc::clone(&self.sem),
@@ -3663,6 +3664,10 @@ impl Runner {
                     },
                 )
                 .await;
+                if self.state.resource_block.is_some() {
+                    return self.stop_for_resource();
+                }
+                round_losses.extend(losses.iter().cloned());
                 self.state.quota.extend(losses);
                 let (updated, res, _) = results.pop().expect("one job in, one result out");
                 seat = updated;
@@ -3697,6 +3702,10 @@ impl Runner {
                     body: blind::sanitize_prose(&body, &self.state.config.blind),
                     tentative,
                 });
+            }
+            if asked > 0 && turns.is_empty() && round_losses.len() == asked {
+                block_machine_outage(&mut self.state, "deliberate", &round_losses);
+                return self.stop_for_resource();
             }
             self.state
                 .deliberation
@@ -5464,6 +5473,10 @@ impl Runner {
                 fix.failed = Some(format!("the fixer was not started: {e}"));
             }
         }
+        if self.state.resource_block.is_some() {
+            self.state.seats.insert(final_seat.key.clone(), final_seat);
+            return self.stop_for_resource();
+        }
         if fix.continuation.is_none() {
             fix.continuation = Some(ContinuationRecord::not_needed());
         }
@@ -5740,13 +5753,8 @@ impl Runner {
             break;
         }
         let (job, seat, out) = last.expect("the fixer chain always has an entry");
-        if let AgentOutcome::Quota(output) = &out
-            && output
-                .quota
-                .as_ref()
-                .is_some_and(|quota| quota.cause == agent::QuotaCause::Authentication)
-        {
-            // Every fallback was tried. Authentication cannot be repaired by
+        if let AgentOutcome::Quota(output) = &out {
+            // Every fallback was tried. Machine outages cannot be repaired by
             // spending a fix round; use each caller's resumable resource path.
             let loss = QuotaLoss::from_report(seat.key.clone(), node, output.quota.as_ref());
             block_machine_outage(&mut self.state, node, std::slice::from_ref(&loss));
@@ -5757,7 +5765,7 @@ impl Runner {
                 job,
                 seat,
                 AgentOutcome::ResourceBlocked(
-                    "fixer authentication unavailable; re-authenticate and resume".into(),
+                    "fixer unavailable; restore agent availability and resume".into(),
                 ),
             );
         }
@@ -6873,6 +6881,10 @@ impl Runner {
                 fix.failed = Some("rate limited (quota); fixer could not run".to_owned());
             }
             AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => fix.failed = Some(e),
+        }
+        if self.state.resource_block.is_some() {
+            self.state.seats.insert(final_seat.key.clone(), final_seat);
+            return Ok(FixStep::Resource);
         }
         fix.continuation = Some(continuation);
         self.state.seats.insert(final_seat.key.clone(), final_seat);
@@ -10304,6 +10316,7 @@ where
     // A stalled quorum already has its own recovery checkpoint. Refresh
     // its missing seats before deciding whether it can resume.
     if state.status != RunStatus::Stalled
+        && ctx.node != "deliberate"
         && n > 0
         && losses.len() == n
         && done.iter().all(|r| r.as_ref().is_some_and(Result::is_err))

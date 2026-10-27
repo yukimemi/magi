@@ -160,6 +160,7 @@ pub async fn rebase_with_fixer(
         let stop = rebase_head(scratch).await;
         let index_outside = Some(round_baseline(state, scratch, &paths).await?);
         state.rebase_fixes.push(RebaseFixRecord {
+            outage: None,
             agent: ids[0].clone(),
             paths: paths.clone(),
             from: Some(orig.clone()),
@@ -236,16 +237,19 @@ pub async fn rebase_with_fixer(
         let (out, seat_name) = last.expect("the fixer chain always has an entry");
 
         let mut error = None;
-        let mut quota = false;
         match out {
             Ok(o) if o.quota_exhausted() => {
-                state.quota.push(QuotaLoss::from_report(
-                    seat_name,
-                    "rebase",
-                    o.quota.as_ref(),
-                ));
-                error = Some("rate limited (quota); the fixer could not run".to_owned());
-                quota = true;
+                let loss = QuotaLoss::from_report(seat_name, "rebase", o.quota.as_ref());
+                if let Some(record) = state.rebase_fixes.last_mut() {
+                    record.outage = Some(loss.cause);
+                }
+                crate::graph::block_machine_outage(state, "rebase", std::slice::from_ref(&loss));
+                state.quota.push(loss);
+                state.save()?;
+                return Err(crate::repo_lock::ResourceBlocked(
+                    "rebase fixer unavailable; restore agent availability and resume".into(),
+                )
+                .into());
             }
             Ok(o) if !o.usable() => {
                 error = Some(format!(
@@ -260,32 +264,16 @@ pub async fn rebase_with_fixer(
         if let Some(r) = state.rebase_fixes.last_mut() {
             r.error = error.clone();
         }
-        if !quota {
-            // The seat resolved contents; the launcher owns Git's metadata.
-            // A denied write is `Err` (a resumable stop, no further round).
-            if let Launch::Nothing(why) = launcher_stage(state, scratch, &orig, &onto_sha).await? {
-                state.event("rebase", format!("launcher staging skipped: {why}"));
-            }
+        // The seat resolved contents; the launcher owns Git's metadata.
+        // A denied write is a resumable stop with no further round.
+        if let Launch::Nothing(why) = launcher_stage(state, scratch, &orig, &onto_sha).await? {
+            state.event("rebase", format!("launcher staging skipped: {why}"));
         }
         let finished = !git::rebase_in_progress(scratch).await;
         if let Some(r) = state.rebase_fixes.last_mut() {
             r.finished = finished;
         }
         state.save()?;
-
-        if quota {
-            // A retry now fails the same way; do not burn the rest.
-            let paths = git::unmerged_paths(scratch).await.unwrap_or_default();
-            let why = reason(
-                state.rebase_fixes.len(),
-                cap,
-                &paths,
-                &said,
-                "the fixer hit its rate limit",
-            );
-            abandon(&repo, scratch, branch, &orig).await;
-            return Ok(Rebased::Stopped(why));
-        }
     }
 }
 
@@ -419,7 +407,10 @@ fn stop_records(state: &RunState) -> &[RebaseFixRecord] {
 
 async fn stop_rounds(state: &RunState, scratch: &Path) -> usize {
     if same_stop(state, scratch).await {
-        stop_records(state).len()
+        stop_records(state)
+            .iter()
+            .filter(|record| record.outage.is_none())
+            .count()
     } else {
         0
     }
@@ -2038,6 +2029,7 @@ mod tests {
         let paths = git::unmerged_paths(&scratch).await.unwrap();
         assert_eq!(paths, vec![conflict]);
         state.rebase_fixes.push(RebaseFixRecord {
+            outage: None,
             agent: "mock".into(),
             index_outside: index_outside(&scratch, &paths).await.ok(),
             stop: if stop_recorded {

@@ -935,6 +935,10 @@ pub struct GateFixRecord {
 /// round back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RebaseFixRecord {
+    /// A machine outage deferred this call without spending a conflict round.
+    /// The record retains the original index baseline for safe resumption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outage: Option<crate::agent::QuotaCause>,
     /// Agent asked to resolve the conflict.
     pub agent: String,
     /// Paths git reported unmerged when the round started.

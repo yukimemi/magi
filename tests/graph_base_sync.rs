@@ -337,6 +337,7 @@ async fn the_conflict_round_bound_is_counted_in_state_and_survives_a_resume() {
     // Two rounds were already spent by an earlier process of this run.
     for _ in 0..2 {
         runner.state.rebase_fixes.push(magi::run::RebaseFixRecord {
+            outage: None,
             agent: "mock".to_owned(),
             paths: vec!["note.txt".to_owned()],
             from: None,
@@ -381,6 +382,7 @@ async fn legacy_conflict_records_recover_the_baseline_and_retain_the_resume_budg
     // Two rounds were already spent by an earlier process of this run.
     for _ in 0..2 {
         runner.state.rebase_fixes.push(magi::run::RebaseFixRecord {
+            outage: None,
             agent: "mock".to_owned(),
             paths: vec!["note.txt".to_owned()],
             from: None,
@@ -427,6 +429,7 @@ async fn legacy_baseline_mismatch_blocks_without_spending_a_conflict_round() {
     // Two rounds were already spent by an earlier process of this run.
     for _ in 0..2 {
         runner.state.rebase_fixes.push(magi::run::RebaseFixRecord {
+            outage: None,
             agent: "mock".to_owned(),
             paths: vec!["unexpected.txt".to_owned()],
             from: None,
@@ -810,5 +813,45 @@ async fn an_upstream_commit_that_a_later_commit_revises_is_not_reported_as_dropp
     let winner = state.winner().expect("a winner");
     let second = std::fs::read_to_string(winner.worktree.join("second.txt")).unwrap();
     assert!(second.contains("revised"), "{second}");
+}
+}
+
+common::e2e! {
+async fn rebase_authentication_outages_keep_the_conflict_resumable_and_refund_attempts() {
+    let home = home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    fx.config.graph.implementers = 1;
+    fx.config.graph.review_rounds = 1;
+    fx.config.roles.fixer = Some(magi::config::AgentChoice::Chain(vec!["beta".into(), "gamma".into()]));
+    for agent in &mut fx.config.agents { agent.env.insert("MOCK_REBASE_AUTH".into(), "1".into()); }
+    let origin = wire_origin(&fx);
+    let mut runner = Runner::start(&fx.repo, "create note.txt".into(), fx.config.clone(), magi::run::Origin::operator()).await.unwrap();
+    land_on_origin(&origin.sideline, "note.txt", "a conflicting note from upstream\n");
+    let result = runner.execute().await;
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(runner.state.status, RunStatus::Blocked);
+    assert!(runner.state.base_sync.as_ref().is_none_or(|sync| sync.conflict.is_none()));
+    assert_eq!(runner.state.resource_block.as_ref().unwrap().kind, "agent authentication");
+    assert!(magi::git::rebase_in_progress(&runner.state.dir().join("base-sync")).await);
+    assert_eq!(runner.state.rebase_fixes.len(), 1);
+    assert_eq!(runner.state.rebase_fixes[0].outage, Some(magi::agent::QuotaCause::Authentication));
+    assert!(runner.state.rebase_fixes[0].index_outside.is_some());
+    let mut task = magi::queue::Task::new("Rebase authentication outage".into(), "create note.txt".into(), fx.repo.clone(), magi::queue::Source::Human);
+    task.start(runner.state.id.clone());
+    let queue = magi::queue::Queue::open();
+    queue.put(&mut task).unwrap();
+    magi::daemon::finish_attempt(2, &queue, &mut task, &runner.state, &[], result);
+    assert_eq!(task.attempts, 0);
+    assert_eq!(task.status, magi::queue::TaskStatus::Held);
+    let id = runner.state.id.clone();
+    drop(runner);
+    let mut saved = magi::run::RunState::load(&id).unwrap();
+    for agent in &mut saved.config.agents { agent.env.remove("MOCK_REBASE_AUTH"); }
+    saved.save().unwrap();
+    let mut resumed = Runner::resume(&id).unwrap();
+    resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.status, RunStatus::Ready, "{}", magi::report::run(&resumed.state));
+    assert!(resumed.state.base_sync.as_ref().unwrap().conflict.is_none());
+    assert!(resumed.state.rebase_fixes.last().unwrap().finished);
 }
 }

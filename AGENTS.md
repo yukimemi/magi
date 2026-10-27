@@ -1010,8 +1010,9 @@ upstream CRLF, not drift worth committing — normalise back to LF and
   records); losses also retain the agent id. Both use `AgentOutcome::Quota`,
   so neither is immediately re-asked and both can hand over to another agent.
   Authentication raises a notice keyed by agent id asking to re-authenticate.
-  A fixer chain ending in authentication failure uses its caller's resource
-  deferral path: gate and review fix rounds remain unspent until recovery.
+  A fixer chain ending in a usage limit or authentication failure uses its
+  caller's resource deferral path. The same applies to missing-report
+  continuations: gate and review fix rounds remain unspent until recovery.
 - **A node with no available agents stops resumably.** When every final seat
   of an advisor, implementation or shared structured wave ends on quota/auth,
   record a `ResourceBlock` and stop `Blocked` before completing the node.
@@ -1022,6 +1023,9 @@ upstream CRLF, not drift worth committing — normalise back to LF and
   and require re-authentication followed by explicit release/resume, never a
   cooldown-triggered second empty attempt. Historical losses alone must not
   turn a later ordinary failure into a refundable machine outage.
+  Sequential deliberation aggregates all turns in a round before declaring
+  an outage; one unavailable seat does not block healthy peers. Interrupted
+  rounds remain pending, while completed rounds survive resumption.
 - **A verdict needs a quorum.** `tally()` counts a judge as present unless a
   `QuotaLoss` names that seat; a strict majority (`judges/2 + 1`) is required,
   or the run becomes `Stalled`. `Stalled` is a terminal-but-suspect status: it
@@ -1335,7 +1339,11 @@ resolves it and runs `git rebase --continue`. magi never resolves a conflict
 itself. The budget is `graph.review_rounds`, counted in
 `RunState::rebase_fixes` and saved *before* each call (so a park or crash
 cannot hand a round back), shared by both callers, and touching neither the
-task's attempts nor land's own rebase budget. A round is judged by what git
+task's attempts nor land's own rebase budget. An observed machine outage
+retains the scratch rebase and its original index baseline, records
+`RebaseFixRecord::outage`, and stops with a resource block instead of a
+permanent conflict. Such records do not spend the conflict-round budget.
+A round is judged by what git
 says - rebase no longer in progress, nothing unmerged, no markers left in a
 path that conflicted, the base an ancestor of the result - never by the
 fixer's report. `git::rebase_start` records HEAD after each pick with

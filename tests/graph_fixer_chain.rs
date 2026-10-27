@@ -63,7 +63,7 @@ async fn a_quota_on_the_first_fixer_hands_the_round_to_the_next_with_a_fresh_sea
 }
 
 common::e2e! {
-async fn every_fixer_failing_ends_like_a_single_failed_fixer() {
+async fn every_fixer_reaching_a_usage_limit_defers_without_spending_a_round() {
     let home = common::home_lock().await;
     let mut fx = fixture(home, Judges::Unanimous, false);
     fx.config.disk.min_free_bytes = 0;
@@ -78,14 +78,27 @@ async fn every_fixer_failing_ends_like_a_single_failed_fixer() {
     let state = &runner.state;
 
     assert_eq!(state.status, RunStatus::Blocked);
-    assert_eq!(state.gate_fixes.len(), 1);
-    assert_eq!(
-        state.gate_fixes[0].error.as_deref(),
-        Some("rate limited (quota); fixer could not run")
-    );
+    assert!(state.gate_fixes.is_empty());
+    assert_eq!(state.resource_block.as_ref().unwrap().kind, "agent usage limit");
     // One quota loss for the one exhausted call, like a single fixer.
     assert_eq!(state.quota.len(), 1, "{:?}", state.quota);
     assert_eq!(state.handovers.iter().filter(|h| h.node == "gate-fix").count(), 1);
+    let mut task = magi::queue::Task::new("Usage outage".into(), "create note.txt".into(), fx.repo.clone(), magi::queue::Source::Human);
+    task.start(state.id.clone());
+    let queue = magi::queue::Queue::open();
+    queue.put(&mut task).unwrap();
+    magi::daemon::finish_attempt(2, &queue, &mut task, state, &[], Ok(()));
+    assert_eq!(task.attempts, 0);
+    let id = state.id.clone();
+    drop(runner);
+    let mut saved = magi::run::RunState::load(&id).unwrap();
+    for agent in &mut saved.config.agents { agent.env.remove("MOCK_QUOTA_SEAT"); }
+    saved.save().unwrap();
+    let mut resumed = Runner::resume(&id).unwrap();
+    resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.status, RunStatus::Ready);
+    assert_eq!(resumed.state.gate_fixes.len(), 1);
+
 }
 }
 
@@ -127,7 +140,8 @@ async fn a_single_string_fixer_behaves_as_before() {
     runner.execute().await.expect("execute");
     let state = &runner.state;
 
-    assert_eq!(state.gate_fixes[0].agent, "beta");
+    assert!(state.gate_fixes.is_empty());
+    assert_eq!(state.quota[0].agent, "beta");
     assert_eq!(state.quota.len(), 1);
     assert!(state.handovers.iter().all(|h| h.node != "gate-fix"));
 }

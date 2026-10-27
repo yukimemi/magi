@@ -258,6 +258,10 @@ fi
 # `git rebase --skip` once, on the first stop only, then resolves as usual. Both count their calls in
 # `rebase-fix.log` in the run's artifacts directory.
 if has "Your rebase stopped on a conflict"; then
+  if [ -n "$MOCK_REBASE_AUTH" ]; then
+    printf '%s\n' '{"is_error":true,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed"}'
+    exit 1
+  fi
   echo "$seat" >> "$(dirname "$p")/rebase-fix.log"
   if [ -n "$MOCK_REBASE_FIX_NOOP" ]; then
     printf '{"addressed":[],"rejected":[],"notes":"changed nothing"}\n'
@@ -544,6 +548,10 @@ fi
 # never recovers, for exhaustion coverage; every other matching seat recovers
 # on this, its first resumed call.
 if has "the report this step requires"; then
+  if [ -n "$MOCK_CONTINUATION_AUTH" ]; then
+    printf '%s\n' '{"is_error":true,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed"}'
+    exit 1
+  fi
   if [ -n "$MOCK_FIX_ALWAYS_INCOMPLETE_SEAT" ] && { case ",$MOCK_FIX_ALWAYS_INCOMPLETE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
     printf "Still waiting on the background test run; I will report back once it finishes.\n"
     exit 0
