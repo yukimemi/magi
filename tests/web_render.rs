@@ -5028,6 +5028,11 @@ async fn loop_version_details_stay_compact_and_preserve_toggle_state() {
             const rects = controls.map(e => e.getBoundingClientRect());
             check(r.height <= 42, 'status must occupy one line: ' + r.height);
             check(box.scrollWidth <= box.clientWidth && r.right <= innerWidth, 'header overflow');
+            if (innerWidth >= 1280) {
+              const versionRect = webVersion.getBoundingClientRect(), infoRect = info.getBoundingClientRect();
+              check(Math.abs(versionRect.top + versionRect.height/2 - (infoRect.top + infoRect.height/2)) < 3, 'web version shares info button line');
+              check(versionRect.width > 0 && versionRect.right <= infoRect.left, 'web version visibly precedes info button');
+            }
             for (const [i, rect] of rects.entries()) {
               check(rect.left >= 0 && rect.right <= innerWidth, 'control outside viewport');
               check(Math.abs(rect.top + rect.height/2 - (rects[0].top + rects[0].height/2)) < 2, 'controls must share one line');
