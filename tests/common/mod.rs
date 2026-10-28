@@ -192,9 +192,9 @@ const MOCK: &str = r##"#!/bin/sh
 # Mock agent. Dispatches on the prompt magi generated for this seat.
 set -e
 p="$MAGI_PROMPT_FILE"
-# Prompt paths always name a file in the artifacts directory. Shell parameter
-# expansion avoids spawning dirname for every attribution/context entry.
-artifacts="${p%/*}"
+# dirname also understands native Windows separators and bare filenames.
+# Compute it once rather than spawning it for every log entry.
+artifacts=$(dirname "$p")
 seat="$MAGI_SEAT"
 
 # One read of the prompt, matched with shell builtins: each `grep -q` below was

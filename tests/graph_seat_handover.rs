@@ -337,3 +337,39 @@ async fn a_spare_reviewer_is_used_instead_of_doubling_up_another_seat() {
     assert_eq!((one.as_str(), two.as_str()), ("gamma", "beta"));
 }
 }
+
+// A prompt may use native Windows separators or have no directory component.
+// Both defeat slash-only shell prefix removal; dirname handles the latter on
+// every host, so this exercises the actual mock's log writes portably.
+common::e2e! {
+async fn mock_logs_beside_relative_and_native_absolute_prompts() {
+    let home = common::home_lock().await;
+    let fx = common::fixture(home, common::Judges::Unanimous, false);
+    let artifacts = fx.tmp.path().join("prompt artifacts");
+    std::fs::create_dir(&artifacts).unwrap();
+    std::fs::write(artifacts.join("prompt.txt"), "Final vote\n# Candidates\n").unwrap();
+    let agent = &fx.config.agents[0];
+    for prompt in [std::path::PathBuf::from("prompt.txt"), artifacts.join("prompt.txt")] {
+        let output = std::process::Command::new(&agent.command[0])
+            .args(&agent.command[1..])
+            .current_dir(&artifacts)
+            .envs(&agent.env)
+            .env("MAGI_PROMPT_FILE", &prompt)
+            .env("MAGI_RUN", "mock-path-test")
+            .env("MAGI_NODE", "vote")
+            .env("MAGI_SEAT", "judge-1")
+            .output()
+            .expect("run the actual shell mock");
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("\"vote\":\"A\""));
+    }
+    assert_eq!(
+        std::fs::read_to_string(artifacts.join("attribution.log")).unwrap(),
+        "mock-path-test vote judge-1\n".repeat(2)
+    );
+    assert_eq!(
+        std::fs::read_to_string(artifacts.join("prompts.log")).unwrap(),
+        "vote judge-1 cands\n".repeat(2)
+    );
+}
+}

@@ -19,9 +19,12 @@ nextest e2e group: combining the scenes with the previous half-CPU cap measured
 subprocess batches increased contention. Nextest groups, home locks, and
 Windows shard configuration remain in place.
 A test-only `sysinfo` optimization targets the process-table walks performed
-when every mock CLI is cleaned up. The shell mock derives the artifacts directory with parameter expansion rather
-than spawning `dirname` twice per ordinary invocation (and again for hang and
-rebase cases). Attribution, context, and hang assertions still read those logs.
+when every mock CLI is cleaned up. The shell mock calls `dirname` once and
+reuses its result for attribution, context, hang, and rebase logs. This preserves
+native Windows path handling while avoiding repeated subprocesses. The initial
+slash-only parameter expansion broke Windows paths and has been corrected;
+the timing samples below predate that correction. A regression case additionally
+checks relative and native absolute prompt paths.
 
 ## Measurement method
 
