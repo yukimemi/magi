@@ -465,6 +465,7 @@ async fn merge_repair_resume_refuses_a_commit_added_after_the_saved_gate() {
     magi::git::git(&winner.worktree, &["commit", "--allow-empty", "-m", "fix: unverified later commit"]).await.unwrap();
     let added = magi::git::rev_parse(&winner.worktree, "HEAD").await.unwrap();
     assert_ne!(added, checked);
+    let events_before = verified.state.events.len();
     let mut resumed = Runner::resume(&verified.state.id).unwrap();
     resumed.execute().await.unwrap();
     assert_eq!(resumed.state.status, RunStatus::Blocked);
@@ -473,6 +474,9 @@ async fn merge_repair_resume_refuses_a_commit_added_after_the_saved_gate() {
     assert_eq!(magi::git::remote_head(&winner.worktree, "origin", &winner.branch).await.unwrap(), remote_before);
     assert_eq!(magi::git::rev_parse(&winner.worktree, "HEAD").await.unwrap(), added);
     assert!(resumed.state.land_approval.is_none());
+    assert_eq!(resumed.state.gate_head.as_deref(), Some(checked.as_str()));
+    assert_eq!(serde_json::to_value(&resumed.state.verification_history).unwrap(), serde_json::to_value(&verified.state.verification_history).unwrap());
+    assert!(resumed.state.events[events_before..].iter().all(|e| !matches!(e.node.as_str(), "review" | "verify" | "gate" | "e2e")), "external changes must be held before refreshing verification");
     assert_eq!(std::fs::read_to_string(fx.tmp.path().join("forge/fixes")).unwrap().lines().count(), 1);
 }
 }

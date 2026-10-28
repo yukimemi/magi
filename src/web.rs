@@ -3731,7 +3731,9 @@ impl RunSummary {
             winner: state.winner().map(|c| c.label),
             reviews: state.reviews.len(),
             quota_losses: state.quota.len(),
-            event: state.events.last().map(|e| e.message.clone()),
+            event: state
+                .verification_blocking_cause()
+                .or_else(|| state.events.last().map(|e| e.message.clone())),
             waiting,
             live,
             // Filled in by the list route, which is the only place that can

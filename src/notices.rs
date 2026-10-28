@@ -885,6 +885,7 @@ pub fn run_stopped(id: &str, state: &crate::run::RunState) -> Notice {
 
 /// Last recorded graph evidence; immediate errors are attached by the caller.
 fn run_cause(state: &crate::run::RunState) -> String {
+    let verification_cause = state.verification_blocking_cause();
     let cause = state
         .prep_failure
         .as_deref()
@@ -896,6 +897,7 @@ fn run_cause(state: &crate::run::RunState) -> String {
                 .next()
                 .map(String::as_str)
         })
+        .or(verification_cause.as_deref())
         .or_else(|| state.events.last().map(|e| e.message.as_str()));
     cause
         .and_then(|s| s.lines().find(|line| !line.trim().is_empty()))

@@ -3760,8 +3760,11 @@ async fn publish_landing_head<F: Forge>(
         git::is_clean(&winner.worktree).await?,
         "landing worktree is dirty"
     );
-    if state.gate_head.as_deref() != Some(&head) || !state.gate_ran || !state.gate_allows_progress()
+    if state.gate_head.as_deref() != Some(&head)
+        || !state.gate_ran
+        || !state.gate_commands_allow_progress()
     {
+        state.reconcile_verification_head(&head);
         state.gate.clear();
         state.gate_head = None;
         state.gate_ran = false;
@@ -3801,12 +3804,12 @@ async fn publish_landing_head<F: Forge>(
         }
         state.gate = outcomes;
         state.gate_ran = true;
-        state.gate_head = Some(git::rev_parse(&winner.worktree, "HEAD").await?);
         state.save()?;
     }
-    anyhow::ensure!(
-        state.gate_allows_progress(),
-        "landing gate failed; nothing published"
+    let inherited = crate::repo_lock::WaitPolicy::current();
+    let wait = crate::repo_lock::WaitPolicy::new(
+        Duration::from_secs(state.config.graph.timeout_resource_wait),
+        move || inherited.cancelled(),
     );
     let checked = state
         .gate_head
@@ -3816,11 +3819,6 @@ async fn publish_landing_head<F: Forge>(
         git::rev_parse(&winner.worktree, "HEAD").await? == checked
             && git::is_clean(&winner.worktree).await?,
         "landing tree changed after gate"
-    );
-    let inherited = crate::repo_lock::WaitPolicy::current();
-    let wait = crate::repo_lock::WaitPolicy::new(
-        Duration::from_secs(state.config.graph.timeout_resource_wait),
-        move || inherited.cancelled(),
     );
     let e2e = crate::graph::check_gate_repair_e2e(state, &winner, &wait).await?;
     if matches!(e2e, crate::graph::GateFix::Defer) {
@@ -3840,6 +3838,14 @@ async fn publish_landing_head<F: Forge>(
         git::rev_parse(&winner.worktree, "HEAD").await? == checked
             && git::is_clean(&winner.worktree).await?,
         "landing tree changed during post-repair e2e"
+    );
+    anyhow::ensure!(
+        crate::graph::verify_current_head(state, &winner, &wait).await?,
+        "current head e2e has not passed; nothing published"
+    );
+    anyhow::ensure!(
+        state.gate_allows_progress(),
+        "landing gate failed; nothing published"
     );
     crate::pr_head::ensure_owner(state)?;
     if owner_requested_stop(state)? {

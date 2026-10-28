@@ -888,6 +888,28 @@ pub struct GateRepairE2e {
     pub outcomes: Vec<CommandOutcome>,
 }
 
+/// Superseded head-specific evidence; repair budgets remain on the run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationEvidence {
+    /// Replacement SHA, unknown when archived without a head change.
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    /// Archive time, unknown for records written before this field existed.
+    #[serde(default)]
+    pub archived_at: Option<Timestamp>,
+    /// Run-wide gate-fix rounds spent at archival, unknown for legacy records.
+    #[serde(default)]
+    pub fixes_spent: Option<usize>,
+    /// SHA of the superseded gate, unknown for legacy records.
+    pub gate_head: Option<String>,
+    /// Whether the superseded gate completed.
+    pub gate_ran: bool,
+    /// Original command results, including failures.
+    pub gate: Vec<CommandOutcome>,
+    /// Superseded verification independent of the review judgment.
+    pub e2e: Option<GateRepairE2e>,
+}
+
 /// One fix round spent on a failing `verify.gate`: which fixer, what it did to
 /// the tree, and the gate output it was shown.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2240,6 +2262,12 @@ pub struct RunState {
     /// from before this existed, which reads as "commit unknown".
     #[serde(default)]
     pub gate_head: Option<String>,
+    /// Verification on a changed head, separate from the review judgment.
+    #[serde(default)]
+    pub head_e2e: Option<GateRepairE2e>,
+    /// Append-only evidence replaced when the winner moves to another head.
+    #[serde(default)]
+    pub verification_history: Vec<VerificationEvidence>,
     /// Resume must reconcile, sync, gate and publish the existing PR head before CI.
     #[serde(default)]
     pub land_sync_pending: bool,
@@ -2678,6 +2706,8 @@ impl RunState {
             gate: Vec::new(),
             gate_ran: false,
             gate_head: None,
+            head_e2e: None,
+            verification_history: Vec::new(),
             land_sync_pending: false,
             land_rebase_from: None,
             gate_fixes: Vec::new(),
@@ -2966,8 +2996,104 @@ impl RunState {
         Ok(())
     }
 
-    /// Empty verification can finish an intentional workflow, without claiming a test pass.
-    pub fn gate_allows_progress(&self) -> bool {
+    /// Reconcile after Git updates as well as on reentry after an interrupted save.
+    /// Unknown legacy heads cannot establish current verification.
+    pub fn reconcile_verification_head(&mut self, head: &str) {
+        let stale_gate = self.gate_ran && self.gate_head.as_deref() != Some(head);
+        let stale_e2e = self.head_e2e.as_ref().is_some_and(|e| e.head != head);
+        if stale_gate || stale_e2e {
+            self.verification_history.push(VerificationEvidence {
+                superseded_by: Some(head.to_owned()),
+                archived_at: Some(Timestamp::now()),
+                fixes_spent: Some(self.gate_fixes.len()),
+                gate_head: self.gate_head.clone(),
+                gate_ran: self.gate_ran,
+                gate: self.gate.clone(),
+                e2e: self.head_e2e.clone(),
+            });
+            if stale_gate {
+                let previous = self
+                    .gate_head
+                    .as_deref()
+                    .map(short)
+                    .unwrap_or_else(|| "unknown".into());
+                self.event(
+                    "gate",
+                    format!(
+                        "archived gate on {previous}, superseded by {}; {} gate-fix round(s) already spent stay spent",
+                        short(head),
+                        self.gate_fixes.len()
+                    ),
+                );
+                self.gate.clear();
+                self.gate_ran = false;
+                self.gate_head = None;
+                self.pre_gate.clear();
+                self.pre_gate_commit = None;
+            }
+            if stale_e2e {
+                self.head_e2e = None;
+            }
+        }
+    }
+
+    /// Structured current failures take precedence over successful progress events.
+    pub fn verification_blocking_cause(&self) -> Option<String> {
+        if self.base_sync_blocked() {
+            return self
+                .base_sync
+                .as_ref()
+                .and_then(|s| s.conflict.as_ref())
+                .map(|detail| format!("Base-sync conflict: {detail}"));
+        }
+        if let Some(resource) = &self.resource_block {
+            return Some(resource.detail.clone());
+        }
+        if self.status != RunStatus::Blocked {
+            return None;
+        }
+        if crate::graph::review_conclusion(&self.reviews, self.config.graph.review_rounds)
+            == Some(RunStatus::Blocked)
+        {
+            return self.reviews.last().map(|r| format!(
+                "review blocked on reviewed head {} ({} blocking finding(s), {}/{} reviewers answered)",
+                r.head, r.blocking, r.answered, r.expected
+            ));
+        }
+        if let Some(e) = &self.head_e2e
+            && !e.passed
+            && e.outcomes.iter().any(|o| !o.ok())
+        {
+            return Some(format!(
+                "verify.e2e failed on head {}; nothing published",
+                e.head
+            ));
+        }
+        if let Some(e) = &self.gate_repair_e2e
+            && !e.passed
+            && e.outcomes.iter().any(|o| !o.ok())
+        {
+            return Some(format!(
+                "verify.e2e failed on head {} after gate repair; nothing published",
+                e.head
+            ));
+        }
+        if self.gate_ran && self.gate.iter().any(|o| !o.ok()) {
+            return Some(format!(
+                "{} on head {} after {} gate-fix round(s); nothing published",
+                crate::stop_reason::command_failure(
+                    "gate",
+                    self.gate.iter().find(|o| !o.ok()).unwrap()
+                ),
+                self.gate_head.as_deref().unwrap_or("unknown"),
+                self.gate_fixes.len()
+            ));
+        }
+        None
+    }
+
+    /// Whether the configured gate commands completed successfully, independent of e2e.
+    pub(crate) fn gate_commands_allow_progress(&self) -> bool {
         self.gate_status().ok()
             || (self
                 .pr_recovery
@@ -2975,6 +3101,15 @@ impl RunState {
                 .is_none_or(|s| s.disposition == Some(crate::pr_recovery::Disposition::Review))
                 && self.gate_ran
                 && self.gate_status() == GateStatus::NotConfigured)
+    }
+
+    /// Empty verification can finish an intentional workflow, without claiming a test pass.
+    pub fn gate_allows_progress(&self) -> bool {
+        self.gate_commands_allow_progress()
+            && self
+                .head_e2e
+                .as_ref()
+                .is_none_or(|e| e.passed && self.gate_head.as_deref() == Some(e.head.as_str()))
     }
 
     /// Note something in the run log and on the tracing stream.
@@ -4554,6 +4689,22 @@ mod tests {
             RunState::load_under("20260101-000000-none", dir.path()).is_err(),
             "an id with nothing saved under this home must not silently read something else"
         );
+    }
+
+    #[test]
+    fn verification_history_legacy_metadata_remains_unknown() {
+        let history: VerificationEvidence = serde_json::from_value(serde_json::json!({
+            "gate_head": "old-head",
+            "gate_ran": true,
+            "gate": [],
+            "e2e": null
+        }))
+        .unwrap();
+        assert!(history.superseded_by.is_none());
+        assert!(history.archived_at.is_none());
+        assert!(history.fixes_spent.is_none());
+        assert_eq!(history.gate_head.as_deref(), Some("old-head"));
+        assert!(history.gate_ran);
     }
 
     #[test]
