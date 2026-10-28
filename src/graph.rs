@@ -7310,6 +7310,16 @@ impl Runner {
         {
             return Ok(());
         }
+        let Some(winner) = self.state.winner().cloned() else {
+            return Ok(());
+        };
+        let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+        self.state.reconcile_verification_head(&head);
+        self.state.save()?;
+        let wait = self.repository_wait();
+        if !verify_current_head(&mut self.state, &winner, &wait).await? {
+            return Ok(());
+        }
         if self.state.gate_ran {
             // `review_loop` derives its conclusion from the clean review
             // record on every reentry and therefore puts a completed run back
@@ -7327,11 +7337,9 @@ impl Runner {
             }
             return Ok(());
         }
-        let Some(winner) = self.state.winner().cloned() else {
-            return Ok(());
-        };
         self.state.status = RunStatus::Gating;
         let mut outcomes = self.run_gate(&winner).await?;
+        let mut attempted_head = self.state.gate_head.clone();
         loop {
             // A resource-blocked outcome means the gate command never actually
             // ran - the shared build cache could not be acquired or confirmed
@@ -7350,9 +7358,26 @@ impl Runner {
             if outcomes.iter().all(CommandOutcome::ok) {
                 break;
             }
+            let fixes_before = self.state.gate_fixes.len();
             match self.gate_fix_round(&winner, &outcomes).await? {
-                GateFix::Retry => outcomes = self.run_gate(&winner).await?,
-                GateFix::Stop => break,
+                GateFix::Retry => {
+                    outcomes = self.run_gate(&winner).await?;
+                    attempted_head = self.state.gate_head.clone();
+                }
+                GateFix::Stop => {
+                    let current = git::rev_parse(&winner.worktree, "HEAD").await?;
+                    if self.state.gate_fixes.len() > fixes_before
+                        && attempted_head.as_deref() != Some(current.as_str())
+                        && verify_current_head(&mut self.state, &winner, &wait).await?
+                    {
+                        // A new SHA owes a gate even when a spent fixer changed only
+                        // commit metadata. This does not grant another repair round.
+                        outcomes = self.run_gate(&winner).await?;
+                        attempted_head = self.state.gate_head.clone();
+                    } else {
+                        break;
+                    }
+                }
                 GateFix::Defer => {
                     self.state.save()?;
                     return Ok(());
@@ -7362,7 +7387,11 @@ impl Runner {
         let passed = outcomes.iter().all(CommandOutcome::ok);
         self.state.gate = outcomes;
         self.state.gate_ran = true;
-        self.state.gate_head = git::rev_parse(&winner.worktree, "HEAD").await.ok();
+        self.state.gate_head = attempted_head;
+        self.state.save()?;
+        if !verify_current_head(&mut self.state, &winner, &wait).await? {
+            return Ok(());
+        }
         if !passed {
             self.state.status = RunStatus::Blocked;
             let spent = self.state.gate_fixes.len();
@@ -8434,7 +8463,7 @@ impl Runner {
     }
 
     async fn merge(&mut self) -> Result<()> {
-        if self.hold_base_sync().await? {
+        if self.resource_halt()? || self.hold_base_sync().await? {
             return Ok(());
         }
         // Same reasoning as `gate`: ask the review and gate records directly
@@ -8483,6 +8512,20 @@ impl Runner {
         let Some(winner) = self.state.winner().cloned() else {
             return Ok(());
         };
+        let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+        if self.state.gate_head.as_deref() != Some(head.as_str()) {
+            self.state.status = RunStatus::Blocked;
+            self.state.event(
+                "gate",
+                "winner changed after gate; fresh verification required",
+            );
+            self.state.save()?;
+            return Ok(());
+        }
+        let wait = self.repository_wait();
+        if !verify_current_head(&mut self.state, &winner, &wait).await? {
+            return Ok(());
+        }
         let repo = self.state.repo.clone();
         let base = self.state.base_branch.clone();
         let mode = self.state.config.merge.mode;
@@ -8974,6 +9017,16 @@ impl Runner {
     }
 
     fn begin_merge_repair_review(&mut self, index: usize) -> Result<()> {
+        if let Some(e2e) = self.state.head_e2e.take() {
+            self.state
+                .verification_history
+                .push(crate::run::VerificationEvidence {
+                    gate_head: None,
+                    gate_ran: false,
+                    gate: Vec::new(),
+                    e2e: Some(e2e),
+                });
+        }
         self.state.reviews.clear();
         self.state.gate.clear();
         self.state.gate_ran = false;
@@ -11373,6 +11426,116 @@ pub(crate) async fn repair_landing_gate(
     result
 }
 
+/// Review judgment survives a clean rebase; command evidence belongs to a SHA.
+/// A completed failure is terminal on that SHA. Resource waits remain retryable.
+pub(crate) async fn verify_current_head(
+    state: &mut RunState,
+    winner: &Candidate,
+    wait: &crate::repo_lock::WaitPolicy,
+) -> Result<bool> {
+    let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+    // Preserve the previous record before replacing it, including on crash recovery.
+    if state.head_e2e.as_ref().is_some_and(|e| e.head != head) {
+        state
+            .verification_history
+            .push(crate::run::VerificationEvidence {
+                gate_head: None,
+                gate_ran: false,
+                gate: Vec::new(),
+                e2e: state.head_e2e.take(),
+            });
+    }
+    if let Some(e) = &state.head_e2e
+        && e.head == head
+    {
+        if e.passed {
+            return Ok(true);
+        }
+        if !e.outcomes.is_empty() && !verify_inconclusive(&e.outcomes) {
+            state.status = RunStatus::Blocked;
+            state.save()?;
+            return Ok(false);
+        }
+    } else if state.reviews.last().is_some_and(|r| {
+        r.verified_head.as_deref() == Some(head.as_str())
+            && (r.e2e_status() == E2eStatus::Passed
+                || (r.e2e_status() == E2eStatus::NotConfigured
+                    && state.config.verify.e2e.is_empty()))
+    }) || state
+        .gate_repair_e2e
+        .as_ref()
+        .is_some_and(|e| e.head == head && e.passed)
+    {
+        return Ok(true);
+    }
+    if let Some(e) = &state.gate_repair_e2e
+        && e.head == head
+        && !e.passed
+        && !e.outcomes.is_empty()
+        && !verify_inconclusive(&e.outcomes)
+    {
+        state.status = RunStatus::Blocked;
+        state.save()?;
+        return Ok(false);
+    }
+    state.head_e2e = Some(crate::run::GateRepairE2e {
+        head: head.clone(),
+        passed: false,
+        outcomes: Vec::new(),
+    });
+    state.save()?;
+    let commands = state.config.verify.e2e.clone();
+    let shell = state.config.shell();
+    let timeout = Duration::from_secs(state.config.graph.verify_timeout());
+    let cache_dir = state.config.cache_dir();
+    let outcomes = if commands.is_empty() {
+        Vec::new()
+    } else {
+        let (outcomes, _) = with_cache_lease(
+            state,
+            cache_dir.as_deref(),
+            "e2e",
+            "e2e",
+            &winner.worktree,
+            &head,
+            timeout,
+            "current head e2e",
+            wait,
+            |state, budget| async move {
+                run_e2e_with_retry(
+                    state,
+                    &shell,
+                    &commands,
+                    &winner.worktree,
+                    budget,
+                    "current head e2e",
+                )
+                .await
+            },
+        )
+        .await?;
+        outcomes
+    };
+    let unresolved = verify_inconclusive(&outcomes);
+    let passed = !unresolved
+        && outcomes.iter().all(CommandOutcome::ok)
+        && git::rev_parse(&winner.worktree, "HEAD").await? == head;
+    state.head_e2e = Some(crate::run::GateRepairE2e {
+        head: head.clone(),
+        passed,
+        outcomes,
+    });
+    if !passed && !unresolved {
+        state.status = RunStatus::Blocked;
+        state.event(
+            "e2e",
+            format!("verify.e2e failed on head {head}; nothing published"),
+        );
+    }
+    state.save()?;
+    Ok(passed)
+}
+
 /// Recheck a repair's e2e requirement across failures, resource deferrals and
 /// process interruptions. A successful result only applies to its exact SHA.
 pub(crate) async fn check_gate_repair_e2e(
@@ -11461,6 +11624,7 @@ pub(crate) async fn run_landing_gate(
     let gate_commands = state.config.verify.gate.clone();
     let has_pre_gate = !state.config.verify.pre_gate.is_empty();
     let outcomes = if gate_commands.is_empty() && !has_pre_gate {
+        state.gate_head = Some(git::rev_parse(&winner.worktree, "HEAD").await?);
         Vec::new()
     } else {
         let timeout = Duration::from_secs(state.config.graph.verify_timeout());
@@ -11482,6 +11646,8 @@ pub(crate) async fn run_landing_gate(
                 let winner = winner.clone();
                 async move {
                     Runner::run_pre_gate(state, &winner).await;
+                    // Bind command evidence after mechanical fixes, before commands start.
+                    state.gate_head = git::rev_parse(&winner.worktree, "HEAD").await.ok();
                     let (outcomes, timed_out_pids) = run_commands(
                         state,
                         "gate",
@@ -11500,6 +11666,16 @@ pub(crate) async fn run_landing_gate(
         .await?;
         outcomes
     };
+    let current = git::rev_parse(&winner.worktree, "HEAD").await?;
+    if !verify_inconclusive(&outcomes) && state.gate_head.as_deref() != Some(current.as_str()) {
+        let mut outcomes = outcomes;
+        outcomes.push(CommandOutcome {
+            command: "gate head stability".into(), code: None,
+            output_tail: "winner changed during gate, or checked head is unknown; fresh verification required".into(),
+            duration_ms: 0, resource_blocked: false,
+        });
+        return Ok(outcomes);
+    }
     if outcomes.is_empty() {
         // Nothing configured to check — distinct from every other
         // silence in this run's event log, since an empty `gate` alone
@@ -15501,6 +15677,295 @@ esac
     }
 
     #[cfg(unix)]
+    async fn resumed_gate_fixture() -> (tempfile::TempDir, Runner, String) {
+        let (tmp, mut runner, head, _) = exhausted_base_fixture().await;
+        // This is an ordinary gate stop, not an authorized base-budget recovery.
+        runner.state.prep_complete = Some(true);
+        runner.state.base_sync = None;
+        runner.state.base_sync_recovery = Default::default();
+        runner.state.config.graph.gate_fix_rounds = 1;
+        let mut review = review_round(true, 0, 1, 1, false, true);
+        review.head = head.clone();
+        review.verified_head = Some(head.clone());
+        runner.state.reviews = vec![review];
+        runner.state.gate = vec![CommandOutcome {
+            command: "old gate".into(),
+            code: Some(1),
+            output_tail: "old failure".into(),
+            duration_ms: 0,
+            resource_blocked: false,
+        }];
+        runner.state.gate_head = Some(head.clone());
+        runner.state.gate_ran = true;
+        runner.state.gate_fixes = vec![crate::run::GateFixRecord {
+            agent: "fixture".into(),
+            failed: runner.state.gate.clone(),
+            notes: "spent".into(),
+            committed: false,
+            error: None,
+        }];
+        runner.state.land_approval = Some(crate::run::LandApproval {
+            question: "old approval".into(),
+            head: head.clone(),
+        });
+        runner.state.status = RunStatus::Blocked;
+        (tmp, runner, head)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resumed_gate_rebase_verifies_new_head_without_refilling_repairs() {
+        for (e2e_ok, gate_ok) in [(true, true), (true, false), (false, true)] {
+            let (tmp, mut runner, old) = resumed_gate_fixture().await;
+            let phases = tmp.path().join("phases");
+            runner.state.config.verify.e2e = vec![format!(
+                "echo e2e >> '{}'; {}",
+                phases.display(),
+                if e2e_ok {
+                    "true"
+                } else {
+                    "echo new-e2e-failure; false"
+                }
+            )];
+            runner.state.config.verify.gate = vec![format!(
+                "echo gate >> '{}'; {}",
+                phases.display(),
+                if gate_ok {
+                    "true"
+                } else {
+                    "echo new-gate-failure; false"
+                }
+            )];
+            runner.state.save().unwrap();
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            runner.sync_to_base().await.unwrap();
+            let head = git::rev_parse(&runner.state.repo, "HEAD").await.unwrap();
+            assert_ne!(head, old);
+            // Reentry after Git updated but before verification was invalidated.
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            runner.execute_graph().await.unwrap();
+            assert_eq!(runner.state.gate_fixes.len(), 1);
+            assert_eq!(runner.state.reviews.len(), 1);
+            assert_eq!(runner.state.reviews[0].head, old);
+            assert_eq!(runner.state.land_approval.as_ref().unwrap().head, old);
+            assert_eq!(runner.state.verification_history.len(), 1);
+            let history = &runner.state.verification_history[0];
+            assert_eq!(history.gate_head.as_deref(), Some(old.as_str()));
+            assert_eq!(history.gate[0].output_tail, "old failure");
+            assert_eq!(runner.state.head_e2e.as_ref().unwrap().head, head);
+            assert_eq!(runner.state.head_e2e.as_ref().unwrap().passed, e2e_ok);
+            if e2e_ok {
+                assert_eq!(runner.state.gate_head.as_deref(), Some(head.as_str()));
+                assert_eq!(runner.state.gate_allows_progress(), gate_ok);
+            } else {
+                assert!(!runner.state.gate_ran);
+            }
+            assert_eq!(
+                runner.state.status,
+                if e2e_ok && gate_ok {
+                    RunStatus::Ready
+                } else {
+                    RunStatus::Blocked
+                }
+            );
+            if !e2e_ok || !gate_ok {
+                let cause = runner.state.verification_blocking_cause().unwrap();
+                assert!(cause.contains(&head));
+                assert!(cause.contains(if e2e_ok { "gate failed" } else { "e2e failed" }));
+                // A later successful progress event must not become the cause.
+                runner.state.event("land", "rebased successfully");
+                let notice = crate::notices::run_ended(&runner.state).unwrap();
+                assert!(!format!("{notice:?}").contains("rebased successfully"));
+                assert!(runner.state.merge.is_none());
+            }
+            let before = std::fs::read_to_string(&phases).unwrap();
+            runner.state.save().unwrap();
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            runner.review_loop().await.unwrap();
+            runner.gate().await.unwrap();
+            assert_eq!(std::fs::read_to_string(&phases).unwrap(), before);
+            assert_eq!(runner.state.verification_history.len(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resumed_gate_unchanged_head_keeps_failure_and_unknown_head_rechecks() {
+        let (tmp, mut runner, head) = resumed_gate_fixture().await;
+        let marker = tmp.path().join("gate-ran");
+        runner.state.config.verify.gate = vec![format!("touch '{}'", marker.display())];
+        runner.review_loop().await.unwrap();
+        runner.gate().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert!(!marker.exists());
+        assert!(runner.state.verification_history.is_empty());
+        runner.state.gate_head = None;
+        runner.gate().await.unwrap();
+        assert!(marker.exists());
+        assert_eq!(runner.state.gate_head.as_deref(), Some(head.as_str()));
+        assert_eq!(runner.state.verification_history.len(), 1);
+        assert_eq!(runner.state.gate_fixes.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resumed_gate_pending_e2e_retries_without_spending_or_landing() {
+        let (_tmp, mut runner, _old) = resumed_gate_fixture().await;
+        runner.sync_to_base().await.unwrap();
+        let head = git::rev_parse(&runner.state.repo, "HEAD").await.unwrap();
+        runner.state.reconcile_verification_head(&head);
+        // Both crash-before-command and resource wait are unresolved evidence.
+        for outcomes in [
+            Vec::new(),
+            vec![CommandOutcome {
+                command: "true".into(),
+                code: None,
+                output_tail: "cache unavailable".into(),
+                duration_ms: 0,
+                resource_blocked: true,
+            }],
+        ] {
+            runner.state.head_e2e = Some(crate::run::GateRepairE2e {
+                head: head.clone(),
+                passed: false,
+                outcomes,
+            });
+            runner.state.gate_ran = false;
+            runner.state.gate.clear();
+            runner.state.save().unwrap();
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            runner.merge().await.unwrap();
+            assert!(runner.state.merge.is_none());
+            runner.review_loop().await.unwrap();
+            runner.gate().await.unwrap();
+            assert!(runner.state.head_e2e.as_ref().unwrap().passed);
+            assert!(runner.state.gate_allows_progress());
+            assert_eq!(runner.state.gate_fixes.len(), 1);
+            assert!(runner.state.merge.is_none());
+        }
+        // Moving the winner after a successful gate cannot publish an unchecked SHA.
+        git::git(
+            &runner.state.repo,
+            &["commit", "--allow-empty", "-m", "external update"],
+        )
+        .await
+        .unwrap();
+        runner.merge().await.unwrap();
+        assert!(runner.state.merge.is_none());
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resumed_gate_resource_waits_preserve_budget_and_retry_on_reentry() {
+        for waiting_on_gate in [false, true] {
+            let (tmp, mut runner, _old) = resumed_gate_fixture().await;
+            runner.sync_to_base().await.unwrap();
+            let head = git::rev_parse(&runner.state.repo, "HEAD").await.unwrap();
+            runner.state.reconcile_verification_head(&head);
+            if waiting_on_gate {
+                runner.state.head_e2e = Some(crate::run::GateRepairE2e {
+                    head: head.clone(),
+                    passed: true,
+                    outcomes: Vec::new(),
+                });
+            }
+            let cache = tmp.path().join("cache");
+            runner.state.config.verify.e2e =
+                vec![format!("CARGO_TARGET_DIR='{}' true", cache.display())];
+            runner.state.config.verify.gate = vec!["true".into()];
+            runner.state.config.graph.timeout_resource_wait = 1;
+            let owner =
+                crate::cache::Owner::here("other", "e2e", "e2e", &runner.state.repo, "other-head");
+            let guard =
+                match crate::cache::try_acquire(&crate::run::home(), &cache, &owner).unwrap() {
+                    crate::cache::AcquireOutcome::Acquired(g) => g,
+                    crate::cache::AcquireOutcome::Busy(b) => panic!("unexpected busy cache: {b:?}"),
+                };
+            runner.review_loop().await.unwrap();
+            runner.gate().await.unwrap();
+            assert!(!runner.state.gate_ran);
+            assert_eq!(runner.state.gate_fixes.len(), 1);
+            assert!(runner.state.resource_block.is_some());
+            runner.merge().await.unwrap();
+            assert!(runner.state.merge.is_none());
+            drop(guard);
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            // The driver clears the previous pass's resource stop on resume.
+            runner.state.resource_block = None;
+            runner.review_loop().await.unwrap();
+            runner.gate().await.unwrap();
+            assert!(runner.state.gate_allows_progress());
+            assert_eq!(runner.state.gate_head.as_deref(), Some(head.as_str()));
+            assert_eq!(runner.state.gate_fixes.len(), 1);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resumed_gate_pre_gate_head_change_and_review_holds() {
+        let (_tmp, mut runner, _old) = resumed_gate_fixture().await;
+        runner.sync_to_base().await.unwrap();
+        let before = git::rev_parse(&runner.state.repo, "HEAD").await.unwrap();
+        runner.state.config.verify.pre_gate = vec!["echo mechanical > mechanical".into()];
+        // Verification passes before pre_gate and fails on the mechanically changed head.
+        runner.state.config.verify.e2e = vec!["test ! -f mechanical".into()];
+        runner.review_loop().await.unwrap();
+        runner.gate().await.unwrap();
+        let after = git::rev_parse(&runner.state.repo, "HEAD").await.unwrap();
+        assert_ne!(before, after);
+        assert_eq!(runner.state.head_e2e.as_ref().unwrap().head, after);
+        assert!(!runner.state.head_e2e.as_ref().unwrap().passed);
+        assert!(!runner.state.gate_allows_progress());
+        runner.merge().await.unwrap();
+        assert!(runner.state.merge.is_none());
+        assert!(
+            runner
+                .state
+                .verification_history
+                .iter()
+                .any(|h| h.e2e.as_ref().is_some_and(|e| e.head == before && e.passed))
+        );
+
+        // An incomplete review is still an independent hold on a changed head.
+        runner.state.reviews[0].clean = false;
+        runner.state.reviews[0].answered = 0;
+        runner.state.config.verify.e2e = vec!["true".into()];
+        runner.review_loop().await.unwrap();
+        runner.gate().await.unwrap();
+        runner.merge().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert!(runner.state.merge.is_none());
+        assert!(
+            runner
+                .state
+                .verification_blocking_cause()
+                .unwrap()
+                .contains("review blocked")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resumed_gate_cannot_certify_a_head_changed_by_its_command() {
+        let (_tmp, mut runner, old) = resumed_gate_fixture().await;
+        runner.state.gate_head = None;
+        runner.state.config.verify.gate =
+            vec!["git -c commit.gpgsign=false commit --allow-empty -m 'gate changed head'".into()];
+        runner.review_loop().await.unwrap();
+        runner.gate().await.unwrap();
+        assert_ne!(
+            git::rev_parse(&runner.state.repo, "HEAD").await.unwrap(),
+            old
+        );
+        assert_eq!(runner.state.gate_head.as_deref(), Some(old.as_str()));
+        assert!(!runner.state.gate_allows_progress());
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        runner.merge().await.unwrap();
+        assert!(runner.state.merge.is_none());
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn base_recovery_success_requires_new_review_e2e_and_gate() {
         let (_tmp, mut runner, head, task) = exhausted_base_fixture().await;
@@ -17134,6 +17599,14 @@ esac
             verdict: None,
         }];
 
+        state.reviews[0].verified_head = Some(git::rev_parse(&repo, "HEAD").await.unwrap());
+        state.reviews[0].e2e = vec![CommandOutcome {
+            command: state.config.verify.e2e[0].clone(),
+            code: Some(0),
+            output_tail: String::new(),
+            duration_ms: 0,
+            resource_blocked: false,
+        }];
         let mut runner = Runner {
             state,
             roles: ResolvedRoles {

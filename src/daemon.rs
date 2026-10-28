@@ -6075,7 +6075,9 @@ fn describe(state: &RunState) -> String {
     } else {
         format!("{}{}", p.run_ended, state.status.display_label())
     };
-    if let Some(last) = state.events.last() {
+    if let Some(cause) = state.verification_blocking_cause() {
+        detail.push_str(&format!(" ({cause})"));
+    } else if let Some(last) = state.events.last() {
         // The review loop's "never answered" stop is the one event worth
         // translating; it is recognised from structured state, not by
         // matching the English event text (which stays as recorded).

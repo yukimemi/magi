@@ -18,7 +18,15 @@ pub(crate) fn of(state: &RunState, latest: Option<(&str, RunStatus)>) -> Option<
         .into_iter()
         .filter(|f| f.severity.blocks())
         .count();
-    let reason = if state.gate_status() == GateStatus::Failed {
+    let current = (state.gate_head.is_some()
+        || state.head_e2e.is_some()
+        || state.resource_block.is_some()
+        || state.base_sync_blocked())
+    .then(|| state.verification_blocking_cause())
+    .flatten();
+    let reason = if let Some(reason) = current {
+        Some(reason)
+    } else if state.gate_status() == GateStatus::Failed {
         state
             .gate
             .iter()
@@ -94,7 +102,8 @@ fn one_line(text: &str) -> String {
         .join(" ")
 }
 
-fn command_failure(kind: &str, command: &CommandOutcome) -> String {
+/// Name the failing command and any test identified in its output.
+pub(crate) fn command_failure(kind: &str, command: &CommandOutcome) -> String {
     let mut name = None;
     let mut failed = None;
     let mut failures = false;
