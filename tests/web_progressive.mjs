@@ -6,11 +6,13 @@ import { test } from 'node:test';
 const source = readFileSync(new URL('../assets/ui/app.js', import.meta.url), 'utf8');
 const sections = source.slice(source.indexOf('const detailSections ='), source.indexOf('function sectionNotice('));
 const runs = source.slice(source.indexOf('const runDetailRequests ='), source.indexOf('/* Named with a trailing underscore'));
-const talks = source.slice(source.indexOf('const talkDetailRequests ='), source.indexOf('/* The server uses Done'));
+const talks = source.slice(source.indexOf('// A frame callback runs before paint;'), source.indexOf('/* The server uses Done'));
 const tasks = source.slice(source.indexOf('const taskDetailRequests ='), source.indexOf('function renderTask()'));
 const stats = source.slice(source.indexOf('async function loadStats('), source.indexOf('/* The repository selector'));
 const flush = () => new Promise(resolve => setImmediate(resolve));
-function harness() {
+function harness({ manualPaint = false, visibility } = {}) {
+  const frames = [];
+  const sectionRenders = [];
   const requests = [];
   const renders = [];
   const notices = [];
@@ -18,17 +20,19 @@ function harness() {
   const successes = [];
   const state = { detail: { id: null }, runs: [], talkDetail: { id: 'a' }, talkWaits: new Map(), stats: null, queue: [], taskDetail: { id: null } };
   const get = (url, options) => new Promise((resolve, reject) => requests.push({ url, options, resolve, reject }));
-  const api = runInNewContext(`${sections}\n${runs}\n${talks}\n${tasks}\n${stats}\n({loadRun, loadTalk, loadTask, loadStats, cancelDetailSections, sectionRequest})`, {
+  const api = runInNewContext(`${sections}\n${runs}\n${talks}\n${tasks}\n${stats}\n({loadRun, loadTalk, loadTask, loadStats, cancelDetailSections, sectionRequest, acceptTalkUpdate})`, {
+    document: visibility,
+    requestAnimationFrame: callback => manualPaint ? frames.push(callback) : callback(), setTimeout: callback => callback(),
     state, $: () => null, AbortController, URLSearchParams, API: { run: id => `run/${id}`, report: id => `raw/${id}`, reportJson: id => `report/${id}`, talk: id => `talk/${id}`, stats: 'stats', task: id => `task/${id}` },
     REPORT_VIEW_SCHEMA: 1, getJson: get, getText: get,
     renderRunDetail: () => renders.push(state.detail.run), renderReportCards: () => renders.push(state.detail.reportView),
     renderTask: () => renders.push(state.taskDetail.task), renderTaskActions() {},
-    renderTalk: () => renders.push(state.talkDetail.talk), renderStats: () => renders.push(state.stats),
+    renderTalkSections: () => sectionRenders.push(state.talkDetail.sections), renderTalk: () => renders.push(state.talkDetail.talk), renderStats: () => renders.push(state.stats),
     renderStatsQueue: counts => renders.push({ queue: counts }),
     show() {}, sectionNotice: (...args) => notices.push(args), trackTalkThinking() {}, rememberTalkChoices() {}, endTalkTurn() {},
     ok: (...args) => successes.push(args), failFor: (...args) => failures.push(args), shortId: id => id,
   });
-  return { api, requests, renders, notices, failures, successes, state };
+  return { api, requests, renders, sectionRenders, frames, notices, failures, successes, state };
 }
 function assertNoFailures(h) {
   assert.equal(h.failures.length, 0, 'successful loads must not call failFor');
@@ -360,7 +364,7 @@ test('pending notices preserve snapshots and Retry controls, and settle busy sta
     removeAttribute(key) { delete this.attrs[key]; },
   };
   nodes.set('anchor', anchor);
-  const noticeSource = source.slice(source.indexOf('const sectionNoticePending ='), source.indexOf('const talkDetailRequests ='));
+  const noticeSource = source.slice(source.indexOf('const sectionNoticePending ='), source.indexOf('// A frame callback runs before paint;'));
   const notice = runInNewContext(`${noticeSource}\nsectionNotice`, {
     $: key => nodes.get(key),
     el: (tag, props) => ({ tag, ...props, dataset: {}, children: [], append(child) { this.children.push(child); } }),
@@ -449,13 +453,13 @@ test('conversation navigation rejects old core and enrichment even on return to 
   h.state.talkDetail = { id: 'a' };
   const current = h.api.loadTalk('a');
   assert.equal(h.requests[0].options.signal.aborted, true);
-  h.requests[2].resolve({ id: 'a', updated_at: 'new', turns: [{ body: 'Current transcript' }] });
+  h.requests[1].resolve({ id: 'a', updated_at: 'new', turns: [{ body: 'Current transcript' }] });
   await flush();
   assert.equal(h.state.talkDetail.talk.turns[0].body, 'Current transcript');
-  h.requests[3].resolve({ context_for: 'new', roster: [], personas: [], tasks: ['current'] });
+  h.requests[2].resolve({ context_for: 'new', roster: [], personas: [], tasks: ['current'] });
   await current;
   h.requests[0].resolve({ id: 'a', updated_at: 'old', turns: [{ body: 'Obsolete transcript' }] });
-  h.requests[1].resolve({ context_for: 'old', roster: [], personas: [], tasks: ['obsolete'] });
+  assert.equal(h.requests.length, 3, 'obsolete core cannot launch sections');
   await old;
   assert.equal(h.state.talkDetail.talk.turns[0].body, 'Current transcript');
   assert.deepEqual(h.state.talkDetail.talk.tasks, ['current']);
@@ -557,11 +561,12 @@ test('late reference decoration never changes a replaced conversation', async ()
   assert.equal(h.walk(h.root).find(node => node.tag === 'a').href, '#/tasks/current');
 });
 
-test('conversation detail preempts health/list connections until its sections finish', async () => {
+test('conversation detail releases health/list connections when core finishes', async () => {
   const requests = [];
   const transport = source.slice(source.indexOf('const conversationPriority ='), source.indexOf('const getText ='));
   const state = { talkDetail: { id: 'a' }, talkWaits: new Map() };
   const api = runInNewContext(`${transport}\n${sections}\n${talks}\n({getJson, loadTalk})`, {
+    requestAnimationFrame: callback => callback(), setTimeout: callback => callback(),
     AbortController, state, API: { talk: id => `/api/talks/${id}` },
     pendingForRequest: () => () => {},
     fetch: (url, options = {}) => new Promise((resolve, reject) => {
@@ -569,7 +574,7 @@ test('conversation detail preempts health/list connections until its sections fi
       requests.push(entry);
       options.signal?.addEventListener('abort', () => reject(new Error('aborted')));
     }),
-    sectionNotice() {}, trackTalkThinking() {}, renderTalk() {}, ok() {}, rememberTalkChoices() {},
+    sectionNotice() {}, trackTalkThinking() {}, renderTalk() {}, renderTalkSections() {}, ok() {}, rememberTalkChoices() {},
     shortId: id => id, failFor: () => assert.fail('unexpected detail failure'),
   });
   const health = api.getJson('/api/health');
@@ -580,11 +585,11 @@ test('conversation detail preempts health/list connections until its sections fi
   await flush();
   assert.ok(requests[0].options.signal.aborted);
   assert.ok(requests[1].options.signal.aborted);
-  assert.equal(requests.length, 4, 'bulk requests must wait, not retry alongside detail');
+  assert.equal(requests.length, 3, 'only core starts before transcript rendering');
   requests.find(r => r.url.endsWith('/core')).resolve({ id: 'a' });
   await flush();
   assert.equal(state.talkDetail.talk.id, 'a');
-  assert.equal(requests.length, 4);
+  assert.equal(requests.length, 6, 'bulk reads resume while sections remain pending');
   requests.find(r => r.url.endsWith('/sections')).resolve({ roster: [], personas: [] });
   await detail;
   await flush();
@@ -768,4 +773,118 @@ test('chat search hydrates matches outside the loaded page in bounded batches', 
   assert.equal(state.talks.length, 74);
   assert.equal(state.search.chats.status, 'ok');
   assert.equal(state.search.chats.hits.size, 73);
+});
+
+test('conversation paints core before starting sections, and sections never rerender transcript', async () => {
+  const h = harness({ manualPaint: true });
+  const done = h.api.loadTalk('a');
+  assert.equal(h.requests.length, 1);
+  h.requests[0].resolve({ id: 'a', updated_at: 'now', turns: [{ body: 'Visible transcript' }] });
+  await flush();
+  assert.equal(h.renders.length, 1);
+  assert.equal(h.requests.length, 1, 'secondary work waits for paint');
+  assert.ok(h.notices.some(n => n[1] === 'talk-core-state' && n[2] === ''));
+  h.frames.shift()();
+  await flush();
+  assert.equal(h.requests[1].url, 'talk/a/sections');
+  assert.equal(h.renders.length, 1, 'held sections leave transcript visible');
+  h.requests[1].resolve({ context_for: 'now', tasks: ['related'], roster: [], personas: [] });
+  await done;
+  assert.equal(h.renders.length, 1, 'enrichment updates only secondary controls');
+  assert.equal(h.sectionRenders.length, 1);
+  assert.deepEqual(h.state.talkDetail.talk.tasks, ['related']);
+});
+
+test('navigation cancels sections scheduled for after paint', async () => {
+  const h = harness({ manualPaint: true });
+  const done = h.api.loadTalk('a');
+  h.requests[0].resolve({ id: 'a' });
+  await flush();
+  h.api.cancelDetailSections();
+  h.frames.shift()();
+  await done;
+  assert.equal(h.requests.length, 1);
+});
+
+for (const status of [404, 500]) test(`core failure never starts sections (${status})`, async () => {
+  const h = harness();
+  const done = h.api.loadTalk('a');
+  h.requests[0].reject(Object.assign(new Error('Unavailable'), { status }));
+  await done;
+  assert.equal(h.requests.length, 1);
+  if (status === 404) assert.equal(h.state.talkDetail.gone, true);
+});
+
+test('sections retry preserves transcript and rejects stale context and persona metadata', async () => {
+  const h = harness();
+  const done = h.api.loadTalk('a');
+  h.requests[0].resolve({ id: 'a', updated_at: 'new', persona_name: 'Current persona' });
+  await flush();
+  h.requests[1].reject(new Error('Secondary unavailable'));
+  await done;
+  const retry = h.notices.find(n => n[2].includes('Secondary unavailable'))[3]();
+  h.requests[2].resolve({ id: 'a', updated_at: 'new', persona_name: 'Current persona' });
+  await flush();
+  h.requests[3].resolve({ context_for: 'old', context: 'obsolete', persona_name: 'Old persona', tasks: ['current'], roster: [], personas: [] });
+  await retry;
+  assert.equal(h.state.talkDetail.talk.context, undefined);
+  assert.equal(h.state.talkDetail.talk.persona_name, 'Current persona');
+  assert.deepEqual(h.state.talkDetail.talk.tasks, ['current']);
+  assert.equal(h.state.talkDetail.sectionsError, false);
+});
+
+test('pending sections coalesce refreshes without holding newer transcript updates', async () => {
+  const h = harness();
+  const first = h.api.loadTalk('a');
+  h.requests[0].resolve({ id: 'a', updated_at: 'old' });
+  await flush();
+  const refresh = h.api.loadTalk('a', { background: true });
+  h.requests[2].resolve({ id: 'a', updated_at: 'new', turns: [{ body: 'New transcript' }] });
+  await flush();
+  assert.equal(h.state.talkDetail.talk.turns[0].body, 'New transcript');
+  assert.equal(h.requests.length, 3, 'sections refresh joins existing work');
+  h.requests[1].resolve({ context_for: 'old', context: 'old context', tasks: ['old'], roster: [], personas: [] });
+  await flush();
+  assert.equal(h.requests.length, 4, 'one trailing sections read retains the refresh');
+  h.requests[3].resolve({ context_for: 'new', context: 'new context', tasks: ['new'], roster: [], personas: [] });
+  await Promise.all([first, refresh]);
+  assert.equal(h.state.talkDetail.talk.context, 'new context');
+  assert.deepEqual(h.state.talkDetail.talk.tasks, ['new']);
+});
+
+test('successful operations invalidate both pending responses and scheduled enrichment', async () => {
+  const h = harness({ manualPaint: true });
+  const old = h.api.loadTalk('a');
+  h.requests[0].resolve({ id: 'a', updated_at: 'old', agent: 'old' });
+  await flush();
+  h.api.acceptTalkUpdate({ id: 'a', updated_at: 'new', agent: 'new' });
+  h.frames.shift()();
+  await old;
+  assert.equal(h.requests.length, 2, 'operation supersedes deferred sections');
+  h.requests[1].resolve({ id: 'a', updated_at: 'new', agent: 'new' });
+  await flush();
+  h.frames.shift()();
+  await flush();
+  h.requests[2].resolve({ context_for: 'new', roster: [], personas: [], tasks: ['new'] });
+  await flush();
+  assert.equal(h.state.talkDetail.talk.agent, 'new');
+  assert.deepEqual(h.state.talkDetail.talk.tasks, ['new']);
+});
+
+test('hiding a chat while its first paint is scheduled does not stall refreshes', async () => {
+  const listeners = new Set();
+  const visibility = { hidden: false,
+    addEventListener: (_, listener) => listeners.add(listener),
+    removeEventListener: (_, listener) => listeners.delete(listener) };
+  const h = harness({ manualPaint: true, visibility });
+  const done = h.api.loadTalk('a');
+  h.requests[0].resolve({ id: 'a' });
+  await flush();
+  visibility.hidden = true;
+  for (const listener of listeners) listener();
+  await flush();
+  assert.equal(listeners.size, 0);
+  assert.equal(h.requests[1].url, 'talk/a/sections');
+  h.requests[1].resolve({ roster: [], personas: [] });
+  await done;
 });

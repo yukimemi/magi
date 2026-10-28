@@ -3867,6 +3867,7 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
                 let release;
                 const gate = new Promise(resolve => { release = resolve; });
                 window.delayedChatReads = { references: 0, sections: 0, health: 0 };
+                let failSections = true;
                 window.releaseChatReads = release;
                 window.fetch = async (...args) => {
                     const url = String(args[0]);
@@ -3876,6 +3877,10 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
                     if (kind) {
                         window.delayedChatReads[kind]++;
                         await gate;
+                    }
+                    if (kind === 'sections' && failSections) {
+                        failSections = false;
+                        return new Response(JSON.stringify({ error: 'Delayed sections unavailable' }), { status: 503 });
                     }
                     return original(...args);
                 };
@@ -3891,9 +3896,9 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
         )
         .await
         .unwrap();
-    // Cold navigation gives core and sections priority over health. Waiting
-    // for health to start while sections are held would deadlock this test.
-    browser
+    // Keep secondary responses held until a painted transcript is observable.
+    // Save the result so the gate is released even if this assertion fails.
+    let transcript = browser
         .wait_for(
             &page,
             "document.querySelectorAll('#talk-turns > li').length === 85 \
@@ -3901,24 +3906,47 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
              && document.querySelector('#talk-turns pre code')?.textContent.trim() === '12ba' \
              && window.delayedChatReads.references > 0 \
              && window.delayedChatReads.sections > 0 \
-             && window.delayedChatReads.health === 0",
+             && window.delayedChatReads.health > 0 \
+             && document.getElementById('talk-core-state').hidden \
+             && !document.getElementById('talk-sections-state').hidden \
+             && document.getElementById('talk-agent').disabled \
+             && document.getElementById('talk-persona').disabled \
+             && document.getElementById('talk-turns').getClientRects().length > 0",
             Duration::from_secs(30),
         )
-        .await
-        .expect("long transcript renders with health deferred and related sections and references held");
+        .await;
     browser
-        .eval(&page, "window.releaseChatReads(); true")
+        .eval(&page, "window.savedTurn = document.querySelector('#talk-turns > li'); document.getElementById('f-talk-say').value = 'Unsent draft'; window.releaseChatReads(); true")
+        .await
+        .unwrap();
+    transcript.expect(
+        "transcript paints while sections and references remain held and bulk reads resume",
+    );
+    browser
+        .wait_for(&page, "!!document.querySelector('#talk-sections-state button') && document.getElementById('talk-agent').disabled", Duration::from_secs(30))
+        .await.expect("secondary failure offers a local retry");
+    browser
+        .eval(
+            &page,
+            "document.querySelector('#talk-sections-state button').click(); true",
+        )
         .await
         .unwrap();
     browser
         .wait_for(
             &page,
             "document.querySelectorAll('.turn[data-who=agent] a[href=\"#/tasks/20260908-205803-12ba\"]').length === 2 \
-             && window.delayedChatReads.health > 0",
+             && window.delayedChatReads.sections >= 2 \
+             && document.getElementById('talk-sections-state').hidden \
+             && !document.getElementById('talk-tasks-panel').hidden \
+             && document.querySelector('#talk-turns > li') === window.savedTurn \
+             && document.getElementById('f-talk-say').value === 'Unsent draft' \
+             && !document.getElementById('talk-persona').disabled \
+             && document.getElementById('talk-persona').options.length > 1",
             Duration::from_secs(30),
         )
         .await
-        .expect("deferred references decorate the preserved transcript and health resumes after sections");
+        .expect("retry populates related tasks and decorates the preserved transcript");
     browser
         .eval(&page, "location.hash = '#/queue'; true")
         .await
@@ -5583,27 +5611,39 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
             const snapshot = structuredClone(deck.state.talkDetail.talk);
             const sections = structuredClone(deck.state.talkDetail.sections);
             const pending = [];
+            const next = async () => {
+                const deadline = performance.now() + 10000;
+                while (!pending.length && performance.now() < deadline) await new Promise(resolve => setTimeout(resolve, 0));
+                if (!pending.length) throw new Error('Expected next conversation request');
+                return pending.shift();
+            };
             const response = body => ({ ok: true, status: 200, headers: new Headers(), json: async () => body });
             const out = {};
             window.fetch = () => new Promise(resolve => pending.push(resolve));
             try {
                 const old = deck.loadTalk(id), fresh = deck.loadTalk(id);
-                out.coalesced = pending.length === 2;
-                pending.shift()(response(snapshot));
-                pending.shift()(response(sections));
+                out.coalesced = pending.length === 1;
+                (await next())(response(snapshot));
+                (await next())(response(sections));
                 await Promise.all([old, fresh]);
+                // Retain a pending sections response, then supersede it with
+                // an operation whose core response is also kept pending.
+                const obsolete = deck.loadTalk(id);
+                (await next())(response(snapshot));
+                const staleSections = await next();
                 deck.acceptTalkUpdate({ id, status: 'closed' });
                 out.preserved = deck.state.talkDetail.talk.task_progress.total === 7
                     && deck.state.talkDetail.talk.tasks.length === 7;
-                // A newer operation cancels both sections of the older read.
+                // A newer operation cancels the preceding core and enrichment.
                 const stale = pending.splice(0);
                 deck.acceptTalkUpdate({ id, status: 'open' });
                 const latest = deck.loadTalk(id);
-                pending.shift()(response(snapshot));
-                pending.shift()(response(sections));
+                (await next())(response(snapshot));
+                (await next())(response(sections));
                 await latest;
                 stale[0]({ ok: false, status: 404, headers: new Headers(), text: async () => '{}' });
-                stale[1](response({ ...sections, tasks: [], task_progress: { state: 'none', total: 0, done: 0, counts: {}, unfinished_ids: [] } }));
+                staleSections(response({ ...sections, tasks: [], task_progress: { state: 'none', total: 0, done: 0, counts: {}, unfinished_ids: [] } }));
+                await obsolete;
                 await new Promise(resolve => setTimeout(resolve, 0));
                 out.stale404Ignored = !deck.state.talkDetail.gone && !!deck.state.talkDetail.talk
                     && deck.state.talkDetail.talk.tasks.length === 7;
