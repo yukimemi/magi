@@ -2516,8 +2516,8 @@ async fn unreachable_banner_waits_out_transient_failures() {
           deck.state.talkDetail = { id: 'waiting-chat', talk: null };
           deck.state.talkWaits = new Map(['waiting-chat', 'other-conversation'].map(id =>
             [id, { lastPoll: clock - 10000, waitFrom: clock, generation: 1 }]));
-          let polls = 0;
-          window.fetch = async () => { polls++; throw new TypeError('Failed to fetch'); };
+          const polls = [];
+          window.fetch = async url => { polls.push(String(url)); throw new TypeError('Failed to fetch'); };
           /* tickTalkWaits does not await its requests. Drain the promise chain
              before inspecting the banner or replacing the fetch stub. */
           const tick = async () => {
@@ -2526,7 +2526,8 @@ async fn unreachable_banner_waits_out_transient_failures() {
           };
           await tick();
           out.talkFirstQuiet = !shown();
-          out.talkPolls = polls;
+          out.talkPolls = polls.length;
+          out.talkCoreOnly = polls.every(url => url.endsWith('/core'));
           out.talkFailures = deck.unreachable.failures;
           await deck.loadHealth();
           clock += 10000;
@@ -2642,8 +2643,9 @@ async fn unreachable_banner_waits_out_transient_failures() {
     assert_eq!(r["storeQuiet"], true);
     assert_eq!(r["loopQuiet"], true);
     assert_eq!(r["talkFirstQuiet"], true);
-    // The visible chat loads core + sections; the other wait polls core only.
-    assert_eq!(r["talkPolls"], 3);
+    // Both waits poll core; failed core reads must not start sections.
+    assert_eq!(r["talkPolls"], 2);
+    assert_eq!(r["talkCoreOnly"], true);
     assert_eq!(r["talkFailures"], 0);
     assert_eq!(r["talkEarlyQuiet"], true);
     assert_eq!(r["parallelFailures"], 2);
