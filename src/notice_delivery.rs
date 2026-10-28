@@ -120,7 +120,9 @@ fn clean(text: &str) -> String {
 
 fn reconcile(n: &Notice, queue: &Queue, talks: &Talks, home: &Path, repo: &Path) -> Result<()> {
     let store = Notices::at(home.join("notifications"));
-    if n.key.starts_with("deputy:") {
+    // conductor_resumption is raised only when the producer verified no new
+    // blocker and made no state change. Retain the audit record, not a chat turn.
+    if n.key.starts_with("deputy:") || n.key.starts_with("conductor-resumption:") {
         return acknowledge(&store, n, None);
     }
     let tasks = queue.list();
@@ -146,23 +148,6 @@ fn reconcile(n: &Notice, queue: &Queue, talks: &Talks, home: &Path, repo: &Path)
         });
     if let Some(q) = question {
         return acknowledge(&store, n, Some(q.id));
-    }
-    // Completion delivery already reports the same task hold / final run.
-    if let Some(task) = task
-        && (n.key.starts_with("run:")
-            || n.key.starts_with("task:")
-            || n.key.starts_with("handover:"))
-        && task.chat_notice.as_ref().is_some_and(|receipt| {
-            receipt.outcome == crate::queue::ChatNoticeOutcome::Posted
-                && task.chat_notice_key().as_ref() == Some(&receipt.key)
-                && receipt.at >= n.since.unwrap_or(n.first_at)
-                && (n.generation == 1
-                    || n.severity != crate::notices::Severity::Error
-                    || receipt.at >= n.last_at)
-                && task.chat_notice_due().is_none()
-        })
-    {
-        return acknowledge(&store, n, Some("task-completion".into()));
     }
     let mut chat = if let Some(task) = task {
         crate::task_chat::destination(queue, talks, &task.id)?.1
@@ -211,13 +196,16 @@ fn reconcile(n: &Notice, queue: &Queue, talks: &Talks, home: &Path, repo: &Path)
         Some(id) => format!("notice:{}:{id}:{}", n.id, n.generation),
         None => format!("notice:{}:{}", n.id, n.generation),
     };
-    talk::queue_notice(
+    talk::queue_semantic_notice(
         &mut chat,
         talks,
         &text,
         &delivery_key,
         &|_| false,
-        None,
+        (
+            None,
+            crate::notice_semantics::attention(home, task, run_id, n),
+        ),
         crate::prompt::NoticeDisplay {
             facts: body,
             output: None,
@@ -255,5 +243,37 @@ pub fn sweep(queue: &Queue, talks: &Talks, home: &Path, repo: &Path) {
         if let Err(e) = reconcile(&n, queue, talks, home, repo) {
             tracing::warn!("notice {} delivery deferred: {e:#}", n.id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unchanged_conductor_representations_are_history_without_chat_delivery() {
+        let home = tempfile::tempdir().unwrap();
+        let queue = Queue::at(home.path().join("queue"));
+        let talks = Talks::at(home.path().join("talks"));
+        let notices = Notices::at(home.path().join("notifications"));
+        for reason in ["same concern", "reworded concern"] {
+            let notice = notices
+                .raise(crate::notices::conductor_resumption(
+                    "task",
+                    "task",
+                    Some(reason),
+                    &[],
+                    &["run".into()],
+                    true,
+                ))
+                .unwrap();
+            reconcile(&notice, &queue, &talks, home.path(), home.path()).unwrap();
+            let saved = notices.get(&notice.id).unwrap();
+            assert_eq!(saved.delivered, saved.generation);
+            assert!(!saved.unread());
+        }
+        assert!(talks.list().is_empty());
+        assert!(queue.list().is_empty());
+        assert_eq!(notices.all().len(), 1);
     }
 }

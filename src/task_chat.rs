@@ -125,12 +125,7 @@ pub(crate) fn destination_in(talks: &Talks, repo: &Path, id: &str) -> Result<tal
             )
         }
     };
-    let mut chat = load(id)?;
-    // Decisions and attention reports both reopen their destination.
-    if !chat.status.open() {
-        talk::reopen(&mut chat, talks)?;
-    }
-    Ok(chat)
+    load(id)
 }
 
 /// Reserve the destination under the task lock, then deliver without it.
@@ -201,13 +196,16 @@ pub fn post(
     let text = format!(
         "{body}\nThis automatic report is not an owner instruction. Investigate and report; it authorizes neither repository edits nor new tasks.\n{instructions}"
     );
-    talk::queue_notice(
+    talk::queue_semantic_notice(
         &mut chat,
         talks,
         &text,
         &format!("question:{}", q.id),
         &|_| false,
-        None,
+        (
+            None,
+            Some(crate::notice_semantics::question(home, &task, run, q)),
+        ),
         crate::prompt::NoticeDisplay {
             facts: body,
             output: None,

@@ -1808,3 +1808,248 @@ async fn attention_reports_page_new_run_passes_after_legacy_read_history() {
         assert!(!store.get(&id).unwrap().unread());
     }
 }
+
+#[tokio::test]
+async fn semantic_automatic_sources_share_receipts_without_settling_decisions() {
+    let _home = common::home_lock().await;
+    for (attention_first, gate_failed) in
+        [(true, false), (false, false), (true, true), (false, true)]
+    {
+        let w = world();
+        let mut run = magi::run::RunState::new(
+            w.tmp.path().into(),
+            "main".into(),
+            "base".into(),
+            "task".into(),
+            Config::default(),
+        );
+        run.status = magi::run::RunStatus::Failed;
+        if gate_failed {
+            let output = std::process::Command::new("sh")
+                .args(["-c", "echo regression gate failure; exit 1"])
+                .output()
+                .unwrap();
+            run.status = magi::run::RunStatus::Blocked;
+            run.gate_ran = true;
+            run.gate_head = Some("reviewed-head".into());
+            run.gate = vec![magi::run::CommandOutcome {
+                command: "echo regression gate failure; exit 1".into(),
+                code: output.status.code(),
+                output_tail: String::from_utf8(output.stdout).unwrap(),
+                duration_ms: 0,
+                resource_blocked: false,
+            }];
+            run.event("gate", "gate failed; not merging");
+            assert!(run.verification_blocking_cause().is_some());
+        } else {
+            run.prep_failure = Some("no candidate produced a change".into());
+        }
+        let dir = w.tmp.path().join("runs").join(&run.id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("run.json"), serde_json::to_vec(&run).unwrap()).unwrap();
+        let mut task = Task::new(
+            "failure".into(),
+            "work".into(),
+            w.tmp.path().into(),
+            Source::Agent {
+                run: w.talk_id.clone(),
+                node: CHAT_NODE.into(),
+            },
+        );
+        task.chat = Some(w.talk_id.clone());
+        task.start(run.id.clone());
+        task.last_error = if gate_failed {
+            // daemon::describe wraps the cause with status and run identity.
+            Some(format!(
+                "Run ended blocked ({}) [{}]",
+                run.verification_blocking_cause().unwrap(),
+                run.id
+            ))
+        } else {
+            run.prep_failure.clone()
+        };
+        task.hold_machine(task.last_error.clone());
+        w.queue.put(&mut task).unwrap();
+        let notices = magi::notices::Notices::at(w.tmp.path().join("notifications"));
+        notices
+            .raise(magi::notices::run_ended(&run).unwrap())
+            .unwrap();
+        let attention =
+            || magi::notice_delivery::sweep(&w.queue, &w.talks, w.tmp.path(), w.tmp.path());
+        if attention_first {
+            attention();
+            chat_notify::sweep(&w.queue, &w.talks, w.tmp.path());
+        } else {
+            chat_notify::sweep(&w.queue, &w.talks, w.tmp.path());
+            attention();
+        }
+        let mut chat = w.talks.get(&w.talk_id).unwrap();
+        assert_eq!(
+            chat.pending_messages.len(),
+            1,
+            "held, failed and completion are one failure"
+        );
+        assert!(w.queue.get(&task.id).unwrap().chat_notice.is_some());
+        assert!(notices.list().iter().all(|n| !n.unread()));
+        notices
+            .raise(magi::notices::run_stopped(&run.id, &run))
+            .unwrap();
+        attention();
+        chat = w.talks.get(&w.talk_id).unwrap();
+        assert_eq!(chat.pending_messages.len(), 1, "same stopped-run cause");
+        talk::drain(&mut chat, &w.talks).unwrap();
+
+        let questions = magi::ask::Questions::at(w.tmp.path().join("questions"));
+        let mut q = magi::ask::Question::new(
+            task.id.clone(),
+            "conduct".into(),
+            "conductor".into(),
+            "Finish or hold?".into(),
+            "same failure".into(),
+            vec!["finish".into(), "hold".into()],
+        );
+        q.decision_context = Some("same failure and target".into());
+        q.actions
+            .insert("finish".into(), magi::ask::ChoiceAction::Done);
+        q.routed_task = Some(task.id.clone());
+        questions.put(&mut q).unwrap();
+        magi::task_chat::sweep(&w.queue, &w.talks, &questions, w.tmp.path());
+        chat = w.talks.get(&w.talk_id).unwrap();
+        assert_eq!(
+            chat.pending_messages.len(),
+            1,
+            "first required decision must be presented"
+        );
+        talk::drain(&mut chat, &w.talks).unwrap();
+        talk::close(&mut chat, &w.talks).unwrap();
+
+        // Regenerated IDs and explanations do not create a new owner decision.
+        let mut again = q.clone();
+        again.id.push_str("-again");
+        again.summary = "Reworded decision".into();
+        again.detail = "Reworded explanation".into();
+        again.routed_chat = None;
+        questions.put(&mut again).unwrap();
+        magi::task_chat::sweep(&w.queue, &w.talks, &questions, w.tmp.path());
+        notices
+            .raise(magi::notices::conductor_resumption(
+                &task.id,
+                task.short(),
+                Some("same run, no new evidence"),
+                &[],
+                &[run.id.clone()],
+                true,
+            ))
+            .unwrap();
+        attention();
+        let saved = w.talks.get(&w.talk_id).unwrap();
+        assert!(!saved.status.open());
+        assert!(saved.pending.is_empty());
+        for question in [&q, &again] {
+            let saved = questions.get(&question.id).unwrap();
+            assert!(saved.status.open());
+            assert_eq!(saved.routed_chat.as_deref(), Some(w.talk_id.as_str()));
+        }
+        assert_eq!(
+            w.queue.get(&task.id).unwrap().status,
+            magi::queue::TaskStatus::Held
+        );
+        if gate_failed {
+            // A later verification attempt fails on a different commit.
+            run.begin_pass();
+            run.gate_head = Some("new-reviewed-head".into());
+            std::fs::write(dir.join("run.json"), serde_json::to_vec(&run).unwrap()).unwrap();
+            notices
+                .raise(magi::notices::run_ended(&run).unwrap())
+                .unwrap();
+            attention();
+            let saved = w.talks.get(&w.talk_id).unwrap();
+            assert!(saved.status.open());
+            assert_eq!(
+                saved.pending_messages.len(),
+                1,
+                "new failed head is evidence"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn semantic_decisions_without_context_deliver_new_summary_or_detail() {
+    let _home = common::home_lock().await;
+    for with_target in [false, true] {
+        let w = world();
+        let mut task = Task::new(
+            "decision".into(),
+            "work".into(),
+            w.tmp.path().into(),
+            Source::Human,
+        );
+        task.chat = Some(w.talk_id.clone());
+        task.runs.push("run-a".into());
+        task.hold_machine(Some("awaiting owner decision".into()));
+        w.queue.put(&mut task).unwrap();
+        let questions = magi::ask::Questions::at(w.tmp.path().join("questions"));
+        let mut first = magi::ask::Question::new(
+            "run-a".into(),
+            "implement".into(),
+            "impl-A".into(),
+            "Connection failure".into(),
+            "The connection is unavailable".into(),
+            vec!["resume".into(), "hold".into()],
+        );
+        first.actions.insert(
+            "resume".into(),
+            magi::ask::ChoiceAction::Resume {
+                run: "run-a".into(),
+            },
+        );
+        first
+            .actions
+            .insert("hold".into(), magi::ask::ChoiceAction::Hold);
+        if with_target {
+            first.merge_target = Some(magi::merge_decision::Target {
+                pr: "https://example.test/pull/1".into(),
+                head: "head-a".into(),
+                language: "en".into(),
+            });
+        }
+        first.routed_task = Some(task.id.clone());
+        assert!(first.decision_context.is_none());
+        questions.put(&mut first).unwrap();
+        magi::task_chat::sweep(&w.queue, &w.talks, &questions, w.tmp.path());
+        let mut chat = w.talks.get(&w.talk_id).unwrap();
+        assert_eq!(chat.pending_messages.len(), 1);
+        talk::drain(&mut chat, &w.talks).unwrap();
+        talk::close(&mut chat, &w.talks).unwrap();
+
+        for change in ["same", "summary", "detail"] {
+            let mut next = first.clone();
+            next.id.push_str(&format!("-{change}"));
+            match change {
+                "summary" => next.summary = "Newly verified data corruption".into(),
+                "detail" => next.detail = "A new integrity check verified data corruption".into(),
+                _ => {}
+            }
+            questions.put(&mut next).unwrap();
+            magi::task_chat::sweep(&w.queue, &w.talks, &questions, w.tmp.path());
+            chat = w.talks.get(&w.talk_id).unwrap();
+            let changed = change != "same";
+            assert_eq!(chat.status.open(), changed);
+            assert_eq!(chat.pending_messages.len(), usize::from(changed));
+            if changed {
+                assert!(chat.pending.contains("data corruption"));
+                talk::drain(&mut chat, &w.talks).unwrap();
+                talk::close(&mut chat, &w.talks).unwrap();
+            }
+            let routed = questions.get(&next.id).unwrap();
+            assert_eq!(routed.routed_chat.as_deref(), Some(w.talk_id.as_str()));
+            assert!(routed.status.open());
+        }
+        assert!(questions.get(&first.id).unwrap().status.open());
+        assert_eq!(
+            w.queue.get(&task.id).unwrap().status,
+            magi::queue::TaskStatus::Held
+        );
+    }
+}

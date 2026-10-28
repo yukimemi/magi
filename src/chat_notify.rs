@@ -579,17 +579,20 @@ fn deliver(
                     .is_some_and(|n| n.key == old && task.legacy_notice_matches(old))
         })
     };
-    match talk::queue_notice(
+    match talk::queue_semantic_notice(
         &mut talk,
         talks,
         &text,
         &format!("{prefix}{key}"),
         &previous,
-        Some(&CompletionReference {
-            task: task.id.clone(),
-            run: task.runs.last().cloned(),
-            notice: text.clone(),
-        }),
+        (
+            Some(&CompletionReference {
+                task: task.id.clone(),
+                run: task.runs.last().cloned(),
+                notice: text.clone(),
+            }),
+            Some(crate::notice_semantics::outcome(home, task)),
+        ),
         display,
     ) {
         Ok(added) => Ok((ChatNoticeOutcome::Posted, added)),

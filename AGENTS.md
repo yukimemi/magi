@@ -3340,3 +3340,24 @@ because candidate branches and worktrees use the four-character short id.
 New conversations go through `Talks::create`; `Talks::put` is the update path.
 Both stores share `src/id_reserve.rs` with queue filing for bounded retries and
 injected candidate sources. Unknown I/O results are errors, never free ids.
+
+### Automatic chat delivery receipts
+
+Automatic attention (`notice_delivery`), task decisions (`task_chat`) and task
+outcomes (`chat_notify`) share `notice_semantics` and
+`talk::queue_semantic_notice`. Compare confirmed task/run failure evidence,
+execution pass, state, target head and required decision; source IDs, delivery
+generations and generic timestamps are not new evidence. Unknown causes retain
+their literal evidence. Structured decision context supersedes explanatory
+wording, while choices, effects and merge targets remain significant.
+A decision covers its underlying failure report; a failure report does not
+cover an unpresented decision.
+
+Under `Talks::guard`, reread the talk and persist transport keys, semantic
+receipts, pending content and any reopen together. A semantic duplicate still
+acknowledges its source and decision routing but neither appends content nor
+reopens the chat. Receipts survive drains, closes and restarts and are never
+count-pruned. Conductor resumption concerns with no verified new blocker or
+state change remain notice history without waking a chat. These receipts never
+resolve questions, change holds or authorize work. Owner input and explicitly
+requested updates/watches bypass semantic suppression.
