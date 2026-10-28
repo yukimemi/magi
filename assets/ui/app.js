@@ -6410,7 +6410,7 @@ function renderTalk() {
       renderTalkAgent(shown, true, true);
       renderTalkPersona(shown, true, true);
       show($("talk-implementers-box"), true);
-      $("talk-implementers").disabled = true;
+      renderTalkImplementers(shown, true, true);
     } else {
       show($("talk-agent-box"), false);
       show($("talk-persona-box"), false);
@@ -6659,10 +6659,12 @@ function renderTalkPersona(talk, busy, loading = false) {
    refusal. */
 let talkImplementersSwitching = false;
 
-function renderTalkImplementers(talk, busy) {
+function renderTalkImplementers(talk, busy, loading = false) {
   const select = $("talk-implementers");
-  if (document.activeElement !== select) select.value = String(talk.implementers || 1);
-  select.disabled = busy || talkImplementersSwitching || talkPersonaSwitching
+  // List summaries may omit the count. Leave it blank until core arrives,
+  // rather than showing the previous conversation's choice or guessing Solo.
+  if (document.activeElement !== select) select.value = String(talk.implementers || (loading ? "" : 1));
+  select.disabled = loading || busy || talkImplementersSwitching || talkPersonaSwitching
     || talkAgentSwitching || String(talk.status || "open") !== "open";
 }
 

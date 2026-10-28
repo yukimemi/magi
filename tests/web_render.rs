@@ -3225,8 +3225,7 @@ async fn chat_remembers_persona_and_implementers_for_new_conversations() {
         )
         .await
         .unwrap_or_else(|e| panic!("start: {e}"));
-    // A loading shell keeps the previous selector values but disables them.
-    // Wait for the new record to render before inspecting its remembered count.
+    // Wait for the new record before inspecting its remembered count.
     browser
         .wait_for(
             &page,
@@ -3462,6 +3461,136 @@ async fn chat_remembers_selector_changes_after_navigation() {
         assert_eq!(current["persona"], "default");
         assert_eq!(current["implementers"], 1);
     }
+    // A new document cannot finish the old document's response handlers.
+    // Confirmed defaults must survive independently in browser storage.
+    browser.close_page(&page).await;
+    let page = browser
+        .open_page(&format!("{base}#/chat/{}", second.id), 1280, 900, false)
+        .await
+        .expect("reopen chat in a new document");
+    browser.wait_for(&page, &format!(
+        "document.getElementById('talk-meta')?.title.startsWith('{}\\n') \
+         && document.getElementById('talk-implementers')?.disabled === false", second.id
+    ), w).await.expect("reopened chat loaded");
+    let stored = browser.eval(&page, "JSON.parse(localStorage.getItem('magi-talk-defaults'))")
+        .await.expect("read defaults in new document");
+    assert_eq!(stored["agent"], fx.config.agents[1].id);
+    assert_eq!(stored["persona"], "rei");
+    assert_eq!(stored["implementers"], 3);
+}
+}
+
+// A slow destination must never show the previous conversation's count.
+// Hold the core response so this checks the loading shell, not fetch timing.
+common::e2e! {
+async fn chat_clears_previous_implementers_while_loading() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "CI requires Chrome");
+        eprintln!("SKIP web_render: no Chrome/Chromium found (set MAGI_CHROME to run it)");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    publish_fixture_roster(&fx).await;
+    let home = fx.tmp.path().join("magi-home");
+    let talks = Talks::at(home.join("talks"));
+    let agent = &fx.config.agents[0].id;
+    let mut first = talk::begin(&talks, &fx.config, fx.repo.clone(), Some(agent)).unwrap();
+    talk::switch_implementers(&mut first, &talks, 3).unwrap();
+    let mut second = talk::begin(&talks, &fx.config, fx.repo.clone(), Some(agent)).unwrap();
+    talk::switch_implementers(&mut second, &talks, 2).unwrap();
+    let base = serve(
+        &home,
+        Queue::at(home.join("queue")),
+        talks,
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("launch Chrome");
+    let page = browser
+        .open_page(&format!("{base}#/chat/{}", first.id), 1280, 900, false)
+        .await
+        .expect("open first chat");
+    let w = Duration::from_secs(30);
+    browser
+        .wait_for(
+            &page,
+            &format!(
+                "document.getElementById('talk-meta')?.title.startsWith('{}\\n') \
+                     && document.getElementById('talk-implementers')?.value === '3' \
+                     && document.getElementById('talk-implementers')?.disabled === false \
+                     && !!document.querySelector('#talks-list a[href=\"#/chat/{}\"]')",
+                first.id, second.id
+            ),
+            w,
+        )
+        .await
+        .expect("first chat and destination summary loaded");
+    browser
+        .eval(
+            &page,
+            &format!(
+                r#"(() => {{
+                        const originalFetch = window.fetch;
+                        window.releaseTalkCore = null;
+                        window.fetch = async (...args) => {{
+                            const response = await originalFetch(...args);
+                            if (String(args[0]).endsWith('/{}/core')) {{
+                                if (!response.ok) throw new Error(await response.text());
+                                window.fetch = originalFetch;
+                                await new Promise(resolve => {{ window.releaseTalkCore = resolve; }});
+                            }}
+                            return response;
+                        }};
+                        location.hash = '#/chat/{}';
+                        return true;
+                    }})()"#,
+                second.id, second.id
+            ),
+        )
+        .await
+        .expect("hold destination core");
+    browser
+        .wait_for(&page, "typeof window.releaseTalkCore === 'function'", w)
+        .await
+        .expect("destination core held");
+    let shell = browser.eval(&page,
+        "({ value: document.getElementById('talk-implementers').value, disabled: document.getElementById('talk-implementers').disabled })")
+        .await.expect("read loading shell");
+    // The list projection has no implementer count: show no selection until
+    // core arrives, rather than borrowing a value from the previous chat.
+    assert_eq!(shell["value"], "");
+    assert_eq!(shell["disabled"], true);
+    browser
+        .eval(&page, "window.releaseTalkCore(); true")
+        .await
+        .expect("release core");
+    browser
+        .wait_for(
+            &page,
+            &format!(
+                "document.getElementById('talk-meta')?.title.startsWith('{}\\n') \
+                     && document.getElementById('talk-implementers')?.disabled === false",
+                second.id
+            ),
+            w,
+        )
+        .await
+        .expect("destination loaded");
+    let loaded = browser
+        .eval(&page, "document.getElementById('talk-implementers').value")
+        .await
+        .expect("read destination count");
+    assert_eq!(loaded, "2");
+    assert_eq!(
+        browser
+            .eval(&page, "localStorage.getItem('magi-talk-defaults')")
+            .await
+            .expect("read defaults"),
+        Value::Null,
+        "navigation must not write defaults"
+    );
 }
 }
 
