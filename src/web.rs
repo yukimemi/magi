@@ -1271,6 +1271,18 @@ impl Ui {
 
     /// In-flight admission, detached startup, or a cross-process turn lease.
     fn is_thinking(&self, id: &str) -> bool {
+        self.talk_turns
+            .lock()
+            .is_ok_and(|turns| turns.live.contains(id))
+            // Another process (the CLI) can hold the turn through the
+            // on-disk lease.
+            || self.talks.turn_held(id)
+            || crate::consult::turn_worker_active(&self.talks, id)
+    }
+
+    /// 表示専用の観測。ローカルの受付処理やワーカーストアの書き込みを待たない。
+    /// 送信・アップグレードなどの判断には [`Ui::is_thinking`] を使う。
+    fn is_thinking_observed(&self, id: &str) -> bool {
         self.talk_turns.try_lock().map_or_else(
             // Admission may itself be waiting on the worker store. Display a
             // conservative busy state rather than waiting behind that writer.
@@ -1280,14 +1292,7 @@ impl Ui {
             // Another process (the CLI) can hold the turn through the
             // on-disk lease.
             || self.talks.turn_held(id)
-            // Display reads must not reconcile under the writable worker store
-            // lock. Admission still uses consult::turn_worker_active below.
-            || crate::worker::observe_active(&self.home).is_ok_and(|jobs| {
-                jobs.iter().any(|job| {
-                    job.kind == "chat"
-                        && job.payload.get("talk").and_then(serde_json::Value::as_str) == Some(id)
-                })
-            })
+            || crate::consult::turn_worker_observed(&self.talks, id)
     }
 
     /// Claim the right to run one turn in a talk, or report that it is busy.
@@ -8820,7 +8825,7 @@ async fn talk_core(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResu
     bulk_blocking(ui.monitor.talk_core_slots.clone(), move || {
         let id = resolve_talk(&ui.talks, &id)?;
         let talk = ui.talks.get(&id)?;
-        let thinking = ui.is_thinking(&id);
+        let thinking = ui.is_thinking_observed(&id);
         // The browser already resolves Markdown text/code references after
         // rendering. A cold reference/review index must not gate the transcript.
         Ok(Json(TalkView::with_references(
@@ -8902,7 +8907,7 @@ async fn talk_detail(
     blocking(move || {
         let id = resolve_talk(&ui.talks, &id)?;
         let talk = ui.talks.get(&id)?;
-        let thinking = ui.is_thinking(&talk.id);
+        let thinking = ui.is_thinking_observed(&talk.id);
         let tasks = ui.find_tasks_for_talk(&talk.id)?;
         let task_progress = talk_task_progress(&tasks);
         let tasks = tasks.into_iter().map(TaskView::from).collect();
@@ -24810,13 +24815,19 @@ mod tests {
                     .0
                     .thinking
             );
+            assert!(ui.is_thinking(&id));
+            assert!(ui.is_thinking_observed(&id));
             drop(live);
             assert!(
-                !ui.is_thinking(&id),
+                !ui.is_thinking_observed(&id),
                 "a finished lease no longer appears live"
             );
+            assert!(!ui.is_thinking(&id));
             let _turn = ui.begin_talk_turn(&id).unwrap().unwrap();
-            assert!(ui.is_thinking(&id), "local admission remains visible");
+            assert!(
+                ui.is_thinking_observed(&id),
+                "local admission remains visible"
+            );
         });
     }
 

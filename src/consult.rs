@@ -443,6 +443,17 @@ pub fn turn_worker_active(talks: &Talks, talk_id: &str) -> bool {
     })
 }
 
+/// 表示専用の生存確認。ワーカーストアの排他ロックやレコード修復を行わない。
+/// 送信可否の判断には引き続き [`turn_worker_active`] を使う。
+pub fn turn_worker_observed(talks: &Talks, talk_id: &str) -> bool {
+    crate::worker::observe_active(talks.home()).is_ok_and(|jobs| {
+        jobs.iter().any(|job| {
+            job.kind == "chat"
+                && job.payload.get("talk").and_then(serde_json::Value::as_str) == Some(talk_id)
+        })
+    })
+}
+
 /// Task-authored transcript posts do not answer a submitted owner turn.
 fn recorded_answered(talk: &Talk, index: usize) -> bool {
     index
