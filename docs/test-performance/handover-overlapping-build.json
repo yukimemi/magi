@@ -1,0 +1,76 @@
+[
+  {
+    "binary": "graph_seat_handover",
+    "wall_seconds": 30.266,
+    "tests": [
+      {
+        "test": "a_single_agent_roster_keeps_its_same_agent_retries",
+        "seconds": 8.183
+      },
+      {
+        "test": "later::a_judge_that_times_out_voting_is_handed_over_with_full_context",
+        "seconds": 6.821
+      },
+      {
+        "test": "the_roster_tail_keeps_its_same_agent_retries",
+        "seconds": 6.422
+      },
+      {
+        "test": "later::a_deliberation_turn_is_handed_over_instead_of_skipped",
+        "seconds": 5.325
+      },
+      {
+        "test": "later::a_vote_chain_ends_when_the_roster_does_and_asks_each_agent_once",
+        "seconds": 5.184
+      },
+      {
+        "test": "a_timeout_hands_the_seat_over",
+        "seconds": 5.146
+      },
+      {
+        "test": "later::a_reviewer_that_failed_its_reconsideration_is_handed_over_with_the_patch_and_panel",
+        "seconds": 5.074
+      },
+      {
+        "test": "a_judge_seat_is_handed_over_too",
+        "seconds": 4.897
+      },
+      {
+        "test": "a_reviewer_seat_does_not_re_ask_an_agent_that_failed_it_in_an_earlier_round",
+        "seconds": 4.661
+      },
+      {
+        "test": "later::a_judge_recovering_from_a_stall_is_handed_over_for_its_ranking_and_its_vote",
+        "seconds": 4.601
+      },
+      {
+        "test": "later::a_judge_rate_limited_on_its_vote_is_handed_over_not_lost",
+        "seconds": 4.57
+      },
+      {
+        "test": "later::a_judge_that_failed_its_vote_is_handed_over_with_full_context",
+        "seconds": 4.449
+      },
+      {
+        "test": "a_roster_that_runs_out_ends_the_seat_with_each_agent_tried_once",
+        "seconds": 3.861
+      },
+      {
+        "test": "a_seat_with_a_successor_is_handed_over_without_a_same_agent_nudge",
+        "seconds": 3.787
+      },
+      {
+        "test": "a_failed_seat_is_handed_to_the_next_agent_and_recovers",
+        "seconds": 3.522
+      },
+      {
+        "test": "two_identical_failures_in_a_row_stop_the_chain",
+        "seconds": 2.889
+      },
+      {
+        "test": "a_spare_reviewer_is_used_instead_of_doubling_up_another_seat",
+        "seconds": 2.81
+      }
+    ]
+  }
+]

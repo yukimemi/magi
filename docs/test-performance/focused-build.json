@@ -1,0 +1,114 @@
+{
+  "cold": false,
+  "wall_seconds": 81.31,
+  "units": [
+    {
+      "name": "magi-cli",
+      "target": "",
+      "duration": 48.93,
+      "sections": [
+        [
+          "frontend",
+          {
+            "start": 0.0,
+            "end": 33.86
+          }
+        ],
+        [
+          "codegen",
+          {
+            "start": 33.86,
+            "end": 48.93
+          }
+        ]
+      ]
+    },
+    {
+      "name": "aws-lc-sys",
+      "target": " build-script (run)",
+      "duration": 16.4,
+      "sections": null
+    },
+    {
+      "name": "axum",
+      "target": "",
+      "duration": 12.27,
+      "sections": [
+        [
+          "frontend",
+          {
+            "start": 0.0,
+            "end": 11.99
+          }
+        ],
+        [
+          "codegen",
+          {
+            "start": 11.99,
+            "end": 12.27
+          }
+        ]
+      ]
+    },
+    {
+      "name": "magi-cli",
+      "target": " magi \"bin\"",
+      "duration": 6.44,
+      "sections": null
+    },
+    {
+      "name": "magi-cli",
+      "target": " graph_seat_handover \"test\" (test)",
+      "duration": 4.49,
+      "sections": null
+    },
+    {
+      "name": "magi-cli",
+      "target": " graph_seat_handover_later \"test\" (test)",
+      "duration": 4.48,
+      "sections": null
+    },
+    {
+      "name": "rustls",
+      "target": "",
+      "duration": 4.0,
+      "sections": [
+        [
+          "frontend",
+          {
+            "start": 0.0,
+            "end": 2.69
+          }
+        ],
+        [
+          "codegen",
+          {
+            "start": 2.69,
+            "end": 4.0
+          }
+        ]
+      ]
+    },
+    {
+      "name": "reqwest",
+      "target": "",
+      "duration": 3.03,
+      "sections": [
+        [
+          "frontend",
+          {
+            "start": 0.0,
+            "end": 1.87
+          }
+        ],
+        [
+          "codegen",
+          {
+            "start": 1.87,
+            "end": 3.03
+          }
+        ]
+      ]
+    }
+  ]
+}

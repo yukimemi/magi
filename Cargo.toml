@@ -99,7 +99,13 @@ opt-level = 3
 [profile.dev]
 debug = "line-tables-only"
 
-# Smaller debug information reduces repeated integration-test linking and the
-# executable bytes hashed by worker-generation tests. Release is unchanged.
+# Request less debug information while retaining source locations. Measure
+# total build time separately; this does not imply a cold-build speedup.
+# Release is unchanged.
 [profile.test]
 debug = "line-tables-only"
+
+# Every mock CLI cleanup walks the process table. Optimize that dependency in
+# tests while leaving the application and release profiles unchanged.
+[profile.test.package.sysinfo]
+opt-level = 3

@@ -13,9 +13,9 @@ fail-fast = false
 [profile.ci.junit]
 path = "junit.xml"
 
-# `tests/common::isolated` used to cap concurrent children at half the CPUs
-# per binary. Under nextest every test is its own process and binaries overlap,
-# so the cap has to be expressed here, or end-to-end scenes (each spawning git,
+# `tests/common::isolated` caps concurrent children at half the CPUs, at most
+# four per binary. Under nextest every test is its own process and binaries
+# overlap, so the cap also lives here, or end-to-end scenes (each spawning git,
 # and a mock agent) pile up and trip node timeouts.
 [test-groups]
 e2e = { max-threads = 4 }

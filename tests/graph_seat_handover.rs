@@ -5,6 +5,11 @@
 
 mod common;
 
+// Share the fixture compilation and link step with the initial-turn scenes.
+// These remain separate libtest cases (and separate nextest processes).
+#[path = "graph_seat_handover/later.rs"]
+mod later;
+
 use common::fixture_with_handover_failures;
 use magi::graph::Runner;
 use magi::run::RunState;

@@ -4,7 +4,7 @@
 //! which has no session of its own - is sent a full-context prompt rather than
 //! the short one the seat's own conversation would have understood.
 
-mod common;
+use crate::common;
 
 use common::{Fixture, Judges};
 use magi::graph::Runner;

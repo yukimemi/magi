@@ -1,0 +1,60 @@
+{
+  "cold": false,
+  "wall_seconds": 54.8,
+  "units": [
+    {
+      "name": "magi-cli",
+      "target": "",
+      "duration": 49.4,
+      "sections": [
+        [
+          "frontend",
+          {
+            "start": 0.0,
+            "end": 34.69
+          }
+        ],
+        [
+          "codegen",
+          {
+            "start": 34.69,
+            "end": 49.4
+          }
+        ]
+      ]
+    },
+    {
+      "name": "magi-cli",
+      "target": " magi \"bin\"",
+      "duration": 4.83,
+      "sections": null
+    },
+    {
+      "name": "magi-cli",
+      "target": " graph_seat_handover \"test\" (test)",
+      "duration": 2.32,
+      "sections": null
+    },
+    {
+      "name": "sysinfo",
+      "target": "",
+      "duration": 0.83,
+      "sections": [
+        [
+          "frontend",
+          {
+            "start": 0.0,
+            "end": 0.35
+          }
+        ],
+        [
+          "codegen",
+          {
+            "start": 0.35,
+            "end": 0.83
+          }
+        ]
+      ]
+    }
+  ]
+}
