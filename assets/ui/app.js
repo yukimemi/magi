@@ -399,7 +399,10 @@ function currentReference(item) {
 }
 function queueReference(item) {
   referencePending.push({ item, generation: ++item.generation });
-  if (referenceTimer === null) referenceTimer = setTimeout(flushReferences, 0);
+  if (referenceTimer === null) {
+    referenceTimer = typeof requestAnimationFrame === "undefined" ? setTimeout(flushReferences, 0)
+      : requestAnimationFrame(() => { referenceTimer = setTimeout(flushReferences, 0); });
+  }
 }
 function refreshReferences() {
   for (const handle of referenceRanges) {
@@ -5657,6 +5660,20 @@ function renderNoticeDisplay(display, md) {
   return box;
 }
 
+function updateTurnIdentity(row, kind, item) {
+  const r = row.refs;
+  setAvatar(r.avatar, kind === "agent" ? item.personaAvatar
+    : kind === "operator" ? item.operatorAvatar : (item.magiAvatar || magiIconState.avatar));
+  setText(r.who, kind === "operator" ? (item.operatorName || "YOU")
+    : kind === "system" ? "MAGI" : (item.personaName || "AGENT"));
+  const action = r.actions.firstElementChild;
+  if (action) setAttr(action, "aria-label", `Reply to ${r.who.textContent}`);
+  if (row.replyQuote && r.reply.firstElementChild) {
+    const reply = row.replyQuote;
+    setText(r.reply.firstElementChild, `${reply.sender === "magi" ? "MAGI" : reply.who === "operator" ? (item.operatorName || "YOU") : (item.personaName || "AGENT")}: ${reply.excerpt}`);
+  }
+}
+
 function updateTurnRow(row, item) {
   const r = row.refs;
   const turn = item.turn;
@@ -5664,10 +5681,7 @@ function updateTurnRow(row, item) {
   const body = String(turn.display ? turn.display.facts : (turn.body || ""));
 
   setAttr(row, "data-who", kind);
-  setAvatar(r.avatar, kind === "agent" ? item.personaAvatar
-    : kind === "operator" ? item.operatorAvatar : (item.magiAvatar || magiIconState.avatar));
-  setText(r.who, kind === "operator" ? (item.operatorName || "YOU")
-    : kind === "system" ? "MAGI" : (item.personaName || "AGENT"));
+  updateTurnIdentity(row, kind, item);
 
   /* Build prose when its display representation changes. Agent replies and
      MAGI notification facts are parsed server-side and rendered as
@@ -5712,6 +5726,7 @@ function updateTurnRow(row, item) {
     }
   }
 
+  row.replyQuote = turn.reply;
   clear(r.reply);
   clear(r.actions);
   if (item.replyTarget) {
@@ -6150,7 +6165,9 @@ function talkShell(id, summary) {
 // A section owns its request until navigation or completion. Repeated refresh
 // signals join pending work instead of continually superseding slow responses.
 const detailSections = new Map();
+let detailSectionGeneration = 0;
 function cancelDetailSections(prefix = "") {
+  detailSectionGeneration++;
   for (const [key, job] of detailSections) {
     if (!key.startsWith(prefix)) continue;
     job.controller.abort();
@@ -6202,11 +6219,18 @@ function sectionNotice(anchorId, key, message, retry, { pending = false, snapsho
   show(box, Boolean(message));
 }
 
-const talkDetailRequests = new Map();
-function nextTalkRequest(id) {
-  const request = (talkDetailRequests.get(id) || 0) + 1;
-  talkDetailRequests.set(id, request);
-  return request;
+// A frame callback runs before paint; the following task lets that paint finish.
+function afterTalkPaint() {
+  return new Promise(resolve => {
+    // Hidden tabs suspend animation frames; they still need refreshes to settle,
+    // including when visibility changes after the frame has been scheduled.
+    const doc = typeof document === "undefined" ? null : document;
+    const finish = () => { doc?.removeEventListener("visibilitychange", hidden); resolve(); };
+    const hidden = () => { if (doc.hidden) finish(); };
+    if (doc?.hidden) return setTimeout(finish, 0);
+    doc?.addEventListener("visibilitychange", hidden);
+    requestAnimationFrame(() => setTimeout(finish, 0));
+  });
 }
 
 /* Operation responses omit detail-only fields. Keep the last known task
@@ -6220,23 +6244,26 @@ function acceptTalkUpdate(talk) {
 
 function applyTalkSections(detail) {
   if (!detail.talk || !detail.sections) return;
-  const { context, context_for, ...metadata } = detail.sections;
+  const { context, context_for, persona_name, persona_avatar, operator_name, ...metadata } = detail.sections;
   Object.assign(detail.talk, metadata);
-  if (context_for === detail.talk.updated_at) detail.talk.context = context;
+  if (context_for === detail.talk.updated_at) Object.assign(detail.talk, { context, persona_name, persona_avatar, operator_name });
 }
 
 async function loadTalk(id, { background = false } = {}) {
   const release = typeof conversationPriority === "undefined" ? () => {} : conversationPriority.begin();
+  const generation = detailSectionGeneration;
+  const detail = state.talkDetail;
+  const wait = state.talkWaits.get(id);
+  const observed = wait && { generation: wait.generation, startedAt: Date.now() };
+  const current = () => detailSectionGeneration === generation && state.talkDetail === detail && state.talkDetail.id === id;
+  const retry = () => loadTalk(id, { background: true });
+  let loaded;
   try {
-    const detail = state.talkDetail;
-    const wait = state.talkWaits.get(id);
-    const observed = wait && { generation: wait.generation, startedAt: Date.now() };
-    const current = () => state.talkDetail === detail && state.talkDetail.id === id;
-    const retry = () => loadTalk(id, { background: true });
     sectionNotice("talk-meta", "talk-core-state", "Loading conversation…", null, { pending: true, snapshot: Boolean(detail.talk) });
     const core = sectionRequest(`talk:${id}:core`, `${API.talk(id)}/core`, talk => {
       trackTalkThinking(talk, observed);
       if (!current()) return;
+      detail.coreLoaded = true;
       detail.talk = { ...detail.talk, ...talk };
       applyTalkSections(detail);
       sectionNotice("talk-meta", "talk-core-state", "");
@@ -6245,6 +6272,7 @@ async function loadTalk(id, { background = false } = {}) {
     }, error => {
       if (error.status === 404) endTalkTurn(id);
       if (!current()) return;
+      detail.coreLoaded = false;
       if (error.status === 404) {
         detail.talk = null;
         detail.gone = true;
@@ -6255,30 +6283,34 @@ async function loadTalk(id, { background = false } = {}) {
       sectionNotice("talk-meta", "talk-core-state", `Conversation: ${error.message}`, retry);
       failFor(background, `Could not load conversation ${shortId(id)}: ${error.message}`, error);
     }, false, background);
-    // Waiting conversations outside the visible detail need only liveness.
-    if (!current()) return await core;
-    sectionNotice("talk-task-progress", "talk-sections-state", "Loading related tasks and choices…", null, { pending: true, snapshot: Boolean(detail.sections) });
-    const sections = sectionRequest(`talk:${id}:sections`, `${API.talk(id)}/sections`, data => {
-      if (!current()) return;
-      detail.sections = data;
-      detail.sectionsError = false;
-      detail.roster = data.roster;
-      detail.personas = data.personas;
-      if (detail.talk) {
-        applyTalkSections(detail);
-        rememberTalkChoices(detail.talk.repo, data.roster, data.personas);
-      }
-      sectionNotice("talk-task-progress", "talk-sections-state", "");
-      renderTalk();
-    }, error => {
-      if (current()) {
-        detail.sectionsError = true;
-        sectionNotice("talk-task-progress", "talk-sections-state", `Related information: ${error.message}`, retry);
-        renderTalk();
-      }
-    }, false, background);
-    await Promise.allSettled([core, sections]);
+    await core;
+    // Coalesced reads wait for trailing refreshes but keep the first promise's
+    // value. Use the status recorded by the latest core callback instead.
+    loaded = detail.coreLoaded;
+    if (loaded && current()) await afterTalkPaint();
   } finally { release(); }
+  if (!loaded || !current()) return;
+  sectionNotice("talk-task-progress", "talk-sections-state", "Loading related tasks and choices…", null, { pending: true, snapshot: Boolean(detail.sections) });
+  const sections = sectionRequest(`talk:${id}:sections`, `${API.talk(id)}/sections`, data => {
+    if (!current()) return;
+    detail.sections = data;
+    detail.sectionsError = false;
+    detail.roster = data.roster;
+    detail.personas = data.personas;
+    if (detail.talk) {
+      applyTalkSections(detail);
+      rememberTalkChoices(detail.talk.repo, data.roster, data.personas);
+    }
+    sectionNotice("talk-task-progress", "talk-sections-state", "");
+    renderTalkSections();
+  }, error => {
+    if (current()) {
+      detail.sectionsError = true;
+      sectionNotice("talk-task-progress", "talk-sections-state", `Related information: ${error.message}`, retry);
+      renderTalkSections();
+    }
+  }, false, background);
+  await sections;
 }
 
 /* The server uses Done alone as completion, for the same tasks as the list. */
@@ -6428,7 +6460,9 @@ function renderTalk() {
      silently clear an unread the operator never looked at. The
      visibilitychange handler below re-renders once the tab is actually
      looked at again, which is what marks it read. */
-  if (!document.hidden) markTalkRead(talk);
+  afterTalkPaint().then(() => {
+    if (!document.hidden && state.talkDetail.talk === talk && state.route.name === "talk") markTalkRead(talk);
+  });
 
   const status = String(talk.status || "open");
   /* The operator's own message, shown immediately and held until the
@@ -6530,6 +6564,24 @@ function renderTalk() {
   renderTalkImplementers(talk, busy);
   show($("talk-wait"), busy);
   renderTalkDelete(talk);
+}
+
+function renderTalkSections() {
+  const talk = state.talkDetail.talk;
+  if (!talk) return;
+  const busy = state.talkWaits.has(talk.id) || Boolean(talk.thinking);
+  renderTalkTasks(talk);
+  renderTalkAgent(talk, busy);
+  renderTalkPersona(talk, busy);
+  renderTalkImplementers(talk, busy);
+  // Configuration supplies display names and avatars too. Patch those labels
+  // without rebuilding prose, reply controls, or the operator's selection.
+  const identity = { operatorName: talk.operator_name, operatorAvatar: talk.operator_avatar,
+    magiAvatar: talk.magi_avatar, personaName: talk.persona_name, personaAvatar: talk.persona_avatar };
+  for (const row of $("talk-turns").children) updateTurnIdentity(row, row.dataset.who, identity);
+  const head = $("talk-status");
+  clear(head);
+  head.append(chip(String(talk.status || "open"), TALK_STATUS), contextTag(talk.context));
 }
 
 /* The agent selector. Native <select>, so a phone gets its own picker. Never

@@ -445,6 +445,7 @@ pub(crate) struct SharedMonitor {
     disk_cache: Mutex<DiskCache>,
     talk_index: Mutex<HashMap<String, (FileIdentity, TalkListView)>>,
     bulk_slots: Arc<tokio::sync::Semaphore>,
+    talk_core_slots: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     talk_parses: std::sync::atomic::AtomicUsize,
 }
@@ -528,6 +529,7 @@ impl SharedMonitor {
             disk_cache: Mutex::default(),
             talk_index: Mutex::default(),
             bulk_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            talk_core_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             #[cfg(test)]
             talk_parses: std::sync::atomic::AtomicUsize::new(0),
         }
@@ -1276,6 +1278,21 @@ impl Ui {
             // on-disk lease.
             || self.talks.turn_held(id)
             || crate::consult::turn_worker_active(&self.talks, id)
+    }
+
+    /// 表示専用の観測。ローカルの受付処理やワーカーストアの書き込みを待たない。
+    /// 送信・アップグレードなどの判断には [`Ui::is_thinking`] を使う。
+    fn is_thinking_observed(&self, id: &str) -> bool {
+        self.talk_turns.try_lock().map_or_else(
+            // Admission may itself be waiting on the worker store. Display a
+            // conservative busy state rather than waiting behind that writer.
+            |error| matches!(error, std::sync::TryLockError::WouldBlock),
+            |turns| turns.live.contains(id),
+        )
+            // Another process (the CLI) can hold the turn through the
+            // on-disk lease.
+            || self.talks.turn_held(id)
+            || crate::consult::turn_worker_observed(&self.talks, id)
     }
 
     /// Claim the right to run one turn in a talk, or report that it is busy.
@@ -8806,10 +8823,11 @@ async fn talk_post(
 
 /// Transcript first: unrelated queue history and repository probes are deferred.
 async fn talk_core(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResult<Json<TalkView>> {
-    blocking(move || {
+    // Keep transcript reads independent of sections and the runtime blocking pool.
+    bulk_blocking(ui.monitor.talk_core_slots.clone(), move || {
         let id = resolve_talk(&ui.talks, &id)?;
         let talk = ui.talks.get(&id)?;
-        let thinking = ui.is_thinking(&id);
+        let thinking = ui.is_thinking_observed(&id);
         // The browser already resolves Markdown text/code references after
         // rendering. A cold reference/review index must not gate the transcript.
         Ok(Json(TalkView::with_references(
@@ -8827,7 +8845,7 @@ async fn talk_sections(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    blocking(move || {
+    bulk_blocking(ui.monitor.bulk_slots.clone(), move || {
         let id = resolve_talk(&ui.talks, &id)?;
         let talk = ui.talks.get(&id)?;
         let tasks = ui.find_tasks_for_talk(&talk.id)?;
@@ -8891,7 +8909,7 @@ async fn talk_detail(
     blocking(move || {
         let id = resolve_talk(&ui.talks, &id)?;
         let talk = ui.talks.get(&id)?;
-        let thinking = ui.is_thinking(&talk.id);
+        let thinking = ui.is_thinking_observed(&talk.id);
         let tasks = ui.find_tasks_for_talk(&talk.id)?;
         let task_progress = talk_task_progress(&tasks);
         let tasks = tasks.into_iter().map(TaskView::from).collect();
@@ -24705,6 +24723,114 @@ mod tests {
             .unwrap();
         assert_eq!(core.talk.id, id);
         assert!(talk_sections(State(ui), Path(id)).await.is_ok());
+    }
+
+    #[test]
+    fn conversation_core_ignores_worker_store_lock_and_busy_secondary_pool() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let id = seed_talk_at(&ui.talks, "20261019-000000-cafe", "open");
+        let directory = home.path().join("workers/jobs/abcdef");
+        std::fs::create_dir_all(&directory).unwrap();
+        let job = crate::worker::Job {
+            id: "abcdef".into(),
+            sequence: 1,
+            kind: "chat".into(),
+            key: id.clone(),
+            payload: serde_json::json!({ "talk": id }),
+            generation: "test".into(),
+            version: None,
+            status: crate::worker::Status::Running,
+            result: None,
+            pid: None,
+            created_at: 0,
+            finished_at: None,
+        };
+        std::fs::write(
+            directory.join("job.json"),
+            serde_json::to_vec(&job).unwrap(),
+        )
+        .unwrap();
+        let live = crate::worker::execution_lease_for_test(&directory.join("live.lock"));
+        let store =
+            crate::worker::execution_lease_for_test(&home.path().join("workers/store.lock"));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (release, held) = std::sync::mpsc::channel();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let occupied = tokio::task::spawn_blocking(move || {
+                started.send(()).unwrap();
+                held.recv().unwrap();
+            });
+            ready.await.unwrap();
+            let secondary = tokio::spawn(talk_sections(State(ui.clone()), Path(id.clone())));
+            let bulk = ui
+                .monitor
+                .bulk_slots
+                .clone()
+                .acquire_many_owned(2)
+                .await
+                .unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                talk_core(State(ui.clone()), Path(id.clone())),
+            )
+            .await;
+            // Release all blockers before assertions, including on a regression.
+            drop(store);
+            drop(bulk);
+            release.send(()).unwrap();
+            occupied.await.unwrap();
+            let _ = secondary.await.unwrap().unwrap();
+            let Json(core) = result
+                .expect("transcript must bypass secondary work and the worker store lock")
+                .unwrap();
+            assert!(
+                core.thinking,
+                "read-only observation retains live worker state"
+            );
+            assert_eq!(core.talk.id, id);
+            let admission_ui = ui.clone();
+            let (release, held) = std::sync::mpsc::channel();
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let admission = std::thread::spawn(move || {
+                let _lock = admission_ui.talk_turns.lock().unwrap();
+                started.send(()).unwrap();
+                held.recv().unwrap();
+            });
+            ready.await.unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                talk_core(State(ui.clone()), Path(id.clone())),
+            )
+            .await;
+            release.send(()).unwrap();
+            admission.join().unwrap();
+            assert!(
+                result
+                    .expect("display must not wait behind local admission")
+                    .unwrap()
+                    .0
+                    .thinking
+            );
+            assert!(ui.is_thinking(&id));
+            assert!(ui.is_thinking_observed(&id));
+            drop(live);
+            assert!(
+                !ui.is_thinking_observed(&id),
+                "a finished lease no longer appears live"
+            );
+            assert!(!ui.is_thinking(&id));
+            let _turn = ui.begin_talk_turn(&id).unwrap().unwrap();
+            assert!(
+                ui.is_thinking_observed(&id),
+                "local admission remains visible"
+            );
+        });
     }
 
     #[tokio::test]
