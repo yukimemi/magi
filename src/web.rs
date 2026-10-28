@@ -441,6 +441,49 @@ pub(crate) struct SharedMonitor {
     pub queue_index: Arc<Mutex<QueueIndex>>,
     list_walks: Mutex<Vec<ListWalk>>,
     disk: Arc<Mutex<DiskObservation>>,
+    health_index: Mutex<HealthIndex>,
+    disk_cache: Mutex<DiskCache>,
+    talk_index: Mutex<HashMap<String, (FileIdentity, TalkListView)>>,
+    bulk_slots: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    talk_parses: std::sync::atomic::AtomicUsize,
+}
+
+/// Request-time indexes retain projections, never transcripts or whole runs.
+#[derive(Debug, Default)]
+struct HealthIndex {
+    runs: HashMap<String, (FileIdentity, bool)>,
+    questions: Option<QuestionCounts>,
+    notices: Option<(u64, usize)>,
+    #[cfg(test)]
+    run_parses: usize,
+}
+
+/// Live stamps invalidate counts immediately; the TTL also refreshes lease state.
+const QUESTION_COUNTS_TTL: Duration = Duration::from_secs(10);
+
+#[derive(Debug)]
+struct QuestionCounts {
+    revision: u64,
+    measured: std::time::Instant,
+    open: usize,
+    owner: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DiskSizes {
+    runs: u64,
+    worktrees: u64,
+    cache: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct DiskCache {
+    measured: Option<std::time::Instant>,
+    loading: bool,
+    config: Option<Config>,
+    disk: Option<DiskSizes>,
+    update: Option<UpdateView>,
 }
 
 /// Keep a failed store's last observation without suppressing healthy stores.
@@ -481,6 +524,12 @@ impl SharedMonitor {
             queue_index: Arc::default(),
             list_walks: Mutex::default(),
             disk: Arc::default(),
+            health_index: Mutex::default(),
+            disk_cache: Mutex::default(),
+            talk_index: Mutex::default(),
+            bulk_slots: Arc::new(tokio::sync::Semaphore::new(2)),
+            #[cfg(test)]
+            talk_parses: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -2140,6 +2189,37 @@ where
     }
 }
 
+/// Bulk readers have a bounded, separate execution lane. A cold health
+/// index or multiple slow list clients cannot occupy the pool serving detail.
+async fn bulk_blocking<T>(
+    slots: Arc<tokio::sync::Semaphore>,
+    job: impl FnOnce() -> ApiResult<T> + Send + 'static,
+) -> ApiResult<T>
+where
+    T: Send + 'static,
+{
+    let permit = slots
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::internal("Bulk reader stopped"))?;
+    let (send, receive) = tokio::sync::oneshot::channel();
+    #[cfg(test)]
+    let job = request_cost::carry(job);
+    let runtime = tokio::runtime::Handle::current();
+    std::thread::Builder::new()
+        .name("web-bulk".into())
+        .spawn(move || {
+            let _permit = permit;
+            // Capacity observations schedule their independent blocking job.
+            let _runtime = runtime.enter();
+            let _ = send.send(job());
+        })
+        .map_err(|error| ApiError::internal(format!("start bulk reader: {error}")))?;
+    receive
+        .await
+        .map_err(|_| ApiError::internal("Bulk reader failed"))?
+}
+
 /// Cache policy for the three compiled-in front-end files.
 ///
 /// The whole interface is `include_str!`ed into the binary, so its content
@@ -2269,7 +2349,7 @@ struct HealthView {
     /// is exactly where the operator learns "the disk is the constraint" -
     /// the diagnosis that a run is being held for want of space has to be
     /// checkable on the same screen.
-    disk: DiskView,
+    disk: Option<serde_json::Value>,
     /// Questions nobody has answered yet, including ones an owner talked
     /// back on and is now waiting for the agent's reply to. A round trip
     /// never changes [`crate::ask::QuestionStatus`], so this does not drop
@@ -2352,7 +2432,7 @@ impl From<crate::worker::Job> for WorkerView {
 /// is already the newest" from "never checked" - both are `None` - and the
 /// phone needs to tell those apart to decide whether the deck can be trusted
 /// to have an opinion at all.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct UpdateView {
     /// A newer release is known to exist.
     available: bool,
@@ -2750,8 +2830,14 @@ impl DiskView {
             DiskScope::of(ui, cfg),
             DiskCapacity::measure,
         );
+        Self::with_capacity(ui, capacity)
+    }
+
+    fn with_capacity(ui: &Ui, capacity: DiskCapacity) -> Self {
         Self {
-            free_bytes: capacity.free_bytes,
+            free_bytes: crate::disk::free_bytes(&ui.runs)
+                .ok()
+                .or(capacity.free_bytes),
             runs_bytes: capacity.runs_bytes,
             worktrees_bytes: capacity.worktrees_bytes,
             cache_bytes: capacity.cache_bytes,
@@ -2806,9 +2892,113 @@ impl DaemonView {
     }
 }
 
+// Discover display configuration off the request path. Capacity measurement
+// retains its separate single flight and scope/failure handling below.
+fn refresh_health_config(ui: &Arc<Ui>) {
+    let mut cache = ui
+        .monitor
+        .disk_cache
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if cache.loading
+        || cache
+            .measured
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
+    {
+        return;
+    }
+    cache.loading = true;
+    let weak = Arc::downgrade(ui);
+    std::thread::spawn(move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let cfg = deputy_config(&ui.repo);
+        let update = cached_update_view(cfg.as_ref());
+        let mut cache = ui
+            .monitor
+            .disk_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        cache.config = cfg;
+        cache.update = Some(update);
+        cache.measured = Some(std::time::Instant::now());
+        cache.loading = false;
+    });
+}
+
+fn health_counts(
+    ui: &Ui,
+    fallback_questions_rev: u64,
+) -> ApiResult<(usize, usize, usize, u64, usize)> {
+    let mut index = ui
+        .monitor
+        .health_index
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let ids = run_ids(&ui.runs);
+    let seen: HashSet<_> = ids.iter().cloned().collect();
+    index.runs.retain(|id, _| seen.contains(id));
+    let mut unreadable = 0;
+    for id in ids {
+        // Recheck identity on every request, including atomic replacements
+        // with preserved length/mtime. A failed stat is never cached as good.
+        let identity = file_identity(&ui.runs.join(&id).join("run.json"));
+        let bad = match identity {
+            Ok(identity) => {
+                if index.runs.get(&id).is_none_or(|(old, _)| *old != identity) {
+                    let bad = read_run(&ui.runs, &id).is_err();
+                    index.runs.insert(id.clone(), (identity, bad));
+                    #[cfg(test)]
+                    {
+                        index.run_parses += 1;
+                    }
+                }
+                index.runs[&id].1
+            }
+            Err(_) => true,
+        };
+        unreadable += usize::from(bad);
+    }
+    let questions_rev = try_stamps(ui.questions.root(), false, true)
+        .map(|stamps| stamps_revision(&stamps))
+        .unwrap_or(fallback_questions_rev);
+    if index.questions.as_ref().is_none_or(|counts| {
+        counts.revision != questions_rev || counts.measured.elapsed() >= QUESTION_COUNTS_TTL
+    }) {
+        let questions = ui.questions.list();
+        index.questions = Some(QuestionCounts {
+            revision: questions_rev,
+            measured: std::time::Instant::now(),
+            open: questions.iter().filter(|q| q.status.open()).count(),
+            owner: questions
+                .iter()
+                .filter(|q| {
+                    q.status.open() && (!q.waiting_on_agent() || ui.questions.deputy_exhausted(q))
+                })
+                .count(),
+        });
+    }
+    let notifications_rev =
+        stamps_revision(&try_stamps(ui.notices.root(), false, true).map_err(anyhow::Error::from)?);
+    if index
+        .notices
+        .is_none_or(|(rev, _)| rev != notifications_rev)
+    {
+        index.notices = Some((notifications_rev, ui.notices.count_unread()));
+    }
+    let questions = index.questions.as_ref().unwrap();
+    Ok((
+        unreadable,
+        questions.open,
+        questions.owner,
+        notifications_rev,
+        index.notices.unwrap().1,
+    ))
+}
+
 async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
     let revisions = ui.monitor.revisions(&ui).await?;
-    blocking(move || {
+    refresh_health_config(&ui);
+    bulk_blocking(ui.monitor.bulk_slots.clone(), move || {
         // One read of the status file for the two fields that describe it, so
         // `daemon` and `loop` in the same answer cannot disagree about who is
         // running the loop.
@@ -2817,12 +3007,67 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
         // is not reentrant, and a guard taken as a temporary there would still
         // be held when `loop_view` took it again.
         let loop_rev = ui.lock_loop().rev;
-        // One discover for both views: each is a few git processes plus a
-        // config render, and neither depends on anything the other reads.
-        let cfg = deputy_config(&ui.repo);
-        let update = cached_update_view(cfg.as_ref());
+        let (
+            runs_unreadable,
+            questions_open,
+            questions_needs_owner,
+            notifications_rev,
+            notifications_unread,
+        ) = health_counts(&ui, revisions.2)?;
+        let ((cfg, config_observed, sizes, measured), update) = {
+            let cache = ui
+                .monitor
+                .disk_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            (
+                (
+                    cache.config.clone(),
+                    cache.measured.is_some(),
+                    cache.disk.clone(),
+                    cache.measured,
+                ),
+                cache.update.clone().unwrap_or(UpdateView {
+                    available: false,
+                    to: None,
+                }),
+            )
+        };
+        // Retain the base's capacity observation independently of config
+        // refreshes. A cold config read may still be pending; an existing
+        // capacity flight must remain visible to concurrent health requests.
+        let prior_capacity = {
+            let mut observation = ui
+                .monitor
+                .disk
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // Adopt a completed size snapshot only before the scoped capacity
+            // observer has started. Later scope changes remain its authority.
+            if observation.scope.is_none()
+                && let Some(sizes) = sizes
+            {
+                observation.scope = Some(DiskScope::of(&ui, cfg.as_ref()));
+                observation.capacity = DiskCapacity {
+                    runs_bytes: Some(sizes.runs),
+                    worktrees_bytes: Some(sizes.worktrees),
+                    cache_bytes: sizes.cache,
+                    free_bytes: None,
+                };
+                observation.finished = measured;
+            }
+            observation.scope.as_ref().map(|_| observation.capacity)
+        };
+        let disk = if config_observed {
+            serde_json::to_value(DiskView::of(&ui, cfg.as_ref())).ok()
+        } else {
+            serde_json::to_value(DiskView::with_capacity(
+                &ui,
+                prior_capacity.unwrap_or_default(),
+            ))
+            .ok()
+        };
         let upgrade = updater::read_progress(&ui.home).map(|p| upgrade_progress_view(&ui, p));
-        let questions = ui.questions.list();
         let jobs = crate::worker::active(&ui.home).map_err(ApiError::from)?;
         #[cfg(not(test))]
         let looping = ui.runtime_loop_view(reading.clone(), &jobs);
@@ -2836,22 +3081,15 @@ async fn health(State(ui): State<Arc<Ui>>) -> ApiResult<Json<HealthView>> {
             runs_rev: revisions.1,
             questions_rev: revisions.2,
             talks_rev: revisions.3,
-            notifications_rev: stamps_revision(
-                &try_stamps(ui.notices.root(), false, true).map_err(anyhow::Error::from)?,
-            ),
-            notifications_unread: ui.notices.count_unread(),
+            notifications_rev,
+            notifications_unread,
             loop_rev,
-            runs_unreadable: runs_unreadable(&ui.runs),
-            questions_open: questions.iter().filter(|q| q.status.open()).count(),
-            questions_needs_owner: questions
-                .iter()
-                .filter(|q| {
-                    q.status.open() && (!q.waiting_on_agent() || ui.questions.deputy_exhausted(q))
-                })
-                .count(),
-            daemon: DaemonView::of(reading),
+            runs_unreadable,
+            questions_open,
+            questions_needs_owner,
+            daemon: DaemonView::of(reading.clone()),
             looping,
-            disk: DiskView::of(&ui, cfg.as_ref()),
+            disk,
             update,
             upgrade,
             upgrade_request_error: ui
@@ -4908,10 +5146,9 @@ async fn queue_page(
     .await
 }
 
-/// List-only projection: retain every turn timestamp for exact unread counts,
-/// but do not ship transcripts, parse Markdown or discover repository config.
-/// Opening a conversation obtains its full context window and controls.
-#[derive(Serialize)]
+/// Fixed-size wire projection. Agent timestamps stay in the server index so
+/// exact unread counts do not require sending an ever-growing turn list.
+#[derive(Debug, Clone, Serialize)]
 struct TalkListView {
     title: Option<talk::ChatTitle>,
     id: String,
@@ -4919,39 +5156,58 @@ struct TalkListView {
     agent: String,
     status: talk::TalkStatus,
     turns: Vec<TalkListTurn>,
-    thinking: bool,
+    turn_count: usize,
+    unread_count: usize,
     context: talk::ContextUsage,
+    #[serde(skip)]
+    agent_times: Vec<Timestamp>,
+    thinking: bool,
     created_at: Timestamp,
     updated_at: Timestamp,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct TalkListTurn {
     who: talk::Who,
     at: Timestamp,
     body: String,
 }
 
-async fn talks_page(
-    State(ui): State<Arc<Ui>>,
-    Query(q): Query<PageQuery>,
-) -> ApiResult<Json<StorePage<TalkListView>>> {
-    blocking(move || {
-        let (ids, next) = page_ids(&ui, true, q)?;
-        let rows = ids
-            .into_iter()
-            .filter_map(|id| ui.talks.get(&id).ok())
-            .map(|talk| TalkListView {
-                title: talk.title.clone(),
-                thinking: ui.is_thinking(&talk.id),
-                context: talk::context_usage(&talk, None),
-                turns: talk
+fn talk_rows(ui: &Ui, ids: Vec<String>, headers: &header::HeaderMap) -> Vec<TalkListView> {
+    let reads: HashMap<String, Timestamp> = headers
+        .get("x-talk-reads")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| serde_json::from_str(v).ok())
+        .unwrap_or_default();
+    let mut index = ui
+        .monitor
+        .talk_index
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    // Bound memory independently of the number of conversations ever opened.
+    if index.len() > 1000 {
+        index.clear();
+    }
+    ids.into_iter()
+        .filter_map(|id| {
+            let identity = file_identity(&ui.talks.path_of(&id)).ok()?;
+            if index.get(&id).is_none_or(|(old, _)| *old != identity) {
+                let talk = ui.talks.get(&id).ok()?;
+                #[cfg(test)]
+                ui.monitor
+                    .talk_parses
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let first = talk.turns.iter().position(|t| t.who == talk::Who::Operator);
+                let last = talk.turns.len().checked_sub(1);
+                let turns = talk
                     .turns
                     .iter()
-                    .map(|turn| TalkListTurn {
-                        who: turn.who,
-                        at: turn.at,
-                        body: turn
+                    .enumerate()
+                    .filter(|(i, _)| Some(*i) == first || Some(*i) == last)
+                    .map(|(_, t)| TalkListTurn {
+                        who: t.who,
+                        at: t.at,
+                        body: t
                             .body
                             .lines()
                             .next()
@@ -4960,16 +5216,66 @@ async fn talks_page(
                             .take(240)
                             .collect(),
                     })
-                    .collect(),
-                id: talk.id,
-                repo: talk.repo,
-                agent: talk.agent,
-                status: talk.status,
-                created_at: talk.created_at,
-                updated_at: talk.updated_at,
-            })
-            .collect();
-        Ok(Json(StorePage { rows, next }))
+                    .collect();
+                let row = TalkListView {
+                    title: talk.title.clone(),
+                    agent_times: talk
+                        .turns
+                        .iter()
+                        .filter(|t| t.who == talk::Who::Agent)
+                        .map(|t| t.at)
+                        .collect(),
+                    turn_count: talk.turns.len(),
+                    unread_count: 0,
+                    context: talk::context_usage(&talk, None),
+                    turns,
+                    thinking: false,
+                    id: talk.id,
+                    repo: talk.repo,
+                    agent: talk.agent,
+                    status: talk.status,
+                    created_at: talk.created_at,
+                    updated_at: talk.updated_at,
+                };
+                index.insert(id.clone(), (identity, row));
+            }
+            let row = &index.get(&id)?.1;
+            let mut row = TalkListView {
+                title: row.title.clone(),
+                unread_count: row
+                    .agent_times
+                    .iter()
+                    .filter(|at| reads.get(&id).is_none_or(|read| *at > read))
+                    .count(),
+                agent_times: Vec::new(),
+                id: row.id.clone(),
+                repo: row.repo.clone(),
+                agent: row.agent.clone(),
+                status: row.status,
+                context: row.context.clone(),
+                turns: row.turns.clone(),
+                turn_count: row.turn_count,
+                thinking: false,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+            };
+            row.thinking = ui.is_thinking(&id);
+            Some(row)
+        })
+        .collect()
+}
+
+async fn talks_page(
+    State(ui): State<Arc<Ui>>,
+    Query(q): Query<PageQuery>,
+    headers: header::HeaderMap,
+) -> ApiResult<Json<StorePage<TalkListView>>> {
+    bulk_blocking(ui.monitor.bulk_slots.clone(), move || {
+        let (ids, next) = page_ids(&ui, true, q)?;
+        Ok(Json(StorePage {
+            rows: talk_rows(&ui, ids, &headers),
+            next,
+        }))
     })
     .await
 }
@@ -8415,49 +8721,28 @@ struct RosterEntry {
     runnable: bool,
 }
 
-/// `GET /api/talks`.
-///
-/// Every conversation, open ones first and newest first - [`Talks::list`]'s
-/// own order.
+/// Bounded summaries; `/page` carries a cursor for older membership.
 async fn talks_list(
     State(ui): State<Arc<Ui>>,
     Query(q): Query<ListQuery>,
-) -> ApiResult<Json<Vec<TalkView>>> {
-    blocking(move || {
-        let mut configs: HashMap<PathBuf, Option<Config>> = HashMap::new();
-        let talks = q.ids.as_ref().map_or_else(
-            || ui.talks.list(),
-            |ids| {
-                ids.split(',')
-                    .filter(|id| plain_record_id(id))
-                    .filter_map(|id| ui.talks.get(id).ok())
-                    .collect()
-            },
-        );
-        let references = if talks.iter().any(id_links::has_references) {
-            ui.references.get(
-                &ui.runs,
-                &ui.queue,
-                &ui.questions,
-                &ui.talks,
-                talks.iter().any(id_links::has_findings),
-            )
+    headers: header::HeaderMap,
+) -> ApiResult<Json<Vec<TalkListView>>> {
+    bulk_blocking(ui.monitor.bulk_slots.clone(), move || {
+        let limit = q.limit.unwrap_or(50).min(50);
+        let ids = if let Some(ids) = q.ids {
+            ids.split(',')
+                .filter(|id| plain_record_id(id))
+                .take(limit)
+                .map(str::to_owned)
+                .collect()
         } else {
-            Arc::new(id_links::IdIndex::default())
-        };
-        Ok(Json(
-            talks
+            page_ids(&ui, true, PageQuery::default())?
+                .0
                 .into_iter()
-                .filter(|talk| q.contains(&talk.id))
-                .map(|talk| {
-                    let thinking = ui.is_thinking(&talk.id);
-                    let cfg = configs
-                        .entry(talk.repo.clone())
-                        .or_insert_with(|| Config::discover(&talk.repo, None).ok().map(|(c, _)| c));
-                    TalkView::with_references(talk, thinking, cfg.as_ref(), &ui.home, &references)
-                })
-                .collect(),
-        ))
+                .take(limit)
+                .collect()
+        };
+        Ok(Json(talk_rows(&ui, ids, &headers)))
     })
     .await
 }
@@ -10857,8 +11142,8 @@ mod tests {
             let mut costs = Vec::new();
             for (path, discoveries) in [
                 ("/api/questions", 1),
-                ("/api/talks", 2),
-                ("/api/health", 1),
+                ("/api/talks", 0),
+                ("/api/health", 0),
                 ("/api/stats", 1),
             ] {
                 // Equal cold extraction caches at both scales; this also
@@ -10872,7 +11157,10 @@ mod tests {
                 let cost = request_counts(&fx.get(path).await);
                 eprintln!("{path} N={n}: discoveries={} git={}", cost.0, cost.1);
                 assert_eq!(cost.0, discoveries, "{path}, N={n}");
-                assert!(cost.1 > 0 && cost.1 <= 40, "{path}: {cost:?}");
+                assert!(
+                    cost.1 <= 40 && (discoveries == 0 || cost.1 > 0),
+                    "{path}: {cost:?}"
+                );
                 costs.push(cost);
             }
             if let Some(previous) = previous {
@@ -10928,6 +11216,7 @@ mod tests {
                                     limit: None,
                                     ids: None,
                                 }),
+                                header::HeaderMap::new(),
                             )
                             .await
                             .unwrap();
@@ -10946,10 +11235,17 @@ mod tests {
                 eprintln!("{endpoint} handler N={n}: {cost:?}");
                 assert_eq!(
                     cost.0,
-                    if endpoint == "talks" { 2 } else { 1 },
+                    if matches!(endpoint, "talks" | "health") {
+                        0
+                    } else {
+                        1
+                    },
                     "{endpoint}"
                 );
-                assert!(cost.1 > 0 && cost.1 <= 40, "{endpoint}: {cost:?}");
+                assert!(
+                    cost.1 <= 40 && (matches!(endpoint, "talks" | "health") || cost.1 > 0),
+                    "{endpoint}: {cost:?}"
+                );
                 costs.push(cost);
             }
             if let Some(previous) = previous {
@@ -10969,7 +11265,9 @@ mod tests {
             fx.get("/api/notifications")
         );
         assert_eq!(request_counts(&questions).0, 1);
-        assert_eq!(request_counts(&talks).0, 2);
+        // Cached summaries perform no config discovery or git work, even
+        // alongside the questions request that still discovers config.
+        assert_eq!(request_counts(&talks), (0, 0));
         assert_eq!(request_counts(&notices), (0, 0));
     }
 
@@ -20652,14 +20950,17 @@ mod tests {
 
     fn delta_test_ui(home: &FsPath) -> Arc<Ui> {
         std::fs::create_dir_all(home.join("runs")).unwrap();
-        Arc::new(Ui::new(
-            Queue::at(home.join("queue")),
-            Questions::at(home.join("questions")),
-            Talks::at(home.join("talks")),
-            home.join("runs"),
-            home.to_owned(),
-            PathBuf::from("/repo/magi"),
-        ))
+        Arc::new(
+            Ui::new(
+                Queue::at(home.join("queue")),
+                Questions::at(home.join("questions")),
+                Talks::at(home.join("talks")),
+                home.join("runs"),
+                home.to_owned(),
+                PathBuf::from("/repo/magi"),
+            )
+            .with_worktrees_root(home.join("wt")),
+        )
     }
 
     #[test]
@@ -20825,17 +21126,21 @@ mod tests {
         seed_talk_at(&ui.talks, "20260905-000000-d4e5", "open");
         seed_talk_at(&ui.talks, "20260905-000001-d4e6", "open");
         let talks = serde_json::to_value(
-            talks_list(State(ui.clone()), query(Some("20260905-000000-d4e5")))
-                .await
-                .unwrap()
-                .0,
+            talks_list(
+                State(ui.clone()),
+                query(Some("20260905-000000-d4e5")),
+                header::HeaderMap::new(),
+            )
+            .await
+            .unwrap()
+            .0,
         )
         .unwrap();
         assert_eq!(talks.as_array().unwrap().len(), 1);
         assert_eq!(talks[0]["id"], "20260905-000000-d4e5");
         assert_eq!(
             serde_json::to_value(
-                talks_list(State(ui.clone()), query(Some("")))
+                talks_list(State(ui.clone()), query(Some("")), header::HeaderMap::new())
                     .await
                     .unwrap()
                     .0
@@ -20858,7 +21163,10 @@ mod tests {
         };
         let queue = queue_list(State(ui.clone()), query(None)).await.unwrap().0;
         let runs = runs_list(State(ui.clone()), query(None)).await.unwrap().0;
-        let talks = talks_list(State(ui.clone()), query(None)).await.unwrap().0;
+        let talks = talks_list(State(ui.clone()), query(None), header::HeaderMap::new())
+            .await
+            .unwrap()
+            .0;
         let queue_id = queue
             .iter()
             .find(|row| row.task.status == crate::queue::TaskStatus::Running)
@@ -20874,10 +21182,14 @@ mod tests {
             .await
             .unwrap()
             .0;
-        let talks_delta = talks_list(State(ui.clone()), query(Some(talks[0].talk.id.clone())))
-            .await
-            .unwrap()
-            .0;
+        let talks_delta = talks_list(
+            State(ui.clone()),
+            query(Some(talks[0].id.clone())),
+            header::HeaderMap::new(),
+        )
+        .await
+        .unwrap()
+        .0;
         let bytes = |rows: serde_json::Value| serde_json::to_vec(&rows).unwrap().len();
         eprintln!(
             "DELTA_PAYLOAD {}",
@@ -22479,7 +22791,9 @@ mod tests {
                 let disk = serde_json::to_value(view.disk).unwrap();
                 assert!(disk["runs_bytes"].is_null());
                 assert!(disk["worktrees_bytes"].is_null());
-                assert!(disk.get("free_bytes").is_none());
+                // Free space is a cheap live observation even while the
+                // recursive capacity measurement remains blocked.
+                assert!(disk["free_bytes"].is_u64());
             }
         })
         .await
@@ -24321,10 +24635,14 @@ mod tests {
         assert_eq!(next["rows"].as_array().unwrap().len(), STORE_PAGE_SIZE);
         assert!(next["rows"][0]["id"].as_str().unwrap() < last_id);
         let chats = serde_json::to_value(
-            talks_page(State(ui.clone()), Query(PageQuery::default()))
-                .await
-                .unwrap()
-                .0,
+            talks_page(
+                State(ui.clone()),
+                Query(PageQuery::default()),
+                header::HeaderMap::new(),
+            )
+            .await
+            .unwrap()
+            .0,
         )
         .unwrap();
         assert_eq!(chats["rows"].as_array().unwrap().len(), STORE_PAGE_SIZE);

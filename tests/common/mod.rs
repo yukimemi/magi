@@ -100,7 +100,7 @@ where
                 for key in SEAT_ENV.into_iter().chain(WORKER_ENV) {
                     std::env::remove_var(key);
                 }
-                std::env::set_var("MAGI_WORKER_EXE", env!("CARGO_BIN_EXE_magi"));
+                std::env::set_var("MAGI_WORKER_EXE", cli::magi_executable());
             };
         }
         tokio::runtime::Builder::new_current_thread()
@@ -132,7 +132,7 @@ where
         // `config.toml` would otherwise merge with a fixture's `magi.toml` and
         // trip the "array declared in two layers" refusal on that machine only.
         .env(magi::config::Config::CONFIG_DIR_ENV, "")
-        .env("MAGI_WORKER_EXE", env!("CARGO_BIN_EXE_magi"))
+        .env("MAGI_WORKER_EXE", cli::magi_executable())
         .output();
     *lock.lock().unwrap() += 1;
     cv.notify_one();

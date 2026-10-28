@@ -556,3 +556,216 @@ test('late reference decoration never changes a replaced conversation', async ()
   await current;
   assert.equal(h.walk(h.root).find(node => node.tag === 'a').href, '#/tasks/current');
 });
+
+test('conversation detail preempts health/list connections until its sections finish', async () => {
+  const requests = [];
+  const transport = source.slice(source.indexOf('const conversationPriority ='), source.indexOf('const getText ='));
+  const state = { talkDetail: { id: 'a' }, talkWaits: new Map() };
+  const api = runInNewContext(`${transport}\n${sections}\n${talks}\n({getJson, loadTalk})`, {
+    AbortController, state, API: { talk: id => `/api/talks/${id}` },
+    pendingForRequest: () => () => {},
+    fetch: (url, options = {}) => new Promise((resolve, reject) => {
+      const entry = { url, options, resolve: value => resolve({ ok: true, json: async () => value }) };
+      requests.push(entry);
+      options.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+    }),
+    sectionNotice() {}, trackTalkThinking() {}, renderTalk() {}, ok() {}, rememberTalkChoices() {},
+    shortId: id => id, failFor: () => assert.fail('unexpected detail failure'),
+  });
+  const health = api.getJson('/api/health');
+  const list = api.getJson('/api/talks/page');
+  await flush();
+  assert.equal(requests.length, 2);
+  const detail = api.loadTalk('a');
+  await flush();
+  assert.ok(requests[0].options.signal.aborted);
+  assert.ok(requests[1].options.signal.aborted);
+  assert.equal(requests.length, 4, 'bulk requests must wait, not retry alongside detail');
+  requests.find(r => r.url.endsWith('/core')).resolve({ id: 'a' });
+  await flush();
+  assert.equal(state.talkDetail.talk.id, 'a');
+  assert.equal(requests.length, 4);
+  requests.find(r => r.url.endsWith('/sections')).resolve({ roster: [], personas: [] });
+  await detail;
+  await flush();
+  assert.equal(requests.length, 6);
+  requests[4].resolve({});
+  requests[5].resolve({ rows: [], next: null });
+  await Promise.all([health, list]);
+});
+
+for (const expired of [false, true]) test(`chat paging is on demand and recovers expired cursors (expired=${expired})`, async () => {
+  const requests = [];
+  let recovered = false;
+  const state = { talks: null, talkReads: {}, talkWaits: new Map(), rev: {} };
+  const loaders = source.slice(source.indexOf('const storeReads ='), source.indexOf('function loadRuns('));
+  const chatLoaders = source.slice(source.indexOf('let talksNext ='), source.indexOf('/* Refresh one conversation.'));
+  const api = runInNewContext(`${loaders}\n${chatLoaders}\n({ loadTalks, loadOlderTalks, markAllTalksRead: undefined })`, {
+    state, API: { talks: '/api/talks' },
+    getJson: async url => {
+      requests.push(url);
+      if (expired && url.includes('before=') && !recovered) {
+        recovered = true;
+        throw Object.assign(new Error('cursor expired'), { status: 409 });
+      }
+      return url.includes('before=') ? { rows: [{ id: 'old', turns: [] }], next: null }
+        : { rows: [{ id: 'new', turns: [] }], next: 'cursor' };
+    },
+    $: () => null, sectionNotice() {}, renderTalks() {}, refreshSearch() {}, trackTalkThinking() {},
+    sortTalks: list => list, ok() {}, setTimeout, clearTimeout, incrementalListRender: false,
+  });
+  await api.loadTalks();
+  assert.equal(requests.length, 1);
+  assert.equal(state.talks.length, 1);
+  await api.loadOlderTalks();
+  assert.equal(requests.length, expired ? 4 : 2);
+  assert.equal(state.talks.length, 2);
+});
+
+for (const expired of [false, true]) for (const deltaFirst of [false, true]) {
+  test(`older chat pages preserve overlapping deltas (expired=${expired}, deltaFirst=${deltaFirst})`, async () => {
+    const requests = [];
+    const state = { talks: null, talkReads: {}, talkWaits: new Map(), rev: {} };
+    const loaders = source.slice(source.indexOf('const storeReads ='), source.indexOf('function loadRuns('));
+    const chatLoaders = source.slice(source.indexOf('let talksNext ='), source.indexOf('/* Refresh one conversation.'));
+    const api = runInNewContext(`${loaders}\n${chatLoaders}\n({ loadTalks, loadOlderTalks })`, {
+      state, API: { talks: '/api/talks' },
+      getJson: url => new Promise((resolve, reject) => requests.push({ url, resolve, reject })),
+      $: () => null, sectionNotice() {}, renderTalks() {}, refreshSearch() {}, trackTalkThinking() {},
+      sortTalks: list => list, ok() {}, setTimeout: () => 1, clearTimeout() {}, incrementalListRender: false,
+    });
+    const initial = api.loadTalks({ rev: 'r0' });
+    requests[0].resolve({ rows: [{ id: 'new' }, { id: 'updated', version: 0 }], next: 'cursor' });
+    await initial;
+    const older = api.loadOlderTalks();
+    let pageRequest = requests[1];
+    if (expired) {
+      pageRequest.reject(Object.assign(new Error('expired'), { status: 409 }));
+      await flush();
+      requests[2].resolve({ rows: [{ id: 'new' }], next: 'replacement' });
+      await flush();
+      pageRequest = requests[3];
+    }
+    const delta = api.loadTalks({ rev: 'r1', delta: {
+      base: 'r0', changed: ['updated', 'unreadable'], removed: ['deleted'],
+    } });
+    const deltaRequest = requests.at(-1);
+    const page = { rows: ['updated', 'unreadable', 'deleted', 'untouched'].map(id => ({ id, version: 0 })), next: 'older' };
+    if (deltaFirst) {
+      deltaRequest.resolve([{ id: 'updated', version: 1 }]);
+      await delta;
+      pageRequest.resolve(page);
+      await older;
+    } else {
+      pageRequest.resolve(page);
+      await older;
+      deltaRequest.resolve([{ id: 'updated', version: 1 }]);
+      await delta;
+    }
+    assert.equal(state.rev.talks, 'r1');
+    assert.equal(state.talks.find(row => row.id === 'updated').version, 1);
+    assert.ok(!state.talks.some(row => row.id === 'deleted' || row.id === 'unreadable'));
+    assert.ok(state.talks.some(row => row.id === 'untouched'), 'unaffected older rows still load');
+    // The accepted page must advance the cursor even when some rows were excluded.
+    const next = api.loadOlderTalks();
+    assert.equal(requests.at(-1).url, '/api/talks/page?before=older');
+    requests.at(-1).resolve({ rows: [], next: null });
+    await next;
+  });
+}
+
+for (const failSecondBatch of [false, true]) test(`coalesced chat deltas fetch all batches before applying (failure=${failSecondBatch})`, async () => {
+  const ids = Array.from({ length: 60 }, (_, i) => `chat-${i}`);
+  const requests = [];
+  const state = {
+    talks: ['starter', 'removed', ...ids].map(id => ({ id, version: 0 })),
+    talkReads: { 'chat-59': 'read-at' }, talkWaits: new Map(), rev: { talks: 'r0' },
+  };
+  const loaders = source.slice(source.indexOf('const storeReads ='), source.indexOf('function loadRuns('));
+  const chatLoaders = source.slice(source.indexOf('let talksNext ='), source.indexOf('/* Refresh one conversation.'));
+  const api = runInNewContext(`${loaders}\n${chatLoaders}\n({ loadTalks })`, {
+    state, API: { talks: '/api/talks' },
+    getJson: (url, options) => new Promise((resolve, reject) => {
+      const requested = new URL(url, 'http://localhost').searchParams.get('ids').split(',');
+      requests.push({ ids: requested, options, resolve, reject });
+    }),
+    $: () => null, sectionNotice() {}, renderTalks() {}, refreshSearch() {}, trackTalkThinking() {},
+    sortTalks: list => list, ok() {}, setTimeout: () => 1, clearTimeout() {}, incrementalListRender: false,
+  });
+  const done = api.loadTalks({ rev: 'r1', delta: { base: 'r0', changed: ['starter'], removed: [] } });
+  api.loadTalks({ rev: 'r2', delta: { base: 'r1', changed: ids.slice(0, 30), removed: [] } });
+  api.loadTalks({ rev: 'r3', delta: { base: 'r2', changed: ids.slice(30), removed: ['removed'] } });
+  requests[0].resolve([{ id: 'starter', version: 1 }]);
+  await flush();
+  assert.equal(requests[1].ids.length, 50);
+  requests[1].resolve(requests[1].ids.map(id => ({ id, version: 1 })));
+  await flush();
+  assert.equal(requests[2].ids.length, 10);
+  assert.equal(state.rev.talks, 'r1', 'revision waits for all batches');
+  assert.equal(state.talks.find(row => row.id === ids[0]).version, 0, 'no partial merge');
+  if (failSecondBatch) {
+    requests[2].reject(new Error('batch failed'));
+    await done;
+    assert.equal(state.rev.talks, null, 'failed batches require recovery');
+    assert.equal(state.talks.length, 62, 'failed delta retains the snapshot');
+    assert.ok(state.talks.filter(row => ids.includes(row.id)).every(row => row.version === 0));
+  } else {
+    // A changed row absent from the server must still be removed.
+    requests[2].resolve(requests[2].ids.filter(id => id !== 'chat-58').map(id => ({ id, version: 1 })));
+    await flush();
+    assert.equal(requests[3].ids.join(','), 'chat-59');
+    assert.equal(JSON.parse(requests[3].options.headers['x-talk-reads'])['chat-59'], 'read-at');
+    requests[3].resolve([{ id: 'chat-59', version: 1, unread_count: 0 }]);
+    await done;
+    assert.equal(state.rev.talks, 'r3');
+    assert.equal(state.talks.length, 60);
+    assert.ok(!state.talks.some(row => row.id === 'removed' || row.id === 'chat-58'));
+    assert.ok(state.talks.every(row => row.version === 1));
+    assert.equal(state.talks.find(row => row.id === 'chat-59').unread_count, 0);
+    assert.deepEqual(requests.slice(1, 3).flatMap(request => request.ids), ids);
+  }
+});
+
+test('mark all read includes unloaded pages and uses captured turn timestamps', async () => {
+  const saved = [];
+  const state = { talks: [{ id: 'new', turns: [{ who: 'agent', at: '2026-10-20T00:00:00Z' }] }], talkReads: {} };
+  const unread = source.slice(source.indexOf('const talkTurns ='), source.indexOf('/* Open first, then newest first'));
+  const complete = runInNewContext(`let talksNext = 'older';
+    async function loadOlderTalks() {
+      state.talks.push({ id: 'old', turns: [{ who: 'agent', at: '2026-10-19T00:00:00Z' }] });
+      talksNext = null;
+    }
+    ${unread}\n({ markAllTalksRead, talkUnreadCount })`, {
+    state, TALK_READS_KEY: 'reads', saveCollapsed: (_, data) => saved.push({ ...data }), renderTalks() {}, announce() {},
+  });
+  await complete.markAllTalksRead();
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0].old, '2026-10-19T00:00:00Z');
+  assert.equal(saved[0].new, '2026-10-20T00:00:00Z');
+  assert.equal(complete.talkUnreadCount({ id: 'old', unread_count: 7, turns: [{ at: saved[0].old }] }), 0);
+  assert.equal(complete.talkUnreadCount(null), 0);
+});
+
+test('chat search hydrates matches outside the loaded page in bounded batches', async () => {
+  const requests = [];
+  const state = { talks: [{ id: 'loaded' }], talkReads: {}, search: { chats: { seq: 0 } } };
+  const search = source.slice(source.indexOf('async function runSearch('), source.indexOf('/* After the list behind a search'));
+  const rows = source.slice(source.indexOf('function talkReadOptions('), source.indexOf('function showOlderTalks('));
+  const api = runInNewContext(`${rows}\n${search}\n({ runSearch })`, {
+    state, API: { search: () => '/api/search', talks: '/api/talks' },
+    searchText: () => 'needle', renderSearchScope() {},
+    mergeStore: (_, rows) => [...state.talks, ...rows],
+    getJson: async url => {
+      requests.push(url);
+      if (url === '/api/search') return { hits: Array.from({ length: 73 }, (_, i) => ({ id: `older-${i}` })), total: 73 };
+      const ids = new URL(url, 'http://localhost').searchParams.get('ids').split(',');
+      assert.ok(ids.length <= 50);
+      return ids.map(id => ({ id }));
+    },
+  });
+  await api.runSearch('chats');
+  assert.equal(requests.length, 3);
+  assert.equal(state.talks.length, 74);
+  assert.equal(state.search.chats.status, 'ok');
+  assert.equal(state.search.chats.hits.size, 73);
+});

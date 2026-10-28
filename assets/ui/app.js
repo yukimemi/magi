@@ -825,6 +825,23 @@ let fallbackTimer = null;
 let nextTalkWaitGeneration = 1;
 
 /* ---- transport --------------------------------------------------------- */
+const conversationPriority = {
+  active: 0, waiting: [], background: new Set(),
+  begin() {
+    this.active++;
+    for (const controller of this.background) controller.abort();
+    let ended = false;
+    return () => {
+      if (ended) return;
+      ended = true;
+      if (--this.active === 0) this.waiting.splice(0).forEach(resolve => resolve());
+    };
+  },
+  async idle() {
+    if (this.active) await new Promise(resolve => this.waiting.push(resolve));
+  },
+};
+
 async function request(url, init) {
   const unbusy = pendingForRequest(init);
   let res;
@@ -862,7 +879,23 @@ async function request(url, init) {
   return res;
 }
 
-const getJson = (url, options) => request(url, options).then((r) => r.json());
+const getJson = async (url, options) => {
+  const background = /^\/api\/(health|talks(?:\/page)?)(?:[?]|$)/.test(url);
+  if (!background) return request(url, options).then(r => r.json());
+  for (;;) {
+    await conversationPriority.idle();
+    if (conversationPriority.active) continue;
+    const controller = new AbortController();
+    conversationPriority.background.add(controller);
+    try {
+      return await request(url, { ...options, signal: controller.signal, priority: "low" }).then(r => r.json());
+    } catch (error) {
+      if (!controller.signal.aborted) throw error;
+    } finally {
+      conversationPriority.background.delete(controller);
+    }
+  }
+};
 const getText = (url, options) => request(url, options).then((r) => r.text());
 
 const postJson = (url, body) =>
@@ -3114,6 +3147,14 @@ async function runSearch(scope, allowSearchJump = false) {
   try {
     const found = await getJson(API.search(scope, text));
     if (mine !== s.seq) return;
+    if (scope === "chats") {
+      const missing = found.hits.filter(hit => !(state.talks || []).some(talk => talk.id === hit.id));
+      for (let i = 0; i < missing.length; i += 50) {
+        const rows = await getTalkRows(`${API.talks}?ids=${encodeURIComponent(missing.slice(i, i + 50).map(hit => hit.id).join(","))}`);
+        if (mine !== s.seq) return;
+        state.talks = mergeStore("talks", rows, { changed: [], removed: [] });
+      }
+    }
     s.hits = new Map(found.hits.map((h) => [h.id, h]));
     Object.assign(s, {
       status: "ok", forText: text, total: found.total, truncated: found.truncated,
@@ -5775,7 +5816,11 @@ function talkUnreadTurns(talk) {
 }
 
 function talkUnreadCount(talk) {
-  return talk ? talkUnreadTurns(talk).length : 0;
+  if (!talk) return 0;
+  const turns = talkTurns(talk);
+  const last = turns.length && turns[turns.length - 1].at;
+  if (last && (Date.parse(state.talkReads[talk.id]) || 0) >= Date.parse(last)) return 0;
+  return Number.isInteger(talk.unread_count) ? talk.unread_count : talkUnreadTurns(talk).length;
 }
 
 /* Called only once a conversation's real turns are on screen - never from
@@ -5794,7 +5839,12 @@ function markTalkRead(talk) {
    this runs would be swallowed as already-read. One combined save and
    re-render, not one per talk, so this stays a single write regardless of
    how many conversations there are. */
-function markAllTalksRead() {
+async function markAllTalksRead() {
+  // The explicit action walks older summaries too, without downloading turns.
+  try { while (talksNext) await loadOlderTalks(); } catch (error) {
+    failFor(false, `Could not mark conversations read: ${error.message}`, error);
+    return;
+  }
   const talks = state.talks;
   if (!talks) return;
   let changed = false;
@@ -5928,7 +5978,7 @@ function updateTalkCard(row, talk) {
   setText(r.context, ctxLabel ? `context ${ctxLabel.text}` : "context unknown");
   setAttr(r.context, "data-warn", ctxLabel && ctxLabel.warn ? "1" : null);
   setAttr(r.context, "title", contextTitle(ctxLabel));
-  setText(r.turns, plural(turns.length, "turn", "turns"));
+  setText(r.turns, plural(talk.turn_count ?? turns.length, "turn", "turns"));
   const tasks = Array.isArray(talk.tasks) ? talk.tasks.length : 0;
   setText(r.tasks, tasks ? plural(tasks, "task filed", "tasks filed") : "");
   show(r.tasks, tasks > 0);
@@ -5943,8 +5993,8 @@ function updateTalkCard(row, talk) {
 function renderTalks() {
   const list = $("talks-list");
   const talks = state.talks;
-  const totalUnread = renderTalkIndicators();
-  $("talks-mark-all-read").disabled = !talks || totalUnread === 0;
+  renderTalkIndicators();
+  $("talks-mark-all-read").disabled = !talks || talks.length === 0;
 
   if (talks === null) {
     setText($("talks-count"), "Loading…");
@@ -5996,8 +6046,73 @@ function talkIsThinking(talk) {
   return Boolean(talk && (talk.thinking || state.talkWaits.has(talk.id)));
 }
 
+let talksNext = null;
+let olderTalksFlight = null;
+let olderTalksRead = null;
+function talkReadOptions(rows) {
+  const reads = Object.fromEntries(rows.filter(row => state.talkReads[row.id]).map(row => [row.id, state.talkReads[row.id]]));
+  return { headers: { "x-talk-reads": JSON.stringify(reads) } };
+}
+async function getTalkRows(url) {
+  const data = await getJson(url);
+  const rows = Array.isArray(data) ? data : data.rows;
+  const readRows = rows.filter(row => state.talkReads[row.id]);
+  if (readRows.length) {
+    const counted = await getJson(`${API.talks}?ids=${encodeURIComponent(readRows.map(row => row.id).join(","))}`, talkReadOptions(readRows));
+    const byId = new Map(counted.map(row => [row.id, row]));
+    for (let i = 0; i < rows.length; i++) if (byId.has(rows[i].id)) rows[i] = byId.get(rows[i].id);
+  }
+  return data;
+}
+function showOlderTalks() {
+  sectionNotice("talks-h", "talks-load-state", talksNext ? "Older conversations are available." : "");
+  const box = $("talks-load-state");
+  if (box) for (const button of box.querySelectorAll("button")) button.remove();
+  if (talksNext && box) box.append(el("button", { type: "button", class: "btn btn-quiet", text: "Load older conversations", onclick: () => loadOlderTalks().catch(error => {
+    sectionNotice("talks-h", "talks-load-state", error.message, () => loadOlderTalks());
+  }) }));
+}
+function loadOlderTalks() {
+  if (olderTalksFlight) return olderTalksFlight;
+  if (!talksNext) return Promise.resolve();
+  const cursor = talksNext;
+  const read = { changed: new Set(), superseded: false };
+  olderTalksRead = read;
+  olderTalksFlight = (async () => {
+    let page;
+    try {
+      page = await getTalkRows(`${API.talks}/page?before=${encodeURIComponent(cursor)}`);
+    } catch (error) {
+      if (error.status !== 409) throw error;
+      // Membership snapshots expire. Resume from a new snapshot, skipping
+      // pages already on screen, rather than trapping the button in retries.
+      const known = new Set((state.talks || []).map(row => row.id));
+      let next = null;
+      do {
+        page = await getTalkRows(`${API.talks}/page${next ? `?before=${encodeURIComponent(next)}` : ""}`);
+        next = page.next;
+      } while (next && !page.rows.some(row => !known.has(row.id)));
+    }
+    // A refresh may have replaced this membership snapshot while we waited.
+    if (talksNext !== cursor || read.superseded) return;
+    // Deltas may finish while this page is in flight. Preserve both their
+    // updated rows and their deletions, including IDs not previously loaded.
+    const rows = page.rows.filter(row => !read.changed.has(row.id));
+    state.talks = mergeStore("talks", rows, { changed: [], removed: [] });
+    talksNext = page.next;
+    renderTalks();
+    showOlderTalks();
+  })().finally(() => { olderTalksFlight = null; olderTalksRead = null; });
+  return olderTalksFlight;
+}
+
 function loadTalks(change) {
-  return loadStore("talks", API.talks, change, (list, partial, observed, fetched) => {
+  return loadStore("talks", API.talks, change, (list, partial, observed, fetched, delta) => {
+    if (olderTalksRead) {
+      if (delta) {
+        for (const id of [...delta.changed, ...delta.removed]) olderTalksRead.changed.add(id);
+      } else olderTalksRead.superseded = true;
+    }
     state.talks = list;
     for (const talk of fetched) trackTalkThinking(talk, observed.get(talk.id));
     renderStoreList(partial, renderTalks);
@@ -6111,56 +6226,59 @@ function applyTalkSections(detail) {
 }
 
 async function loadTalk(id, { background = false } = {}) {
-  const detail = state.talkDetail;
-  const wait = state.talkWaits.get(id);
-  const observed = wait && { generation: wait.generation, startedAt: Date.now() };
-  const current = () => state.talkDetail === detail && state.talkDetail.id === id;
-  const retry = () => loadTalk(id, { background: true });
-  sectionNotice("talk-meta", "talk-core-state", "Loading conversation…", null, { pending: true, snapshot: Boolean(detail.talk) });
-  const core = sectionRequest(`talk:${id}:core`, `${API.talk(id)}/core`, talk => {
-    trackTalkThinking(talk, observed);
-    if (!current()) return;
-    detail.talk = { ...detail.talk, ...talk };
-    applyTalkSections(detail);
-    sectionNotice("talk-meta", "talk-core-state", "");
-    renderTalk();
-    ok();
-  }, error => {
-    if (error.status === 404) endTalkTurn(id);
-    if (!current()) return;
-    if (error.status === 404) {
-      detail.talk = null;
-      detail.gone = true;
+  const release = typeof conversationPriority === "undefined" ? () => {} : conversationPriority.begin();
+  try {
+    const detail = state.talkDetail;
+    const wait = state.talkWaits.get(id);
+    const observed = wait && { generation: wait.generation, startedAt: Date.now() };
+    const current = () => state.talkDetail === detail && state.talkDetail.id === id;
+    const retry = () => loadTalk(id, { background: true });
+    sectionNotice("talk-meta", "talk-core-state", "Loading conversation…", null, { pending: true, snapshot: Boolean(detail.talk) });
+    const core = sectionRequest(`talk:${id}:core`, `${API.talk(id)}/core`, talk => {
+      trackTalkThinking(talk, observed);
+      if (!current()) return;
+      detail.talk = { ...detail.talk, ...talk };
+      applyTalkSections(detail);
+      sectionNotice("talk-meta", "talk-core-state", "");
       renderTalk();
       ok();
-      return;
-    }
-    sectionNotice("talk-meta", "talk-core-state", `Conversation: ${error.message}`, retry);
-    failFor(background, `Could not load conversation ${shortId(id)}: ${error.message}`, error);
-  }, false, background);
-  // Waiting conversations outside the visible detail need only liveness.
-  if (!current()) return core;
-  sectionNotice("talk-task-progress", "talk-sections-state", "Loading related tasks and choices…", null, { pending: true, snapshot: Boolean(detail.sections) });
-  const sections = sectionRequest(`talk:${id}:sections`, `${API.talk(id)}/sections`, data => {
-    if (!current()) return;
-    detail.sections = data;
-    detail.sectionsError = false;
-    detail.roster = data.roster;
-    detail.personas = data.personas;
-    if (detail.talk) {
-      applyTalkSections(detail);
-      rememberTalkChoices(detail.talk.repo, data.roster, data.personas);
-    }
-    sectionNotice("talk-task-progress", "talk-sections-state", "");
-    renderTalk();
-  }, error => {
-    if (current()) {
-      detail.sectionsError = true;
-      sectionNotice("talk-task-progress", "talk-sections-state", `Related information: ${error.message}`, retry);
+    }, error => {
+      if (error.status === 404) endTalkTurn(id);
+      if (!current()) return;
+      if (error.status === 404) {
+        detail.talk = null;
+        detail.gone = true;
+        renderTalk();
+        ok();
+        return;
+      }
+      sectionNotice("talk-meta", "talk-core-state", `Conversation: ${error.message}`, retry);
+      failFor(background, `Could not load conversation ${shortId(id)}: ${error.message}`, error);
+    }, false, background);
+    // Waiting conversations outside the visible detail need only liveness.
+    if (!current()) return await core;
+    sectionNotice("talk-task-progress", "talk-sections-state", "Loading related tasks and choices…", null, { pending: true, snapshot: Boolean(detail.sections) });
+    const sections = sectionRequest(`talk:${id}:sections`, `${API.talk(id)}/sections`, data => {
+      if (!current()) return;
+      detail.sections = data;
+      detail.sectionsError = false;
+      detail.roster = data.roster;
+      detail.personas = data.personas;
+      if (detail.talk) {
+        applyTalkSections(detail);
+        rememberTalkChoices(detail.talk.repo, data.roster, data.personas);
+      }
+      sectionNotice("talk-task-progress", "talk-sections-state", "");
       renderTalk();
-    }
-  }, false, background);
-  await Promise.allSettled([core, sections]);
+    }, error => {
+      if (current()) {
+        detail.sectionsError = true;
+        sectionNotice("talk-task-progress", "talk-sections-state", `Related information: ${error.message}`, retry);
+        renderTalk();
+      }
+    }, false, background);
+    await Promise.allSettled([core, sections]);
+  } finally { release(); }
 }
 
 /* The server uses Done alone as completion, for the same tasks as the list. */
@@ -6761,7 +6879,7 @@ function endTalkTurn(id) {
 function trackTalkThinking(talk, observed) {
   const wait = state.talkWaits.get(talk.id);
   if (wait) {
-    if (wait.target !== null && talkTurns(talk).length >= wait.target) endTalkTurn(talk.id);
+    if (wait.target !== null && (talk.turn_count ?? talkTurns(talk).length) >= wait.target) endTalkTurn(talk.id);
     else if (observed && observed.generation === wait.generation && talk.thinking) {
       wait.confirmed = true;
       wait.missingClaimSince = null;
@@ -6775,7 +6893,7 @@ function trackTalkThinking(talk, observed) {
     }
     return;
   }
-  if (talk.thinking) beginTalkTurn(talk.id, talkTurns(talk).length, null);
+  if (talk.thinking) beginTalkTurn(talk.id, talk.turn_count ?? talkTurns(talk).length, null);
 }
 
 function talkError(message) {
@@ -9404,11 +9522,21 @@ function loadStore(name, url, change, apply) {
             ? `${url}${url.includes("?") ? "&" : "?"}ids=${encodeURIComponent(delta.changed.join(","))}` : url;
           let rows;
           const paged = !partial && (name === "queue" || name === "talks");
-          if (paged) {
+          if (partial && name === "talks") {
+            // Coalesced notifications can exceed the endpoint's 50-row cap.
+            // Fetch every batch before merging or acknowledging the revision.
+            rows = [];
+            for (let i = 0; i < delta.changed.length; i += 50) {
+              const ids = delta.changed.slice(i, i + 50);
+              const batch = await getTalkRows(`${url}${url.includes("?") ? "&" : "?"}ids=${encodeURIComponent(ids.join(","))}`);
+              rows.push(...batch);
+            }
+          } else if (paged) {
             let cursor = null;
             const collected = new Map();
             do {
-              const page = await getJson(`${url}/page${cursor ? `?before=${encodeURIComponent(cursor)}` : ""}`);
+              const pageUrl = `${url}/page${cursor ? `?before=${encodeURIComponent(cursor)}` : ""}`;
+              const page = name === "talks" ? await getTalkRows(pageUrl) : await getJson(pageUrl);
               for (const row of page.rows) collected.set(row.id, row);
               // Keep the old snapshot while refreshing; remove deleted rows
               // only after a complete enumeration. New pages retain DOM nodes.
@@ -9416,6 +9544,10 @@ function loadStore(name, url, change, apply) {
               for (const row of collected.values()) visible.set(row.id, row);
               apply(mergeStore(name, [...visible.values()], { changed: [], removed: [] }), true, observed, page.rows);
               cursor = page.next;
+              if (name === "talks") {
+                talksNext = cursor;
+                break;
+              }
               sectionNotice(`${name}-h`, `${name}-load-state`, cursor ? "Loading older entries…" : "", null, { pending: Boolean(cursor), snapshot });
               // Finish the frozen membership walk even under continuous
               // writes. Queued deltas reconcile it after every page is shown.
@@ -9424,20 +9556,21 @@ function loadStore(name, url, change, apply) {
               changed: (state[name] || []).map(row => row.id), removed: [],
             });
           } else {
-            rows = await getJson(endpoint);
+            rows = name === "talks" ? await getTalkRows(endpoint) : await getJson(endpoint);
           }
           if (partial && name === "runs" && delta.changed.some((id) =>
             state.runs.some((run) => run.id === id) && !rows.some((row) => row.id === id))) {
             rows = await getJson(url);
             apply(rows, false, observed, rows);
           } else {
-            apply(partial ? mergeStore(name, rows, delta) : rows, partial || paged, observed, rows);
+            apply(partial ? mergeStore(name, rows, delta) : rows, partial || paged, observed, rows, partial ? delta : null);
           }
           // Only successful reads acknowledge the target. A later notification
           // may already be queued; its base will be checked on the next read.
           if (target) state.rev[name] = target.rev;
           cancelStoreRetry(name);
           sectionNotice(`${name === "queue" ? "queue" : name}-h`, `${name}-load-state`, "");
+          if (name === "talks") showOlderTalks();
           ok();
         } catch (error) {
           state.rev[name] = null;

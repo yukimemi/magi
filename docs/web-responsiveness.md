@@ -42,12 +42,26 @@ Unchanged task histories and run timelines retain their DOM nodes.
   保持して対象の再読み取りを失敗させ、不正な「関連なし」へ変換しない。
 - Run detail obtains the matching task once for successor, latest attempt and
   task outcome. This eliminates three independent queue parses.
-- A single worker scans revision metadata for all SSE clients and health reads.
-  Cold SSE clients wait for that worker instead of starting duplicate scans.
-  Health shares revisions and reads questions once for its two counts. Transient
-  scan failures preserve the last successful snapshot and are retried. Revision
-  tokens include file identity and deletion, including question/notice stores.
-  Question stores include lease and panel entries, not just JSON records.
+- SSE と health の revision メタデータ走査は単一 worker で共有する。
+  初回の SSE 接続は独自に走査せず、その worker を待つ。質問件数はライブの
+  ストアスタンプと 10 秒の TTL でキャッシュし、スタンプ取得失敗時は既存の
+  revision にフォールバックする。一時的な走査失敗では最後の正常な snapshot を
+  保持して再試行する。revision はファイルの同一性と削除を検出し、質問では
+  JSON 以外のリースやパネルも対象にする。
+- Run の可読性はファイルの同一性でキャッシュする。毎回メタデータを照合するため、
+  置換・修復・削除は `runs_unreadable` に即時反映される。質問のリース状態は
+  ファイル変更がなくても 10 秒の TTL で再評価する。通知の revision は monitor の
+  ポーリング間でも最新値を取得する。
+- 更新用の設定探索は毎分 1 回までのバックグラウンドスレッドで実行する。
+  ディスクサイズ計測は独立した処理として下記の規則に従う。
+  空き容量と retention は各 health リクエストで読み直す。初回の可読性判定は
+  各 Run を一度解析し、その後は変更された Run のみを解析する。変更系ハンドラーは
+  引き続き実データを検証する。
+- 両方の会話一覧ルートは最大 50 件のサマリーを返す。各サマリーには最大 2 件の
+  240 文字プレビュー、総ターン数、正確な未読数、固定サイズの context 表示を含む。
+  本文全体、Markdown ツリー、参照情報は詳細ルートで取得する。エージェントの
+  タイムスタンプはサーバー内部で保持する。`x-talk-reads` は会話 ID と最終既読時刻の
+  JSON マップを受け取り、UI は現在のページ分だけ送信してヘッダーサイズを抑える。
 - Health capacity measurements have a separate demand-driven single flight.
   Recursive runs/worktree/cache walks never delay the initial health response or
   revision worker. Refreshes become eligible 60 seconds after the previous walk
@@ -56,8 +70,11 @@ Unchanged task histories and run timelines retain their DOM nodes.
   from the old scope. Cold/unavailable `runs_bytes` and `worktrees_bytes` are
   `null`; optional free/cache values are omitted until known. A fully measured
   empty tree is still `0`. Admission and cleanup use their existing authority.
-- No config or process-liveness cache was introduced. Mutation handlers retain
-  their existing authoritative validation.
+- Chat loads one page, with an explicit button for older conversations. Search
+  hydrates matching summaries from the whole store; marking all read explicitly
+  walks remaining pages. Health/list reads use a separate two-slot execution
+  lane, and the browser aborts and retries those reads around conversation core
+  and sections requests, including when a response body is still downloading.
 
 The `health_disk_*` unit regressions hold a capacity walk open while concurrent
 health responses complete, then exercise single-flight refresh, failure recovery
@@ -219,9 +236,11 @@ Related conversation tasks and roster still share one secondary response.
 タスク履歴、Run の関係情報、Stats の履歴集計には一括処理が残る。
 Queue / Chat 一覧はページ単位で表示し、Stats のキュー集計は独立して表示する。 Report/detail routes still
 read run state and check liveness separately; lazy text fallback removes one
-normal read but does not eliminate the other two. Health still does config,
-disk and unreadable-run work. Further section splitting and measured shared run
-projections remain follow-up work. There is no claim that every route is O(1).
+normal read but does not eliminate the other two. Health metadata reconciliation
+and cold readability indexing remain proportional to history size; disk metrics
+and update configuration can lag by a minute plus measurement time. Further
+section splitting and measured shared run projections remain follow-up work.
+There is no claim that every route is O(1).
 
 This environment denies process inspection, so no CPU/profile comparison against
 the running web process was collected. Production accumulated-history browser
