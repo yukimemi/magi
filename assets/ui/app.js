@@ -6263,15 +6263,16 @@ async function loadTalk(id, { background = false } = {}) {
     const core = sectionRequest(`talk:${id}:core`, `${API.talk(id)}/core`, talk => {
       trackTalkThinking(talk, observed);
       if (!current()) return;
+      detail.coreLoaded = true;
       detail.talk = { ...detail.talk, ...talk };
       applyTalkSections(detail);
       sectionNotice("talk-meta", "talk-core-state", "");
       renderTalk();
       ok();
-      return true;
     }, error => {
       if (error.status === 404) endTalkTurn(id);
       if (!current()) return;
+      detail.coreLoaded = false;
       if (error.status === 404) {
         detail.talk = null;
         detail.gone = true;
@@ -6282,7 +6283,10 @@ async function loadTalk(id, { background = false } = {}) {
       sectionNotice("talk-meta", "talk-core-state", `Conversation: ${error.message}`, retry);
       failFor(background, `Could not load conversation ${shortId(id)}: ${error.message}`, error);
     }, false, background);
-    loaded = await core;
+    await core;
+    // Coalesced reads wait for trailing refreshes but keep the first promise's
+    // value. Use the status recorded by the latest core callback instead.
+    loaded = detail.coreLoaded;
     if (loaded && current()) await afterTalkPaint();
   } finally { release(); }
   if (!loaded || !current()) return;

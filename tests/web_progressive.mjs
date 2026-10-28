@@ -888,3 +888,51 @@ test('hiding a chat while its first paint is scheduled does not stall refreshes'
   h.requests[1].resolve({ roster: [], personas: [] });
   await done;
 });
+
+test('a successful trailing core retry starts sections after a coalesced failure', { timeout: 5000 }, async () => {
+  const h = harness({ manualPaint: true });
+  const first = h.api.loadTalk('a');
+  const refresh = h.api.loadTalk('a', { background: true });
+  assert.equal(h.requests.length, 1);
+  h.requests[0].reject(Object.assign(new Error('Temporary failure'), { status: 503 }));
+  await flush();
+  assert.equal(h.requests[1].url, 'talk/a/core');
+  h.requests[1].resolve({ id: 'a', updated_at: 'new', turns: [{ body: 'Recovered transcript' }] });
+  await flush();
+  assert.equal(h.state.talkDetail.talk.turns[0].body, 'Recovered transcript');
+  assert.equal(h.notices.filter(n => n[1] === 'talk-core-state').at(-1)[2], '');
+  assert.equal(h.requests.length, 2, 'recovered transcript paints before enrichment');
+  assert.ok(h.frames.length > 0, 'successful trailing core must schedule enrichment after paint');
+  for (const frame of h.frames.splice(0)) frame();
+  await flush();
+  assert.equal(h.requests.length, 3, 'coalesced callers start one sections request');
+  assert.equal(h.requests[2].url, 'talk/a/sections');
+  const roster = [{ id: 'available-agent', runnable: true }];
+  const personas = [{ id: 'default', name: 'Default' }];
+  const data = { context_for: 'new', tasks: ['related'], roster, personas };
+  h.requests[2].resolve(data);
+  await flush();
+  assert.equal(h.requests.length, 4, 'background invalidation retains one trailing sections read');
+  assert.equal(h.requests[3].url, 'talk/a/sections');
+  h.requests[3].resolve(data);
+  await Promise.all([first, refresh]);
+  assert.deepEqual(h.state.talkDetail.talk.tasks, ['related']);
+  assert.deepEqual(h.state.talkDetail.roster, roster);
+  assert.deepEqual(h.state.talkDetail.personas, personas);
+  assert.equal(h.notices.filter(n => n[1] === 'talk-sections-state').at(-1)[2], '');
+});
+
+test('a failed trailing core refresh retains retry without starting sections', { timeout: 5000 }, async () => {
+  const h = harness();
+  const first = h.api.loadTalk('a');
+  const refresh = h.api.loadTalk('a', { background: true });
+  h.requests[0].resolve({ id: 'a', turns: [{ body: 'Retained transcript' }] });
+  await flush();
+  h.requests[1].reject(Object.assign(new Error('Refresh unavailable'), { status: 503 }));
+  await Promise.all([first, refresh]);
+  assert.equal(h.requests.length, 2);
+  assert.equal(h.state.talkDetail.talk.turns[0].body, 'Retained transcript');
+  const notice = h.notices.filter(n => n[1] === 'talk-core-state').at(-1);
+  assert.ok(notice[2].includes('Refresh unavailable'));
+  assert.equal(typeof notice[3], 'function');
+});
