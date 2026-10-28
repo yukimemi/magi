@@ -31,6 +31,13 @@ fn run_evidence(home: &Path, run: Option<&str>) -> Value {
         return Value::Null;
     };
     let mut evidence = serde_json::Map::new();
+    // Use the same structured cause as run_ended/run_stopped. The last event
+    // and the task's formatted error need not contain this diagnostic.
+    let verification_cause = serde_json::from_value::<crate::run::RunState>(record.clone())
+        .ok()
+        .and_then(|state| crate::run::migrate_schema(state).ok())
+        .and_then(|state| state.verification_blocking_cause());
+    evidence.insert("verification_cause".into(), json!(verification_cause));
     for field in [
         "status",
         "prep_failure",
@@ -193,6 +200,7 @@ pub(crate) fn attention(
         cause.is_some_and(|cause| {
             [
                 evidence["prep_failure"].as_str(),
+                evidence["verification_cause"].as_str(),
                 evidence
                     .pointer("/resource_block/detail")
                     .and_then(Value::as_str),

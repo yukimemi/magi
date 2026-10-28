@@ -1812,7 +1812,9 @@ async fn attention_reports_page_new_run_passes_after_legacy_read_history() {
 #[tokio::test]
 async fn semantic_automatic_sources_share_receipts_without_settling_decisions() {
     let _home = common::home_lock().await;
-    for attention_first in [true, false] {
+    for (attention_first, gate_failed) in
+        [(true, false), (false, false), (true, true), (false, true)]
+    {
         let w = world();
         let mut run = magi::run::RunState::new(
             w.tmp.path().into(),
@@ -1822,7 +1824,26 @@ async fn semantic_automatic_sources_share_receipts_without_settling_decisions() 
             Config::default(),
         );
         run.status = magi::run::RunStatus::Failed;
-        run.prep_failure = Some("no candidate produced a change".into());
+        if gate_failed {
+            let output = std::process::Command::new("sh")
+                .args(["-c", "echo regression gate failure; exit 1"])
+                .output()
+                .unwrap();
+            run.status = magi::run::RunStatus::Blocked;
+            run.gate_ran = true;
+            run.gate_head = Some("reviewed-head".into());
+            run.gate = vec![magi::run::CommandOutcome {
+                command: "echo regression gate failure; exit 1".into(),
+                code: output.status.code(),
+                output_tail: String::from_utf8(output.stdout).unwrap(),
+                duration_ms: 0,
+                resource_blocked: false,
+            }];
+            run.event("gate", "gate failed; not merging");
+            assert!(run.verification_blocking_cause().is_some());
+        } else {
+            run.prep_failure = Some("no candidate produced a change".into());
+        }
         let dir = w.tmp.path().join("runs").join(&run.id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("run.json"), serde_json::to_vec(&run).unwrap()).unwrap();
@@ -1837,7 +1858,16 @@ async fn semantic_automatic_sources_share_receipts_without_settling_decisions() 
         );
         task.chat = Some(w.talk_id.clone());
         task.start(run.id.clone());
-        task.last_error = run.prep_failure.clone();
+        task.last_error = if gate_failed {
+            // daemon::describe wraps the cause with status and run identity.
+            Some(format!(
+                "Run ended blocked ({}) [{}]",
+                run.verification_blocking_cause().unwrap(),
+                run.id
+            ))
+        } else {
+            run.prep_failure.clone()
+        };
         task.hold_machine(task.last_error.clone());
         w.queue.put(&mut task).unwrap();
         let notices = magi::notices::Notices::at(w.tmp.path().join("notifications"));
@@ -1861,6 +1891,12 @@ async fn semantic_automatic_sources_share_receipts_without_settling_decisions() 
         );
         assert!(w.queue.get(&task.id).unwrap().chat_notice.is_some());
         assert!(notices.list().iter().all(|n| !n.unread()));
+        notices
+            .raise(magi::notices::run_stopped(&run.id, &run))
+            .unwrap();
+        attention();
+        chat = w.talks.get(&w.talk_id).unwrap();
+        assert_eq!(chat.pending_messages.len(), 1, "same stopped-run cause");
         talk::drain(&mut chat, &w.talks).unwrap();
 
         let questions = magi::ask::Questions::at(w.tmp.path().join("questions"));
@@ -1918,6 +1954,23 @@ async fn semantic_automatic_sources_share_receipts_without_settling_decisions() 
             w.queue.get(&task.id).unwrap().status,
             magi::queue::TaskStatus::Held
         );
+        if gate_failed {
+            // A later verification attempt fails on a different commit.
+            run.begin_pass();
+            run.gate_head = Some("new-reviewed-head".into());
+            std::fs::write(dir.join("run.json"), serde_json::to_vec(&run).unwrap()).unwrap();
+            notices
+                .raise(magi::notices::run_ended(&run).unwrap())
+                .unwrap();
+            attention();
+            let saved = w.talks.get(&w.talk_id).unwrap();
+            assert!(saved.status.open());
+            assert_eq!(
+                saved.pending_messages.len(),
+                1,
+                "new failed head is evidence"
+            );
+        }
     }
 }
 
