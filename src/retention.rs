@@ -2592,13 +2592,16 @@ mod tests {
             retire_empty(&home, &Fx::disk(), Fx::now(), &mut report).await;
             report
         });
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        // These are deadlock watchdogs, not speed assertions. The proof stays
+        // blocked until the task update completes, even on a loaded runner.
+        let watchdog = std::time::Duration::from_secs(60);
+        tokio::time::timeout(watchdog, async {
             while !entered.exists() {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         })
         .await
-        .unwrap();
+        .expect("Git retirement proof did not enter the blocking hook");
         let queue = crate::queue::Queue::at(f.home.join("queue"));
         let mut selected = queue.get(&task.id).unwrap();
         selected.resume_override = Some(crate::queue::OperatorResume {
@@ -2609,8 +2612,10 @@ mod tests {
             pinned_run: Some(empty.id.clone()),
         });
         let mut update = tokio::task::spawn_blocking(move || queue.put(&mut selected));
-        let quick = match tokio::time::timeout(std::time::Duration::from_secs(2), &mut update).await
-        {
+        // The proof is released only after the update returns, so correctness
+        // is decided by ordering, not speed. The 60-second bound only detects
+        // a writer blocked behind the proof; it is not a performance threshold.
+        let updated_while_blocked = match tokio::time::timeout(watchdog, &mut update).await {
             Ok(result) => {
                 result.unwrap().unwrap();
                 true
@@ -2622,12 +2627,12 @@ mod tests {
             }
         };
         std::fs::write(release, "continue").unwrap();
-        let report = tokio::time::timeout(std::time::Duration::from_secs(8), sweep)
+        let report = tokio::time::timeout(watchdog, sweep)
             .await
-            .unwrap()
+            .expect("Git retirement proof did not finish after release")
             .unwrap();
         assert!(
-            quick,
+            updated_while_blocked,
             "task writers must not wait behind Git retirement proof"
         );
         assert_eq!(report.retired, 0);

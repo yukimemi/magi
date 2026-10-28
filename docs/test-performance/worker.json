@@ -1,0 +1,11 @@
+{
+  "test": "worker::tests::terminal_records_are_bounded_without_pruning_live_reservations",
+  "before_seconds": 10.53,
+  "after_seconds": 2.46,
+  "before_build_seconds": 122.0,
+  "after_build_seconds": 21.74,
+  "profile": "round-1 test profile for both measurements",
+  "before_source": "6326009 worker fixture",
+  "after_source": "candidate worker fixture",
+  "passed": true
+}

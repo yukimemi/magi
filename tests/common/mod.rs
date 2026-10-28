@@ -54,7 +54,7 @@ const CHILD_ENV: &str = "MAGI_E2E_CHILD";
 static SLOTS: LazyLock<(std::sync::Mutex<usize>, std::sync::Condvar)> = LazyLock::new(|| {
     let cpus = std::thread::available_parallelism().map_or(2, |n| n.get());
     (
-        std::sync::Mutex::new((cpus / 2).max(2)),
+        std::sync::Mutex::new((cpus / 2).clamp(2, 4)),
         std::sync::Condvar::new(),
     )
 });
@@ -73,7 +73,8 @@ static SLOTS: LazyLock<(std::sync::Mutex<usize>, std::sync::Condvar)> = LazyLock
 ///
 /// The parent insists the child reported `1 passed`: a name that drifts from
 /// what libtest filters on would otherwise run zero tests and pass. Concurrency
-/// is capped (half the CPUs) so load alone cannot trip a node timeout.
+/// is capped (half the CPUs, at most four, matching nextest's e2e group)
+/// so subprocess contention cannot grow unchecked on larger machines.
 ///
 /// Under `cargo nextest` (`NEXTEST_EXECUTION_MODE=process-per-test`) the body
 /// runs directly: the process is already the test's own, and the cap lives in
@@ -154,7 +155,10 @@ macro_rules! e2e {
         $(#[$m])*
         #[test]
         fn $name() {
-            $crate::common::isolated(stringify!($name), || async $body)
+            // libtest omits the crate name but includes nested module names.
+            let qualified = concat!(module_path!(), "::", stringify!($name));
+            let (_, name) = qualified.split_once("::").expect("crate and test name");
+            $crate::common::isolated(name, || async $body)
         }
     };
 }
@@ -188,6 +192,9 @@ const MOCK: &str = r##"#!/bin/sh
 # Mock agent. Dispatches on the prompt magi generated for this seat.
 set -e
 p="$MAGI_PROMPT_FILE"
+# dirname also understands native Windows separators and bare filenames.
+# Compute it once rather than spawning it for every log entry.
+artifacts=$(dirname "$p")
 seat="$MAGI_SEAT"
 
 # One read of the prompt, matched with shell builtins: each `grep -q` below was
@@ -200,7 +207,7 @@ has() { case "$prompt" in *"$1"*) return 0 ;; esac; return 1; }
 # agent-filed work to a passing human. Recording them here is what lets a test
 # assert the plumbing from inside a real graph run.
 printf '%s %s %s\n' "$MAGI_RUN" "$MAGI_NODE" "$seat" \
-  >> "$(dirname "$p")/attribution.log"
+  >> "$artifacts/attribution.log"
 
 # Context trail: which of the pieces a seat with no session of its own needs
 # this prompt carried. A seat resumed on its own conversation gets a short
@@ -213,7 +220,7 @@ if has "(re-sent in full)"; then ctx="$ctx resent"; fi
 if has "# Patch under review"; then ctx="$ctx patch"; fi
 if has "What was argued before this vote"; then ctx="$ctx argued"; fi
 if has "# The panel's votes and findings"; then ctx="$ctx panel"; fi
-printf '%s %s%s\n' "$MAGI_NODE" "$seat" "$ctx" >> "$(dirname "$p")/prompts.log"
+printf '%s %s%s\n' "$MAGI_NODE" "$seat" "$ctx" >> "$artifacts/prompts.log"
 
 # Failure knobs below fire only when this is satisfied: `MOCK_ONLY_NODE` names
 # the node, `MOCK_ONLY_HAS` a phrase the prompt must carry. Unset means always.
@@ -258,7 +265,7 @@ fi
 # `git rebase --skip` once, on the first stop only, then resolves as usual. Both count their calls in
 # `rebase-fix.log` in the run's artifacts directory.
 if has "Your rebase stopped on a conflict"; then
-  echo "$seat" >> "$(dirname "$p")/rebase-fix.log"
+  echo "$seat" >> "$artifacts/rebase-fix.log"
   if [ -n "$MOCK_REBASE_FIX_NOOP" ]; then
     printf '{"addressed":[],"rejected":[],"notes":"changed nothing"}\n'
     exit 0
@@ -268,8 +275,8 @@ if has "Your rebase stopped on a conflict"; then
     printf '{"addressed":[],"rejected":[],"notes":"aborted"}\n'
     exit 0
   fi
-  if [ -n "$MOCK_REBASE_FIX_SKIP_ONE" ] && [ ! -f "$(dirname "$p")/skipped-once" ]; then
-    : > "$(dirname "$p")/skipped-once"
+  if [ -n "$MOCK_REBASE_FIX_SKIP_ONE" ] && [ ! -f "$artifacts/skipped-once" ]; then
+    : > "$artifacts/skipped-once"
     GIT_EDITOR=true git rebase --skip >/dev/null 2>&1 || true
   fi
   if [ -n "$MOCK_REBASE_FIX_SKIP" ]; then
@@ -377,7 +384,7 @@ if [ -n "$MOCK_HANG_SEAT" ] && { case ",$MOCK_HANG_SEAT," in *",$seat,"*) true ;
   # holding stdout. Any orphan lives at most one second, with one spawn per
   # second rather than ten. The 600-iteration safety cap is far above
   # HANG_TURN_SECS, but prevents an endless hang if killing the shell fails.
-  printf '%s %s %s\n' "$MAGI_NODE" "$seat" "$MOCK_AGENT_ID" >> "$(dirname "$p")/hangs.log"
+  printf '%s %s %s\n' "$MAGI_NODE" "$seat" "$MOCK_AGENT_ID" >> "$artifacts/hangs.log"
   hang=0
   while [ "$hang" -lt 600 ]; do
     sleep 1 </dev/null >/dev/null 2>&1

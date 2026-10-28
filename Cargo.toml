@@ -93,3 +93,19 @@ futures-util = { version = "0.3.34", default-features = false, features = ["sink
 # of a debug build debuggable.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Keep source locations and backtraces without variable debug information in
+# dev builds too, including the library linked by integration tests.
+[profile.dev]
+debug = "line-tables-only"
+
+# Request less debug information while retaining source locations. Measure
+# total build time separately; this does not imply a cold-build speedup.
+# Release is unchanged.
+[profile.test]
+debug = "line-tables-only"
+
+# Every mock CLI cleanup walks the process table. Optimize that dependency in
+# tests while leaving the application and release profiles unchanged.
+[profile.test.package.sysinfo]
+opt-level = 3
