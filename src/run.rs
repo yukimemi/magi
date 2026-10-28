@@ -891,6 +891,15 @@ pub struct GateRepairE2e {
 /// Superseded head-specific evidence; repair budgets remain on the run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationEvidence {
+    /// Replacement SHA, unknown when archived without a head change.
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+    /// Archive time, unknown for records written before this field existed.
+    #[serde(default)]
+    pub archived_at: Option<Timestamp>,
+    /// Run-wide gate-fix rounds spent at archival, unknown for legacy records.
+    #[serde(default)]
+    pub fixes_spent: Option<usize>,
     /// SHA of the superseded gate, unknown for legacy records.
     pub gate_head: Option<String>,
     /// Whether the superseded gate completed.
@@ -2994,12 +3003,28 @@ impl RunState {
         let stale_e2e = self.head_e2e.as_ref().is_some_and(|e| e.head != head);
         if stale_gate || stale_e2e {
             self.verification_history.push(VerificationEvidence {
+                superseded_by: Some(head.to_owned()),
+                archived_at: Some(Timestamp::now()),
+                fixes_spent: Some(self.gate_fixes.len()),
                 gate_head: self.gate_head.clone(),
                 gate_ran: self.gate_ran,
                 gate: self.gate.clone(),
                 e2e: self.head_e2e.clone(),
             });
             if stale_gate {
+                let previous = self
+                    .gate_head
+                    .as_deref()
+                    .map(short)
+                    .unwrap_or_else(|| "unknown".into());
+                self.event(
+                    "gate",
+                    format!(
+                        "archived gate on {previous}, superseded by {}; {} gate-fix round(s) already spent stay spent",
+                        short(head),
+                        self.gate_fixes.len()
+                    ),
+                );
                 self.gate.clear();
                 self.gate_ran = false;
                 self.gate_head = None;
@@ -4664,6 +4689,22 @@ mod tests {
             RunState::load_under("20260101-000000-none", dir.path()).is_err(),
             "an id with nothing saved under this home must not silently read something else"
         );
+    }
+
+    #[test]
+    fn verification_history_legacy_metadata_remains_unknown() {
+        let history: VerificationEvidence = serde_json::from_value(serde_json::json!({
+            "gate_head": "old-head",
+            "gate_ran": true,
+            "gate": [],
+            "e2e": null
+        }))
+        .unwrap();
+        assert!(history.superseded_by.is_none());
+        assert!(history.archived_at.is_none());
+        assert!(history.fixes_spent.is_none());
+        assert_eq!(history.gate_head.as_deref(), Some("old-head"));
+        assert!(history.gate_ran);
     }
 
     #[test]

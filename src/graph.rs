@@ -9021,6 +9021,9 @@ impl Runner {
             self.state
                 .verification_history
                 .push(crate::run::VerificationEvidence {
+                    superseded_by: None,
+                    archived_at: Some(Timestamp::now()),
+                    fixes_spent: Some(self.state.gate_fixes.len()),
                     gate_head: None,
                     gate_ran: false,
                     gate: Vec::new(),
@@ -11439,6 +11442,9 @@ pub(crate) async fn verify_current_head(
         state
             .verification_history
             .push(crate::run::VerificationEvidence {
+                superseded_by: Some(head.clone()),
+                archived_at: Some(Timestamp::now()),
+                fixes_spent: Some(state.gate_fixes.len()),
                 gate_head: None,
                 gate_ran: false,
                 gate: Vec::new(),
@@ -15751,7 +15757,24 @@ esac
             assert_eq!(runner.state.verification_history.len(), 1);
             let history = &runner.state.verification_history[0];
             assert_eq!(history.gate_head.as_deref(), Some(old.as_str()));
+            assert_eq!(history.superseded_by.as_deref(), Some(head.as_str()));
+            assert!(history.archived_at.is_some());
+            assert_eq!(history.fixes_spent, Some(1));
             assert_eq!(history.gate[0].output_tail, "old failure");
+            let archive_events: Vec<_> = runner
+                .state
+                .events
+                .iter()
+                .filter(|e| e.node == "gate" && e.message.starts_with("archived gate on "))
+                .collect();
+            assert_eq!(archive_events.len(), 1);
+            assert!(archive_events[0].message.contains(&short(&old)));
+            assert!(archive_events[0].message.contains(&short(&head)));
+            assert!(
+                archive_events[0]
+                    .message
+                    .contains("1 gate-fix round(s) already spent stay spent")
+            );
             assert_eq!(runner.state.head_e2e.as_ref().unwrap().head, head);
             assert_eq!(runner.state.head_e2e.as_ref().unwrap().passed, e2e_ok);
             if e2e_ok {
@@ -15785,6 +15808,10 @@ esac
             runner.gate().await.unwrap();
             assert_eq!(std::fs::read_to_string(&phases).unwrap(), before);
             assert_eq!(runner.state.verification_history.len(), 1);
+            let history = &runner.state.verification_history[0];
+            assert_eq!(history.superseded_by.as_deref(), Some(head.as_str()));
+            assert!(history.archived_at.is_some());
+            assert_eq!(history.fixes_spent, Some(1));
         }
     }
 
