@@ -6944,6 +6944,9 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
                 "--nocapture",
             ])
             .env(CHILD, "1")
+            // Binary tests link config as a non-test library; do not read the
+            // operator's machine layer or inherit a parent's config fixture.
+            .env(Config::CONFIG_DIR_ENV, "")
             .env_remove("MAGI_HOME")
             .env_remove("MAGI_RUN")
             .env_remove("MAGI_NODE")
