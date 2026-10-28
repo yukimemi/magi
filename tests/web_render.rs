@@ -3762,6 +3762,8 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
         )
         .await
         .unwrap();
+    // Cold navigation gives core and sections priority over health. Waiting
+    // for health to start while sections are held would deadlock this test.
     browser
         .wait_for(
             &page,
@@ -3770,11 +3772,11 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
              && document.querySelector('#talk-turns pre code')?.textContent.trim() === '12ba' \
              && window.delayedChatReads.references > 0 \
              && window.delayedChatReads.sections > 0 \
-             && window.delayedChatReads.health > 0",
+             && window.delayedChatReads.health === 0",
             Duration::from_secs(30),
         )
         .await
-        .expect("long transcript renders before health, related sections and references finish");
+        .expect("long transcript renders with health deferred and related sections and references held");
     browser
         .eval(&page, "window.releaseChatReads(); true")
         .await
@@ -3782,11 +3784,12 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
     browser
         .wait_for(
             &page,
-            "document.querySelectorAll('.turn[data-who=agent] a[href=\"#/tasks/20260908-205803-12ba\"]').length === 2",
+            "document.querySelectorAll('.turn[data-who=agent] a[href=\"#/tasks/20260908-205803-12ba\"]').length === 2 \
+             && window.delayedChatReads.health > 0",
             Duration::from_secs(30),
         )
         .await
-        .expect("real deferred reference response decorates the preserved transcript");
+        .expect("deferred references decorate the preserved transcript and health resumes after sections");
     browser
         .eval(&page, "location.hash = '#/queue'; true")
         .await
