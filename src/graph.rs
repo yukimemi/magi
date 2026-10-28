@@ -8883,6 +8883,23 @@ impl Runner {
             self.hold_merge_repair(i, why)?;
             return Ok(false);
         }
+        // A completed repair gate is a publication checkpoint. On reentry,
+        // reject external changes before the ordinary gate path can replace
+        // that evidence by verifying a new head. Requested repairs still
+        // start their own review generation below.
+        if request.phase == Phase::Reviewing && self.state.gate_ran {
+            let winner = self
+                .state
+                .winner()
+                .context("repair has no winning branch")?;
+            let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+            if self.state.gate_head.as_deref() != Some(head.as_str())
+                || !git::is_clean(&winner.worktree).await?
+            {
+                self.hold_merge_repair(i, "repair branch changed after its recorded gate, or the verified head is unknown; nothing was published. Inspect the branch and run an explicit review before requesting a new merge decision".to_owned())?;
+                return Ok(false);
+            }
+        }
         let failure = if i >= self.state.config.graph.land_rounds
             || self.state.config.graph.review_rounds == 0
         {
