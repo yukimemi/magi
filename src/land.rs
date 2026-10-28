@@ -5576,6 +5576,27 @@ pub async fn fix_round(
             state.quota.push(loss);
             state.status = RunStatus::Blocked;
             state.save()?;
+            // Keep partial edits reachable on the winner branch and leave a
+            // clean tree for resume_landing_head. The resumed landing gates
+            // this new commit before it can publish it; no push happens here.
+            let inherited = crate::repo_lock::WaitPolicy::current();
+            let wait = crate::repo_lock::WaitPolicy::new(
+                Duration::from_secs(state.config.graph.timeout_resource_wait),
+                move || inherited.cancelled(),
+            );
+            let _coordination = crate::repo_lock::SeatLease::operation_with(
+                &winner.worktree,
+                state.config.coordination.as_ref(),
+                &wait,
+            )
+            .await?;
+            let rescue = git::rescue_commit(
+                &winner.worktree,
+                &format!("magi: deferred land round {round} (uncommitted work)"),
+            )
+            .await?;
+            state.note_withheld("land", &rescue.withheld);
+            state.save()?;
             return Ok(Fixed::Deferred);
         }
         Ok(o) if !o.usable() => {

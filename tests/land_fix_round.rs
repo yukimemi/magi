@@ -131,6 +131,33 @@ async fn land_rescue_waits_for_the_real_repository_lock() {
 }
 }
 
+#[cfg(unix)]
+fn install_resume_forge(root: &Path, branch: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = root.join("resume-forge");
+    std::fs::create_dir(&bin).unwrap();
+    let script = bin.join("gh");
+    std::fs::write(&script, r#"#!/bin/sh
+sha=$(git ls-remote --refs origin "refs/heads/$LAND_TEST_BRANCH" | cut -f1)
+case "$1 $2" in
+ 'pr view') printf '{"url":"https://github.com/example/repo/pull/1","number":1,"state":"OPEN","title":"feat: existing work","reviews":[],"comments":[],"mergeStateStatus":"CLEAN","headRefOid":"%s","baseRefName":"main","autoMergeRequest":null,"headRefName":"%s","isCrossRepository":false}\n' "$sha" "$LAND_TEST_BRANCH" ;;
+ 'api graphql') printf '{"data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{"oid":"%s","statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false},"nodes":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}}}}]}}}}}\n' "$sha" ;;
+ 'api repos/{owner}/{repo}/pulls/1/comments') echo '[]' ;;
+ 'pr merge') case "$*" in *--disable-auto*) exit 0 ;; *) exit 99 ;; esac ;;
+ *) exit 98 ;;
+esac
+"#).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    // SAFETY: this e2e scene runs in its own child, between graph executions.
+    unsafe {
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        std::env::set_var("LAND_TEST_BRANCH", branch);
+    }
+}
+
+#[cfg(unix)]
 async fn unavailable_landing_fix_is_refunded_and_retryable(authentication: bool) {
     let home = common::home_lock().await;
     let mut fx = fixture(home, Judges::Unanimous, false);
@@ -162,14 +189,14 @@ async fn unavailable_landing_fix_is_refunded_and_retryable(authentication: bool)
     };
     std::fs::write(
         &outage_script,
-        format!("cat <<'EVENTS'\n{line}\nEVENTS\nexit 1\n"),
+        format!("echo partial >> partial-land.txt\necho changed >> note.txt\ncat <<'EVENTS'\n{line}\nEVENTS\nexit 1\n"),
     )
     .unwrap();
     for agent in &mut state.config.agents {
         agent.command = vec!["sh".into(), outage_script.to_string_lossy().into_owned()];
     }
     let pr = PrState {
-        url: "https://example.invalid/pull/1".into(),
+        url: "https://github.com/example/repo/pull/1".into(),
         number: 1,
         state: PrLifecycle::Open,
         checks: Checks::Red,
@@ -232,8 +259,59 @@ async fn unavailable_landing_fix_is_refunded_and_retryable(authentication: bool)
                 .contains("re-authenticate")
         );
     }
+    let saved_head = git(&winner.worktree, &["rev-parse", "HEAD"]);
+    assert_eq!(git(&winner.worktree, &["status", "--porcelain"]), "");
+    assert!(git(&winner.worktree, &["show", "HEAD:partial-land.txt"]).contains("partial"));
+    assert!(git(&winner.worktree, &["show", "HEAD:note.txt"]).contains("changed"));
+    assert_ne!(
+        saved_head,
+        git(
+            &winner.worktree,
+            &["rev-parse", &format!("{remote}/{}", winner.branch)]
+        ),
+        "deferred work must remain local until resume gates it"
+    );
     state.config.agents = fx.config.agents.clone();
-    state.resource_block = None; // Cleared by Runner::resume for a new pass.
+    state.config.graph.land = true;
+    state.config.graph.land_approval = true;
+    state.config.merge.mode = magi::config::MergeMode::Pr;
+    state.merge = Some(magi::run::MergeOutcome {
+        mode: magi::config::MergeMode::Pr,
+        ok: true,
+        detail: pr.url.clone(),
+        empty: false,
+    });
+    state.pr_pushed_head = Some(git(
+        &winner.worktree,
+        &["rev-parse", &format!("{remote}/{}", winner.branch)],
+    ));
+    install_resume_forge(fx.tmp.path(), &winner.branch);
+    state.save().unwrap();
+    // Exercise execute_graph -> resume_landing_head -> restore_landing_worktree,
+    // rather than clearing the resource block and calling the fixer directly.
+    let mut resumed = Runner::resume(&state.id).unwrap();
+    resumed.execute().await.unwrap();
+    assert!(resumed.state.resource_block.is_none());
+    assert!(!resumed.state.land_sync_pending);
+    assert!(
+        resumed.state.parked,
+        "resume must reach fresh owner approval: {:?}",
+        resumed.state.events
+    );
+    assert_eq!(
+        resumed.state.gate_head.as_deref(),
+        Some(saved_head.as_str())
+    );
+    assert_eq!(
+        resumed.state.pr_pushed_head.as_deref(),
+        Some(saved_head.as_str())
+    );
+    assert_eq!(git(&winner.worktree, &["status", "--porcelain"]), "");
+    assert!(resumed.state.land_approval.is_some());
+    // Recovery still leaves the fixer callable with the original round budget.
+    let mut state = resumed.state;
+    state.parked = false;
+    state.land_approval = None;
     let retried = fix_round(&mut state, &pr, 1, 1, "check failed", "")
         .await
         .unwrap();
@@ -241,12 +319,14 @@ async fn unavailable_landing_fix_is_refunded_and_retryable(authentication: bool)
 }
 
 common::e2e! {
+#[cfg(unix)]
 async fn landing_authentication_outage_refunds_the_attempt_and_retries_the_fix() {
     unavailable_landing_fix_is_refunded_and_retryable(true).await;
 }
 }
 
 common::e2e! {
+#[cfg(unix)]
 async fn landing_usage_outage_refunds_the_attempt_and_retries_the_fix() {
     unavailable_landing_fix_is_refunded_and_retryable(false).await;
 }

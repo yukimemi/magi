@@ -1013,7 +1013,9 @@ upstream CRLF, not drift worth committing — normalise back to LF and
   A fixer chain ending in a usage limit or authentication failure uses its
   caller's resource deferral path, including the independent landing fixer
   chain: it records the final agent/cause and defers without handing off the
-  PR or spending a fix round. Resume retries its checks/comments; an explicit
+  PR or spending a fix round. Partial edits are rescued to a local commit
+  under repository coordination before deferral; normal resume gates that
+  commit before publishing it. Resume retries its checks/comments; an explicit
   merge-repair request remains pending after restoring partial fixer work.
   This excludes best-effort graft, which records
   the loss, restores its tree and proceeds to review and gate. The same applies
