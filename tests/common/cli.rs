@@ -10,7 +10,7 @@ pub(super) const SEAT_ENV: [&str; 3] = ["MAGI_RUN", "MAGI_NODE", "MAGI_SEAT"];
 pub(super) const WORKER_ENV: [&str; 4] = magi::worker::INVOCATION_ENV;
 
 /// Cargo's unqualified `debug/magi` can be relinked by another toolchain using
-/// the shared target directory while these tests run. Use the hashed artifact
+/// the shared target directory while these tests run. Use the dependency artifact
 /// linked against this test's library instead, including for worker launches.
 pub fn magi_executable() -> &'static Path {
     static EXE: LazyLock<PathBuf> = LazyLock::new(|| {
@@ -24,6 +24,12 @@ pub fn magi_executable() -> &'static Path {
 /// Cargo's supplied executable. A local build with fingerprints must find an
 /// exact library match, rather than silently run a different schema version.
 pub(super) fn matching_cli(test: &Path) -> Option<PathBuf> {
+    // Cargo omits extra-filename for ordinary local MSVC executables so their
+    // embedded PDB path has no hash. Test executables still carry a hash.
+    matching_cli_for_layout(test, !cfg!(target_env = "msvc"))
+}
+
+pub(super) fn matching_cli_for_layout(test: &Path, hashed_executable: bool) -> Option<PathBuf> {
     let (name, hash) = test.file_stem()?.to_str()?.rsplit_once('-')?;
     let profile = test.parent()?.parent()?;
     let fingerprints = profile.join(".fingerprint");
@@ -56,9 +62,12 @@ pub(super) fn matching_cli(test: &Path) -> Option<PathBuf> {
         else {
             continue;
         };
-        let executable = profile
-            .join("deps")
-            .join(format!("magi-{hash}{}", std::env::consts::EXE_SUFFIX));
+        let name = if hashed_executable {
+            format!("magi-{hash}{}", std::env::consts::EXE_SUFFIX)
+        } else {
+            format!("magi{}", std::env::consts::EXE_SUFFIX)
+        };
+        let executable = profile.join("deps").join(name);
         if executable.is_file() {
             return Some(executable);
         }
