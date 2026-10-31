@@ -166,7 +166,7 @@ async fn a_dirty_worktree_is_refused_and_left_alone() {
 }
 
 common::e2e! {
-async fn a_run_that_is_not_superseded_is_left_alone() {
+async fn a_recorded_path_outside_the_run_is_reviewed_as_foreign() {
     let _home = common::home_lock().await;
     let fx = fixture(_home, Judges::Unanimous, true);
     let (old, wt) = old_run_at(&fx, true);
@@ -175,12 +175,9 @@ async fn a_run_that_is_not_superseded_is_left_alone() {
     let result =
         Runner::review_taking_over(&fx.repo, BRANCH, fx.config.clone(), Some(takeover(&[])), magi::run::Origin::operator()).await;
 
-    let err = result.err().expect("git still refuses to share the branch");
-    let text = format!("{err:#}");
-    assert!(
-        err.downcast_ref::<magi::handover::Refused>().is_some() && text.contains("by hand"),
-        "the refusal says the path is not magi's: {text}"
-    );
+    let runner = result.expect("clean foreign checkout can be reviewed in isolation");
+    assert!(runner.state.foreign_checkout.is_some());
+    assert_ne!(runner.state.winner().unwrap().branch, BRANCH);
     assert!(wt.exists(), "a worktree magi did not make keeps its worktree");
     let old = RunState::load_under(&old.id, &magi::run::home()).unwrap();
     assert!(!old.released());

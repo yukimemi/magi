@@ -79,7 +79,10 @@ async fn held_pr_choice(
     choice: &str,
 ) -> (common::Fixture, Runner, String) {
     let home = common::home_lock().await;
-    let fx = common::fixture_that_never_clears(home, 1);
+    let mut fx = common::fixture_that_never_clears(home, 1);
+    // These scenes exercise decisions, not host disk admission or cleanup.
+    fx.config.disk.min_free_bytes = 0;
+    fx.config.disk.auto_fold = false;
     let mut runner = Runner::start(
         &fx.repo,
         "create note.txt".into(),
@@ -89,7 +92,12 @@ async fn held_pr_choice(
     .await
     .unwrap();
     runner.execute().await.unwrap();
-    assert_eq!(runner.state.status, RunStatus::Ready);
+    assert_eq!(
+        runner.state.status,
+        RunStatus::Ready,
+        "{:?}",
+        runner.state.events
+    );
     let w = runner.state.winner().unwrap().clone();
     let push = magi::git::push(&w.worktree, "origin", &w.branch)
         .await
@@ -488,6 +496,17 @@ async fn decision_owner(runner: &mut Runner, fx: &common::Fixture) -> magi::queu
         fx.repo.clone(),
         magi::queue::Source::Human,
     );
+    // CLI resumes launch a standalone scheduler, which discovers config
+    // afresh instead of using the saved run's config for disk admission.
+    // Give it the same fixture settings as the daemon-driven scenarios,
+    // while allowing a real daemon's later configuration changes to win.
+    let config = fx.tmp.path().join("owner.toml");
+    std::fs::write(&config, toml::to_string(&runner.state.config).unwrap()).unwrap();
+    task.overrides = Some(magi::queue::RunOverrides {
+        config: Some(config),
+        inherit_daemon_options: true,
+        ..Default::default()
+    });
     task.runs.push(runner.state.id.clone());
     task.status = magi::queue::TaskStatus::Parked;
     runner.state.origin = Some(Origin::queue(&task.id));

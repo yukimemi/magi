@@ -16,13 +16,13 @@
 //! A branch held by a run of *another* task is released on the same terms when
 //! magi can prove the worktree is its own: the path is a candidate worktree
 //! one run's record names, laid under that record's own worktree root, and the
-//! run is not being driven. Anything else - a path magi did not make, a live
-//! run, uncommitted files - is left alone and the refusal names which.
+//! run is not being driven. Foreign worktrees are never released: [`preflight`]
+//! accepts clean holders for isolated review and refuses dirty or locked ones.
+//! Live magi holders retain the existing refusal policy.
 //!
-//! [`decide`] is pure; [`release`] is the only function here that touches git
-//! or disk. A hand-run `magi review` has no task, so it carries a [`Takeover`]
-//! with no earlier attempts and can only release a worktree of a run magi
-//! itself recorded.
+//! [`decide`] is pure; [`release`] performs owned-worktree handover. A hand-run
+//! `magi review` has no task, so it carries a [`Takeover`] with no earlier
+//! attempts and can only release a worktree of a run magi itself recorded.
 
 use std::path::{Path, PathBuf};
 
@@ -93,8 +93,10 @@ impl std::fmt::Display for Refused {
             Refused::Foreign { branch, path, why } => write!(
                 f,
                 "branch `{branch}` is checked out in {path}, which magi will not remove by \
-                 itself: {why}. Remove that worktree (`git worktree remove`) if it is not \
-                 needed, and try again."
+                 itself: {why}. Commit or stash changes first. If no longer needed, run: \
+                 git worktree remove {} (or renri remove {} -y --non-interactive), then try again.",
+                crate::foreign_checkout::quote(path),
+                crate::foreign_checkout::quote(branch)
             ),
             Refused::Unsafe { branch, path, why } => write!(
                 f,
@@ -329,6 +331,55 @@ fn foreign(branch: &str, path: &Path, why: &str) -> anyhow::Error {
         why: why.to_owned(),
     }
     .into()
+}
+
+/// Check foreign holders before filing a review and again when it starts.
+/// Recorded magi worktrees retain the existing handover policy.
+pub async fn preflight(
+    repo: &Path,
+    branch: &str,
+    home: &Path,
+) -> Result<Option<crate::foreign_checkout::ForeignCheckout>> {
+    let Some(path) = git::worktree_holding(repo, branch).await? else {
+        return Ok(None);
+    };
+    match find_magi_owner(&path, home) {
+        Ok(Some(_)) => return Ok(None),
+        Err(why) => return Err(foreign(branch, &path, &why)),
+        Ok(None) => {}
+    }
+    crate::foreign_checkout::inspect(repo, branch, &path)
+        .await
+        .map(Some)
+        .map_err(|error| foreign(branch, &path, &format!("{error:#}")))
+}
+
+/// Preflight for a review request, including foreign-branch remote divergence.
+/// This runs before queue writes; execution repeats it to catch later changes.
+pub async fn preflight_review(
+    repo: &Path,
+    branch: &str,
+    home: &Path,
+    remote: &str,
+) -> Result<Option<crate::foreign_checkout::ForeignCheckout>> {
+    let checkout = preflight(repo, branch, home).await?;
+    if let Some(checkout) = &checkout {
+        let fetched = git::fetch(repo, remote, branch).await;
+        if matches!(fetched, Ok(ref out) if out.ok()) {
+            let tracking = format!("{remote}/{branch}");
+            let tip = git::rev_parse(repo, &tracking).await?;
+            if !git::is_ancestor(repo, &checkout.synced_head, &tip).await
+                && !git::is_ancestor(repo, &tip, &checkout.synced_head).await
+            {
+                return Err(foreign(
+                    branch,
+                    &checkout.path,
+                    &format!("branch diverged from {tracking}; reconcile it before review"),
+                ));
+            }
+        }
+    }
+    Ok(checkout)
 }
 
 /// The run and candidate whose recorded worktree is `path`, when magi
@@ -615,15 +666,8 @@ pub async fn release(
         };
     }
     let Some((state, _, kind)) = owner else {
-        return Err(foreign(
-            branch,
-            &path,
-            &format!(
-                "{} is not a candidate worktree any magi run recorded (made by hand, or by \
-                 something other than magi)",
-                path.display()
-            ),
-        ));
+        preflight(repo, branch, &takeover.home).await?;
+        return Ok(None);
     };
 
     let (mut state, index, _owner) = locked_holder(&takeover.home, &state.id, &path)?;
@@ -725,8 +769,7 @@ mod tests {
         };
         assert_eq!(
             r.to_string(),
-            "branch `b` is checked out in /w, which magi will not remove by itself: w. Remove \
-             that worktree (`git worktree remove`) if it is not needed, and try again."
+            "branch `b` is checked out in /w, which magi will not remove by itself: w. Commit or stash changes first. If no longer needed, run: git worktree remove '/w' (or renri remove 'b' -y --non-interactive), then try again."
         );
     }
 

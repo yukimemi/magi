@@ -1548,6 +1548,8 @@ async fn dispatch(command: Command) -> Result<()> {
             // cache through this repository, so it must not start blind on a
             // disk that is already too full to finish it.
             disk_precheck(&repo, &cfg)?;
+            magi::handover::preflight_review(&repo, &branch, &magi::run::home(), &cfg.merge.remote)
+                .await?;
             let filing = magi::direct::Filing {
                 title: format!("review {branch}"),
                 instruction: format!(
@@ -4430,6 +4432,11 @@ async fn run_existing_task(
     overrides.inherit_daemon_options = false;
     task.overrides = Some(overrides);
     if let Some(branch) = review {
+        let (cfg, _) = Config::discover(
+            &task.repo,
+            task.overrides.as_ref().and_then(|o| o.config.as_deref()),
+        )?;
+        magi::handover::preflight_review(&task.repo, &branch, &home, &cfg.merge.remote).await?;
         task.review_of = Some(branch);
         // An explicit review is not a retry of earlier work: it must not be
         // swallowed by resuming an unfinished run of this task.

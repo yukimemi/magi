@@ -770,6 +770,16 @@ impl Runner {
         // The owner's answer to an earlier divergence question is applied
         // here: after the release (git will not move a checked-out branch)
         // and before the sync that would otherwise ask again.
+        state.foreign_checkout = crate::handover::preflight_review(
+            &repo,
+            branch,
+            &takeover.home,
+            &state.config.merge.remote,
+        )
+        .await?;
+        if state.foreign_checkout.is_some() && takeover.choice.is_some() {
+            bail!("cannot reconcile a foreign checkout automatically; resolve its branch first");
+        }
         if let Some(choice) = takeover.choice.as_ref()
             && let Err(e) =
                 crate::reconcile::apply_choice(&repo, &state.config.merge.remote, branch, choice)
@@ -994,7 +1004,12 @@ impl Runner {
     ) -> Result<Self> {
         let wait = repository_wait(&state, None);
         let _coordination = coordinate_operation(&mut state, repo, &wait).await?;
-        if state.pr_recovery.is_none() {
+        if state.foreign_checkout.is_some() {
+            // Never reconcile or force-move a ref checked out by the operator.
+            if state.pr_head.is_none() {
+                state.pr_head = Some(branch.to_owned());
+            }
+        } else if state.pr_recovery.is_none() {
             sync_review_branch(repo, branch, &state.config.merge.remote, &base_commit).await?;
         }
         // The commit subjects are the closest thing to a task statement that
@@ -1084,7 +1099,25 @@ impl Runner {
             tokio::fs::create_dir_all(parent).await.ok();
         }
         let path = worktree.to_string_lossy().to_string();
-        git::git(repo, &["worktree", "add", &path, branch])
+        let review_branch = if let Some(checkout) = &state.foreign_checkout {
+            let shadow = format!("magi/{}/review", state.short());
+            let tracking = format!("{}/{branch}", state.config.merge.remote);
+            // A surviving tracking ref is not evidence that the remote still
+            // offers this tip. Adopt it only after a successful fetch here.
+            let fetched = git::fetch(repo, &state.config.merge.remote, branch).await;
+            let mut head = checkout.synced_head.clone();
+            if matches!(fetched, Ok(out) if out.ok()) {
+                let remote = git::rev_parse(repo, &tracking).await?;
+                if git::is_ancestor(repo, &checkout.synced_head, &remote).await {
+                    head = remote;
+                }
+            }
+            git::git(repo, &["branch", &shadow, &head]).await?;
+            shadow
+        } else {
+            branch.to_owned()
+        };
+        git::git(repo, &["worktree", "add", &path, &review_branch])
             .await
             .with_context(|| {
                 format!("checking out `{branch}` at {path} (is it checked out elsewhere?)")
@@ -1137,7 +1170,7 @@ impl Runner {
             // Not an agent id on purpose: nothing in the roster wrote this, and
             // the stats tables must not credit anyone with a win for it.
             agent: EXISTING_BRANCH.to_owned(),
-            branch: branch.to_owned(),
+            branch: review_branch,
             worktree,
             summary: String::new(),
             stat,
@@ -4792,6 +4825,10 @@ impl Runner {
     /// doc warns about ("two answers to a question nobody notices until a
     /// diff is wrong").
     ///
+    /// Foreign-checkout reviews instead merge the base into the owned shadow
+    /// worktree, preserving the ancestry required for fast-forward delivery.
+    /// A conflicting merge is aborted and held for operator resolution.
+    ///
     /// A conflict is not the end of the road: the standing rebase is handed
     /// to the fixer seat, at most `graph.review_rounds` times, counted in
     /// `state.rebase_fixes` (so it survives a park/resume and is shared with
@@ -4926,7 +4963,7 @@ impl Runner {
         if attempts >= BASE_SYNC_ROUNDS && !recovery {
             let why = format!(
                 "{base_branch} moved {behind} commit(s) ahead of {} after {BASE_SYNC_ROUNDS} \
-                 rebase(s); rebasing again would only race it",
+                 synchronization(s); synchronizing again would only race it",
                 winner.branch
             );
             self.state.status = RunStatus::Blocked;
@@ -4940,6 +4977,58 @@ impl Runner {
             self.state.event("land", why);
             self.hold_base_sync_kind(crate::base_sync_recovery::StopKind::Exhausted)
                 .await?;
+            self.state.save()?;
+            return Ok(());
+        }
+
+        if self.state.foreign_checkout.is_some() {
+            // Delivery to the operator's checkout is fast-forward only. A
+            // rebase here would discard its saved head from our ancestry.
+            let wait = repository_wait(&self.state, None);
+            let _coordination = coordinate_operation(&mut self.state, &repo, &wait).await?;
+            let merged = git::git_raw(
+                &winner.worktree,
+                &[
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "merge",
+                    "--no-ff",
+                    "--no-autostash",
+                    "--no-edit",
+                    "-m",
+                    &format!("Merge {tracking} before verifying"),
+                    &tip,
+                ],
+            )
+            .await?;
+            let conflict = if merged.ok() {
+                refresh_reviewed_commits(&mut self.state, &winner.branch).await;
+                self.state.event(
+                    "land",
+                    format!("merged {tracking} into {} before verifying", winner.branch),
+                );
+                None
+            } else {
+                if git::rev_exists(&winner.worktree, "MERGE_HEAD").await {
+                    git::git(&winner.worktree, &["merge", "--abort"]).await?;
+                }
+                let why = format!(
+                    "could not merge {tracking} into {} without rewriting foreign checkout history: {}",
+                    winner.branch,
+                    merged.stderr.chars().take(600).collect::<String>()
+                );
+                self.state.status = RunStatus::Blocked;
+                self.state.event("land", &why);
+                Some(why)
+            };
+            let synced = conflict.is_none();
+            self.state.base_sync = Some(BaseSync {
+                tip,
+                behind: if synced { 0 } else { behind },
+                attempts: attempts + 1,
+                conflict,
+                already_in: None,
+            });
             self.state.save()?;
             return Ok(());
         }
@@ -8562,6 +8651,10 @@ impl Runner {
         };
         let message = pr.commit_message();
 
+        let delivery_head = git::rev_parse(&winner.worktree, "HEAD").await?;
+        if !crate::foreign_checkout::write_back(&mut self.state, &delivery_head).await? {
+            return Ok(());
+        }
         let outcome = match mode {
             MergeMode::None => MergeOutcome {
                 mode,
@@ -8635,7 +8728,13 @@ impl Runner {
             }
             MergeMode::Pr => {
                 let remote = self.state.config.merge.remote.clone();
-                let pushed = git::push(&winner.worktree, &remote, &winner.branch).await?;
+                let public = self.state.pr_branch().unwrap_or(&winner.branch).to_owned();
+                let pushed = if self.state.foreign_checkout.is_some() {
+                    let refspec = format!("{delivery_head}:refs/heads/{public}");
+                    git::git_raw(&winner.worktree, &["push", &remote, &refspec]).await?
+                } else {
+                    git::push(&winner.worktree, &remote, &winner.branch).await?
+                };
                 if !pushed.ok() {
                     MergeOutcome {
                         mode,
@@ -8644,22 +8743,19 @@ impl Runner {
                         empty: false,
                     }
                 } else {
+                    if self.state.foreign_checkout.is_some() {
+                        self.state.pr_pushed_head = Some(delivery_head.clone());
+                    }
                     // A retry or resume of a run whose branch already has an
                     // open pull request adopts it rather than failing on a
                     // duplicate. Only this winner branch into this base:
                     // `branch_for` derives the name from the run id, so a
                     // different run's pull request never matches.
-                    let found = land::find_open_pr(&winner.worktree, &winner.branch, &base).await;
+                    let found = land::find_open_pr(&winner.worktree, &public, &base).await;
                     let out = match pr_merge_plan(found) {
                         PrPlan::Create => {
-                            gh_pr_create(
-                                &winner.worktree,
-                                &base,
-                                &winner.branch,
-                                &pr.title,
-                                &pr.body,
-                            )
-                            .await
+                            gh_pr_create(&winner.worktree, &base, &public, &pr.title, &pr.body)
+                                .await
                         }
                         PrPlan::Adopt { url, title } => {
                             self.state
@@ -8992,6 +9088,9 @@ impl Runner {
         let public = self.state.pr_branch().unwrap_or(&winner.branch).to_owned();
         // Push the checked commit itself: a local ref moving after the check
         // must not change which commit the forge receives.
+        if !crate::foreign_checkout::write_back(&mut self.state, &after).await? {
+            return Ok(false);
+        }
         let lease = format!("--force-with-lease=refs/heads/{public}:{expected}");
         let refspec = format!("{after}:refs/heads/{public}");
         let push = git::git_raw(

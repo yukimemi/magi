@@ -3361,3 +3361,26 @@ count-pruned. Conductor resumption concerns with no verified new blocker or
 state change remain notice history without waking a chat. These receipts never
 resolve questions, change holds or authorize work. Owner input and explicitly
 requested updates/watches bypass semantic suppression.
+
+### Reviews of foreign worktrees
+
+A clean hand-written checkout remains operator-owned. Review-only runs record
+`RunState::foreign_checkout` and edit a `magi/<run>/review` shadow branch in their
+own worktree. Never run setup, reset, clean, rescue commits or fold against the
+foreign path. Before filing a review, and again at execution, reject dirty or
+locked foreign holders. Completion and every publication path must pass through
+`foreign_checkout::write_back`: revalidate the canonical Git directory, attached
+branch, clean status (including untracked files) and saved head, then fast-forward
+only. A moved checkout or rewritten review history blocks delivery and retains
+the isolated fixes; never force-move the operator's branch to recover.
+
+Remote tips may seed the shadow branch only after a successful branch fetch;
+failed fetches retain the saved local head even if a tracking ref survives.
+Automatic base synchronization merges into the shadow branch instead of rebasing,
+so the saved foreign head remains an ancestor for fast-forward delivery. A merge
+conflict is aborted and blocks the run with both checkouts retained.
+Landing synchronization retains the existing rebase/fixer path, then joins the
+saved pre-sync head with an `ours` merge before gating or publication. This keeps
+the repaired tree and fast-forward delivery ancestry. `land_rebase_from` remains
+the recovery checkpoint until restoration and that ancestry join complete;
+resumes must perform the same join before clearing it.
