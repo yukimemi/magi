@@ -968,7 +968,11 @@ async fn approval_gate_late_stop(choice: &str, during_gate: bool) {
     // from the saved run's config. Isolate that threshold in its fixture home.
     let config_dir = magi::run::home().join("config/magi");
     std::fs::create_dir_all(&config_dir).unwrap();
-    std::fs::write(config_dir.join("config.toml"), "[disk]\nmin_free_bytes = 0\n").unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[disk]\nmin_free_bytes = 0\n",
+    )
+    .unwrap();
     let task = decision_owner(&mut runner, &fx).await;
     Questions::open()
         .update(&question, |q| {
