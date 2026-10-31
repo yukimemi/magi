@@ -917,7 +917,9 @@ pub struct Disk {
     pub cache_limit_bytes: u64,
     /// Aggregate retained worktree Cargo output cap; 0 disables reclamation.
     pub worktree_limit_bytes: u64,
-    /// Maximum declared artifact bytes reclaimed per pass.
+    /// Declared artifact byte budget per pass; 0 disables reclamation.
+    /// The first deletion target may exceed a positive budget to ensure progress,
+    /// increasing deletion volume and pass duration; no later target may exceed it.
     pub worktree_reclaim_bytes: u64,
     /// Maximum unretired attempts of one task before another run may be
     /// created. Resumes do not create worktrees and remain allowed. Automatic

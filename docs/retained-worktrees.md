@@ -10,12 +10,19 @@ is never a deletion inventory.
 
 `[disk] worktree_limit_bytes` defaults to 10 GiB across retained worktree Cargo
 outputs, separately from the existing shared-cache `cache_limit_bytes`.
-`worktree_reclaim_bytes` defaults to 16 GiB per pass. A target larger than the
-remaining budget is retained with a reason; raise the budget deliberately if
-needed. `worktree_limit_bytes = 0` disables target eviction. The existing
+`worktree_reclaim_bytes` defaults to 16 GiB per pass; zero disables output
+reclamation. With a positive budget, the first target whose deletion starts may
+exceed the budget so oversized outputs cannot remain forever. No further target
+is deleted after that exception, including when deletion fails partway through.
+Otherwise, subsequent targets must fit the remaining budget. The budget uses only
+dep-info-proven artifact bytes measured under locks, not the whole target size.
+This exception can increase both deletion volume and pass duration.
+`worktree_limit_bytes = 0` disables target eviction. The existing
 `fold_grace_secs` (six hours by default) also protects recently used targets.
-Oldest run activity is considered first. Low free space permits reclamation below
-the cap, but does not override grace, ownership or the per-pass budget.
+Oldest run activity is considered first normally. Under low free space, targets
+are remeasured and considered largest first, with oldest activity breaking ties;
+ineligible targets do not consume the first-deletion exception. Low free space
+permits reclamation below the cap, but does not override grace or ownership.
 
 Only plain, canonical, registered worktrees are eligible. A legacy `target` must
 be ignored, contain no tracked files, carry Cargo's cache tag and rustc identity,
