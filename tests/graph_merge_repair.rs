@@ -980,6 +980,11 @@ fn run_cli(fx: &common::Fixture, args: &[&str]) {
 
 async fn approval_gate_late_stop(choice: &str, during_gate: bool) {
     let (fx, mut runner, question) = held_pr_choice(false, false, choice).await;
+    // CLI resume also checks admission using discovered config, separately
+    // from the saved run's config. Isolate that threshold in its fixture home.
+    let config_dir = magi::run::home().join("config/magi");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("config.toml"), "[disk]\nmin_free_bytes = 0\n").unwrap();
     let task = decision_owner(&mut runner, &fx).await;
     Questions::open()
         .update(&question, |q| {
