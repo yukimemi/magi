@@ -3361,3 +3361,17 @@ count-pruned. Conductor resumption concerns with no verified new blocker or
 state change remain notice history without waking a chat. These receipts never
 resolve questions, change holds or authorize work. Owner input and explicitly
 requested updates/watches bypass semantic suppression.
+
+### Retained output sweep budget
+
+`src/retention.rs` normally visits targets by oldest activity; under free-space
+pressure it remeasures and visits largest targets first (oldest breaks ties).
+Inventory sizes only prioritize targets. Budget decisions use dep-info-proven
+outputs measured under all ownership, registration, lease and Cargo locks.
+`[disk] worktree_reclaim_bytes = 0` disables output deletion. A positive budget
+allows the first target whose deletion starts to exceed it, preventing permanent
+retention of oversized outputs; this can increase deletion volume and duration.
+That exception is consumed at deletion start even on partial failure, and stops
+further deletions in that pass. Successful removals are counted even on failure.
+Other targets must fit the remaining budget; safety refusals consume no exception.
+See `docs/retained-worktrees.md` for the complete retention policy.
