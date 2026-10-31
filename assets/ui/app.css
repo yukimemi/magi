@@ -3078,3 +3078,12 @@ button[aria-busy="true"] {
 }
 
 .progress-implementers:empty { display: none; }
+
+/* Pending decisions remain reachable on phones without transcript scrolling. */
+.decision-card h2 { overflow-wrap: anywhere; font-size: 1.05rem; }
+.decision-card { min-width: 0; overflow-wrap: anywhere; }
+.decision-links { display: flex; flex-wrap: wrap; gap: .5rem 1rem; }
+.decision-links a { display: inline-flex; align-items: center; min-height: 44px; }
+.decision-status { font-weight: 600; }
+.decision-error { white-space: pre-wrap; overflow-wrap: anywhere; }
+.decision-inquiry { scroll-margin-top: 5rem; white-space: normal; }

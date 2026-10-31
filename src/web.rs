@@ -332,6 +332,15 @@ struct Delta {
     removed: Vec<String>,
 }
 
+fn notice_and_decision_stamps(ui: &Ui) -> std::io::Result<Stamps> {
+    let mut stamps = try_stamps(ui.notices.root(), false, true)?;
+    let inquiries = ui.home.join("notifications").join("task-inquiries");
+    for (id, stamp) in try_stamps(&inquiries, false, false)? {
+        stamps.insert(format!("decision:{id}"), stamp);
+    }
+    Ok(stamps)
+}
+
 fn diff_stamps(previous: &Stamps, next: &Stamps, base: u64) -> Delta {
     let mut changed: Vec<_> = next
         .iter()
@@ -617,7 +626,7 @@ fn monitor_scan(ui: &Ui, previous: MonitorSnapshot) -> (Revisions, [Stamps; 3]) 
     if let Ok(next) = try_stamps(ui.questions.root(), false, true) {
         rev.2 = stamps_revision(&next);
     }
-    if let Ok(next) = try_stamps(ui.notices.root(), false, true) {
+    if let Ok(next) = notice_and_decision_stamps(ui) {
         rev.4 = stamps_revision(&next);
     }
     rev.5 = ui.lock_loop().rev;
@@ -1628,6 +1637,8 @@ impl Ui {
             .route("/api/queue/{id}/attempt-limit", post(queue_attempt_limit))
             .route("/api/queue/{id}/edit", post(queue_edit))
             .route("/api/queue/{id}/done", post(queue_done))
+            .route("/api/decisions", get(decisions_list))
+            .route("/api/decisions/{id}", get(decision_get))
             .route("/api/questions", get(questions_list))
             .route("/api/questions/core", get(questions_core))
             .route("/api/questions/origins", get(question_origins))
@@ -3109,7 +3120,7 @@ fn health_counts(
         });
     }
     let notifications_rev =
-        stamps_revision(&try_stamps(ui.notices.root(), false, true).map_err(anyhow::Error::from)?);
+        stamps_revision(&notice_and_decision_stamps(ui).map_err(anyhow::Error::from)?);
     if index
         .notices
         .is_none_or(|(rev, _)| rev != notifications_rev)
@@ -7997,6 +8008,64 @@ fn holder_of(q: &Question, lease: Option<&ask::Lease>) -> Option<&'static str> {
 /// Everything, not just the open ones: an answered question is the record of a
 /// decision, and the phone is where the operator goes back to check what they
 /// told an agent at 3am. `ask::Questions::list` already ranks open first.
+#[derive(serde::Serialize)]
+struct DecisionView {
+    id: String,
+    task: String,
+    run: Option<String>,
+    chat: Option<String>,
+    display: String,
+    delivery_error: Option<String>,
+    decision: crate::task_decision::Decision,
+}
+
+impl DecisionView {
+    fn from_inquiry(inquiry: crate::task_inquiry::Inquiry) -> Option<Self> {
+        Some(Self {
+            id: inquiry.id,
+            task: inquiry.task,
+            run: inquiry.run,
+            chat: inquiry.delivered_to,
+            display: inquiry.display,
+            delivery_error: inquiry.delivery_error,
+            decision: inquiry.decision?,
+        })
+    }
+}
+
+// Read-only: list visits and inquiry links never create owner decisions,
+// delivery receipts or effect acknowledgements.
+async fn decisions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<DecisionView>>> {
+    blocking(move || {
+        let mut views: Vec<_> = crate::task_inquiry::Outbox::at(&ui.home)
+            .list()?
+            .into_iter()
+            .filter_map(DecisionView::from_inquiry)
+            .collect();
+        views.sort_by_key(|view| {
+            (
+                view.decision.status == crate::task_decision::Status::Resolved,
+                view.id.clone(),
+            )
+        });
+        Ok(Json(views))
+    })
+    .await
+}
+
+async fn decision_get(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<DecisionView>> {
+    blocking(move || {
+        let inquiry = crate::task_inquiry::Outbox::at(&ui.home).get(&id)?;
+        DecisionView::from_inquiry(inquiry)
+            .map(Json)
+            .ok_or_else(|| ApiError::not_found("inquiry is informational"))
+    })
+    .await
+}
+
 async fn questions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<QuestionView>>> {
     blocking(move || {
         let questions = ui.questions.list();

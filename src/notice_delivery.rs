@@ -207,6 +207,7 @@ fn reconcile(n: &Notice, queue: &Queue, talks: &Talks, home: &Path, repo: &Path)
             crate::notice_semantics::attention(home, task, run_id, n),
         ),
         crate::prompt::NoticeDisplay {
+            inquiry: None,
             facts: body,
             output: None,
             task: task_id.map(str::to_owned),

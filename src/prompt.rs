@@ -1774,6 +1774,9 @@ pub fn is_completion_notice(message: &str) -> bool {
 /// Display-only snapshot of an automatic event, separate from agent instructions.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NoticeDisplay {
+    /// Stable inquiry identity; retained from pending delivery into the transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inquiry: Option<String>,
     /// Bounded, scrubbed notification facts, without machine instructions.
     pub facts: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1812,6 +1815,7 @@ pub fn chat_watch_report(id: &str, status: &str, tail: &str) -> (String, NoticeD
     (
         body,
         NoticeDisplay {
+            inquiry: None,
             facts,
             output: Some(output),
             task: None,
@@ -1883,6 +1887,7 @@ fn task_report_with(
         s.push_str(&format!("- Result: {}\n", clean(m, 600)));
     }
     let display = NoticeDisplay {
+        inquiry: None,
         facts: s.clone(),
         output: None,
         task: Some(clean(n.id, 120)),
@@ -1911,6 +1916,7 @@ pub fn legacy_notice_display(body: &str) -> Option<NoticeDisplay> {
         "# {CHAT_CONSULT_HEADING}\n\nThe operator passed you a question"
     )) {
         return Some(NoticeDisplay {
+            inquiry: None,
             facts: "# Question consultation\n\nA question was passed to this conversation. See the question card for details.".into(),
             output: None,
             task: None,
@@ -2043,6 +2049,7 @@ pub fn chat_consult_display(q: &crate::ask::Question) -> NoticeDisplay {
         }
     }
     NoticeDisplay {
+        inquiry: None,
         facts: clip(
             &crate::scrub::scrub(&facts, &crate::scrub::Identity::current()),
             8192,

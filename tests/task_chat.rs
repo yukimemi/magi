@@ -280,12 +280,14 @@ async fn task_ask_cli_posts_and_exits_without_a_waiter() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).contains("without waiting"));
     let questions = Questions::at(home.join("questions"));
-    let filed = questions.list();
+    assert!(questions.list().is_empty(), "native task asks must not create a Question envelope");
+    let filed = magi::task_inquiry::Outbox::at(&home).list().unwrap();
     assert_eq!(filed.len(), 1);
-    assert_eq!(filed[0].routed_task.as_deref(), Some(task.id.as_str()));
-    assert!(filed[0].waiter.is_none());
-    assert!(filed[0].deputy.is_none());
-    assert!(questions.read_lease(&filed[0].id).is_none());
+    assert_eq!(filed[0].task, task.id);
+    assert_eq!(filed[0].run.as_deref(), Some("run-a"));
+    assert_eq!(filed[0].decision.as_ref().unwrap().status, magi::task_decision::Status::AwaitingOwner);
+    assert!(filed[0].delivered_to.is_none());
+    assert!(!home.join("questions").exists());
 }
 }
 common::e2e! {
@@ -315,7 +317,7 @@ async fn forwarded_triage_does_not_file_another_question_while_chat_decides() {
 }
 
 common::e2e! {
-async fn targetless_release_approval_keeps_its_compatibility_card_and_answer() {
+async fn targetless_saved_release_approval_imports_intent_without_fabricating_a_target() {
     let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
     let home = fx.tmp.path().join("outbox");
     let queue = Queue::at(home.join("queue"));
@@ -340,8 +342,11 @@ async fn targetless_release_approval_keeps_its_compatibility_card_and_answer() {
     assert!(q.routed_task.is_none());
     assert!(q.routed_chat.is_none());
     assert!(q.merge_target.is_none());
-    assert!(talks.list().is_empty());
-    assert!(magi::deputy::kind_of(&q).is_some());
+    assert_eq!(talks.list().len(), 1);
+    let imported = magi::task_inquiry::Outbox::at(&home).get(&q.id).unwrap();
+    assert_eq!(imported.task, task.id);
+    assert_eq!(imported.decision.unwrap().status, magi::task_decision::Status::AwaitingOwner);
+    assert!(imported.delivered_to.is_some());
     // Repair a record already misrouted by the previous implementation too.
     let mut misrouted = q.clone();
     misrouted.routed_task = Some(task.id.clone());
@@ -353,7 +358,8 @@ async fn targetless_release_approval_keeps_its_compatibility_card_and_answer() {
     assert!(repaired.routed_chat.is_none());
     assert!(repaired.consult.is_none());
     magi::task_chat::sweep(&queue, &talks, &questions, &home);
-    assert!(talks.list().is_empty());
+    assert_eq!(talks.list().len(), 1);
+    assert_eq!(talks.list()[0].pending_messages.len(), 1, "restart reuses the stable inquiry key");
     let (q, ()) = questions.update(&q.id, |q| q.answer(Answer::Choice(magi::land::HOLD.into()))).unwrap();
     assert_eq!(q.resolution().as_deref(), Some(magi::land::HOLD));
 }

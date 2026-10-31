@@ -1626,3 +1626,43 @@ Buttons remain optional and validate their displayed head. Silence is a hold.
 Existing head verification and merge transitions remain in charge. The Question store and legacy non-task
 question/deputy/waiter workflows remain available during this migration.
 Delivery requires the daemon; pending outbox records survive a restart.
+
+### Pending decisions in task chats
+
+The phone dock and desktop rail include **判断待ち** (Pending decisions), separate
+from notifications. Each actionable native inquiry retains its reason, task,
+optional run, exact chat inquiry link, lifecycle status and outcome history.
+Delivery, opening or reading the chat, ordinary replies and newer messages never
+remove an unresolved decision. Informational deliveries do not create items.
+
+Task-scoped `magi ask --summary ... --detail ...` files a native durable inquiry
+and exits. The scheduler reuses or reopens the task chat and creates a missing
+chat with its configured chatter head, default persona, task repository and Solo
+mode. An unsent owner draft remains a draft. The outbox and independent chat
+execution workers recover across web and scheduler replacement.
+
+The owner discusses and decides in free text. The chat binds a task/run effect
+to the inquiry with `magi task control --decision <inquiry-id> <command>`.
+Acceptance, execution and confirmed application are separate states; recording
+or queuing an operation is insufficient to clear it. A failed or uncertain
+operation remains visible with its error and receipt context. Repeating a request
+never blindly replays an effect that might already have happened. Resume requests
+remain active until the scheduler observes the owning execution running.
+
+If the owner explicitly settles discussion with no effect remaining necessary,
+the chat uses `magi task control settle-decision <id> --reason <reason>`. Add
+`--replacement <new-inquiry-id>` to supersede an unanswered inquiry with an
+existing active one in the same task chat. Accepted or uncertain operations need
+receipt reconciliation first. For a task-local crash window, the owner can ask
+for `magi task control reconcile-decision <id>`: it executes nothing and resolves
+only if the exact intended task condition is already durably confirmed. External
+merge and check-rerun operations retain their own request-bound receipts. No exact owner phrase, quote fingerprint or button
+click is required; silence remains a hold and landing approval remains on by
+default.
+
+Existing task-scoped source inquiries are imported under their original delivery
+keys, including saved replies without confirmed effects. A saved reply is
+historical evidence, never a new owner instruction or approval. Migration posts
+no operation and retains unresolved outcomes. Source decision consumers still
+exist during this continuation; their complete retirement remains necessary
+before calling step 3 finished.

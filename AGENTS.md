@@ -3321,12 +3321,14 @@ those rules now apply only to the retained non-task legacy workflow.
 `task_chat::sweep` converts task-scoped source records into independent
 `task_inquiry::Inquiry` deliveries in `notifications/task-inquiries`. The outbox
 stores task/run/repository ownership, producer identity, free text, display facts,
-semantic evidence and a delivery receipt; it carries no executable action or
-owner approval. Keep the original `question:<id>` transcript key when adapting
+semantic evidence and a delivery receipt. Filing and delivery grant no owner
+authority; a separate decision lifecycle may retain an explicitly accepted owner
+request and confirmed effect receipt. Keep the original `question:<id>` transcript key when adapting
 an existing source, so a crash before its new receipt cannot duplicate delivery.
 The scheduler retries pending native deliveries independently of source records;
-a corrupt record is reported without preventing unrelated deliveries. Decision
-execution still uses the source records until that separate migration is complete.
+a corrupt record is reported without preventing unrelated deliveries. Legacy decision
+consumers still use their source records until that migration is complete;
+native task inquiries bind typed chat commands directly.
 These deliveries are not conversations with their askers. `magi ask` posts and
 finishes; do not wait or start a deputy/waiter for these records. Decisions go as free text to the task's
 persisted `chat`, its own source chat, or its inherited origin chat. A missing
@@ -3539,3 +3541,32 @@ full run ID inside that claim before awaiting or editing. New runs snapshot
 `task_assignment` before startup: their public heads use that durable generation,
 not the task's later assignment. Legacy generation zero keeps its original head.
 Publication takeover and explicit PR recovery must not cross assignment generations.
+
+### Durable pending decision lifecycle
+
+`task_inquiry::Inquiry::decision` is task/chat-native durable state, independent
+of transport acknowledgement. `task_decision::Decision` tracks awaiting owner,
+queued, in progress, retry needed and resolved, with append-only outcome history.
+Never resolve it from delivery, read receipts, opening/closing a conversation,
+ordinary replies, elapsed time or restart. Information-only inquiries have no
+`decision` and never enter the list. The phone dock's `判断待ち` route is
+`#/decisions`, and exact inquiry links are
+`#/chat/<chat>/inquiry/<inquiry>`; the inquiry snapshot survives transcript burial.
+
+Task-scoped CLI asks now file native inquiries directly. Chat effects bind to
+these records through `magi task control --decision <inquiry> <command>`;
+acceptance is saved before execution, duplicate/uncertain operations are never
+blindly replayed, and only confirmed application resolves them. Resume commands
+wait for the owning execution to start. Explicit no-effect settlement and
+supersession use `settle-decision --reason`, with a same-task/chat active
+replacement when supplied; accepted effects need receipt reconciliation.
+`reconcile-decision` is an explicit, read-only owner request to confirm an exact
+task-local end condition under its claim. External effects require their own
+matching receipts. Never infer merge completion from an accepted command.
+
+Legacy source decisions are still operational in this continuation. Their import
+preserves stable source keys, pending intent and saved replies as history; it
+never reissues a saved reply as owner authority. Do not claim the Question /
+deputy / waiter retirement is complete until every remaining consumer and
+compatibility execution path has been replaced and removed. The source adapter
+lives in `task_chat`, not in the native decision state machine.

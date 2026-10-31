@@ -1612,6 +1612,8 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
             ActionDecision::Hold => task.hold_manual(Some(q.summary.clone())),
             ActionDecision::Done => task.succeed(),
             ActionDecision::Refuse(why) => {
+                let _ =
+                    crate::task_inquiry::Outbox::at(home).update_decision(&q.id, |d| d.fail(&why));
                 if task.operator_held() {
                     // A rejected answer does not release the operator's hold
                     // or reclassify it as recoverable by the conductor.
@@ -3862,6 +3864,9 @@ async fn poll(
         crate::chat_notify::sweep(queue, &talks, home);
         crate::notice_delivery::sweep(queue, &talks, home, &opts.repo);
         crate::chat_watch::sweep(home, &talks);
+        if let Err(error) = crate::chat_control::reconcile_decisions(queue, home) {
+            tracing::warn!("decision receipt reconciliation remains pending: {error:#}");
+        }
         let mut turns = tokio::task::JoinSet::new();
         crate::chat_notify::start_turns(&talks, stop.parking(), &mut turns);
         // start_turns dispatches detached turns; no paid work lives in this set.

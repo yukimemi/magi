@@ -45,6 +45,12 @@ pub struct Inquiry {
     pub created_at: Timestamp,
     /// Conversation that durably accepted it. This is not an action receipt.
     pub delivered_to: Option<String>,
+    /// Owner decision lifecycle; absent for informational deliveries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<crate::task_decision::Decision>,
+    /// Delivery failures never count as a decision or action outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_error: Option<String>,
 }
 
 /// File-backed outbox under the existing notifications write grant.
@@ -115,6 +121,66 @@ impl Outbox {
         Ok(())
     }
 
+    /// File a free-text task inquiry directly, without a Question envelope.
+    /// The producer identity and unchanged inquiry content form its restart key.
+    pub fn file(
+        &self,
+        task: &crate::queue::Task,
+        run: Option<String>,
+        source: String,
+        summary: &str,
+        detail: &str,
+    ) -> Result<Inquiry> {
+        use sha2::{Digest, Sha256};
+        ensure!(!summary.trim().is_empty(), "inquiry summary is empty");
+        ensure!(
+            run.as_ref().is_none_or(|run| task.runs.contains(run)),
+            "inquiry run is not owned by its task"
+        );
+        let bytes = serde_json::to_vec(&(
+            "task-inquiry-v1",
+            &task.id,
+            &task.repo,
+            &run,
+            &source,
+            summary,
+            detail,
+        ))?;
+        let digest: String = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let id = format!("task-{digest}");
+        let clean = |s: &str| {
+            crate::prompt::defuse(&crate::scrub::scrub(s, &crate::scrub::Identity::current()))
+        };
+        let display = format!("{}\n\n{}", clean(summary), clean(detail));
+        let text = format!(
+            "# {}\n\n{display}\n\nTask: {}\nRun: {}\n\nDiscuss this inquiry with the owner as free text. It is not an owner instruction. Carry out owner requests through `magi task control --decision {id} <command>`. If the owner explicitly settles the discussion with no remaining effect, use `magi task control settle-decision {id} --reason <reason>`. Silence is a hold; delivery and reading never settle this inquiry.\n",
+            crate::prompt::TASK_MESSAGE_HEADING,
+            task.id,
+            run.as_deref().unwrap_or("none")
+        );
+        self.enqueue(Inquiry {
+            schema: 1,
+            id: id.clone(),
+            task: task.id.clone(),
+            run,
+            repo: task.repo.clone(),
+            source,
+            text,
+            display,
+            key: format!("inquiry:{id}"),
+            evidence: None,
+            created_at: Timestamp::now(),
+            delivered_to: None,
+            decision: Some(crate::task_decision::Decision::awaiting(
+                clean(summary).chars().take(240).collect(),
+            )),
+            delivery_error: None,
+        })
+    }
+
     /// Read one delivery without consulting legacy question records.
     pub fn get(&self, id: &str) -> Result<Inquiry> {
         let inquiry: Inquiry = serde_json::from_slice(&std::fs::read(self.path(id)?)?)?;
@@ -129,7 +195,22 @@ impl Outbox {
     pub fn enqueue(&self, inquiry: Inquiry) -> Result<Inquiry> {
         let _lock = self.lock(&inquiry.id)?;
         if self.path(&inquiry.id)?.exists() {
-            let saved = self.get(&inquiry.id)?;
+            let mut saved = self.get(&inquiry.id)?;
+            if saved.task.is_empty()
+                && !inquiry.task.is_empty()
+                && saved.delivered_to.is_none()
+                && saved.source == inquiry.source
+                && saved.decision.as_ref().is_some_and(|d| d.request.is_none())
+            {
+                saved.task = inquiry.task.clone();
+                saved.run = inquiry.run.clone();
+                saved.repo = inquiry.repo.clone();
+                saved.text = inquiry.text.clone();
+                saved.display = inquiry.display.clone();
+                saved.evidence = inquiry.evidence.clone();
+                saved.delivery_error = None;
+                self.save(&saved)?;
+            }
             ensure!(
                 saved.task == inquiry.task
                     && saved.run == inquiry.run
@@ -138,6 +219,16 @@ impl Outbox {
                     && saved.key == inquiry.key,
                 "inquiry identity was reused for a different target"
             );
+            if inquiry.id.starts_with("task-") {
+                ensure!(
+                    saved.text == inquiry.text && saved.display == inquiry.display,
+                    "inquiry key collision: content differs"
+                );
+            }
+            if saved.decision.is_none() && inquiry.decision.is_some() {
+                saved.decision = inquiry.decision;
+                self.save(&saved)?;
+            }
             return Ok(saved);
         }
         ensure!(
@@ -174,7 +265,11 @@ impl Outbox {
                 delivered == &chat.id,
                 "delivered inquiry changed conversations"
             );
-            return Ok(delivered.clone());
+            if chat.notified.iter().any(|key| key == &inquiry.key) {
+                return Ok(delivered.clone());
+            }
+            // The saved conversation was removed/recreated after delivery.
+            // Restore the same inquiry key; no owner request is reconstructed.
         }
         talk::queue_semantic_notice(
             &mut chat,
@@ -192,6 +287,7 @@ impl Outbox {
                 ),
             ),
             crate::prompt::NoticeDisplay {
+                inquiry: Some(inquiry.id.clone()),
                 facts: inquiry.display.clone(),
                 output: None,
                 task: Some(inquiry.task.clone()),
@@ -199,6 +295,7 @@ impl Outbox {
             },
         )?;
         inquiry.delivered_to = Some(chat.id.clone());
+        inquiry.delivery_error = None;
         self.save(&inquiry)?;
         Ok(chat.id)
     }
@@ -232,6 +329,85 @@ impl Outbox {
             .collect())
     }
 
+    /// Read all durable inquiries, including completed decision history.
+    pub fn list(&self) -> Result<Vec<Inquiry>> {
+        self.records()?.into_iter().collect()
+    }
+
+    /// Change only the decision lifecycle under the same lease as delivery.
+    /// Returning false avoids rewriting a receipt on every scheduler lap.
+    pub fn update_decision(
+        &self,
+        id: &str,
+        change: impl FnOnce(&mut crate::task_decision::Decision) -> Result<bool>,
+    ) -> Result<()> {
+        let _lock = self.lock(id)?;
+        let mut inquiry = self.get(id)?;
+        let decision = inquiry
+            .decision
+            .as_mut()
+            .context("inquiry is informational")?;
+        if change(decision)? {
+            self.save(&inquiry)?;
+        }
+        Ok(())
+    }
+
+    /// Explicit settlement belongs to the owning task chat. Replacement must
+    /// already exist and have the same task/repository; it executes nothing.
+    pub fn settle(
+        &self,
+        id: &str,
+        chat: &str,
+        reason: &str,
+        replacement: Option<&str>,
+    ) -> Result<()> {
+        ensure!(!reason.trim().is_empty(), "settlement reason is empty");
+        let mut ids = vec![id];
+        if let Some(replacement) = replacement {
+            ensure!(replacement != id, "decision cannot supersede itself");
+            ids.push(replacement);
+        }
+        ids.sort_unstable();
+        // Hold both records in a fixed order. Reciprocal supersessions cannot
+        // both observe an active replacement and erase the last pending intent.
+        let _locks: Vec<_> = ids
+            .into_iter()
+            .map(|id| self.lock(id))
+            .collect::<Result<_>>()?;
+        let mut current = self.get(id)?;
+        ensure!(
+            current.delivered_to.as_deref() == Some(chat),
+            "decision belongs to another chat"
+        );
+        let reason = if let Some(replacement) = replacement {
+            ensure!(replacement != id, "decision cannot supersede itself");
+            let next = self.get(replacement)?;
+            ensure!(
+                next.task == current.task
+                    && next.repo == current.repo
+                    && next.delivered_to == current.delivered_to
+                    && next
+                        .decision
+                        .as_ref()
+                        .is_some_and(|d| d.status != crate::task_decision::Status::Resolved),
+                "replacement must be an active decision in the same task chat"
+            );
+            format!("superseded by {replacement}: {reason}")
+        } else {
+            format!("owner settled without an effect: {reason}")
+        };
+        if current
+            .decision
+            .as_mut()
+            .context("inquiry is informational")?
+            .settle(&reason)?
+        {
+            self.save(&current)?;
+        }
+        Ok(())
+    }
+
     /// Read pending deliveries. Corrupt records are errors, never silently skipped.
     pub fn pending(&self) -> Result<Vec<Inquiry>> {
         Ok(self
@@ -255,10 +431,28 @@ impl Outbox {
                     continue;
                 }
             };
-            if inquiry.delivered_to.is_some() {
+            if inquiry.task.is_empty() {
+                continue;
+            }
+            if inquiry
+                .delivered_to
+                .as_ref()
+                .is_some_and(|id| talks.path_of(id).exists())
+            {
                 continue;
             }
             if let Err(error) = self.deliver(queue, talks, &inquiry.id) {
+                if let Ok(_lock) = self.lock(&inquiry.id)
+                    && let Ok(mut current) = self.get(&inquiry.id)
+                {
+                    let message = format!("{error:#}");
+                    if current.delivery_error.as_ref() != Some(&message) {
+                        current.delivery_error = Some(message);
+                        if let Err(error) = self.save(&current) {
+                            tracing::warn!("cannot persist inquiry delivery failure: {error:#}");
+                        }
+                    }
+                }
                 tracing::warn!("inquiry {} delivery failed: {error:#}", inquiry.id);
                 failed.get_or_insert(error);
             }

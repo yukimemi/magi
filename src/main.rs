@@ -719,6 +719,18 @@ enum ControlCmd {
         #[command(flatten)]
         request: magi::repair_budget::Request,
     },
+    /// Reconcile an uncertain task-local effect without replaying it.
+    ReconcileDecision { inquiry: String },
+    /// Explicitly settle discussion with no remaining effect, or supersede it.
+    SettleDecision {
+        inquiry: String,
+        /// Owner's reason; reading or delivery never settles a decision.
+        #[arg(long)]
+        reason: String,
+        /// Existing active replacement inquiry in this task chat.
+        #[arg(long)]
+        replacement: Option<String>,
+    },
     /// Merge a PR at the head read from the forge when the owner asks.
     MergePr {
         repo: String,
@@ -778,7 +790,7 @@ enum ControlCmd {
     Decide {
         /// Question id from the automatic message.
         question: String,
-        /// One of the recorded options, exactly.
+        /// Operation to record from the owner’s free-text request.
         choice: String,
         /// Literal replacement title for a publication decision's `use my text` choice.
         #[arg(long)]
@@ -821,6 +833,9 @@ enum TaskCmd {
     /// an open conversation) may use it.
     /// Direct PR merges require the current forge head SHA.
     Control {
+        /// Link this effect to an inquiry in the task's Pending decisions list.
+        #[arg(long)]
+        decision: Option<String>,
         /// What to do.
         #[command(subcommand)]
         op: ControlCmd,
@@ -2627,6 +2642,39 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         bail!(why);
     }
 
+    // Agent inquiries about tasks are native durable chat records. There is no
+    // waiting process or compatibility envelope to resume after this command.
+    if thread.is_none() {
+        let home = magi::run::home();
+        let queue = Queue::at(home.join("queue"));
+        let owners: Vec<_> = queue
+            .list()
+            .into_iter()
+            .filter(|task| task.id == run || task.runs.contains(&run))
+            .collect();
+        if owners.len() > 1 {
+            bail!("more than one task owns this run; repair ownership before asking");
+        }
+        if let Some(task) = owners.first() {
+            anyhow::ensure!(
+                panel.is_none() && assets.is_empty(),
+                "task inquiries use free-text chat; include evidence in --detail"
+            );
+            let inquiry = magi::task_inquiry::Outbox::at(&home).file(
+                task,
+                (task.id != run).then(|| run.clone()),
+                format!("{node}:{seat}:{run}"),
+                &summary,
+                &detail,
+            )?;
+            println!(
+                "Posted decision {} to the task chat outbox; finish this turn without waiting.",
+                inquiry.id
+            );
+            return Ok(());
+        }
+    }
+
     let budget = std::time::Duration::from_secs(timeout.unwrap_or(cfg.graph.answer_timeout));
     // Refused here, at filing time, so a typo cannot become a question whose
     // chosen answer silently does nothing.
@@ -3581,7 +3629,7 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             }
             Ok(())
         }
-        TaskCmd::Control { op } => {
+        TaskCmd::Control { op, decision } => {
             let home = magi::run::home();
             let talks = magi::talk::Talks::open();
             let talk = magi::chat_control::authorize(
@@ -3594,6 +3642,18 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             let operation = match op {
                 ControlCmd::Reassign { id, repo } => cc::Operation::Reassign { task: id, repo },
                 ControlCmd::GrantRepair { request } => cc::Operation::GrantRepair { request },
+                ControlCmd::ReconcileDecision { inquiry } => {
+                    cc::Operation::ReconcileDecision { inquiry }
+                }
+                ControlCmd::SettleDecision {
+                    inquiry,
+                    reason,
+                    replacement,
+                } => cc::Operation::SettleDecision {
+                    inquiry,
+                    reason,
+                    replacement,
+                },
                 ControlCmd::MergePr {
                     repo,
                     number,
@@ -3654,6 +3714,14 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                     apply,
                 },
                 ControlCmd::Abandon { run } => cc::Operation::Abandon { run },
+            };
+            let operation = if let Some(inquiry) = decision {
+                cc::Operation::ForDecision {
+                    inquiry,
+                    command: Box::new(operation),
+                }
+            } else {
+                operation
             };
             println!(
                 "{}",
@@ -5761,6 +5829,51 @@ mod tests {
     }
 
     #[test]
+    fn pending_decision_controls_parse_without_owner_quote_evidence() {
+        let cli = Cli::try_parse_from([
+            "magi",
+            "task",
+            "control",
+            "--decision",
+            "inquiry-a",
+            "hold",
+            "task-a",
+            "owner requested a hold",
+        ])
+        .unwrap();
+        let Some(Command::Task {
+            command:
+                TaskCmd::Control {
+                    decision,
+                    op: ControlCmd::Hold { id, reason },
+                },
+            ..
+        }) = cli.command
+        else {
+            panic!("expected a decision-linked hold");
+        };
+        assert_eq!(decision.as_deref(), Some("inquiry-a"));
+        assert_eq!(id, "task-a");
+        assert_eq!(reason, ["owner requested a hold"]);
+        assert!(
+            Cli::try_parse_from(["magi", "task", "control", "reconcile-decision", "inquiry-a"])
+                .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "magi",
+                "task",
+                "control",
+                "settle-decision",
+                "inquiry-a",
+                "--reason",
+                "owner no longer needs an effect"
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn merge_pr_accepts_agent_arguments_without_a_quote() {
         let head = "a".repeat(40);
         let args = [
@@ -5786,6 +5899,7 @@ mod tests {
                             head: parsed_head,
                             request,
                         },
+                    ..
                 },
             ..
         }) = cli.command

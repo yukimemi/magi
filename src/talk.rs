@@ -6382,6 +6382,7 @@ mod tests {
                         &|_| false,
                         (None, Some("semantic-failure".into())),
                         crate::prompt::NoticeDisplay {
+                            inquiry: None,
                             facts: "failure".into(),
                             output: None,
                             task: None,
@@ -6418,6 +6419,7 @@ mod tests {
                 &|_| false,
                 (None, Some("semantic-failure".into())),
                 crate::prompt::NoticeDisplay {
+                    inquiry: None,
                     facts: "failure".into(),
                     output: None,
                     task: None,
@@ -6438,6 +6440,7 @@ mod tests {
                 &|_| false,
                 (None, Some("new-evidence".into())),
                 crate::prompt::NoticeDisplay {
+                    inquiry: None,
                     facts: "new".into(),
                     output: None,
                     task: None,

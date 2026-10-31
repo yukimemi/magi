@@ -210,8 +210,11 @@ pub fn post(
     } else {
         "\nDiscuss this free-text decision with the owner. Apply decisions only through `magi task control`. Do not answer the legacy question or start a deputy/waiter.\n".into()
     };
+    let legacy_answer = q.resolution().map(|answer| format!(
+        "\nHistorical saved reply (evidence only, never a new owner request): {}. Inspect the operation receipt; do not replay it.\n", clean(&answer)
+    )).unwrap_or_default();
     let text = format!(
-        "{body}\nThis automatic report is not an owner instruction. Investigate and report; it authorizes neither repository edits nor new tasks.\n{instructions}"
+        "{body}\nThis automatic report is not an owner instruction. Investigate and report; it authorizes neither repository edits nor new tasks.\n{instructions}{legacy_answer}"
     );
     let outbox = crate::task_inquiry::Outbox::at(home);
     outbox.enqueue(crate::task_inquiry::Inquiry {
@@ -227,6 +230,8 @@ pub fn post(
         evidence: Some(crate::notice_semantics::question(home, &task, run, q)),
         created_at: q.asked_at,
         delivered_to: None,
+        decision: Some(crate::task_decision::Decision::awaiting(q.summary.clone())),
+        delivery_error: None,
     })?;
     outbox.deliver(queue, talks, &q.id)
 }
@@ -237,6 +242,41 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
     let tasks = queue.list();
     let all = questions.list();
     let watches = crate::release_watch::states_for_questions(home, &all);
+    // Restartable migration: stable source IDs preserve identity across the old
+    // record, native outbox and transcript. Reading a saved reply never executes
+    // it and delivery never settles the decision.
+    for q in &all {
+        if q.node == crate::bump::NOTICE_NODE && q.choices.is_empty() {
+            continue;
+        }
+        let Some(task_id) = task_of_with_watches(q, &tasks, &watches) else {
+            // Missing or ambiguous ownership is visible pending work, never
+            // permission to guess a repository or manufacture a queue task.
+            let result = crate::task_inquiry::Outbox::at(home).enqueue(crate::task_inquiry::Inquiry {
+                    schema: 1, id: q.id.clone(), task: String::new(),
+                    run: (!q.run.is_empty()).then(|| q.run.clone()),
+                    repo: std::path::PathBuf::new(),
+                    source: format!("{}:{}:{}", q.node, q.seat, q.run),
+                    text: format!("{}\n\n{}\n\nHistorical inquiry; restore its original task ownership before acting. Saved replies are evidence only.", q.summary, q.detail),
+                    display: format!("{}\n\n{}", q.summary, q.detail),
+                    key: format!("question:{}", q.id), evidence: None,
+                    created_at: q.asked_at, delivered_to: None,
+                    decision: Some(crate::task_decision::Decision::awaiting(q.summary.clone())),
+                    delivery_error: Some("Owning task is missing or ambiguous. Restore the original task/run association; no operation has been replayed.".into()),
+                });
+            if let Err(error) = result {
+                tracing::warn!("unowned decision {} import: {error:#}", q.id);
+            }
+            continue;
+        };
+        // Abandonment includes elapsed deadlines and dead askers. Neither is
+        // evidence that the decision effect was applied or explicitly settled.
+        if let Err(error) = post(queue, talks, home, &task_id, q) {
+            tracing::warn!("decision {} migration/delivery pending: {error:#}", q.id);
+            continue;
+        }
+        sync_effect_receipt(home, queue, q);
+    }
     for q in all.into_iter().filter(|q| q.status.open()) {
         // Targetless legacy approvals retain their compatibility card. Do not
         // send even a draft that would imply this chat can decide that record.
@@ -300,6 +340,91 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
         if let Err(e) = result {
             tracing::warn!("task decision {} delivery: {e:#}", q.id);
         }
+    }
+}
+
+/// Project only authoritative durable application evidence. Answered, delivered
+/// and read fields are deliberately not treated as effect receipts.
+fn sync_effect_receipt(home: &Path, queue: &Queue, q: &Question) {
+    use crate::task_decision::Status;
+    let outbox = crate::task_inquiry::Outbox::at(home);
+    let Ok(inquiry) = outbox.get(&q.id) else {
+        return;
+    };
+    let Some(decision) = inquiry.decision.as_ref() else {
+        return;
+    };
+    if decision.status == Status::Resolved {
+        return;
+    }
+    let receipt = if q.chosen_action().is_some_and(|a| a.maintenance()) {
+        let path = home.join("choice-actions").join(format!("{}.json", q.id));
+        match std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        {
+            Some(value) if value["status"] == "applied" => {
+                Some(format!("choice-actions/{}.json: applied", q.id))
+            }
+            Some(value) => {
+                let error = format!(
+                    "Operation needs reconciliation; inspect choice-actions/{}.json: {}. Do not replay an uncertain effect.",
+                    q.id, value["status"]
+                );
+                let _ = outbox.update_decision(&q.id, |d| d.fail(&error));
+                None
+            }
+            None => None,
+        }
+    } else if q.node == crate::triage::NODE || q.node == crate::triage::DEPS_NODE {
+        queue
+            .get(&inquiry.task)
+            .ok()
+            .filter(|task| task.triage_applied(&q.id))
+            .map(|_| format!("task {}: triage {} committed", inquiry.task, q.id))
+    } else if q.chosen_action().is_some()
+        && decision.request.is_some()
+        && decision.status != Status::RetryNeeded
+    {
+        queue
+            .get(&inquiry.task)
+            .ok()
+            .filter(|task| {
+                task.action_applied(&q.id)
+                    && match q.chosen_action() {
+                        Some(crate::ask::ChoiceAction::Resume { run }) => {
+                            task.status == crate::queue::TaskStatus::Running
+                                && task.runs.last() == Some(run)
+                        }
+                        _ => true,
+                    }
+            })
+            .map(|_| format!("task {}: action {} committed", inquiry.task, q.id))
+    } else if let Some(target) = &q.merge_target {
+        crate::run::RunState::load_under(&q.run, home)
+            .ok()
+            .filter(|run| {
+                q.resolution().as_deref() == Some(crate::land::APPROVE)
+                    && run.pr_merged_head.as_deref() == Some(target.head.as_str())
+                    && run.pr.as_ref().is_some_and(|pr| {
+                        pr.url == target.pr && pr.state.eq_ignore_ascii_case("merged")
+                    })
+            })
+            .map(|_| format!("run {}: merged {} at {}", q.run, target.pr, target.head))
+    } else {
+        None
+    };
+    if let Some(receipt) = receipt {
+        if let Err(error) = outbox.update_decision(&q.id, |d| d.applied(&receipt)) {
+            tracing::warn!("decision {} application projection: {error:#}", q.id);
+        }
+    } else if q.answer.is_some()
+        && decision.request.is_none()
+        && decision.status == Status::AwaitingOwner
+    {
+        // A pre-migration reply is history, not fresh authority. Keep it visible
+        // until the operation consumer proves application or reconciles failure.
+        let _ = outbox.update_decision(&q.id, |d| d.fail("Saved reply has no confirmed effect receipt. Inspect the owning task/run before retrying; migration did not replay it."));
     }
 }
 

@@ -7158,3 +7158,87 @@ async fn task_blocker_actions_are_mobile_read_only_navigation() {
     assert_eq!(queue.get(&disk_held.id).unwrap().status, TaskStatus::Held);
     browser.close_page(&page).await;
 }
+
+#[tokio::test]
+async fn phone_pending_decisions_link_to_exact_inquiry_without_settling_it() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP pending decisions phone navigation: no Chrome");
+        return;
+    };
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("pending-phone");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let mut task = Task::new(
+        "Pending work".into(),
+        "Work".into(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    task.chat = Some(chat.id.clone());
+    queue.put(&mut task).unwrap();
+    let outbox = magi::task_inquiry::Outbox::at(&home);
+    let inquiry = outbox
+        .file(
+            &task,
+            None,
+            "implement".into(),
+            "変更方針の判断が必要",
+            "この問い合わせへの回答をチャットで相談してください。",
+        )
+        .unwrap();
+    outbox.deliver(&queue, &talks, &inquiry.id).unwrap();
+    let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
+    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
+    let page = browser
+        .open_page(&format!("{base}#/decisions"), 390, 844, true)
+        .await
+        .unwrap();
+    browser
+        .wait_for(
+            &page,
+            "document.querySelectorAll('#decisions-list .decision-card').length === 1",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    let measure = browser.eval(&page, r##"(() => {
+      const card = document.querySelector('#decisions-list .decision-card');
+      const links = [...card.querySelectorAll('a')];
+      const dock = document.querySelector('.dock [data-nav="decisions"], [data-nav="decisions"].dock-item');
+      const bounds = card.getBoundingClientRect();
+      return { text: card.innerText, links: links.map(a => a.hash), dock: !!dock && dock.getBoundingClientRect().height > 0,
+        fits: bounds.left >= 0 && bounds.right <= innerWidth,
+        touch: links.every(a => a.getBoundingClientRect().height >= 44) };
+    })()"##).await.unwrap();
+    assert_eq!(measure["fits"], true, "{measure}");
+    assert_eq!(measure["touch"], true, "{measure}");
+    assert_eq!(measure["dock"], true, "{measure}");
+    assert!(
+        measure["text"]
+            .as_str()
+            .unwrap()
+            .contains("所有者の入力待ち")
+    );
+    assert!(measure["links"].as_array().unwrap().iter().any(|link| {
+        link.as_str()
+            .unwrap()
+            .contains(&format!("/inquiry/{}", inquiry.id))
+    }));
+    // Follow the shipped link, rather than synthesizing a different route.
+    browser.eval(&page, "[...document.querySelectorAll('#decisions-list a')].find(a => a.hash.includes('/inquiry/')).click()").await.unwrap();
+    browser.wait_for(&page, "!document.getElementById('talk-inquiry').hidden && document.getElementById('talk-inquiry').innerText.includes('この問い合わせへの回答')", Duration::from_secs(30)).await.unwrap();
+    assert_eq!(
+        outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
+        magi::task_decision::Status::AwaitingOwner
+    );
+    browser
+        .eval(&page, "location.hash = '#/decisions'")
+        .await
+        .unwrap();
+    browser.wait_for(&page, "!document.getElementById('view-decisions').hidden && document.querySelectorAll('#decisions-list .decision-card').length === 1", Duration::from_secs(30)).await.unwrap();
+    assert!(console_problems(&browser.take_events(&page.session)).is_empty());
+    browser.close_page(&page).await;
+}
