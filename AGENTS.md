@@ -3318,9 +3318,17 @@ apply; fold never authorizes deletion of another run's source.
 This section supersedes earlier task-question waiting, choice and deputy rules;
 those rules now apply only to the retained non-task legacy workflow.
 
-Task-scoped Questions are a durable outbox for `task_chat::sweep`, not a
-conversation with their asker. `magi ask` posts and finishes; do not wait or
-start a deputy/waiter for these records. Decisions go as free text to the task's
+`task_chat::sweep` converts task-scoped source records into independent
+`task_inquiry::Inquiry` deliveries in `notifications/task-inquiries`. The outbox
+stores task/run/repository ownership, producer identity, free text, display facts,
+semantic evidence and a delivery receipt; it carries no executable action or
+owner approval. Keep the original `question:<id>` transcript key when adapting
+an existing source, so a crash before its new receipt cannot duplicate delivery.
+The scheduler retries pending native deliveries independently of source records;
+a corrupt record is reported without preventing unrelated deliveries. Decision
+execution still uses the source records until that separate migration is complete.
+These deliveries are not conversations with their askers. `magi ask` posts and
+finishes; do not wait or start a deputy/waiter for these records. Decisions go as free text to the task's
 persisted `chat`, its own source chat, or its inherited origin chat. A missing
 chat is created with the chatter-chain head, default persona and one
 implementer. This decision path deliberately **reopens closed chats**; the

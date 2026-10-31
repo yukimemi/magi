@@ -3842,6 +3842,11 @@ async fn poll(
 
         // Deterministic: no model, run before the conductor sees anything so
         // its input reflects the queue's current, already-resolved state.
+        if let Err(error) = crate::task_inquiry::Outbox::at(home)
+            .sweep(queue, &crate::talk::Talks::at(home.join("talks")))
+        {
+            tracing::warn!("task inquiry delivery remains pending: {error:#}");
+        }
         crate::task_chat::sweep(
             queue,
             &crate::talk::Talks::at(home.join("talks")),

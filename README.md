@@ -1609,8 +1609,9 @@ and repair never permit a merge.
 
 Task questions (including `magi ask` from a task seat) are posted as free text
 in the task's chat and the asker finishes without waiting. The daemon uses the
-question record as a durable outbox, then runs the existing chat turn; it starts
-no deputy or waiter. If needed it opens a Solo chat with the chatter-chain head
+task-owned delivery record in `notifications/task-inquiries`, then runs the
+existing chat turn; it starts no deputy or waiter. If needed it opens a Solo
+chat with the chatter-chain head
 and default persona, and records that chat on the task for later messages.
 Decision delivery reopens a closed associated chat. Passive completion and
 watched-command notifications still skip closed chats.
