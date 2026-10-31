@@ -498,6 +498,7 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
         return report;
     };
     let mut targets = Vec::new();
+    let mut under_pressure = false;
     let mut registrations = std::collections::HashMap::new();
     let measurements_path = home.join("output-measurements.json");
     let mut measurements: std::collections::BTreeMap<PathBuf, Measurement> =
@@ -569,6 +570,7 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
             observed.insert(target.clone());
             let pressure =
                 crate::disk::free_bytes(&path).map_or(true, |free| free < disk.min_free_bytes);
+            under_pressure |= pressure;
             let measurement = measurements.entry(target).or_default();
             if pressure
                 || measurement
@@ -583,9 +585,17 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
             targets.push((state.updated_at, id.clone(), path, size));
         }
     }
-    targets.sort_by_key(|t| t.0);
+    if under_pressure {
+        // Inventory sizes prioritize scarce-space recovery only; deletion authority
+        // and budget accounting come from declared outputs measured under locks.
+        targets.sort_by_key(|t| (std::cmp::Reverse(t.3), t.0));
+    } else {
+        targets.sort_by_key(|t| t.0);
+    }
     let mut remaining = report.measured_bytes;
-    for (updated, id, path, size) in targets {
+    let mut deletion_started = false;
+    let mut oversized_started = false;
+    for (updated, id, path, _) in targets {
         if disk.worktree_limit_bytes == 0
             || remaining <= disk.worktree_limit_bytes
                 && crate::disk::free_bytes(&path).is_ok_and(|free| free >= disk.min_free_bytes)
@@ -593,10 +603,10 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
             report.retained.push(format!("{id}: output reclamation disabled or aggregate usage and free space are within policy"));
             continue;
         }
-        if report.freed_bytes.saturating_add(size) > disk.worktree_reclaim_bytes {
-            report.retained.push(format!(
-                "{id}: target exceeds remaining per-pass byte budget"
-            ));
+        if oversized_started || report.freed_bytes >= disk.worktree_reclaim_bytes {
+            report
+                .retained
+                .push(format!("{id}: per-pass byte budget spent"));
             continue;
         }
         let result = async {
@@ -622,11 +632,15 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
             let _cargo = cargo_locks(&target)?;
             let outputs = declared_outputs(&target)?;
             ensure!(!outputs.is_empty(), "no dep-info-proven outputs; unknown files retained");
-            let current_size = outputs.iter().try_fold(0u64, |bytes, p| {
-                Ok::<_, std::io::Error>(bytes.saturating_add(std::fs::metadata(p)?.len()))
-            })?;
-            ensure!(report.freed_bytes.saturating_add(current_size) <= disk.worktree_reclaim_bytes,
-                "target grew beyond remaining per-pass budget");
+            let sizes = outputs.iter().map(|p| std::fs::metadata(p).map(|m| m.len()))
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let current_size = sizes.iter().fold(0u64, |bytes, size| bytes.saturating_add(*size));
+            let exceeds_budget = current_size > disk.worktree_reclaim_bytes.saturating_sub(report.freed_bytes);
+            // 予算は1回の削除量を抑えるもので、大きな出力を永久に保持するためではない。
+            // 正の予算では最初の削除対象だけ超過を許し、その後は予算消費済みとする。
+            // 途中で失敗しても再度許可しないよう、例外は削除開始時に消費する。
+            ensure!(!deletion_started || !exceeds_budget,
+                "declared outputs exceed remaining per-pass byte budget");
             // Record adoption before deletion; interrupted deletion is revalidated
             // on the next pass. No source file or branch is modified.
             let ledger = home.join("runs").join(&id).join("build-outputs.json");
@@ -641,23 +655,24 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
             if let Err(error) = record_residue(home, &id, &target, &outputs) {
                 report.retained.push(format!("{id}: residue not adopted for retirement: {error:#}"));
             }
-            for output in &outputs {
-                std::fs::remove_file(output)?;
-            }
+            deletion_started = true;
+            oversized_started = exceeds_budget;
             measurements.remove(&target);
+            for (output, size) in outputs.iter().zip(sizes) {
+                std::fs::remove_file(output)?;
+                // Preserve actual progress even if a later removal fails.
+                report.freed_bytes = report.freed_bytes.saturating_add(size);
+                remaining = remaining.saturating_sub(size);
+            }
             report.retained.push(format!("{id}: unmanifested files and Cargo metadata retained"));
-            Ok::<_, anyhow::Error>(current_size)
+            Ok::<_, anyhow::Error>(())
         }
         .await;
-        match result {
-            Ok(freed) => {
-                report.freed_bytes = report.freed_bytes.saturating_add(freed);
-                remaining = remaining.saturating_sub(freed);
-            }
-            Err(e) => report.retained.push(format!(
+        if let Err(e) = result {
+            report.retained.push(format!(
                 "{id}/{}: {e:#}",
                 path.file_name().unwrap_or_default().to_string_lossy()
-            )),
+            ));
         }
     }
     measurements.retain(|path, _| observed.contains(path));
@@ -1308,6 +1323,171 @@ mod tests {
                 .unwrap();
             task
         }
+    }
+
+    #[tokio::test]
+    async fn sweep_budget_oversized_target_makes_progress_without_a_second_deletion() {
+        let f = Fx::new().await;
+        let first = f.run("ba00", true).await;
+        let second = f.run("ba01", true).await;
+        for state in [&first, &second] {
+            Fx::target(&state.candidates[0].worktree);
+        }
+        let mut disk = Fx::disk();
+        disk.worktree_reclaim_bytes = 100;
+        let out = sweep(&f.home, &disk, Fx::now()).await;
+        assert_eq!(out.freed_bytes, 200, "{out:?}");
+        assert!(
+            out.retained
+                .contains(&format!("{}: per-pass byte budget spent", second.id)),
+            "{out:?}"
+        );
+        assert!(
+            !first.candidates[0]
+                .worktree
+                .join("target/debug/output")
+                .exists()
+        );
+        assert!(
+            second.candidates[0]
+                .worktree
+                .join("target/debug/output")
+                .exists()
+        );
+        assert_eq!(sweep(&f.home, &disk, Fx::now()).await.freed_bytes, 200);
+    }
+
+    #[tokio::test]
+    async fn sweep_budget_pressure_prioritizes_largest_over_oldest() {
+        let f = Fx::new().await;
+        let small = f.run("bb00", true).await;
+        let large = f.run("bb01", true).await;
+        for state in [&small, &large] {
+            Fx::target(&state.candidates[0].worktree);
+        }
+        let output = large.candidates[0].worktree.join("target/debug/output");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&output)
+            .unwrap()
+            .set_len(1000)
+            .unwrap();
+        let mut disk = Fx::disk();
+        disk.worktree_reclaim_bytes = 300;
+        disk.min_free_bytes = u64::MAX;
+        // Pressure must trigger reclamation even when aggregate usage is below cap.
+        disk.worktree_limit_bytes = u64::MAX;
+        let out = sweep(&f.home, &disk, Fx::now()).await;
+        assert_eq!(out.freed_bytes, 1000, "{out:?}");
+        assert!(!output.exists());
+        assert!(
+            small.candidates[0]
+                .worktree
+                .join("target/debug/output")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_budget_zero_remaining_and_inventory_are_distinct() {
+        let f = Fx::new().await;
+        let first = f.run("bc00", true).await;
+        let second = f.run("bc01", true).await;
+        for state in [&first, &second] {
+            Fx::target(&state.candidates[0].worktree);
+        }
+        // Non-declared Cargo data must not determine whether outputs fit.
+        std::fs::create_dir_all(
+            first.candidates[0]
+                .worktree
+                .join("target/debug/incremental"),
+        )
+        .unwrap();
+        std::fs::write(
+            first.candidates[0]
+                .worktree
+                .join("target/debug/incremental/cache"),
+            [0; 1000],
+        )
+        .unwrap();
+        let mut disk = Fx::disk();
+        disk.worktree_reclaim_bytes = 0;
+        assert_eq!(sweep(&f.home, &disk, Fx::now()).await.freed_bytes, 0);
+        disk.worktree_reclaim_bytes = 300;
+        let out = sweep(&f.home, &disk, Fx::now()).await;
+        assert_eq!(out.freed_bytes, 200, "{out:?}");
+        assert!(
+            !first.candidates[0]
+                .worktree
+                .join("target/debug/output")
+                .exists()
+        );
+        assert!(
+            second.candidates[0]
+                .worktree
+                .join("target/debug/output")
+                .exists()
+        );
+        assert!(
+            out.retained
+                .iter()
+                .any(|r| r.contains("declared outputs exceed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_budget_exception_preserves_grace_liveness_and_locks() {
+        let f = Fx::new().await;
+        let mut protected = f.run("bd00", true).await;
+        let later = f.run("bd01", true).await;
+        for state in [&protected, &later] {
+            Fx::target(&state.candidates[0].worktree);
+        }
+        let mut disk = Fx::disk();
+        disk.worktree_reclaim_bytes = 100;
+        disk.fold_grace_secs = 3600;
+        let out = sweep(&f.home, &disk, Fx::now()).await;
+        assert_eq!(out.freed_bytes, 0);
+        assert!(
+            out.retained
+                .iter()
+                .any(|r| r.contains("within grace period"))
+        );
+        disk.fold_grace_secs = 0;
+        protected.driver_exited = false;
+        protected.driver_pid = Some(std::process::id());
+        protected.driver_started_at = crate::proc::process_started_at(std::process::id());
+        protected
+            .save_under_at(&f.home, protected.updated_at)
+            .unwrap();
+        let out = sweep(&f.home, &disk, Fx::now()).await;
+        assert!(
+            out.retained
+                .iter()
+                .any(|r| r.contains("run live or ownership unknown"))
+        );
+        assert_eq!(
+            out.freed_bytes, 200,
+            "live target must not consume exception: {out:?}"
+        );
+        let output = protected.candidates[0].worktree.join("target/debug/output");
+        assert!(output.exists());
+        protected.driver_exited = true;
+        protected.save_under(&f.home).unwrap();
+        let owner = crate::pr_head::owner_lock(&f.home, &protected.id).unwrap();
+        assert_eq!(sweep(&f.home, &disk, Fx::now()).await.freed_bytes, 0);
+        assert!(output.exists());
+        drop(owner);
+        let cargo = cargo_locks(&protected.candidates[0].worktree.join("target")).unwrap();
+        assert_eq!(sweep(&f.home, &disk, Fx::now()).await.freed_bytes, 0);
+        assert!(output.exists());
+        drop(cargo);
+        let lease = OutputLease::take(&protected.candidates[0].worktree, true).unwrap();
+        assert_eq!(sweep(&f.home, &disk, Fx::now()).await.freed_bytes, 0);
+        assert!(output.exists());
+        drop(lease);
+        assert_eq!(sweep(&f.home, &disk, Fx::now()).await.freed_bytes, 200);
+        assert!(!output.exists());
     }
 
     #[tokio::test]
