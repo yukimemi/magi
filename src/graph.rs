@@ -16268,6 +16268,8 @@ esac
             "task".to_owned(),
             Config::default(),
         );
+        // These fixtures test execution flow, independent of host disk capacity.
+        state.config.disk.min_free_bytes = 0;
         // These fixtures share one home and save concurrently. Short clock
         // IDs can collide, making an ownership test read another test's run.
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -18117,6 +18119,7 @@ esac
         init_repo(&repo);
 
         let mut config = Config::default();
+        config.disk.min_free_bytes = 0;
         config.verify.gate = vec![
             "printf started > started.marker; i=0; while [ ! -f release.marker ] && \
              [ \"$i\" -lt 100 ]; do i=$((i+1)); sleep 0.05; done"
@@ -19191,6 +19194,8 @@ esac
             instruction.to_owned(),
             Config::default(),
         );
+        // These fixtures test execution flow, independent of host disk capacity.
+        state.config.disk.min_free_bytes = 0;
         state.candidates.push(Candidate {
             index: 0,
             label: 'A',

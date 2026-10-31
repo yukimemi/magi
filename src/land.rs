@@ -7100,6 +7100,8 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             "add retries to the uploader".to_owned(),
             crate::config::Config::default(),
         );
+        // These fixtures test execution flow, independent of host disk capacity.
+        state.config.disk.min_free_bytes = 0;
         // Tests run in parallel against one persistent home and the ids
         // `RunState::new` draws from the clock can repeat, so two tests would
         // share a run's questions. The home also outlives the process, so the
