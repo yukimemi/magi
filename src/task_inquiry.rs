@@ -334,6 +334,23 @@ impl Outbox {
         self.records()?.into_iter().collect()
     }
 
+    /// 一覧表示用の同一走査で、正常な記録と読めない記録の件数を返す。
+    /// 実行系の厳密な list / pending のエラー処理は変更しない。
+    pub fn list_readable(&self) -> Result<(Vec<Inquiry>, usize)> {
+        let mut items = Vec::new();
+        let mut unreadable = 0;
+        for record in self.records()? {
+            match record {
+                Ok(inquiry) => items.push(inquiry),
+                Err(error) => {
+                    tracing::warn!("task inquiry record is unreadable: {error:#}");
+                    unreadable += 1;
+                }
+            }
+        }
+        Ok((items, unreadable))
+    }
+
     /// Change only the decision lifecycle under the same lease as delivery.
     /// Returning false avoids rewriting a receipt on every scheduler lap.
     pub fn update_decision(

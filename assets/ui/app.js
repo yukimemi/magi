@@ -10134,7 +10134,7 @@ function loadQuestions() {
  * falls back to health's own count. Every string from the API is rendered as
  * text, and the one URL goes through forgeUrl(). */
 /* ---- durable pending decisions ------------------------------------------ */
-const decisionState = { items: [], loaded: false, loading: false, error: null, focus: null };
+const decisionState = { items: [], unreadable: 0, loaded: false, loading: false, error: null, focus: null };
 const decisionLabels = {
   awaiting_owner: "所有者の入力待ち", queued: "受付・実行待ち", in_progress: "実行中",
   retry_needed: "失敗・結果の確認が必要", resolved: "解決済み",
@@ -10166,19 +10166,23 @@ function renderDecisions() {
     setText(badge, String(active.length)); show(badge, active.length > 0);
   }
   setText($("decisions-count"), decisionState.error ? "一覧を更新できませんでした" : decisionState.loaded ? `${active.length} 件の判断待ち` : "読み込み中…");
-  show($("decisions-error"), Boolean(decisionState.error));
-  if (decisionState.error) $("decisions-error").replaceChildren(
-    el("p", { text: decisionState.error }), el("button", { type: "button", text: "再読み込み", onclick: () => loadDecisions() }));
+  const warning = decisionState.error || (decisionState.unreadable
+    ? `${decisionState.unreadable} 件の記録を読み込めません。表示中の件数には含まれていません。` : null);
+  show($("decisions-error"), Boolean(warning));
+  if (warning) $("decisions-error").replaceChildren(
+    el("p", { text: warning }), el("button", { type: "button", text: "再読み込み", onclick: () => loadDecisions() }));
   $("decisions-list").replaceChildren(...active.map(decisionCard));
   $("decisions-resolved").replaceChildren(...resolved.map(decisionCard));
-  show($("decisions-empty"), decisionState.loaded && !active.length && !decisionState.error);
+  show($("decisions-empty"), decisionState.loaded && !active.length && !warning);
   show($("decisions-history"), resolved.length > 0);
 }
 async function loadDecisions() {
   if (decisionState.loading) return;
   decisionState.loading = true;
   try {
-    decisionState.items = await getJson(API.decisions);
+    const result = await getJson(API.decisions);
+    decisionState.items = result.items;
+    decisionState.unreadable = result.unreadable;
     decisionState.loaded = true;
     decisionState.error = null;
   } catch (error) { decisionState.error = error.message; }

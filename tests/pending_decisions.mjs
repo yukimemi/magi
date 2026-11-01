@@ -26,3 +26,34 @@ test('phone dock and rail point to pending decisions separately from notificatio
   assert.ok(html.includes('id="talk-inquiry"'));
   assert.ok(html.includes('href="#/notifications"'));
 });
+
+test('partial lists keep readable decisions visible and report unreadable records', async () => {
+  const section = source.slice(source.indexOf('const decisionState ='), source.indexOf('async function loadInquiry('));
+  const nodes = new Map();
+  const node = id => {
+    if (!nodes.has(id)) nodes.set(id, { children: [], replaceChildren(...children) { this.children = children; } });
+    return nodes.get(id);
+  };
+  let response = { items: [{ id: 'pending', task: 'task', run: null, chat: 'chat', decision: {
+    status: 'awaiting_owner', reason: '入力待ち', history: [],
+  } }], unreadable: 2 };
+  const ui = runInNewContext(`${section}\n({ loadDecisions, decisionState })`, {
+    API: { decisions: '/api/decisions' }, getJson: async () => response,
+    $: node, setText: (target, text) => { target.text = text; },
+    show: (target, visible) => { target.visible = visible; },
+    el: (tag, attrs, ...children) => ({ tag, ...attrs, children }),
+  });
+  await ui.loadDecisions();
+  assert.equal(ui.decisionState.error, null);
+  assert.equal(node('decisions-list').children.length, 1);
+  assert.equal(node('decisions-count').text, '1 件の判断待ち');
+  assert.equal(node('decisions-error').visible, true);
+  assert.match(node('decisions-error').children[0].text, /2 件の記録を読み込めません/);
+  response = { items: [], unreadable: 2 };
+  await ui.loadDecisions();
+  assert.equal(node('decisions-empty').visible, false);
+  response = { items: [], unreadable: 0 };
+  await ui.loadDecisions();
+  assert.equal(node('decisions-error').visible, false);
+  assert.equal(node('decisions-empty').visible, true);
+});

@@ -8033,12 +8033,18 @@ impl DecisionView {
     }
 }
 
+#[derive(serde::Serialize)]
+struct DecisionsView {
+    items: Vec<DecisionView>,
+    unreadable: usize,
+}
+
 // Read-only: list visits and inquiry links never create owner decisions,
 // delivery receipts or effect acknowledgements.
-async fn decisions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<DecisionView>>> {
+async fn decisions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<DecisionsView>> {
     blocking(move || {
-        let mut views: Vec<_> = crate::task_inquiry::Outbox::at(&ui.home)
-            .list()?
+        let (items, unreadable) = crate::task_inquiry::Outbox::at(&ui.home).list_readable()?;
+        let mut views: Vec<_> = items
             .into_iter()
             .filter_map(DecisionView::from_inquiry)
             .collect();
@@ -8048,7 +8054,10 @@ async fn decisions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<Decisio
                 view.id.clone(),
             )
         });
-        Ok(Json(views))
+        Ok(Json(DecisionsView {
+            items: views,
+            unreadable,
+        }))
     })
     .await
 }
@@ -13672,6 +13681,49 @@ mod tests {
                 .unwrap()
                 .contains("answerable_question")
         );
+    }
+
+    #[tokio::test]
+    async fn decisions_list_reports_unreadable_records_without_hiding_pending_items() {
+        let fx = Fixture::start().await;
+        let outbox = crate::task_inquiry::Outbox::at(fx.home.path());
+        let task = crate::queue::Task::new(
+            "work".into(),
+            "work".into(),
+            fx.home.path().into(),
+            crate::queue::Source::Human,
+        );
+        let inquiry = outbox
+            .file(&task, None, "test".into(), "入力待ち", "詳細")
+            .unwrap();
+        let root = fx.home.path().join("notifications/task-inquiries");
+        std::fs::write(root.join("broken.json"), "{").unwrap();
+        let mut unsupported = inquiry.clone();
+        unsupported.id = "unsupported".into();
+        unsupported.schema = 99;
+        std::fs::write(
+            root.join("unsupported.json"),
+            serde_json::to_vec(&unsupported).unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read(root.join(format!("{}.json", inquiry.id))).unwrap();
+        for _ in 0..2 {
+            let response = fx.get("/api/decisions").await;
+            assert_eq!(response.status, 200, "{}", response.body);
+            let listed = response.json();
+            assert_eq!(listed["unreadable"], 2);
+            assert_eq!(listed["items"].as_array().unwrap().len(), 1);
+            assert_eq!(listed["items"][0]["id"], inquiry.id);
+            assert_eq!(listed["items"][0]["decision"]["status"], "awaiting_owner");
+        }
+        assert_eq!(
+            before,
+            std::fs::read(root.join(format!("{}.json", inquiry.id))).unwrap()
+        );
+        assert!(outbox.list().is_err());
+        std::fs::remove_file(root.join("broken.json")).unwrap();
+        std::fs::remove_file(root.join("unsupported.json")).unwrap();
+        assert_eq!(fx.get("/api/decisions").await.json()["unreadable"], 0);
     }
 
     #[tokio::test]
