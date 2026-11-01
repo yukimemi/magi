@@ -49,6 +49,7 @@ fn inquiry(task: &Task, id: &str) -> Inquiry {
         delivered_to: None,
         decision: None,
         delivery_error: None,
+        archived: false,
     }
 }
 
@@ -392,5 +393,125 @@ async fn orphaned_migration_stays_visible_and_recovers_original_ownership_once()
     assert_eq!(recovered.decision.unwrap().status, Status::AwaitingOwner);
     assert_eq!(talks.get(&chat.id).unwrap().pending_messages.len(), 1);
     assert_eq!(queue.get(&task.id).unwrap().status, magi::queue::TaskStatus::Queued);
+}
+}
+
+common::e2e! {
+async fn receipt_reconciliation_isolates_missing_runs_corrupt_receipts_and_corrupt_inquiries() {
+    use magi::{chat_control::{self, Operation}, task_decision::{Decision, Status}};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("isolated-receipts");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let mut task = Task::new("work".into(), "work".into(), fx.repo.clone(), Source::Human);
+    task.chat = Some(chat.id.clone()); task.runs.push("run-a".into()); queue.put(&mut task).unwrap();
+    let outbox = Outbox::at(&home);
+    let head = "a".repeat(40);
+    let missing = Operation::RerunChecks { run: "20260101-000000-dead".into(), request:"missing".into(), head:head.clone(), workflows:vec!["123".into()] };
+    let merge = |request: &str| Operation::MergePr { repo:"owner/repo".into(), number:42, head:head.clone(), request:request.into() };
+    for (id, op) in [("a-missing", missing), ("b-corrupt", merge("corrupt")), ("z-applied", merge("applied"))] {
+        let mut record = inquiry(&task, id); record.decision = Some(Decision::awaiting(id.into()));
+        outbox.enqueue(record).unwrap(); outbox.deliver(&queue, &talks, id).unwrap();
+        outbox.update_decision(id, |d| d.accept(&serde_json::to_string(&op).unwrap())).unwrap();
+        outbox.update_decision(id, |d| d.start()).unwrap();
+    }
+    let dir = home.join("chat-controls").join(&chat.id); std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("corrupt.json"), "{truncated").unwrap();
+    std::fs::write(dir.join("applied.json"), serde_json::to_vec(&serde_json::json!({"action":{"repo":"owner/repo","number":42,"head":head,"request":"applied"},"status":"merged","detail":"confirmed by forge"})).unwrap()).unwrap();
+    std::fs::write(home.join("notifications/task-inquiries/broken.json"), "{bad").unwrap();
+    assert!(chat_control::reconcile_decisions(&queue, &home).is_err());
+    assert_eq!(outbox.get("z-applied").unwrap().decision.unwrap().status, Status::Resolved);
+    for id in ["a-missing", "b-corrupt"] {
+        let decision = outbox.get(id).unwrap().decision.unwrap();
+        assert_eq!(decision.status, Status::RetryNeeded); assert!(decision.error.unwrap().contains("reconciliation failed"));
+    }
+    assert_eq!(std::fs::read_to_string(dir.join("corrupt.json")).unwrap(), "{truncated");
+    assert!(magi::worker::active(&home).unwrap().is_empty());
+}
+}
+
+common::e2e! {
+async fn imported_discussion_reply_can_be_explicitly_settled_without_creating_a_request() {
+    use magi::{ask::{Answer, Question, Questions}, chat_control::{self, Operation}, task_decision::Status};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("settle-import");
+    let queue = Queue::at(home.join("queue")); let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let mut task = Task::new("work".into(),"work".into(),fx.repo.clone(),Source::Human);
+    task.chat=Some(chat.id.clone()); task.runs.push("run-a".into()); queue.put(&mut task).unwrap();
+    let questions = Questions::at(home.join("questions"));
+    let mut q = Question::new("run-a".into(),"implement".into(),"impl-A".into(),"Saved discussion".into(),"No typed effect".into(),vec![]);
+    q.answer(Answer::Text("Historical owner response".into())).unwrap(); questions.put(&mut q).unwrap();
+    // Upgrade a record already imported by the previous version.
+    magi::task_chat::post(&queue,&talks,&home,&task.id,&q).unwrap();
+    let outbox=Outbox::at(&home); outbox.update_decision(&q.id,|d|d.fail("Saved reply has no effect receipt")).unwrap();
+    let before=std::fs::read(questions.path_of(&q.id)).unwrap();
+    chat_control::dispatch(&queue,&home,&talks,&chat.id,Operation::SettleDecision{inquiry:q.id.clone(),reason:"Owner explicitly confirmed no further operation is needed".into(),replacement:None}).await.unwrap();
+    let decision=outbox.get(&q.id).unwrap().decision.unwrap(); assert_eq!(decision.status,Status::Resolved); assert!(decision.request.is_none());
+    assert_eq!(before,std::fs::read(questions.path_of(&q.id)).unwrap());
+    assert!(magi::worker::active(&home).unwrap().is_empty());
+}
+}
+
+common::e2e! {
+async fn completed_history_migration_is_bounded_passive_and_has_a_durable_boundary() {
+    use magi::ask::{Answer, Question, Questions};
+    let fx=common::fixture(common::home_lock().await,common::Judges::Unanimous,false);
+    let home=fx.tmp.path().join("passive-migration"); let queue=Queue::at(home.join("queue")); let talks=Talks::at(home.join("talks"));
+    let mut chat=talk::begin(&talks,&fx.config,fx.repo.clone(),Some("alpha")).unwrap(); talk::close(&mut chat,&talks).unwrap();
+    let mut task=Task::new("completed".into(),"completed".into(),fx.repo.clone(),Source::Human);
+    task.chat=Some(chat.id.clone()); task.runs.push("run-a".into()); task.succeed(); queue.put(&mut task).unwrap();
+    let questions=Questions::at(home.join("questions"));
+    for index in 0..65 {
+        let mut q=Question::new("run-a".into(),"implement".into(),"impl-A".into(),format!("Historical discussion {index}"),"Saved history".into(),vec![]);
+        q.answer(Answer::Text("Already discussed".into())).unwrap(); questions.put(&mut q).unwrap();
+    }
+    let outbox=Outbox::at(&home);
+    magi::task_chat::sweep(&queue,&talks,&questions,&home);
+    assert_eq!(outbox.list().unwrap().len(),64,"bounded first batch");
+    magi::task_chat::sweep(&queue,&talks,&questions,&home);
+    assert_eq!(outbox.list().unwrap().len(),65);
+    assert!(outbox.list().unwrap().iter().all(|record| record.archived && record.decision.is_none()));
+    assert!(outbox.pending().unwrap().is_empty()); outbox.sweep(&queue,&talks).unwrap();
+    let fresh=talks.get(&chat.id).unwrap(); assert!(!fresh.status.open()); assert!(fresh.pending_messages.is_empty());
+    assert!(magi::chat_notify::talks_to_start(&talks).is_empty());
+    let mut later=Question::new("run-a".into(),"implement".into(),"impl-A".into(),"Outside migration boundary".into(),"Later history".into(),vec![]);
+    later.answer(Answer::Text("Saved after migration".into())).unwrap(); questions.put(&mut later).unwrap();
+    magi::task_chat::sweep(&queue,&talks,&questions,&home);
+    assert_eq!(outbox.list().unwrap().len(),65,"completed migration does not expand its snapshot after restart");
+    assert!(questions.get(&later.id).unwrap().answer.is_some());
+}
+}
+
+common::e2e! {
+async fn a_fast_completed_resume_has_an_exact_durable_start_receipt_after_restart() {
+    use magi::{chat_control::{self,Operation},run::{RunState,RunStatus,Origin},task_decision::Status};
+    let mut fx=common::fixture(common::home_lock().await,common::Judges::Unanimous,false);
+    fx.config.merge.mode=magi::config::MergeMode::None; fx.config.graph.land=false;
+    fx.config.disk.min_free_bytes=0; fx.config.disk.auto_fold=false; fx.config.disk.cache_limit_bytes=0;
+    let config=fx.tmp.path().join("resume-config.toml"); std::fs::write(&config,toml::to_string(&fx.config).unwrap()).unwrap();
+    let home=magi::run::home(); let queue=Queue::at(home.join("queue")); let talks=Talks::at(home.join("talks"));
+    let chat=talk::begin(&talks,&fx.config,fx.repo.clone(),Some("alpha")).unwrap();
+    let mut task=Task::new("Resume work".into(),"Add a note.txt file".into(),fx.repo.clone(),Source::Human); task.chat=Some(chat.id.clone());
+    let head=std::process::Command::new("git").args(["rev-parse","HEAD"]).current_dir(&fx.repo).output().unwrap();
+    let mut state=RunState::new(fx.repo.clone(),"main".into(),String::from_utf8(head.stdout).unwrap().trim().into(),task.instruction.clone(),fx.config.clone());
+    state.reserve_under(&home).unwrap(); state.origin=Some(Origin::queue(&task.id)); state.status=RunStatus::Blocked; state.driver_exited=true; state.begin_pass(); state.save_under(&home).unwrap();
+    task.runs.push(state.id.clone()); task.hold_manual(Some("Owner input required".into())); queue.put(&mut task).unwrap();
+    let outbox=Outbox::at(&home); let record=outbox.file(&task,Some(state.id.clone()),"owner".into(),"Resume this execution","Explicit owner request").unwrap(); outbox.deliver(&queue,&talks,&record.id).unwrap();
+    chat_control::dispatch(&queue,&home,&talks,&chat.id,Operation::ForDecision{inquiry:record.id.clone(),command:Box::new(Operation::Resume{run:state.id.clone()})}).await.unwrap();
+    let mut pending=queue.get(&task.id).unwrap();
+    assert_eq!(pending.resume_override.as_ref().unwrap().question_id,record.id);
+    pending.status=magi::queue::TaskStatus::Running; queue.put(&mut pending).unwrap();
+    chat_control::reconcile_decisions(&queue,&home).unwrap();
+    assert_eq!(outbox.get(&record.id).unwrap().decision.unwrap().status,Status::Queued,"a task status alone is not execution-start proof");
+    pending.status=magi::queue::TaskStatus::Queued; queue.put(&mut pending).unwrap();
+    let opts=magi::daemon::Opts{repo:fx.repo.clone(),config:Some(config),worktrees_root:Some(fx.tmp.path().join("resume-wt")),..Default::default()};
+    let claim=queue.claim(&task.id).unwrap(); Box::pin(magi::daemon::run_claimed(&opts,&queue,&mut pending)).await; drop(claim);
+    let finished=queue.get(&task.id).unwrap(); assert_ne!(finished.status,magi::queue::TaskStatus::Running);
+    let disk=RunState::load_under(&state.id,&home).unwrap(); assert!(disk.decision_starts.contains_key(&record.id),"{:?}",finished.last_error);
+    chat_control::reconcile_decisions(&queue,&home).unwrap();
+    assert_eq!(Outbox::at(&home).get(&record.id).unwrap().decision.unwrap().status,Status::Resolved);
+    chat_control::dispatch(&queue,&home,&talks,&chat.id,Operation::ReconcileDecision{inquiry:record.id.clone()}).await.unwrap();
 }
 }

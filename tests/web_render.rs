@@ -7190,6 +7190,17 @@ async fn phone_pending_decisions_link_to_exact_inquiry_without_settling_it() {
         )
         .unwrap();
     outbox.deliver(&queue, &talks, &inquiry.id).unwrap();
+    let questions = magi::ask::Questions::at(home.join("questions"));
+    let mut legacy = magi::ask::Question::new(
+        String::new(),
+        "ask".into(),
+        "operator".into(),
+        "従来の単発問い合わせ".into(),
+        "移行中も回答経路を維持する".into(),
+        vec![],
+    );
+    questions.put(&mut legacy).unwrap();
+    questions.beat(&legacy.id, magi::ask::WaiterKind::Asker);
     let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
     let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
     let page = browser
@@ -7239,6 +7250,23 @@ async fn phone_pending_decisions_link_to_exact_inquiry_without_settling_it() {
         .await
         .unwrap();
     browser.wait_for(&page, "!document.getElementById('view-decisions').hidden && document.querySelectorAll('#decisions-list .decision-card').length === 1", Duration::from_secs(30)).await.unwrap();
+    assert!(console_problems(&browser.take_events(&page.session)).is_empty());
+    // Follow the compatibility entry that remains necessary while non-task
+    // foreground questions still exist, then answer through the real UI.
+    browser
+        .eval(
+            &page,
+            "document.querySelector('#view-decisions a[href=\"#/questions\"]').click()",
+        )
+        .await
+        .unwrap();
+    browser.wait_for(&page, "!document.getElementById('view-questions').hidden && !!document.querySelector('#questions-list .ask-free textarea:not(:disabled)')", Duration::from_secs(30)).await.unwrap();
+    browser.eval(&page, "(() => { const form = document.querySelector('#questions-list .ask-free'); form.querySelector('textarea').value = '確認済み'; form.querySelector('button').click(); })()").await.unwrap();
+    browser.wait_for(&page, "[...document.querySelectorAll('#questions-list .ask')].some(row => row.textContent.includes('確認済み') && row.textContent.includes('Decided'))", Duration::from_secs(30)).await.unwrap();
+    assert_eq!(
+        questions.get(&legacy.id).unwrap().resolution().as_deref(),
+        Some("確認済み")
+    );
     assert!(console_problems(&browser.take_events(&page.session)).is_empty());
     browser.close_page(&page).await;
 }

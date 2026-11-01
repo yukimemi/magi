@@ -51,6 +51,9 @@ pub struct Inquiry {
     /// Delivery failures never count as a decision or action outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_error: Option<String>,
+    /// Passive imported history; never submitted to a chat worker.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 /// File-backed outbox under the existing notifications write grant.
@@ -178,6 +181,7 @@ impl Outbox {
                 clean(summary).chars().take(240).collect(),
             )),
             delivery_error: None,
+            archived: false,
         })
     }
 
@@ -226,6 +230,11 @@ impl Outbox {
                 );
             }
             if saved.decision.is_none() && inquiry.decision.is_some() {
+                saved.archived = inquiry.archived;
+                if !inquiry.archived {
+                    saved.text = inquiry.text;
+                    saved.display = inquiry.display;
+                }
                 saved.decision = inquiry.decision;
                 self.save(&saved)?;
             }
@@ -245,6 +254,10 @@ impl Outbox {
     pub fn deliver(&self, queue: &Queue, talks: &Talks, id: &str) -> Result<String> {
         let _lock = self.lock(id)?;
         let mut inquiry = self.get(id)?;
+        ensure!(
+            !inquiry.archived,
+            "passive inquiry history is not a delivery"
+        );
         let (_, mut chat) =
             crate::task_chat::destination_checked(queue, talks, &inquiry.task, |task| {
                 ensure!(
@@ -327,6 +340,18 @@ impl Outbox {
                 self.get(id).with_context(|| format!("read inquiry {id}"))
             })
             .collect())
+    }
+
+    /// Stop compatibility/history delivery without manufacturing resolution.
+    pub(crate) fn suspend_delivery(&self, id: &str, reason: &str) -> Result<()> {
+        let _lock = self.lock(id)?;
+        let mut record = self.get(id)?;
+        if !record.archived || record.delivery_error.as_deref() != Some(reason) {
+            record.archived = true;
+            record.delivery_error = Some(reason.to_owned());
+            self.save(&record)?;
+        }
+        Ok(())
     }
 
     /// Read all durable inquiries, including completed decision history.
@@ -432,12 +457,24 @@ impl Outbox {
             .into_iter()
             .collect::<Result<Vec<_>>>()?
             .into_iter()
-            .filter(|inquiry| inquiry.delivered_to.is_none())
+            .filter(|inquiry| {
+                inquiry.delivered_to.is_none()
+                    && !inquiry.archived
+                    && inquiry.decision.as_ref().is_none_or(|decision| {
+                        decision.status != crate::task_decision::Status::Resolved
+                    })
+            })
             .collect())
     }
 
     /// Resume durable deliveries after a scheduler restart without starting agents.
     pub fn sweep(&self, queue: &Queue, talks: &Talks) -> Result<()> {
+        let home = self
+            .root
+            .parent()
+            .and_then(Path::parent)
+            .context("inquiry store has no home")?;
+        let deferred = crate::task_chat::migration_pending(home);
         let mut failed = None;
         for record in self.records()? {
             let inquiry = match record {
@@ -448,7 +485,20 @@ impl Outbox {
                     continue;
                 }
             };
-            if inquiry.task.is_empty() {
+            if inquiry.key.starts_with("question:")
+                && deferred
+                    .as_ref()
+                    .map_or(true, |ids| ids.contains(&inquiry.id))
+            {
+                continue;
+            }
+            if inquiry.archived
+                || inquiry
+                    .decision
+                    .as_ref()
+                    .is_some_and(|d| d.status == crate::task_decision::Status::Resolved)
+                || inquiry.task.is_empty()
+            {
                 continue;
             }
             if inquiry

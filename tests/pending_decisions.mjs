@@ -57,3 +57,10 @@ test('partial lists keep readable decisions visible and report unreadable record
   assert.equal(node('decisions-error').visible, false);
   assert.equal(node('decisions-empty').visible, true);
 });
+
+test('pending list retains a reachable foreground legacy entry until retirement completes', () => {
+  const html = readFileSync(new URL('../assets/ui/index.html', import.meta.url), 'utf8');
+  const view = html.slice(html.indexOf('id="view-decisions"'), html.indexOf('<!-- QUESTIONS'));
+  assert.ok(view.includes('href="#/questions"'));
+  assert.ok(view.includes('id="ask-badge-rail"'));
+});

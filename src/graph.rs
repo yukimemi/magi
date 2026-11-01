@@ -8800,6 +8800,7 @@ impl Runner {
                         resolved: false,
                         chosen_title: None,
                         choice: None,
+                        publication: None,
                     };
                     return self.settle_withheld(winner, &pr, record).await;
                 }
@@ -9625,13 +9626,9 @@ impl Runner {
                         PrPlan::Adopt { url, title } => {
                             self.state
                                 .event("merge", format!("Pr: adopted open pull request {url}"));
-                            if self.state.github_text.as_ref().is_some_and(|g| {
-                                g.resolved
-                                    && g.choice == Some(GithubTextChoice::Rewrite)
-                                    && g.rewrite.is_some()
-                            }) {
-                                // The owner chose the entire pair, even if the
-                                // existing title already matches or was edited.
+                            if self.state.explicit_github_text_selection() {
+                                // An explicit publication selection applies the prepared
+                                // payload; acceptance alone is not publication proof.
                                 land::set_pr_text_verbatim(
                                     &winner.worktree,
                                     &url,
@@ -9711,6 +9708,9 @@ impl Runner {
                 outcome.detail.lines().next().unwrap_or("")
             ),
         );
+        if mode == MergeMode::Pr && outcome.ok && !outcome.empty {
+            self.state.record_github_text_publication(&outcome.detail);
+        }
         self.state.merge = Some(outcome);
         self.state.save()?;
 

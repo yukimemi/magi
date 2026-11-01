@@ -85,7 +85,7 @@ impl Decision {
             return Ok(false);
         }
         ensure!(
-            self.status == Status::AwaitingOwner,
+            matches!(self.status, Status::AwaitingOwner | Status::RetryNeeded),
             "decision needs reconciliation"
         );
         self.request = Some(request.to_owned());
@@ -136,7 +136,8 @@ impl Decision {
     /// its consumer; an owner reply alone cannot hide it.
     pub fn settle(&mut self, reason: &str) -> Result<bool> {
         ensure!(
-            self.status == Status::AwaitingOwner,
+            self.status == Status::AwaitingOwner
+                || (self.status == Status::RetryNeeded && self.request.is_none()),
             "an accepted effect requires receipt reconciliation"
         );
         ensure!(!reason.trim().is_empty(), "settlement reason is empty");

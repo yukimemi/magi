@@ -455,8 +455,43 @@ Adds note.txt. token=abcdef0123456789abcdef";
         magi::github_text::read_reply(&saved),
         magi::github_text::Reply::Title(title.into())
     );
+    if routed {
+        let outbox = magi::task_inquiry::Outbox::at(&home);
+        magi::task_chat::sweep(&queue, &talks, &store, &home);
+        assert_eq!(
+            outbox.get(&q.id).unwrap().decision.unwrap().status,
+            magi::task_decision::Status::Queued,
+            "accepting a publication payload is not successful publication"
+        );
+    }
     let mut runner = Runner::resume(&run_id).unwrap();
     runner.execute().await.unwrap();
+    let receipt = runner
+        .state
+        .github_text
+        .as_ref()
+        .unwrap()
+        .publication
+        .as_ref()
+        .unwrap();
+    assert_eq!(receipt.inquiry, q.id);
+    if routed {
+        magi::task_chat::sweep(&queue, &talks, &store, &home);
+        let resolved = magi::task_inquiry::Outbox::at(&home)
+            .get(&q.id)
+            .unwrap()
+            .decision
+            .unwrap();
+        assert_eq!(resolved.status, magi::task_decision::Status::Resolved);
+        assert!(
+            resolved
+                .history
+                .last()
+                .unwrap()
+                .evidence
+                .contains("publication")
+        );
+    }
     let made = creates(&log);
     assert_eq!(made.len(), 1);
     assert_eq!(arg_after(&made[0], "--title"), title);

@@ -430,7 +430,9 @@ pub(crate) async fn publish(
             url,
             title: current,
         } => {
-            let retitle = posted_title.as_deref() == Some(current.as_str())
+            let selected_publication = state.explicit_github_text_selection();
+            let retitle = selected_publication
+                || posted_title.as_deref() == Some(current.as_str())
                 || crate::graph::should_retitle(&current, title, &[]);
             let mut args = vec!["pr", "edit", url.as_str(), "--body", body];
             if retitle {
@@ -456,6 +458,7 @@ pub(crate) async fn publish(
         rounds: state.config.graph.land_rounds,
         red_at_merge: Vec::new(),
     });
+    state.record_github_text_publication(&url);
     state.save()?;
     for (old, _lock) in previous {
         // Re-read before writing, using the same terminal/driver guard.

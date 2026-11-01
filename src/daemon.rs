@@ -3844,17 +3844,17 @@ async fn poll(
 
         // Deterministic: no model, run before the conductor sees anything so
         // its input reflects the queue's current, already-resolved state.
-        if let Err(error) = crate::task_inquiry::Outbox::at(home)
-            .sweep(queue, &crate::talk::Talks::at(home.join("talks")))
-        {
-            tracing::warn!("task inquiry delivery remains pending: {error:#}");
-        }
         crate::task_chat::sweep(
             queue,
             &crate::talk::Talks::at(home.join("talks")),
             &questions,
             home,
         );
+        if let Err(error) = crate::task_inquiry::Outbox::at(home)
+            .sweep(queue, &crate::talk::Talks::at(home.join("talks")))
+        {
+            tracing::warn!("task inquiry delivery remains pending: {error:#}");
+        }
         repair_choice_offers(&questions);
         resolve_blockers(queue, &questions);
         apply_task_choice_actions(queue, &questions, home);
@@ -4883,6 +4883,11 @@ async fn attempt(
     // `Running` before `execute` is what makes a crash mid-run legible.
     let run = runner.state.id.clone();
     let before_start = task.clone();
+    runner.state.next_pass_inquiry = task
+        .resume_override
+        .as_ref()
+        .filter(|pin| pin.pinned_run.as_ref() == Some(&run) && !pin.question_id.is_empty())
+        .map(|pin| pin.question_id.clone());
     task.start(run.clone());
     if let Err(error) = queue.put(task) {
         *task = before_start;
@@ -9213,6 +9218,7 @@ mod tests {
             resolved: false,
             chosen_title: None,
             choice: None,
+            publication: None,
         });
         state.save().unwrap();
         let store = ask::Questions::open();
