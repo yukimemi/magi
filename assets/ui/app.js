@@ -3153,8 +3153,10 @@ async function runSearch(scope, allowSearchJump = false) {
     if (scope === "chats") {
       const missing = found.hits.filter(hit => !(state.talks || []).some(talk => talk.id === hit.id));
       for (let i = 0; i < missing.length; i += 50) {
+        const generation = state.talkListGeneration || 0;
         const rows = await getTalkRows(`${API.talks}?ids=${encodeURIComponent(missing.slice(i, i + 50).map(hit => hit.id).join(","))}`);
         if (mine !== s.seq) return;
+        if (generation !== (state.talkListGeneration || 0)) return runSearch(scope, allowSearchJump);
         state.talks = mergeStore("talks", rows, { changed: [], removed: [] });
       }
     }
@@ -6073,8 +6075,12 @@ async function getTalkRows(url) {
   const rows = Array.isArray(data) ? data : data.rows;
   const readRows = rows.filter(row => state.talkReads[row.id]);
   if (readRows.length) {
-    const counted = await getJson(`${API.talks}?ids=${encodeURIComponent(readRows.map(row => row.id).join(","))}`, talkReadOptions(readRows));
-    const byId = new Map(counted.map(row => [row.id, row]));
+    const byId = new Map();
+    for (let i = 0; i < readRows.length; i += 50) {
+      const batch = readRows.slice(i, i + 50);
+      const counted = await getJson(`${API.talks}?ids=${encodeURIComponent(batch.map(row => row.id).join(","))}`, talkReadOptions(batch));
+      for (const row of counted) byId.set(row.id, row);
+    }
     for (let i = 0; i < rows.length; i++) if (byId.has(rows[i].id)) rows[i] = byId.get(rows[i].id);
   }
   return data;
@@ -6089,6 +6095,8 @@ function showOlderTalks() {
 }
 function loadOlderTalks() {
   if (olderTalksFlight) return olderTalksFlight;
+  const refresh = storeReads.get("talks");
+  if (refresh) return refresh.promise.then(() => loadOlderTalks());
   if (!talksNext) return Promise.resolve();
   const cursor = talksNext;
   const read = { changed: new Set(), superseded: false };
@@ -6103,17 +6111,30 @@ function loadOlderTalks() {
       // pages already on screen, rather than trapping the button in retries.
       const known = new Set((state.talks || []).map(row => row.id));
       let next = null;
+      const recovered = new Map();
       do {
         page = await getTalkRows(`${API.talks}/page${next ? `?before=${encodeURIComponent(next)}` : ""}`);
+        for (const row of page.rows) recovered.set(row.id, row);
         next = page.next;
-      } while (next && !page.rows.some(row => !known.has(row.id)));
+        // Replayed open rows do not count as progress through closed history.
+      } while (next && !page.rows.some(row => row.status !== "open" && !known.has(row.id)));
+      // Rows retained from the expired snapshot may have been closed,
+      // removed or corrupted while outside the new first history page.
+      const retained = [...known].filter(id => !recovered.has(id));
+      for (let i = 0; i < retained.length; i += 50) {
+        const batch = await getTalkRows(`${API.talks}?ids=${encodeURIComponent(retained.slice(i, i + 50).join(","))}`);
+        for (const row of batch) recovered.set(row.id, row);
+      }
+      page = { rows: [...recovered.values()], next, revalidated: retained };
     }
     // A refresh may have replaced this membership snapshot while we waited.
     if (talksNext !== cursor || read.superseded) return;
     // Deltas may finish while this page is in flight. Preserve both their
     // updated rows and their deletions, including IDs not previously loaded.
     const rows = page.rows.filter(row => !read.changed.has(row.id));
-    state.talks = mergeStore("talks", rows, { changed: [], removed: [] });
+    state.talks = mergeStore("talks", rows, {
+      changed: (page.revalidated || []).filter(id => !read.changed.has(id)), removed: [],
+    });
     talksNext = page.next;
     renderTalks();
     showOlderTalks();
@@ -6128,6 +6149,7 @@ function loadTalks(change) {
         for (const id of [...delta.changed, ...delta.removed]) olderTalksRead.changed.add(id);
       } else olderTalksRead.superseded = true;
     }
+    state.talkListGeneration = (state.talkListGeneration || 0) + 1;
     state.talks = list;
     for (const talk of fetched) trackTalkThinking(talk, observed.get(talk.id));
     renderStoreList(partial, renderTalks);
@@ -9588,6 +9610,8 @@ function loadStore(name, url, change, apply) {
           } else if (paged) {
             let cursor = null;
             const collected = new Map();
+            if (name === "talks" && olderTalksRead) olderTalksRead.superseded = true;
+            const loadedTalkIds = name === "talks" ? (state.talks || []).map(row => row.id) : [];
             do {
               const pageUrl = `${url}/page${cursor ? `?before=${encodeURIComponent(cursor)}` : ""}`;
               const page = name === "talks" ? await getTalkRows(pageUrl) : await getJson(pageUrl);
@@ -9606,6 +9630,14 @@ function loadStore(name, url, change, apply) {
               // Finish the frozen membership walk even under continuous
               // writes. Queued deltas reconcile it after every page is shown.
             } while (cursor);
+            // A reload renews closed-history membership without walking all
+            // history. Revalidate only the rows already loaded, in API batches,
+            // so deleted/corrupt files disappear and close transitions survive.
+            const retained = loadedTalkIds.filter(id => !collected.has(id));
+            for (let i = 0; i < retained.length; i += 50) {
+              const batch = await getTalkRows(`${url}?ids=${encodeURIComponent(retained.slice(i, i + 50).join(","))}`);
+              for (const row of batch) collected.set(row.id, row);
+            }
             rows = mergeStore(name, [...collected.values()], {
               changed: (state[name] || []).map(row => row.id), removed: [],
             });

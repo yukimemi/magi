@@ -936,3 +936,172 @@ test('a failed trailing core refresh retains retry without starting sections', {
   assert.ok(notice[2].includes('Refresh unavailable'));
   assert.equal(typeof notice[3], 'function');
 });
+
+function chatListHarness(initial = {}) {
+  const requests = [];
+  const state = { talks: null, talkReads: {}, talkWaits: new Map(), rev: {}, ...initial };
+  const loaders = source.slice(source.indexOf('const storeReads ='), source.indexOf('function loadRuns('));
+  const chatLoaders = source.slice(source.indexOf('let talksNext ='), source.indexOf('/* Refresh one conversation.'));
+  const sort = source.slice(source.indexOf('function sortTalks('), source.indexOf('/* The context meter'));
+  const search = source.slice(source.indexOf('async function runSearch('), source.indexOf('/* After the list behind a search'));
+  const api = runInNewContext(`${loaders}\n${chatLoaders}\n${sort}\n${search}\n({ loadTalks, loadOlderTalks, getTalkRows, runSearch })`, {
+    state, API: { talks: '/api/talks', search: () => '/api/search' },
+    getJson: (url, options) => new Promise((resolve, reject) => requests.push({ url, options, resolve, reject })),
+    $: () => null, sectionNotice() {}, renderTalks() {}, refreshSearch() {}, trackTalkThinking() {},
+    searchText: () => 'needle', renderSearchScope() {},
+    ok() {}, setTimeout: () => 1, clearTimeout() {}, incrementalListRender: false,
+  });
+  return { api, state, requests };
+}
+
+const chatRow = (id, status = 'open', created_at = '2020-01-01T00:00:00Z') => ({ id, status, created_at });
+const requestedIds = request => new URL(request.url, 'http://localhost').searchParams.get('ids').split(',');
+
+test('large initial chat pages count all open rows and preserve creation order and ties', async () => {
+  const h = chatListHarness();
+  const rows = Array.from({ length: 67 }, (_, i) => chatRow(`old-${i}`));
+  rows.push(chatRow('a-newer-open', 'open', '2021-01-01T00:00:00Z'));
+  rows.push(chatRow('recent-closed', 'closed', '2026-01-01T00:00:00Z'));
+  const done = h.api.loadTalks();
+  h.requests[0].resolve({ rows, next: 'closed-history' });
+  await done;
+  assert.equal(h.requests.length, 1, 'history remains on demand');
+  assert.equal(h.state.talks.filter(row => row.status === 'open').length, 68);
+  assert.equal(h.state.talks[0].id, 'a-newer-open', 'creation time wins over ID order');
+  assert.deepEqual(Array.from(h.state.talks.slice(1, 68), row => row.id), rows.slice(0, 67).map(row => row.id));
+  assert.equal(h.state.talks.at(-1).id, 'recent-closed');
+  const count = {};
+  const render = source.slice(source.indexOf('function renderTalks()'), source.indexOf('/* The rail and dock'));
+  runInNewContext(`${render}\nrenderTalks()`, {
+    state: h.state, $: id => id === 'talks-count' ? count : {}, renderTalkIndicators() {},
+    setText: (node, text) => { node.text = text; }, plural: (n, one, many) => `${n} ${n === 1 ? one : many}`,
+    show() {}, searchText: () => '', syncList() {}, sortTalks: list => list,
+    createTalkCard() {}, updateTalkCard() {}, markSelected() {},
+  });
+  assert.equal(count.text, '68 conversations open');
+});
+
+test('large initial chat pages refresh every read count in batches of at most 50', async () => {
+  const rows = Array.from({ length: 123 }, (_, i) => chatRow(`read-${i}`));
+  const h = chatListHarness({ talkReads: Object.fromEntries(rows.map(row => [row.id, 'read-at'])) });
+  const done = h.api.loadTalks();
+  h.requests[0].resolve({ rows, next: null });
+  await flush();
+  for (const size of [50, 50, 23]) {
+    const request = h.requests.at(-1);
+    const ids = requestedIds(request);
+    assert.equal(ids.length, size);
+    assert.equal(Object.keys(JSON.parse(request.options.headers['x-talk-reads'])).length, size);
+    request.resolve(ids.map(id => ({ ...chatRow(id), unread_count: 0 })));
+    await flush();
+  }
+  await done;
+  assert.equal(h.state.talks.length, 123);
+  assert.ok(h.state.talks.every(row => row.unread_count === 0));
+});
+
+test('expired chat cursors merge the renewed open page and continue to new closed history', async () => {
+  const h = chatListHarness();
+  const initial = h.api.loadTalks();
+  h.requests[0].resolve({ rows: [chatRow('known-open'), chatRow('known-closed', 'closed')], next: 'expired' });
+  await initial;
+  const older = h.api.loadOlderTalks();
+  h.requests[1].reject(Object.assign(new Error('expired'), { status: 409 }));
+  await flush();
+  h.requests[2].resolve({ rows: [chatRow('new-open'), { ...chatRow('known-open'), version: 2 }, chatRow('known-closed', 'closed')], next: 'restarted' });
+  await flush();
+  assert.equal(h.requests[3].url, '/api/talks/page?before=restarted');
+  h.requests[3].resolve({ rows: [chatRow('older-closed', 'closed')], next: null });
+  await older;
+  assert.equal(h.state.talks.find(row => row.id === 'known-open').version, 2);
+  assert.deepEqual(new Set(h.state.talks.map(row => row.id)), new Set(['known-open', 'new-open', 'known-closed', 'older-closed']));
+  assert.equal(h.state.talks.length, 4);
+});
+
+test('chat reload revalidates loaded history and open/closed transitions without dropping history', async () => {
+  const history = Array.from({ length: 63 }, (_, i) => chatRow(`closed-${i}`, 'closed'));
+  const h = chatListHarness({ talks: [chatRow('now-closed'), ...history] });
+  const done = h.api.loadTalks();
+  h.requests[0].resolve({ rows: [chatRow('closed-62'), chatRow('new-open')], next: 'renewed' });
+  await flush();
+  for (const size of [50, 13]) {
+    const request = h.requests.at(-1);
+    assert.equal(requestedIds(request).length, size);
+    request.resolve(requestedIds(request).filter(id => id !== 'closed-0' && id !== 'closed-1').map(id => chatRow(id, 'closed')));
+    await flush();
+  }
+  await done;
+  assert.equal(h.state.talks.length, 63);
+  assert.equal(h.state.talks.find(row => row.id === 'now-closed').status, 'closed');
+  assert.equal(h.state.talks.find(row => row.id === 'closed-62').status, 'open');
+  assert.ok(!h.state.talks.some(row => ['closed-0', 'closed-1'].includes(row.id)), 'deleted and unreadable history disappear');
+  assert.equal(new Set(h.state.talks.map(row => row.id)).size, h.state.talks.length);
+});
+
+for (const pageFirst of [false, true]) test(`chat reload supersedes an older cursor response (pageFirst=${pageFirst})`, async () => {
+  const h = chatListHarness();
+  const initial = h.api.loadTalks();
+  h.requests[0].resolve({ rows: [chatRow('known')], next: 'old' });
+  await initial;
+  const older = h.api.loadOlderTalks();
+  const reload = h.api.loadTalks();
+  const oldPage = { rows: [chatRow('deleted')], next: 'stale' };
+  const freshPage = { rows: [chatRow('known'), chatRow('new-open')], next: 'fresh' };
+  if (pageFirst) {
+    h.requests[1].resolve(oldPage);
+    await older;
+    h.requests[2].resolve(freshPage);
+    await reload;
+  } else {
+    h.requests[2].resolve(freshPage);
+    await reload;
+    h.requests[1].resolve(oldPage);
+    await older;
+  }
+  assert.deepEqual(new Set(h.state.talks.map(row => row.id)), new Set(['known', 'new-open']));
+  const next = h.api.loadOlderTalks();
+  assert.equal(h.requests.at(-1).url, '/api/talks/page?before=fresh');
+  h.requests.at(-1).resolve({ rows: [], next: null });
+  await next;
+});
+
+test('a chat delta prevents stale search hydration from restoring deleted or closed rows', async () => {
+  const h = chatListHarness({ talks: [], rev: { talks: 'r0' }, search: { chats: { seq: 0 } } });
+  const search = h.api.runSearch('chats');
+  h.requests[0].resolve({ hits: [{ id: 'deleted' }, { id: 'updated' }], total: 2 });
+  await flush();
+  const delta = h.api.loadTalks({ rev: 'r1', delta: { base: 'r0', changed: ['updated'], removed: ['deleted'] } });
+  h.requests[2].resolve([chatRow('updated', 'closed')]);
+  await delta;
+  h.requests[1].resolve([chatRow('deleted'), chatRow('updated')]);
+  await flush();
+  assert.equal(h.requests[3].url, '/api/search', 'the invalidated search retries');
+  h.requests[3].resolve({ hits: [{ id: 'updated' }], total: 1 });
+  await search;
+  assert.equal(h.state.talks.length, 1);
+  assert.equal(h.state.talks[0].status, 'closed');
+  assert.equal(h.state.search.chats.total, 1);
+});
+
+test('expired chat cursor recovery revalidates retained rows and respects a concurrent delta', async () => {
+  const h = chatListHarness();
+  const initial = h.api.loadTalks({ rev: 'r0' });
+  h.requests[0].resolve({ rows: ['deleted', 'corrupt', 'closed-now', 'updated'].map(id => chatRow(id)), next: 'expired' });
+  await initial;
+  const older = h.api.loadOlderTalks();
+  h.requests[1].reject(Object.assign(new Error('expired'), { status: 409 }));
+  await flush();
+  h.requests[2].resolve({ rows: [chatRow('new-open'), chatRow('new-closed', 'closed')], next: 'older' });
+  await flush();
+  assert.deepEqual(requestedIds(h.requests[3]), ['deleted', 'corrupt', 'closed-now', 'updated']);
+  const delta = h.api.loadTalks({ rev: 'r1', delta: { base: 'r0', changed: ['updated'], removed: [] } });
+  h.requests[4].resolve([{ ...chatRow('updated'), version: 2 }]);
+  await delta;
+  h.requests[3].resolve([chatRow('closed-now', 'closed'), { ...chatRow('updated', 'closed'), version: 1 }]);
+  await older;
+  assert.equal(h.state.talks.length, 4);
+  assert.ok(!h.state.talks.some(row => ['deleted', 'corrupt'].includes(row.id)));
+  assert.equal(h.state.talks.find(row => row.id === 'closed-now').status, 'closed');
+  assert.equal(h.state.talks.find(row => row.id === 'updated').version, 2);
+  assert.equal(new Set(h.state.talks.map(row => row.id)).size, h.state.talks.length);
+});

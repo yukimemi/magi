@@ -444,6 +444,7 @@ pub(crate) struct SharedMonitor {
     health_index: Mutex<HealthIndex>,
     disk_cache: Mutex<DiskCache>,
     talk_index: Mutex<HashMap<String, (FileIdentity, TalkListView)>>,
+    talk_status_index: Mutex<TalkStatusIndex>,
     bulk_slots: Arc<tokio::sync::Semaphore>,
     talk_core_slots: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -458,6 +459,114 @@ struct HealthIndex {
     notices: Option<(u64, usize)>,
     #[cfg(test)]
     run_parses: usize,
+}
+
+/// Membership classification retains no transcript data, including for closed
+/// history that has never been requested. Cache unreadable files too.
+#[derive(Debug, Default)]
+struct TalkStatusIndex {
+    records: HashMap<String, (FileIdentity, Option<talk::TalkStatus>)>,
+    #[cfg(test)]
+    parses: usize,
+}
+
+/// Talk's serializer writes status before turns. Stop deserializing as soon as
+/// that header is available; do not validate or traverse the transcript here.
+/// Noncanonical headers are bounded too and conservatively included in the
+/// initial page, where the ordinary row reader validates their actual status.
+fn read_talk_status(reader: impl std::io::Read) -> Option<talk::TalkStatus> {
+    use serde::de::{IgnoredAny, MapAccess, Visitor};
+
+    struct StatusHeader<'a>(&'a mut Option<talk::TalkStatus>);
+    impl<'de> Visitor<'de> for StatusHeader<'_> {
+        type Value = ();
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a conversation header")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                match key.as_str() {
+                    "status" => {
+                        *self.0 = Some(map.next_value()?);
+                        return Err(serde::de::Error::custom("conversation header complete"));
+                    }
+                    "turns" => {
+                        *self.0 = Some(talk::TalkStatus::Open);
+                        return Err(serde::de::Error::custom("noncanonical conversation header"));
+                    }
+                    _ => {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    // At most one KiB of read-ahead for canonical files, and a fixed maximum
+    // even for an oversized header. Do not call Deserializer::end: the rest of
+    // the document deliberately belongs to the paged row reader.
+    let reader = std::io::BufReader::with_capacity(1024, reader.take(64 * 1024));
+    let mut json = serde_json::Deserializer::from_reader(reader);
+    let mut status = None;
+    // The visitor deliberately signals completion with an error, avoiding the
+    // deserializer's normal closing-brace check on the unfinished object.
+    let result = serde::Deserializer::deserialize_map(&mut json, StatusHeader(&mut status));
+    status.or_else(|| match result {
+        Ok(()) => Some(talk::TalkStatus::Open),
+        Err(error) if error.is_eof() => Some(talk::TalkStatus::Open),
+        Err(_) => None,
+    })
+}
+
+fn open_talk_ids(ui: &Ui, ids: &[String]) -> std::collections::HashSet<String> {
+    open_talk_ids_with(ui, ids, |path| {
+        std::fs::File::open(path).ok().and_then(read_talk_status)
+    })
+}
+
+fn open_talk_ids_with(
+    ui: &Ui,
+    ids: &[String],
+    mut read_status: impl FnMut(&FsPath) -> Option<talk::TalkStatus>,
+) -> std::collections::HashSet<String> {
+    let mut index = ui
+        .monitor
+        .talk_status_index
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let present: std::collections::HashSet<_> = ids.iter().collect();
+    index.records.retain(|id, _| present.contains(id));
+    let mut open = std::collections::HashSet::new();
+    for id in ids {
+        let Ok(identity) = file_identity(&ui.talks.path_of(id)) else {
+            index.records.remove(id);
+            continue;
+        };
+        let status = if let Some((old, status)) = index.records.get(id)
+            && *old == identity
+        {
+            *status
+        } else {
+            let status = read_status(&ui.talks.path_of(id));
+            #[cfg(test)]
+            {
+                index.parses += 1;
+            }
+            if file_identity(&ui.talks.path_of(id)).is_ok_and(|after| after == identity) {
+                index.records.insert(id.clone(), (identity, status));
+            } else {
+                index.records.remove(id);
+            }
+            status
+        };
+        if status == Some(talk::TalkStatus::Open) {
+            open.insert(id.clone());
+        }
+    }
+    open
 }
 
 /// Live stamps invalidate counts immediately; the TTL also refreshes lease state.
@@ -528,6 +637,7 @@ impl SharedMonitor {
             health_index: Mutex::default(),
             disk_cache: Mutex::default(),
             talk_index: Mutex::default(),
+            talk_status_index: Mutex::default(),
             bulk_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             talk_core_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             #[cfg(test)]
@@ -5061,8 +5171,8 @@ async fn queue_list(
     .await
 }
 
-/// Cursor pages read a bounded number of records, never the older transcripts
-/// or instructions. Cursors advance through a frozen file-name snapshot,
+/// History pages read a bounded number of records; the first conversation
+/// page also includes every open talk. Cursors advance through a frozen snapshot,
 /// including corrupt rows, so skipped/deleted records cannot repeat a page.
 /// Concurrent inserts are reconciled by a trailing store refresh.
 #[derive(Debug, Default, Deserialize)]
@@ -5078,8 +5188,8 @@ struct StorePage<T> {
 
 const STORE_PAGE_SIZE: usize = 16;
 
-/// Freeze only membership for one bounded cursor walk. Statuses and bodies are
-/// always read from disk; writes/deletions during the walk are reconciled by
+/// Freeze membership and the initial open/history boundary for a cursor walk.
+/// Returned rows are read fresh; writes/deletions during the walk are reconciled by
 /// the next store revision. Never rescan the entire directory for every page.
 #[derive(Debug)]
 struct ListWalk {
@@ -5087,16 +5197,26 @@ struct ListWalk {
     talks: bool,
     opened: std::time::Instant,
     ids: Arc<Vec<String>>,
+    initial_end: usize,
 }
 
 fn page_ids(ui: &Ui, talks: bool, q: PageQuery) -> ApiResult<(Vec<String>, Option<String>)> {
+    page_ids_with(ui, talks, q, open_talk_ids)
+}
+
+fn page_ids_with(
+    ui: &Ui,
+    talks: bool,
+    q: PageQuery,
+    classify: impl FnOnce(&Ui, &[String]) -> std::collections::HashSet<String>,
+) -> ApiResult<(Vec<String>, Option<String>)> {
     let mut walks = ui
         .monitor
         .list_walks
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     walks.retain(|walk| walk.opened.elapsed() < Duration::from_secs(120));
-    let (token, ids, offset) = if let Some(cursor) = q.before {
+    let (token, ids, offset, initial_end) = if let Some(cursor) = q.before {
         let (token, offset) = cursor
             .split_once(':')
             .ok_or_else(|| ApiError::bad_request("Invalid list cursor"))?;
@@ -5110,8 +5230,11 @@ fn page_ids(ui: &Ui, talks: bool, q: PageQuery) -> ApiResult<(Vec<String>, Optio
             .iter()
             .find(|walk| walk.token == token && walk.talks == talks)
             .ok_or_else(|| ApiError::conflict("List cursor expired; retry the list"))?;
-        (token, walk.ids.clone(), offset)
+        (token, walk.ids.clone(), offset, walk.initial_end)
     } else {
+        // Header I/O must not hold the snapshot registry shared with queue
+        // pagination or with clients continuing an existing history walk.
+        drop(walks);
         let root = if talks {
             ui.talks.root()
         } else {
@@ -5119,7 +5242,22 @@ fn page_ids(ui: &Ui, talks: bool, q: PageQuery) -> ApiResult<(Vec<String>, Optio
         };
         let mut ids = crate::queue::record_ids(root, "json")?;
         ids.sort_unstable_by(|a, b| b.cmp(a));
+        let initial_end = if talks {
+            let open = classify(ui, &ids);
+            // Stable partition: ID order is only the existing membership order,
+            // never a substitute for the UI's creation-time ordering.
+            ids.sort_by_key(|id| !open.contains(id));
+            open.len().saturating_add(STORE_PAGE_SIZE).min(ids.len())
+        } else {
+            STORE_PAGE_SIZE.min(ids.len())
+        };
         let ids = Arc::new(ids);
+        walks = ui
+            .monitor
+            .list_walks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        walks.retain(|walk| walk.opened.elapsed() < Duration::from_secs(120));
         let mut token = crate::rng::entropy();
         while walks.iter().any(|walk| walk.token == token) {
             token = crate::rng::entropy();
@@ -5134,13 +5272,18 @@ fn page_ids(ui: &Ui, talks: bool, q: PageQuery) -> ApiResult<(Vec<String>, Optio
             talks,
             opened: std::time::Instant::now(),
             ids: ids.clone(),
+            initial_end,
         });
-        (token, ids, 0)
+        (token, ids, 0, initial_end)
     };
     if offset > ids.len() {
         return Err(ApiError::bad_request("Invalid list cursor"));
     }
-    let end = offset.saturating_add(STORE_PAGE_SIZE).min(ids.len());
+    let end = if offset == 0 {
+        initial_end
+    } else {
+        offset.saturating_add(STORE_PAGE_SIZE).min(ids.len())
+    };
     let next = (end < ids.len()).then(|| format!("{token}:{end}"));
     Ok((ids[offset..end].to_vec(), next))
 }
@@ -5205,7 +5348,11 @@ fn talk_rows(ui: &Ui, ids: Vec<String>, headers: &header::HeaderMap) -> Vec<Talk
         .unwrap_or_else(PoisonError::into_inner);
     // Bound memory independently of the number of conversations ever opened.
     if index.len() > 1000 {
-        index.clear();
+        let keep: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        index.retain(|id, (_, row)| keep.contains(id.as_str()) || row.status.open());
+        if index.len() > 1000 {
+            index.retain(|id, _| keep.contains(id.as_str()));
+        }
     }
     ids.into_iter()
         .filter_map(|id| {
@@ -8765,7 +8912,7 @@ async fn talks_list(
             page_ids(&ui, true, PageQuery::default())?
                 .0
                 .into_iter()
-                .take(limit)
+                .take(limit.min(STORE_PAGE_SIZE))
                 .collect()
         };
         Ok(Json(talk_rows(&ui, ids, &headers)))
@@ -24570,6 +24717,375 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn talk_pages_load_every_open_then_frozen_closed_history() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        // Every closed conversation is newer by ID than every open conversation.
+        for i in 0..23 {
+            seed_talk_at(&ui.talks, &format!("20260101-000000-{i:03}"), "open");
+        }
+        for i in 0..45 {
+            seed_talk_at(&ui.talks, &format!("20261019-000000-{i:03}"), "closed");
+        }
+        std::fs::write(ui.talks.path_of("20261020-000000-corrupt"), "broken").unwrap();
+        let first = talks_page(
+            State(ui.clone()),
+            Query(PageQuery::default()),
+            header::HeaderMap::new(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            first.rows.iter().filter(|row| row.status.open()).count(),
+            23
+        );
+        assert_eq!(first.rows.len(), 23 + STORE_PAGE_SIZE - 1);
+        assert!(first.rows[..23].iter().all(|row| row.status.open()));
+        let parsed = ui
+            .monitor
+            .talk_parses
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            parsed,
+            first.rows.len(),
+            "closed bodies outside this page are not restored"
+        );
+        let fresh = talks_page(
+            State(ui.clone()),
+            Query(PageQuery::default()),
+            header::HeaderMap::new(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(fresh.rows.len(), first.rows.len());
+        assert_eq!(
+            ui.monitor
+                .talk_parses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            parsed
+        );
+        let mut seen: std::collections::HashSet<_> =
+            first.rows.iter().map(|row| row.id.clone()).collect();
+        // Status changes keep their original membership position until refresh.
+        seed_talk_at(&ui.talks, "20261019-000000-000", "open");
+        seed_talk_at(&ui.talks, "20260101-000000-000", "closed");
+        std::fs::remove_file(ui.talks.path_of("20261019-000000-001")).unwrap();
+        let mut next = first.next;
+        while let Some(cursor) = next {
+            let page = talks_page(
+                State(ui.clone()),
+                Query(PageQuery {
+                    before: Some(cursor),
+                }),
+                header::HeaderMap::new(),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert!(page.rows.len() <= STORE_PAGE_SIZE);
+            for row in page.rows {
+                assert!(seen.insert(row.id), "a cursor must not repeat membership");
+            }
+            next = page.next;
+        }
+        let expected: HashSet<_> = (0..23)
+            .map(|i| format!("20260101-000000-{i:03}"))
+            .chain(
+                (0..45)
+                    .filter(|i| *i != 1)
+                    .map(|i| format!("20261019-000000-{i:03}")),
+            )
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "the cursor walk must return every surviving ID"
+        );
+        let refreshed = talks_page(
+            State(ui.clone()),
+            Query(PageQuery::default()),
+            header::HeaderMap::new(),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(
+            refreshed
+                .rows
+                .iter()
+                .filter(|row| row.status.open())
+                .count(),
+            23
+        );
+        assert!(
+            refreshed
+                .rows
+                .iter()
+                .any(|row| row.id == "20261019-000000-000")
+        );
+        assert!(
+            !refreshed
+                .rows
+                .iter()
+                .any(|row| row.id == "20260101-000000-000")
+        );
+    }
+
+    #[test]
+    fn talk_pages_with_only_open_rows_have_no_history_cursor() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        for i in 0..STORE_PAGE_SIZE + 5 {
+            seed_talk_at(&ui.talks, &format!("open-{i:03}"), "open");
+        }
+        let (ids, next) = page_ids(&ui, true, PageQuery::default()).unwrap();
+        assert_eq!(ids.len(), STORE_PAGE_SIZE + 5);
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn talk_status_header_reads_are_bounded_independently_of_transcript_size() {
+        struct Counted<R> {
+            inner: R,
+            bytes: usize,
+        }
+        impl<R: std::io::Read> std::io::Read for Counted<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.inner.read(buf)?;
+                self.bytes += n;
+                Ok(n)
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let id = seed_talk_at(&ui.talks, "header-chat", "closed");
+        let mut chat = ui.talks.get(&id).unwrap();
+        for size in [0, 1024 * 1024, 8 * 1024 * 1024] {
+            chat.turns = vec![
+                serde_json::from_value(serde_json::json!({
+                    "who": "agent", "body": "x".repeat(size), "at": chat.updated_at,
+                }))
+                .unwrap(),
+            ];
+            for status in [talk::TalkStatus::Closed, talk::TalkStatus::Open] {
+                chat.status = status;
+                // Exercise the actual on-disk serializer, including its field order.
+                let body = serde_json::to_vec_pretty(&chat).unwrap();
+                let mut reader = Counted {
+                    inner: body.as_slice(),
+                    bytes: 0,
+                };
+                assert_eq!(read_talk_status(&mut reader), Some(status));
+                assert!(
+                    reader.bytes <= 1024,
+                    "header classification read {} bytes",
+                    reader.bytes
+                );
+            }
+        }
+        // Noncanonical field order must neither traverse a transcript nor hide
+        // an open row. Its real status is validated by the ordinary row reader.
+        let noncanonical = format!(
+            r#"{{"turns":[{{"body":"{}"}}],"status":"open"}}"#,
+            "x".repeat(1024 * 1024)
+        );
+        let mut reader = Counted {
+            inner: noncanonical.as_bytes(),
+            bytes: 0,
+        };
+        assert_eq!(read_talk_status(&mut reader), Some(talk::TalkStatus::Open));
+        assert!(reader.bytes <= 1024);
+        let oversized = format!(
+            r#"{{"agent":"{}","status":"open"}}"#,
+            "x".repeat(128 * 1024)
+        );
+        let mut reader = Counted {
+            inner: oversized.as_bytes(),
+            bytes: 0,
+        };
+        assert_eq!(read_talk_status(&mut reader), Some(talk::TalkStatus::Open));
+        assert!(reader.bytes <= 64 * 1024);
+    }
+
+    #[test]
+    fn talk_header_classification_does_not_hold_the_queue_cursor_registry() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        seed_talk_at(&ui.talks, "header-chat", "open");
+        std::fs::create_dir_all(ui.queue.root()).unwrap();
+        let (started, ready) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let chat_ui = ui.clone();
+        let scan = std::thread::spawn(move || {
+            page_ids_with(&chat_ui, true, PageQuery::default(), |ui, ids| {
+                started.send(()).unwrap();
+                wait.recv().unwrap();
+                open_talk_ids(ui, ids)
+            })
+            .unwrap()
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (finished, result) = std::sync::mpsc::channel();
+        let queue = std::thread::spawn(move || {
+            finished
+                .send(page_ids(&ui, false, PageQuery::default()).is_ok())
+                .unwrap();
+        });
+        let completed = result.recv_timeout(Duration::from_secs(2));
+        // Release and join both workers even if the regression returns.
+        release.send(()).unwrap();
+        scan.join().unwrap();
+        queue.join().unwrap();
+        assert!(
+            completed.unwrap(),
+            "queue paging must not wait for chat header I/O"
+        );
+    }
+
+    #[test]
+    fn talk_status_projection_does_not_cache_files_changed_during_read() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let ids = vec!["changing-chat".to_owned()];
+        seed_talk_at(&ui.talks, &ids[0], "closed");
+        assert!(open_talk_ids(&ui, &ids).is_empty());
+        seed_talk_at(&ui.talks, &ids[0], "open");
+        let open = open_talk_ids_with(&ui, &ids, |path| {
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            // Replace the file after parsing, before its identity is checked again.
+            seed_talk_at(&ui.talks, &ids[0], "closed");
+            serde_json::from_value(value["status"].clone()).ok()
+        });
+        assert!(open.contains(&ids[0]));
+        assert!(
+            ui.monitor
+                .talk_status_index
+                .lock()
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        assert!(open_talk_ids(&ui, &ids).is_empty());
+        assert_eq!(ui.monitor.talk_status_index.lock().unwrap().parses, 3);
+    }
+
+    #[test]
+    fn talk_rows_cache_shrinks_without_reparsing_open_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let headers = header::HeaderMap::new();
+        seed_talk_at(&ui.talks, "open-chat", "open");
+        seed_talk_at(&ui.talks, "closed-chat", "closed");
+        talk_rows(
+            &ui,
+            vec!["open-chat".into(), "closed-chat".into()],
+            &headers,
+        );
+        {
+            let mut index = ui.monitor.talk_index.lock().unwrap();
+            let closed = index["closed-chat"].1.clone();
+            for i in 0..1000 {
+                index.insert(
+                    format!("cached-closed-{i}"),
+                    (
+                        file_identity(&ui.talks.path_of("closed-chat")).unwrap(),
+                        closed.clone(),
+                    ),
+                );
+            }
+        }
+        assert_eq!(
+            talk_rows(&ui, vec!["closed-chat".into()], &headers).len(),
+            1
+        );
+        assert_eq!(ui.monitor.talk_index.lock().unwrap().len(), 2);
+        assert_eq!(talk_rows(&ui, vec!["open-chat".into()], &headers).len(), 1);
+        assert_eq!(
+            ui.monitor
+                .talk_parses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        {
+            let mut index = ui.monitor.talk_index.lock().unwrap();
+            let open = index["open-chat"].1.clone();
+            for i in 0..1000 {
+                index.insert(
+                    format!("cached-open-{i}"),
+                    (
+                        file_identity(&ui.talks.path_of("open-chat")).unwrap(),
+                        open.clone(),
+                    ),
+                );
+            }
+        }
+        // Even when open rows exceed the bound, keep the currently requested rows.
+        assert_eq!(talk_rows(&ui, vec!["open-chat".into()], &headers).len(), 1);
+        assert_eq!(ui.monitor.talk_index.lock().unwrap().len(), 1);
+        assert_eq!(
+            ui.monitor
+                .talk_parses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+    }
+
+    #[test]
+    fn talk_status_projection_reuses_large_indexes_and_prunes_deleted_files() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        std::fs::create_dir_all(ui.talks.root()).unwrap();
+        let ids: Vec<_> = (0..1050).map(|i| format!("chat-{i:04}")).collect();
+        for id in &ids {
+            std::fs::write(
+                ui.talks.path_of(id),
+                r#"{"status":"closed","turns":[{"body":"ignored"}]}"#,
+            )
+            .unwrap();
+        }
+        assert!(open_talk_ids(&ui, &ids).is_empty());
+        assert_eq!(
+            ui.monitor.talk_status_index.lock().unwrap().parses,
+            ids.len()
+        );
+        assert!(open_talk_ids(&ui, &ids).is_empty());
+        assert_eq!(
+            ui.monitor.talk_status_index.lock().unwrap().parses,
+            ids.len()
+        );
+        std::fs::write(ui.talks.path_of(&ids[0]), r#"{"status":"open"}"#).unwrap();
+        std::fs::write(ui.talks.path_of(&ids[1]), "broken").unwrap();
+        assert_eq!(
+            open_talk_ids(&ui, &ids),
+            std::collections::HashSet::from([ids[0].clone()])
+        );
+        let parsed = ui.monitor.talk_status_index.lock().unwrap().parses;
+        assert_eq!(parsed, ids.len() + 2);
+        open_talk_ids(&ui, &ids);
+        assert_eq!(
+            ui.monitor.talk_status_index.lock().unwrap().parses,
+            parsed,
+            "unreadable rows are cached too"
+        );
+        std::fs::remove_file(ui.talks.path_of(&ids[0])).unwrap();
+        assert!(open_talk_ids(&ui, &ids[1..]).is_empty());
+        assert!(
+            !ui.monitor
+                .talk_status_index
+                .lock()
+                .unwrap()
+                .records
+                .contains_key(&ids[0])
+        );
+        assert!(
+            ui.monitor.talk_index.lock().unwrap().is_empty(),
+            "classification never caches bodies"
+        );
+    }
+
+    #[tokio::test]
     async fn stats_queue_index_counts_only_fresh_readable_statuses() {
         let home = tempfile::tempdir().unwrap();
         let ui = delta_test_ui(home.path());
@@ -24630,7 +25146,7 @@ mod tests {
                 task.blocked_by = vec!["20261019-000000-page".into()];
             }
             queue.put(&mut task).unwrap();
-            seed_talk_at(talks, &id, "open");
+            seed_talk_at(talks, &id, "closed");
         }
         let page = serde_json::to_value(
             queue_page(State(ui.clone()), Query(PageQuery::default()))
