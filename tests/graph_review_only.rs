@@ -12,7 +12,7 @@ use common::{
     fixture_with_silent_review_seat,
 };
 use magi::graph::Runner;
-use magi::run::RunStatus;
+use magi::run::{RunState, RunStatus, StartupFailure};
 
 fn run_git(repo: &std::path::Path, args: &[&str]) {
     let out = std::process::Command::new("git")
@@ -404,7 +404,15 @@ async fn a_diverged_branch_with_local_work_is_refused_and_leaves_no_worktree() {
         .await
         .err()
         .expect("a diverged branch must not be reviewed");
-    assert!(err.to_string().contains("diverged"), "{err}");
+    assert!(format!("{err:#}").contains("diverged"), "{err:#}");
+    assert!(err.downcast_ref::<magi::reconcile::Diverged>().is_some());
+    let startup = err.downcast_ref::<StartupFailure>().expect("startup attribution");
+    let failed = RunState::load(&startup.run).unwrap();
+    assert_eq!(failed.status, RunStatus::Failed);
+    let evidence = failed.startup.unwrap();
+    assert!(!evidence.complete);
+    assert_eq!(evidence.stage, "review-sync");
+    assert!(evidence.failure.unwrap().contains("diverged"));
     assert_eq!(rev(&fx.repo, "refs/heads/feat/split"), local);
     let list = std::process::Command::new("git")
         .args(["worktree", "list"])
@@ -449,7 +457,14 @@ async fn a_branch_whose_tree_equals_the_base_is_refused_and_releases_its_worktre
         .await
         .err()
         .expect("an empty-tree branch must not be reviewed");
-    assert!(err.to_string().contains("tree identical"), "{err}");
+    assert!(format!("{err:#}").contains("tree identical"), "{err:#}");
+    let startup = err.downcast_ref::<StartupFailure>().expect("startup attribution");
+    let failed = RunState::load(&startup.run).unwrap();
+    assert_eq!(failed.status, RunStatus::Failed);
+    let evidence = failed.startup.unwrap();
+    assert!(!evidence.complete);
+    assert_eq!(evidence.stage, "worktree-setup");
+    assert!(evidence.failure.unwrap().contains("tree identical"));
     // The branch is not left locked by the aborted attempt.
     run_git(&fx.repo, &["worktree", "prune"]);
     let list = std::process::Command::new("git")
