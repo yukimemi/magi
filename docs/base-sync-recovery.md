@@ -91,3 +91,15 @@ new synchronization allowance.
 検証の進捗と同期の成功は区別して記録し、古い記録に同期の証拠がなければ
 この診断は付けません。承認の拒否は `consumed` と `invalidated` の理由を
 まとめて記録し、再開後にも拒否理由を確認できます。
+
+A legacy resource stop with a standing scratch rebase can import that operation
+once. Migration verifies its saved original HEAD, branch identity and target,
+and the retained branch/worktree, then saves a spent reservation against that
+saved target. It completes before a separate reservation follows newer main;
+no interval renewal or repair-budget grant is inferred from the old wait.
+
+Conflict-resolution validation saves the exact accepted result HEAD on the
+matching base-sync reservation before removing scratch evidence. A restart can
+accept that exact result even when resolution changed the original patch IDs.
+It still checks the retained branch/worktree; a different HEAD does not inherit
+this validation.

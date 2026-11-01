@@ -497,6 +497,27 @@ pub(crate) async fn rebase_target(scratch: &Path) -> Result<String> {
     git::rev_parse(scratch, &format!("{}^{{commit}}", target.trim())).await
 }
 
+/// Read the original branch identity retained by a paused merge-backend rebase.
+pub(crate) async fn saved_base_identity(scratch: &Path, branch: &str) -> Result<String> {
+    let read = |name: &'static str| async move {
+        let path = git::git(
+            scratch,
+            &["rev-parse", "--git-path", &format!("rebase-merge/{name}")],
+        )
+        .await?;
+        anyhow::Ok(
+            std::fs::read_to_string(scratch.join(path))?
+                .trim()
+                .to_owned(),
+        )
+    };
+    anyhow::ensure!(
+        read("head-name").await? == format!("refs/heads/{branch}"),
+        "saved rebase belongs to another branch"
+    );
+    git::rev_parse(scratch, &format!("{}^{{commit}}", read("orig-head").await?)).await
+}
+
 async fn stop_identity(scratch: &Path, original: &str, onto: &str) -> Result<()> {
     for (name, expected) in [("orig-head", original), ("onto", onto)] {
         let path = git::git(
@@ -834,7 +855,7 @@ async fn launcher_stage(
 }
 
 /// Judge a rebase that is no longer in progress by what git says.
-async fn finish(
+pub(crate) async fn finish(
     state: &mut RunState,
     scratch: &Path,
     branch: &str,
@@ -915,6 +936,19 @@ async fn finish(
     };
     match problem {
         None => {
+            // The validated result may legitimately have different patch IDs
+            // after conflict resolution. Persist its exact identity before
+            // deleting the Git evidence needed to validate it again.
+            if scratch == state.dir().join("base-sync")
+                && state.winner().is_some_and(|winner| winner.branch == branch)
+                && let Some(op) = state.base_sync_recovery.operations.last_mut()
+                && !op.finished
+                && op.head == orig
+                && op.tip == onto_sha
+            {
+                op.validated_head = Some(head.clone());
+                state.save()?;
+            }
             git::worktree_remove(&repo, scratch).await.ok();
             state.event(
                 "rebase",

@@ -122,6 +122,9 @@ pub struct Operation {
     pub head: String,
     pub tip: String,
     pub finished: bool,
+    /// Exact result accepted by the rebase validator, saved before scratch cleanup.
+    #[serde(default)]
+    pub validated_head: Option<String>,
 }
 
 /// Consumed owner approval for an infrastructure boundary.
@@ -363,6 +366,7 @@ impl RunState {
             head: head.into(),
             tip: tip.into(),
             finished: false,
+            validated_head: None,
         });
         if let Some(sync) = &mut self.base_sync {
             sync.attempts += 1;

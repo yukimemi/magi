@@ -4965,7 +4965,7 @@ impl Runner {
 
         let head = git::rev_parse(&winner.worktree, "HEAD").await?;
         self.state.ensure_base_episode();
-        let pending = self
+        let mut pending = self
             .state
             .base_sync_recovery
             .operations
@@ -4974,8 +4974,41 @@ impl Runner {
             .cloned();
         let scratch = self.state.dir().join("base-sync");
         if git::rebase_in_progress(&scratch).await {
-            let expected = pending.as_ref().map_or(tip.as_str(), |op| op.tip.as_str());
-            if crate::rebase::rebase_target(&scratch).await.as_deref().ok() != Some(expected) {
+            // Older resource stops predate operation reservations. Import the
+            // standing Git operation, never retarget it to today's main.
+            if pending.is_none()
+                && self.state.base_sync_recovery.operations.is_empty()
+                && !conflicted
+                && crate::rebase::saved_base_identity(&scratch, &winner.branch)
+                    .await
+                    .ok()
+                    .as_deref()
+                    == Some(head.as_str())
+                && git::rev_parse(&repo, &format!("refs/heads/{}", winner.branch)).await? == head
+                && git::is_clean(&winner.worktree).await?
+            {
+                let saved_tip = crate::rebase::rebase_target(&scratch).await?;
+                if self.state.base_sync.is_none() {
+                    self.state.base_sync = Some(BaseSync {
+                        tip: saved_tip.clone(),
+                        behind: 0,
+                        attempts: 0,
+                        conflict: None,
+                        already_in: None,
+                    });
+                }
+                self.state.reserve_base_operation(&head, &saved_tip);
+                self.state.event(
+                    "base-recovery",
+                    "imported standing legacy rebase as a spent synchronization reservation",
+                );
+                self.state.save()?;
+                pending = self.state.base_sync_recovery.operations.last().cloned();
+            }
+            let expected = pending.as_ref().map(|op| op.tip.as_str());
+            if expected.is_none()
+                || crate::rebase::rebase_target(&scratch).await.as_deref().ok() != expected
+            {
                 let why = "saved scratch rebase targets a different base; inspect the retained rebase before resuming";
                 if self.state.base_sync.is_none() {
                     self.state.base_sync = Some(BaseSync {
@@ -4995,8 +5028,9 @@ impl Runner {
         }
         if let Some(op) = &pending {
             // A replay may add the pinned base's commits, never foreign work.
-            let mut replay_proven = head == op.head;
-            if head != op.head && git::is_ancestor(&repo, &op.tip, &head).await {
+            let mut replay_proven =
+                head == op.head || op.validated_head.as_deref() == Some(head.as_str());
+            if !replay_proven && git::is_ancestor(&repo, &op.tip, &head).await {
                 if self.state.foreign_checkout.is_some() {
                     replay_proven = git::rev_parse(&repo, &format!("{head}^1"))
                         .await
@@ -16754,6 +16788,168 @@ esac
             git::rev_parse(&runner.state.repo, "HEAD").await.unwrap(),
             foreign_head
         );
+    }
+
+    #[cfg(unix)]
+    async fn paused_base_conflict_fixture() -> (tempfile::TempDir, Runner, String, String, PathBuf)
+    {
+        let (tmp, mut runner, head, _) = exhausted_base_fixture().await;
+        fresh_base_interval_fixture(&mut runner);
+        let repo = &runner.state.repo;
+        git::git(repo, &["checkout", "main"]).await.unwrap();
+        std::fs::write(repo.join("retained"), "upstream change\n").unwrap();
+        git::git(repo, &["add", "retained"]).await.unwrap();
+        git::git(repo, &["commit", "-m", "upstream retained change"])
+            .await
+            .unwrap();
+        git::git(repo, &["push", "origin", "main"]).await.unwrap();
+        let tip = git::rev_parse(repo, "HEAD").await.unwrap();
+        git::git(repo, &["checkout", "fix/retained"]).await.unwrap();
+        let scratch = runner.state.dir().join("base-sync");
+        assert!(matches!(
+            git::rebase_start(repo, &scratch, "fix/retained", &tip)
+                .await
+                .unwrap(),
+            git::RebaseStart::Conflicted(_)
+        ));
+        runner.state.rebase_fixes.push(crate::run::RebaseFixRecord {
+            agent: "fixture".into(),
+            paths: vec!["retained".into()],
+            from: Some(head.clone()),
+            stop: Some(git::rev_parse(&scratch, "REBASE_HEAD").await.unwrap()),
+            index_outside: None,
+            finished: false,
+            error: None,
+            launcher: None,
+            infra: None,
+        });
+        (tmp, runner, head, tip, scratch)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_imports_legacy_rebase_before_following_new_main() {
+        let (_tmp, mut runner, head, tip, scratch) = paused_base_conflict_fixture().await;
+        // A resource stop from before reservations existed, with resolved
+        // contents left for the launcher's ordinary staging continuation.
+        std::fs::write(
+            scratch.join("retained"),
+            "upstream and retained resolution\n",
+        )
+        .unwrap();
+        runner.state.resource_block = Some(crate::run::ResourceBlock {
+            node: "rebase".into(),
+            kind: "repository coordination".into(),
+            detail: "busy".into(),
+            at: Timestamp::now(),
+            cause: crate::run::ResourceBlockCause::Other,
+        });
+        runner.state.save().unwrap();
+        // Advance the remote without moving either checkout participating
+        // in the standing rebase.
+        let newer = git::git(
+            &runner.state.repo,
+            &[
+                "commit-tree",
+                "main^{tree}",
+                "-p",
+                "main",
+                "-m",
+                "base advanced during wait",
+            ],
+        )
+        .await
+        .unwrap();
+        git::git(
+            &runner.state.repo,
+            &[
+                "push",
+                "origin",
+                &format!("{}:refs/heads/main", newer.trim()),
+            ],
+        )
+        .await
+        .unwrap();
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        runner.state.resource_block = None;
+        runner.sync_to_base().await.unwrap();
+        assert!(!runner.state.base_sync_blocked());
+        let op = &runner.state.base_sync_recovery.operations[0];
+        assert_eq!(op.head, head);
+        assert_eq!(op.tip, tip);
+        assert!(op.finished);
+        assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 1);
+        assert_eq!(runner.state.rebase_fixes.len(), 1);
+        let latest = git::rev_parse(&runner.state.repo, "origin/main")
+            .await
+            .unwrap();
+        assert_ne!(latest, tip);
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        runner.sync_to_base().await.unwrap();
+        assert!(!runner.state.base_sync_blocked());
+        assert_eq!(runner.state.base_sync_recovery.operations.len(), 2);
+        assert_eq!(runner.state.base_sync_recovery.operations[1].tip, latest);
+        assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_resumes_exact_validated_conflict_result_after_crash() {
+        let (_tmp, mut runner, head, tip, scratch) = paused_base_conflict_fixture().await;
+        runner.state.reserve_base_operation(&head, &tip);
+        runner.state.save().unwrap();
+        std::fs::write(
+            scratch.join("retained"),
+            "upstream and retained resolution\n",
+        )
+        .unwrap();
+        git::git(&scratch, &["add", "retained"]).await.unwrap();
+        git::git(
+            &scratch,
+            &["-c", "core.editor=true", "rebase", "--continue"],
+        )
+        .await
+        .unwrap();
+        let result = git::rev_parse(&scratch, "HEAD").await.unwrap();
+        assert!(
+            !crate::reconcile::origin_missing(&runner.state.repo, &result, &head)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            crate::rebase::finish(
+                &mut runner.state,
+                &scratch,
+                "fix/retained",
+                &head,
+                &tip,
+                &["retained".into()],
+                ""
+            )
+            .await
+            .unwrap(),
+            crate::rebase::Rebased::Applied
+        );
+        assert!(!scratch.exists());
+        // Simulate losing the caller before finish_base_operation/save.
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        let op = &runner.state.base_sync_recovery.operations[0];
+        assert!(!op.finished);
+        assert_eq!(op.validated_head.as_deref(), Some(result.as_str()));
+        runner.sync_to_base().await.unwrap();
+        assert!(!runner.state.base_sync_blocked());
+        assert!(runner.state.base_sync_recovery.operations[0].finished);
+        assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 1);
+        assert_eq!(runner.state.rebase_fixes.len(), 1);
+        let winner = runner.state.winner().unwrap().clone();
+        let wait = runner.repository_wait();
+        assert!(
+            verify_current_head(&mut runner.state, &winner, &wait)
+                .await
+                .unwrap()
+        );
+        assert_eq!(runner.state.head_e2e.as_ref().unwrap().head, result);
     }
 
     #[cfg(unix)]
