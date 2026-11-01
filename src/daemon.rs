@@ -4632,6 +4632,11 @@ async fn attempt(
             })
         }
     }})).await;
+    if let Err(error) = &started
+        && let Some(failure) = error.downcast_ref::<crate::run::StartupFailure>()
+    {
+        task.record_startup_failure(failure.clone());
+    }
     let mut runner = match started {
         Ok(r) => r,
         Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => {
@@ -4653,10 +4658,6 @@ async fn attempt(
         Err(e) if task.pr_recovery.is_some() => {
             task.startup_notice_cause("startup-public-head");
             task.attempts += 1;
-            if let Some(partial) = e.downcast_ref::<crate::pr_recovery::StartupFailed>() {
-                task.link_run(&partial.run);
-                task.record_pass(&partial.run, 0, task.attempts, None);
-            }
             task.last_error = Some(format!("{start_failed}{e:#}"));
             task.hold_unrequested_retry(Some(format!(
                 "Selected public-head recovery could not start: {e:#}. Correct the cause and use `magi task recover-pr` with the approved public head; automatic recovery is stopped."
@@ -4777,8 +4778,12 @@ async fn attempt(
                 ),
             );
             if let Err(e) = old.save() {
+                let error = runner.fail_startup("replacement-history", e);
+                if let Some(failure) = error.downcast_ref::<crate::run::StartupFailure>() {
+                    task.record_startup_failure(failure.clone());
+                }
                 task.hold_manual(Some(format!(
-                    "Could not link replacement history: {e}; no agents dispatched"
+                    "Could not link replacement history: {error:#}; no agents dispatched"
                 )));
                 record(queue, task);
                 return Vec::new();
@@ -4802,8 +4807,20 @@ async fn attempt(
     // `start` has minted the run, so the task can now point at it. Persisting
     // `Running` before `execute` is what makes a crash mid-run legible.
     let run = runner.state.id.clone();
+    let before_start = task.clone();
     task.start(run.clone());
-    record(queue, task);
+    if let Err(error) = queue.put(task) {
+        *task = before_start;
+        let error = runner.fail_startup("task-start", error);
+        if let Some(failure) = error.downcast_ref::<crate::run::StartupFailure>() {
+            task.record_startup_failure(failure.clone());
+        }
+        task.hold_manual(Some(format!(
+            "Could not persist task start; no agents dispatched: {error:#}"
+        )));
+        record(queue, task);
+        return Vec::new();
+    }
     lock(status).current.push(Current {
         worker: None,
         task: task.id.clone(),

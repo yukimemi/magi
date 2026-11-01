@@ -120,24 +120,6 @@ pub(crate) fn explicit_sources_retained(home: &Path, id: &str) -> bool {
         .unwrap_or(true)
 }
 
-/// A partially created recovery is retained and linked to its task for inspection.
-#[derive(Debug)]
-pub(crate) struct StartupFailed {
-    pub run: String,
-    pub cause: String,
-}
-
-impl std::fmt::Display for StartupFailed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "recovery run {} could not start: {}",
-            self.run, self.cause
-        )
-    }
-}
-impl std::error::Error for StartupFailed {}
-
 impl Selection {
     /// Immutable implementation commit, distinct from the public update lease.
     pub fn source(&self) -> &str {

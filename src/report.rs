@@ -130,7 +130,12 @@ pub fn line_with_liveness(state: &RunState, live: Liveness) -> String {
         ),
         _ => String::new(),
     };
-    let stale = if !state.status.done() && live == Liveness::Dead {
+    let stale = if let Some(startup) = state.startup.as_ref().filter(|s| !s.complete) {
+        format!(
+            "  startup incomplete ({}) — inspect retained evidence; no ordinary resume",
+            startup.stage
+        )
+    } else if !state.status.done() && live == Liveness::Dead {
         format!(
             "  {}",
             bold(&yellow("STALE — driver exited; resume required"))
@@ -161,6 +166,9 @@ pub fn line_with_liveness(state: &RunState, live: Liveness) -> String {
 /// gone. Kept separate from [`active_seats`] because a process can die at a
 /// node boundary with no active seat left in the saved state.
 pub fn liveness_notice(state: &RunState, live: Liveness) -> String {
+    if state.startup.as_ref().is_some_and(|s| !s.complete) {
+        return "Startup incomplete; inspect startup evidence and retained assets. Ordinary resume is disabled.\n\n".to_owned();
+    }
     if !state.status.done() && live == Liveness::Dead {
         format!(
             "{}\n\n",
@@ -343,6 +351,19 @@ pub fn run(state: &RunState) -> String {
         "  origin  {}",
         crate::run::origin_label(state.origin.as_ref())
     );
+    if let Some(startup) = &state.startup {
+        let _ = writeln!(
+            s,
+            "  startup {} branch={} stage={} complete={}",
+            startup.kind,
+            startup.branch.as_deref().unwrap_or("-"),
+            startup.stage,
+            startup.complete
+        );
+        if let Some(failure) = &startup.failure {
+            let _ = writeln!(s, "  startup failure {failure}");
+        }
+    }
     let _ = writeln!(s, "  state   {}", state.dir().display());
 
     let _ = writeln!(s, "\n{}", bold("candidates"));

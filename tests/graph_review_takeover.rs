@@ -113,6 +113,13 @@ async fn a_clean_superseded_run_has_its_worktree_released() {
     .await
     .expect("the review takes the branch over");
 
+    let saved = RunState::load(&runner.state.id).unwrap();
+    assert!(saved.startup.as_ref().unwrap().complete);
+    assert_eq!(saved.prep_complete, Some(true));
+    assert_eq!(saved.status, RunStatus::Reviewing);
+    assert_eq!(saved.candidates.len(), 1);
+    assert!(saved.instruction.contains(BRANCH));
+    assert!(Runner::resume(&saved.id).is_ok());
     assert!(!wt.exists(), "the old worktree is gone");
     assert_eq!(
         run_git(&fx.repo, &["rev-parse", BRANCH]),
@@ -196,11 +203,13 @@ async fn a_running_run_is_refused_and_left_alone() {
     old.driver_exited = false;
     old.save().unwrap();
 
+    let before = std::fs::read(old.dir().join("run.json")).unwrap();
+    let origin = magi::run::Origin::queue("20261021-233844-7701");
     let err = Runner::review_taking_over(
         &fx.repo,
         BRANCH,
         fx.config.clone(),
-        Some(takeover(&[&old])), magi::run::Origin::operator(),
+        Some(takeover(&[&old])), origin.clone(),
     )
     .await
     .err()
@@ -210,6 +219,24 @@ async fn a_running_run_is_refused_and_left_alone() {
     assert!(wt.exists());
     let old = RunState::load_under(&old.id, &magi::run::home()).unwrap();
     assert!(!old.released());
+    assert!(err.downcast_ref::<magi::handover::Refused>().is_some());
+    let failure = err.downcast_ref::<magi::run::StartupFailure>().expect("attributable reservation");
+    let partial = RunState::load(&failure.run).unwrap();
+    assert_eq!(partial.status, RunStatus::Failed);
+    assert_eq!(partial.origin, Some(origin));
+    assert!(partial.instruction.contains(BRANCH));
+    let startup = partial.startup.as_ref().unwrap();
+    assert_eq!(startup.branch.as_deref(), Some(BRANCH));
+    assert_eq!(startup.stage, "handover");
+    assert!(!startup.complete);
+    assert!(startup.failure.as_ref().unwrap().contains("right now"));
+    assert!(partial.candidates.is_empty() && partial.passes.is_empty());
+    assert!(partial.driver_exited);
+    assert!(Runner::resume(&failure.run).is_err());
+    assert_eq!(std::fs::read(old.dir().join("run.json")).unwrap(), before,
+        "old ownership, approval policy and execution evidence are untouched");
+    assert!(magi::report::line(&partial).contains("startup incomplete"));
+
 }
 }
 
@@ -514,5 +541,106 @@ async fn historical_approval_on_a_completed_run_does_not_block_handover() {
     ).await.expect("completed-run evidence is historical");
     assert!(!wt.exists());
     assert_eq!(RunState::load(&old.id).unwrap().released_to.as_deref(), Some(successor.state.id.as_str()));
+}
+}
+
+common::e2e! {
+async fn failed_review_setup_records_the_failure_and_restores_the_predecessor() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (old, wt) = old_run(&fx);
+    let tip = run_git(&fx.repo, &["rev-parse", BRANCH]);
+    let mut config = fx.config.clone();
+    config.worktree.setup = vec![magi::config::SetupStep {
+        run: Some("exit 1".into()),
+        ..Default::default()
+    }];
+    let error = Runner::review_taking_over(
+        &fx.repo, BRANCH, config, Some(takeover(&[&old])), magi::run::Origin::operator(),
+    ).await.err().expect("setup fails after takeover");
+    let failure = error.downcast_ref::<magi::run::StartupFailure>().unwrap();
+    let partial = RunState::load(&failure.run).unwrap();
+    assert_eq!(partial.status, RunStatus::Failed);
+    assert_eq!(partial.startup.as_ref().unwrap().stage, "worktree-setup");
+    assert!(partial.events.iter().any(|e| e.node == "startup-restore"));
+    assert!(Runner::resume(&failure.run).is_err());
+    let restored = RunState::load(&old.id).unwrap();
+    assert!(!restored.released());
+    assert!(!restored.candidates[0].folded);
+    assert_eq!(restored.config.graph.land_approval, old.config.graph.land_approval);
+    assert!(wt.exists());
+    assert_eq!(run_git(&wt, &["rev-parse", "HEAD"]), tip);
+}
+}
+
+common::e2e! {
+async fn queue_review_refusal_records_startup_without_spending_an_attempt() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (mut old, wt) = old_run(&fx);
+    old.driver_pid = Some(std::process::id());
+    old.driver_started_at = magi::proc::process_started_at(std::process::id());
+    old.driver_exited = false;
+    old.save().unwrap();
+    let before = std::fs::read(old.dir().join("run.json")).unwrap();
+    let mut config = fx.config.clone();
+    config.disk.min_free_bytes = 0;
+    let config_path = fx.tmp.path().join("startup-config.toml");
+    std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+    let queue = magi::queue::Queue::open();
+    let mut task = magi::queue::Task::new("Review existing work".into(), "preserve criteria".into(),
+        fx.repo.clone(), magi::queue::Source::Human);
+    task.review_of = Some(BRANCH.into());
+    queue.put(&mut task).unwrap();
+    let _claim = queue.claim(&task.id).unwrap();
+    magi::daemon::run_claimed(&magi::daemon::Opts {
+        repo: fx.repo.clone(), config: Some(config_path), ..Default::default()
+    }, &queue, &mut task).await;
+    let saved = queue.get(&task.id).unwrap();
+    assert_eq!(saved.status, magi::queue::TaskStatus::Held, "{:?}", saved.last_error);
+    assert_eq!(saved.attempts, 0);
+    assert!(saved.runs.is_empty() && saved.passes.is_empty());
+    assert_eq!(saved.startup_failures.len(), 1, "{:?}", saved.last_error);
+    let partial = RunState::load(&saved.startup_failures[0].run).unwrap();
+    assert_eq!(partial.status, RunStatus::Failed);
+    assert_eq!(partial.origin.unwrap().task.as_deref(), Some(task.id.as_str()));
+    assert!(partial.instruction.contains(BRANCH));
+    assert_eq!(std::fs::read(old.dir().join("run.json")).unwrap(), before);
+    assert!(wt.exists());
+}
+}
+
+common::e2e! {
+async fn queue_successful_review_links_one_execution_run() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (mut old, _) = old_run(&fx);
+    old.status = RunStatus::Ready;
+    old.save().unwrap();
+    let mut config = fx.config.clone();
+    config.disk.min_free_bytes = 0;
+    config.merge.mode = magi::config::MergeMode::None;
+    let config_path = fx.tmp.path().join("startup-config.toml");
+    std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+    let queue = magi::queue::Queue::open();
+    let mut task = magi::queue::Task::new("Review existing work".into(), "preserve criteria".into(),
+        fx.repo.clone(), magi::queue::Source::Human);
+    task.review_of = Some(BRANCH.into());
+    queue.put(&mut task).unwrap();
+    let _claim = queue.claim(&task.id).unwrap();
+    magi::daemon::run_claimed(&magi::daemon::Opts {
+        repo: fx.repo.clone(), config: Some(config_path), ..Default::default()
+    }, &queue, &mut task).await;
+    let saved = queue.get(&task.id).unwrap();
+    assert_eq!(saved.status, magi::queue::TaskStatus::Done, "{:?}", saved.last_error);
+    assert_eq!(saved.runs.len(), 1);
+    assert_eq!(saved.attempts, 1);
+    assert!(saved.startup_failures.is_empty());
+    let run = RunState::load(&saved.runs[0]).unwrap();
+    assert!(run.startup.unwrap().complete);
+    assert_eq!(run.prep_complete, Some(true));
+    assert_eq!(run.candidates.len(), 1);
+    assert_eq!(run.passes.len(), 1);
+    assert_eq!(run.origin.unwrap().task.as_deref(), Some(task.id.as_str()));
 }
 }

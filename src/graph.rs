@@ -612,7 +612,118 @@ impl Drop for DriverExecution<'_> {
     }
 }
 
+fn startup_stage(state: &mut RunState, stage: &str) -> Result<()> {
+    if let Some(startup) = &mut state.startup {
+        startup.stage = stage.to_owned();
+    }
+    state.save()
+}
+
+/// Keep a reservation visible as blocked until startup finishes. A killed process
+/// leaves the same explicit incomplete marker; dropping a cancelled future records it.
+struct StartupGuard {
+    id: String,
+    armed: bool,
+}
+
+impl StartupGuard {
+    fn reserve(state: &mut RunState, kind: &str, branch: Option<&str>) -> Result<Self> {
+        state.startup = Some(crate::run::Startup {
+            kind: kind.to_owned(),
+            branch: branch.map(str::to_owned),
+            stage: "reserved".to_owned(),
+            complete: false,
+            failure: None,
+        });
+        state.status = RunStatus::Blocked;
+        state.reserve()?;
+        Ok(Self {
+            id: state.id.clone(),
+            armed: true,
+        })
+    }
+
+    fn stage(&self, state: &mut RunState, stage: &str) -> Result<()> {
+        startup_stage(state, stage)
+    }
+
+    fn finish(mut self, state: &mut RunState, result: Result<()>) -> Result<()> {
+        let result = result.and_then(|()| {
+            state.startup.as_mut().expect("reserved startup").complete = true;
+            state.save()
+        });
+        self.armed = false;
+        match result {
+            Ok(()) => Ok(()),
+            Err(mut error) => {
+                let startup = state.startup.as_mut().expect("reserved startup");
+                startup.complete = false;
+                startup.failure = Some(format!("{error:#}"));
+                let context = crate::run::StartupFailure {
+                    run: state.id.clone(),
+                    stage: startup.stage.clone(),
+                };
+                // Repository assets may remain. Never infer that a failed startup
+                // is safe to resume or that an earlier owner has been restored.
+                state.status = RunStatus::Failed;
+                state.driver_exited = true;
+                state.event(
+                    "startup-failed",
+                    format!("{context}: {error:#}; retained assets require inspection"),
+                );
+                if let Err(save) = state.save() {
+                    error = error.context(format!("could not save terminal startup record: {save:#}; reservation requires reconciliation"));
+                }
+                Err(error.context(context))
+            }
+        }
+    }
+}
+
+impl Drop for StartupGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(mut state) = RunState::load(&self.id)
+        {
+            state.status = RunStatus::Blocked;
+            state.driver_exited = true;
+            if let Some(startup) = &mut state.startup {
+                startup.failure = Some("startup interrupted; reconciliation required".to_owned());
+            }
+            state.event(
+                "startup-interrupted",
+                "startup did not finish; inspect retained assets before recovery",
+            );
+            if let Err(error) = state.save() {
+                tracing::error!(
+                    "could not record interrupted startup {}: {error:#}",
+                    self.id
+                );
+            }
+        }
+    }
+}
+
 impl Runner {
+    /// A queue-side failure after construction must not strand an unexecuted run.
+    pub(crate) fn fail_startup(&mut self, stage: &str, error: anyhow::Error) -> anyhow::Error {
+        if !self.state.passes.is_empty() || self.state.driver_claimed != Some(false) {
+            return error;
+        }
+        if let Some(startup) = &mut self.state.startup {
+            startup.stage = stage.to_owned();
+        } else {
+            // A resumed run already has execution history: do not rewrite it.
+            return error;
+        }
+        StartupGuard {
+            id: self.state.id.clone(),
+            armed: true,
+        }
+        .finish(&mut self.state, Err(error))
+        .expect_err("startup failed")
+    }
+
     /// Start a fresh run against `repo`.
     pub async fn start(
         repo: &Path,
@@ -660,9 +771,10 @@ impl Runner {
         // to decide anything.
         state.fetched_base = Some(fetched_base);
         state.origin = Some(origin);
-        state.reserve()?;
+        let startup = StartupGuard::reserve(&mut state, "implementation", None)?;
+        state.status = RunStatus::Prep;
         state.event("start", format!("run {} created", state.id));
-        state.save()?;
+        startup.finish(&mut state, Ok(()))?;
         Ok(Self {
             state,
             roles,
@@ -732,101 +844,129 @@ impl Runner {
             repo.clone(),
             base_branch,
             base_commit.clone(),
-            String::new(),
+            format!("Review the work already on branch `{branch}`."),
             config,
         );
         state.fetched_base = Some(fetched_base);
         state.origin = Some(origin);
-        state.reserve()?;
+        state.task_instruction = takeover.as_ref().and_then(|t| t.task_instruction.clone());
+        let startup = StartupGuard::reserve(&mut state, "review", Some(branch))?;
+        let opened = async {
+            startup.stage(&mut state, "handover")?;
 
-        // Released before anything else touches the branch: a stale local
-        // branch is moved with `git branch -f`, which git refuses while an
-        // earlier attempt's worktree still has it checked out. Everything
-        // after this point that can fail puts the old run back.
-        // A hand-run review has no task, hence no earlier attempts, but a
-        // worktree of a dead run magi made may still be released.
-        let takeover = takeover.unwrap_or_else(|| crate::handover::Takeover {
-            earlier: Vec::new(),
-            home: crate::run::home(),
-            choice: None,
-            task_instruction: None,
-        });
-        let wait = repository_wait(&state, None);
-        let coordination_config = state.config.coordination.clone();
-        let coordination =
-            crate::repo_lock::SeatLease::operation_with(&repo, coordination_config.as_ref(), &wait)
-                .await?;
-        let released = crate::handover::release(&repo, branch, &state.id, &takeover).await?;
-        if let Some(released) = &released {
-            state.event(
-                "release",
-                format!(
-                    "took `{branch}` over from run {}: its worktree was released: {}",
-                    crate::run::short_of(&released.old_id),
-                    released.audit
-                ),
-            );
-        }
-        // The owner's answer to an earlier divergence question is applied
-        // here: after the release (git will not move a checked-out branch)
-        // and before the sync that would otherwise ask again.
-        state.foreign_checkout = crate::handover::preflight_review(
-            &repo,
-            branch,
-            &takeover.home,
-            &state.config.merge.remote,
-        )
-        .await?;
-        if state.foreign_checkout.is_some() && takeover.choice.is_some() {
-            bail!("cannot reconcile a foreign checkout automatically; resolve its branch first");
-        }
-        if let Some(choice) = takeover.choice.as_ref()
-            && let Err(e) =
-                crate::reconcile::apply_choice(&repo, &state.config.merge.remote, branch, choice)
-                    .await
-        {
+            // Released before anything else touches the branch: a stale local
+            // branch is moved with `git branch -f`, which git refuses while an
+            // earlier attempt's worktree still has it checked out. Everything
+            // after this point that can fail puts the old run back.
+            // A hand-run review has no task, hence no earlier attempts, but a
+            // worktree of a dead run magi made may still be released.
+            let takeover = takeover.unwrap_or_else(|| crate::handover::Takeover {
+                earlier: Vec::new(),
+                home: crate::run::home(),
+                choice: None,
+                task_instruction: None,
+            });
+            let wait = repository_wait(&state, None);
+            let coordination_config = state.config.coordination.clone();
+            let coordination =
+                crate::repo_lock::SeatLease::operation_with(&repo, coordination_config.as_ref(), &wait)
+                    .await?;
+            let released = crate::handover::release(&repo, branch, &state.id, &takeover).await?;
             if let Some(released) = &released {
-                released.restore(&repo, branch).await;
+                state.event(
+                    "release",
+                    format!(
+                        "took `{branch}` over from run {}: its worktree was released: {}",
+                        crate::run::short_of(&released.old_id),
+                        released.audit
+                    ),
+                );
             }
-            return Err(e.context("applying the owner's answer about the diverged branch"));
-        }
-        // An earlier attempt of this task that published the task head, and
-        // whose work is the branch under review, hands that head over: the
-        // review run updates the same pull request. Without one (a legacy
-        // `magi/<run>/<label>` PR, a hand-named branch) the branch keeps its
-        // own head and its own open pull request is adopted as before.
-        for id in takeover.earlier.iter().rev() {
-            if let Ok(old) = RunState::load_under(id, &takeover.home)
-                && let Some(head) = old.pr_head.clone()
-                && (head == branch || old.winner().is_some_and(|w| w.branch == branch))
+            let opened = async {
+                startup.stage(&mut state, "review-preflight")?;
+                // The owner's answer to an earlier divergence question is applied
+                // here: after the release (git will not move a checked-out branch)
+                // and before the sync that would otherwise ask again.
+                state.foreign_checkout = crate::handover::preflight_review(
+                    &repo,
+                    branch,
+                    &takeover.home,
+                    &state.config.merge.remote,
+                )
+                .await?;
+                if state.foreign_checkout.is_some() && takeover.choice.is_some() {
+                    bail!("cannot reconcile a foreign checkout automatically; resolve its branch first");
+                }
+                if let Some(choice) = takeover.choice.as_ref()
+                    && let Err(e) =
+                        crate::reconcile::apply_choice(&repo, &state.config.merge.remote, branch, choice)
+                            .await
+                {
+                    return Err(e.context("applying the owner's answer about the diverged branch"));
+                }
+                // An earlier attempt of this task that published the task head, and
+                // whose work is the branch under review, hands that head over: the
+                // review run updates the same pull request. Without one (a legacy
+                // `magi/<run>/<label>` PR, a hand-named branch) the branch keeps its
+                // own head and its own open pull request is adopted as before.
+                for id in takeover.earlier.iter().rev() {
+                    if let Ok(old) = RunState::load_under(id, &takeover.home)
+                        && let Some(head) = old.pr_head.clone()
+                        && (head == branch || old.winner().is_some_and(|w| w.branch == branch))
+                    {
+                        state.pr_head = Some(head);
+                        break;
+                    }
+                }
+                drop(coordination);
+                startup.stage(&mut state, "open-review")?;
+                Self::open_review(&repo, branch, &mut state, base_commit, &takeover).await
+            }
+            .await;
+            if opened.is_err()
+                && let Some(released) = &released
             {
-                state.pr_head = Some(head);
-                break;
+                // Restoration is ownership checked and best effort. Keep the original
+                // startup cause even if reacquiring coordination is no longer possible.
+                match crate::repo_lock::SeatLease::operation_with(
+                    &repo,
+                    coordination_config.as_ref(),
+                    &wait,
+                )
+                .await
+                {
+                    Ok(_coordination) => {
+                        released.restore(&repo, branch).await;
+                        let outcome = RunState::load_under(&released.old_id, &takeover.home)
+                            .map(|old| {
+                                format!(
+                                    "predecessor released_to={:?}; candidate path exists={}",
+                                    old.released_to,
+                                    old.candidates.iter().any(|c| {
+                                        c.branch == branch && c.worktree.exists()
+                                    }),
+                                )
+                            })
+                            .unwrap_or_else(|error| format!("predecessor could not be inspected: {error:#}"));
+                        state.event("startup-restore", format!("ownership-checked restoration attempted: {outcome}; retained successor assets require inspection"));
+                    }
+                    Err(error) => state.event(
+                        "startup-restore",
+                        format!("restoration not attempted: {error:#}"),
+                    ),
+                }
             }
+            opened
         }
-        drop(coordination);
-        let opened = Self::open_review(
-            &repo,
-            branch,
+        .await;
+        startup.finish(&mut state, opened)?;
+        Ok(Self {
             state,
             roles,
-            max_parallel,
-            base_commit,
-            &takeover,
-        )
-        .await;
-        if opened.is_err()
-            && let Some(released) = &released
-        {
-            let _coordination = crate::repo_lock::SeatLease::operation_with(
-                &repo,
-                coordination_config.as_ref(),
-                &wait,
-            )
-            .await?;
-            released.restore(&repo, branch).await;
-        }
-        opened
+            sem: Arc::new(Semaphore::new(max_parallel)),
+            pause: Pause::new(),
+            interrupt: Pause::new(),
+        })
     }
 
     /// Recover exactly the operator-selected public implementation, without touching old sources.
@@ -872,88 +1012,59 @@ impl Runner {
         state.origin = Some(crate::run::Origin::queue(task));
         state.pr_head = Some(selection.branch.clone());
         state.pr_recovery = Some(selection.clone());
-        state.reserve()?;
-        if let Err(e) = crate::pr_head::check_predecessors(&state, &selection.branch).await {
-            // Never leave a reserved record behind as a phantom owner of the head.
-            state.discard_reserved();
-            return Err(e);
-        }
         Self::open_selected(repo, state, roles, max_parallel, base_commit, selection).await
     }
 
     async fn open_selected(
         repo: &Path,
-        state: RunState,
+        mut state: RunState,
         roles: ResolvedRoles,
         max_parallel: usize,
         base_commit: String,
         selection: crate::pr_recovery::Selection,
     ) -> Result<Self> {
-        let mut state = state;
-        let branch = state.branch_for('A');
-        let wait = repository_wait(&state, None);
-        let prepared = async {
-            let coordination = coordinate_operation(&mut state, repo, &wait).await?;
-            git::git(repo, &["branch", &branch, selection.source()]).await?;
-            drop(coordination);
-            anyhow::Ok(())
+        let startup = StartupGuard::reserve(&mut state, "pr-recovery", Some(&selection.branch))?;
+        let opened = async {
+            startup.stage(&mut state, "predecessors")?;
+            crate::pr_head::check_predecessors(&state, &selection.branch).await?;
+            startup.stage(&mut state, "open-selected")?;
+            let branch = state.branch_for('A');
+            let wait = repository_wait(&state, None);
+            let prepared = async {
+                let coordination = coordinate_operation(&mut state, repo, &wait).await?;
+                git::git(repo, &["branch", &branch, selection.source()]).await?;
+                drop(coordination);
+                anyhow::Ok(())
+            }
+            .await;
+            prepared?;
+            state.event(
+                "recovery",
+                format!(
+                    "selected implementation {} for {} (public lease {})",
+                    selection.source(),
+                    selection.url,
+                    selection.head
+                ),
+            );
+            let takeover = crate::handover::Takeover {
+                earlier: Vec::new(),
+                home: crate::run::home(),
+                choice: None,
+                task_instruction: Some(selection.instruction.clone()),
+            };
+            state.save()?;
+            Self::open_review(repo, &branch, &mut state, base_commit, &takeover).await
         }
         .await;
-        if let Err(e) = prepared {
-            // Nothing was exposed yet: do not leave a reserved record as a
-            // phantom owner of the public head.
-            state.discard_reserved();
-            return Err(e);
-        }
-        state.event(
-            "recovery",
-            format!(
-                "selected implementation {} for {} (public lease {})",
-                selection.source(),
-                selection.url,
-                selection.head
-            ),
-        );
-        let takeover = crate::handover::Takeover {
-            earlier: Vec::new(),
-            home: crate::run::home(),
-            choice: None,
-            task_instruction: Some(selection.instruction.clone()),
-        };
-        if let Err(e) = state.save() {
-            state.discard_reserved();
-            return Err(e);
-        }
-        let id = state.id.clone();
-        let opened = Self::open_review(
-            repo,
-            &branch,
+        startup.finish(&mut state, opened)?;
+        Ok(Self {
             state,
             roles,
-            max_parallel,
-            base_commit,
-            &takeover,
-        )
-        .await;
-        match opened {
-            Ok(runner) => Ok(runner),
-            Err(e) => {
-                if let Ok(mut partial) = RunState::load(&id) {
-                    partial.status = RunStatus::Blocked;
-                    partial.driver_exited = true;
-                    partial.event(
-                        "recovery",
-                        format!("startup failed; retained source and candidate {branch}: {e:#}"),
-                    );
-                    partial.save()?;
-                }
-                Err(crate::pr_recovery::StartupFailed {
-                    run: id,
-                    cause: format!("{e:#}"),
-                }
-                .into())
-            }
-        }
+            sem: Arc::new(Semaphore::new(max_parallel)),
+            pause: Pause::new(),
+            interrupt: Pause::new(),
+        })
     }
 
     /// What the newest earlier attempt that reviewed `branch` leaves for this
@@ -996,14 +1107,13 @@ impl Runner {
     async fn open_review(
         repo: &Path,
         branch: &str,
-        mut state: RunState,
-        roles: ResolvedRoles,
-        max_parallel: usize,
+        state: &mut RunState,
         base_commit: String,
         takeover: &crate::handover::Takeover,
-    ) -> Result<Self> {
-        let wait = repository_wait(&state, None);
-        let _coordination = coordinate_operation(&mut state, repo, &wait).await?;
+    ) -> Result<()> {
+        startup_stage(state, "review-sync")?;
+        let wait = repository_wait(state, None);
+        let _coordination = coordinate_operation(state, repo, &wait).await?;
         if state.foreign_checkout.is_some() {
             // Never reconcile or force-move a ref checked out by the operator.
             if state.pr_head.is_none() {
@@ -1124,13 +1234,15 @@ impl Runner {
         } else {
             branch.to_owned()
         };
+        startup_stage(state, "review-checkout")?;
         git::git(repo, &["worktree", "add", &path, &review_branch])
             .await
             .with_context(|| {
                 format!("checking out `{branch}` at {path} (is it checked out elsewhere?)")
             })?;
 
-        let setup = match ensure_setup_config(&mut state, repo).await {
+        startup_stage(state, "worktree-setup")?;
+        let setup = match ensure_setup_config(state, repo).await {
             Ok(()) => worktree_setup::prepare(&state.config, repo, &worktree).await,
             Err(e) => Err(e),
         };
@@ -1217,14 +1329,7 @@ impl Runner {
                 state.id
             ),
         );
-        state.save()?;
-        Ok(Self {
-            state,
-            roles,
-            sem: Arc::new(Semaphore::new(max_parallel)),
-            pause: Pause::new(),
-            interrupt: Pause::new(),
-        })
+        Ok(())
     }
 
     /// Authorize exactly one additional rebase, under the caller's queue task
@@ -1329,6 +1434,16 @@ impl Runner {
     /// Reopen an existing run.
     pub fn resume(id: &str) -> Result<Self> {
         let state = RunState::load(id)?;
+        if state.startup.as_ref().is_some_and(|s| !s.complete)
+            || (state.status == RunStatus::Prep
+                && state.instruction.trim().is_empty()
+                && state.candidates.is_empty()
+                && state.prep_complete == Some(false))
+        {
+            bail!(
+                "run {id} did not finish startup; inspect its startup evidence and retained assets, then start an explicitly authorized review or recovery"
+            );
+        }
         crate::pr_head::ensure_owner(&state)?;
         if state.pr_recovery.is_some() && state.reviewed_commits.is_none() {
             bail!(
@@ -1367,6 +1482,10 @@ impl Runner {
     /// Blocked / Stalled / Failed, or died with an error, is announced to the
     /// attention-report outbox. Best-effort: see [`crate::notices::raise`].
     pub async fn execute(&mut self) -> Result<()> {
+        anyhow::ensure!(
+            self.state.startup.as_ref().is_none_or(|s| s.complete),
+            "startup incomplete; inspect retained evidence before explicit recovery"
+        );
         if let Some(selection) = &self.state.pr_recovery
             && (selection.source_proof.is_some() || selection.source_run.is_some())
         {
@@ -13618,13 +13737,13 @@ mod tests {
         };
         assert_eq!(
             error
-                .downcast_ref::<crate::pr_recovery::StartupFailed>()
+                .downcast_ref::<crate::run::StartupFailure>()
                 .unwrap()
                 .run,
             id
         );
         let failed = RunState::load(&id).unwrap();
-        assert_eq!(failed.status, RunStatus::Blocked);
+        assert_eq!(failed.status, RunStatus::Failed);
         assert_eq!(failed.liveness(false), crate::run::Liveness::Dead);
         assert!(Runner::resume(&id).is_err());
         runner.state.status = RunStatus::Ready;
@@ -15623,6 +15742,90 @@ mod tests {
     // `RunState::new`, so they never collide there.
     fn ask_test_home() {
         crate::run::pin_test_home();
+    }
+
+    #[test]
+    fn startup_terminal_save_failure_preserves_original_error_and_reservation() {
+        ask_test_home();
+        let mut runner = runner_at(RunStatus::Prep);
+        let guard = StartupGuard::reserve(&mut runner.state, "review", Some("feature")).unwrap();
+        // A blocked temporary output path makes the terminal save fail while
+        // preserving the already published reservation.
+        std::fs::create_dir(runner.state.dir().join("run.json.tmp")).unwrap();
+        let error = guard
+            .finish(
+                &mut runner.state,
+                Err(
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, "original refusal")
+                        .into(),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert!(error.downcast_ref::<crate::run::StartupFailure>().is_some());
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("original refusal") && message.contains("could not save terminal")
+        );
+        let saved = RunState::load(&runner.state.id).unwrap();
+        assert_eq!(saved.status, RunStatus::Blocked);
+        assert!(!saved.startup.unwrap().complete);
+    }
+
+    #[test]
+    fn reserved_startup_interruption_is_blocked_and_not_resumable() {
+        ask_test_home();
+        let mut runner = runner_at(RunStatus::Prep);
+        let guard = StartupGuard::reserve(&mut runner.state, "review", Some("feature")).unwrap();
+        let id = runner.state.id.clone();
+        drop(guard);
+        let saved = RunState::load(&id).unwrap();
+        assert_eq!(saved.status, RunStatus::Blocked);
+        assert!(!saved.startup.as_ref().unwrap().complete);
+        assert!(
+            saved
+                .startup
+                .unwrap()
+                .failure
+                .unwrap()
+                .contains("interrupted")
+        );
+        assert!(Runner::resume(&id).is_err());
+    }
+
+    #[test]
+    fn startup_failure_keeps_typed_cause_and_separate_task_history() {
+        ask_test_home();
+        let mut runner = runner_at(RunStatus::Prep);
+        let guard = StartupGuard::reserve(&mut runner.state, "review", Some("feature")).unwrap();
+        let error = guard
+            .finish(
+                &mut runner.state,
+                Err(
+                    std::io::Error::new(std::io::ErrorKind::PermissionDenied, "refused startup")
+                        .into(),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let failure = error.downcast_ref::<crate::run::StartupFailure>().unwrap();
+        let mut task = crate::queue::Task::new(
+            "review".into(),
+            "criteria".into(),
+            runner.state.repo.clone(),
+            crate::queue::Source::Human,
+        );
+        task.record_startup_failure(failure.clone());
+        task.record_startup_failure(failure.clone());
+        assert_eq!(task.startup_failures.len(), 1);
+        assert!(task.runs.is_empty());
+        assert_eq!(task.attempts, 0);
     }
 
     #[cfg(unix)]

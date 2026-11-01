@@ -242,6 +242,9 @@ pub async fn fold_due(
                 continue;
             }
         };
+        if state.startup.as_ref().is_some_and(|s| !s.complete) {
+            continue;
+        }
         if let Some(reason) = crate::pr_recovery::source_retention_reason(home, &state) {
             tracing::info!(%id, %reason, "housekeep: source retained; fold refused");
             continue;

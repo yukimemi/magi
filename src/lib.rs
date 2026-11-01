@@ -91,6 +91,8 @@ pub mod run;
 pub mod scrub;
 mod seat_process;
 pub mod settings;
+/// Explicit audit-only repair of never-executed startup reservations.
+pub mod startup_reconcile;
 pub mod stats;
 mod stop_reason;
 pub mod talk;
