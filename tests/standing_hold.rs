@@ -31,7 +31,11 @@ async fn standing_turn_answers_owner_requests_through_the_cli_without_quotes() {
          [ \"$MAGI_NODE\" = talk-title ] && exit 0\n\
          test \"$MAGI_ALLOW_WRITE\" = 0 || exit 31\n\
          test -n \"$MAGI_CHAT_CONTROL_FD$MAGI_CHAT_CONTROL_PIPE\" || exit 33\n\
-         MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" answer \"$QUESTION\" --reply \"$CHOICE\" || exit 32\n\
+         if [ \"$NATIVE_DECISION\" = 1 ]; then\n\
+           MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" task control decide \"$QUESTION\" \"$CHOICE\" || exit 32\n\
+         else\n\
+           MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" answer \"$QUESTION\" --reply \"$CHOICE\" || exit 32\n\
+         fi\n\
          echo 'Turn finished.'\n",
     )
     .unwrap();
@@ -130,11 +134,15 @@ async fn standing_turn_answers_owner_requests_through_the_cli_without_quotes() {
             }
             questions.put(&mut q).unwrap();
             assert!(
-                q.routed_task.is_none(),
-                "fixture must stay on the consultation path"
+                q.routed_task.as_ref() == owner_task.as_ref(),
+                "owned tasks route despite the retired opt-out"
             );
             let mut t = talk::begin(&talks, &cfg, repo.clone(), Some("mock")).unwrap();
-            if destination != "none" {
+            if let Some(task_id) = &owner_task {
+                magi::queue::Queue::at(tmp.path().join("queue")).modify(task_id, |task| { task.chat = Some(t.id.clone()); true }).unwrap();
+                magi::task_chat::sweep(&magi::queue::Queue::at(tmp.path().join("queue")), &talks, &questions, tmp.path());
+            }
+            if destination != "none" && owner_task.is_none() {
                 let origin = if destination == "same" {
                     t.clone()
                 } else {
@@ -150,6 +158,7 @@ async fn standing_turn_answers_owner_requests_through_the_cli_without_quotes() {
             let words = "それでお願い";
             talk::record(&mut t, &talks, words, vec![]).unwrap();
             let env = &mut cfg.agents[0].env;
+            env.insert("NATIVE_DECISION".into(), if owner_task.is_some() { "1" } else { "0" }.into());
             env.insert("CHOICE".into(), choice.into());
             env.insert("QUESTION".into(), q.id.clone());
             let _ = std::fs::remove_dir_all(&decoy);

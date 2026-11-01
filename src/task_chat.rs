@@ -19,31 +19,12 @@ pub fn task_of(q: &Question, tasks: &[Task]) -> Option<String> {
     matching.next().is_none().then(|| task.id.clone())
 }
 
-/// `[graph] question_routing` of the task's repository. An unreadable config
-/// is "unknown", never "on": routing is persisted on the record and cannot be
-/// undone when the config comes back, so a read failure keeps the legacy path.
-pub(crate) fn enabled_for(tasks: &[Task], task_id: &str) -> bool {
-    tasks.iter().find(|t| t.id == task_id).is_some_and(|t| {
-        Config::discover(&t.repo, None).is_ok_and(|(cfg, _)| cfg.graph.question_routing)
-    })
-}
-
-/// Every question about a task is routed to its chat. Two shapes need a
-/// head-bound merge target to be routable at all (a merge approval and a
-/// local release approval): without one they are old cards whose dismiss /
-/// repair recovery lives on the question path. A choice-less bump notice is a
-/// notice, not a decision.
+/// Informational bump notices have no decision. Every actionable task inquiry
+/// routes to chat, including recovery of approvals without a saved target.
 pub(crate) fn chat_routable(q: &Question) -> bool {
-    if q.node == crate::land::APPROVAL_NODE {
-        return q.merge_target.is_some();
-    }
-    if q.node == crate::bump::NOTICE_NODE {
-        return q.merge_target.is_some()
-            || (q.seat == "release-watch"
-                && !q.choices.is_empty()
-                && !q.choices.iter().any(|c| c == crate::land::APPROVE));
-    }
-    true
+    q.node != crate::bump::NOTICE_NODE
+        || q.merge_target.is_some()
+        || (q.seat == "release-watch" && !q.choices.is_empty())
 }
 
 /// Routed questions whose answer is consumed by machinery (the posting gate,
@@ -52,7 +33,8 @@ pub(crate) fn chat_routable(q: &Question) -> bool {
 /// them with `magi task control decide`, including merge and recovery
 /// decisions: the agent records the owner's request as it is.
 pub fn awaits_decision(q: &Question) -> bool {
-    q.merge_target.is_some()
+    q.node == crate::land::APPROVAL_NODE
+        || q.merge_target.is_some()
         || (chat_routable(q)
             // A structured action (done, resume, requeue ...) is applied by the
             // daemon from the recorded answer, so the record must stay open.
@@ -74,7 +56,7 @@ pub(crate) fn routes(q: &Question, home: &Path) -> bool {
     }
     let tasks = Queue::at(home.join("queue")).list();
     let watches = crate::release_watch::states_for_questions(home, std::slice::from_ref(q));
-    task_of_with_watches(q, &tasks, &watches).is_some_and(|id| enabled_for(&tasks, &id))
+    task_of_with_watches(q, &tasks, &watches).is_some()
 }
 
 /// Shared task destination reservation for decisions and attention reports.
@@ -226,7 +208,7 @@ pub fn post(
         source: format!("{}:{}:{}", q.node, q.seat, q.run),
         occurrence: None,
         text,
-        display: body,
+        display: format!("{body}{legacy_answer}"),
         key: format!("question:{}", q.id),
         evidence: Some(crate::notice_semantics::question(home, &task, run, q)),
         created_at: q.asked_at,
@@ -245,8 +227,59 @@ pub fn post(
 struct Migration {
     schema: u32,
     pending: Vec<String>,
+    /// Immutable boundary, retained after individual imports finish.
+    #[serde(default)]
+    sources: Option<std::collections::BTreeSet<String>>,
     #[serde(default)]
     errors: std::collections::BTreeMap<String, String>,
+}
+
+/// Whether a saved source belongs to the finite history import. A corrupt
+/// boundary is a hold, never evidence that its replies may be executed.
+pub(crate) fn migration_sources(home: &Path) -> Result<Option<std::collections::BTreeSet<String>>> {
+    let path = home.join("notifications/task-chat-migration-v1/state.json");
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Some(Default::default()));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let state: Migration = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(state.schema == 1, "unsupported inquiry migration");
+    Ok(state.sources)
+}
+
+pub(crate) fn migrated_source(home: &Path, id: &str) -> bool {
+    migration_sources(home).map_or_else(
+        |error| {
+            tracing::warn!("source {id} stays held: {error:#}");
+            true
+        },
+        |sources| sources.as_ref().is_none_or(|ids| ids.contains(id)),
+    )
+}
+
+/// Import never turns a saved reply into an executable request. Only a fresh
+/// task/chat command can authorize consumption of a quarantined source reply.
+pub(crate) fn saved_reply_requires_confirmation(home: &Path, q: &Question) -> bool {
+    migrated_source(home, &q.id) && source_reply_needs_confirmation(home, q)
+}
+
+pub(crate) fn source_reply_needs_confirmation(home: &Path, q: &Question) -> bool {
+    if q.answer.is_none() {
+        return false;
+    }
+    let request = format!("decision: {}", q.resolution().unwrap_or_default());
+    !crate::task_inquiry::Outbox::at(home)
+        .get(&q.id)
+        .is_ok_and(|record| {
+            record.decision.as_ref().is_some_and(|decision| {
+                decision.request.as_deref() == Some(request.as_str())
+                    && decision.source_answer_at.is_some()
+                    && decision.source_answer_at == q.answered_at
+            })
+        })
 }
 
 /// A migration source which still needs operator reconciliation. Reading the
@@ -363,9 +396,36 @@ fn migrate_batch(
                 }
                 ids.into_iter().collect()
             },
+            sources: None,
             errors: Default::default(),
         }
     };
+    let needs_boundary = migration.sources.is_none();
+    if needs_boundary {
+        let mut sources: std::collections::BTreeSet<_> =
+            migration.pending.iter().cloned().collect();
+        match std::fs::read_dir(questions.root()) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry?.path();
+                    if path
+                        .extension()
+                        .is_some_and(|extension| extension == "json")
+                    {
+                        let id = path
+                            .file_stem()
+                            .and_then(|stem| stem.to_str())
+                            .context("saved inquiry filename is not UTF-8")?;
+                        sources.insert(id.to_owned());
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        migration.pending = sources.iter().cloned().collect();
+        migration.sources = Some(sources);
+    }
     anyhow::ensure!(migration.schema == 1, "unsupported task inquiry migration");
     let save = |state: &Migration| -> Result<()> {
         let temp = path.with_extension("tmp");
@@ -375,7 +435,7 @@ fn migrate_batch(
     };
     // Persist the boundary before delivering anything. Receipt loss can repeat
     // a batch, but the original inquiry/transcript keys make that repeat inert.
-    if !path.exists() {
+    if !path.exists() || needs_boundary {
         save(&migration)?;
     }
     if migration.pending.is_empty() {
@@ -395,23 +455,17 @@ fn migrate_batch(
             let task = task_of_with_watches(&q, &tasks, watches)
                 .and_then(|id| tasks.iter().find(|task| task.id == id));
             let outbox = crate::task_inquiry::Outbox::at(home);
-            // A record that cannot safely route keeps its existing audience;
-            // the UI retains the legacy entry until that consumer is retired.
-            if !chat_routable(&q) || task.is_some_and(|task| !enabled_for(&tasks, &task.id)) {
-                if outbox.get(&q.id).is_ok() {
-                    outbox.suspend_delivery(&q.id, "This source still uses the legacy Questions entry; no second chat delivery is scheduled.")?;
-                }
-                return Ok(());
-            }
             let receipt = match effect_receipt(home, queue, &q, task.map(|task| task.id.as_str())) {
                 Ok(receipt) => receipt,
                 Err(error) => {
                     if pending_intent(home, &q, task, watches) {
                         if let Some(task) = task {
-                            questions.update(&q.id, |source| {
-                                source.routed_task = Some(task.id.clone());
-                                Ok(())
-                            })?;
+                            if q.routed_task.as_ref() != Some(&task.id) {
+                                questions.update(&q.id, |source| {
+                                    source.routed_task = Some(task.id.clone());
+                                    Ok(())
+                                })?;
+                            }
                             post(queue, talks, home, &task.id, &q)?;
                             sync_effect_receipt(home, queue, &q);
                         } else if !q.run.is_empty() {
@@ -442,10 +496,12 @@ fn migrate_batch(
             if let Some(task) = task {
                 // Reserve task routing before delivery: a deputy/waiter must
                 // never be a second audience for the same imported inquiry.
-                questions.update(&q.id, |source| {
-                    source.routed_task = Some(task.id.clone());
-                    Ok(())
-                })?;
+                if q.routed_task.as_ref() != Some(&task.id) {
+                    questions.update(&q.id, |source| {
+                        source.routed_task = Some(task.id.clone());
+                        Ok(())
+                    })?;
+                }
                 post(queue, talks, home, &task.id, &q)?;
                 sync_effect_receipt(home, queue, &q);
             } else if !q.run.is_empty() {
@@ -599,7 +655,6 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
             if record.task.is_empty()
                 && chat_routable(q)
                 && let Some(task) = task_of_with_watches(q, &tasks, &watches)
-                && enabled_for(&tasks, &task)
             {
                 if let Err(error) = post(queue, talks, home, &task, q) {
                     tracing::warn!("decision {} owner recovery: {error:#}", q.id);
@@ -609,11 +664,17 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
     }
     for q in all
         .into_iter()
-        .filter(|q| q.status.open() && !deferred.contains(&q.id))
+        .filter(|q| q.status.open() && chat_routable(q) && !deferred.contains(&q.id))
     {
-        // Targetless legacy approvals retain their compatibility card. Do not
-        // send even a draft that would imply this chat can decide that record.
-        if q.routed_task.is_none() && !chat_routable(&q) {
+        // The pre-migration scan may have projected a not-yet-imported source
+        // as open. Recheck the native result before scheduling delivery: the
+        // batch may just have classified it as passive completed history.
+        if outbox.get(&q.id).is_ok_and(|record| {
+            record.archived
+                || record.decision.is_some_and(|decision| {
+                    decision.status == crate::task_decision::Status::Resolved
+                })
+        }) {
             continue;
         }
         let Some(task_id) = q
@@ -623,11 +684,6 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
         else {
             continue;
         };
-        // A record routed at filing time stays routed even if the switch was
-        // turned off since: `routes` already hides it from the legacy path.
-        if q.routed_task.is_none() && !enabled_for(&tasks, &task_id) {
-            continue;
-        }
         // A delivered decision that waits for the owner is left alone: it is
         // rewritten only while it still lacks its task link (R2-1-1 / R2-2-1:
         // every poll used to lock and rewrite it).
@@ -953,12 +1009,12 @@ mod tests {
             "release-watch",
             vec![crate::land::APPROVE.into(), crate::land::HOLD.into()],
         );
-        assert!(!chat_routable(&legacy_release));
-        assert!(!awaits_decision(&legacy_release));
-        // A choice-less bump notice and an old approval card without a target
-        // are not decisions to route.
+        assert!(chat_routable(&legacy_release));
+        assert!(awaits_decision(&legacy_release));
+        // A choice-less bump notice is informational; a targetless approval
+        // still needs an owner discussion and safe recovery in its chat.
         assert!(!chat_routable(&q(crate::bump::NOTICE_NODE, "bump", vec![])));
-        assert!(!chat_routable(&q(
+        assert!(chat_routable(&q(
             crate::land::APPROVAL_NODE,
             "land",
             vec!["merge".into()]
@@ -975,7 +1031,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unreadable_repository_config_never_routes_a_question() {
+    fn unreadable_repository_config_keeps_task_routing_and_pending_delivery() {
         let home = tempfile::tempdir().unwrap();
         let queue = Queue::at(home.path().join("queue"));
         let repo = home.path().join("repo");
@@ -983,7 +1039,6 @@ mod tests {
         std::fs::write(repo.join("magi.toml"), "this is = [not toml").unwrap();
         let mut task = Task::new("t".into(), "i".into(), repo, crate::queue::Source::Human);
         queue.put(&mut task).unwrap();
-        assert!(!enabled_for(&queue.list(), &task.id));
         let questions = Questions::at(home.path().join("questions"));
         let mut q = Question::new(
             task.id.clone(),
@@ -994,10 +1049,27 @@ mod tests {
             vec![],
         );
         questions.put(&mut q).unwrap();
-        // Routing is persisted and cannot be undone when the config returns,
-        // so a read failure keeps the legacy question path.
-        assert!(q.routed_task.is_none());
-        assert!(questions.get(&q.id).unwrap().routed_task.is_none());
+        assert_eq!(q.routed_task.as_deref(), Some(task.id.as_str()));
+        assert_eq!(
+            questions.get(&q.id).unwrap().routed_task.as_deref(),
+            Some(task.id.as_str())
+        );
+        let talks = Talks::at(home.path().join("talks"));
+        sweep(&queue, &talks, &questions, home.path());
+        let outbox = crate::task_inquiry::Outbox::at(home.path());
+        outbox.sweep(&queue, &talks).unwrap();
+        assert!(
+            migration_issues(home.path())
+                .iter()
+                .any(|issue| issue.id == q.id)
+        );
+        let pending = outbox.get(&q.id).unwrap();
+        assert!(pending.delivered_to.is_none());
+        assert!(talks.list().is_empty());
+        assert_eq!(
+            pending.decision.unwrap().status,
+            crate::task_decision::Status::AwaitingOwner
+        );
     }
 
     #[test]

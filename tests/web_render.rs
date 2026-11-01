@@ -5025,154 +5025,96 @@ async fn chat_notification_display_hides_machine_context_on_phone_and_desktop() 
     }
 }
 
-/// Chat navigation remains independent of consultation and answer controls.
+/// Task inquiries retain their navigation independently of read and settlement.
 #[tokio::test]
-async fn question_chat_link_survives_consultation_and_settlement() {
+async fn pending_chat_links_survive_closed_chats_and_explicit_settlement() {
     let Some(chrome) = cdp::find_chrome() else {
         assert!(std::env::var_os("CI").is_none(), "CI requires Chrome");
-        eprintln!("SKIP question chat link: no Chrome/Chromium found");
         return;
     };
-    let guard = common::home_lock().await;
-    let fx = common::fixture(guard, common::Judges::Unanimous, false);
-    let home = fx.tmp.path().join("magi-home");
-    // The consult button and origin-chat link belong to the retained legacy
-    // question path; with task-chat routing (the default) a question about a
-    // chat-filed task goes to that chat and never reaches this list.
-    let mut legacy = fx.config.clone();
-    legacy.graph.question_routing = false;
-    std::fs::write(fx.repo.join("magi.toml"), toml::to_string(&legacy).unwrap()).unwrap();
-    for args in [
-        vec!["add", "magi.toml"],
-        vec!["commit", "-m", "test: legacy question path"],
-        vec!["push", "origin", "main"],
-    ] {
-        let out = std::process::Command::new("git")
-            .args(&args)
-            .current_dir(&fx.repo)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("pending-chat-links");
     let talks = Talks::at(home.join("talks"));
-    let mut chat = talk::begin(
-        &talks,
-        &fx.config,
-        fx.repo.clone(),
-        Some(&fx.config.agents[0].id),
-    )
-    .unwrap();
-    talk::record(&mut chat, &talks, "Question origin chat", Vec::new()).unwrap();
+    let mut chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
     let queue = Queue::at(home.join("queue"));
     let mut task = Task::new(
-        "Question origin task".into(),
-        "Instruction".into(),
+        "Pending task".into(),
+        "Work".into(),
         fx.repo.clone(),
-        Source::Agent {
-            run: chat.id.clone(),
-            node: magi::queue::CHAT_NODE.into(),
-        },
+        Source::Human,
     );
-    task.status = TaskStatus::Running;
-    task.runs = vec!["run".into()];
+    task.chat = Some(chat.id.clone());
     queue.put(&mut task).unwrap();
-    seed_questions(
-        &home,
-        &[QuestionSeed {
-            id: "question-chat-link",
-            run: "run",
-            node: "implement",
-            seat: "impl-A",
-            summary: "Choose a backend",
-            asked_at: "2026-10-12T23:05:24Z",
-            choices: &[],
-        }],
-    );
-    let base = serve_with_client_probe(
-        &home,
-        queue,
-        talks,
-        home.join("runs"),
-        &fx.repo,
-        ClientProbe::Questions,
-    )
-    .await;
+    let outbox = magi::task_inquiry::Outbox::at(&home);
+    let inquiry = outbox
+        .file(
+            &task,
+            None,
+            "implement".into(),
+            "方針を相談",
+            "元の問い合わせの詳細",
+        )
+        .unwrap();
+    outbox.deliver(&queue, &talks, &inquiry.id).unwrap();
+    for index in 0..20 {
+        talk::record(&mut chat, &talks, &format!("Later message {index}"), vec![]).unwrap();
+    }
+    talk::close(&mut chat, &talks).unwrap();
+    let base = serve(&home, queue, talks.clone(), home.join("runs"), &fx.repo).await;
     let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
     for (width, height, mobile) in [(1280, 900, false), (390, 844, true), (320, 640, true)] {
         let page = browser
-            .open_page(&format!("{base}#/questions"), width, height, mobile)
+            .open_page(&format!("{base}#/decisions"), width, height, mobile)
             .await
             .unwrap();
         browser
             .wait_for(
                 &page,
-                "!!window.deck && Array.isArray(deck.state.questions) && deck.state.questions.length === 1",
+                "document.querySelectorAll('#decisions-list .decision-card').length === 1",
                 Duration::from_secs(30),
             )
             .await
             .unwrap();
-        browser
-            .eval(&page, &format!("window.originChat = {:?}", chat.id))
-            .await
-            .unwrap();
-        let out = browser.eval(&page, r##"(async () => {
-          await window.queueReady;
-          while (deck.storeReads.get('questions')) await deck.storeReads.get('questions').promise;
-          await deck.loadQuestionOrigins();
-          const check = (ok, why) => { if (!ok) throw new Error(why); };
-          const q = deck.state.questions.find(item => item.id === 'question-chat-link');
-          check(q && q.origin_chat === originChat && q.can_consult_chat, 'origin chat not loaded');
-          const render = (patch = {}) => {
-            Object.assign(q, patch); deck.state.questions = [{ ...q }]; deck.renderQuestions();
-          };
-          render();
-          const row = document.querySelector('#questions-list .ask');
-          const { consultBtn, chatLink, text, sayText } = row.refs;
-          check(chatLink.tagName === 'A' && !chatLink.hidden, 'missing native chat link');
-          check(!consultBtn.hidden && !consultBtn.disabled, 'consultation unavailable');
-          text.value = 'Keep this answer'; sayText.value = 'Keep this reply'; text.focus();
-          render({ consult: { talk: originChat } });
-          check(consultBtn.disabled && consultBtn.textContent === 'Asked the chat agent', 'consultation state lost');
-          check(!chatLink.hidden && chatLink.getAttribute('href') === '#/chat/' + encodeURIComponent(originChat), 'consulted chat unavailable');
-          check(text.value === 'Keep this answer' && sayText.value === 'Keep this reply' && document.activeElement === text, 'draft or focus lost');
-          check(!row.refs.send.disabled, 'answering disabled by consultation');
-          const box = row.refs.consultBox.getBoundingClientRect();
-          for (const control of [consultBtn, chatLink]) {
-            const rect = control.getBoundingClientRect();
-            check(rect.height >= 44, 'small tap target');
-            check(rect.left >= box.left && rect.right <= box.right + 1 && rect.right <= innerWidth, 'action overflows');
-          }
-          const buttonRect = consultBtn.getBoundingClientRect(), linkRect = chatLink.getBoundingClientRect();
-          check(linkRect.left >= buttonRect.right || linkRect.top >= buttonRect.bottom, 'actions overlap');
-          render({ status: 'answered', can_consult_chat: false });
-          check(consultBtn.hidden && !chatLink.hidden, 'settled chat unavailable');
-          render({ origin_chat_closed: true });
-          check(chatLink.textContent === 'Open chat (closed)', 'closed chat not labelled');
-          render({ status: 'abandoned' });
-          check(!chatLink.hidden, 'abandoned chat unavailable');
-          render({ origin_chat: null });
-          check(row.refs.consultBox.hidden && chatLink.hidden && !chatLink.hasAttribute('href'), 'stale chat link retained');
-          render({ origin_chat: 'chat /?#日本語' });
-          check(decodeURIComponent(chatLink.hash.split('/')[2]) === q.origin_chat, 'chat ID encoding lost');
-          render({ origin_chat: originChat });
-          chatLink.click();
-          return true;
+        let result = browser.eval(&page, r##"(() => {
+          const card = document.querySelector('#decisions-list .decision-card');
+          const bounds = card.getBoundingClientRect();
+          const links = [...card.querySelectorAll('a')];
+          if (bounds.left < 0 || bounds.right > innerWidth) throw new Error('card overflow');
+          if (!links.every(link => link.getBoundingClientRect().height >= 44)) throw new Error('small tap target');
+          const inquiry = links.find(link => link.hash.includes('/inquiry/'));
+          if (!inquiry || !links.some(link => link.hash.startsWith('#/tasks/'))) throw new Error('missing ownership links');
+          inquiry.click(); return true;
         })()"##).await.unwrap();
-        assert_eq!(out, true, "question chat link @{width}px");
-        browser
-            .wait_for(
-                &page,
-                "!document.querySelector('#view-talk').hidden && document.querySelector('#talk-h').textContent === 'Question origin chat'",
-                Duration::from_secs(30),
-            )
-            .await
-            .unwrap();
+        assert_eq!(result, true);
+        browser.wait_for(&page, "!document.querySelector('#talk-inquiry').hidden && document.querySelector('#talk-inquiry').innerText.includes('元の問い合わせの詳細')", Duration::from_secs(30)).await.unwrap();
+        assert_eq!(
+            outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
+            magi::task_decision::Status::AwaitingOwner
+        );
+        assert!(
+            !talks.get(&chat.id).unwrap().status.open(),
+            "navigation is not reopening or settlement"
+        );
+        assert!(console_problems(&browser.take_events(&page.session)).is_empty());
         browser.close_page(&page).await;
     }
+    outbox
+        .settle(
+            &inquiry.id,
+            &chat.id,
+            "Owner explicitly confirms no further effect is necessary",
+            None,
+        )
+        .unwrap();
+    let page = browser
+        .open_page(&format!("{base}#/decisions"), 390, 844, true)
+        .await
+        .unwrap();
+    browser.wait_for(&page, "!document.querySelector('#decisions-history').hidden && document.querySelectorAll('#decisions-list .decision-card').length === 0 && document.querySelectorAll('#decisions-resolved .decision-card').length === 1", Duration::from_secs(30)).await.unwrap();
+    browser.eval(&page, "document.querySelector('#decisions-history summary').click(); document.querySelector('#decisions-resolved a[href*=\"/inquiry/\"]').click()").await.unwrap();
+    browser.wait_for(&page, "!document.querySelector('#talk-inquiry').hidden && document.querySelector('#talk-inquiry').innerText.includes('解決済み')", Duration::from_secs(30)).await.unwrap();
+    assert!(!talks.get(&chat.id).unwrap().status.open());
+    browser.close_page(&page).await;
 }
 
 #[tokio::test]

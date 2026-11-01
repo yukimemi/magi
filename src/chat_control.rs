@@ -561,7 +561,9 @@ async fn execute_decision(
             decision.request.as_deref() == Some(&request),
             "decision resolved for a different request"
         );
-        return Ok(format!("decision {id} effect was already confirmed"));
+        return Ok(format!(
+            "decision {id} is already resolved; inspect its outcome history"
+        ));
     }
     if decision.request.is_none() && decision.status == Status::RetryNeeded {
         if let Ok(source) = crate::ask::Questions::at(home.join("questions")).get(id) {
@@ -575,13 +577,20 @@ async fn execute_decision(
     if decision.request.is_some()
         && matches!(decision.status, Status::InProgress | Status::RetryNeeded)
     {
-        let action = merge
-            .as_ref()
-            .context("previous effect needs receipt reconciliation; it will not be replayed")?;
-        ensure!(
-            merge_receipt(home, chat, action)?.is_some(),
-            "previous merge has no receipt; inspect the operation before retrying"
-        );
+        if decision.retry_safe {
+            outbox.update_decision(id, |d| {
+                d.retry_unapplied()?;
+                d.start()
+            })?;
+        } else {
+            let action = merge
+                .as_ref()
+                .context("previous effect needs receipt reconciliation; it will not be replayed")?;
+            ensure!(
+                merge_receipt(home, chat, action)?.is_some(),
+                "previous merge has no receipt; inspect the operation before retrying"
+            );
+        }
         // The shared merge service only checks the forge once this exact
         // request has a receipt; it never issues the merge command twice.
     } else {
@@ -647,11 +656,30 @@ async fn execute_decision(
             Ok(message)
         }
         Err(error) => {
-            outbox.update_decision(id, |d| d.fail(&format!("Operation failed or has an uncertain result: {error:#}. Inspect its receipt before retrying.")))?;
+            let message = if error.is::<BeforeEffect>() {
+                format!(
+                    "{error:#}. No effect began; retry this same request after resolving the cause, or explicitly settle it."
+                )
+            } else {
+                format!(
+                    "Operation failed or has an uncertain result: {error:#}. Inspect its receipt before retrying."
+                )
+            };
+            outbox.update_decision(id, |d| {
+                if error.is::<BeforeEffect>() {
+                    d.fail_before_effect(&message)
+                } else {
+                    d.fail(&message)
+                }
+            })?;
             Err(error)
         }
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("effect did not start: {0:#}")]
+struct BeforeEffect(anyhow::Error);
 
 /// Commit a task-local effect and its exact receipt under one queue claim.
 /// The inquiry projection may lag this write, but restart never has to infer
@@ -672,53 +700,57 @@ fn apply_local_decision(
         | Operation::Retry { task, .. } => task,
         _ => return Ok(None),
     };
-    let (_claim, mut task) = claimed(queue, target)?;
-    ensure!(
-        task.id == owner && task.repo == repo,
-        "decision ownership changed"
-    );
-    if let Some(prior) = task.decision_effects.get(id) {
-        ensure!(prior == request, "decision receipt binds another command");
-        return Ok(Some(format!(
-            "task {}: decision {id} already applied",
-            task.id
-        )));
-    }
-    let message = match command {
-        Operation::Done { .. } => {
-            task.succeed();
-            describe(&task, "done")
+    let prepare = || -> Result<_> {
+        let (_claim, mut task) = claimed(queue, target)?;
+        ensure!(
+            task.id == owner && task.repo == repo,
+            "decision ownership changed"
+        );
+        if let Some(prior) = task.decision_effects.get(id) {
+            ensure!(prior == request, "decision receipt binds another command");
+            let message = format!("task {}: decision {id} already applied", task.id);
+            return Ok((_claim, task, message, true));
         }
-        Operation::Hold { reason, .. } => {
-            check_hold_release(&task, "hold")?;
-            let reason = reason.trim();
-            task.hold_manual((!reason.is_empty()).then(|| reason.to_owned()));
-            describe(&task, "held")
-        }
-        Operation::Release { .. } => {
-            check_hold_release(&task, "release")?;
-            task.release_operator("chat", Some(id));
-            describe(&task, "released")
-        }
-        Operation::Retry {
-            title, instruction, ..
-        } => {
-            ensure!(
-                !instruction.trim().is_empty(),
-                "the new instruction is empty"
-            );
-            let title = title
-                .clone()
-                .unwrap_or_else(|| crate::queue::title_from(instruction, 72));
-            task.edit(title, instruction.clone())?;
-            task.release_operator("chat", Some(id));
-            describe(&task, "retry queued for")
-        }
-        _ => unreachable!("task-local operation checked above"),
+        let message = match command {
+            Operation::Done { .. } => {
+                task.succeed();
+                describe(&task, "done")
+            }
+            Operation::Hold { reason, .. } => {
+                check_hold_release(&task, "hold")?;
+                let reason = reason.trim();
+                task.hold_manual((!reason.is_empty()).then(|| reason.to_owned()));
+                describe(&task, "held")
+            }
+            Operation::Release { .. } => {
+                check_hold_release(&task, "release")?;
+                task.release_operator("chat", Some(id));
+                describe(&task, "released")
+            }
+            Operation::Retry {
+                title, instruction, ..
+            } => {
+                ensure!(
+                    !instruction.trim().is_empty(),
+                    "the new instruction is empty"
+                );
+                let title = title
+                    .clone()
+                    .unwrap_or_else(|| crate::queue::title_from(instruction, 72));
+                task.edit(title, instruction.clone())?;
+                task.release_operator("chat", Some(id));
+                describe(&task, "retry queued for")
+            }
+            _ => unreachable!("task-local operation checked above"),
+        };
+        task.decision_effects
+            .insert(id.to_owned(), request.to_owned());
+        Ok((_claim, task, message, false))
     };
-    task.decision_effects
-        .insert(id.to_owned(), request.to_owned());
-    queue.put(&mut task)?;
+    let (_claim, mut task, message, already_applied) = prepare().map_err(BeforeEffect)?;
+    if !already_applied {
+        queue.put(&mut task)?;
+    }
     if matches!(command, Operation::Done { .. }) {
         crate::daemon::supersede_prior_runs(&task, home);
     }
@@ -1044,6 +1076,21 @@ fn record_decision(
         q.short()
     );
     let (q, ()) = questions.update(&q.id, |r| {
+        if crate::task_chat::saved_reply_requires_confirmation(home, r) {
+            ensure!(
+                crate::task_inquiry::Outbox::at(home)
+                    .get(&r.id)?
+                    .decision
+                    .is_some_and(
+                        |decision| decision.status != crate::task_decision::Status::Resolved
+                    ),
+                "saved decision is settled; no effect remains necessary"
+            );
+            r.status = crate::ask::QuestionStatus::Open;
+            r.answer = None;
+            r.answered_at = None;
+            r.answer_authority = None;
+        }
         ensure!(
             r.status.open(),
             "question {} is already {}",
@@ -1051,6 +1098,11 @@ fn record_decision(
             r.status.as_str()
         );
         let reply = r.resolve_reply(choice)?.to_owned();
+        ensure!(
+            crate::land::approval(Some(&reply)) != crate::land::Approval::Merge || r.merge_target.is_some()
+                || !(r.node == crate::land::APPROVAL_NODE || (r.node == crate::bump::NOTICE_NODE && r.seat == "release-watch")),
+            "approval has no recorded PR/head; recover its target or discuss a non-merge operation in chat"
+        );
         let replacement =
             r.node == crate::github_text::ASK_NODE && reply == crate::github_text::USE_MY_TEXT;
         ensure!(
@@ -1081,7 +1133,11 @@ fn record_decision(
         let outbox = crate::task_inquiry::Outbox::at(home);
         if outbox.get(&r.id).is_ok() {
             outbox.update_decision(&r.id, |d| {
-                d.accept(&format!("decision: {}", r.resolution().unwrap_or_default()))
+                let accepted =
+                    d.accept(&format!("decision: {}", r.resolution().unwrap_or_default()))?;
+                let changed = d.source_answer_at != r.answered_at;
+                d.source_answer_at = r.answered_at;
+                Ok(accepted || changed)
             })?;
         }
         Ok(())

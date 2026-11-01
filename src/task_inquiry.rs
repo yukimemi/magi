@@ -73,7 +73,7 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
-/// Stable native identity: prose changes do not create a new decision.
+/// Stable identity for one producer-assigned occurrence.
 fn id_for(task: &str, kind: &str, generation: &str) -> String {
     use sha2::{Digest, Sha256};
     let bytes = serde_json::to_vec(&("task-inquiry-v3", task, kind, generation))
@@ -139,9 +139,8 @@ impl Outbox {
         Ok(())
     }
 
-    /// File a free-text task inquiry directly, without a Question envelope.
-    /// Task, producer and execution generation form its restart key; prose does not.
-    /// Reopening the same occurrence preserves its original content and lifecycle.
+    /// File one content-distinct inquiry. An unchanged producer replay retains
+    /// its receipt; independent inquiries need distinct occurrence identifiers.
     pub fn file(
         &self,
         task: &crate::queue::Task,
@@ -150,12 +149,32 @@ impl Outbox {
         summary: &str,
         detail: &str,
     ) -> Result<Inquiry> {
+        let content = serde_json::to_string(&(summary, detail))?;
+        let occurrence = format!("content:{}", id_for(&task.id, &source, &content));
+        self.file_for_occurrence(task, run, source, &occurrence, summary, detail)
+    }
+
+    /// File or replay an explicit producer occurrence independently of prose.
+    /// Use a new key for each separate inquiry, including identical wording.
+    pub fn file_for_occurrence(
+        &self,
+        task: &crate::queue::Task,
+        run: Option<String>,
+        source: String,
+        request: &str,
+        summary: &str,
+        detail: &str,
+    ) -> Result<Inquiry> {
+        ensure!(!request.trim().is_empty(), "inquiry occurrence is empty");
         ensure!(!summary.trim().is_empty(), "inquiry summary is empty");
         ensure!(
             run.as_ref().is_none_or(|run| task.runs.contains(run)),
             "inquiry run is not owned by its task"
         );
-        let occurrence = serde_json::to_string(&(task.passes.len(), &task.operator_decided_at))?;
+        let old_generation =
+            serde_json::to_string(&(task.passes.len(), &task.operator_decided_at))?;
+        let occurrence =
+            serde_json::to_string(&(task.passes.len(), &task.operator_decided_at, request))?;
         let generation = serde_json::to_string(&(&task.repo, &run, &occurrence))?;
         let mut id = id_for(&task.id, &source, &generation);
         let clean = |s: &str| {
@@ -176,7 +195,10 @@ impl Outbox {
                         && saved.repo == task.repo
                         && saved.source == source
                         && match &saved.occurrence {
-                            Some(prior) => prior == &occurrence,
+                            Some(prior) => {
+                                prior == &occurrence
+                                    || (prior == &old_generation && saved.display == display)
+                            }
                             None => {
                                 saved.display == display
                                     && saved.decision.as_ref().is_some_and(|d| {
@@ -263,14 +285,20 @@ impl Outbox {
             // The original prose and decision lifecycle survive a producer replay.
             // Identity is ownership plus occurrence, never the rephrased body.
             if let Some(occurrence) = &inquiry.occurrence {
+                let retained_generation = saved.occurrence.as_ref().is_some_and(|prior| {
+                    let prior = serde_json::from_str::<Vec<serde_json::Value>>(prior);
+                    let next = serde_json::from_str::<Vec<serde_json::Value>>(occurrence);
+                    matches!((prior, next), (Ok(prior), Ok(next)) if prior.len() == 2 && next.len() == 3 && prior == next[..2] && saved.display == inquiry.display)
+                });
                 ensure!(
                     saved
                         .occurrence
                         .as_ref()
-                        .is_none_or(|prior| prior == occurrence),
+                        .is_none_or(|prior| prior == occurrence)
+                        || retained_generation,
                     "inquiry identity was reused across occurrence generations"
                 );
-                if saved.occurrence.is_none() {
+                if saved.occurrence.is_none() || retained_generation {
                     saved.occurrence = Some(occurrence.clone());
                     self.save(&saved)?;
                 }
@@ -607,10 +635,11 @@ mod tests {
         task.runs = vec!["run-a".into(), "run-b".into()];
         let outbox = Outbox::at(dir.path());
         let first = outbox
-            .file(
+            .file_for_occurrence(
                 &task,
                 Some("run-a".into()),
                 "implement".into(),
+                "first-inquiry",
                 "Original",
                 "Original detail",
             )
@@ -631,10 +660,11 @@ mod tests {
             decision.error = (status == Status::RetryNeeded).then(|| "uncertain effect".into());
             outbox.save(&saved).unwrap();
             let replay = Outbox::at(dir.path())
-                .file(
+                .file_for_occurrence(
                     &task,
                     Some("run-a".into()),
                     "implement".into(),
+                    "first-inquiry",
                     "Reworded",
                     "Changed detail",
                 )
@@ -642,19 +672,21 @@ mod tests {
             assert_eq!(replay, saved);
         }
         let other_kind = outbox
-            .file(
+            .file_for_occurrence(
                 &task,
                 Some("run-a".into()),
                 "review".into(),
+                "first-inquiry",
                 "Original",
                 "Original detail",
             )
             .unwrap();
         let other_run = outbox
-            .file(
+            .file_for_occurrence(
                 &task,
                 Some("run-b".into()),
                 "implement".into(),
+                "first-inquiry",
                 "Original",
                 "Original detail",
             )
@@ -663,10 +695,11 @@ mod tests {
         assert_ne!(first.id, other_run.id);
         task.hold_manual(Some("new owner generation".into()));
         let next = outbox
-            .file(
+            .file_for_occurrence(
                 &task,
                 Some("run-a".into()),
                 "implement".into(),
+                "first-inquiry",
                 "Original",
                 "Original detail",
             )
@@ -682,10 +715,11 @@ mod tests {
         let task = task();
         let outbox = Outbox::at(dir.path());
         let mut retained = outbox
-            .file(
+            .file_for_occurrence(
                 &task,
                 None,
                 "implement".into(),
+                "first-inquiry",
                 "Original",
                 "Original detail",
             )
@@ -703,10 +737,11 @@ mod tests {
             .unwrap();
         outbox.save(&retained).unwrap();
         let replay = Outbox::at(dir.path())
-            .file(
+            .file_for_occurrence(
                 &task,
                 None,
                 "implement".into(),
+                "first-inquiry",
                 "Reworded",
                 "Changed detail",
             )

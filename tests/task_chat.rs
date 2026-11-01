@@ -317,7 +317,7 @@ async fn forwarded_triage_does_not_file_another_question_while_chat_decides() {
 }
 
 common::e2e! {
-async fn targetless_release_approval_keeps_its_compatibility_card_and_answer() {
+async fn targetless_release_approval_stays_in_chat_and_never_manufactures_a_head() {
     let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
     let home = fx.tmp.path().join("outbox");
     let queue = Queue::at(home.join("queue"));
@@ -337,27 +337,19 @@ async fn targetless_release_approval_keeps_its_compatibility_card_and_answer() {
         "question": q.id, "run": "run-a", "url": "https://example.test/pull/1",
         "repo": fx.repo, "local": true
     })).unwrap()).unwrap();
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    task.chat = Some(chat.id.clone()); queue.put(&mut task).unwrap();
     for _ in 0..2 { magi::task_chat::sweep(&queue, &talks, &questions, &home); }
-    let q = questions.get(&q.id).unwrap();
-    assert!(q.routed_task.is_none());
-    assert!(q.routed_chat.is_none());
-    assert!(q.merge_target.is_none());
-    assert!(talks.list().is_empty());
-    assert!(magi::deputy::kind_of(&q).is_some());
-    // Repair a record already misrouted by the previous implementation too.
-    let mut misrouted = q.clone();
-    misrouted.routed_task = Some(task.id.clone());
-    misrouted.routed_chat = Some("old-chat".into());
-    misrouted.consult = Some(magi::ask::ChatConsult { talk: "old-chat".into(), at: jiff::Timestamp::now() });
-    questions.put(&mut misrouted).unwrap();
-    let repaired = questions.get(&q.id).unwrap();
-    assert!(repaired.routed_task.is_none());
-    assert!(repaired.routed_chat.is_none());
-    assert!(repaired.consult.is_none());
-    magi::task_chat::sweep(&queue, &talks, &questions, &home);
-    assert!(talks.list().is_empty());
-    let (q, ()) = questions.update(&q.id, |q| q.answer(Answer::Choice(magi::land::HOLD.into()))).unwrap();
-    assert_eq!(q.resolution().as_deref(), Some(magi::land::HOLD));
+    let pending = questions.get(&q.id).unwrap();
+    assert_eq!(pending.routed_task.as_deref(), Some(task.id.as_str()));
+    assert_eq!(pending.routed_chat.as_deref(), Some(chat.id.as_str()));
+    assert!(pending.merge_target.is_none(), "migration must not invent a head");
+    assert!(magi::deputy::kind_of(&pending).is_none());
+    assert_eq!(talks.get(&chat.id).unwrap().pending_messages.len(), 1);
+    assert!(magi::chat_control::decide(&talks, &home, &chat.id, &q.id, "merge").is_err());
+    assert!(magi::task_inquiry::Outbox::at(&home).get(&q.id).unwrap().decision.unwrap().request.is_none());
+    let held = magi::chat_control::decide(&talks, &home, &chat.id, &q.id, "hold").unwrap();
+    assert_eq!(held.resolution().as_deref(), Some(magi::land::HOLD));
 }
 }
 
@@ -546,5 +538,33 @@ async fn abandoned_dependency_decision_does_not_block_a_new_dependency_question(
     assert_eq!(questions.get(&current.id).unwrap().routed_chat, first.routed_chat);
     assert_eq!(talks.get(&chat.id).unwrap().pending_messages.len(), 2);
     assert!(magi::triage::run_once(&queue, &questions, None, jiff::Timestamp::now()).asked.is_empty());
+}
+}
+
+common::e2e! {
+async fn separate_cli_asks_create_separate_decisions_and_request_ids_deduplicate_only_replays() {
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("separate-asks");
+    let queue = Queue::at(home.join("queue"));
+    let mut task = task(&fx.repo, Source::Human); queue.put(&mut task).unwrap();
+    for (summary, request) in [
+        ("First inquiry", None), ("Second inquiry", None),
+        ("First inquiry", None), ("Explicit occurrence", Some("stable-request")),
+        ("Rephrased replay", Some("stable-request")),
+    ] {
+        let mut command = common::magi_cli(&home);
+        command.current_dir(&fx.repo).args(["ask", "--summary", summary, "--detail", "Context"])
+            .env("MAGI_RUN", "run-a").env("MAGI_NODE", "implement").env("MAGI_SEAT", "impl-A");
+        if let Some(request) = request { command.args(["--request", request]); }
+        let mut command = tokio::process::Command::from(command); command.kill_on_drop(true);
+        let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output()).await.unwrap().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    }
+    let items = magi::task_inquiry::Outbox::at(&home).list().unwrap();
+    assert_eq!(items.len(), 4, "distinct invocations, including identical wording, are independent inquiries");
+    assert_eq!(items.iter().filter(|item| item.display.starts_with("First inquiry")).count(), 2);
+    assert_eq!(items.iter().filter(|item| item.display.starts_with("Explicit occurrence")).count(), 1);
+    assert!(items.iter().all(|item| item.task == task.id && item.run.as_deref() == Some("run-a") && item.decision.as_ref().unwrap().request.is_none()));
+    assert!(!home.join("questions").exists());
 }
 }

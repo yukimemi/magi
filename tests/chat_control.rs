@@ -738,16 +738,16 @@ fn chat_controls_through_real_cli_child() {
 /// launcher's stores through the inherited bridge.
 #[cfg(unix)]
 #[test]
-fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
+fn chat_commands_over_the_bridge_settle_native_inquiries_and_dismiss_approvals() {
     common::isolated(
-        "chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record",
+        "chat_commands_over_the_bridge_settle_native_inquiries_and_dismiss_approvals",
         || async {
             use std::os::unix::fs::PermissionsExt as _;
             let f = Fixture::new();
             let home = f.tmp.path();
             magi::run::set_home(home.to_owned());
             let questions = magi::ask::Questions::at(home.join("questions"));
-            // An ordinary (not task-chat routed) approval, answered here.
+            // Task inquiries use native chat commands even with the retired opt-out.
             let repo = home.join("repository");
             std::fs::create_dir(&repo).unwrap();
             assert!(
@@ -809,11 +809,12 @@ fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
                 Source::Human,
             );
             owner.runs.push(state.id.clone());
+            owner.chat = Some(f.talk.clone());
             owner.status = TaskStatus::Parked;
             f.queue().put(&mut owner).unwrap();
             questions.put(&mut approval).unwrap();
             let mut free = magi::ask::Question::new(
-                "20260902-000000-beef".into(),
+                state.id.clone(),
                 "implement".into(),
                 "impl-A".into(),
                 "Which file?".into(),
@@ -821,7 +822,9 @@ fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
                 Vec::new(),
             );
             questions.put(&mut free).unwrap();
-            assert!(approval.routed_task.is_none() && free.routed_task.is_none());
+            assert_eq!(approval.routed_task.as_deref(), Some(owner.id.as_str()));
+            assert_eq!(free.routed_task.as_deref(), Some(owner.id.as_str()));
+            magi::task_chat::sweep(&f.queue(), &f.talks, &questions, home);
 
             // The decoy home holds copies of what the CLI reads; its question
             // store is read-only, so a direct answer could not even lock it.
@@ -838,6 +841,15 @@ fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
                 Talks::at(decoy.join("talks")).path_of(&f.talk),
             )
             .unwrap();
+            let decoy_before: std::collections::BTreeMap<_, _> = [&free, &approval]
+                .into_iter()
+                .map(|q| {
+                    (
+                        q.id.clone(),
+                        std::fs::read(decoy_questions.path_of(&q.id)).unwrap(),
+                    )
+                })
+                .collect();
             let readonly = |mode| {
                 std::fs::set_permissions(
                     decoy.join("questions"),
@@ -893,8 +905,8 @@ fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
                  MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" task add --repo \"$FILING_REPO\" --solo --urgent --priority 7 --implementers 2 --attach \"$FILING_ATTACH\" --hold 'owner requested' --title 'Follow-up' -- 'Implement follow-up work' || exit 35\n\
                  MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" task priority \"$COMPLETE_TASK\" 12 || exit 36\n\
                  MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" task done \"$COMPLETE_TASK\" || exit 37\n\
-                 MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" answer \"$FREE\" --reply src/lib.rs || exit 33\n\
-                 MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" answer \"$APPROVAL\" --reply \"$DISMISS\" || exit 34\n"
+                 MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" task control settle-decision \"$FREE\" --reason 'Owner selected src/lib.rs; no further effect remains'  || exit 33\n\
+                 MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" task control decide \"$APPROVAL\" \"$DISMISS\" || exit 34\n"
                     .into(),
             ];
             let mut seat = magi::agent::SeatState::new("chat", "mock", 1);
@@ -945,15 +957,22 @@ fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
                 RunStatus::Superseded
             );
             // The launcher's report comes back through the bridge.
-            assert!(output.text.contains("answered"), "{output:?}");
-            assert!(
-                output.text.contains("Obsolete approval ended"),
-                "{output:?}"
-            );
+            assert!(output.text.contains("settled decision"), "{output:?}");
+            assert!(output.text.contains("recorded"), "{output:?}");
 
-            assert_eq!(
-                questions.get(&free.id).unwrap().resolution().as_deref(),
-                Some("src/lib.rs")
+            let decision = magi::task_inquiry::Outbox::at(home)
+                .get(&free.id)
+                .unwrap()
+                .decision
+                .unwrap();
+            assert_eq!(decision.status, magi::task_decision::Status::Resolved);
+            assert!(
+                decision
+                    .history
+                    .last()
+                    .unwrap()
+                    .evidence
+                    .contains("src/lib.rs")
             );
             assert_eq!(
                 questions.get(&approval.id).unwrap().resolution().as_deref(),
@@ -968,7 +987,10 @@ fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
             assert_eq!(run.pr.unwrap().state, "open");
             assert_eq!(f.queue().get(&owner.id).unwrap().status, TaskStatus::Done);
             for q in [&free, &approval] {
-                assert!(decoy_questions.get(&q.id).unwrap().status.open());
+                assert_eq!(
+                    std::fs::read(decoy_questions.path_of(&q.id)).unwrap(),
+                    decoy_before[&q.id]
+                );
             }
         },
     );

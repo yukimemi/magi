@@ -1434,20 +1434,22 @@ async fn maintenance_conductor_release_restores_its_original_hold_once() {
 }
 
 common::e2e! {
-async fn maintenance_resume_preserves_operator_decisions_after_deputy_settle() {
+async fn maintenance_resume_preserves_later_operator_decisions_after_chat_acceptance() {
     use magi::{ask::ChoiceAction, queue::{Queue, Source, Task, TaskStatus}, run::{RunState, RunStatus}};
     let s = scene(home_lock().await);
     s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
-    // This is the retained legacy deputy workflow: the repository opts out of
-    // task-chat routing (`question_routing = false`) in its committed layer.
+    // The retired opt-out cannot divert an owned maintenance decision back
+    // to a deputy. Its native acceptance must preserve later operator intent.
     let mut legacy = s.fx.config.clone();
     legacy.graph.question_routing = false;
     std::fs::write(s.fx.repo.join("magi.toml"), toml::to_string(&legacy).unwrap()).unwrap();
-    for args in [vec!["add", "magi.toml"], vec!["commit", "-m", "test: legacy question path"], vec!["push", "origin", "main"]] {
+    for args in [vec!["add", "magi.toml"], vec!["commit", "-m", "test: retired routing key compatibility"], vec!["push", "origin", "main"]] {
         let out = std::process::Command::new("git").args(&args).current_dir(&s.fx.repo).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     }
     let queue = Queue::at(s.home.join("queue"));
+    let talks = magi::talk::Talks::at(s.home.join("talks"));
+    let chat = magi::talk::begin(&talks, &s.fx.config, s.fx.repo.clone(), Some("alpha")).unwrap();
     for manual_hold in [true, false] {
         let mut run = RunState::new(s.fx.repo.clone(), "main".into(), "base".into(),
             "work".into(), s.fx.config.clone());
@@ -1456,15 +1458,14 @@ async fn maintenance_resume_preserves_operator_decisions_after_deputy_settle() {
         run.save_under(&s.home).unwrap();
         let mut task = Task::new("resume".into(), "work".into(), s.fx.repo.clone(), Source::Human);
         task.runs.push(run.id.clone());
+        task.chat = Some(chat.id.clone());
         task.hold_machine(Some("waiting for resume".into()));
         queue.put(&mut task).unwrap();
-        let mut q = conductor_maintenance_question(&s, &queue, &task,
+        let q = conductor_maintenance_question(&s, &queue, &task,
             ChoiceAction::ResumeRun { run: run.id.clone() });
-        q.say("daemon: execute").unwrap();
-        s.store.put(&mut q).unwrap();
-        script(&s, &["MAGI ask --settle \"$qid\" --choice 'daemon: execute'"]);
-        turn(&mut deputies(&s, 2)).await;
-        assert_actions_succeeded(&s, 1);
+        magi::task_chat::sweep(&queue, &talks, &s.store, &s.home);
+        assert_eq!(s.store.get(&q.id).unwrap().routed_chat.as_deref(), Some(chat.id.as_str()));
+        magi::chat_control::decide(&talks, &s.home, &chat.id, &q.id, "daemon: execute").unwrap();
         assert_eq!(s.store.get(&q.id).unwrap().status, QuestionStatus::Answered);
         task = queue.get(&task.id).unwrap();
         assert_eq!(task.status, TaskStatus::Blocked, "settling applies nothing");

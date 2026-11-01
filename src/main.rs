@@ -533,6 +533,10 @@ enum Command {
         /// Longer explanation, markdown. Reads stdin when omitted.
         #[arg(long, conflicts_with = "wait")]
         detail: Option<String>,
+        /// Stable task-inquiry occurrence ID for retrying the same post.
+        /// Omit to create a new inquiry on each invocation.
+        #[arg(long, conflicts_with_all = ["wait", "thread", "settle"])]
+        request: Option<String>,
         /// An answer to offer; repeat for more. Omit for a free-text reply.
         ///
         /// With `--thread`, replaces the question's choices wholesale rather
@@ -1995,6 +1999,7 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::Ask {
             summary,
             detail,
+            request,
             choices,
             actions,
             timeout,
@@ -2009,6 +2014,7 @@ async fn dispatch(command: Command) -> Result<()> {
             ask_cmd(AskArgs {
                 summary,
                 detail,
+                request,
                 choices,
                 actions,
                 timeout,
@@ -2555,6 +2561,7 @@ async fn task_text(words: &[String], file: Option<&Path>, issue: Option<u64>) ->
 struct AskArgs {
     summary: Option<String>,
     detail: Option<String>,
+    request: Option<String>,
     choices: Vec<String>,
     actions: Vec<String>,
     timeout: Option<u64>,
@@ -2584,6 +2591,7 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
     let AskArgs {
         summary,
         detail,
+        request,
         choices,
         actions,
         timeout,
@@ -2660,10 +2668,13 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
                 panel.is_none() && assets.is_empty(),
                 "task inquiries use free-text chat; include evidence in --detail"
             );
-            let inquiry = magi::task_inquiry::Outbox::at(&home).file(
+            let request = request
+                .unwrap_or_else(|| magi::rng::SplitMix64::new(magi::rng::entropy()).uuid_v4());
+            let inquiry = magi::task_inquiry::Outbox::at(&home).file_for_occurrence(
                 task,
                 (task.id != run).then(|| run.clone()),
                 format!("{node}:{seat}:{run}"),
+                &request,
                 &summary,
                 &detail,
             )?;

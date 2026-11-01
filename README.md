@@ -552,9 +552,11 @@ waiter stays held and no choice action runs.
 | Merge (land and release-watch approvals) | Recorded PR/head; final head, review and gate checks still apply |
 | `post original` / `use rewrite` / `use fallback` / `use my text` | Final posting gate; `use my text` needs the literal title |
 
-`[graph] question_routing` (default `true`) sends what used to be a question
-about a task to that task's chat as free text. Setting it to `false` for a
-repository keeps the question store, deputies and waiter as they were there.
+Task inquiries always route to their task's chat. The retired
+`[graph] question_routing` key is accepted for saved configuration compatibility
+and warns when disabled; its value no longer selects a legacy workflow.
+An approval without a saved PR/head remains discoverable in chat for recovery;
+its missing target never authorizes a merge.
 
 Merge approval uses two independent controls: `land_approval=true` asks for
 every merge; `hold_contested_merge=true` asks for unresolved Major-or-above
@@ -1636,7 +1638,11 @@ Delivery, opening or reading the chat, ordinary replies and newer messages never
 remove an unresolved decision. Informational deliveries do not create items.
 
 Task-scoped `magi ask --summary ... --detail ...` files a native durable inquiry
-and exits. The scheduler reuses or reopens the task chat and creates a missing
+and exits. Each CLI invocation creates an independent inquiry, even with identical
+wording. Use `--request <stable-occurrence-id>` to retry the same post after an
+uncertain CLI result; reusing that key preserves the original inquiry and its
+lifecycle. Use a different key for a different decision. The scheduler reuses
+or reopens the task chat and creates a missing
 chat with its configured chatter head, default persona, task repository and Solo
 mode. An unsent owner draft remains a draft. The outbox and independent chat
 execution workers recover across web and scheduler replacement.
@@ -1646,7 +1652,11 @@ to the inquiry with `magi task control --decision <inquiry-id> <command>`.
 Acceptance, execution and confirmed application are separate states; recording
 or queuing an operation is insufficient to clear it. A failed or uncertain
 operation remains visible with its error and receipt context. Repeating a request
-never blindly replays an effect that might already have happened. Resume requests
+never blindly replays an effect that might already have happened. A task claim or
+pure validation failure is recorded as a proven pre-execution failure: the owner
+can retry the same command after fixing the cause or explicitly cancel it with
+`settle-decision`. A failed write or uncertain external result retains its receipt
+reconciliation requirement. Restart itself performs no retry. Resume requests
 remain active until the scheduler observes the owning execution running.
 
 Task-local hold, release, completion and instruction-retry effects save the exact
@@ -1680,3 +1690,11 @@ and restarts, alongside readable items. Restoring a source retries its import
 with the original delivery identity. The migration decoder reads history without
 repair upgrades or routing writes; importing actionable work still uses the
 source adapter described above.
+
+The migration retains its complete source-ID boundary after imports finish.
+Saved replies in that boundary remain history, including while awaiting import;
+operational readers cannot use them to execute task actions, merge or release.
+Fresh chat commands bind their exact response generation before it is exposed
+to consumers, avoiding a crash window that could consume an older title or
+answer. Legacy workers cannot resume imported sources. The original source
+files remain available to the passive history decoder.

@@ -3346,11 +3346,9 @@ owner's request without a button or extra evidence.
 Silence is a hold; `land_approval` stays on by default. Keep the Question store and non-task legacy workflow until the
 next migration step.
 
-`[graph] question_routing` (default on) is the per-repository switch for task
-decision routing (`task_chat::enabled_for`, consulted by `Questions::put`,
-`task_chat::routes` and `task_chat::sweep`). Off restores the question/deputy/
-waiter path. `Queue::put_unlocked` keeps a stored `Task::chat` against stale
-writes, so the one chat per task is never lost.
+Task inquiries always route to their chat. The retired `[graph] question_routing`
+key is read only for saved-config compatibility and never selects a workflow.
+`Queue::put_unlocked` keeps a stored `Task::chat` against stale writes.
 
 Update (step 2 scope): every task-scoped producer routes, including the posting
 gate, the branch-divergence question and non-merge release-watch questions
@@ -3359,16 +3357,10 @@ abandoned on delivery: the record stays open for the machinery that reads its
 answer, and the chat settles it with `magi task control decide`
 (`chat_control::decide`: open calling chat, open record, valid offered
 choice). Merge and recovery decisions use the same command. Existing consumers
-retain state, ownership, liveness and transition checks. The legacy non-routed
-consultation workflow follows the same owner-request policy. An approval or release-watch
-record offering `merge` with no `merge_target` is
-an old card and is never routed, even when its watch record identifies a task.
-`Questions::with_repair_choice` first attempts to recover the saved watch head;
-if none exists, it also clears any invalid routing from earlier versions so
-the compatibility card is usable again. Non-merge release recovery records
-still route. `task_chat::enabled_for` treats an unreadable
-repository config as "off", because `routed_task` is persisted and cannot be
-undone when the config returns. The button endpoint has no stronger caller
+retain state, ownership, liveness and transition checks. Approvals without a recorded `merge_target` still route to chat for recovery;
+`task control decide` rejects merging them until a PR/head has been recovered.
+Unreadable repository config retains the native pending inquiry and exposes its
+delivery/migration error; it never enables a legacy task route. The button endpoint has no stronger caller
 identity than every other owner route (the tailnet is the boundary); what it
 validates is the optional chat binding and displayed head binding. A direct
 answer requires neither a prior persona offer nor a button. Open routed
@@ -3584,3 +3576,21 @@ Keep per-source import errors in its journal and show them in Pending decisions;
 a corrupt source must not disappear because the old list reader skipped it.
 `Questions::read_history` is the passive decoder: never use a getter that upgrades
 or writes records as the history migration's reader.
+
+Native CLI inquiries use an independent occurrence ID for each invocation.
+`magi ask --request <id>` explicitly replays an occurrence, preserving its first
+prose and lifecycle. Low-level `Outbox::file` distinguishes different content in
+the same task/run/producer generation; `file_for_occurrence` supports stable
+explicit keys independent of rephrasing.
+
+Only known pre-execution failures set `Decision::retry_safe`; failed writes or
+external uncertainty must never set it. Owner retries of those known-unstarted
+requests revalidate their task claim and preconditions. Explicit settlement may
+cancel them without claiming an applied effect. Reading or restart does neither.
+
+The migration journal retains `sources` after its `pending` batch drains.
+Consumers project its saved replies as unanswered until a fresh native command
+binds both the operation and `source_answer_at`. This timestamp identifies the
+accepted source response generation; it is not owner quote/consent evidence.
+Do not execute an older payload between native acceptance and the source write.
+Passive history reads preserve the raw source; legacy workers skip imported IDs.

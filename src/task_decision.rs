@@ -45,6 +45,13 @@ pub struct Decision {
     pub request: Option<String>,
     /// Current actionable error, including uncertainty about an external call.
     pub error: Option<String>,
+    /// The consumer proved that the last attempt failed before any effect.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retry_safe: bool,
+    /// Exact source response generation accepted by a fresh owner command.
+    /// Migration never fills this field from a saved reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_answer_at: Option<Timestamp>,
     /// Complete lifecycle history; never pruned by delivery or read receipts.
     pub history: Vec<Event>,
 }
@@ -57,6 +64,8 @@ impl Decision {
             status: Status::AwaitingOwner,
             request: None,
             error: None,
+            retry_safe: false,
+            source_answer_at: None,
             history: vec![],
         }
     }
@@ -97,6 +106,7 @@ impl Decision {
     pub fn start(&mut self) -> Result<bool> {
         ensure!(self.status == Status::Queued, "decision is not queued");
         ensure!(self.request.is_some(), "decision has no owner request");
+        self.retry_safe = false;
         Ok(self.event(Status::InProgress, "effect consumer started"))
     }
 
@@ -117,7 +127,31 @@ impl Decision {
         );
         ensure!(!error.trim().is_empty(), "decision error is empty");
         self.error = Some(error.to_owned());
+        self.retry_safe = false;
         Ok(self.event(Status::RetryNeeded, error))
+    }
+
+    /// Record proof that no operation began. This is distinct from uncertainty
+    /// after a write or external call; only an owner retry may requeue it.
+    pub(crate) fn fail_before_effect(&mut self, error: &str) -> Result<bool> {
+        let prior = self.retry_safe;
+        let changed = self.fail(error)?;
+        self.retry_safe = true;
+        Ok(changed || !prior)
+    }
+
+    /// Requeue the same owner request after a proven pre-execution failure.
+    pub(crate) fn retry_unapplied(&mut self) -> Result<bool> {
+        ensure!(
+            self.status == Status::RetryNeeded && self.retry_safe && self.request.is_some(),
+            "effect needs receipt reconciliation before retry"
+        );
+        self.error = None;
+        self.retry_safe = false;
+        Ok(self.event(
+            Status::Queued,
+            "owner retried a request proven not to have started",
+        ))
     }
 
     /// Called only after rereading the operation's authoritative durable receipt.
@@ -128,6 +162,7 @@ impl Decision {
             return Ok(false);
         }
         self.error = None;
+        self.retry_safe = false;
         Ok(self.event(Status::Resolved, receipt))
     }
 
@@ -137,7 +172,8 @@ impl Decision {
     pub fn settle(&mut self, reason: &str) -> Result<bool> {
         ensure!(
             self.status == Status::AwaitingOwner
-                || (self.status == Status::RetryNeeded && self.request.is_none()),
+                || (self.status == Status::RetryNeeded
+                    && (self.request.is_none() || self.retry_safe)),
             "an accepted effect requires receipt reconciliation"
         );
         ensure!(!reason.trim().is_empty(), "settlement reason is empty");
