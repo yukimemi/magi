@@ -491,7 +491,7 @@ async fn legacy_baseline(
     Ok((outside_diff(&out.stdout, paths), head, pick))
 }
 
-async fn rebase_target(scratch: &Path) -> Result<String> {
+pub(crate) async fn rebase_target(scratch: &Path) -> Result<String> {
     let path = git::git(scratch, &["rev-parse", "--git-path", "rebase-merge/onto"]).await?;
     let target = std::fs::read_to_string(scratch.join(path))?;
     git::rev_parse(scratch, &format!("{}^{{commit}}", target.trim())).await

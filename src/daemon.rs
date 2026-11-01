@@ -4195,7 +4195,7 @@ async fn attempt(
             false
         };
         if !authorized {
-            task.hold_machine(Some("Base synchronization remains stopped. Inspect the retained run; for movement exhaustion, explicitly use `magi run --resume <run> --recover-base`. A release without a new owner approval grants no additional rebase and starts no replacement competition.".into()));
+            task.hold_machine(Some(format!("Base synchronization remains stopped. {} A release without a new owner approval grants no additional synchronization budget and starts no replacement competition.", held.base_sync_next_action())));
             // Retain the existing stop identity when an old release reached the queue.
             task.base_sync_notice(&held);
             task.resume_override = None;

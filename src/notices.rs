@@ -899,6 +899,13 @@ fn run_cause(state: &crate::run::RunState) -> String {
         })
         .or(verification_cause.as_deref())
         .or_else(|| state.events.last().map(|e| e.message.as_str()));
+    if state.base_sync_blocked() || state.resource_block.is_some() {
+        return format!(
+            "{} Next: {}",
+            cause.unwrap_or("Synchronization stopped."),
+            state.base_sync_next_action()
+        );
+    }
     cause
         .and_then(|s| s.lines().find(|line| !line.trim().is_empty()))
         .unwrap_or("No cause recorded; inspect the run.")
