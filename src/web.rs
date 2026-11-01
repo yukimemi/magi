@@ -470,19 +470,60 @@ struct TalkStatusIndex {
     parses: usize,
 }
 
-fn open_talk_ids(ui: &Ui, ids: &[String]) -> std::collections::HashSet<String> {
-    #[derive(Deserialize)]
-    struct StatusOnly {
-        status: talk::TalkStatus,
+/// Talk's serializer writes status before turns. Stop deserializing as soon as
+/// that header is available; do not validate or traverse the transcript here.
+/// Noncanonical headers are bounded too and conservatively included in the
+/// initial page, where the ordinary row reader validates their actual status.
+fn read_talk_status(reader: impl std::io::Read) -> Option<talk::TalkStatus> {
+    use serde::de::{IgnoredAny, MapAccess, Visitor};
+
+    struct StatusHeader<'a>(&'a mut Option<talk::TalkStatus>);
+    impl<'de> Visitor<'de> for StatusHeader<'_> {
+        type Value = ();
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a conversation header")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                match key.as_str() {
+                    "status" => {
+                        *self.0 = Some(map.next_value()?);
+                        return Err(serde::de::Error::custom("conversation header complete"));
+                    }
+                    "turns" => {
+                        *self.0 = Some(talk::TalkStatus::Open);
+                        return Err(serde::de::Error::custom("noncanonical conversation header"));
+                    }
+                    _ => {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok(())
+        }
     }
+
+    // At most one KiB of read-ahead for canonical files, and a fixed maximum
+    // even for an oversized header. Do not call Deserializer::end: the rest of
+    // the document deliberately belongs to the paged row reader.
+    let reader = std::io::BufReader::with_capacity(1024, reader.take(64 * 1024));
+    let mut json = serde_json::Deserializer::from_reader(reader);
+    let mut status = None;
+    // The visitor deliberately signals completion with an error, avoiding the
+    // deserializer's normal closing-brace check on the unfinished object.
+    let result = serde::Deserializer::deserialize_map(&mut json, StatusHeader(&mut status));
+    status.or_else(|| match result {
+        Ok(()) => Some(talk::TalkStatus::Open),
+        Err(error) if error.is_eof() => Some(talk::TalkStatus::Open),
+        Err(_) => None,
+    })
+}
+
+fn open_talk_ids(ui: &Ui, ids: &[String]) -> std::collections::HashSet<String> {
     open_talk_ids_with(ui, ids, |path| {
-        // serde skips unknown fields without allocating turns or bodies.
-        std::fs::File::open(path)
-            .ok()
-            .and_then(|file| {
-                serde_json::from_reader::<_, StatusOnly>(std::io::BufReader::new(file)).ok()
-            })
-            .map(|row| row.status)
+        std::fs::File::open(path).ok().and_then(read_talk_status)
     })
 }
 
@@ -5160,6 +5201,15 @@ struct ListWalk {
 }
 
 fn page_ids(ui: &Ui, talks: bool, q: PageQuery) -> ApiResult<(Vec<String>, Option<String>)> {
+    page_ids_with(ui, talks, q, open_talk_ids)
+}
+
+fn page_ids_with(
+    ui: &Ui,
+    talks: bool,
+    q: PageQuery,
+    classify: impl FnOnce(&Ui, &[String]) -> std::collections::HashSet<String>,
+) -> ApiResult<(Vec<String>, Option<String>)> {
     let mut walks = ui
         .monitor
         .list_walks
@@ -5182,6 +5232,9 @@ fn page_ids(ui: &Ui, talks: bool, q: PageQuery) -> ApiResult<(Vec<String>, Optio
             .ok_or_else(|| ApiError::conflict("List cursor expired; retry the list"))?;
         (token, walk.ids.clone(), offset, walk.initial_end)
     } else {
+        // Header I/O must not hold the snapshot registry shared with queue
+        // pagination or with clients continuing an existing history walk.
+        drop(walks);
         let root = if talks {
             ui.talks.root()
         } else {
@@ -5190,7 +5243,7 @@ fn page_ids(ui: &Ui, talks: bool, q: PageQuery) -> ApiResult<(Vec<String>, Optio
         let mut ids = crate::queue::record_ids(root, "json")?;
         ids.sort_unstable_by(|a, b| b.cmp(a));
         let initial_end = if talks {
-            let open = open_talk_ids(ui, &ids);
+            let open = classify(ui, &ids);
             // Stable partition: ID order is only the existing membership order,
             // never a substitute for the UI's creation-time ordering.
             ids.sort_by_key(|id| !open.contains(id));
@@ -5199,6 +5252,12 @@ fn page_ids(ui: &Ui, talks: bool, q: PageQuery) -> ApiResult<(Vec<String>, Optio
             STORE_PAGE_SIZE.min(ids.len())
         };
         let ids = Arc::new(ids);
+        walks = ui
+            .monitor
+            .list_walks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        walks.retain(|walk| walk.opened.elapsed() < Duration::from_secs(120));
         let mut token = crate::rng::entropy();
         while walks.iter().any(|walk| walk.token == token) {
             token = crate::rng::entropy();
@@ -24783,6 +24842,105 @@ mod tests {
         let (ids, next) = page_ids(&ui, true, PageQuery::default()).unwrap();
         assert_eq!(ids.len(), STORE_PAGE_SIZE + 5);
         assert!(next.is_none());
+    }
+
+    #[test]
+    fn talk_status_header_reads_are_bounded_independently_of_transcript_size() {
+        struct Counted<R> {
+            inner: R,
+            bytes: usize,
+        }
+        impl<R: std::io::Read> std::io::Read for Counted<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.inner.read(buf)?;
+                self.bytes += n;
+                Ok(n)
+            }
+        }
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let id = seed_talk_at(&ui.talks, "header-chat", "closed");
+        let mut chat = ui.talks.get(&id).unwrap();
+        for size in [0, 1024 * 1024, 8 * 1024 * 1024] {
+            chat.turns = vec![
+                serde_json::from_value(serde_json::json!({
+                    "who": "agent", "body": "x".repeat(size), "at": chat.updated_at,
+                }))
+                .unwrap(),
+            ];
+            for status in [talk::TalkStatus::Closed, talk::TalkStatus::Open] {
+                chat.status = status;
+                // Exercise the actual on-disk serializer, including its field order.
+                let body = serde_json::to_vec_pretty(&chat).unwrap();
+                let mut reader = Counted {
+                    inner: body.as_slice(),
+                    bytes: 0,
+                };
+                assert_eq!(read_talk_status(&mut reader), Some(status));
+                assert!(
+                    reader.bytes <= 1024,
+                    "header classification read {} bytes",
+                    reader.bytes
+                );
+            }
+        }
+        // Noncanonical field order must neither traverse a transcript nor hide
+        // an open row. Its real status is validated by the ordinary row reader.
+        let noncanonical = format!(
+            r#"{{"turns":[{{"body":"{}"}}],"status":"open"}}"#,
+            "x".repeat(1024 * 1024)
+        );
+        let mut reader = Counted {
+            inner: noncanonical.as_bytes(),
+            bytes: 0,
+        };
+        assert_eq!(read_talk_status(&mut reader), Some(talk::TalkStatus::Open));
+        assert!(reader.bytes <= 1024);
+        let oversized = format!(
+            r#"{{"agent":"{}","status":"open"}}"#,
+            "x".repeat(128 * 1024)
+        );
+        let mut reader = Counted {
+            inner: oversized.as_bytes(),
+            bytes: 0,
+        };
+        assert_eq!(read_talk_status(&mut reader), Some(talk::TalkStatus::Open));
+        assert!(reader.bytes <= 64 * 1024);
+    }
+
+    #[test]
+    fn talk_header_classification_does_not_hold_the_queue_cursor_registry() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        seed_talk_at(&ui.talks, "header-chat", "open");
+        std::fs::create_dir_all(ui.queue.root()).unwrap();
+        let (started, ready) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let chat_ui = ui.clone();
+        let scan = std::thread::spawn(move || {
+            page_ids_with(&chat_ui, true, PageQuery::default(), |ui, ids| {
+                started.send(()).unwrap();
+                wait.recv().unwrap();
+                open_talk_ids(ui, ids)
+            })
+            .unwrap()
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (finished, result) = std::sync::mpsc::channel();
+        let queue = std::thread::spawn(move || {
+            finished
+                .send(page_ids(&ui, false, PageQuery::default()).is_ok())
+                .unwrap();
+        });
+        let completed = result.recv_timeout(Duration::from_secs(2));
+        // Release and join both workers even if the regression returns.
+        release.send(()).unwrap();
+        scan.join().unwrap();
+        queue.join().unwrap();
+        assert!(
+            completed.unwrap(),
+            "queue paging must not wait for chat header I/O"
+        );
     }
 
     #[test]
