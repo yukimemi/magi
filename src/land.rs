@@ -8672,50 +8672,74 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
 
     #[tokio::test]
     async fn reviewed_branch_hold_asks_and_survives_removal_and_resume() {
-        let (_tmp, mut state, _) = landing_git_fixture().await;
-        state.config.graph.land_approval = false;
-        state.config.graph.hold_contested_merge = false;
-        state.reviewed_commits = Some(Vec::new());
-        std::fs::write(
-            state.repo.join("magi.toml"),
-            "[graph]\nland_approval = true\n[verify]\ngate = ['untrusted']\n",
-        )
-        .unwrap();
-        git::git(&state.repo, &["add", "magi.toml"]).await.unwrap();
-        git::git(&state.repo, &["commit", "-m", "require approval"])
-            .await
-            .unwrap();
-        let head = git::rev_parse(&state.repo, "HEAD").await.unwrap();
-        let gate = state.config.verify.gate.clone();
-        state.observe_branch_owner_holds(&head).await;
-        assert_eq!(state.config.verify.gate, gate);
-        assert_eq!(approval_reasons(&state), [ApprovalReason::EveryMerge]);
-        git::git(&state.repo, &["rm", "magi.toml"]).await.unwrap();
-        git::git(&state.repo, &["commit", "-m", "remove config"])
-            .await
-            .unwrap();
-        let later = git::rev_parse(&state.repo, "HEAD").await.unwrap();
-        state = serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
-        state.observe_branch_owner_holds(&later).await;
-        assert_eq!(state.branch_owner_holds[0].head, head);
-        state.land_sync_pending = false;
-        state.pr_pushed_head = Some(later.clone());
-        state.gate_head = Some(later.clone());
-        let forge = Scripted::new(
-            vec![seen(&later, Checks::Green, "CLEAN", false)],
-            vec![(true, "")],
-        );
-        land_with(&mut state, URL, &forge).await.unwrap();
-        assert!(!forge.calls().contains(&"merge"));
-        let question = ask::Questions::open()
-            .get(&state.land_approval.as_ref().unwrap().question)
-            .unwrap();
-        assert!(question.detail.contains("Approval required because:"));
-        assert!(
-            question
-                .detail
-                .contains("land_approval=true from the reviewed branch's magi.toml")
-        );
+        for file in ["magi.toml", ".magi/config.toml"] {
+            for control in crate::config::OwnerHold::ALL {
+                let (_tmp, mut state, _) = landing_git_fixture().await;
+                state.config.graph.land_approval = false;
+                state.config.graph.hold_contested_merge = false;
+                state.reviewed_commits = Some(Vec::new());
+                if control == crate::config::OwnerHold::HoldContestedMerge {
+                    state.reviews = repair_state(false, true).reviews;
+                }
+                let config = state.repo.join(file);
+                std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+                std::fs::write(
+                    &config,
+                    format!(
+                        "[graph]\n{} = true\n[verify]\ngate = ['untrusted']\n",
+                        control.key()
+                    ),
+                )
+                .unwrap();
+                git::git(&state.repo, &["add", file]).await.unwrap();
+                git::git(&state.repo, &["commit", "-m", "require approval"])
+                    .await
+                    .unwrap();
+                let head = git::rev_parse(&state.repo, "HEAD").await.unwrap();
+                let gate = state.config.verify.gate.clone();
+                state.observe_branch_owner_holds(&head).await;
+                assert_eq!(state.config.verify.gate, gate);
+                assert!(state.owner_hold(control));
+                let holds = state.branch_owner_holds.clone();
+                git::git(&state.repo, &["rm", file]).await.unwrap();
+                git::git(&state.repo, &["commit", "-m", "remove config"])
+                    .await
+                    .unwrap();
+                let later = git::rev_parse(&state.repo, "HEAD").await.unwrap();
+                state.save().unwrap();
+                state = RunState::load(&state.id).unwrap();
+                state.observe_branch_owner_holds(&later).await;
+                assert_eq!(state.branch_owner_holds, holds);
+                assert_eq!(state.branch_owner_holds[0].head, head);
+                state.land_sync_pending = false;
+                state.pr_pushed_head = Some(later.clone());
+                state.gate_head = Some(later.clone());
+                let forge = Scripted::new(
+                    vec![seen(&later, Checks::Green, "CLEAN", false)],
+                    vec![(true, "")],
+                );
+                land_with(&mut state, URL, &forge).await.unwrap();
+                assert!(!forge.calls().contains(&"merge"));
+                assert!(state.parked);
+                let question = ask::Questions::open()
+                    .get(&state.land_approval.as_ref().unwrap().question)
+                    .unwrap();
+                assert!(question.detail.contains("Approval required because:"));
+                assert!(question.detail.contains(&format!(
+                    "{}=true from the reviewed branch's {file}",
+                    control.key()
+                )));
+                assert_eq!(state.branch_owner_holds, holds);
+                state.save().unwrap();
+                let resumed = RunState::load(&state.id).unwrap();
+                assert!(resumed.owner_hold(control));
+                assert_eq!(resumed.branch_owner_holds, holds);
+                assert_eq!(
+                    resumed.land_approval.unwrap().question,
+                    state.land_approval.unwrap().question
+                );
+            }
+        }
     }
 
     #[tokio::test]

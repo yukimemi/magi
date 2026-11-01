@@ -54,7 +54,9 @@ async fn foreign_clean_checkout_receives_review_fixes_without_being_removed() {
 common::e2e! {
 async fn foreign_dirty_checkout_is_refused_before_filing_and_untouched() {
     let guard = common::home_lock().await;
-    let fx = fixture(guard, Judges::Unanimous, true);
+    let mut fx = fixture(guard, Judges::Unanimous, true);
+    // This tiny CLI fixture tests dirty-worktree refusal, not production disk headroom.
+    fx.config.disk.min_free_bytes = 1024 * 1024;
     let path = foreign(&fx).await;
     // Even a user's status configuration cannot hide untracked work.
     git::git(&path, &["config", "status.showUntrackedFiles", "no"]).await.unwrap();
@@ -268,6 +270,124 @@ async fn foreign_review_adopts_a_fresh_remote_descendant() {
     assert_eq!(runner.state.status, RunStatus::Ready, "{:?}", runner.state.events);
     let delivered = git::rev_parse(&path, "HEAD").await.unwrap();
     assert!(git::is_ancestor(&fx.repo, &remote, &delivered).await);
+    assert!(git::is_clean(&path).await.unwrap());
+}
+}
+
+async fn selected_remote_hold_survives_repair(file: &str, control: magi::config::OwnerHold) {
+    let guard = common::home_lock().await;
+    let mut fx = fixture(guard, Judges::Unanimous, true);
+    fx.config.graph.land_approval = false;
+    fx.config.graph.hold_contested_merge = false;
+    let path = foreign(&fx).await;
+    let original = git::rev_parse(&path, "HEAD").await.unwrap();
+    // Publish D without advancing the operator's checkout at C.
+    let publisher = fx.tmp.path().join("publisher");
+    git::worktree_add_detached(&fx.repo, &publisher, &original)
+        .await
+        .unwrap();
+    let config = publisher.join(file);
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, format!("[graph]\n{} = true\n", control.key())).unwrap();
+    commit(&publisher, "require owner approval on remote tip").await;
+    let remote = git::rev_parse(&publisher, "HEAD").await.unwrap();
+    git::git(
+        &publisher,
+        &["push", "origin", &format!("{remote}:refs/heads/{BRANCH}")],
+    )
+    .await
+    .unwrap();
+
+    let mut runner = Runner::review(&fx.repo, BRANCH, fx.config.clone(), Origin::operator())
+        .await
+        .unwrap();
+    let shadow = runner.state.winner().unwrap().worktree.clone();
+    assert_eq!(git::rev_parse(&shadow, "HEAD").await.unwrap(), remote);
+    assert_eq!(git::rev_parse(&path, "HEAD").await.unwrap(), original);
+    assert!(git::is_clean(&path).await.unwrap());
+    let saved = RunState::load(&runner.state.id).unwrap();
+    assert_eq!(
+        saved.branch_owner_holds,
+        vec![magi::run::BranchOwnerHold {
+            control,
+            file: file.into(),
+            head: remote.clone(),
+        }]
+    );
+    assert!(saved.events.iter().any(|e| e.node == "approval-policy"
+        && e.message.contains(control.key())
+        && e.message.contains(file)
+        && e.message.contains(&remote)));
+
+    // Simulate a repair deleting the policy before review or landing
+    // can observe it again. The startup snapshot must already be saved.
+    git::git(&shadow, &["rm", file]).await.unwrap();
+    commit(&shadow, "remove approval policy during repair").await;
+    let repaired = git::rev_parse(&shadow, "HEAD").await.unwrap();
+    runner = Runner::resume(&runner.state.id).unwrap();
+    runner.state.observe_branch_owner_holds(&repaired).await;
+    assert!(runner.state.owner_hold(control));
+    assert_eq!(runner.state.branch_owner_holds, saved.branch_owner_holds);
+    runner.execute().await.unwrap();
+    assert_eq!(
+        runner.state.status,
+        RunStatus::Ready,
+        "{:?}",
+        runner.state.events
+    );
+    let delivered = git::rev_parse(&path, "HEAD").await.unwrap();
+    assert!(git::is_ancestor(&fx.repo, &repaired, &delivered).await);
+    assert!(!path.join(file).exists());
+    assert!(git::is_clean(&path).await.unwrap());
+    let resumed = Runner::resume(&runner.state.id).unwrap();
+    assert!(resumed.state.owner_hold(control));
+    assert_eq!(resumed.state.branch_owner_holds, saved.branch_owner_holds);
+}
+
+common::e2e! {
+async fn foreign_remote_land_approval_survives_repair_and_resume() {
+    selected_remote_hold_survives_repair("magi.toml", magi::config::OwnerHold::LandApproval).await;
+}
+}
+
+common::e2e! {
+async fn foreign_remote_contested_merge_survives_repair_and_resume() {
+    selected_remote_hold_survives_repair("magi.toml", magi::config::OwnerHold::HoldContestedMerge).await;
+}
+}
+
+common::e2e! {
+async fn foreign_remote_nested_land_approval_survives_repair_and_resume() {
+    selected_remote_hold_survives_repair(".magi/config.toml", magi::config::OwnerHold::LandApproval).await;
+}
+}
+
+common::e2e! {
+async fn foreign_remote_nested_contested_merge_survives_repair_and_resume() {
+    selected_remote_hold_survives_repair(".magi/config.toml", magi::config::OwnerHold::HoldContestedMerge).await;
+}
+}
+
+common::e2e! {
+async fn foreign_review_observes_only_the_selected_remote_policy() {
+    let guard = common::home_lock().await;
+    let mut fx = fixture(guard, Judges::Unanimous, true);
+    fx.config.graph.land_approval = false;
+    fx.config.graph.hold_contested_merge = false;
+    let path = foreign(&fx).await;
+    std::fs::write(path.join("magi.toml"), "[graph]\nland_approval = true\nhold_contested_merge = true\n").unwrap();
+    commit(&path, "require approval locally").await;
+    let original = git::rev_parse(&path, "HEAD").await.unwrap();
+    let publisher = fx.tmp.path().join("publisher");
+    git::worktree_add_detached(&fx.repo, &publisher, &original).await.unwrap();
+    git::git(&publisher, &["rm", "magi.toml"]).await.unwrap();
+    commit(&publisher, "owner removes approval policy before review").await;
+    let remote = git::rev_parse(&publisher, "HEAD").await.unwrap();
+    git::git(&publisher, &["push", "origin", &format!("{remote}:refs/heads/{BRANCH}")]).await.unwrap();
+    let runner = Runner::review(&fx.repo, BRANCH, fx.config.clone(), Origin::operator()).await.unwrap();
+    assert_eq!(git::rev_parse(&runner.state.winner().unwrap().worktree, "HEAD").await.unwrap(), remote);
+    assert!(RunState::load(&runner.state.id).unwrap().branch_owner_holds.is_empty());
+    assert_eq!(git::rev_parse(&path, "HEAD").await.unwrap(), original);
     assert!(git::is_clean(&path).await.unwrap());
 }
 }
