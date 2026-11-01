@@ -233,7 +233,19 @@ mod acquisition_tests {
 
     fn script(dir: &Path, name: &str, body: &str) -> String {
         let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        // Keep writable script descriptors out of this multithreaded process:
+        // a concurrent fork can retain one and make exec fail with ETXTBSY.
+        let status = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "printf '%s\\n' '#!/bin/sh' \"$2\" > \"$1\"",
+                "fixture",
+            ])
+            .arg(&path)
+            .arg(body)
+            .status()
+            .unwrap();
+        assert!(status.success());
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path.to_string_lossy().into_owned()
     }
@@ -279,7 +291,8 @@ mod acquisition_tests {
             error.contains(&gh)
                 && error.contains("denied")
                 && error.contains("forbidden")
-                && error.contains('7')
+                && error.contains('7'),
+            "{error}"
         );
         let gh = script(
             tmp.path(),
