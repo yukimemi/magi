@@ -655,7 +655,7 @@ impl StartupGuard {
         self.armed = false;
         match result {
             Ok(()) => Ok(()),
-            Err(mut error) => {
+            Err(error) => {
                 let startup = state.startup.as_mut().expect("reserved startup");
                 startup.complete = false;
                 startup.failure = Some(format!("{error:#}"));
@@ -672,7 +672,10 @@ impl StartupGuard {
                     format!("{context}: {error:#}; retained assets require inspection"),
                 );
                 if let Err(save) = state.save() {
-                    error = error.context(format!("could not save terminal startup record: {save:#}; reservation requires reconciliation"));
+                    tracing::warn!(
+                        "run {}: could not save terminal startup record: {save:#}; reservation requires reconciliation",
+                        state.id
+                    );
                 }
                 Err(error.context(context))
             }
@@ -950,10 +953,16 @@ impl Runner {
                             .unwrap_or_else(|error| format!("predecessor could not be inspected: {error:#}"));
                         state.event("startup-restore", format!("ownership-checked restoration attempted: {outcome}; retained successor assets require inspection"));
                     }
-                    Err(error) => state.event(
-                        "startup-restore",
-                        format!("restoration not attempted: {error:#}"),
-                    ),
+                    Err(error) => {
+                        tracing::warn!(
+                            "run {}: could not take the repository lease to restore `{branch}`: {error:#}",
+                            state.id
+                        );
+                        state.event(
+                            "startup-restore",
+                            format!("restoration not attempted: {error:#}"),
+                        );
+                    }
                 }
             }
             opened
@@ -15767,8 +15776,12 @@ mod tests {
         );
         assert!(error.downcast_ref::<crate::run::StartupFailure>().is_some());
         let message = format!("{error:#}");
-        assert!(
-            message.contains("original refusal") && message.contains("could not save terminal")
+        assert!(message.contains("original refusal"));
+        assert!(!message.contains("could not save terminal"));
+        assert_eq!(
+            error.chain().count(),
+            2,
+            "only startup attribution wraps the original error"
         );
         let saved = RunState::load(&runner.state.id).unwrap();
         assert_eq!(saved.status, RunStatus::Blocked);
