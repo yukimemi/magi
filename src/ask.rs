@@ -1539,6 +1539,21 @@ impl Questions {
         Ok(())
     }
 
+    /// Decode an exact saved record for migration without repair upgrades,
+    /// routing writes, lease changes or any other operational side effect.
+    pub(crate) fn read_history(&self, id: &str) -> Result<Question> {
+        anyhow::ensure!(
+            !id.is_empty() && !id.contains(['/', '\\']) && id != "." && id != "..",
+            "invalid saved inquiry identity"
+        );
+        let q = read_path(&self.path_of(id))?;
+        anyhow::ensure!(
+            q.id == id,
+            "saved inquiry identity does not match its filename"
+        );
+        Ok(q)
+    }
+
     /// Load a question by id or unambiguous id prefix.
     pub fn get(&self, id: &str) -> Result<Question> {
         let resolved = self.resolve_id(id)?;

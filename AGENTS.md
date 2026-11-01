@@ -3570,3 +3570,17 @@ never reissues a saved reply as owner authority. Do not claim the Question /
 deputy / waiter retirement is complete until every remaining consumer and
 compatibility execution path has been replaced and removed. The source adapter
 lives in `task_chat`, not in the native decision state machine.
+
+Task-local chat effects commit `Task::decision_effects` with the queue transition;
+the value is the exact serialized typed command. Keep these receipts across
+later holds, releases, retries and execution starts. Receipt reconciliation must
+check task/repository ownership and command equality before resolving an inquiry;
+a queue state that merely looks similar is insufficient for automatic recovery.
+Native inquiry identities include the execution-pass/owner-decision generation,
+so repeated wording after a new occurrence does not alias resolved history.
+
+The bounded migration snapshots source filenames as well as readable records.
+Keep per-source import errors in its journal and show them in Pending decisions;
+a corrupt source must not disappear because the old list reader skipped it.
+`Questions::read_history` is the passive decoder: never use a getter that upgrades
+or writes records as the history migration's reader.

@@ -224,6 +224,7 @@ pub fn post(
         run: task.runs.contains(&q.run).then(|| q.run.clone()),
         repo: task.repo.clone(),
         source: format!("{}:{}:{}", q.node, q.seat, q.run),
+        occurrence: None,
         text,
         display: body,
         key: format!("question:{}", q.id),
@@ -244,6 +245,62 @@ pub fn post(
 struct Migration {
     schema: u32,
     pending: Vec<String>,
+    #[serde(default)]
+    errors: std::collections::BTreeMap<String, String>,
+}
+
+/// A migration source which still needs operator reconciliation. Reading the
+/// pending list never acknowledges or removes these failures.
+#[derive(serde::Serialize)]
+pub struct MigrationIssue {
+    /// Exact source identity; ownership may be unknowable until it is repaired.
+    pub id: String,
+    /// Why import remains pending. No action or approval has been executed.
+    pub reason: String,
+}
+
+/// Report persistent import failures alongside readable native inquiries.
+/// Even a damaged migration journal must not hide the rest of the pending list.
+pub fn migration_issues(home: &Path) -> Vec<MigrationIssue> {
+    let read = || -> Result<Vec<MigrationIssue>> {
+        let path = home.join("notifications/task-chat-migration-v1/state.json");
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(error) => return Err(error.into()),
+        };
+        let migration: Migration = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(migration.schema == 1, "unsupported inquiry migration");
+        Ok(migration
+            .errors
+            .into_iter()
+            .map(|(id, reason)| MigrationIssue { id, reason })
+            .collect())
+    };
+    let mut issues = read().unwrap_or_else(|error| {
+        vec![MigrationIssue {
+            id: "migration".into(),
+            reason: format!(
+                "Migration journal needs reconciliation: {error:#}. No approval was inferred."
+            ),
+        }]
+    });
+    if !issues.iter().any(|issue| issue.id == "migration") {
+        match std::fs::read_to_string(
+            home.join("notifications/task-chat-migration-v1/last-error.txt"),
+        ) {
+            Ok(reason) => issues.push(MigrationIssue {
+                id: "migration".into(),
+                reason,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => issues.push(MigrationIssue {
+                id: "migration".into(),
+                reason: format!("Migration diagnostic is unreadable: {error:#}"),
+            }),
+        }
+    }
+    issues
 }
 
 pub(crate) fn migration_pending(home: &Path) -> Result<std::collections::BTreeSet<String>> {
@@ -263,7 +320,6 @@ fn migrate_batch(
     talks: &Talks,
     questions: &Questions,
     home: &Path,
-    all: &[Question],
     watches: &[crate::release_watch::WatchState],
 ) -> Result<()> {
     let dir = home.join("notifications/task-chat-migration-v1");
@@ -285,7 +341,29 @@ fn migrate_batch(
     } else {
         Migration {
             schema: 1,
-            pending: all.iter().map(|q| q.id.clone()).collect(),
+            // list() intentionally skips unreadable records for the old UI.
+            // A finite migration boundary must include their filenames too.
+            pending: {
+                let mut ids = std::collections::BTreeSet::new();
+                match std::fs::read_dir(questions.root()) {
+                    Ok(entries) => {
+                        for entry in entries {
+                            let path = entry?.path();
+                            if path.extension().is_some_and(|ext| ext == "json") {
+                                let id = path
+                                    .file_stem()
+                                    .and_then(|name| name.to_str())
+                                    .context("saved inquiry filename is not UTF-8")?;
+                                ids.insert(id.to_owned());
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+                ids.into_iter().collect()
+            },
+            errors: Default::default(),
         }
     };
     anyhow::ensure!(migration.schema == 1, "unsupported task inquiry migration");
@@ -310,7 +388,7 @@ fn migrate_batch(
     let tasks = queue.list();
     for id in batch {
         let result = (|| -> Result<()> {
-            let q = questions.get(&id)?;
+            let q = questions.read_history(&id)?;
             if q.node == crate::bump::NOTICE_NODE && q.choices.is_empty() {
                 return Ok(());
             }
@@ -381,7 +459,15 @@ fn migrate_batch(
         })();
         if let Err(error) = result {
             tracing::warn!("legacy inquiry {id} import: {error:#}");
+            migration.errors.insert(
+                id.clone(),
+                format!(
+                    "Saved inquiry needs reconciliation: {error:#}. Import executed no action."
+                ),
+            );
             migration.pending.push(id);
+        } else {
+            migration.errors.remove(&id);
         }
     }
     save(&migration)
@@ -443,6 +529,7 @@ fn history_record(q: &Question, task: Option<&Task>) -> crate::task_inquiry::Inq
         run: (!q.run.is_empty() && !q.run_names_task()).then(|| q.run.clone()),
         repo: task.map(|task| task.repo.clone()).unwrap_or_default(),
         source: format!("{}:{}:{}", q.node, q.seat, q.run),
+        occurrence: None,
         text: display.clone(),
         display,
         key: format!("question:{}", q.id),
@@ -482,8 +569,19 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
     let tasks = queue.list();
     let all = questions.list();
     let watches = crate::release_watch::states_for_questions(home, &all);
-    if let Err(error) = migrate_batch(queue, talks, questions, home, &all, &watches) {
+    let migration_error = home.join("notifications/task-chat-migration-v1/last-error.txt");
+    if let Err(error) = migrate_batch(queue, talks, questions, home, &watches) {
         tracing::warn!("legacy inquiry migration remains pending: {error:#}");
+        if let Err(save) = std::fs::write(
+            &migration_error,
+            format!("Migration remains pending: {error:#}. No approval was inferred."),
+        ) {
+            tracing::warn!("cannot persist migration failure: {save:#}");
+        }
+    } else if let Err(error) = std::fs::remove_file(&migration_error)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!("cannot clear migration diagnostic: {error:#}");
     }
     let deferred = migration_pending(home).unwrap_or_else(|error| {
         tracing::warn!("legacy delivery boundary is unreadable: {error:#}");

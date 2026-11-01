@@ -64,3 +64,31 @@ test('pending list retains a reachable foreground legacy entry until retirement 
   assert.ok(view.includes('href="#/questions"'));
   assert.ok(view.includes('id="ask-badge-rail"'));
 });
+
+test('migration failures stay visible beside readable decisions until source repair', async () => {
+  const section = source.slice(source.indexOf('const decisionState ='), source.indexOf('async function loadInquiry('));
+  const nodes = new Map();
+  const node = id => {
+    if (!nodes.has(id)) nodes.set(id, { replaceChildren(...children) { this.children = children; } });
+    return nodes.get(id);
+  };
+  const response = { items: [], unreadable: 0, migration_errors: [
+    { id: 'saved-inquiry', reason: 'Malformed source; no action executed' },
+  ] };
+  const ui = runInNewContext(`${section}\n({ loadDecisions })`, {
+    API: { decisions: '/api/decisions' }, getJson: async () => response,
+    $: node, setText: (target, text) => { target.text = text; },
+    show: (target, visible) => { target.visible = visible; },
+    el: (tag, attrs, ...children) => ({ tag, ...attrs, children }),
+  });
+  for (let visit = 0; visit < 2; visit++) {
+    await ui.loadDecisions();
+    assert.equal(node('decisions-error').visible, true);
+    assert.match(node('decisions-error').children[0].text, /saved-inquiry: Malformed source/);
+    assert.equal(node('decisions-empty').visible, false);
+  }
+  response.migration_errors = [];
+  await ui.loadDecisions();
+  assert.equal(node('decisions-error').visible, false);
+  assert.equal(node('decisions-empty').visible, true);
+});

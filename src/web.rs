@@ -8037,6 +8037,7 @@ impl DecisionView {
 struct DecisionsView {
     items: Vec<DecisionView>,
     unreadable: usize,
+    migration_errors: Vec<crate::task_chat::MigrationIssue>,
 }
 
 // Read-only: list visits and inquiry links never create owner decisions,
@@ -8057,6 +8058,7 @@ async fn decisions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<DecisionsVi
         Ok(Json(DecisionsView {
             items: views,
             unreadable,
+            migration_errors: crate::task_chat::migration_issues(&ui.home),
         }))
     })
     .await
@@ -13724,6 +13726,32 @@ mod tests {
         std::fs::remove_file(root.join("broken.json")).unwrap();
         std::fs::remove_file(root.join("unsupported.json")).unwrap();
         assert_eq!(fx.get("/api/decisions").await.json()["unreadable"], 0);
+    }
+
+    #[tokio::test]
+    async fn decisions_list_exposes_migration_errors_without_acknowledging_them() {
+        let fx = Fixture::start().await;
+        let root = fx.home.path().join("notifications/task-chat-migration-v1");
+        std::fs::create_dir_all(&root).unwrap();
+        let journal = serde_json::json!({
+            "schema": 1, "pending": ["saved-inquiry"],
+            "errors": {"saved-inquiry": "Source is unreadable; no action executed"}
+        });
+        let bytes = serde_json::to_vec(&journal).unwrap();
+        std::fs::write(root.join("state.json"), &bytes).unwrap();
+        for _ in 0..2 {
+            let response = fx.get("/api/decisions").await;
+            assert_eq!(response.status, 200);
+            let listed = response.json();
+            assert_eq!(listed["migration_errors"][0]["id"], "saved-inquiry");
+            assert!(listed["items"].as_array().unwrap().is_empty());
+            assert_eq!(std::fs::read(root.join("state.json")).unwrap(), bytes);
+        }
+        // An unreadable journal must not make the endpoint hide the list.
+        std::fs::write(root.join("state.json"), b"{").unwrap();
+        let response = fx.get("/api/decisions").await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.json()["migration_errors"][0]["id"], "migration");
     }
 
     #[tokio::test]

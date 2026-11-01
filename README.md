@@ -1649,6 +1649,13 @@ operation remains visible with its error and receipt context. Repeating a reques
 never blindly replays an effect that might already have happened. Resume requests
 remain active until the scheduler observes the owning execution running.
 
+Task-local hold, release, completion and instruction-retry effects save the exact
+command receipt in the same queue write as their transition. Restart recovery
+can therefore finish an interrupted decision projection even after the task has
+moved to a later state; it does not execute the command again. Repeated inquiry
+wording in a later execution pass or owner-decision generation creates a new
+pending item while redelivery in the same generation remains deduplicated.
+
 If the owner explicitly settles discussion with no effect remaining necessary,
 the chat uses `magi task control settle-decision <id> --reason <reason>`. Add
 `--replacement <new-inquiry-id>` to supersede an unanswered inquiry with an
@@ -1666,3 +1673,10 @@ historical evidence, never a new owner instruction or approval. Migration posts
 no operation and retains unresolved outcomes. Source decision consumers still
 exist during this continuation; their complete retirement remains necessary
 before calling step 3 finished.
+
+Unreadable saved inquiry files are included in the migration boundary. Their
+source identities and errors remain visible in Pending decisions across visits
+and restarts, alongside readable items. Restoring a source retries its import
+with the original delivery identity. The migration decoder reads history without
+repair upgrades or routing writes; importing actionable work still uses the
+source adapter described above.

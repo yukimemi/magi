@@ -40,6 +40,7 @@ fn inquiry(task: &Task, id: &str) -> Inquiry {
         run: Some("run-a".into()),
         repo: task.repo.clone(),
         source: "implement:impl-A".into(),
+        occurrence: None,
         text: "An automatic inquiry, not an owner instruction. Please discuss the required change."
             .into(),
         display: "A change needs discussion".into(),
@@ -513,5 +514,174 @@ async fn a_fast_completed_resume_has_an_exact_durable_start_receipt_after_restar
     chat_control::reconcile_decisions(&queue,&home).unwrap();
     assert_eq!(Outbox::at(&home).get(&record.id).unwrap().decision.unwrap().status,Status::Resolved);
     chat_control::dispatch(&queue,&home,&talks,&chat.id,Operation::ReconcileDecision{inquiry:record.id.clone()}).await.unwrap();
+}
+}
+
+common::e2e! {
+async fn task_command_receipts_survive_later_transitions_and_lost_projection_writes() {
+    use magi::{chat_control::{self, Operation}, task_decision::Status};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("task-command-receipts");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    for kind in ["hold", "release", "done", "retry"] {
+        let mut task = Task::new(kind.into(), "original instruction".into(), fx.repo.clone(), Source::Human);
+        task.chat = Some(chat.id.clone());
+        task.hold_manual(Some("original hold".into()));
+        queue.put(&mut task).unwrap();
+        let outbox = Outbox::at(&home);
+        let record = outbox.file(&task, None, "receipt-test".into(), "Owner decision", kind).unwrap();
+        outbox.deliver(&queue, &talks, &record.id).unwrap();
+        let command = match kind {
+            "hold" => Operation::Hold { task: task.id.clone(), reason: "new hold".into() },
+            "release" => Operation::Release { task: task.id.clone() },
+            "done" => Operation::Done { task: task.id.clone() },
+            "retry" => Operation::Retry { task: task.id.clone(), title: None, instruction: "revised instruction".into() },
+            _ => unreachable!(),
+        };
+        let request = serde_json::to_string(&command).unwrap();
+        chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ForDecision {
+            inquiry: record.id.clone(), command: Box::new(command),
+        }).await.unwrap();
+        assert_eq!(outbox.get(&record.id).unwrap().decision.unwrap().status, Status::Resolved);
+        let committed = queue.get(&task.id).unwrap();
+        assert_eq!(committed.decision_effects.get(&record.id), Some(&request));
+        // Simulate death after the queue commit and before the final inquiry
+        // projection rename. The independently committed receipt is authoritative.
+        let path = home.join("notifications/task-inquiries").join(format!("{}.json", record.id));
+        let mut saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        saved["decision"]["status"] = "in_progress".into();
+        saved["decision"]["history"].as_array_mut().unwrap().pop();
+        std::fs::write(path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        // A subsequent transition must not erase proof of the earlier effect.
+        // This writer still holds a pre-effect snapshot. Queue persistence
+        // must merge the receipt even when saving its later transition.
+        task.succeed(); queue.put(&mut task).unwrap();
+        assert_eq!(queue.get(&task.id).unwrap().decision_effects.get(&record.id), Some(&request));
+        let before = std::fs::read(queue.path_of(&task.id)).unwrap();
+        chat_control::reconcile_decisions(&queue, &home).unwrap();
+        let decision = Outbox::at(&home).get(&record.id).unwrap().decision.unwrap();
+        assert_eq!(decision.status, Status::Resolved, "{kind}");
+        assert!(decision.history.last().unwrap().evidence.contains("receipt"));
+        assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before, "recovery never replays {kind}");
+    }
+}
+}
+
+common::e2e! {
+async fn failed_task_transition_has_no_effect_receipt_and_stays_actionable_after_restart() {
+    use magi::{chat_control::{self, Operation}, task_decision::Status};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("failed-task-receipt");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let mut task = Task::new("completed work".into(), "completed work".into(), fx.repo.clone(), Source::Human);
+    task.chat = Some(chat.id.clone());
+    task.succeed(); queue.put(&mut task).unwrap();
+    let outbox = Outbox::at(&home);
+    let record = outbox.file(&task, None, "receipt-test".into(), "Discuss completed work", "A reply alone does not restart it").unwrap();
+    outbox.deliver(&queue, &talks, &record.id).unwrap();
+    let before = std::fs::read(queue.path_of(&task.id)).unwrap();
+    assert!(chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ForDecision {
+        inquiry: record.id.clone(),
+        command: Box::new(Operation::Hold { task: task.id.clone(), reason: "change direction".into() }),
+    }).await.is_err());
+    chat_control::reconcile_decisions(&queue, &home).unwrap();
+    let failed = Outbox::at(&home).get(&record.id).unwrap().decision.unwrap();
+    assert_eq!(failed.status, Status::RetryNeeded);
+    assert!(failed.error.unwrap().contains("completed work must not be restarted"));
+    assert!(queue.get(&task.id).unwrap().decision_effects.is_empty());
+    assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+}
+}
+
+common::e2e! {
+async fn malformed_legacy_sources_remain_visible_across_restart_and_repair_once() {
+    use magi::ask::{Question, Questions};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("malformed-migration");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let mut task = Task::new("original work".into(), "original work".into(), fx.repo.clone(), Source::Human);
+    task.chat = Some(chat.id.clone()); task.runs.push("run-a".into()); queue.put(&mut task).unwrap();
+    let questions = Questions::at(home.join("questions"));
+    std::fs::create_dir_all(questions.root()).unwrap();
+    let mut old = Question::new("run-a".into(), "implement".into(), "impl-A".into(), "Original pending intent".into(), "Preserve me".into(), vec![]);
+    let path = questions.path_of(&old.id);
+    std::fs::write(&path, b"{").unwrap();
+    for _ in 0..2 { magi::task_chat::sweep(&queue, &talks, &questions, &home); }
+    let errors = magi::task_chat::migration_issues(&home);
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].id, old.id);
+    assert!(errors[0].reason.contains("Import executed no action"));
+    assert_eq!(std::fs::read(&path).unwrap(), b"{");
+    assert!(Outbox::at(&home).list().unwrap().is_empty());
+    assert!(talks.get(&chat.id).unwrap().pending_messages.is_empty());
+    // Restoring the original saved source is a fixture repair, not an answer.
+    questions.put(&mut old).unwrap();
+    for _ in 0..2 { magi::task_chat::sweep(&queue, &talks, &questions, &home); }
+    assert!(magi::task_chat::migration_issues(&home).is_empty());
+    let records = Outbox::at(&home).list().unwrap();
+    assert_eq!(records.len(), 1);
+    assert!(records[0].decision.as_ref().unwrap().request.is_none());
+    assert_eq!(talks.get(&chat.id).unwrap().pending_messages.len(), 1);
+}
+}
+
+common::e2e! {
+async fn identical_inquiry_wording_in_a_new_owner_generation_is_not_lost_as_redelivery() {
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("inquiry-generations");
+    let queue = Queue::at(home.join("queue")); let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let mut task = Task::new("recurring work".into(), "recurring work".into(), fx.repo.clone(), Source::Human);
+    task.chat = Some(chat.id.clone()); queue.put(&mut task).unwrap();
+    let outbox = Outbox::at(&home);
+    let first = outbox.file(&task, None, "implement:impl-A".into(), "Discuss the same issue", "The reason is unchanged").unwrap();
+    assert_eq!(first.id, outbox.file(&task, None, "implement:impl-A".into(), "Discuss the same issue", "The reason is unchanged").unwrap().id);
+    outbox.deliver(&queue, &talks, &first.id).unwrap();
+    outbox.settle(&first.id, &chat.id, "Owner settled this occurrence", None).unwrap();
+    task.hold_manual(Some("owner requests a new direction".into()));
+    queue.put(&mut task).unwrap();
+    let second = Outbox::at(&home).file(&task, None, "implement:impl-A".into(), "Discuss the same issue", "The reason is unchanged").unwrap();
+    assert_ne!(first.id, second.id);
+    outbox.deliver(&queue, &talks, &second.id).unwrap();
+    assert_eq!(outbox.get(&first.id).unwrap().decision.unwrap().status, magi::task_decision::Status::Resolved);
+    assert_eq!(outbox.get(&second.id).unwrap().decision.unwrap().status, magi::task_decision::Status::AwaitingOwner);
+    assert_eq!(talks.get(&chat.id).unwrap().pending_messages.len(), 2);
+}
+}
+
+common::e2e! {
+async fn retained_native_inquiry_without_occurrence_metadata_is_adopted_without_redelivery() {
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("retained-native-generation");
+    let queue = Queue::at(home.join("queue")); let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let mut task = Task::new("retained work".into(), "retained work".into(), fx.repo.clone(), Source::Human);
+    task.chat = Some(chat.id.clone()); queue.put(&mut task).unwrap();
+    let outbox = Outbox::at(&home);
+    let first = outbox.file(&task, None, "implement:impl-A".into(), "Retained inquiry", "Unresolved context").unwrap();
+    outbox.deliver(&queue, &talks, &first.id).unwrap();
+    let path = home.join("notifications/task-inquiries").join(format!("{}.json", first.id));
+    let mut saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    saved.as_object_mut().unwrap().remove("occurrence");
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    // The retained implementation did not include this owner generation in
+    // its key. Restart must preserve the existing unresolved delivery instead
+    // of treating upgrade alone as a second inquiry or an owner request.
+    task.hold_manual(Some("original owner generation".into())); queue.put(&mut task).unwrap();
+    for _ in 0..2 {
+        let adopted = Outbox::at(&home).file(&task, None, "implement:impl-A".into(), "Retained inquiry", "Unresolved context").unwrap();
+        assert_eq!(adopted.id, first.id);
+        assert!(adopted.occurrence.is_some());
+        assert!(adopted.decision.as_ref().unwrap().request.is_none());
+        outbox.deliver(&queue, &talks, &adopted.id).unwrap();
+    }
+    assert_eq!(outbox.list().unwrap().len(), 1);
+    assert_eq!(talks.get(&chat.id).unwrap().pending_messages.len(), 1);
 }
 }

@@ -43,6 +43,8 @@ use crate::id_reserve::{IdSource, path_exists};
 
 /// On-disk format for a queued task. Bumped when a field's meaning changes.
 ///
+/// 21: task/chat command effect receipts commit atomically with local transitions.
+///
 /// 18: retained review criteria snapshots survive operator edits.
 ///
 /// 17: durable explicit operator resumption, independent of run startup.
@@ -460,6 +462,10 @@ pub struct Task {
     /// `#[serde(default)]` so an older record reads as empty.
     #[serde(default)]
     pub actions_applied: Vec<String>,
+    /// Exact task/chat commands committed in the same write as their effects.
+    /// These receipts survive subsequent transitions and execution starts.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub decision_effects: std::collections::BTreeMap<String, String>,
     /// The operator's "resume" answer to a triage question, kept until the
     /// task actually runs (or is done) so `crate::conduct` cannot silently
     /// undo it and `crate::triage` can tell that a hold it sees now came
@@ -969,6 +975,7 @@ impl Task {
             answers: Vec::new(),
             triage_applied: Vec::new(),
             actions_applied: Vec::new(),
+            decision_effects: Default::default(),
             resume_override: None,
             repair_grants: Vec::new(),
             resumption: None,
@@ -2707,6 +2714,14 @@ impl Queue {
                     task.hold_reason = stored.hold_reason.clone();
                     task.held_at = stored.held_at;
                 }
+            }
+            // A writer holding an older task snapshot must never erase or
+            // rewrite proof that a chat command already committed its effect.
+            for (id, receipt) in stored.decision_effects {
+                task.decision_effects.insert(id, receipt);
+            }
+            if !task.decision_effects.is_empty() {
+                task.schema = task.schema.max(SCHEMA);
             }
             // The task's message chat is recorded once and never rewound or
             // dropped by a writer holding an older snapshot.

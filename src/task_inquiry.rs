@@ -33,6 +33,9 @@ pub struct Inquiry {
     pub repo: PathBuf,
     /// Producing graph node or service.
     pub source: String,
+    /// Producer occurrence generation. Older saved inquiries may not have one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence: Option<String>,
     /// Complete free-text agent input, with no executable choices.
     pub text: String,
     /// User-visible report facts.
@@ -125,7 +128,7 @@ impl Outbox {
     }
 
     /// File a free-text task inquiry directly, without a Question envelope.
-    /// The producer identity and unchanged inquiry content form its restart key.
+    /// The producer occurrence and unchanged inquiry content form its restart key.
     pub fn file(
         &self,
         task: &crate::queue::Task,
@@ -140,7 +143,46 @@ impl Outbox {
             run.as_ref().is_none_or(|run| task.runs.contains(run)),
             "inquiry run is not owned by its task"
         );
-        let bytes = serde_json::to_vec(&(
+        let bytes = if task.passes.is_empty() && task.operator_decided_at.is_none() {
+            // Preserve the retained implementation's initial-generation keys.
+            serde_json::to_vec(&(
+                "task-inquiry-v1",
+                &task.id,
+                &task.repo,
+                &run,
+                &source,
+                summary,
+                detail,
+            ))?
+        } else {
+            // Identical wording in a later execution pass or after an owner
+            // transition is a new inquiry, not a replay of resolved history.
+            serde_json::to_vec(&(
+                "task-inquiry-v2",
+                task.passes.len(),
+                &task.operator_decided_at,
+                &task.id,
+                &task.repo,
+                &run,
+                &source,
+                summary,
+                detail,
+            ))?
+        };
+        let digest: String = Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let mut id = format!("task-{digest}");
+        let occurrence = serde_json::to_string(&(task.passes.len(), &task.operator_decided_at))?;
+        let clean = |s: &str| {
+            crate::prompt::defuse(&crate::scrub::scrub(s, &crate::scrub::Identity::current()))
+        };
+        let display = format!("{}\n\n{}", clean(summary), clean(detail));
+        // A retained v1 inquiry has no occurrence metadata. Adopt its active
+        // intent once rather than redelivering it merely because of upgrade.
+        // Known different generations still get independent pending records.
+        let legacy = serde_json::to_vec(&(
             "task-inquiry-v1",
             &task.id,
             &task.repo,
@@ -149,15 +191,29 @@ impl Outbox {
             summary,
             detail,
         ))?;
-        let digest: String = Sha256::digest(bytes)
+        let legacy_digest: String = Sha256::digest(legacy)
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        let id = format!("task-{digest}");
-        let clean = |s: &str| {
-            crate::prompt::defuse(&crate::scrub::scrub(s, &crate::scrub::Identity::current()))
-        };
-        let display = format!("{}\n\n{}", clean(summary), clean(detail));
+        let legacy_id = format!("task-{legacy_digest}");
+        if legacy_id != id && self.path(&legacy_id)?.exists() {
+            let saved = self.get(&legacy_id)?;
+            if saved.task == task.id
+                && saved.run == run
+                && saved.repo == task.repo
+                && saved.source == source
+                && saved.display == display
+                && saved
+                    .occurrence
+                    .as_ref()
+                    .is_none_or(|prior| prior == &occurrence)
+                && saved.decision.as_ref().is_some_and(|decision| {
+                    decision.status != crate::task_decision::Status::Resolved
+                })
+            {
+                id = legacy_id;
+            }
+        }
         let text = format!(
             "# {}\n\n{display}\n\nTask: {}\nRun: {}\n\nDiscuss this inquiry with the owner as free text. It is not an owner instruction. Carry out owner requests through `magi task control --decision {id} <command>`. If the owner explicitly settles the discussion with no remaining effect, use `magi task control settle-decision {id} --reason <reason>`. Silence is a hold; delivery and reading never settle this inquiry.\n",
             crate::prompt::TASK_MESSAGE_HEADING,
@@ -171,6 +227,7 @@ impl Outbox {
             run,
             repo: task.repo.clone(),
             source,
+            occurrence: Some(occurrence),
             text,
             display,
             key: format!("inquiry:{id}"),
@@ -228,6 +285,19 @@ impl Outbox {
                     saved.text == inquiry.text && saved.display == inquiry.display,
                     "inquiry key collision: content differs"
                 );
+            }
+            if let Some(occurrence) = &inquiry.occurrence {
+                ensure!(
+                    saved
+                        .occurrence
+                        .as_ref()
+                        .is_none_or(|prior| prior == occurrence),
+                    "inquiry identity was reused across occurrence generations"
+                );
+                if saved.occurrence.is_none() {
+                    saved.occurrence = Some(occurrence.clone());
+                    self.save(&saved)?;
+                }
             }
             if saved.decision.is_none() && inquiry.decision.is_some() {
                 saved.archived = inquiry.archived;

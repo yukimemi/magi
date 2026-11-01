@@ -587,7 +587,20 @@ async fn execute_decision(
     } else {
         outbox.update_decision(id, |d| d.start())?;
     }
-    let result = if let Operation::Resume { run } = &command {
+    let local = apply_local_decision(
+        queue,
+        home,
+        id,
+        &request,
+        &inquiry.task,
+        &inquiry.repo,
+        &command,
+    );
+    let result = if let Err(error) = local {
+        Err(error)
+    } else if let Some(message) = local? {
+        Ok(message)
+    } else if let Operation::Resume { run } = &command {
         (|| -> Result<String> {
             crate::resume::validate(home, run)?;
             ensure!(
@@ -640,6 +653,78 @@ async fn execute_decision(
     }
 }
 
+/// Commit a task-local effect and its exact receipt under one queue claim.
+/// The inquiry projection may lag this write, but restart never has to infer
+/// completion from the task's current status or repeat the operation.
+fn apply_local_decision(
+    queue: &Queue,
+    home: &Path,
+    id: &str,
+    request: &str,
+    owner: &str,
+    repo: &Path,
+    command: &Operation,
+) -> Result<Option<String>> {
+    let target = match command {
+        Operation::Done { task }
+        | Operation::Hold { task, .. }
+        | Operation::Release { task }
+        | Operation::Retry { task, .. } => task,
+        _ => return Ok(None),
+    };
+    let (_claim, mut task) = claimed(queue, target)?;
+    ensure!(
+        task.id == owner && task.repo == repo,
+        "decision ownership changed"
+    );
+    if let Some(prior) = task.decision_effects.get(id) {
+        ensure!(prior == request, "decision receipt binds another command");
+        return Ok(Some(format!(
+            "task {}: decision {id} already applied",
+            task.id
+        )));
+    }
+    let message = match command {
+        Operation::Done { .. } => {
+            task.succeed();
+            describe(&task, "done")
+        }
+        Operation::Hold { reason, .. } => {
+            check_hold_release(&task, "hold")?;
+            let reason = reason.trim();
+            task.hold_manual((!reason.is_empty()).then(|| reason.to_owned()));
+            describe(&task, "held")
+        }
+        Operation::Release { .. } => {
+            check_hold_release(&task, "release")?;
+            task.release_operator("chat", Some(id));
+            describe(&task, "released")
+        }
+        Operation::Retry {
+            title, instruction, ..
+        } => {
+            ensure!(
+                !instruction.trim().is_empty(),
+                "the new instruction is empty"
+            );
+            let title = title
+                .clone()
+                .unwrap_or_else(|| crate::queue::title_from(instruction, 72));
+            task.edit(title, instruction.clone())?;
+            task.release_operator("chat", Some(id));
+            describe(&task, "retry queued for")
+        }
+        _ => unreachable!("task-local operation checked above"),
+    };
+    task.decision_effects
+        .insert(id.to_owned(), request.to_owned());
+    queue.put(&mut task)?;
+    if matches!(command, Operation::Done { .. }) {
+        crate::daemon::supersede_prior_runs(&task, home);
+    }
+    Ok(Some(message))
+}
+
 /// Explicit owner-requested reconciliation executes nothing. Under the task
 /// claim, prove that the exact intended condition already holds; otherwise keep
 /// uncertainty visible. External effects require their own receipts instead.
@@ -669,6 +754,15 @@ fn reconcile_task_decision(queue: &Queue, home: &Path, chat: &str, id: &str) -> 
     let command: Operation = serde_json::from_str(&request)?;
     let (_claim, task) = claimed(queue, &inquiry.task)?;
     ensure!(task.repo == inquiry.repo, "decision repository changed");
+    if let Some(receipt) = task.decision_effects.get(id) {
+        ensure!(
+            receipt == &request,
+            "decision receipt binds another command"
+        );
+        return outbox.update_decision(id, |d| {
+            d.applied("exact task command receipt confirmed; no operation replayed")
+        });
+    }
     let matches = match command {
         Operation::Hold {
             task: target,
@@ -800,6 +894,18 @@ fn reconcile_inquiry(
     let Ok(command) = serde_json::from_str::<Operation>(&request) else {
         return Ok(());
     };
+    let task = queue.get(&inquiry.task)?;
+    ensure!(task.repo == inquiry.repo, "decision repository changed");
+    if let Some(receipt) = task.decision_effects.get(&inquiry.id) {
+        ensure!(
+            receipt == &request,
+            "decision receipt binds another command"
+        );
+        outbox.update_decision(&inquiry.id, |d| {
+            d.applied("exact task command receipt confirmed after restart")
+        })?;
+        return Ok(());
+    }
     let queued_resume = matches!(&command, Operation::Resume { .. });
     let mut pending_external = false;
     let receipt = match command {
