@@ -78,3 +78,16 @@ PR publication leases and head-specific owner merge approval remain required.
 An already-integrated PR whose closure failed is a separate resumable checkpoint:
 resume rechecks integration and public ownership and retries closure without any
 new synchronization allowance.
+
+## 停止診断と消費数の表示
+
+次の行動には、現在のエピソード番号、エピソード内の消費数／上限、
+生涯の同期回数が一行で表示されます。承認済みなら、その承認を使って
+保存済みの実行を再開するよう案内します。
+
+停止記録の `unverified_sync` は、同期が成功したHEADについてゲートが
+実行される前にbaseが再び進んだことを示します。これは原因を説明する
+診断情報であり、新しい同期枠を付与する根拠にはなりません。
+検証の進捗と同期の成功は区別して記録し、古い記録に同期の証拠がなければ
+この診断は付けません。承認の拒否は `consumed` と `invalidated` の理由を
+まとめて記録し、再開後にも拒否理由を確認できます。

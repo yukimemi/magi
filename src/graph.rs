@@ -4877,10 +4877,10 @@ impl Runner {
             && !authorization.consumed
             && authorization.stop.head != head
         {
-            authorization.invalidated = Some(
-                "retained HEAD changed; inspect it and authorize again with --recover-base".into(),
-            );
-            authorization.consumed = true;
+            authorization.refuse(format!(
+                "retained HEAD changed from {} to {head}; inspect it and authorize again with --recover-base",
+                authorization.stop.head
+            ));
         }
         self.state.record_base_sync_stop(&head);
         if let Some(kind) = kind {
@@ -5143,9 +5143,7 @@ impl Runner {
                     .authorizations
                     .last_mut()
                     .unwrap();
-                authorization.invalidated =
-                    Some(format!("{reason}; authorize again with --recover-base"));
-                authorization.consumed = true;
+                authorization.refuse(format!("{reason}; authorize again with --recover-base"));
                 self.state.save()?;
                 return Ok(());
             }
@@ -16493,11 +16491,125 @@ esac
             runner.state.base_sync_recovery.stop.as_ref().unwrap().kind,
             crate::base_sync_recovery::StopKind::Exhausted
         );
+        let stop = runner.state.base_sync_recovery.stop.as_ref().unwrap();
+        assert!(stop.unverified_sync);
+        let action = runner.state.base_sync_next_action();
+        assert!(action.contains("never reached its gate"));
+        assert!(action.contains("4/4 in episode 0, 4 lifetime"));
         assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 4);
         runner.state = RunState::load(&runner.state.id).unwrap();
         runner.sync_to_base().await.unwrap();
         assert_eq!(runner.state.base_episode_used(), 4);
         assert_eq!(runner.state.base_sync_recovery.episodes.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_stop_diagnostic_requires_synced_head_without_current_gate() {
+        let (_tmp, mut runner, head, _) = exhausted_base_fixture().await;
+        runner.state.ensure_base_episode();
+        // Verification progress alone is not evidence of a successful sync.
+        runner.state.record_base_progress(&head);
+        runner.state.base_sync_recovery.stop = None;
+        runner.state.record_base_sync_stop(&head);
+        assert!(
+            !runner
+                .state
+                .base_sync_recovery
+                .stop
+                .as_ref()
+                .unwrap()
+                .unverified_sync
+        );
+
+        runner.state.finish_base_operation(Some(&head));
+        // A gate for another head cannot verify this synchronization.
+        runner.state.gate_ran = true;
+        runner.state.gate_head = Some("older-head".into());
+        runner.state.base_sync_recovery.stop = None;
+        runner.state.record_base_sync_stop(&head);
+        runner.state.save().unwrap();
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        assert!(
+            runner
+                .state
+                .base_sync_recovery
+                .stop
+                .as_ref()
+                .unwrap()
+                .unverified_sync
+        );
+
+        runner.state.gate_head = Some(head.clone());
+        runner.state.base_sync_recovery.stop = None;
+        runner.state.record_base_sync_stop(&head);
+        assert!(
+            !runner
+                .state
+                .base_sync_recovery
+                .stop
+                .as_ref()
+                .unwrap()
+                .unverified_sync
+        );
+        assert!(
+            !runner
+                .state
+                .base_sync_next_action()
+                .contains("never reached its gate")
+        );
+
+        // Historical records cannot establish the missing synchronization evidence.
+        let mut legacy = serde_json::to_value(&runner.state).unwrap();
+        legacy["base_sync_recovery"]["stop"]
+            .as_object_mut()
+            .unwrap()
+            .remove("unverified_sync");
+        legacy["base_sync_recovery"]["episodes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("last_sync_head");
+        runner.state = serde_json::from_value(legacy).unwrap();
+        assert!(
+            !runner
+                .state
+                .base_sync_recovery
+                .stop
+                .as_ref()
+                .unwrap()
+                .unverified_sync
+        );
+        assert!(
+            runner.state.base_sync_recovery.episodes[0]
+                .last_sync_head
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_next_action_reports_new_episode_and_pending_approval() {
+        let (_tmp, mut runner, head, task) = exhausted_base_fixture().await;
+        runner.state.authorize_base_sync(&task).unwrap();
+        assert!(
+            runner
+                .state
+                .base_sync_next_action()
+                .contains("Approval recorded")
+        );
+        assert!(
+            runner
+                .state
+                .base_sync_next_action()
+                .contains("4/4 in episode 0, 4 lifetime")
+        );
+        assert!(runner.state.consume_base_recovery(&head));
+        assert!(
+            runner
+                .state
+                .base_sync_next_action()
+                .contains("0/4 in episode 1, 4 lifetime")
+        );
     }
 
     #[cfg(unix)]
@@ -16520,6 +16632,14 @@ esac
             .unwrap();
         assert!(a.consumed);
         assert!(a.invalidated.as_deref().unwrap().contains("HEAD changed"));
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        assert!(
+            runner
+                .state
+                .base_sync_next_action()
+                .contains("Approval invalidated")
+        );
+        assert!(!runner.state.base_recovery_pending());
         assert!(runner.state.base_sync_blocked());
         assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 4);
     }
@@ -16542,7 +16662,13 @@ esac
             .authorizations
             .last()
             .unwrap();
-        assert!(a.consumed && a.invalidated.is_some());
+        assert!(
+            a.consumed
+                && a.invalidated
+                    .as_deref()
+                    .unwrap()
+                    .contains("fetched base changed")
+        );
         assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 4);
         assert_eq!(
             git::rev_parse(&runner.state.repo, "HEAD").await.unwrap(),

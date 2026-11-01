@@ -38,6 +38,9 @@ pub struct Stop {
     pub detail: String,
     /// When this record was created.
     pub at: Timestamp,
+    /// A synchronized HEAD had not reached its gate before the base advanced.
+    #[serde(default)]
+    pub unverified_sync: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +76,14 @@ pub struct Authorization {
     pub gate_ran: bool,
 }
 
+impl Authorization {
+    /// Consume a refused approval without granting recovery, retaining the reason.
+    pub(crate) fn refuse(&mut self, reason: impl Into<String>) {
+        self.invalidated = Some(reason.into());
+        self.consumed = true;
+    }
+}
+
 /// A bounded active interval. Lifetime attempts remain in `BaseSync`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Episode {
@@ -84,6 +95,9 @@ pub struct Episode {
     pub used: usize,
     /// Last successful synchronization or actually executed verification in this interval.
     pub synced_head: Option<String>,
+    /// Last successful synchronization, distinct from verification progress.
+    #[serde(default)]
+    pub last_sync_head: Option<String>,
     /// An interruption after progress; consumed at most once.
     pub boundary: Option<Boundary>,
     /// Earlier interruption evidence superseded by actual progress.
@@ -153,6 +167,19 @@ pub struct Recovery {
 impl RunState {
     /// Shared CLI, notice and web instruction, based on the typed checkpoint.
     pub fn base_sync_next_action(&self) -> String {
+        let episode = self.base_sync_recovery.episodes.last().map_or(0, |e| e.id);
+        let lifetime = self.base_sync.as_ref().map_or(0, |s| s.attempts);
+        format!(
+            "{} ({}/{} in episode {}, {} lifetime synchronizations)",
+            self.base_sync_action(),
+            self.base_episode_used(),
+            crate::graph::BASE_SYNC_ROUNDS,
+            episode,
+            lifetime
+        )
+    }
+
+    fn base_sync_action(&self) -> String {
         if let Some(reason) = self
             .base_sync_recovery
             .authorizations
@@ -177,7 +204,18 @@ impl RunState {
             );
         }
         match self.base_sync_recovery.stop.as_ref().map(|s| &s.kind) {
-            Some(StopKind::Exhausted) => "Authorize a new bounded synchronization interval with `magi run --resume <run> --recover-base`, or a new owner resumption approval".into(),
+            Some(StopKind::Exhausted) => {
+                let why = if self.base_sync_recovery.stop.as_ref().is_some_and(|s| s.unverified_sync) {
+                    "The synchronized HEAD never reached its gate before the base moved again. "
+                } else {
+                    ""
+                };
+                if self.base_recovery_pending() {
+                    format!("{why}Approval recorded; resume the retained run to open the approved bounded synchronization interval")
+                } else {
+                    format!("{why}Authorize a new bounded synchronization interval with `magi run --resume {} --recover-base`, or a new owner resumption approval", self.id)
+                }
+            },
             Some(StopKind::Conflict) => "Inspect and resolve the retained textual conflict; base-budget recovery cannot resolve it".into(),
             Some(StopKind::Divergence) => "Reconcile foreign remote branch commits before resuming; do not overwrite them".into(),
             Some(StopKind::Publication) => "Inspect the retained publication failure and remote lease before resuming".into(),
@@ -200,6 +238,7 @@ impl RunState {
                 reason: "initial or conservative legacy migration".into(),
                 used,
                 synced_head: None,
+                last_sync_head: None,
                 boundary: None,
                 prior_boundaries: Vec::new(),
             });
@@ -214,6 +253,7 @@ impl RunState {
             reason: reason.into(),
             used: 0,
             synced_head: None,
+            last_sync_head: None,
             boundary: None,
             prior_boundaries: Vec::new(),
         });
@@ -339,6 +379,7 @@ impl RunState {
                 episode.prior_boundaries.push(boundary);
             }
             episode.synced_head = Some(head.into());
+            episode.last_sync_head = Some(head.into());
             self.reconcile_verification_head(head);
         }
     }
@@ -419,7 +460,15 @@ impl RunState {
             .rev()
             .find(|event| event.node == "land" && event.message == detail)
             .map_or(self.updated_at, |event| event.at);
+        let unverified_sync = sync.behind > 0
+            && self
+                .base_sync_recovery
+                .episodes
+                .last()
+                .is_some_and(|e| e.last_sync_head.as_deref() == Some(head))
+            && !(self.gate_ran && self.gate_head.as_deref() == Some(head));
         let stop = Stop {
+            unverified_sync,
             kind,
             head: head.to_owned(),
             tip: sync.tip.clone(),
@@ -522,9 +571,10 @@ impl RunState {
         let a = self.base_sync_recovery.authorizations.last_mut().unwrap();
         a.consumed = true;
         if a.stop.head != head {
-            a.invalidated = Some(
-                "retained HEAD changed; inspect it and authorize again with --recover-base".into(),
-            );
+            a.refuse(format!(
+                "retained HEAD changed from {} to {head}; inspect it and authorize again with --recover-base",
+                a.stop.head
+            ));
             return false;
         }
         a.reviews = self.reviews.clone();
