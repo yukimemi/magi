@@ -13779,14 +13779,23 @@ mod tests {
 
     #[cfg(unix)]
     async fn registered_runner(root: &Path) -> Runner {
+        repository_runner(root, crate::config::test_coordination()).await
+    }
+
+    async fn repository_runner(
+        root: &Path,
+        coordination: Option<crate::config::Coordination>,
+    ) -> Runner {
         ask_test_home();
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         init_repo(&repo);
-        std::fs::write(repo.join(".git/updater.contract"), "test-protocol-v1\n").unwrap();
+        if coordination.is_some() {
+            std::fs::write(repo.join(".git/updater.contract"), "test-protocol-v1\n").unwrap();
+        }
         let mut runner = runner_at(RunStatus::Prep);
         runner.state.repo = repo.clone();
-        runner.state.config.coordination = crate::config::test_coordination();
+        runner.state.config.coordination = coordination;
         runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
         runner.state.config.graph.worktree_root = Some(root.join("wt"));
         runner.state.config.graph.advise = false;
@@ -13801,7 +13810,7 @@ mod tests {
     #[tokio::test]
     async fn all_unauthenticated_wave_stops_the_node_without_nudges() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut runner = registered_runner(tmp.path()).await;
+        let mut runner = repository_runner(tmp.path(), None).await;
         let prompts = runner.state.config.prompts.clone();
         let run = runner.state.id.clone();
         let ctx = WaveCtx {
@@ -13886,7 +13895,7 @@ mod tests {
     #[tokio::test]
     async fn unauthenticated_implementation_keeps_its_candidate_pending() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut runner = registered_runner(tmp.path()).await;
+        let mut runner = repository_runner(tmp.path(), None).await;
         let implementer = scripted("implement", AUTH_OUTAGE);
         runner.roles.implementers = vec![implementer.clone()];
         runner.state.config.agents = vec![implementer];
