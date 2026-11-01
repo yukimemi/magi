@@ -27,9 +27,12 @@ permits reclamation below the cap, but does not override grace or ownership.
 Only plain, canonical, registered worktrees are eligible. A legacy `target` must
 be ignored, contain no tracked files, carry Cargo's standard
 [cache directory tag signature](https://bford.info/cachedir/) and rustc identity,
-and contain only recognized Cargo root entries (`debug`, `release`, the tag and
-identity). These checks do not authorize recursive deletion. Cleanup removes only
-regular artifact files declared as outputs in rustc dep-info (`.d`) records in
+and have plain canonical directories for any existing `debug` and `release`
+profiles. Unrelated root entries, including logs, `tmp` and `magi-tools`, are
+retained and do not veto artifact eviction. They provide no ownership evidence
+and never expand the artifact search. These checks do not authorize recursive
+deletion. Cleanup removes only regular artifact files declared as outputs in
+rustc dep-info (`.d`) records in
 `debug`, `release` or their `deps` directories, with matching artifact names and
 recognized binary/library extensions and compiler-artifact signatures. Text that
 replaced a stale output remains. Dependency inputs never authorize deletion.
@@ -136,7 +139,10 @@ is not released or completed. No PR is closed and no question is answered.
 Cargo residue qualifies only after artifact reclamation recorded a complete
 inventory, and only if every remaining file still matches that inventory under
 the output and Cargo locks. Added files, changed metadata, symlinks and missing
-proof retain the worktree. The archived metadata survives worktree removal.
+proof retain the worktree. Unknown target-root entries, including empty
+directories, prevent both residue adoption and verification of an existing proof;
+artifact eviction can still proceed. These leftovers also prevent whole-worktree
+retirement and folding. The archived metadata survives worktree removal.
 
 `retired_to` prevents execution independently of run status, before any worktree
 is removed. Reports, branch refs and the retirement event remain. Interrupted
@@ -225,9 +231,11 @@ authorize discarding that work. No local historical run was changed.
 The real-Cargo retention regression builds a dependency-free temporary crate offline
 with stable Cargo, an isolated Cargo home and an explicit temporary target directory.
 It passes Cargo's unchanged cache identity and dep-info through the production sweep,
-checking artifact reclamation and its ledger while preserving source and an unknown
-profile file. Synthetic fixtures continue to cover the other safety protections
-and the oversized-target budget exception.
+checking artifact reclamation and its ledger while preserving source, an unknown
+profile file, root logs and sentinel contents in `tmp` and `magi-tools`. Compiler
+bytes and dep-info outside supported profiles remain untouched. Synthetic fixtures
+continue to cover the other safety protections and the oversized-target budget
+exception.
 
 Focused regression verification:
 
