@@ -103,3 +103,9 @@ matching base-sync reservation before removing scratch evidence. A restart can
 accept that exact result even when resolution changed the original patch IDs.
 It still checks the retained branch/worktree; a different HEAD does not inherit
 this validation.
+
+If Git continuation completed before result validation was saved, reconciliation
+revalidates the remaining scratch using the same completion checks. Scratch
+repository, branch, original HEAD, current HEAD, clean tree and recorded picks
+must match the reserved operation. Validation is saved before cleanup; refused
+or incomplete evidence stays intact for inspection and grants no new attempt.

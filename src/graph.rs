@@ -5030,6 +5030,20 @@ impl Runner {
             // A replay may add the pinned base's commits, never foreign work.
             let mut replay_proven =
                 head == op.head || op.validated_head.as_deref() == Some(head.as_str());
+            if !replay_proven && scratch.exists() && !git::rebase_in_progress(&scratch).await {
+                let wait = repository_wait(&self.state, None);
+                let _coordination = coordinate_operation(&mut self.state, &repo, &wait).await?;
+                match crate::rebase::recover_completed_base(&self.state, &scratch, &winner.branch, op, &head).await {
+                    Ok(true) => {
+                        self.state.base_sync_recovery.operations.last_mut().unwrap().validated_head = Some(head.clone());
+                        self.state.save()?;
+                        git::worktree_remove(&repo, &scratch).await.ok();
+                        replay_proven = true;
+                    }
+                    Ok(false) => self.state.event("base-recovery", "completed scratch failed result validation; retained for inspection"),
+                    Err(error) => self.state.event("base-recovery", format!("completed scratch could not be validated; retained for inspection: {error:#}")),
+                }
+            }
             if !replay_proven && git::is_ancestor(&repo, &op.tip, &head).await {
                 if self.state.foreign_checkout.is_some() {
                     replay_proven = git::rev_parse(&repo, &format!("{head}^1"))
@@ -16950,6 +16964,103 @@ esac
                 .unwrap()
         );
         assert_eq!(runner.state.head_e2e.as_ref().unwrap().head, result);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_revalidates_completed_scratch_before_validation_save() {
+        for damage in [None, Some("record"), Some("foreign"), Some("dirty")] {
+            let (_tmp, mut runner, head, tip, scratch) = paused_base_conflict_fixture().await;
+            runner.state.reserve_base_operation(&head, &tip);
+            runner.state.save().unwrap();
+            std::fs::write(
+                scratch.join("retained"),
+                "upstream and retained resolution\n",
+            )
+            .unwrap();
+            git::git(&scratch, &["add", "retained"]).await.unwrap();
+            git::git(
+                &scratch,
+                &["-c", "core.editor=true", "rebase", "--continue"],
+            )
+            .await
+            .unwrap();
+            let result = git::rev_parse(&scratch, "HEAD").await.unwrap();
+            assert!(!git::rebase_in_progress(&scratch).await);
+            assert!(
+                !crate::reconcile::origin_missing(&runner.state.repo, &result, &head)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            match damage {
+                Some("record") => {
+                    let path =
+                        git::git(&scratch, &["rev-parse", "--git-path", "magi-rebase-heads"])
+                            .await
+                            .unwrap();
+                    std::fs::write(scratch.join(path), "").unwrap();
+                }
+                Some("foreign") => {
+                    std::fs::write(scratch.join("foreign"), "foreign work").unwrap();
+                    git::git(&scratch, &["add", "foreign"]).await.unwrap();
+                    git::git(&scratch, &["commit", "-m", "foreign work"])
+                        .await
+                        .unwrap();
+                }
+                Some("dirty") => {
+                    std::fs::write(scratch.join("retained"), "uncommitted work").unwrap();
+                }
+                _ => {}
+            }
+            let retained_head = git::rev_parse(&runner.state.repo, "HEAD").await.unwrap();
+            // Crash immediately after Git continuation, before finish runs.
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            assert!(
+                runner.state.base_sync_recovery.operations[0]
+                    .validated_head
+                    .is_none()
+            );
+            runner.sync_to_base().await.unwrap();
+            assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 1);
+            assert_eq!(runner.state.base_episode_used(), 1);
+            assert_eq!(runner.state.rebase_fixes.len(), 1);
+            assert_eq!(
+                git::rev_parse(&runner.state.repo, "HEAD").await.unwrap(),
+                retained_head
+            );
+            if damage.is_some() {
+                assert!(runner.state.base_sync_blocked());
+                assert!(scratch.exists());
+                assert!(!runner.state.base_sync_recovery.operations[0].finished);
+                assert!(
+                    runner.state.base_sync_recovery.operations[0]
+                        .validated_head
+                        .is_none()
+                );
+            } else {
+                assert!(!runner.state.base_sync_blocked());
+                assert!(!scratch.exists());
+                assert!(runner.state.base_sync_recovery.operations[0].finished);
+                assert_eq!(
+                    runner.state.base_sync_recovery.operations[0]
+                        .validated_head
+                        .as_deref(),
+                    Some(result.as_str())
+                );
+                let winner = runner.state.winner().unwrap().clone();
+                let wait = runner.repository_wait();
+                assert!(
+                    verify_current_head(&mut runner.state, &winner, &wait)
+                        .await
+                        .unwrap()
+                );
+                assert_eq!(runner.state.head_e2e.as_ref().unwrap().head, result);
+                runner.state = RunState::load(&runner.state.id).unwrap();
+                runner.sync_to_base().await.unwrap();
+                assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 1);
+            }
+        }
     }
 
     #[cfg(unix)]
