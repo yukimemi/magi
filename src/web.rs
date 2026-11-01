@@ -475,6 +475,22 @@ fn open_talk_ids(ui: &Ui, ids: &[String]) -> std::collections::HashSet<String> {
     struct StatusOnly {
         status: talk::TalkStatus,
     }
+    open_talk_ids_with(ui, ids, |path| {
+        // serde skips unknown fields without allocating turns or bodies.
+        std::fs::File::open(path)
+            .ok()
+            .and_then(|file| {
+                serde_json::from_reader::<_, StatusOnly>(std::io::BufReader::new(file)).ok()
+            })
+            .map(|row| row.status)
+    })
+}
+
+fn open_talk_ids_with(
+    ui: &Ui,
+    ids: &[String],
+    mut read_status: impl FnMut(&FsPath) -> Option<talk::TalkStatus>,
+) -> std::collections::HashSet<String> {
     let mut index = ui
         .monitor
         .talk_status_index
@@ -488,29 +504,24 @@ fn open_talk_ids(ui: &Ui, ids: &[String]) -> std::collections::HashSet<String> {
             index.records.remove(id);
             continue;
         };
-        if index
-            .records
-            .get(id)
-            .is_none_or(|(old, _)| *old != identity)
+        let status = if let Some((old, status)) = index.records.get(id)
+            && *old == identity
         {
-            // serde skips unknown fields without allocating turns or bodies.
-            let status = std::fs::File::open(ui.talks.path_of(id))
-                .ok()
-                .and_then(|file| {
-                    serde_json::from_reader::<_, StatusOnly>(std::io::BufReader::new(file)).ok()
-                })
-                .map(|row| row.status);
+            *status
+        } else {
+            let status = read_status(&ui.talks.path_of(id));
             #[cfg(test)]
             {
                 index.parses += 1;
             }
-            index.records.insert(id.clone(), (identity, status));
-        }
-        if index
-            .records
-            .get(id)
-            .is_some_and(|(_, status)| *status == Some(talk::TalkStatus::Open))
-        {
+            if file_identity(&ui.talks.path_of(id)).is_ok_and(|after| after == identity) {
+                index.records.insert(id.clone(), (identity, status));
+            } else {
+                index.records.remove(id);
+            }
+            status
+        };
+        if status == Some(talk::TalkStatus::Open) {
             open.insert(id.clone());
         }
     }
@@ -5278,7 +5289,11 @@ fn talk_rows(ui: &Ui, ids: Vec<String>, headers: &header::HeaderMap) -> Vec<Talk
         .unwrap_or_else(PoisonError::into_inner);
     // Bound memory independently of the number of conversations ever opened.
     if index.len() > 1000 {
-        index.clear();
+        let keep: HashSet<&str> = ids.iter().map(String::as_str).collect();
+        index.retain(|id, (_, row)| keep.contains(id.as_str()) || row.status.open());
+        if index.len() > 1000 {
+            index.retain(|id, _| keep.contains(id.as_str()));
+        }
     }
     ids.into_iter()
         .filter_map(|id| {
@@ -24646,13 +24661,14 @@ mod tests {
     async fn talk_pages_load_every_open_then_frozen_closed_history() {
         let home = tempfile::tempdir().unwrap();
         let ui = delta_test_ui(home.path());
+        // Every closed conversation is newer by ID than every open conversation.
         for i in 0..23 {
-            seed_talk_at(&ui.talks, &format!("old-open-{i:03}"), "open");
+            seed_talk_at(&ui.talks, &format!("20260101-000000-{i:03}"), "open");
         }
         for i in 0..45 {
-            seed_talk_at(&ui.talks, &format!("recent-closed-{i:03}"), "closed");
+            seed_talk_at(&ui.talks, &format!("20261019-000000-{i:03}"), "closed");
         }
-        std::fs::write(ui.talks.path_of("recent-corrupt"), "broken").unwrap();
+        std::fs::write(ui.talks.path_of("20261020-000000-corrupt"), "broken").unwrap();
         let first = talks_page(
             State(ui.clone()),
             Query(PageQuery::default()),
@@ -24694,9 +24710,9 @@ mod tests {
         let mut seen: std::collections::HashSet<_> =
             first.rows.iter().map(|row| row.id.clone()).collect();
         // Status changes keep their original membership position until refresh.
-        seed_talk_at(&ui.talks, "recent-closed-000", "open");
-        seed_talk_at(&ui.talks, "old-open-000", "closed");
-        std::fs::remove_file(ui.talks.path_of("recent-closed-001")).unwrap();
+        seed_talk_at(&ui.talks, "20261019-000000-000", "open");
+        seed_talk_at(&ui.talks, "20260101-000000-000", "closed");
+        std::fs::remove_file(ui.talks.path_of("20261019-000000-001")).unwrap();
         let mut next = first.next;
         while let Some(cursor) = next {
             let page = talks_page(
@@ -24715,7 +24731,18 @@ mod tests {
             }
             next = page.next;
         }
-        assert_eq!(seen.len(), 23 + 45 - 1);
+        let expected: HashSet<_> = (0..23)
+            .map(|i| format!("20260101-000000-{i:03}"))
+            .chain(
+                (0..45)
+                    .filter(|i| *i != 1)
+                    .map(|i| format!("20261019-000000-{i:03}")),
+            )
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "the cursor walk must return every surviving ID"
+        );
         let refreshed = talks_page(
             State(ui.clone()),
             Query(PageQuery::default()),
@@ -24736,9 +24763,14 @@ mod tests {
             refreshed
                 .rows
                 .iter()
-                .any(|row| row.id == "recent-closed-000")
+                .any(|row| row.id == "20261019-000000-000")
         );
-        assert!(!refreshed.rows.iter().any(|row| row.id == "old-open-000"));
+        assert!(
+            !refreshed
+                .rows
+                .iter()
+                .any(|row| row.id == "20260101-000000-000")
+        );
     }
 
     #[test]
@@ -24751,6 +24783,95 @@ mod tests {
         let (ids, next) = page_ids(&ui, true, PageQuery::default()).unwrap();
         assert_eq!(ids.len(), STORE_PAGE_SIZE + 5);
         assert!(next.is_none());
+    }
+
+    #[test]
+    fn talk_status_projection_does_not_cache_files_changed_during_read() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let ids = vec!["changing-chat".to_owned()];
+        seed_talk_at(&ui.talks, &ids[0], "closed");
+        assert!(open_talk_ids(&ui, &ids).is_empty());
+        seed_talk_at(&ui.talks, &ids[0], "open");
+        let open = open_talk_ids_with(&ui, &ids, |path| {
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            // Replace the file after parsing, before its identity is checked again.
+            seed_talk_at(&ui.talks, &ids[0], "closed");
+            serde_json::from_value(value["status"].clone()).ok()
+        });
+        assert!(open.contains(&ids[0]));
+        assert!(
+            ui.monitor
+                .talk_status_index
+                .lock()
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        assert!(open_talk_ids(&ui, &ids).is_empty());
+        assert_eq!(ui.monitor.talk_status_index.lock().unwrap().parses, 3);
+    }
+
+    #[test]
+    fn talk_rows_cache_shrinks_without_reparsing_open_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let headers = header::HeaderMap::new();
+        seed_talk_at(&ui.talks, "open-chat", "open");
+        seed_talk_at(&ui.talks, "closed-chat", "closed");
+        talk_rows(
+            &ui,
+            vec!["open-chat".into(), "closed-chat".into()],
+            &headers,
+        );
+        {
+            let mut index = ui.monitor.talk_index.lock().unwrap();
+            let closed = index["closed-chat"].1.clone();
+            for i in 0..1000 {
+                index.insert(
+                    format!("cached-closed-{i}"),
+                    (
+                        file_identity(&ui.talks.path_of("closed-chat")).unwrap(),
+                        closed.clone(),
+                    ),
+                );
+            }
+        }
+        assert_eq!(
+            talk_rows(&ui, vec!["closed-chat".into()], &headers).len(),
+            1
+        );
+        assert_eq!(ui.monitor.talk_index.lock().unwrap().len(), 2);
+        assert_eq!(talk_rows(&ui, vec!["open-chat".into()], &headers).len(), 1);
+        assert_eq!(
+            ui.monitor
+                .talk_parses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        {
+            let mut index = ui.monitor.talk_index.lock().unwrap();
+            let open = index["open-chat"].1.clone();
+            for i in 0..1000 {
+                index.insert(
+                    format!("cached-open-{i}"),
+                    (
+                        file_identity(&ui.talks.path_of("open-chat")).unwrap(),
+                        open.clone(),
+                    ),
+                );
+            }
+        }
+        // Even when open rows exceed the bound, keep the currently requested rows.
+        assert_eq!(talk_rows(&ui, vec!["open-chat".into()], &headers).len(), 1);
+        assert_eq!(ui.monitor.talk_index.lock().unwrap().len(), 1);
+        assert_eq!(
+            ui.monitor
+                .talk_parses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
     }
 
     #[test]
