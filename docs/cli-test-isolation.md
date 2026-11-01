@@ -15,6 +15,15 @@ Tests embedding the library's scheduler use `MAGI_WORKER_EXE` to name
 kill only the web/scheduler PID, not its descendant tree: killing a process tree
 would deliberately kill the workers whose independence the test must measure.
 
+The deputy restart/capacity test owns its schedulers, release guard and fixture
+in a failure-diagnostic guard. On assertion or timeout panic, it captures bounded
+old/new scheduler and worker log tails, selected job/result metadata, read-only
+active-worker observations, Question deputy/lease state and started/release
+markers before cleanup. Missing, unreadable and unparseable evidence stays
+explicit; an unobserved worker is not proof of exit. Observations are sequential,
+not an atomic snapshot. Record, directory, tail and total output limits report
+omissions; prompts, payloads and answer bodies are excluded. Success is silent.
+
 CLI environment resets belong to the spawned command, not to its embedding test
 process. A fixture that copies those settings into its own environment must
 retain its explicit `MAGI_WORKER_EXE`; otherwise later library dispatch tries
