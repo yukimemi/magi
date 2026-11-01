@@ -5741,7 +5741,8 @@ enum Starter {
 }
 
 /// A second bound independent of inputs and the resettable failure counter.
-/// Count recovery records, not history entries: resuming appends the same id.
+/// Count execution and failed-startup recovery records once per run. Startup
+/// failures can retain unrecorded preparation assets without an execution pass.
 /// Unknown history is not evidence that a new set of worktrees is affordable.
 fn retained_attempt_hold(
     task: &Task,
@@ -5753,7 +5754,12 @@ fn retained_attempt_hold(
         return None;
     }
     let mut retained = 0;
-    for id in task.runs.iter().collect::<std::collections::BTreeSet<_>>() {
+    for id in task
+        .runs
+        .iter()
+        .chain(task.startup_failures.iter().map(|failure| &failure.run))
+        .collect::<std::collections::BTreeSet<_>>()
+    {
         let state = match load(id) {
             Ok(state) if state.id == *id => state,
             _ => {
@@ -12449,6 +12455,75 @@ mod tests {
         assert!(check(&restored, &Starter::Start, 8).is_some());
         assert!(check(&restored, &Starter::Resume(task.runs[0].clone()), 8).is_none());
         assert!(check(&restored, &Starter::Start, 0).is_none());
+    }
+
+    #[test]
+    fn retained_attempt_bound_includes_failed_startups_without_execution_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut task = Task::new(
+            "recover selected PR".into(),
+            "preserve implementation".into(),
+            tmp.path().join("repo"),
+            crate::queue::Source::Human,
+        );
+        let mut failed = run_state(RunStatus::Failed);
+        failed.id = "20260101-000000-fail".into();
+        failed.candidates.clear();
+        failed.prep_complete = Some(false);
+        failed.config.graph.worktree_root = Some(tmp.path().join("worktrees"));
+        failed.startup = Some(crate::run::Startup {
+            kind: "pr-recovery".into(),
+            branch: Some("selected-public-head".into()),
+            stage: "worktree-setup".into(),
+            complete: false,
+            failure: Some("setup modified a tracked file and failed".into()),
+        });
+        // Setup may fail before a candidate is recorded; its dirty worktree
+        // still needs protection and consumes the independent retained bound.
+        let worktree = failed.worktree_root().join("under-review");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let retained_edit = worktree.join("implementation");
+        std::fs::write(&retained_edit, "retained setup edit").unwrap();
+        task.record_startup_failure(crate::run::StartupFailure {
+            run: failed.id.clone(),
+            stage: "worktree-setup".into(),
+        });
+        let task: Task = serde_json::from_slice(&serde_json::to_vec(&task).unwrap()).unwrap();
+        assert!(task.runs.is_empty() && task.passes.is_empty());
+        assert_eq!(task.attempts, 0);
+        let starter = Starter::Review("selected-public-head".into());
+        assert!(
+            retained_attempt_hold(&task, &starter, 1, |_| Ok(failed.clone()))
+                .unwrap()
+                .contains("1 unretired")
+        );
+        assert!(retained_attempt_hold(&task, &starter, 2, |_| Ok(failed.clone())).is_none());
+        assert!(
+            retained_attempt_hold(&task, &starter, 2, |_| anyhow::bail!("unreadable"))
+                .unwrap()
+                .contains("Cannot verify")
+        );
+        // Older or mixed writers can link the same reservation in both lists.
+        let mut mixed = task.clone();
+        mixed.runs.push(failed.id.clone());
+        mixed
+            .startup_failures
+            .push(task.startup_failures[0].clone());
+        assert!(retained_attempt_hold(&mixed, &starter, 2, |_| Ok(failed.clone())).is_none());
+        failed.retired_to = Some("verified-recovery-owner".into());
+        assert!(retained_attempt_hold(&task, &starter, 1, |_| Ok(failed.clone())).is_none());
+        assert!(
+            retained_attempt_hold(&task, &Starter::Resume(failed.id.clone()), 1, |_| {
+                panic!("resuming the existing owner must not allocate a new attempt")
+            })
+            .is_none()
+        );
+        assert_eq!(
+            std::fs::read_to_string(retained_edit).unwrap(),
+            "retained setup edit"
+        );
+        assert!(task.runs.is_empty() && task.passes.is_empty());
+        assert_eq!(task.attempts, 0);
     }
 
     #[test]

@@ -20,6 +20,10 @@ and its observed outcome is recorded rather than assumed.
 The task's `startup_failures` is audit history. It does not select a resume
 source, grant recovery authority, add an execution pass or spend an attempt.
 Existing startup error classification still determines holds and attempt costs.
+The independent retained-attempt admission bound counts both execution history
+and failed startup reservations once per run, because even a startup with no
+recorded candidates can retain preparation work. Unknown records fail closed;
+only recorded retirement or release removes them from that bound.
 Only successful construction and persistence of `task.start` dispatch execution.
 `magi show`, `magi list`, and `magi task show` expose the startup evidence.
 

@@ -346,7 +346,7 @@ pub struct Task {
     /// contain repeated ids; execution history lives in the run pass records.
     #[serde(default)]
     pub runs: Vec<String>,
-    /// Reserved startups that failed before execution; never a resume source or budget entry.
+    /// Reserved startups that failed before execution; never a resume source or execution attempt.
     #[serde(default)]
     pub startup_failures: Vec<crate::run::StartupFailure>,
     /// Why the last attempt did not land.
