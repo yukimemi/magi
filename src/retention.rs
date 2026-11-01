@@ -173,7 +173,7 @@ fn registered_worktrees(state: &RunState, list: &str) -> Result<Vec<PathBuf>> {
 }
 
 /// Recognize Cargo's generated directory, never merely an ignored directory.
-/// Unknown root entries and symlinked cache identity/profile paths fail closed.
+/// Unknown root entries are retained; cache identity/profile paths fail closed.
 async fn cargo_target(worktree: &Path) -> Result<PathBuf> {
     let target = worktree.join("target");
     ensure!(plain_dir(&target), "target absent or not a plain directory");
@@ -208,22 +208,15 @@ async fn cargo_target(worktree: &Path) -> Result<PathBuf> {
         info.get("rustc_fingerprint").is_some(),
         "unknown Cargo identity"
     );
-    for entry in std::fs::read_dir(&target)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_str().context("non-UTF8 output")?;
-        ensure!(
-            matches!(
-                name,
-                "debug" | "release" | "CACHEDIR.TAG" | ".rustc_info.json"
-            ),
-            "unrecognized target entry {name}"
-        );
-        if matches!(name, "debug" | "release") {
-            ensure!(
-                plain_dir(&entry.path()) && entry.path().canonicalize()? == entry.path(),
+    for name in ["debug", "release"] {
+        let path = target.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => ensure!(
+                metadata.is_dir() && path.canonicalize()? == path,
                 "profile is not a plain directory"
-            );
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).with_context(|| format!("inspect profile {name}")),
         }
     }
     Ok(target)
@@ -394,7 +387,24 @@ fn residue_proof(home: &Path, id: &str, worktree: &Path) -> Result<PathBuf> {
         .join(worktree.file_name().context("missing worktree name")?))
 }
 
+// Artifact eviction tolerates unrelated root data. Whole-target removal must
+// still reject it, including empty directories absent from the file inventory.
+fn residue_root(target: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(target)? {
+        let name = entry?.file_name();
+        ensure!(
+            matches!(
+                name.to_str(),
+                Some("debug" | "release" | "CACHEDIR.TAG" | ".rustc_info.json")
+            ),
+            "unrecognized Cargo residue root entry"
+        );
+    }
+    Ok(())
+}
+
 fn record_residue(home: &Path, id: &str, target: &Path, outputs: &[PathBuf]) -> Result<()> {
+    residue_root(target)?;
     let files = residue_files(target, outputs)?;
     for (relative, body) in &files {
         let path = target.join(relative);
@@ -433,6 +443,7 @@ fn record_residue(home: &Path, id: &str, target: &Path, outputs: &[PathBuf]) -> 
 
 pub(crate) async fn verify_residue(home: &Path, id: &str, worktree: &Path) -> Result<Vec<File>> {
     let target = cargo_target(worktree).await?;
+    residue_root(&target)?;
     let locks = cargo_locks(&target)?;
     let proof: CargoResidue =
         serde_json::from_slice(&std::fs::read(residue_proof(home, id, worktree)?)?)?;
@@ -1377,8 +1388,39 @@ mod tests {
         let unknown = wt.join("target/release/operator-note");
         std::fs::write(&unknown, "keep this note\n").unwrap();
 
+        let target = wt.join("target");
+        let mut preserved = std::collections::BTreeMap::new();
+        for relative in [
+            "tmp/sentinel",
+            "magi-tools/sentinel",
+            "lifecycle-client-check.log",
+        ] {
+            let path = target.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, format!("retain {relative}\n")).unwrap();
+            preserved.insert(path.clone(), std::fs::read(path).unwrap());
+        }
+        // Even genuine compiler bytes and valid dep-info outside supported
+        // profiles cannot expand the deletion inventory.
+        let decoy = target.join("magi-tools/retained-fixture");
+        std::fs::copy(&artifact, &decoy).unwrap();
+        let dep_info = decoy.with_extension("d");
+        std::fs::write(&dep_info, format!("{}: src/main.rs\n", decoy.display())).unwrap();
+        for path in [
+            decoy,
+            dep_info,
+            wt.join("Cargo.toml"),
+            wt.join("Cargo.lock"),
+        ] {
+            preserved.insert(path.clone(), std::fs::read(path).unwrap());
+        }
+        let proven = declared_outputs(&target).unwrap();
+
         let out = sweep(&f.home, &Fx::disk(), Fx::now()).await;
         assert!(out.freed_bytes > 0, "{out:?}");
+        for (path, bytes) in preserved {
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{}", path.display());
+        }
         assert!(!artifact.exists(), "{out:?}");
         assert_eq!(
             std::fs::read_to_string(wt.join("src/main.rs")).unwrap(),
@@ -1399,12 +1441,17 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        assert!(
-            ledger["files"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!(artifact))
-        );
+        let deleted: Vec<PathBuf> = serde_json::from_value(ledger["files"].clone()).unwrap();
+        assert!(deleted.contains(&artifact));
+        assert_eq!(deleted, proven);
+        for path in deleted {
+            assert!(!path.exists());
+            assert!(
+                [target.join("release"), target.join("release/deps")]
+                    .contains(&path.parent().unwrap().to_owned())
+            );
+        }
+        assert!(!residue_proof(&f.home, &state.id, wt).unwrap().exists());
     }
 
     #[tokio::test]
@@ -2980,14 +3027,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_targets_cargo_owners_and_driver_resumes_are_protected() {
+    async fn cargo_owners_and_driver_resumes_are_protected_with_retained_root_data() {
         let f = Fx::new().await;
         let state = f.run("cccc", false).await;
         let wt = &state.candidates[0].worktree;
         Fx::target(wt);
         std::fs::write(wt.join("target/notes"), "user file").unwrap();
-        assert!(cargo_target(wt).await.is_err());
-        std::fs::remove_file(wt.join("target/notes")).unwrap();
         std::os::unix::fs::symlink(f.repo.join("source"), wt.join("target/debug/link")).unwrap();
         assert!(
             !declared_outputs(&wt.join("target"))
@@ -3011,6 +3056,121 @@ mod tests {
         );
         drop(exclusive);
         assert!(sweep(&f.home, &Fx::disk(), Fx::now()).await.freed_bytes > 0);
+        assert_eq!(
+            std::fs::read(wt.join("target/notes")).unwrap(),
+            b"user file"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_leftovers_allow_eviction_but_keep_empty_attempts_registered() {
+        for leftover in ["tmp", "magi-tools", "lifecycle-client-check.log"] {
+            let f = Fx::new().await;
+            let source = f.run("aa10", true).await;
+            let empty = f.run("aa11", false).await;
+            f.task(&[source, empty.clone()]);
+            let wt = &empty.candidates[0].worktree;
+            Fx::target(wt);
+            let path = wt.join("target").join(leftover);
+            if leftover.ends_with(".log") {
+                std::fs::write(&path, "keep log\n").unwrap();
+            } else {
+                // Empty unknown directories are not present in residue_files.
+                std::fs::create_dir(&path).unwrap();
+            }
+            let mut disk = Fx::disk();
+            disk.auto_fold = true;
+            let report = sweep(&f.home, &disk, Fx::now()).await;
+            assert_eq!(report.freed_bytes, 200, "{report:?}");
+            assert_eq!(report.retired, 0, "{report:?}");
+            assert!(!wt.join("target/debug/output").exists());
+            assert!(!residue_proof(&f.home, &empty.id, wt).unwrap().exists());
+            assert!(path.exists());
+            if leftover.ends_with(".log") {
+                assert_eq!(std::fs::read(&path).unwrap(), b"keep log\n");
+            }
+            assert_eq!(std::fs::read(wt.join("source")).unwrap(), b"base\n");
+            assert!(worktrees(&empty).await.unwrap().contains(wt));
+            assert!(
+                git::branch_exists(&f.repo, &empty.candidates[0].branch)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                RunState::load_under(&empty.id, &f.home)
+                    .unwrap()
+                    .retired_to
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn residue_proof_rejects_new_unknown_root_entries_including_empty_directories() {
+        let f = Fx::new().await;
+        let state = f.run("aa12", false).await;
+        let wt = &state.candidates[0].worktree;
+        Fx::target(wt);
+        let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+        assert_eq!(report.freed_bytes, 200, "{report:?}");
+        assert!(verify_residue(&f.home, &state.id, wt).await.is_ok());
+        for name in ["tmp", "magi-tools", "log"] {
+            let path = wt.join("target").join(name);
+            std::fs::create_dir(&path).unwrap();
+            assert!(verify_residue(&f.home, &state.id, wt).await.is_err());
+            std::fs::remove_dir(path).unwrap();
+        }
+        assert!(verify_residue(&f.home, &state.id, wt).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn target_identity_and_known_profiles_still_fail_closed_with_root_leftovers() {
+        for invalid in [
+            "tag",
+            "identity",
+            "tracked",
+            "profile-file",
+            "profile-symlink",
+            "identity-symlink",
+        ] {
+            let f = Fx::new().await;
+            let state = f.run("aa13", false).await;
+            let wt = &state.candidates[0].worktree;
+            Fx::target(wt);
+            std::fs::create_dir(wt.join("target/tmp")).unwrap();
+            let target = wt.join("target");
+            match invalid {
+                "tag" => std::fs::write(target.join("CACHEDIR.TAG"), "not Cargo").unwrap(),
+                "identity" => std::fs::write(target.join(".rustc_info.json"), "{}").unwrap(),
+                "tracked" => {
+                    git::git(wt, &["add", "-f", "target/debug/output"])
+                        .await
+                        .unwrap();
+                }
+                "profile-file" => {
+                    std::fs::write(target.join("release"), "keep").unwrap();
+                }
+                "profile-symlink" => {
+                    std::os::unix::fs::symlink(target.join("debug"), target.join("release"))
+                        .unwrap();
+                }
+                "identity-symlink" => {
+                    std::fs::rename(target.join(".rustc_info.json"), target.join("saved-info"))
+                        .unwrap();
+                    std::os::unix::fs::symlink(
+                        target.join("saved-info"),
+                        target.join(".rustc_info.json"),
+                    )
+                    .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = std::fs::read(target.join("debug/output")).unwrap();
+            let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+            assert_eq!(report.freed_bytes, 0, "{invalid}: {report:?}");
+            assert_eq!(std::fs::read(target.join("debug/output")).unwrap(), before);
+            assert!(target.join("tmp").is_dir());
+        }
     }
 
     #[tokio::test]
