@@ -610,16 +610,19 @@ async fn execute_decision(
     } else if let Some(message) = local? {
         Ok(message)
     } else if let Operation::Resume { run } = &command {
-        (|| -> Result<String> {
-            crate::resume::validate(home, run)?;
-            ensure!(
-                crate::resume::pin_queued(queue, run, None, Some(id))?,
-                "no queued task owns this run"
-            );
-            Ok(format!(
-                "resume queued for {run}; execution start remains unconfirmed"
-            ))
-        })()
+        // Validation precedes any write: a refusal means nothing began.
+        crate::resume::validate(home, run)
+            .map(|_| ())
+            .map_err(|e| anyhow::Error::new(BeforeEffect(e)))
+            .and_then(|()| -> Result<String> {
+                ensure!(
+                    crate::resume::pin_queued(queue, run, None, Some(id))?,
+                    "no queued task owns this run"
+                );
+                Ok(format!(
+                    "resume queued for {run}; execution start remains unconfirmed"
+                ))
+            })
     } else {
         Box::pin(execute(queue, home, talks, chat, command)).await
     };

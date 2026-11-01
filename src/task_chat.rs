@@ -504,7 +504,9 @@ fn migrate_batch(
                 }
                 post(queue, talks, home, &task.id, &q)?;
                 sync_effect_receipt(home, queue, &q);
-            } else if !q.run.is_empty() {
+            } else {
+                // An ownerless saved inquiry (empty run included) keeps its
+                // unresolved intent in the pending list for manual repair.
                 let mut record = history_record(&q, None);
                 record.archived = false;
                 record.decision = Some(crate::task_decision::Decision::awaiting(q.summary.clone()));
@@ -856,6 +858,27 @@ fn effect_receipt(
                     receipt.url, q.id, receipt.choice
                 )));
             }
+        }
+    }
+    if q.node == crate::land::APPROVAL_NODE
+        && q.resolution().as_deref() == Some(crate::merge_decision::DISMISS)
+    {
+        // `merge_decision::dismiss` persists the run stop and the task's
+        // applied marker; both are the receipt, read without replaying it.
+        let run = crate::run::RunState::load_under(&q.run, home)?;
+        let stopped = run
+            .merge_decision
+            .as_ref()
+            .is_some_and(|d| d.question == q.id && d.choice == crate::merge_decision::DISMISS);
+        let settled = queue
+            .list()
+            .iter()
+            .any(|t| t.runs.contains(&q.run) && t.action_applied(&q.id));
+        if stopped && settled {
+            return Ok(Some(format!(
+                "run {}: obsolete approval {} dismissed; PR unchanged",
+                q.run, q.id
+            )));
         }
     }
     if let Some(target) = &q.merge_target
