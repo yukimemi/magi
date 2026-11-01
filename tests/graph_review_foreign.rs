@@ -54,7 +54,9 @@ async fn foreign_clean_checkout_receives_review_fixes_without_being_removed() {
 common::e2e! {
 async fn foreign_dirty_checkout_is_refused_before_filing_and_untouched() {
     let guard = common::home_lock().await;
-    let fx = fixture(guard, Judges::Unanimous, true);
+    let mut fx = fixture(guard, Judges::Unanimous, true);
+    // This tiny CLI fixture tests dirty-worktree refusal, not production disk headroom.
+    fx.config.disk.min_free_bytes = 1024 * 1024;
     let path = foreign(&fx).await;
     // Even a user's status configuration cannot hide untracked work.
     git::git(&path, &["config", "status.showUntrackedFiles", "no"]).await.unwrap();
