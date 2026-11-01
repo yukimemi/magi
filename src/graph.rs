@@ -1089,18 +1089,10 @@ impl Runner {
                 }
             }
         }
-        let reviewed_head = git::rev_parse(repo, branch).await?;
-        state.observe_branch_owner_holds(&reviewed_head).await;
-
-        // An attached worktree, so the fixer's commits land on the branch under
-        // review rather than on a detached head nobody will look at again.
-        let worktree = state.worktree_root().join("under-review");
-        if let Some(parent) = worktree.parent() {
-            tokio::fs::create_dir_all(parent).await.ok();
-        }
-        let path = worktree.to_string_lossy().to_string();
-        let review_branch = if let Some(checkout) = &state.foreign_checkout {
-            let shadow = format!("magi/{}/review", state.short());
+        // Select the actual review tip before observing owner policy. A foreign
+        // checkout can lag its remote descendant, and repairs must not erase
+        // holds introduced only on that selected commit.
+        let reviewed_head = if let Some(checkout) = &state.foreign_checkout {
             let tracking = format!("{}/{branch}", state.config.merge.remote);
             // A surviving tracking ref is not evidence that the remote still
             // offers this tip. Adopt it only after a successful fetch here.
@@ -1112,7 +1104,22 @@ impl Runner {
                     head = remote;
                 }
             }
-            git::git(repo, &["branch", &shadow, &head]).await?;
+            head
+        } else {
+            git::rev_parse(repo, branch).await?
+        };
+        state.observe_branch_owner_holds(&reviewed_head).await;
+
+        // An attached worktree, so the fixer's commits land on the branch under
+        // review rather than on a detached head nobody will look at again.
+        let worktree = state.worktree_root().join("under-review");
+        if let Some(parent) = worktree.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        let path = worktree.to_string_lossy().to_string();
+        let review_branch = if state.foreign_checkout.is_some() {
+            let shadow = format!("magi/{}/review", state.short());
+            git::git(repo, &["branch", &shadow, &reviewed_head]).await?;
             shadow
         } else {
             branch.to_owned()
