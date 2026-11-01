@@ -86,11 +86,11 @@ pub fn repo_name() -> &'static str {
 ///
 /// Linux resolves `current_exe` through `/proc/self/exe`, and once the upgrade
 /// has swapped the binary the kernel reports the old, unlinked inode as
-/// `/path/magi (deleted)`. Spawning that string fails with ENOENT, which is how
-/// `Update & restart` killed `magi web` without a successor. The suffix is
-/// kernel decoration, not part of the name, so it is stripped when the
-/// decorated path does not exist and the plain one does - the new binary is
-/// what the successor has to be.
+/// `/path/magi (deleted)`. Spawning that string fails with ENOENT. Callers that
+/// look up the executable after replacement (currently the two `chat_watch`
+/// spawn sites) use this helper to strip the suffix only when the decorated
+/// path does not exist and the plain one does. Web successor spawning uses
+/// the executable path saved at startup instead.
 pub fn current_exe() -> std::io::Result<PathBuf> {
     let exe = std::env::current_exe()?;
     Ok(without_deleted_suffix(exe))
@@ -1053,7 +1053,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_replaced_binarys_deleted_suffix_is_stripped_only_when_the_plain_path_exists() {
-        use std::os::unix::ffi::OsStringExt as _;
         let dir = tempfile::tempdir().unwrap();
         let plain = dir.path().join("magi");
         let decorated = dir.path().join("magi (deleted)");
@@ -1064,8 +1063,28 @@ mod tests {
         assert_eq!(without_deleted_suffix(plain.clone()), plain);
         std::fs::write(&decorated, b"odd").unwrap();
         assert_eq!(without_deleted_suffix(decorated.clone()), decorated);
+    }
 
-        // A directory that is not UTF-8 must be repaired too.
+    #[cfg(unix)]
+    #[test]
+    fn a_deleted_suffix_is_stripped_from_non_utf8_bytes_without_filesystem_access() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let raw = PathBuf::from(std::ffi::OsString::from_vec(b"m\xffgi".to_vec()));
+        let mut decorated = raw.clone().into_os_string();
+        decorated.push(" (deleted)");
+        assert_eq!(plain_of_deleted(Path::new(&decorated)), Some(raw.clone()));
+        assert_eq!(plain_of_deleted(&raw), None);
+    }
+
+    // macOS filesystems reject invalid UTF-8 names with EILSEQ. Keep the
+    // filesystem case on Linux; the byte-only test above also runs on macOS.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_replaced_binarys_deleted_suffix_is_stripped_from_a_non_utf8_path() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
         let raw = dir
             .path()
             .join(std::ffi::OsString::from_vec(b"m\xffgi".to_vec()));
